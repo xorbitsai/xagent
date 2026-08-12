@@ -439,6 +439,31 @@ class CreateWorkforceRunResponse(BaseModel):
     control_state: str = Field("idle", description="Detailed task control state.")
 
 
+class PendingInteraction(BaseModel):
+    """The agent's latest unanswered question on a waiting task.
+
+    ``interactions`` is an opaque list of structured-control descriptors
+    (the agent tool's own JSON shape, e.g. ``{"type": "text_input",
+    "field": ..., "label": ...}``) passed through as-is rather than typed
+    against a fixed schema, because the seven-value ``type`` enum lives
+    with the agent tool and duplicating it here would be a second source
+    of truth to keep in sync. ``[]`` and ``null`` both mean "no
+    structured control, answer with plain text" and are intentionally
+    not normalized to one value server-side -- callers should treat them
+    the same way.
+    """
+
+    question: str = Field(..., description="The agent's pending question text.")
+    interactions: Optional[List[Dict[str, Any]]] = Field(
+        None,
+        description=(
+            "Opaque structured-control descriptors for this question, or "
+            "null. May also be an empty list; treat [] and null the same "
+            "way (both mean plain-text answer)."
+        ),
+    )
+
+
 class TaskInfoResponse(BaseModel):
     """``GET /v1/chat/tasks/{task_id}`` response.
 
@@ -490,6 +515,19 @@ class TaskInfoResponse(BaseModel):
         description=(
             "UTC timestamp when the task reached a terminal state "
             "(completed or failed). Null while still running."
+        ),
+    )
+    pending_interaction: Optional[PendingInteraction] = Field(
+        None,
+        description=(
+            "Convenience projection of the agent's most recent unanswered "
+            "question. Always present in the response body, but null "
+            "unless status='waiting_for_user' AND the task has at least "
+            "one persisted question message -- a task can reach "
+            "waiting_for_user with no question recorded (e.g. an empty "
+            "message body), and this field is null in that case too. "
+            "This is a convenience read, not the historical interaction "
+            "record; see #1079 for the full typed interaction surface."
         ),
     )
 

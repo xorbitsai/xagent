@@ -40,12 +40,14 @@ from ...schemas.v1 import (
     AppendMessageResponse,
     CreateTaskRequest,
     CreateTaskResponse,
+    PendingInteraction,
     PublicStep,
     StepsResponse,
     TaskInfoResponse,
     UploadedFileInfo,
     UploadFilesResponse,
 )
+from ...services.chat_history_service import get_latest_waiting_question
 from ...services.connector_runtime import (
     bind_create_connector_runtime_plan,
     persist_create_connector_runtime_context,
@@ -653,6 +655,8 @@ class _TaskInfoSnapshot:
     error: str | None
     created_at: datetime | None
     updated_at: datetime | None
+    pending_question: str | None
+    pending_interactions: list[dict[str, Any]] | None
 
 
 @dataclass(frozen=True)
@@ -751,6 +755,12 @@ def _load_task_info_snapshot(
     SessionLocal = get_session_local()
     with SessionLocal() as db:
         task = _resolve_task_or_404(task_id, principal, db)
+        pending_question: str | None = None
+        pending_interactions: list[dict[str, Any]] | None = None
+        if task.status == TaskStatus.WAITING_FOR_USER:
+            pending_question, pending_interactions = get_latest_waiting_question(
+                db, task_id
+            )
         return _TaskInfoSnapshot(
             task_id=int(task.id),
             agent_id=int(task.agent_id),
@@ -763,6 +773,8 @@ def _load_task_info_snapshot(
             error=cast(str | None, task.error_message),
             created_at=cast(datetime | None, task.created_at),
             updated_at=cast(datetime | None, task.updated_at),
+            pending_question=pending_question,
+            pending_interactions=pending_interactions,
         )
 
 
@@ -832,15 +844,34 @@ def _get_chat_task_sync(
     task_id: int,
     principal: ApiKeyPrincipal,
 ) -> TaskInfoResponse:
-    """Build one task response without retaining a Session during cache I/O."""
+    """Build one task response without retaining a Session during cache I/O.
+
+    ``pending_interaction`` is deliberately kept OUT of the cached
+    response body and stitched on after every cache read/write. The
+    cache entry's freshness token is ``tasks.updated_at`` (see
+    ``task_updated_at`` below), but the pending question lives in
+    ``task_chat_messages`` -- a write there does not touch
+    ``tasks.updated_at``, so a cached entry has no way to prove its
+    ``pending_interaction`` is still current. Caching it anyway would
+    let a stale question survive a cache hit indefinitely.
+    """
 
     task = _load_task_info_snapshot(task_id, principal)
     completed_at = task.updated_at if task.status in _TERMINAL_STATUSES else None
+    pending_interaction = (
+        PendingInteraction(
+            question=task.pending_question,
+            interactions=task.pending_interactions,
+        )
+        if task.pending_question is not None
+        else None
+    )
     cache_key = task_snapshot_key(task_id)
     task_updated_at = cache_version_token(task.updated_at)
     cached = cache_get(cache_key)
     if isinstance(cached, dict) and cached.get("updated_at") == task_updated_at:
-        return TaskInfoResponse.model_validate(cached["response"])
+        response = TaskInfoResponse.model_validate(cached["response"])
+        return response.model_copy(update={"pending_interaction": pending_interaction})
 
     response = TaskInfoResponse(
         task_id=task.task_id,
@@ -866,7 +897,7 @@ def _get_chat_task_sync(
         },
         ttl_seconds=task_cache_ttl_seconds(),
     )
-    return response
+    return response.model_copy(update={"pending_interaction": pending_interaction})
 
 
 def _get_chat_task_steps_sync(

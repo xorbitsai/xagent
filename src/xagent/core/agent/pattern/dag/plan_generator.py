@@ -52,6 +52,14 @@ class PlanStep:
     termination_condition: str | None = None
     completion_evidence: str | None = None
     tool_names: list[str] = field(default_factory=list)
+    # One of: pending, running, completed, failed, interrupted,
+    # clarification_invalidated. clarification_invalidated marks a step
+    # whose question was superseded by another step's question in the
+    # same concurrent batch before it reached the user; the step is not
+    # terminal and becomes schedulable again once the batch settles.
+    # waiting_for_user is never a step status -- a step waiting on the
+    # user stays "running" here, and only the owning pattern's own
+    # status field moves to "waiting_for_user".
     status: str = "pending"
     result: Any = None
     error: str | None = None

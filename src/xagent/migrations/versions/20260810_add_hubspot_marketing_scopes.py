@@ -1,7 +1,7 @@
 """add HubSpot Marketing Hub scopes (forms, analytics, marketing email, campaigns)
 
 Revision ID: 20260810_add_hubspot_marketing_scopes
-Revises: 20260809_add_task_interaction_requests
+Revises: 20260810_add_task_interaction_protocol_version
 Create Date: 2026-08-10
 
 """
@@ -15,7 +15,7 @@ from alembic import op
 logger = logging.getLogger(__name__)
 
 revision: str = "20260810_add_hubspot_marketing_scopes"
-down_revision: Union[str, None] = "20260809_add_task_interaction_requests"
+down_revision: Union[str, None] = "20260810_add_task_interaction_protocol_version"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 

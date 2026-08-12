@@ -870,7 +870,7 @@ class DAGPattern(AgentPattern):
                     )
                     return None
                 schedule_ready_steps()
-        except Exception:
+        except BaseException:
             try:
                 await self._cancel_pending_steps(
                     pending,
@@ -1886,6 +1886,11 @@ class DAGPattern(AgentPattern):
         path. ``_execute_ready_steps`` clears the set in a ``finally``
         before it returns, whatever the outcome, so a caller inspecting
         this once ``run()`` has returned always sees an accurate answer.
+        This holds for cancellation too: when the task running the
+        pattern is cancelled, the sibling step tasks are cancelled and
+        awaited inside the same exception handler before the ``finally``
+        clears the set, so an empty set on return still means no step
+        task is left running.
         """
 
         return bool(self._live_step_tasks)

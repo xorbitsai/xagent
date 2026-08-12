@@ -1758,6 +1758,62 @@ async def test_dag_pattern_failed_step_wins_over_waiting_sibling_in_same_batch()
     assert "clarification_draft" not in result
 
 
+@pytest.mark.asyncio
+async def test_dag_pattern_cancelling_the_run_task_cancels_sibling_steps() -> None:
+    """Cancelling the task that is awaiting pattern.run() while two
+    independent steps are still executing must not leave their step
+    tasks running as orphans. Both step tasks are cancelled and awaited
+    before the cancellation is allowed to propagate out of run(), and
+    active_step_ids ends up empty."""
+
+    step_tasks: dict[str, asyncio.Task[Any]] = {}
+    started: dict[str, asyncio.Event] = {}
+    cancelled_ids: set[str] = set()
+
+    async def fake_execute_step(
+        self: DAGPattern, *, step: PlanStep, **kwargs: Any
+    ) -> dict[str, Any] | None:
+        step_tasks[step.id] = asyncio.current_task()
+        started.setdefault(step.id, asyncio.Event()).set()
+        try:
+            await asyncio.Future()
+        except asyncio.CancelledError:
+            cancelled_ids.add(step.id)
+            raise
+        return None
+
+    pattern = DAGPattern(
+        lambda **_: build_plan(
+            PlanStep(id="a", task="A task"),
+            PlanStep(id="b", task="B task"),
+        ),
+        max_concurrency=2,
+    )
+    pattern._execute_step = fake_execute_step.__get__(pattern, DAGPattern)  # type: ignore[method-assign]
+
+    run_task = asyncio.create_task(
+        pattern.run(
+            context=ExecutionContext(execution_id="dag-cancel-outer"),
+            tools=[],
+            llm=object(),
+            runtime=PatternRuntime(execution_id="dag-cancel-outer"),
+        )
+    )
+    await asyncio.wait_for(started.setdefault("a", asyncio.Event()).wait(), timeout=1)
+    await asyncio.wait_for(started.setdefault("b", asyncio.Event()).wait(), timeout=1)
+    await asyncio.sleep(0)  # let _execute_ready_steps park inside asyncio.wait
+
+    run_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await run_task
+
+    assert run_task.cancelled()
+    assert cancelled_ids == {"a", "b"}
+    assert step_tasks["a"].cancelled()
+    assert step_tasks["b"].cancelled()
+    assert pattern.active_step_ids == []
+
+
 class ConcurrentWaitingLLM:
     """Two DAG steps that each reach waiting_for_user via
     send_message(expect_response=True), synchronized on a shared release

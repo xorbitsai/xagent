@@ -148,6 +148,23 @@ interface TemplateRequirements {
 // instead (issue #802), and `other` is an internal fallback bucket.
 const isAssignableToolCategory = (c: string) => c !== 'agent' && c !== 'other'
 
+// Round-2 review of #1280: selectedMcpServers must be re-seeded from a
+// save's resolved tool_categories the same way loadAgent seeds it from a
+// fetched agent's tool_categories -- otherwise it keeps holding whatever
+// (often unresolved, e.g. a display name) value the user picked, while
+// originalData.tool_categories now holds resolveMcpToolSelector's
+// authoritative resolved name. isDirty's comparison of the two is a plain
+// string compare with no name/id normalization, so a resolved value that
+// differs from the display name (Chrome: "chrome-devtools" vs. "Chrome")
+// left isDirty permanently true after a successful save, with no further
+// action from the user, until a full page reload re-seeded it correctly
+// via loadAgent.
+function mcpServerNamesFromToolCategories(categories: string[]): string[] {
+  return categories
+    .filter((c) => c.startsWith('mcp:'))
+    .map((c) => c.replace('mcp:', ''))
+}
+
 function readNonEmptyString(value: unknown): string | null {
   return typeof value === "string" && value.trim() ? value.trim() : null
 }
@@ -1454,14 +1471,9 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
       finalToolCategories.push("ssh")
     }
 
-    // Add selected MCP servers back into tool_categories. See
-    // resolveMcpToolSelector: the backend names a catalog app's MCPServer
-    // row after either its app_id or its display name depending on app
-    // type, so this resolves the real connected row rather than guessing
-    // at a single fallback (a guess broke Chrome, app_id "chrome-devtools"
-    // vs. display name "Chrome", with the pre-existing "prefer name"
-    // fallback; the reverse "prefer id" fallback breaks Facebook, app_id
-    // "facebook" vs. display name "Facebook Pages", the other direction).
+    // Add selected MCP servers back into tool_categories, resolved to the
+    // real connected MCPServer row's name -- see resolveMcpToolSelector for
+    // why a hard-coded id/name fallback can't work for every app.
     selectedMcpServers.forEach(server => {
       finalToolCategories.push(`mcp:${resolveMcpToolSelector(server, mcpServers, officialApps)}`)
     })
@@ -1541,6 +1553,11 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
             logo_url: updatedAgent.logo_url,
             ...(ownershipResult ?? {}),
           })
+          // Re-seed selectedMcpServers to match: see
+          // mcpServerNamesFromToolCategories's comment for why (isDirty
+          // would otherwise compare a resolved name against the
+          // display name the user picked, forever).
+          setSelectedMcpServers(mcpServerNamesFromToolCategories(finalToolCategories))
           // Sync the saved logo URL so the preview doesn't fall back to the
           // stale URL captured at initial load once logoFile is cleared below.
           setLogoUrl(updatedAgent.logo_url || null)
@@ -1577,6 +1594,11 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
           // Newly created agents are always personal; promote if the user chose Team.
           const ownershipResult = await reconcileOwnership(newAgent.id.toString(), newAgent.team_id)
           setOriginalData({ ...newAgent, ...(ownershipResult ?? {}) })
+          // Same re-seed as the edit-mode branch above, and for the same
+          // reason: newAgent.tool_categories echoes back the resolved
+          // selectors this request submitted (finalToolCategories), not
+          // the possibly-unresolved values selectedMcpServers still holds.
+          setSelectedMcpServers(mcpServerNamesFromToolCategories(finalToolCategories))
           // Only confirm success once ownership resolved. If a promote was blocked
           // (the share-connectors dialog opened, ownershipResult is null), don't
           // stack a "created" dialog on top of it — but remember to show it when

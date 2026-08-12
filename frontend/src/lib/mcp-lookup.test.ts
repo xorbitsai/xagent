@@ -35,32 +35,89 @@ describe("resolveMcpToolSelector", () => {
   // display name (_ensure_user_mcp_server) for builtin_oauth apps. A single
   // hard-coded fallback can only satisfy one -- these two apps diverge in
   // opposite directions and must both resolve correctly.
+  //
+  // Chrome is stdio transport: _enrich_oauth_server_info short-circuits on
+  // non-oauth transports, so its real connected row never carries an
+  // app_id -- just { name: "chrome-devtools" }, as used below.
   const chromeApp = { id: "chrome-devtools", name: "Chrome" }
+  // Facebook is oauth transport: GET /api/mcp/servers enriches oauth rows
+  // with app_id via _enrich_oauth_server_info, so its real row shape is
+  // { name: "Facebook Pages", app_id: "facebook" } -- carrying both.
   const facebookApp = { id: "facebook", name: "Facebook Pages" }
 
-  it("resolves a connected app-id-named server row (chrome-devtools convention)", () => {
+  it("resolves a connected app-id-named server row (chrome-devtools convention, no app_id on the row)", () => {
     const mcpServers = [{ name: "chrome-devtools" }]
     expect(resolveMcpToolSelector("Chrome", mcpServers, [chromeApp])).toBe(
       "chrome-devtools"
     )
   })
 
-  it("resolves a connected name-named server row (facebook builtin_oauth convention)", () => {
+  it("resolves a real oauth row carrying app_id (facebook, via step 1's direct app_id match)", () => {
+    const mcpServers = [{ name: "Facebook Pages", app_id: "facebook" }]
+    expect(resolveMcpToolSelector("facebook", mcpServers, [facebookApp])).toBe(
+      "Facebook Pages"
+    )
+  })
+
+  it("resolves a name-named row with no id at all (isolates the builtin_oauth name-fallback step)", () => {
+    // A row shaped like _ensure_user_mcp_server's convention with no app_id
+    // present at all -- unlike the case above, this can only resolve via
+    // resolveMcpToolSelector's app-name fallback step, not a direct id
+    // match, so it exercises that step independently.
     const mcpServers = [{ name: "Facebook Pages" }]
     expect(resolveMcpToolSelector("facebook", mcpServers, [facebookApp])).toBe(
       "Facebook Pages"
     )
   })
 
-  it("falls back to the app id when the app is known but no server row is connected yet", () => {
-    expect(resolveMcpToolSelector("Chrome", [], [chromeApp])).toBe(
-      "chrome-devtools"
+  it("picks the one matching row out of several connected servers", () => {
+    const mcpServers = [
+      { name: "Zoom" },
+      { name: "chrome-devtools" },
+      { name: "Facebook Pages", app_id: "facebook" },
+    ]
+    expect(
+      resolveMcpToolSelector("Chrome", mcpServers, [chromeApp, facebookApp])
+    ).toBe("chrome-devtools")
+    expect(
+      resolveMcpToolSelector("facebook", mcpServers, [chromeApp, facebookApp])
+    ).toBe("Facebook Pages")
+  })
+
+  it("round-trips an already-resolved real server name unchanged (loadAgent -> re-save)", () => {
+    // loadAgent seeds selectedMcpServers straight from a saved
+    // tool_categories entry, which after any save already holds the
+    // resolved real name -- the very next save must not perturb it.
+    const mcpServers = [{ name: "chrome-devtools" }]
+    expect(
+      resolveMcpToolSelector("chrome-devtools", mcpServers, [chromeApp])
+    ).toBe("chrome-devtools")
+  })
+
+  it("preserves the raw selector unchanged when the app is known but no server row is connected yet", () => {
+    // Round-2 review: guessing connectedApp.id here was itself a
+    // wrong-convention guess for builtin_oauth apps (facebook), and,
+    // regardless of app type, risked overwriting an already-correct
+    // selector for a row this viewer simply can't currently see (a stale
+    // fetch, or a row query-restricted to this viewer) with a guessed one.
+    // Preserving the input unchanged is strictly safer than guessing.
+    expect(resolveMcpToolSelector("Chrome", [], [chromeApp])).toBe("Chrome")
+    expect(resolveMcpToolSelector("Facebook Pages", [], [facebookApp])).toBe(
+      "Facebook Pages"
     )
   })
 
-  it("falls back to the raw selector when nothing matches at all", () => {
+  it("preserves the raw selector unchanged when nothing matches at all", () => {
     expect(resolveMcpToolSelector("some-custom-server", [], [])).toBe(
       "some-custom-server"
     )
+  })
+
+  it("preserves an empty selector unchanged rather than guessing", () => {
+    // Documents current behavior rather than asserting it's the ideal
+    // outcome: an empty selector never resolves to anything, so it passes
+    // through as "" (becoming the tool category "mcp:", handled downstream
+    // by selection_spec.py as an unmatchable scope entry).
+    expect(resolveMcpToolSelector("", [], [])).toBe("")
   })
 })

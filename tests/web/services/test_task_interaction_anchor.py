@@ -294,6 +294,55 @@ def test_ta3_corrupt_conditions(
 
 
 # ---------------------------------------------------------------------------
+# The row's data column holds something other than a dict -- the shape
+# resolve_interaction_anchor's isinstance(row.data, dict) guard exists to
+# handle without raising. A list payload coerces to an empty dict inside
+# the resolver, which has no checkpoint_type key, so it fails the
+# checkpoint-type self-consistency condition immediately and lands on
+# corrupt, the same outcome the six-condition table above produces. A None
+# payload would exercise the same guard, but trace_events.data is a
+# NOT NULL column, so committing a row with data=None raises an
+# IntegrityError before this function ever runs -- that shape cannot be
+# built through a committed row at all, so it is not covered here.
+# ---------------------------------------------------------------------------
+
+
+def test_non_dict_row_data_classifies_corrupt(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(
+        logging.ERROR, logger="xagent.web.services.task_interaction_anchor"
+    )
+    engine = _engine(tmp_path)
+    db = _session_factory(engine)()
+    task = _make_task(db, run_id="run-a")
+    # Built directly rather than through _make_row, which always writes a
+    # dict -- this is the one caller that needs a non-dict payload.
+    row = TraceEvent(
+        task_id=task.id,
+        build_id=None,
+        event_id=f"anchor-event-{next(_event_counter)}",
+        event_type="system_update_general",
+        timestamp=datetime.now(timezone.utc),
+        data=["not", "a", "dict"],
+    )
+    db.add(row)
+    db.commit()
+    db.refresh(row)
+    _point(db, task, row.id)
+
+    result = resolve_interaction_anchor(db, task)
+
+    assert result is None
+    assert ops_signals.INTERACTION_ANCHOR_CORRUPT in ops_signals.active_degradations()
+    assert ir.counters_snapshot() == {}
+    errors = [r for r in caplog.records if r.levelno == logging.ERROR]
+    assert len(errors) == 1, caplog.records
+    assert errors[0].msg == "task %s's checkpoint pointer %s failed anchor validation"
+    db.close()
+
+
+# ---------------------------------------------------------------------------
 # task.run_id IS NULL classifies as absence even when the pointer names a
 # row that would otherwise fail a corrupt condition -- proving step 1
 # short-circuits before the row is ever evaluated, not merely that its own

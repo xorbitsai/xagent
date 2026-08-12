@@ -16,9 +16,10 @@ file's module docstring).
 from __future__ import annotations
 
 import logging
+from contextlib import contextmanager
 
 import pytest
-from sqlalchemy import create_engine
+from sqlalchemy import Select, Update, create_engine, event
 from sqlalchemy.exc import IntegrityError, InvalidRequestError, OperationalError
 from sqlalchemy.orm import Query, Session, sessionmaker
 from sqlalchemy.orm.session import SessionTransaction
@@ -622,5 +623,132 @@ def test_supersede_end_to_end_with_the_reader():
         assert get_latest_waiting_question(db, int(task.id))[0] == "A question"
         supersede_legacy_question_rows(db, task_id=int(task.id))
         assert get_latest_waiting_question(db, int(task.id)) == (None, None)
+    finally:
+        db.close()
+
+
+@contextmanager
+def _captured_statements(bind):
+    """Every SQL construct SQLAlchemy sends through ``bind`` while the
+    block runs, as the ``ClauseElement`` objects themselves rather than
+    rendered strings -- the WHERE clause has to be compared as a clause,
+    not string-carved out of a full statement."""
+    seen: list[object] = []
+
+    def _record(conn, clauseelement, multiparams, params, execution_options):
+        seen.append(clauseelement)
+
+    event.listen(bind, "before_execute", _record)
+    try:
+        yield seen
+    finally:
+        event.remove(bind, "before_execute", _record)
+
+
+def _rendered_where(bind, statement) -> str:
+    return " ".join(
+        str(
+            statement.whereclause.compile(
+                dialect=bind.dialect, compile_kwargs={"literal_binds": True}
+            )
+        ).split()
+    )
+
+
+def _reader_and_writer_where_clauses(db, task_id: int) -> tuple[str, str]:
+    """Run both production functions for real and return the WHERE clause
+    each one actually sent to the database.
+
+    Neither side is reconstructed here: the SELECT is whatever
+    ``get_latest_waiting_question`` emits and the UPDATE is whatever
+    ``supersede_legacy_question_rows`` emits. So the comparison keeps
+    measuring the real statements even if one function stops calling
+    ``_waiting_question_filters`` -- what it detects is the two clauses
+    differing, not the helper going unused. ``literal_binds`` renders the
+    bound ``task_id`` inline, so the comparison covers the bound value
+    too, not only the column/operator shape.
+
+    The comparison is on rendered WHERE text, which makes it strict on
+    purpose: conditions in a different order, or an equivalent rewrite
+    such as ``message_type.in_(["question"])``, count as a difference.
+    Two predicates that mean the same thing but do not render the same
+    thing are exactly the state this abstraction exists to prevent.
+    """
+    bind = db.get_bind()
+    with _captured_statements(bind) as read_seen:
+        get_latest_waiting_question(db, task_id)
+    with _captured_statements(bind) as write_seen:
+        supersede_legacy_question_rows(db, task_id=task_id)
+
+    selects = [s for s in read_seen if isinstance(s, Select)]
+    updates = [s for s in write_seen if isinstance(s, Update)]
+    assert len(selects) == 1, [type(s).__name__ for s in read_seen]
+    assert len(updates) == 1, [type(s).__name__ for s in write_seen]
+    assert selects[0].get_final_froms()[0].name == TaskChatMessage.__tablename__
+    assert updates[0].table.name == TaskChatMessage.__tablename__
+
+    return _rendered_where(bind, selects[0]), _rendered_where(bind, updates[0])
+
+
+def test_reader_and_writer_compile_the_same_where_clause():
+    """#1263's drift check, at runtime rather than over the source text:
+    compile what the reader and the writer actually send and require the
+    two WHERE clauses to be identical, so the two cannot silently
+    diverge. The end-to-end test above cannot do this: its single fixture
+    row satisfies both predicates even after one of them loses a
+    condition.
+
+    What this does not check is that both functions still call
+    ``_waiting_question_filters``. A function that inlined the identical
+    three conditions in the identical order would render the identical
+    clause and pass -- correctly, since nothing has diverged. Keeping the
+    single definition is a readability and maintenance property, and it is
+    visible in the source, not in the emitted SQL.
+    """
+    db = _create_db_session()
+    try:
+        task = _create_task(db)
+        persist_assistant_message(
+            db,
+            int(task.id),
+            int(task.user_id),
+            "A question",
+            message_type="question",
+        )
+
+        read_where, write_where = _reader_and_writer_where_clauses(db, int(task.id))
+
+        assert read_where == write_where
+    finally:
+        db.close()
+
+
+def test_the_shared_where_clause_still_has_all_three_legs():
+    """The equality above holds by construction while both sides splat the
+    same helper, so it alone would stay green if a condition were dropped
+    from the helper itself. This pins what the shared predicate compiles
+    to: task, assistant role, question message_type -- and nothing else.
+    """
+    db = _create_db_session()
+    try:
+        task = _create_task(db)
+        task_id = int(task.id)
+        persist_assistant_message(
+            db,
+            task_id,
+            int(task.user_id),
+            "A question",
+            message_type="question",
+        )
+
+        read_where, write_where = _reader_and_writer_where_clauses(db, task_id)
+
+        expected = (
+            f"task_chat_messages.task_id = {task_id} "
+            "AND task_chat_messages.role = 'assistant' "
+            "AND task_chat_messages.message_type = 'question'"
+        )
+        assert read_where == expected
+        assert write_where == expected
     finally:
         db.close()

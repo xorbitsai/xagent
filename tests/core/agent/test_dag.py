@@ -2374,6 +2374,99 @@ async def test_dag_pattern_mixed_batch_interrupted_wins_over_waiting() -> None:
 
 
 @pytest.mark.asyncio
+async def test_dag_pattern_delivered_result_outranks_pending_replan_in_same_batch() -> (
+    None
+):
+    """A completed result already handed to the user is never discarded
+    just because a new user message showed up mid-batch and made
+    _needs_replan() true. The waiting step's sibling both drops out with
+    no result (as an interrupted step does) and appends a fresh user
+    message to the shared context while it runs, so by the time the
+    batch is processed self.status is "waiting_for_user" and
+    _needs_replan() would read true -- but the completed-results branch
+    returns first, so the plan is generated exactly once: no replan
+    happens, and that new message is simply picked up one turn later.
+    """
+
+    release = asyncio.Event()
+    started: dict[str, asyncio.Event] = {}
+    plan_calls: list[None] = []
+    dropout_calls: list[None] = []
+
+    def counting_plan_generator(**_: Any) -> Any:
+        plan_calls.append(None)
+        return build_plan(
+            PlanStep(id="wait_step", task="Ask me"),
+            PlanStep(id="dropout_step", task="Drop out"),
+        )
+
+    async def fake_execute_step(
+        self: DAGPattern, *, step: PlanStep, **kwargs: Any
+    ) -> dict[str, Any] | None:
+        started.setdefault(step.id, asyncio.Event()).set()
+        await release.wait()
+        root_context = kwargs["root_context"]
+        if step.id == "dropout_step":
+            # A new message arrives while this sibling is in flight, once
+            # only, so a wrongly-ordered implementation replans exactly
+            # once instead of looping forever on it; it then drops out
+            # with no result of its own, the same shape a step cancelled
+            # mid-turn produces.
+            if not dropout_calls:
+                dropout_calls.append(None)
+                root_context.add_user_message("Actually, do something else")
+            return None
+        self.status = "waiting_for_user"
+        draft = draft_from_waiting_request(
+            {
+                "message": "Pick one",
+                "message_type": "question",
+                "interactions": [],
+                "tool_call_id": "ask-wait",
+                "tool_name": "ask_user_question",
+                "message_count": 2,
+            },
+            execution_id=root_context.execution_id,
+            step_id=None,
+        )
+        attributed_draft = draft.with_origin_step(step.id) if draft else None
+        return {
+            "success": False,
+            "status": "waiting_for_user",
+            "message": "Pick one",
+            "message_type": "question",
+            "clarification_draft": attributed_draft,
+            "execution_id": root_context.execution_id,
+            "context": root_context,
+            "active_step_id": step.id,
+        }
+
+    pattern = DAGPattern(counting_plan_generator, max_concurrency=2)
+    pattern._execute_step = fake_execute_step.__get__(pattern, DAGPattern)  # type: ignore[method-assign]
+
+    run_task = asyncio.create_task(
+        pattern.run(
+            context=ExecutionContext(execution_id="dag-result-outranks-replan"),
+            tools=[],
+            llm=object(),
+            runtime=PatternRuntime(execution_id="dag-result-outranks-replan"),
+        )
+    )
+    await asyncio.wait_for(
+        started.setdefault("wait_step", asyncio.Event()).wait(), timeout=1
+    )
+    await asyncio.wait_for(
+        started.setdefault("dropout_step", asyncio.Event()).wait(), timeout=1
+    )
+    release.set()
+    result = await asyncio.wait_for(run_task, timeout=1)
+
+    assert result["status"] == "waiting_for_user"
+    assert result["active_step_id"] == "wait_step"
+    assert len(plan_calls) == 1
+
+
+@pytest.mark.asyncio
 async def test_dag_waiting_draft_attribution_differs_only_by_step() -> None:
     """Two independently-run steps reaching an identical waiting
     turn (same message count, same tool_call_id/interaction_id) get

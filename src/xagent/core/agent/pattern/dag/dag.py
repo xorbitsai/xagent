@@ -1935,11 +1935,32 @@ class DAGPattern(AgentPattern):
         """Pick the one result a same-wakeup completed batch delivers.
 
         Sorts ``completed_results`` in place and returns its new first
-        entry: an interrupted result always outranks a waiting one (an
-        interrupt is a control instruction, not a workflow question the
-        user can be asked to sit through), and within the same kind the
-        lexicographically first step id wins. Callers needing the losers
-        read ``completed_results[1:]`` after this call.
+        entry. The full precedence a batch's outcome follows, from
+        highest to lowest:
+
+        1. A failed step outranks every completed result in the same
+           batch (handled by the caller before this method is even
+           reached: a doomed DAG must not ask a question or report an
+           interrupt in place of the failure).
+        2. Among completed results, an interrupted one outranks a
+           waiting one -- an interrupt is a control instruction, not a
+           workflow question the user can be asked to sit through.
+        3. Within the same kind, the lexicographically first step id
+           wins, for a deterministic pick regardless of which task an
+           ``asyncio.wait()`` wakeup or set iteration happens to surface
+           first.
+        4. Any completed result -- winner or loser -- outranks a
+           pending replan. The caller only checks ``_needs_replan()``
+           after this batch has been fully handled, so a result the
+           user has already been shown (a question, an interrupt) is
+           never discarded just because a new user message arrived
+           mid-batch. That message is not lost either: it does not
+           advance ``planned_user_message_count``, so the next
+           iteration of ``run()``'s loop still sees the replan as
+           pending and picks it up one turn later.
+
+        Callers needing the losers read ``completed_results[1:]`` after
+        this call.
         """
         completed_results.sort(
             key=lambda item: (

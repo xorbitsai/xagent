@@ -28,9 +28,27 @@ from xagent.web.models.database import Base
 from xagent.web.models.task import Task, TaskStatus, TraceEvent
 from xagent.web.models.task_interaction import TaskInteractionRequest
 from xagent.web.services import task_interaction_service as svc
+from xagent.web.services.ops_signals import (
+    CHECKPOINT_LOAD_UNAVAILABLE,
+    CHECKPOINT_PK_ANCHOR_DANGLING,
+    clear_degradation,
+)
 from xagent.web.services.task_lease_service import TASK_RUN_ID_TRACE_FIELD
 
 pytestmark = pytest.mark.postgresql
+
+
+@pytest.fixture(autouse=True)
+def _clean_degradation_registry():
+    """The anchor resolver registers process-global degradation signals on
+    its failure paths; clear this module's two signals around every test so
+    they cannot leak into tests that read the shared registry."""
+    for signal in (CHECKPOINT_PK_ANCHOR_DANGLING, CHECKPOINT_LOAD_UNAVAILABLE):
+        clear_degradation(signal)
+    yield
+    for signal in (CHECKPOINT_PK_ANCHOR_DANGLING, CHECKPOINT_LOAD_UNAVAILABLE):
+        clear_degradation(signal)
+
 
 _key_counter = count()
 

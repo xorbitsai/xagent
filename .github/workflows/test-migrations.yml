@@ -223,6 +223,10 @@ jobs:
         env:
           DATABASE_URL: postgresql://xagent:xagent@localhost:5432/xagent_test
 
+      # Any new migration test file with postgresql-marked tests must be
+      # added to this list -- the fast job deselects the marker and
+      # provisions no database, so an unlisted file's postgres tests run
+      # nowhere.
       - name: Test Gmail provisioning Postgres-only behavior
         if: needs.detect-migration-changes.outputs.should-test == 'true'
         run: |
@@ -252,10 +256,6 @@ jobs:
         env:
           XAGENT_TEST_POSTGRES_URL: postgresql://xagent:xagent@localhost:5432/xagent_test
 
-      # Any new migration test file with postgresql-marked tests must be
-      # added to this list -- the fast job deselects the marker and
-      # provisions no database, so an unlisted file's postgres tests run
-      # nowhere.
       - name: Test task_interaction_requests migration (Postgres-only)
         if: needs.detect-migration-changes.outputs.should-test == 'true'
         run: |

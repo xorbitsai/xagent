@@ -53,6 +53,10 @@ vi.mock('@/contexts/i18n-context', () => ({
 
 import { JsonRenderer, MarkdownRenderer } from '../markdown-renderer'
 import {
+  FileAccessProvider,
+  defaultFileAccessPolicy,
+} from '@/contexts/file-access-context'
+import {
   AgentCardPresentationCapability,
   LinksOpenInNewTabCapability,
 } from '@/contexts/presentation-capabilities'
@@ -789,29 +793,41 @@ describe('MarkdownRenderer', () => {
   })
 
   it('keeps a playing audio element mounted when surrounding page callbacks update', async () => {
-    // The mocked response has no .json(), so the leading stream-ticket
-    // mint attempt (useResolvedMediaUrl's strategy 1, audio/video only)
-    // throws and falls through to the blob fetch -- two calls per load,
-    // not one, but still none on rerender.
+    // This test is about DOM node identity across rerenders, not about
+    // streaming-ticket mechanics -- opt out of the mint attempt explicitly
+    // (rather than relying on the mocked response lacking .json(), which
+    // would make the mint throw internally and fall through to the blob
+    // fetch for an incidental reason unrelated to what this test verifies).
     apiRequestMock.mockResolvedValue({
       ok: true,
       blob: async () => new Blob(['audio-bytes'], { type: 'audio/mpeg' }),
     })
     const content = '![podcast.mp3](file:output/podcast.mp3)'
+    // Stable across both renders: a fresh object literal per render would
+    // change useResolvedMediaUrl's fileAccess dependency identity and
+    // reset it to its loading state, unmounting/remounting the <audio>
+    // element for a reason unrelated to what this test verifies.
+    const testPolicy = { ...defaultFileAccessPolicy, getStreamingUrl: undefined }
     const { rerender } = render(
-      <MarkdownRenderer content={content} onFileClick={vi.fn()} />
+      <FileAccessProvider policy={testPolicy}>
+        <MarkdownRenderer content={content} onFileClick={vi.fn()} />
+      </FileAccessProvider>
     )
 
     const audioBeforeUpdate = await screen.findByLabelText('podcast.mp3')
-    await waitFor(() => expect(apiRequestMock).toHaveBeenCalledTimes(2))
+    await waitFor(() => expect(apiRequestMock).toHaveBeenCalledTimes(1))
 
     // Trace and task events update the surrounding chat message and create new
     // callback props. The media DOM node must survive that rerender so the
     // browser keeps its currentTime and playing state.
-    rerender(<MarkdownRenderer content={content} onFileClick={vi.fn()} />)
+    rerender(
+      <FileAccessProvider policy={testPolicy}>
+        <MarkdownRenderer content={content} onFileClick={vi.fn()} />
+      </FileAccessProvider>
+    )
 
     expect(await screen.findByLabelText('podcast.mp3')).toBe(audioBeforeUpdate)
-    expect(apiRequestMock).toHaveBeenCalledTimes(2)
+    expect(apiRequestMock).toHaveBeenCalledTimes(1)
   })
 
   it('prefers link label over generic file id when determining preview kind', async () => {

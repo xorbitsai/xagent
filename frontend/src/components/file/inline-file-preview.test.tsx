@@ -36,7 +36,7 @@ vi.mock('@/components/file/pptx-preview-renderer', () => ({
   ),
 }))
 
-import { InlineFilePreview } from './inline-file-preview'
+import { InlineFilePreview, __resetStreamingUrlCacheForTests } from './inline-file-preview'
 import {
   FileAccessProvider,
   createPublicFileAccessPolicy,
@@ -45,6 +45,10 @@ import {
 describe('InlineFilePreview', () => {
   beforeEach(() => {
     apiRequestMock.mockReset()
+    // Several cases below reuse the same fileId; without this, an earlier
+    // case's minted (or attempted) streaming ticket would leak into a
+    // later case that expects its own mock to be exercised.
+    __resetStreamingUrlCacheForTests()
   })
 
   afterEach(() => {
@@ -355,9 +359,145 @@ describe('InlineFilePreview', () => {
       'http://api.local/api/files/preview/video-file-id?ticket=signed-ticket'
     )
     expect(apiRequestMock).toHaveBeenCalledWith(
-      'http://api.local/api/files/stream-tickets/video-file-id'
+      'http://api.local/api/files/stream-tickets/video-file-id',
+      expect.objectContaining({ signal: expect.any(AbortSignal) })
     )
     expect(apiRequestMock).toHaveBeenCalledTimes(1)
+  })
+
+  it('keeps the "Open" link on the safe public preview URL when streaming succeeds', async () => {
+    // The ticketed URL is a replayable credential (unlike the blob path's
+    // session-scoped blob: URL) and must never be exposed via a link a
+    // user can put in the address bar, browser history, or copy/paste.
+    apiRequestMock.mockImplementation(async (url: string) => {
+      if (url.includes('/stream-tickets/')) {
+        return {
+          ok: true,
+          json: async () => ({
+            path: '/api/files/preview/video-file-id?ticket=signed-ticket',
+          }),
+        }
+      }
+      throw new Error(`unexpected blob fetch for ${url}`)
+    })
+
+    render(
+      <InlineFilePreview
+        source={{ type: 'video', fileId: 'video-file-id', filename: 'clip.mp4' }}
+      />
+    )
+
+    await screen.findByLabelText('clip.mp4')
+    expect(screen.getByRole('link', { name: 'Open' })).toHaveAttribute(
+      'href',
+      'http://api.local/api/files/public/preview/video-file-id'
+    )
+  })
+
+  it('reuses a minted streaming ticket across remounts of the same file', async () => {
+    apiRequestMock.mockImplementation(async (url: string) => {
+      if (url.includes('/stream-tickets/')) {
+        return {
+          ok: true,
+          json: async () => ({
+            path: '/api/files/preview/video-file-id?ticket=signed-ticket',
+          }),
+        }
+      }
+      throw new Error(`unexpected blob fetch for ${url}`)
+    })
+
+    const { unmount } = render(
+      <InlineFilePreview
+        source={{ type: 'video', fileId: 'video-file-id', filename: 'clip.mp4' }}
+      />
+    )
+    await screen.findByLabelText('clip.mp4')
+    unmount()
+
+    render(
+      <InlineFilePreview
+        source={{ type: 'video', fileId: 'video-file-id', filename: 'clip.mp4' }}
+      />
+    )
+    await screen.findByLabelText('clip.mp4')
+
+    expect(apiRequestMock).toHaveBeenCalledTimes(1)
+  })
+
+  it('falls back to blob fetch when a minted ticket fails to actually load', async () => {
+    // Minting never checks file ownership -- only redemption does -- so a
+    // ticket can mint successfully for a file the caller can't actually
+    // read; the media element's own fetch then fails at redemption, and
+    // playback must still recover via the blob path rather than being
+    // left on a dead ticketed src.
+    apiRequestMock.mockImplementation(async (url: string) => {
+      if (url.includes('/stream-tickets/')) {
+        return {
+          ok: true,
+          json: async () => ({
+            path: '/api/files/preview/video-file-id?ticket=signed-ticket',
+          }),
+        }
+      }
+      return {
+        ok: true,
+        blob: async () => new Blob(['video-bytes'], { type: 'video/mp4' }),
+      }
+    })
+
+    render(
+      <InlineFilePreview
+        source={{ type: 'video', fileId: 'video-file-id', filename: 'clip.mp4' }}
+      />
+    )
+
+    const streamedVideo = await screen.findByLabelText('clip.mp4')
+    expect(streamedVideo.getAttribute('src')).toBe(
+      'http://api.local/api/files/preview/video-file-id?ticket=signed-ticket'
+    )
+
+    fireEvent.error(streamedVideo)
+
+    await waitFor(() => {
+      expect(screen.getByLabelText('clip.mp4').getAttribute('src')).toMatch(/^blob:/)
+    })
+    expect(screen.queryByText('Failed to load preview.')).not.toBeInTheDocument()
+  })
+
+  it('does not get stuck loading when unmounted while a ticket mint is in flight', async () => {
+    const consoleErrorSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+    let resolveMint: ((value: { ok: boolean; json: () => Promise<unknown> }) => void) | undefined
+    apiRequestMock.mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          resolveMint = resolve
+        })
+    )
+
+    const { unmount } = render(
+      <InlineFilePreview
+        source={{ type: 'video', fileId: 'video-file-id', filename: 'clip.mp4' }}
+      />
+    )
+
+    await waitFor(() => expect(apiRequestMock).toHaveBeenCalled())
+    unmount()
+
+    // Resolving after unmount must not update state on an unmounted
+    // component (React would log an error) or throw -- the isCancelled
+    // guard in useResolvedMediaUrl's effect cleanup is what prevents this.
+    resolveMint?.({
+      ok: true,
+      json: async () => ({
+        path: '/api/files/preview/video-file-id?ticket=signed-ticket',
+      }),
+    })
+    await Promise.resolve()
+    await Promise.resolve()
+
+    expect(consoleErrorSpy).not.toHaveBeenCalled()
+    consoleErrorSpy.mockRestore()
   })
 
   it('falls back to blob fetch when ticket minting fails', async () => {

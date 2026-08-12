@@ -79,6 +79,7 @@ FILE_DELIVERY_REDIRECT_ENABLED = "XAGENT_FILE_DELIVERY_REDIRECT_ENABLED"
 FILE_DELIVERY_SIGNED_URL_TTL_SECONDS = "XAGENT_FILE_DELIVERY_SIGNED_URL_TTL_SECONDS"
 FILE_DELIVERY_ACCEL_REDIRECT_ENABLED = "XAGENT_FILE_DELIVERY_ACCEL_REDIRECT_ENABLED"
 FILE_DELIVERY_ACCEL_REDIRECT_PREFIX = "XAGENT_FILE_DELIVERY_ACCEL_REDIRECT_PREFIX"
+FILE_STREAM_TICKET_TTL_SECONDS = "XAGENT_FILE_STREAM_TICKET_TTL_SECONDS"
 SANDBOX_IMAGE = "SANDBOX_IMAGE"
 LANCEDB_PATH = "LANCEDB_PATH"
 KB_COLLECTIONS_TIMEOUT_SECONDS = "XAGENT_KB_COLLECTIONS_TIMEOUT_SECONDS"
@@ -1778,6 +1779,42 @@ def get_file_delivery_signed_url_ttl_seconds() -> int:
     if ttl <= 0:
         raise ValueError(
             f"Invalid {FILE_DELIVERY_SIGNED_URL_TTL_SECONDS} value: {env_value!r}. "
+            "Value must be positive."
+        )
+
+    return ttl
+
+
+def get_file_stream_ticket_ttl_seconds() -> int:
+    """Get the lifetime of a media-streaming preview ticket.
+
+    Priority:
+        1. XAGENT_FILE_STREAM_TICKET_TTL_SECONDS environment variable
+        2. Default of 600 (10 minutes)
+
+    Kept independent of, and far shorter than, the user's own access token
+    TTL: unlike a Bearer header, this credential rides in a URL a media
+    element loads directly (address bar, browser history, proxy/CDN access
+    logs, the file's "Open" link), so a leaked or logged ticket should stop
+    being replayable long before a stolen access token would need to.
+
+    Returns:
+        Ticket lifetime in seconds.
+    """
+    env_value = os.getenv(FILE_STREAM_TICKET_TTL_SECONDS)
+    if env_value is None or not env_value.strip():
+        return 600
+
+    try:
+        ttl = int(env_value)
+    except ValueError as exc:
+        raise ValueError(
+            f"Invalid {FILE_STREAM_TICKET_TTL_SECONDS} value: {env_value!r}."
+        ) from exc
+
+    if ttl <= 0:
+        raise ValueError(
+            f"Invalid {FILE_STREAM_TICKET_TTL_SECONDS} value: {env_value!r}. "
             "Value must be positive."
         )
 

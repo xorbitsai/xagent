@@ -124,6 +124,7 @@ describe("FileAccessProvider", () => {
     })
     expect(apiRequestMock).toHaveBeenCalledWith(
       "/api/files/stream-tickets/file%2Fid",
+      expect.objectContaining({ signal: expect.any(AbortSignal) }),
     )
   })
 
@@ -141,6 +142,49 @@ describe("FileAccessProvider", () => {
       expect(screen.getByTestId("streaming")).toHaveAttribute(
         "data-result",
         "error:Failed to mint stream ticket: 500",
+      )
+    })
+  })
+
+  it("rejects the streaming URL promise when the mint request itself throws", async () => {
+    // Distinct from a resolved-but-not-ok response: a network-level
+    // rejection (offline, DNS failure, an aborted request) must also
+    // surface as a caught rejection so useResolvedMediaUrl's fallback
+    // fires, not as an unhandled rejection.
+    apiRequestMock.mockRejectedValue(new TypeError("Failed to fetch"))
+    render(
+      <FileAccessProvider>
+        <StreamingUrlProbe />
+      </FileAccessProvider>,
+    )
+
+    screen.getByTestId("streaming").click()
+
+    await waitFor(() => {
+      expect(screen.getByTestId("streaming")).toHaveAttribute(
+        "data-result",
+        "error:Failed to fetch",
+      )
+    })
+  })
+
+  it("rejects the streaming URL promise when the mint response has an unexpected shape", async () => {
+    apiRequestMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({ notPath: "/api/files/preview/file-id" }),
+    })
+    render(
+      <FileAccessProvider>
+        <StreamingUrlProbe />
+      </FileAccessProvider>,
+    )
+
+    screen.getByTestId("streaming").click()
+
+    await waitFor(() => {
+      expect(screen.getByTestId("streaming")).toHaveAttribute(
+        "data-result",
+        "error:Stream ticket response has an unexpected shape",
       )
     })
   })

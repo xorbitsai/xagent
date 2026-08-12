@@ -8,7 +8,15 @@ from typing import Any, Dict, Optional, Tuple, cast
 from urllib.parse import quote
 from uuid import uuid4
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile
+from fastapi import (
+    APIRouter,
+    Depends,
+    File,
+    Form,
+    HTTPException,
+    Query,
+    UploadFile,
+)
 from fastapi.responses import (
     FileResponse,
     RedirectResponse,
@@ -24,6 +32,7 @@ from ...config import (
     get_file_delivery_accel_redirect_prefix,
     get_file_delivery_redirect_enabled,
     get_file_delivery_signed_url_ttl_seconds,
+    get_file_stream_ticket_ttl_seconds,
     get_storage_root,
     get_uploads_dir,
 )
@@ -33,7 +42,7 @@ from ...core.tools.adapters.vibe.file_tool import read_file
 from ...core.tools.core.file_analysis import collect_pptx_slide_blocks
 from ...core.utils.svg import rasterize_svg_bytes
 from ...core.workspace import scoped_user_root
-from ..auth_config import ACCESS_TOKEN_EXPIRE_MINUTES, JWT_ALGORITHM, JWT_SECRET_KEY
+from ..auth_config import JWT_ALGORITHM, JWT_SECRET_KEY
 from ..auth_dependencies import get_current_user, is_admin_user
 from ..config import (
     BINARY_EXTENSIONS,
@@ -264,6 +273,7 @@ def _durable_redirect_response(
     filename: str,
     media_type: str,
     disposition: str,
+    extra_headers: Optional[Dict[str, str]] = None,
 ) -> RedirectResponse | None:
     if not get_file_delivery_redirect_enabled():
         return None
@@ -282,7 +292,13 @@ def _durable_redirect_response(
     if not signed_url:
         return None
 
-    return RedirectResponse(url=signed_url, status_code=307)
+    # extra_headers (e.g. a ticket-authenticated request's Cache-Control) is
+    # best-effort on this response only: browsers don't cache a 307 without
+    # explicit caching headers regardless, and the bytes the client actually
+    # receives come from ``signed_url`` (the durable-object provider), whose
+    # own headers -- governed by its short, provider-side expiry -- are what
+    # actually controls caching for that content, not anything set here.
+    return RedirectResponse(url=signed_url, status_code=307, headers=extra_headers)
 
 
 def _accel_redirect_response(
@@ -292,6 +308,7 @@ def _accel_redirect_response(
     filename: str,
     media_type: str,
     disposition: str,
+    extra_headers: Optional[Dict[str, str]] = None,
 ) -> Response | None:
     if not get_file_delivery_accel_redirect_enabled():
         return None
@@ -309,10 +326,16 @@ def _accel_redirect_response(
     internal_uri = (
         internal_prefix.rstrip("/") + "/" + quote(relative_path.as_posix(), safe="/")
     )
+    # extra_headers is best-effort here too: whether it survives nginx's
+    # internal X-Accel-Redirect (which by default regenerates the response
+    # for the internal location rather than forwarding these headers
+    # verbatim) is reverse-proxy-config-dependent, same caveat that already
+    # applies to Content-Disposition on this exact response.
     return Response(
         status_code=200,
         media_type=media_type,
         headers={
+            **(extra_headers or {}),
             "X-Accel-Redirect": internal_uri,
             "Content-Disposition": _content_disposition_header(disposition, filename),
         },
@@ -1474,17 +1497,27 @@ async def download_file(
 # already grants, and _check_file_access/_is_admin_user below still enforce
 # ownership exactly as they do for the Bearer path. Binding the ticket to one
 # file_id means a leaked ticket can only be replayed against that one file,
-# not enumerated against others. TTL matches the user's own access token,
-# since the ticket's authority is strictly narrower (one file, read-only,
-# inline preview) than the Bearer token it stands in for.
+# not enumerated against others. Unlike a Bearer header, though, this
+# credential rides in a URL a media element loads directly — address bar,
+# browser history, the file's "Open" link, proxy/CDN access logs — so its
+# TTL is kept independently short (get_file_stream_ticket_ttl_seconds(),
+# minutes not hours) rather than matching the user's own access token.
 FILE_STREAM_TICKET_TYPE = "file_stream_ticket"
-FILE_STREAM_TICKET_TTL_SECONDS = ACCESS_TOKEN_EXPIRE_MINUTES * 60
 
 # A ticket rides in the query string of a URL a media element auto-fetches
-# on render, so — like the public/tokened preview route — it must never be
-# written to browser disk cache, where it could outlive its own TTL's
-# intent of being "short-lived".
+# on render, so — like the public/tokened preview route (#1227) — it must
+# never be written to browser disk cache, where it could outlive its own
+# TTL's intent of being "short-lived". This is the single choke point for
+# that decision: every response exit of preview_file that can serve a
+# ticket-authenticated request must apply it, including the redirect
+# fast paths below (see the comment where the ``not ticket`` guards were
+# removed) -- not just the two direct _inline_preview_response calls.
 _TICKET_PREVIEW_CACHE_HEADERS = {"Cache-Control": "private, no-store"}
+
+
+def _preview_cache_headers(ticket: Optional[str]) -> Optional[Dict[str, str]]:
+    return _TICKET_PREVIEW_CACHE_HEADERS if ticket else None
+
 
 _optional_bearer = HTTPBearer(auto_error=False)
 
@@ -1521,11 +1554,15 @@ def _user_from_bearer_or_stream_ticket(
     if ticket:
         return _user_from_stream_ticket(db, ticket, file_id)
     if credentials is None:
-        raise HTTPException(
-            status_code=401,
-            detail="Not authenticated",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
+        # This endpoint predates the ticket param and used the default
+        # HTTPBearer(auto_error=True), which FastAPI raises as 403 "Not
+        # authenticated" -- not 401 -- when the Authorization header is
+        # absent entirely (401 is reserved for a credential that IS
+        # present but rejected: an invalid ticket here, or an invalid/
+        # expired Bearer token via get_current_user below). Switching a
+        # completely-missing credential to 401 would be an unannounced
+        # breaking change to this pre-existing endpoint's error contract.
+        raise HTTPException(status_code=403, detail="Not authenticated")
     return get_current_user(credentials, db)
 
 
@@ -1556,9 +1593,18 @@ async def issue_preview_stream_ticket(
             "user_id": user.id,
             "file_id": file_id,
         },
-        expires_delta=timedelta(seconds=FILE_STREAM_TICKET_TTL_SECONDS),
+        expires_delta=timedelta(seconds=get_file_stream_ticket_ttl_seconds()),
     )
-    return {"path": f"/api/files/preview/{quote(file_id, safe='')}?ticket={ticket}"}
+    # Derived from the router's own mount prefix rather than hardcoded, so
+    # this can't silently drift from preview_file's actual path if either
+    # ever changes. Deliberately not request.url_for(...): verified it does
+    # NOT percent-encode a path-converter parameter at all (a file_id
+    # containing e.g. "?" would corrupt the query string boundary this
+    # ticket is appended to) -- quote(..., safe='') is the safe primitive
+    # here, and a Starlette round-trip confirms it handles slash-bearing
+    # legacy file_id values correctly against ``{file_id:path}``.
+    preview_path = f"{file_router.prefix}/preview/{quote(file_id, safe='')}"
+    return {"path": f"{preview_path}?ticket={ticket}"}
 
 
 @file_router.get("/preview/{file_id:path}", response_model=None)
@@ -1568,7 +1614,7 @@ async def preview_file(
     user: User = Depends(_user_from_bearer_or_stream_ticket),
     db: Session = Depends(get_db),
 ) -> Any:
-    cache_headers = _TICKET_PREVIEW_CACHE_HEADERS if ticket else None
+    cache_headers = _preview_cache_headers(ticket)
     file_record, full_path, owner_user_id = _resolve_file_path(
         db, file_id, _user_id_value(user)
     )
@@ -1580,12 +1626,22 @@ async def preview_file(
         file_name = str(file_record.filename)
         media_type = guess_media_type(file_name)
         local_path_is_trusted = _is_under_uploads(full_path, owner_user_id)
-        if not ticket and _preview_can_redirect(full_path, media_type):
+        # Deliberately not gated on "not ticket": a ticket-authenticated
+        # request is a media element loading this URL for progressive
+        # playback, which is exactly the case object-storage/nginx offload
+        # matters most for. Excluding it here would force large media
+        # through the app process on every ticketed request, defeating the
+        # performance goal this ticket mechanism exists for. cache_headers
+        # is still threaded through (see _preview_cache_headers) so the
+        # no-store invariant travels with the request regardless of which
+        # exit serves it.
+        if _preview_can_redirect(full_path, media_type):
             redirect_response = _durable_redirect_response(
                 file_ref,
                 filename=file_name,
                 media_type=media_type,
                 disposition="inline",
+                extra_headers=cache_headers,
             )
             if redirect_response is not None:
                 return redirect_response
@@ -1596,6 +1652,7 @@ async def preview_file(
                     filename=file_name,
                     media_type=media_type,
                     disposition="inline",
+                    extra_headers=cache_headers,
                 )
                 if accel_response is not None:
                     return accel_response
@@ -1630,13 +1687,16 @@ async def preview_file(
     if not full_path.exists():
         raise HTTPException(status_code=404, detail="File not found")
 
-    if not ticket and _preview_can_redirect(full_path, media_type):
+    if _preview_can_redirect(full_path, media_type):
+        # See the comment on the equivalent branch above: not gated on
+        # ticket presence, for the same reason.
         accel_response = _accel_redirect_response(
             full_path,
             owner_user_id=owner_user_id,
             filename=file_name,
             media_type=media_type,
             disposition="inline",
+            extra_headers=cache_headers,
         )
         if accel_response is not None:
             return accel_response

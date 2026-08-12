@@ -2,6 +2,7 @@ import os
 import tempfile
 from pathlib import Path
 from typing import Any, cast
+from urllib.parse import quote
 
 import pytest
 from fastapi import FastAPI
@@ -741,6 +742,351 @@ class TestAdminFileAccess:
 
         assert response.status_code == 403
 
+    def test_stream_ticket_mint_and_redeem_for_slash_bearing_legacy_file_id(
+        self, test_db, temp_uploads_dir, monkeypatch
+    ):
+        # A legacy file_id can be an arbitrary relative path containing
+        # slashes, with no UploadedFile DB record at all -- confirm the
+        # mint response's quote(..., safe='')-encoded path round-trips
+        # correctly through {file_id:path} on redemption.
+        import xagent.web.api.legacy_file as legacy_file_module
+
+        # resolve_legacy_file_path resolves get_uploads_dir() through its
+        # own module-local import binding, separate from the one
+        # temp_uploads_dir already patches on xagent.web.api.files -- both
+        # must point at the same temp directory for this filesystem-scan
+        # path (unlike the DB-record path other tests exercise, which
+        # stores an absolute path directly and never calls this).
+        monkeypatch.setattr(
+            legacy_file_module, "get_uploads_dir", lambda: temp_uploads_dir
+        )
+
+        admin_user, regular_user, test_app, session = test_db
+        del admin_user
+        regular_user_id = int(cast(Any, regular_user.id))
+
+        legacy_relative_path = "web_task_235/output/clip.mp4"
+        legacy_file_path = (
+            temp_uploads_dir / f"user_{regular_user_id}" / legacy_relative_path
+        )
+        legacy_file_path.parent.mkdir(parents=True, exist_ok=True)
+        legacy_file_path.write_bytes(b"legacy video bytes")
+
+        client = TestClient(test_app)
+        user_headers = create_auth_headers(regular_user)
+        ticket_response = client.get(
+            f"/api/files/stream-tickets/{quote(legacy_relative_path, safe='')}",
+            headers=user_headers,
+        )
+        assert ticket_response.status_code == 200
+        path = ticket_response.json()["path"]
+        assert path.startswith(
+            f"/api/files/preview/{quote(legacy_relative_path, safe='')}?ticket="
+        )
+
+        preview_response = client.get(path)
+
+        assert preview_response.status_code == 200
+        assert preview_response.content == b"legacy video bytes"
+
+    def test_preview_rejects_an_access_token_used_as_a_ticket(
+        self, test_db, temp_uploads_dir
+    ):
+        # type: "access" must not be redeemable via ?ticket= -- the two
+        # credential kinds must stay disjoint even though both are signed
+        # with the same secret.
+        admin_user, regular_user, test_app, session = test_db
+        del admin_user
+        regular_user_id = int(cast(Any, regular_user.id))
+        task = Task(
+            id=97,
+            user_id=regular_user_id,
+            title="Access token as ticket test",
+            description="access token as ticket test",
+        )
+        session.add(task)
+        session.commit()
+
+        uploaded_file = create_uploaded_file(
+            session,
+            temp_uploads_dir,
+            regular_user_id,
+            int(cast(Any, task.id)),
+            "clip.mp4",
+            "video bytes",
+        )
+
+        access_token = create_auth_headers(regular_user)["Authorization"].removeprefix(
+            "Bearer "
+        )
+
+        client = TestClient(test_app)
+        response = client.get(
+            f"/api/files/preview/{uploaded_file.file_id}",
+            params={"ticket": access_token},
+        )
+
+        assert response.status_code == 401
+
+    def test_stream_ticket_rejected_as_a_bearer_credential(
+        self, test_db, temp_uploads_dir
+    ):
+        # The symmetric direction: type: "file_stream_ticket" must not be
+        # accepted as a plain Bearer credential either.
+        admin_user, regular_user, test_app, session = test_db
+        del admin_user
+        regular_user_id = int(cast(Any, regular_user.id))
+        task = Task(
+            id=98,
+            user_id=regular_user_id,
+            title="Ticket as bearer test",
+            description="ticket as bearer test",
+        )
+        session.add(task)
+        session.commit()
+
+        uploaded_file = create_uploaded_file(
+            session,
+            temp_uploads_dir,
+            regular_user_id,
+            int(cast(Any, task.id)),
+            "clip.mp4",
+            "video bytes",
+        )
+
+        client = TestClient(test_app)
+        user_headers = create_auth_headers(regular_user)
+        ticket_response = client.get(
+            f"/api/files/stream-tickets/{uploaded_file.file_id}",
+            headers=user_headers,
+        )
+        ticket = ticket_response.json()["path"].split("ticket=")[1]
+
+        response = client.get(
+            f"/api/files/preview/{uploaded_file.file_id}",
+            headers={"Authorization": f"Bearer {ticket}"},
+        )
+
+        assert response.status_code == 401
+
+    def test_preview_rejects_ticket_signed_with_wrong_secret(
+        self, test_db, temp_uploads_dir
+    ):
+        import jwt as pyjwt
+
+        admin_user, regular_user, test_app, session = test_db
+        del admin_user
+        regular_user_id = int(cast(Any, regular_user.id))
+        task = Task(
+            id=99,
+            user_id=regular_user_id,
+            title="Wrong secret ticket test",
+            description="wrong secret ticket test",
+        )
+        session.add(task)
+        session.commit()
+
+        uploaded_file = create_uploaded_file(
+            session,
+            temp_uploads_dir,
+            regular_user_id,
+            int(cast(Any, task.id)),
+            "clip.mp4",
+            "video bytes",
+        )
+
+        forged_ticket = pyjwt.encode(
+            {
+                "type": "file_stream_ticket",
+                "sub": regular_user.username,
+                "user_id": regular_user.id,
+                "file_id": uploaded_file.file_id,
+            },
+            "not-the-real-secret",
+            algorithm="HS256",
+        )
+
+        client = TestClient(test_app)
+        response = client.get(
+            f"/api/files/preview/{uploaded_file.file_id}",
+            params={"ticket": forged_ticket},
+        )
+
+        assert response.status_code == 401
+
+    def test_preview_rejects_ticket_for_a_deleted_user(self, test_db, temp_uploads_dir):
+        import jwt as pyjwt
+
+        from xagent.web.auth_config import JWT_ALGORITHM, JWT_SECRET_KEY
+
+        admin_user, regular_user, test_app, session = test_db
+        del admin_user, regular_user
+        deleted_user = User(
+            username="soon_deleted",
+            password_hash=hash_password("soon_deleted"),
+            is_admin=False,
+        )
+        session.add(deleted_user)
+        session.commit()
+
+        deleted_user_id = int(cast(Any, deleted_user.id))
+        deleted_username = str(deleted_user.username)
+
+        # _user_from_stream_ticket rejects on the user lookup alone, before
+        # ever resolving a file -- no task/upload needs to exist for this
+        # deleted user, which also avoids a real cascade-delete headache.
+        ticket = pyjwt.encode(
+            {
+                "type": "file_stream_ticket",
+                "sub": deleted_username,
+                "user_id": deleted_user_id,
+                "file_id": "irrelevant-file-id",
+            },
+            JWT_SECRET_KEY,
+            algorithm=JWT_ALGORITHM,
+        )
+
+        session.delete(deleted_user)
+        session.commit()
+
+        client = TestClient(test_app)
+        response = client.get(
+            "/api/files/preview/irrelevant-file-id",
+            params={"ticket": ticket},
+        )
+
+        assert response.status_code == 401
+
+    def test_empty_ticket_query_param_falls_through_to_bearer_path(
+        self, test_db, temp_uploads_dir
+    ):
+        # ?ticket= with an empty string must not short-circuit into the
+        # ticket branch (an empty ticket would then fail JWT decoding);
+        # it should behave exactly as if no ticket param were sent.
+        admin_user, regular_user, test_app, session = test_db
+        del admin_user
+        regular_user_id = int(cast(Any, regular_user.id))
+        task = Task(
+            id=101,
+            user_id=regular_user_id,
+            title="Empty ticket test",
+            description="empty ticket test",
+        )
+        session.add(task)
+        session.commit()
+
+        uploaded_file = create_uploaded_file(
+            session,
+            temp_uploads_dir,
+            regular_user_id,
+            int(cast(Any, task.id)),
+            "clip.mp4",
+            "video bytes",
+        )
+
+        client = TestClient(test_app)
+        user_headers = create_auth_headers(regular_user)
+        response = client.get(
+            f"/api/files/preview/{uploaded_file.file_id}",
+            params={"ticket": ""},
+            headers=user_headers,
+        )
+
+        assert response.status_code == 200
+        assert response.content == b"video bytes"
+        # No ticket was actually redeemed, so this must not get the
+        # ticket path's no-store override.
+        assert "cache-control" not in response.headers
+
+    def test_ticket_takes_precedence_over_a_mismatched_bearer_header(
+        self, test_db, temp_uploads_dir
+    ):
+        # _user_from_bearer_or_stream_ticket checks `if ticket:` before
+        # ever looking at the Bearer header -- confirm a valid ticket for
+        # one user is honored even when a *different* user's Bearer
+        # header is also present, rather than the two being reconciled or
+        # the Bearer header silently winning.
+        admin_user, regular_user, test_app, session = test_db
+        regular_user_id = int(cast(Any, regular_user.id))
+        task = Task(
+            id=102,
+            user_id=regular_user_id,
+            title="Precedence test",
+            description="precedence test",
+        )
+        session.add(task)
+        session.commit()
+
+        uploaded_file = create_uploaded_file(
+            session,
+            temp_uploads_dir,
+            regular_user_id,
+            int(cast(Any, task.id)),
+            "clip.mp4",
+            "video bytes",
+        )
+
+        client = TestClient(test_app)
+        regular_user_headers = create_auth_headers(regular_user)
+        ticket_response = client.get(
+            f"/api/files/stream-tickets/{uploaded_file.file_id}",
+            headers=regular_user_headers,
+        )
+        ticket = ticket_response.json()["path"].split("ticket=")[1]
+
+        admin_headers = create_auth_headers(admin_user)
+        response = client.get(
+            f"/api/files/preview/{uploaded_file.file_id}",
+            params={"ticket": ticket},
+            headers=admin_headers,
+        )
+
+        assert response.status_code == 200
+        assert response.content == b"video bytes"
+
+    def test_ticket_authenticated_preview_can_use_accel_redirect(
+        self, test_db, temp_uploads_dir, monkeypatch
+    ):
+        # The redirect fast paths are no longer gated on "not ticket" --
+        # confirm a ticketed request actually reaches the accel-redirect
+        # branch instead of being forced through the app process, and
+        # still carries the no-store guard on that response.
+        monkeypatch.setenv("XAGENT_FILE_DELIVERY_ACCEL_REDIRECT_ENABLED", "true")
+        admin_user, regular_user, test_app, session = test_db
+        del admin_user
+        regular_user_id = int(cast(Any, regular_user.id))
+        task = Task(
+            id=103,
+            user_id=regular_user_id,
+            title="Ticket accel redirect test",
+            description="ticket accel redirect test",
+        )
+        session.add(task)
+        session.commit()
+
+        uploaded_file = create_uploaded_file(
+            session,
+            temp_uploads_dir,
+            regular_user_id,
+            int(cast(Any, task.id)),
+            "clip.mp4",
+            "video bytes",
+        )
+
+        client = TestClient(test_app)
+        user_headers = create_auth_headers(regular_user)
+        ticket_response = client.get(
+            f"/api/files/stream-tickets/{uploaded_file.file_id}",
+            headers=user_headers,
+        )
+        path = ticket_response.json()["path"]
+
+        response = client.get(path, follow_redirects=False)
+
+        assert response.status_code == 200
+        assert "x-accel-redirect" in response.headers
+        assert response.headers["cache-control"] == "private, no-store"
+
     def test_preview_rejects_garbage_ticket(self, test_db, temp_uploads_dir):
         admin_user, regular_user, test_app, session = test_db
         del admin_user
@@ -820,6 +1166,11 @@ class TestAdminFileAccess:
         assert response.status_code == 401
 
     def test_preview_requires_bearer_or_ticket(self, test_db, temp_uploads_dir):
+        # 403, matching this pre-existing endpoint's error contract from
+        # before the ticket param existed: FastAPI's default
+        # HTTPBearer(auto_error=True) raises 403 "Not authenticated" for a
+        # completely absent Authorization header, not 401 (401 is reserved
+        # for a credential that IS present but rejected).
         admin_user, regular_user, test_app, session = test_db
         del admin_user
         regular_user_id = int(cast(Any, regular_user.id))
@@ -844,4 +1195,4 @@ class TestAdminFileAccess:
         client = TestClient(test_app)
         response = client.get(f"/api/files/preview/{uploaded_file.file_id}")
 
-        assert response.status_code == 401
+        assert response.status_code == 403

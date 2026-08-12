@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react'
+import React, { useCallback, useEffect, useState } from 'react'
 import { FileText, Loader2, Video, Volume2 } from 'lucide-react'
 
 import { DocxPreviewRenderer } from '@/components/file/docx-preview-renderer'
@@ -32,6 +32,37 @@ const fileNameFromSource = (source: InlineFilePreviewSource) =>
 const DEFAULT_OPEN_LABEL = 'Open'
 const DEFAULT_LOAD_ERROR_TEXT = 'Failed to load preview.'
 
+// A minted streaming URL is cached briefly per fileId so remounts/rerenders
+// of the same attachment (common in a chat transcript) don't each pay an
+// extra mint round trip. Deliberately much shorter than the server's own
+// ticket TTL default (10 minutes) rather than trying to track the real
+// expiry -- this is a de-dup window for near-simultaneous mounts, not an
+// attempt to use a ticket right up to the edge of its validity.
+const STREAMING_URL_CACHE_TTL_MS = 4 * 60 * 1000
+const streamingUrlCache = new Map<string, { url: string; expiresAt: number }>()
+
+async function mintStreamingUrl(
+  fileAccess: FileAccessPolicy,
+  fileId: string
+): Promise<string> {
+  const cached = streamingUrlCache.get(fileId)
+  if (cached && cached.expiresAt > Date.now()) return cached.url
+  const url = await fileAccess.getStreamingUrl!(fileId)
+  streamingUrlCache.set(fileId, { url, expiresAt: Date.now() + STREAMING_URL_CACHE_TTL_MS })
+  return url
+}
+
+/**
+ * Test-only escape hatch: this module-level cache persists across test
+ * cases within the same test file (no module reset between them), so a
+ * fixed test fileId reused across cases would otherwise silently return an
+ * earlier case's mocked ticket instead of exercising the current case's
+ * mock. Call from `beforeEach` in any test that mocks `getStreamingUrl`.
+ */
+export function __resetStreamingUrlCacheForTests(): void {
+  streamingUrlCache.clear()
+}
+
 /**
  * Resolve the URL a media element (<img>/<audio>/<video>) can load.
  *
@@ -42,7 +73,14 @@ const DEFAULT_LOAD_ERROR_TEXT = 'Failed to load preview.'
  *    short-lived, file-scoped ticket and hands the media element a direct
  *    URL, preserving HTTP range requests for progressive playback. Falls
  *    through to (2) if minting fails (e.g. offline) rather than leaving
- *    the player on a permanent spinner.
+ *    the player on a permanent spinner. If the media element itself then
+ *    fails to load that URL (e.g. the ticket expired mid-session, or
+ *    redemption 403s for a file minting never checked ownership on), the
+ *    caller's ``onError`` should invoke the returned ``reportLoadFailure``
+ *    to retry via (2)/(3) instead of leaving a dead ``src`` — this is not
+ *    hypothetical: minting never checks file ownership by design (only
+ *    redemption does), so a ticket can mint successfully for a file the
+ *    caller can't actually read.
  * 2. Blob fetch: the default policy's authenticated preview route needs a
  *    Bearer header that media elements cannot send, so managed files are
  *    fetched into a blob object URL. If that fetch fails, the public
@@ -60,13 +98,21 @@ const DEFAULT_LOAD_ERROR_TEXT = 'Failed to load preview.'
  * seek-before-download or progressive-loading need, so paying an extra
  * network round trip to mint a ticket before every image load would be
  * pure overhead with no benefit.
+ *
+ * Returns ``openUrl`` alongside ``resolvedUrl`` for the "Open in new tab"
+ * affordance: the ticketed URL from strategy (1) is a replayable
+ * credential (unlike the blob path's session-scoped ``blob:`` URL, or the
+ * direct path's already-anonymous public URL), so it must never be handed
+ * to something a user can put in the address bar, browser history, or a
+ * copied link -- ``openUrl`` falls back to the same credential-free
+ * ``previewUrl`` the blob path itself uses on failure.
  */
 function useResolvedMediaUrl(
   source: InlineFilePreviewSource,
   previewUrl: string,
   fileAccess: FileAccessPolicy,
   allowStreaming: boolean
-): string {
+): { resolvedUrl: string; openUrl: string; reportLoadFailure: () => boolean } {
   const fileId = source.fileId
   const canStream =
     allowStreaming && Boolean(fileId) && Boolean(fileAccess.getStreamingUrl)
@@ -74,15 +120,26 @@ function useResolvedMediaUrl(
   const [resolvedUrl, setResolvedUrl] = useState(
     canStream || needsBlobFetch ? '' : previewUrl
   )
+  const [isStreamingUrl, setIsStreamingUrl] = useState(false)
+  // Set once the *media element itself* (not just minting) has failed to
+  // load a streaming URL for this fileId, so this hook stops retrying
+  // strategy (1) and settles on (2)/(3) for the remainder of this mount.
+  const [streamingFailedFor, setStreamingFailedFor] = useState<string | null>(null)
+  const streamingDisabled = canStream && streamingFailedFor === fileId
 
   useEffect(() => {
     let objectUrl: string | null = null
     let isCancelled = false
+    const effectiveCanStream = canStream && !streamingDisabled
 
-    setResolvedUrl(canStream || needsBlobFetch ? '' : previewUrl)
+    setResolvedUrl(effectiveCanStream || needsBlobFetch ? '' : previewUrl)
+    setIsStreamingUrl(false)
 
     const loadBlobOrDirect = async () => {
-      if (!needsBlobFetch || !fileId) return
+      if (!needsBlobFetch || !fileId) {
+        setResolvedUrl(previewUrl)
+        return
+      }
       try {
         const response = await fileAccess.request(fileAccess.previewUrl(fileId), {
           cache: 'no-cache',
@@ -100,24 +157,34 @@ function useResolvedMediaUrl(
         if (isCancelled) return
         objectUrl = URL.createObjectURL(blob)
         setResolvedUrl(objectUrl)
-      } catch {
+      } catch (error) {
         if (!isCancelled) {
+          console.warn(
+            'InlineFilePreview: authenticated preview fetch failed, falling back to the public preview URL.',
+            error
+          )
           setResolvedUrl(previewUrl)
         }
       }
     }
 
     const loadMedia = async () => {
-      if (!fileId) return
-      if (canStream && fileAccess.getStreamingUrl) {
+      if (!fileId) {
+        setResolvedUrl(previewUrl)
+        return
+      }
+      if (effectiveCanStream && fileAccess.getStreamingUrl) {
         try {
-          const streamingUrl = await fileAccess.getStreamingUrl(fileId)
+          const streamingUrl = await mintStreamingUrl(fileAccess, fileId)
           if (isCancelled) return
           setResolvedUrl(streamingUrl)
+          setIsStreamingUrl(true)
           return
-        } catch {
-          // Ticket minting failed -- fall through to the blob/direct path
-          // below instead of a permanent spinner.
+        } catch (error) {
+          console.warn(
+            'InlineFilePreview: failed to mint a media streaming ticket, falling back.',
+            error
+          )
         }
       }
       if (isCancelled) return
@@ -130,9 +197,25 @@ function useResolvedMediaUrl(
       isCancelled = true
       if (objectUrl) URL.revokeObjectURL(objectUrl)
     }
-  }, [fileAccess, fileId, canStream, needsBlobFetch, previewUrl])
+  }, [fileAccess, fileId, canStream, streamingDisabled, needsBlobFetch, previewUrl])
 
-  return resolvedUrl
+  const reportLoadFailure = useCallback((): boolean => {
+    if (isStreamingUrl && fileId) {
+      // The ticket minted but the media element couldn't actually load it.
+      // Evict the cache entry too, so a remount of this same fileId mints
+      // fresh rather than immediately reusing the ticket that just failed.
+      streamingUrlCache.delete(fileId)
+      setStreamingFailedFor(fileId)
+      return false // not terminal -- a (2)/(3) fallback attempt is starting
+    }
+    return true // every strategy has been exhausted
+  }, [isStreamingUrl, fileId])
+
+  return {
+    resolvedUrl,
+    openUrl: isStreamingUrl ? previewUrl : resolvedUrl,
+    reportLoadFailure,
+  }
 }
 
 function InlineImagePreview({
@@ -150,7 +233,7 @@ function InlineImagePreview({
   onFileClick?: (filePath: string, fileName: string) => void
   fileAccess: FileAccessPolicy
 }) {
-  const resolvedUrl = useResolvedMediaUrl(source, previewUrl, fileAccess, false)
+  const { resolvedUrl } = useResolvedMediaUrl(source, previewUrl, fileAccess, false)
 
   const handleClick = (event: React.MouseEvent<HTMLImageElement>) => {
     if (!onFileClick || !source.fileId) return
@@ -213,15 +296,21 @@ function InlineMediaPreview({
     media: { onError: () => void; onLoaded: () => void }
   ) => React.ReactNode
 }) {
-  const resolvedUrl = useResolvedMediaUrl(source, previewUrl, fileAccess, true)
+  const { resolvedUrl, openUrl, reportLoadFailure } = useResolvedMediaUrl(
+    source,
+    previewUrl,
+    fileAccess,
+    true
+  )
   const [failedUrl, setFailedUrl] = useState('')
   const [loadedUrl, setLoadedUrl] = useState('')
-  // Terminal load failure only: useResolvedMediaUrl already falls back from
-  // the authenticated fetch to the public preview URL, so an error event
-  // from a media element that never loaded data means both paths are
-  // exhausted. Errors after data has loaded (e.g. a mid-playback decode
-  // hiccup) keep the player mounted — the element surfaces those itself.
-  // Keyed by URL so a later re-resolve clears the failure.
+  // Terminal load failure only: an error event from a media element that
+  // never loaded data means every fallback useResolvedMediaUrl has (blob
+  // fetch, direct src, and -- via reportLoadFailure below -- a streaming
+  // ticket that minted but wouldn't actually load) is exhausted. Errors
+  // after data has loaded (e.g. a mid-playback decode hiccup) keep the
+  // player mounted -- the element surfaces those itself. Keyed by URL so a
+  // later re-resolve (including a post-failure fallback attempt) clears it.
   const failed = Boolean(resolvedUrl) && failedUrl === resolvedUrl
 
   return (
@@ -237,7 +326,7 @@ function InlineMediaPreview({
         <span className="min-w-0 flex-1 truncate">{filename}</span>
         {resolvedUrl ? (
           <a
-            href={resolvedUrl}
+            href={openUrl}
             target="_blank"
             rel="noreferrer"
             className="shrink-0 text-foreground hover:underline"
@@ -253,7 +342,13 @@ function InlineMediaPreview({
           {resolvedUrl ? (
             renderMedia(resolvedUrl, {
               onError: () => {
-                if (loadedUrl !== resolvedUrl) setFailedUrl(resolvedUrl)
+                if (loadedUrl === resolvedUrl) return
+                if (reportLoadFailure()) setFailedUrl(resolvedUrl)
+                // else: reportLoadFailure disabled the streaming ticket for
+                // this fileId, which reruns useResolvedMediaUrl's effect
+                // and falls back to the blob/direct strategy -- resolvedUrl
+                // changes on the next render, so this failedUrl is stale
+                // and `failed` above naturally goes back to false.
               },
               onLoaded: () => setLoadedUrl(resolvedUrl),
             })

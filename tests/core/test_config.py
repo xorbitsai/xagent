@@ -36,6 +36,7 @@ from xagent.config import (
     FILE_STORAGE_OPTIONS,
     FILE_STORAGE_STARTUP_SYNC_ENABLED,
     FILE_STORAGE_URI,
+    FILE_STREAM_TICKET_TTL_SECONDS,
     FRONTEND_DIST_DIR,
     GMAIL_PUBSUB_PROJECT_ID,
     GMAIL_PUBSUB_PUSH_SERVICE_ACCOUNT,
@@ -134,6 +135,7 @@ from xagent.config import (
     get_file_storage_options,
     get_file_storage_startup_sync_enabled,
     get_file_storage_uri,
+    get_file_stream_ticket_ttl_seconds,
     get_frontend_dist_dir,
     get_gmail_pubsub_project_id,
     get_gmail_pubsub_push_service_account,
@@ -911,6 +913,23 @@ class TestFileStorageConfig:
             ValueError, match="XAGENT_FILE_DELIVERY_SIGNED_URL_TTL_SECONDS"
         ):
             get_file_delivery_signed_url_ttl_seconds()
+
+    def test_file_stream_ticket_ttl_defaults_to_600(self, monkeypatch):
+        monkeypatch.delenv(FILE_STREAM_TICKET_TTL_SECONDS, raising=False)
+
+        assert get_file_stream_ticket_ttl_seconds() == 600
+
+    def test_file_stream_ticket_ttl_with_env_var(self, monkeypatch):
+        monkeypatch.setenv(FILE_STREAM_TICKET_TTL_SECONDS, "120")
+
+        assert get_file_stream_ticket_ttl_seconds() == 120
+
+    @pytest.mark.parametrize("value", ["0", "-1", "abc"])
+    def test_file_stream_ticket_ttl_rejects_invalid(self, monkeypatch, value):
+        monkeypatch.setenv(FILE_STREAM_TICKET_TTL_SECONDS, value)
+
+        with pytest.raises(ValueError, match="XAGENT_FILE_STREAM_TICKET_TTL_SECONDS"):
+            get_file_stream_ticket_ttl_seconds()
 
     def test_file_delivery_accel_redirect_enabled_defaults_false(self, monkeypatch):
         monkeypatch.delenv(FILE_DELIVERY_ACCEL_REDIRECT_ENABLED, raising=False)

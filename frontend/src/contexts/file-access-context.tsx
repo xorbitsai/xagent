@@ -43,7 +43,13 @@ const encodeFileId = (fileId: string) => encodeURIComponent(fileId)
 
 const buildUrl = (path: string): string => `${getApiUrl()}${path}`
 
-const defaultFileAccessPolicy: FileAccessPolicy = {
+const STREAM_TICKET_MINT_TIMEOUT_MS = 10_000
+
+// Exported so tests unrelated to streaming-ticket mechanics can spread this
+// and override just `getStreamingUrl` (e.g. to undefined), rather than
+// depending on an incidental mock-shape quirk (a mocked response missing
+// `.json()`) to keep a ticket mint attempt from participating in the test.
+export const defaultFileAccessPolicy: FileAccessPolicy = {
   previewUrl: (fileId) => buildUrl(`/api/files/preview/${encodeFileId(fileId)}`),
   downloadUrl: (fileId) => buildUrl(`/api/files/download/${encodeFileId(fileId)}`),
   inlinePreviewUrl: (fileId) => buildUrl(`/api/files/public/preview/${encodeFileId(fileId)}`),
@@ -68,14 +74,38 @@ const defaultFileAccessPolicy: FileAccessPolicy = {
   // streaming ticket is available (see getStreamingUrl below).
   requiresBlobFetch: true,
   getStreamingUrl: async (fileId) => {
-    const response = await apiRequest(
-      buildUrl(`/api/files/stream-tickets/${encodeFileId(fileId)}`),
-    )
+    // A hung mint request would otherwise leave a media element stuck
+    // loading indefinitely, with nothing to time it out -- the caller's own
+    // unmount handling (isCancelled checks in useResolvedMediaUrl) ignores
+    // a late response but doesn't abort the underlying request.
+    const controller = new AbortController()
+    const timeout = setTimeout(() => controller.abort(), STREAM_TICKET_MINT_TIMEOUT_MS)
+    let response: Response
+    try {
+      response = await apiRequest(
+        buildUrl(`/api/files/stream-tickets/${encodeFileId(fileId)}`),
+        { signal: controller.signal },
+      )
+    } finally {
+      clearTimeout(timeout)
+    }
     if (!response.ok) {
       throw new Error(`Failed to mint stream ticket: ${response.status}`)
     }
-    const data: { path: string } = await response.json()
-    return buildUrl(data.path)
+    // The mint endpoint's response shape is a server contract this client
+    // doesn't otherwise validate; a malformed/unexpected payload must
+    // surface as a caught rejection (so the caller falls back to the blob
+    // path) rather than silently becoming a broken `undefined`-based URL.
+    const data: unknown = await response.json()
+    if (
+      !data
+      || typeof data !== "object"
+      || typeof (data as { path?: unknown }).path !== "string"
+      || !(data as { path: string }).path.startsWith("/api/files/preview/")
+    ) {
+      throw new Error("Stream ticket response has an unexpected shape")
+    }
+    return buildUrl((data as { path: string }).path)
   },
 }
 

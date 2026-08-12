@@ -2795,6 +2795,112 @@ async def test_dag_pattern_delivered_result_outranks_pending_replan_in_same_batc
 
 
 @pytest.mark.asyncio
+async def test_dag_pattern_three_step_mixed_batch_interrupt_wins_waiting_supersedes_only() -> (
+    None
+):
+    """A genuinely three-way mixed batch: two interrupted steps and one
+    waiting step all complete in the same wakeup. The winner is still
+    the higher-ranked kind (interrupted), and within that kind the
+    lexicographically smaller id -- step ids are chosen so the waiting
+    step would sort first under plain lexicographic order, proving rank
+    decides this before id ever does. Only the waiting loser is a
+    superseded question and gets clarification_invalidated with its
+    bookkeeping cleared; the losing interrupted step is a plain
+    tie-break loser, not a superseded question, so it keeps its own
+    bookkeeping and status exactly like the two-interrupted-tie case.
+    """
+
+    release = asyncio.Event()
+    started: dict[str, asyncio.Event] = {}
+
+    async def fake_execute_step(
+        self: DAGPattern, *, step: PlanStep, **kwargs: Any
+    ) -> dict[str, Any] | None:
+        started.setdefault(step.id, asyncio.Event()).set()
+        await release.wait()
+        root_context = kwargs["root_context"]
+        if step.id in ("b_interrupt", "m_interrupt"):
+            self.status = "interrupted"
+            step.status = "interrupted"
+            # A real interrupted step checkpoints its own context and
+            # pattern state before returning; simulate that here since
+            # this test stubs _execute_step entirely.
+            self._set_active_step_context(step.id, {"step": step.id})
+            self._set_active_step_pattern_state(step.id, {"step": step.id})
+            return {
+                "success": False,
+                "status": "interrupted",
+                "execution_id": root_context.execution_id,
+                "context": root_context,
+                "active_step_id": step.id,
+            }
+        self.status = "waiting_for_user"
+        draft = draft_from_waiting_request(
+            {
+                "message": "Pick one",
+                "message_type": "question",
+                "interactions": [],
+                "tool_call_id": "ask-wait",
+                "tool_name": "ask_user_question",
+                "message_count": 2,
+            },
+            execution_id=root_context.execution_id,
+            step_id=None,
+        )
+        attributed_draft = draft.with_origin_step(step.id) if draft else None
+        return {
+            "success": False,
+            "status": "waiting_for_user",
+            "message": "Pick one",
+            "message_type": "question",
+            "clarification_draft": attributed_draft,
+            "execution_id": root_context.execution_id,
+            "context": root_context,
+            "active_step_id": step.id,
+        }
+
+    pattern = DAGPattern(
+        lambda **_: build_plan(
+            PlanStep(id="a_wait", task="Wait"),
+            PlanStep(id="b_interrupt", task="Interrupt b"),
+            PlanStep(id="m_interrupt", task="Interrupt m"),
+        ),
+        max_concurrency=3,
+    )
+    pattern._execute_step = fake_execute_step.__get__(pattern, DAGPattern)  # type: ignore[method-assign]
+
+    run_task = asyncio.create_task(
+        pattern.run(
+            context=ExecutionContext(execution_id="dag-three-way-mixed"),
+            tools=[],
+            llm=object(),
+            runtime=PatternRuntime(execution_id="dag-three-way-mixed"),
+        )
+    )
+    for step_id in ("a_wait", "b_interrupt", "m_interrupt"):
+        await asyncio.wait_for(
+            started.setdefault(step_id, asyncio.Event()).wait(), timeout=1
+        )
+    release.set()
+    result = await asyncio.wait_for(run_task, timeout=1)
+
+    assert result["status"] == "interrupted"
+    assert result["active_step_id"] == "b_interrupt"
+    assert result["clarification_superseded_step_ids"] == ["a_wait"]
+
+    steps_by_id = {step.id: step for step in pattern.plan.steps}
+    assert steps_by_id["a_wait"].status == "clarification_invalidated"
+    assert "a_wait" not in pattern.active_step_ids
+    assert "a_wait" not in pattern.active_step_pattern_states
+    assert "a_wait" not in pattern.active_step_contexts
+
+    assert steps_by_id["m_interrupt"].status == "interrupted"
+    assert "m_interrupt" in pattern.active_step_ids
+    assert "m_interrupt" in pattern.active_step_pattern_states
+    assert "m_interrupt" in pattern.active_step_contexts
+
+
+@pytest.mark.asyncio
 async def test_dag_waiting_draft_attribution_differs_only_by_step() -> None:
     """Two independently-run steps reaching an identical waiting
     turn (same message count, same tool_call_id/interaction_id) get

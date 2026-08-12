@@ -341,11 +341,23 @@ class ComputerTool(BrowserTaskSessionMixin, AbstractBaseTool):
         environment = self._environments.get(session_id)
         try:
             if environment is None:
-                environment = self._environment_factory(
-                    session_id=session_id,
-                    workspace=self._workspace,
-                    headless=self._headless,
-                )
+                factory_kwargs: dict[str, Any] = {
+                    "session_id": session_id,
+                    "workspace": self._workspace,
+                    "headless": self._headless,
+                }
+                # Only the default Playwright-backed factory understands
+                # `locale` -- the native-local-browser factory (a functools.partial
+                # around _authorized_native_browser_environment /
+                # NativeBrowserEnvironment) drives the user's own already-running
+                # browser and has no `locale`/`**kwargs` parameter, so passing it
+                # there would raise TypeError instead of silently doing nothing.
+                if (
+                    self._locale
+                    and self._environment_factory is BrowserComputerEnvironment
+                ):
+                    factory_kwargs["locale"] = self._locale
+                environment = self._environment_factory(**factory_kwargs)
                 self._environments[session_id] = environment
             current = environment.current_observation
             if current is None:

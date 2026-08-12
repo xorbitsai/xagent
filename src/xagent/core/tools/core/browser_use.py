@@ -280,18 +280,17 @@ class BrowserSessionManager:
                 # Ignore headless/locale/timezone_id for existing sessions
                 # (none of these can change after creation)
                 existing = self._sessions[session_id]
-                if locale and existing.locale != locale:
-                    logger.warning(
-                        f"Browser session {session_id!r} already exists with locale "
-                        f"{existing.locale!r}; requested locale {locale!r} ignored "
-                        "(a session's locale is frozen at creation)"
-                    )
-                if timezone_id and existing.timezone_id != timezone_id:
-                    logger.warning(
-                        f"Browser session {session_id!r} already exists with timezone "
-                        f"{existing.timezone_id!r}; requested timezone {timezone_id!r} "
-                        "ignored (a session's timezone is frozen at creation)"
-                    )
+                for attr_name, requested, current in (
+                    ("locale", locale, existing.locale),
+                    ("timezone_id", timezone_id, existing.timezone_id),
+                ):
+                    if requested and current != requested:
+                        logger.warning(
+                            f"Browser session {session_id!r} already exists with "
+                            f"{attr_name} {current!r}; requested {attr_name} "
+                            f"{requested!r} ignored (a session's {attr_name} is "
+                            "frozen at creation)"
+                        )
                 existing._last_used = datetime.now()
                 return existing
 
@@ -1135,12 +1134,16 @@ async def browser_wait_for_selector(**kwargs: Any) -> Dict[str, Any]:
         }
 
 
-async def browser_close(session_id: str) -> Dict[str, Any]:
+async def browser_close(session_id: str, **_kwargs: Any) -> Dict[str, Any]:
     """
     Explicitly close a browser session and free resources.
 
     Args:
         session_id: Session ID to close
+        **_kwargs: Accepted and ignored. ``BrowserTaskSessionMixin._with_default_session``
+            injects a ``locale`` kwarg into every tool call once a task locale is
+            resolved, regardless of which tool happens to create the session first;
+            every sibling browser_* function already tolerates that via **kwargs.
 
     Returns:
         Dictionary with close result

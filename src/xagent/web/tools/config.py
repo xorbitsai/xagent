@@ -9,6 +9,7 @@ import copy
 import inspect
 import logging
 import os
+import re
 import shlex
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -1289,6 +1290,13 @@ class WebToolConfig(BaseToolConfig):
         self._retained_factory_model_state: _RetainedFactoryModelState | None = None
         self._factory_runtime_handed_off = False
         self._pending_runtime_policy: _ToolRuntimePolicySnapshot | None = None
+        # get_browser_locale() memoizes on first call: _detach_factory_runtime_resources()
+        # nulls self.request once tools are built, but AgentService can rebuild tools on
+        # this same config instance later (_ensure_tools_initialized), at which point
+        # re-deriving from self.request would silently lose the already-resolved locale
+        # to the deployment default rather than reusing what was actually resolved.
+        self._browser_locale_resolved = False
+        self._cached_browser_locale: Optional[str] = None
 
     def _build_mcp_file_allowed_dirs(self) -> str:
         """Build comma-separated file roots that local MCP tools may read."""
@@ -1778,15 +1786,37 @@ class WebToolConfig(BaseToolConfig):
         deliberate account choice, and does not necessarily match what
         language the account works in).
 
-        ``None`` (no request, no cookie, or a value the frontend doesn't
-        emit) lets the browser tool fall back to its own deployment
-        default.
+        ``None`` (no request, no cookie, or an unrecognized value) lets the
+        browser tool fall back to its own deployment default.
+
+        Memoized on first call: ``_detach_factory_runtime_resources`` nulls
+        ``self.request`` once tools are built, but ``AgentService`` can
+        rebuild tools on this same config instance later
+        (``_ensure_tools_initialized``) -- re-deriving at that point would
+        silently lose the already-resolved locale to the deployment default
+        instead of reusing what this task actually resolved.
         """
-        cookies = getattr(self.request, "cookies", None)
-        app_locale = getattr(cookies, "get", lambda _key: None)("app_locale")
-        if not isinstance(app_locale, str):
+        if not self._browser_locale_resolved:
+            cookies = getattr(self.request, "cookies", None)
+            app_locale = getattr(cookies, "get", lambda _key: None)("app_locale")
+            self._cached_browser_locale = self._normalize_app_locale_cookie(app_locale)
+            self._browser_locale_resolved = True
+        return self._cached_browser_locale
+
+    @staticmethod
+    def _normalize_app_locale_cookie(app_locale: Any) -> Optional[str]:
+        """Map an ``app_locale`` cookie value to a Playwright locale tag.
+
+        Matches on the primary language subtag so an already-valid BCP-47-ish
+        variant (``zh-CN``, ``zh_CN``, ``EN``, ...) resolves the same as the
+        exact ``"en"``/``"zh"`` the frontend writes today (see
+        ``frontend/src/contexts/i18n-context.tsx``), instead of only matching
+        those two literal strings.
+        """
+        if not isinstance(app_locale, str) or not app_locale:
             return None
-        return _APP_LOCALE_TO_BROWSER_LOCALE.get(app_locale)
+        primary = re.split(r"[-_]", app_locale, maxsplit=1)[0].lower()
+        return _APP_LOCALE_TO_BROWSER_LOCALE.get(primary)
 
     def set_task_runtime_contribution(self, contribution: Any) -> None:
         """Attach the detached contribution built for this task."""

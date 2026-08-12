@@ -149,11 +149,17 @@ class FakeManager:
     def __init__(self, page: FakePage) -> None:
         self.page = page
         self.session = FakeSession(page)
-        self.calls: list[tuple[str, bool]] = []
+        self.calls: list[tuple[str, bool, str | None]] = []
         self.closed: list[str] = []
 
-    async def get_or_create(self, session_id: str, headless: bool) -> FakeSession:
-        self.calls.append((session_id, headless))
+    async def get_or_create(
+        self,
+        session_id: str,
+        headless: bool,
+        locale: str | None = None,
+        timezone_id: str | None = None,
+    ) -> FakeSession:
+        self.calls.append((session_id, headless, locale))
         return self.session
 
     async def close(self, session_id: str) -> None:
@@ -199,7 +205,7 @@ async def test_browser_observation_captures_screenshot_and_dom_elements(
     assert observation.metadata["browser_runtime_kind"] == "ephemeral_playwright"
     assert environment.current_observation == observation
     assert environment.manager.calls == [  # type: ignore[attr-defined]
-        ("browser-1:computer", True)
+        ("browser-1:computer", True, None)
     ]
 
 

@@ -687,6 +687,9 @@ def get_native_browser_app_name() -> str:
     return canonical
 
 
+_BCP47_LOCALE_RE = re.compile(r"^[a-zA-Z]{2,3}(-[a-zA-Z0-9]{2,8})*$")
+
+
 def get_browser_tool_default_locale() -> str:
     """Get the fallback Playwright context locale for the browser_use tool.
 
@@ -699,8 +702,21 @@ def get_browser_tool_default_locale() -> str:
     Priority:
         1. XAGENT_BROWSER_TOOL_DEFAULT_LOCALE environment variable
         2. "en-US"
+
+    Raises:
+        ValueError: if the env var is set but isn't a plausible BCP-47 tag
+            (e.g. "en-US"), so a typo fails loudly at read time instead of
+            surfacing as an opaque Playwright error at session creation.
     """
-    return os.getenv(BROWSER_TOOL_DEFAULT_LOCALE, "").strip() or "en-US"
+    configured = os.getenv(BROWSER_TOOL_DEFAULT_LOCALE, "").strip()
+    if not configured:
+        return "en-US"
+    if not _BCP47_LOCALE_RE.match(configured):
+        raise ValueError(
+            f"{BROWSER_TOOL_DEFAULT_LOCALE} must be a BCP-47 locale tag "
+            f"(e.g. 'en-US', 'zh-CN'), got {configured!r}"
+        )
+    return configured
 
 
 def get_browser_tool_default_timezone() -> str | None:
@@ -709,8 +725,26 @@ def get_browser_tool_default_timezone() -> str | None:
     Priority:
         1. XAGENT_BROWSER_TOOL_DEFAULT_TIMEZONE environment variable
         2. None (Playwright falls back to the host's own system timezone)
+
+    Raises:
+        ValueError: if the env var is set but isn't a recognized IANA
+            timezone name (e.g. "Asia/Shanghai"), so a typo fails loudly at
+            read time instead of surfacing as an opaque Playwright error at
+            session creation.
     """
-    return os.getenv(BROWSER_TOOL_DEFAULT_TIMEZONE, "").strip() or None
+    configured = os.getenv(BROWSER_TOOL_DEFAULT_TIMEZONE, "").strip()
+    if not configured:
+        return None
+    from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+    try:
+        ZoneInfo(configured)
+    except (ZoneInfoNotFoundError, ValueError, KeyError) as exc:
+        raise ValueError(
+            f"{BROWSER_TOOL_DEFAULT_TIMEZONE} must be a valid IANA timezone "
+            f"name (e.g. 'Asia/Shanghai'), got {configured!r}"
+        ) from exc
+    return configured
 
 
 def get_browser_cua_driver_command() -> str:

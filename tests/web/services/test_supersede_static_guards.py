@@ -45,9 +45,18 @@ def parsed_src_files() -> tuple[tuple[str, str, ast.Module], ...]:
     this module: ``(path relative to SRC_ROOT, source text, parsed tree)``.
 
     Two guards below sweep the whole tree. Each used to run its own
-    ``rglob`` + ``read_text``. Module-scoped rather than a module-level
-    cache so pytest owns the lifetime and no state survives the module;
-    the guards only read these trees and never mutate them.
+    ``rglob`` + ``read_text``, and the monotonicity sweep additionally
+    skipped any file whose text did not contain the literal
+    ``"question_superseded"``. That prefilter is gone: the guards now
+    resolve the message-type constants by name, so a file that imports
+    ``SUPERSEDED_MESSAGE_TYPE`` and never spells the literal is exactly
+    the file that most needs scanning. Measured on this tree (815 files):
+    0.14s for the two old prefiltered passes, 1.6s for this one full
+    pass -- the cost of scanning everything, paid once per module.
+
+    Module-scoped rather than a module-level cache so pytest owns the
+    lifetime and no state survives the module; the guards only read these
+    trees and never mutate them.
 
     One consequence of reading and parsing everything up front: a file
     under ``src/xagent`` that is not valid UTF-8, or that this Python
@@ -866,7 +875,7 @@ def mid_turn_functions_writing_superseded_literal(
 
     ``found`` is every name out of ``MID_TURN_FUNCTIONS`` that this source
     actually defines -- tracked separately from ``hits`` so a caller can
-    tell "neither function writes the literal" apart from "neither
+    tell "neither function writes the value" apart from "neither
     function exists here anymore" (e.g. after a rename); a check would be
     vacuously green in that second case without this.
 

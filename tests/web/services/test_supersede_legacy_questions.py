@@ -3,8 +3,11 @@
 Covers everything about the helper that is provable on SQLite: whole-set
 rewrite semantics with negative controls (role, message_type, a
 different task, and a nonexistent task_id), idempotency, the
-degrade/propagate split on the catch clause, signal pairing, and
-transcript-field invariance. One property is not provable here -- that
+degrade/propagate split on the catch clause, signal pairing,
+transcript-field invariance, a caller-originated flush failure
+propagating past the catch instead of being absorbed by it, and the
+reader's and writer's compiled WHERE clauses matching at runtime. One
+property is not provable here -- that
 the savepoint is actually necessary, i.e. that a failed statement
 without it would poison the caller's transaction. SQLite does not abort
 an open transaction after a failed statement the way PostgreSQL does, so

@@ -165,6 +165,37 @@ def get_builtin_oauth_provider_rows() -> list[dict[str, Any]]:
             # kept in sync.
             "default_scopes": ["user:read:user"],
         },
+        {
+            "provider_name": "intercom",
+            "name": "Intercom",
+            "client_id": os.environ.get("INTERCOM_CLIENT_ID", ""),
+            "client_secret": os.environ.get("INTERCOM_CLIENT_SECRET", ""),
+            # The single "app.intercom.com" authorize host serves every
+            # region: once a public app clears Intercom App Review, Intercom
+            # replicates it across US/EU/AU automatically, so there is no
+            # per-region app or authorize URL to manage.
+            "auth_url": "https://app.intercom.com/oauth",
+            # "api.intercom.io" (no region prefix) auto-routes each request
+            # to the workspace's actual hosting region (US/EU/AU) based on
+            # the token/workspace being acted on -- this is what lets one
+            # provider row, unlike the hosted MCP server's separate
+            # mcp.intercom.com / mcp.eu.intercom.com endpoints (which don't
+            # support AU workspaces at all), cover all three regions.
+            "token_url": "https://api.intercom.io/auth/eagle/token",
+            "redirect_uri": os.environ.get("INTERCOM_REDIRECT_URI", ""),
+            "userinfo_url": "https://api.intercom.io/me",
+            "user_id_path": "id",
+            "email_path": "email",
+            # Intercom has no `scope` authorize-URL param at all -- granted
+            # permissions come entirely from the app's Authentication
+            # settings in the Developer Hub, the same out-of-band model as
+            # meta's config_id above. Leaving this empty means
+            # generic_oauth_login's `elif scope_str:` guard (api/auth.py)
+            # never adds a scope param for this provider, which matches
+            # Intercom's actual behavior instead of sending a param it
+            # ignores.
+            "default_scopes": [],
+        },
     ]
 
 
@@ -693,6 +724,27 @@ def get_builtin_public_mcp_app_rows() -> list[dict[str, Any]]:
                     "--no-usage-statistics",
                     "--no-performance-crux",
                 ],
+            },
+        },
+        {
+            "app_id": "intercom",
+            "name": "Intercom",
+            "description": "Connect to Intercom to search contacts, review conversations, and reply to customers.",
+            "icon": "https://www.google.com/s2/favicons?domain=intercom.com&sz=128",
+            "transport": "oauth",
+            "provider_name": "intercom",
+            "category": "Support",
+            "oauth_scopes": [],
+            "is_visible_in_connector": True,
+            # A local FastMCP module talking to Intercom's REST API directly,
+            # not Intercom's hosted MCP server (mcp.intercom.com) -- that
+            # hosted server does not support AU-hosted workspaces, while the
+            # underlying REST API and OAuth (api.intercom.io, auto-routed)
+            # do, which this connector needs for AU customers.
+            "launch_config": {
+                "command": "python",
+                "args": ["-m", "xagent.web.tools.mcp.intercom"],
+                "env_mapping": {"INTERCOM_ACCESS_TOKEN": "access_token"},
             },
         },
     ]

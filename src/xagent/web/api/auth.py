@@ -260,6 +260,27 @@ def _exchange_meta_long_lived_token(
     return {**token_data, **long_lived_token_data}
 
 
+def _normalize_intercom_token_response(
+    provider: str, token_data: dict[str, Any]
+) -> dict[str, Any]:
+    """Map Intercom's `{"token": ...}` token response onto `access_token`.
+
+    Intercom's token endpoint (POST /auth/eagle/token) does not follow the
+    standard OAuth2 token response shape: it returns only `{"token": "..."}`,
+    with no `access_token`, `token_type`, or `expires_in` fields. Without this,
+    generic_oauth_callback's `token_data.get("access_token")` would silently
+    resolve to None and the connection would be persisted with no token.
+    """
+    if provider.lower() != "intercom":
+        return token_data
+    if "access_token" in token_data:
+        return token_data
+    token = token_data.get("token")
+    if not token:
+        return token_data
+    return {**token_data, "access_token": token}
+
+
 def create_access_token(
     data: Dict[str, Any], expires_delta: Optional[timedelta] = None
 ) -> str:
@@ -1446,6 +1467,7 @@ def generic_oauth_callback(
         token_data = _exchange_meta_long_lived_token(
             provider, token_url, token_data, client_id, client_secret
         )
+        token_data = _normalize_intercom_token_response(provider, token_data)
         access_token = token_data.get("access_token")
 
         provider_user_id = None

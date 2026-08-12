@@ -247,62 +247,67 @@ def test_admin_users_bulk_purge_is_not_flagged_as_a_single_row_delete() -> None:
     )
 
 
-def test_single_row_delete_guard_flags_a_row_level_delete() -> None:
-    fixture = """
+@pytest.mark.parametrize(
+    "fixture,expected_names",
+    [
+        (
+            """
 def purge_one(db, message_id):
     message = db.query(TaskChatMessage).filter(TaskChatMessage.id == message_id).first()
     db.delete(message)
-"""
-    findings = single_row_task_chat_message_deletes(ast.parse(fixture))
-    assert [func_name for _lineno, func_name in findings] == ["purge_one"]
-
-
-def test_delete_guard_does_not_attribute_a_nested_binding_to_the_outer_function() -> (
-    None
-):
-    """A name bound inside a nested ``def`` is not the outer function's.
-    Before the scope split, ``ast.walk`` made it look like one and the
-    outer ``db.delete(msg)`` -- which refers to nothing of the sort --
-    was reported."""
-    fixture = """
+""",
+            ["purge_one"],
+        ),
+        (
+            """
 def outer(db):
     def inner(db):
         msg = db.query(TaskChatMessage).first()
         return msg
     db.delete(msg)
-"""
-    assert single_row_task_chat_message_deletes(ast.parse(fixture)) == []
-
-
-def test_delete_guard_follows_a_binding_a_nested_function_closes_over() -> None:
-    """Names still flow inward: the inner function really can read the
-    outer function's ``msg``, so the delete is a real finding and must be
-    reported under the inner function's name."""
-    fixture = """
+""",
+            [],
+        ),
+        (
+            """
 def outer(db):
     msg = db.query(TaskChatMessage).first()
     def inner():
         db.delete(msg)
     return inner
-"""
-    assert [
-        name
-        for _lineno, name in single_row_task_chat_message_deletes(ast.parse(fixture))
-    ] == ["inner"]
-
-
-def test_delete_guard_reports_a_nested_definition_under_its_own_name() -> None:
-    fixture = """
+""",
+            ["inner"],
+        ),
+        (
+            """
 def outer(db):
     def inner(db):
         msg = db.query(TaskChatMessage).first()
         db.delete(msg)
     return inner
-"""
-    assert [
-        name
-        for _lineno, name in single_row_task_chat_message_deletes(ast.parse(fixture))
-    ] == ["inner"]
+""",
+            ["inner"],
+        ),
+    ],
+    ids=[
+        "flat-function",
+        "nested-binding-stays-in-its-own-scope",
+        "closure-reads-the-enclosing-binding",
+        "nested-function-binds-and-deletes-its-own",
+    ],
+)
+def test_single_row_delete_guard_attributes_each_delete_to_its_own_scope(
+    fixture: str, expected_names: list[str]
+) -> None:
+    """One table over the four scope shapes that matter. ``ast.walk`` does
+    not stop at nested definitions, so the guard walks scopes explicitly:
+    a name bound inside a nested ``def`` is not the enclosing function's
+    (case 2), a nested function does read what its enclosing function
+    bound (case 3), and every finding is reported under the function that
+    lexically contains the delete (cases 3 and 4 both name ``inner``).
+    """
+    findings = single_row_task_chat_message_deletes(ast.parse(fixture))
+    assert [name for _lineno, name in findings] == expected_names
 
 
 # ---------------------------------------------------------------------------

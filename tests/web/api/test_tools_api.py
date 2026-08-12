@@ -1201,6 +1201,7 @@ class TestWebToolConfigCustomApi:
 
         # Mirror of production custom_apis row (id=5, name=Post_HelloAPI)
         api = MagicMock()
+        api.id = 5
         api.name = "Post_HelloAPI"
         api.description = None
         api.url = "https://helloapi-u6nc.onrender.com/"
@@ -1209,11 +1210,10 @@ class TestWebToolConfigCustomApi:
         api.body = '{\n  "message": "example message"\n}'
         api.env = None
 
-        user_api = MagicMock()
-        user_api.custom_api = api
-
         db = MagicMock()
-        db.query.return_value.filter.return_value.all.return_value = [user_api]
+        db.query.return_value.filter.return_value.order_by.return_value.all.return_value = [
+            api
+        ]
 
         cfg = WebToolConfig(
             db=db,
@@ -1239,6 +1239,7 @@ class TestWebToolConfigCustomApi:
         from xagent.web.tools.config import WebToolConfig
 
         api = MagicMock()
+        api.id = 6
         api.name = "Get_HiAPI"
         api.description = None
         api.url = "https://helloapi-u6nc.onrender.com/"
@@ -1247,11 +1248,10 @@ class TestWebToolConfigCustomApi:
         api.body = None
         api.env = None
 
-        user_api = MagicMock()
-        user_api.custom_api = api
-
         db = MagicMock()
-        db.query.return_value.filter.return_value.all.return_value = [user_api]
+        db.query.return_value.filter.return_value.order_by.return_value.all.return_value = [
+            api
+        ]
 
         cfg = WebToolConfig(
             db=db,

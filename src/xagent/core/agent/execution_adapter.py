@@ -397,6 +397,14 @@ class AgentExecutionAdapter:
                         if isinstance(interactions, list)
                         else [],
                     },
+                    # This top-level key is the supported contract for
+                    # readers of the clarification draft. ``agent_result``
+                    # above is a diagnostic snapshot of the raw pattern
+                    # result, already read by ``agent_tool.py`` and
+                    # ``websocket.py`` for other purposes -- it happens to
+                    # carry the same draft too, but callers should not dig
+                    # it out from there.
+                    "clarification_draft": result.get("clarification_draft"),
                 }
             )
         return normalized

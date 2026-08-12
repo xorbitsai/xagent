@@ -77,7 +77,9 @@ def entity_rate_limit_key(agent_id: int | None, workforce_id: int | None) -> str
     The single formatter behind every entity-keyed bucket (``"agent:<id>"``
     / ``"workforce:<id>"``), shared by the widget upload/turn gates and the
     share run quota so the shape can never drift between call sites.
-    Workforce wins when both ids are set (callers guarantee at most one is).
+    Workforce wins when both ids are set (callers guarantee at most one is;
+    on the share path ``ShareChatAccessContext.__post_init__`` enforces that
+    structurally, #1225).
     Returns ``None`` when neither id is set; the request-throttle ``allow_*``
     gates degrade that to their shared ``"unknown"`` bucket rather than
     admitting freely, while the run-quota chokepoint (chat.py) instead admits

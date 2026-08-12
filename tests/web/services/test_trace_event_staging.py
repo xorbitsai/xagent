@@ -27,6 +27,8 @@ does not give.
 from __future__ import annotations
 
 import ast
+import inspect
+import textwrap
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -49,7 +51,10 @@ from xagent.web.services.task_lease_service import (
     TaskLease,
     bind_task_lease_context,
 )
-from xagent.web.services.trace_event_staging import stage_trace_event_row
+from xagent.web.services.trace_event_staging import (
+    checkpoint_run_partition_filter,
+    stage_trace_event_row,
+)
 
 
 def _engine(tmp_path: Path):
@@ -584,3 +589,52 @@ def test_prune_checkpoint_history_guard_allows_a_clean_session(
     )
 
     db.close()
+
+
+# ---------------------------------------------------------------------------
+# checkpoint_run_partition_filter's move from a trace_handlers.py
+# staticmethod into this module must leave the old staticmethod delegating,
+# not reimplementing. An earlier draft of the cell below compiled both
+# callables' SQL to a string and compared -- that stays green even if the
+# old path grew its own copy of the predicate body instead of calling this
+# module's function (a real mutation, tried directly), so the cell pins the
+# structural fact instead: the staticmethod's body is exactly one `return`
+# statement calling checkpoint_run_partition_filter.
+# ---------------------------------------------------------------------------
+
+
+def test_legacy_staticmethod_delegates_to_the_shared_predicate() -> None:
+    source = textwrap.dedent(
+        inspect.getsource(DatabaseTraceHandler._checkpoint_run_partition_filter)
+    )
+    func_def = ast.parse(source).body[0]
+    assert isinstance(func_def, ast.FunctionDef)
+    assert len(func_def.body) == 1, (
+        "_checkpoint_run_partition_filter must be exactly one statement "
+        "(a delegating return), not a reimplementation"
+    )
+    stmt = func_def.body[0]
+    assert isinstance(stmt, ast.Return)
+    call = stmt.value
+    assert isinstance(call, ast.Call)
+    assert isinstance(call.func, ast.Name)
+    assert call.func.id == "checkpoint_run_partition_filter"
+
+
+def test_positive_control_both_run_partition_predicates_compile_identical_sql() -> None:
+    """Not the cell above's own guard (see its docstring for why), but a
+    positive control that the two still agree on output today, for both a
+    real run_id and None."""
+
+    for run_id in ("run-a", None):
+        old = str(
+            DatabaseTraceHandler._checkpoint_run_partition_filter(run_id).compile(
+                compile_kwargs={"literal_binds": True}
+            )
+        )
+        new = str(
+            checkpoint_run_partition_filter(run_id).compile(
+                compile_kwargs={"literal_binds": True}
+            )
+        )
+        assert old == new

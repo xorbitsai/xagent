@@ -30,10 +30,11 @@ CHECKPOINT_PRUNE_FAILED = "checkpoint_prune_failed"
 INTERACTION_ROLLOUT_SCHEMA_ABSENT = "interaction_rollout_schema_absent"
 # Set when the interaction rollout gate sees a Task.source value that does
 # not normalize to a known origin. Deliberately not paired with a clear
-# site, unlike every other signal in this module: an unrecognized source is
-# a property of persisted data, and no in-process signal can observe that
-# data being fixed. Auto-clearing would assert "the data got fixed" without
-# evidence for it.
+# site: an unrecognized source is a property of persisted data, and no
+# in-process signal can observe that data being fixed. Auto-clearing would
+# assert "the data got fixed" without evidence for it. See
+# INTERACTION_ANCHOR_CORRUPT below for the same reasoning applied to a
+# different persisted-data corruption.
 INTERACTION_ROLLOUT_UNKNOWN_TASK_SOURCE = "interaction_rollout_unknown_task_source"
 # interaction_handoff (task_interaction_staging.py) degrades instead of
 # losing a caller's turn on five expected failures, sharing this signal.
@@ -46,6 +47,14 @@ INTERACTION_HANDOFF_DEGRADED = "interaction_handoff_degraded"
 INTERACTION_RUN_PARTITION_MISMATCH_DEGRADED = (
     "interaction_run_partition_mismatch_degraded"
 )
+# Set by resolve_interaction_anchor (task_interaction_anchor.py) when the
+# trace_events row its pointer names fails the ownership/type/partition/
+# identity checks that make it a valid anchor. Deliberately not paired with
+# a clear site, the same reasoning as INTERACTION_ROLLOUT_UNKNOWN_TASK_SOURCE
+# above: a corrupt anchor is a property of a persisted trace_events row, and
+# no in-process registry can observe that row being fixed. Auto-clearing
+# would assert "the data got fixed" without evidence for it.
+INTERACTION_ANCHOR_CORRUPT = "interaction_anchor_corrupt"
 # Set by the supersede helper's degrade path; cleared on the next
 # successful supersede for any task.
 CLARIFICATION_LEGACY_SUPERSEDE_FAILED = "clarification_legacy_supersede_failed"

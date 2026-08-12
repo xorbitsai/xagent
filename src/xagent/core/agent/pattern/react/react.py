@@ -47,6 +47,7 @@ from ....tools.user_interaction import (
     tool_result_waits_for_user,
     user_interaction_resume_callable,
 )
+from ...clarification import draft_from_waiting_request
 from ...context.enrichment import (
     enrich_context_with_memory,
     latest_user_text,
@@ -1166,6 +1167,11 @@ class ReActPattern(AgentPattern):
                 ),
                 "interactions": self.waiting_for_user_request.get("interactions"),
                 "context": context,
+                "clarification_draft": draft_from_waiting_request(
+                    self.waiting_for_user_request,
+                    execution_id=getattr(context, "execution_id", None),
+                    step_id=None,
+                ),
             }
 
         response = self._mark_latest_user_message_as_waiting_response(
@@ -1744,6 +1750,11 @@ class ReActPattern(AgentPattern):
                     "message": message,
                     "message_type": message_type,
                     "context": context,
+                    "clarification_draft": draft_from_waiting_request(
+                        self.waiting_for_user_request,
+                        execution_id=getattr(context, "execution_id", None),
+                        step_id=None,
+                    ),
                 }
             context.add_tool_result(
                 tool_name=name,
@@ -1806,6 +1817,11 @@ class ReActPattern(AgentPattern):
                 "message_type": "question",
                 "interactions": interactions,
                 "context": context,
+                "clarification_draft": draft_from_waiting_request(
+                    self.waiting_for_user_request,
+                    execution_id=getattr(context, "execution_id", None),
+                    step_id=None,
+                ),
             }
 
         return None
@@ -1990,6 +2006,11 @@ class ReActPattern(AgentPattern):
             "message_type": message_type,
             "interactions": interactions,
             "context": context,
+            "clarification_draft": draft_from_waiting_request(
+                self.waiting_for_user_request,
+                execution_id=getattr(context, "execution_id", None),
+                step_id=None,
+            ),
         }
         await runtime.checkpoint(
             "waiting_for_user",

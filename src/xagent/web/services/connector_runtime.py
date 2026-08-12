@@ -276,17 +276,15 @@ def load_connector_runtime_view(
     for ref in selected_refs:
         connector = visible.get(ref)
         if connector is None:
-            # Tool loading applies the same visibility filter before
-            # instantiating a tool, so a now-hidden historical ref has no
-            # runtime tool to receive values on this turn. This holds for
-            # MCP on both the new-hook and legacy-hook branches, and for
-            # Custom API on the new-hook branch too (narrowed to the
-            # junction-only set until a follow-up team-keys the Custom API
-            # tool loaders and this branch's Custom API set to match). On
-            # the legacy-hook branch the filters diverge for Custom API: a
-            # legacy user-keyed hook can grant a team-shared Custom API
-            # here while the Custom API tool loader resolves junction-only,
-            # so such a ref stays visible without a runtime tool.
+            # Tool loading applies the same visibility filter when the
+            # team-scope hook is installed, for both connector kinds, so a
+            # ref absent here has no runtime tool either way. With only the
+            # legacy hook installed, this view is user-keyed and unions a
+            # legacy-granted team-shared custom API, while both tool
+            # loaders resolve personal-only -- they consult the team-keyed
+            # hook exclusively, never the legacy one -- so such a ref is
+            # selectable and persistable into a task's connector selection
+            # but builds no runtime tool.
             continue
         raw_ephemeral = (
             ephemeral_by_ref.get(ref.storage_key, {})
@@ -403,11 +401,11 @@ def prepare_connector_runtime_selection_snapshot(
     the agent's tool-selection policy, while ``connector_user_id`` supplies the
     same connector visibility scope used by normal web tool loading:
     ``connector_user_id``'s personal MCP/Custom API links, unioned with
-    ``agent``'s owning team's connectors for MCP when a team-keyed hook is
-    installed (Custom API stays junction-only for now). For published-agent
-    chats, personal visibility still follows the task owner rather than the
-    published agent's owner; team visibility follows the agent regardless of
-    who is running it.
+    ``agent``'s owning team's connectors for both connector kinds when a
+    team-keyed hook is installed. For published-agent chats, personal
+    visibility still follows the task owner rather than the published
+    agent's owner; team visibility follows the agent regardless of who is
+    running it.
     """
 
     if agent is None or connector_user_id is None:
@@ -593,8 +591,8 @@ def _load_visible_runtime_connectors(
     db: Session, *, user_id: int, agent_team_id: int | None = None
 ) -> dict[ConnectorRef, Any]:
     from .connector_team_scope import (
+        resolve_team_connector_ids_or_raise,
         team_connector_hook_installed,
-        team_connector_ids,
         visible_team_connector_ids,
     )
 
@@ -602,31 +600,17 @@ def _load_visible_runtime_connectors(
     if team_connector_hook_installed():
         # Team ownership is resolved from the team that owns the governing
         # agent. A run with no governing agent resolves personal links only.
-        try:
-            team_ids = team_connector_ids(db, team_id=agent_team_id)
-        except ConnectorRuntimeError:
-            raise
-        except Exception as exc:
-            logger.warning(
-                "Failed to resolve team connector scope for user %s",
-                user_id,
-                exc_info=True,
-            )
-            raise ConnectorRuntimeError(
-                ERROR_CONNECTOR_RUNTIME_UNAVAILABLE,
-                "Connector team scope is unavailable.",
-                details={"reason": "team_scope_resolution_failed"},
-                status_code=503,
-            ) from exc
-        # Custom API is not team-keyed on either side of this seam yet: the
-        # tool-build loaders (WebToolConfig's custom-API paths) stay
-        # junction-only until a follow-up team-keys them too. Consuming the
-        # "custom_api" half here without a matching consumer would let a
-        # team-owned custom API be selected into a task's runtime snapshot
-        # and then fail at runtime-view resolution (no personal link to
-        # satisfy it) while never building a tool either -- so this side
-        # stays MCP-only until both halves move together.
-        team_ids = {"mcp": team_ids["mcp"], "custom_api": set()}
+        team_ids = resolve_team_connector_ids_or_raise(
+            db, team_id=agent_team_id, log_subject=user_id
+        )
+        # Both connector kinds are team-keyed together: the tool-build
+        # loaders (WebToolConfig's MCP and custom-API paths) both consult
+        # the same team scope now, so a team-owned custom API selected into
+        # a task's runtime snapshot here always has a matching tool-loader
+        # consumer to build it. Consuming the "custom_api" half without a
+        # matching consumer would let a selected connector fail at
+        # runtime-view resolution while never building a tool either --
+        # that hazard is why the two sides move together, not separately.
     else:
         # No team-keyed hook: keep the legacy user-keyed overlay exactly as
         # it is, so an installation that adopts this revision without

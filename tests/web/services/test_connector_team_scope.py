@@ -417,21 +417,20 @@ def test_installed_hook_with_no_governing_agent_supersedes_legacy_overlay(
 
 
 # ---------------------------------------------------------------------------
-# The new-hook branch narrows to MCP only: a team hook's "custom_api" grant
-# is not consumed at this seam. Custom API is not team-keyed on either side
-# yet -- the tool-build loaders (WebToolConfig's custom-API paths) stay
-# junction-only until a follow-up change team-keys them too. Unioning the
-# custom_api set here without a matching consumer would let a team-owned
-# custom API enter a task's runtime selection snapshot with no personal
-# link to satisfy its runtime-view resolution, and no tool loader able to
-# build it either -- selectable and persistable, never executable. This is
-# distinct from the legacy branch above (test_legacy_visibility_hook_alone_
-# is_unchanged), which keeps granting team custom APIs through the legacy
-# user-keyed hook -- the narrowing applies only to the new team-keyed hook.
+# The new-hook branch unions both connector kinds: a team hook's
+# "custom_api" grant is consumed at this seam exactly like its "mcp" grant.
+# Custom API is now team-keyed on both sides of this seam -- the tool-build
+# loaders (WebToolConfig's custom-API paths) are team-keyed too, so a
+# team-owned custom API entering a task's runtime selection snapshot always
+# has a personal-or-team-satisfied runtime-view resolution and a tool
+# loader able to build it. This is the same shape as the legacy branch
+# above (test_legacy_visibility_hook_alone_is_unchanged), which already
+# grants team custom APIs through the legacy user-keyed hook -- the two
+# branches now agree on custom API instead of diverging.
 # ---------------------------------------------------------------------------
 
 
-def test_new_hook_branch_does_not_union_team_custom_api(db_session, seed):
+def test_new_hook_branch_unions_team_custom_api_too(db_session, seed):
     connector_team_scope.set_connector_team_hooks(team_visibility=_team_hook(seed))
     try:
         visible = _load_visible_runtime_connectors(
@@ -440,10 +439,9 @@ def test_new_hook_branch_does_not_union_team_custom_api(db_session, seed):
         mcp_ids = {r.connector_id for r in visible if r.connector_type == "mcp"}
         capi_ids = {r.connector_id for r in visible if r.connector_type == "custom_api"}
         # T1's hook (see _team_hook above) grants both seed.team_s (mcp) and
-        # seed.a_capi (custom_api). The mcp grant still unions in; the
-        # custom_api grant does not -- that is the narrowing under test.
+        # seed.a_capi (custom_api). Both grants union in now.
         assert mcp_ids == {int(seed.active_own.id), int(seed.team_s.id)}
-        assert capi_ids == {int(seed.capi_own.id)}
+        assert capi_ids == {int(seed.capi_own.id), int(seed.a_capi.id)}
     finally:
         connector_team_scope.set_connector_team_hooks()
 
@@ -579,5 +577,32 @@ def test_runtime_view_seam_retypes_malformed_hook_answer(db_session, seed):
             )
         assert excinfo.value.status_code == 503
         assert isinstance(excinfo.value.__cause__, ValueError)
+    finally:
+        connector_team_scope.set_connector_team_hooks()
+
+
+def test_resolve_or_raise_passes_a_typed_error_through_unchanged():
+    """The shared wrap's ``except ConnectorRuntimeError: raise`` arm: a hook
+    that already raises the typed error must reach the caller as that exact
+    object -- not re-wrapped, not given a new cause -- so an inner seam's
+    more specific reason survives to whatever renders the failure."""
+    planted = ConnectorRuntimeError(
+        "planted_code",
+        "planted typed failure",
+        details={"reason": "planted_inner_reason"},
+        status_code=503,
+    )
+
+    def _raising_hook(db, *, team_id):
+        raise planted
+
+    connector_team_scope.set_connector_team_hooks(team_visibility=_raising_hook)
+    try:
+        with pytest.raises(ConnectorRuntimeError) as excinfo:
+            connector_team_scope.resolve_team_connector_ids_or_raise(
+                None, team_id=T1, log_subject="passthrough-probe"
+            )
+        assert excinfo.value is planted
+        assert excinfo.value.details["reason"] == "planted_inner_reason"
     finally:
         connector_team_scope.set_connector_team_hooks()

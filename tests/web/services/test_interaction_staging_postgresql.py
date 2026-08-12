@@ -43,10 +43,11 @@ from typing import Any
 import pytest
 import sqlalchemy as sa
 from sqlalchemy import event
-from sqlalchemy.exc import IntegrityError, InternalError
+from sqlalchemy.exc import DataError, IntegrityError, InternalError
 from sqlalchemy.orm import Session, sessionmaker
 
 from tests.web.services.task_interaction_schema_shared import (
+    make_row,
     make_task,
     make_trace_event,
     make_user,
@@ -254,6 +255,94 @@ def test_p_over_length_run_id_rejected_before_sql_via_handoff(
         s.strip().upper().startswith(("INSERT", "UPDATE")) for s in issued
     ), issued
     db.rollback()
+
+
+# ---------------------------------------------------------------------------
+# T-PG group: two backend facts that, until now, lived only in comments
+# (``_MAX_LENGTHS``'s and the ``allow_nan=False`` probe's), with no test
+# actually exercising the PostgreSQL behavior those comments predict. Both
+# cells bypass ``stage_interaction_request``'s Python-side validation
+# entirely -- a direct Core INSERT against the table, not the primitive --
+# because that validation is exactly what ordinarily preempts the backend
+# outcome each cell is pinning: the test above this one
+# (T-P, ``test_p_over_length_run_id_rejected_before_sql_via_handoff``)
+# already proves the Python guard fires first, not what happens if it
+# didn't. Both must raise DataError specifically, not IntegrityError or its
+# base -- that distinction is the entire reason
+# ``_MAX_LENGTHS``/``allow_nan=False`` exist as *Python* guards rather than
+# relying on the database's own CHECK/conflict-classification machinery
+# (see the module docstring of task_interaction_staging.py's own
+# misclassification-funnel paragraph). If either assertion below observes
+# the opposite of what its guard's comment predicts, that is a defect in
+# the guard's own justification, not in this test -- do not loosen the
+# assertion to match.
+# ---------------------------------------------------------------------------
+
+
+def test_pg1_over_length_run_id_rejected_by_backend_as_data_error(
+    db_session, fixtures
+) -> None:
+    """``run_id`` is ``String(64)``; a direct 65-character INSERT must raise
+    ``DataError`` on PostgreSQL, not ``IntegrityError`` -- the fact
+    ``_MAX_LENGTHS``'s comment (``task_interaction_staging.py``) predicts to
+    justify deriving those caps from the model instead of trusting a CHECK
+    constraint to catch an over-length value."""
+
+    task_id, anchor_id = fixtures
+    row = make_row(
+        task_id=task_id,
+        resume_trace_event_id=anchor_id,
+        run_id="x" * 65,
+    )
+    db = db_session
+    try:
+        with pytest.raises(DataError) as excinfo:
+            db.execute(sa.insert(TaskInteractionRequest.__table__).values(**row))
+        # pytest.raises(DataError) already does the real pinning (accepts
+        # DataError or a subclass); "not IntegrityError" would be a
+        # tautology (the two are siblings under DBAPIError, never
+        # overlapping) and "not StatementError" is unassertable here --
+        # DataError is itself a StatementError subclass. Exact-type instead,
+        # ruling out DataError's own subclasses too.
+        assert type(excinfo.value) is DataError
+    finally:
+        db.rollback()
+
+
+@pytest.mark.parametrize("value", [float("nan"), float("inf")], ids=["nan", "inf"])
+def test_pg2_non_finite_json_payload_rejected_by_backend_as_data_error(
+    db_session, fixtures, value: float
+) -> None:
+    """A direct INSERT whose ``request_payload`` contains a non-finite float
+    must raise ``DataError`` on PostgreSQL, not ``StatementError`` -- the
+    fact the ``allow_nan=False`` probe's comment
+    (``task_interaction_staging.py``) predicts to justify rejecting NaN/
+    Infinity in Python before the INSERT is issued, rather than trusting
+    the database's own JSON parser to catch it. This bypasses that probe by
+    using the default SQLAlchemy JSON binder (``json.dumps`` with its
+    default ``allow_nan=True``), which renders the bare, non-JSON tokens
+    ``NaN`` / ``Infinity`` the probe exists to catch. The column's
+    PostgreSQL type is ``JSON`` here, not ``jsonb`` (see the corrected
+    comment this cell pins alongside itself) -- the JSON input function
+    that rejects these tokens is the same one either type name would use.
+    """
+
+    task_id, anchor_id = fixtures
+    row = make_row(
+        task_id=task_id,
+        resume_trace_event_id=anchor_id,
+        request_payload={"v": value},
+    )
+    db = db_session
+    try:
+        with pytest.raises(DataError) as excinfo:
+            db.execute(sa.insert(TaskInteractionRequest.__table__).values(**row))
+        # Same reasoning as test_pg1's own comment: pytest.raises(DataError)
+        # already pins the real fact; exact-type here is the non-tautological
+        # assertion left to make.
+        assert type(excinfo.value) is DataError
+    finally:
+        db.rollback()
 
 
 def test_sp1_slot_taken_rolls_back_cleanly(db_session, fixtures) -> None:

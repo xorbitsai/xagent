@@ -88,6 +88,8 @@ class PublicChatAccessContext:
     widget_agent_id: int | None = None
     # Set instead of ``widget_agent_id`` when the widget key exposes a
     # workforce. Exactly one of the two is populated for a widget guest.
+    # Structural enforcement is tracked in #1288 (the share twin is already
+    # enforced below, #1225).
     widget_workforce_id: int | None = None
 
 
@@ -95,7 +97,8 @@ class PublicChatAccessContext:
 class ShareChatAccessContext:
     """Validated share-guest identity: exactly one of ``agent`` /
     ``workforce`` is set, depending on which kind of share token the guest
-    presented. ``user`` is always the owner the shared entity runs as.
+    presented — enforced at construction by ``__post_init__`` (#1225).
+    ``user`` is always the owner the shared entity runs as.
 
     ``guest_id`` is the per-guest isolation credential (#973): a share link is
     public, so many anonymous visitors share the same owner + entity id, and
@@ -110,6 +113,23 @@ class ShareChatAccessContext:
     guest_id: str
     agent: Agent | None = None
     workforce: Workforce | None = None
+
+    def __post_init__(self) -> None:
+        # Exactly-one guard (#1225): the run quota keys off these markers and
+        # entity_rate_limit_key prefers workforce when both ids are set, so a
+        # both-set context would silently charge an agent-share run to a
+        # workforce bucket; a neither-set one has no billing bucket at all.
+        # Compared against None, not truthiness — tests construct the context
+        # with arbitrary stand-in objects. A violation is a programming
+        # defect, never a bad credential: get_share_chat_user only rewrites
+        # _PublicTokenRejected into a 401 and passes HTTPException through
+        # unchanged (e.g. the 403s from ensure_share_*_available), so this
+        # ValueError propagates loudly (#1214). Both production construction
+        # sites set exactly one entity; the guard defends future call sites.
+        if (self.agent is None) == (self.workforce is None):
+            raise ValueError(
+                "ShareChatAccessContext requires exactly one of 'agent' or 'workforce'"
+            )
 
 
 def mint_share_guest_id() -> str:
@@ -1154,11 +1174,13 @@ async def _create_workforce_share_chat_task(
             # Null the agent marker for symmetry with the agent path (#1132),
             # mirroring the widget workforce branch: entity_rate_limit_key
             # prefers workforce, so a stray agent id would be ignored anyway,
-            # but stamping both keeps the run-quota key unambiguous. Safe
-            # because the snapshot-built config never sets either marker --
-            # not because merge order is irrelevant: _merge_agent_config
-            # returns {**extra_agent_config, **task_config}, so the built
-            # config wins every collision and this dict loses.
+            # but stamping both keeps the run-quota key unambiguous. The None
+            # is a literal by the context's exactly-one invariant, enforced in
+            # ShareChatAccessContext.__post_init__ (#1225). Safe also because
+            # the snapshot-built config never sets either marker -- not
+            # because merge order is irrelevant: _merge_agent_config returns
+            # {**extra_agent_config, **task_config}, so the built config wins
+            # every collision and this dict loses.
             "share_agent_id": None,
             # Per-guest isolation (#973). extra_agent_config is overlaid under
             # the snapshot-built config, which never sets guest_id, so this is
@@ -1222,18 +1244,9 @@ async def create_share_chat_task(
     # workforce, so a client-injected share_workforce_id must never survive to
     # redirect an agent-share task's bucket onto a workforce. The sanitizer
     # already strips both, but stamping explicitly keeps this correct
-    # independent of the sanitizer's reserved-key set.
-    #
-    # The workforce marker is a literal None because the dispatch above forces
-    # it: this branch runs only after the early return into
-    # _create_workforce_share_chat_task, so access_context.workforce is None
-    # here and a context read would yield the same value today. Preserving that
-    # guard is what keeps the literal honest. If it were ever removed, a
-    # context read would not be the safe fallback it looks like: this branch
-    # builds an *agent* task (agent_id=share_agent_id below), and
-    # entity_rate_limit_key prefers workforce whenever both markers are set, so
-    # a non-None workforce id here would charge an agent-share run to a
-    # workforce bucket — the misattribution this stamping exists to prevent.
+    # independent of the sanitizer's reserved-key set. The workforce marker is
+    # a literal None by the context's exactly-one invariant, enforced in
+    # ShareChatAccessContext.__post_init__ (#1225).
     agent_config["share_agent_id"] = share_agent_id
     agent_config["share_workforce_id"] = None
 

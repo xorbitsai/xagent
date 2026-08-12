@@ -234,7 +234,7 @@ def test_test_module_consumers_are_not_flagged() -> None:
 
 def test_primitive_module_itself_is_not_flagged() -> None:
     """The primitive module's own body -- definitions, its one internal call
-    from ``_InteractionHandoff.stage()`` to ``stage_interaction_request``,
+    from ``InteractionHandoff.stage()`` to ``stage_interaction_request``,
     and its docstrings mentioning both names in prose -- must not trip the
     gate. ``_production_modules()`` excludes it by filename; this test pins
     that exclusion rather than re-deriving it."""
@@ -245,7 +245,7 @@ def test_primitive_module_itself_is_not_flagged() -> None:
     assert all(path.stem != "task_interaction_staging" for path in modules)
     # Also confirm the module's own source, scanned directly, DOES contain a
     # gated name (stage_interaction_request, called by name from
-    # _InteractionHandoff.stage()) -- proving the filename exclusion is
+    # InteractionHandoff.stage()) -- proving the filename exclusion is
     # doing real work, not vacuously passing because the file has nothing
     # for the scanner to find. interaction_handoff itself is never called
     # from within its own module (only entered via a caller's `with`), so

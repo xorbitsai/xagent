@@ -122,6 +122,33 @@ def seed(db_session: Session):
     )
 
 
+def install_team_hooks(*, team_visibility, agent_owner_id: int) -> None:
+    """Install a ``team_visibility`` hook *and* the agent-team-scope hook
+    mapping ``agent_owner_id`` -> T1.
+
+    Shared by the MCP and custom-API team-visibility suites so the
+    hook-*install* pattern is written once; each suite's own autouse
+    ``_reset_hooks`` undoes both hooks after every test -- this module's
+    copy and the custom-API suite's separate copy are two independent
+    fixtures, not one shared teardown.
+
+    The scope-hook mapping is a negative-control fixture, not something
+    production code consults for this decision (both tool loaders key on
+    ``self._connector_team_id``, never on ``get_agent_team_scope(db, owner)``)
+    -- but without it installed, a runner-keyed misimplementation would be
+    indistinguishable from the correct one on these fixtures, since
+    ``get_agent_team_scope`` would resolve ``None`` for everybody either way.
+    """
+    connector_team_scope.set_connector_team_hooks(team_visibility=team_visibility)
+    agent_team_scope.set_agent_team_scope_hook(
+        lambda db, user_id: (
+            agent_team_scope.AgentTeamScope(team_id=T1, is_team_admin=False)
+            if user_id == agent_owner_id
+            else None
+        )
+    )
+
+
 def _team_visibility_hook(seed):
     """A team_visibility hook whose answer is disjoint per team, empty otherwise."""
 
@@ -137,24 +164,9 @@ def _team_visibility_hook(seed):
 
 def _install_env_t(seed) -> None:
     """Install the team_visibility hook *and* the agent-team-scope hook
-    mapping the run owner C -> T1 (the team that owns ``team_s``).
-
-    The scope-hook mapping is a negative-control fixture, not something
-    production code consults for this decision (the MCP loader keys on
-    ``self._connector_team_id``, never on ``get_agent_team_scope(db, owner)``)
-    -- but without it installed, a runner-keyed misimplementation would be
-    indistinguishable from the correct one on these fixtures, since
-    ``get_agent_team_scope`` would resolve ``None`` for everybody either way.
-    """
-    connector_team_scope.set_connector_team_hooks(
-        team_visibility=_team_visibility_hook(seed)
-    )
-    agent_team_scope.set_agent_team_scope_hook(
-        lambda db, user_id: agent_team_scope.AgentTeamScope(
-            team_id=T1, is_team_admin=False
-        )
-        if user_id == int(seed.c.id)
-        else None
+    mapping the run owner C -> T1 (the team that owns ``team_s``)."""
+    install_team_hooks(
+        team_visibility=_team_visibility_hook(seed), agent_owner_id=int(seed.c.id)
     )
 
 
@@ -247,7 +259,7 @@ def test_production_mcp_query_shape(db_session, seed):
     assert norm.startswith("SELECT")
     assert "MCP_SERVERS" in norm
     assert "JOIN USER_MCPSERVERS" not in norm
-    assert "ORDER BY" in norm
+    assert norm.endswith("ORDER BY MCP_SERVERS.ID")  # exact ordering column
 
 
 # ---------------------------------------------------------------------------

@@ -7,11 +7,19 @@ the application's team tables.
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Callable, Collection
 from dataclasses import dataclass
 from typing import Any, Literal, Protocol
 
 from sqlalchemy.sql.elements import ColumnElement
+
+from ...core.tools.adapters.vibe.connector_runtime import (
+    ERROR_CONNECTOR_RUNTIME_UNAVAILABLE,
+    ConnectorRuntimeError,
+)
+
+logger = logging.getLogger(__name__)
 
 ConnectorType = Literal["mcp", "custom_api"]
 ConnectorRenamedHook = Callable[[Any, int, ConnectorType, int, str, str], None]
@@ -61,10 +69,16 @@ class TeamConnectorVisibilityHook(Protocol):
 
     Every connector id a hook returns becomes executable by *any* runner of
     that team's agents, not only members: for stdio and other static-auth
-    transports, a team-owned server with no personal link for the running
-    user executes using the shared definition row's own stored credentials,
-    not the runner's. (OAuth transports fail closed instead, for lack of a
-    token to resolve.)
+    MCP transports, a team-owned server with no personal link for the
+    running user executes using the shared definition row's own stored
+    credentials, not the runner's. (OAuth transports fail closed instead,
+    for lack of a token to resolve.) Custom APIs are starker: there is no
+    per-member credential override layer at all, and no transport-level
+    exception either -- every custom API always executes with whatever is
+    stored on its shared definition row (headers, a static API key, and so
+    on), for every runner, member or not. Sharing a custom API with a team
+    means sharing whatever credential it holds with everyone who can run
+    the team's agents.
     """
 
     def __call__(self, db: Any, *, team_id: int) -> dict[str, set[int]]: ...
@@ -176,6 +190,50 @@ def team_connector_hook_installed() -> bool:
     return _team_connector_visibility_hook is not None
 
 
+def resolve_team_connector_ids_or_raise(
+    db: Any, *, team_id: int | None, log_subject: int | None
+) -> dict[str, set[int]]:
+    """``team_connector_ids(db, team_id=team_id)``, with every non-typed
+    failure converted into the seam's one typed 503.
+
+    Every team-scope resolution call site -- both of ``WebToolConfig``'s
+    custom-API read points, its MCP read point, and the runtime-context
+    view loader -- wraps ``team_connector_ids`` the same way: a
+    ``ConnectorRuntimeError`` passes through unchanged, and any other
+    exception is logged at ``WARNING`` and converted into
+    ``ConnectorRuntimeError(ERROR_CONNECTOR_RUNTIME_UNAVAILABLE, "Connector
+    team scope is unavailable.", details={"reason":
+    "team_scope_resolution_failed"}, status_code=503)``. This function is
+    that wrap, written once. Returns the full ``{"mcp": ..., "custom_api":
+    ...}`` dict unmodified -- callers that need one connector kind extract
+    it themselves (e.g. ``result["mcp"]``); the runtime-context view loader
+    needs both and takes the dict as-is.
+
+    ``log_subject`` is the user id that identifies the caller in the
+    warning log line -- ``None`` at any call site whose own identity guard
+    the caller has not yet reached (the MCP read point's private loader has
+    no identity guard of its own; production only reaches it through its
+    guarded public wrapper). It is only ever formatted into the log
+    message, never interpreted.
+    """
+    try:
+        return team_connector_ids(db, team_id=team_id)
+    except ConnectorRuntimeError:
+        raise
+    except Exception as exc:
+        logger.warning(
+            "Failed to resolve team connector scope for user %s",
+            log_subject,
+            exc_info=True,
+        )
+        raise ConnectorRuntimeError(
+            ERROR_CONNECTOR_RUNTIME_UNAVAILABLE,
+            "Connector team scope is unavailable.",
+            details={"reason": "team_scope_resolution_failed"},
+            status_code=503,
+        ) from exc
+
+
 def visible_mcp_server_clause(
     owner_user_id: int | None, team_mcp_ids: Collection[int]
 ) -> ColumnElement[bool]:
@@ -207,6 +265,39 @@ def visible_mcp_server_clause(
     if not team_mcp_ids or owner_user_id is None:
         return personal
     return or_(personal, MCPServer.id.in_(set(team_mcp_ids)))
+
+
+def visible_custom_api_clause(
+    owner_user_id: int | None, team_api_ids: Collection[int]
+) -> ColumnElement[bool]:
+    """Predicate selecting the custom APIs visible to ``owner_user_id``.
+
+    Personal custom APIs (an active ``UserCustomApi`` link) unioned with the
+    team-owned APIs named in ``team_api_ids``. ``is_active`` gates only the
+    personal arm -- a team-owned API is visible regardless of the member's
+    own personal link state, which is intentional (see the module's callers
+    for the credential consequence). Pure function over ORM constructs -- no
+    I/O. An empty ``team_api_ids`` reduces to exactly the personal
+    semi-join, so a deployment with no team overlay compiles the same query
+    shape it always has. A ``None`` owner also reduces to the personal arm
+    regardless of ``team_api_ids`` -- defense in depth so this function is
+    fail-closed on its own terms, not only because of how its callers
+    happen to be gated today.
+    """
+
+    from sqlalchemy import or_, select
+
+    from ..models.custom_api import CustomApi, UserCustomApi
+
+    personal = CustomApi.id.in_(
+        select(UserCustomApi.custom_api_id).where(
+            UserCustomApi.user_id == owner_user_id,
+            UserCustomApi.is_active,
+        )
+    )
+    if not team_api_ids or owner_user_id is None:
+        return personal
+    return or_(personal, CustomApi.id.in_(set(team_api_ids)))
 
 
 def delete_team_connector(

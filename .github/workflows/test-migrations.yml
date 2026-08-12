@@ -227,6 +227,10 @@ jobs:
         env:
           DATABASE_URL: postgresql://xagent:xagent@localhost:5432/xagent_test
 
+      # Any new migration test file with postgresql-marked tests must be
+      # added to this list -- the fast job deselects the marker and
+      # provisions no database, so an unlisted file's postgres tests run
+      # nowhere.
       - name: Test Gmail provisioning Postgres-only behavior
         if: needs.detect-migration-changes.outputs.should-test == 'true'
         run: |
@@ -282,6 +286,20 @@ jobs:
         if: needs.detect-migration-changes.outputs.should-test == 'true'
         run: |
           pytest tests/web/services/test_interaction_staging_postgresql.py -m postgresql -q
+        env:
+          XAGENT_TEST_POSTGRES_URL: postgresql://xagent:xagent@localhost:5432/xagent_test
+
+      - name: Test task_interaction_protocol_version migration (Postgres-only)
+        if: needs.detect-migration-changes.outputs.should-test == 'true'
+        run: |
+          pytest tests/alembic/test_20260810_add_task_interaction_protocol_version.py -m postgresql -q
+        env:
+          XAGENT_TEST_POSTGRES_URL: postgresql://xagent:xagent@localhost:5432/xagent_test
+
+      - name: Test task_interaction_protocol_version create_all/migration parity (Postgres-only)
+        if: needs.detect-migration-changes.outputs.should-test == 'true'
+        run: |
+          pytest tests/migrations/test_task_interaction_protocol_version_parity.py -m postgresql -q
         env:
           XAGENT_TEST_POSTGRES_URL: postgresql://xagent:xagent@localhost:5432/xagent_test
 

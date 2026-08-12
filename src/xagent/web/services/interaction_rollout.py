@@ -142,12 +142,15 @@ def gating_key(task: "Task") -> str | None:
 # constants -- even the families this PR does not increment -- so that later
 # producers (materialization, response handling, repair, command staging)
 # reuse this one registry instead of standing up a second counter parser.
-# This mirrors ops_signals's own "one owner, many producers" shape. Only the
-# rollout.decision.* family is incremented in this PR; every other constant
-# below is a placeholder naming its future owner. The nine placeholder
-# constants below are intentionally dead code until the producer named in
-# each one's comment lands and starts incrementing it -- not an oversight
-# to flag.
+# This mirrors ops_signals's own "one owner, many producers" shape. Two
+# families are actively incremented: rollout.decision.* by the publication
+# gate below, and anchor.* by resolve_interaction_anchor
+# (services/task_interaction_anchor.py) -- that resolver imports this
+# module's increment_counter rather than standing up a second registry, the
+# exact reuse this comment exists to encourage. Every other constant below
+# is a placeholder naming its future owner, intentionally dead code until
+# the producer named in each one's comment lands and starts incrementing it
+# -- not an oversight to flag.
 # ---------------------------------------------------------------------------
 COUNTER_ROLLOUT_DECISION_ALLOWED = "rollout.decision.allowed"
 COUNTER_ROLLOUT_DECISION_BLOCKED_MODE = "rollout.decision.blocked_mode"
@@ -158,6 +161,17 @@ COUNTER_ROLLOUT_DECISION_BLOCKED_UNKNOWN_SOURCE = (
 COUNTER_ROLLOUT_DECISION_BLOCKED_SCHEMA_ABSENT = (
     "rollout.decision.blocked_schema_absent"
 )
+
+# Incremented by resolve_interaction_anchor (task_interaction_anchor.py),
+# not by anything in this module -- named here because this registry is the
+# one counter namespace, not because the rollout gate produces them. There
+# is deliberately no anchor.corrupt counter alongside these three: the
+# corrupt outcome registers an ops_signals degradation instead (see that
+# resolver's own docstring for why the two observability surfaces diverge
+# there).
+COUNTER_ANCHOR_ABSENT_NO_RUN = "anchor.absent_no_run"
+COUNTER_ANCHOR_UNAVAILABLE_DANGLING_POINTER = "anchor.unavailable_dangling_pointer"
+COUNTER_ANCHOR_ABSENT_LEGACY_CHECKPOINT_TYPE = "anchor.absent_legacy_checkpoint_type"
 
 # Not incremented by this PR -- placeholders for later owners sharing this
 # registry.

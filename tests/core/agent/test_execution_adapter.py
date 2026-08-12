@@ -427,6 +427,68 @@ async def test_execution_adapter_preserves_waiting_for_user_payload() -> None:
 
 
 @pytest.mark.asyncio
+async def test_execution_adapter_surfaces_clarification_draft_at_top_level() -> None:
+    llm = FakeLLM(
+        [
+            {
+                "tool_calls": [
+                    {
+                        "id": "call-ask",
+                        "function": {
+                            "name": "ask_user_question",
+                            "arguments": (
+                                '{"message":"Pick one","interactions":'
+                                '[{"type":"select_one","field":"choice","label":"Choice"}]}'
+                            ),
+                        },
+                    }
+                ]
+            }
+        ]
+    )
+    adapter = AgentExecutionAdapter(
+        AgentExecutionConfig(
+            name="react",
+            pattern="react",
+            llm=llm,
+            tools=[],
+            service_id="react-service",
+            skill_manager=NoSkillManager(),
+        )
+    )
+
+    result = await adapter.execute(task="Ask something", task_id="react-exec")
+
+    assert result["status"] == "waiting_for_user"
+    assert result["clarification_draft"] is not None
+    assert (
+        result["clarification_draft"] is result["agent_result"]["clarification_draft"]
+    )
+
+
+@pytest.mark.asyncio
+async def test_execution_adapter_omits_clarification_draft_key_when_not_waiting() -> (
+    None
+):
+    llm = FakeLLM(["done"])
+    adapter = AgentExecutionAdapter(
+        AgentExecutionConfig(
+            name="lifecycle",
+            pattern="react",
+            llm=llm,
+            tools=[],
+            service_id="lifecycle-service",
+            skill_manager=NoSkillManager(),
+        )
+    )
+
+    result = await adapter.execute(task="Say done", task_id="lifecycle-exec")
+
+    assert result["status"] != "waiting_for_user"
+    assert "clarification_draft" not in result
+
+
+@pytest.mark.asyncio
 async def test_execution_adapter_includes_persisted_conversation_history() -> None:
     llm = FakeLLM(["generated"])
     adapter = AgentExecutionAdapter(

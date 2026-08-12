@@ -529,6 +529,18 @@ def test_public_token_failure_projection_preserves_http_exception_identity() -> 
     )
 
 
+def test_public_token_failure_projection_leaves_defects_unprojected() -> None:
+    """A non-credential exception (e.g. the ShareChatAccessContext invariant
+    ValueError, #1225) must NOT be laundered into a 401: the projection
+    returns None so the caller re-raises the defect loudly (#1214)."""
+    assert (
+        public_chat_access._project_public_token_failure(
+            ValueError("boom"), invalid_detail="Invalid share token"
+        )
+        is None
+    )
+
+
 @pytest.mark.parametrize(
     ("resolver_kind", "claim", "value", "expected_bind_count"),
     (

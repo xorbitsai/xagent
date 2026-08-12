@@ -2862,7 +2862,7 @@ def test_custom_api_config_loader_propagates_runtime_view_resolution_error(monke
         allow_delegated_authorization=False,
     )
     cfg = WebToolConfig(
-        db=_StaticRowsSession([SimpleNamespace(custom_api=api)]),
+        db=_StaticRowsSession([api]),
         request=None,
         task_id="web_task_123",
         user_id=1,

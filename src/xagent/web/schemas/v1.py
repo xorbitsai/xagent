@@ -368,6 +368,95 @@ class AppendMessageResponse(BaseModel):
     control_state: str = Field(..., description="Detailed task control state.")
 
 
+class ReplyRequest(BaseModel):
+    """Body for ``POST /v1/chat/tasks/{task_id}/reply``.
+
+    Answers the agent's pending question on a task whose
+    ``status == 'waiting_for_user'``, resuming the same run rather than
+    starting a new turn. Owner-scoping fields have the same shape and
+    semantics as :class:`AppendMessageRequest`: agent-bound keys pass
+    ``agent_id`` (required), workforce-bound keys optionally pass
+    ``workforce_id``.
+
+    Deliberately narrower than :class:`AppendMessageRequest`:
+
+    - No ``files``: the resume reattaches to the paused run, which has
+      no turn-file binding point (that only exists when a new turn is
+      claimed).
+    - No ``connector_runtime_context``: the resume reuses the connector
+      context already resolved for the run in progress.
+    - No ``metadata``: not passed through by this endpoint.
+    - No idempotency key: a retried reply can be posted twice; callers
+      that need to avoid a duplicate answer should ``GET`` the task and
+      confirm it has left ``waiting_for_user`` before retrying.
+    """
+
+    agent_id: Optional[int] = Field(
+        None,
+        description=(
+            "Target agent's primary key. Required for agent-bound keys; "
+            "must match the agent the key is bound to and the task's "
+            "agent_id. Omit for workforce-bound keys."
+        ),
+    )
+    workforce_id: Optional[int] = Field(
+        None,
+        description=(
+            "Target workforce's primary key. Optional for workforce-bound "
+            "keys; must match the workforce the key is bound to when "
+            "provided. Omit for agent-bound keys."
+        ),
+    )
+    message: MessageBody = Field(
+        ..., description="The user's answer to the agent's pending question."
+    )
+
+
+class ReplyResponse(BaseModel):
+    """``POST /v1/chat/tasks/{task_id}/reply`` -> 202 Accepted response.
+
+    Same fields and semantics as :class:`AppendMessageResponse`, except:
+    ``status`` is always ``'running'`` (a reply always resumes
+    execution), and ``run_id`` is the *same* run the task was waiting
+    on -- the reply resumes the paused execution rather than starting a
+    new one.
+    """
+
+    task_id: int = Field(..., description="Existing task primary key.")
+    agent_id: int = Field(
+        ...,
+        description=(
+            "Agent the task is bound to. For workforce runs this is the "
+            "workforce's manager agent."
+        ),
+    )
+    workforce_id: Optional[int] = Field(
+        None,
+        description=(
+            "Workforce the task belongs to when the key is workforce-bound; "
+            "null for agent-bound keys."
+        ),
+    )
+    status: str = Field(
+        ..., description="Always 'running': a reply always resumes execution."
+    )
+    accepted_at: datetime = Field(
+        ...,
+        description="UTC timestamp when the server accepted the reply.",
+    )
+    run_id: str = Field(
+        ...,
+        description=(
+            "Identity of the resumed execution run -- the same run_id the "
+            "task was waiting on before this reply."
+        ),
+    )
+    state_version: int = Field(
+        ..., description="Monotonic version of the task control state."
+    )
+    control_state: str = Field(..., description="Detailed task control state.")
+
+
 class CreateWorkforceRunRequest(BaseModel):
     """Body for ``POST /v1/workforces/{workforce_id}/runs``.
 

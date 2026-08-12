@@ -42,6 +42,8 @@ from ...schemas.v1 import (
     CreateTaskResponse,
     PendingInteraction,
     PublicStep,
+    ReplyRequest,
+    ReplyResponse,
     StepsResponse,
     TaskInfoResponse,
     UploadedFileInfo,
@@ -423,6 +425,46 @@ def _prepare_created_task_isolated(
         _retire_turn_session_best_effort(db, task_id=owned_task_id)
 
 
+def _validate_owner_scope(
+    principal: ApiKeyPrincipal,
+    *,
+    request_agent_id: int | None,
+    request_workforce_id: int | None,
+) -> None:
+    """Validate a request body's owner-scoping fields against the key.
+
+    Shared by every ``/v1/chat/tasks/{task_id}/*`` write that reuses the
+    ``AppendMessageRequest``-shaped owner fields (append, reply): an
+    agent-bound key must pass a matching ``agent_id`` and no
+    ``workforce_id``; a workforce-bound key must not pass ``agent_id``
+    and, if it passes ``workforce_id``, it must match the bound
+    workforce. Task ownership itself must already be resolved (e.g. via
+    :func:`_resolve_task_or_404`) before calling this, so an unrelated
+    task stays an opaque ``task_not_found`` even when the body also
+    names the wrong owner.
+    """
+    if principal.agent is not None:
+        if request_agent_id is None:
+            raise V1ApiError(
+                V1ErrorCode.INVALID_INPUT,
+                422,
+                message="agent_id is required",
+            )
+        if request_agent_id != principal.agent.id:
+            raise V1ApiError(V1ErrorCode.AGENT_NOT_FOUND, 404)
+        if request_workforce_id is not None:
+            raise V1ApiError(V1ErrorCode.WORKFORCE_NOT_FOUND, 404)
+    else:
+        assert principal.workforce is not None
+        if request_agent_id is not None:
+            raise V1ApiError(V1ErrorCode.AGENT_NOT_FOUND, 404)
+        if (
+            request_workforce_id is not None
+            and request_workforce_id != principal.workforce.id
+        ):
+            raise V1ApiError(V1ErrorCode.WORKFORCE_NOT_FOUND, 404)
+
+
 def _prepare_append_turn_isolated(
     *,
     task_id: int,
@@ -444,26 +486,11 @@ def _prepare_append_turn_isolated(
 
         # Task ownership is resolved first so an unrelated task remains an
         # opaque task_not_found even when the body also names the wrong owner.
-        if principal.agent is not None:
-            if request_agent_id is None:
-                raise V1ApiError(
-                    V1ErrorCode.INVALID_INPUT,
-                    422,
-                    message="agent_id is required",
-                )
-            if request_agent_id != principal.agent.id:
-                raise V1ApiError(V1ErrorCode.AGENT_NOT_FOUND, 404)
-            if request_workforce_id is not None:
-                raise V1ApiError(V1ErrorCode.WORKFORCE_NOT_FOUND, 404)
-        else:
-            assert principal.workforce is not None
-            if request_agent_id is not None:
-                raise V1ApiError(V1ErrorCode.AGENT_NOT_FOUND, 404)
-            if (
-                request_workforce_id is not None
-                and request_workforce_id != principal.workforce.id
-            ):
-                raise V1ApiError(V1ErrorCode.WORKFORCE_NOT_FOUND, 404)
+        _validate_owner_scope(
+            principal,
+            request_agent_id=request_agent_id,
+            request_workforce_id=request_workforce_id,
+        )
 
         runtime_agent = db.get(Agent, int(task.agent_id))
         if runtime_agent is None:
@@ -1048,6 +1075,36 @@ async def append_message_to_task(
         state_version=started.state_version,
         control_state=started.control_state,
     )
+
+
+@router.post(
+    "/chat/tasks/{task_id}/reply",
+    status_code=202,
+    response_model=ReplyResponse,
+)
+async def reply_to_waiting_task(
+    task_id: int,
+    request: ReplyRequest,
+    principal: ApiKeyPrincipal = Depends(get_principal_from_api_key),
+) -> ReplyResponse:
+    """Answer the agent's pending question on a ``waiting_for_user`` task.
+
+    Route declaration lives here alongside the other task endpoints;
+    the implementation is in ``task_reply.py`` because it resumes an
+    existing run rather than claiming a new turn -- a different
+    lifecycle from create/append that deserves its own module. See
+    :func:`xagent.web.api.v1.task_reply.reply_to_task` for the full
+    contract (accepted states, error codes, fail-closed checkpoint
+    handling).
+
+    Imported inside the handler (not at module level) because
+    ``task_reply`` imports ownership-resolution helpers back from this
+    module; deferring the import here breaks that cycle without
+    duplicating those helpers.
+    """
+    from .task_reply import reply_to_task
+
+    return await reply_to_task(task_id=task_id, request=request, principal=principal)
 
 
 @router.get("/chat/tasks/{task_id}", response_model=TaskInfoResponse)

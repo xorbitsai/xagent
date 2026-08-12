@@ -625,7 +625,7 @@ def test_supersede_end_to_end_with_the_reader():
     """Persist a waiting question, confirm the reader sees it, supersede
     it, then confirm the reader sees nothing -- proving the two functions
     agree end-to-end at runtime, on top of sharing
-    ``_waiting_question_filters`` at the source level."""
+    ``_assistant_question_filters`` at the source level."""
     db = _create_db_session()
     try:
         task = _create_task(db)
@@ -682,7 +682,7 @@ def _reader_and_writer_where_clauses(db, task_id: int) -> tuple[str, str]:
     ``get_latest_waiting_question`` emits and the UPDATE is whatever
     ``supersede_legacy_question_rows`` emits. So the comparison keeps
     measuring the real statements even if one function stops calling
-    ``_waiting_question_filters`` -- what it detects is the two clauses
+    ``_assistant_question_filters`` -- what it detects is the two clauses
     differing, not the helper going unused. ``literal_binds`` renders the
     bound ``task_id`` inline, so the comparison covers the bound value
     too, not only the column/operator shape.

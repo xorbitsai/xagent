@@ -34,7 +34,7 @@ QUESTION_MESSAGE_TYPE = "question"
 SUPERSEDED_MESSAGE_TYPE = "question_superseded"
 
 
-def _waiting_question_filters(task_id: int) -> tuple[ColumnElement[bool], ...]:
+def _assistant_question_filters(task_id: int) -> tuple[ColumnElement[bool], ...]:
     """The three-leg WHERE predicate for a task's assistant question
     rows: ``task_id``, ``role == "assistant"``,
     ``message_type == QUESTION_MESSAGE_TYPE``. It matches every such
@@ -327,7 +327,7 @@ def supersede_legacy_question_rows(db: Session, *, task_id: int) -> int:
     Rewrites ``message_type`` from ``QUESTION_MESSAGE_TYPE`` to
     ``SUPERSEDED_MESSAGE_TYPE`` for every row on ``task_id`` where
     ``role == "assistant"``, using the predicate shared with the reader
-    via ``_waiting_question_filters``. It only rewrites that one column:
+    via ``_assistant_question_filters``. It only rewrites that one column:
     no deletes, no ``content``/``interactions`` changes, no reverse
     direction. Runs with ``synchronize_session=False``, so a
     ``TaskChatMessage`` object already loaded in the caller's session
@@ -481,7 +481,7 @@ def supersede_legacy_question_rows(db: Session, *, task_id: int) -> int:
         with db.begin_nested():
             updated = (
                 db.query(TaskChatMessage)
-                .filter(*_waiting_question_filters(task_id))
+                .filter(*_assistant_question_filters(task_id))
                 .update(
                     {TaskChatMessage.message_type: SUPERSEDED_MESSAGE_TYPE},
                     synchronize_session=False,
@@ -698,7 +698,7 @@ def get_latest_waiting_question(
 
     latest_question = (
         db.query(TaskChatMessage)
-        .filter(*_waiting_question_filters(task_id))
+        .filter(*_assistant_question_filters(task_id))
         .order_by(TaskChatMessage.id.desc())
         .first()
     )

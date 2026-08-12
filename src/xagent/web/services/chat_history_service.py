@@ -453,7 +453,7 @@ def supersede_legacy_question_rows(db: Session, *, task_id: int) -> int:
     # is emitted as an Update construct, and the statement-capture helper in
     # test_supersede_legacy_questions.py requires exactly one Update in the
     # writer's window -- a Core dummy write makes it two and turns the
-    # predicate-drift tests red (measured). Second, "SET id = id" is a
+    # predicate-drift test red (measured). Second, "SET id = id" is a
     # self-assignment, so it cannot alter a row even if the WHERE clause ever
     # matched, whereas .values(id=-1) would write a real value into the primary
     # key. Third, the no-.values() Core form compiles to a SET clause naming

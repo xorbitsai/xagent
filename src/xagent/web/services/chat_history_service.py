@@ -8,6 +8,7 @@ from typing import Any, Dict, List, Optional
 
 from sqlalchemy.exc import DBAPIError, IntegrityError
 from sqlalchemy.orm import Session
+from sqlalchemy.sql.elements import ColumnElement
 
 from ...core.agent.transcript import (
     build_assistant_transcript_content,
@@ -32,17 +33,19 @@ QUESTION_MESSAGE_TYPE = "question"
 SUPERSEDED_MESSAGE_TYPE = "question_superseded"
 
 
-def _waiting_question_filters(task_id: int) -> tuple[Any, ...]:
-    """The three-leg WHERE predicate for a task's pending assistant
-    question rows: ``task_id``, ``role == "assistant"``,
-    ``message_type == QUESTION_MESSAGE_TYPE``. Shared by the reader
-    (``get_latest_waiting_question``) and the writer
-    (``supersede_legacy_question_rows``) so the two conditions cannot
-    drift apart by hand-editing one copy and not the other.
+def _waiting_question_filters(task_id: int) -> tuple[ColumnElement[bool], ...]:
+    """The three-leg WHERE predicate for a task's assistant question
+    rows: ``task_id``, ``role == "assistant"``,
+    ``message_type == QUESTION_MESSAGE_TYPE``. It matches every such
+    row, whether it is still waiting for an answer or was already
+    answered. Shared by the reader (``get_latest_waiting_question``)
+    and the writer (``supersede_legacy_question_rows``) so the two
+    conditions cannot drift apart by hand-editing one copy and not the
+    other.
 
-    Scoped to this pending-question predicate only. A second,
-    ``allow_superseded`` pass over already-superseded rows may be added
-    to the reader later; that pass is not this helper's concern.
+    Scoped to this one predicate. A second, ``allow_superseded`` pass
+    over already-superseded rows may be added to the reader later; that
+    pass is not this helper's concern.
     """
     return (
         TaskChatMessage.task_id == task_id,

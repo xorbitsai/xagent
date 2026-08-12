@@ -71,6 +71,29 @@ existing gate for ``task_interaction_staging.py``'s two entry points
 without extending that gate itself -- this module is not one of the two
 names it scans for. See that test's own docstring for the removal
 condition.
+
+Two kinds of pre-existing row fail the run-partition self-consistency
+check today and classify as corrupt rather than as absence, even though
+neither one represents actual data corruption. The first is a row whose
+checkpoint pointer was filled in by the migration that added
+``last_checkpoint_trace_event_id`` (2026-08): that migration backfills the
+pointer by matching a task's legacy event-id column against an existing
+``trace_events`` row, and that row was written before the run-partition
+field existed, so it never carries one. The second is any legacy-type
+checkpoint row, on any task, because the function that writes this field
+(``stage_trace_event_row``, ``trace_event_staging.py``) only ever writes
+it for current-type checkpoints -- a legacy-type row cannot carry the
+field regardless of when it was written. Both kinds of row are missing
+the field, fail the partition check before the legacy-type check ever
+runs, and register the corrupt-anchor degradation signal
+(``INTERACTION_ANCHOR_CORRUPT``, ``ops_signals.py``). That signal has no
+clearing point by design, so once one of these rows triggers it, it stays
+active until the process restarts. The change that wires this function's
+first production caller has to decide, before that caller ships, how a
+pre-existing row like this should be classified -- as corrupt, as
+absence, or some other way -- because the classification these rows get
+today is a side effect of when and how they were written, not a decision
+anyone made about what a caller should see for them.
 """
 
 from __future__ import annotations

@@ -322,11 +322,51 @@ def test_ta4_no_run_id_short_circuits_before_corrupt_row_is_read(
 
 
 # ---------------------------------------------------------------------------
-# T-A-5: legacy checkpoint type, same task -> absence, not corrupt.
+# A legacy-type row, same task, with no run-partition field at all -- the
+# only shape a real legacy checkpoint row can have, since
+# stage_trace_event_row (trace_event_staging.py) only ever writes that
+# field for current-type checkpoints. Missing the field fails the
+# run-partition self-consistency condition before the legacy-type check is
+# even reached, so this classifies corrupt, not absent.
 # ---------------------------------------------------------------------------
 
 
-def test_ta5_legacy_type_same_task_is_absence(
+def test_legacy_type_row_without_run_partition_field_classifies_corrupt(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(
+        logging.ERROR, logger="xagent.web.services.task_interaction_anchor"
+    )
+    engine = _engine(tmp_path)
+    db = _session_factory(engine)()
+    legacy_type = next(iter(LEGACY_CHECKPOINT_TYPES))
+    task, _row = _build_scenario(db, checkpoint_type=legacy_type, run_partition=None)
+
+    result = resolve_interaction_anchor(db, task)
+
+    assert result is None
+    assert ops_signals.INTERACTION_ANCHOR_CORRUPT in ops_signals.active_degradations()
+    # Corrupt registers no counter -- the legacy-absence counter this row
+    # might look like it should reach is never incremented, because the
+    # run-partition condition fails first.
+    assert ir.counters_snapshot() == {}
+    errors = [r for r in caplog.records if r.levelno == logging.ERROR]
+    assert len(errors) == 1, caplog.records
+    assert errors[0].msg == "task %s's checkpoint pointer %s failed anchor validation"
+    db.close()
+
+
+# ---------------------------------------------------------------------------
+# The one shape that does reach the legacy-absence outcome: a legacy-type
+# row whose run-partition field is present and matches the task's run id.
+# No current writer produces this shape -- stage_trace_event_row only ever
+# writes the run-partition field for current-type checkpoints -- so this
+# cell pins what the outcome does for a row shaped this way, rather than
+# covering a path production data can take today.
+# ---------------------------------------------------------------------------
+
+
+def test_legacy_type_row_with_matching_run_partition_field_is_absence(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
     caplog.set_level(logging.INFO, logger="xagent.web.services.task_interaction_anchor")
@@ -430,6 +470,40 @@ def test_ta7_happy_path_resolves_anchor(tmp_path: Path) -> None:
     assert result.resume_run_partition == "run-a"
     assert result.resume_locator_format == "trace_event_pk_v1"
     assert result.resume_checkpoint_type == "agent_execution_checkpoint"
+    assert ops_signals.active_degradations() == {}
+    db.close()
+
+
+# ---------------------------------------------------------------------------
+# Happy path with a non-empty execution identity on both sides, matching --
+# every other non-corrupt cell in this file leaves execution_id unset, which
+# leaves the row's execution id empty and short-circuits condition 6's
+# comparison before it ever runs. This cell builds the row directly (rather
+# than through _build_scenario, which cannot take the task's own id before
+# the task exists) so the row's execution id can be set to the task's id
+# after creation, exercising the right-hand side of that comparison for the
+# first time: two non-empty, equal execution ids should resolve, not corrupt.
+# ---------------------------------------------------------------------------
+
+
+def test_matching_non_empty_execution_identity_resolves_anchor(
+    tmp_path: Path,
+) -> None:
+    engine = _engine(tmp_path)
+    db = _session_factory(engine)()
+    task = _make_task(db, run_id="run-a")
+    row = _make_row(
+        db,
+        task_id=task.id,
+        run_partition="run-a",
+        execution_id=str(task.id),
+    )
+    _point(db, task, row.id)
+
+    result = resolve_interaction_anchor(db, task)
+
+    assert result is not None
+    assert result.resume_execution_id == str(task.id)
     assert ops_signals.active_degradations() == {}
     db.close()
 

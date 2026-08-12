@@ -1759,6 +1759,74 @@ async def test_dag_pattern_failed_step_wins_over_waiting_sibling_in_same_batch()
 
 
 @pytest.mark.asyncio
+async def test_dag_pattern_failed_step_wins_over_interrupted_sibling_in_same_batch() -> (
+    None
+):
+    """When one step in a batch fails and its sibling is interrupted in
+    the same wakeup, the failure still wins over the interrupt. An
+    interrupt is a control instruction, but converting it to a plain
+    failure here is a deliberate choice: a batch containing a failed step
+    is already doomed, so it reports the failure rather than the
+    interrupt."""
+
+    release = asyncio.Event()
+    started: dict[str, asyncio.Event] = {}
+
+    async def fake_execute_step(
+        self: DAGPattern, *, step: PlanStep, **kwargs: Any
+    ) -> dict[str, Any] | None:
+        started.setdefault(step.id, asyncio.Event()).set()
+        await release.wait()
+        root_context = kwargs["root_context"]
+        if step.id == "fail_step":
+            step.status = "failed"
+            step.error = "boom"
+            self._clear_active_step(step.id)
+            return None
+        self.status = "interrupted"
+        step.status = "interrupted"
+        return {
+            "success": False,
+            "status": "interrupted",
+            "execution_id": root_context.execution_id,
+            "context": root_context,
+            "active_step_id": step.id,
+        }
+
+    pattern = DAGPattern(
+        lambda **_: build_plan(
+            PlanStep(id="fail_step", task="Fail me"),
+            PlanStep(id="interrupt_step", task="Interrupt me"),
+        ),
+        max_concurrency=2,
+    )
+    pattern._execute_step = fake_execute_step.__get__(pattern, DAGPattern)  # type: ignore[method-assign]
+
+    run_task = asyncio.create_task(
+        pattern.run(
+            context=ExecutionContext(execution_id="dag-failed-vs-interrupted"),
+            tools=[],
+            llm=object(),
+            runtime=PatternRuntime(execution_id="dag-failed-vs-interrupted"),
+        )
+    )
+    await asyncio.wait_for(
+        started.setdefault("fail_step", asyncio.Event()).wait(), timeout=1
+    )
+    await asyncio.wait_for(
+        started.setdefault("interrupt_step", asyncio.Event()).wait(), timeout=1
+    )
+    release.set()
+    result = await asyncio.wait_for(run_task, timeout=1)
+
+    assert result["success"] is False
+    assert result["status"] == "failed"
+    assert result["status"] != "interrupted"
+    assert result["failure_reason"] == "step_failed"
+    assert result["failed_step_id"] == "fail_step"
+
+
+@pytest.mark.asyncio
 async def test_dag_pattern_cancelling_the_run_task_cancels_sibling_steps() -> None:
     """Cancelling the task that is awaiting pattern.run() while two
     independent steps are still executing must not leave their step

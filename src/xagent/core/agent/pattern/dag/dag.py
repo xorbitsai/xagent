@@ -1888,9 +1888,9 @@ class DAGPattern(AgentPattern):
         this once ``run()`` has returned always sees an accurate answer.
         This holds for cancellation too: when the task running the
         pattern is cancelled, the sibling step tasks are cancelled and
-        awaited inside the same exception handler before the ``finally``
-        clears the set, so an empty set on return still means no step
-        task is left running.
+        awaited inside the exception handler that wraps the batch loop,
+        before the ``finally`` clears the set, so an empty set on return
+        still means no step task is left running.
         """
 
         return bool(self._live_step_tasks)

@@ -1,6 +1,6 @@
 """Contract tests for ``InteractionHandoff``'s public surface: the
 ``staged`` observability field, the ``__all__`` public boundary, and the
-zero-direct-construction guard the public rename makes necessary (T-A-12).
+zero-direct-construction guard the public rename makes necessary.
 
 This is a companion to ``test_interaction_staging.py``, not a replacement
 for any of it -- the six-swallowed-exception degrade matrix, the savepoint
@@ -287,11 +287,11 @@ def test_th6_all_names_resolve_and_are_public() -> None:
 
 
 # ---------------------------------------------------------------------------
-# T-A-12: InteractionHandoff has zero direct-construction points in src/
-# outside its own defining module (task_interaction_staging.py). Publicizing
-# the class (F-3(a), this module's own rename) makes direct construction
-# syntactically possible for the first time -- this guard depends on that
-# rename having already landed, which is why it lives here rather than in
+# InteractionHandoff has zero direct-construction points in src/ outside
+# its own defining module (task_interaction_staging.py). Publicizing the
+# class (this module's own rename) makes direct construction syntactically
+# possible for the first time -- this guard depends on that rename having
+# already landed, which is why it lives here rather than in
 # test_task_interaction_anchor.py, whose own dependencies do not carry it.
 # ---------------------------------------------------------------------------
 

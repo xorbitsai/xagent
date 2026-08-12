@@ -1,19 +1,18 @@
 """Contract tests for ``resolve_interaction_anchor``
 (``task_interaction_anchor.py``) and the static zero-production-caller
-assertion this module introduces for the resolver itself (T-A-11).
+assertion this module introduces for the resolver itself.
 
-Two cells the task book groups with this test group live elsewhere: T-A-10
-(the checkpoint run-partition predicate's move into
-``trace_event_staging.py``) is not about the resolver at all and lives in
-``test_trace_event_staging.py``, alongside the predicate itself. T-A-12
-(the zero-direct-construction guard for the public ``InteractionHandoff``
-class) depends on that class's public rename, which this module's own
-dependencies do not carry -- it lives in
+Two related cases live in other test files rather than here. The checkpoint
+run-partition predicate's move into ``trace_event_staging.py`` is not about
+the resolver at all and is tested in ``test_trace_event_staging.py``,
+alongside the predicate itself. The zero-direct-construction guard for the
+public ``InteractionHandoff`` class depends on that class's public rename,
+which this module's own dependencies do not carry -- it is tested in
 ``test_interaction_handoff_surface.py``, where the rename is pinned.
 
-All nine judgment-table cells run on a private, file-backed SQLite database
-per test, following ``test_interaction_staging.py``'s own convention (see
-that file's module docstring for why file-backed rather than in-memory).
+All judgment-table cells run on a private, file-backed SQLite database per
+test, following ``test_interaction_staging.py``'s own convention (see that
+file's module docstring for why file-backed rather than in-memory).
 """
 
 from __future__ import annotations
@@ -164,10 +163,10 @@ def _reset_state():
 
 def _count_anchor_constructions(monkeypatch: pytest.MonkeyPatch) -> dict[str, int]:
     """Instruments ``InteractionAnchor.__init__`` itself, not the return
-    value of ``resolve_interaction_anchor`` -- T-A-6a/T-A-6b need to prove
-    the dataclass was never *built* on the corrupt path, which "the
-    function returned None" alone does not distinguish from "it built one
-    and then discarded it"."""
+    value of ``resolve_interaction_anchor`` -- the cross-task-row corrupt
+    tests below need to prove the dataclass was never *built* on the
+    corrupt path, which "the function returned None" alone does not
+    distinguish from "it built one and then discarded it"."""
 
     calls = {"n": 0}
     original_init = InteractionAnchor.__init__
@@ -181,10 +180,10 @@ def _count_anchor_constructions(monkeypatch: pytest.MonkeyPatch) -> dict[str, in
 
 
 # ---------------------------------------------------------------------------
-# T-A-1: task.run_id is NOT NULL but task.last_checkpoint_trace_event_id IS
-# NULL -> absence. Distinct from T-A-4 (task.run_id IS NULL): this cell
-# exercises step 2 of the judgment table specifically, with step 1 passed,
-# so a pointer-NULL misclassification (e.g. falling into step 3's
+# task.run_id is NOT NULL but task.last_checkpoint_trace_event_id IS NULL ->
+# absence. Distinct from the no-run-id case below: this cell exercises step
+# 2 of the judgment table specifically, with step 1 passed, so a
+# pointer-NULL misclassification (e.g. falling into step 3's
 # dangling-pointer branch) cannot hide behind step 1 short-circuiting first.
 # ---------------------------------------------------------------------------
 
@@ -206,7 +205,7 @@ def test_ta1_no_checkpoint_pointer_is_absence(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# T-A-2: pointer names no live trace_events row -> unavailable, reported as
+# The pointer names no live trace_events row -> unavailable, reported as
 # absence, counted separately from a NULL pointer.
 # ---------------------------------------------------------------------------
 
@@ -243,7 +242,7 @@ def test_ta2_dangling_pointer_is_absence_and_counted(
 
 
 # ---------------------------------------------------------------------------
-# T-A-3: the row exists but fails one of six self-consistency conditions ->
+# The row exists but fails one of six self-consistency conditions ->
 # corrupt. Six parametrized cells, one broken condition each.
 # ---------------------------------------------------------------------------
 
@@ -285,8 +284,9 @@ def test_ta3_corrupt_conditions(
     # ops_signals, not the counter registry).
     assert ir.counters_snapshot() == {}
     # Step 4's judgment-table entry is a logger.error call -- same rationale
-    # as T-A-2's warning pin, applied uniformly across all six parametrized
-    # conditions since they all fall through the same log call site.
+    # as the dangling-pointer case's warning pin above, applied uniformly
+    # across all six parametrized conditions since they all fall through
+    # the same log call site.
     errors = [r for r in caplog.records if r.levelno == logging.ERROR]
     assert len(errors) == 1, caplog.records
     assert errors[0].msg == "task %s's checkpoint pointer %s failed anchor validation"
@@ -294,10 +294,10 @@ def test_ta3_corrupt_conditions(
 
 
 # ---------------------------------------------------------------------------
-# T-A-4: task.run_id IS NULL classifies as absence even when the pointer
-# names a row that would otherwise fail a corrupt condition -- proving step
-# 1 short-circuits before the row is ever evaluated, not merely that its
-# own outcome happens to be absence.
+# task.run_id IS NULL classifies as absence even when the pointer names a
+# row that would otherwise fail a corrupt condition -- proving step 1
+# short-circuits before the row is ever evaluated, not merely that its own
+# outcome happens to be absence.
 # ---------------------------------------------------------------------------
 
 
@@ -396,9 +396,9 @@ def test_legacy_type_row_with_matching_run_partition_field_is_absence(
 
 
 # ---------------------------------------------------------------------------
-# T-A-6a / T-A-6b: a row belonging to another task is corrupt regardless of
-# checkpoint_type -- ownership is checked (step 4) before the legacy-type
-# absence classification (step 5), never bypassed by it. Both cells assert
+# A row belonging to another task is corrupt regardless of checkpoint_type
+# -- ownership is checked (step 4) before the legacy-type absence
+# classification (step 5), never bypassed by it. Both cells assert
 # InteractionAnchor's constructor was never even called, not merely that
 # the return value was None.
 # ---------------------------------------------------------------------------
@@ -426,12 +426,11 @@ def test_ta6a_cross_task_row_modern_type_is_corrupt(
 def test_ta6b_cross_task_row_legacy_type_is_still_corrupt(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Differs from T-A-6a in exactly one field: this row's owning task_id
-    is the *other* task's, same as 6a, but here checkpoint_type is legacy.
-    If step 5 (legacy -> absence) ran before step 4 (the six conditions,
-    including ownership), this row would wrongly classify as absence
-    instead of corrupt -- see T-A-9 for the mutation that pins this
-    ordering directly."""
+    """Differs from the previous test in exactly one field: this row's
+    owning task_id is the *other* task's, same as before, but here
+    checkpoint_type is legacy. If step 5 (legacy -> absence) ran before
+    step 4 (the six conditions, including ownership), this row would
+    wrongly classify as absence instead of corrupt."""
 
     calls = _count_anchor_constructions(monkeypatch)
     engine = _engine(tmp_path)
@@ -449,8 +448,8 @@ def test_ta6b_cross_task_row_legacy_type_is_still_corrupt(
 
 
 # ---------------------------------------------------------------------------
-# T-A-7: happy path -- all six conditions pass, checkpoint_type is current
-# -> a resolved InteractionAnchor, every field asserted individually.
+# Happy path -- all six conditions pass, checkpoint_type is current -> a
+# resolved InteractionAnchor, every field asserted individually.
 # ---------------------------------------------------------------------------
 
 
@@ -481,8 +480,8 @@ def test_ta7_happy_path_resolves_anchor(tmp_path: Path) -> None:
 # comparison before it ever runs. This cell builds the row directly (rather
 # than through _build_scenario, which cannot take the task's own id before
 # the task exists) so the row's execution id can be set to the task's id
-# after creation, exercising the right-hand side of that comparison for the
-# first time: two non-empty, equal execution ids should resolve, not corrupt.
+# after creation -- the first cell where that comparison runs and comes out
+# equal: two non-empty, equal execution ids should resolve, not corrupt.
 # ---------------------------------------------------------------------------
 
 
@@ -509,7 +508,7 @@ def test_matching_non_empty_execution_identity_resolves_anchor(
 
 
 # ---------------------------------------------------------------------------
-# T-A-11: resolve_interaction_anchor ships with zero production callers.
+# resolve_interaction_anchor ships with zero production callers.
 # ---------------------------------------------------------------------------
 
 _ANCHOR_GATED_NAME = "resolve_interaction_anchor"

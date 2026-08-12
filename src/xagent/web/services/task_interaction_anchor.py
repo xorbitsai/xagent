@@ -24,7 +24,8 @@ Step 4 must run before step 5: a row belonging to a *different* task, even
 one whose ``checkpoint_type`` is legacy, must still be reported corrupt.
 Folding the two steps into one (checking legacy-type first) would let a
 cross-task row slip through as an ordinary absence instead -- see
-``test_task_interaction_anchor.py``'s mutation test for that ordering.
+``test_task_interaction_anchor.py``'s cross-task legacy-type cell for that
+ordering.
 
 ``run_id IS NULL`` handling deliberately does not match
 ``trace_event_staging.checkpoint_run_partition_filter``. That predicate
@@ -78,8 +79,8 @@ neither one represents actual data corruption. The first is a row whose
 checkpoint pointer was filled in by the migration that added
 ``last_checkpoint_trace_event_id`` (2026-08): that migration backfills the
 pointer by matching a task's legacy event-id column against an existing
-``trace_events`` row, and that row was written before the run-partition
-field existed, so it never carries one. The second is any legacy-type
+``trace_events`` row, and if that row predates the run-partition field
+(added before this migration), it carries none. The second is any legacy-type
 checkpoint row, on any task, because the function that writes this field
 (``stage_trace_event_row``, ``trace_event_staging.py``) only ever writes
 it for current-type checkpoints -- a legacy-type row cannot carry the

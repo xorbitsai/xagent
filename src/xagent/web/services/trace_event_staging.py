@@ -156,6 +156,7 @@ def stage_trace_event_row(
                 trace_event_id=row_id,
             ),
         )
+
     return StagedTraceRow(row_id=None, stored_data=data, anchor=None)
 
 

@@ -745,6 +745,32 @@ class DAGPattern(AgentPattern):
                     if result is not None:
                         completed_results.append((task, result))
 
+                # A batch containing a failed step fails fast, before any
+                # winner is chosen: a DAG that is already doomed must not
+                # ask the user a question or report an interrupt instead of
+                # the failure. This scan therefore runs ahead of the
+                # completed_results winner selection below, so a failure
+                # always outranks an interrupted or waiting result from a
+                # sibling that completed in the same wakeup.
+                failed_step = next(
+                    (step for step in steps_by_id.values() if step.status == "failed"),
+                    None,
+                )
+                if failed_step is not None:
+                    await self._cancel_pending_steps(
+                        pending,
+                        step_ids_by_task=tasks,
+                        steps_by_id=steps_by_id,
+                    )
+                    return await self._fail(
+                        context=root_context,
+                        runtime=runtime,
+                        error=(failed_step.error or f"Step {failed_step.id} failed."),
+                        failure_reason="step_failed",
+                        checkpoint_label="dag_failed",
+                        failed_step_id=failed_step.id,
+                    )
+
                 if completed_results:
                     # Deterministic winner selection: an interrupted result
                     # always outranks a waiting one (an interrupt is a
@@ -829,24 +855,6 @@ class DAGPattern(AgentPattern):
                         )
                     return winner_result
 
-                failed_step = next(
-                    (step for step in steps_by_id.values() if step.status == "failed"),
-                    None,
-                )
-                if failed_step is not None:
-                    await self._cancel_pending_steps(
-                        pending,
-                        step_ids_by_task=tasks,
-                        steps_by_id=steps_by_id,
-                    )
-                    return await self._fail(
-                        context=root_context,
-                        runtime=runtime,
-                        error=(failed_step.error or f"Step {failed_step.id} failed."),
-                        failure_reason="step_failed",
-                        checkpoint_label="dag_failed",
-                        failed_step_id=failed_step.id,
-                    )
                 if self._needs_replan(root_context):
                     await self._cancel_pending_steps(
                         pending,

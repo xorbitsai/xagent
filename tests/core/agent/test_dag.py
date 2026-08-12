@@ -1674,6 +1674,90 @@ async def test_dag_pattern_concurrent_failure_clears_cancelled_sibling() -> None
     }
 
 
+@pytest.mark.asyncio
+async def test_dag_pattern_failed_step_wins_over_waiting_sibling_in_same_batch() -> (
+    None
+):
+    """When one step in a batch fails and its sibling reaches
+    waiting_for_user in the same wakeup, the failure must win: a DAG that
+    is already doomed must not ask the user a question in place of
+    reporting the failure. The returned result is a plain failure with no
+    question or draft attached, and no clarification-related keys at
+    all."""
+
+    release = asyncio.Event()
+    started: dict[str, asyncio.Event] = {}
+
+    async def fake_execute_step(
+        self: DAGPattern, *, step: PlanStep, **kwargs: Any
+    ) -> dict[str, Any] | None:
+        started.setdefault(step.id, asyncio.Event()).set()
+        await release.wait()
+        root_context = kwargs["root_context"]
+        if step.id == "fail_step":
+            step.status = "failed"
+            step.error = "boom"
+            self._clear_active_step(step.id)
+            return None
+        self.status = "waiting_for_user"
+        draft = draft_from_waiting_request(
+            {
+                "message": "Pick one",
+                "message_type": "question",
+                "interactions": [],
+                "tool_call_id": "ask-wait",
+                "tool_name": "ask_user_question",
+                "message_count": 2,
+            },
+            execution_id=root_context.execution_id,
+            step_id=None,
+        )
+        attributed_draft = draft.with_origin_step(step.id) if draft else None
+        return {
+            "success": False,
+            "status": "waiting_for_user",
+            "message": "Pick one",
+            "message_type": "question",
+            "clarification_draft": attributed_draft,
+            "execution_id": root_context.execution_id,
+            "context": root_context,
+            "active_step_id": step.id,
+        }
+
+    pattern = DAGPattern(
+        lambda **_: build_plan(
+            PlanStep(id="fail_step", task="Fail me"),
+            PlanStep(id="wait_step", task="Ask me"),
+        ),
+        max_concurrency=2,
+    )
+    pattern._execute_step = fake_execute_step.__get__(pattern, DAGPattern)  # type: ignore[method-assign]
+
+    run_task = asyncio.create_task(
+        pattern.run(
+            context=ExecutionContext(execution_id="dag-failed-vs-waiting"),
+            tools=[],
+            llm=object(),
+            runtime=PatternRuntime(execution_id="dag-failed-vs-waiting"),
+        )
+    )
+    await asyncio.wait_for(
+        started.setdefault("fail_step", asyncio.Event()).wait(), timeout=1
+    )
+    await asyncio.wait_for(
+        started.setdefault("wait_step", asyncio.Event()).wait(), timeout=1
+    )
+    release.set()
+    result = await asyncio.wait_for(run_task, timeout=1)
+
+    assert result["success"] is False
+    assert result["status"] == "failed"
+    assert result["failure_reason"] == "step_failed"
+    assert result["failed_step_id"] == "fail_step"
+    assert "message" not in result
+    assert "clarification_draft" not in result
+
+
 class ConcurrentWaitingLLM:
     """Two DAG steps that each reach waiting_for_user via
     send_message(expect_response=True), synchronized on a shared release

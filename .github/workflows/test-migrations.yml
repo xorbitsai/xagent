@@ -26,6 +26,9 @@ on:
       - 'tests/web/services/test_interaction_staging_postgresql.py'
       - 'src/xagent/web/services/task_interaction_service.py'
       - 'tests/web/services/test_task_interaction_service_postgresql.py'
+      - 'src/xagent/web/models/task_interaction.py'
+      - 'src/xagent/web/services/task_interaction_schema.py'
+      - 'src/xagent/core/agent/checkpoint.py'
   pull_request:
     branches: [main]
   # Required by the merge queue: without this the two required contexts below
@@ -83,6 +86,9 @@ jobs:
             tests/web/services/test_interaction_staging_postgresql.py
             src/xagent/web/services/task_interaction_service.py
             tests/web/services/test_task_interaction_service_postgresql.py
+            src/xagent/web/models/task_interaction.py
+            src/xagent/web/services/task_interaction_schema.py
+            src/xagent/core/agent/checkpoint.py
           )
 
           case "$EVENT_NAME" in

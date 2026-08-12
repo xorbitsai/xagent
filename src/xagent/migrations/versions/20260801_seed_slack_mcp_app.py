@@ -49,7 +49,28 @@ PUBLIC_MCP_APPS_TABLE = sa.table(
 
 APP_ID = "slack"
 
-SLACK_SCOPES = ["chat:write", "chat:write.public", "channels:read"]
+# Kept in sync with the current builtin_mcp_registry.py row (not just the
+# scopes present when this migration was first written) so
+# test_seed_rows_match_registry keeps catching drift — see the precedent set
+# by 20260720_seed_docs_slides_hubspot.py's own HubSpot row when its scopes
+# were later expanded in 20260810_add_hubspot_marketing_scopes.py. Existing
+# databases are unaffected (this migration only inserts when the row is
+# absent); the follow-up 20260812_add_slack_history_reactions_files_scopes
+# migration is what actually upgrades an already-seeded row.
+SLACK_SCOPES = [
+    "chat:write",
+    "chat:write.public",
+    "channels:read",
+    "channels:history",
+    "groups:read",
+    "groups:history",
+    "im:read",
+    "im:history",
+    "mpim:read",
+    "mpim:history",
+    "reactions:write",
+    "files:write",
+]
 
 
 def _filter_row(row: dict[str, object], allowed_columns: set[str]) -> dict[str, object]:
@@ -81,7 +102,7 @@ def _slack_app_row() -> dict[str, object]:
     return {
         "app_id": APP_ID,
         "name": "Slack",
-        "description": "Connect to Slack to list channels and post messages, e.g. incident summaries and recommended fixes.",
+        "description": "Connect to Slack to search and read channel, thread, and DM history, post messages and replies, react to messages, and upload files, e.g. incident summaries and recommended fixes.",
         "icon": "https://www.google.com/s2/favicons?domain=slack.com&sz=128",
         "transport": "oauth",
         "provider_name": "slack",

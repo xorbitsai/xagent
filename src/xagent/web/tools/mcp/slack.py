@@ -3,6 +3,7 @@ import logging
 import os
 import re
 import time
+from pathlib import Path
 from typing import Any
 
 import requests
@@ -25,6 +26,10 @@ MAX_CHANNELS = 1000
 # conversations.list is Tier-2 rate-limited (~20 req/min); on a 429 with a
 # small Retry-After we wait once and retry rather than failing the page.
 MAX_RETRY_AFTER_SECONDS = 30
+# Bound on how many distinct threads slack_search_messages will fetch replies
+# for in one call — a channel history page can contain many threaded parents,
+# and each one is a separate conversations.replies call.
+MAX_SEARCH_THREADS = 20
 
 # Slack channel/user/group ids are uppercase alphanumerics with a letter
 # prefix; channel *names* are forced lowercase by Slack, so this can't
@@ -55,6 +60,79 @@ def _normalize_channel(channel: str) -> str:
     if value.startswith("#") or _SLACK_ID_PATTERN.match(value):
         return value
     return f"#{value}"
+
+
+def _resolve_channel_id(channel: str) -> str:
+    """Resolve a channel id, bare name, or "#name" to a real Slack channel id.
+
+    Unlike chat.postMessage (which Slack resolves names for natively), the
+    conversations.*/reactions.*/files.* endpoints below require an actual
+    channel id — a name has to be looked up via conversations.list first.
+    DM and group-DM ids have no name form and always match
+    _SLACK_ID_PATTERN, so they pass through unchanged.
+    """
+    value = channel.strip()
+    if _SLACK_ID_PATTERN.match(value):
+        return value
+    name = value.lstrip("#").lower()
+    if not name:
+        raise ValueError("channel must not be empty")
+    cursor: str | None = None
+    for _ in range(MAX_PAGES):
+        params: dict[str, Any] = {
+            "types": "public_channel,private_channel",
+            "exclude_archived": "false",
+            "limit": 200,
+        }
+        if cursor:
+            params["cursor"] = cursor
+        result = _request("GET", "conversations.list", params=params)
+        for candidate in result.get("channels") or []:
+            if str(candidate.get("name") or "").lower() == name:
+                return str(candidate.get("id"))
+        cursor = (result.get("response_metadata") or {}).get("next_cursor")
+        if not cursor:
+            break
+    raise ValueError(
+        f"Could not resolve channel '{channel}' to an id — use slack_list_channels "
+        "or slack_list_direct_messages to look it up, or pass the channel id "
+        "directly."
+    )
+
+
+def _allowed_file_dirs() -> list[Path]:
+    raw_dirs = os.environ.get("XAGENT_SLACK_FILE_ALLOWED_DIRS", "")
+    if not raw_dirs.strip():
+        return [Path.cwd().resolve()]
+    return [
+        Path(raw_dir).expanduser().resolve()
+        for raw_dir in raw_dirs.split(",")
+        if raw_dir.strip()
+    ]
+
+
+def _resolve_allowed_file_path(file_path: str) -> Path:
+    """Restrict slack_upload_file to files under an allowlisted directory,
+    the same defense used by the LinkedIn connector's image upload — without
+    it an agent could be tricked into exfiltrating arbitrary host files
+    through this tool."""
+    local_path = Path(file_path).expanduser()
+    if not local_path.is_absolute():
+        local_path = Path.cwd() / local_path
+    local_path = local_path.resolve()
+
+    if not local_path.is_file():
+        raise FileNotFoundError(f"File not found: {file_path}")
+
+    allowed_dirs = _allowed_file_dirs()
+    for allowed_dir in allowed_dirs:
+        if local_path == allowed_dir or local_path.is_relative_to(allowed_dir):
+            return local_path
+
+    allowed_dirs_str = ", ".join(str(path) for path in allowed_dirs)
+    raise PermissionError(
+        f"File path {file_path} is outside allowed directories: {allowed_dirs_str}"
+    )
 
 
 def _request(
@@ -187,22 +265,415 @@ def slack_list_channels(
 
 
 @mcp.tool()
-def slack_post_message(channel: str, text: str) -> str:
+def slack_post_message(channel: str, text: str, thread_ts: str = "") -> str:
     """
-    Post a message to a Slack channel.
+    Post a message to a Slack channel, DM, or as a threaded reply.
     channel: a channel id (e.g. "C0123456789") or name (e.g. "#incidents" or
     "incidents" — a bare name is normalized to "#incidents").
     text: the message body (plain text or Slack mrkdwn).
+    thread_ts: optional parent message "ts" (from slack_get_channel_history,
+    slack_search_messages, or a prior slack_post_message result) to reply
+    inside that thread instead of posting to the channel's main timeline.
     """
     try:
-        result = _request(
-            "POST",
-            "chat.postMessage",
-            json_data={"channel": _normalize_channel(channel), "text": text},
-        )
+        json_data: dict[str, Any] = {
+            "channel": _normalize_channel(channel),
+            "text": text,
+        }
+        if thread_ts:
+            json_data["thread_ts"] = thread_ts
+        result = _request("POST", "chat.postMessage", json_data=json_data)
         return _success(channel=result.get("channel"), ts=result.get("ts"))
     except Exception as e:
         logger.error(f"Error posting Slack message to {channel}: {e}")
+        return _error(str(e))
+
+
+@mcp.tool()
+def slack_get_channel_history(
+    channel: str,
+    limit: int = 50,
+    oldest: str = "",
+    latest: str = "",
+    cursor: str = "",
+) -> str:
+    """
+    Fetch recent messages from a channel, private channel, or DM.
+    channel: a channel/DM id, or a public/private channel name (with or
+    without "#") — names are resolved to an id first via slack_list_channels.
+    limit: max messages to return in this page (Slack caps at 1000).
+    oldest/latest: optional Slack message timestamps (e.g.
+    "1710000000.000100") to bound the time range.
+    cursor: pass the next_cursor from a previous call's response to fetch
+    the next page.
+    Each message includes its "ts" (needed for slack_get_thread_replies,
+    slack_add_reaction, and replying via slack_post_message's thread_ts) and,
+    when it starts a thread, "thread_ts" and "reply_count".
+    """
+    try:
+        channel_id = _resolve_channel_id(channel)
+        params: dict[str, Any] = {
+            "channel": channel_id,
+            "limit": max(1, min(int(limit), 1000)),
+        }
+        if oldest:
+            params["oldest"] = oldest
+        if latest:
+            params["latest"] = latest
+        if cursor:
+            params["cursor"] = cursor
+        result = _request("GET", "conversations.history", params=params)
+        messages = [
+            {
+                "ts": m.get("ts"),
+                "user": m.get("user"),
+                "text": m.get("text"),
+                "thread_ts": m.get("thread_ts"),
+                "reply_count": m.get("reply_count"),
+            }
+            for m in result.get("messages") or []
+        ]
+        return _success(
+            messages=messages,
+            has_more=bool(result.get("has_more")),
+            next_cursor=(result.get("response_metadata") or {}).get("next_cursor")
+            or "",
+        )
+    except Exception as e:
+        logger.error(f"Error fetching Slack channel history for {channel}: {e}")
+        return _error(str(e))
+
+
+@mcp.tool()
+def slack_get_thread_replies(
+    channel: str, thread_ts: str, limit: int = 100, cursor: str = ""
+) -> str:
+    """
+    Fetch all replies in a message thread (the parent message is included as
+    the first result).
+    channel: a channel/DM id or name the thread lives in.
+    thread_ts: the parent message's "ts".
+    cursor: pass the next_cursor from a previous call's response to fetch
+    the next page of replies.
+    """
+    try:
+        channel_id = _resolve_channel_id(channel)
+        params: dict[str, Any] = {
+            "channel": channel_id,
+            "ts": thread_ts,
+            "limit": max(1, min(int(limit), 1000)),
+        }
+        if cursor:
+            params["cursor"] = cursor
+        result = _request("GET", "conversations.replies", params=params)
+        messages = [
+            {
+                "ts": m.get("ts"),
+                "user": m.get("user"),
+                "text": m.get("text"),
+            }
+            for m in result.get("messages") or []
+        ]
+        return _success(
+            messages=messages,
+            has_more=bool(result.get("has_more")),
+            next_cursor=(result.get("response_metadata") or {}).get("next_cursor")
+            or "",
+        )
+    except Exception as e:
+        logger.error(
+            f"Error fetching Slack thread replies for {channel}:{thread_ts}: {e}"
+        )
+        return _error(str(e))
+
+
+@mcp.tool()
+def slack_get_channel_info(channel: str) -> str:
+    """
+    Get metadata for a channel, private channel, or DM — including its
+    topic, purpose, member count, and archived/private flags.
+    """
+    try:
+        channel_id = _resolve_channel_id(channel)
+        result = _request("GET", "conversations.info", params={"channel": channel_id})
+        info = result.get("channel") or {}
+        return _success(
+            id=info.get("id"),
+            name=info.get("name"),
+            topic=(info.get("topic") or {}).get("value", ""),
+            purpose=(info.get("purpose") or {}).get("value", ""),
+            is_archived=info.get("is_archived", False),
+            is_private=info.get("is_private", False),
+            is_im=info.get("is_im", False),
+            is_mpim=info.get("is_mpim", False),
+            num_members=info.get("num_members"),
+        )
+    except Exception as e:
+        logger.error(f"Error fetching Slack channel info for {channel}: {e}")
+        return _error(str(e))
+
+
+@mcp.tool()
+def slack_list_direct_messages(limit: int = 200) -> str:
+    """
+    List direct-message and group-direct-message conversations the bot is a
+    member of: id, and either the other user's id (1:1 DM) or the
+    conversation name (group DM).
+    Use the returned id with slack_get_channel_history, slack_search_messages,
+    or slack_post_message to work with a specific DM.
+    """
+    conversations: list[dict[str, Any]] = []
+    max_conversations = max(1, min(int(limit), MAX_CHANNELS))
+    cursor: str | None = None
+    truncated = False
+    try:
+        for _ in range(MAX_PAGES):
+            params: dict[str, Any] = {
+                "types": "im,mpim",
+                "exclude_archived": "true",
+                "limit": 200,
+            }
+            if cursor:
+                params["cursor"] = cursor
+            result = _request("GET", "conversations.list", params=params)
+            raw_conversations = result.get("channels") or []
+            for index, conv in enumerate(raw_conversations):
+                entry: dict[str, Any] = {
+                    "id": conv.get("id"),
+                    "is_group_dm": bool(conv.get("is_mpim")),
+                }
+                if conv.get("is_mpim"):
+                    entry["name"] = conv.get("name")
+                else:
+                    entry["user"] = conv.get("user")
+                conversations.append(entry)
+                if len(conversations) >= max_conversations:
+                    more_in_page = index + 1 < len(raw_conversations)
+                    more_pages = bool(
+                        (result.get("response_metadata") or {}).get("next_cursor")
+                    )
+                    return _success(
+                        conversations=conversations,
+                        truncated=more_in_page or more_pages,
+                    )
+            cursor = (result.get("response_metadata") or {}).get("next_cursor")
+            if not cursor:
+                break
+        else:
+            truncated = bool(cursor)
+        return _success(conversations=conversations, truncated=truncated)
+    except Exception as e:
+        logger.error(f"Error listing Slack direct messages: {e}")
+        return _error(str(e))
+
+
+@mcp.tool()
+def slack_search_messages(
+    channel: str,
+    query: str,
+    limit: int = 50,
+    scan_limit: int = 200,
+    include_thread_replies: bool = True,
+) -> str:
+    """
+    Search a channel, private channel, or DM's recent history (and, by
+    default, its threads' replies) for messages containing `query`
+    (case-insensitive substring match).
+    This only scans the given conversation's own history, up to scan_limit
+    most recent messages (default 200) — it is not a Slack workspace-wide
+    search, which needs a user-token search:read scope this bot-token
+    connector does not request. To search multiple conversations, call this
+    once per channel/DM (see slack_list_channels / slack_list_direct_messages).
+    """
+    needle = query.strip().lower()
+    if not needle:
+        return _error("query must not be empty")
+    try:
+        channel_id = _resolve_channel_id(channel)
+        max_scan = max(1, min(int(scan_limit), 1000))
+        max_matches = max(1, int(limit))
+        matches: list[dict[str, Any]] = []
+        threaded_parents: list[dict[str, Any]] = []
+        scanned = 0
+        cursor: str | None = None
+
+        for _ in range(MAX_PAGES):
+            params: dict[str, Any] = {
+                "channel": channel_id,
+                "limit": min(200, max_scan - scanned),
+            }
+            if cursor:
+                params["cursor"] = cursor
+            result = _request("GET", "conversations.history", params=params)
+            for m in result.get("messages") or []:
+                scanned += 1
+                text = str(m.get("text") or "")
+                if needle in text.lower():
+                    matches.append(
+                        {"ts": m.get("ts"), "user": m.get("user"), "text": text}
+                    )
+                if m.get("reply_count"):
+                    threaded_parents.append(m)
+            cursor = (result.get("response_metadata") or {}).get("next_cursor")
+            if not cursor or scanned >= max_scan or len(matches) >= max_matches:
+                break
+
+        threads_scanned = 0
+        if include_thread_replies:
+            for parent in threaded_parents:
+                if threads_scanned >= MAX_SEARCH_THREADS or len(matches) >= max_matches:
+                    break
+                thread_ts = parent.get("thread_ts") or parent.get("ts")
+                try:
+                    replies_result = _request(
+                        "GET",
+                        "conversations.replies",
+                        params={"channel": channel_id, "ts": thread_ts, "limit": 200},
+                    )
+                except Exception as thread_exc:
+                    logger.warning(
+                        f"Slack thread search failed for {thread_ts}: {thread_exc}"
+                    )
+                    continue
+                threads_scanned += 1
+                for reply in replies_result.get("messages") or []:
+                    if reply.get("ts") == thread_ts:
+                        continue  # already scanned as the thread's parent message
+                    text = str(reply.get("text") or "")
+                    if needle in text.lower():
+                        matches.append(
+                            {
+                                "ts": reply.get("ts"),
+                                "user": reply.get("user"),
+                                "text": text,
+                                "thread_ts": thread_ts,
+                            }
+                        )
+
+        # Unscanned threads only count as truncation when thread search was
+        # requested — with include_thread_replies=False the caller opted out,
+        # so leftover threaded parents are not missing coverage.
+        truncated = (
+            len(matches) > max_matches
+            or bool(cursor)
+            or (include_thread_replies and len(threaded_parents) > threads_scanned)
+        )
+        return _success(matches=matches[:max_matches], truncated=truncated)
+    except Exception as e:
+        logger.error(f"Error searching Slack messages in {channel}: {e}")
+        return _error(str(e))
+
+
+@mcp.tool()
+def slack_add_reaction(channel: str, timestamp: str, emoji_name: str) -> str:
+    """
+    Add an emoji reaction to a message.
+    channel: the channel/DM id or name the message is in.
+    timestamp: the message's "ts" (from slack_get_channel_history,
+    slack_get_thread_replies, slack_search_messages, or slack_post_message).
+    emoji_name: the emoji short name, with or without colons (e.g.
+    "thumbsup" or ":thumbsup:").
+    """
+    name = emoji_name.strip().strip(":")
+    try:
+        channel_id = _resolve_channel_id(channel)
+        _request(
+            "POST",
+            "reactions.add",
+            json_data={"channel": channel_id, "timestamp": timestamp, "name": name},
+        )
+        return _success(channel=channel_id, timestamp=timestamp, emoji_name=name)
+    except Exception as e:
+        logger.error(f"Error adding Slack reaction to {channel}:{timestamp}: {e}")
+        return _error(str(e))
+
+
+@mcp.tool()
+def slack_remove_reaction(channel: str, timestamp: str, emoji_name: str) -> str:
+    """
+    Remove an emoji reaction the bot previously added from a message.
+    Same arguments as slack_add_reaction.
+    """
+    name = emoji_name.strip().strip(":")
+    try:
+        channel_id = _resolve_channel_id(channel)
+        _request(
+            "POST",
+            "reactions.remove",
+            json_data={"channel": channel_id, "timestamp": timestamp, "name": name},
+        )
+        return _success(channel=channel_id, timestamp=timestamp, emoji_name=name)
+    except Exception as e:
+        logger.error(f"Error removing Slack reaction from {channel}:{timestamp}: {e}")
+        return _error(str(e))
+
+
+@mcp.tool()
+def slack_upload_file(
+    channel: str,
+    file_path: str,
+    filename: str = "",
+    title: str = "",
+    initial_comment: str = "",
+    thread_ts: str = "",
+) -> str:
+    """
+    Upload a local file into a Slack channel, DM, or thread.
+    file_path: path to a file already on disk (e.g. something written to the
+    task workspace) — must be inside an allowed directory (defaults to the
+    current working directory; configurable via
+    XAGENT_SLACK_FILE_ALLOWED_DIRS) so this tool cannot be used to exfiltrate
+    arbitrary files from the host.
+    channel: the target channel/DM id or name.
+    thread_ts: optional parent message "ts" to post the file as a thread
+    reply instead of into the channel's main timeline.
+    """
+    try:
+        local_path = _resolve_allowed_file_path(file_path)
+        channel_id = _resolve_channel_id(channel)
+        resolved_filename = filename.strip() or local_path.name
+
+        init_result = _request(
+            "GET",
+            "files.getUploadURLExternal",
+            params={
+                "filename": resolved_filename,
+                "length": local_path.stat().st_size,
+            },
+        )
+        upload_url = init_result.get("upload_url")
+        file_id = init_result.get("file_id")
+        if not upload_url or not file_id:
+            raise ValueError("Slack did not return an upload URL")
+
+        # Per Slack's files.completeUploadExternal migration guide, the
+        # returned upload_url is a pre-authenticated endpoint that takes the
+        # raw file as multipart form data under the "file" field — no bearer
+        # token needed (or accepted) on this leg.
+        with local_path.open("rb") as fh:
+            upload_response = requests.post(
+                upload_url,
+                files={"file": (resolved_filename, fh)},
+                timeout=DEFAULT_TIMEOUT_SECONDS,
+            )
+        upload_response.raise_for_status()
+
+        complete_payload: dict[str, Any] = {
+            "files": [{"id": file_id, "title": title or resolved_filename}],
+            "channel_id": channel_id,
+        }
+        if initial_comment:
+            complete_payload["initial_comment"] = initial_comment
+        if thread_ts:
+            complete_payload["thread_ts"] = thread_ts
+
+        complete_result = _request(
+            "POST", "files.completeUploadExternal", json_data=complete_payload
+        )
+        uploaded = (complete_result.get("files") or [{}])[0]
+        return _success(file_id=uploaded.get("id", file_id), filename=resolved_filename)
+    except Exception as e:
+        logger.error(f"Error uploading file to Slack channel {channel}: {e}")
         return _error(str(e))
 
 

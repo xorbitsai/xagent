@@ -2513,7 +2513,9 @@ async def test_dag_pattern_interrupted_tie_break_loser_keeps_bookkeeping() -> No
 
 
 @pytest.mark.asyncio
-async def test_dag_pattern_mixed_batch_interrupted_wins_over_waiting() -> None:
+async def test_dag_pattern_mixed_batch_interrupted_wins_over_waiting(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     """In a batch where one step is interrupted and another is
     waiting in the same wakeup, the interrupted result wins -- an
     interrupt is a control instruction, not a workflow question the user
@@ -2529,6 +2531,10 @@ async def test_dag_pattern_mixed_batch_interrupted_wins_over_waiting() -> None:
     _execute_ready_steps actually schedules as asyncio.Task objects -- and
     exercises the real scheduling, sorting, and invalidation logic under
     test through genuine concurrent tasks.
+
+    The superseded-question log line must also describe an interrupted
+    winner truthfully: an interrupt delivers no question of its own, so
+    the message must not claim the winner's question was delivered.
     """
 
     release = asyncio.Event()
@@ -2608,6 +2614,9 @@ async def test_dag_pattern_mixed_batch_interrupted_wins_over_waiting() -> None:
     steps_by_id = {step.id: step for step in pattern.plan.steps}
     assert steps_by_id["a_wait_step"].status == "clarification_invalidated"
     assert "a_wait_step" not in pattern.active_step_ids
+
+    assert "takes precedence" in caplog.text
+    assert "'s question is delivered" not in caplog.text
 
 
 @pytest.mark.asyncio

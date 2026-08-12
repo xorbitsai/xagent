@@ -817,11 +817,28 @@ class DAGPattern(AgentPattern):
                     )
 
                     if superseded_step_ids:
+                        # A superseded question always means a waiting loser,
+                        # but the winner is not always a question itself --
+                        # an interrupted winner delivers no question of its
+                        # own, so the log line must say so truthfully rather
+                        # than implying %s's question was the one delivered.
+                        if winner_result.get("status") == "waiting_for_user":
+                            log_message = (
+                                "Multiple concurrent DAG steps completed with "
+                                "a pending user question in the same batch; "
+                                "only %s's question is delivered, the rest "
+                                "are invalidated."
+                            )
+                        else:
+                            log_message = (
+                                "Multiple concurrent DAG steps completed with "
+                                "a pending user question in the same batch; "
+                                "questions from the superseded steps were "
+                                "discarded because an interrupt from %s takes "
+                                "precedence."
+                            )
                         logger.warning(
-                            "Multiple concurrent DAG steps completed with a "
-                            "pending user question in the same batch; only "
-                            "%s's question is delivered, the rest are "
-                            "invalidated.",
+                            log_message,
                             winner_step_id,
                             extra={
                                 "execution_id": getattr(

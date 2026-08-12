@@ -129,7 +129,7 @@ def test_create_outcome_producible_reasons_are_a_subset_of_the_full_word_list() 
     assert producible <= svc.CREATE_OUTCOME_REASON_WORDS
 
 
-def test_create_outcome_this_period_covers_exactly_the_six_producible_variants() -> (
+def test_create_outcome_this_period_covers_exactly_the_four_producible_variants() -> (
     None
 ):
     """CreateCreated, CreateConflict, and CreateStale are not producible
@@ -396,6 +396,53 @@ def test_cv3_ttl_out_of_policy_range_is_rejected_not_clamped(
         _db, task_id=_seeded_task, principal=_owning_principal(1), envelope=envelope
     )
     assert outcome == svc.CreateValidationRejected(reason="invalid_values")
+
+
+@pytest.mark.parametrize(
+    "ttl_seconds",
+    [
+        pytest.param(604801, id="one_above_max_rejected"),
+        # True is also rejected via the range check below on its own (it
+        # compares equal to 1, under the 60-second minimum), independent of
+        # the isinstance(..., bool) branch above it -- confirmed by mutation
+        # testing: deleting that isinstance(bool) exclusion from create()
+        # cannot turn any case red under the current bounds (both bool
+        # values fall below the floor). Kept anyway because it still pins a
+        # real, correct outcome (a bool ttl_seconds must be rejected), just
+        # not specifically through the bool-exclusion branch.
+        pytest.param(True, id="bool_true_rejected"),
+        pytest.param("60", id="numeric_string_rejected_not_coerced"),
+    ],
+)
+def test_cv3_ttl_invalid_values_are_rejected(
+    _db: Session, _seeded_task: int, ttl_seconds: Any
+) -> None:
+    envelope = _valid_envelope(ttl_seconds=ttl_seconds)
+    outcome = svc.create(
+        _db, task_id=_seeded_task, principal=_owning_principal(1), envelope=envelope
+    )
+    assert outcome == svc.CreateValidationRejected(reason="invalid_values")
+
+
+@pytest.mark.parametrize(
+    "ttl_seconds",
+    [
+        pytest.param(60, id="min_boundary_passes"),
+        pytest.param(604800, id="max_boundary_passes"),
+    ],
+)
+def test_cv3_ttl_at_policy_boundary_reaches_create_not_wired(
+    _db: Session, _seeded_task: int, ttl_seconds: int
+) -> None:
+    task = _db.query(Task).filter(Task.id == _seeded_task).first()
+    envelope = _valid_envelope(ttl_seconds=ttl_seconds)
+    outcome = svc.create(
+        _db,
+        task_id=_seeded_task,
+        principal=_owning_principal(task.user_id),
+        envelope=envelope,
+    )
+    assert outcome == svc.CreateNotWired(reason="seam_not_wired")
 
 
 def test_ca1_principal_not_owning_the_task_is_unauthorized(
@@ -769,6 +816,31 @@ def test_t1_falls_back_to_legacy_when_there_is_no_active_row(
     assert view.tier == "legacy"
     assert view.question is None
     assert view.interactions is None
+
+
+def test_t1_falls_back_to_legacy_when_task_run_id_is_null(_db: Session) -> None:
+    """``_active_native_row_criteria()`` joins on
+    ``TaskInteractionRequest.run_id == Task.run_id``. SQL NULL never
+    compares equal to anything, including another NULL, so a task whose
+    ``run_id`` is ``None`` cannot match any interaction row's ``run_id`` --
+    active or not. This pins that as the current, deliberate behavior (see
+    the ``_seeded_task`` fixture's own comment above): a task that has not
+    started a run yet has no native interaction visible through this seam
+    and always falls back to the legacy view, even with an active row
+    sitting in the table."""
+
+    user_id = make_user(_db)
+    task_id = make_task(_db, user_id=user_id)
+    task = _db.query(Task).filter(Task.id == task_id).first()
+    assert task.run_id is None
+
+    trace_event_id = _make_trace_event(_db, task_id=task_id)
+    _make_active_interaction_row(
+        _db, task_id=task_id, resume_trace_event_id=trace_event_id
+    )
+
+    view = svc.materialize_compatibility_view(_db, task_id)
+    assert view.tier == "legacy"
 
 
 def test_t1_falls_back_to_legacy_when_protocol_version_is_unrecognized(

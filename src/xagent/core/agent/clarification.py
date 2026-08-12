@@ -155,17 +155,19 @@ class ClarificationDraft:
 def _marker_clean(value: str) -> str:
     """Filter ``value`` to the character domain a marker may contain.
 
-    Four independent copies of this control-character filter exist in the
-    codebase, and all four must stay in the same domain: this function,
-    plus three web-layer closures that the core layer cannot import and so
+    Five independent copies of this control-character filter exist in the
+    codebase, and all five must stay in the same domain: this function,
+    three web-layer closures that the core layer cannot import and so
     cannot share code with -- ``src/xagent/web/api/trace_handlers.py``'s
     ``DatabaseTraceHandler._serialize_data_for_json`` (``clean_string``),
     ``src/xagent/web/api/ws_trace_handlers.py``'s
     ``WebSocketTraceHandler._serialize_data`` (``clean_string``), and
     ``src/xagent/web/api/websocket.py``'s
-    ``SharedWebSocketTracer._serialize_data`` (``clean_string``). If
-    someone changes the domain of any one of the four, the other three must
-    change with it. The test that watches for drift between this copy and
+    ``SharedWebSocketTracer._serialize_data`` (``clean_string``) -- and
+    ``src/xagent/web/services/task_clarification_draft.py``'s
+    ``_strip_control_characters``, for the same reason. If someone changes
+    the domain of any one of the five, the other four must change with it.
+    The test that watches for drift between this copy and
     the database-handler copy is
     ``test_marker_survives_trace_serialization_of_a_dirty_interaction_id`` in
     ``tests/core/agent/test_react_clarification_draft.py``, which calls the

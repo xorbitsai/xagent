@@ -890,6 +890,11 @@ class DAGPattern(AgentPattern):
                     return None
                 schedule_ready_steps()
         except BaseException:
+            # A sibling that already completed by this point is not in
+            # `pending`, so cancel_all() below never clears its active-step
+            # bookkeeping. Unobserved today: this exit writes no checkpoint,
+            # and the pattern object is discarded right after re-raising.
+            # Closing or formally waiving this gap is tracked in #1311.
             try:
                 await cancel_all()
             except Exception:

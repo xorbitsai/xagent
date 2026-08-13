@@ -243,6 +243,27 @@ def test_widget_workforce_binding_rejects_non_int_convertible_value_without_rais
     )
 
 
+def test_widget_workforce_binding_rejects_infinite_config_value_without_raising() -> (
+    None
+):
+    """Same non-int-convertible-value guard as the string case above, for a
+    JSON float that round-trips through SQLite as ``inf``: ``int(float("inf"))``
+    raises ``OverflowError`` rather than ``ValueError``, a distinct exception
+    the predicate's except clause must also catch cleanly."""
+
+    task = _task(
+        agent_id=None,
+        agent_config={
+            "auth_mode": "widget",
+            "guest_id": "g-1",
+            "widget_workforce_id": float("inf"),
+        },
+    )
+    assert (
+        task_is_owned_by_public_principal(task, _widget_workforce_principal()) is False
+    )
+
+
 def test_widget_workforce_binding_rejects_a_true_config_value_against_id_one() -> None:
     """A JSON ``true`` deserializes to Python's ``True``, and Python's
     ``bool`` is an ``int`` subclass, so ``int(True) == 1``. Without an

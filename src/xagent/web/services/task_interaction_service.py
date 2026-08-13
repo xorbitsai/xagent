@@ -159,11 +159,12 @@ def _json_entity_binding_matches(config_value: Any, expected: int) -> bool:
     ``config_value`` comes from ``Task.agent_config``, a JSON column
     another writer controls -- it is untrusted data, not a value this
     predicate can assume is even convertible to ``int``. A non-empty
-    string that is not a number, a list, or a dict would make a bare
-    ``int(config_value)`` raise ``TypeError``/``ValueError``; this treats
-    every such value as "does not match" instead of letting the exception
-    escape, the same fail-closed default every other conjunct in this
-    predicate uses for a missing or wrong value.
+    string that is not a number, a list, or a dict, or a JSON float of
+    infinity or NaN, would make a bare ``int(config_value)`` raise
+    ``TypeError``/``ValueError``/``OverflowError``; this treats every such
+    value as "does not match" instead of letting the exception escape, the
+    same fail-closed default every other conjunct in this predicate uses
+    for a missing or wrong value.
 
     This is not a behavior change from the pre-existing code's
     ``int(x or 0) != expected`` shape for the inputs that shape actually
@@ -208,7 +209,7 @@ def _json_entity_binding_matches(config_value: Any, expected: int) -> bool:
         return False
     try:
         return int(config_value) == expected
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return False
 
 

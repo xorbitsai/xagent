@@ -2,10 +2,10 @@ import React from "react"
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 
-// #1280 round-3 review, Major finding 2: the pure resolveMcpToolSelector unit
-// tests cover the helper in isolation, but nothing exercised the two things
-// this PR's fix actually depends on end to end: (a) the outbound save
-// request's tool_categories carries the *resolved* selector, not whatever
+// The pure resolveMcpToolSelector unit tests (mcp-lookup.test.ts) cover the
+// helper in isolation, but nothing exercised the two things this fix
+// actually depends on end to end: (a) the outbound save request's
+// tool_categories carries the *resolved* selector, not whatever
 // selectedMcpServers holds, and (b) isDirty returns to false after a
 // successful save instead of staying permanently true because
 // selectedMcpServers was never re-seeded to match. This drives both through
@@ -229,7 +229,8 @@ describe("AgentBuilder mcp: selector resolution on save", () => {
     // The Update button starts disabled: nothing has changed yet, and
     // selectedMcpServers/originalData's MCP extraction agree on the loaded
     // (still-unresolved) "Chrome" -- loading an already-broken agent
-    // doesn't self-heal it without an edit, by design (round-1 review).
+    // doesn't self-heal it without an edit, by design (a plain save does
+    // not re-resolve a selector that was already persisted unresolved).
     const updateButton = screen.getByRole("button", {
       name: "builds.editor.header.update",
     })

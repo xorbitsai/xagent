@@ -541,6 +541,70 @@ def test_reply_closes_the_legacy_resume_interaction_row_on_successful_injection(
         db.close()
 
 
+def test_update_reply_input_rolls_back_the_interaction_close_with_the_fence() -> None:
+    """Mirrors test_a2a_api.py's
+    test_update_a2a_resume_input_rolls_back_the_interaction_close_with_the_fence
+    for the reply site's own fence-and-close pair: the fence UPDATE and the
+    legacy resume interaction close are one atomic write in
+    ``_update_reply_input_sync`` too. A fence miss (ownership changed under
+    this lease) must roll back both together, not close the row while
+    rejecting the input.
+
+    What this actually pins is that the close must never commit
+    independently of the host transaction -- reordering the two statements
+    within that same transaction changes nothing observable, because a
+    rollback undoes every statement issued since the last commit regardless
+    of program order. Turning this red needs two changes at once, the same
+    pair the a2a-side test calls out: the close must move ahead of the
+    fence's early return (unreachable there today, since a fence miss
+    returns before the close ever runs) and it must commit independently of
+    this function's session.
+    """
+    agent_id, full_key = _create_agent_with_key()
+    task_id = _create_waiting_task(full_key, agent_id, run_id="run-reply-atomicity")
+    db = _direct_db_session()
+    try:
+        task = db.query(Task).filter(Task.id == task_id).one()
+        # _create_waiting_task leaves the task in waiting_for_user with no
+        # lease held (mirrors a real ask_user_question turn). This test
+        # needs a live RUNNING lease for the fence UPDATE to have a chance
+        # of matching, under a runner_id the stale lease below deliberately
+        # does not share -- the fence's WHERE clause requires an exact
+        # match, so that lease has already lost the race by the time the
+        # write is attempted.
+        task.status = TaskStatus.RUNNING
+        task.runner_id = "current-runner"
+        task.interaction_protocol_version = 1
+        db.commit()
+    finally:
+        db.close()
+    row_id = _seed_active_interaction_row(
+        task_id, run_id="run-reply-atomicity", idempotency_key="reply-atomicity-q1"
+    )
+
+    stale_lease = TaskLease(
+        task_id=task_id, runner_id="a-different-runner", run_id="run-reply-atomicity"
+    )
+    updated = task_reply_module._update_reply_input_sync(stale_lease, "attempted text")
+
+    assert updated is False
+    db = _direct_db_session()
+    try:
+        row = (
+            db.query(TaskInteractionRequest)
+            .filter(TaskInteractionRequest.id == row_id)
+            .one()
+        )
+        assert row.status == "active"
+        refreshed = db.query(Task).filter(Task.id == task_id).one()
+        assert refreshed.interaction_protocol_version == 1
+        # Unchanged from _create_task's original content, not overwritten
+        # with the rejected fence write's "attempted text".
+        assert refreshed.input == "hello"
+    finally:
+        db.close()
+
+
 def test_reply_checkpoint_missing_restore_clears_an_unpaired_marker(mock_start_task):
     """The restore (abandonment) branch's compensation cleanup: when
     post_user_message returns False, the prelease is released back to

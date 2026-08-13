@@ -244,6 +244,84 @@ def test_a2a_resume_input_fence_precedes_the_close_call() -> None:
     )
 
 
+TABLE_EXISTS_CHECK_NAME = "interaction_requests_table_exists"
+
+
+def _table_exists_guard_line_for_close_call(
+    fn: ast.AST, *, close_call_attr: str
+) -> int | None:
+    """Line number of an ``if interaction_requests_table_exists(...):``
+    guard whose body contains a call to ``close_call_attr``, or ``None`` if
+    no such guard wraps that call."""
+    for node in ast.walk(fn):
+        if not isinstance(node, ast.If):
+            continue
+        test = node.test
+        test_name = None
+        if isinstance(test, ast.Call):
+            func = test.func
+            test_name = (
+                func.attr
+                if isinstance(func, ast.Attribute)
+                else getattr(func, "id", None)
+            )
+        if test_name != TABLE_EXISTS_CHECK_NAME:
+            continue
+        for inner in ast.walk(node):
+            if inner is node:
+                continue
+            if not isinstance(inner, ast.Call):
+                continue
+            inner_func = inner.func
+            inner_name = (
+                inner_func.attr
+                if isinstance(inner_func, ast.Attribute)
+                else getattr(inner_func, "id", None)
+            )
+            if inner_name == close_call_attr:
+                return node.lineno
+    return None
+
+
+def test_a2a_resume_input_close_is_gated_by_table_exists_check() -> None:
+    """The A2A fence-and-close site must confirm
+    task_interaction_requests exists before calling
+    close_legacy_resume_interaction. Nothing else in this repo pins that
+    gate down: every test database already has the table, so deleting the
+    gate leaves the rest of the suite green.
+
+    Deleting the ``if interaction_requests_table_exists(db):`` guard, or
+    moving the close call outside its body, turns this red.
+    """
+    fn = _find_function(ast.parse(_source(a2a)), "_update_a2a_resume_input_sync")
+    guard_line = _table_exists_guard_line_for_close_call(
+        fn, close_call_attr="close_legacy_resume_interaction"
+    )
+    assert guard_line is not None, (
+        "expected close_legacy_resume_interaction to be called inside an "
+        "`if interaction_requests_table_exists(db):` guard in "
+        "_update_a2a_resume_input_sync"
+    )
+
+
+def test_reply_resume_input_close_is_gated_by_table_exists_check() -> None:
+    """Same obligation as the A2A site, above, for task_reply.py's
+    fence-and-close pair.
+
+    Deleting the ``if interaction_requests_table_exists(db):`` guard, or
+    moving the close call outside its body, turns this red.
+    """
+    fn = _find_function(ast.parse(_source(task_reply)), "_update_reply_input_sync")
+    guard_line = _table_exists_guard_line_for_close_call(
+        fn, close_call_attr="close_legacy_resume_interaction"
+    )
+    assert guard_line is not None, (
+        "expected close_legacy_resume_interaction to be called inside an "
+        "`if interaction_requests_table_exists(db):` guard in "
+        "_update_reply_input_sync"
+    )
+
+
 def _fence_update_value_columns(fn: ast.AST) -> set[str]:
     """Attribute names (``Task.<name>``) used as keys in the resume-input
     fence's ``.update({...})`` values dict."""
@@ -397,6 +475,15 @@ def test_every_post_user_message_caller_wires_the_close_family() -> None:
     each carry their own per-site argument for why their wiring is
     complete; see the tests
     above and task_interaction_close.py's module docstring.
+
+    Scan root is xagent/web, not the whole installed xagent package: the
+    scan is looking for callers of post_user_message, but post_user_message
+    is itself *defined* under xagent/core/agent (service.py, runner.py,
+    registry.py, execution_adapter.py), where each layer's delegation to
+    the next also matches the same AST call-name check. Widening the root
+    to include core/ would catch those internal delegations as unwired
+    callers and turn this permanently red for a reason unrelated to the
+    wiring obligation being checked.
 
     Deleting a close-family call from a module that calls
     post_user_message, without adding the module to

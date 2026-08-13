@@ -5,7 +5,6 @@ This module provides video generation capabilities using pre-configured video
 models passed from the web layer.
 """
 
-import logging
 from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
@@ -14,8 +13,6 @@ from ....workspace import TaskWorkspace
 from ...core.video_tool import VideoGenerationToolCore
 from .base import ToolCategory
 from .function import FunctionTool
-
-logger = logging.getLogger(__name__)
 
 
 class VideoGenerationFunctionTool(FunctionTool):

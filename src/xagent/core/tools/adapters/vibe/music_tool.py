@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import logging
 from typing import TYPE_CHECKING, Any, Optional
 
 from ....model.music import BaseMusicModel
@@ -10,8 +9,6 @@ from ....workspace import TaskWorkspace
 from ...core.music_tool import MusicToolCore
 from .base import ToolCategory
 from .function import FunctionTool
-
-logger = logging.getLogger(__name__)
 
 
 class MusicFunctionTool(FunctionTool):

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import logging
 from typing import TYPE_CHECKING, Any, Optional
 
 from ....model.sound_effect import BaseSoundEffectModel
@@ -10,8 +9,6 @@ from ....workspace import TaskWorkspace
 from ...core.sound_effect_tool import SoundEffectToolCore
 from .base import ToolCategory
 from .function import FunctionTool
-
-logger = logging.getLogger(__name__)
 
 
 class SoundEffectFunctionTool(FunctionTool):

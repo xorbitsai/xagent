@@ -8,7 +8,6 @@ This module provides audio processing capabilities including:
 Uses pre-configured ASR and TTS models passed from the web layer.
 """
 
-import logging
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 from ....model.asr.base import BaseASR
@@ -17,8 +16,6 @@ from ....workspace import TaskWorkspace
 from ...core.audio_tool import AudioToolCore
 from .base import ToolCategory
 from .function import FunctionTool
-
-logger = logging.getLogger(__name__)
 
 
 class AudioFunctionTool(FunctionTool):

@@ -114,7 +114,9 @@ class ToolRegistry:
         Register a tool creator function.
 
         The creator function will be called during create_all_tools()
-        with the current config.
+        with the current config. Creators must not blanket-catch their own
+        failures: ``create_registered_tools`` is the single enforcement point
+        for the exception contract described in its docstring.
 
         Usage (bare decorator, no category metadata):
             @register_tool
@@ -218,6 +220,11 @@ class ToolRegistry:
         (dynamic ones: MCP / Custom API / Image / Audio) are always
         dispatched and are responsible for
         short-circuiting internally based on the spec.
+
+        Exception contract for creators: ``ConnectorRuntimeError`` and
+        ``RequiredMCPUnavailableError`` propagate to the caller; any other
+        exception is logged as a warning and that creator contributes no
+        tools. Creators rely on this and must not catch broadly themselves.
         """
         # Import tool modules on first call to trigger decorator registration
         cls._import_tool_modules()
@@ -242,7 +249,9 @@ class ToolRegistry:
             except RequiredMCPUnavailableError:
                 raise
             except Exception as e:
-                logger.warning(f"Tool creator {creator.__name__} failed: {e}")
+                logger.warning(
+                    f"Tool creator {creator.__name__} failed: {e}", exc_info=True
+                )
 
         # Sort tools by category priority
         tools = cls._sort_tools_by_category(tools)

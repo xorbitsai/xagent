@@ -5,7 +5,6 @@ This module provides image generation capabilities using pre-configured image mo
 passed from the web layer.
 """
 
-import logging
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 from ....model.image.base import BaseImageModel
@@ -13,8 +12,6 @@ from ....workspace import TaskWorkspace
 from ...core.image_tool import ImageGenerationToolCore
 from .base import ToolCategory
 from .function import FunctionTool
-
-logger = logging.getLogger(__name__)
 
 
 class ImageGenerationFunctionTool(FunctionTool):
@@ -69,8 +66,10 @@ class ImageGenerationTool(ImageGenerationToolCore):
         """Get all tool instances."""
         # A note inside the description is not enough: models blind-retry a
         # registered-but-doomed tool, so an unusable one has to leave the schema.
-        # list_image_models stays either way — it is read-only, cannot fail, and
-        # is the only way to answer "why is there nothing here".
+        # list_image_models stays whenever the ability probes return — it is the
+        # only way to answer "why is there nothing here". A probe that *raises*
+        # takes the whole toolset with it, by design: that is a broken model
+        # class, not a deployment without image models.
         can_generate = self._get_model() is not None
         can_edit = self._get_edit_model() is not None
 

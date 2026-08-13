@@ -30,6 +30,11 @@ on:
       - 'src/xagent/web/models/task_interaction.py'
       - 'src/xagent/web/services/task_interaction_schema.py'
       - 'src/xagent/core/agent/checkpoint.py'
+      - 'src/xagent/web/services/task_lease_service.py'
+      - 'src/xagent/web/services/chat_history_service.py'
+      - 'src/xagent/web/services/ops_signals.py'
+      - 'src/xagent/core/tools/adapters/vibe/ask_user_tool.py'
+      - 'src/xagent/web/models/database.py'
   pull_request:
     branches: [main]
   # Required by the merge queue: without this the two required contexts below
@@ -91,6 +96,11 @@ jobs:
             src/xagent/web/models/task_interaction.py
             src/xagent/web/services/task_interaction_schema.py
             src/xagent/core/agent/checkpoint.py
+            src/xagent/web/services/task_lease_service.py
+            src/xagent/web/services/chat_history_service.py
+            src/xagent/web/services/ops_signals.py
+            src/xagent/core/tools/adapters/vibe/ask_user_tool.py
+            src/xagent/web/models/database.py
           )
 
           case "$EVENT_NAME" in

@@ -709,7 +709,10 @@ def test_reconcile_unlinks_titled_reference_with_ambiguous_filename():
             content='[下载报告](file:invented-id "report.mp4")',
         )
 
-        assert content == "下载报告"
+        # The title survives as plain text: it's this function's own
+        # channel for the real filename, and dropping it here would
+        # destroy the one clue naming which file was meant.
+        assert content == "下载报告 (report.mp4)"
         assert "file:" not in content
     finally:
         db.close()
@@ -718,7 +721,8 @@ def test_reconcile_unlinks_titled_reference_with_ambiguous_filename():
 def test_reconcile_unlinks_titled_reference_when_stored_file_id_is_invalid():
     # Title-based repair can still land on a record whose OWN stored id is
     # malformed; that must still be caught and unlinked (dropping the
-    # title along with the brackets), same as the label-based case.
+    # brackets/link structure), same as the label-based case -- but the
+    # title itself survives as plain text rather than being destroyed.
     db, user, task = _create_context()
     try:
         _add_file(
@@ -736,7 +740,7 @@ def test_reconcile_unlinks_titled_reference_when_stored_file_id_is_invalid():
             content='[下载视频](file:invented-id "generated_video.mp4")',
         )
 
-        assert content == "下载视频"
+        assert content == "下载视频 (generated_video.mp4)"
     finally:
         db.close()
 
@@ -838,7 +842,9 @@ def test_reconcile_unlinks_reference_with_escaped_quote_in_invented_titles_id():
     # [label](file:id "...") construct fail to match -- that would let an
     # invented id skip validation entirely (the pre-title-support regex
     # bypassed this kind of link completely; this asserts the id is
-    # actually evaluated and correctly unlinked, not silently ignored).
+    # actually evaluated and correctly unlinked, not silently ignored). The
+    # title itself survives as plain text (raw, backslash included -- same
+    # as the label, this function never unescapes it for display).
     db, user, task = _create_context()
     try:
         _add_file(db, user, task, file_id="real-id", filename="clip.mp4")
@@ -850,7 +856,7 @@ def test_reconcile_unlinks_reference_with_escaped_quote_in_invented_titles_id():
             content='[x](file:invented-id "we\\"ird.mp4")',
         )
 
-        assert content == "x"
+        assert content == 'x (we\\"ird.mp4)'
     finally:
         db.close()
 
@@ -1243,7 +1249,10 @@ def test_reconcile_does_not_repair_via_whitespace_only_title_or_label():
     # is literally empty, silently repairing an invented id to the wrong
     # file. Internal record construction doesn't validate filenames the way
     # the HTTP upload endpoints do, so an empty-filename record is a real
-    # (if unusual) possibility, not a hypothetical.
+    # (if unusual) possibility, not a hypothetical. Exercises both
+    # candidates from the shared (parsed_title, label) repair loop -- a
+    # title clause is present here, not just a whitespace-only label, so
+    # the title branch of that loop is actually covered.
     db, user, task = _create_context()
     try:
         _add_file(db, user, task, file_id="empty-name-id", filename="")
@@ -1252,10 +1261,10 @@ def test_reconcile_does_not_repair_via_whitespace_only_title_or_label():
             db,
             task_id=int(task.id),
             user_id=int(user.id),
-            content="[  ](file:invented-id)",
+            content='[  ](file:invented-id "   ")',
         )
 
-        assert content == "  "
+        assert "file:" not in content
     finally:
         db.close()
 

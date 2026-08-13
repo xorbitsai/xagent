@@ -949,18 +949,27 @@ describe('MarkdownRenderer', () => {
     expect(screen.queryByText('generated_video.mp4')).not.toBeInTheDocument()
   })
 
-  it('displays the model label, not the title, for a non-media titled file link', () => {
-    // The title is only ever a media-type detection hint; a non-media
-    // reference's title must never leak into what the user sees as content
-    // (it's fine as an invisible <a title> tooltip), and must not make the
-    // reference misclassify as some previewable kind it isn't.
-    const content =
-      '[下载报告](file:550e8400-e29b-41d4-a716-446655440000 "annual_report_2024.pdf")'
+  it('displays the model label, not the title, for a non-media titled file link', async () => {
+    // The title is only ever a media-type detection hint; even once it
+    // wins detection (the label here reveals no type of its own), the
+    // model's own label must still be what's shown as the previewed
+    // file's name, not the title. Uses a .docx title rather than .pdf
+    // deliberately: .pdf is never previewable via either title or label,
+    // so a test using it can't distinguish "display correctly stayed
+    // label-first" from "nothing preview-related could ever happen here
+    // regardless of precedence" -- this needs a title that genuinely wins
+    // detection (mounting the real office-preview header) to be
+    // load-bearing against a title-first display regression.
+    apiRequestMock.mockResolvedValue({
+      ok: true,
+      arrayBuffer: async () => new Uint8Array([65, 66]).buffer,
+    })
+    const content = '[下载报告](file:doc-file-id "annual_report_2024.docx")'
     render(<MarkdownRenderer content={content} />)
 
+    expect(await screen.findByTestId('docx-preview')).toBeInTheDocument()
     expect(screen.getByText('下载报告')).toBeInTheDocument()
-    expect(screen.queryByText('annual_report_2024.pdf')).not.toBeInTheDocument()
-    expect(apiRequestMock).not.toHaveBeenCalled()
+    expect(screen.queryByText('annual_report_2024.docx')).not.toBeInTheDocument()
   })
 
   it('lets a title that classifies differently than the label win detection', async () => {

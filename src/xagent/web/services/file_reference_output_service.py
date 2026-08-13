@@ -268,6 +268,13 @@ def reconcile_assistant_file_references(
     records_by_filename: dict[str, list[UploadedFile]] = defaultdict(list)
     task_records_by_filename: dict[str, list[UploadedFile]] = defaultdict(list)
     for record in records:
+        # filename is NOT NULL in the schema, but skip defensively rather
+        # than index a None record under the literal string "none" (via
+        # str(None).casefold()) -- a title/label candidate of literally
+        # "None" is unlikely but not impossible, and there is no reason for
+        # this index to ever produce a false match for it.
+        if record.filename is None:
+            continue
         filename_key = str(record.filename).casefold()
         records_by_filename[filename_key].append(record)
         if record.task_id is not None and int(record.task_id) == int(task_id):
@@ -288,7 +295,24 @@ def reconcile_assistant_file_references(
         # exactly as written" -- never "keep the junk's surrounding syntax
         # but delete the junk itself".
         junk = match.group("junk")
-        unrecoverable_fallback = match.group(0) if junk and junk.strip() else label
+        if junk and junk.strip():
+            unrecoverable_fallback = match.group(0)
+        elif parsed_title:
+            # The title is this function's own designated channel for the
+            # real filename (see below) -- on give-up, dropping it bare
+            # would destroy the one piece of information naming which file
+            # was meant, while the label may be generic model prose with no
+            # filename in it at all. That recreates, in this function's own
+            # new code, exactly the destructive-loss failure class #1202
+            # asked this function to eliminate. Preserving it as plain text
+            # alongside the label costs nothing: the reference is already
+            # being unlinked, so there is no markdown structure left to
+            # keep it safe for.
+            unrecoverable_fallback = (
+                f"{label} ({parsed_title})" if label else parsed_title
+            )
+        else:
+            unrecoverable_fallback = label
 
         if record is None:
             # Try the title before the label, but fall through to the label

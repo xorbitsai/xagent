@@ -341,6 +341,9 @@ jobs:
         if: needs.detect-migration-changes.outputs.should-test == 'true'
         run: |
           pytest tests/migrations/test_20260813_trace_json_columns_to_jsonb.py -m postgresql -q
+        env:
+          XAGENT_TEST_POSTGRES_URL: postgresql://xagent:xagent@localhost:5432/xagent_test
+
       - name: Test legacy resume interaction close rowcount grid (Postgres-only)
         if: needs.detect-migration-changes.outputs.should-test == 'true'
         run: |

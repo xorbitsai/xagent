@@ -394,8 +394,8 @@ def test_every_post_user_message_caller_wires_the_close_family() -> None:
     close-family call exists somewhere in the module, not that it runs on
     every code path that reaches post_user_message. Today's four call
     sites across three modules (a2a.py, websocket.py x2, task_reply.py)
-    each carry their own
-    per-site argument for why their wiring is complete; see the tests
+    each carry their own per-site argument for why their wiring is
+    complete; see the tests
     above and task_interaction_close.py's module docstring.
 
     Deleting a close-family call from a module that calls

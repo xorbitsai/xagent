@@ -743,8 +743,6 @@ def parse_v1_request_payload(values: Any) -> AskUserQuestionArgs:
     translates it into its own outcome shape at its own call site.
     """
 
-    if isinstance(values, AskUserQuestionArgs):
-        return values
     return AskUserQuestionArgs.model_validate(values)
 
 

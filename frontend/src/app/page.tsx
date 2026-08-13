@@ -33,6 +33,7 @@ import { useVoiceInputControls } from "@/components/voice-input-controller";
 import * as homePageExtensionModule from "@/lib/home-page-extension";
 import { HomePageExtension } from "@/lib/home-page-extension";
 import type { HomeGetStartedDestinationOverrides } from "@/lib/page-extension-contracts";
+import { defaultHomeGetStartedDestinations } from "@/lib/home-get-started-destinations";
 import { toast } from "@/components/ui/sonner";
 
 interface HomeTemplateConnection {
@@ -161,12 +162,6 @@ function decodeRecentTasks(value: unknown): RecentTask[] | null {
 const homeGetStartedDestinationOverrides: HomeGetStartedDestinationOverrides =
   (homePageExtensionModule as { homeGetStartedDestinationOverrides?: HomeGetStartedDestinationOverrides })
     .homeGetStartedDestinationOverrides ?? {}
-
-const defaultHomeGetStartedDestinations: Record<keyof HomeGetStartedDestinationOverrides, string> = {
-  docs: "https://help.xagent.co/overview.html",
-  guides: "https://help.xagent.co/user-guide/overview.html",
-  whatsNew: "https://docs.xagent.co/release-notes",
-}
 
 function resolveHomeGetStartedDestination(
   configured: unknown,

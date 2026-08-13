@@ -115,6 +115,7 @@ vi.mock("@/components/welcome-modal", () => ({
 vi.mock("@/lib/home-page-extension", createHomeExtensionMock)
 
 import Home from "./page"
+import { defaultHomeGetStartedDestinations } from "@/lib/home-get-started-destinations"
 
 const successfulSelection = {
   kind: "success" as const,
@@ -463,9 +464,9 @@ describe("Home", () => {
       render(<OldSurfaceHome />)
 
       expect(await screen.findByTestId("old-surface-extension")).toBeInTheDocument()
-      expectLinkedGetStartedCard("home.getStarted.docs.title", "https://help.xagent.co/overview.html")
-      expectLinkedGetStartedCard("home.getStarted.guides.title", "https://help.xagent.co/user-guide/overview.html")
-      expectLinkedGetStartedCard("home.getStarted.whatsNew.title", "https://docs.xagent.co/release-notes")
+      expectLinkedGetStartedCard("home.getStarted.docs.title", defaultHomeGetStartedDestinations.docs)
+      expectLinkedGetStartedCard("home.getStarted.guides.title", defaultHomeGetStartedDestinations.guides)
+      expectLinkedGetStartedCard("home.getStarted.whatsNew.title", defaultHomeGetStartedDestinations.whatsNew)
     } finally {
       vi.doMock("@/lib/home-page-extension", createHomeExtensionMock)
       vi.resetModules()
@@ -483,9 +484,9 @@ describe("Home", () => {
   it("resolves canonical and distinct configured Get Started destinations per key", () => {
     render(<Home />)
 
-    expectLinkedGetStartedCard("home.getStarted.docs.title", "https://help.xagent.co/overview.html")
-    expectLinkedGetStartedCard("home.getStarted.guides.title", "https://help.xagent.co/user-guide/overview.html")
-    expectLinkedGetStartedCard("home.getStarted.whatsNew.title", "https://docs.xagent.co/release-notes")
+    expectLinkedGetStartedCard("home.getStarted.docs.title", defaultHomeGetStartedDestinations.docs)
+    expectLinkedGetStartedCard("home.getStarted.guides.title", defaultHomeGetStartedDestinations.guides)
+    expectLinkedGetStartedCard("home.getStarted.whatsNew.title", defaultHomeGetStartedDestinations.whatsNew)
     expectInertGetStartedCard("home.getStarted.video.title")
 
     cleanup()
@@ -621,14 +622,14 @@ describe("Home", () => {
         if (key === "docs") {
           expectInertGetStartedCard("home.getStarted.docs.title")
           expectLinkedGetStartedCard("home.getStarted.guides.title", "/valid-guides")
-          expectLinkedGetStartedCard("home.getStarted.whatsNew.title", "https://docs.xagent.co/release-notes")
+          expectLinkedGetStartedCard("home.getStarted.whatsNew.title", defaultHomeGetStartedDestinations.whatsNew)
         } else if (key === "guides") {
           expectLinkedGetStartedCard("home.getStarted.docs.title", "/valid-docs")
           expectInertGetStartedCard("home.getStarted.guides.title")
-          expectLinkedGetStartedCard("home.getStarted.whatsNew.title", "https://docs.xagent.co/release-notes")
+          expectLinkedGetStartedCard("home.getStarted.whatsNew.title", defaultHomeGetStartedDestinations.whatsNew)
         } else {
           expectLinkedGetStartedCard("home.getStarted.docs.title", "/valid-docs")
-          expectLinkedGetStartedCard("home.getStarted.guides.title", "https://help.xagent.co/user-guide/overview.html")
+          expectLinkedGetStartedCard("home.getStarted.guides.title", defaultHomeGetStartedDestinations.guides)
           expectInertGetStartedCard("home.getStarted.whatsNew.title")
         }
         expectInertGetStartedCard("home.getStarted.video.title")
@@ -645,7 +646,7 @@ describe("Home", () => {
 
     expectLinkedGetStartedCard("home.getStarted.docs.title", "custom:docs")
     expectInertGetStartedCard("home.getStarted.guides.title")
-    expectLinkedGetStartedCard("home.getStarted.whatsNew.title", "https://docs.xagent.co/release-notes")
+    expectLinkedGetStartedCard("home.getStarted.whatsNew.title", defaultHomeGetStartedDestinations.whatsNew)
     expect([
       "home.getStarted.video.title",
       "home.getStarted.docs.title",
@@ -755,6 +756,7 @@ describe("Home", () => {
     const contractsSource = readFileSync("src/lib/page-extension-contracts.ts", "utf8")
     const extensionSource = readFileSync("src/lib/home-page-extension.tsx", "utf8")
     const pageSource = readFileSync("src/app/page.tsx", "utf8")
+    const destinationsSource = readFileSync("src/lib/home-get-started-destinations.ts", "utf8")
     const contractInterface = sourceSlice(
       contractsSource,
       "export interface HomeGetStartedDestinationOverrides",
@@ -774,7 +776,14 @@ describe("Home", () => {
     expect(pageSource).toMatch(
       /const homeGetStartedDestinationOverrides: HomeGetStartedDestinationOverrides =\s*\(homePageExtensionModule as \{ homeGetStartedDestinationOverrides\?: HomeGetStartedDestinationOverrides \}\)\s*\.homeGetStartedDestinationOverrides \?\? \{\}/,
     )
-    expect(pageSource).toMatch(/const defaultHomeGetStartedDestinations: Record<keyof HomeGetStartedDestinationOverrides, string> = \{/)
+    expect(pageSource).toMatch(
+      /import \{ defaultHomeGetStartedDestinations \} from "@\/lib\/home-get-started-destinations";/,
+    )
+    expect(pageSource).not.toMatch(/const defaultHomeGetStartedDestinations/)
+    expect(destinationsSource).toMatch(/export const defaultHomeGetStartedDestinations: Record<keyof HomeGetStartedDestinationOverrides, string> = \{/)
+    expect(destinationsSource).toMatch(/docs: "https:\/\/help\.xagent\.co\/overview\.html"/)
+    expect(destinationsSource).toMatch(/guides: "https:\/\/help\.xagent\.co\/user-guide\/overview\.html"/)
+    expect(destinationsSource).toMatch(/whatsNew: "https:\/\/docs\.xagent\.co\/release-notes"/)
     expect(resolver).toContain("configured === undefined")
     expect(resolver).toContain("typeof configured !== \"string\"")
     expect(resolver).toContain("configured.trim().length === 0")

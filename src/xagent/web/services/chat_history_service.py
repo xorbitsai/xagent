@@ -494,6 +494,18 @@ def supersede_legacy_question_rows(db: Session, *, task_id: int) -> int:
     savepoint_entered = False
     try:
         with db.begin_nested():
+            # Force the SAVEPOINT out now, while savepoint_entered is still
+            # False. SQLAlchemy does not emit it inside begin_nested(); it
+            # defers it to the next statement on the connection, which here
+            # would be the UPDATE below -- by which point the flag is True
+            # and a failure to create the savepoint would be misread as a
+            # failure inside one. This adds no SQL: the SAVEPOINT was going
+            # to be issued either way, just later. Remove this line and the
+            # SAVEPOINT goes back to being issued at the UPDATE, where a
+            # failure to create it reads as a failure inside one. If this
+            # call itself fails the flag is still False, so that routes to
+            # propagate as well.
+            db.connection()
             savepoint_entered = True
             updated = (
                 db.query(TaskChatMessage)

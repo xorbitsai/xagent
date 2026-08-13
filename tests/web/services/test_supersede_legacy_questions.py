@@ -316,14 +316,15 @@ def test_supersede_distinguishes_a_savepoint_exit_failure_from_a_statement_failu
         db.close()
 
 
-def test_supersede_propagates_a_savepoint_that_never_opened(monkeypatch):
-    """The third failure position: the ``SAVEPOINT`` statement itself
-    fails, so the savepoint never exists and there is nothing holding the
-    damage. Like the exit failure, and unlike a failure of the UPDATE
-    inside an open savepoint, this propagates and registers no signal --
-    degrading here would tell an operator the sweep failed when what
-    actually happened is that the transaction could not be sectioned off
-    in the first place."""
+def test_supersede_propagates_a_savepoint_that_could_not_be_created(monkeypatch):
+    """The savepoint fails to be created, so nothing is holding the
+    relabel and the caller's transaction is not sectioned off. This
+    propagates and registers no signal, like the exit failure and unlike a
+    failure of the UPDATE inside an open savepoint.
+
+    The failure is injected at ``dialect.do_savepoint``, which is where the
+    SAVEPOINT is actually issued. Patching ``Session.begin_nested`` instead
+    would not exercise this path at all: that call emits no SQL."""
     db = _create_db_session()
     try:
         task = _create_task(db)
@@ -336,10 +337,12 @@ def test_supersede_propagates_a_savepoint_that_never_opened(monkeypatch):
         )
         signal_name = ops_signals.CLARIFICATION_LEGACY_SUPERSEDE_FAILED
 
-        def refusing_begin_nested(self, *args, **kwargs):
+        def refusing_do_savepoint(connection, name):
             raise OperationalError("SAVEPOINT", {}, Exception("savepoint refused"))
 
-        monkeypatch.setattr(Session, "begin_nested", refusing_begin_nested)
+        monkeypatch.setattr(
+            db.get_bind().dialect, "do_savepoint", refusing_do_savepoint
+        )
 
         with pytest.raises(OperationalError):
             supersede_legacy_question_rows(db, task_id=int(task.id))

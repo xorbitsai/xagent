@@ -165,12 +165,16 @@ class TaskInteractionRequest(Base):  # type: ignore
     reject.
 
     ``terminal_reason`` vocabulary: each of the three members is spoken for
-    by exactly one intended writer, and none of those writers exists yet.
-    ``deadline_elapsed`` and ``run_superseded`` are the two reclaim
-    branches, arriving with the staging primitive; ``answered_via_legacy_resume``
-    arrives with the transitional close on the legacy answer path. It is
-    not the same outcome as ``answered`` -- that path recovers a free-text
-    chat message, not a protocol v1 structured response, and synthesizing a
+    by exactly one intended writer. ``deadline_elapsed`` and
+    ``run_superseded`` are the two reclaim branches the staging primitive's
+    ``_reclaim_stale_slot_stmt`` already writes (``task_interaction_staging.py``)
+    -- that write statement exists, but the staging primitive it belongs to
+    has no production caller yet, so neither value is reachable outside
+    tests; ``answered_via_legacy_resume`` already has both its write
+    statement and a production caller, the transitional close in
+    ``task_interaction_close.py`` on the legacy answer path. It is not the
+    same outcome as ``answered`` -- that path recovers a free-text chat
+    message, not a protocol v1 structured response, and synthesizing a
     payload for it would fabricate a contract the client never produced.
     ``operator_cancelled`` and ``task_terminated`` have no writer yet and are
     intentionally not in the vocabulary; the old name

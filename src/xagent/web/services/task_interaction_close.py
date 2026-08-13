@@ -20,6 +20,26 @@ unconditional, because an abandonment can also race a resume that never
 even reached the injection call -- clearing unconditionally there would
 erase a marker that is still correct for a question that is still active.
 
+The two WebSocket sites and the one A2A site do not give this close the
+same atomicity guarantee. At both WebSocket sites (``websocket.py``),
+``close_legacy_resume_interaction_sync`` opens its own short transaction
+only after the message write has already committed -- the close is a
+best-effort step that follows the message write, not part of it. If that
+separate transaction fails, both call sites only log the failure; they do
+not retry, raise, or register a degradation signal. That is a deliberate
+choice, not a gap: a stale marker degrades to the legacy fallback question
+by design -- the same guarantee documented in the marker comment on
+``Task.interaction_protocol_version`` (``models/task.py``) -- so there is
+nothing left to protect by escalating. Both WebSocket call sites handle the
+failure of the delivery marker write immediately beside each close call
+(``mark_user_message_delivery_sync``) the identical log-only way, for the
+identical reason; see the inline comments beside each pair. The A2A site
+is different: its close call runs inside
+``_update_a2a_resume_input_sync``'s own transaction, committed together
+with the ownership fence UPDATE that precedes it, so that site's close is
+genuinely atomic with the write that answered the question -- not a
+best-effort follow-up.
+
 Every rowcount the close statement below produces is classified the same
 way, at the one place the classification happens
 (``_classify_close_rowcount``): exactly one row closed is the expected
@@ -106,6 +126,19 @@ def close_legacy_resume_interaction(
     Returns the close statement's rowcount, classified and logged by
     ``_classify_close_rowcount`` -- see the module docstring for why a
     rowcount greater than 1 is logged, not raised.
+
+    A constraint on the batch that adds a production writer for
+    ``task_interaction_requests``: the close statement matches on
+    ``(task_id, run_id, active)`` alone -- nothing binds it to the
+    specific question the injected user message answered. That is sound
+    only while this run cannot stage a new row between the message write
+    and this close. Injecting the message is exactly what resumes the
+    agent, so once a production writer exists, the resumed agent may
+    stage a fresh question in that window and this statement would
+    retire it as if it had been answered. The writer batch must either
+    key this close on the row observed before injection (read the
+    primary key first) or add a staleness fence; it must not ship the
+    statement as-is.
     """
     now = datetime.now(timezone.utc)
     close_result = db.execute(

@@ -1975,8 +1975,8 @@ class DAGPattern(AgentPattern):
            not a workflow question the user can be asked to sit
            through. A result status the table does not know sorts last
            instead of raising (see ``rank()`` below for why), and is
-           logged loudly since an unranked status is itself worth
-           investigating.
+           logged as a warning since an unranked status is a handled
+           anomaly worth investigating, not a failure of this method.
         3. Within the same rank, the lexicographically first step id
            wins, for a deterministic pick regardless of which task an
            ``asyncio.wait()`` wakeup or set iteration happens to surface
@@ -2012,7 +2012,7 @@ class DAGPattern(AgentPattern):
                 # the entire batch over one unrecognized status string.
                 # Sorting it last instead preserves the invariant that a
                 # question already asked is delivered whenever possible.
-                logger.error(
+                logger.warning(
                     "Completed DAG step %s has an unranked result status "
                     "%r; ranking it last in this batch instead of raising.",
                     step_ids_by_task[task],

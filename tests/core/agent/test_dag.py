@@ -2670,8 +2670,8 @@ def test_dag_pattern_select_winner_ranks_an_unknown_status_last(
     asyncio.wait() loop in _execute_ready_steps(), where an uncaught
     exception would propagate through the BaseException cancellation
     handler and fail every step in the batch over one unexpected status
-    string. It ranks last instead, behind both known ranks, and logs an
-    error so the unrecognized status does not go unnoticed."""
+    string. It ranks last instead, behind both known ranks, and logs a
+    warning so the unrecognized status does not go unnoticed."""
 
     pattern = DAGPattern(lambda **_: None)
 

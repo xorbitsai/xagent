@@ -595,7 +595,7 @@ export function ChatInput({
   // Only a new standalone task: the backend takes execution_mode at creation
   // only, and an agent (a template resolves into one) overrides it anyway.
   const showExecutionModePicker =
-    !compact && !hideConfig && !readOnlyConfig && !taskConfig && !selectedTemplate;
+    !hideConfig && !readOnlyConfig && !taskConfig && !selectedTemplate;
   const showLocalBrowser = Boolean(user?.is_admin) && !readOnlyConfig && !hideConfig;
   const showTaskRuntimeExtension =
     hasTaskRuntimeComposerExtension && !readOnlyConfig && !hideConfig;
@@ -603,6 +603,12 @@ export function ChatInput({
   const activeTaskRuntimeSelection = showTaskRuntimeExtension
     ? taskRuntimeSelection
     : null;
+  useEffect(() => {
+    if (!showExecutionModePicker) {
+      setPickedExecutionMode(undefined);
+      setExecutionModeMenuOpen(false);
+    }
+  }, [showExecutionModePicker]);
   useEffect(() => {
     if (!showLocalBrowser) setLocalBrowserTarget(null);
   }, [showLocalBrowser]);
@@ -751,6 +757,8 @@ export function ChatInput({
 
       await onSend(messageToSend, configToSend);
       deliveryAttemptRef.current = null;
+      setPickedExecutionMode(undefined);
+      setExecutionModeMenuOpen(false);
       setLocalBrowserTarget(null);
       setTaskRuntimeSelection(null);
       fileMention.resetMention();
@@ -1156,6 +1164,9 @@ export function ChatInput({
                       className="inline-flex h-9 items-center gap-2 rounded-xl px-3 text-xs text-muted-foreground hover:bg-secondary/80 hover:text-foreground disabled:pointer-events-none disabled:opacity-50"
                       disabled={isInputBusy}
                       title={t("builds.configForm.executionMode.label")}
+                      aria-label={`${t("builds.configForm.executionMode.label")}: ${t(
+                        `builds.configForm.executionMode.${pickedExecutionMode ?? "auto"}.title`
+                      )}`}
                     >
                       <Sparkles className="h-4 w-4" />
                       <span className="max-w-[150px] truncate hidden sm:inline-block">
@@ -1167,6 +1178,7 @@ export function ChatInput({
                         <button
                           key={mode}
                           type="button"
+                          aria-pressed={mode === pickedExecutionMode}
                           onClick={() => {
                             setPickedExecutionMode(mode);
                             setExecutionModeMenuOpen(false);

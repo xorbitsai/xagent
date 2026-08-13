@@ -538,6 +538,56 @@ def test_oversized_interactions_are_dropped_entirely() -> None:
     assert payload["question"] == draft.message
 
 
+def test_request_leaf_control_characters_are_stripped_from_the_payload() -> None:
+    """``requests`` is built from ``ClarificationRequestItem.to_dict()``,
+    whose string fields (``tool_name``, ``tool_call_id``,
+    ``interaction_id``) come from the same untrusted tool-call surface as
+    ``interactions``' free-text leaves and must go through the same
+    ``_clean_leaves`` filter, not straight into the payload."""
+
+    dirty_requests = (
+        ClarificationRequestItem("tool\x07one", "call\x00-1", "call\x00-1"),
+    )
+    draft = _draft(requests=dirty_requests)
+    payload = build_clarification_payload(draft)
+    assert payload["requests"] == [
+        {
+            "tool_name": "toolone",
+            "tool_call_id": "call-1",
+            "interaction_id": "call-1",
+        }
+    ]
+
+    # The idempotency key is derived only from turn_marker (computed from
+    # the *raw*, unfiltered requests), so filtering the payload's requests
+    # leaves must not move it.
+    key_before = clarification_idempotency_key(draft)
+    build_clarification_payload(draft)
+    assert clarification_idempotency_key(draft) == key_before
+
+
+def test_message_type_control_characters_are_stripped_from_the_payload() -> None:
+    """``message_type`` reaches ``ClarificationDraft`` by way of
+    ``react.py``'s ``send_message`` handler --
+    ``str(args.get("message_type", "info"))``, a raw LLM tool-call
+    argument with no runtime validation against the tool schema's declared
+    ``enum``. A JSON-schema ``enum`` is a hint the model is told to follow,
+    not a constraint this code enforces, so ``message_type`` needs the
+    same control-character filtering ``question`` already gets, not a
+    straight pass-through."""
+
+    draft = _draft(message_type="info\x07\x00BEL-AND-NUL")
+    payload = build_clarification_payload(draft)
+    assert payload["message_type"] == "infoBEL-AND-NUL"
+
+    # Same independence check as the requests-leaf test above: filtering
+    # message_type must not move the idempotency key, since that key is
+    # derived only from turn_marker.
+    key_before = clarification_idempotency_key(draft)
+    build_clarification_payload(draft)
+    assert clarification_idempotency_key(draft) == key_before
+
+
 def test_payload_still_too_large_after_truncation_is_not_applicable() -> None:
     """Only ``tool_waiting`` -- the multi-tool waiting point -- can
     realistically produce thousands of ``requests`` entries;
@@ -561,6 +611,22 @@ def test_payload_still_too_large_after_truncation_is_not_applicable() -> None:
 
 def test_question_emptied_by_character_filtering_is_not_applicable() -> None:
     draft = _draft(message="\x00\x01\x02\x1f")
+    result = {"status": "waiting_for_user", "clarification_draft": draft}
+    resolution = resolve_publishable_clarification(
+        result, task=_task(), lease=_lease(), anchor=_anchor(), now=_now()
+    )
+    assert isinstance(resolution, NotApplicable)
+    assert resolution.reason == "empty_question"
+
+
+def test_whitespace_only_question_is_not_applicable() -> None:
+    """A question made only of whitespace -- including a tab -- survives
+    ``_strip_control_characters`` unchanged, since ``\\n``, ``\\r``, and
+    ``\\t`` are the three exceptions that filter keeps. The guard must
+    still treat it as empty rather than let a blank question through as
+    ``Publishable``."""
+
+    draft = _draft(message="   \t  \n  ")
     result = {"status": "waiting_for_user", "clarification_draft": draft}
     resolution = resolve_publishable_clarification(
         result, task=_task(), lease=_lease(), anchor=_anchor(), now=_now()
@@ -642,6 +708,57 @@ def test_superseded_steps_register_the_multiple_drafts_signal_and_it_stays_up() 
         result, task=_task(), lease=_lease(), anchor=_anchor(), now=_now()
     )
     assert isinstance(resolution, Publishable)
+    assert (
+        ops_signals.CLARIFICATION_MULTIPLE_DRAFTS in ops_signals.active_degradations()
+    )
+
+
+def test_interrupted_winner_with_superseded_steps_registers_the_multiple_drafts_signal() -> (
+    None
+):
+    """When an interrupt wins a wakeup that also superseded a losing
+    waiting step, ``AgentExecutionAdapter`` puts
+    ``clarification_superseded_step_ids`` on the *interrupted* result, not
+    a waiting one (see the ``"interrupted"`` branch of
+    ``AgentExecutionAdapter._normalize_result`` in ``execution_adapter.py``).
+    The signal has to register here even though the guard sequence
+    classifies this round ``NotApplicable(None)`` well before it would
+    otherwise touch ``clarification_superseded_step_ids`` -- registering
+    must not be gated behind reaching the ``Publishable`` path."""
+
+    result = {
+        "status": "interrupted",
+        "clarification_superseded_step_ids": ["step-2"],
+    }
+    resolution = resolve_publishable_clarification(
+        result, task=_task(), lease=_lease(), anchor=_anchor(), now=_now()
+    )
+    assert isinstance(resolution, NotApplicable)
+    assert resolution.reason is None
+    assert (
+        ops_signals.CLARIFICATION_MULTIPLE_DRAFTS in ops_signals.active_degradations()
+    )
+
+
+def test_waiting_with_superseded_steps_and_no_anchor_registers_the_multiple_drafts_signal() -> (
+    None
+):
+    """Same point as the interrupted-winner case above, for the other
+    degrade-not-fail exit: a waiting round with no resume anchor still
+    reports a sibling step having been superseded, even though it never
+    reaches the ``Publishable`` branch that used to be the only place this
+    registered."""
+
+    result = {
+        "status": "waiting_for_user",
+        "clarification_draft": _draft(),
+        "clarification_superseded_step_ids": ["step-2"],
+    }
+    resolution = resolve_publishable_clarification(
+        result, task=_task(), lease=_lease(), anchor=None, now=_now()
+    )
+    assert isinstance(resolution, NotApplicable)
+    assert resolution.reason == "no_anchor"
     assert (
         ops_signals.CLARIFICATION_MULTIPLE_DRAFTS in ops_signals.active_degradations()
     )

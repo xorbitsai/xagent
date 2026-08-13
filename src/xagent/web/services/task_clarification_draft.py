@@ -301,9 +301,9 @@ def build_clarification_payload(draft: ClarificationDraft) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "question": question,
         "interactions": interactions_payload,
-        "message_type": draft.message_type,
+        "message_type": _strip_control_characters(draft.message_type),
         "source": draft.source,
-        "requests": [item.to_dict() for item in draft.requests],
+        "requests": [_clean_leaves(item.to_dict()) for item in draft.requests],
     }
     if question_truncated:
         payload["question_truncated"] = True
@@ -407,9 +407,10 @@ def resolve_publishable_clarification(
        against; this degrades, it does not fail the round.
     5b. The payload built from the draft fits the character domain and size
         limits in :func:`build_clarification_payload`; if it does not
-        (empty after filtering, or still oversized after truncation), that
-        also degrades rather than fails. This check runs last because it is
-        the only one that requires building the payload first.
+        (empty after filtering, or reduced to only whitespace, or still
+        oversized after truncation), that also degrades rather than fails.
+        This check runs last because it is the only one that requires
+        building the payload first.
 
     A cross-run anchor mismatch is deliberately absent from this sequence:
     that check belongs to ``interaction_handoff`` (it already raises a
@@ -418,12 +419,30 @@ def resolve_publishable_clarification(
 
     On success, this function clears ``CLARIFICATION_DRAFT_MISSING`` --
     reaching ``Publishable`` is itself the evidence that the draft pipeline
-    worked this time. ``CLARIFICATION_MULTIPLE_DRAFTS`` is different: it
-    reports that a concurrent-waiting-step conflict happened *this round*,
-    which a successful publish does not undo, so it is registered (not
-    cleared) whenever ``result["clarification_superseded_step_ids"]`` is
-    non-empty, and left alone otherwise.
+    worked this time.
+
+    ``CLARIFICATION_MULTIPLE_DRAFTS`` is registered before any guard below
+    gets a chance to return, not only on the ``Publishable`` path: whether
+    ``result["clarification_superseded_step_ids"]`` is non-empty is a fact
+    about this round's ``result`` that holds regardless of which guard
+    ultimately classifies it -- a losing waiting step can be superseded by
+    an interrupt that wins the same round, so ``NotApplicable(None)`` and
+    every other non-``Publishable`` outcome must still be able to report
+    the conflict. Clearing it is the opposite: confined to the
+    ``Publishable`` path only, alongside ``CLARIFICATION_DRAFT_MISSING`` --
+    a successful publish clears the signal only when nothing was
+    superseded *this same round* either, since publishing this round's
+    draft does not retroactively undo a sibling step's draft having been
+    discarded.
     """
+
+    superseded_step_ids = result.get("clarification_superseded_step_ids") or []
+    if superseded_step_ids:
+        register_degradation(
+            CLARIFICATION_MULTIPLE_DRAFTS,
+            f"task {task.id}: run {lease.run_id}: superseded step ids "
+            f"{list(superseded_step_ids)}",
+        )
 
     status = result.get("status")
     draft = result.get("clarification_draft")
@@ -466,21 +485,14 @@ def resolve_publishable_clarification(
 
     payload = build_clarification_payload(draft)
 
-    if not payload["question"]:
+    if not payload["question"].strip():
         return NotApplicable("empty_question")
 
     if _serialized_byte_length(payload) > _TOTAL_PAYLOAD_MAX_BYTES:
         return NotApplicable("payload_too_large")
 
     clear_degradation(CLARIFICATION_DRAFT_MISSING)
-    superseded_step_ids = result.get("clarification_superseded_step_ids") or []
-    if superseded_step_ids:
-        register_degradation(
-            CLARIFICATION_MULTIPLE_DRAFTS,
-            f"task {task.id}: run {lease.run_id}: superseded step ids "
-            f"{list(superseded_step_ids)}",
-        )
-    else:
+    if not superseded_step_ids:
         clear_degradation(CLARIFICATION_MULTIPLE_DRAFTS)
 
     return Publishable(

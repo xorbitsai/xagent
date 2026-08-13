@@ -327,11 +327,27 @@ def parse_clarification_payload(
     interactions)`` shape ``get_latest_waiting_question``
     (``chat_history_service.py``) already returns for the legacy transcript
     path -- a cross-module contract with no shared base class to enforce it,
-    pinned by ``test_payload_round_trip_matches_the_legacy_reader_shape`` in
-    ``tests/web/services/test_task_clarification_draft.py``, which calls
+    pinned by ``test_payload_round_trip_matches_the_legacy_reader_shape*``
+    in ``tests/web/services/test_task_clarification_draft.py``, which calls
     the real ``get_latest_waiting_question`` and compares its return shape
     against this function's, rather than re-deriving the expectation from
     this function's own return type.
+
+    ``interactions`` comes back ``None``, not ``[]``, whenever the payload
+    carries no interaction items. ``get_latest_waiting_question`` itself is
+    not this consistent: it returns ``None`` for a persisted row whose
+    ``interactions`` column is ``NULL`` (the shape a ``send_message``-
+    sourced draft always produces, since that source's payload never has
+    any interactions to carry), but it returns ``[]`` for a row whose
+    column holds an actual empty list -- the shape an empty-form
+    ``ask_user_question`` call produces (a legal call: ``ask_user_question``
+    is classified by whether its request carries an ``interactions`` key at
+    all, not by whether that key's value is non-empty; see
+    ``draft_from_waiting_request``). That ``NULL``-vs-``[]`` split on the
+    legacy side is a known, un-reconciled divergence, not something this
+    function reproduces: every empty case collapses to ``None`` here,
+    deliberately, so a caller checking "did this turn have interactions"
+    never has to handle two different falsy shapes.
 
     This is the one place allowed to know what a payload's version implies:
     a reader elsewhere in the codebase must call this function rather than
@@ -344,7 +360,7 @@ def parse_clarification_payload(
     interactions = payload.get("interactions")
     return (
         question if isinstance(question, str) else None,
-        interactions if isinstance(interactions, list) else None,
+        interactions if isinstance(interactions, list) and interactions else None,
     )
 
 

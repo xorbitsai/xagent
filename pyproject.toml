@@ -70,7 +70,7 @@ dependencies = [
   "beartype>=0.18.5",
   "matplotlib>=3.5.0",
   "google-auth-oauthlib>=1.2.0",
-  "google-api-python-client>=2.111.0",
+  "google-api-python-client>=2.145.0",
   "boxlite>=0.6.0; sys_platform == 'linux' and platform_machine == 'x86_64'",
   "boxlite>=0.6.0; sys_platform == 'darwin' and platform_machine == 'arm64'",
   "filelock>=3.0.0",

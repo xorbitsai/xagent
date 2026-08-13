@@ -235,8 +235,10 @@ def test_gmail_callback_survives_a_raising_account_lookup_during_provisioning(
 
     The test above stubs provisioning out entirely, so it only proves the
     callback guard works. Here the real service runs and its own account
-    lookup raises, which is the failure #1150 reproduced on staging.
+    lookup raises, which is the failure #1150 reproduced on staging. The
+    watch flag must be on for the real service to reach that lookup.
     """
+    monkeypatch.setenv("XAGENT_GMAIL_WATCH_ENABLED", "true")
     db, user = db_session
     state = create_access_token(
         data={

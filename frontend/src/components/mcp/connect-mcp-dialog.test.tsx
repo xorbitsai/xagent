@@ -1411,4 +1411,54 @@ describe("ConnectMcpDialog Custom API detail loading", () => {
       expect(new URLSearchParams(url.split("?")[1]).get("category")).toBe("Operations")
     })
   })
+
+  it("cleanly deselects a card whose stored selection is an id, instead of duplicating it", async () => {
+    // Regression test for a Major finding on #1280: a consumer (e.g.
+    // agent-builder.tsx, which re-seeds selectedMcpServers with a
+    // connector's resolved server-row name after a save) can pass this
+    // component a selection that names the connector by id
+    // ("chrome-devtools") rather than display name ("Chrome"). isSelected
+    // matches by id OR name, so the card renders selected either way -- but
+    // the toggle previously removed only by name, so clicking a
+    // visually-selected id-only entry appended the name instead of
+    // removing the id: both ended up present, the card stayed selected,
+    // and further clicks just oscillated between duplicated and
+    // stuck-selected, never reaching "deselected".
+    const onConnectSelected = vi.fn()
+    apiRequestMock.mockImplementation((url: string) => {
+      if (url.includes("/api/mcp/apps?")) {
+        return Promise.resolve({
+          ok: true,
+          json: async () => [
+            {
+              id: "chrome-devtools",
+              name: "Chrome",
+              description: "",
+              icon: "",
+              is_connected: true,
+              transport: "stdio",
+              auth_type: "keyless",
+            },
+          ],
+        })
+      }
+      throw new Error(`Unexpected request: ${url}`)
+    })
+
+    render(
+      <ConnectMcpDialog
+        open
+        onOpenChange={vi.fn()}
+        selectedMcpServers={["chrome-devtools"]}
+        onConnectSelected={onConnectSelected}
+      />,
+    )
+    await screen.findByText("Chrome")
+
+    // One click on the visually-selected card must deselect it outright.
+    fireEvent.click(screen.getByText("Chrome"))
+
+    fireEvent.click(screen.getByRole("button", { name: "tools.mcp.dialog.connect" }))
+    expect(onConnectSelected).toHaveBeenCalledWith([])
+  })
 })

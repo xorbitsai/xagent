@@ -3,6 +3,7 @@
 import asyncio
 import logging
 from datetime import datetime
+from types import SimpleNamespace
 from typing import Any, cast
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -122,7 +123,8 @@ def _create_tool_info(
         elif tool_name == "edit_image":
             # Special check for image editing capability
             has_edit_capability = any(
-                "edit" in model.abilities for model in image_models.values()
+                "edit" in (getattr(model, "abilities", None) or ())
+                for model in image_models.values()
             )
             if not has_edit_capability:
                 status = "missing_capability"
@@ -224,6 +226,33 @@ def _create_tool_info(
         "config": {},
         "dependencies": [],
     }
+
+
+def _withheld_edit_image_row(
+    tools: list[dict[str, Any]], image_models: Any
+) -> dict[str, Any] | None:
+    """Row explaining an edit_image that capability gating kept out of the toolset.
+
+    Without it the admin listing just drops the tool, losing the only prompt to
+    register an edit-capable model.
+    """
+    # Not dead code despite the status check below also rejecting this case: with
+    # no image model there is nothing to explain, and the route asserts it does no
+    # extra work here.
+    if not image_models:
+        return None
+    if any(item.get("name") == "edit_image" for item in tools):
+        return None
+    row = _create_tool_info(
+        SimpleNamespace(
+            name="edit_image",
+            description="Edit an existing image with a text prompt",
+        ),
+        "image",
+        image_models=image_models,
+    )
+    # Only ever surface the disabled explanation, never invent an available tool.
+    return row if row["status"] == "missing_capability" else None
 
 
 @tools_router.get("/available")
@@ -356,6 +385,10 @@ async def get_available_tools(
                     music_models,
                 )
             )
+
+        withheld = _withheld_edit_image_row(tools, image_models)
+        if withheld is not None:
+            tools.append(withheld)
 
         from collections import defaultdict
 

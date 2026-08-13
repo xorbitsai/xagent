@@ -8007,7 +8007,7 @@ requires-dist = [
     { name = "fastapi", specifier = ">=0.35.0" },
     { name = "filelock", specifier = ">=3.0.0" },
     { name = "fsspec", specifier = ">=2024.0.0" },
-    { name = "google-api-python-client", specifier = ">=2.111.0" },
+    { name = "google-api-python-client", specifier = ">=2.145.0" },
     { name = "google-auth-oauthlib", specifier = ">=1.2.0" },
     { name = "google-cloud-pubsub", specifier = ">=2.21.0" },
     { name = "google-genai", specifier = ">=1.65.0" },

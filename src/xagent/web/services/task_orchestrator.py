@@ -102,7 +102,9 @@ logger = logging.getLogger(__name__)
 # Statuses for the "can a user message start the next turn?" check. A
 # task in any of these is eligible for ``TurnKind.APPEND``. PENDING is
 # claimed by ``CREATE``; RUNNING is still busy; WAITING_FOR_USER is an
-# answer to an explicit pending agent question and resumes that execution.
+# answer to a pending agent question and is handled by the dedicated
+# reply endpoint instead, which resumes the existing run rather than
+# claiming a new turn.
 _APPENDABLE_STATUSES = (
     TaskStatus.COMPLETED,
     TaskStatus.FAILED,
@@ -443,6 +445,9 @@ class TaskTurnOrchestrator:
             TaskTurnError("bg_inflight"): a previous bg coroutine is running.
             TaskTurnError("busy"): the row exists and is owned but its status
                 did not match the claim filter.
+            TaskTurnError("interaction_response_required"): ``kind ==
+                APPEND`` and the row's status is ``WAITING_FOR_USER`` --
+                use the reply endpoint instead of append.
             TaskTurnNotFoundError: no row matched id + owner.
         """
         if kind == TurnKind.CREATE and force_fresh:
@@ -985,12 +990,14 @@ def _claim_turn_no_commit(
     )
     if claimed == 0:
         owned = (
-            db.query(Task.id)
+            db.query(Task.id, Task.status)
             .filter(Task.id == task_id, Task.user_id == task_owner_user_id)
             .first()
         )
         if owned is None:
             raise TaskTurnNotFoundError(task_id)
+        if owned.status == TaskStatus.WAITING_FOR_USER:
+            raise TaskTurnError("interaction_response_required")
         raise TaskTurnError("busy")
 
     task_lease = acquire_task_lease_no_commit(
@@ -1078,7 +1085,10 @@ def _begin_turn_atomic_sync(
 
       - row missing / not owned by ``task_owner_user_id`` →
         :class:`TaskTurnNotFoundError`
-      - row exists + owned but wrong status → ``TaskTurnError("busy")``
+      - row exists + owned but wrong status → ``TaskTurnError("busy")``,
+        or ``TaskTurnError("interaction_response_required")`` when the
+        row's status is ``WAITING_FOR_USER`` (use the reply endpoint
+        instead of append)
 
     The committed-row snapshot is SELECTed pre-commit (read-your-writes within
     the transaction; a bulk ``.update(synchronize_session=False)`` leaves no

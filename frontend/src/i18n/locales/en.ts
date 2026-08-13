@@ -2072,6 +2072,7 @@ Build when you need.`,
           title: "Selected Files",
           empty: "No files selected",
           clearAll: "Clear All",
+          limitReached: "You can select up to {count} files per import.",
         },
         select: {
           driveLabel: "Select Drive",

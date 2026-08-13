@@ -154,6 +154,7 @@ class BrowserComputerEnvironment(ComputerEnvironment):
         headless: bool = True,
         viewport_width: int = 1280,
         viewport_height: int = 720,
+        locale: str | None = None,
     ) -> None:
         super().__init__(session_id)
         if viewport_width <= 0 or viewport_height <= 0:
@@ -164,6 +165,7 @@ class BrowserComputerEnvironment(ComputerEnvironment):
         self.headless = headless
         self.viewport_width = viewport_width
         self.viewport_height = viewport_height
+        self.locale = locale
         self._manager_session_id = f"{self.session_id}:computer"
         self._browser_session: Any | None = None
 
@@ -171,6 +173,7 @@ class BrowserComputerEnvironment(ComputerEnvironment):
         session = await self.manager.get_or_create(
             self._manager_session_id,
             headless=self.headless,
+            locale=self.locale,
         )
         recreated = (
             self._browser_session is not None and session is not self._browser_session

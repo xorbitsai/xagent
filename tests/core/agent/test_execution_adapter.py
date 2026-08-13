@@ -488,6 +488,93 @@ async def test_execution_adapter_omits_clarification_draft_key_when_not_waiting(
     assert "clarification_draft" not in result
 
 
+def test_execution_adapter_surfaces_superseded_step_ids_at_top_level() -> None:
+    adapter = AgentExecutionAdapter(
+        AgentExecutionConfig(
+            name="dag",
+            pattern="react",
+            llm=FakeLLM([]),
+            skill_manager=NoSkillManager(),
+        )
+    )
+
+    with_losers = adapter._normalize_result(
+        result={
+            "status": "waiting_for_user",
+            "success": False,
+            "message": "Pick one",
+            "clarification_superseded_step_ids": ["ask_b"],
+        },
+        execution_type="agent_dag",
+        execution_id="dag-superseded-exec",
+    )
+    assert with_losers["clarification_superseded_step_ids"] == ["ask_b"]
+
+    without_losers = adapter._normalize_result(
+        result={
+            "status": "waiting_for_user",
+            "success": False,
+            "message": "Pick one",
+        },
+        execution_type="agent_dag",
+        execution_id="dag-no-superseded-exec",
+    )
+    assert without_losers["clarification_superseded_step_ids"] == []
+
+    not_waiting = adapter._normalize_result(
+        result={
+            "status": "completed",
+            "success": True,
+            "output": "done",
+        },
+        execution_type="agent_dag",
+        execution_id="dag-completed-exec",
+    )
+    assert "clarification_superseded_step_ids" not in not_waiting
+
+
+def test_execution_adapter_surfaces_superseded_step_ids_for_an_interrupted_winner() -> (
+    None
+):
+    """A batch's winner can be an interrupt rather than a question -- the
+    DAG ranks an interrupt ahead of a waiting result within the same
+    wakeup -- and a losing waiting step is still superseded in that case.
+    The interrupted branch must promote the same top-level key, with the
+    same empty-list default, as the waiting branch already does; otherwise
+    a reader cannot tell "no sibling was superseded" apart from "this
+    status never carries the key"."""
+
+    adapter = AgentExecutionAdapter(
+        AgentExecutionConfig(
+            name="dag",
+            pattern="react",
+            llm=FakeLLM([]),
+            skill_manager=NoSkillManager(),
+        )
+    )
+
+    with_losers = adapter._normalize_result(
+        result={
+            "status": "interrupted",
+            "success": False,
+            "clarification_superseded_step_ids": ["ask_b"],
+        },
+        execution_type="agent_dag",
+        execution_id="dag-interrupted-superseded-exec",
+    )
+    assert with_losers["clarification_superseded_step_ids"] == ["ask_b"]
+
+    without_losers = adapter._normalize_result(
+        result={
+            "status": "interrupted",
+            "success": False,
+        },
+        execution_type="agent_dag",
+        execution_id="dag-interrupted-no-superseded-exec",
+    )
+    assert without_losers["clarification_superseded_step_ids"] == []
+
+
 @pytest.mark.asyncio
 async def test_execution_adapter_includes_persisted_conversation_history() -> None:
     llm = FakeLLM(["generated"])

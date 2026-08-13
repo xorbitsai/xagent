@@ -63,6 +63,27 @@ def test_sound_effect_tool_requires_sound_effect_model() -> None:
     assert available["status"] == "available"
 
 
+def test_withheld_edit_image_keeps_its_admin_row() -> None:
+    from xagent.web.api.tools import _withheld_edit_image_row
+
+    generate_only = {"img": SimpleNamespace(abilities=["generate"])}
+    edit_capable = {"img": SimpleNamespace(abilities=["generate", "edit"])}
+
+    row = _withheld_edit_image_row([], generate_only)
+
+    assert row is not None
+    assert row["name"] == "edit_image"
+    assert row["enabled"] is False
+    assert row["status"] == "missing_capability"
+    assert "editing support" in row["status_reason"]
+
+    # Nothing to explain when the tool is present, or when no model is configured.
+    assert _withheld_edit_image_row([{"name": "edit_image"}], generate_only) is None
+    assert _withheld_edit_image_row([], {}) is None
+    # An edit-capable deployment must never grow a synthetic row.
+    assert _withheld_edit_image_row([], edit_capable) is None
+
+
 def test_music_tool_requires_music_model() -> None:
     class Tool:
         name = "generate_music"
@@ -79,6 +100,76 @@ def test_music_tool_requires_music_model() -> None:
     assert unavailable["status"] == "missing_model"
     assert available["enabled"] is True
     assert available["status"] == "available"
+
+
+@pytest.mark.asyncio
+async def test_available_tools_route_surfaces_the_withheld_edit_image(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The helper's unit test cannot catch the wiring being dropped, and every
+    # other route test configures zero image models, which short-circuits it.
+    from xagent.web.api.tools import get_available_tools
+
+    class Config:
+        def __init__(self, **_kwargs) -> None:
+            pass
+
+        def get_vision_model(self):
+            return None
+
+        def get_image_models(self):
+            return {"img": SimpleNamespace(abilities=["generate"])}
+
+        def get_video_models(self):
+            return {}
+
+        def get_asr_models(self):
+            return {}
+
+        def get_tts_models(self):
+            return {}
+
+        def get_sound_effect_models(self):
+            return {}
+
+        def get_music_models(self):
+            return {}
+
+        def get_user_tool_overrides(self):
+            return {}
+
+        def close(self) -> None:
+            return None
+
+    async def create_all_tools(_config, apply_user_override_filter: bool = True):
+        # Capability gating already withheld edit_image.
+        return []
+
+    class Query:
+        def all(self) -> list[object]:
+            return []
+
+    class Database:
+        def query(self, _model: object) -> Query:
+            return Query()
+
+    monkeypatch.setattr("xagent.web.api.tools.WebToolConfig", Config)
+    monkeypatch.setattr(
+        "xagent.core.tools.adapters.vibe.factory.ToolFactory.create_all_tools",
+        create_all_tools,
+    )
+    monkeypatch.setattr("xagent.web.sandbox_manager.get_sandbox_manager", lambda: None)
+    monkeypatch.setattr("xagent.web.api.tools.get_default_tool_configs", lambda: [])
+
+    response = await get_available_tools(
+        current_user=SimpleNamespace(id=7, is_admin=False),
+        db=Database(),
+    )
+
+    rows = {item["name"]: item for item in response["tools"]}
+    assert rows["edit_image"]["enabled"] is False
+    assert rows["edit_image"]["status"] == "missing_capability"
+    assert "editing support" in rows["edit_image"]["status_reason"]
 
 
 class _AvailableToolsRouteHarness:

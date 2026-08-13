@@ -118,7 +118,7 @@ def _new_app_rows() -> list[dict[str, object]]:
         {
             "app_id": "hubspot",
             "name": "HubSpot",
-            "description": "Connect to HubSpot CRM to search, create, and update contacts and companies, read deals, and log notes.",
+            "description": "Connect to HubSpot CRM and Marketing Hub to search, create, and update contacts and companies, read deals, log notes, read forms and submissions, pull traffic analytics reports, and read marketing emails and campaigns.",
             "icon": "https://www.google.com/s2/favicons?domain=hubspot.com&sz=128",
             "transport": "oauth",
             "provider_name": "hubspot",
@@ -129,6 +129,17 @@ def _new_app_rows() -> list[dict[str, object]]:
                 "crm.objects.companies.read",
                 "crm.objects.companies.write",
                 "crm.objects.deals.read",
+                "forms",
+            ],
+            # Not a public_mcp_apps column - _filter_row strips this before
+            # any insert, so it never reaches the DB. Present purely so this
+            # snapshot's dict equals the live registry row's dict, which is
+            # what tests/alembic/test_20260720_seed_docs_slides_hubspot.py's
+            # test_seed_rows_match_registry asserts.
+            "optional_oauth_scopes": [
+                "business-intelligence",
+                "marketing-email",
+                "marketing.campaigns.read",
             ],
             "is_visible_in_connector": True,
             "launch_config": {

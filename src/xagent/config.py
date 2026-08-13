@@ -52,6 +52,8 @@ UPLOADED_FILE_RECOVERY_BATCH_SIZE = "XAGENT_UPLOADED_FILE_RECOVERY_BATCH_SIZE"
 STORAGE_ROOT = "XAGENT_STORAGE_ROOT"
 NATIVE_BROWSER_ENABLED = "XAGENT_NATIVE_BROWSER_ENABLED"
 NATIVE_BROWSER_APP_NAME = "XAGENT_NATIVE_BROWSER_APP_NAME"
+BROWSER_TOOL_DEFAULT_LOCALE = "XAGENT_BROWSER_TOOL_DEFAULT_LOCALE"
+BROWSER_TOOL_DEFAULT_TIMEZONE = "XAGENT_BROWSER_TOOL_DEFAULT_TIMEZONE"
 BROWSER_CUA_DRIVER_COMMAND = "XAGENT_BROWSER_CUA_DRIVER_COMMAND"
 BROWSER_CUA_DRIVER_SOCKET = "XAGENT_BROWSER_CUA_DRIVER_SOCKET"
 BROWSER_CUA_DRIVER_TIMEOUT_SECONDS = "XAGENT_BROWSER_CUA_DRIVER_TIMEOUT_SECONDS"
@@ -83,6 +85,13 @@ SANDBOX_IMAGE = "SANDBOX_IMAGE"
 LANCEDB_PATH = "LANCEDB_PATH"
 KB_COLLECTIONS_TIMEOUT_SECONDS = "XAGENT_KB_COLLECTIONS_TIMEOUT_SECONDS"
 KB_SEARCH_TIMEOUT_SECONDS = "XAGENT_KB_SEARCH_TIMEOUT_SECONDS"
+GOOGLE_DRIVE_DOWNLOAD_TIMEOUT_SECONDS = "XAGENT_GOOGLE_DRIVE_DOWNLOAD_TIMEOUT_SECONDS"
+DEEPDOC_XINFERENCE_URL = "XAGENT_DEEPDOC_XINFERENCE_URL"
+DEEPDOC_XINFERENCE_API_KEY = "XAGENT_DEEPDOC_XINFERENCE_API_KEY"
+DEEPDOC_XINFERENCE_TIMEOUT_SECONDS = "XAGENT_DEEPDOC_XINFERENCE_TIMEOUT_SECONDS"
+DEEPDOC_XINFERENCE_MODEL_UID = "XAGENT_DEEPDOC_XINFERENCE_MODEL_UID"
+DEEPDOC_XINFERENCE_USERNAME = "XAGENT_DEEPDOC_XINFERENCE_USERNAME"
+DEEPDOC_XINFERENCE_PASSWORD = "XAGENT_DEEPDOC_XINFERENCE_PASSWORD"
 DATABASE_URL = "DATABASE_URL"
 DB_POOL_SIZE = "XAGENT_DB_POOL_SIZE"
 DB_MAX_OVERFLOW = "XAGENT_DB_MAX_OVERFLOW"
@@ -460,6 +469,29 @@ def _normalized_http_env_url(env_var: str) -> str | None:
     return value
 
 
+def _reject_url_userinfo(env_var: str, value: str | None) -> str | None:
+    """Reject a URL carrying ``user:password@``, returning it otherwise.
+
+    httpx does not send URL userinfo as Basic auth, so credentials placed there
+    authenticate nothing -- but ``httpx.HTTPStatusError`` renders the full URL
+    unredacted, and callers put that string into log messages, so a password
+    there ends up in plaintext in the application log.
+
+    Kept separate from :func:`_normalized_http_env_url` on purpose. That helper
+    has pre-existing callers whose own call sites do not catch ``ValueError``
+    and rely on ``or``-chained fallbacks, so rejecting inside it would turn a
+    working (if ill-advised) configuration into a runtime failure for them.
+    """
+    if value is not None and "@" in urlsplit(value).netloc:
+        raise ValueError(
+            f"Invalid {env_var} value: credentials embedded in the URL are not "
+            "supported, because error messages built from it are logged. "
+            "Remove the 'user:password@' part and configure the credential "
+            "separately."
+        )
+    return value
+
+
 def get_password_reset_expire_minutes() -> int:
     """Return the password reset token expiry window in minutes."""
     return _get_positive_int_env(PASSWORD_RESET_EXPIRE_MINUTES, 30)
@@ -683,6 +715,68 @@ def get_native_browser_app_name() -> str:
             f"{NATIVE_BROWSER_APP_NAME} must name a supported browser: {supported}"
         )
     return canonical
+
+
+_BCP47_LOCALE_RE = re.compile(r"^[a-zA-Z]{2,3}(-[a-zA-Z0-9]{2,8})*$")
+
+
+def get_browser_tool_default_locale() -> str:
+    """Get the fallback Playwright context locale for the browser_use tool.
+
+    Used when a task/request carries no resolvable locale of its own (see
+    ``WebToolConfig.get_browser_locale``). Was previously hardcoded to
+    ``"zh-CN"``, which forced every automated browser session -- regardless
+    of the requesting user's own language -- to request and render
+    Chinese-localized pages.
+
+    Priority:
+        1. XAGENT_BROWSER_TOOL_DEFAULT_LOCALE environment variable
+        2. "en-US"
+
+    Raises:
+        ValueError: if the env var is set but isn't a plausible BCP-47 tag
+            (e.g. "en-US"). This getter is called lazily, from
+            BrowserSession.__init__ on first browser tool use rather than at
+            process startup, so a typo still fails as a clean tool-call
+            error instead of an opaque Playwright error at session creation.
+    """
+    configured = os.getenv(BROWSER_TOOL_DEFAULT_LOCALE, "").strip()
+    if not configured:
+        return "en-US"
+    if not _BCP47_LOCALE_RE.match(configured):
+        raise ValueError(
+            f"{BROWSER_TOOL_DEFAULT_LOCALE} must be a BCP-47 locale tag "
+            f"(e.g. 'en-US', 'zh-CN'), got {configured!r}"
+        )
+    return configured
+
+
+def get_browser_tool_default_timezone() -> str | None:
+    """Get the fallback Playwright context timezone for the browser_use tool.
+
+    Priority:
+        1. XAGENT_BROWSER_TOOL_DEFAULT_TIMEZONE environment variable
+        2. None (Playwright falls back to the host's own system timezone)
+
+    Raises:
+        ValueError: if the env var is set but isn't a recognized IANA
+            timezone name (e.g. "Asia/Shanghai"). Like
+            get_browser_tool_default_locale, this is read lazily on first
+            browser tool use, not at process startup.
+    """
+    configured = os.getenv(BROWSER_TOOL_DEFAULT_TIMEZONE, "").strip()
+    if not configured:
+        return None
+    from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+    try:
+        ZoneInfo(configured)
+    except (ZoneInfoNotFoundError, ValueError, KeyError) as exc:
+        raise ValueError(
+            f"{BROWSER_TOOL_DEFAULT_TIMEZONE} must be a valid IANA timezone "
+            f"name (e.g. 'Asia/Shanghai'), got {configured!r}"
+        ) from exc
+    return configured
 
 
 def get_browser_cua_driver_command() -> str:
@@ -1380,7 +1474,25 @@ def get_gmail_callback_base_url() -> str | None:
 
 
 def get_gmail_watch_enabled() -> bool:
-    """Return whether Gmail automatic watch registration is enabled."""
+    """Return whether the Gmail watch feature is enabled.
+
+    Gates both watch registration (OAuth connect, Gmail trigger
+    create/update/enable) and the background renewal/retry scans. With the
+    flag off (the default), no new watch is created and Gmail triggers report
+    a failed provisioning status with an explicit disabled error where
+    applicable. An existing Gmail watch is not stopped by disabling this flag:
+    callbacks can remain deliverable until the watch expires or its mailbox
+    resources are explicitly torn down.
+
+    Teardown is deliberately left ungated: rebinding, disabling, or deleting
+    a Gmail trigger still releases the old mailbox's watch and Pub/Sub
+    resources while this flag is off, so switching it off never strands
+    those resources.
+
+    The operator endpoint-reconciliation CLI
+    (``reconcile_gmail_push_endpoints``) is also deliberately ungated, so
+    push endpoints can be migrated ahead of enabling this flag.
+    """
     return _get_bool_env(GMAIL_WATCH_ENABLED, False)
 
 
@@ -2068,6 +2180,23 @@ def get_lancedb_path() -> Path:
     return get_storage_root() / "data" / "lancedb"
 
 
+def get_google_drive_download_timeout_seconds() -> int:
+    """Get the maximum wait for a Google Drive long-running download.
+
+    Native Google Workspace exports can return a pending Drive operation. This
+    timeout bounds polling inside the cloud-ingest HTTP request. External proxy
+    timeouts must also allow time for the final file transfer.
+
+    Priority:
+        1. XAGENT_GOOGLE_DRIVE_DOWNLOAD_TIMEOUT_SECONDS environment variable
+        2. Default of 600 seconds
+
+    Returns:
+        Maximum operation wait in seconds.
+    """
+    return _get_positive_int_env(GOOGLE_DRIVE_DOWNLOAD_TIMEOUT_SECONDS, 600)
+
+
 def get_kb_collections_timeout_seconds() -> int:
     """Get the deadline for a single knowledge base collection listing scan.
 
@@ -2118,6 +2247,69 @@ def get_kb_search_timeout_seconds() -> int:
     # threading a per-call timeout through SearchConfig into the rerank adapter.
     # Do it if leaked workers actually starve the executor.
     return _get_positive_int_env(KB_SEARCH_TIMEOUT_SECONDS, 60)
+
+
+def get_deepdoc_xinference_url() -> str | None:
+    """Return the Xinference base URL that DeepDoc parsing is offloaded to.
+
+    Leaving this unset keeps document parsing entirely local. It must
+    otherwise be an absolute http:// or https:// base URL carrying no query
+    or fragment, since request paths are appended to it. A malformed value
+    raises rather than silently downgrading to local parsing, so the
+    misconfiguration surfaces instead of showing up only as unexplained
+    slowness.
+    """
+    return _reject_url_userinfo(
+        DEEPDOC_XINFERENCE_URL, _normalized_http_env_url(DEEPDOC_XINFERENCE_URL)
+    )
+
+
+def get_deepdoc_xinference_api_key() -> str | None:
+    """Return the API key for remote DeepDoc parsing, if one is configured.
+
+    A dedicated key wins over the bare ``XINFERENCE_API_KEY`` shared with the
+    other Xinference clients. Returning None is valid: a self-hosted
+    Xinference deployment often runs without authentication.
+    """
+    value = (os.getenv(DEEPDOC_XINFERENCE_API_KEY) or "").strip()
+    if value:
+        return value
+    return (os.getenv("XINFERENCE_API_KEY") or "").strip() or None
+
+
+def get_deepdoc_xinference_timeout_seconds() -> int:
+    """Return the read timeout for one remote DeepDoc document parse.
+
+    Parsing a large PDF can take minutes, so the default matches the
+    ``timeout=1800`` precedent in deepdoc-lib's own MinerU API client
+    (``deepdoc/parser/mineru_parser.py``).
+    """
+    return _get_positive_int_env(DEEPDOC_XINFERENCE_TIMEOUT_SECONDS, 1800)
+
+
+def get_deepdoc_xinference_model_uid() -> str:
+    """Return the Xinference model UID that remote DeepDoc requests target.
+
+    The OCR endpoint dispatches on this ``model`` form field, so it must name a
+    launched DeepDoc model. ``DeepDoc`` is the model name Xinference registers
+    the family under, which is also the UID a launch gets when none is chosen.
+    """
+    return (os.getenv(DEEPDOC_XINFERENCE_MODEL_UID) or "").strip() or "DeepDoc"
+
+
+def get_deepdoc_xinference_username() -> str | None:
+    """Return the username for the remote DeepDoc JWT exchange, if configured.
+
+    Xinference clusters started with authentication mint a bearer token from
+    ``POST /token``; deployments that instead issue a long-lived API key leave
+    this unset and configure the key.
+    """
+    return (os.getenv(DEEPDOC_XINFERENCE_USERNAME) or "").strip() or None
+
+
+def get_deepdoc_xinference_password() -> str | None:
+    """Return the password for the remote DeepDoc JWT exchange, if configured."""
+    return os.getenv(DEEPDOC_XINFERENCE_PASSWORD) or None
 
 
 def get_default_sqlite_db_path() -> str:

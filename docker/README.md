@@ -325,6 +325,19 @@ backend cannot see v2 containers and otherwise double-provisions sandboxes.
 - `nginx.conf` - Frontend nginx configuration
 - `entrypoint.sh` - Backend startup script
 
+## Cloud Ingest Limits and Timeouts
+
+`POST /api/kb/ingest-cloud` accepts one to five files per request. The bundled
+`nginx.conf` gives this route a 900-second read timeout. For native Google
+Workspace files, Drive polling has a 600-second default application deadline.
+The final transfer, parsing, chunking, and embedding all continue within the
+same HTTP request.
+
+Custom reverse proxies must allow for the full end-to-end request. Increase the
+proxy timeout when you increase
+`XAGENT_GOOGLE_DRIVE_DOWNLOAD_TIMEOUT_SECONDS`. A closed client request does
+not stop the active worker thread.
+
 ## Building Individual Images
 
 ### Backend

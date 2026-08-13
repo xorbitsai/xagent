@@ -42,6 +42,11 @@ from ..services.share_rate_limit import (
     get_share_rate_limiter,
     remote_ip_from_request,
 )
+from ..services.task_interaction_service import (
+    InteractionPrincipal,
+    public_chat_identity_matches,
+    task_is_owned_by_public_principal,
+)
 from ..services.task_runtime import sanitize_client_agent_config
 from ..services.workforce_runs import create_workforce_run
 from ..utils.db_timezone import format_datetime_for_api
@@ -622,16 +627,18 @@ def _get_task_for_workforce_widget_context(
     )
     if not task:
         raise HTTPException(status_code=403, detail="Task not found or access denied")
-    if task.channel_id is not None:
-        raise HTTPException(status_code=403, detail="Widget is unavailable")
-    if not isinstance(task.agent_config, dict):
-        raise HTTPException(status_code=403, detail="Widget is unavailable")
-    if task.agent_config.get("auth_mode") != "widget":
-        raise HTTPException(status_code=403, detail="Widget is unavailable")
-    if task.agent_config.get("guest_id") != access_context.guest_id:
+    principal = InteractionPrincipal(
+        kind="guest",
+        user_id=int(access_context.user.id),
+        is_admin=False,
+        auth_mode="widget",
+        widget_workforce_id=widget_workforce_id,
+        guest_id=access_context.guest_id,
+    )
+    if not task_is_owned_by_public_principal(task, principal):
+        if public_chat_identity_matches(task, principal):
+            raise HTTPException(status_code=403, detail="Widget is unavailable")
         raise HTTPException(status_code=403, detail="Task not found or access denied")
-    if int(task.agent_config.get("widget_workforce_id") or 0) != widget_workforce_id:
-        raise HTTPException(status_code=403, detail="Widget is unavailable")
     workforce_run_id = task.agent_config.get("workforce_run_id")
     if not isinstance(workforce_run_id, int):
         raise HTTPException(status_code=403, detail="Widget is unavailable")
@@ -652,6 +659,18 @@ def _get_task_for_workforce_widget_context(
 def get_task_for_public_context(
     db: Session, task_id: int, access_context: PublicChatAccessContext
 ) -> Task:
+    # Deliberately NOT routed through task_is_owned_by_public_principal
+    # (task_interaction_service.py): the widget-agent branch below has no
+    # auth_mode check today, unlike the other three ownership entry points
+    # in this file, which the shared predicate does check on every
+    # direction. Routing this branch through the predicate would be a
+    # behavior change to a production authorization path -- a candidate
+    # security issue (a widget guest whose self-chosen guest_id happens to
+    # equal a share guest's server-minted one can otherwise reach a
+    # share-mode task through this branch) is logged against that gap, not
+    # fixed here (#1304): "old-path extract, don't refactor" -- fixing it
+    # belongs to a change scoped to that behavior, not to this predicate
+    # extraction.
     if access_context.widget_workforce_id is not None:
         return _get_task_for_workforce_widget_context(db, task_id, access_context)
     task = (
@@ -680,27 +699,6 @@ def get_task_for_public_context(
     return task
 
 
-def _require_share_guest_owns_task(
-    task: Task, access_context: ShareChatAccessContext
-) -> None:
-    """Per-guest isolation gate (#973), shared by both share branches.
-
-    The share-entity checks in each branch only pin a task to the shared
-    agent/workforce, which every guest of the link has in common. This binds
-    it to the specific guest that created it. ``access_context.guest_id`` is
-    guaranteed non-empty by :func:`get_share_chat_user`, so a task carrying no
-    guest_id (or a different one) fails this strict-inequality compare.
-
-    Precondition: callers validate ``task.agent_config`` is a dict first.
-
-    The detail deliberately matches the callers' not-found branch: a
-    distinguishable guest-mismatch message would tell a probing visitor which
-    task ids exist on this share link (#973 enumeration oracle).
-    """
-    if task.agent_config.get("guest_id") != access_context.guest_id:
-        raise HTTPException(status_code=403, detail="Task not found or access denied")
-
-
 def _get_task_for_workforce_share_context(
     db: Session, task_id: int, access_context: ShareChatAccessContext
 ) -> Task:
@@ -722,17 +720,18 @@ def _get_task_for_workforce_share_context(
     )
     if not task:
         raise HTTPException(status_code=403, detail="Task not found or access denied")
-    if task.channel_id is not None:
-        raise HTTPException(status_code=403, detail="Share link is unavailable")
-    if not isinstance(task.agent_config, dict):
-        raise HTTPException(status_code=403, detail="Share link is unavailable")
-    if task.agent_config.get("auth_mode") != "share":
-        raise HTTPException(status_code=403, detail="Share link is unavailable")
-    if int(task.agent_config.get("share_workforce_id") or 0) != workforce_id:
-        raise HTTPException(status_code=403, detail="Share link is unavailable")
-    # A valid workforce-share JWT + a matching WorkforceRun is not enough:
-    # both hold for *any* guest of the same workforce (#973).
-    _require_share_guest_owns_task(task, access_context)
+    principal = InteractionPrincipal(
+        kind="guest",
+        user_id=int(access_context.user.id),
+        is_admin=False,
+        auth_mode="share",
+        share_workforce_id=workforce_id,
+        guest_id=access_context.guest_id,
+    )
+    if not task_is_owned_by_public_principal(task, principal):
+        if public_chat_identity_matches(task, principal):
+            raise HTTPException(status_code=403, detail="Share link is unavailable")
+        raise HTTPException(status_code=403, detail="Task not found or access denied")
     workforce_run_id = task.agent_config.get("workforce_run_id")
     if not isinstance(workforce_run_id, int):
         raise HTTPException(status_code=403, detail="Share link is unavailable")
@@ -769,17 +768,18 @@ def get_task_for_share_context(
     )
     if not task:
         raise HTTPException(status_code=403, detail="Task not found or access denied")
-    if task.channel_id is not None:
-        raise HTTPException(status_code=403, detail="Share link is unavailable")
-    if not isinstance(task.agent_config, dict):
-        raise HTTPException(status_code=403, detail="Share link is unavailable")
-    if task.agent_config.get("auth_mode") != "share":
-        raise HTTPException(status_code=403, detail="Share link is unavailable")
-    if int(task.agent_config.get("share_agent_id") or 0) != int(agent.id):
-        raise HTTPException(status_code=403, detail="Share link is unavailable")
-    # The checks above only pin the task to the shared agent, which every
-    # guest of this link has in common (#973).
-    _require_share_guest_owns_task(task, access_context)
+    principal = InteractionPrincipal(
+        kind="guest",
+        user_id=int(access_context.user.id),
+        is_admin=False,
+        auth_mode="share",
+        share_agent_id=int(agent.id),
+        guest_id=access_context.guest_id,
+    )
+    if not task_is_owned_by_public_principal(task, principal):
+        if public_chat_identity_matches(task, principal):
+            raise HTTPException(status_code=403, detail="Share link is unavailable")
+        raise HTTPException(status_code=403, detail="Task not found or access denied")
     return task
 
 

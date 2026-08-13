@@ -2753,6 +2753,73 @@ def test_append_message_to_running_task_returns_409(mock_start_task):
     assert mock_start_task.call_count == 0
 
 
+def test_append_message_to_waiting_task_returns_interaction_response_required(
+    mock_start_task,
+):
+    """Appending to a waiting_for_user task is rejected with the
+    dedicated code (not task_busy), points at reply, and leaves the task
+    completely untouched -- no new transcript row, same status, same
+    run_id, no new background kickoff."""
+    agent_id, full_key = _create_agent_with_key()
+    task_id = _create_task(full_key, agent_id)
+    _force_task_status(task_id, TaskStatus.WAITING_FOR_USER)
+
+    db = _direct_db_session()
+    try:
+        before = db.query(Task).filter(Task.id == task_id).one()
+        run_id_before = before.run_id
+        from xagent.web.models.chat_message import TaskChatMessage
+
+        message_count_before = (
+            db.query(TaskChatMessage).filter(TaskChatMessage.task_id == task_id).count()
+        )
+    finally:
+        db.close()
+    mock_start_task.reset_mock()
+
+    resp = client.post(
+        f"/v1/chat/tasks/{task_id}/messages",
+        headers=_bearer(full_key),
+        json={"agent_id": agent_id, "message": {"role": "user", "content": "hello"}},
+    )
+    assert resp.status_code == 409, resp.text
+    assert resp.json()["error"]["code"] == "interaction_response_required"
+    assert "reply" in resp.json()["error"]["message"]
+    assert mock_start_task.call_count == 0
+
+    db = _direct_db_session()
+    try:
+        after = db.query(Task).filter(Task.id == task_id).one()
+        assert after.status == TaskStatus.WAITING_FOR_USER
+        assert after.run_id == run_id_before
+        from xagent.web.models.chat_message import TaskChatMessage
+
+        message_count_after = (
+            db.query(TaskChatMessage).filter(TaskChatMessage.task_id == task_id).count()
+        )
+        assert message_count_after == message_count_before
+    finally:
+        db.close()
+
+
+def test_append_message_to_running_task_still_returns_task_busy(mock_start_task):
+    """The new waiting-specific code must not leak onto the
+    unrelated RUNNING rejection -- RUNNING keeps plain task_busy."""
+    agent_id, full_key = _create_agent_with_key()
+    task_id = _create_task(full_key, agent_id)
+    _force_task_status(task_id, TaskStatus.RUNNING)
+    mock_start_task.reset_mock()
+
+    resp = client.post(
+        f"/v1/chat/tasks/{task_id}/messages",
+        headers=_bearer(full_key),
+        json={"agent_id": agent_id, "message": {"role": "user", "content": "hello"}},
+    )
+    assert resp.status_code == 409, resp.text
+    assert resp.json()["error"]["code"] == "task_busy"
+    assert mock_start_task.call_count == 0
+
+
 def test_append_message_claims_slot_atomically(mock_start_task):
     """Successful append flips task.status to RUNNING in the same
     transaction as the input write, so a concurrent POST can't pass
@@ -3127,6 +3194,206 @@ def test_get_task_cache_io_runs_after_database_session_closes(
         assert checked_out == [("get", 0), ("set", 0)]
     finally:
         engine.dispose()
+
+
+# ===== GET pending_interaction projection =====
+
+
+def _insert_question_message(
+    task_id: int,
+    *,
+    content: str = "Where are you flying to?",
+    interactions: list[dict] | None = None,
+    turn_id: str | None = None,
+) -> None:
+    """Write one assistant question row directly, bypassing the WS writer.
+
+    Mirrors the shape ``_persist_agent_outbound_event`` in
+    ``api/websocket.py`` writes for ``expect_response`` outbound events:
+    ``role='assistant'``, ``message_type='question'``.
+    """
+    from xagent.web.models.chat_message import TaskChatMessage
+
+    db = _direct_db_session()
+    try:
+        task = db.query(Task).filter(Task.id == task_id).first()
+        assert task is not None
+        db.add(
+            TaskChatMessage(
+                task_id=task_id,
+                user_id=int(task.user_id),
+                role="assistant",
+                content=content,
+                message_type="question",
+                interactions=interactions,
+                turn_id=turn_id or f"question-{content[:8]}-{id(content)}",
+            )
+        )
+        db.commit()
+    finally:
+        db.close()
+
+
+def test_get_task_waiting_returns_pending_interaction_with_structured_controls(
+    mock_start_task,
+):
+    """Waiting task with a structured question returns question +
+    non-empty interactions."""
+    agent_id, full_key = _create_agent_with_key()
+    task_id = _create_task(full_key, agent_id)
+    _force_task_status(task_id, TaskStatus.WAITING_FOR_USER)
+    _insert_question_message(
+        task_id,
+        content="Where are you flying to?",
+        interactions=[
+            {"type": "text_input", "field": "destination", "label": "Destination"}
+        ],
+    )
+
+    resp = client.get(f"/v1/chat/tasks/{task_id}", headers=_bearer(full_key))
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["status"] == "waiting_for_user"
+    assert body["pending_interaction"] is not None
+    assert body["pending_interaction"]["question"] == "Where are you flying to?"
+    assert body["pending_interaction"]["interactions"] == [
+        {"type": "text_input", "field": "destination", "label": "Destination"}
+    ]
+
+
+def test_get_task_waiting_null_interactions_stays_null(mock_start_task):
+    """A plain-text question (interactions stored NULL) must come
+    back as null, not []."""
+    agent_id, full_key = _create_agent_with_key()
+    task_id = _create_task(full_key, agent_id)
+    _force_task_status(task_id, TaskStatus.WAITING_FOR_USER)
+    _insert_question_message(task_id, content="Should I continue?", interactions=None)
+
+    resp = client.get(f"/v1/chat/tasks/{task_id}", headers=_bearer(full_key))
+    assert resp.status_code == 200, resp.text
+    body = resp.json()["pending_interaction"]
+    assert body["question"] == "Should I continue?"
+    assert body["interactions"] is None
+
+
+def test_get_task_waiting_empty_interactions_list_stays_empty_list(mock_start_task):
+    """An empty structured-controls list must come back as [], not
+    null -- the server does not normalize [] and null together."""
+    agent_id, full_key = _create_agent_with_key()
+    task_id = _create_task(full_key, agent_id)
+    _force_task_status(task_id, TaskStatus.WAITING_FOR_USER)
+    _insert_question_message(task_id, content="Should I continue?", interactions=[])
+
+    resp = client.get(f"/v1/chat/tasks/{task_id}", headers=_bearer(full_key))
+    assert resp.status_code == 200, resp.text
+    body = resp.json()["pending_interaction"]
+    assert body["question"] == "Should I continue?"
+    assert body["interactions"] == []
+
+
+def test_get_task_waiting_drops_non_mapping_interaction_elements(mock_start_task):
+    """A dirty row whose stored interactions list mixes dicts with a
+    non-dict element (e.g. a bare string a buggy writer once persisted)
+    must not 500 the GET forever -- the v1 read path filters non-mapping
+    elements out, keeping only the valid dict entries."""
+    agent_id, full_key = _create_agent_with_key()
+    task_id = _create_task(full_key, agent_id)
+    _force_task_status(task_id, TaskStatus.WAITING_FOR_USER)
+    _insert_question_message(
+        task_id,
+        content="Should I continue?",
+        interactions=[
+            {"type": "text_input", "field": "destination", "label": "Destination"},
+            "not a mapping",
+        ],
+    )
+
+    resp = client.get(f"/v1/chat/tasks/{task_id}", headers=_bearer(full_key))
+    assert resp.status_code == 200, resp.text
+    body = resp.json()["pending_interaction"]
+    assert body["question"] == "Should I continue?"
+    assert body["interactions"] == [
+        {"type": "text_input", "field": "destination", "label": "Destination"}
+    ]
+
+
+def test_get_task_waiting_with_no_question_row_returns_null(mock_start_task):
+    """A task can reach waiting_for_user with no question message
+    persisted (e.g. an empty outbound message string). pending_interaction
+    must be null, and the response must still be 200, not 500."""
+    agent_id, full_key = _create_agent_with_key()
+    task_id = _create_task(full_key, agent_id)
+    _force_task_status(task_id, TaskStatus.WAITING_FOR_USER)
+
+    resp = client.get(f"/v1/chat/tasks/{task_id}", headers=_bearer(full_key))
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["pending_interaction"] is None
+
+
+def test_get_task_non_waiting_never_queries_for_a_question(
+    mock_start_task,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """A non-waiting task's pending_interaction is null, and the
+    server must not even issue the question lookup query."""
+    agent_id, full_key = _create_agent_with_key()
+    task_id = _create_task(full_key, agent_id)
+    _force_task_status(task_id, TaskStatus.COMPLETED)
+
+    called = False
+
+    def spy_get_latest_waiting_question(*_args, **_kwargs):
+        nonlocal called
+        called = True
+        return None, None
+
+    monkeypatch.setattr(
+        v1_tasks, "get_latest_waiting_question", spy_get_latest_waiting_question
+    )
+
+    resp = client.get(f"/v1/chat/tasks/{task_id}", headers=_bearer(full_key))
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["pending_interaction"] is None
+    assert called is False
+
+
+def test_get_task_pending_interaction_bypasses_stale_cache_entry(mock_start_task):
+    """Cache isolation. The task is already waiting_for_user (with
+    no question yet) when the first GET populates the snapshot cache. A
+    question row is then inserted directly into ``task_chat_messages`` --
+    which, unlike a ``Task`` column write, never touches ``tasks.updated_at``
+    -- so the cache's freshness token is still valid on the next GET. That
+    next GET must still surface the new question: the cache entry itself
+    must never carry ``pending_interaction``, or this second read would
+    serve the pre-question snapshot forever (until the cache TTL expires).
+
+    Needs a real cache backend (the default test backend is a no-op), or
+    this test would pass vacuously without ever exercising a cache hit.
+    """
+    set_cache_backend_for_testing(InMemoryTTLCache())
+    try:
+        agent_id, full_key = _create_agent_with_key()
+        task_id = _create_task(full_key, agent_id)
+        _force_task_status(task_id, TaskStatus.WAITING_FOR_USER)
+
+        first = client.get(f"/v1/chat/tasks/{task_id}", headers=_bearer(full_key))
+        assert first.status_code == 200, first.text
+        assert first.json()["status"] == "waiting_for_user"
+        assert first.json()["pending_interaction"] is None
+
+        # This insert does not touch the tasks row at all, so
+        # tasks.updated_at -- the cache's only freshness token -- is
+        # unchanged. The next GET is a genuine cache hit on the base body.
+        _insert_question_message(task_id, content="Should I continue?")
+
+        second = client.get(f"/v1/chat/tasks/{task_id}", headers=_bearer(full_key))
+        assert second.status_code == 200, second.text
+        body = second.json()
+        assert body["status"] == "waiting_for_user"
+        assert body["pending_interaction"] is not None
+        assert body["pending_interaction"]["question"] == "Should I continue?"
+    finally:
+        set_cache_backend_for_testing(None)
 
 
 @pytest.mark.asyncio

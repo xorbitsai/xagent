@@ -1077,6 +1077,7 @@ def test_listing_triggers_reflects_background_provisioning_convergence(
 ) -> None:
     """Status reported by the API self-resolves once the watch state converges,
     without requiring another user-initiated create/update."""
+    monkeypatch.setenv("XAGENT_GMAIL_WATCH_ENABLED", "true")
     from xagent.web.models.gmail_watch import GmailWatchState
 
     def fake_provision_gmail_trigger(db, trigger: AgentTrigger) -> str:
@@ -1138,6 +1139,59 @@ def test_listing_triggers_reflects_background_provisioning_convergence(
         assert trigger.provisioning_status == TriggerProvisioningStatus.ACTIVE.value
     finally:
         db.close()
+
+
+def test_listing_reports_disabled_and_expired_gmail_watch_through_api(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """End-to-end flag-off derivation through the real endpoints: creating a
+    Gmail trigger reports failed/disabled (no provisioning thread, no watch
+    state row), and a leftover expired-active watch state surfaces as failed
+    on the next listing instead of reading healthy (#1231)."""
+    from xagent.web.models.gmail_watch import GmailWatchState
+
+    monkeypatch.setenv("XAGENT_GMAIL_WATCH_ENABLED", "false")
+    headers = _admin_headers()
+    agent_id = _create_agent(headers)
+    account_id = _connect_gmail_account()
+
+    created = client.post(
+        f"/api/agents/{agent_id}/triggers",
+        headers=headers,
+        json={
+            "type": "gmail",
+            "name": "Support inbox",
+            "config": {"watch_label": "INBOX", "oauth_account_id": account_id},
+        },
+    )
+    assert created.status_code == 200, created.text
+    assert created.json()["provisioning_status"] == "failed"
+    assert "disabled" in str(created.json()["provisioning_error"])
+
+    # Simulate a watch left over from when the flag was on, already expired.
+    db = _direct_db_session()
+    try:
+        user = db.query(User).filter(User.username == "admin").one()
+        assert db.query(GmailWatchState).count() == 0
+        db.add(
+            GmailWatchState(
+                user_id=int(user.id),
+                oauth_account_id=account_id,
+                email="owner@gmail.example",
+                history_id="hist-1",
+                topic_name="projects/demo/topics/xagent-gmail-abc",
+                status=TriggerProvisioningStatus.ACTIVE.value,
+                watch_expiration=datetime.now(timezone.utc) - timedelta(minutes=1),
+            )
+        )
+        db.commit()
+    finally:
+        db.close()
+
+    listed = client.get(f"/api/agents/{agent_id}/triggers", headers=headers)
+    assert listed.status_code == 200, listed.text
+    assert listed.json()[0]["provisioning_status"] == "failed"
+    assert "expired" in str(listed.json()[0]["provisioning_error"])
 
 
 def test_gmail_trigger_update_releases_previous_mailbox_and_provisions_new_one(

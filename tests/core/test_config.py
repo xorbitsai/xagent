@@ -26,6 +26,12 @@ from xagent.config import (
     DB_MAX_OVERFLOW,
     DB_POOL_SIZE,
     DB_POOL_TIMEOUT_SECONDS,
+    DEEPDOC_XINFERENCE_API_KEY,
+    DEEPDOC_XINFERENCE_MODEL_UID,
+    DEEPDOC_XINFERENCE_PASSWORD,
+    DEEPDOC_XINFERENCE_TIMEOUT_SECONDS,
+    DEEPDOC_XINFERENCE_URL,
+    DEEPDOC_XINFERENCE_USERNAME,
     EXTERNAL_SKILLS_LIBRARY_DIRS,
     EXTERNAL_UPLOAD_DIRS,
     FILE_DELIVERY_ACCEL_REDIRECT_ENABLED,
@@ -122,6 +128,12 @@ from xagent.config import (
     get_db_max_overflow,
     get_db_pool_size,
     get_db_pool_timeout_seconds,
+    get_deepdoc_xinference_api_key,
+    get_deepdoc_xinference_model_uid,
+    get_deepdoc_xinference_password,
+    get_deepdoc_xinference_timeout_seconds,
+    get_deepdoc_xinference_url,
+    get_deepdoc_xinference_username,
     get_default_sqlite_db_path,
     get_default_task_execution_mode,
     get_external_skills_dirs,
@@ -1222,6 +1234,31 @@ class TestGetLancedbPath:
         assert result == Path("/custom/lancedb")
 
 
+class TestGoogleDriveDownloadTimeout:
+    """Test the Google Drive LRO timeout configuration."""
+
+    def test_constant_name(self):
+        assert (
+            config.GOOGLE_DRIVE_DOWNLOAD_TIMEOUT_SECONDS
+            == "XAGENT_GOOGLE_DRIVE_DOWNLOAD_TIMEOUT_SECONDS"
+        )
+
+    def test_default(self, monkeypatch):
+        monkeypatch.delenv(
+            "XAGENT_GOOGLE_DRIVE_DOWNLOAD_TIMEOUT_SECONDS", raising=False
+        )
+        assert config.get_google_drive_download_timeout_seconds() == 600
+
+    def test_environment_override(self, monkeypatch):
+        monkeypatch.setenv("XAGENT_GOOGLE_DRIVE_DOWNLOAD_TIMEOUT_SECONDS", "120")
+        assert config.get_google_drive_download_timeout_seconds() == 120
+
+    @pytest.mark.parametrize("value", ["0", "-1", "not-a-number"])
+    def test_invalid_value_uses_default(self, monkeypatch, value):
+        monkeypatch.setenv("XAGENT_GOOGLE_DRIVE_DOWNLOAD_TIMEOUT_SECONDS", value)
+        assert config.get_google_drive_download_timeout_seconds() == 600
+
+
 class TestGetKbCollectionsTimeoutSeconds:
     """Test get_kb_collections_timeout_seconds() function."""
 
@@ -1266,6 +1303,122 @@ class TestGetKbSearchTimeoutSeconds:
     def test_non_positive_falls_back_to_default(self, monkeypatch):
         monkeypatch.setenv(KB_SEARCH_TIMEOUT_SECONDS, "0")
         assert get_kb_search_timeout_seconds() == 60
+
+
+class TestDeepDocRemoteParsingConfig:
+    """Test the remote DeepDoc parsing (Xinference) configuration getters."""
+
+    def test_env_var_constants(self):
+        assert DEEPDOC_XINFERENCE_URL == "XAGENT_DEEPDOC_XINFERENCE_URL"
+        assert DEEPDOC_XINFERENCE_API_KEY == "XAGENT_DEEPDOC_XINFERENCE_API_KEY"
+        assert (
+            DEEPDOC_XINFERENCE_TIMEOUT_SECONDS
+            == "XAGENT_DEEPDOC_XINFERENCE_TIMEOUT_SECONDS"
+        )
+        assert DEEPDOC_XINFERENCE_MODEL_UID == "XAGENT_DEEPDOC_XINFERENCE_MODEL_UID"
+        assert DEEPDOC_XINFERENCE_USERNAME == "XAGENT_DEEPDOC_XINFERENCE_USERNAME"
+        assert DEEPDOC_XINFERENCE_PASSWORD == "XAGENT_DEEPDOC_XINFERENCE_PASSWORD"
+
+    def test_url_unset_defaults_to_local_mode(self, monkeypatch):
+        monkeypatch.delenv(DEEPDOC_XINFERENCE_URL, raising=False)
+        assert get_deepdoc_xinference_url() is None
+
+    def test_url_blank_defaults_to_local_mode(self, monkeypatch):
+        monkeypatch.setenv(DEEPDOC_XINFERENCE_URL, "   ")
+        assert get_deepdoc_xinference_url() is None
+
+    def test_url_strips_whitespace_and_trailing_slash(self, monkeypatch):
+        monkeypatch.setenv(DEEPDOC_XINFERENCE_URL, " http://gpu-host:9997/ ")
+        assert get_deepdoc_xinference_url() == "http://gpu-host:9997"
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            "gpu-host:9997",
+            "ftp://gpu-host:9997",
+            "https:///missing-host",
+            "http://gpu-host:9997?model=deepdoc",
+            "http://gpu-host:9997#deepdoc",
+            "http://gpu-host:9997/v1/deepdoc?model=deepdoc",
+        ],
+    )
+    def test_url_rejects_invalid_values(self, monkeypatch, value):
+        monkeypatch.setenv(DEEPDOC_XINFERENCE_URL, value)
+
+        with pytest.raises(ValueError, match="XAGENT_DEEPDOC_XINFERENCE_URL"):
+            get_deepdoc_xinference_url()
+
+    def test_api_key_dedicated_var_wins(self, monkeypatch):
+        monkeypatch.setenv(DEEPDOC_XINFERENCE_API_KEY, " deepdoc-key ")
+        monkeypatch.setenv("XINFERENCE_API_KEY", "shared-key")
+        assert get_deepdoc_xinference_api_key() == "deepdoc-key"
+
+    def test_api_key_falls_back_to_shared_xinference_key(self, monkeypatch):
+        monkeypatch.delenv(DEEPDOC_XINFERENCE_API_KEY, raising=False)
+        monkeypatch.setenv("XINFERENCE_API_KEY", " shared-key ")
+        assert get_deepdoc_xinference_api_key() == "shared-key"
+
+    def test_api_key_blank_dedicated_var_falls_back(self, monkeypatch):
+        monkeypatch.setenv(DEEPDOC_XINFERENCE_API_KEY, "  ")
+        monkeypatch.setenv("XINFERENCE_API_KEY", "shared-key")
+        assert get_deepdoc_xinference_api_key() == "shared-key"
+
+    def test_api_key_unset_means_no_auth(self, monkeypatch):
+        monkeypatch.delenv(DEEPDOC_XINFERENCE_API_KEY, raising=False)
+        monkeypatch.delenv("XINFERENCE_API_KEY", raising=False)
+        assert get_deepdoc_xinference_api_key() is None
+
+    def test_timeout_default(self, monkeypatch):
+        monkeypatch.delenv(DEEPDOC_XINFERENCE_TIMEOUT_SECONDS, raising=False)
+        assert get_deepdoc_xinference_timeout_seconds() == 1800
+
+    def test_timeout_env_override(self, monkeypatch):
+        monkeypatch.setenv(DEEPDOC_XINFERENCE_TIMEOUT_SECONDS, "600")
+        assert get_deepdoc_xinference_timeout_seconds() == 600
+
+    @pytest.mark.parametrize("value", ["not-a-number", "", "0", "-1"])
+    def test_timeout_invalid_or_non_positive_falls_back(self, monkeypatch, value):
+        monkeypatch.setenv(DEEPDOC_XINFERENCE_TIMEOUT_SECONDS, value)
+        assert get_deepdoc_xinference_timeout_seconds() == 1800
+
+    def test_model_uid_defaults_to_the_family_name(self, monkeypatch):
+        monkeypatch.delenv(DEEPDOC_XINFERENCE_MODEL_UID, raising=False)
+        assert get_deepdoc_xinference_model_uid() == "DeepDoc"
+
+    def test_model_uid_env_override_is_trimmed(self, monkeypatch):
+        monkeypatch.setenv(DEEPDOC_XINFERENCE_MODEL_UID, "  deepdoc-gpu-1  ")
+        assert get_deepdoc_xinference_model_uid() == "deepdoc-gpu-1"
+
+    @pytest.mark.parametrize("value", ["", "   "])
+    def test_model_uid_blank_falls_back_to_the_default(self, monkeypatch, value):
+        monkeypatch.setenv(DEEPDOC_XINFERENCE_MODEL_UID, value)
+        assert get_deepdoc_xinference_model_uid() == "DeepDoc"
+
+    def test_username_unset_means_no_token_exchange(self, monkeypatch):
+        monkeypatch.delenv(DEEPDOC_XINFERENCE_USERNAME, raising=False)
+        assert get_deepdoc_xinference_username() is None
+
+    def test_username_is_trimmed(self, monkeypatch):
+        monkeypatch.setenv(DEEPDOC_XINFERENCE_USERNAME, "  admin  ")
+        assert get_deepdoc_xinference_username() == "admin"
+
+    @pytest.mark.parametrize("value", ["", "   "])
+    def test_username_blank_means_no_token_exchange(self, monkeypatch, value):
+        monkeypatch.setenv(DEEPDOC_XINFERENCE_USERNAME, value)
+        assert get_deepdoc_xinference_username() is None
+
+    def test_password_unset_means_no_token_exchange(self, monkeypatch):
+        monkeypatch.delenv(DEEPDOC_XINFERENCE_PASSWORD, raising=False)
+        assert get_deepdoc_xinference_password() is None
+
+    def test_password_blank_means_no_token_exchange(self, monkeypatch):
+        monkeypatch.setenv(DEEPDOC_XINFERENCE_PASSWORD, "")
+        assert get_deepdoc_xinference_password() is None
+
+    def test_password_preserves_surrounding_whitespace(self, monkeypatch):
+        """Whitespace can be significant in a secret, so it is not stripped."""
+        monkeypatch.setenv(DEEPDOC_XINFERENCE_PASSWORD, "  pa ss  ")
+        assert get_deepdoc_xinference_password() == "  pa ss  "
 
 
 class TestGetDefaultSqliteDbPath:
@@ -1747,6 +1900,31 @@ class TestLocalBrowserConfig:
 
         with pytest.raises(ValueError, match="must name a supported browser"):
             get_native_browser_app_name()
+
+
+class TestBrowserToolDefaultLocaleConfig:
+    """Fallback locale/timezone for browser_use (Playwright) sessions."""
+
+    def test_defaults(self, monkeypatch):
+        monkeypatch.delenv(config.BROWSER_TOOL_DEFAULT_LOCALE, raising=False)
+        monkeypatch.delenv(config.BROWSER_TOOL_DEFAULT_TIMEZONE, raising=False)
+
+        assert config.get_browser_tool_default_locale() == "en-US"
+        assert config.get_browser_tool_default_timezone() is None
+
+    def test_env_overrides(self, monkeypatch):
+        monkeypatch.setenv(config.BROWSER_TOOL_DEFAULT_LOCALE, "ja-JP")
+        monkeypatch.setenv(config.BROWSER_TOOL_DEFAULT_TIMEZONE, "Asia/Tokyo")
+
+        assert config.get_browser_tool_default_locale() == "ja-JP"
+        assert config.get_browser_tool_default_timezone() == "Asia/Tokyo"
+
+    def test_blank_values_fall_back(self, monkeypatch):
+        monkeypatch.setenv(config.BROWSER_TOOL_DEFAULT_LOCALE, "   ")
+        monkeypatch.setenv(config.BROWSER_TOOL_DEFAULT_TIMEZONE, "")
+
+        assert config.get_browser_tool_default_locale() == "en-US"
+        assert config.get_browser_tool_default_timezone() is None
 
 
 class TestCheckpointStorageConfig:
@@ -2354,3 +2532,39 @@ class TestCompactThresholdConfig:
 
         monkeypatch.setenv(COMPACT_THRESHOLD_DEFAULT, value)
         assert get_compact_threshold_default() == 32000
+
+
+class TestUrlUserinfoRejectionIsScopedToDeepDoc:
+    """Only the DeepDoc URL rejects embedded credentials.
+
+    The rejection guards a specific hazard: the remote client interpolates
+    ``httpx.HTTPStatusError`` — which renders the URL unredacted — into an
+    exception the caller logs. Putting the check inside the shared
+    ``_normalized_http_env_url`` would also apply it to
+    ``PUBLIC_API_BASE_URL``/``S2S_API_BASE_URL``, whose call sites do not catch
+    ``ValueError`` and depend on ``or``-chained fallbacks, so a pre-existing
+    (if ill-advised) config would start failing at runtime.
+    """
+
+    def test_deepdoc_url_rejects_credentials(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv(DEEPDOC_XINFERENCE_URL, "http://user:pw@gpu-host:9997")
+        with pytest.raises(ValueError, match="credentials embedded"):
+            get_deepdoc_xinference_url()
+
+    def test_deepdoc_url_without_credentials_is_accepted(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv(DEEPDOC_XINFERENCE_URL, "http://gpu-host:9997/base")
+        assert get_deepdoc_xinference_url() == "http://gpu-host:9997/base"
+
+    def test_shared_helper_consumers_keep_working(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The other consumers of the shared helper must be unaffected."""
+        monkeypatch.setenv(PUBLIC_API_BASE_URL, "http://user:pw@api.example.com")
+        monkeypatch.delenv(S2S_API_BASE_URL, raising=False)
+
+        assert get_public_api_base_url() == "http://user:pw@api.example.com"
+        assert get_s2s_api_base_url() == "http://user:pw@api.example.com"

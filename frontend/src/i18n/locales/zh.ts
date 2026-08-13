@@ -2072,6 +2072,7 @@ const zh = {
           title: "已选文件",
           empty: "未选择文件",
           clearAll: "清除全部",
+          limitReached: "每次最多可选择 {count} 个文件。",
         },
         select: {
           driveLabel: "选择硬盘",

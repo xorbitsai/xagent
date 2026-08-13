@@ -197,6 +197,12 @@ export async function parseApiResponse(response: Response): Promise<ParsedApiRes
 export const UPLOAD_ERROR_MESSAGES = { tooLarge: "File is too large. Please reduce the upload size and try again.", proxy: "Upload failed before reaching the application. Please check the server upload limit." }
 export function getUploadErrorMessage(response: Response, parsed: ParsedApiResponse, messages: { generic: string; tooLarge: string; proxy: string }): string {
   if (isJsonRecord(parsed.data) && typeof parsed.data.detail === "string" && parsed.data.detail.trim()) return parsed.data.detail
+  if (isJsonRecord(parsed.data) && Array.isArray(parsed.data.detail)) {
+    const validationMessages = parsed.data.detail
+      .map(item => isJsonRecord(item) && typeof item.msg === "string" ? item.msg.trim() : "")
+      .filter(Boolean)
+    if (validationMessages.length) return validationMessages.join("; ")
+  }
   if (isJsonRecord(parsed.data) && typeof parsed.data.message === "string" && parsed.data.message.trim()) return parsed.data.message
   if (response.status === 413) return messages.tooLarge
   if (parsed.isHtml) return messages.proxy

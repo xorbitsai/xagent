@@ -36,6 +36,7 @@ from ...config import (
     get_gmail_pubsub_topic_prefix,
     get_gmail_pubsub_transport,
     get_gmail_registration_timeout_seconds,
+    get_gmail_watch_enabled,
 )
 from ..models.gmail_watch import GmailWatchState
 from ..models.trigger import (
@@ -44,6 +45,7 @@ from ..models.trigger import (
     TriggerType,
 )
 from ..models.user_oauth import UserOAuth
+from .time_utils import coerce_utc as _coerce_utc
 
 logger = logging.getLogger(__name__)
 
@@ -59,6 +61,24 @@ _LOCAL_GMAIL_WATCH_TRANSITION_LOCK = threading.RLock()
 
 PublisherFactory = Callable[[], Any]
 SubscriberFactory = Callable[[], Any]
+
+GMAIL_WATCH_DISABLED_ERROR = (
+    "Gmail watch registration is disabled "
+    "(set XAGENT_GMAIL_WATCH_ENABLED=true to enable)"
+)
+
+
+def gmail_watch_disabled_error() -> str:
+    """Trigger-facing disabled message, extended with the project-id
+    prerequisite when that is also missing (default deployments would
+    otherwise discover the two requirements one error at a time)."""
+    if get_gmail_pubsub_project_id():
+        return GMAIL_WATCH_DISABLED_ERROR
+    return (
+        "Gmail watch registration is disabled "
+        "(set XAGENT_GMAIL_WATCH_ENABLED=true and "
+        "XAGENT_GMAIL_PUBSUB_PROJECT_ID to enable)"
+    )
 
 
 class GmailProvisioningError(RuntimeError):
@@ -156,6 +176,61 @@ def _now() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def _trigger_facing_status(state: GmailWatchState) -> tuple[str, str | None]:
+    """Derive the status a trigger should report from its mailbox watch state.
+
+    Four derivations beyond a plain pass-through of the stored status and
+    last_error:
+
+    - An ``active`` row whose ``watch_expiration`` has passed is reported as
+      failed: Gmail has already dropped the watch, so the row only looks
+      healthy while nothing is delivered.
+    - An ``active`` row with no recorded expiration is reported as failed too
+      while ``XAGENT_GMAIL_WATCH_ENABLED`` is off: with the flag on the
+      renewal scan treats a null expiration as due and renews it imminently,
+      so it is only a problem when nothing will ever renew it.
+    - With the flag off, a ``pending`` row is reported as failed — the sweep
+      that would converge it is gated by the same flag, so it never
+      resolves.
+    - A row already stored as ``failed`` keeps its status, but while the flag
+      is off its error is annotated to note that automatic retry is disabled
+      too, distinguishing it from a failure the sweep would otherwise retry.
+
+    Both ``provision_gmail_trigger`` and the reconcile paths derive through
+    this one helper so the reported status cannot flap between them.
+    """
+    status = str(state.status or TriggerProvisioningStatus.PENDING.value)
+    last_error = getattr(state, "last_error", None)
+    error = str(last_error) if last_error else None
+    watch_enabled = get_gmail_watch_enabled()
+    if status == TriggerProvisioningStatus.ACTIVE.value:
+        expiration = _coerce_utc(getattr(state, "watch_expiration", None))
+        if expiration is not None and expiration <= _now():
+            status = TriggerProvisioningStatus.FAILED.value
+            error = (
+                f"Gmail watch expired at {expiration.isoformat()} and was not renewed"
+            )
+        elif expiration is None and not watch_enabled:
+            status = TriggerProvisioningStatus.FAILED.value
+            error = (
+                "Gmail watch has no recorded expiration and cannot be renewed "
+                "while watch registration is disabled "
+                "(set XAGENT_GMAIL_WATCH_ENABLED=true to enable)"
+            )
+    elif status == TriggerProvisioningStatus.PENDING.value and not watch_enabled:
+        status = TriggerProvisioningStatus.FAILED.value
+        error = error or gmail_watch_disabled_error()
+    elif status == TriggerProvisioningStatus.FAILED.value and not watch_enabled:
+        if not error:
+            error = gmail_watch_disabled_error()
+        elif "XAGENT_GMAIL_WATCH_ENABLED" not in error:
+            error = (
+                f"{error} (automatic retry is disabled; "
+                "set XAGENT_GMAIL_WATCH_ENABLED=true to enable)"
+            )
+    return status, error
+
+
 def mailbox_slug(email: str) -> str:
     """Deterministic, resource-name-safe identifier for one mailbox."""
     return hashlib.sha256(email.strip().lower().encode("utf-8")).hexdigest()[:16]
@@ -231,6 +306,19 @@ def _validate_provisioning_config() -> tuple[str, str, str]:
     return project_id, base_url, push_service_account
 
 
+def _coerce_oauth_account_id(value: Any) -> int | None:
+    """Tolerantly coerce a stored ``oauth_account_id`` value to an int.
+
+    ``None`` maps to ``None``; anything int-coercible maps to that int;
+    anything else (a malformed config value) also maps to ``None`` rather
+    than raising.
+    """
+    try:
+        return int(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
 def _referenced_gmail_oauth_account_ids(
     db: Session,
     accounts: Sequence[tuple[int, str]],
@@ -275,13 +363,7 @@ def _referenced_gmail_oauth_account_ids(
     referenced: set[int] = set()
     for raw_config, raw_resource_id in candidate_rows:
         config = raw_config if isinstance(raw_config, dict) else {}
-        raw_account_id = config.get("oauth_account_id")
-        try:
-            bound_account_id = (
-                int(raw_account_id) if raw_account_id is not None else None
-            )
-        except (TypeError, ValueError):
-            bound_account_id = None
+        bound_account_id = _coerce_oauth_account_id(config.get("oauth_account_id"))
         if bound_account_id in account_ids:
             referenced.add(bound_account_id)
             continue
@@ -831,6 +913,22 @@ def _ensure_gmail_mailbox_provisioned_locked(
     if not email:
         raise GmailProvisioningError("Gmail account email is required")
 
+    if not get_gmail_watch_enabled():
+        # Defense in depth: every production caller of this function already
+        # checks the flag before reaching here (provision_gmail_trigger,
+        # sweep_gmail_provisioning, best_effort_provision_gmail_watches_for_user,
+        # _renew_watch_for_account), so this only fires for a future ungated
+        # caller. Converging to a failed watch state here preserves this
+        # function's "never raises" contract instead of leaking the disabled
+        # condition as an exception.
+        state = _get_or_create_watch_state(db, oauth_account, email)
+        setattr(state, "status", TriggerProvisioningStatus.FAILED.value)
+        setattr(state, "last_error", GMAIL_WATCH_DISABLED_ERROR)
+        db.add(state)
+        db.commit()
+        db.refresh(state)
+        return state
+
     state = _get_or_create_watch_state(db, oauth_account, email)
     state_id = int(state.id)
     try:
@@ -917,6 +1015,13 @@ def provision_gmail_trigger(
     registration timeout. When the cloud side is slow, the API observes a
     pending state while the thread converges to active or failed on its own.
     Returns the trigger provisioning status.
+
+    With ``XAGENT_GMAIL_WATCH_ENABLED`` off no watch is registered: the
+    renewal scan that keeps watches alive is gated by the same flag, so a
+    watch created here would silently expire. The trigger reports failed
+    with an explicit disabled error instead of a healthy-looking state,
+    unless the mailbox still has a watch state row from when the flag was
+    on, in which case its derived status is reported.
     """
     config: dict[str, Any] = trigger.config if isinstance(trigger.config, dict) else {}
     oauth_account_id = config.get("oauth_account_id")
@@ -928,6 +1033,24 @@ def provision_gmail_trigger(
         )
         db.add(trigger)
         db.commit()
+        return status
+
+    if not get_gmail_watch_enabled():
+        state = (
+            db.query(GmailWatchState)
+            .filter(GmailWatchState.oauth_account_id == int(oauth_account_id))
+            .first()
+        )
+        if state is None:
+            status = TriggerProvisioningStatus.FAILED.value
+            error: str | None = gmail_watch_disabled_error()
+        else:
+            status, error = _trigger_facing_status(state)
+        setattr(trigger, "provisioning_status", status)
+        setattr(trigger, "provisioning_error", error)
+        db.add(trigger)
+        db.commit()
+        db.refresh(trigger)
         return status
 
     timeout = (
@@ -959,11 +1082,9 @@ def provision_gmail_trigger(
     )
     if thread.is_alive() or state is None:
         status = TriggerProvisioningStatus.PENDING.value
-        error: str | None = None
+        error = None
     else:
-        status = str(state.status or TriggerProvisioningStatus.PENDING.value)
-        last_error = getattr(state, "last_error", None)
-        error = str(last_error) if last_error else None
+        status, error = _trigger_facing_status(state)
     setattr(trigger, "provisioning_status", status)
     setattr(trigger, "provisioning_error", error)
     db.add(trigger)
@@ -1028,19 +1149,53 @@ def reconcile_gmail_trigger_provisioning(
             return updated
 
 
+def _bound_gmail_oauth_account_id(trigger: AgentTrigger) -> int | None:
+    """Read a trigger's bound OAuth account id, tolerating malformed configs.
+
+    Mirrors the coercion in ``_referenced_gmail_oauth_account_ids``: any
+    value that is present but not int-coercible is treated the same as a
+    missing binding rather than raising.
+    """
+    config: dict[str, Any] = trigger.config if isinstance(trigger.config, dict) else {}
+    return _coerce_oauth_account_id(config.get("oauth_account_id"))
+
+
 def _reconcile_gmail_trigger_batch(
     db: Session, candidates: Sequence[AgentTrigger]
 ) -> int:
-    """Copy diverged watch-state status onto one bounded candidate batch."""
+    """Copy diverged watch-state status onto one bounded candidate batch.
+
+    Looks up each trigger's watch state by its bound OAuth account id
+    (``config.oauth_account_id``) when one is present and valid, falling back
+    to the legacy ``(user_id, resource_id-email)`` key only for legacy or
+    malformed configs that carry no usable binding. This mirrors
+    ``_referenced_gmail_oauth_account_ids``'s precedence: a trigger's
+    ``resource_id`` mailbox email can go stale (the connected Google account
+    changed email and a reconnect refreshed ``GmailWatchState.email``), and
+    matching by the durable account id instead of the stale email avoids a
+    spurious miss that would otherwise clobber an active trigger to
+    failed/disabled once the flag-off None-state behavior below kicks in.
+    """
     if not candidates:
         return 0
 
-    emails = {str(trigger.resource_id).strip().lower() for trigger in candidates}
-    states = (
-        db.query(GmailWatchState)
-        .filter(func.lower(GmailWatchState.email).in_(emails))
-        .all()
-    )
+    account_ids: set[int] = set()
+    emails: set[str] = set()
+    for trigger in candidates:
+        bound_account_id = _bound_gmail_oauth_account_id(trigger)
+        if bound_account_id is not None:
+            account_ids.add(bound_account_id)
+        else:
+            emails.add(str(trigger.resource_id).strip().lower())
+
+    filters = []
+    if account_ids:
+        filters.append(GmailWatchState.oauth_account_id.in_(account_ids))
+    if emails:
+        filters.append(func.lower(GmailWatchState.email).in_(emails))
+    states = db.query(GmailWatchState).filter(or_(*filters)).all() if filters else []
+
+    states_by_account_id = {int(state.oauth_account_id): state for state in states}
     states_by_key = {
         (int(state.user_id), str(state.email or "").strip().lower()): state
         for state in states
@@ -1048,13 +1203,20 @@ def _reconcile_gmail_trigger_batch(
 
     updated = 0
     for trigger in candidates:
-        key = (int(trigger.user_id), str(trigger.resource_id).strip().lower())
-        state = states_by_key.get(key)
+        bound_account_id = _bound_gmail_oauth_account_id(trigger)
+        if bound_account_id is not None:
+            state = states_by_account_id.get(bound_account_id)
+        else:
+            key = (int(trigger.user_id), str(trigger.resource_id).strip().lower())
+            state = states_by_key.get(key)
+        error: str | None
         if state is None:
-            continue
-        status = str(state.status or TriggerProvisioningStatus.PENDING.value)
-        last_error = getattr(state, "last_error", None)
-        error = str(last_error) if last_error else None
+            if get_gmail_watch_enabled():
+                continue
+            status = TriggerProvisioningStatus.FAILED.value
+            error = gmail_watch_disabled_error()
+        else:
+            status, error = _trigger_facing_status(state)
         if (
             str(trigger.provisioning_status or "") == status
             and (trigger.provisioning_error or None) == error
@@ -1160,8 +1322,17 @@ def sweep_gmail_provisioning(
     """Retry stale pending and failed Gmail registrations.
 
     Only mailboxes still referenced by an enabled Gmail trigger are retried.
-    Returns the number of registration attempts.
+    Returns the number of registration attempts. Registration retries are
+    gated on ``XAGENT_GMAIL_WATCH_ENABLED`` (like the renewal scan), so this
+    function re-registers nothing while the feature is switched off.
+    Trigger-status reconciliation runs either way, though: it does not touch
+    the cloud, and skipping it while disabled would leave disabled/expired
+    statuses frozen instead of observable through the trigger API.
     """
+    if not get_gmail_watch_enabled():
+        reconcile_gmail_trigger_provisioning(db, batch_size=max(1, min(limit, 500)))
+        return 0
+
     scan_time = now or _now()
     stale_before = scan_time - timedelta(seconds=stale_pending_seconds)
     candidates = (
@@ -1223,21 +1394,29 @@ def best_effort_provision_gmail_watches_for_user(
 
     Rolls back ``db`` on failure, so callers must not hold uncommitted work on
     that session across this call.
+
+    Gated on ``XAGENT_GMAIL_WATCH_ENABLED``: with the flag off nothing renews
+    a watch, so registering one here would leave it to expire silently.
     """
+    if not get_gmail_watch_enabled():
+        logger.debug(
+            "Gmail watch registration is disabled; skipping provisioning "
+            "for user %s %s",
+            user_id,
+            context,
+        )
+        return
+
     # The account lookup and the binding resolution are inside the guard, not
     # just the per-account loop: the caller runs this after committing the
     # OAuth token, so a raise here would turn an already-successful connect
     # into an error page.
     #
-    # A mailbox missed here has no automatic retry under the default
-    # configuration. ``XAGENT_GMAIL_WATCH_ENABLED`` defaults to false and gates
-    # both ``scan_due_gmail_watch_renewals`` and ``sweep_gmail_provisioning``;
-    # only with it set does the former recover this case, by selecting Gmail
-    # accounts that back an enabled Gmail trigger and have no watch state row.
-    # (``sweep_gmail_provisioning`` never covers it either way: it only retries
-    # mailboxes that already have such a row.) Otherwise the mailbox stays
-    # unprovisioned until its trigger is next saved, which re-enters
-    # provisioning through ``GmailTriggerProvider.register``.
+    # A mailbox missed here is recovered by ``scan_due_gmail_watch_renewals``,
+    # which selects Gmail accounts that back an enabled Gmail trigger and have
+    # no watch state row. (``sweep_gmail_provisioning`` never covers it: it
+    # only retries mailboxes that already have such a row.) Both scans and
+    # this function share the ``XAGENT_GMAIL_WATCH_ENABLED`` gate.
     try:
         accounts = (
             db.query(UserOAuth)

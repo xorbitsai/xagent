@@ -231,6 +231,95 @@ def test_meta_login_uses_comma_separated_canonical_scopes_for_builtin_app(
     ]
 
 
+def test_hubspot_login_sends_tier_gated_scopes_as_optional(db_session):
+    """business-intelligence, marketing-email, and marketing.campaigns.read
+    are all gated on a Marketing Hub tier above Free/CRM-only - requesting
+    any of them as required scopes would block the whole authorization for
+    portals below that tier. They must arrive via optional_scope, not
+    merged into the required scope param."""
+    db, user = db_session
+    token = _token_for(user)
+    db.add(
+        PublicMCPApp(
+            app_id="hubspot",
+            name="HubSpot",
+            description="HubSpot connector",
+            transport="oauth",
+            provider_name="hubspot",
+            category="CRM",
+            oauth_scopes=["crm.objects.contacts.read"],
+            is_visible_in_connector=True,
+            launch_config={},
+        )
+    )
+    db.commit()
+
+    provider = _provider(
+        auth_url="https://app.hubspot.com/oauth/authorize",
+        default_scopes=["oauth"],
+        redirect_uri="https://app.example.com/api/auth/hubspot/callback",
+    )
+
+    resp = generic_oauth_login(
+        provider="hubspot",
+        token=token,
+        app_id="hubspot",
+        redirect=None,
+        db=db,
+        db_provider=provider,
+    )
+    qs = parse_qs(urlparse(_location(resp)).query)
+
+    assert "business-intelligence" not in qs["scope"][0]
+    assert "marketing-email" not in qs["scope"][0]
+    assert "marketing.campaigns.read" not in qs["scope"][0]
+    assert qs["optional_scope"] == [
+        "business-intelligence marketing-email marketing.campaigns.read"
+    ]
+
+
+def test_non_hubspot_app_sends_no_optional_scope_param(db_session, monkeypatch):
+    """optional_oauth_scopes is a HubSpot-specific registry field today; a
+    builtin app that doesn't set it must not get a stray optional_scope
+    param on a provider whose authorize endpoint doesn't expect one."""
+    db, user = db_session
+    token = _token_for(user)
+    monkeypatch.delenv("META_CONFIG_ID", raising=False)
+    monkeypatch.delenv("META_LOGIN_CONFIG_ID", raising=False)
+    db.add(
+        PublicMCPApp(
+            app_id="facebook",
+            name="Facebook Pages",
+            description="Facebook connector",
+            transport="oauth",
+            provider_name="meta",
+            category="Marketing",
+            oauth_scopes=["pages_show_list"],
+            is_visible_in_connector=True,
+            launch_config={},
+        )
+    )
+    db.commit()
+
+    provider = _provider(
+        auth_url="https://www.facebook.com/v25.0/dialog/oauth",
+        default_scopes=["public_profile"],
+        redirect_uri="https://app.example.com/api/auth/meta/callback",
+    )
+
+    resp = generic_oauth_login(
+        provider="meta",
+        token=token,
+        app_id="facebook",
+        redirect=None,
+        db=db,
+        db_provider=provider,
+    )
+    qs = parse_qs(urlparse(_location(resp)).query)
+
+    assert "optional_scope" not in qs
+
+
 def test_meta_login_uses_config_id_without_scope_when_configured(
     db_session, monkeypatch
 ):
@@ -270,6 +359,68 @@ def test_meta_login_uses_config_id_without_scope_when_configured(
 
     assert qs["config_id"] == ["1234567890"]
     assert "scope" not in qs
+    assert "optional_scope" not in qs
+
+
+def test_meta_login_suppresses_optional_scope_under_config_id(db_session, monkeypatch):
+    """config_id mode discards the registry's scope list entirely (the Meta
+    Login Configuration is the sole source of truth) - optional_scope must
+    be suppressed the same way scope already is, even for an app that DOES
+    declare optional_oauth_scopes. No builtin meta-provider app declares
+    optional_oauth_scopes today, so the registry lookup is patched to
+    simulate one rather than asserting a coincidence of current data."""
+    import xagent.web.mcp_apps as mcp_apps_module
+    from xagent.web.builtin_mcp_registry import (
+        get_builtin_execution_fields_and_optional_scopes,
+    )
+
+    def fake_lookup(app_id):
+        execution_fields, _ = get_builtin_execution_fields_and_optional_scopes(app_id)
+        optional_scopes = ["some_tier_gated_scope"] if app_id == "facebook" else []
+        return execution_fields, optional_scopes
+
+    db, user = db_session
+    token = _token_for(user)
+    monkeypatch.setenv("META_CONFIG_ID", "1234567890")
+    monkeypatch.setattr(
+        mcp_apps_module,
+        "get_builtin_execution_fields_and_optional_scopes",
+        fake_lookup,
+    )
+    db.add(
+        PublicMCPApp(
+            app_id="facebook",
+            name="Facebook Pages",
+            description="Facebook connector",
+            transport="oauth",
+            provider_name="meta",
+            category="Marketing",
+            oauth_scopes=["pages_show_list"],
+            is_visible_in_connector=True,
+            launch_config={},
+        )
+    )
+    db.commit()
+
+    provider = _provider(
+        auth_url="https://www.facebook.com/v25.0/dialog/oauth",
+        default_scopes=["public_profile"],
+        redirect_uri="https://app.example.com/api/auth/meta/callback",
+    )
+
+    resp = generic_oauth_login(
+        provider="meta",
+        token=token,
+        app_id="facebook",
+        redirect=None,
+        db=db,
+        db_provider=provider,
+    )
+    qs = parse_qs(urlparse(_location(resp)).query)
+
+    assert qs["config_id"] == ["1234567890"]
+    assert "scope" not in qs
+    assert "optional_scope" not in qs
 
 
 def test_meta_login_uses_config_id_without_scope_for_facebook(db_session, monkeypatch):
@@ -321,6 +472,7 @@ def test_meta_login_uses_config_id_without_scope_for_facebook(db_session, monkey
 
     assert qs["config_id"] == ["1234567890"]
     assert "scope" not in qs
+    assert "optional_scope" not in qs
 
 
 def test_meta_login_ignores_undocumented_legacy_config_id_alias(

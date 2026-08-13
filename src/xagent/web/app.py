@@ -1145,9 +1145,11 @@ async def startup_event() -> None:
 
     from .services.trigger_providers.gmail import (
         warn_if_gmail_oidc_verification_degraded,
+        warn_if_gmail_watch_registration_degraded,
     )
 
     warn_if_gmail_oidc_verification_degraded()
+    warn_if_gmail_watch_registration_degraded()
 
     initialize_langfuse()
 

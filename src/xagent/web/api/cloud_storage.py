@@ -209,7 +209,10 @@ async def list_google_drive_files(
             .list(
                 q=query,
                 pageSize=100,
-                fields="nextPageToken, files(id, name, mimeType, size, modifiedTime)",
+                fields=(
+                    "nextPageToken, "
+                    "files(id, name, mimeType, size, modifiedTime, resourceKey)"
+                ),
                 orderBy="folder,name",
                 supportsAllDrives=supports_all_drives,
                 includeItemsFromAllDrives=include_items_from_all_drives,
@@ -255,6 +258,7 @@ async def list_google_drive_files(
                     "size": size_str,
                     "updatedAt": updated_at,
                     "mimeType": mime_type,  # Optional, helpful for debugging
+                    "resourceKey": file.get("resourceKey"),
                 }
             )
 

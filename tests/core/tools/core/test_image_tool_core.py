@@ -223,7 +223,8 @@ class TestImageGenerationToolCore:
         result = await tool.generate_image("A test prompt")
 
         assert result["success"] is False
-        assert result["error"] == "No available image models configured"
+        assert "No available image models with generate capabilities" in result["error"]
+        assert "Configured image models:" in result["error"]
         assert result["image_path"] is None
 
     @pytest.mark.asyncio

@@ -51,6 +51,7 @@ from .task_orchestrator import (
     TaskTurnPayload,
     TurnKind,
 )
+from .time_utils import coerce_utc as _coerce_utc
 from .trigger_providers.base import TriggerConfigError
 from .trigger_providers.registry import maybe_get_trigger_provider
 from .trigger_providers.schemas import (
@@ -114,14 +115,6 @@ class _PreparedTriggerStart:
 
 def _now() -> datetime:
     return datetime.now(timezone.utc)
-
-
-def _coerce_utc(value: datetime | None) -> datetime | None:
-    if value is None:
-        return None
-    if value.tzinfo is None:
-        return value.replace(tzinfo=timezone.utc)
-    return value.astimezone(timezone.utc)
 
 
 def _json_dumps(value: Any) -> str:

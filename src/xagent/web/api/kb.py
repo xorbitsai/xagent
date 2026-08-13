@@ -4,6 +4,7 @@ import asyncio
 import functools
 import hashlib
 import inspect
+import io
 import json
 import logging
 import mimetypes
@@ -46,7 +47,10 @@ from googleapiclient.http import MediaIoBaseDownload  # type: ignore
 from pydantic import BaseModel, Field, ValidationError
 from sqlalchemy.orm import Session
 
-from ...config import get_kb_collections_timeout_seconds
+from ...config import (
+    get_google_drive_download_timeout_seconds,
+    get_kb_collections_timeout_seconds,
+)
 from ...core.file_storage.keys import build_upload_storage_key
 from ...core.tools.core.RAG_tools.core.config import DEFAULT_VECTOR_STORE_SCAN_LIMIT
 from ...core.tools.core.RAG_tools.core.parser_registry import (
@@ -113,6 +117,7 @@ from ..services.background_jobs import (
     is_background_job_enqueue_available,
     mark_job_failed,
 )
+from ..services.google_drive_download import download_google_workspace_file
 from ..services.kb_collection_service import (
     delete_collection_physical_dir,
     delete_collection_uploaded_files,
@@ -174,6 +179,12 @@ from .cloud_storage import get_google_credentials
 
 T = TypeVar("T", bound=Callable[..., Any])
 logger = logging.getLogger(__name__)
+
+_GOOGLE_SLIDES_MIME_TYPE = "application/vnd.google-apps.presentation"
+_GOOGLE_DRIVE_SHORTCUT_MIME_TYPE = "application/vnd.google-apps.shortcut"
+_POWERPOINT_EXPORT_MIME_TYPE = (
+    "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+)
 
 
 def _create_file_compensation_delete(
@@ -649,6 +660,24 @@ _BACKGROUND_INGEST_STAGING_DIR = ".background-ingest"
 class UploadCopyResult:
     total_size: int
     sha256: str
+
+
+class _LimitedWriter(io.BufferedWriter):
+    """Reject a write before a cloud download can exceed its byte limit."""
+
+    def __init__(self, raw: io.FileIO, *, max_bytes: int) -> None:
+        super().__init__(raw)
+        self._max_bytes = max_bytes
+        self._written = 0
+
+    def write(self, data: Any) -> int:
+        if self._written + len(data) > self._max_bytes:
+            raise ValueError(
+                f"File size exceeds maximum limit of {MAX_FILE_SIZE_LABEL}"
+            )
+        written = super().write(data)
+        self._written += written
+        return written
 
 
 def _like_contains_pattern(value: str) -> str:
@@ -3349,13 +3378,15 @@ def _effective_knowledge_base_user(
 
 class CloudFile(BaseModel):
     provider: str
-    fileId: str
+    fileId: str = Field(pattern=r"^[^\r\n]*$")
     fileName: str
+    resourceKey: Optional[str] = Field(default=None, pattern=r"^[^\r\n]*$")
 
 
 class CloudIngestRequest(BaseModel):
-    # An empty batch ingests nothing, so it must not reach the handler at all.
-    files: List[CloudFile] = Field(..., min_length=1)
+    # Reject empty work and keep each request within one five-file concurrency
+    # wave so Drive polling cannot add a second full timeout interval.
+    files: List[CloudFile] = Field(..., min_length=1, max_length=5)
     collection: str
     parse_method: Optional[ParseMethod] = None
     chunk_strategy: Optional[ChunkStrategy] = None
@@ -3382,6 +3413,10 @@ class CollectionConfigSaveError(RuntimeError):
     def __init__(self, message: str, *, file_id: Optional[str] = None) -> None:
         super().__init__(message if not file_id else f"{message} (file_id: {file_id})")
         self.file_id = file_id
+
+
+class GoogleDriveMetadataValidationError(ValueError):
+    """Report a client-safe validation failure in trusted Drive metadata fields."""
 
 
 async def _maybe_await(value: Any) -> Any:
@@ -3556,12 +3591,17 @@ async def _save_collection_config_after_ingest(
 
 
 def _build_cloud_storage_filename(original_filename: str, file_id: str) -> str:
-    """Generate a collision-resistant local filename for cloud ingests."""
+    """Generate a collision-resistant filename within filesystem byte limits."""
     original_path = Path(original_filename)
     suffix = original_path.suffix
-    stem = original_path.stem or "cloud-file"
     digest = hashlib.sha256(file_id.encode("utf-8")).hexdigest()[:12]
-    return f"{stem}__{digest}{suffix}"
+    trailer = f"__{digest}{suffix}"
+    max_stem_bytes = _MAX_FILESYSTEM_FILENAME_BYTES - len(trailer.encode("utf-8"))
+    stem = _truncate_utf8_bytes(
+        original_path.stem or "cloud-file",
+        max_stem_bytes,
+    )
+    return f"{stem}{trailer}"
 
 
 def _raise_if_list_collections_failed(
@@ -4608,7 +4648,137 @@ async def ingest_cloud(
             file_backup_path: Optional[Path] = None
             had_existing_file = False
             uploaded_file_existed_before = False
-            safe_filename = Path(file_info.fileName).name
+            source_filename = Path(file_info.fileName).name
+            safe_filename = source_filename
+            stored_mime_type = (
+                mimetypes.guess_type(safe_filename)[0] or "application/octet-stream"
+            )
+            is_native_google_slides = False
+            service: Any = None
+            creds: Any = None
+            drive_request_headers: dict[str, str] = {}
+
+            if file_info.provider == "google-drive":
+                if file_info.resourceKey:
+                    drive_request_headers["X-Goog-Drive-Resource-Keys"] = (
+                        f"{file_info.fileId}/{file_info.resourceKey}"
+                    )
+                try:
+                    creds = await asyncio.to_thread(
+                        get_google_credentials, int(actor_user.id), db
+                    )
+                except HTTPException as e:
+                    return KBApiOperationResult(
+                        result=IngestionResult(
+                            status="error",
+                            message=f"Authentication error: {e.detail}",
+                            doc_id=source_filename,
+                        )
+                    )
+
+                try:
+                    service = await asyncio.to_thread(
+                        build,
+                        "drive",
+                        "v3",
+                        credentials=creds,
+                        cache_discovery=False,
+                    )
+
+                    def _get_file_metadata() -> dict[str, Any]:
+                        """Read current metadata before deriving the local file format."""
+                        metadata_request = service.files().get(
+                            fileId=file_info.fileId,
+                            fields="id,name,mimeType,size",
+                            supportsAllDrives=True,
+                        )
+                        if drive_request_headers:
+                            metadata_request.headers.update(drive_request_headers)
+                        return cast(
+                            dict[str, Any], metadata_request.execute(num_retries=3)
+                        )
+
+                    metadata = await asyncio.to_thread(_get_file_metadata)
+                    metadata_name = metadata.get("name")
+                    metadata_mime_type = metadata.get("mimeType")
+                    metadata_size = metadata.get("size")
+                    if metadata_name:
+                        source_filename = Path(str(metadata_name)).name
+                    if metadata_mime_type == _GOOGLE_DRIVE_SHORTCUT_MIME_TYPE:
+                        raise GoogleDriveMetadataValidationError(
+                            "Google Drive shortcuts are not supported"
+                        )
+                    if (
+                        not metadata_name
+                        or not metadata_mime_type
+                        or metadata_size is None
+                    ):
+                        raise GoogleDriveMetadataValidationError(
+                            "Google Drive returned incomplete file metadata"
+                        )
+
+                    if not source_filename:
+                        raise GoogleDriveMetadataValidationError(
+                            "Google Drive returned an invalid file name"
+                        )
+                    try:
+                        file_size = int(str(metadata_size))
+                    except (TypeError, ValueError) as exc:
+                        raise GoogleDriveMetadataValidationError(
+                            "Google Drive returned an invalid file size"
+                        ) from exc
+                    drive_mime_type = str(metadata_mime_type)
+                    is_native_google_slides = (
+                        drive_mime_type == _GOOGLE_SLIDES_MIME_TYPE
+                    )
+                    # Drive reports the native editor-file size here, not the
+                    # generated PPTX size. The export stream enforces its own
+                    # byte limit while it is written.
+                    if not is_native_google_slides and file_size > MAX_FILE_SIZE:
+                        return KBApiOperationResult(
+                            result=IngestionResult(
+                                status="error",
+                                message=(
+                                    "File size exceeds maximum limit of "
+                                    f"{MAX_FILE_SIZE_LABEL}"
+                                ),
+                                doc_id=source_filename,
+                            )
+                        )
+
+                    safe_filename = source_filename
+                    if is_native_google_slides and not safe_filename.lower().endswith(
+                        ".pptx"
+                    ):
+                        safe_filename = f"{safe_filename}.pptx"
+                    stored_mime_type = (
+                        _POWERPOINT_EXPORT_MIME_TYPE
+                        if is_native_google_slides
+                        else drive_mime_type
+                    )
+                except GoogleDriveMetadataValidationError as e:
+                    return KBApiOperationResult(
+                        result=IngestionResult(
+                            status="error",
+                            message=f"Metadata lookup failed: {e}",
+                            doc_id=source_filename or file_info.fileId,
+                        )
+                    )
+                except Exception:
+                    logger.warning(
+                        "Google Drive metadata lookup failed for file_id=%s user_id=%s",
+                        file_info.fileId,
+                        int(actor_user.id),
+                        exc_info=True,
+                    )
+                    return KBApiOperationResult(
+                        result=IngestionResult(
+                            status="error",
+                            message="Google Drive metadata lookup failed",
+                            doc_id=source_filename or file_info.fileId,
+                        )
+                    )
+
             storage_filename = _build_cloud_storage_filename(
                 safe_filename,
                 file_info.fileId,
@@ -4625,30 +4795,11 @@ async def ingest_cloud(
                     result=IngestionResult(
                         status="error",
                         message=ve.detail,
-                        doc_id=file_info.fileName,
+                        doc_id=source_filename,
                     )
                 )
             try:
                 if file_info.provider == "google-drive":
-                    # Get credentials (run in thread to avoid blocking)
-                    try:
-                        creds = await asyncio.to_thread(
-                            get_google_credentials, int(actor_user.id), db
-                        )
-                    except HTTPException as e:
-                        return KBApiOperationResult(
-                            result=IngestionResult(
-                                status="error",
-                                message=f"Authentication error: {e.detail}",
-                                doc_id=file_info.fileName,
-                            )
-                        )
-
-                    # Build service (blocking)
-                    service = await asyncio.to_thread(
-                        build, "drive", "v3", credentials=creds, cache_discovery=False
-                    )
-
                     # Save to local path
                     had_existing_file = file_path.exists()
                     if had_existing_file:
@@ -4661,23 +4812,60 @@ async def ingest_cloud(
                     try:
 
                         def _download_file() -> None:
-                            request_file = service.files().get_media(
-                                fileId=file_info.fileId
-                            )
-                            with open(file_path, "wb") as fh:
-                                downloader = MediaIoBaseDownload(fh, request_file)
-                                done = False
-                                while done is False:
-                                    status, done = downloader.next_chunk()
+                            if is_native_google_slides:
+                                download_google_workspace_file(
+                                    service=service,
+                                    credentials=creds,
+                                    file_id=file_info.fileId,
+                                    mime_type=_POWERPOINT_EXPORT_MIME_TYPE,
+                                    destination=file_path,
+                                    timeout_seconds=get_google_drive_download_timeout_seconds(),
+                                    resource_key=file_info.resourceKey,
+                                    max_bytes=MAX_FILE_SIZE,
+                                )
+                                return
 
+                            request_file = service.files().get_media(
+                                fileId=file_info.fileId,
+                                supportsAllDrives=True,
+                            )
+                            if drive_request_headers:
+                                request_file.headers.update(drive_request_headers)
+                            with open(file_path, "wb", buffering=0) as raw_file:
+                                with _LimitedWriter(
+                                    raw_file,
+                                    max_bytes=MAX_FILE_SIZE,
+                                ) as output_file:
+                                    downloader = MediaIoBaseDownload(
+                                        output_file,
+                                        request_file,
+                                    )
+                                    done = False
+                                    while done is False:
+                                        _status, done = downloader.next_chunk()
+
+                        if is_native_google_slides:
+                            logger.info(
+                                "Downloading native Google Slides file_id=%s user_id=%s mime_type=%s",
+                                file_info.fileId,
+                                int(actor_user.id),
+                                _POWERPOINT_EXPORT_MIME_TYPE,
+                            )
                         await asyncio.to_thread(_download_file)
 
                     except Exception as e:
+                        logger.warning(
+                            "Google Drive download failed for file_id=%s user_id=%s: %s",
+                            file_info.fileId,
+                            int(actor_user.id),
+                            e,
+                            exc_info=True,
+                        )
                         rollback_api_result = KBApiOperationResult(
                             result=IngestionResult(
                                 status="error",
                                 message=f"Download failed: {str(e)}",
-                                doc_id=file_info.fileName,
+                                doc_id=source_filename,
                             )
                         )
                         rollback_execution = await _get_api_compatibility_facade().run_failed_ingest_rollback_async(
@@ -4695,10 +4883,10 @@ async def ingest_cloud(
                                     status="error",
                                     message=(
                                         "Failed to fully roll back cloud ingest for "
-                                        f"{safe_collection}/{file_info.fileName}: "
+                                        f"{safe_collection}/{source_filename}: "
                                         f"{rollback_execution.error}"
                                     ),
-                                    doc_id=file_info.fileName,
+                                    doc_id=source_filename,
                                 ),
                             )
                         return rollback_execution.operation_result
@@ -4715,10 +4903,7 @@ async def ingest_cloud(
                         user_id=int(_user.id),
                         filename=safe_filename,
                         storage_path=file_path,
-                        mime_type=(
-                            mimetypes.guess_type(safe_filename)[0]
-                            or "application/octet-stream"
-                        ),
+                        mime_type=stored_mime_type,
                         file_size=int(file_path.stat().st_size),
                     )
 
@@ -4774,7 +4959,7 @@ async def ingest_cloud(
                                     IngestionResult(
                                         status="error",
                                         message=str(rollback_execution.error),
-                                        doc_id=file_info.fileName,
+                                        doc_id=source_filename,
                                     ),
                                 )
                         elif file_backup_path is not None:
@@ -4788,7 +4973,7 @@ async def ingest_cloud(
                             result=IngestionResult(
                                 status="error",
                                 message=str(rollback_exc),
-                                doc_id=file_info.fileName,
+                                doc_id=source_filename,
                             ),
                             operation_outcome=api_result.operation_outcome
                             if "api_result" in locals()
@@ -4798,7 +4983,7 @@ async def ingest_cloud(
                     except Exception as e:
                         rollback_result = IngestionResult(
                             status="error",
-                            doc_id=file_info.fileName,
+                            doc_id=source_filename,
                             message=f"Ingestion failed: {str(e)}",
                         )
                         rollback_api_result = KBApiOperationResult(
@@ -4829,7 +5014,7 @@ async def ingest_cloud(
                                 IngestionResult(
                                     status="error",
                                     message=str(rollback_execution.error),
-                                    doc_id=file_info.fileName,
+                                    doc_id=source_filename,
                                 ),
                             )
                         return rollback_execution.operation_result
@@ -4839,7 +5024,7 @@ async def ingest_cloud(
                         result=IngestionResult(
                             status="error",
                             message=f"Unsupported provider: {file_info.provider}",
-                            doc_id=file_info.fileName,
+                            doc_id=source_filename,
                         )
                     )
 
@@ -4849,7 +5034,7 @@ async def ingest_cloud(
                     result=IngestionResult(
                         status="error",
                         message=str(e),
-                        doc_id=file_info.fileName,
+                        doc_id=source_filename,
                     ),
                     rollback_complete=False,
                 )
@@ -4858,7 +5043,7 @@ async def ingest_cloud(
                     result=IngestionResult(
                         status="error",
                         message=f"Unexpected error: {str(e)}",
-                        doc_id=file_info.fileName,
+                        doc_id=source_filename,
                     )
                 )
                 rollback_execution = await _get_api_compatibility_facade().run_failed_ingest_rollback_async(
@@ -4881,10 +5066,10 @@ async def ingest_cloud(
                             status="error",
                             message=(
                                 "Failed to fully roll back cloud ingest for "
-                                f"{safe_collection}/{file_info.fileName}: "
+                                f"{safe_collection}/{source_filename}: "
                                 f"{rollback_execution.error}"
                             ),
-                            doc_id=file_info.fileName,
+                            doc_id=source_filename,
                         ),
                     )
                 logger.exception(

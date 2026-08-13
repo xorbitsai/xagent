@@ -24,8 +24,9 @@ from ...config import (
 from ...core.utils.encryption import decrypt_value
 from ..models.gmail_watch import GmailWatchState
 from ..models.oauth_provider import OAuthProvider
-from ..models.trigger import AgentTrigger, TriggerType
+from ..models.trigger import AgentTrigger, TriggerProvisioningStatus, TriggerType
 from ..models.user_oauth import UserOAuth
+from .time_utils import coerce_utc as _coerce_utc
 
 logger = logging.getLogger(__name__)
 
@@ -42,6 +43,10 @@ class GmailTriggerError(RuntimeError):
 
 class GmailWatchConfigurationError(GmailTriggerError):
     """Raised when Gmail watch cannot be configured for the deployment."""
+
+
+class GmailWatchDisabledError(GmailWatchConfigurationError):
+    """Raised when watch (re-)registration is blocked by XAGENT_GMAIL_WATCH_ENABLED."""
 
 
 class _GmailApiRequest:
@@ -218,14 +223,6 @@ def build_gmail_service(db: Session, oauth_account: UserOAuth) -> Any:
     return _GmailApiService(AuthorizedSession(creds))
 
 
-def _coerce_utc(value: datetime | None) -> datetime | None:
-    if value is None:
-        return None
-    if value.tzinfo is None:
-        return value.replace(tzinfo=timezone.utc)
-    return value.astimezone(timezone.utc)
-
-
 def _exception_status_code(exc: Exception) -> int | None:
     response = getattr(exc, "response", None)
     status_code = getattr(response, "status_code", None)
@@ -261,10 +258,13 @@ def _record_watch_state_error(
     *,
     state_id: int,
     error_message: str,
+    mark_failed: bool = False,
 ) -> None:
     state = db.query(GmailWatchState).filter(GmailWatchState.id == state_id).first()
     if state is None:
         return
+    if mark_failed:
+        setattr(state, "status", TriggerProvisioningStatus.FAILED.value)
     setattr(state, "last_error", error_message)
     db.add(state)
     db.commit()
@@ -281,8 +281,20 @@ def _renew_watch_for_account(
     The legacy shared-token global-topic registration path has been removed;
     a deployment without per-mailbox Pub/Sub configuration converges to a
     failed watch state with a clear last_error instead.
+
+    Gated on ``XAGENT_GMAIL_WATCH_ENABLED`` like the renewal scan that calls
+    this directly: without the gate here too, the webhook stale-history path
+    (``collect_gmail_pubsub_events``) would reach this function ungated and
+    re-register a watch while the flag is off, recreating the
+    silently-expiring-watch bug (#1231).
     """
-    from .gmail_provisioning import ensure_gmail_mailbox_provisioned
+    from .gmail_provisioning import (
+        GMAIL_WATCH_DISABLED_ERROR,
+        ensure_gmail_mailbox_provisioned,
+    )
+
+    if not get_gmail_watch_enabled():
+        raise GmailWatchDisabledError(GMAIL_WATCH_DISABLED_ERROR)
 
     state = ensure_gmail_mailbox_provisioned(
         db,
@@ -577,14 +589,35 @@ async def collect_gmail_pubsub_events(
                 exc_info=True,
             )
             db.rollback()
+            from .gmail_provisioning import GMAIL_WATCH_DISABLED_ERROR
+
+            watch_error = str(watch_exc).strip()
+            disabled = isinstance(watch_exc, GmailWatchDisabledError)
+            error_message = (
+                GMAIL_WATCH_DISABLED_ERROR
+                if disabled
+                else (
+                    "Gmail history expired and re-registration failed"
+                    + (f": {watch_error}" if watch_error else "")
+                )
+            )
+            # The disabled case is a permanent condition, not a transient
+            # failure: retrying re-registration will fail identically until an
+            # operator flips XAGENT_GMAIL_WATCH_ENABLED, and the renewal scan
+            # already retries by expiration once it is. Mark the row failed
+            # and ack (200) instead of raising, so Pub/Sub does not redeliver
+            # with backoff for the retention window; a transient failure keeps
+            # last_error only (no status flip) and still raises so the
+            # pipeline's failure_status=500 preserves redelivery semantics.
             _record_watch_state_error(
                 db,
                 state_id=state_id,
-                error_message="Gmail history expired and re-registration failed",
+                error_message=error_message,
+                mark_failed=disabled,
             )
-            raise GmailTriggerError(
-                "Gmail history expired and re-registration failed"
-            ) from watch_exc
+            if disabled:
+                return GmailPubsubEventCollection(events=[], skipped=1)
+            raise GmailTriggerError(error_message) from watch_exc
         return GmailPubsubEventCollection(events=[], skipped=1)
 
     triggers = (

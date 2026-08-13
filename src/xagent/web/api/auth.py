@@ -1190,15 +1190,38 @@ def generic_oauth_login(
     state = create_access_token(data=state_payload, expires_delta=timedelta(minutes=10))
 
     app_scopes: list[str] | None = None
+    app_optional_scopes: list[str] = []
     from ..mcp_apps import get_app_by_id
 
     if app_id:
         app_info = get_app_by_id(db, app_id)
-        if app_info and "oauth_scopes" in app_info:
-            app_scopes = app_info["oauth_scopes"]
+        if app_info:
+            if "oauth_scopes" in app_info:
+                app_scopes = app_info["oauth_scopes"]
+            app_optional_scopes = app_info.get("optional_oauth_scopes") or []
 
     scopes = _merge_oauth_scopes(db_provider.default_scopes or [], app_scopes)
     scope_str = _oauth_scope_separator(provider).join(scopes)
+    # Sent via the authorize request's own optional_scope parameter (see
+    # get_builtin_execution_fields_and_optional_scopes) rather than merged
+    # into `scopes` above: a scope tier-gated on the connected account's
+    # plan would otherwise block the whole authorization if the account
+    # can't grant it. Scopes already in the required set are dropped here
+    # too - not just a duplicate-avoidance nicety, but correctness: HubSpot
+    # blocks installation outright if the same scope appears in both `scope`
+    # and `optional_scope` on one authorize request. dict.fromkeys then
+    # dedupes what's left before joining, in case the registry ever lists a
+    # scope twice within optional_oauth_scopes itself.
+    required_scopes = set(scopes)
+    optional_scope_str = _oauth_scope_separator(provider).join(
+        sorted(
+            dict.fromkeys(
+                scope
+                for scope in app_optional_scopes
+                if scope and scope not in required_scopes
+            )
+        )
+    )
 
     from urllib.parse import urlencode
 
@@ -1217,8 +1240,11 @@ def generic_oauth_login(
     meta_config_id = _meta_login_config_id() if provider.lower() == "meta" else ""
     if meta_config_id:
         params["config_id"] = meta_config_id
-    elif scope_str:
-        params["scope"] = scope_str
+    else:
+        if scope_str:
+            params["scope"] = scope_str
+        if optional_scope_str:
+            params["optional_scope"] = optional_scope_str
 
     separator = "&" if "?" in auth_url else "?"
     full_auth_url = f"{auth_url}{separator}{urlencode(params)}"

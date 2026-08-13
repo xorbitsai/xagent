@@ -420,7 +420,7 @@ class TaskInteractionRequest(Base):  # type: ignore
 
     request_idempotency_key = Column(
         String(64), nullable=False
-    )  # validated against COMMAND_ID_PATTERN by the first production writer
+    )  # validated against COMMAND_ID_PATTERN by stage_interaction_request(), the write path that populates this column
 
     resume_trace_event_id = Column(
         Integer,

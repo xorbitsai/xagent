@@ -45,6 +45,16 @@ logger = logging.getLogger(__name__)
 
 DAG_COMPLETION_TOOL_NAME = "assess_dag_completion"
 
+# Precedence for _select_winner()'s ranking of a same-wakeup completed
+# batch: lower rank wins. A status not listed here (only "interrupted"
+# and "waiting_for_user" are expected -- every other completed result
+# status the codebase produces is a terminal one that never reaches
+# this sort) ranks after both via dict.get()'s default in the sort key.
+_COMPLETED_RESULT_RANK: dict[str, int] = {
+    "interrupted": 0,
+    "waiting_for_user": 1,
+}
+
 
 @dataclass
 class DAGCompletionAssessment:
@@ -321,7 +331,14 @@ class _RuntimeLLMProxy:
 
 
 class DAGPattern(AgentPattern):
-    """Minimal DAG execution pattern that reuses ReActPattern for each step."""
+    """Minimal DAG execution pattern that reuses ReActPattern for each step.
+
+    A task is only ever allowed one active question outstanding at a time
+    against the user; the DAG side of that rule is exactly-one: when
+    concurrent steps in the same batch all end up waiting for a user reply
+    in the same wakeup, exactly one of them gets to keep its question, and
+    the rest are invalidated rather than left to race the user's answer.
+    """
 
     def __init__(
         self,
@@ -354,6 +371,11 @@ class DAGPattern(AgentPattern):
         self.planned_user_message_count = 0
         self.completion_feedback: str | None = None
         self.completion_replan_count = 0
+        # Live concurrent step tasks for the in-progress batch, maintained by
+        # _execute_ready_steps() and always empty once it returns (whatever
+        # the outcome). asyncio.Task objects are not JSON-serializable, so
+        # this must never be added to get_state().
+        self._live_step_tasks: set[asyncio.Task[Any]] = set()
 
     async def run(
         self,
@@ -679,6 +701,19 @@ class DAGPattern(AgentPattern):
         steps_by_id = {step.id: step for step in steps}
         pending = set(tasks)
         scheduled_step_ids = set(steps_by_id)
+        self._live_step_tasks = set(pending)
+
+        async def cancel_all() -> None:
+            # `pending` is rebound (not mutated) by the `asyncio.wait()`
+            # call inside the loop below; this closure reads the free
+            # variable from the enclosing scope, so it always sees whatever
+            # `pending` is currently bound to -- same mechanism
+            # `schedule_ready_steps()` already relies on.
+            await self._cancel_pending_steps(
+                pending,
+                step_ids_by_task=tasks,
+                steps_by_id=steps_by_id,
+            )
 
         def schedule_ready_steps() -> None:
             if self.plan is None:
@@ -709,6 +744,7 @@ class DAGPattern(AgentPattern):
                 tasks[task] = ready_step.id
                 steps_by_id[ready_step.id] = ready_step
                 pending.add(task)
+                self._live_step_tasks.add(task)
                 scheduled_step_ids.add(ready_step.id)
                 available_slots -= 1
                 if available_slots <= 0:
@@ -720,79 +756,152 @@ class DAGPattern(AgentPattern):
                     pending,
                     return_when=asyncio.FIRST_COMPLETED,
                 )
+                self._live_step_tasks = set(pending)
+
+                # A single wakeup can complete more than one step; collect
+                # every non-None result instead of acting on whichever task
+                # a ``set`` happens to iterate first.
+                completed_results: list[tuple[asyncio.Task[Any], dict[str, Any]]] = []
                 for task in done:
                     result = task.result()
                     if result is not None:
-                        await self._cancel_pending_steps(
-                            pending,
-                            step_ids_by_task=tasks,
-                            steps_by_id=steps_by_id,
-                        )
-                        if pending:
-                            await runtime.checkpoint(
-                                "dag_after_cancelled_siblings",
-                                context=root_context,
-                                pattern=self,
-                                status=self.status,
-                                metadata={
-                                    "active_step_ids": list(self.active_step_ids),
-                                    "cancelled_step_ids": [
-                                        step_id
-                                        for task, step_id in tasks.items()
-                                        if task in pending
-                                    ],
-                                },
-                            )
-                        return result
-                    failed_step = next(
-                        (
-                            step
-                            for step in steps_by_id.values()
-                            if step.status == "failed"
-                        ),
-                        None,
-                    )
-                    if failed_step is not None:
-                        await self._cancel_pending_steps(
-                            pending,
-                            step_ids_by_task=tasks,
-                            steps_by_id=steps_by_id,
-                        )
-                        return await self._fail(
-                            context=root_context,
-                            runtime=runtime,
-                            error=(
-                                failed_step.error or f"Step {failed_step.id} failed."
-                            ),
-                            failure_reason="step_failed",
-                            checkpoint_label="dag_failed",
-                            failed_step_id=failed_step.id,
-                        )
-                    if self._needs_replan(root_context):
-                        await self._cancel_pending_steps(
-                            pending,
-                            step_ids_by_task=tasks,
-                            steps_by_id=steps_by_id,
-                        )
-                        return None
-                    if self.status in {"interrupted", "waiting_for_user"}:
-                        await self._cancel_pending_steps(
-                            pending,
-                            step_ids_by_task=tasks,
-                            steps_by_id=steps_by_id,
-                        )
-                        return None
-                schedule_ready_steps()
-        except Exception:
-            try:
-                await self._cancel_pending_steps(
-                    pending,
-                    step_ids_by_task=tasks,
-                    steps_by_id=steps_by_id,
+                        completed_results.append((task, result))
+
+                # A batch containing a failed step fails fast, before any
+                # winner is chosen: a DAG that is already doomed must not
+                # ask the user a question or report an interrupt instead of
+                # the failure. This scan therefore runs ahead of the
+                # completed_results winner selection below, so a failure
+                # always outranks an interrupted or waiting result from a
+                # sibling that completed in the same wakeup.
+                failed_step = next(
+                    (step for step in steps_by_id.values() if step.status == "failed"),
+                    None,
                 )
+                if failed_step is not None:
+                    # A completed sibling in this same wakeup (e.g. one that
+                    # reached waiting_for_user or got interrupted) is never
+                    # coming back for its own turn -- the batch is failing
+                    # regardless -- so its active-step bookkeeping must be
+                    # cleared here too, not just the still-pending ones
+                    # cancel_all() below handles. Every completed sibling is
+                    # cleared unconditionally (clear_all_bookkeeping=True),
+                    # unlike the winner path below, which only clears a
+                    # "waiting_for_user" loser -- there is no winner here to
+                    # spare an "interrupted" sibling's bookkeeping for.
+                    self._invalidate_batch_siblings(
+                        completed_results,
+                        step_ids_by_task=tasks,
+                        steps_by_id=steps_by_id,
+                        clear_all_bookkeeping=True,
+                    )
+                    await cancel_all()
+                    return await self._fail(
+                        context=root_context,
+                        runtime=runtime,
+                        error=(failed_step.error or f"Step {failed_step.id} failed."),
+                        failure_reason="step_failed",
+                        checkpoint_label="dag_failed",
+                        failed_step_id=failed_step.id,
+                    )
+
+                if completed_results:
+                    winner_task, winner_result = self._select_winner(
+                        completed_results,
+                        step_ids_by_task=tasks,
+                    )
+                    winner_step_id = tasks[winner_task]
+
+                    # This invalidates losers drawn from `done`; the
+                    # cancellation below acts on `pending`. `asyncio.wait`
+                    # partitions the tasks it was given into exactly these
+                    # two sets, so a task can never be in both -- the two
+                    # cleanup passes touch disjoint task sets, and running
+                    # this one before or after the cancellation below
+                    # cannot change which steps end up invalidated versus
+                    # cancelled.
+                    superseded_step_ids = self._invalidate_batch_siblings(
+                        completed_results[1:],
+                        step_ids_by_task=tasks,
+                        steps_by_id=steps_by_id,
+                    )
+
+                    if superseded_step_ids:
+                        # A superseded question always means a waiting loser,
+                        # but the winner is not always a question itself --
+                        # an interrupted winner delivers no question of its
+                        # own, so the log line must say so truthfully rather
+                        # than implying %s's question was the one delivered.
+                        if winner_result.get("status") == "waiting_for_user":
+                            log_message = (
+                                "Multiple concurrent DAG steps completed with "
+                                "a pending user question in the same batch; "
+                                "only %s's question is delivered, the rest "
+                                "are invalidated."
+                            )
+                        else:
+                            log_message = (
+                                "Multiple concurrent DAG steps completed with "
+                                "a pending user question in the same batch; "
+                                "questions from the superseded steps were "
+                                "discarded because an interrupt from %s takes "
+                                "precedence."
+                            )
+                        logger.warning(
+                            log_message,
+                            winner_step_id,
+                            extra={
+                                "execution_id": getattr(
+                                    root_context, "execution_id", None
+                                ),
+                                "superseded_step_ids": superseded_step_ids,
+                                "winner_step_id": winner_step_id,
+                            },
+                        )
+                        winner_result = {
+                            **winner_result,
+                            "clarification_superseded_step_ids": superseded_step_ids,
+                        }
+
+                    await cancel_all()
+                    if pending or superseded_step_ids:
+                        await runtime.checkpoint(
+                            "dag_after_cancelled_siblings",
+                            context=root_context,
+                            pattern=self,
+                            status=self.status,
+                            metadata={
+                                "active_step_ids": list(self.active_step_ids),
+                                "cancelled_step_ids": [
+                                    step_id
+                                    for task, step_id in tasks.items()
+                                    if task in pending
+                                ],
+                                "superseded_step_ids": superseded_step_ids,
+                            },
+                        )
+                    return winner_result
+
+                if self._needs_replan(root_context):
+                    await cancel_all()
+                    return None
+                if self.status in {"interrupted", "waiting_for_user"}:
+                    await cancel_all()
+                    return None
+                schedule_ready_steps()
+        except BaseException:
+            # A sibling that already completed by this point is not in
+            # `pending`, so cancel_all() below never clears its active-step
+            # bookkeeping. Unobserved today: this exit writes no checkpoint,
+            # and the pattern object is discarded right after re-raising.
+            # Closing or formally waiving this gap is tracked in #1311.
+            try:
+                await cancel_all()
             except Exception:
                 logger.exception("Failed to clean up cancelled DAG sibling steps.")
             raise
+        finally:
+            self._live_step_tasks.clear()
         return None
 
     async def _execute_step(
@@ -959,8 +1068,18 @@ class DAGPattern(AgentPattern):
                 pattern=self,
                 metadata={"active_step_id": step.id},
             )
+            # ReAct itself never knows which DAG step it is running as (its
+            # draft always carries step_id=None); attribute the draft to
+            # this step here, where that identity is known. The draft is a
+            # frozen dataclass, so this is a copy, not an in-place edit.
+            draft = result.get("clarification_draft")
+            attributed_result = dict(result)
+            if draft is not None:
+                attributed_result["clarification_draft"] = draft.with_origin_step(
+                    step.id
+                )
             return {
-                **result,
+                **attributed_result,
                 "execution_id": root_context.execution_id,
                 "context": root_context,
                 "active_step_id": step.id,
@@ -1778,6 +1897,24 @@ class DAGPattern(AgentPattern):
                 None,
             )
 
+    def has_live_step_tasks(self) -> bool:
+        """Return whether a concurrent step batch is still running right now.
+
+        Only the multi-step branch of ``_execute_ready_steps`` ever
+        populates ``_live_step_tasks``; the single-step fast path never
+        creates an ``asyncio.Task`` and this is always ``False`` on that
+        path. ``_execute_ready_steps`` clears the set in a ``finally``
+        before it returns, whatever the outcome, so a caller inspecting
+        this once ``run()`` has returned always sees an accurate answer.
+        This holds for cancellation too: when the task running the
+        pattern is cancelled, the sibling step tasks are cancelled and
+        awaited inside the exception handler that wraps the batch loop,
+        before the ``finally`` clears the set, so an empty set on return
+        still means no step task is left running.
+        """
+
+        return bool(self._live_step_tasks)
+
     def _waiting_step_id(self) -> str | None:
         for step_id in self.active_step_ids:
             state = self.active_step_pattern_states.get(step_id)
@@ -1820,6 +1957,132 @@ class DAGPattern(AgentPattern):
         if getattr(tool, "name", None):
             return str(tool.name)
         return str(tool)
+
+    def _select_winner(
+        self,
+        completed_results: list[tuple[asyncio.Task[Any], dict[str, Any]]],
+        *,
+        step_ids_by_task: dict[asyncio.Task[Any], str],
+    ) -> tuple[asyncio.Task[Any], dict[str, Any]]:
+        """Pick the one result a same-wakeup completed batch delivers.
+
+        Sorts ``completed_results`` in place and returns its new first
+        entry. The full precedence a batch's outcome follows, from
+        highest to lowest:
+
+        1. A failed step outranks every completed result in the same
+           batch (handled by the caller before this method is even
+           reached: a doomed DAG must not ask a question or report an
+           interrupt in place of the failure).
+        2. Among completed results, rank comes from
+           ``_COMPLETED_RESULT_RANK``: "interrupted" outranks
+           "waiting_for_user" -- an interrupt is a control instruction,
+           not a workflow question the user can be asked to sit
+           through. A result status the table does not know sorts last
+           instead of raising (see ``rank()`` below for why), and is
+           logged as a warning since an unranked status is a handled
+           anomaly worth investigating, not a failure of this method.
+        3. Within the same rank, the lexicographically first step id
+           wins, for a deterministic pick regardless of which task an
+           ``asyncio.wait()`` wakeup or set iteration happens to surface
+           first.
+        4. Any completed result -- winner or loser -- outranks a
+           pending replan. The caller only checks ``_needs_replan()``
+           after this batch has been fully handled, so a result the
+           user has already been shown (a question, an interrupt) is
+           never discarded just because a new user message arrived
+           mid-batch. That message is not lost either: it does not
+           advance ``planned_user_message_count``, so the next
+           iteration of ``run()``'s loop still sees the replan as
+           pending and picks it up one turn later.
+
+        Callers needing the losers read ``completed_results[1:]`` after
+        this call.
+        """
+
+        def rank(
+            item: tuple[asyncio.Task[Any], dict[str, Any]],
+        ) -> tuple[int, str]:
+            task, result = item
+            status = result.get("status")
+            # dict.get()'s key must be `str`; a missing or non-string
+            # status (both otherwise valid at this untyped result-dict
+            # boundary) stringifies to something that is never a table
+            # key, which is exactly the "unranked" case below.
+            status_key = str(status)
+            if status_key not in _COMPLETED_RESULT_RANK:
+                # This runs inside the asyncio.wait() loop in
+                # _execute_ready_steps(); raising here would propagate
+                # through the BaseException cancellation handler and fail
+                # the entire batch over one unrecognized status string.
+                # Sorting it last instead preserves the invariant that a
+                # question already asked is delivered whenever possible.
+                logger.warning(
+                    "Completed DAG step %s has an unranked result status "
+                    "%r; ranking it last in this batch instead of raising.",
+                    step_ids_by_task[task],
+                    status,
+                )
+            return (
+                _COMPLETED_RESULT_RANK.get(status_key, len(_COMPLETED_RESULT_RANK)),
+                step_ids_by_task[task],
+            )
+
+        completed_results.sort(key=rank)
+        return completed_results[0]
+
+    def _invalidate_batch_siblings(
+        self,
+        siblings: list[tuple[asyncio.Task[Any], dict[str, Any]]],
+        *,
+        step_ids_by_task: dict[asyncio.Task[Any], str],
+        steps_by_id: dict[str, PlanStep],
+        clear_all_bookkeeping: bool = False,
+    ) -> list[str]:
+        """Invalidate the losers of a same-wakeup completed batch.
+
+        By default (the winner path) a sibling is only touched at all if
+        its result is "waiting_for_user": its active-step bookkeeping is
+        cleared and its step is flipped to "clarification_invalidated".
+        Any other sibling -- e.g. one that lost an id tie-break between
+        two "interrupted" results -- is left completely alone,
+        bookkeeping included; that tie is not this method's problem to
+        solve.
+
+        Pass clear_all_bookkeeping=True (the failure fast-path) to
+        instead clear every sibling's bookkeeping unconditionally: the
+        whole batch is terminating there, so no sibling's active-step
+        registration should survive into the dag_failed checkpoint
+        regardless of what status it completed with. The
+        clarification_invalidated flip still only ever applies to a
+        "waiting_for_user" result, since that status is reserved for a
+        step whose question was live and never reached the user -- an
+        "interrupted" sibling caught up in a failure is not that step,
+        so it only loses its bookkeeping, not its status.
+
+        Returns the ids that got the clarification_invalidated flip, in
+        input order.
+        """
+        invalidated_step_ids: list[str] = []
+        for sibling_task, sibling_result in siblings:
+            is_waiting = sibling_result.get("status") == "waiting_for_user"
+            if not is_waiting and not clear_all_bookkeeping:
+                continue
+            sibling_step_id = step_ids_by_task[sibling_task]
+            self._clear_active_step(sibling_step_id)
+            if not is_waiting:
+                continue
+            sibling_step = steps_by_id.get(sibling_step_id)
+            if sibling_step is not None:
+                # Non-terminal, and not picked up by the same-wakeup
+                # backfill in schedule_ready_steps(): _ready_steps() offers
+                # this step again once active_step_ids drains, but
+                # _pending_ready_steps() only collects steps already at
+                # "pending", so it waits for the next wakeup's readiness
+                # check before it reruns.
+                sibling_step.status = "clarification_invalidated"
+                invalidated_step_ids.append(sibling_step_id)
+        return invalidated_step_ids
 
     async def _cancel_pending_steps(
         self,

@@ -246,9 +246,9 @@ Images are automatically saved to workspace.
         default_model_lines = []
         other_model_lines = []
         for model_id, model in self._image_models.items():
-            if hasattr(model, "has_ability") and model.has_ability("generate"):
+            if self._has_ability(model, "generate"):
                 description = self._model_descriptions.get(model_id, "")
-                edit_marker = " ✎" if model.has_ability("edit") else ""
+                edit_marker = " ✎" if self._has_ability(model, "edit") else ""
                 is_default = model_id == default_generate_id
                 default_marker = " ⭐[DEFAULT]" if is_default else ""
 
@@ -275,7 +275,7 @@ Images are automatically saved to workspace.
         default_edit_lines = []
         other_edit_lines = []
         for model_id, model in self._image_models.items():
-            if hasattr(model, "has_ability") and model.has_ability("edit"):
+            if self._has_ability(model, "edit"):
                 description = self._model_descriptions.get(model_id, "")
                 is_default = model_id == default_edit_id
                 default_marker = " ⭐[DEFAULT]" if is_default else ""
@@ -317,19 +317,19 @@ Images are automatically saved to workspace.
         """Get image model with generate capability by ID or default model."""
         if model_id and model_id in self._image_models:
             model = self._image_models[model_id]
-            if hasattr(model, "has_ability") and model.has_ability("generate"):
+            if self._has_ability(model, "generate"):
                 return model
             else:
                 logger.warning(f"Model {model_id} does not support generation")
                 return None
 
         # Use configured default generate model
-        if self._default_generate_model:
+        if self._has_ability(self._default_generate_model, "generate"):
             return self._default_generate_model
 
         # Fallback: return first available model with generate capability
         for model in self._image_models.values():
-            if hasattr(model, "has_ability") and model.has_ability("generate"):
+            if self._has_ability(model, "generate"):
                 return model
 
         return None
@@ -340,22 +340,89 @@ Images are automatically saved to workspace.
         """Get image model with edit capability by ID or default edit model."""
         if model_id and model_id in self._image_models:
             model = self._image_models[model_id]
-            if hasattr(model, "has_ability") and model.has_ability("edit"):
+            if self._has_ability(model, "edit"):
                 return model
             else:
                 logger.warning(f"Model {model_id} does not support editing")
                 return None
 
-        # Use configured default edit model
-        if self._default_edit_model:
+        # A hand-configured default still has to declare the ability, or it
+        # reaches the provider and raises there instead of returning our error.
+        if self._has_ability(self._default_edit_model, "edit"):
             return self._default_edit_model
 
         # Fallback: return first available model with edit capability
         for model in self._image_models.values():
-            if hasattr(model, "has_ability") and model.has_ability("edit"):
+            if self._has_ability(model, "edit"):
                 return model
 
         return None
+
+    @staticmethod
+    def _has_ability(model: Any, ability: str) -> bool:
+        """Capable only when the model itself declares the ability."""
+        has_ability = getattr(model, "has_ability", None)
+        return callable(has_ability) and bool(has_ability(ability))
+
+    def _available_models_summary(self) -> str:
+        entries = []
+        for model_id, model in self._image_models.items():
+            abilities = getattr(model, "abilities", None)
+            if abilities is None:
+                joined = "unknown"
+            elif not isinstance(abilities, (list, tuple)):
+                logger.warning(
+                    "Model %s reports a non-sequence abilities value of type %s",
+                    model_id,
+                    type(abilities).__name__,
+                )
+                joined = "unknown"
+            else:
+                joined = ", ".join(str(ability) for ability in abilities) or "none"
+            entries.append(f"{model_id} (abilities: {joined})")
+        return "; ".join(entries) or "none configured"
+
+    def _no_edit_model_error(self, model_id: Optional[str] = None) -> str:
+        # Each branch has to name a different way out, or the model retries the
+        # exact call it just made — the failure this whole error exists to stop.
+        if model_id and self._get_edit_model() is not None:
+            remedy = (
+                f"Model {model_id} cannot edit: retry edit_image without model_id, "
+                "or pick one listed above that has the edit ability."
+            )
+        elif self._get_model() is not None:
+            # generate_image(images=...) delegates here, so never answer that
+            # call with "use generate_image".
+            remedy = (
+                "Image editing is unavailable in this deployment: retry "
+                "generate_image without images and describe the change in the "
+                "prompt instead."
+            )
+        else:
+            remedy = (
+                "No configured model can edit or generate images: stop retrying "
+                "image tools and report that to the user."
+            )
+        return (
+            "No available image models with edit capabilities. "
+            f"Configured image models: {self._available_models_summary()}. {remedy}"
+        )
+
+    def _no_generate_model_error(self, model_id: Optional[str] = None) -> str:
+        if model_id and self._get_model() is not None:
+            remedy = (
+                f"Model {model_id} cannot generate: retry generate_image without "
+                "model_id, or pick one listed above that has the generate ability."
+            )
+        else:
+            remedy = (
+                "No configured model can generate images: stop retrying image "
+                "tools and report that to the user."
+            )
+        return (
+            "No available image models with generate capabilities. "
+            f"Configured image models: {self._available_models_summary()}. {remedy}"
+        )
 
     def _resolve_image_path(self, image_input: str) -> str:
         """
@@ -570,7 +637,7 @@ Images are automatically saved to workspace.
             if not image_model:
                 return {
                     "success": False,
-                    "error": "No available image models configured",
+                    "error": self._no_generate_model_error(model_id),
                     "image_path": None,
                 }
 
@@ -695,7 +762,7 @@ Images are automatically saved to workspace.
             if not image_model:
                 return {
                     "success": False,
-                    "error": "No available image models with edit capabilities",
+                    "error": self._no_edit_model_error(model_id),
                     "image_path": None,
                 }
 
@@ -805,10 +872,19 @@ Images are automatically saved to workspace.
         """
         try:
             models_info = []
-            for model_id in self._image_models.keys():
+            for model_id, model in self._image_models.items():
+                # When capability gating withholds every image tool this listing
+                # is the only thing left to explain why, so it has to report what
+                # each model can actually serve rather than a flat "available".
+                abilities = [
+                    ability
+                    for ability in ("generate", "edit")
+                    if self._has_ability(model, ability)
+                ]
                 model_info = {
                     "model_id": model_id,
-                    "available": True,
+                    "available": bool(abilities),
+                    "abilities": abilities,
                     "description": self._model_descriptions.get(model_id, ""),
                 }
                 models_info.append(model_info)

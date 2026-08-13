@@ -820,7 +820,12 @@ export function KnowledgeBaseCreationDialog({ open, onOpenChange, onSuccess }: K
     try {
       // Aggregate all selected files from all providers
       const filesToIngest = Object.entries(cloudSelections).flatMap(([provider, files]) =>
-        files.map(file => ({ provider, fileId: file.id, fileName: file.name }))
+        files.map(file => ({
+          provider,
+          fileId: file.id,
+          fileName: file.name,
+          resourceKey: file.resourceKey,
+        }))
       )
 
       await reserveTeamName(collectionName, teamClaimed)

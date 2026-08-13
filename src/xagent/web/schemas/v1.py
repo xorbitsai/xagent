@@ -368,6 +368,95 @@ class AppendMessageResponse(BaseModel):
     control_state: str = Field(..., description="Detailed task control state.")
 
 
+class ReplyRequest(BaseModel):
+    """Body for ``POST /v1/chat/tasks/{task_id}/reply``.
+
+    Answers the agent's pending question on a task whose
+    ``status == 'waiting_for_user'``, resuming the same run rather than
+    starting a new turn. Owner-scoping fields have the same shape and
+    semantics as :class:`AppendMessageRequest`: agent-bound keys pass
+    ``agent_id`` (required), workforce-bound keys optionally pass
+    ``workforce_id``.
+
+    Deliberately narrower than :class:`AppendMessageRequest`:
+
+    - No ``files``: the resume reattaches to the paused run, which has
+      no turn-file binding point (that only exists when a new turn is
+      claimed).
+    - No ``connector_runtime_context``: the resume reuses the connector
+      context already resolved for the run in progress.
+    - No ``metadata``: not passed through by this endpoint.
+    - No idempotency key: a retried reply can be posted twice; callers
+      that need to avoid a duplicate answer should ``GET`` the task and
+      confirm it has left ``waiting_for_user`` before retrying.
+    """
+
+    agent_id: Optional[int] = Field(
+        None,
+        description=(
+            "Target agent's primary key. Required for agent-bound keys; "
+            "must match the agent the key is bound to and the task's "
+            "agent_id. Omit for workforce-bound keys."
+        ),
+    )
+    workforce_id: Optional[int] = Field(
+        None,
+        description=(
+            "Target workforce's primary key. Optional for workforce-bound "
+            "keys; must match the workforce the key is bound to when "
+            "provided. Omit for agent-bound keys."
+        ),
+    )
+    message: MessageBody = Field(
+        ..., description="The user's answer to the agent's pending question."
+    )
+
+
+class ReplyResponse(BaseModel):
+    """``POST /v1/chat/tasks/{task_id}/reply`` -> 202 Accepted response.
+
+    Same fields and semantics as :class:`AppendMessageResponse`, except:
+    ``status`` is always ``'running'`` (a reply always resumes
+    execution), and ``run_id`` is the *same* run the task was waiting
+    on -- the reply resumes the paused execution rather than starting a
+    new one.
+    """
+
+    task_id: int = Field(..., description="Existing task primary key.")
+    agent_id: int = Field(
+        ...,
+        description=(
+            "Agent the task is bound to. For workforce runs this is the "
+            "workforce's manager agent."
+        ),
+    )
+    workforce_id: Optional[int] = Field(
+        None,
+        description=(
+            "Workforce the task belongs to when the key is workforce-bound; "
+            "null for agent-bound keys."
+        ),
+    )
+    status: str = Field(
+        ..., description="Always 'running': a reply always resumes execution."
+    )
+    accepted_at: datetime = Field(
+        ...,
+        description="UTC timestamp when the server accepted the reply.",
+    )
+    run_id: str = Field(
+        ...,
+        description=(
+            "Identity of the resumed execution run -- the same run_id the "
+            "task was waiting on before this reply."
+        ),
+    )
+    state_version: int = Field(
+        ..., description="Monotonic version of the task control state."
+    )
+    control_state: str = Field(..., description="Detailed task control state.")
+
+
 class CreateWorkforceRunRequest(BaseModel):
     """Body for ``POST /v1/workforces/{workforce_id}/runs``.
 
@@ -439,6 +528,31 @@ class CreateWorkforceRunResponse(BaseModel):
     control_state: str = Field("idle", description="Detailed task control state.")
 
 
+class PendingInteraction(BaseModel):
+    """The agent's most recent question on a waiting task.
+
+    ``interactions`` is an opaque list of structured-control descriptors
+    (the agent tool's own JSON shape, e.g. ``{"type": "text_input",
+    "field": ..., "label": ...}``) passed through as-is rather than typed
+    against a fixed schema, because the seven-value ``type`` enum lives
+    with the agent tool and duplicating it here would be a second source
+    of truth to keep in sync. ``[]`` and ``null`` both mean "no
+    structured control, answer with plain text" and are intentionally
+    not normalized to one value server-side -- callers should treat them
+    the same way.
+    """
+
+    question: str = Field(..., description="The agent's pending question text.")
+    interactions: Optional[List[Dict[str, Any]]] = Field(
+        None,
+        description=(
+            "Opaque structured-control descriptors for this question, or "
+            "null. May also be an empty list; treat [] and null the same "
+            "way (both mean plain-text answer)."
+        ),
+    )
+
+
 class TaskInfoResponse(BaseModel):
     """``GET /v1/chat/tasks/{task_id}`` response.
 
@@ -459,7 +573,10 @@ class TaskInfoResponse(BaseModel):
     )
     status: str = Field(
         ...,
-        description="One of: pending / running / paused / completed / failed.",
+        description=(
+            "One of: pending / running / paused / waiting_for_user / "
+            "completed / failed."
+        ),
     )
     run_id: Optional[str] = Field(None, description="Current execution run identity.")
     state_version: int = Field(
@@ -489,6 +606,23 @@ class TaskInfoResponse(BaseModel):
             "(completed or failed). Null while still running."
         ),
     )
+    pending_interaction: Optional[PendingInteraction] = Field(
+        None,
+        description=(
+            "Convenience projection of the agent's most recent question. "
+            "Always present in the response body, but null unless "
+            "status='waiting_for_user' AND the task has at least one "
+            "persisted question message. A task can reach waiting_for_user "
+            "with no question ever recorded (e.g. an empty message body), "
+            "in which case this field is null too -- but if an earlier "
+            "turn already persisted a question, this field surfaces that "
+            "earlier question rather than null, since the read returns "
+            "the latest persisted question row regardless of which turn "
+            "wrote it. This is a convenience read, not the historical "
+            "interaction record; see #1079 for the full typed interaction "
+            "surface."
+        ),
+    )
 
 
 # ``PublicStep.type`` is the public surface for what was internally one
@@ -498,9 +632,10 @@ class TaskInfoResponse(BaseModel):
 # internal->public mapping table.
 PublicStepType = Literal["thinking", "tool_call", "agent_delegation", "message"]
 
-# ``running`` means a start event was seen with no matching end (the
-# task is still mid-step at the time of the GET). ``completed`` /
-# ``failed`` reflect the end event's success flag.
+# ``running`` means a start event was seen with no matching end; a
+# terminal task can still contain running steps (interrupted/cancelled
+# steps never get an end event). ``completed`` / ``failed`` reflect
+# the end event's success flag.
 PublicStepStatus = Literal["running", "completed", "failed"]
 
 
@@ -542,9 +677,12 @@ class PublicStep(BaseModel):
         ...,
         description=(
             "running while the corresponding end event has not yet "
-            "fired (i.e. the SDK polled mid-step), completed on a "
-            "normal end event, failed when the end event carries "
-            "success=false."
+            "fired, completed on a normal end event, failed when the "
+            "end event carries success=false. A task in a terminal "
+            "state can still contain running steps: interrupted or "
+            "cancelled steps never get an end event, so terminal "
+            "state is judged from the task's own status, not from "
+            "the absence of running steps."
         ),
     )
     started_at: datetime = Field(

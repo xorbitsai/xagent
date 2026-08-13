@@ -128,7 +128,20 @@ def get_builtin_oauth_provider_rows() -> list[dict[str, Any]]:
             # connection would show up unlabeled in the connector UI.
             "user_id_path": "team_id",
             "email_path": "team",
-            "default_scopes": ["chat:write", "chat:write.public", "channels:read"],
+            "default_scopes": [
+                "chat:write",
+                "chat:write.public",
+                "channels:read",
+                "channels:history",
+                "groups:read",
+                "groups:history",
+                "im:read",
+                "im:history",
+                "mpim:read",
+                "mpim:history",
+                "reactions:write",
+                "files:write",
+            ],
         },
         {
             "provider_name": "zoom",
@@ -316,7 +329,7 @@ def get_builtin_public_mcp_app_rows() -> list[dict[str, Any]]:
         {
             "app_id": "hubspot",
             "name": "HubSpot",
-            "description": "Connect to HubSpot CRM to search, create, and update contacts and companies, read deals, and log notes.",
+            "description": "Connect to HubSpot CRM and Marketing Hub to search, create, and update contacts and companies, read deals, log notes, read forms and submissions, pull traffic analytics reports, and read marketing emails and campaigns.",
             "icon": "https://www.google.com/s2/favicons?domain=hubspot.com&sz=128",
             "transport": "oauth",
             "provider_name": "hubspot",
@@ -327,6 +340,39 @@ def get_builtin_public_mcp_app_rows() -> list[dict[str, Any]]:
                 "crm.objects.companies.read",
                 "crm.objects.companies.write",
                 "crm.objects.deals.read",
+                "forms",
+            ],
+            # All three are tier-gated, each confirmed against HubSpot's own
+            # docs: business-intelligence requires Marketing Hub Basic+ (the
+            # traffic analytics tool isn't available on Free/Starter);
+            # marketing-email requires Enterprise or the transactional email
+            # add-on; marketing.campaigns.read requires Professional+ (the
+            # Campaigns API docs state this explicitly). Requesting any of
+            # them as required scopes would block the whole OAuth
+            # authorization (and therefore every CRM tool too) for portals
+            # below those tiers. Separately: GET /marketing/v3/emails (used
+            # by hubspot_list_marketing_emails and
+            # hubspot_get_marketing_email_statistics) accepts marketing-email
+            # OR content OR transactional-email - marketing-email is used
+            # here as the most narrowly-scoped of the three that still
+            # covers both read calls; content is broader (also grants
+            # pages/blog/campaigns access this connector doesn't use) and
+            # transactional-email's applicability to non-transactional
+            # marketing emails is unconfirmed.
+            # Sent via the authorize request's optional_scope parameter
+            # instead (see api/auth.py) so those portals still connect
+            # successfully and only hubspot_get_analytics_report /
+            # hubspot_list_marketing_emails / hubspot_get_marketing_email_statistics /
+            # hubspot_list_campaigns / hubspot_get_campaign_metrics fail at
+            # call time if the tier doesn't grant them. This pairing must
+            # also be reflected in this app's scope configuration in the
+            # HubSpot Developer Dashboard - HubSpot blocks installation if a
+            # scope's required/optional designation there disagrees with
+            # which parameter it arrives in.
+            "optional_oauth_scopes": [
+                "business-intelligence",
+                "marketing-email",
+                "marketing.campaigns.read",
             ],
             "is_visible_in_connector": True,
             "launch_config": {
@@ -481,12 +527,25 @@ def get_builtin_public_mcp_app_rows() -> list[dict[str, Any]]:
         {
             "app_id": "slack",
             "name": "Slack",
-            "description": "Connect to Slack to list channels and post messages, e.g. incident summaries and recommended fixes.",
+            "description": "Connect to Slack to search and read channel, thread, and DM history, post messages and replies, react to messages, and upload files, e.g. incident summaries and recommended fixes.",
             "icon": "https://www.google.com/s2/favicons?domain=slack.com&sz=128",
             "transport": "oauth",
             "provider_name": "slack",
             "category": "Communication",
-            "oauth_scopes": ["chat:write", "chat:write.public", "channels:read"],
+            "oauth_scopes": [
+                "chat:write",
+                "chat:write.public",
+                "channels:read",
+                "channels:history",
+                "groups:read",
+                "groups:history",
+                "im:read",
+                "im:history",
+                "mpim:read",
+                "mpim:history",
+                "reactions:write",
+                "files:write",
+            ],
             "is_visible_in_connector": True,
             "launch_config": {
                 "command": "python",
@@ -666,6 +725,34 @@ def get_builtin_execution_fields(app_id: str) -> dict[str, Any] | None:
     return deepcopy(
         {field_name: row[field_name] for field_name in _BUILTIN_EXECUTION_FIELD_NAMES}
     )
+
+
+def get_builtin_execution_fields_and_optional_scopes(
+    app_id: str,
+) -> tuple[dict[str, Any] | None, list[str]]:
+    """The app's execution fields, plus OAuth scopes requested via the
+    authorize request's optional_scope parameter rather than its required
+    scope parameter (see api/auth.py).
+
+    A single registry scan (plus one deepcopy of the matched row) serving
+    both needs: _app_to_dict wants both for every app on a listing path,
+    and scanning + deepcopying the full row twice per app to get them
+    separately would be wasted work.
+
+    optional_oauth_scopes is deliberately not in
+    _BUILTIN_EXECUTION_FIELD_NAMES: unlike oauth_scopes, there is no legacy
+    persisted-row state to drift-check against for a field this new, so
+    this reads straight from the row rather than going through the
+    DB-column drift-tracking machinery. Most builtin apps have no optional
+    scopes at all, hence the plain ``.get`` default.
+    """
+    row = get_builtin_public_mcp_app(app_id)
+    if row is None:
+        return None, []
+    execution_fields = {
+        field_name: row[field_name] for field_name in _BUILTIN_EXECUTION_FIELD_NAMES
+    }
+    return execution_fields, list(row.get("optional_oauth_scopes", []))
 
 
 def _safe_configuration_hash(values: dict[str, Any]) -> str:

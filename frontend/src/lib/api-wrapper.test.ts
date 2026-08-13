@@ -161,6 +161,22 @@ describe("api-wrapper upload helpers", () => {
     expect(message).toBe("explicit detail")
   })
 
+  it("renders FastAPI validation detail arrays as readable messages", () => {
+    const response = new Response(null, { status: 422 })
+    const message = getUploadErrorMessage(response, {
+      data: {
+        detail: [
+          { type: "too_long", loc: ["body", "files"], msg: "List should have at most 5 items", input: [] },
+          { type: "string_pattern_mismatch", loc: ["body", "files", 0, "fileId"], msg: "String should match pattern" },
+        ],
+      },
+      text: null,
+      isHtml: false,
+    }, MESSAGES)
+
+    expect(message).toBe("List should have at most 5 items; String should match pattern")
+  })
+
   it("returns truncated raw text for non-413 non-html responses", () => {
     const response = new Response(null, { status: 500 })
     const rawText = "x".repeat(240)

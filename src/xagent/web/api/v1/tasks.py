@@ -40,12 +40,16 @@ from ...schemas.v1 import (
     AppendMessageResponse,
     CreateTaskRequest,
     CreateTaskResponse,
+    PendingInteraction,
     PublicStep,
+    ReplyRequest,
+    ReplyResponse,
     StepsResponse,
     TaskInfoResponse,
     UploadedFileInfo,
     UploadFilesResponse,
 )
+from ...services.chat_history_service import get_latest_waiting_question
 from ...services.connector_runtime import (
     bind_create_connector_runtime_plan,
     persist_create_connector_runtime_context,
@@ -421,6 +425,46 @@ def _prepare_created_task_isolated(
         _retire_turn_session_best_effort(db, task_id=owned_task_id)
 
 
+def _validate_owner_scope(
+    principal: ApiKeyPrincipal,
+    *,
+    request_agent_id: int | None,
+    request_workforce_id: int | None,
+) -> None:
+    """Validate a request body's owner-scoping fields against the key.
+
+    Shared by every ``/v1/chat/tasks/{task_id}/*`` write that reuses the
+    ``AppendMessageRequest``-shaped owner fields (append, reply): an
+    agent-bound key must pass a matching ``agent_id`` and no
+    ``workforce_id``; a workforce-bound key must not pass ``agent_id``
+    and, if it passes ``workforce_id``, it must match the bound
+    workforce. Task ownership itself must already be resolved (e.g. via
+    :func:`_resolve_task_or_404`) before calling this, so an unrelated
+    task stays an opaque ``task_not_found`` even when the body also
+    names the wrong owner.
+    """
+    if principal.agent is not None:
+        if request_agent_id is None:
+            raise V1ApiError(
+                V1ErrorCode.INVALID_INPUT,
+                422,
+                message="agent_id is required",
+            )
+        if request_agent_id != principal.agent.id:
+            raise V1ApiError(V1ErrorCode.AGENT_NOT_FOUND, 404)
+        if request_workforce_id is not None:
+            raise V1ApiError(V1ErrorCode.WORKFORCE_NOT_FOUND, 404)
+    else:
+        assert principal.workforce is not None
+        if request_agent_id is not None:
+            raise V1ApiError(V1ErrorCode.AGENT_NOT_FOUND, 404)
+        if (
+            request_workforce_id is not None
+            and request_workforce_id != principal.workforce.id
+        ):
+            raise V1ApiError(V1ErrorCode.WORKFORCE_NOT_FOUND, 404)
+
+
 def _prepare_append_turn_isolated(
     *,
     task_id: int,
@@ -442,26 +486,11 @@ def _prepare_append_turn_isolated(
 
         # Task ownership is resolved first so an unrelated task remains an
         # opaque task_not_found even when the body also names the wrong owner.
-        if principal.agent is not None:
-            if request_agent_id is None:
-                raise V1ApiError(
-                    V1ErrorCode.INVALID_INPUT,
-                    422,
-                    message="agent_id is required",
-                )
-            if request_agent_id != principal.agent.id:
-                raise V1ApiError(V1ErrorCode.AGENT_NOT_FOUND, 404)
-            if request_workforce_id is not None:
-                raise V1ApiError(V1ErrorCode.WORKFORCE_NOT_FOUND, 404)
-        else:
-            assert principal.workforce is not None
-            if request_agent_id is not None:
-                raise V1ApiError(V1ErrorCode.AGENT_NOT_FOUND, 404)
-            if (
-                request_workforce_id is not None
-                and request_workforce_id != principal.workforce.id
-            ):
-                raise V1ApiError(V1ErrorCode.WORKFORCE_NOT_FOUND, 404)
+        _validate_owner_scope(
+            principal,
+            request_agent_id=request_agent_id,
+            request_workforce_id=request_workforce_id,
+        )
 
         runtime_agent = db.get(Agent, int(task.agent_id))
         if runtime_agent is None:
@@ -653,6 +682,8 @@ class _TaskInfoSnapshot:
     error: str | None
     created_at: datetime | None
     updated_at: datetime | None
+    pending_question: str | None
+    pending_interactions: list[dict[str, Any]] | None
 
 
 @dataclass(frozen=True)
@@ -751,6 +782,12 @@ def _load_task_info_snapshot(
     SessionLocal = get_session_local()
     with SessionLocal() as db:
         task = _resolve_task_or_404(task_id, principal, db)
+        pending_question: str | None = None
+        pending_interactions: list[dict[str, Any]] | None = None
+        if task.status == TaskStatus.WAITING_FOR_USER:
+            pending_question, pending_interactions = get_latest_waiting_question(
+                db, task_id
+            )
         return _TaskInfoSnapshot(
             task_id=int(task.id),
             agent_id=int(task.agent_id),
@@ -763,6 +800,8 @@ def _load_task_info_snapshot(
             error=cast(str | None, task.error_message),
             created_at=cast(datetime | None, task.created_at),
             updated_at=cast(datetime | None, task.updated_at),
+            pending_question=pending_question,
+            pending_interactions=pending_interactions,
         )
 
 
@@ -828,19 +867,60 @@ def _load_task_steps_snapshot(
         )
 
 
+def _filter_interaction_descriptors(
+    interactions: list[dict[str, Any]] | None,
+) -> list[dict[str, Any]] | None:
+    """Drop non-mapping elements from a stored interactions list.
+
+    ``PendingInteraction.interactions`` is typed ``list[dict[str, Any]] |
+    None``. A row written by an older or buggy writer can carry a list
+    with non-dict elements (e.g. a bare string); passing that straight
+    into the schema fails Pydantic validation and 500s the GET
+    permanently, for as long as the dirty row exists. Filtering here --
+    not in ``get_latest_waiting_question`` or the schema type -- keeps
+    the fix scoped to this read path's output contract; the shared
+    reader and its other consumers (websocket.py, chat.py) are
+    untouched. Same semantics as react.py's
+    ``_normalize_ask_user_interactions``: a non-dict element is dropped,
+    not coerced or repaired.
+    """
+    if interactions is None:
+        return None
+    return [item for item in interactions if isinstance(item, dict)]
+
+
 def _get_chat_task_sync(
     task_id: int,
     principal: ApiKeyPrincipal,
 ) -> TaskInfoResponse:
-    """Build one task response without retaining a Session during cache I/O."""
+    """Build one task response without retaining a Session during cache I/O.
+
+    ``pending_interaction`` is deliberately kept OUT of the cached
+    response body and stitched on after every cache read/write. The
+    cache entry's freshness token is ``tasks.updated_at`` (see
+    ``task_updated_at`` below), but the pending question lives in
+    ``task_chat_messages`` -- a write there does not touch
+    ``tasks.updated_at``, so a cached entry has no way to prove its
+    ``pending_interaction`` is still current. Caching it anyway would
+    let a stale question survive a cache hit indefinitely.
+    """
 
     task = _load_task_info_snapshot(task_id, principal)
     completed_at = task.updated_at if task.status in _TERMINAL_STATUSES else None
+    pending_interaction = (
+        PendingInteraction(
+            question=task.pending_question,
+            interactions=_filter_interaction_descriptors(task.pending_interactions),
+        )
+        if task.pending_question is not None
+        else None
+    )
     cache_key = task_snapshot_key(task_id)
     task_updated_at = cache_version_token(task.updated_at)
     cached = cache_get(cache_key)
     if isinstance(cached, dict) and cached.get("updated_at") == task_updated_at:
-        return TaskInfoResponse.model_validate(cached["response"])
+        response = TaskInfoResponse.model_validate(cached["response"])
+        return response.model_copy(update={"pending_interaction": pending_interaction})
 
     response = TaskInfoResponse(
         task_id=task.task_id,
@@ -866,7 +946,7 @@ def _get_chat_task_sync(
         },
         ttl_seconds=task_cache_ttl_seconds(),
     )
-    return response
+    return response.model_copy(update={"pending_interaction": pending_interaction})
 
 
 def _get_chat_task_steps_sync(
@@ -927,12 +1007,13 @@ async def append_message_to_task(
          provided with a workforce key, must match the bound workforce
          (404 ``workforce_not_found`` otherwise).
       3. Rejects the call with 409 ``task_busy`` if the task is
-         currently ``RUNNING`` -- the SDK client should poll
-         ``GET /v1/chat/tasks/{id}`` until status leaves RUNNING and
-         retry. Workforce turn rejections map to their own stable
-         codes (``workforce_archived`` / ``workforce_config_changed``,
-         409 -- NOT retryable) so clients aren't told to retry a
-         permanently-rejected conversation.
+         currently ``RUNNING``, or 409 ``interaction_response_required``
+         if it is ``WAITING_FOR_USER`` -- that status answers a pending
+         agent question and is handled by
+         ``POST /v1/chat/tasks/{id}/reply`` instead. Workforce turn
+         rejections map to their own stable codes (``workforce_archived``
+         / ``workforce_config_changed``, 409 -- NOT retryable) so clients
+         aren't told to retry a permanently-rejected conversation.
       4. Otherwise persists the new user message to
          ``task_chat_messages``, updates ``task.input`` to record
          this turn's input, and kicks off the next background turn
@@ -952,8 +1033,9 @@ async def append_message_to_task(
         V1ApiError 404: task not found OR not owned by the key OR
             body.agent_id / body.workforce_id doesn't match the bound
             owner.
-        V1ApiError 409: ``task_busy`` (retryable) or a workforce
-            rejection code (not retryable).
+        V1ApiError 409: ``task_busy`` (retryable), a workforce rejection
+            code (not retryable), or ``interaction_response_required``
+            (use ``reply`` instead).
         500: any other unexpected error (V1 envelope via global handler).
     """
     actor_user_id = principal.owner_user_id
@@ -1017,6 +1099,36 @@ async def append_message_to_task(
     )
 
 
+@router.post(
+    "/chat/tasks/{task_id}/reply",
+    status_code=202,
+    response_model=ReplyResponse,
+)
+async def reply_to_waiting_task(
+    task_id: int,
+    request: ReplyRequest,
+    principal: ApiKeyPrincipal = Depends(get_principal_from_api_key),
+) -> ReplyResponse:
+    """Answer the agent's pending question on a ``waiting_for_user`` task.
+
+    Route declaration lives here alongside the other task endpoints;
+    the implementation is in ``task_reply.py`` because it resumes an
+    existing run rather than claiming a new turn -- a different
+    lifecycle from create/append that deserves its own module. See
+    :func:`xagent.web.api.v1.task_reply.reply_to_task` for the full
+    contract (accepted states, error codes, fail-closed checkpoint
+    handling).
+
+    Imported inside the handler (not at module level) because
+    ``task_reply`` imports ownership-resolution helpers back from this
+    module; deferring the import here breaks that cycle without
+    duplicating those helpers.
+    """
+    from .task_reply import reply_to_task
+
+    return await reply_to_task(task_id=task_id, request=request, principal=principal)
+
+
 @router.get("/chat/tasks/{task_id}", response_model=TaskInfoResponse)
 async def get_chat_task(
     task_id: int,
@@ -1062,9 +1174,11 @@ async def get_chat_task_steps(
     The internal trace event taxonomy has ~32 ``event_type`` strings
     today; SDK callers see only the 4 types listed above. Internal
     events not on the public allow-list (LLM calls, memory ops,
-    visualization ticks, DAG bookkeeping) are silently dropped --
+    visualization ticks, most DAG bookkeeping) are silently dropped --
     intentionally, so internal trace evolution doesn't break the SDK
-    contract.
+    contract; the exception is dag_execution's planning/replanning/
+    executing phase transitions, which project onto a planning
+    thinking step.
 
     Args:
         task_id: Path parameter; the target task's primary key.

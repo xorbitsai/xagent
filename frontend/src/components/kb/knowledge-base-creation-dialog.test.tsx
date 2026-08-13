@@ -140,15 +140,32 @@ vi.mock("./cloud-connect-dialog", () => ({
   }: {
     open: boolean
     provider: { id: string } | null
-    onConfirm: (files: Array<{ id: string; name: string; size?: string }>) => void
+    onConfirm: (files: Array<{ id: string; name: string; size?: string; resourceKey?: string }>) => void
   }) => (
     open && provider ? (
-      <button
-        data-testid="mock-cloud-confirm"
-        onClick={() => onConfirm([{ id: `${provider.id}-file-1`, name: "alpha.pdf", size: "1 KB" }])}
-      >
-        mock cloud confirm
-      </button>
+      <>
+        <button
+          data-testid="mock-cloud-confirm"
+          onClick={() => onConfirm([{
+            id: `${provider.id}-file-1`,
+            name: "alpha.pdf",
+            size: "1 KB",
+            resourceKey: "resource-secret",
+          }])}
+        >
+          mock cloud confirm
+        </button>
+        <button
+          data-testid="mock-cloud-confirm-no-key"
+          onClick={() => onConfirm([{
+            id: `${provider.id}-file-2`,
+            name: "beta.pdf",
+            size: "1 KB",
+          }])}
+        >
+          mock cloud confirm without resource key
+        </button>
+      </>
     ) : null
   ),
 }))
@@ -215,7 +232,12 @@ const IMPORT_TABS = ["file", "web", "cloud"] as const
 type ImportTab = (typeof IMPORT_TABS)[number]
 
 /** Walk the wizard to step 3 (where the create button lives) for one import tab. */
-async function goToStep3(container: HTMLElement, tab: ImportTab, fileCount = 1) {
+async function goToStep3(
+  container: HTMLElement,
+  tab: ImportTab,
+  fileCount = 1,
+  cloudFileHasResourceKey = true,
+) {
   fireEvent.click(screen.getByText("common.next"))
 
   if (tab === "file") {
@@ -235,9 +257,13 @@ async function goToStep3(container: HTMLElement, tab: ImportTab, fileCount = 1) 
   } else {
     fireEvent.click(screen.getByText("kb.dialog.tabs.cloud"))
     fireEvent.click(screen.getByText("kb.dialog.cloudConnect.googleDrive"))
-    fireEvent.click(await screen.findByTestId("mock-cloud-confirm"))
+    fireEvent.click(await screen.findByTestId(
+      cloudFileHasResourceKey ? "mock-cloud-confirm" : "mock-cloud-confirm-no-key"
+    ))
     await waitFor(() => {
-      expect(screen.getByText("alpha.pdf")).toBeInTheDocument()
+      expect(
+        screen.getByText(cloudFileHasResourceKey ? "alpha.pdf" : "beta.pdf")
+      ).toBeInTheDocument()
     })
   }
 
@@ -542,6 +568,18 @@ describe("KnowledgeBaseCreationDialog collection naming", () => {
         )
       })
 
+      const cloudCall = apiRequestMock.mock.calls.find(
+        ([url]) => url === "http://api.local/api/kb/ingest-cloud"
+      )
+      expect(JSON.parse(cloudCall?.[1]?.body as string).files).toEqual([
+        {
+          provider: "google-drive",
+          fileId: "google-drive-file-1",
+          fileName: "alpha.pdf",
+          resourceKey: "resource-secret",
+        },
+      ])
+
       expect(toastSuccessMock).not.toHaveBeenCalled()
       expect(onOpenChange).not.toHaveBeenCalledWith(false)
       expect(onSuccess).not.toHaveBeenCalled()
@@ -549,6 +587,52 @@ describe("KnowledgeBaseCreationDialog collection naming", () => {
     } finally {
       consoleErrorSpy.mockRestore()
     }
+  })
+
+  it("omits an absent cloud resource key from the ingest request", async () => {
+    const baseApiRequest = apiRequestMock.getMockImplementation()
+    apiRequestMock.mockImplementation((url: string, options?: RequestInit) => {
+      if (url === "http://api.local/api/kb/ingest-cloud") {
+        return Promise.resolve(createJsonResponse([{
+          status: "success",
+          message: "ok",
+          doc_id: "doc-1",
+          chunk_count: 1,
+          embedding_count: 1,
+        }]))
+      }
+      if (!baseApiRequest) {
+        throw new Error(`Unhandled apiRequest: ${url}`)
+      }
+      return baseApiRequest(url, options)
+    })
+
+    const { container } = render(
+      <KnowledgeBaseCreationDialog open={true} onOpenChange={vi.fn()} onSuccess={vi.fn()} />
+    )
+    fireEvent.change(container.querySelector("#collection_name") as HTMLInputElement, {
+      target: { value: "cloud-docs" },
+    })
+
+    await goToStep3(container, "cloud", 1, false)
+    fireEvent.click(screen.getByText("kb.dialog.createButton"))
+
+    await waitFor(() => {
+      expect(apiRequestMock).toHaveBeenCalledWith(
+        "http://api.local/api/kb/ingest-cloud",
+        expect.any(Object),
+      )
+    })
+    const cloudCall = apiRequestMock.mock.calls.find(
+      ([url]) => url === "http://api.local/api/kb/ingest-cloud"
+    )
+    expect(JSON.parse(cloudCall?.[1]?.body as string).files).toEqual([
+      {
+        provider: "google-drive",
+        fileId: "google-drive-file-2",
+        fileName: "beta.pdf",
+      },
+    ])
   })
 
   it("keeps the dialog open for web partial failures and surfaces the failure message", async () => {

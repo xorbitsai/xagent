@@ -21,14 +21,20 @@ from xagent.web.models.oauth_provider import OAuthProvider
 from xagent.web.models.trigger import (
     AgentTrigger,
     TriggerAudit,
+    TriggerProvisioningStatus,
     TriggerRun,
     TriggerType,
 )
 from xagent.web.models.user import User
 from xagent.web.models.user_oauth import UserOAuth
-from xagent.web.services.gmail_provisioning import gmail_topic_path
+from xagent.web.services.gmail_provisioning import (
+    GMAIL_WATCH_DISABLED_ERROR,
+    gmail_topic_path,
+    reconcile_gmail_trigger_provisioning,
+)
 from xagent.web.services.gmail_triggers import (
     GmailPubsubNotification,
+    GmailTriggerError,
     GmailWatchConfigurationError,
     _credentials_expiry,
     _get_google_oauth_config,
@@ -1368,6 +1374,7 @@ def test_best_effort_provisioning_targets_only_referenced_mailboxes(
     """After OAuth, only mailboxes bound to enabled Gmail triggers are provisioned."""
     from xagent.web.services import gmail_provisioning
 
+    monkeypatch.setenv("XAGENT_GMAIL_WATCH_ENABLED", "true")
     calls: list[str] = []
 
     def fake_ensure(_db, account, **_kwargs):
@@ -1907,6 +1914,7 @@ def test_collect_gmail_pubsub_events_skips_subject_mismatch() -> None:
 def test_collect_gmail_pubsub_events_reregisters_expired_history_id(
     monkeypatch: pytest.MonkeyPatch, per_mailbox_pubsub_env
 ) -> None:
+    monkeypatch.setenv("XAGENT_GMAIL_WATCH_ENABLED", "true")
     db = _direct_db_session()
     try:
         user = _create_user(db, "gmail-expired-history-user")
@@ -1958,6 +1966,248 @@ def test_collect_gmail_pubsub_events_reregisters_expired_history_id(
         ]
         assert state.topic_name == expected_topic
     finally:
+        db.close()
+
+
+def test_collect_gmail_pubsub_events_does_not_reregister_while_watch_disabled(
+    monkeypatch: pytest.MonkeyPatch, per_mailbox_pubsub_env
+) -> None:
+    """With the flag off, a stale-history callback must not re-register a
+    watch: that would recreate the silently-expiring-watch bug (#1231)."""
+    monkeypatch.delenv("XAGENT_GMAIL_WATCH_ENABLED", raising=False)
+    db = _direct_db_session()
+    try:
+        user = _create_user(db, "gmail-expired-history-disabled-user")
+        oauth = _create_gmail_oauth(db, user)
+        trigger = _mark_unified_gmail_trigger(
+            db,
+            _create_gmail_trigger(db, user),
+        )
+        trigger.provisioning_status = TriggerProvisioningStatus.ACTIVE.value
+        db.add(trigger)
+        db.commit()
+        state = GmailWatchState(
+            user_id=int(user.id),
+            oauth_account_id=int(oauth.id),
+            email="codeacme17@gmail.com",
+            history_id="100",
+            topic_name="projects/demo/topics/xagent-gmail",
+        )
+        db.add(state)
+        db.commit()
+        expired_history_service = _FakeGmailService(
+            history_exception=_FakeHttpError(404, "history expired")
+        )
+        renewed_watch_service = _FakeGmailService(
+            {"historyId": "333", "expiration": "1782864000000"}
+        )
+        services = iter([expired_history_service, renewed_watch_service])
+
+        collection = asyncio.run(
+            collect_gmail_pubsub_events(
+                db,
+                GmailPubsubNotification(
+                    email_address="codeacme17@gmail.com",
+                    history_id="222",
+                    pubsub_message_id="pubsub-expired-disabled",
+                ),
+                state=state,
+                service_factory=lambda _db, _oauth: next(services),
+            )
+        )
+
+        # A permanent condition acks (200-equivalent: no exception, no
+        # events) instead of driving Pub/Sub redelivery-with-backoff for the
+        # retention window; the renewal scan retries by expiration once the
+        # flag is re-enabled.
+        assert collection.events == []
+        assert collection.skipped == 1
+
+        db.refresh(state)
+        # The watch endpoint was never called: history_id stays at the
+        # original value instead of adopting the renewal service's.
+        assert state.history_id == "100"
+        assert state.status == TriggerProvisioningStatus.FAILED.value
+        assert state.last_error == GMAIL_WATCH_DISABLED_ERROR
+        assert renewed_watch_service.calls == []
+        assert reconcile_gmail_trigger_provisioning(db, [trigger]) == 1
+        db.refresh(trigger)
+        assert trigger.provisioning_status == TriggerProvisioningStatus.FAILED.value
+        assert trigger.provisioning_error == GMAIL_WATCH_DISABLED_ERROR
+    finally:
+        db.close()
+
+
+def test_collect_gmail_pubsub_events_retains_reregistration_failure_detail(
+    monkeypatch: pytest.MonkeyPatch, per_mailbox_pubsub_env
+) -> None:
+    monkeypatch.setenv("XAGENT_GMAIL_WATCH_ENABLED", "true")
+    db = _direct_db_session()
+    try:
+        user = _create_user(db, "gmail-expired-history-reregistration-failure-user")
+        oauth = _create_gmail_oauth(db, user)
+        state = GmailWatchState(
+            user_id=int(user.id),
+            oauth_account_id=int(oauth.id),
+            email="codeacme17@gmail.com",
+            history_id="100",
+            topic_name="projects/demo/topics/xagent-gmail",
+        )
+        db.add(state)
+        db.commit()
+        expired_history_service = _FakeGmailService(
+            history_exception=_FakeHttpError(404, "history expired")
+        )
+        service_calls = 0
+
+        def service_factory(_db, _oauth):
+            nonlocal service_calls
+            service_calls += 1
+            if service_calls == 1:
+                return expired_history_service
+            raise RuntimeError("renewal backend unavailable")
+
+        with pytest.raises(GmailTriggerError) as exc_info:
+            asyncio.run(
+                collect_gmail_pubsub_events(
+                    db,
+                    GmailPubsubNotification(
+                        email_address="codeacme17@gmail.com",
+                        history_id="222",
+                        pubsub_message_id="pubsub-expired-renewal-failed",
+                    ),
+                    state=state,
+                    service_factory=service_factory,
+                )
+            )
+
+        assert "Gmail history expired and re-registration failed" in str(exc_info.value)
+        assert "renewal backend unavailable" in str(exc_info.value)
+        db.refresh(state)
+        # FAILED here comes from ensure_gmail_mailbox_provisioned's own error
+        # handling for the genuine RuntimeError (a real provisioning
+        # failure), not from collect_gmail_pubsub_events's mark_failed flag -
+        # that flag is only set for the disabled condition (see the
+        # ...disabled test above) and is False on this flag-on transient
+        # path, so it does not redundantly re-flip an already-converged
+        # status here.
+        assert state.status == TriggerProvisioningStatus.FAILED.value
+        assert "renewal backend unavailable" in str(state.last_error)
+    finally:
+        db.close()
+
+
+def test_gmail_unified_callback_acks_and_stays_disabled_when_watch_disabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A stale-history push through the real callback route, with watch
+    registration disabled, must ack (200) instead of retrying, and finalize
+    must not erase the disabled marking collect_gmail_pubsub_events just
+    recorded (#1231 follow-up)."""
+    monkeypatch.delenv("XAGENT_GMAIL_WATCH_ENABLED", raising=False)
+    db = _direct_db_session()
+    try:
+        user = _create_user(db, "gmail-disabled-route-user")
+        oauth = _create_gmail_oauth(db, user)
+        _mark_unified_gmail_trigger(db, _create_gmail_trigger(db, user))
+        state = _create_gmail_watch_state(
+            db, user, oauth, callback_id="cb-disabled-route"
+        )
+
+        fake_service = _FakeGmailService(
+            history_exception=_FakeHttpError(404, "history expired")
+        )
+
+        def fake_verify(_token: str, audience: str) -> dict[str, object]:
+            return {"iss": "https://accounts.google.com", "aud": audience}
+
+        register_trigger_provider(
+            GmailProvider(
+                service_factory=lambda _db, _oauth: fake_service,
+                oidc_verifier=fake_verify,
+            ),
+            replace=True,
+        )
+        raw_body = _gmail_pubsub_push_body(
+            claimed_email="attacker@example.com",
+            message_id="pubsub-disabled-route",
+        )
+
+        response = client.post(
+            "/api/triggers/callback/gmail/cb-disabled-route",
+            headers={"Authorization": "Bearer oidc-token"},
+            content=raw_body,
+        )
+
+        assert response.status_code == 200, response.text
+        db.refresh(state)
+        assert state.status == TriggerProvisioningStatus.FAILED.value
+        assert state.last_error == GMAIL_WATCH_DISABLED_ERROR
+        # finalize_callback must not have advanced the cursor or cleared the
+        # marking despite the callback being acked as a whole.
+        assert state.history_id == "100"
+    finally:
+        register_trigger_provider(GmailProvider(), replace=True)
+        db.close()
+
+
+def test_gmail_unified_callback_advances_transient_failure_when_flag_off(
+    monkeypatch: pytest.MonkeyPatch,
+    mock_bg_scheduler,
+) -> None:
+    """A row failed for a transient reason (not the disabled marking) while
+    the flag happens to be off must keep advancing its cursor once a valid
+    push arrives - only the exact disabled marking should freeze finalize
+    (#1231 review follow-up, F2)."""
+    monkeypatch.delenv("XAGENT_GMAIL_WATCH_ENABLED", raising=False)
+    db = _direct_db_session()
+    try:
+        user = _create_user(db, "gmail-transient-failure-flag-off-user")
+        oauth = _create_gmail_oauth(db, user)
+        _mark_unified_gmail_trigger(db, _create_gmail_trigger(db, user))
+        state = _create_gmail_watch_state(
+            db, user, oauth, callback_id="cb-transient-flag-off"
+        )
+        setattr(state, "status", TriggerProvisioningStatus.FAILED.value)
+        setattr(state, "last_error", "quota exceeded")
+        db.add(state)
+        db.commit()
+
+        fake_service = _FakeGmailService(
+            history_response={
+                "history": [{"messagesAdded": [{"message": {"id": "msg-transient"}}]}]
+            },
+            messages={"msg-transient": _gmail_message("msg-transient")},
+        )
+
+        def fake_verify(_token: str, audience: str) -> dict[str, object]:
+            return {"iss": "https://accounts.google.com", "aud": audience}
+
+        register_trigger_provider(
+            GmailProvider(
+                service_factory=lambda _db, _oauth: fake_service,
+                oidc_verifier=fake_verify,
+            ),
+            replace=True,
+        )
+        raw_body = _gmail_pubsub_push_body(
+            claimed_email="attacker@example.com",
+            message_id="pubsub-transient-flag-off",
+        )
+
+        response = client.post(
+            "/api/triggers/callback/gmail/cb-transient-flag-off",
+            headers={"Authorization": "Bearer oidc-token"},
+            content=raw_body,
+        )
+
+        assert response.status_code == 200, response.text
+        assert response.json()["outcome"] == "accepted"
+        db.refresh(state)
+        assert state.history_id == "222"
+        assert state.last_error is None
+    finally:
+        register_trigger_provider(GmailProvider(), replace=True)
         db.close()
 
 
@@ -2143,6 +2393,7 @@ def test_collect_gmail_pubsub_events_fails_batch_on_transient_message_error_and_
             email="codeacme17@gmail.com",
             history_id="100",
             topic_name="projects/demo/topics/xagent-gmail",
+            status=TriggerProvisioningStatus.ACTIVE.value,
         )
         db.add(state)
         db.commit()
@@ -2179,6 +2430,7 @@ def test_collect_gmail_pubsub_events_fails_batch_on_transient_message_error_and_
 
         db.refresh(state)
         assert state.history_id == "100"
+        assert state.status == TriggerProvisioningStatus.ACTIVE.value
         assert "transient-msg" in str(state.last_error)
     finally:
         db.close()

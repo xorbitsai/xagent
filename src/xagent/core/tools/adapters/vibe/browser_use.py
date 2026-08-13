@@ -38,6 +38,11 @@ class BrowserTaskSessionMixin:
     """Keeps browser tool default sessions aligned during task setup."""
 
     _task_id: Optional[str] = None
+    # Playwright context locale for sessions this task creates. Set once by
+    # ``create_browser_tools`` on every browser tool (not just navigate):
+    # a session springs into existence on the FIRST tool call that touches
+    # it, whichever tool that is, and the locale is frozen at that moment.
+    _locale: Optional[str] = None
 
     async def setup(self, task_id: Optional[str] = None) -> None:
         if task_id:
@@ -51,6 +56,8 @@ class BrowserTaskSessionMixin:
         step_id = updated.pop(_STEP_SESSION_ARG, None)
         if not updated.get("session_id") and self._task_id:
             updated["session_id"] = self._default_session_id(step_id)
+        if self._locale and "locale" not in updated:
+            updated["locale"] = self._locale
         return updated
 
     def _default_session_id(self, step_id: Any = None) -> str:
@@ -327,11 +334,15 @@ class BrowserNavigateTool(BrowserTaskSessionMixin, AbstractBaseTool):
     """Navigate to a URL in a browser session."""
 
     def __init__(
-        self, task_id: Optional[str] = None, workspace: Optional["TaskWorkspace"] = None
+        self,
+        task_id: Optional[str] = None,
+        workspace: Optional["TaskWorkspace"] = None,
+        locale: Optional[str] = None,
     ):
         self._visibility = ToolVisibility.PUBLIC
         self._task_id = task_id
         self._workspace = workspace
+        self._locale = locale
 
     @property
     def name(self) -> str:
@@ -493,9 +504,10 @@ class BrowserClickTool(BrowserTaskSessionMixin, AbstractBaseTool):
     category = ToolCategory.BROWSER
     """Click an element on the current page."""
 
-    def __init__(self, task_id: Optional[str] = None):
+    def __init__(self, task_id: Optional[str] = None, locale: Optional[str] = None):
         self._visibility = ToolVisibility.PUBLIC
         self._task_id = task_id
+        self._locale = locale
 
     @property
     def name(self) -> str:
@@ -541,9 +553,10 @@ class BrowserFillTool(BrowserTaskSessionMixin, AbstractBaseTool):
     category = ToolCategory.BROWSER
     """Fill an input field with text."""
 
-    def __init__(self, task_id: Optional[str] = None):
+    def __init__(self, task_id: Optional[str] = None, locale: Optional[str] = None):
         self._visibility = ToolVisibility.PUBLIC
         self._task_id = task_id
+        self._locale = locale
 
     @property
     def name(self) -> str:
@@ -590,11 +603,15 @@ class BrowserScreenshotTool(BrowserTaskSessionMixin, AbstractBaseTool):
     """Take a screenshot of the current page."""
 
     def __init__(
-        self, task_id: Optional[str] = None, workspace: Optional["TaskWorkspace"] = None
+        self,
+        task_id: Optional[str] = None,
+        workspace: Optional["TaskWorkspace"] = None,
+        locale: Optional[str] = None,
     ):
         self._visibility = ToolVisibility.PUBLIC
         self._task_id = task_id
         self._workspace = workspace
+        self._locale = locale
 
     @property
     def name(self) -> str:
@@ -709,9 +726,10 @@ class BrowserExtractTextTool(BrowserTaskSessionMixin, AbstractBaseTool):
     category = ToolCategory.BROWSER
     """Extract text content from the page."""
 
-    def __init__(self, task_id: Optional[str] = None):
+    def __init__(self, task_id: Optional[str] = None, locale: Optional[str] = None):
         self._visibility = ToolVisibility.PUBLIC
         self._task_id = task_id
+        self._locale = locale
 
     @property
     def name(self) -> str:
@@ -756,9 +774,10 @@ class BrowserEvaluateTool(BrowserTaskSessionMixin, AbstractBaseTool):
     category = ToolCategory.BROWSER
     """Execute JavaScript code in the browser."""
 
-    def __init__(self, task_id: Optional[str] = None):
+    def __init__(self, task_id: Optional[str] = None, locale: Optional[str] = None):
         self._visibility = ToolVisibility.PUBLIC
         self._task_id = task_id
+        self._locale = locale
 
     @property
     def name(self) -> str:
@@ -863,9 +882,10 @@ class BrowserSelectOptionTool(BrowserTaskSessionMixin, AbstractBaseTool):
     category = ToolCategory.BROWSER
     """Select an option from a dropdown."""
 
-    def __init__(self, task_id: Optional[str] = None):
+    def __init__(self, task_id: Optional[str] = None, locale: Optional[str] = None):
         self._visibility = ToolVisibility.PUBLIC
         self._task_id = task_id
+        self._locale = locale
 
     @property
     def name(self) -> str:
@@ -912,9 +932,10 @@ class BrowserWaitForSelectorTool(BrowserTaskSessionMixin, AbstractBaseTool):
     category = ToolCategory.BROWSER
     """Wait for an element to appear on the page."""
 
-    def __init__(self, task_id: Optional[str] = None):
+    def __init__(self, task_id: Optional[str] = None, locale: Optional[str] = None):
         self._visibility = ToolVisibility.PUBLIC
         self._task_id = task_id
+        self._locale = locale
 
     @property
     def name(self) -> str:
@@ -960,9 +981,10 @@ class BrowserCloseTool(BrowserTaskSessionMixin, AbstractBaseTool):
     category = ToolCategory.BROWSER
     """Close a browser session and free resources."""
 
-    def __init__(self, task_id: Optional[str] = None):
+    def __init__(self, task_id: Optional[str] = None, locale: Optional[str] = None):
         self._visibility = ToolVisibility.PRIVATE  # Internal tool
         self._task_id = task_id
+        self._locale = locale
 
     @property
     def name(self) -> str:
@@ -1004,11 +1026,15 @@ class BrowserPdfTool(BrowserTaskSessionMixin, AbstractBaseTool):
     """Save current page as PDF."""
 
     def __init__(
-        self, task_id: Optional[str] = None, workspace: Optional["TaskWorkspace"] = None
+        self,
+        task_id: Optional[str] = None,
+        workspace: Optional["TaskWorkspace"] = None,
+        locale: Optional[str] = None,
     ):
         self._visibility = ToolVisibility.PUBLIC
         self._task_id = task_id
         self._workspace = workspace
+        self._locale = locale
 
     @property
     def name(self) -> str:
@@ -1122,6 +1148,7 @@ def create_browser_tools(
     workspace: Optional["TaskWorkspace"] = None,
     *,
     include_debug_tools: bool = False,
+    locale: Optional[str] = None,
 ) -> list:
     """
     Create all browser automation tools for a task.
@@ -1131,24 +1158,31 @@ def create_browser_tools(
         workspace: Optional workspace for saving screenshots
         include_debug_tools: Include browser session diagnostics. Disabled for
             normal agent runs so debug schemas do not consume model context.
+        locale: Playwright context locale for sessions this task creates
+            (e.g. derived from the requesting account's app_locale setting).
+            Falls back to the deployment default when not supplied.
 
     Returns:
         List of browser tool instances
     """
     from .computer import ComputerTool
 
+    # A browser session is created by the FIRST tool call that touches it
+    # (navigate is typical, but nothing guarantees it), so every tool needs
+    # locale passed explicitly rather than relying on just one of them
+    # (e.g. navigate) to carry it.
     tools = [
-        ComputerTool(task_id=task_id, workspace=workspace),
-        BrowserNavigateTool(task_id=task_id, workspace=workspace),
-        BrowserClickTool(task_id=task_id),
-        BrowserFillTool(task_id=task_id),
-        BrowserScreenshotTool(task_id=task_id, workspace=workspace),
-        BrowserExtractTextTool(task_id=task_id),
-        BrowserPdfTool(task_id=task_id, workspace=workspace),
-        BrowserEvaluateTool(task_id=task_id),
-        BrowserSelectOptionTool(task_id=task_id),
-        BrowserWaitForSelectorTool(task_id=task_id),
-        BrowserCloseTool(task_id=task_id),
+        ComputerTool(task_id=task_id, workspace=workspace, locale=locale),
+        BrowserNavigateTool(task_id=task_id, workspace=workspace, locale=locale),
+        BrowserClickTool(task_id=task_id, locale=locale),
+        BrowserFillTool(task_id=task_id, locale=locale),
+        BrowserScreenshotTool(task_id=task_id, workspace=workspace, locale=locale),
+        BrowserExtractTextTool(task_id=task_id, locale=locale),
+        BrowserPdfTool(task_id=task_id, workspace=workspace, locale=locale),
+        BrowserEvaluateTool(task_id=task_id, locale=locale),
+        BrowserSelectOptionTool(task_id=task_id, locale=locale),
+        BrowserWaitForSelectorTool(task_id=task_id, locale=locale),
+        BrowserCloseTool(task_id=task_id, locale=locale),
     ]
     if include_debug_tools:
         tools.append(BrowserListSessionsTool())

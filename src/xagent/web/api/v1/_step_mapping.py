@@ -33,18 +33,39 @@ Pure-function design:
     place SDK clients can observe a behavior change is through this
     one function's output -- which makes regressions easy to gate.
 
+Incremental projection:
+
+    The state machine that implements the pairing rules below lives in
+    :class:`PublicStepProjector`, not in this function. The projector
+    holds all the folding state a fold needs -- the pending
+    (start-seen, end-not-yet-seen) table, the ``dag_plan_*`` replan
+    counter, and the independent ``dag_execution`` planning-phase
+    counter -- so a caller can feed it one event at a time and read
+    back the steps that changed. ``map_trace_events_to_public_steps``
+    stays pure by constructing one fresh, throwaway projector per
+    call and reading back its materialized result; it keeps no
+    folding state of its own.
+
 Pairing rule:
 
     Start / end events are paired by a stable ``key``:
 
-      - ``tool_execution_*`` events pair on ``data['tool_execution_id']``
-        when present, falling back to ``step_id``. The tool execution
-        id is generated per-invocation and is the only safe key when
-        the same tool is called twice in the same step.
+      - ``tool_execution_*`` events pair on ``data['tool_call_id']``
+        (the provider-assigned call id), falling back to ``step_id``.
+        ``tool_execution_id`` is accepted ahead of it for compatibility
+        but has no current producer. A per-invocation id is the only
+        safe key when the same tool is called twice in the same step.
       - ``react_action_*`` events pair on ``step_id``.
       - ``dag_step_*`` events pair on ``step_id``.
       - ``dag_plan_*`` events pair on ``task_id`` (single planning
         phase per task; no per-plan identifier available).
+      - ``dag_execution`` events pair on ``data['phase']``: a
+        ``planning``/``replanning`` value opens a planning-phase
+        thinking step, an ``executing`` value closes the currently
+        open one. This is a second, independent source of the same
+        public phase as ``dag_plan_*`` above -- it keeps its own
+        counter and open key so the two families never collide, even
+        when both appear in the same event stream.
       - ``skill_select_*`` events pair on ``task_id`` (single skill
         selection phase per task).
 
@@ -56,6 +77,18 @@ Pairing rule:
     Orphan starts (start with no matching end) are emitted with
     ``status='running'`` and ``completed_at=None``. This naturally
     handles the case where the SDK polls ``/steps`` mid-task.
+
+    Key collision -- two starts sharing one pairing key before either
+    ends -- is last-write-wins: the second start replaces the first
+    pending entry, so only the second reaches a terminal state. Both
+    carry the same public step id (id and pairing key are derived from
+    the same (type, key) pair), so a consumer folding ``feed`` results
+    by id converges on the second step rather than being left with a
+    stranded ``running`` one. ``dag_plan_*`` and the planning-phase
+    steps ``dag_execution`` produces are the exception: neither has a
+    natural key at all, so each family keeps its own counter (and its
+    own ``plan:`` / ``planning:`` key prefix) to generate a distinct
+    one per occurrence.
 """
 
 from __future__ import annotations
@@ -78,6 +111,339 @@ logger = logging.getLogger(__name__)
 # Agent tool names are routed to the public ``agent_delegation`` type
 # instead of ``tool_call`` so SDK consumers can render nested
 # timelines without pattern-matching tool names client-side.
+
+
+class PublicStepProjector:
+    """Incremental folding state machine: trace events -> public steps.
+
+    Holds all the folding state a fold needs -- the pending
+    (start-seen, end-not-yet-seen) pairing table and the ``dag_plan_*``
+    counter/open-key used to disambiguate replan. The batch driver
+    (``map_trace_events_to_public_steps``) keeps none of its own: it
+    builds one instance and reads back the result. Holding this state
+    on an instance is what lets a caller feed a live event stream one
+    event at a time (see the module docstring's pairing rules for what
+    "pairing" means per event family).
+
+    Two ways to build one:
+
+      - ``PublicStepProjector()`` then repeated ``feed(event)`` calls, for
+        a live/incremental consumer.
+      - :meth:`from_history` to replay a full event list in one call and
+        get a projector whose state is exactly where it would be had it
+        been fed those events live -- this is what
+        ``map_trace_events_to_public_steps`` uses, and it's also how a
+        late-attaching consumer pre-warms pairing state instead of seeing
+        orphan ends for steps that started before it attached.
+
+    :meth:`materialized_steps` never sorts by ``started_at``. That global
+    resort is a batch-only concern (see ``map_trace_events_to_public_steps``):
+    a live consumer wants steps in the order they actually resolved, not
+    resorted on every event.
+
+    Preconditions for the incremental path: one instance per task, fed
+    in event order, from one thread/task at a time. ``feed`` mutates
+    the pairing tables without any locking, and the ``dag_plan_*`` open
+    key is a single slot, so two interleaved tasks would cross-pair.
+    The batch driver satisfies all three trivially -- it builds a fresh
+    throwaway instance per call.
+    """
+
+    def __init__(self) -> None:
+        # In-progress (start seen, end not yet seen) steps keyed by
+        # (public_type, pairing_key). Order of insertion is preserved by
+        # Python 3.7+ dict semantics, which is what we use to emit final
+        # output in the order steps were started.
+        self._pending: Dict[Tuple[str, str], Dict[str, Any]] = {}
+        # Completed-or-emitted-immediately steps. Filled in either by an
+        # end event matching a pending start, or by a one-shot event like
+        # ``user_message`` / ``ai_message`` which has no separate end.
+        self._finished: List[Dict[str, Any]] = []
+        # ``dag_plan_*`` has no per-plan identifier in the event data, so
+        # we synthesize one by counting starts and remembering the
+        # currently-open key. Replan in a single task (rare but legal)
+        # produces N >= 2 pairs; without this counter the second
+        # dag_plan_start would silently overwrite the first's pending
+        # entry. We assume plans don't nest (only one in flight at a
+        # time); nesting would require a stack, which DAG doesn't emit.
+        self._plan_counter = 0
+        self._open_plan_key: Optional[str] = None
+        # ``dag_execution`` (phase planning/replanning/executing) is a
+        # second source of the same public planning phase, translated
+        # further down in ``feed``. It gets its own counter and open
+        # key so it never shares pairing state with ``dag_plan_*``
+        # above -- both families can appear in the same stream without
+        # cross-talk or id collisions.
+        self._dag_execution_counter = 0
+        self._open_dag_execution_key: Optional[str] = None
+
+    @classmethod
+    def from_history(cls, events: List[Any]) -> "PublicStepProjector":
+        """Build a projector pre-warmed by replaying a full event history.
+
+        Feeds every event into a fresh instance, in order. The resulting
+        pairing state (open plan key/counter, any still-``pending``
+        starts) is identical to what a live consumer would have
+        accumulated by that point -- there is no separate "batch" code
+        path for the folding logic itself, only this replay.
+        """
+        projector = cls()
+        for event in events:
+            projector.feed(event)
+        return projector
+
+    def materialized_steps(self) -> List[Dict[str, Any]]:
+        """Return every step currently known, finished or still running.
+
+        Order: finished steps in the order they resolved, then any
+        still-``pending`` (``running``) steps in the order they started.
+        Callers that need the public started_at-sorted order (currently
+        only the ``map_trace_events_to_public_steps`` batch driver) sort
+        this themselves.
+
+        The list itself is a fresh snapshot, but the step dicts inside
+        it are the projector's live objects: a still-``running`` step
+        is mutated in place when its end event arrives (see
+        :meth:`feed`). Treat them as read-only views -- a caller that
+        needs a stable picture must copy before storing.
+        """
+        steps = list(self._finished)
+        steps.extend(self._pending.values())
+        return steps
+
+    def feed(self, event: Any) -> List[Dict[str, Any]]:
+        """Fold one trace event, returning the step(s) it changed.
+
+        A start event returns the new ``running`` step; an end event
+        (or failure event) returns the step now in its terminal state;
+        a one-shot event (``user_message`` / ``ai_message``) returns the
+        step it produces. Events that don't affect any public step --
+        unexposed types, orphan ends, non-terminal sub-events of an
+        exposed family -- return ``[]``.
+
+        The returned dict is the same object subsequently held in
+        :meth:`materialized_steps`'s backing storage (mutated in place
+        when a pending start is later finalized), so a caller folding
+        successive ``feed`` results by step id always ends up with the
+        current state of each step.
+        """
+        event_type = _safe_get(event, "event_type")
+        if not event_type:
+            return []
+
+        # ===== messages: one event per message, no pairing =====
+        if event_type == "user_message":
+            step = _build_message_step(event, role="user")
+            self._finished.append(step)
+            return [step]
+        if event_type == "ai_message":
+            step = _build_message_step(event, role="assistant")
+            self._finished.append(step)
+            return [step]
+
+        # ===== thinking: paired start/end =====
+        thinking_phase = _thinking_phase_for(event_type)
+        if thinking_phase == "planning":
+            # Special-cased because plan events have no per-plan id;
+            # we generate one from a counter and remember the open
+            # key so the next dag_plan_end pairs with the latest start.
+            # The dag_execution branch below keeps its own independent
+            # counter and "planning:" key prefix; keep pairing
+            # semantics changes in lockstep between the two branches.
+            if event_type.endswith("_start"):
+                self._plan_counter += 1
+                task_ref = (
+                    _safe_get(event, "task_id")
+                    or _safe_get(event, "event_id")
+                    or "anon"
+                )
+                self._open_plan_key = f"plan:{task_ref}:{self._plan_counter}"
+                step = _build_thinking_start(
+                    event, phase="planning", key=self._open_plan_key
+                )
+                self._pending[("thinking", self._open_plan_key)] = step
+                return [step]
+            if event_type.endswith("_end") and self._open_plan_key is not None:
+                finalized = _finalize_pending(
+                    self._pending,
+                    self._finished,
+                    ("thinking", self._open_plan_key),
+                    end_event=event,
+                    status="completed",
+                )
+                self._open_plan_key = None
+                return [finalized] if finalized is not None else []
+            # Orphan end with no open plan: drop silently (same policy
+            # as orphan tool_execution_end).
+            return []
+
+        if thinking_phase is not None:
+            # action / step branch -- step_id is the natural pair key.
+            key = _thinking_pair_key(event, thinking_phase)
+            if event_type.endswith("_start"):
+                step = _build_thinking_start(event, phase=thinking_phase, key=key)
+                self._pending[("thinking", key)] = step
+                return [step]
+            if event_type.endswith("_end"):
+                finalized = _finalize_pending(
+                    self._pending,
+                    self._finished,
+                    ("thinking", key),
+                    end_event=event,
+                    status="completed",
+                )
+                return [finalized] if finalized is not None else []
+            # Events in these families that are neither a start nor an
+            # end carry no step transition.
+            return []
+
+        # ===== tool_call / agent_delegation: paired start/end + failure =====
+        if event_type in (
+            "tool_execution_start",
+            "tool_execution_end",
+            "tool_execution_failed",
+        ):
+            tool_name = _data_get(event, "tool_name")
+            is_delegation = is_agent_tool_name(tool_name)
+            public_type = "agent_delegation" if is_delegation else "tool_call"
+            # Pair on a per-invocation id (unique even when one step
+            # invokes the same tool twice). The effective key today is
+            # ``tool_call_id``; ``tool_execution_id`` is accepted ahead
+            # of it for compatibility but has no current producer.
+            # step_id alone is unsafe because one step may invoke
+            # multiple tools.
+            key = (
+                _data_get(event, "tool_execution_id")
+                or _data_get(event, "tool_call_id")
+                or _safe_get(event, "step_id")
+                or _safe_get(event, "event_id")
+            )
+            if not key:
+                return []
+
+            if event_type == "tool_execution_start":
+                step = _build_tool_start(
+                    event,
+                    public_type=public_type,
+                    tool_name=tool_name,
+                    key=str(key),
+                )
+                self._pending[(public_type, str(key))] = step
+                return [step]
+            if event_type == "tool_execution_end":
+                success = _data_get(event, "success", default=True)
+                status = "completed" if success else "failed"
+                # ``tool_call`` and ``agent_delegation`` use different keys
+                # on the public schema: tool_call exposes ``result``
+                # (generic tool return), agent_delegation exposes
+                # ``output`` (mirroring ``input`` on the start side). The
+                # underlying internal field is still ``data['result']`` --
+                # we only rename on the public surface. ``error`` is the
+                # same on both for failures.
+                success_key = (
+                    "output" if public_type == "agent_delegation" else "result"
+                )
+                finalized = _finalize_pending(
+                    self._pending,
+                    self._finished,
+                    (public_type, str(key)),
+                    end_event=event,
+                    status=status,
+                    extra_data_fn=lambda ev, succ=success, k=success_key: (
+                        {k: _data_get(ev, "result")}
+                        if succ
+                        else {
+                            "error": _data_get(ev, "error") or "Tool execution failed"
+                        }
+                    ),
+                )
+                return [finalized] if finalized is not None else []
+            # tool_execution_failed: v2 runtime emits a dedicated failure
+            # event (TraceCategory.TOOL + TraceAction.ERROR) instead of
+            # tool_execution_end with success=False. Without this branch
+            # the pending start was never finalized and the public step
+            # stayed at status='running' indefinitely.
+            finalized = _finalize_pending(
+                self._pending,
+                self._finished,
+                (public_type, str(key)),
+                end_event=event,
+                status="failed",
+                extra_data_fn=lambda ev: {
+                    "error": _data_get(ev, "error")
+                    or _data_get(ev, "error_message")
+                    or "Tool execution failed"
+                },
+            )
+            return [finalized] if finalized is not None else []
+
+        # ===== skill_select_*: surface as tool_call with skill name =====
+        if event_type in ("skill_select_start", "skill_select_end"):
+            key = (
+                _data_get(event, "skill_name")
+                or _safe_get(event, "step_id")
+                or str(_safe_get(event, "task_id") or "skill")
+            )
+            if event_type == "skill_select_start":
+                step = _build_tool_start(
+                    event,
+                    public_type="tool_call",
+                    tool_name=_data_get(event, "skill_name") or "skill_select",
+                    key=str(key),
+                )
+                self._pending[("tool_call", str(key))] = step
+                return [step]
+            finalized = _finalize_pending(
+                self._pending,
+                self._finished,
+                ("tool_call", str(key)),
+                end_event=event,
+                status="completed",
+                extra_data_fn=lambda ev: {"result": _data_get(ev, "result")},
+            )
+            return [finalized] if finalized is not None else []
+
+        # ===== dag_execution: translate an existing signal into the
+        # same public planning phase ``dag_plan_*`` produces =====
+        if event_type == "dag_execution":
+            phase = _data_get(event, "phase")
+            if not isinstance(phase, str):
+                # Missing/malformed phase: nothing to translate.
+                return []
+            if phase in ("planning", "replanning"):
+                self._dag_execution_counter += 1
+                task_ref = (
+                    _safe_get(event, "task_id")
+                    or _safe_get(event, "event_id")
+                    or "anon"
+                )
+                key = f"planning:{task_ref}:{self._dag_execution_counter}"
+                self._open_dag_execution_key = key
+                step = _build_thinking_start(event, phase="planning", key=key)
+                self._pending[("thinking", key)] = step
+                return [step]
+            if phase == "executing":
+                if self._open_dag_execution_key is None:
+                    # No open planning step to close: same policy as an
+                    # orphan end elsewhere in this module -- drop.
+                    return []
+                finalized = _finalize_pending(
+                    self._pending,
+                    self._finished,
+                    ("thinking", self._open_dag_execution_key),
+                    end_event=event,
+                    status="completed",
+                )
+                self._open_dag_execution_key = None
+                return [finalized] if finalized is not None else []
+            # Other phases (e.g. completion_assessment): not exposed.
+            return []
+
+        # Everything else (llm_call_*, memory_*, dag_execute_*,
+        # react_task_*, react_step_*, visualization_update,
+        # task_completion, trace_error, action_*_compact) -- not
+        # exposed in the SDK contract. Silently drop.
+        return []
 
 
 def map_trace_events_to_public_steps(
@@ -123,201 +489,11 @@ def map_trace_events_to_public_steps(
           tables in this module) are silently dropped. Adding a new
           public type is a deliberate per-type opt-in.
     """
-    # In-progress (start seen, end not yet seen) steps keyed by
-    # (public_type, pairing_key). Order of insertion is preserved by
-    # Python 3.7+ dict semantics, which is what we use to emit final
-    # output in the order steps were started.
-    pending: Dict[Tuple[str, str], Dict[str, Any]] = {}
-    # Completed-or-emitted-immediately steps. Filled in either by an
-    # end event matching a pending start, or by a one-shot event like
-    # ``user_message`` / ``ai_message`` which has no separate end.
-    finished: List[Dict[str, Any]] = []
-    # ``dag_plan_*`` has no per-plan identifier in the event data, so
-    # we synthesize one by counting starts and remembering the
-    # currently-open key. Replan in a single task (rare but legal)
-    # produces N >= 2 pairs; without this counter the second
-    # dag_plan_start would silently overwrite the first's pending
-    # entry. We assume plans don't nest (only one in flight at a
-    # time); nesting would require a stack, which DAG doesn't emit.
-    plan_counter = 0
-    open_plan_key: Optional[str] = None
-
-    for event in events:
-        event_type = _safe_get(event, "event_type")
-        if not event_type:
-            continue
-
-        # ===== messages: one event per message, no pairing =====
-        if event_type == "user_message":
-            finished.append(_build_message_step(event, role="user"))
-            continue
-        if event_type == "ai_message":
-            finished.append(_build_message_step(event, role="assistant"))
-            continue
-
-        # ===== thinking: paired start/end =====
-        thinking_phase = _thinking_phase_for(event_type)
-        if thinking_phase == "planning":
-            # Special-cased because plan events have no per-plan id;
-            # we generate one from a counter and remember the open
-            # key so the next dag_plan_end pairs with the latest start.
-            if event_type.endswith("_start"):
-                plan_counter += 1
-                task_ref = (
-                    _safe_get(event, "task_id")
-                    or _safe_get(event, "event_id")
-                    or "anon"
-                )
-                open_plan_key = f"plan:{task_ref}:{plan_counter}"
-                pending[("thinking", open_plan_key)] = _build_thinking_start(
-                    event, phase="planning", key=open_plan_key
-                )
-            elif event_type.endswith("_end") and open_plan_key is not None:
-                _finalize_pending(
-                    pending,
-                    finished,
-                    ("thinking", open_plan_key),
-                    end_event=event,
-                    status="completed",
-                )
-                open_plan_key = None
-            # Orphan end with no open plan: drop silently (same policy
-            # as orphan tool_execution_end).
-            continue
-
-        if thinking_phase is not None:
-            # action / step branch -- step_id is the natural pair key.
-            key = _thinking_pair_key(event, thinking_phase)
-            if event_type.endswith("_start"):
-                pending[("thinking", key)] = _build_thinking_start(
-                    event, phase=thinking_phase, key=key
-                )
-            elif event_type.endswith("_end"):
-                _finalize_pending(
-                    pending,
-                    finished,
-                    ("thinking", key),
-                    end_event=event,
-                    status="completed",
-                )
-            # other actions (e.g. dag_execution UPDATE) for these
-            # categories are not exposed.
-            continue
-
-        # ===== tool_call / agent_delegation: paired start/end + failure =====
-        if event_type in (
-            "tool_execution_start",
-            "tool_execution_end",
-            "tool_execution_failed",
-        ):
-            tool_name = _data_get(event, "tool_name")
-            is_delegation = is_agent_tool_name(tool_name)
-            public_type = "agent_delegation" if is_delegation else "tool_call"
-            # Pair on a per-invocation id (unique even when one step
-            # invokes the same tool twice). v1 emits
-            # ``tool_execution_id``; v2 emits ``tool_call_id``. Either
-            # is fine — the fallback chain accepts both. step_id alone
-            # is unsafe because one step may invoke multiple tools.
-            key = (
-                _data_get(event, "tool_execution_id")
-                or _data_get(event, "tool_call_id")
-                or _safe_get(event, "step_id")
-                or _safe_get(event, "event_id")
-            )
-            if not key:
-                continue
-
-            if event_type == "tool_execution_start":
-                pending[(public_type, str(key))] = _build_tool_start(
-                    event,
-                    public_type=public_type,
-                    tool_name=tool_name,
-                    key=str(key),
-                )
-            elif event_type == "tool_execution_end":
-                success = _data_get(event, "success", default=True)
-                status = "completed" if success else "failed"
-                # ``tool_call`` and ``agent_delegation`` use different keys
-                # on the public schema: tool_call exposes ``result``
-                # (generic tool return), agent_delegation exposes
-                # ``output`` (mirroring ``input`` on the start side). The
-                # underlying internal field is still ``data['result']`` --
-                # we only rename on the public surface. ``error`` is the
-                # same on both for failures.
-                success_key = (
-                    "output" if public_type == "agent_delegation" else "result"
-                )
-                _finalize_pending(
-                    pending,
-                    finished,
-                    (public_type, str(key)),
-                    end_event=event,
-                    status=status,
-                    extra_data_fn=lambda ev, succ=success, k=success_key: (
-                        {k: _data_get(ev, "result")}
-                        if succ
-                        else {
-                            "error": _data_get(ev, "error") or "Tool execution failed"
-                        }
-                    ),
-                )
-            else:  # tool_execution_failed
-                # v2 runtime emits a dedicated failure event
-                # (TraceCategory.TOOL + TraceAction.ERROR) instead of
-                # tool_execution_end with success=False. Without this
-                # branch the pending start was never finalized and the
-                # public step stayed at status='running' indefinitely.
-                _finalize_pending(
-                    pending,
-                    finished,
-                    (public_type, str(key)),
-                    end_event=event,
-                    status="failed",
-                    extra_data_fn=lambda ev: {
-                        "error": _data_get(ev, "error")
-                        or _data_get(ev, "error_message")
-                        or "Tool execution failed"
-                    },
-                )
-            continue
-
-        # ===== skill_select_*: surface as tool_call with skill name =====
-        if event_type in ("skill_select_start", "skill_select_end"):
-            key = (
-                _data_get(event, "skill_name")
-                or _safe_get(event, "step_id")
-                or str(_safe_get(event, "task_id") or "skill")
-            )
-            if event_type == "skill_select_start":
-                pending[("tool_call", str(key))] = _build_tool_start(
-                    event,
-                    public_type="tool_call",
-                    tool_name=_data_get(event, "skill_name") or "skill_select",
-                    key=str(key),
-                )
-            else:
-                _finalize_pending(
-                    pending,
-                    finished,
-                    ("tool_call", str(key)),
-                    end_event=event,
-                    status="completed",
-                    extra_data_fn=lambda ev: {"result": _data_get(ev, "result")},
-                )
-            continue
-
-        # Everything else (llm_call_*, memory_*, dag_execute_*,
-        # react_task_*, react_step_*, visualization_update,
-        # task_completion, trace_error, action_*_compact) -- not
-        # exposed in the SDK contract. Silently drop.
-
-    # Emit pending starts as ``running`` steps. The insertion order in
-    # ``pending`` plus the iteration order of ``finished`` gives us a
-    # stable public ordering: ``finished`` are sorted by completion
-    # (which is the order they fired), and any still-running steps
-    # come after in started-at order.
-    output = list(finished)
-    output.extend(pending.values())
+    # The folding state machine itself lives in ``PublicStepProjector``;
+    # this is a thin batch driver that replays the full event list
+    # through a fresh instance and applies the one sort step that is a
+    # batch-only concern (see ``PublicStepProjector.materialized_steps``).
+    output = PublicStepProjector.from_history(events).materialized_steps()
     # Final sort by ``started_at`` so output is monotonic regardless of
     # whether a step finishes before the next one starts. Stable sort
     # preserves insertion order for ties.
@@ -353,8 +529,8 @@ def _thinking_pair_key(event: Any, phase: str) -> str:
 
     ``react_action_*`` and ``dag_step_*`` always carry a step_id
     which is the natural pairing key. Planning events are handled
-    inline in :func:`map_trace_events_to_public_steps` because they
-    lack a per-plan identifier and need a synthesized counter.
+    inline in :meth:`PublicStepProjector.feed` because they lack a
+    per-plan identifier and need a synthesized counter.
     """
     return str(_safe_get(event, "step_id") or _safe_get(event, "event_id") or "")
 
@@ -476,16 +652,19 @@ def _finalize_pending(
     end_event: Any,
     status: str,
     extra_data_fn: Optional[Any] = None,
-) -> None:
+) -> Optional[Dict[str, Any]]:
     """Move ``pending[key]`` to ``finished`` and patch with end metadata.
 
     Orphan end (no matching start in ``pending``) is dropped on
-    purpose -- see module docstring.
+    purpose -- see module docstring. Returns the finalized step dict
+    (the same object moved into ``finished``), or ``None`` for a
+    dropped orphan end, so callers that need to report "what changed"
+    (:meth:`PublicStepProjector.feed`) don't have to re-derive it.
     """
     step = pending.pop(key, None)
     if step is None:
         # Orphan end event; skip.
-        return
+        return None
     step["status"] = status
     step["completed_at"] = _ts(end_event)
     if extra_data_fn is not None:
@@ -495,6 +674,7 @@ def _finalize_pending(
         except Exception as exc:  # defensive; data shape is external
             logger.debug("step extra_data_fn failed: %s", exc)
     finished.append(step)
+    return step
 
 
 # ===== attribute / data accessors =====

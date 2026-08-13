@@ -43,6 +43,12 @@ place, and this module makes no claim about what happens there. Extending
 the caller set to a fourth site is a reason to come back and re-read this
 module, not to assume its guards still describe the new caller's situation.
 
+Timing is as strict as the caller set: the finalizer must call this
+function before it releases the lease, against the same task row it
+already holds locked under ``SELECT ... FOR UPDATE`` -- never a row
+re-read afterward, which could already reflect a different attempt's
+ownership by the time this function's ownership and attempt guards run.
+
 This module is also the only place allowed to construct or parse the JSON
 shape a published row's ``request_payload`` carries -- see
 :func:`build_clarification_payload` and :func:`parse_clarification_payload`
@@ -133,6 +139,14 @@ def _strip_control_characters(value: str) -> str:
     comment above for the cross-layer contract this filter must not drift
     from."""
 
+    # Both replaces below target the same code point, NUL (U+0000); the
+    # second is a no-op after the first. It is kept so this filter's
+    # character-handling semantics match clarification.py's
+    # ``_marker_clean`` exactly, for the five-copy comparison the
+    # cross-layer contract in the comment above ``_CONTROL_CHAR_KEEP``
+    # depends on -- not because the two copies are written alike
+    # line-for-line: that one uses two separate statements, this one
+    # chains both replaces into a single line.
     cleaned = value.replace("\x00", "").replace("\u0000", "")
     return "".join(ch for ch in cleaned if ord(ch) >= 32 or ch in _CONTROL_CHAR_KEEP)
 
@@ -432,23 +446,29 @@ def resolve_publishable_clarification(
     dedicated exception for exactly this case, reported under its own
     degradation signal), not to this resolver.
 
-    On success, this function clears ``CLARIFICATION_DRAFT_MISSING`` --
-    reaching ``Publishable`` is itself the evidence that the draft pipeline
-    worked this time.
+    ``now`` must be an aware UTC datetime -- the same obligation
+    ``stage_interaction_request`` documents for its own ``now`` parameter
+    (``task_interaction_staging.py``). It is folded into ``expires_at``
+    (``now + CLARIFICATION_REQUEST_TTL``) on the ``Publishable`` path, and a
+    naive or non-UTC value would corrupt that column the same way an
+    unvalidated ``expires_at`` would. This function does not itself
+    validate ``now``: ``stage_interaction_request``'s own validation of the
+    ``expires_at`` this function hands it already enforces the obligation
+    downstream, so a second check here would only duplicate that guard.
 
     ``CLARIFICATION_MULTIPLE_DRAFTS`` is registered before any guard below
     gets a chance to return, not only on the ``Publishable`` path: whether
     ``result["clarification_superseded_step_ids"]`` is non-empty is a fact
     about this round's ``result`` that holds regardless of which guard
     ultimately classifies it -- a losing waiting step can be superseded by
-    an interrupt that wins the same round, so ``NotApplicable(None)`` and
-    every other non-``Publishable`` outcome must still be able to report
-    the conflict. Clearing it is the opposite: confined to the
-    ``Publishable`` path only, alongside ``CLARIFICATION_DRAFT_MISSING`` --
-    a successful publish clears the signal only when nothing was
-    superseded *this same round* either, since publishing this round's
-    draft does not retroactively undo a sibling step's draft having been
-    discarded.
+    an interrupt that wins the same round (see ``AgentExecutionAdapter``'s
+    ``"interrupted"`` branch), so ``NotApplicable(None)`` and every other
+    non-``Publishable`` outcome must still be able to report the conflict.
+    Clearing it is the opposite: confined to the ``Publishable`` path only,
+    alongside ``CLARIFICATION_DRAFT_MISSING`` -- a successful publish
+    clears the signal only when nothing was superseded *this same round*
+    either, since publishing this round's draft does not retroactively
+    undo a sibling step's draft having been discarded.
     """
 
     superseded_step_ids = result.get("clarification_superseded_step_ids") or []

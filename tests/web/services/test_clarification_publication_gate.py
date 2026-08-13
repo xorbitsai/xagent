@@ -5,9 +5,13 @@ paths that settle a task run against its lease calls it yet. A static test
 asserts exactly that -- no production code path calls it -- so the module
 cannot end up half-wired, called from one finalizer but not the other two.
 
-The gate's expected call count today is zero. It becomes exactly three
-(one call in each of the two finalizers that settle a running task, one in
-the finalizer that settles a resumed one) only once all three of those
+None of today's three finalizers has a pipeline that hands it both the
+pattern's result dict and the resume anchor this resolver needs --
+``finalize_managed_task_lease_result``'s current signature
+(``managed_task_lease.py``), for instance, takes neither. The gate's
+expected call count today is zero. It becomes exactly three (one call in
+each of the two finalizers that settle a running task, one in the
+finalizer that settles a resumed one) only once all three of those
 finalizers call it, the task-side protocol marker exists, and the read
 surface that consumes a published row is switched on together -- not one
 finalizer at a time. This mirrors the existing zero-to-nonzero gate this

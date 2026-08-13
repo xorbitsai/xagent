@@ -3059,6 +3059,59 @@ async def test_callable_plan_generator_receives_structured_request() -> None:
 
 
 @pytest.mark.asyncio
+async def test_dag_pattern_replan_treats_invalidated_step_as_pending() -> None:
+    """A step already flipped to clarification_invalidated by a
+    superseded-question batch is neither a completed result to reuse
+    nor a status that should silently carry over into a fresh plan.
+    Replan generation must still see it on previous_plan -- the replan
+    prompt is built straight from that request, so a planner can react
+    to a step whose question got superseded -- but the regenerated plan
+    comes back with every step at "pending", and any active-step
+    bookkeeping left over from before the replan is gone.
+    """
+
+    seen: list[PlanGenerationRequest] = []
+
+    def build_from_request(**kwargs: Any) -> ExecutionPlan:
+        request = kwargs["request"]
+        seen.append(request)
+        return build_plan(
+            PlanStep(id="step_1", task="Redo step 1"),
+            PlanStep(id="step_2", task="Redo step 2"),
+        )
+
+    pattern = DAGPattern(build_from_request)
+    pattern.plan = build_plan(
+        PlanStep(id="step_1", task="Do step 1", status="running"),
+        PlanStep(id="step_2", task="Do step 2", status="clarification_invalidated"),
+    )
+    pattern._set_active_step_context("step_2", {"step": "step_2"})
+    pattern._set_active_step_pattern_state("step_2", {"step": "step_2"})
+
+    context = ExecutionContext(execution_id="dag-replan-invalidated")
+
+    await pattern._generate_plan(
+        context=context,
+        tools=[],
+        llm=object(),
+        runtime=PatternRuntime(execution_id=context.execution_id),
+        replan=True,
+    )
+
+    assert len(seen) == 1
+    previous_steps_by_id = {
+        step["id"]: step for step in seen[0].previous_plan.to_dict()["steps"]
+    }
+    assert previous_steps_by_id["step_2"]["status"] == "clarification_invalidated"
+
+    assert [step.status for step in pattern.plan.steps] == ["pending", "pending"]
+
+    assert pattern.active_step_ids == []
+    assert pattern.active_step_pattern_states == {}
+    assert pattern.active_step_contexts == {}
+
+
+@pytest.mark.asyncio
 async def test_llm_plan_generator_builds_plan_from_model_json() -> None:
     generator = LLMPlanGenerator()
     context = ExecutionContext(execution_id="dag-llm-plan")

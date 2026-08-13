@@ -50,9 +50,10 @@ def parsed_src_files() -> tuple[tuple[str, str, ast.Module], ...]:
     ``"question_superseded"``. That prefilter is gone: the guards now
     resolve the message-type constants by name, so a file that imports
     ``SUPERSEDED_MESSAGE_TYPE`` and never spells the literal is exactly
-    the file that most needs scanning. Measured on this tree (815 files):
-    0.14s for the two old prefiltered passes, 1.6s for this one full
-    pass -- the cost of scanning everything, paid once per module.
+    the file that most needs scanning. Measured on this tree, the one full
+    pass costs roughly an order of magnitude more than the two prefiltered
+    passes it replaces -- the cost of scanning everything, paid once per
+    module.
 
     Module-scoped rather than a module-level cache so pytest owns the
     lifetime and no state survives the module; the guards only read these

@@ -428,9 +428,10 @@ def supersede_legacy_question_rows(db: Session, *, task_id: int) -> int:
     This function does not order them — it takes no row lock on the task,
     reads no lease, and checks no caller state. Where this repository needs
     that ordering elsewhere it uses a row lock plus an ownership filter
-    (``websocket.py:2190-2197`` and ``:2876-2885`` take
-    ``with_for_update()`` alongside ``runner_id``/``run_id`` predicates),
-    and ``task_interaction_staging.py:1176-1190`` records what that costs
+    (``websocket.py`` loads the task with ``with_for_update()`` alongside
+    ``runner_id``/``run_id`` predicates before a lease-scoped write), and
+    ``_assert_current_attempt`` in ``task_interaction_staging.py`` records
+    what that costs
     on SQLite, where SQLAlchemy drops ``with_for_update()`` and only
     single-writer semantics keep the window shut. Choosing among those
     belongs to the change that introduces the first call site, together
@@ -459,10 +460,10 @@ def supersede_legacy_question_rows(db: Session, *, task_id: int) -> int:
     """
 
     # ``Session.begin_nested()`` flushes the whole session before issuing the
-    # SAVEPOINT, so that flush -- and any constraint violation among the
-    # caller's own pending rows -- would otherwise happen inside the try below
-    # and be caught as if this UPDATE had failed. Flushing here, outside the
-    # try, keeps a caller-originated failure attributed to the caller.
+    # SAVEPOINT. Flushing here instead, outside the try, raises a constraint
+    # violation among the caller's own pending rows from this line rather
+    # than from inside the block, and keeps that attribution independent of
+    # where SQLAlchemy chooses to flush.
     db.flush()
 
     # SQLite only: make sure a real transaction is open before the SAVEPOINT.

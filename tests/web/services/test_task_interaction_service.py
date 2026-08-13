@@ -307,7 +307,6 @@ def _owning_principal(task_user_id: int) -> svc.InteractionPrincipal:
         kind="user",
         user_id=task_user_id,
         is_admin=False,
-        channel_id=None,
         auth_mode=None,
     )
 
@@ -514,7 +513,6 @@ def test_create_never_touches_staging_or_stages_a_row(
             kind="user",
             user_id=None,
             is_admin=True,
-            channel_id=None,
             auth_mode=None,
         ),
         envelope=envelope,
@@ -579,7 +577,6 @@ def _widget_workforce_guest_principal(
         kind="guest",
         user_id=user_id,
         is_admin=False,
-        channel_id=None,
         auth_mode="widget",
         widget_workforce_id=workforce_id,
         guest_id=guest_id,
@@ -632,7 +629,6 @@ def test_ca1_guest_principal_with_two_populated_directions_is_unauthorized_not_r
         kind="guest",
         user_id=1,
         is_admin=False,
-        channel_id=None,
         auth_mode="widget",
         widget_agent_id=1,
         widget_workforce_id=1,
@@ -651,7 +647,6 @@ def test_ca1_guest_principal_with_zero_populated_directions_is_unauthorized_not_
         kind="guest",
         user_id=1,
         is_admin=False,
-        channel_id=None,
         auth_mode="widget",
         guest_id="guest-1",
     )
@@ -672,7 +667,6 @@ def test_ca1_unknown_principal_kind_is_always_unauthorized(
         kind="robot",
         user_id=task.user_id,
         is_admin=True,
-        channel_id=None,
         auth_mode=None,
     )
     outcome = svc.create(

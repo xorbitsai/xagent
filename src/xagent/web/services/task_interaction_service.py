@@ -122,23 +122,13 @@ class InteractionPrincipal:
     and a guest's owning user is the entity (agent/workforce) owner the
     guest is chatting through, not the guest itself. ``is_admin`` records
     whether this is an admin acting on someone else's task (the turn still
-    runs as the task owner; ``is_admin`` is audit-only). ``channel_id``,
-    ``auth_mode``, the four ``*_id`` entity-binding fields, and ``guest_id``
-    mirror the fields ``public_chat_access.py``'s access-context dataclasses
-    already carry (see that module's ``PublicChatAccessContext`` and
+    runs as the task owner; ``is_admin`` is audit-only). ``auth_mode``, the
+    four ``*_id`` entity-binding fields, and ``guest_id`` mirror the fields
+    ``public_chat_access.py``'s access-context dataclasses already carry
+    (see that module's ``PublicChatAccessContext`` and
     ``ShareChatAccessContext``); exactly one of ``widget_agent_id`` /
     ``widget_workforce_id`` / ``share_agent_id`` / ``share_workforce_id`` is
     populated for a guest principal, none for a ``"user"`` principal.
-
-    ``channel_id`` on this object is carried for parity with
-    ``PublicChatAccessContext`` only -- channel ownership is decided
-    entirely on the ``task`` side (``task_is_owned_by_public_principal``'s
-    first conjunct reads ``task.channel_id``), so this field does not
-    itself feed any predicate in this module. The two share-side
-    construction points in ``public_chat_access.py`` pass
-    ``channel_id=None`` because ``ShareChatAccessContext`` has no channel
-    field to read from, not because a real value is being discarded; the
-    widget-workforce construction point passes the real channel id.
 
     ``identity_string`` produces the same ``"user:{id}"`` / ``"guest:{gid}"``
     namespacing the ``responder_identity`` column comment documents
@@ -150,7 +140,6 @@ class InteractionPrincipal:
     kind: str  # "user" | "guest"
     user_id: int | None
     is_admin: bool
-    channel_id: int | None
     auth_mode: str | None  # "widget" | "share" | None
     widget_agent_id: int | None = None
     widget_workforce_id: int | None = None

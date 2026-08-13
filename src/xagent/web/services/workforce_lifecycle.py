@@ -28,14 +28,19 @@ from .workforce_runtime import (
 logger = logging.getLogger(__name__)
 
 
-def is_workforce_manager_discard_safe(
+def is_workforce_manager_removal_safe(
     workforce: Workforce,
     manager: Agent | None,
     *,
     used_as_other_manager: bool,
     used_as_worker: bool,
 ) -> bool:
-    """Return whether discard may also remove this Workforce's manager."""
+    """Return whether removing this Workforce may also remove its manager.
+
+    Shared by discard (undo a run-free draft) and permanent delete (remove
+    any workforce outright) -- both may cascade into deleting a generated,
+    exclusively-owned manager agent alongside the workforce itself.
+    """
     if manager is None or not is_workforce_generated_manager_agent(manager):
         return True
     return bool(
@@ -52,11 +57,12 @@ def _conflict(code: str, message: str) -> HTTPException:
     )
 
 
-def _ensure_discard_access(
+def _ensure_workforce_lifecycle_access(
     db: Session,
     user: User,
     workforce: Workforce | None,
 ) -> Workforce:
+    """Shared 404/403 gate for lifecycle mutations (discard, permanent delete)."""
     if workforce is None:
         raise HTTPException(status_code=404, detail="Workforce not found")
     if not can_edit_workforce(db, user, workforce):
@@ -106,7 +112,7 @@ def _lock_generated_manager(
 
     Returns ``(None, True)`` when the manager is not a generated one (there
     is nothing extra to delete), otherwise the locked generated manager and
-    whether removing it is safe per :func:`is_workforce_manager_discard_safe`.
+    whether removing it is safe per :func:`is_workforce_manager_removal_safe`.
     """
     manager = (
         db.query(Agent)
@@ -133,7 +139,7 @@ def _lock_generated_manager(
         .first()
         is not None
     )
-    safe = is_workforce_manager_discard_safe(
+    safe = is_workforce_manager_removal_safe(
         workforce,
         manager,
         used_as_other_manager=used_as_other_manager,
@@ -162,12 +168,12 @@ def discard_draft_workforce(
 ) -> None:
     """Atomically discard one run-free draft and its owned manager, if any."""
 
-    workforce = _ensure_discard_access(db, user, workforce)
+    workforce = _ensure_workforce_lifecycle_access(db, user, workforce)
     workforce_id = int(workforce.id)
     deleted_manager_identity: tuple[int, int] | None = None
 
     try:
-        workforce = _ensure_discard_access(
+        workforce = _ensure_workforce_lifecycle_access(
             db,
             user,
             acquire_workforce_lifecycle_fence(db, workforce_id),
@@ -229,22 +235,23 @@ def delete_workforce_permanently(
     like archive), and a generated manager that is still referenced by other
     workforces is kept instead of blocking the delete.
 
+    Stays a plain sync function -- its caller (an ``async def`` route) is
+    expected to run it via ``asyncio.to_thread`` rather than call it
+    directly, since the cascade below can walk a large run/trigger history
+    and would otherwise block that thread for every concurrent request.
     Returns the PAUSE targets alongside the cascade-deleted triggers'
-    teardown data (trigger, type, config) -- this function stays sync and
-    does not perform the actual provider unregister calls itself: it runs
-    directly on the request's event-loop thread (its caller is an ``async
-    def`` route, not one FastAPI offloads to a worker thread), so any
-    provider network I/O has to happen through the caller's own
-    ``asyncio.to_thread`` the same way :func:`pause_workforce_tasks_after_archive`
-    already does, or it would block that thread for every concurrent request.
+    teardown data (trigger, type, config); it does not perform the actual
+    provider unregister calls itself, so that network I/O also has to
+    happen through the caller's own ``asyncio.to_thread`` dispatch, the same
+    way :func:`pause_workforce_tasks_after_archive` already does its own.
     """
 
-    workforce = _ensure_discard_access(db, user, workforce)
+    workforce = _ensure_workforce_lifecycle_access(db, user, workforce)
     workforce_id = int(workforce.id)
     deleted_manager_identity: tuple[int, int] | None = None
 
     try:
-        workforce = _ensure_discard_access(
+        workforce = _ensure_workforce_lifecycle_access(
             db,
             user,
             acquire_workforce_lifecycle_fence(db, workforce_id),
@@ -260,6 +267,20 @@ def delete_workforce_permanently(
         # (Gmail watches etc.). Capture what teardown needs while the rows
         # are still readable; the actual unregister runs after commit, same
         # ordering as _delete_trigger.
+        #
+        # Known race, accepted rather than closed: trigger creation
+        # (create_workforce_trigger / _create_trigger) does not acquire this
+        # function's lifecycle fence, so a trigger created for this
+        # workforce between this SELECT and this transaction's commit is
+        # cascade-deleted at the DB level (workforce.triggers is re-resolved
+        # fresh at flush time) but never appears in trigger_teardowns --
+        # its provider-side binding silently leaks. Widening the fence to
+        # cover trigger creation would close it, but that path is shared
+        # with unrelated, actively-used trigger CRUD far outside this
+        # workforce lifecycle feature; the window is also narrow (a create
+        # request racing the exact commit of a delete on the same
+        # workforce), so it's left as a known, documented gap rather than
+        # risking new contention on that shared path.
         trigger_teardowns: list[tuple[AgentTrigger, str, dict[str, Any]]] = []
         for trigger in (
             db.query(AgentTrigger)
@@ -287,10 +308,10 @@ def delete_workforce_permanently(
         # is_visible=True -- so without this, the conversations/traces a
         # "permanent delete" promises to remove would stay fully visible in
         # history/search after the workforce and its runs are gone. Hiding
-        # rather than deleting the Task rows mirrors stage_delete_agent's
-        # own tasks cleanup (detach/hide, never hard-delete a Task), since
-        # other subsystems (trace storage, workspace files) still key off
-        # the task id.
+        # rather than hard-deleting the Task rows only shares "never
+        # hard-delete a Task" with stage_delete_agent's own cleanup (which
+        # detaches by nulling Task.agent_id, not hides) -- other subsystems
+        # (trace storage, workspace files) still key off the task id.
         task_ids_query = db.query(WorkforceRun.task_id).filter(
             WorkforceRun.workforce_id == workforce_id,
             WorkforceRun.task_id.isnot(None),
@@ -311,6 +332,22 @@ def delete_workforce_permanently(
             Deployment.owner_id == workforce_id,
         ).delete(synchronize_session=False)
 
+        # This ORM cascade (workers/runs/builder_messages/triggers, all
+        # cascade="all, delete-orphan" on Workforce -- models/workforce.py)
+        # loads every child row into Python and deletes them one by one
+        # rather than a single DB-side statement, which is the same
+        # already-accepted cost discard_draft_workforce's own db.delete(
+        # workforce) has always paid for the same relationships. Adding
+        # passive_deletes=True to lean on DB-level ON DELETE CASCADE instead
+        # would fix that here, but this project's SQLite path never enables
+        # foreign-key enforcement (no PRAGMA foreign_keys=ON in
+        # models/database.py, the same reason AgentApiKey/Deployment above
+        # need an explicit delete) -- passive_deletes would silently stop
+        # cleaning up these rows on SQLite instead of just being slower,
+        # which is worse than the N+1 cost it would remove. Left as a known,
+        # bounded-scale cost instead; the caller offloading this whole
+        # function via asyncio.to_thread (see the docstring above) keeps it
+        # off the event loop regardless of workforce size.
         db.delete(workforce)
         db.flush()
 

@@ -49,7 +49,7 @@ from .db_runtime import (
     run_db_io_cancellation_safe,
 )
 from .workforce_access import can_edit_workforce, filter_visible_workforces
-from .workforce_lifecycle import is_workforce_manager_discard_safe
+from .workforce_lifecycle import is_workforce_manager_removal_safe
 from .workforce_names import resolve_unique_agent_name
 
 logger = logging.getLogger(__name__)
@@ -442,7 +442,7 @@ class AgentManagementService:
                 status != "archived" and can_edit_workforce(self.db, actor, workforce)
             )
             manager_id = int(workforce.manager_agent_id)
-            manager_discard_safe = is_workforce_manager_discard_safe(
+            manager_discard_safe = is_workforce_manager_removal_safe(
                 workforce,
                 managers_by_id.get(manager_id),
                 used_as_other_manager=manager_reference_counts.get(manager_id, 0) > 1,

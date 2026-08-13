@@ -55,9 +55,12 @@ export default function WorkforcesPage() {
   const [triggersItem, setTriggersItem] = useState<WorkforceListItem | null>(null)
   const [deleteItem, setDeleteItem] = useState<WorkforceListItem | null>(null)
   const [deleting, setDeleting] = useState(false)
-  const [unarchivingId, setUnarchivingId] = useState<number | null>(null)
-  const [archivingId, setArchivingId] = useState<number | null>(null)
-  const [publishingId, setPublishingId] = useState<number | null>(null)
+  // Single slot, not one flag per action: publish/unpublish/archive/
+  // unarchive/delete on the same card must not overlap -- with separate
+  // flags, publish being in flight left archive/unarchive/delete on that
+  // same card still clickable, so the outcome depended on whichever
+  // request the backend happened to finish first.
+  const [busyItemId, setBusyItemId] = useState<number | null>(null)
   // The three-dot menu is uncontrolled-by-default in Radix (stays open
   // after an item click), but the Publish/Unpublish row is conditionally
   // rendered on item.status -- so once an action's load() resolves and the
@@ -96,60 +99,45 @@ export default function WorkforcesPage() {
     void load(page, search)
   }, [load, page, search])
 
-  const createPublishHandler = (publish: boolean) => async (item: WorkforceListItem) => {
-    const apiCall = publish ? publishWorkforce : unpublishWorkforce
+  // Shared shape for every immediate (non-confirm-dialog) menu action:
+  // close the menu, claim the busy slot, call the API, toast, reload, clear
+  // the slot. Delete doesn't fit -- it opens a confirm dialog instead of
+  // calling the API directly -- so handleDelete below stays separate but
+  // still claims/releases the same busyItemId slot.
+  const runMenuAction = (
+    item: WorkforceListItem,
+    apiCall: (id: number | string) => Promise<unknown>,
+    successKey: "workforces.messages.published" | "workforces.messages.unpublished" | "workforces.messages.archived" | "workforces.messages.unarchived",
+    errorKey: "workforces.errors.publish" | "workforces.errors.unpublish" | "workforces.errors.archive" | "workforces.errors.unarchive",
+  ) => async () => {
     setOpenMenuId(null)
     try {
-      setPublishingId(item.id)
+      setBusyItemId(item.id)
       await apiCall(item.id)
-      toast.success(t(publish ? "workforces.messages.published" : "workforces.messages.unpublished"))
+      toast.success(t(successKey))
       void load(page, search)
     } catch (err) {
-      const nextError = err instanceof Error
-        ? err.message
-        : t(publish ? "workforces.errors.publish" : "workforces.errors.unpublish")
+      const nextError = err instanceof Error ? err.message : t(errorKey)
       toast.error(nextError)
     } finally {
-      setPublishingId(null)
-    }
-  }
-  const handlePublish = createPublishHandler(true)
-  const handleUnpublish = createPublishHandler(false)
-
-  const handleArchive = async (item: WorkforceListItem) => {
-    setOpenMenuId(null)
-    try {
-      setArchivingId(item.id)
-      await archiveWorkforce(item.id)
-      toast.success(t("workforces.messages.archived"))
-      void load(page, search)
-    } catch (err) {
-      const nextError = err instanceof Error ? err.message : t("workforces.errors.archive")
-      toast.error(nextError)
-    } finally {
-      setArchivingId(null)
+      setBusyItemId(null)
     }
   }
 
-  const handleUnarchive = async (item: WorkforceListItem) => {
-    setOpenMenuId(null)
-    try {
-      setUnarchivingId(item.id)
-      await unarchiveWorkforce(item.id)
-      toast.success(t("workforces.messages.unarchived"))
-      void load(page, search)
-    } catch (err) {
-      const nextError = err instanceof Error ? err.message : t("workforces.errors.unarchive")
-      toast.error(nextError)
-    } finally {
-      setUnarchivingId(null)
-    }
-  }
+  const handlePublish = (item: WorkforceListItem) =>
+    runMenuAction(item, publishWorkforce, "workforces.messages.published", "workforces.errors.publish")()
+  const handleUnpublish = (item: WorkforceListItem) =>
+    runMenuAction(item, unpublishWorkforce, "workforces.messages.unpublished", "workforces.errors.unpublish")()
+  const handleArchive = (item: WorkforceListItem) =>
+    runMenuAction(item, archiveWorkforce, "workforces.messages.archived", "workforces.errors.archive")()
+  const handleUnarchive = (item: WorkforceListItem) =>
+    runMenuAction(item, unarchiveWorkforce, "workforces.messages.unarchived", "workforces.errors.unarchive")()
 
   const handleDelete = async () => {
     if (!deleteItem) return
     try {
       setDeleting(true)
+      setBusyItemId(deleteItem.id)
       await deleteWorkforcePermanently(deleteItem.id)
       toast.success(t("workforces.messages.deleted"))
       setDeleteItem(null)
@@ -168,6 +156,7 @@ export default function WorkforcesPage() {
       toast.error(nextError)
     } finally {
       setDeleting(false)
+      setBusyItemId(null)
     }
   }
 
@@ -297,6 +286,7 @@ export default function WorkforcesPage() {
                                 size="icon"
                                 className="h-8 w-8 text-muted-foreground hover:text-foreground"
                                 aria-label={t("workforces.actions.moreActions")}
+                                disabled={busyItemId === item.id}
                               >
                                 <MoreVertical className="h-4 w-4" />
                               </Button>
@@ -309,7 +299,7 @@ export default function WorkforcesPage() {
                                       <Button
                                         variant="ghost"
                                         className="justify-start px-2 py-1.5 h-auto font-normal text-sm"
-                                        disabled={publishingId === item.id}
+                                        disabled={busyItemId === item.id}
                                         onClick={() => handleUnpublish(item)}
                                       >
                                         <Globe className="mr-2 h-4 w-4" />
@@ -319,7 +309,7 @@ export default function WorkforcesPage() {
                                       <Button
                                         variant="ghost"
                                         className="justify-start px-2 py-1.5 h-auto font-normal text-sm"
-                                        disabled={publishingId === item.id}
+                                        disabled={busyItemId === item.id}
                                         onClick={() => handlePublish(item)}
                                       >
                                         <Globe className="mr-2 h-4 w-4" />
@@ -333,7 +323,7 @@ export default function WorkforcesPage() {
                                   <Button
                                     variant="ghost"
                                     className="justify-start px-2 py-1.5 h-auto font-normal text-sm"
-                                    disabled={unarchivingId === item.id}
+                                    disabled={busyItemId === item.id}
                                     onClick={() => handleUnarchive(item)}
                                   >
                                     <ArchiveRestore className="mr-2 h-4 w-4" />
@@ -343,7 +333,7 @@ export default function WorkforcesPage() {
                                   <Button
                                     variant="ghost"
                                     className="justify-start px-2 py-1.5 h-auto font-normal text-sm"
-                                    disabled={archivingId === item.id}
+                                    disabled={busyItemId === item.id}
                                     onClick={() => handleArchive(item)}
                                   >
                                     <Archive className="mr-2 h-4 w-4" />
@@ -354,6 +344,7 @@ export default function WorkforcesPage() {
                                 <Button
                                   variant="ghost"
                                   className="justify-start px-2 py-1.5 h-auto font-normal text-sm text-destructive hover:text-destructive hover:bg-destructive/10"
+                                  disabled={busyItemId === item.id}
                                   onClick={() => {
                                     setOpenMenuId(null)
                                     setDeleteItem(item)

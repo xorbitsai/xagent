@@ -652,6 +652,54 @@ describe("workforce route entry points", () => {
     })
   })
 
+  it("hides Archive/Publish/Unpublish on an archived card's menu", async () => {
+    // The Popover mock renders its content unconditionally (ignores `open`),
+    // so this exercises page.tsx's own per-status conditional rendering --
+    // an archived card must only ever offer Unarchive and Delete.
+    listWorkforcesMock.mockResolvedValueOnce({
+      ...listResponse,
+      items: [{ ...listResponse.items[0], status: "archived" }],
+    })
+
+    render(<WorkforcesPage />)
+    expect(await screen.findByText("Launch Workforce")).toBeInTheDocument()
+
+    expect(screen.getByRole("button", { name: "workforces.actions.unarchive" })).toBeInTheDocument()
+    expect(screen.getByRole("button", { name: "workforces.actions.delete" })).toBeInTheDocument()
+    expect(screen.queryByRole("button", { name: "workforces.actions.archive" })).not.toBeInTheDocument()
+    expect(screen.queryByRole("button", { name: "workforces.actions.publish" })).not.toBeInTheDocument()
+    expect(screen.queryByRole("button", { name: "workforces.actions.unpublish" })).not.toBeInTheDocument()
+  })
+
+  it("shows Unpublish + Archive (not Publish/Unarchive) on an active card's menu", async () => {
+    listWorkforcesMock.mockResolvedValueOnce(listResponse) // fixture default status: "active"
+
+    render(<WorkforcesPage />)
+    expect(await screen.findByText("Launch Workforce")).toBeInTheDocument()
+
+    expect(screen.getByRole("button", { name: "workforces.actions.unpublish" })).toBeInTheDocument()
+    expect(screen.getByRole("button", { name: "workforces.actions.archive" })).toBeInTheDocument()
+    expect(screen.getByRole("button", { name: "workforces.actions.delete" })).toBeInTheDocument()
+    expect(screen.queryByRole("button", { name: "workforces.actions.publish" })).not.toBeInTheDocument()
+    expect(screen.queryByRole("button", { name: "workforces.actions.unarchive" })).not.toBeInTheDocument()
+  })
+
+  it("shows Publish + Archive (not Unpublish/Unarchive) on a draft card's menu", async () => {
+    listWorkforcesMock.mockResolvedValueOnce({
+      ...listResponse,
+      items: [{ ...listResponse.items[0], status: "draft" }],
+    })
+
+    render(<WorkforcesPage />)
+    expect(await screen.findByText("Launch Workforce")).toBeInTheDocument()
+
+    expect(screen.getByRole("button", { name: "workforces.actions.publish" })).toBeInTheDocument()
+    expect(screen.getByRole("button", { name: "workforces.actions.archive" })).toBeInTheDocument()
+    expect(screen.getByRole("button", { name: "workforces.actions.delete" })).toBeInTheDocument()
+    expect(screen.queryByRole("button", { name: "workforces.actions.unpublish" })).not.toBeInTheDocument()
+    expect(screen.queryByRole("button", { name: "workforces.actions.unarchive" })).not.toBeInTheDocument()
+  })
+
   it("deletes a workforce from the list card's three-dot menu through the confirm dialog", async () => {
     listWorkforcesMock.mockResolvedValueOnce(listResponse)
     deleteWorkforcePermanentlyMock.mockResolvedValueOnce(undefined)
@@ -675,7 +723,7 @@ describe("workforce route entry points", () => {
     })
   })
 
-  it("steps pagination back when deleting the last card on a page beyond the first (page.tsx:143-152)", async () => {
+  it("steps pagination back when deleting the last card on a page beyond the first", async () => {
     // Regression coverage for the out-of-range-page fix: deleting the only
     // item on page 2 must not reload page 2 as-is (the backend would return
     // zero items for it, rendering the "no workforces" empty state with

@@ -15,6 +15,7 @@ tests/web/api/test_a2a_api.py.
 
 from __future__ import annotations
 
+import logging
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -26,10 +27,20 @@ from tests.web.services.task_interaction_schema_shared import (
     make_user,
     tables_excluding_interaction_requests,
 )
-from xagent.web.models.database import Base, get_db, get_engine, init_db
+from xagent.web.models import database as database_module
+from xagent.web.models.database import (
+    Base,
+    configure_db,
+    get_db,
+    get_engine,
+    get_session_local,
+    init_db,
+)
 from xagent.web.models.task import Task
 from xagent.web.models.task_interaction import TaskInteractionRequest
+from xagent.web.services import ops_signals
 from xagent.web.services.task_interaction_close import (
+    _classify_close_rowcount,
     clear_interaction_marker_if_unpaired,
     close_legacy_resume_interaction,
     close_legacy_resume_interaction_sync,
@@ -39,6 +50,17 @@ from xagent.web.services.task_interaction_staging import (
     InteractionSlotTaken,
     stage_interaction_request,
 )
+
+_CLOSE_MODULE_NAME = "xagent.web.services.task_interaction_close"
+
+
+@pytest.fixture(autouse=True)
+def _reset_ops_signals():
+    for name in list(ops_signals.active_degradations()):
+        ops_signals.clear_degradation(name)
+    yield
+    for name in list(ops_signals.active_degradations()):
+        ops_signals.clear_degradation(name)
 
 
 @pytest.fixture()
@@ -85,6 +107,49 @@ def _row_state(db, row_id: int) -> TaskInteractionRequest:
 def _task_marker(db, task_id: int) -> int | None:
     db.expire_all()
     return db.query(Task).filter(Task.id == task_id).one().interaction_protocol_version
+
+
+# --------------------------------------------------------------------------
+# _classify_close_rowcount -- the one place every rowcount the close
+# statement can produce gets classified, called directly, no database
+# involved.
+# --------------------------------------------------------------------------
+
+
+def test_classify_close_rowcount_logs_info_for_the_expected_single_row_case(
+    caplog,
+) -> None:
+    with caplog.at_level(logging.INFO, logger=_CLOSE_MODULE_NAME):
+        _classify_close_rowcount(1, task_id=1, run_id="run-a")
+
+    assert [record.levelno for record in caplog.records] == [logging.INFO]
+    assert ops_signals.active_degradations() == {}
+
+
+def test_classify_close_rowcount_logs_debug_for_the_common_no_op_case(
+    caplog,
+) -> None:
+    with caplog.at_level(logging.DEBUG, logger=_CLOSE_MODULE_NAME):
+        _classify_close_rowcount(0, task_id=1, run_id="run-a")
+
+    assert [record.levelno for record in caplog.records] == [logging.DEBUG]
+    assert ops_signals.active_degradations() == {}
+
+
+def test_classify_close_rowcount_logs_error_and_registers_a_signal_for_an_impossible_rowcount(
+    caplog,
+) -> None:
+    """rowcount > 1 is impossible under uq_task_interaction_active_slot
+    unless that constraint has already been violated -- see this module's
+    docstring. Logged at error and surfaced on /health, not raised."""
+    with caplog.at_level(logging.ERROR, logger=_CLOSE_MODULE_NAME):
+        _classify_close_rowcount(2, task_id=7, run_id="run-b")
+
+    assert [record.levelno for record in caplog.records] == [logging.ERROR]
+    assert (
+        ops_signals.INTERACTION_LEGACY_RESUME_CLOSE_ROWCOUNT_ANOMALY
+        in ops_signals.active_degradations()
+    )
 
 
 # --------------------------------------------------------------------------
@@ -210,21 +275,36 @@ def test_close_sync_opens_its_own_transaction_and_commits(db) -> None:
 
 @pytest.fixture()
 def db_without_interaction_table(tmp_path):
-    from sqlalchemy import create_engine
-    from sqlalchemy.orm import sessionmaker
+    """A deployment shape missing task_interaction_requests -- bound as the
+    *global* engine/session factory, not a private one.
 
-    from xagent.db.sqlite import apply_sqlite_concurrency_pragmas
-
-    engine = create_engine(f"sqlite:///{tmp_path / 'no_interaction_table.db'}")
-    apply_sqlite_concurrency_pragmas(engine)
+    close_legacy_resume_interaction_sync (unlike the other functions this
+    module tests) takes no db argument of its own: it opens its own session
+    through get_session_local(), which reads the process-global factory.
+    A fixture that built its own private engine here and handed back a
+    session from it would leave that global factory pointed wherever the
+    previous test left it, so close_legacy_resume_interaction_sync would run
+    against a different database than the one this fixture seeds and
+    asserts against -- the table-absence gate it is supposed to exercise
+    would never actually see this fixture's schema. configure_db() only
+    binds the engine and session factory; it does not create any tables
+    (unlike init_db()), so the subset schema below is still built by hand.
+    """
+    previous_engine = database_module._engine
+    previous_session_local = database_module._SessionLocal
+    configure_db(db_url=f"sqlite:///{tmp_path / 'no_interaction_table.db'}")
     Base.metadata.create_all(
-        bind=engine, tables=tables_excluding_interaction_requests()
+        bind=get_engine(), tables=tables_excluding_interaction_requests()
     )
-    session = sessionmaker(autocommit=False, autoflush=False, bind=engine)()
+    session = get_session_local()()
     try:
         yield session
     finally:
         session.close()
+        # Restore the prior global factory so this fixture's rebinding does
+        # not leak into whatever test runs next in this file (or module).
+        database_module._engine = previous_engine
+        database_module._SessionLocal = previous_session_local
 
 
 def test_close_no_ops_when_the_interaction_table_does_not_exist(

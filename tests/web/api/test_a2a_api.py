@@ -860,6 +860,90 @@ def test_update_a2a_resume_input_rolls_back_the_interaction_close_with_the_fence
         db.close()
 
 
+def test_message_send_closes_the_legacy_resume_interaction_row_on_successful_injection() -> (
+    None
+):
+    """The success path this whole change exists for, driven through the
+    real HTTP message:send call rather than the sync helper directly: once
+    the fence UPDATE lands, the run's active interaction row is retired
+    (``terminated`` / ``answered_via_legacy_resume``) and the task's
+    protocol marker is cleared back to NULL in the same commit."""
+    agent_id, full_key = _create_published_agent_with_key()
+    db = _direct_db_session()
+    try:
+        owner_id = int(db.query(Agent).filter(Agent.id == agent_id).one().user_id)
+        task = Task(
+            user_id=owner_id,
+            title="legacy resume close success",
+            status=TaskStatus.PAUSED,
+            control_state=TaskControlState.PAUSED.value,
+            run_id="run-close-success",
+            agent_id=agent_id,
+            source="a2a",
+            is_visible=False,
+            agent_config={"a2a_context_id": "ctx-close-success"},
+            interaction_protocol_version=1,
+        )
+        db.add(task)
+        db.commit()
+        db.refresh(task)
+        task_id = int(task.id)
+        row_id = _seed_active_interaction_row(
+            db,
+            task_id=task_id,
+            run_id="run-close-success",
+            idempotency_key="close-success-q1",
+        )
+    finally:
+        db.close()
+
+    agent_service = MagicMock()
+    agent_service.post_user_message = AsyncMock(return_value=True)
+    agent_manager = MagicMock()
+    agent_manager.get_agent_for_task = AsyncMock(return_value=agent_service)
+    begin_turn = AsyncMock()
+    with (
+        patch(
+            "xagent.web.api.chat.get_agent_manager",
+            return_value=agent_manager,
+        ),
+        patch("xagent.web.api.a2a._schedule_waiting_a2a_resume"),
+        patch(
+            "xagent.web.api.a2a.TaskTurnOrchestrator.begin_turn",
+            new=begin_turn,
+        ),
+    ):
+        response = client.post(
+            f"/api/a2a/agents/{agent_id}/message:send",
+            headers=_bearer(full_key),
+            json={
+                "message": {
+                    "messageId": "msg-close-success",
+                    "taskId": task_id,
+                    "role": "ROLE_USER",
+                    "parts": [{"text": "answered via legacy resume"}],
+                },
+                "configuration": {"returnImmediately": True},
+            },
+        )
+
+    assert response.status_code == 200, response.text
+    agent_service.post_user_message.assert_awaited_once()
+    db = _direct_db_session()
+    try:
+        row = (
+            db.query(TaskInteractionRequest)
+            .filter(TaskInteractionRequest.id == row_id)
+            .one()
+        )
+        assert row.status == "terminated"
+        assert row.terminal_reason == "answered_via_legacy_resume"
+        refreshed = db.query(Task).filter(Task.id == task_id).one()
+        assert refreshed.interaction_protocol_version is None
+    finally:
+        db.close()
+
+
 @pytest.mark.asyncio
 async def test_a2a_handover_restores_input_required_on_unreadable_checkpoint() -> None:
     """The A2A handover carries the pre-claim status into the resume.

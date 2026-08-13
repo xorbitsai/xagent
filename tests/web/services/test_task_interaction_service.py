@@ -1003,6 +1003,64 @@ def test_t3_prime_anchor_dangling_when_the_row_fails_validation(
     assert view.reason == "anchor_dangling"
 
 
+# ---------------------------------------------------------------------------
+# T3', the other five conditions: _resolve_read_direction_anchor's row-
+# validity judgment is six self-consistency conditions ANDed together (task
+# id, event type, build id, checkpoint type, run partition, execution
+# identity -- see that function's own docstring). The run-partition cell is
+# covered above; each of these five breaks exactly one of the remaining
+# conditions, following the same one-condition-per-cell shape
+# test_task_interaction_anchor.py's own _CONDITION_BREAKS table uses for the
+# sibling resolver it covers.
+# ---------------------------------------------------------------------------
+
+_T3_ANCHOR_VALIDATION_BREAKS: dict[str, dict[str, Any]] = {
+    "task_id": {"cross_task": True},
+    "event_type": {"event_type": "system_update_partial"},
+    "build_id": {"build_id": "build-x"},
+    "checkpoint_type": {"checkpoint_type": "not_a_checkpoint_type"},
+    "execution_id": {"mismatched_resume_execution_id": "exec-mismatch"},
+}
+
+
+@pytest.mark.parametrize("condition", sorted(_T3_ANCHOR_VALIDATION_BREAKS))
+def test_t3_prime_anchor_dangling_for_each_remaining_validity_condition(
+    _db: Session, _seeded_task: int, condition: str
+) -> None:
+    """Every other cell in this file leaves all six conditions passing (or,
+    for the run-partition cell above, breaks exactly one). Deleting any one
+    of the five conditions exercised here from
+    _resolve_read_direction_anchor's boolean guard must turn exactly this
+    cell red and leave every other cell -- including the four remaining
+    parametrizations of this same test -- green."""
+
+    overrides = dict(_T3_ANCHOR_VALIDATION_BREAKS[condition])
+    trace_task_id = _seeded_task
+    if overrides.pop("cross_task", False):
+        other_user_id = make_user(_db)
+        trace_task_id = make_task(_db, user_id=other_user_id)
+    # The trace side's execution_id stays at its non-empty default ("exec-1")
+    # for every cell: an empty trace-side execution_id short-circuits the
+    # comparison to "matches" regardless of the row side, so leaving it
+    # non-empty is what makes the execution_id cell's mismatch reachable at
+    # all, and leaving it non-empty (and equal to the row's own default) for
+    # the other four cells is what keeps this condition passing everywhere
+    # else.
+    resume_execution_id = overrides.pop("mismatched_resume_execution_id", "exec-1")
+
+    trace_event_id = _make_trace_event(_db, task_id=trace_task_id, **overrides)
+    _make_active_interaction_row(
+        _db,
+        task_id=_seeded_task,
+        resume_trace_event_id=trace_event_id,
+        resume_execution_id=resume_execution_id,
+    )
+
+    view = svc.materialize_compatibility_view(_db, _seeded_task)
+    assert view.tier == "unanswerable"
+    assert view.reason == "anchor_dangling"
+
+
 def test_t3_does_not_fall_back_to_legacy(_db: Session, _seeded_task: int) -> None:
     """A T3 result must never present
     as "no active row" -- it must always be the unanswerable tier, never

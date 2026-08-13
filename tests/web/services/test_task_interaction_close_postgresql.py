@@ -16,13 +16,27 @@ Fixture pattern: a disposable, uniquely-named schema inside whatever
 database XAGENT_TEST_POSTGRES_URL names (CREATE SCHEMA / DROP SCHEMA
 CASCADE), matching test_interaction_staging_postgresql.py's convention --
 see that file's docstring for why a schema instead of the whole database.
+
+Known coverage gap, not closed here: neither this file nor
+test_task_interaction_close.py ever calls
+close_legacy_resume_interaction_sync -- the one function that issues the
+FOR NO KEY UPDATE / key_share=True lock read the ordering obligation in
+test_interaction_close_lock_ordering.py depends on -- against a real
+PostgreSQL connection. test_task_interaction_close.py calls it on SQLite,
+where with_for_update's clause is silently dropped and the single-writer
+lock serializes instead, so it never issues the real statement either. No
+test anywhere in this repo, on this database, opens two sessions and
+proves FOR NO KEY UPDATE actually holds the lock the ordering argument
+claims (blocking a concurrent purge, not blocking a concurrent KEY SHARE
+stager) -- every case here runs one session against one fixture at a
+time. The lock-ordering guard is therefore statement-order-in-source-code
+evidence only, not lock-behavior evidence.
 """
 
 from __future__ import annotations
 
 import os
 import uuid
-from itertools import count
 
 import pytest
 import sqlalchemy as sa
@@ -30,16 +44,15 @@ from sqlalchemy.orm import sessionmaker
 
 from tests.web.services.task_interaction_schema_shared import (
     make_row,
-    make_task,
     make_trace_event,
-    make_user,
+    row_state,
+    seed_active_row,
+    seed_task_with_run,
+    task_marker,
 )
 from xagent.web.models.database import Base
-from xagent.web.models.task import Task
 from xagent.web.models.task_interaction import TaskInteractionRequest
 from xagent.web.services.task_interaction_close import close_legacy_resume_interaction
-
-_key_counter = count()
 
 pytestmark = pytest.mark.postgresql
 
@@ -80,59 +93,24 @@ def db(session_factory):
         session.close()
 
 
-def _seed_task_with_run(db, *, run_id: str, marker: int | None) -> int:
-    user_id = make_user(db)
-    task_id = make_task(db, user_id=user_id)
-    db.query(Task).filter(Task.id == task_id).update(
-        {Task.run_id: run_id, Task.interaction_protocol_version: marker}
-    )
-    db.commit()
-    return task_id
-
-
-def _seed_active_row(db, *, task_id: int, run_id: str) -> int:
-    anchor_id = make_trace_event(db, task_id=task_id)
-    row = TaskInteractionRequest(
-        **make_row(task_id=task_id, resume_trace_event_id=anchor_id, run_id=run_id)
-    )
-    db.add(row)
-    db.commit()
-    db.refresh(row)
-    return int(row.id)
-
-
-def _row_state(db, row_id: int) -> TaskInteractionRequest:
-    db.expire_all()
-    return (
-        db.query(TaskInteractionRequest)
-        .filter(TaskInteractionRequest.id == row_id)
-        .one()
-    )
-
-
-def _task_marker(db, task_id: int) -> int | None:
-    db.expire_all()
-    return db.query(Task).filter(Task.id == task_id).one().interaction_protocol_version
-
-
 def test_close_retires_the_active_row_for_its_own_run(db) -> None:
-    task_id = _seed_task_with_run(db, run_id="run-a", marker=1)
-    row_id = _seed_active_row(db, task_id=task_id, run_id="run-a")
+    task_id = seed_task_with_run(db, run_id="run-a", marker=1)
+    row_id = seed_active_row(db, task_id=task_id, run_id="run-a")
 
     rowcount = close_legacy_resume_interaction(db, task_id=task_id, run_id="run-a")
     db.commit()
 
     assert rowcount == 1
-    row = _row_state(db, row_id)
+    row = row_state(db, row_id)
     assert row.status == "terminated"
     assert row.active_slot is None
     assert row.terminal_reason == "answered_via_legacy_resume"
     assert row.terminated_at is not None
-    assert _task_marker(db, task_id) is None
+    assert task_marker(db, task_id) is None
 
 
 def test_close_is_a_no_op_replaying_an_already_terminated_row(db) -> None:
-    task_id = _seed_task_with_run(db, run_id="run-a", marker=1)
+    task_id = seed_task_with_run(db, run_id="run-a", marker=1)
     anchor_id = make_trace_event(db, task_id=task_id)
     row = TaskInteractionRequest(
         **make_row(
@@ -152,40 +130,40 @@ def test_close_is_a_no_op_replaying_an_already_terminated_row(db) -> None:
     db.commit()
 
     assert rowcount == 0
-    row = _row_state(db, row_id)
+    row = row_state(db, row_id)
     assert row.status == "terminated"
     assert row.terminal_reason == original_terminal_reason
-    assert _task_marker(db, task_id) is None
+    assert task_marker(db, task_id) is None
 
 
 def test_close_is_a_no_op_with_no_interaction_rows_at_all(db) -> None:
     """Today's 100% case: the table has no production writer yet."""
-    task_id = _seed_task_with_run(db, run_id="run-a", marker=None)
+    task_id = seed_task_with_run(db, run_id="run-a", marker=None)
 
     rowcount = close_legacy_resume_interaction(db, task_id=task_id, run_id="run-a")
     db.commit()
 
     assert rowcount == 0
-    assert _task_marker(db, task_id) is None
+    assert task_marker(db, task_id) is None
 
 
 def test_close_does_not_touch_a_different_runs_active_row(db) -> None:
-    task_id = _seed_task_with_run(db, run_id="run-a", marker=1)
-    orphan_row_id = _seed_active_row(db, task_id=task_id, run_id="run-b")
+    task_id = seed_task_with_run(db, run_id="run-a", marker=1)
+    orphan_row_id = seed_active_row(db, task_id=task_id, run_id="run-b")
 
     rowcount = close_legacy_resume_interaction(db, task_id=task_id, run_id="run-a")
     db.commit()
 
     assert rowcount == 0
-    orphan = _row_state(db, orphan_row_id)
+    orphan = row_state(db, orphan_row_id)
     assert orphan.status == "active"
-    assert _task_marker(db, task_id) is None
+    assert task_marker(db, task_id) is None
 
 
 def test_close_does_not_overwrite_a_row_already_recycled_by_another_terminal_reason(
     db,
 ) -> None:
-    task_id = _seed_task_with_run(db, run_id="run-a", marker=None)
+    task_id = seed_task_with_run(db, run_id="run-a", marker=None)
     anchor_id = make_trace_event(db, task_id=task_id)
     row = TaskInteractionRequest(
         **make_row(
@@ -205,4 +183,4 @@ def test_close_does_not_overwrite_a_row_already_recycled_by_another_terminal_rea
     db.commit()
 
     assert rowcount == 0
-    assert _row_state(db, row_id).terminal_reason == "run_superseded"
+    assert row_state(db, row_id).terminal_reason == "run_superseded"

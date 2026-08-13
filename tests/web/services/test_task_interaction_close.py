@@ -25,7 +25,11 @@ from tests.web.services.task_interaction_schema_shared import (
     make_task,
     make_trace_event,
     make_user,
+    row_state,
+    seed_active_row,
+    seed_task_with_run,
     tables_excluding_interaction_requests,
+    task_marker,
 )
 from xagent.web.models import database as database_module
 from xagent.web.models.database import (
@@ -72,41 +76,6 @@ def db(tmp_path):
     finally:
         session.close()
         Base.metadata.drop_all(bind=get_engine())
-
-
-def _seed_task_with_run(db, *, run_id: str, marker: int | None) -> int:
-    user_id = make_user(db)
-    task_id = make_task(db, user_id=user_id)
-    db.query(Task).filter(Task.id == task_id).update(
-        {Task.run_id: run_id, Task.interaction_protocol_version: marker}
-    )
-    db.commit()
-    return task_id
-
-
-def _seed_active_row(db, *, task_id: int, run_id: str) -> int:
-    anchor_id = make_trace_event(db, task_id=task_id)
-    row = TaskInteractionRequest(
-        **make_row(task_id=task_id, resume_trace_event_id=anchor_id, run_id=run_id)
-    )
-    db.add(row)
-    db.commit()
-    db.refresh(row)
-    return int(row.id)
-
-
-def _row_state(db, row_id: int) -> TaskInteractionRequest:
-    db.expire_all()
-    return (
-        db.query(TaskInteractionRequest)
-        .filter(TaskInteractionRequest.id == row_id)
-        .one()
-    )
-
-
-def _task_marker(db, task_id: int) -> int | None:
-    db.expire_all()
-    return db.query(Task).filter(Task.id == task_id).one().interaction_protocol_version
 
 
 # --------------------------------------------------------------------------
@@ -158,23 +127,23 @@ def test_classify_close_rowcount_logs_error_and_registers_a_signal_for_an_imposs
 
 
 def test_close_retires_the_active_row_for_its_own_run(db) -> None:
-    task_id = _seed_task_with_run(db, run_id="run-a", marker=1)
-    row_id = _seed_active_row(db, task_id=task_id, run_id="run-a")
+    task_id = seed_task_with_run(db, run_id="run-a", marker=1)
+    row_id = seed_active_row(db, task_id=task_id, run_id="run-a")
 
     rowcount = close_legacy_resume_interaction(db, task_id=task_id, run_id="run-a")
     db.commit()
 
     assert rowcount == 1
-    row = _row_state(db, row_id)
+    row = row_state(db, row_id)
     assert row.status == "terminated"
     assert row.active_slot is None
     assert row.terminal_reason == "answered_via_legacy_resume"
     assert row.terminated_at is not None
-    assert _task_marker(db, task_id) is None
+    assert task_marker(db, task_id) is None
 
 
 def test_close_is_a_no_op_replaying_an_already_terminated_row(db) -> None:
-    task_id = _seed_task_with_run(db, run_id="run-a", marker=1)
+    task_id = seed_task_with_run(db, run_id="run-a", marker=1)
     anchor_id = make_trace_event(db, task_id=task_id)
     row = TaskInteractionRequest(
         **make_row(
@@ -194,45 +163,45 @@ def test_close_is_a_no_op_replaying_an_already_terminated_row(db) -> None:
     db.commit()
 
     assert rowcount == 0
-    row = _row_state(db, row_id)
+    row = row_state(db, row_id)
     assert row.status == "terminated"
     assert row.terminal_reason == original_terminal_reason
     # The clear runs unconditionally: a marker left dangling by an earlier,
     # incomplete write still gets zeroed even though this close matched no
     # row of its own.
-    assert _task_marker(db, task_id) is None
+    assert task_marker(db, task_id) is None
 
 
 def test_close_is_a_no_op_with_no_interaction_rows_at_all(db) -> None:
     """Today's 100% case: the table has no production writer yet."""
-    task_id = _seed_task_with_run(db, run_id="run-a", marker=None)
+    task_id = seed_task_with_run(db, run_id="run-a", marker=None)
 
     rowcount = close_legacy_resume_interaction(db, task_id=task_id, run_id="run-a")
     db.commit()
 
     assert rowcount == 0
-    assert _task_marker(db, task_id) is None
+    assert task_marker(db, task_id) is None
 
 
 def test_close_does_not_touch_a_different_runs_active_row(db) -> None:
-    task_id = _seed_task_with_run(db, run_id="run-a", marker=1)
-    orphan_row_id = _seed_active_row(db, task_id=task_id, run_id="run-b")
+    task_id = seed_task_with_run(db, run_id="run-a", marker=1)
+    orphan_row_id = seed_active_row(db, task_id=task_id, run_id="run-b")
 
     rowcount = close_legacy_resume_interaction(db, task_id=task_id, run_id="run-a")
     db.commit()
 
     assert rowcount == 0
-    orphan = _row_state(db, orphan_row_id)
+    orphan = row_state(db, orphan_row_id)
     assert orphan.status == "active"
     # This call's own run still gets its marker cleared -- the orphan row
     # belongs to a different run's marker, which this call never touches.
-    assert _task_marker(db, task_id) is None
+    assert task_marker(db, task_id) is None
 
 
 def test_close_does_not_overwrite_a_row_already_recycled_by_another_terminal_reason(
     db,
 ) -> None:
-    task_id = _seed_task_with_run(db, run_id="run-a", marker=None)
+    task_id = seed_task_with_run(db, run_id="run-a", marker=None)
     anchor_id = make_trace_event(db, task_id=task_id)
     row = TaskInteractionRequest(
         **make_row(
@@ -252,20 +221,20 @@ def test_close_does_not_overwrite_a_row_already_recycled_by_another_terminal_rea
     db.commit()
 
     assert rowcount == 0
-    assert _row_state(db, row_id).terminal_reason == "run_superseded"
+    assert row_state(db, row_id).terminal_reason == "run_superseded"
 
 
 def test_close_sync_opens_its_own_transaction_and_commits(db) -> None:
     """The short-transaction wrapper the two WebSocket injection sites
     share: no caller-held session."""
-    task_id = _seed_task_with_run(db, run_id="run-a", marker=1)
-    row_id = _seed_active_row(db, task_id=task_id, run_id="run-a")
+    task_id = seed_task_with_run(db, run_id="run-a", marker=1)
+    row_id = seed_active_row(db, task_id=task_id, run_id="run-a")
 
     rowcount = close_legacy_resume_interaction_sync(task_id, "run-a")
 
     assert rowcount == 1
-    assert _row_state(db, row_id).status == "terminated"
-    assert _task_marker(db, task_id) is None
+    assert row_state(db, row_id).status == "terminated"
+    assert task_marker(db, task_id) is None
 
 
 # --------------------------------------------------------------------------
@@ -363,7 +332,7 @@ def test_clear_marker_if_unpaired_zeroes_a_marker_with_no_active_row(db) -> None
     The row is already terminated (the close already ran); a marker left
     at 1 -- however that happened -- has nothing to protect and is zeroed.
     """
-    task_id = _seed_task_with_run(db, run_id="run-a", marker=1)
+    task_id = seed_task_with_run(db, run_id="run-a", marker=1)
     anchor_id = make_trace_event(db, task_id=task_id)
     row = TaskInteractionRequest(
         **make_row(
@@ -379,20 +348,20 @@ def test_clear_marker_if_unpaired_zeroes_a_marker_with_no_active_row(db) -> None
     clear_interaction_marker_if_unpaired(db, task_id=task_id, run_id="run-a")
     db.commit()
 
-    assert _task_marker(db, task_id) is None
+    assert task_marker(db, task_id) is None
 
 
 def test_clear_marker_if_unpaired_leaves_a_still_active_row_untouched(db) -> None:
     """This is the mutation-testable half: removing the NOT EXISTS guard
     would zero a marker that still names a live question."""
-    task_id = _seed_task_with_run(db, run_id="run-a", marker=1)
-    row_id = _seed_active_row(db, task_id=task_id, run_id="run-a")
+    task_id = seed_task_with_run(db, run_id="run-a", marker=1)
+    row_id = seed_active_row(db, task_id=task_id, run_id="run-a")
 
     clear_interaction_marker_if_unpaired(db, task_id=task_id, run_id="run-a")
     db.commit()
 
-    assert _task_marker(db, task_id) == 1
-    assert _row_state(db, row_id).status == "active"
+    assert task_marker(db, task_id) == 1
+    assert row_state(db, row_id).status == "active"
 
 
 # --------------------------------------------------------------------------
@@ -428,7 +397,7 @@ def test_close_lets_a_second_question_on_the_same_run_become_active(db) -> None:
     """Deleting the close call must turn this red: without it, the second
     stage attempt collides with the first question's still-active slot and
     raises InteractionSlotTaken instead of ever becoming the active row."""
-    task_id = _seed_task_with_run(db, run_id="run-a", marker=1)
+    task_id = seed_task_with_run(db, run_id="run-a", marker=1)
     anchor_id = make_trace_event(db, task_id=task_id)
 
     first = _stage(db, task_id=task_id, run_id="run-a", anchor_id=anchor_id, key="q1")
@@ -460,7 +429,7 @@ def test_without_the_close_call_a_second_question_cannot_become_active(db) -> No
     same run), so the second stage attempt's INSERT collides with the
     unique active-slot constraint and raises InteractionSlotTaken -- the
     first question remains the only active row."""
-    task_id = _seed_task_with_run(db, run_id="run-a", marker=1)
+    task_id = seed_task_with_run(db, run_id="run-a", marker=1)
     anchor_id = make_trace_event(db, task_id=task_id)
 
     first = _stage(db, task_id=task_id, run_id="run-a", anchor_id=anchor_id, key="q1")

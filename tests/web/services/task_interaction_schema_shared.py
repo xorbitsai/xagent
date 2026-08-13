@@ -183,6 +183,63 @@ def make_row(
     return row
 
 
+def seed_task_with_run(db: Session, *, run_id: str, marker: int | None) -> int:
+    """Create a task pinned to ``run_id`` with the given protocol marker.
+
+    Shared by test_task_interaction_close.py (SQLite) and
+    test_task_interaction_close_postgresql.py (PostgreSQL) -- previously
+    defined identically, six lines apart, in both files.
+    """
+    user_id = make_user(db)
+    task_id = make_task(db, user_id=user_id)
+    db.query(Task).filter(Task.id == task_id).update(
+        {Task.run_id: run_id, Task.interaction_protocol_version: marker}
+    )
+    db.commit()
+    return task_id
+
+
+def seed_active_row(db: Session, *, task_id: int, run_id: str) -> int:
+    """Create one active TaskInteractionRequest row for ``(task_id, run_id)``.
+
+    Shared by test_task_interaction_close.py and
+    test_task_interaction_close_postgresql.py.
+    """
+    anchor_id = make_trace_event(db, task_id=task_id)
+    row = TaskInteractionRequest(
+        **make_row(task_id=task_id, resume_trace_event_id=anchor_id, run_id=run_id)
+    )
+    db.add(row)
+    db.commit()
+    db.refresh(row)
+    return int(row.id)
+
+
+def row_state(db: Session, row_id: int) -> TaskInteractionRequest:
+    """Re-read one TaskInteractionRequest row past the session's identity cache.
+
+    Shared by test_task_interaction_close.py and
+    test_task_interaction_close_postgresql.py.
+    """
+    db.expire_all()
+    return (
+        db.query(TaskInteractionRequest)
+        .filter(TaskInteractionRequest.id == row_id)
+        .one()
+    )
+
+
+def task_marker(db: Session, task_id: int) -> int | None:
+    """Re-read a task's interaction_protocol_version past the session's
+    identity cache.
+
+    Shared by test_task_interaction_close.py and
+    test_task_interaction_close_postgresql.py.
+    """
+    db.expire_all()
+    return db.query(Task).filter(Task.id == task_id).one().interaction_protocol_version
+
+
 def assert_accepted(db: Session, row: dict[str, object]) -> TaskInteractionRequest:
     """Insert ``row``, commit, and confirm it reads back.
 

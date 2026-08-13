@@ -232,7 +232,12 @@ def clear_interaction_marker_if_unpaired(
     The semantics are not "clear the marker" but "if the marker no longer
     corresponds to any active row, zero it": the UPDATE below only matches
     when NOT EXISTS an active row for this exact (task_id, run_id) pair,
-    so a marker that still names a live question survives untouched.
+    so a marker that still names a live question survives untouched. The
+    outer ``Task.run_id == run_id`` predicate is what keeps this scoped to
+    the run being abandoned -- if another run now owns the task (a new
+    turn already started), this UPDATE matches zero rows regardless of the
+    NOT EXISTS check, so an abandoned resume can never clear a marker that
+    belongs to a run other than its own.
 
     Caller obligations: the caller owns the transaction (this function
     never commits or rolls back) and has already confirmed the resume is

@@ -2523,6 +2523,7 @@ const zh = {
       },
       executionMode: {
         label: "执行模式",
+        unset: "默认",
         auto: {
           title: "自动",
           description: "由智能体按请求自行选择",

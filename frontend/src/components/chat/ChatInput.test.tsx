@@ -1134,6 +1134,7 @@ describe("ChatInput", () => {
 
   const executionModeLabel = (mode: string) =>
     `builds.configForm.executionMode.${mode}.title`
+  const UNSET_MODE_LABEL = "builds.configForm.executionMode.unset"
 
   it("sends the picked execution mode for a new standalone task", async () => {
     mockDefaultModel()
@@ -1147,7 +1148,7 @@ describe("ChatInput", () => {
       />
     )
 
-    const trigger = await screen.findByText(executionModeLabel("auto"))
+    const trigger = await screen.findByText(UNSET_MODE_LABEL)
     fireEvent.click(trigger)
     fireEvent.click(screen.getByText(executionModeLabel("think")))
     fireEvent.submit(container.querySelector("form") as HTMLFormElement)
@@ -1172,10 +1173,9 @@ describe("ChatInput", () => {
       />
     )
 
-    fireEvent.click(await screen.findByText(executionModeLabel("auto")))
-    const menuItem = screen.getAllByText(executionModeLabel("auto"))
-      .find((node) => node.closest('[role="dialog"]')) as HTMLElement
-    fireEvent.click(menuItem)
+    fireEvent.click(await screen.findByText(UNSET_MODE_LABEL))
+    fireEvent.click(screen.getByText(executionModeLabel("auto")))
+    expect(screen.getByText(executionModeLabel("auto"))).toBeInTheDocument()
     fireEvent.submit(container.querySelector("form") as HTMLFormElement)
 
     await waitFor(() => {
@@ -1198,7 +1198,7 @@ describe("ChatInput", () => {
       />
     )
 
-    await screen.findByText(executionModeLabel("auto"))
+    await screen.findByText(UNSET_MODE_LABEL)
     fireEvent.submit(container.querySelector("form") as HTMLFormElement)
 
     await waitFor(() => expect(onSend).toHaveBeenCalledOnce())
@@ -1217,7 +1217,7 @@ describe("ChatInput", () => {
       />
     )
 
-    expect(screen.queryByText(executionModeLabel("auto"))).not.toBeInTheDocument()
+    expect(screen.queryByText(UNSET_MODE_LABEL)).not.toBeInTheDocument()
   })
 
   it("drops a pick made before the picker was hidden", async () => {
@@ -1231,7 +1231,7 @@ describe("ChatInput", () => {
     }
     const { container, rerender } = render(<ChatInput {...props} />)
 
-    fireEvent.click(await screen.findByText(executionModeLabel("auto")))
+    fireEvent.click(await screen.findByText(UNSET_MODE_LABEL))
     fireEvent.click(screen.getByText(executionModeLabel("think")))
     expect(screen.getByText(executionModeLabel("think"))).toBeInTheDocument()
 
@@ -1240,7 +1240,7 @@ describe("ChatInput", () => {
     )
     rerender(<ChatInput {...props} />)
 
-    expect(screen.getByText(executionModeLabel("auto"))).toBeInTheDocument()
+    expect(screen.getByText(UNSET_MODE_LABEL)).toBeInTheDocument()
     fireEvent.submit(container.querySelector("form") as HTMLFormElement)
 
     await waitFor(() => expect(onSend).toHaveBeenCalledOnce())
@@ -1259,7 +1259,7 @@ describe("ChatInput", () => {
       />
     )
 
-    fireEvent.click(await screen.findByText(executionModeLabel("auto")))
+    fireEvent.click(await screen.findByText(UNSET_MODE_LABEL))
     expect(screen.getByText(executionModeLabel("think"))).toBeInTheDocument()
     fireEvent.submit(container.querySelector("form") as HTMLFormElement)
 
@@ -1281,7 +1281,7 @@ describe("ChatInput", () => {
       />
     )
 
-    expect(screen.queryByText(executionModeLabel("auto"))).not.toBeInTheDocument()
+    expect(screen.queryByText(UNSET_MODE_LABEL)).not.toBeInTheDocument()
   })
 
   it("hides the execution mode picker when composer config is hidden", async () => {
@@ -1296,7 +1296,7 @@ describe("ChatInput", () => {
       />
     )
 
-    expect(screen.queryByText(executionModeLabel("auto"))).not.toBeInTheDocument()
+    expect(screen.queryByText(UNSET_MODE_LABEL)).not.toBeInTheDocument()
   })
 
   it("hides the execution mode picker for an existing task and keeps its mode", async () => {

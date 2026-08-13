@@ -596,6 +596,11 @@ export function ChatInput({
   // only, and an agent (a template resolves into one) overrides it anyway.
   const showExecutionModePicker =
     !hideConfig && !readOnlyConfig && !taskConfig && !selectedTemplate;
+  // Unset reads as "Default", not "Auto": the server default is auto only when
+  // XAGENT_AGENT_RUNTIME is unset (config.get_default_task_execution_mode).
+  const executionModeTriggerLabel = pickedExecutionMode
+    ? t(`builds.configForm.executionMode.${pickedExecutionMode}.title`)
+    : t("builds.configForm.executionMode.unset");
   const showLocalBrowser = Boolean(user?.is_admin) && !readOnlyConfig && !hideConfig;
   const showTaskRuntimeExtension =
     hasTaskRuntimeComposerExtension && !readOnlyConfig && !hideConfig;
@@ -1164,13 +1169,11 @@ export function ChatInput({
                       className="inline-flex h-9 items-center gap-2 rounded-xl px-3 text-xs text-muted-foreground hover:bg-secondary/80 hover:text-foreground disabled:pointer-events-none disabled:opacity-50"
                       disabled={isInputBusy}
                       title={t("builds.configForm.executionMode.label")}
-                      aria-label={`${t("builds.configForm.executionMode.label")}: ${t(
-                        `builds.configForm.executionMode.${pickedExecutionMode ?? "auto"}.title`
-                      )}`}
+                      aria-label={`${t("builds.configForm.executionMode.label")}: ${executionModeTriggerLabel}`}
                     >
                       <Sparkles className="h-4 w-4" />
                       <span className="max-w-[150px] truncate hidden sm:inline-block">
-                        {t(`builds.configForm.executionMode.${pickedExecutionMode ?? "auto"}.title`)}
+                        {executionModeTriggerLabel}
                       </span>
                     </PopoverTrigger>
                     <PopoverContent align="start" side="top" className="w-64 space-y-0.5 p-1.5">

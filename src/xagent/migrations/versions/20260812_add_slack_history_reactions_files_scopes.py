@@ -6,6 +6,7 @@ Create Date: 2026-08-12
 
 """
 
+import json
 import logging
 from typing import Sequence, Union
 
@@ -107,10 +108,11 @@ def _set_slack_scopes(bind: sa.engine.Connection, scopes: list[str]) -> None:
     )
 
 
-def _set_slack_provider_default_scopes(
-    bind: sa.engine.Connection, scopes: list[str]
+def _set_slack_provider_default_scopes_if_unchanged(
+    bind: sa.engine.Connection, expected_current: list[str], new_value: list[str]
 ) -> None:
-    """Keep oauth_providers.default_scopes for provider "slack" in sync too.
+    """Keep oauth_providers.default_scopes for provider "slack" in sync too,
+    without clobbering an operator customization.
 
     Unlike public_mcp_apps.oauth_scopes, this one DOES drive live behavior:
     the app-id-less authorize path (``GET /api/auth/{provider}/login`` with
@@ -123,6 +125,15 @@ def _set_slack_provider_default_scopes(
     connect flow is unaffected either way, since it unions this value with
     the app's own (always-current) oauth_scopes.
 
+    Unlike oauth_scopes, default_scopes has no admin_mcp builtin-protected-
+    fields guard, so an operator can legitimately have edited it via the
+    admin PATCH endpoint. Mirrors
+    _set_slack_description_if_unchanged's only-overwrite-when-unchanged
+    guard — except the comparison happens in Python after a SELECT rather
+    than in the UPDATE's WHERE clause, since JSON-column equality operators
+    are not guaranteed to compare consistently (key order, whitespace)
+    across every SQLAlchemy-supported backend.
+
     No other app_id shares provider_name "slack" today, so this update
     cannot affect an unrelated app's authorize request.
     """
@@ -131,10 +142,27 @@ def _set_slack_provider_default_scopes(
     ):
         return
 
+    current = bind.execute(
+        sa.select(OAUTH_PROVIDERS_TABLE.c.default_scopes).where(
+            OAUTH_PROVIDERS_TABLE.c.provider_name == PROVIDER_NAME
+        )
+    ).scalar()
+    if isinstance(current, str):
+        try:
+            current = json.loads(current)
+        except (TypeError, ValueError):
+            pass
+    # current is None both when no "slack" provider row exists (the update
+    # below then affects zero rows, same as before this guard existed) and
+    # when an existing row's default_scopes is genuinely NULL; either way
+    # there is nothing customized to protect, so the write proceeds.
+    if current is not None and current != expected_current:
+        return
+
     bind.execute(
         sa.update(OAUTH_PROVIDERS_TABLE)
         .where(OAUTH_PROVIDERS_TABLE.c.provider_name == PROVIDER_NAME)
-        .values(default_scopes=scopes)
+        .values(default_scopes=new_value)
     )
 
 
@@ -181,9 +209,8 @@ def _invalidate_existing_slack_grants(bind: sa.engine.Connection) -> None:
     if not _columns_present(bind, "user_oauth", {"provider", "access_token"}):
         return
 
-    columns = {c["name"] for c in sa.inspect(bind).get_columns("user_oauth")}
     values: dict[str, object] = {"access_token": ""}
-    if "refresh_token" in columns:
+    if _columns_present(bind, "user_oauth", {"refresh_token"}):
         values["refresh_token"] = None
 
     result = bind.execute(
@@ -203,7 +230,9 @@ def _invalidate_existing_slack_grants(bind: sa.engine.Connection) -> None:
 def upgrade() -> None:
     bind = op.get_bind()
     _set_slack_scopes(bind, CURRENT_SCOPES)
-    _set_slack_provider_default_scopes(bind, CURRENT_SCOPES)
+    _set_slack_provider_default_scopes_if_unchanged(
+        bind, PREVIOUS_SCOPES, CURRENT_SCOPES
+    )
     _set_slack_description_if_unchanged(bind, PREVIOUS_DESCRIPTION, CURRENT_DESCRIPTION)
     _invalidate_existing_slack_grants(bind)
 
@@ -213,5 +242,7 @@ def downgrade() -> None:
     # reconnect); there is nothing meaningful to restore for user_oauth here.
     bind = op.get_bind()
     _set_slack_scopes(bind, PREVIOUS_SCOPES)
-    _set_slack_provider_default_scopes(bind, PREVIOUS_SCOPES)
+    _set_slack_provider_default_scopes_if_unchanged(
+        bind, CURRENT_SCOPES, PREVIOUS_SCOPES
+    )
     _set_slack_description_if_unchanged(bind, CURRENT_DESCRIPTION, PREVIOUS_DESCRIPTION)

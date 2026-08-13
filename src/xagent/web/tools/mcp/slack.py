@@ -38,8 +38,16 @@ MAX_SEARCH_THREADS = 20
 # mistake (e.g. copied from slack_list_direct_messages' "user" field) is
 # rejected up front instead of being misclassified as an already-resolved
 # conversation id. Channel *names* are forced lowercase by Slack, so this
-# can't misclassify a name as an id either way.
+# can't misclassify a name as an id either way. Used only by
+# _resolve_channel_id, whose conversations.*/reactions.*/files.* endpoints
+# genuinely require a conversation id — never by _normalize_channel below.
 _SLACK_ID_PATTERN = re.compile(r"^[CGD][A-Z0-9]{5,}$")
+
+# Any Slack object id (channel, user "U...", bot "B..."), for
+# _normalize_channel: chat.postMessage accepts a user id directly to open/
+# post into a DM, so that id must pass through unchanged rather than being
+# misread as a bare channel name and prefixed with "#" (which 404s).
+_SLACK_ANY_ID_PATTERN = re.compile(r"^[A-Z][A-Z0-9]{5,}$")
 
 
 def _success(**payload: Any) -> str:
@@ -58,11 +66,12 @@ def _headers() -> dict[str, str]:
 
 
 def _normalize_channel(channel: str) -> str:
-    """Accept a channel id ("C0123456789") or a name with or without the
-    leading "#"; bare names get the "#" prepended so all three documented
-    forms reach the API in a shape it accepts."""
+    """Accept a channel id ("C0123456789"), a user id ("U0123456789", for
+    posting into a DM), or a name with or without the leading "#"; bare
+    names get the "#" prepended so all forms reach the API in a shape it
+    accepts."""
     value = channel.strip()
-    if value.startswith("#") or _SLACK_ID_PATTERN.match(value):
+    if value.startswith("#") or _SLACK_ANY_ID_PATTERN.match(value):
         return value
     return f"#{value}"
 
@@ -98,6 +107,16 @@ def _resolve_channel_id(channel: str) -> str:
         cursor = (result.get("response_metadata") or {}).get("next_cursor")
         if not cursor:
             break
+    else:
+        # MAX_PAGES exhausted with a cursor still pending: the workspace has
+        # more channels than this scan covers, so "not found" is not a firm
+        # answer — say so rather than implying an exhaustive search.
+        if cursor:
+            raise ValueError(
+                f"Could not resolve channel '{channel}' to an id after scanning "
+                f"the first {MAX_PAGES * 200} channels (more remain) — pass the "
+                "channel id directly, or narrow the search via slack_list_channels."
+            )
     raise ValueError(
         f"Could not resolve channel '{channel}' to an id — use slack_list_channels "
         "or slack_list_direct_messages to look it up, or pass the channel id "
@@ -131,7 +150,9 @@ def _resolve_allowed_file_path(file_path: str) -> Path:
 
     allowed_dirs = _allowed_file_dirs()
     for allowed_dir in allowed_dirs:
-        if local_path == allowed_dir or local_path.is_relative_to(allowed_dir):
+        # is_relative_to already covers the equality case (a path is
+        # relative to itself), so no separate "== allowed_dir" arm is needed.
+        if local_path.is_relative_to(allowed_dir):
             return local_path
 
     # The absolute host path is deliberately kept out of the raised message:
@@ -282,8 +303,10 @@ def slack_list_channels(
 def slack_post_message(channel: str, text: str, thread_ts: str = "") -> str:
     """
     Post a message to a Slack channel, DM, or as a threaded reply.
-    channel: a channel id (e.g. "C0123456789") or name (e.g. "#incidents" or
-    "incidents" — a bare name is normalized to "#incidents").
+    channel: a channel id (e.g. "C0123456789"), a user id (e.g.
+    "U0123456789", to open/post into a 1:1 DM — see
+    slack_list_direct_messages' "user" field), or a channel name (e.g.
+    "#incidents" or "incidents" — a bare name is normalized to "#incidents").
     text: the message body (plain text or Slack mrkdwn).
     thread_ts: optional parent message "ts" (from slack_get_channel_history,
     slack_search_messages, or a prior slack_post_message result) to reply
@@ -366,8 +389,9 @@ def slack_get_thread_replies(
     channel: str, thread_ts: str, limit: int = 100, cursor: str = ""
 ) -> str:
     """
-    Fetch all replies in a message thread (the parent message is included as
-    the first result).
+    Fetch a page of replies in a message thread (the parent message is
+    included as the first result). Defaults to the 100 most recent replies
+    per call — pass cursor to page through a longer thread.
     channel: a channel/DM id or name the thread lives in.
     thread_ts: the parent message's "ts".
     cursor: pass the next_cursor from a previous call's response to fetch
@@ -509,11 +533,17 @@ def slack_search_messages(
     Search a channel, private channel, or DM's recent history (and, by
     default, its threads' replies) for messages containing `query`
     (case-insensitive substring match).
+    limit: max matching messages to return (default 50, capped at 1000).
+    scan_limit: max messages to scan from the conversation's history to look
+    for matches in (default 200, capped at 1000) — distinct from `limit`,
+    which bounds the result count, not the scan depth. Each thread's replies
+    are scanned up to 200 per thread regardless of scan_limit; a thread with
+    more replies than that may under-report matches in its tail.
     This only scans the given conversation's own history, up to scan_limit
-    most recent messages (default 200) — it is not a Slack workspace-wide
-    search, which needs a user-token search:read scope this bot-token
-    connector does not request. To search multiple conversations, call this
-    once per channel/DM (see slack_list_channels / slack_list_direct_messages).
+    most recent messages — it is not a Slack workspace-wide search, which
+    needs a user-token search:read scope this bot-token connector does not
+    request. To search multiple conversations, call this once per channel/DM
+    (see slack_list_channels / slack_list_direct_messages).
     """
     needle = query.strip().lower()
     if not needle:
@@ -523,6 +553,7 @@ def slack_search_messages(
         max_scan = max(1, min(int(scan_limit), 1000))
         max_matches = max(1, min(int(limit), 1000))
         matches: list[dict[str, Any]] = []
+        matched_ts: set[str] = set()
         threaded_parents: list[dict[str, Any]] = []
         scanned = 0
         cursor: str | None = None
@@ -539,9 +570,10 @@ def slack_search_messages(
                 scanned += 1
                 text = str(m.get("text") or "")
                 if needle in text.lower():
-                    matches.append(
-                        {"ts": m.get("ts"), "user": m.get("user"), "text": text}
-                    )
+                    ts = m.get("ts")
+                    matches.append({"ts": ts, "user": m.get("user"), "text": text})
+                    if ts:
+                        matched_ts.add(ts)
                 if m.get("reply_count"):
                     threaded_parents.append(m)
             cursor = (result.get("response_metadata") or {}).get("next_cursor")
@@ -550,6 +582,7 @@ def slack_search_messages(
 
         threads_scanned = 0
         thread_fetch_failed = False
+        thread_replies_truncated = False
         if include_thread_replies:
             for parent in threaded_parents:
                 if threads_scanned >= MAX_SEARCH_THREADS or len(matches) >= max_matches:
@@ -579,30 +612,46 @@ def slack_search_messages(
                     # purposes.
                     thread_fetch_failed = True
                     continue
+                # A thread with over 200 replies is only partially scanned —
+                # has_more/next_cursor are not followed, so a match in the
+                # untouched tail is missed. Flag it rather than silently
+                # under-reporting as "complete".
+                if replies_result.get("has_more"):
+                    thread_replies_truncated = True
                 for reply in replies_result.get("messages") or []:
-                    if reply.get("ts") == thread_ts:
-                        continue  # already scanned as the thread's parent message
+                    reply_ts = reply.get("ts")
+                    if reply_ts == thread_ts or reply_ts in matched_ts:
+                        # Skip the parent (already scanned above) and any
+                        # reply already matched via the history scan — a
+                        # thread-broadcast reply is surfaced in both.
+                        continue
                     text = str(reply.get("text") or "")
                     if needle in text.lower():
                         matches.append(
                             {
-                                "ts": reply.get("ts"),
+                                "ts": reply_ts,
                                 "user": reply.get("user"),
                                 "text": text,
                                 "thread_ts": thread_ts,
                             }
                         )
+                        if reply_ts:
+                            matched_ts.add(reply_ts)
 
-        # Unscanned/failed threads only count as truncation when thread
-        # search was requested — with include_thread_replies=False the
-        # caller opted out, so leftover threaded parents are not missing
-        # coverage.
+        # Unscanned/failed/under-scanned threads only count as truncation
+        # when thread search was requested — with include_thread_replies=
+        # False the caller opted out, so leftover threaded parents are not
+        # missing coverage.
         truncated = (
             len(matches) > max_matches
             or bool(cursor)
             or (
                 include_thread_replies
-                and (thread_fetch_failed or len(threaded_parents) > threads_scanned)
+                and (
+                    thread_fetch_failed
+                    or thread_replies_truncated
+                    or len(threaded_parents) > threads_scanned
+                )
             )
         )
         return _success(matches=matches[:max_matches], truncated=truncated)
@@ -664,10 +713,12 @@ def slack_upload_file(
     """
     Upload a local file into a Slack channel, DM, or thread.
     file_path: path to a file already on disk (e.g. something written to the
-    task workspace) — must be inside an allowed directory (defaults to the
-    current working directory; configurable via
-    XAGENT_SLACK_FILE_ALLOWED_DIRS) so this tool cannot be used to exfiltrate
-    arbitrary files from the host.
+    task workspace) — must be inside an allowed directory (automatically
+    scoped to the current task workspace) so this tool cannot be used to
+    exfiltrate arbitrary files from the host. Pass an absolute path — a
+    relative path resolves against this process's own working directory,
+    not the allowed directory, and will not find a file written to the
+    task workspace.
     channel: the target channel/DM id or name.
     thread_ts: optional parent message "ts" to post the file as a thread
     reply instead of into the channel's main timeline.
@@ -706,7 +757,20 @@ def slack_upload_file(
                 files={"file": (resolved_filename, fh)},
                 timeout=DEFAULT_TIMEOUT_SECONDS,
             )
-        upload_response.raise_for_status()
+        if not upload_response.ok:
+            # Checked directly rather than via raise_for_status(): its
+            # HTTPError embeds the pre-authenticated upload_url in str(e),
+            # which would otherwise reach the caller/LLM through
+            # _error(str(e)) below — the same host-detail leak this file's
+            # own PermissionError message is careful to avoid elsewhere.
+            logger.warning(
+                "Slack file upload leg failed with status %s for upload_url=%s",
+                upload_response.status_code,
+                upload_url,
+            )
+            raise ValueError(
+                f"Slack rejected the file upload (status {upload_response.status_code})"
+            )
 
         complete_payload: dict[str, Any] = {
             "files": [{"id": file_id, "title": title or resolved_filename}],

@@ -16,6 +16,10 @@ class MockResponse:
     def json(self):
         return self._json_data
 
+    @property
+    def ok(self):
+        return self.status_code < 400
+
     def raise_for_status(self):
         if self.status_code >= 400:
             raise requests.HTTPError(f"{self.status_code} Client Error", response=self)
@@ -41,6 +45,10 @@ def test_headers_include_bearer_token():
     ("raw", "normalized"),
     [
         ("C0123456789", "C0123456789"),  # channel id, untouched
+        ("G0123456789", "G0123456789"),  # private channel / mpim id, untouched
+        ("D0123456789", "D0123456789"),  # DM id, untouched
+        ("U0123456789", "U0123456789"),  # user id, untouched — DM by user id
+        ("B0123456789", "B0123456789"),  # bot id, untouched
         ("#incidents", "#incidents"),  # already hash-prefixed
         ("incidents", "#incidents"),  # bare name gets the hash
         (" incidents ", "#incidents"),  # whitespace trimmed first
@@ -393,6 +401,22 @@ def test_post_message_normalizes_channel_names(monkeypatch, raw, sent):
     json.loads(slack.slack_post_message(raw, "hello"))
 
     assert mock_request.call_args.kwargs["json"]["channel"] == sent
+
+
+def test_post_message_sends_a_bare_user_id_unchanged(monkeypatch):
+    """Regression: a prior narrowing of the shared id pattern (for
+    _resolve_channel_id's channel-only prefixes) must not also make
+    _normalize_channel treat a user id as a bare name and prefix it with
+    "#" — chat.postMessage accepts a user id directly to open/post into a
+    1:1 DM, and "#U0123456789" would 404."""
+    mock_request = Mock(
+        return_value=MockResponse({"ok": True, "channel": "D0123", "ts": "1.1"})
+    )
+    monkeypatch.setattr(slack.requests, "request", mock_request)
+
+    json.loads(slack.slack_post_message("U0123456789", "hello"))
+
+    assert mock_request.call_args.kwargs["json"]["channel"] == "U0123456789"
 
 
 @pytest.mark.parametrize("error_code", ["channel_not_found", "not_in_channel"])
@@ -824,6 +848,94 @@ def test_search_messages_searches_thread_replies(monkeypatch):
         {"ts": "1.2", "user": "U2", "text": "the deploy failed", "thread_ts": "1.1"}
     ]
     assert mock_request.call_count == 2
+
+
+def test_search_messages_dedupes_thread_broadcast_replies(monkeypatch):
+    """A thread-broadcast reply is surfaced both in conversations.history
+    (the main channel timeline) and again in conversations.replies for its
+    thread — a match on that message must appear once, not twice."""
+    mock_request = Mock(
+        side_effect=[
+            MockResponse(
+                {
+                    "ok": True,
+                    "messages": [
+                        {
+                            "ts": "1.1",
+                            "user": "U1",
+                            "text": "kickoff",
+                            "thread_ts": "1.1",
+                            "reply_count": 1,
+                        },
+                        {
+                            "ts": "1.2",
+                            "user": "U2",
+                            "text": "the deploy failed",
+                            "thread_ts": "1.1",
+                        },
+                    ],
+                }
+            ),
+            MockResponse(
+                {
+                    "ok": True,
+                    "messages": [
+                        {"ts": "1.1", "user": "U1", "text": "kickoff"},
+                        {"ts": "1.2", "user": "U2", "text": "the deploy failed"},
+                    ],
+                }
+            ),
+        ]
+    )
+    monkeypatch.setattr(slack.requests, "request", mock_request)
+
+    result = json.loads(slack.slack_search_messages("C0123456789", "deploy"))
+
+    assert result["status"] == "success"
+    assert result["matches"] == [
+        {"ts": "1.2", "user": "U2", "text": "the deploy failed"}
+    ]
+
+
+def test_search_messages_flags_truncation_for_a_thread_with_over_200_replies(
+    monkeypatch,
+):
+    """conversations.replies is fetched with a flat limit=200 per thread and
+    has_more/next_cursor are not followed — a thread with more replies than
+    that must be flagged truncated rather than silently reported complete,
+    even when nothing failed and every threaded parent was attempted."""
+    mock_request = Mock(
+        side_effect=[
+            MockResponse(
+                {
+                    "ok": True,
+                    "messages": [
+                        {
+                            "ts": "1.1",
+                            "user": "U1",
+                            "text": "kickoff",
+                            "thread_ts": "1.1",
+                            "reply_count": 250,
+                        }
+                    ],
+                }
+            ),
+            MockResponse(
+                {
+                    "ok": True,
+                    "has_more": True,
+                    "messages": [{"ts": "1.1", "user": "U1", "text": "kickoff"}],
+                }
+            ),
+        ]
+    )
+    monkeypatch.setattr(slack.requests, "request", mock_request)
+
+    result = json.loads(slack.slack_search_messages("C0123456789", "deploy"))
+
+    assert result["status"] == "success"
+    assert result["matches"] == []
+    assert result["truncated"] is True
 
 
 def test_search_messages_rejects_empty_query():

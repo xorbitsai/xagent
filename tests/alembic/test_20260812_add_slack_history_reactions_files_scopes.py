@@ -411,3 +411,73 @@ def test_provider_default_scopes_match_registry():
         r for r in get_builtin_oauth_provider_rows() if r["provider_name"] == "slack"
     )
     assert migration.CURRENT_SCOPES == registry_provider["default_scopes"]
+
+
+# ---------------------------------------------------------------------------
+# N4 — oauth_providers.default_scopes must not clobber an operator
+# customization, mirroring the description's if-unchanged guard.
+# ---------------------------------------------------------------------------
+
+
+def test_upgrade_preserves_customized_provider_default_scopes(tmp_path):
+    engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
+    migration = _load_migration_module()
+    with engine.begin() as connection:
+        _create_table(connection, description=migration.PREVIOUS_DESCRIPTION)
+        _create_oauth_providers_table(connection, ["chat:write", "custom:scope"])
+        with patch.object(migration, "op", _operations(connection)):
+            migration.upgrade()
+        assert _provider_default_scopes(connection, "slack") == [
+            "chat:write",
+            "custom:scope",
+        ]
+        # The app-facing oauth_scopes column is unaffected by this guard —
+        # it always updates (see _set_slack_scopes's own docstring).
+        _, scopes = _row(connection)
+        assert scopes == migration.CURRENT_SCOPES
+
+
+def test_downgrade_preserves_customized_provider_default_scopes(tmp_path):
+    engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
+    migration = _load_migration_module()
+    with engine.begin() as connection:
+        _create_table(connection, description=migration.PREVIOUS_DESCRIPTION)
+        _create_oauth_providers_table(connection, migration.PREVIOUS_SCOPES)
+        with patch.object(migration, "op", _operations(connection)):
+            migration.upgrade()
+            connection.execute(
+                text(
+                    "UPDATE oauth_providers SET default_scopes = :s "
+                    "WHERE provider_name = 'slack'"
+                ),
+                {"s": json.dumps(["chat:write", "custom:scope"])},
+            )
+            migration.downgrade()
+        assert _provider_default_scopes(connection, "slack") == [
+            "chat:write",
+            "custom:scope",
+        ]
+
+
+def test_upgrade_updates_provider_default_scopes_when_no_row_exists(tmp_path):
+    """No 'slack' provider row is not a customization to protect — the
+    if-unchanged guard must not turn a previously-unconditional no-op into a
+    silent skip once a row is later created some other way."""
+    engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
+    migration = _load_migration_module()
+    with engine.begin() as connection:
+        _create_table(connection, description=migration.PREVIOUS_DESCRIPTION)
+        connection.execute(
+            text(
+                """
+                CREATE TABLE oauth_providers (
+                    id INTEGER PRIMARY KEY,
+                    provider_name VARCHAR(50) NOT NULL UNIQUE,
+                    default_scopes JSON
+                )
+                """
+            )
+        )
+        with patch.object(migration, "op", _operations(connection)):
+            migration.upgrade()  # must not raise with no matching row
+        assert _provider_default_scopes(connection, "slack") is None

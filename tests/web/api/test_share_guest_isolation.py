@@ -281,7 +281,10 @@ def test_agent_share_task_create_ignores_client_supplied_guest_id() -> None:
         json={
             "title": "forged",
             "description": "forged",
-            "agent_config": {"guest_id": _share_guest_id(victim["Authorization"])},
+            "agent_config": {
+                "guest_id": _share_guest_id(victim["Authorization"]),
+                "__xagent_file_operation_access_version": 999,
+            },
         },
     )
     assert created.status_code == 200, created.text
@@ -298,6 +301,7 @@ def test_agent_share_task_create_ignores_client_supplied_guest_id() -> None:
         assert task.agent_config.get("guest_id") != _share_guest_id(
             victim["Authorization"]
         )
+        assert task.agent_config.get("__xagent_file_operation_access_version") == 1
     finally:
         db.close()
 

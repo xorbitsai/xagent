@@ -1842,6 +1842,85 @@ async def test_mcp_oauth_local_listing_also_requires_a_grant(db_session):
 
 
 @pytest.mark.asyncio
+async def test_local_mcp_oauth_listing_carries_the_auth_type_for_the_picker(
+    db_session,
+):
+    """#1313: the connector picker dispatches Connect on auth_type, which the
+    location=local branch never emitted — so a custom mcp_oauth server left
+    unconnected by the grant gate above had no branch to fall into and
+    dead-ended on the mis-authored-entry toast."""
+    db, user, _ = db_session
+    _add_mcp_oauth_server(db, user)
+
+    records = next(
+        a
+        for a in list_mcp_apps(location="local", current_user=user, db=db)
+        if a["id"] == "records"
+    )
+    assert records["is_connected"] is False
+    assert records["auth_type"] == "mcp_oauth"
+
+
+@pytest.mark.asyncio
+async def test_local_non_mcp_oauth_server_carries_no_auth_type(db_session):
+    """The hint is scoped to the mcp_oauth shape on purpose: a catalog
+    classification on any other custom server would repoint the settings
+    dialog's Configure button away from the custom edit form."""
+    db, user, _ = db_session
+    server = MCPServer.from_config(
+        {
+            "name": "local-notes",
+            "managed": "external",
+            "transport": "stdio",
+            "command": "notes-mcp",
+        }
+    )
+    db.add(server)
+    db.commit()
+    db.refresh(server)
+    db.add(
+        UserMCPServer(
+            user_id=user.id, mcpserver_id=server.id, is_owner=True, is_active=True
+        )
+    )
+    db.commit()
+
+    notes = next(
+        a
+        for a in list_mcp_apps(location="local", current_user=user, db=db)
+        if a["id"] == "local-notes"
+    )
+    assert notes["is_connected"] is True
+    assert "auth_type" not in notes
+
+
+@pytest.mark.asyncio
+async def test_local_mcp_oauth_listing_omits_auth_type_when_deactivated(db_session):
+    """The per-server OAuth endpoints require an active association, so
+    advertising the flow on a deactivated server would swap one dead end for
+    a 404 — such a server needs re-enabling, not re-authorization."""
+    db, user, _ = db_session
+    server = _add_mcp_oauth_server(db, user)
+    assoc = (
+        db.query(UserMCPServer)
+        .filter(
+            UserMCPServer.user_id == user.id,
+            UserMCPServer.mcpserver_id == server.id,
+        )
+        .one()
+    )
+    assoc.is_active = False
+    db.commit()
+
+    records = next(
+        a
+        for a in list_mcp_apps(location="local", current_user=user, db=db)
+        if a["id"] == "records"
+    )
+    assert "auth_type" not in records
+
+
+@pytest.mark.asyncio
 async def test_delete_mcp_server_revokes_only_the_disconnecting_users_grant(
     db_session, monkeypatch
 ):

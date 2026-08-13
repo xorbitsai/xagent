@@ -1,5 +1,6 @@
 """Tests for CreateAgentTool - dynamically creating agents during task execution."""
 
+import inspect
 import tempfile
 from pathlib import Path
 from types import SimpleNamespace
@@ -16,13 +17,17 @@ from xagent.core.tools.adapters.vibe.agent_tool import (
     CreateAgentTool,
     ListAgentsTool,
     ListToolCategoriesTool,
+    PublishedAgentToolRecord,
     UpdateAgentTool,
     _coerce_db_task_id,
     _DelegatedAgentWebSocketTraceHandler,
+    build_published_agent_tools_from_records,
     gen_agent_tool_name,
     get_published_agents_tools,
 )
 from xagent.core.tools.adapters.vibe.agent_tool_names import parse_agent_tool_id
+from xagent.core.tools.adapters.vibe.factory import ToolFactory
+from xagent.core.tools.core.workspace_file_tool import WorkspaceFileOperations
 from xagent.core.tracing.langfuse.handler import LangfuseTraceHandler
 from xagent.core.workspace import TaskWorkspace
 from xagent.web.models.agent import Agent, AgentOrigin, AgentStatus
@@ -499,6 +504,51 @@ class TestCreateAgentTool:
             except OSError:
                 pass
 
+    def test_agent_tool_accepts_parent_file_operation_policy(self) -> None:
+        assert (
+            "file_operation_access_version" in inspect.signature(AgentTool).parameters
+        )
+
+        tool = AgentTool(
+            agent_id=1,
+            agent_name="Worker",
+            agent_description="Worker",
+            session_factory=lambda: None,
+            user_id=7,
+            task_id="77",
+            parent_task_id="77",
+            file_operation_access_version=1,
+        )
+
+        assert tool._file_operation_access_version == 1
+
+    def test_published_agent_builder_propagates_file_operation_policy(self) -> None:
+        assert (
+            "file_operation_access_version"
+            in inspect.signature(build_published_agent_tools_from_records).parameters
+        )
+
+        tools = build_published_agent_tools_from_records(
+            [
+                PublishedAgentToolRecord(
+                    id=1,
+                    name="Worker",
+                    description="Worker",
+                    instructions=None,
+                    status="published",
+                )
+            ],
+            session_factory=lambda: None,
+            user_id=7,
+            task_id="77",
+            parent_task_id="77",
+            file_operation_access_version=1,
+        )
+
+        assert len(tools) == 1
+        assert isinstance(tools[0], AgentTool)
+        assert tools[0]._file_operation_access_version == 1
+
     @pytest.mark.asyncio
     async def test_agent_tool_returns_parent_owned_file_refs_for_worker_outputs(
         self,
@@ -512,8 +562,18 @@ class TestCreateAgentTool:
             db.commit()
             db.refresh(user)
 
-            task = Task(id=77, user_id=user.id, title="Parent task")
-            db.add(task)
+            task = Task(
+                id=77,
+                user_id=user.id,
+                title="Parent task",
+                source="shared_link",
+                agent_config={
+                    "auth_mode": "share",
+                    "__xagent_file_operation_access_version": 1,
+                },
+            )
+            sibling_task = Task(id=78, user_id=user.id, title="Sibling task")
+            db.add_all([task, sibling_task])
             db.commit()
 
             model = Model(
@@ -580,6 +640,7 @@ class TestCreateAgentTool:
                     parent_task_id="77",
                     parent_tracer=parent_tracer,
                     workspace_base_dir=workspace_root,
+                    file_operation_access_version=1,
                     runtime_metadata={"workforce_id": 1},
                 )
 
@@ -643,7 +704,37 @@ class TestCreateAgentTool:
                 assert file_record.workspace_category == "output"
 
                 tool_config = mock_agent_service_class.call_args.kwargs["tool_config"]
-                assert tool_config.get_workspace_config()["db_task_id"] == 77
+                workspace_config = tool_config.get_workspace_config()
+                assert workspace_config["db_task_id"] == 77
+                assert workspace_config["user_id"] == user.id
+                assert workspace_config["__xagent_file_operation_access_version"] == 1
+
+                sibling_path = Path(workspace_root) / "sibling.txt"
+                sibling_path.write_text("sibling", encoding="utf-8")
+                db.add(
+                    UploadedFile(
+                        file_id="sibling-file",
+                        user_id=user.id,
+                        task_id=78,
+                        filename=sibling_path.name,
+                        storage_path=str(sibling_path),
+                        storage_status="available",
+                        mime_type="text/plain",
+                        file_size=sibling_path.stat().st_size,
+                    )
+                )
+                db.commit()
+                with patch(
+                    "xagent.core.storage.manager.create_db_session",
+                    SessionLocal,
+                ):
+                    child_workspace = ToolFactory.create_workspace(workspace_config)
+                    assert child_workspace is not None
+                    with pytest.raises(FileNotFoundError):
+                        WorkspaceFileOperations(child_workspace).read_file(
+                            "sibling-file"
+                        )
+
                 assert parent_tracer.events[-1]["data"]["file_outputs"] == file_outputs
 
                 tracer = mock_agent_service_class.call_args.kwargs["tracer"]

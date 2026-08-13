@@ -5,7 +5,6 @@ This module provides video generation capabilities using pre-configured video
 models passed from the web layer.
 """
 
-import logging
 from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
@@ -14,8 +13,6 @@ from ....workspace import TaskWorkspace
 from ...core.video_tool import VideoGenerationToolCore
 from .base import ToolCategory
 from .function import FunctionTool
-
-logger = logging.getLogger(__name__)
 
 
 class VideoGenerationFunctionTool(FunctionTool):
@@ -117,12 +114,8 @@ async def create_video_tools_from_config(config: "BaseToolConfig") -> List[Any]:
     if not workspace:
         return []
 
-    try:
-        return create_video_tool(
-            video_models,
-            workspace=workspace,
-            default_video_model=config.get_video_model(),
-        )
-    except Exception as e:
-        logger.warning("Failed to create video tools: %s", e)
-        return []
+    return create_video_tool(
+        video_models,
+        workspace=workspace,
+        default_video_model=config.get_video_model(),
+    )

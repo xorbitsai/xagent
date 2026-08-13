@@ -7,6 +7,8 @@ from sqlalchemy.orm import sessionmaker
 
 from xagent.core.agent.trace import get_display_user_message
 from xagent.core.file_storage.factory import get_unscoped_file_storage
+from xagent.core.tools.core.workspace_file_tool import WorkspaceFileOperations
+from xagent.core.workspace import TaskWorkspace
 from xagent.web.api import websocket as websocket_api
 from xagent.web.api.chat import _build_task_agent_config
 from xagent.web.api.websocket import (
@@ -1216,6 +1218,58 @@ async def test_handle_file_upload_for_task_rejects_unowned_and_wrong_task_files(
     assert [item["file_id"] for item in result["file_info_list"]] == ["valid-file"]
     db_session.refresh(valid_file)
     assert valid_file.task_id == 10
+
+
+@pytest.mark.asyncio
+async def test_marked_websocket_first_turn_file_remains_readable(
+    db_session,
+    tmp_path,
+    monkeypatch,
+):
+    owner = _create_user(db_session, 1, "owner")
+    task = _create_task(db_session, task_id=10, user_id=owner.id)
+    task.source = "widget"
+    task.agent_config = {
+        "auth_mode": "widget",
+        "__xagent_file_operation_access_version": 1,
+    }
+    upload = _create_uploaded_file(
+        db_session,
+        tmp_path,
+        file_id="first-turn-file",
+        user_id=owner.id,
+        task_id=None,
+        filename="first-turn.txt",
+    )
+    Path(upload.storage_path).write_text("first turn", encoding="utf-8")
+    db_session.commit()
+
+    result = await handle_file_upload_for_task(
+        task.id,
+        [{"file_id": upload.file_id}],
+        db_session,
+        SimpleNamespace(id=owner.id, is_admin=False),
+        task_owner_id=owner.id,
+    )
+    assert [item["file_id"] for item in result["file_info_list"]] == [upload.file_id]
+    db_session.refresh(upload)
+    assert upload.task_id == task.id
+
+    SessionLocal = sessionmaker(bind=db_session.get_bind())
+    monkeypatch.setattr(
+        "xagent.core.storage.manager.create_db_session",
+        SessionLocal,
+    )
+    workspace = TaskWorkspace(
+        id="agent_1_websocket_first_turn",
+        base_dir=str(tmp_path / "workspaces"),
+        allowed_external_dirs=[str(Path(upload.storage_path).parent)],
+        db_task_id=task.id,
+    )
+    workspace.owner_user_id = owner.id
+    workspace.file_operation_access_version = 1
+
+    assert WorkspaceFileOperations(workspace).read_file(upload.file_id) == "first turn"
 
 
 def test_register_uploaded_files_for_agent_binds_existing_durable_metadata(

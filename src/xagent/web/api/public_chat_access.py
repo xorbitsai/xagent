@@ -17,6 +17,10 @@ from jose import JWTError, jwt
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
+from ...core.task_runtime import (
+    FILE_OPERATION_ACCESS_VERSION,
+    FILE_OPERATION_ACCESS_VERSION_KEY,
+)
 from ..auth_config import JWT_ALGORITHM, JWT_SECRET_KEY
 from ..jwt_validation import (
     has_matching_temporal_claim_conversion_failure,
@@ -1006,6 +1010,7 @@ async def _create_workforce_widget_chat_task(
         source="widget",
         is_visible=False,
         extra_agent_config={
+            FILE_OPERATION_ACCESS_VERSION_KEY: FILE_OPERATION_ACCESS_VERSION,
             "auth_mode": "widget",
             "widget_workforce_id": int(workforce.id),
             # Null the agent marker for symmetry with the agent path (#1108):
@@ -1069,6 +1074,7 @@ async def create_public_chat_task(
     agent_config = sanitize_client_agent_config(request.agent_config)
     agent_config["guest_id"] = access_context.guest_id
     agent_config["auth_mode"] = "widget"
+    agent_config[FILE_OPERATION_ACCESS_VERSION_KEY] = FILE_OPERATION_ACCESS_VERSION
     # Server-observed creator IP (#1108): the per-abuser key for the widget
     # run quota. Stamped by the backend, never client-supplied.
     agent_config["widget_client_ip"] = client_ip
@@ -1169,6 +1175,7 @@ async def _create_workforce_share_chat_task(
         source="shared_link",
         is_visible=False,
         extra_agent_config={
+            FILE_OPERATION_ACCESS_VERSION_KEY: FILE_OPERATION_ACCESS_VERSION,
             "auth_mode": "share",
             "share_workforce_id": int(workforce.id),
             # Null the agent marker for symmetry with the agent path (#1132),
@@ -1236,6 +1243,7 @@ async def create_share_chat_task(
     # on the validated access context (#973).
     agent_config = sanitize_client_agent_config(request.agent_config)
     agent_config["auth_mode"] = "share"
+    agent_config[FILE_OPERATION_ACCESS_VERSION_KEY] = FILE_OPERATION_ACCESS_VERSION
     agent_config["guest_id"] = access_context.guest_id
     # Stamp BOTH entity markers from the validated access context, writing the
     # inapplicable one as None — the share-path counterpart of the widget

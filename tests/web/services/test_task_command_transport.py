@@ -1067,7 +1067,10 @@ async def test_dispatcher_recovers_unrelated_tasks_concurrently(db_session) -> N
 
     start_task_command_dispatcher(execute)
     try:
-        await asyncio.wait_for(second_started.wait(), timeout=1)
+        # This is an anti-hang bound, not a latency assertion. The dispatcher
+        # normally starts both tasks immediately, but the complete web suite
+        # can heavily contend for CI workers and SQLite connections.
+        await asyncio.wait_for(second_started.wait(), timeout=10)
         release_first.set()
     finally:
         release_first.set()

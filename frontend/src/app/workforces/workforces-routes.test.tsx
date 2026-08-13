@@ -12,8 +12,10 @@ const listWorkforceRunsMock = vi.hoisted(() => vi.fn())
 const runWorkforceMock = vi.hoisted(() => vi.fn())
 const addWorkforceAgentMock = vi.hoisted(() => vi.fn())
 const archiveWorkforceMock = vi.hoisted(() => vi.fn())
+const deleteWorkforcePermanentlyMock = vi.hoisted(() => vi.fn())
 const publishWorkforceMock = vi.hoisted(() => vi.fn())
 const removeWorkforceAgentMock = vi.hoisted(() => vi.fn())
+const unarchiveWorkforceMock = vi.hoisted(() => vi.fn())
 const unpublishWorkforceMock = vi.hoisted(() => vi.fn())
 const updateWorkforceMock = vi.hoisted(() => vi.fn())
 const updateWorkforceAgentMock = vi.hoisted(() => vi.fn())
@@ -24,6 +26,7 @@ const closeFilePreviewMock = vi.hoisted(() => vi.fn())
 const dispatchMock = vi.hoisted(() => vi.fn())
 const apiRequestMock = vi.hoisted(() => vi.fn())
 const toastErrorMock = vi.hoisted(() => vi.fn())
+const toastSuccessMock = vi.hoisted(() => vi.fn())
 const workforceAppState = vi.hoisted(() => ({
   currentTask: null as null | { id: string; status: string },
   traceEvents: [] as Array<Record<string, unknown>>,
@@ -139,9 +142,30 @@ vi.mock("@/lib/api-wrapper", () => ({
   apiRequest: apiRequestMock,
 }))
 
+vi.mock("@/components/ui/confirm-dialog", () => ({
+  ConfirmDialog: ({
+    isOpen,
+    onConfirm,
+  }: {
+    isOpen: boolean
+    onConfirm: () => void
+  }) => (isOpen ? <button onClick={onConfirm}>confirm-delete</button> : null),
+}))
+
+// Same simplification as build/page.test.tsx's Popover mock: render every
+// menu item unconditionally rather than driving Radix's real open/close
+// state, so tests can click a menu action directly instead of simulating
+// a trigger click + portal + floating-ui positioning first.
+vi.mock("@/components/ui/popover", () => ({
+  Popover: ({ children }: { children: React.ReactNode }) => <div>{children}</div>,
+  PopoverTrigger: ({ children }: { children: React.ReactNode }) => <>{children}</>,
+  PopoverContent: ({ children }: { children: React.ReactNode }) => <div>{children}</div>,
+}))
+
 vi.mock("@/lib/workforces-api", () => ({
   addWorkforceAgent: addWorkforceAgentMock,
   archiveWorkforce: archiveWorkforceMock,
+  deleteWorkforcePermanently: deleteWorkforcePermanentlyMock,
   getWorkforce: getWorkforceMock,
   getWorkforceAgentExecution: getWorkforceAgentExecutionMock,
   getWorkforceRun: getWorkforceRunMock,
@@ -151,6 +175,7 @@ vi.mock("@/lib/workforces-api", () => ({
   publishWorkforce: publishWorkforceMock,
   removeWorkforceAgent: removeWorkforceAgentMock,
   runWorkforce: runWorkforceMock,
+  unarchiveWorkforce: unarchiveWorkforceMock,
   unpublishWorkforce: unpublishWorkforceMock,
   updateWorkforce: updateWorkforceMock,
   updateWorkforceAgent: updateWorkforceAgentMock,
@@ -159,7 +184,7 @@ vi.mock("@/lib/workforces-api", () => ({
 vi.mock("sonner", () => ({
   toast: {
     error: toastErrorMock,
-    success: vi.fn(),
+    success: toastSuccessMock,
   },
 }))
 
@@ -297,8 +322,10 @@ describe("workforce route entry points", () => {
     runWorkforceMock.mockReset()
     addWorkforceAgentMock.mockReset()
     archiveWorkforceMock.mockReset()
+    deleteWorkforcePermanentlyMock.mockReset()
     publishWorkforceMock.mockReset()
     removeWorkforceAgentMock.mockReset()
+    unarchiveWorkforceMock.mockReset()
     unpublishWorkforceMock.mockReset()
     updateWorkforceMock.mockReset()
     updateWorkforceAgentMock.mockReset()
@@ -309,6 +336,7 @@ describe("workforce route entry points", () => {
     dispatchMock.mockReset()
     apiRequestMock.mockReset()
     toastErrorMock.mockReset()
+    toastSuccessMock.mockReset()
     workforceAppState.currentTask = null
     workforceAppState.traceEvents = []
     workforceAppState.filePreview = {
@@ -599,6 +627,225 @@ describe("workforce route entry points", () => {
     // confusing on a button that mints API keys / configures webhooks.
     const deployButton = screen.getByTitle("workforces.deploy.inactiveDisabled")
     expect(deployButton).toBeDisabled()
+  })
+
+  it("unarchives a workforce from the list card's three-dot menu", async () => {
+    listWorkforcesMock.mockResolvedValueOnce({
+      ...listResponse,
+      items: [{ ...listResponse.items[0], status: "archived" }],
+    })
+    unarchiveWorkforceMock.mockResolvedValueOnce({ ...workforceDetail, status: "draft" })
+    listWorkforcesMock.mockResolvedValueOnce({
+      ...listResponse,
+      items: [{ ...listResponse.items[0], status: "draft" }],
+    })
+
+    render(<WorkforcesPage />)
+
+    expect(await screen.findByText("Launch Workforce")).toBeInTheDocument()
+    fireEvent.click(screen.getByRole("button", { name: "workforces.actions.unarchive" }))
+
+    await waitFor(() => {
+      expect(unarchiveWorkforceMock).toHaveBeenCalledWith(42)
+    })
+    // Reloads the list after a successful unarchive, same as archive/publish.
+    await waitFor(() => {
+      expect(listWorkforcesMock).toHaveBeenCalledTimes(2)
+    })
+    expect(toastSuccessMock).toHaveBeenCalledWith("workforces.messages.unarchived")
+  })
+
+  it("publishes a draft workforce from the list card's three-dot menu", async () => {
+    listWorkforcesMock.mockResolvedValueOnce({
+      ...listResponse,
+      items: [{ ...listResponse.items[0], status: "draft" }],
+    })
+    publishWorkforceMock.mockResolvedValueOnce({ ...workforceDetail, status: "active" })
+    listWorkforcesMock.mockResolvedValueOnce({
+      ...listResponse,
+      items: [{ ...listResponse.items[0], status: "active" }],
+    })
+
+    render(<WorkforcesPage />)
+    expect(await screen.findByText("Launch Workforce")).toBeInTheDocument()
+    fireEvent.click(screen.getByRole("button", { name: "workforces.actions.publish" }))
+
+    await waitFor(() => {
+      expect(publishWorkforceMock).toHaveBeenCalledWith(42)
+    })
+    await waitFor(() => {
+      expect(listWorkforcesMock).toHaveBeenCalledTimes(2)
+    })
+    expect(toastSuccessMock).toHaveBeenCalledWith("workforces.messages.published")
+  })
+
+  it("unpublishes an active workforce from the list card's three-dot menu", async () => {
+    listWorkforcesMock.mockResolvedValueOnce(listResponse) // fixture default status: "active"
+    unpublishWorkforceMock.mockResolvedValueOnce({ ...workforceDetail, status: "draft" })
+    listWorkforcesMock.mockResolvedValueOnce({
+      ...listResponse,
+      items: [{ ...listResponse.items[0], status: "draft" }],
+    })
+
+    render(<WorkforcesPage />)
+    expect(await screen.findByText("Launch Workforce")).toBeInTheDocument()
+    fireEvent.click(screen.getByRole("button", { name: "workforces.actions.unpublish" }))
+
+    await waitFor(() => {
+      expect(unpublishWorkforceMock).toHaveBeenCalledWith(42)
+    })
+    await waitFor(() => {
+      expect(listWorkforcesMock).toHaveBeenCalledTimes(2)
+    })
+    expect(toastSuccessMock).toHaveBeenCalledWith("workforces.messages.unpublished")
+  })
+
+  it("archives a workforce from the list card's three-dot menu", async () => {
+    listWorkforcesMock.mockResolvedValueOnce(listResponse) // fixture default status: "active"
+    archiveWorkforceMock.mockResolvedValueOnce({ id: 42, status: "archived" })
+    listWorkforcesMock.mockResolvedValueOnce({
+      ...listResponse,
+      items: [{ ...listResponse.items[0], status: "archived" }],
+    })
+
+    render(<WorkforcesPage />)
+    expect(await screen.findByText("Launch Workforce")).toBeInTheDocument()
+    fireEvent.click(screen.getByRole("button", { name: "workforces.actions.archive" }))
+
+    await waitFor(() => {
+      expect(archiveWorkforceMock).toHaveBeenCalledWith(42)
+    })
+    await waitFor(() => {
+      expect(listWorkforcesMock).toHaveBeenCalledTimes(2)
+    })
+    expect(toastSuccessMock).toHaveBeenCalledWith("workforces.messages.archived")
+  })
+
+  it("shows an error toast when permanent delete fails", async () => {
+    listWorkforcesMock.mockResolvedValueOnce(listResponse)
+    deleteWorkforcePermanentlyMock.mockRejectedValueOnce(new Error("Failed to delete workforce"))
+
+    render(<WorkforcesPage />)
+    expect(await screen.findByText("Launch Workforce")).toBeInTheDocument()
+    fireEvent.click(screen.getByRole("button", { name: "workforces.actions.delete" }))
+    fireEvent.click(await screen.findByText("confirm-delete"))
+
+    await waitFor(() => {
+      expect(toastErrorMock).toHaveBeenCalledWith("Failed to delete workforce")
+    })
+    // A failed delete must not reload the list as if it succeeded.
+    expect(listWorkforcesMock).toHaveBeenCalledTimes(1)
+  })
+
+  it("hides Archive/Publish/Unpublish on an archived card's menu", async () => {
+    // The Popover mock renders its content unconditionally (ignores `open`),
+    // so this exercises page.tsx's own per-status conditional rendering --
+    // an archived card must only ever offer Unarchive and Delete.
+    listWorkforcesMock.mockResolvedValueOnce({
+      ...listResponse,
+      items: [{ ...listResponse.items[0], status: "archived" }],
+    })
+
+    render(<WorkforcesPage />)
+    expect(await screen.findByText("Launch Workforce")).toBeInTheDocument()
+
+    expect(screen.getByRole("button", { name: "workforces.actions.unarchive" })).toBeInTheDocument()
+    expect(screen.getByRole("button", { name: "workforces.actions.delete" })).toBeInTheDocument()
+    expect(screen.queryByRole("button", { name: "workforces.actions.archive" })).not.toBeInTheDocument()
+    expect(screen.queryByRole("button", { name: "workforces.actions.publish" })).not.toBeInTheDocument()
+    expect(screen.queryByRole("button", { name: "workforces.actions.unpublish" })).not.toBeInTheDocument()
+  })
+
+  it("shows Unpublish + Archive (not Publish/Unarchive) on an active card's menu", async () => {
+    listWorkforcesMock.mockResolvedValueOnce(listResponse) // fixture default status: "active"
+
+    render(<WorkforcesPage />)
+    expect(await screen.findByText("Launch Workforce")).toBeInTheDocument()
+
+    expect(screen.getByRole("button", { name: "workforces.actions.unpublish" })).toBeInTheDocument()
+    expect(screen.getByRole("button", { name: "workforces.actions.archive" })).toBeInTheDocument()
+    expect(screen.getByRole("button", { name: "workforces.actions.delete" })).toBeInTheDocument()
+    expect(screen.queryByRole("button", { name: "workforces.actions.publish" })).not.toBeInTheDocument()
+    expect(screen.queryByRole("button", { name: "workforces.actions.unarchive" })).not.toBeInTheDocument()
+  })
+
+  it("shows Publish + Archive (not Unpublish/Unarchive) on a draft card's menu", async () => {
+    listWorkforcesMock.mockResolvedValueOnce({
+      ...listResponse,
+      items: [{ ...listResponse.items[0], status: "draft" }],
+    })
+
+    render(<WorkforcesPage />)
+    expect(await screen.findByText("Launch Workforce")).toBeInTheDocument()
+
+    expect(screen.getByRole("button", { name: "workforces.actions.publish" })).toBeInTheDocument()
+    expect(screen.getByRole("button", { name: "workforces.actions.archive" })).toBeInTheDocument()
+    expect(screen.getByRole("button", { name: "workforces.actions.delete" })).toBeInTheDocument()
+    expect(screen.queryByRole("button", { name: "workforces.actions.unpublish" })).not.toBeInTheDocument()
+    expect(screen.queryByRole("button", { name: "workforces.actions.unarchive" })).not.toBeInTheDocument()
+  })
+
+  it("deletes a workforce from the list card's three-dot menu through the confirm dialog", async () => {
+    listWorkforcesMock.mockResolvedValueOnce(listResponse)
+    deleteWorkforcePermanentlyMock.mockResolvedValueOnce(undefined)
+    listWorkforcesMock.mockResolvedValueOnce({ ...listResponse, items: [], total: 0, pages: 0 })
+
+    render(<WorkforcesPage />)
+
+    expect(await screen.findByText("Launch Workforce")).toBeInTheDocument()
+    fireEvent.click(screen.getByRole("button", { name: "workforces.actions.delete" }))
+    // ConfirmDialog is mocked to a plain button once open -- the Delete menu
+    // item only opens it, the actual deleteWorkforcePermanently call is
+    // gated behind this second click.
+    expect(deleteWorkforcePermanentlyMock).not.toHaveBeenCalled()
+    fireEvent.click(await screen.findByText("confirm-delete"))
+
+    await waitFor(() => {
+      expect(deleteWorkforcePermanentlyMock).toHaveBeenCalledWith(42)
+    })
+    await waitFor(() => {
+      expect(listWorkforcesMock).toHaveBeenCalledTimes(2)
+    })
+  })
+
+  it("steps pagination back when deleting the last card on a page beyond the first", async () => {
+    // Regression coverage for the out-of-range-page fix: deleting the only
+    // item on page 2 must not reload page 2 as-is (the backend would return
+    // zero items for it, rendering the "no workforces" empty state with
+    // pagination hidden since `pages` shrank below the stale page value).
+    listWorkforcesMock
+      // Initial page-1 load: pages > 1 so the Next button renders.
+      .mockResolvedValueOnce({ ...listResponse, pages: 2, total: 11 })
+      // After clicking Next: a single item on page 2.
+      .mockResolvedValueOnce({
+        ...listResponse,
+        items: [{ ...listResponse.items[0], id: 99, name: "Only Item On Page Two" }],
+        pages: 2,
+        total: 11,
+      })
+    deleteWorkforcePermanentlyMock.mockResolvedValueOnce(undefined)
+    // Reload after the step-back: back to the normal page-1 fixture.
+    listWorkforcesMock.mockResolvedValueOnce({ ...listResponse, pages: 1, total: 10 })
+
+    render(<WorkforcesPage />)
+    expect(await screen.findByText("Launch Workforce")).toBeInTheDocument()
+    fireEvent.click(screen.getByRole("button", { name: "workforces.pagination.next" }))
+
+    expect(await screen.findByText("Only Item On Page Two")).toBeInTheDocument()
+    fireEvent.click(screen.getByRole("button", { name: "workforces.actions.delete" }))
+    fireEvent.click(await screen.findByText("confirm-delete"))
+
+    await waitFor(() => {
+      expect(deleteWorkforcePermanentlyMock).toHaveBeenCalledWith(99)
+    })
+    // The reload after stepping back must have been for page 1, not a
+    // re-fetch of the now out-of-range page 2.
+    await waitFor(() => {
+      expect(listWorkforcesMock).toHaveBeenLastCalledWith(
+        expect.objectContaining({ page: 1 }),
+      )
+    })
+    expect(await screen.findByText("Launch Workforce")).toBeInTheDocument()
   })
 
   it("runs an active workforce and opens the created task", async () => {

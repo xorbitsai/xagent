@@ -116,6 +116,7 @@ from ..services.task_lease_service import (
     stop_task_lease_heartbeat,
 )
 from ..services.task_runtime import (
+    FILE_OPERATION_ACCESS_VERSION_KEY,
     SELECTED_FILE_IDS_AGENT_CONFIG_KEY,
     TaskRuntimeExtensionError,
     agent_config_with_task_extension_bindings,
@@ -593,6 +594,8 @@ async def create_default_tools(
     mcp_load_summary_tracer: Optional[Any] = None,
     mcp_load_summary_trace_task_id: Optional[str] = None,
     connector_team_id: Optional[int] = None,
+    db_task_id: Optional[int] = None,
+    file_operation_access_version: Any = None,
 ) -> tuple[list[Any], Any]:
     """Create default tools and tool_config for AgentService using ToolFactory.
 
@@ -606,6 +609,11 @@ async def create_default_tools(
     calling user's own team membership. It threads into ``WebToolConfig`` so
     the connector-visibility team-scope hook (when installed) resolves that
     team's connectors instead of the run owner's personal set only.
+
+    ``db_task_id`` and ``file_operation_access_version`` are appended to the
+    historical positional signature. Runtime callers pass them by keyword so
+    File Operation receives trusted task and rollout authority without shifting
+    existing positional integrations.
     """
     if not user:
         raise ValueError("User is required for tool creation")
@@ -629,6 +637,9 @@ async def create_default_tools(
     # uploads (see _build_allowed_external_dirs docstring).
     allowed_external_dirs = _build_allowed_external_dirs(owner_id, scope=scope)
     scope_segments = scope.workspace_segments if scope is not None else ()
+    durable_storage_segments = (
+        scope.durable_storage_segments if scope is not None else ()
+    )
 
     tool_config = WebToolConfig(
         db=db,
@@ -641,9 +652,14 @@ async def create_default_tools(
         workspace_config={
             "base_dir": canonical_workspace_base(owner_id, scope_segments),
             "task_id": task_id,
+            "db_task_id": db_task_id
+            if db_task_id is not None
+            else _int_id_or_none(task_id),
+            FILE_OPERATION_ACCESS_VERSION_KEY: file_operation_access_version,
             "user_id": owner_id,
             "allowed_external_dirs": allowed_external_dirs,
             "scope_segments": scope_segments,
+            "durable_storage_segments": durable_storage_segments,
         },
         execution_scope=scope,
         # Only load MCP servers (a DB query + per-server session init)
@@ -813,6 +829,14 @@ def _delete_task_sync(*, task_id: int) -> bool:
         raise
     finally:
         delete_db.close()
+
+
+def _file_operation_access_version_from_agent_config(agent_config: Any) -> Any:
+    """Read the server marker without trusting malformed JSON column values."""
+
+    if not isinstance(agent_config, Mapping):
+        return None
+    return agent_config.get(FILE_OPERATION_ACCESS_VERSION_KEY)
 
 
 def _selected_file_ids_from_agent_config(
@@ -1992,7 +2016,11 @@ class AgentServiceManager:
             request=self.request,
             user=user,
             task_id=f"web_task_{task_id}",
+            db_task_id=task_id,
             workspace_owner_id=int(task.user_id),
+            file_operation_access_version=(
+                _file_operation_access_version_from_agent_config(task.agent_config)
+            ),
             scope=scope,
             task_runtime_context=_task_runtime_context_for_tool_build(
                 task_id=task_id,
@@ -2622,7 +2650,13 @@ class AgentServiceManager:
                     # ``request``'s admin from widening this back.
                     user=runtime_user,
                     task_id=f"web_task_{task_id}",
+                    db_task_id=task_id,
                     workspace_owner_id=workspace_owner_id,
+                    file_operation_access_version=(
+                        _file_operation_access_version_from_agent_config(
+                            getattr(task, "agent_config", None)
+                        )
+                    ),
                     scope=scope,
                     task_runtime_context=_task_runtime_context_for_tool_build(
                         task_id=task_id,

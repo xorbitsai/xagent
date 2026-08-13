@@ -163,9 +163,7 @@ class WorkspaceFileTools(WorkspaceFileOperations):
             Dictionary with list of all user files with metadata including file_id,
             filename, storage_path, size, mime_type, etc.
         """
-        return self.workspace.list_all_user_files(
-            include_workspace_files, limit, offset
-        )
+        return self.inner.list_all_user_files(include_workspace_files, limit, offset)
 
     def get_tools(self) -> List[FunctionTool]:
         """Get all tool instances"""

@@ -10,6 +10,7 @@ from json_repair import loads as repair_json_loads
 
 from ....model.chat.exceptions import LLMToolProtocolError
 from ...context.enrichment import (
+    IMAGE_EDIT_UNAVAILABLE_METADATA_KEY,
     MEMORY_CONTEXT_METADATA_KEY,
     RETRIEVED_MEMORIES_METADATA_KEY,
     SELECTED_SKILL_METADATA_KEY,
@@ -1803,6 +1804,7 @@ class AutoPattern(AgentPattern):
             SKILL_CONTEXT_METADATA_KEY,
             SKILL_INDEX_METADATA_KEY,
             LOADED_SKILLS_METADATA_KEY,
+            IMAGE_EDIT_UNAVAILABLE_METADATA_KEY,
         ):
             metadata.pop(key, None)
 

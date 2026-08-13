@@ -3957,6 +3957,9 @@ const zh = {
       publish: "发布",
       unpublish: "取消发布",
       archive: "归档",
+      unarchive: "取消归档",
+      delete: "删除",
+      moreActions: "更多操作",
       deploy: "部署",
       triggers: "触发器",
       share: "分享",
@@ -3964,6 +3967,11 @@ const zh = {
       createTeam: "创建团队",
       change: "更换",
       addAgent: "添加 Agent",
+    },
+    delete: {
+      confirmTitle: "删除该 Workforce？",
+      confirmDescription: "「{name}」及其运行历史将被永久删除，进行中的运行也会被停止，此操作无法撤销。",
+      confirmAction: "永久删除",
     },
     share_link: {
       title: "分享 Workforce",
@@ -4324,7 +4332,9 @@ const zh = {
       workerRemoved: "Worker 已移除",
       published: "Workforce 已发布",
       unpublished: "Workforce 已取消发布",
-      archived: "Workforce 已归档"
+      archived: "Workforce 已归档",
+      unarchived: "Workforce 已取消归档",
+      deleted: "Workforce 已删除"
     },
     errors: {
       loadList: "加载 Workforces 失败",
@@ -4344,6 +4354,8 @@ const zh = {
       publish: "发布 Workforce 失败",
       unpublish: "取消发布 Workforce 失败",
       archive: "归档 Workforce 失败",
+      unarchive: "取消归档 Workforce 失败",
+      delete: "删除 Workforce 失败",
       editDiscardedByArchive: "该修改尚未保存时 Workforce 已被归档,修改已被丢弃。"
     }
   },

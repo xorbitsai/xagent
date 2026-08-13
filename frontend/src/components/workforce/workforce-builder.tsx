@@ -10,7 +10,6 @@ import type { Task } from "@/contexts/app-context-chat"
 import { type TaskStatus } from "@/lib/task-status"
 import {
     addWorkforceAgent,
-    archiveWorkforce,
     createWorkforce,
     getWorkforce,
     listAgentOptions,
@@ -481,23 +480,6 @@ export function WorkforceBuilder({ workforceId }: WorkforceBuilderProps) {
         }
     }
 
-    const archiveCurrentWorkforce = async () => {
-        if (!localId) return
-        try {
-            beginMutation()
-            await archiveWorkforce(localId)
-            const next = await getWorkforce(localId)
-            setWorkforce(next)
-            toast.success(t("workforces.messages.archived"))
-        } catch (err) {
-            const nextError = err instanceof Error ? err.message : t("workforces.errors.archive")
-            setError(nextError)
-            toast.error(nextError)
-        } finally {
-            setSaving(false)
-        }
-    }
-
     const canCreate = Boolean(draftName.trim() && draftManagerAgentId)
     const enabledDraftWorkers = draftWorkers.filter((worker) => worker.enabled)
     const canTestDraft = Boolean(draftManagerAgentId) && enabledDraftWorkers.length > 0
@@ -769,11 +751,6 @@ export function WorkforceBuilder({ workforceId }: WorkforceBuilderProps) {
                                 >
                                     <Webhook className="mr-1.5 h-3.5 w-3.5" />
                                     {t("workforces.actions.triggers")}
-                                </Button>
-                            )}
-                            {!isArchived && (
-                                <Button variant="ghost" size="sm" onClick={archiveCurrentWorkforce} disabled={saving}>
-                                    {t("workforces.actions.archive")}
                                 </Button>
                             )}
                             {workforce.status === "active" ? (

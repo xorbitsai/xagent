@@ -1745,6 +1745,7 @@ def test_widget_task_create_persists_connector_runtime_selection_snapshot() -> N
             .one()
         )
         assert task.connector_runtime_selected_refs == []
+        assert task.agent_config.get("__xagent_file_operation_access_version") == 1
     finally:
         db.close()
 

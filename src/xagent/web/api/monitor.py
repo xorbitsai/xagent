@@ -100,8 +100,28 @@ def get_json_field_expression(column: Any, field_path: str, db_session: Session)
         # NUL raises "unsupported Unicode escape sequence", an unpaired UTF-16
         # surrogate raises "invalid input syntax for type json" -- and one such
         # row fails the entire query. Null those payloads out before extracting
-        # so the row drops instead. jsonb would reject them at write time, but
-        # this column is json, which stores them happily.
+        # so the row drops instead.
+        #
+        # These columns are jsonb since #1248, and jsonb rejects such payloads
+        # at INSERT, so on a migrated database this guard can never match. It
+        # stays because it is not this module's business to assume the
+        # migration has run: a database still on the json type -- one upgraded
+        # by hand, or mid-rollout -- carries exactly the rows it defends
+        # against.
+        #
+        # Retirement condition, so this does not linger on an unmeasurable
+        # "while any deployment might still hold one": it can go once no
+        # supported upgrade path reaches this code with a json column -- that
+        # is, once skipping the 20260813 migration is no longer supported.
+        # What to check on a given database before removing it:
+        #
+        #     SELECT data_type FROM information_schema.columns
+        #     WHERE table_name = 'trace_events' AND column_name = 'data';
+        #
+        # Because jsonb makes this branch unreachable over the model's own
+        # table, its drop path is exercised against a throwaway native-json
+        # table by tests/web/api/test_monitor_postgresql.py's
+        # TestReadGuardAgainstNativeJson -- delete that alongside this.
         #
         # Matching runs on the column's text form because valid JSON never
         # holds a raw control character or a bare surrogate (RFC 8259 requires

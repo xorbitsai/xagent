@@ -2266,3 +2266,16 @@ async def test_auto_decision_prompt_includes_memory_rule_only_with_store() -> No
 
     assert "memory tools can persist" in with_memory
     assert "memory tools can persist" not in without_memory
+
+
+def test_clearing_request_scoped_enrichment_drops_the_image_edit_flag() -> None:
+    from xagent.core.agent.context.enrichment import (
+        IMAGE_EDIT_UNAVAILABLE_METADATA_KEY,
+    )
+
+    context = ExecutionContext(system_prompt="Base prompt.")
+    context.metadata[IMAGE_EDIT_UNAVAILABLE_METADATA_KEY] = True
+
+    AutoPattern()._clear_request_scoped_enrichment(context)
+
+    assert IMAGE_EDIT_UNAVAILABLE_METADATA_KEY not in context.metadata

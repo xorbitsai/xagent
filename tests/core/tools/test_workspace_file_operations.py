@@ -5,16 +5,163 @@ This module tests the core workspace file operations functionality,
 focusing on JSON and CSV workspace writes and reads.
 """
 
+import logging
+from types import SimpleNamespace
+
 import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
+from xagent.core.tools.adapters.vibe.factory import ToolFactory
+from xagent.core.tools.adapters.vibe.workspace_file_tool import WorkspaceFileTools
 from xagent.core.tools.core.workspace_file_tool import WorkspaceFileOperations
 from xagent.core.workspace import DEFAULT_USER_FILE_LIST_LIMIT, TaskWorkspace
 from xagent.web.models import Base
 from xagent.web.models.task import Task
 from xagent.web.models.uploaded_file import UploadedFile
 from xagent.web.models.user import User
+from xagent.web.tools.config import WebToolConfig
+
+
+@pytest.fixture
+def public_file_scope_context(tmp_path, monkeypatch):
+    engine = create_engine(
+        "sqlite:///:memory:", connect_args={"check_same_thread": False}
+    )
+    SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+    Base.metadata.create_all(bind=engine)
+    db = SessionLocal()
+    monkeypatch.setattr(
+        "xagent.core.storage.manager.create_db_session",
+        SessionLocal,
+    )
+
+    owner = User(username="public-file-owner", password_hash="hash")
+    other = User(username="other-file-owner", password_hash="hash")
+    db.add_all([owner, other])
+    db.flush()
+
+    marked_task = Task(
+        id=801,
+        user_id=owner.id,
+        title="Marked public task",
+        source="shared_link",
+        agent_config={
+            "auth_mode": "share",
+            "__xagent_file_operation_access_version": 1,
+        },
+    )
+    sibling_task = Task(id=802, user_id=owner.id, title="Sibling task")
+    historical_task = Task(
+        id=803,
+        user_id=owner.id,
+        title="Historical public task",
+        source="shared_link",
+        agent_config={"auth_mode": "share"},
+    )
+    db.add_all([marked_task, sibling_task, historical_task])
+    db.flush()
+
+    external_dir = tmp_path / "external"
+    external_dir.mkdir()
+
+    def add_file(
+        *,
+        file_id: str,
+        filename: str,
+        content: str,
+        user_id: int,
+        task_id: int | None,
+        storage_status: str = "available",
+    ) -> tuple[UploadedFile, object]:
+        path = external_dir / filename
+        path.write_text(content, encoding="utf-8")
+        record = UploadedFile(
+            file_id=file_id,
+            user_id=user_id,
+            task_id=task_id,
+            filename=filename,
+            storage_path=str(path),
+            storage_status=storage_status,
+            mime_type="text/plain",
+            file_size=path.stat().st_size,
+        )
+        db.add(record)
+        return record, path
+
+    current_record, current_path = add_file(
+        file_id="current-file",
+        filename="current.txt",
+        content="current",
+        user_id=int(owner.id),
+        task_id=int(marked_task.id),
+    )
+    sibling_record, sibling_path = add_file(
+        file_id="sibling-file",
+        filename="sibling.txt",
+        content="sibling",
+        user_id=int(owner.id),
+        task_id=int(sibling_task.id),
+    )
+    unbound_record, unbound_path = add_file(
+        file_id="unbound-file",
+        filename="unbound.txt",
+        content="unbound",
+        user_id=int(owner.id),
+        task_id=None,
+    )
+    compensating_record, _ = add_file(
+        file_id="compensating-file",
+        filename="compensating.txt",
+        content="compensating",
+        user_id=int(owner.id),
+        task_id=int(marked_task.id),
+        storage_status="compensating",
+    )
+    other_record, other_path = add_file(
+        file_id="other-file",
+        filename="other.txt",
+        content="other",
+        user_id=int(other.id),
+        task_id=None,
+    )
+    raw_external_path = external_dir / "raw-external.txt"
+    raw_external_path.write_text("raw", encoding="utf-8")
+    db.commit()
+
+    marked_workspace = TaskWorkspace(
+        id="agent_nested_workspace",
+        base_dir=str(tmp_path / "workspaces"),
+        allowed_external_dirs=[str(external_dir)],
+        db_task_id=int(marked_task.id),
+    )
+    marked_workspace.owner_user_id = int(owner.id)
+    marked_workspace.file_operation_access_version = 1
+    marked_workspace.db_session = db
+
+    try:
+        yield SimpleNamespace(
+            db=db,
+            owner=owner,
+            marked_task=marked_task,
+            historical_task=historical_task,
+            external_dir=external_dir,
+            workspace=marked_workspace,
+            ops=WorkspaceFileOperations(marked_workspace),
+            current_record=current_record,
+            current_path=current_path,
+            sibling_record=sibling_record,
+            sibling_path=sibling_path,
+            unbound_record=unbound_record,
+            unbound_path=unbound_path,
+            compensating_record=compensating_record,
+            other_record=other_record,
+            other_path=other_path,
+            raw_external_path=raw_external_path,
+        )
+    finally:
+        db.close()
+        engine.dispose()
 
 
 class TestWorkspaceFileOperations:
@@ -315,6 +462,640 @@ class TestWorkspaceFileOperations:
                 # CSV writer may handle special characters differently
                 # We'll just verify the structure is preserved
                 assert key in read_data[i]
+
+    def test_marked_public_listing_uses_db_task_id_before_pagination(
+        self, public_file_scope_context
+    ):
+        context = public_file_scope_context
+
+        result = context.ops.list_all_user_files(include_workspace_files=False)
+
+        assert result["user_id"] == context.owner.id
+        assert result["total_count"] == 1
+        assert [item["file_id"] for item in result["files"]] == [
+            context.current_record.file_id
+        ]
+
+    def test_marked_public_listing_excludes_record_outside_authorized_storage(
+        self, public_file_scope_context, tmp_path
+    ):
+        context = public_file_scope_context
+        escaped_path = tmp_path / "outside-authorized-storage.txt"
+        escaped_path.write_text("outside", encoding="utf-8")
+        escaped_record = UploadedFile(
+            file_id="escaped-file",
+            user_id=int(context.owner.id),
+            task_id=int(context.marked_task.id),
+            filename=escaped_path.name,
+            storage_path=str(escaped_path),
+            storage_status="available",
+            mime_type="text/plain",
+            file_size=escaped_path.stat().st_size,
+        )
+        context.db.add(escaped_record)
+        context.db.commit()
+
+        listed = context.ops.list_all_user_files(include_workspace_files=False)
+
+        assert escaped_record.file_id not in {
+            item["file_id"] for item in listed["files"]
+        }
+        assert listed["total_count"] == 1
+        with pytest.raises(FileNotFoundError):
+            context.ops.read_file(escaped_record.file_id)
+
+    def test_vibe_adapter_uses_marked_public_listing_policy(
+        self, public_file_scope_context
+    ):
+        context = public_file_scope_context
+        tools = WorkspaceFileTools(context.workspace)
+
+        result = tools.list_all_user_files(include_workspace_files=False)
+
+        assert result["total_count"] == 1
+        assert [item["file_id"] for item in result["files"]] == [
+            context.current_record.file_id
+        ]
+
+    def test_delegated_marked_workspace_reads_exact_record_under_owner_base(
+        self, public_file_scope_context
+    ):
+        context = public_file_scope_context
+        raw_workspace_config = {
+            "base_dir": str(context.external_dir),
+            "task_id": "agent_1_delegated",
+            "db_task_id": int(context.marked_task.id),
+            "__xagent_file_operation_access_version": 1,
+            "scope_segments": (),
+        }
+        tool_config = WebToolConfig(
+            db=context.db,
+            request=None,
+            user_id=int(context.owner.id),
+            task_id="agent_1_delegated",
+            workspace_config=raw_workspace_config,
+        )
+
+        workspace = ToolFactory.create_workspace(tool_config.get_workspace_config())
+        assert workspace is not None
+        workspace.db_session = context.db
+        assert workspace.owner_user_id == context.owner.id
+        assert workspace.db_task_id == context.marked_task.id
+        assert workspace.file_operation_access_version == 1
+        assert workspace.allowed_external_dirs == []
+        assert (
+            WorkspaceFileOperations(workspace).read_file(context.current_record.file_id)
+            == "current"
+        )
+
+    @pytest.mark.parametrize(
+        ("source", "auth_mode"),
+        [("shared_link", "share"), ("widget", "widget")],
+    )
+    def test_marked_public_reads_only_workspace_or_exact_task_records(
+        self, public_file_scope_context, source, auth_mode
+    ):
+        context = public_file_scope_context
+        context.marked_task.source = source
+        context.marked_task.agent_config = {
+            "auth_mode": auth_mode,
+            "__xagent_file_operation_access_version": 1,
+        }
+        context.db.commit()
+
+        assert context.ops.read_file(context.current_record.file_id) == "current"
+        assert (
+            context.ops.read_file(f"file:{context.current_record.file_id}") == "current"
+        )
+        assert (
+            context.ops.read_file(f"file://{context.current_record.file_id}")
+            == "current"
+        )
+        assert context.ops.read_file(str(context.current_path)) == "current"
+
+        denied = (
+            context.sibling_record.file_id,
+            str(context.sibling_path),
+            context.unbound_record.file_id,
+            str(context.unbound_path),
+            context.other_record.file_id,
+            str(context.other_path),
+            str(context.raw_external_path),
+        )
+        for reference in denied:
+            with pytest.raises((FileNotFoundError, ValueError)):
+                context.ops.read_file(reference)
+            assert context.ops.file_exists(reference) is False
+
+    @pytest.mark.parametrize(
+        ("durable_segments", "storage_key", "allowed"),
+        [
+            ((), "users/{owner}/uploads/current/file.txt", True),
+            (("tenant-a",), "users/{owner}/tenant-a/uploads/current/file.txt", True),
+            (("tenant-a",), "users/{owner}/uploads/current/file.txt", False),
+        ],
+    )
+    def test_marked_public_durable_scope_matches_write_side_segments(
+        self,
+        public_file_scope_context,
+        durable_segments,
+        storage_key,
+        allowed,
+    ):
+        context = public_file_scope_context
+        context.workspace.scope_segments = ("tenant-a",)
+        context.workspace.durable_storage_segments = durable_segments
+        context.current_record.storage_key = storage_key.format(owner=context.owner.id)
+        context.db.commit()
+
+        if allowed:
+            assert context.ops.read_file(context.current_record.file_id) == "current"
+            listed = context.ops.list_all_user_files(include_workspace_files=False)
+            assert context.current_record.file_id in {
+                item["file_id"] for item in listed["files"]
+            }
+        else:
+            with pytest.raises(FileNotFoundError):
+                context.ops.read_file(context.current_record.file_id)
+            listed = context.ops.list_all_user_files(include_workspace_files=False)
+            assert context.current_record.file_id not in {
+                item["file_id"] for item in listed["files"]
+            }
+
+    def test_marked_public_selector_misses_hide_record_existence(
+        self, public_file_scope_context
+    ):
+        context = public_file_scope_context
+
+        with pytest.raises(FileNotFoundError) as missing:
+            context.ops.read_file("missing-file-id")
+        with pytest.raises(FileNotFoundError) as foreign:
+            context.ops.read_file(context.other_record.file_id)
+
+        assert str(missing.value) == "File not found: missing-file-id"
+        assert str(foreign.value) == f"File not found: {context.other_record.file_id}"
+
+    def test_marked_public_taskless_durable_id_does_not_materialize(
+        self, public_file_scope_context, monkeypatch
+    ):
+        from xagent.web.services.managed_file_ref import ManagedFileRef
+
+        context = public_file_scope_context
+        taskless = UploadedFile(
+            file_id="taskless-durable-selector",
+            user_id=context.owner.id,
+            task_id=None,
+            filename="taskless.txt",
+            storage_path=str(context.external_dir / "missing-taskless.txt"),
+            storage_key=f"users/{context.owner.id}/uploads/taskless/file.txt",
+            storage_status="available",
+            mime_type="text/plain",
+            file_size=8,
+        )
+        context.db.add(taskless)
+        context.db.commit()
+
+        monkeypatch.setattr(
+            ManagedFileRef,
+            "materialize",
+            lambda self: pytest.fail("unauthorized durable record was materialized"),
+        )
+
+        with pytest.raises(FileNotFoundError):
+            context.ops.read_file(taskless.file_id)
+
+    def test_foreign_file_id_does_not_shadow_workspace_local_file(
+        self, public_file_scope_context
+    ):
+        context = public_file_scope_context
+        local_path = context.workspace.input_dir / context.other_record.file_id
+        local_path.write_text("local", encoding="utf-8")
+
+        assert context.ops.read_file(context.other_record.file_id) == "local"
+
+    def test_marked_public_named_directory_listing_validates_authority_once(
+        self, public_file_scope_context, monkeypatch
+    ):
+        context = public_file_scope_context
+        calls = 0
+        original = context.workspace.requires_exact_file_operation_scope
+
+        def count_authority_checks():
+            nonlocal calls
+            calls += 1
+            return original()
+
+        monkeypatch.setattr(
+            context.workspace,
+            "requires_exact_file_operation_scope",
+            count_authority_checks,
+        )
+        (context.workspace.output_dir / "listed").mkdir()
+
+        context.ops.list_files("listed")
+
+        assert calls == 1
+
+    def test_marked_public_output_registers_to_exact_task(
+        self, public_file_scope_context
+    ):
+        context = public_file_scope_context
+
+        result = context.ops.write_file("generated.txt", "generated")
+        record = (
+            context.db.query(UploadedFile)
+            .filter(UploadedFile.file_id == result["file_id"])
+            .one()
+        )
+
+        assert record.user_id == context.owner.id
+        assert record.task_id == context.marked_task.id
+        assert context.ops.read_file(record.file_id) == "generated"
+        assert record.file_id in {
+            item["file_id"]
+            for item in context.ops.list_all_user_files(include_workspace_files=False)[
+                "files"
+            ]
+        }
+
+    @pytest.mark.parametrize(
+        "operation",
+        ["append", "delete", "edit", "replace"],
+    )
+    def test_marked_public_mutations_deny_sibling_path(
+        self, public_file_scope_context, operation
+    ):
+        context = public_file_scope_context
+        sibling_path = str(context.sibling_path)
+
+        with pytest.raises((FileNotFoundError, ValueError)):
+            if operation == "append":
+                context.ops.append_file(sibling_path, "-changed")
+            elif operation == "delete":
+                context.ops.delete_file(sibling_path)
+            elif operation == "edit":
+                context.ops.edit_file(sibling_path, [])
+            else:
+                context.ops.find_and_replace(sibling_path, "sibling", "changed")
+
+    @pytest.mark.parametrize(
+        "operation",
+        ["info", "csv", "html_asset"],
+    )
+    def test_marked_public_specialized_reads_deny_sibling_path(
+        self, public_file_scope_context, operation
+    ):
+        context = public_file_scope_context
+        sibling_path = str(context.sibling_path)
+
+        with pytest.raises((FileNotFoundError, ValueError)):
+            if operation == "info":
+                context.ops.get_file_info(sibling_path)
+            elif operation == "csv":
+                context.ops.read_csv_file(sibling_path)
+            else:
+                context.ops.prepare_html_asset(
+                    sibling_path,
+                    "preview/index.html",
+                )
+
+    def test_marked_public_revalidates_cached_sibling_file_id(
+        self, public_file_scope_context
+    ):
+        context = public_file_scope_context
+        context.workspace._file_id_to_path[context.sibling_record.file_id] = (
+            context.sibling_path
+        )
+
+        with pytest.raises((FileNotFoundError, ValueError)):
+            context.ops.read_file(context.sibling_record.file_id)
+
+    def test_marked_public_durable_files_require_exact_task_and_owner_prefix(
+        self, public_file_scope_context, monkeypatch
+    ):
+        from xagent.web.services.managed_file_ref import ManagedFileRef
+
+        context = public_file_scope_context
+        owner_id = int(context.owner.id)
+        task_id = int(context.marked_task.id)
+
+        def durable_record(file_id, record_task_id, storage_key):
+            return UploadedFile(
+                file_id=file_id,
+                user_id=owner_id,
+                task_id=record_task_id,
+                filename=f"{file_id}.txt",
+                storage_path=str(context.external_dir / f"missing-{file_id}.txt"),
+                storage_key=storage_key,
+                storage_status="available",
+                mime_type="text/plain",
+                file_size=7,
+            )
+
+        current = durable_record(
+            "current-durable-file",
+            task_id,
+            f"users/{owner_id}/web_task_{task_id}/input/current.txt",
+        )
+        sibling = durable_record(
+            "sibling-durable-file",
+            802,
+            f"users/{owner_id}/web_task_802/input/sibling.txt",
+        )
+        invalid_prefix = durable_record(
+            "invalid-durable-file",
+            task_id,
+            f"users/{owner_id + 1}/web_task_{task_id}/input/invalid.txt",
+        )
+        pending_path = context.external_dir / "pending-file.txt"
+        pending_path.write_text("pending", encoding="utf-8")
+        pending = UploadedFile(
+            file_id="pending-file",
+            user_id=owner_id,
+            task_id=task_id,
+            filename=pending_path.name,
+            storage_path=str(pending_path),
+            storage_status="pending",
+            mime_type="text/plain",
+            file_size=pending_path.stat().st_size,
+        )
+        context.db.add_all([current, sibling, invalid_prefix, pending])
+        context.db.commit()
+
+        materialized_root = context.external_dir.parent / "materialized-cache"
+        materialized_root.mkdir()
+        monkeypatch.setenv("XAGENT_FILE_MATERIALIZE_DIR", str(materialized_root))
+        materialized_path = materialized_root / "materialized-durable.txt"
+        materialized_path.write_text("durable", encoding="utf-8")
+        materialize_calls = 0
+        opened_sessions = []
+        detached_session_factory = sessionmaker(
+            autocommit=False,
+            autoflush=False,
+            bind=context.db.get_bind(),
+        )
+
+        def create_tracked_session():
+            session = detached_session_factory()
+            opened_sessions.append(session)
+            return session
+
+        def assert_released_before_materialization(_self):
+            nonlocal materialize_calls
+            materialize_calls += 1
+            assert all(not session.in_transaction() for session in opened_sessions)
+            return materialized_path
+
+        monkeypatch.setattr(
+            "xagent.core.storage.manager.create_db_session",
+            create_tracked_session,
+        )
+        monkeypatch.setattr(
+            ManagedFileRef,
+            "materialize",
+            assert_released_before_materialization,
+        )
+
+        listed = context.ops.list_all_user_files(include_workspace_files=False)
+        listed_ids = {item["file_id"] for item in listed["files"]}
+        assert current.file_id in listed_ids
+        assert sibling.file_id not in listed_ids
+        assert invalid_prefix.file_id not in listed_ids
+        assert pending.file_id not in listed_ids
+        assert listed["total_count"] == 2
+
+        assert context.ops.read_file(current.file_id) == "durable"
+        assert context.ops.read_file(str(current.storage_path)) == "durable"
+        assert materialize_calls == 2
+        for denied_file_id in (
+            sibling.file_id,
+            invalid_prefix.file_id,
+            pending.file_id,
+        ):
+            with pytest.raises(FileNotFoundError):
+                context.ops.read_file(denied_file_id)
+
+    @pytest.mark.parametrize(
+        "operation",
+        ["text", "json", "csv", "mkdir", "list"],
+    )
+    def test_marked_public_workspace_operations_revalidate_authority(
+        self, public_file_scope_context, operation, caplog
+    ):
+        context = public_file_scope_context
+        context.workspace.owner_user_id = int(context.owner.id) + 1
+
+        with pytest.raises(ValueError, match="File Operation unavailable"):
+            if operation == "text":
+                context.ops.write_file("blocked.txt", "blocked")
+            elif operation == "json":
+                context.ops.write_json_file("blocked.json", {"blocked": True})
+            elif operation == "csv":
+                context.ops.write_csv_file("blocked.csv", [{"blocked": "true"}])
+            elif operation == "mkdir":
+                context.ops.create_directory("blocked")
+            else:
+                context.ops.list_files(".")
+
+        assert any(
+            record.levelno == logging.WARNING
+            and "workspace authority validation failed" in record.message
+            and record.exc_info is not None
+            for record in caplog.records
+        )
+
+    @pytest.mark.parametrize("operation", ["read", "list"])
+    def test_marked_public_file_operation_does_not_reuse_bound_session(
+        self, public_file_scope_context, monkeypatch, operation
+    ):
+        context = public_file_scope_context
+        detached_session_factory = sessionmaker(
+            autocommit=False,
+            autoflush=False,
+            bind=context.db.get_bind(),
+        )
+
+        class ThreadBoundSession:
+            def query(self, *_args, **_kwargs):
+                raise AssertionError("bound session crossed into File Operation")
+
+        context.workspace.db_session = ThreadBoundSession()
+        monkeypatch.setattr(
+            "xagent.core.storage.manager.create_db_session",
+            detached_session_factory,
+        )
+
+        if operation == "read":
+            assert context.ops.read_file(context.current_record.file_id) == "current"
+        else:
+            listed = context.ops.list_all_user_files(include_workspace_files=False)
+            assert context.current_record.file_id in {
+                item["file_id"] for item in listed["files"]
+            }
+
+    def test_marked_public_missing_task_row_does_not_fall_back_to_legacy_paths(
+        self, public_file_scope_context
+    ):
+        context = public_file_scope_context
+        context.db.query(Task).filter(Task.id == int(context.marked_task.id)).delete(
+            synchronize_session=False
+        )
+        context.db.commit()
+
+        with pytest.raises(FileNotFoundError):
+            context.ops.read_file(str(context.raw_external_path))
+        with pytest.raises(ValueError, match="File Operation unavailable"):
+            context.ops.write_file("blocked-after-delete.txt", "blocked")
+
+    def test_unmarked_local_read_does_not_require_policy_database(self, tmp_path):
+        class FailingSession:
+            def query(self, *_args, **_kwargs):
+                raise OSError("policy database unavailable")
+
+        workspace = TaskWorkspace(
+            id="web_task_803",
+            base_dir=str(tmp_path / "unmarked-local-workspace"),
+            db_task_id=803,
+        )
+        workspace.db_session = FailingSession()
+        local_path = workspace.input_dir / "local.txt"
+        local_path.write_text("local", encoding="utf-8")
+
+        assert WorkspaceFileOperations(workspace).read_file("local.txt") == "local"
+
+    def test_marked_public_policy_load_failure_uses_file_not_found_shape(
+        self, public_file_scope_context, monkeypatch, caplog
+    ):
+        context = public_file_scope_context
+
+        def fail_policy_load():
+            raise OSError("database unavailable")
+
+        monkeypatch.setattr(
+            context.workspace,
+            "requires_exact_file_operation_scope",
+            fail_policy_load,
+        )
+
+        with pytest.raises(FileNotFoundError, match="File not found"):
+            context.ops.read_file(context.current_record.file_id)
+
+        assert any(
+            record.levelno == logging.WARNING
+            and "selector policy validation failed" in record.message
+            and record.exc_info is not None
+            for record in caplog.records
+        )
+
+    def test_marked_public_output_listing_propagates_policy_failure(
+        self, public_file_scope_context
+    ):
+        context = public_file_scope_context
+        context.workspace.file_operation_access_version = True
+
+        with pytest.raises(ValueError, match="File Operation unavailable"):
+            context.ops.get_workspace_output_files()
+
+    def test_marked_public_listing_fails_if_task_disappears_after_validation(
+        self, public_file_scope_context, monkeypatch
+    ):
+        context = public_file_scope_context
+        original = context.workspace.list_all_user_files
+
+        def delete_then_list(*args, **kwargs):
+            task = context.db.get(Task, context.marked_task.id)
+            assert task is not None
+            context.db.delete(task)
+            context.db.commit()
+            return original(*args, **kwargs)
+
+        monkeypatch.setattr(
+            context.workspace,
+            "list_all_user_files",
+            delete_then_list,
+        )
+
+        with pytest.raises(ValueError, match="File listing unavailable"):
+            context.ops.list_all_user_files()
+
+    def test_marked_public_malformed_listing_uses_value_error_shape(
+        self, public_file_scope_context, caplog
+    ):
+        context = public_file_scope_context
+        context.marked_task.agent_config = {
+            "auth_mode": "share",
+            "__xagent_file_operation_access_version": 2,
+        }
+        context.db.commit()
+
+        with pytest.raises(ValueError, match="File listing unavailable"):
+            context.ops.list_all_user_files(include_workspace_files=False)
+
+        assert any(
+            record.levelno == logging.WARNING
+            and "listing policy validation failed" in record.message
+            and record.exc_info is not None
+            for record in caplog.records
+        )
+
+    def test_marked_public_missing_owner_fails_before_legacy_allow(
+        self, public_file_scope_context, tmp_path
+    ):
+        context = public_file_scope_context
+        workspace = TaskWorkspace(
+            id="web_task_801",
+            base_dir=str(tmp_path / "missing-owner-workspaces"),
+            allowed_external_dirs=[str(context.external_dir)],
+            db_task_id=int(context.marked_task.id),
+        )
+        workspace.file_operation_access_version = 1
+        workspace.db_session = context.db
+        ops = WorkspaceFileOperations(workspace)
+
+        with pytest.raises((FileNotFoundError, ValueError)):
+            ops.read_file(context.current_record.file_id)
+
+    def test_marked_public_missing_db_task_id_fails_before_legacy_parse(
+        self, public_file_scope_context, tmp_path
+    ):
+        context = public_file_scope_context
+        workspace = TaskWorkspace(
+            id="web_task_801",
+            base_dir=str(tmp_path / "missing-db-task-workspaces"),
+            allowed_external_dirs=[str(context.external_dir)],
+        )
+        workspace.owner_user_id = int(context.owner.id)
+        workspace.file_operation_access_version = 1
+        workspace.db_session = context.db
+
+        with pytest.raises(FileNotFoundError):
+            WorkspaceFileOperations(workspace).read_file(context.current_record.file_id)
+
+    def test_unmarked_historical_file_operation_behavior_is_unchanged(
+        self, public_file_scope_context, tmp_path
+    ):
+        context = public_file_scope_context
+        workspace = TaskWorkspace(
+            id="web_task_803",
+            base_dir=str(tmp_path / "historical-workspaces"),
+            allowed_external_dirs=[str(context.external_dir)],
+            db_task_id=int(context.historical_task.id),
+        )
+        workspace.owner_user_id = int(context.owner.id)
+        workspace.db_session = context.db
+        ops = WorkspaceFileOperations(workspace)
+
+        listed = ops.list_all_user_files(include_workspace_files=False)
+        listed_ids = {item["file_id"] for item in listed["files"]}
+        assert context.current_record.file_id in listed_ids
+        assert context.sibling_record.file_id in listed_ids
+        assert context.unbound_record.file_id in listed_ids
+        assert context.other_record.file_id not in listed_ids
+        assert workspace.resolve_file_id(context.sibling_record.file_id) is None
+        assert workspace.resolve_file_id(context.unbound_record.file_id) == (
+            context.unbound_path
+        )
+        assert ops.read_file(str(context.sibling_path)) == "sibling"
 
     def test_list_all_user_files_test_workspace(self, tmp_path):
         """Test list_all_user_files with test workspace (no database)."""

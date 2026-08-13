@@ -77,7 +77,8 @@ Browser sign-in requires local browser storage and the Web Locks API for safe
 cross-tab session coordination. The bundled HTTP Compose endpoint is a
 local-development reference. Production deployments must terminate TLS and use
 a browser that supports Web Locks; `localhost`, `127.0.0.1`, and `::1` remain
-secure-context forms for local development.
+secure-context forms for local development. See [deployment changes](docs/deployment.md)
+for release-specific rollout and rollback requirements.
 
 On first startup, Xagent redirects to `/setup` to create the first administrator account. Forgot the admin password? Reset it:
 

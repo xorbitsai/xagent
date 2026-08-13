@@ -200,6 +200,26 @@ class WorkspaceFileOperations:
     def __init__(self, workspace: TaskWorkspace):
         self.workspace = workspace
 
+    def _require_workspace_authority(self) -> None:
+        """Fail closed before marked workspace-only reads or writes.
+
+        Unmarked workspaces return immediately without a database query.
+        Marked workspaces revalidate their persisted task, owner, and explicit
+        database task identity before File Operation performs filesystem effects.
+        """
+
+        try:
+            self.workspace.requires_exact_file_operation_scope()
+        except Exception as exc:
+            logger.warning(
+                "File Operation workspace authority validation failed for "
+                "workspace %s and task %s",
+                self.workspace.id,
+                self.workspace.db_task_id,
+                exc_info=True,
+            )
+            raise ValueError("File Operation unavailable") from exc
+
     def read_file(
         self,
         file_path: str,
@@ -215,7 +235,7 @@ class WorkspaceFileOperations:
         )
 
         # Smart search: first look in input directory, then in output directory
-        resolved_path = self.workspace.resolve_path_with_search(file_path)
+        resolved_path = self._resolve_path_with_search(file_path)
         logger.debug("Resolved path: %s", resolved_path)
 
         # Simple retry mechanism for potential timing issues
@@ -377,7 +397,7 @@ class WorkspaceFileOperations:
     ) -> Dict[str, Any]:
         """Copy an existing file next to an HTML output and return the HTML src."""
         source_ref = self._normalize_file_ref(file_id)
-        source_path = self.workspace.resolve_path_with_search(source_ref)
+        source_path = self._resolve_path_with_search(source_ref)
         if not source_path.exists() or not source_path.is_file():
             raise FileNotFoundError(f"File not found: {file_id}")
 
@@ -463,7 +483,7 @@ class WorkspaceFileOperations:
         create_dirs: bool = True,
     ) -> bool:
         """Append content to file in workspace"""
-        resolved_path = self.workspace.resolve_path_with_search(file_path)
+        resolved_path = self._resolve_path_with_search(file_path)
 
         if create_dirs:
             resolved_path.parent.mkdir(parents=True, exist_ok=True)
@@ -474,7 +494,7 @@ class WorkspaceFileOperations:
 
     def delete_file(self, file_path: str) -> bool:
         """Delete file in workspace"""
-        resolved_path = self.workspace.resolve_path_with_search(file_path)
+        resolved_path = self._resolve_path_with_search(file_path)
 
         if not resolved_path.exists():
             raise FileNotFoundError(f"File not found: {file_path}")
@@ -485,7 +505,7 @@ class WorkspaceFileOperations:
     def file_exists(self, file_path: str) -> bool:
         """Check if file exists in workspace"""
         try:
-            resolved_path = self.workspace.resolve_path_with_search(file_path)
+            resolved_path = self._resolve_path_with_search(file_path)
             return resolved_path.exists()
         except (ValueError, FileNotFoundError):
             # ValueError: path is outside allowed directories
@@ -499,8 +519,11 @@ class WorkspaceFileOperations:
         recursive: bool = False,
     ) -> Dict[str, Any]:
         """List files in workspace directory (default: list all directories)"""
-        # If no directory path specified, return all directories' files
+        # The workspace-wide branch has no selector resolver to perform this
+        # check. Named directories delegate to ``_resolve_path``, which already
+        # revalidates marked-task authority before resolving the selector.
         if directory_path == ".":
+            self._require_workspace_authority()
             return self.workspace.get_all_files()
 
         # If specific directory is specified, only list files in that directory
@@ -559,7 +582,7 @@ class WorkspaceFileOperations:
             File information including metadata
         """
         # Try to resolve as file_id first
-        resolved_path = self.workspace.resolve_path_with_search(file_path_or_id)
+        resolved_path = self._resolve_path_with_search(file_path_or_id)
 
         if not resolved_path.exists():
             raise FileNotFoundError(f"File not found: {file_path_or_id}")
@@ -581,7 +604,7 @@ class WorkspaceFileOperations:
         """Read JSON file in workspace. Accepts either file paths or file_ids."""
         from .file_tool import read_json_file as basic_read_json_file
 
-        resolved_path = self.workspace.resolve_path_with_search(file_path_or_id)
+        resolved_path = self._resolve_path_with_search(file_path_or_id)
         return basic_read_json_file(str(resolved_path), encoding)
 
     def write_json_file(
@@ -611,7 +634,7 @@ class WorkspaceFileOperations:
         """Read CSV file in workspace. Accepts either file paths or file_ids."""
         # Read the file directly without using document parser
         # CSV files should be read as plain text for proper parsing
-        resolved_path = self.workspace.resolve_path_with_search(file_path_or_id)
+        resolved_path = self._resolve_path_with_search(file_path_or_id)
 
         if not resolved_path.exists():
             raise FileNotFoundError(f"File not found: {file_path_or_id}")
@@ -649,6 +672,7 @@ class WorkspaceFileOperations:
 
     def get_workspace_output_files(self) -> Dict[str, Any]:
         """Get output file list from current workspace"""
+        self._require_workspace_authority()
         try:
             output_files = self.workspace.get_output_files()
 
@@ -680,9 +704,34 @@ class WorkspaceFileOperations:
             Dictionary with list of all user files with metadata including file_id,
             filename, storage_path, size, mime_type, etc.
         """
-        return self.workspace.list_all_user_files(
-            include_workspace_files, limit, offset
-        )
+        try:
+            exact_scope = self.workspace.requires_exact_file_operation_scope()
+        except Exception as exc:
+            logger.warning(
+                "File Operation listing policy validation failed for "
+                "workspace %s and task %s",
+                self.workspace.id,
+                self.workspace.db_task_id,
+                exc_info=True,
+            )
+            raise ValueError("File listing unavailable") from exc
+        try:
+            return self.workspace.list_all_user_files(
+                include_workspace_files,
+                limit,
+                offset,
+                _exact_task_scope=exact_scope,
+            )
+        except RuntimeError as exc:
+            if not exact_scope:
+                raise
+            logger.warning(
+                "File Operation listing authority changed for workspace %s and task %s",
+                self.workspace.id,
+                self.workspace.db_task_id,
+                exc_info=True,
+            )
+            raise ValueError("File listing unavailable") from exc
 
     def edit_file(
         self,
@@ -755,8 +804,9 @@ class WorkspaceFileOperations:
         """Intelligently resolve file path in workspace (first in input directory, then in output directory)"""
         logger.debug("_resolve_path_with_search called with file_path: %s", file_path)
 
-        # Use the centralized workspace method
-        return self.workspace.resolve_path_with_search(file_path)
+        # Use the File Operation-specific policy without changing shared
+        # workspace resolvers used by other tool families.
+        return self.workspace.resolve_file_operation_path(file_path)
 
     @staticmethod
     def _in_workspace(path: Path, workspace_abs: Path) -> bool:
@@ -770,6 +820,7 @@ class WorkspaceFileOperations:
 
     def _resolve_path(self, file_path: str, default_dir: str = "output") -> Path:
         """Resolve file path within workspace"""
+        self._require_workspace_authority()
         logger.debug(
             "_resolve_path called with file_path: %s, default_dir: %s",
             file_path,

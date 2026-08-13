@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import logging
 from typing import TYPE_CHECKING, Any, Optional
 
 from ....model.sound_effect import BaseSoundEffectModel
@@ -10,8 +9,6 @@ from ....workspace import TaskWorkspace
 from ...core.sound_effect_tool import SoundEffectToolCore
 from .base import ToolCategory
 from .function import FunctionTool
-
-logger = logging.getLogger(__name__)
 
 
 class SoundEffectFunctionTool(FunctionTool):
@@ -69,12 +66,8 @@ async def create_sound_effect_tools_from_config(
     workspace = ToolFactory.create_workspace(config.get_workspace_config())
     if workspace is None:
         return []
-    try:
-        return create_sound_effect_tools(
-            models=models,
-            workspace=workspace,
-            default_model=config.get_sound_effect_model(),
-        )
-    except Exception as exc:
-        logger.warning("Failed to create sound effect tools: %s", exc)
-        return []
+    return create_sound_effect_tools(
+        models=models,
+        workspace=workspace,
+        default_model=config.get_sound_effect_model(),
+    )

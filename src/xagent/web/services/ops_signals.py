@@ -66,6 +66,18 @@ INTERACTION_ANCHOR_CORRUPT = "interaction_anchor_corrupt"
 # working, not whether a particular task has been repaired.
 CLARIFICATION_LEGACY_SUPERSEDE_FAILED = "clarification_legacy_supersede_failed"
 
+# task_clarification_draft.py registers this when a waiting run's result
+# carries no clarification draft to publish, and clears it the next time a
+# draft is successfully resolved to a publishable payload.
+CLARIFICATION_DRAFT_MISSING = "clarification_draft_missing"
+# task_clarification_draft.py registers this when the same batch produced
+# more than one waiting step and a losing step's draft was discarded.
+# Deliberately not cleared by the very publish that reports it -- a
+# successful publish this round does not undo the fact that a sibling's
+# question was dropped this round, so this stays visible until a later,
+# conflict-free resolution clears it.
+CLARIFICATION_MULTIPLE_DRAFTS = "clarification_multiple_drafts"
+
 _signals: dict[str, str] = {}
 _lock = threading.Lock()
 

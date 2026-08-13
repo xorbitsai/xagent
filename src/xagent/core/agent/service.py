@@ -13,6 +13,7 @@ from ..memory.in_memory import InMemoryMemoryStore
 from ..model.chat.basic.base import BaseLLM
 from ..task_runtime import (
     EMPTY_TASK_RUNTIME_CONTRIBUTION,
+    FILE_OPERATION_ACCESS_VERSION_KEY,
     TaskRuntimeContribution,
     normalize_input_modalities,
 )
@@ -180,6 +181,13 @@ class AgentService:
                 scope_segments=tuple(
                     ws_config.get("scope_segments") or self.scope_segments
                 ),
+                durable_storage_segments=ws_config.get("durable_storage_segments"),
+            )
+            user_id = ws_config.get("user_id")
+            if isinstance(user_id, int) and not isinstance(user_id, bool):
+                self.workspace.owner_user_id = user_id
+            self.workspace.file_operation_access_version = ws_config.get(
+                FILE_OPERATION_ACCESS_VERSION_KEY
             )
         elif self.enable_workspace:
             self._setup_workspace()

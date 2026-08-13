@@ -23,17 +23,33 @@ from ...config import (
     get_task_runtime_hook_queue_timeout_seconds,
 )
 from ...core.execution_scope import EXECUTION_SCOPE_AGENT_CONFIG_KEY
+
+# Compatibility re-exports for callers using the former web-layer paths.
 from ...core.task_runtime import (
     EMPTY_TASK_RUNTIME_CONTRIBUTION,
+)
+from ...core.task_runtime import (
+    FILE_OPERATION_ACCESS_VERSION as FILE_OPERATION_ACCESS_VERSION,
+)
+from ...core.task_runtime import (
+    FILE_OPERATION_ACCESS_VERSION_KEY,
     MAX_TASK_RUNTIME_EXTENSIONS,
     MAX_TASK_RUNTIME_JSON_BYTES,
     MAX_TASK_RUNTIME_PUBLIC_METADATA_BYTES,
     MAX_TASK_RUNTIME_REQUEST_BYTES,
+)
+from ...core.task_runtime import (
+    FileOperationAccessPolicyError as FileOperationAccessPolicyError,
+)
+from ...core.task_runtime import (
     TaskRuntimeContext,
     TaskRuntimeContribution,
     TaskRuntimeExtensionProvider,
     merge_task_runtime_contributions,
     normalize_task_runtime_contribution,
+)
+from ...core.task_runtime import (
+    requires_exact_file_operation_scope as requires_exact_file_operation_scope,
 )
 
 _EXTENSION_NAME_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
@@ -172,6 +188,7 @@ CLIENT_RESERVED_AGENT_CONFIG_KEYS: frozenset[str] = frozenset(
         TASK_RUNTIME_BINDINGS_AGENT_CONFIG_KEY,
         EXECUTION_SCOPE_AGENT_CONFIG_KEY,
         SELECTED_FILE_IDS_AGENT_CONFIG_KEY,
+        FILE_OPERATION_ACCESS_VERSION_KEY,
         "auth_mode",
         "guest_id",
         "widget_agent_id",

@@ -13,6 +13,12 @@ from dataclasses import dataclass, field, replace
 from typing import Any, Protocol
 
 PREFERRED_INPUT_MODALITIES_METADATA_KEY = "preferred_input_modalities"
+# Server-owned marker and workspace-config key for the minimal new-public-task
+# File Operation rollout. The namespaced spelling reduces collision risk with
+# historical free-form Task.agent_config values.
+FILE_OPERATION_ACCESS_VERSION_KEY = "__xagent_file_operation_access_version"
+FILE_OPERATION_ACCESS_VERSION = 1
+SUPPORTED_FILE_OPERATION_ACCESS_VERSIONS = frozenset({1})
 MAX_TASK_RUNTIME_EXTENSIONS = 16
 MAX_TASK_RUNTIME_JSON_BYTES = 64 * 1024
 MAX_TASK_RUNTIME_ENVIRONMENT_BYTES = 64 * 1024
@@ -24,6 +30,58 @@ MAX_TASK_RUNTIME_PUBLIC_METADATA_BYTES = 256 * 1024
 # path bounds the whole payload the way the public-metadata read path bounds
 # the whole response.
 MAX_TASK_RUNTIME_REQUEST_BYTES = 256 * 1024
+
+
+class FileOperationAccessPolicyError(RuntimeError):
+    """A marked task cannot prove its exact File Operation authority."""
+
+
+def requires_exact_file_operation_scope(task: Any) -> bool:
+    """Return whether one persisted task opts into exact File Operation scope.
+
+    Marker absence deliberately preserves private and historical behavior for
+    the focused #803 rollout. Once a marker exists, every field is strict: an
+    unknown version or inconsistent public identity fails closed instead of
+    falling back to creator-wide access.
+    """
+
+    config = getattr(task, "agent_config", None)
+    if not isinstance(config, Mapping):
+        return False
+    marker = config.get(FILE_OPERATION_ACCESS_VERSION_KEY)
+    if marker is None:
+        return False
+    if (
+        isinstance(marker, bool)
+        or not isinstance(marker, int)
+        or marker not in SUPPORTED_FILE_OPERATION_ACCESS_VERSIONS
+    ):
+        raise FileOperationAccessPolicyError(
+            "File Operation access policy version is unsupported"
+        )
+
+    task_id = getattr(task, "id", None)
+    owner_user_id = getattr(task, "user_id", None)
+    if (
+        isinstance(task_id, bool)
+        or not isinstance(task_id, int)
+        or task_id <= 0
+        or isinstance(owner_user_id, bool)
+        or not isinstance(owner_user_id, int)
+        or owner_user_id <= 0
+    ):
+        raise FileOperationAccessPolicyError(
+            "Marked File Operation task has no authoritative identity"
+        )
+
+    source = getattr(task, "source", None)
+    auth_mode = config.get("auth_mode")
+    expected_source = "shared_link" if auth_mode == "share" else "widget"
+    if auth_mode not in {"share", "widget"} or source != expected_source:
+        raise FileOperationAccessPolicyError(
+            "Marked File Operation task has inconsistent public identity"
+        )
+    return True
 
 
 class TaskRuntimeClientError(Exception):

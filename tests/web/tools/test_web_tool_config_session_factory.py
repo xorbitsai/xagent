@@ -1,10 +1,12 @@
 import asyncio
 import functools
+import inspect
 import logging
 import threading
 from collections.abc import Mapping
 from dataclasses import dataclass, field, fields, is_dataclass, replace
 from types import MappingProxyType, SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 from sqlalchemy import create_engine, event
@@ -385,15 +387,103 @@ async def test_create_default_tools_uses_worker_session_factory_without_live_db(
     monkeypatch.setattr("xagent.web.tools.config.WebToolConfig", _FakeToolConfig)
     monkeypatch.setattr(ToolFactory, "create_all_tools", create_tools)
 
+    parameters = inspect.signature(create_default_tools).parameters
+    assert "db_task_id" in parameters
+    assert "file_operation_access_version" in parameters
+
     tools, config = await create_default_tools(
         None,
         user=SimpleNamespace(id=7, is_admin=False),
         task_id="web_task_11",
+        db_task_id=11,
+        file_operation_access_version=1,
     )
 
     assert tools == ["prepared-tool"]
     assert captured["db"] is None
     assert captured["db_factory"] is session_factory
+    assert captured["workspace_config"]["db_task_id"] == 11
+    assert captured["workspace_config"]["__xagent_file_operation_access_version"] == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("agent_config", ["malformed", ["malformed"]])
+async def test_build_tools_treats_non_mapping_policy_config_as_unmarked(
+    monkeypatch,
+    agent_config,
+):
+    from xagent.web.api.chat import AgentServiceManager
+
+    captured: dict[str, object] = {}
+
+    async def fake_create_default_tools(*_args, **kwargs):
+        captured.update(kwargs)
+        return [], object()
+
+    manager = AgentServiceManager()
+    monkeypatch.setattr(
+        manager,
+        "_get_or_create_task_sandbox",
+        AsyncMock(return_value=None),
+    )
+    monkeypatch.setattr(
+        "xagent.web.api.chat.create_default_tools",
+        fake_create_default_tools,
+    )
+
+    await manager._build_tools_for_task(
+        task_id=11,
+        task=SimpleNamespace(user_id=7, agent_config=agent_config, source="internal"),
+        db=None,
+        user=SimpleNamespace(id=7, is_admin=False),
+        agent_config=None,
+        task_llm=None,
+        task_vision_llm=None,
+        task_setup_snapshot=SimpleNamespace(
+            workforce_runtime=None,
+            excluded_agent_id=None,
+            agent=None,
+        ),
+    )
+
+    assert captured["file_operation_access_version"] is None
+
+
+@pytest.mark.asyncio
+async def test_create_default_tools_preserves_legacy_positional_owner(
+    monkeypatch,
+):
+    from xagent.web.api.chat import create_default_tools
+
+    captured: dict[str, object] = {}
+
+    class _FakeToolConfig:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+        def set_task_runtime_contribution(self, contribution) -> None:
+            self.task_runtime_contribution = contribution
+
+    async def create_tools(_config):
+        return []
+
+    monkeypatch.setattr(
+        "xagent.web.models.database.get_session_local",
+        lambda: object(),
+    )
+    monkeypatch.setattr("xagent.web.tools.config.WebToolConfig", _FakeToolConfig)
+    monkeypatch.setattr(ToolFactory, "create_all_tools", create_tools)
+
+    await create_default_tools(
+        None,
+        None,
+        SimpleNamespace(id=8, is_admin=False),
+        "web_task_11",
+        7,
+    )
+
+    assert captured["workspace_config"]["user_id"] == 7
+    assert captured["workspace_config"]["db_task_id"] is None
 
 
 @pytest.mark.asyncio

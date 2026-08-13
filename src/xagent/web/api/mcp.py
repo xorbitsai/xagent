@@ -1823,6 +1823,20 @@ def _connected_non_oauth_server_for_app(
     return cast(int, server.id)
 
 
+def _is_mcp_oauth_server(server: MCPServer) -> bool:
+    """Whether a stored server row is authorized through per-user MCP OAuth.
+
+    The shape check behind both the connection-state gate below and the
+    connector picker's `auth_type` hint, so the field that decides which
+    Connect flow the picker starts can't disagree with the field that decides
+    whether the server counts as connected."""
+    auth: dict[str, Any] = server.auth if isinstance(server.auth, dict) else {}
+    return (
+        str(server.transport or "").lower() in HTTP_MCP_TRANSPORTS
+        and auth.get("type") == "mcp_oauth"
+    )
+
+
 def _mcp_oauth_server_is_actually_connected(
     server: MCPServer, active_grant_server_ids: set[int]
 ) -> bool:
@@ -1833,11 +1847,7 @@ def _mcp_oauth_server_is_actually_connected(
     branch — shared so every code path that reports connection state for an
     mcp_oauth server (including the location=local/all branch, which used to
     bypass this check entirely) agrees (F1)."""
-    auth: dict[str, Any] = server.auth if isinstance(server.auth, dict) else {}
-    if (
-        str(server.transport or "").lower() not in HTTP_MCP_TRANSPORTS
-        or auth.get("type") != "mcp_oauth"
-    ):
+    if not _is_mcp_oauth_server(server):
         return True
     return cast(int, server.id) in active_grant_server_ids
 
@@ -2015,28 +2025,43 @@ def list_mcp_apps(
             if category and category != "All":
                 continue
 
-            results.append(
-                {
-                    "id": server.name,
-                    "name": server.name,
-                    "description": server.description or "Custom MCP Server",
-                    "icon": "",
-                    "users": "1",
-                    "transport": server.transport,
-                    # F1: this loop's own membership check above (name-based)
-                    # doesn't gate on a real grant, so a custom mcp_oauth
-                    # server the user abandoned mid-consent must not be
-                    # reported connected just because the row exists.
-                    "is_connected": _mcp_oauth_server_is_actually_connected(
-                        server, active_grant_server_ids
-                    ),
-                    "provider": "custom",
-                    "category": "Local",
-                    "is_local": True,
-                    "server_id": server.id,
-                    "is_custom": True,
-                }
-            )
+            entry = {
+                "id": server.name,
+                "name": server.name,
+                "description": server.description or "Custom MCP Server",
+                "icon": "",
+                "users": "1",
+                "transport": server.transport,
+                # F1: this loop's own membership check above (name-based)
+                # doesn't gate on a real grant, so a custom mcp_oauth
+                # server the user abandoned mid-consent must not be
+                # reported connected just because the row exists.
+                "is_connected": _mcp_oauth_server_is_actually_connected(
+                    server, active_grant_server_ids
+                ),
+                "provider": "custom",
+                "category": "Local",
+                "is_local": True,
+                "server_id": server.id,
+                "is_custom": True,
+            }
+            # The picker dispatches its Connect button on auth_type, and custom
+            # entries used to omit the field entirely — so an mcp_oauth server
+            # left unconnected by the check above had no way forward and hit
+            # the mis-authored-entry toast instead (#1313).
+            #
+            # Emitted only for the mcp_oauth shape, deliberately: every other
+            # custom shape is reported connected unconditionally (so its
+            # Connect button never renders), while tagging those rows with a
+            # catalog classification would repoint the settings dialog's
+            # Configure button away from the custom edit form. Inactive
+            # associations are excluded because the per-server OAuth endpoints
+            # require an active one — a deactivated server needs re-enabling,
+            # not re-authorization.
+            if user_mcp.is_active and _is_mcp_oauth_server(server):
+                entry["auth_type"] = "mcp_oauth"
+
+            results.append(entry)
 
         # Append Custom APIs
         user_custom_apis = (
@@ -2327,16 +2352,14 @@ def _reject_hidden_catalog_app(app_info: dict) -> None:
     the connector with a direct POST. 404 (not 403) so a hidden app is
     indistinguishable from a nonexistent one.
 
-    Scope: wired into the api_key/keyless path (_ensure_catalog_app_server)
-    and the remote-MCP OAuth path (_ensure_catalog_mcp_oauth_server) only.
-    The builtin_oauth provider-redirect flow (auth.py generic_oauth_callback
-    -> _ensure_user_mcp_server) does NOT run this check. This is a config
-    action away from mattering, not just a future refactor: is_visible_in_
-    connector is freely admin-mutable via PATCH on any catalog app, so the
-    moment an operator hides an existing builtin_oauth row using this same
-    release-gate idiom, new connections reopen through this third path with
-    no code change. Tracked in #1203 — do not apply the hidden-as-release-
-    gate pattern to an oauth-transport row until that closes.
+    Scope: wired into all three connect paths — the api_key/keyless path
+    (_ensure_catalog_app_server), the remote-MCP OAuth path
+    (_ensure_catalog_mcp_oauth_server), and the builtin_oauth
+    provider-redirect flow (auth.py generic_oauth_login and
+    generic_oauth_callback's single-app and bare-provider-batch branches).
+    #1203 tracked exactly this gap on the third path — call this same helper
+    rather than reintroducing a fourth, divergent is_visible_in_connector
+    check if a new connect path is ever added.
 
     Blast radius: this fires on every connect call, before the caller's
     existing association is looked up — so on a hidden app it also blocks

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Iterator
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -12,15 +13,21 @@ from xagent.core.execution_scope import (
     EXECUTION_SCOPE_AGENT_CONFIG_KEY,
     execution_scope_from_agent_config,
 )
-from xagent.core.task_runtime import TaskRuntimeContext, TaskRuntimeContribution
+from xagent.core.task_runtime import (
+    FILE_OPERATION_ACCESS_VERSION_KEY,
+    TaskRuntimeContext,
+    TaskRuntimeContribution,
+)
 from xagent.web.services.task_runtime import (
     CLIENT_RESERVED_AGENT_CONFIG_KEYS,
     SELECTED_FILE_IDS_AGENT_CONFIG_KEY,
     TASK_RUNTIME_BINDINGS_AGENT_CONFIG_KEY,
+    FileOperationAccessPolicyError,
     TaskRuntimeExtensionError,
     agent_config_with_task_extension_bindings,
     delete_task_extensions,
     register_task_extension,
+    requires_exact_file_operation_scope,
     sanitize_client_agent_config,
     task_extension_bindings_from_agent_config,
     unregister_task_extension,
@@ -93,6 +100,16 @@ def test_bindings_decode_tolerates_missing_and_malformed_records(
     agent_config: Any,
 ) -> None:
     assert task_extension_bindings_from_agent_config(agent_config) == ()
+
+
+def test_bindings_encode_preserves_file_operation_policy_marker() -> None:
+    encoded = agent_config_with_task_extension_bindings(
+        {FILE_OPERATION_ACCESS_VERSION_KEY: 1},
+        ["local_browser"],
+    )
+
+    assert encoded[FILE_OPERATION_ACCESS_VERSION_KEY] == 1
+    assert encoded[TASK_RUNTIME_BINDINGS_AGENT_CONFIG_KEY] == ["local_browser"]
 
 
 def test_bindings_encode_drops_the_key_when_empty() -> None:
@@ -267,7 +284,7 @@ def test_the_reserved_key_set_has_exactly_the_audited_members() -> None:
     cannot detect a wrongly-added member -- whatever the set holds, that
     test's forged payload holds too. This test covers that direction instead.
     Literals are deliberate for a second reason: comparing against them also
-    fails if either constant's *value* changes, which would silently move
+    fails if a named constant's *value* changes, which would silently move
     which requests get stripped at every task-create boundary.
     """
     assert CLIENT_RESERVED_AGENT_CONFIG_KEYS == frozenset(
@@ -275,6 +292,7 @@ def test_the_reserved_key_set_has_exactly_the_audited_members() -> None:
             "runtime_extension_bindings",
             "execution_scope",
             "selected_file_ids",
+            "__xagent_file_operation_access_version",
             # Public-channel identity/quota markers (#1108).
             "auth_mode",
             "guest_id",
@@ -286,6 +304,96 @@ def test_the_reserved_key_set_has_exactly_the_audited_members() -> None:
             "share_token",
         }
     )
+
+
+def test_file_operation_scope_marker_is_strict_and_new_public_only() -> None:
+    historical = SimpleNamespace(
+        id=1,
+        user_id=7,
+        source="shared_link",
+        agent_config={"auth_mode": "share"},
+    )
+    historical_with_old_free_form_key = SimpleNamespace(
+        id=7,
+        user_id=7,
+        source="shared_link",
+        agent_config={
+            "auth_mode": "share",
+            "file_operation_access_version": 1,
+        },
+    )
+    marked_share = SimpleNamespace(
+        id=2,
+        user_id=7,
+        source="shared_link",
+        agent_config={
+            "auth_mode": "share",
+            "__xagent_file_operation_access_version": 1,
+        },
+    )
+    marked_widget = SimpleNamespace(
+        id=3,
+        user_id=7,
+        source="widget",
+        agent_config={
+            "auth_mode": "widget",
+            "__xagent_file_operation_access_version": 1,
+        },
+    )
+
+    assert requires_exact_file_operation_scope(historical) is False
+    assert (
+        requires_exact_file_operation_scope(historical_with_old_free_form_key) is False
+    )
+    assert requires_exact_file_operation_scope(marked_share) is True
+    assert requires_exact_file_operation_scope(marked_widget) is True
+
+    for malformed in (
+        SimpleNamespace(
+            id=4,
+            user_id=7,
+            source="internal",
+            agent_config={"__xagent_file_operation_access_version": 1},
+        ),
+        SimpleNamespace(
+            id=5,
+            user_id=7,
+            source="shared_link",
+            agent_config={
+                "auth_mode": "share",
+                "__xagent_file_operation_access_version": 2,
+            },
+        ),
+        SimpleNamespace(
+            id=None,
+            user_id=7,
+            source="shared_link",
+            agent_config={
+                "auth_mode": "share",
+                "__xagent_file_operation_access_version": 1,
+            },
+        ),
+        SimpleNamespace(
+            id=6,
+            user_id=7,
+            source="shared_link",
+            agent_config={
+                "auth_mode": "share",
+                "__xagent_file_operation_access_version": True,
+            },
+        ),
+        SimpleNamespace(
+            id=7,
+            user_id=7,
+            source="shared_link",
+            agent_config={
+                "auth_mode": "share",
+                "__xagent_file_operation_access_version": [1],
+            },
+        ),
+    ):
+        with pytest.raises(FileOperationAccessPolicyError):
+            requires_exact_file_operation_scope(malformed)
 
 
 def test_agent_builder_preview_keys_are_not_reserved() -> None:

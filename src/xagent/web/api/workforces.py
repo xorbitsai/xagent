@@ -1,10 +1,11 @@
+import asyncio
 import logging
 from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from typing import Any, cast
 
-from fastapi import APIRouter, Depends, HTTPException, Response
+from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from pydantic import BaseModel, Field
 from sqlalchemy import func, or_
 from sqlalchemy.orm import Session, selectinload
@@ -14,6 +15,7 @@ from ..models.agent import Agent, is_workforce_generated_manager_agent
 from ..models.database import get_db
 from ..models.deployment import Deployment, DeploymentOwnerType
 from ..models.task import TaskStatus, TraceEvent
+from ..models.trigger import AgentTrigger
 from ..models.user import User
 from ..models.workforce import (
     Workforce,
@@ -38,6 +40,7 @@ from ..services.deployments import (
     new_widget_key,
 )
 from ..services.trace_message_storage import decode_trace_events_data
+from ..services.triggers import unregister_deleted_trigger_bindings
 from ..services.workforce_access import (
     can_create_workforce,
     can_edit_workforce,
@@ -49,12 +52,15 @@ from ..services.workforce_access import (
 from ..services.workforce_creator import create_workforce_from_prompt
 from ..services.workforce_lifecycle import (
     acquire_workforce_lifecycle_fence,
+    delete_workforce_permanently,
     discard_draft_workforce,
+    ensure_workforce_lifecycle_access,
 )
 from ..services.workforce_names import workforce_name_exists
 from ..services.workforce_runs import create_preview_workforce_run
 from ..services.workforce_runs import create_workforce_run as start_workforce_run
 from ..services.workforce_runtime import (
+    WorkforceRunPauseTarget,
     cancel_active_workforce_runs,
     pause_workforce_tasks_after_archive,
 )
@@ -801,12 +807,79 @@ async def update_workforce(
     )
 
 
-@router.delete("/{workforce_id}")
-async def archive_workforce(
+@router.delete("/{workforce_id}", operation_id="archive_workforce")
+async def archive_or_delete_workforce(
     workforce_id: int,
+    permanent: bool = Query(
+        False,
+        description=(
+            "Permanently delete the workforce and all run history; cannot be undone."
+        ),
+    ),
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ) -> dict[str, Any]:
+    if permanent:
+
+        def _load_and_delete_permanently() -> tuple[
+            list[WorkforceRunPauseTarget],
+            list[tuple[AgentTrigger, str, dict[str, Any]]],
+        ]:
+            # Offloaded as one unit (load + the cascade-heavy delete
+            # itself), not just the delete: a workforce with a large
+            # run/trigger history would otherwise walk every child row on
+            # this route's event-loop thread, stalling every other
+            # concurrent request. See delete_workforce_permanently's
+            # docstring for why the function itself stays a plain sync def
+            # rather than offloading internally.
+            return delete_workforce_permanently(
+                db, user, _load_workforce(db, workforce_id)
+            )
+
+        try:
+            pause_targets, trigger_teardowns = await asyncio.to_thread(
+                _load_and_delete_permanently
+            )
+        except HTTPException:
+            raise
+        except Exception:
+            logger.exception("Failed to delete workforce %s", workforce_id)
+            db.rollback()
+            raise HTTPException(
+                status_code=500,
+                detail={
+                    "code": "workforce_delete_failed",
+                    "message": "Failed to delete workforce",
+                },
+            ) from None
+        await pause_workforce_tasks_after_archive(pause_targets, reason="delete")
+        if trigger_teardowns:
+            try:
+                # Provider unregister (e.g. releasing a Gmail watch) can do
+                # real network I/O; offload to a worker thread instead of
+                # blocking every other concurrent request on the event
+                # loop. Does NOT pass this request's `db` through -- a
+                # Session is not safe to hand to a background thread, so
+                # the callee opens its own.
+                await asyncio.to_thread(
+                    unregister_deleted_trigger_bindings, trigger_teardowns
+                )
+            except Exception:
+                # The delete itself already succeeded and is committed --
+                # a dispatch-setup failure here (e.g. get_session_local()
+                # or the executor construction inside
+                # unregister_deleted_trigger_bindings, before its own
+                # per-trigger try/except even starts) must not turn an
+                # already-successful delete into a 500; per-trigger
+                # provider failures are already swallowed and logged
+                # inside that function.
+                logger.exception(
+                    "Failed to dispatch trigger-binding teardown for "
+                    "deleted workforce %s",
+                    workforce_id,
+                )
+        return {"id": workforce_id, "status": "deleted"}
+
     workforce = ensure_workforce_access(
         db,
         user,
@@ -832,6 +905,57 @@ async def archive_workforce(
     db.commit()
     await pause_workforce_tasks_after_archive(pause_targets)
     return {"id": workforce.id, "status": workforce.status}
+
+
+@router.post("/{workforce_id}/unarchive")
+async def unarchive_workforce(
+    workforce_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> dict[str, Any]:
+    # Not ensure_workforce_access(..., action="edit"): that helper's archived
+    # -> 409 guard exists precisely to keep archived workforces read-only, so
+    # it would reject the one workforce this route is meant to act on.
+    # ensure_workforce_lifecycle_access has no such guard -- same 404/403
+    # gate discard_draft_workforce and delete_workforce_permanently use.
+    workforce = ensure_workforce_lifecycle_access(
+        db, user, _load_workforce(db, workforce_id)
+    )
+    workforce_id_value = int(workforce.id)
+    # Same lifecycle fence as archive: serializes against a concurrent
+    # archive/delete so the status check below reads committed state instead
+    # of racing the other transaction's flip. Re-wrapped through
+    # ensure_workforce_lifecycle_access (not just checked for None), same as
+    # delete_workforce_permanently, so the dependency on the fence's
+    # refreshed row is explicit rather than relying on the pre-fence
+    # `workforce` happening to be the same identity-map instance.
+    workforce = ensure_workforce_lifecycle_access(
+        db, user, acquire_workforce_lifecycle_fence(db, workforce_id_value)
+    )
+    if workforce.status != "archived":
+        raise HTTPException(
+            status_code=409,
+            detail="Only archived workforces can be unarchived",
+        )
+    # Restore to draft, not active: runs were cancelled at archive time and
+    # the config may have gone stale, so re-activation stays an explicit
+    # publish step that re-runs validation.
+    cast(Any, workforce).status = "draft"
+    try:
+        db.commit()
+    except Exception:
+        logger.exception("Failed to unarchive workforce %s", workforce_id)
+        db.rollback()
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "code": "workforce_unarchive_failed",
+                "message": "Failed to unarchive workforce",
+            },
+        ) from None
+    return _serialize_workforce_detail(
+        _reload_workforce(db, workforce), user, get_agent_team_scope(db, int(user.id))
+    )
 
 
 @router.post("/{workforce_id}/discard", status_code=204)

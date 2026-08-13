@@ -183,6 +183,7 @@ from ..services.workforce_runtime import (
 from ..tracing import create_ephemeral_tracer
 from ..user_isolated_memory import UserContext
 from ..utils.db_timezone import safe_timestamp_to_unix
+from ..utils.json_payload_sanitizer import sanitize_json_payload
 from .public_trace_events import (
     is_audit_only_trace_data,
     normalize_public_trace_event,
@@ -769,6 +770,11 @@ def _persist_agent_outbound_event(task_id: int, event: Dict[str, Any]) -> None:
         data: Dict[str, Any] = cast(
             Dict[str, Any], event_data if isinstance(event_data, dict) else {}
         )
+        # This function builds its own TraceEvent row instead of going
+        # through stage_trace_event_row (see that module's "known bypass"
+        # note), so it must sanitize for itself: PostgreSQL's jsonb rejects
+        # NUL and unpaired-surrogate code points at INSERT (#1248).
+        data = sanitize_json_payload(data)
         timestamp = event.get("timestamp")
         if isinstance(timestamp, (int, float)):
             event_time = datetime.fromtimestamp(float(timestamp), timezone.utc)

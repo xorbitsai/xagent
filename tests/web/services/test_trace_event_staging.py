@@ -638,3 +638,100 @@ def test_positive_control_both_run_partition_predicates_compile_identical_sql() 
             )
         )
         assert old == new
+
+
+# --------------------------------------------------------------------------
+# Write-side payload sanitation (#1248): code points PostgreSQL's jsonb
+# rejects at INSERT must never reach the row, on any path
+# --------------------------------------------------------------------------
+
+# chr, not source escapes: an editor will happily turn an escape into the
+# character it names, and a lone surrogate is not encodable as UTF-8.
+_NUL = chr(0x0000)
+_LONE_HIGH_SURROGATE = chr(0xD800)
+_REPLACEMENT = chr(0xFFFD)
+
+
+def test_stage_trace_event_row_sanitizes_unstorable_code_points(
+    tmp_path: Path,
+) -> None:
+    """A non-checkpoint payload carrying NUL or a lone surrogate is stored
+    with those code points replaced, and ``stored_data`` reports what was
+    actually written."""
+    engine = _engine(tmp_path)
+    session_factory = _session_factory(engine)
+    db, task_id = _create_task(session_factory, username="s8-sanitize")
+
+    staged = stage_trace_event_row(
+        db,
+        task_id=task_id,
+        build_id=None,
+        event_id="evt-s8",
+        event_type="tool_execution_end",
+        timestamp=datetime.now(timezone.utc),
+        step_id=None,
+        parent_event_id=None,
+        data={
+            "tool_name": "noop",
+            "output": f"head{_NUL}tail",
+            "nested": [f"lone{_LONE_HIGH_SURROGATE}"],
+        },
+        checkpoint_lease=None,
+    )
+    db.commit()
+
+    expected = {
+        "tool_name": "noop",
+        "output": f"head{_REPLACEMENT}tail",
+        "nested": [f"lone{_REPLACEMENT}"],
+    }
+    assert staged.stored_data == expected
+
+    other = session_factory()
+    try:
+        row = other.query(DatabaseTraceEvent).filter_by(event_id="evt-s8").one()
+        assert row.data == expected
+    finally:
+        other.close()
+    db.close()
+
+
+def test_stage_trace_event_row_sanitizes_before_checkpoint_encoding(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The checkpoint branch hashes blob rows out of the payload, so the
+    encoder must already see the sanitized form -- otherwise the stored
+    hash would be computed over content that never lands in the column."""
+    engine = _engine(tmp_path)
+    session_factory = _session_factory(engine)
+    db, task_id = _create_task(session_factory, username="s9-sanitize")
+
+    seen: list[Any] = []
+    original_encode = trace_event_staging.encode_checkpoint_data_for_storage
+
+    def capturing_encode(db, *, task_id, data, use_v2=None):  # noqa: ANN001
+        seen.append(data)
+        return original_encode(db, task_id=task_id, data=data, use_v2=use_v2)
+
+    monkeypatch.setattr(
+        trace_event_staging, "encode_checkpoint_data_for_storage", capturing_encode
+    )
+
+    dirty = _checkpoint_data("exec-s9", f"label{_NUL}")
+    stage_trace_event_row(
+        db,
+        task_id=task_id,
+        build_id="build-s9",
+        event_id="evt-s9",
+        event_type="system_update_general",
+        timestamp=datetime.now(timezone.utc),
+        step_id=None,
+        parent_event_id=None,
+        data=dirty,
+        checkpoint_lease=None,
+    )
+
+    assert len(seen) == 1
+    assert seen[0]["snapshot"] == {"label": f"label{_REPLACEMENT}"}
+    db.rollback()
+    db.close()

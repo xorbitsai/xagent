@@ -772,12 +772,29 @@ def test_agent_workspace_register_file_is_idempotent_after_canonicalization(
         engine.dispose()
 
 
-def test_tool_factory_workspace_preserves_db_task_id(tmp_path):
+@pytest.mark.parametrize(
+    ("durable_segments", "expected"),
+    [
+        (None, ("tenant-a",)),
+        ((), ()),
+    ],
+)
+def test_tool_factory_workspace_preserves_db_task_id(
+    tmp_path, durable_segments, expected
+):
     workspace = ToolFactory.create_workspace(
         {
             "base_dir": str(tmp_path / "workspaces"),
             "task_id": "agent_2_abcd1234",
             "db_task_id": 654,
+            "__xagent_file_operation_access_version": 1,
+            "user_id": 7,
+            "scope_segments": ("tenant-a",),
+            **(
+                {}
+                if durable_segments is None
+                else {"durable_storage_segments": durable_segments}
+            ),
         }
     )
 
@@ -785,6 +802,9 @@ def test_tool_factory_workspace_preserves_db_task_id(tmp_path):
     assert workspace.id == "agent_2_abcd1234"
     assert workspace.db_task_id == 654
     assert workspace.current_task_id == 654
+    assert workspace.owner_user_id == 7
+    assert workspace.file_operation_access_version == 1
+    assert workspace.durable_storage_segments == expected
 
 
 def test_workspace_manager_updates_cached_workspace_db_task_id(tmp_path):
@@ -807,12 +827,29 @@ def test_workspace_manager_updates_cached_workspace_db_task_id(tmp_path):
     assert same_workspace.current_task_id == 654
 
 
-def test_agent_service_workspace_preserves_config_db_task_id(tmp_path):
+@pytest.mark.parametrize(
+    ("durable_segments", "expected"),
+    [
+        (None, ("tenant-a",)),
+        ((), ()),
+    ],
+)
+def test_agent_service_workspace_preserves_config_db_task_id(
+    tmp_path, durable_segments, expected
+):
     class ToolConfig:
         _workspace_config = {
             "base_dir": str(tmp_path / "workspaces"),
             "task_id": "agent_2_abcd1234",
             "db_task_id": 987,
+            "user_id": 7,
+            "scope_segments": ("tenant-a",),
+            "__xagent_file_operation_access_version": 1,
+            **(
+                {}
+                if durable_segments is None
+                else {"durable_storage_segments": durable_segments}
+            ),
         }
 
         def get_allowed_skills(self):
@@ -829,6 +866,9 @@ def test_agent_service_workspace_preserves_config_db_task_id(tmp_path):
     assert service.workspace.id == "agent_2_abcd1234"
     assert service.workspace.db_task_id == 987
     assert service.workspace.current_task_id == 987
+    assert service.workspace.owner_user_id == 7
+    assert service.workspace.file_operation_access_version == 1
+    assert service.workspace.durable_storage_segments == expected
 
 
 def test_workspace_register_file_stages_then_uses_already_durable_upsert(

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import logging
 from typing import TYPE_CHECKING, Any, Optional
 
 from ....model.music import BaseMusicModel
@@ -10,8 +9,6 @@ from ....workspace import TaskWorkspace
 from ...core.music_tool import MusicToolCore
 from .base import ToolCategory
 from .function import FunctionTool
-
-logger = logging.getLogger(__name__)
 
 
 class MusicFunctionTool(FunctionTool):
@@ -69,12 +66,8 @@ async def create_music_tools_from_config(
     workspace = ToolFactory.create_workspace(config.get_workspace_config())
     if workspace is None:
         return []
-    try:
-        return create_music_tools(
-            models=models,
-            workspace=workspace,
-            default_model=config.get_music_model(),
-        )
-    except Exception as exc:
-        logger.warning("Failed to create music tools: %s", exc)
-        return []
+    return create_music_tools(
+        models=models,
+        workspace=workspace,
+        default_model=config.get_music_model(),
+    )

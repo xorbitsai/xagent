@@ -794,6 +794,62 @@ def _unregister_trigger_binding(
     _run_provider_coro(provider.unregister(db, trigger, config))
 
 
+def unregister_deleted_trigger_bindings(
+    teardowns: list[tuple[AgentTrigger, str, dict[str, Any]]],
+) -> None:
+    """Best-effort provider teardown for trigger rows deleted outside the
+    trigger CRUD path (workforce hard delete cascades them away).
+
+    Runs each item on its own session and its own worker thread, in
+    parallel: this whole function is already invoked via a single
+    ``asyncio.to_thread`` from an async route, and a caller with N triggers
+    (e.g. N Gmail watches) would otherwise pay N sequential provider
+    round-trips serialized on that one thread before the response can
+    return. A fresh session per item also means one binding's failure can't
+    roll back another's still-pending work -- same reasoning
+    ``pause_workforce_tasks_after_archive`` already applies per pause
+    target, just fanned out across threads here instead of processed
+    one-by-one on the single thread the caller already offloaded to.
+
+    Mirrors ``_delete_trigger``'s tail otherwise: the rows are already gone
+    and committed, so a teardown failure is logged rather than surfaced -- it
+    must not turn an already-successful delete into an error. Each
+    ``(trigger, trigger_type, config)`` tuple must have been captured BEFORE
+    the delete committed, with ``trigger`` expunged from the capturing
+    session so it stays a plain, already-hydrated object safe to read from
+    any of these worker threads.
+    """
+    if not teardowns:
+        return
+
+    from ..models.database import get_session_local
+
+    SessionLocal = get_session_local()
+
+    def _teardown_one(item: tuple[AgentTrigger, str, dict[str, Any]]) -> None:
+        trigger, trigger_type, config = item
+        try:
+            with SessionLocal() as db:
+                _unregister_trigger_binding(
+                    db, trigger, trigger_type=trigger_type, config=config
+                )
+        except Exception:
+            logger.exception(
+                "Failed to unregister binding for cascade-deleted trigger; "
+                "the trigger row is gone but its provider-side binding may "
+                "be leaked (type=%s)",
+                trigger_type,
+            )
+
+    with ThreadPoolExecutor(max_workers=min(len(teardowns), 8)) as pool:
+        # map() submits every item to the pool immediately (only iterating
+        # its return value is lazy); exiting this `with` block calls
+        # shutdown(wait=True), which already blocks until every submitted
+        # item finishes regardless of whether the returned iterator is
+        # consumed -- no need to iterate/collect it here.
+        pool.map(_teardown_one, teardowns)
+
+
 def get_owned_agent(db: Session, *, user_id: int, agent_id: int) -> Agent | None:
     # Workforce-generated manager agents are private implementation details;
     # they must not be addressable through trigger management, matching the

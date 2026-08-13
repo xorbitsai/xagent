@@ -47,25 +47,37 @@ class Workforce(Base):  # type: ignore[no-any-unimported]
 
     owner = relationship("User", foreign_keys=[owner_user_id])
     manager_agent = relationship("Agent", foreign_keys=[manager_agent_id])
+    # passive_deletes=True on all four: their child FK is a real
+    # ON DELETE CASCADE (workforce_agents.workforce_id, workforce_runs.
+    # workforce_id, workforce_builder_messages.workforce_id, agent_triggers.
+    # workforce_id) and this project enables SQLite foreign-key enforcement
+    # per connection (db/sqlite.py's PRAGMA foreign_keys=ON), so deleting a
+    # Workforce can rely on the database to cascade-delete these rows
+    # instead of the ORM loading and deleting every child row in Python one
+    # at a time.
     workers = relationship(
         "WorkforceAgent",
         back_populates="workforce",
         cascade="all, delete-orphan",
+        passive_deletes=True,
     )
     runs = relationship(
         "WorkforceRun",
         back_populates="workforce",
         cascade="all, delete-orphan",
+        passive_deletes=True,
     )
     builder_messages = relationship(
         "WorkforceBuilderMessage",
         back_populates="workforce",
         cascade="all, delete-orphan",
+        passive_deletes=True,
     )
     triggers = relationship(
         "AgentTrigger",
         back_populates="workforce",
         cascade="all, delete-orphan",
+        passive_deletes=True,
     )
 
 

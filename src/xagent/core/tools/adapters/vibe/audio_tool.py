@@ -8,7 +8,6 @@ This module provides audio processing capabilities including:
 Uses pre-configured ASR and TTS models passed from the web layer.
 """
 
-import logging
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 from ....model.asr.base import BaseASR
@@ -17,8 +16,6 @@ from ....workspace import TaskWorkspace
 from ...core.audio_tool import AudioToolCore
 from .base import ToolCategory
 from .function import FunctionTool
-
-logger = logging.getLogger(__name__)
 
 
 class AudioFunctionTool(FunctionTool):
@@ -251,14 +248,10 @@ async def create_audio_tools_from_config(config: "BaseToolConfig") -> List[Any]:
     if not workspace:
         return []
 
-    try:
-        return create_audio_tool(
-            asr_models=asr_models,
-            tts_models=tts_models,
-            workspace=workspace,
-            default_asr_model=config.get_asr_model(),
-            default_tts_model=config.get_tts_model(),
-        )
-    except Exception as e:
-        logger.warning(f"Failed to create audio tools: {e}")
-        return []
+    return create_audio_tool(
+        asr_models=asr_models,
+        tts_models=tts_models,
+        workspace=workspace,
+        default_asr_model=config.get_asr_model(),
+        default_tts_model=config.get_tts_model(),
+    )

@@ -60,7 +60,11 @@ def _make_user() -> User:
     return User(id=1, username="snap-int-user", password_hash="hash", is_admin=False)
 
 
-def _build_snapshot(*, source: str | None = "internal") -> TaskSetupSnapshot:
+def _build_snapshot(
+    *,
+    source: str | None = "internal",
+    agent_config: Any = None,
+) -> TaskSetupSnapshot:
     return TaskSetupSnapshot(
         task=_TaskFields(
             id=42,
@@ -68,7 +72,7 @@ def _build_snapshot(*, source: str | None = "internal") -> TaskSetupSnapshot:
             status=TaskStatus.PENDING,
             source=source,
             agent_id=None,
-            agent_config=None,
+            agent_config=agent_config,
             model_name=None,
             compact_model_name=None,
             execution_mode="flash",
@@ -147,6 +151,7 @@ async def test_live_request_session_releases_clean_read_before_snapshot_worker(
         runtime_user = kwargs["user"]
         assert isinstance(runtime_user, RuntimeUserFields)
         runtime_users.append(runtime_user)
+        assert kwargs["db_task_id"] == task_id
         assert engine.pool.checkedout() == 0
         await asyncio.sleep(0.03)
         assert engine.pool.checkedout() == 0
@@ -716,6 +721,40 @@ async def test_snapshot_source_controls_mcp_failure_policy(
     assert create_tools.await_args.kwargs["mcp_failure_policy"] is expected_policy
     assert create_tools.await_args.kwargs["mcp_load_summary_tracer"] is tracer
     assert create_tools.await_args.kwargs["mcp_load_summary_trace_task_id"] == "42"
+
+
+@pytest.mark.asyncio
+async def test_fresh_public_snapshot_forwards_file_operation_policy() -> None:
+    snapshot = _build_snapshot(
+        source="shared_link",
+        agent_config={
+            "auth_mode": "share",
+            "__xagent_file_operation_access_version": 1,
+        },
+    )
+    manager = AgentServiceManager()
+    db = MagicMock()
+    db.query.return_value.filter.return_value.first.return_value = MagicMock(
+        status=TaskStatus.PENDING
+    )
+    create_tools = AsyncMock(return_value=([], MagicMock()))
+
+    with (
+        patch(
+            "xagent.web.api.chat.load_task_setup_snapshot_sync",
+            return_value=snapshot,
+        ),
+        patch.object(manager, "_load_persisted_conversation_history"),
+        patch.object(manager, "_load_persisted_execution_context", new=AsyncMock()),
+        patch("xagent.web.api.chat.create_task_tracer", return_value=MagicMock()),
+        patch("xagent.web.api.chat.create_default_tools", new=create_tools),
+        patch("xagent.web.sandbox_manager.get_sandbox_manager", return_value=None),
+        patch("xagent.web.api.chat.AgentService"),
+    ):
+        await manager.get_agent_for_task(task_id=42, db=db, user=_make_user())
+
+    assert create_tools.await_args.kwargs["db_task_id"] == 42
+    assert create_tools.await_args.kwargs["file_operation_access_version"] == 1
 
 
 @pytest.mark.asyncio

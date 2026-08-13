@@ -19,6 +19,7 @@ from typing import (
 from sqlalchemy.orm import Session
 
 from .....config import get_uploads_dir
+from .....core.task_runtime import FILE_OPERATION_ACCESS_VERSION_KEY
 from .....core.workspace import TaskWorkspace
 from .base import AbstractBaseTool, Tool
 from .config import (
@@ -114,7 +115,9 @@ class ToolRegistry:
         Register a tool creator function.
 
         The creator function will be called during create_all_tools()
-        with the current config.
+        with the current config. Creators must not blanket-catch their own
+        failures: ``create_registered_tools`` is the single enforcement point
+        for the exception contract described in its docstring.
 
         Usage (bare decorator, no category metadata):
             @register_tool
@@ -218,6 +221,11 @@ class ToolRegistry:
         (dynamic ones: MCP / Custom API / Image / Audio) are always
         dispatched and are responsible for
         short-circuiting internally based on the spec.
+
+        Exception contract for creators: ``ConnectorRuntimeError`` and
+        ``RequiredMCPUnavailableError`` propagate to the caller; any other
+        exception is logged as a warning and that creator contributes no
+        tools. Creators rely on this and must not catch broadly themselves.
         """
         # Import tool modules on first call to trigger decorator registration
         cls._import_tool_modules()
@@ -242,7 +250,9 @@ class ToolRegistry:
             except RequiredMCPUnavailableError:
                 raise
             except Exception as e:
-                logger.warning(f"Tool creator {creator.__name__} failed: {e}")
+                logger.warning(
+                    f"Tool creator {creator.__name__} failed: {e}", exc_info=True
+                )
 
         # Sort tools by category priority
         tools = cls._sort_tools_by_category(tools)
@@ -862,10 +872,16 @@ class ToolFactory:
                 allowed_external_dirs=workspace_config.get("allowed_external_dirs"),
                 db_task_id=workspace_config.get("db_task_id"),
                 scope_segments=tuple(workspace_config.get("scope_segments") or ()),
+                durable_storage_segments=workspace_config.get(
+                    "durable_storage_segments"
+                ),
             )
             user_id = workspace_config.get("user_id")
             if isinstance(user_id, int):
                 workspace.owner_user_id = user_id
+            workspace.file_operation_access_version = workspace_config.get(
+                FILE_OPERATION_ACCESS_VERSION_KEY
+            )
             return workspace
         except Exception as e:
             logger.warning(f"Failed to create workspace: {e}")

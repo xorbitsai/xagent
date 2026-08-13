@@ -374,6 +374,67 @@ def test_persist_agent_outbound_event_uses_payload_ids(monkeypatch) -> None:
         db.close()
 
 
+def test_persist_agent_outbound_event_sanitizes_payload(monkeypatch) -> None:
+    """This function builds its own TraceEvent row without going through
+    stage_trace_event_row (the staging module's "known bypass"), so it must
+    sanitize for itself: PostgreSQL's jsonb rejects NUL and lone-surrogate
+    code points at INSERT (#1248)."""
+    engine = _shared_memory_sqlite_engine()
+    SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+    Base.metadata.create_all(bind=engine)
+    db = SessionLocal()
+    try:
+        user = User(
+            username="sanitizer", password_hash="hashed_password", is_admin=False
+        )
+        db.add(user)
+        db.commit()
+        db.refresh(user)
+        task = Task(
+            user_id=int(user.id),
+            title="Chat task",
+            description="Task chat",
+            status=TaskStatus.PENDING,
+        )
+        db.add(task)
+        db.commit()
+        db.refresh(task)
+    finally:
+        db.close()
+
+    def get_test_db() -> Iterator[Session]:
+        session = SessionLocal()
+        try:
+            yield session
+        finally:
+            session.close()
+
+    monkeypatch.setattr("xagent.web.api.websocket.get_db", get_test_db)
+
+    # chr, not source escapes: a lone surrogate is not encodable as UTF-8.
+    nul, lone_high, replacement = chr(0x0000), chr(0xD800), chr(0xFFFD)
+    event = create_stream_event(
+        "agent_progress",
+        int(task.id),
+        {
+            "event_id": "agent-event-dirty",
+            "message": f"head{nul}mid{lone_high}tail",
+            "expect_response": False,
+        },
+    )
+
+    _persist_agent_outbound_event(int(task.id), event)
+
+    db = SessionLocal()
+    try:
+        trace_event = (
+            db.query(DatabaseTraceEvent).filter_by(event_id="agent-event-dirty").one()
+        )
+        assert trace_event.data["message"] == f"head{replacement}mid{replacement}tail"
+    finally:
+        db.close()
+
+
 def _create_trace_handler_test_task(
     username: str,
     *,

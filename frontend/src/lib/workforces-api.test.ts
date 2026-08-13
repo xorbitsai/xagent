@@ -19,11 +19,13 @@ vi.mock("@/lib/utils", () => ({
 import {
   archiveWorkforce,
   createWorkforce,
+  deleteWorkforcePermanently,
   discardWorkforce,
   getWorkforceAgentExecution,
   listAgentOptions,
   listWorkforces,
   runWorkforce,
+  unarchiveWorkforce,
 } from "./workforces-api"
 
 function jsonResponse(data: unknown, init?: ResponseInit) {
@@ -162,6 +164,83 @@ describe("workforces-api", () => {
     await expect(archiveWorkforce(5)).rejects.toThrow(
       "Archived workforce cannot be edited",
     )
+  })
+
+  it("restores an archived workforce to draft through the unarchive endpoint", async () => {
+    apiRequestMock.mockResolvedValueOnce(jsonResponse({ id: 5, status: "draft" }))
+
+    const result = await unarchiveWorkforce(5)
+
+    expect(apiRequestMock).toHaveBeenCalledWith(
+      "http://api.local/api/workforces/5/unarchive",
+      { method: "POST" },
+    )
+    expect(result.status).toBe("draft")
+  })
+
+  it("surfaces backend detail strings when unarchive is rejected", async () => {
+    apiRequestMock.mockResolvedValueOnce(
+      jsonResponse(
+        { detail: "Only archived workforces can be unarchived" },
+        { status: 409 },
+      ),
+    )
+
+    await expect(unarchiveWorkforce(5)).rejects.toThrow(
+      "Only archived workforces can be unarchived",
+    )
+  })
+
+  it("extracts detail.message from the structured error shape when unarchive fails", async () => {
+    apiRequestMock.mockResolvedValueOnce(
+      jsonResponse(
+        { detail: { code: "workforce_unarchive_failed", message: "Failed to unarchive workforce" } },
+        { status: 500 },
+      ),
+    )
+
+    let caught: unknown
+    try {
+      await unarchiveWorkforce(5)
+    } catch (error) {
+      caught = error
+    }
+
+    expect(caught).toBeInstanceOf(Error)
+    expect((caught as Error).message).toBe("Failed to unarchive workforce")
+  })
+
+  it("permanently deletes a workforce with the ?permanent=true DELETE verb", async () => {
+    apiRequestMock.mockResolvedValueOnce(new Response(null, { status: 200 }))
+
+    await expect(deleteWorkforcePermanently(5)).resolves.toBeUndefined()
+
+    expect(apiRequestMock).toHaveBeenCalledWith(
+      "http://api.local/api/workforces/5?permanent=true",
+      { method: "DELETE" },
+    )
+  })
+
+  it("extracts detail.message from the structured error shape when permanent delete fails", async () => {
+    // toThrow(string) does a substring match, which would also pass if the
+    // whole raw JSON body leaked through unextracted -- assert the exact
+    // message instead to actually prove extraction.
+    apiRequestMock.mockResolvedValueOnce(
+      jsonResponse(
+        { detail: { code: "workforce_delete_failed", message: "Failed to delete workforce" } },
+        { status: 500 },
+      ),
+    )
+
+    let caught: unknown
+    try {
+      await deleteWorkforcePermanently(5)
+    } catch (error) {
+      caught = error
+    }
+
+    expect(caught).toBeInstanceOf(Error)
+    expect((caught as Error).message).toBe("Failed to delete workforce")
   })
 
   it("discards an eligible draft through the dedicated endpoint", async () => {

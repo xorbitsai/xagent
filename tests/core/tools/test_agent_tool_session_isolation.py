@@ -12,7 +12,10 @@ from sqlalchemy.orm import sessionmaker
 import xagent.core.tools.adapters.vibe.agent_tool as mod
 import xagent.core.tools.adapters.vibe.db_session as db_session_module
 from xagent.core.agent.result import tool_result_succeeded
-from xagent.core.tools.adapters.vibe.agent_tool import AgentTool
+from xagent.core.tools.adapters.vibe.agent_tool import (
+    _CHILD_NO_ANSWER_MESSAGE,
+    AgentTool,
+)
 from xagent.web.models.agent import Agent, AgentStatus
 from xagent.web.models.database import Base
 from xagent.web.models.model import Model
@@ -856,10 +859,10 @@ async def test_agent_tool_without_resolved_model_fails_closed(monkeypatch):
 class _StubSingleCallLLM:
     """Minimal LLM stub returning one fixed tool call from ``chat()``.
 
-    Each scenario below only needs a single LLM turn: both the
-    ``ask_user_question`` and the empty ``final_answer`` control tools end
-    the ReAct loop immediately once handled, so no follow-up response is
-    ever requested.
+    ``ask_user_question`` ends the ReAct loop immediately once handled, so
+    those scenarios only need a single turn. An empty ``final_answer`` is
+    rejected as a tool-protocol violation and re-requested once, so those
+    scenarios take two turns and get this same fixed response both times.
     """
 
     model_name = "stub-model"
@@ -977,11 +980,17 @@ async def test_agent_tool_real_child_with_empty_final_answer_fails_closed(
 ):
     """A real ReAct child that answers with an empty ``final_answer`` fails closed.
 
-    The classifier reads the child's raw ``""`` final answer directly, so
-    this scenario never touches the placeholder constants at all; it is
-    ``test_agent_tool_completed_child_without_usable_output_fails_closed``'s
-    parametrized rows (which do exercise the literal placeholder strings)
-    that serve as the drift detector for ``NO_OUTPUT_PLACEHOLDER`` /
+    ReAct now rejects an empty ``final_answer`` as a tool-protocol violation and
+    spends its one repair retry on it, so the child fails inside its own run
+    instead of reaching the parent as a ``completed`` result. It still classifies
+    as ``missing_delegated_output`` — the child never produced an answer either
+    way — but via the no-answer-status branch rather than the completed-but-empty
+    one, and the parent sees an actionable message instead of the runtime's
+    "invalid tool protocol" diagnostic.
+
+    ``test_agent_tool_completed_child_without_usable_output_fails_closed``
+    covers the completed-but-empty branch, and its parametrized rows serve as
+    the drift detector for ``NO_OUTPUT_PLACEHOLDER`` /
     ``NO_RESPONSE_PLACEHOLDER``.
     """
 
@@ -1007,22 +1016,29 @@ async def test_agent_tool_real_child_with_empty_final_answer_fails_closed(
     assert result["failure_code"] == "missing_delegated_output"
     assert result["status"] == "error"
     assert result["success"] is False
+    assert tool_result_succeeded(result) is False
+    # The child re-requested an answer once before giving up, instead of
+    # finalizing the empty one.
+    assert llm.calls == 2
+    # The parent gets an actionable message, not the child's internal
+    # "invalid tool protocol" diagnostic.
+    assert "tool protocol" not in result["output"]
+    assert result["output"] == _CHILD_NO_ANSWER_MESSAGE
 
 
 @pytest.mark.asyncio
 async def test_agent_tool_real_child_with_stale_assistant_preamble_fails_closed(
     monkeypatch, tmp_path
 ):
-    """A completed child with an empty final answer fails closed even when
-    the adapter backfilled a non-empty earlier assistant message as output.
+    """A child with an empty final answer never surfaces a stale preamble.
 
     The single LLM turn carries both a reasoning preamble (assistant
-    ``content``) and an empty ``final_answer``. ``AgentExecutionAdapter``
-    backfills the normalized ``output`` from that preamble via
-    ``_latest_assistant_message`` because the pattern's own answer is falsy
-    (execution_adapter.py:362-363, 399-409) — without reading the raw
-    ``agent_result`` envelope, the classifier would see a non-empty
-    ``output`` and let this reach the parent as a completed response.
+    ``content``) and an empty ``final_answer``. The preamble is exactly what
+    ``AgentExecutionAdapter`` would backfill as ``output`` via
+    ``_latest_assistant_message`` when the pattern's own answer is falsy, so
+    the invariant under test is that it must never reach the parent as the
+    child's answer. ReAct now rejects the empty ``final_answer`` before the run
+    can complete, so the failure is reported instead of the preamble.
     """
 
     llm = _StubSingleCallLLM(
@@ -1047,6 +1063,60 @@ async def test_agent_tool_real_child_with_stale_assistant_preamble_fails_closed(
     assert result["failure_code"] == "missing_delegated_output"
     assert result["status"] == "error"
     assert result["success"] is False
+    assert tool_result_succeeded(result) is False
+    # The invariant: the preamble must not be laundered into the child's answer.
+    assert "Let me look into that for you." not in json.dumps(
+        {key: value for key, value in result.items() if key != "agent_result"},
+        default=str,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("marker", "expects_no_answer_classification"),
+    [
+        pytest.param(True, True, id="empty-answer"),
+        pytest.param(False, False, id="other-protocol-violation"),
+    ],
+)
+async def test_agent_tool_child_protocol_failure_keeps_its_diagnostic(
+    monkeypatch, marker, expects_no_answer_classification
+):
+    """Only a genuinely unanswered child is classified as missing output.
+
+    ``invalid_tool_protocol`` also covers provider protocol errors, mixed
+    control calls, and a non-``final_answer`` tool on a forced turn, which can
+    follow a child that did produce text. For those the child's own error is the
+    parent's only way to tell "the child model misbehaved" from "the child had
+    nothing to say", so it must survive classification.
+    """
+
+    child_error = "The model returned an invalid tool protocol response."
+
+    async def execute_task():
+        return {
+            "status": "invalid_tool_protocol",
+            "success": False,
+            "error": child_error,
+            "empty_final_answer": marker,
+        }
+
+    _patch_delegated_runtime(
+        monkeypatch, execute_task, close_config=_SucceedingCloseConfig
+    )
+    tool = _delegated_agent_tool()
+    monkeypatch.setattr(tool, "_create_child_execution_tracer", lambda **_kwargs: None)
+
+    result = await tool.run_json_async({"task": "run"})
+
+    assert result["status"] == "error"
+    assert result["success"] is False
+    if expects_no_answer_classification:
+        assert result["failure_code"] == "missing_delegated_output"
+        assert child_error not in result["output"]
+    else:
+        assert "failure_code" not in result
+        assert result["output"] == child_error
 
 
 @pytest.mark.asyncio

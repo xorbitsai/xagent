@@ -158,6 +158,9 @@ vi.mock("./official-mcp-settings-dialog", () => ({
       <button type="button" onClick={() => onConnectStart(mcpOauthApp())}>
         connect-granola
       </button>
+      <button type="button" onClick={() => onConnectStart(customMcpOauthApp())}>
+        connect-records
+      </button>
       <button type="button" onClick={() => onConnectStart(keylessApp())}>
         connect-chrome
       </button>
@@ -231,6 +234,25 @@ function mcpOauthApp() {
     description: "",
     icon: "",
     is_connected: false,
+    transport: "streamable_http",
+    auth_type: "mcp_oauth",
+  }
+}
+
+// A user-added mcp_oauth MCP server whose consent was never completed: it is
+// listed under location=local with a server_id, and authorizing it must go
+// through the per-server /api/mcp/{server_id}/oauth/connect — the catalog
+// route resolves app ids only and can never see it (#1313).
+function customMcpOauthApp() {
+  return {
+    id: "records",
+    name: "records",
+    description: "",
+    icon: "",
+    is_connected: false,
+    is_custom: true,
+    is_local: true,
+    server_id: 9,
     transport: "streamable_http",
     auth_type: "mcp_oauth",
   }
@@ -509,6 +531,189 @@ describe("ConnectMcpDialog Custom API detail loading", () => {
       expect(toastErrorMock).not.toHaveBeenCalled()
     } finally {
       openSpy.mockRestore()
+    }
+  })
+
+  it("connects a custom mcp_oauth server through the per-server oauth/connect endpoint", async () => {
+    // #1313: this Connect button used to be unreachable — local entries
+    // carried no auth_type, so the dispatch fell through to the
+    // mis-authored-entry toast. With the hint in place it must also avoid
+    // the catalog route: /api/mcp/apps/{id}/oauth/connect resolves catalog
+    // app ids only and would 404 on a user-added server.
+    const popup = { closed: false, close: vi.fn(), opener: {}, location: { href: "" } }
+    const openSpy = vi.spyOn(window, "open").mockReturnValue(popup as unknown as Window)
+    try {
+      apiRequestMock.mockImplementation((url: string, options?: RequestInit) => {
+        if (url.includes("/api/mcp/apps?")) {
+          return Promise.resolve({ ok: true, json: async () => [] })
+        }
+        if (url === "http://api.local/api/mcp/9/oauth/connect") {
+          expect(options?.method).toBe("POST")
+          return Promise.resolve({
+            ok: true,
+            json: async () => ({ authorization_url: "https://auth.example.com/authorize" }),
+          })
+        }
+        throw new Error(`Unexpected request: ${url}`)
+      })
+
+      renderDialog()
+      fireEvent.click(screen.getByRole("button", { name: "connect-records" }))
+
+      await waitFor(() => {
+        expect(popup.location.href).toBe("https://auth.example.com/authorize")
+      })
+      expect(popup.close).not.toHaveBeenCalled()
+      expect(toastErrorMock).not.toHaveBeenCalled()
+    } finally {
+      openSpy.mockRestore()
+    }
+  })
+
+  it("rechecks a closed custom mcp_oauth popup against the local listing", async () => {
+    // The popup's opener link is severed, so a closed popup is ambiguous and
+    // the handler asks the backend what actually happened. A custom server
+    // only exists under location=local — querying the remote branch (as the
+    // catalog path does) would report every custom connect as a failure.
+    const popup = { closed: false, close: vi.fn(), opener: {}, location: { href: "" } }
+    const openSpy = vi.spyOn(window, "open").mockReturnValue(popup as unknown as Window)
+    const onSuccess = vi.fn()
+    let localListCalls = 0
+    try {
+      apiRequestMock.mockImplementation((url: string) => {
+        if (url === "http://api.local/api/mcp/9/oauth/connect") {
+          return Promise.resolve({
+            ok: true,
+            json: async () => ({ authorization_url: "https://auth.example.com/authorize" }),
+          })
+        }
+        if (url === "http://api.local/api/mcp/apps?location=local") {
+          localListCalls += 1
+          return Promise.resolve({
+            ok: true,
+            json: async () => [{ ...customMcpOauthApp(), is_connected: true }],
+          })
+        }
+        if (url.includes("/api/mcp/apps?")) {
+          return Promise.resolve({ ok: true, json: async () => [] })
+        }
+        throw new Error(`Unexpected request: ${url}`)
+      })
+
+      render(
+        <ConnectMcpDialog
+          open
+          onOpenChange={vi.fn()}
+          selectedMcpServers={selectedMcpServers}
+          onSuccess={onSuccess}
+        />,
+      )
+
+      // Fake timers only from here on: the poll's setInterval must be created
+      // under them to be advanceable, and @testing-library's async queries
+      // hang once they are active.
+      vi.useFakeTimers()
+      await act(async () => {
+        fireEvent.click(screen.getByRole("button", { name: "connect-records" }))
+      })
+
+      popup.closed = true
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(500)
+      })
+
+      expect(localListCalls).toBe(1)
+      expect(onSuccess).toHaveBeenCalled()
+    } finally {
+      openSpy.mockRestore()
+      vi.useRealTimers()
+    }
+  })
+
+  // Pins the ordering the F5 fix depends on: a dialog close must beat a
+  // still-in-flight connect POST that resolves afterwards. isMountedRef
+  // alone cannot see this — it only flips false on unmount, and both real
+  // consumers of this dialog keep the component mounted across open/close
+  // (only the `open` prop toggles), so isMountedRef.current is still true
+  // here. Before the fix, that made the post-await guard pass regardless of
+  // the close, registering a poll after clearMcpOauthPollState() had already
+  // run — a poll nothing would ever clear, which would go on to recheck
+  // location=local and fire onSuccess against a dialog the user already
+  // closed.
+  it("skips registering a poll when the dialog closes before the connect POST resolves", async () => {
+    const popup = { closed: false, close: vi.fn(), opener: {}, location: { href: "" } }
+    const openSpy = vi.spyOn(window, "open").mockReturnValue(popup as unknown as Window)
+    const onSuccess = vi.fn()
+    let localListCalls = 0
+    const connectResponse = deferred<{ ok: boolean; json: () => Promise<{ authorization_url: string }> }>()
+    try {
+      apiRequestMock.mockImplementation((url: string) => {
+        if (url === "http://api.local/api/mcp/9/oauth/connect") {
+          return connectResponse.promise
+        }
+        if (url === "http://api.local/api/mcp/apps?location=local") {
+          localListCalls += 1
+          return Promise.resolve({ ok: true, json: async () => [] })
+        }
+        if (url.includes("/api/mcp/apps?")) {
+          return Promise.resolve({ ok: true, json: async () => [] })
+        }
+        throw new Error(`Unexpected request: ${url}`)
+      })
+
+      const { rerender } = render(
+        <ConnectMcpDialog
+          open
+          onOpenChange={vi.fn()}
+          selectedMcpServers={selectedMcpServers}
+          onSuccess={onSuccess}
+        />,
+      )
+
+      // Fake timers from here on, same as the recheck test above: the poll's
+      // setInterval (if one is wrongly registered) must be created under
+      // them to be advanceable, and this test issues no further async
+      // queries that would hang once they are active.
+      vi.useFakeTimers()
+
+      await act(async () => {
+        fireEvent.click(screen.getByRole("button", { name: "connect-records" }))
+      })
+
+      // Close the dialog while the connect POST above is still unresolved —
+      // only the `open` prop changes, so the component itself stays mounted
+      // and isMountedRef never flips. This is what runs
+      // clearMcpOauthPollState() and bumps the generation counter, ahead of
+      // the POST settling.
+      await act(async () => {
+        rerender(
+          <ConnectMcpDialog
+            open={false}
+            onOpenChange={vi.fn()}
+            selectedMcpServers={selectedMcpServers}
+            onSuccess={onSuccess}
+          />,
+        )
+      })
+
+      await act(async () => {
+        connectResponse.resolve({
+          ok: true,
+          json: async () => ({ authorization_url: "https://auth.example.com/authorize" }),
+        })
+        await connectResponse.promise
+      })
+
+      popup.closed = true
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(500)
+      })
+
+      expect(localListCalls).toBe(0)
+      expect(onSuccess).not.toHaveBeenCalled()
+    } finally {
+      openSpy.mockRestore()
+      vi.useRealTimers()
     }
   })
 

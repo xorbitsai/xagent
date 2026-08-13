@@ -35,7 +35,11 @@ from .components import (
     WorkspaceComponent,
     clone_component,
 )
-from .enrichment import MEMORY_CONTEXT_METADATA_KEY, SKILL_CONTEXT_METADATA_KEY
+from .enrichment import (
+    IMAGE_EDIT_UNAVAILABLE_METADATA_KEY,
+    MEMORY_CONTEXT_METADATA_KEY,
+    SKILL_CONTEXT_METADATA_KEY,
+)
 from .memory_tool import MEMORY_TOOLS_METADATA_KEY
 from .message import LLMCallRecord, Message
 from .skill_tool import (
@@ -606,6 +610,24 @@ class ExecutionContext:
                 "Selected skill guidance. Use it when relevant to the current task:\n"
                 f"{str(skill_context).strip()}"
             )
+            # Skill text is injected verbatim and cannot know which tools were
+            # registered, so the correction has to come after it.
+            if (
+                self.metadata.get(IMAGE_EDIT_UNAVAILABLE_METADATA_KEY)
+                and "edit_image" in str(skill_context).lower()
+            ):
+                # Last sentence pair mirrors the capability prefix in
+                # tools/adapters/vibe/image_tool.py; edit both together.
+                parts.append(
+                    "Correction to the skill guidance above: image editing is "
+                    "unavailable here. edit_image is not in your tools, and "
+                    "passing images to generate_image routes into the same "
+                    "absent edit path. Ignore any instruction to edit an "
+                    "existing image or to attach a reference through images; "
+                    "render each deliverable from a text prompt in one call, "
+                    "and describe in the prompt what a reference would have "
+                    "contributed."
+                )
         return "\n\n".join(part for part in parts if part.strip())
 
     def get_recent_messages(self, n: int = 10) -> list[Message]:

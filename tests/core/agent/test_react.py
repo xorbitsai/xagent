@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import re
 from types import SimpleNamespace
 from typing import Any
@@ -18,6 +19,7 @@ from xagent.core.agent import (
     ToolCallInterrupted,
     ToolCallRecord,
 )
+from xagent.core.agent.result import tool_result_succeeded
 from xagent.core.model.chat.basic.router import RouterLLM
 from xagent.core.model.chat.exceptions import LLMToolProtocolError
 from xagent.core.model.chat.tool_protocol import (
@@ -5115,3 +5117,640 @@ async def test_final_answer_preserves_semantic_completion_outcome() -> None:
     assert result["success"] is True
     assert result["status"] == "completed"
     assert result["completion_outcome"] == "partial"
+
+
+class StreamingEmptyFinalAnswerLLM:
+    """Calls ``final_answer`` with an unusable answer, then optionally recovers.
+
+    Models the two observed shapes of xorbitsai/xagent#1312: an arguments object
+    that omits ``answer`` entirely (truncated output), and an arguments payload
+    that fails JSON parsing.
+    """
+
+    RECOVERED_ARGUMENTS = (
+        '{"response_language":"English","answer":"The result is 4.",'
+        '"outcome":"completed"}'
+    )
+
+    def __init__(
+        self,
+        *,
+        recover: bool = True,
+        broken_arguments: str = '{"response_language":"English","outcome":"completed"}',
+        preamble: str = "",
+    ) -> None:
+        self.recover = recover
+        self.broken_arguments = broken_arguments
+        self.preamble = preamble
+        self.stream_calls: list[dict[str, Any]] = []
+
+    async def chat(self, **kwargs: Any) -> Any:
+        raise AssertionError("empty final answer path should stay streaming")
+
+    async def stream_chat(
+        self, messages: list[dict[str, Any]] | None = None, **kwargs: Any
+    ) -> Any:
+        if messages is not None:
+            kwargs["messages"] = messages
+        self.stream_calls.append(kwargs)
+        call_index = len(self.stream_calls) - 1
+        arguments = (
+            self.RECOVERED_ARGUMENTS
+            if call_index > 0 and self.recover
+            else self.broken_arguments
+        )
+        if self.preamble:
+            yield StreamChunk(type=ChunkType.TOKEN, delta=self.preamble)
+        yield StreamChunk(
+            type=ChunkType.TOOL_CALL,
+            tool_calls=[
+                {
+                    "id": f"call_final_{call_index}",
+                    "function": {"name": "final_answer", "arguments": arguments},
+                }
+            ],
+        )
+        yield StreamChunk(type=ChunkType.END)
+
+
+def _react_empty_final_answer_fixture() -> tuple[
+    ReActPattern,
+    ExecutionContext,
+    PatternRuntime,
+    OutboundCollector,
+    TraceEventRecorder,
+]:
+    pattern = ReActPattern(max_iterations=3)
+    context = ExecutionContext(system_prompt="You are helpful.", execution_id="task-1")
+    context.add_user_message("What is 2+2?")
+    outbound = OutboundCollector()
+    tracer = TraceEventRecorder()
+    runtime = PatternRuntime(
+        execution_id="task-1",
+        tracer=tracer,
+        outbound_message_handler=outbound,
+    )
+    return pattern, context, runtime, outbound, tracer
+
+
+@pytest.mark.asyncio
+async def test_react_retries_final_answer_that_omits_the_answer_field() -> None:
+    llm = StreamingEmptyFinalAnswerLLM()
+    pattern, context, runtime, outbound, tracer = _react_empty_final_answer_fixture()
+
+    result = await pattern.run(
+        context=context,
+        tools=[FakeTool()],
+        llm=llm,
+        runtime=runtime,
+    )
+
+    assert result["success"] is True
+    assert result["response"] == "The result is 4."
+    assert len(llm.stream_calls) == 2
+
+    retry_starts = [
+        event
+        for event in tracer.events
+        if event["event_type"] == "action_start_llm"
+        and event["data"].get("phase") == "empty_final_answer_recovery"
+    ]
+    assert len(retry_starts) == 1
+    assert retry_starts[0]["data"]["recovery_reason"] == "empty_final_answer"
+
+    # The discarded turn must not leak a partial stream to the user.
+    assert [event["type"] for event in outbound.events] == [
+        "final_answer_start",
+        "final_answer_delta",
+        "final_answer_end",
+    ]
+    assert outbound.events[-1]["content"] == "The result is 4."
+
+
+@pytest.mark.asyncio
+async def test_react_fails_when_final_answer_stays_empty_after_retry(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    llm = StreamingEmptyFinalAnswerLLM(recover=False)
+    pattern, context, runtime, outbound, tracer = _react_empty_final_answer_fixture()
+
+    with caplog.at_level(
+        logging.WARNING, logger="xagent.core.agent.pattern.react.react"
+    ):
+        result = await pattern.run(
+            context=context,
+            tools=[FakeTool()],
+            llm=llm,
+            runtime=runtime,
+        )
+
+    # The core regression: an empty answer must never finalize as success with
+    # the "No output provided" placeholder.
+    assert result["success"] is False
+    assert result["status"] == "invalid_tool_protocol"
+    assert "output" not in result
+    assert len(llm.stream_calls) == 2
+    assert outbound.events == []
+
+    discarded = [
+        event["data"]["phase"]
+        for event in tracer.events
+        if event["event_type"] == "action_end_llm"
+        and event["data"].get("success") is False
+    ]
+    assert discarded == [
+        "discarded_invalid_tool_protocol",
+        "discarded_invalid_tool_protocol_retry",
+    ]
+
+    # Neither condition was logged before this fix, leaving nothing to debug from.
+    messages = [record.getMessage() for record in caplog.records]
+    assert any("final_answer carried no answer text" in m for m in messages)
+    assert any(
+        "invalid tool protocol after retry" in m and "failing the run" in m
+        for m in messages
+    )
+
+
+@pytest.mark.asyncio
+async def test_react_retries_final_answer_with_malformed_arguments() -> None:
+    llm = StreamingEmptyFinalAnswerLLM(
+        broken_arguments='{"response_language":"English","answer":"The res',
+    )
+    pattern, context, runtime, outbound, _tracer = _react_empty_final_answer_fixture()
+
+    result = await pattern.run(
+        context=context,
+        tools=[FakeTool()],
+        llm=llm,
+        runtime=runtime,
+    )
+
+    assert result["success"] is True
+    assert result["response"] == "The result is 4."
+    assert len(llm.stream_calls) == 2
+    # Truncated arguments can stream a partial answer before the call is
+    # rejected. That partial is closed with an error and superseded by a fresh
+    # stream, matching how the pattern already handles a protocol retry - the
+    # point is that the run ends with a real answer instead of nothing.
+    assert [event["type"] for event in outbound.events] == [
+        "final_answer_start",
+        "final_answer_delta",
+        "final_answer_error",
+        "final_answer_start",
+        "final_answer_delta",
+        "final_answer_end",
+    ]
+    assert outbound.events[-1]["content"] == "The result is 4."
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "blank_answer",
+    [
+        pytest.param({}, id="missing"),
+        pytest.param({"answer": ""}, id="empty-string"),
+        pytest.param({"answer": "   \n"}, id="whitespace"),
+        # ``str(None)`` is the literal "None", which would sail past a naive
+        # ``str(args.get("answer", "")).strip()`` check and be finalized as the
+        # user-facing answer.
+        pytest.param({"answer": None}, id="none"),
+    ],
+)
+async def test_react_re_requests_final_answer_for_resumed_empty_pending_call(
+    blank_answer: dict[str, Any],
+) -> None:
+    """A pending call restored from a checkpoint bypasses response normalization."""
+
+    llm = StreamingEmptyFinalAnswerLLM()
+    pattern, context, runtime, _outbound, _tracer = _react_empty_final_answer_fixture()
+    pattern.status = "acting"
+    pattern.pending_tool_calls = [
+        {
+            "id": "call_resumed",
+            "name": "final_answer",
+            "args": {
+                "response_language": "English",
+                "outcome": "completed",
+                **blank_answer,
+            },
+        }
+    ]
+
+    result = await pattern.run(
+        context=context,
+        tools=[FakeTool()],
+        llm=llm,
+        runtime=runtime,
+    )
+
+    assert result["success"] is True
+    assert result["response"] == "The result is 4."
+    assert pattern.tool_ledger["call_resumed"].status == "failed"
+    assert pattern.pending_tool_calls == []
+    # The next turn is forced back to final_answer only.
+    assert [
+        tool["function"]["name"] for tool in llm.stream_calls[0].get("tools") or []
+    ] == ["final_answer"]
+
+
+def test_final_answer_text_treats_none_as_absent() -> None:
+    """One coercion for both the protocol check and finalization.
+
+    ``str(None)`` is the literal "None"; if the two sites coerce independently
+    they drift, and a null answer gets finalized as the string "None".
+    """
+
+    pattern = ReActPattern()
+
+    assert pattern._final_answer_text({"answer": None}) == ""
+    assert pattern._final_answer_text({}) == ""
+    assert pattern._final_answer_text(None) == ""
+    assert pattern._final_answer_text({"answer": ""}) == ""
+    assert pattern._final_answer_text({"answer": "  hi  "}) == "  hi  "
+    assert pattern._final_answer_text({"answer": 0}) == "0"
+
+
+def test_coerce_arguments_drops_unusable_control_tool_payloads() -> None:
+    pattern = ReActPattern()
+
+    # Work tools keep the opaque passthrough so existing behavior is unchanged.
+    assert pattern._coerce_arguments("not json", tool_name="calculator") == {
+        "input": "not json"
+    }
+    assert pattern._coerce_arguments("[1, 2]", tool_name="calculator") == {
+        "input": [1, 2]
+    }
+
+    # Control tools must not smuggle a malformed payload through as ``input``,
+    # which would silently strip ``answer`` and finalize with nothing to show.
+    assert pattern._coerce_arguments("not json", tool_name="final_answer") == {}
+    assert pattern._coerce_arguments('"just a string"', tool_name="final_answer") == {}
+    assert pattern._coerce_arguments("not json", tool_name="send_message") == {}
+
+    # Well-formed payloads are untouched.
+    assert pattern._coerce_arguments('{"answer":"hi"}', tool_name="final_answer") == {
+        "answer": "hi"
+    }
+
+
+def test_empty_final_answer_call_detects_blank_answers() -> None:
+    pattern = ReActPattern()
+
+    def normalized(args: Any) -> dict[str, Any]:
+        return {"tool_calls": [{"id": "c1", "name": "final_answer", "args": args}]}
+
+    assert pattern._empty_final_answer_call(normalized({})) is not None
+    assert pattern._empty_final_answer_call(normalized({"answer": ""})) is not None
+    assert pattern._empty_final_answer_call(normalized({"answer": "  \n"})) is not None
+    assert pattern._empty_final_answer_call(normalized({"answer": None})) is not None
+    assert pattern._empty_final_answer_call(normalized({"answer": "done"})) is None
+    # Coercion must match ``_handle_control_tool``, which stringifies the value,
+    # so a scalar answer is not mistaken for a missing one.
+    assert pattern._empty_final_answer_call(normalized({"answer": 0})) is None
+    assert pattern._empty_final_answer_call({"tool_calls": []}) is None
+    assert (
+        pattern._empty_final_answer_call(
+            {"tool_calls": [{"id": "c1", "name": "calculator", "args": {}}]}
+        )
+        is None
+    )
+
+
+@pytest.mark.asyncio
+async def test_react_discards_rest_of_resumed_batch_after_empty_final_answer() -> None:
+    """A rejected resume batch must not run work the fresh path would discard.
+
+    The fresh-turn path throws away the whole offending response, so a
+    ``[final_answer(""), work_tool]`` batch never executes the work tool. A
+    resumed batch has to match, or a pre-fix checkpoint replays a side effect
+    that the same model output would never have produced on a live turn.
+    """
+
+    llm = StreamingEmptyFinalAnswerLLM()
+    pattern, context, runtime, _outbound, _tracer = _react_empty_final_answer_fixture()
+    tool = FakeTool()
+    pattern.status = "acting"
+    pattern.pending_tool_calls = [
+        {
+            "id": "call_resumed",
+            "name": "final_answer",
+            "args": {"response_language": "English", "outcome": "completed"},
+        },
+        {"id": "call_work", "name": "calculator", "args": {"expression": "2+2"}},
+    ]
+
+    result = await pattern.run(
+        context=context,
+        tools=[tool],
+        llm=llm,
+        runtime=runtime,
+    )
+
+    assert result["success"] is True
+    assert result["response"] == "The result is 4."
+    # The side-effecting tool never ran.
+    assert tool.calls == []
+    # I2: the abandoned call still got exactly one result.
+    assert pattern.tool_ledger["call_work"].status == "cancelled"
+    assert pattern.tool_ledger["call_resumed"].status == "failed"
+    assert pattern.pending_tool_calls == []
+
+
+@pytest.mark.asyncio
+async def test_react_finalizes_a_scalar_zero_answer() -> None:
+    """``answer=0`` is an answer, not an absent one.
+
+    The empty check coerces before testing, so a falsy scalar must survive the
+    guard and reach the user rather than being rejected as blank.
+    """
+
+    llm = StreamingEmptyFinalAnswerLLM(
+        broken_arguments='{"response_language":"English","answer":0,"outcome":"completed"}',
+    )
+    pattern, context, runtime, _outbound, _tracer = _react_empty_final_answer_fixture()
+
+    result = await pattern.run(
+        context=context,
+        tools=[FakeTool()],
+        llm=llm,
+        runtime=runtime,
+    )
+
+    assert result["success"] is True
+    assert result["response"] == "0"
+    # Accepted on the first turn: no repair retry was spent.
+    assert len(llm.stream_calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_react_marks_the_abandoned_run_when_the_answer_stayed_empty() -> None:
+    """The abandoned result distinguishes "never answered" from other violations.
+
+    ``invalid_tool_protocol`` also covers provider protocol errors, mixed control
+    calls, and a non-``final_answer`` tool on a forced turn. Delegated-child
+    classification reads this marker so it does not collapse all of them into
+    "never produced an answer" and discard the child's own diagnostic.
+    """
+
+    llm = StreamingEmptyFinalAnswerLLM(recover=False)
+    pattern, context, runtime, _outbound, _tracer = _react_empty_final_answer_fixture()
+
+    result = await pattern.run(
+        context=context,
+        tools=[FakeTool()],
+        llm=llm,
+        runtime=runtime,
+    )
+
+    assert result["success"] is False
+    assert result["status"] == "invalid_tool_protocol"
+    assert result["empty_final_answer"] is True
+    assert "final_answer without an answer" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_react_does_not_mark_other_tool_protocol_violations() -> None:
+    """A non-empty-answer violation keeps the generic error and no marker."""
+
+    llm = StreamingInvalidToolProtocolFinalAnswerLLM(
+        structured_work_tool=True,
+        invalid_retry=True,
+    )
+    pattern = ReActPattern(max_iterations=3, finalize_after_tool_result=True)
+    context = ExecutionContext(system_prompt="You are helpful.", execution_id="task-1")
+    context.add_user_message("Find an audio clip")
+    runtime = PatternRuntime(execution_id="task-1")
+
+    result = await pattern.run(
+        context=context,
+        tools=[FakeTool()],
+        llm=llm,
+        runtime=runtime,
+    )
+
+    assert result["success"] is False
+    assert result["status"] == "invalid_tool_protocol"
+    assert result["empty_final_answer"] is False
+    assert "invalid tool protocol response" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_react_resumed_empty_final_answer_survives_a_state_roundtrip() -> None:
+    """The post-rejection state is recoverable through the real mechanism.
+
+    The guard exists for checkpoint resumes, so the rejection it performs has to
+    survive ``get_state``/``load_state`` rather than only an in-process mutation.
+    """
+
+    pattern = ReActPattern(max_iterations=3)
+    pattern.status = "acting"
+    pattern.pending_tool_calls = [
+        {
+            "id": "call_resumed",
+            "name": "final_answer",
+            "args": {"response_language": "English", "outcome": "completed"},
+        }
+    ]
+
+    resumed = ReActPattern(max_iterations=3)
+    resumed.load_state(pattern.get_state())
+    assert resumed.pending_tool_calls == pattern.pending_tool_calls
+
+    llm = StreamingEmptyFinalAnswerLLM()
+    context = ExecutionContext(system_prompt="You are helpful.", execution_id="task-1")
+    context.add_user_message("What is 2+2?")
+    result = await resumed.run(
+        context=context,
+        tools=[FakeTool()],
+        llm=llm,
+        runtime=PatternRuntime(execution_id="task-1"),
+    )
+
+    assert result["success"] is True
+    assert result["response"] == "The result is 4."
+
+    # The forcing the rejection installed is itself serializable, which is what a
+    # crash between the rejection and the next turn would depend on.
+    carried = ReActPattern()
+    carried.load_state(resumed.get_state())
+    assert carried.force_final_answer_next is False  # cleared once answered
+    assert carried.tool_ledger["call_resumed"].status == "failed"
+
+
+@pytest.mark.asyncio
+async def test_react_resumed_empty_final_answer_abandons_after_forced_retry() -> None:
+    """resume -> reject -> forced turn -> empty -> in-turn retry -> abandon."""
+
+    llm = StreamingEmptyFinalAnswerLLM(recover=False)
+    pattern, context, runtime, _outbound, _tracer = _react_empty_final_answer_fixture()
+    pattern.status = "acting"
+    pattern.pending_tool_calls = [
+        {
+            "id": "call_resumed",
+            "name": "final_answer",
+            "args": {"response_language": "English", "outcome": "completed"},
+        }
+    ]
+
+    result = await pattern.run(
+        context=context,
+        tools=[FakeTool()],
+        llm=llm,
+        runtime=runtime,
+    )
+
+    assert result["success"] is False
+    assert result["status"] == "invalid_tool_protocol"
+    assert result["empty_final_answer"] is True
+    assert pattern.pending_tool_calls == []
+    # The forced turn plus its one in-turn repair attempt, and no more.
+    assert len(llm.stream_calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_react_resumed_reverse_batch_order_cannot_undo_an_executed_tool() -> None:
+    """Pins the documented limit of the resume guard's batch discard.
+
+    In ``[work_tool, final_answer("")]`` the work tool has already executed by
+    the time the rejection runs, so the match with the fresh path's
+    whole-response rejection is exact only when the empty answer comes first.
+    """
+
+    llm = StreamingEmptyFinalAnswerLLM()
+    tool = FakeTool()
+    pattern, context, runtime, _outbound, _tracer = _react_empty_final_answer_fixture()
+    pattern.status = "acting"
+    pattern.pending_tool_calls = [
+        {"id": "call_work", "name": "calculator", "args": {"expression": "2+2"}},
+        {
+            "id": "call_resumed",
+            "name": "final_answer",
+            "args": {"response_language": "English", "outcome": "completed"},
+        },
+    ]
+
+    result = await pattern.run(
+        context=context,
+        tools=[tool],
+        llm=llm,
+        runtime=runtime,
+    )
+
+    assert result["success"] is True
+    # The work tool ran: the rejection cannot reach back past it.
+    assert tool.calls == [{"expression": "2+2"}]
+    assert pattern.tool_ledger["call_work"].status == "completed"
+    assert pattern.tool_ledger["call_resumed"].status == "failed"
+
+
+def test_rejected_empty_final_answer_is_recorded_as_a_failure() -> None:
+    """The rejection must not read back as a successful tool result."""
+
+    pattern = ReActPattern()
+    context = ExecutionContext(system_prompt="You are helpful.", execution_id="task-1")
+    context.add_user_message("What is 2+2?")
+    tool_call = {"id": "call_1", "name": "final_answer", "args": {"answer": ""}}
+    pattern.pending_tool_calls = [tool_call]
+
+    pattern._reject_empty_final_answer(tool_call, context)
+
+    recorded = pattern.tool_ledger["call_1"]
+    assert recorded.status == "failed"
+    # The recorded result carries the keys ``tool_result_succeeded`` reads, so a
+    # consumer cannot read this failure back as a success.
+    assert tool_result_succeeded(recorded.result) is False
+    # Same shape as the cancelled siblings, so the ledger is uniform.
+    assert recorded.result["status"] == "error"
+    tool_messages = [m for m in context.messages if getattr(m, "role", None) == "tool"]
+    assert "empty answer" in tool_messages[-1].content
+
+
+def test_reject_empty_final_answer_tolerates_non_string_arg_keys() -> None:
+    """Log formatting must not abort the run it is diagnosing.
+
+    ``sorted`` over mixed-type keys raises ``TypeError``, and ``run()`` re-raises
+    from its ``except``, so an unsortable payload would fail the run at exactly
+    the point this guard exists to recover from.
+    """
+
+    pattern = ReActPattern()
+    context = ExecutionContext(system_prompt="You are helpful.", execution_id="task-1")
+    context.add_user_message("What is 2+2?")
+    tool_call = {
+        "id": "call_1",
+        "name": "final_answer",
+        "args": {"answer": "", 1: "numeric", None: "null"},
+    }
+    pattern.pending_tool_calls = [tool_call]
+
+    pattern._reject_empty_final_answer(tool_call, context)
+
+    assert pattern.force_final_answer_next is True
+
+
+@pytest.mark.asyncio
+async def test_react_discards_the_preamble_with_the_rejected_response() -> None:
+    """Pins the documented cost of whole-response rejection.
+
+    The preamble arrived attached to a protocol violation, so it is not a vetted
+    answer and is dropped with the response rather than replayed into the retry.
+    A model that recovers supersedes it; one that repeats the pattern fails the
+    run and the preamble is never shown.
+    """
+
+    llm = StreamingEmptyFinalAnswerLLM(preamble="Let me look into that.")
+    pattern, context, runtime, outbound, _tracer = _react_empty_final_answer_fixture()
+
+    result = await pattern.run(
+        context=context,
+        tools=[FakeTool()],
+        llm=llm,
+        runtime=runtime,
+    )
+
+    assert result["success"] is True
+    assert result["response"] == "The result is 4."
+    assert "Let me look into that." not in str(result["response"])
+    assert all(
+        "Let me look into that." not in str(event.get("content") or event.get("delta"))
+        for event in outbound.events
+    )
+
+
+@pytest.mark.parametrize(
+    ("tool_names", "unavailable"),
+    [
+        (["generate_image", "list_image_models"], True),
+        (["generate_image", "edit_image"], False),
+        (["list_image_models"], False),
+        (["web_search"], False),
+    ],
+)
+@pytest.mark.asyncio
+async def test_run_flags_missing_image_editing_and_renders_the_correction(
+    tool_names: list[str], unavailable: bool
+) -> None:
+    from xagent.core.agent.context.enrichment import (
+        IMAGE_EDIT_UNAVAILABLE_METADATA_KEY,
+        SKILL_CONTEXT_METADATA_KEY,
+    )
+
+    from .concurrency_harness import FakeTool as NamedFakeTool
+
+    llm = FakeLLM(responses=[{"content": "done", "done": True}])
+    pattern = ReActPattern(max_iterations=2)
+    context = ExecutionContext(system_prompt="You are helpful.")
+    context.metadata[SKILL_CONTEXT_METADATA_KEY] = "Use `edit_image` to refine."
+    context.add_user_message("make an ad")
+
+    await pattern.run(
+        context=context,
+        tools=[NamedFakeTool(name) for name in tool_names],
+        llm=llm,
+    )
+
+    assert context.metadata[IMAGE_EDIT_UNAVAILABLE_METADATA_KEY] is unavailable
+    rendered = llm.calls[0]["messages"][0]["content"]
+    assert ("image editing is unavailable here" in rendered) is unavailable
+    assert ("attach a reference through images" in rendered) is unavailable

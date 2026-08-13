@@ -11,10 +11,13 @@ from __future__ import annotations
 
 import asyncio
 import io
+from pathlib import Path
 from typing import Any
 
 import pytest
 
+from xagent.core.tools.core.workspace_file_tool import WorkspaceFileOperations
+from xagent.core.workspace import TaskWorkspace
 from xagent.web.models.agent import Agent, AgentStatus
 from xagent.web.models.deployment import Deployment, DeploymentOwnerType
 from xagent.web.models.task import Task, TaskStatus
@@ -443,6 +446,7 @@ def test_share_task_create_starts_workforce_run(
         assert task.source == "shared_link"
         assert bool(task.is_visible) is False
         assert int(task.user_id) == _user_id()
+        assert task.agent_config.get("__xagent_file_operation_access_version") == 1
 
         run = db.query(WorkforceRun).filter(WorkforceRun.task_id == task_id).one()
         assert int(run.workforce_id) == workforce_id
@@ -552,6 +556,7 @@ def test_share_guest_can_upload_to_own_shared_task(
 
 def test_workforce_share_first_turn_attachments_reach_run(
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
 ) -> None:
     """M1: opening-message files are uploaded task-lessly, then threaded into
     the run's task so the very first turn actually sees them."""
@@ -593,7 +598,26 @@ def test_workforce_share_first_turn_attachments_reach_run(
     db = _direct_db_session()
     try:
         bound = db.query(UploadedFile).filter(UploadedFile.file_id == file_id).one()
+        task = db.query(Task).filter(Task.id == task_id).one()
         assert bound.task_id == task_id
+        assert task.agent_config.get("__xagent_file_operation_access_version") == 1
+
+        workspace = TaskWorkspace(
+            id="agent_1_first_turn",
+            base_dir=str(tmp_path / "workspaces"),
+            allowed_external_dirs=[str(Path(bound.storage_path).parent)],
+            db_task_id=task_id,
+        )
+        workspace.owner_user_id = int(task.user_id)
+        workspace.file_operation_access_version = 1
+        # File Operation runs in a worker thread and deliberately ignores
+        # caller-bound ORM sessions. Point its operation-local session factory
+        # at this test's temporary application database instead.
+        monkeypatch.setattr(
+            "xagent.core.storage.manager.create_db_session",
+            _direct_db_session,
+        )
+        assert WorkspaceFileOperations(workspace).read_file(file_id) == "trip brief"
     finally:
         db.close()
 

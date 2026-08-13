@@ -36,6 +36,7 @@ import copy
 import hashlib
 import inspect
 import json
+import logging
 from dataclasses import dataclass, replace
 from datetime import timezone
 from enum import Enum
@@ -49,6 +50,7 @@ from ....tools.user_interaction import (
 )
 from ...clarification import draft_from_waiting_request
 from ...context.enrichment import (
+    IMAGE_EDIT_UNAVAILABLE_METADATA_KEY,
     enrich_context_with_memory,
     latest_user_text,
 )
@@ -71,6 +73,8 @@ from ...runtime import (
 )
 from ..base import AgentPattern, PatternResult, truncate_prompt_preview
 from ..final_answer_stream import ReActFinalAnswerStreamer
+
+logger = logging.getLogger(__name__)
 
 
 class ReActReasoningMode(str, Enum):
@@ -386,6 +390,11 @@ class ReActPattern(AgentPattern):
     ) -> dict[str, Any]:
         self.status = "thinking"
         self._tool_decision_groups_by_name = self._tool_decision_groups_for_tools(tools)
+        # Read by get_system_context to contradict skill text naming edit_image.
+        context.metadata[IMAGE_EDIT_UNAVAILABLE_METADATA_KEY] = (
+            "generate_image" in self._tool_decision_groups_by_name
+            and "edit_image" not in self._tool_decision_groups_by_name
+        )
         base_tool_schemas = (
             []
             if self.tool_choice == "none"
@@ -583,13 +592,38 @@ class ReActPattern(AgentPattern):
                         iteration=iteration,
                         answer_streamer=answer_streamer,
                         stream_failure_message=("invalid tool protocol after recovery"),
+                        empty_final_answer=(
+                            self._empty_final_answer_call(normalized) is not None
+                        ),
                     )
                 if answer_streamer is not None:
                     await answer_streamer.fail("invalid tool protocol, retrying")
+                # Rejecting the whole response drops any assistant preamble it
+                # carried: the response is discarded before ``add_assistant_message``,
+                # so the retry rebuilds from context without it. Deliberate - the
+                # preamble arrived attached to a protocol violation, so it is not a
+                # vetted user-facing answer, and replaying the model's own discarded
+                # prose invites it to treat that text as already committed. The cost
+                # is that a model which keeps emitting "preamble + empty answer"
+                # fails the run without the user seeing the preamble.
                 recover_full_tool_set = self._requires_full_tool_set_recovery(
                     normalized,
                     force_final_answer=force_final_answer_now,
                 )
+                empty_final_answer = self._empty_final_answer_call(normalized)
+                if empty_final_answer is not None:
+                    logger.warning(
+                        "ReAct final_answer carried no answer text; discarding the "
+                        "response and retrying. iteration=%s arg_keys=%s",
+                        iteration,
+                        sorted(self._tool_call_args_dict(empty_final_answer), key=str),
+                    )
+                if recover_full_tool_set:
+                    recovery_reason: str | None = "unavailable_tool_call"
+                elif empty_final_answer is not None:
+                    recovery_reason = "empty_final_answer"
+                else:
+                    recovery_reason = None
                 try:
                     (
                         response,
@@ -603,9 +637,8 @@ class ReActPattern(AgentPattern):
                         force_final_answer=(
                             force_final_answer_now and not recover_full_tool_set
                         ),
-                        recovery_reason=(
-                            "unavailable_tool_call" if recover_full_tool_set else None
-                        ),
+                        recovery_reason=recovery_reason,
+                        empty_final_answer=empty_final_answer is not None,
                     )
                 except LLMCallInterrupted:
                     interrupted = await self._interrupt_if_requested(
@@ -632,6 +665,9 @@ class ReActPattern(AgentPattern):
                         iteration=iteration,
                         answer_streamer=answer_streamer,
                         stream_failure_message="invalid tool protocol after retry",
+                        empty_final_answer=(
+                            self._empty_final_answer_call(normalized) is not None
+                        ),
                     )
             if force_final_answer_now and not normalized.get("tool_calls"):
                 normalized["done"] = True
@@ -698,7 +734,25 @@ class ReActPattern(AgentPattern):
         iteration: int,
         answer_streamer: ReActFinalAnswerStreamer | None,
         stream_failure_message: str,
+        empty_final_answer: bool = False,
     ) -> dict[str, Any]:
+        """Abandon the run after the one repair attempt failed.
+
+        ``empty_final_answer`` distinguishes "the model never produced an answer"
+        from the status's other producers (provider protocol errors, mixed
+        control calls, a non-``final_answer`` tool on a forced turn), whose
+        ``error`` text is the only signal a caller has. Delegated-child
+        classification reads it to avoid collapsing all four into "never
+        produced an answer" - see ``agent_tool._classify_delegated_failure``.
+        """
+
+        logger.warning(
+            "ReAct failing the run after an invalid tool protocol: %s "
+            "(iteration=%s empty_final_answer=%s)",
+            stream_failure_message,
+            iteration,
+            empty_final_answer,
+        )
         if answer_streamer is not None:
             await answer_streamer.fail(stream_failure_message)
         await runtime.checkpoint(
@@ -707,15 +761,20 @@ class ReActPattern(AgentPattern):
             pattern=self,
             metadata={"iteration": iteration},
         )
+        error = (
+            "The model called final_answer without an answer twice, so the run "
+            "produced no response."
+            if empty_final_answer
+            else "The model returned an invalid tool protocol response "
+            "after one repair attempt."
+        )
         return PatternResult(
             success=False,
-            error=(
-                "The model returned an invalid tool protocol response "
-                "after one repair attempt."
-            ),
+            error=error,
             metadata={
                 "iterations": iteration + 1,
                 "status": "invalid_tool_protocol",
+                "empty_final_answer": empty_final_answer,
             },
         ).to_dict()
 
@@ -744,7 +803,7 @@ class ReActPattern(AgentPattern):
                 continue
             args = tool_call.get("args")
             if isinstance(args, dict):
-                return str(args.get("answer", ""))
+                return self._final_answer_text(args)
         return None
 
     def _messages_for_llm(
@@ -834,6 +893,7 @@ class ReActPattern(AgentPattern):
         tool_schemas: list[dict[str, Any]],
         force_final_answer: bool,
         recovery_reason: str | None = None,
+        empty_final_answer: bool = False,
     ) -> tuple[Any, ReActFinalAnswerStreamer]:
         tools = (
             [self._final_answer_tool_schema()] if force_final_answer else tool_schemas
@@ -864,6 +924,27 @@ class ReActPattern(AgentPattern):
                 "complete user-facing response in its answer field."
             )
             retry_phase = "malformed_tool_arguments_recovery"
+        elif recovery_reason == "empty_final_answer":
+            # On a forced turn ``tools`` above is final_answer alone, so offering
+            # a work tool would instruct the model to do something the schema
+            # forbids and waste the one repair attempt.
+            retry_instruction = (
+                "The previous response called final_answer with an empty answer "
+                "field, so the user received no reply at all. "
+                + (
+                    "final_answer is the only tool available on this turn: call it "
+                    "again with the complete user-facing response in its answer "
+                    "field."
+                    if force_final_answer
+                    else "Retry this turn: if the task is complete, call "
+                    "final_answer again with the complete user-facing response in "
+                    "its answer field; if work remains, call the appropriate "
+                    "available work tool instead."
+                )
+                + " Never call final_answer with an omitted, empty, or "
+                "whitespace-only answer."
+            )
+            retry_phase = "empty_final_answer_recovery"
         else:
             retry_instruction = (
                 "The previous response used an invalid tool protocol. Retry the same "
@@ -873,6 +954,15 @@ class ReActPattern(AgentPattern):
                 "call final_answer only when the task is actually complete."
             )
             retry_phase = "tool_protocol_retry"
+        if empty_final_answer and recovery_reason != "empty_final_answer":
+            # A more fundamental repair owns the instruction, but the empty answer
+            # was still detected on this response and would otherwise go
+            # unmentioned.
+            retry_instruction = (
+                f"{retry_instruction} The previous response also called "
+                "final_answer with an empty answer field; never call final_answer "
+                "with an omitted, empty, or whitespace-only answer."
+            )
         messages[0] = {
             **messages[0],
             "content": f"{messages[0].get('content', '')}\n\n{retry_instruction}",
@@ -960,7 +1050,46 @@ class ReActPattern(AgentPattern):
                 continue
             if force_final_answer and tool_call.get("name") != "final_answer":
                 return True
-        return False
+        return self._empty_final_answer_call(normalized) is not None
+
+    def _empty_final_answer_call(
+        self, normalized: dict[str, Any]
+    ) -> dict[str, Any] | None:
+        """Return the first ``final_answer`` call that carries no answer text.
+
+        Under ``tool_choice="required"`` ``final_answer`` is the only way ReAct
+        can reply, so an empty ``answer`` produces a run that completes with
+        nothing streamed and nothing persisted. Treating it as a tool-protocol
+        violation routes it into the pattern's existing single repair retry
+        instead of finalizing silently.
+        """
+
+        for tool_call in normalized.get("tool_calls") or []:
+            if not isinstance(tool_call, dict):
+                continue
+            if tool_call.get("name") != "final_answer":
+                continue
+            if not self._final_answer_text(tool_call.get("args")).strip():
+                return tool_call
+        return None
+
+    def _final_answer_text(self, args: Any) -> str:
+        """Coerce a ``final_answer`` argument payload into its answer text.
+
+        The single coercion for every site that reads an answer out of
+        ``final_answer`` args - this check, the finalization it guards, and the
+        streamer's candidate lookup - so they cannot disagree on what counts as
+        an answer. ``None`` must become the empty string rather than
+        ``str(None)``, which would yield the literal ``"None"`` and be sent to
+        the user as the answer.
+        """
+
+        if not isinstance(args, dict):
+            return ""
+        answer = args.get("answer")
+        if answer is None:
+            return ""
+        return str(answer)
 
     def _requires_full_tool_set_recovery(
         self,
@@ -1386,41 +1515,33 @@ class ReActPattern(AgentPattern):
     def _normalize_tool_calls(self, tool_calls: list[Any]) -> list[dict[str, Any]]:
         normalized: list[dict[str, Any]] = []
         for index, tool_call in enumerate(tool_calls):
+            # Three provider shapes: a dict with a nested ``function`` payload, a
+            # flat dict, and an object with a ``function`` attribute. Each yields
+            # the same (id, name, arguments) triple.
             if isinstance(tool_call, dict):
+                call_id = tool_call.get("id")
                 function_payload = tool_call.get("function")
                 if isinstance(function_payload, dict):
+                    name = function_payload.get("name")
                     arguments = function_payload.get("arguments", {})
-                    normalized.append(
-                        {
-                            "id": tool_call.get("id") or f"tool_call_{index}",
-                            "name": function_payload.get("name"),
-                            "args": self._coerce_arguments(arguments),
-                        }
-                    )
+                else:
+                    name = tool_call.get("name")
+                    arguments = tool_call.get("args", tool_call.get("arguments", {}))
+            else:
+                function_payload = getattr(tool_call, "function", None)
+                if function_payload is None:
                     continue
+                call_id = getattr(tool_call, "id", None)
+                name = getattr(function_payload, "name", None)
+                arguments = getattr(function_payload, "arguments", {})
 
-                normalized.append(
-                    {
-                        "id": tool_call.get("id") or f"tool_call_{index}",
-                        "name": tool_call.get("name"),
-                        "args": self._coerce_arguments(
-                            tool_call.get("args", tool_call.get("arguments", {}))
-                        ),
-                    }
-                )
-                continue
-
-            function_payload = getattr(tool_call, "function", None)
-            if function_payload is not None:
-                normalized.append(
-                    {
-                        "id": getattr(tool_call, "id", None) or f"tool_call_{index}",
-                        "name": getattr(function_payload, "name", None),
-                        "args": self._coerce_arguments(
-                            getattr(function_payload, "arguments", {})
-                        ),
-                    }
-                )
+            normalized.append(
+                {
+                    "id": call_id or f"tool_call_{index}",
+                    "name": name,
+                    "args": self._coerce_arguments(arguments, tool_name=name),
+                }
+            )
 
         return [call for call in normalized if call.get("name")]
 
@@ -1442,16 +1563,56 @@ class ReActPattern(AgentPattern):
                 self.pending_tool_call_content[tool_call_id] = content
             return
 
-    def _coerce_arguments(self, arguments: Any) -> dict[str, Any]:
+    def _coerce_arguments(
+        self, arguments: Any, *, tool_name: str | None = None
+    ) -> dict[str, Any]:
         if isinstance(arguments, dict):
             return arguments
         if isinstance(arguments, str):
             try:
                 parsed = json.loads(arguments)
             except json.JSONDecodeError:
-                return {"input": arguments}
-            return parsed if isinstance(parsed, dict) else {"input": parsed}
+                logger.warning(
+                    "ReAct tool call %s returned malformed JSON arguments "
+                    "(%d chars); dropping them for control tools and passing "
+                    "them through as `input` otherwise.",
+                    tool_name or "<unknown>",
+                    len(arguments),
+                )
+                return self._fallback_arguments(tool_name, arguments)
+            if isinstance(parsed, dict):
+                return parsed
+            logger.warning(
+                "ReAct tool call %s returned non-object JSON arguments (%s).",
+                tool_name or "<unknown>",
+                type(parsed).__name__,
+            )
+            return self._fallback_arguments(tool_name, parsed)
         return {}
+
+    def _fallback_arguments(
+        self, tool_name: str | None, payload: Any
+    ) -> dict[str, Any]:
+        """Wrap unusable tool arguments, or drop them for control tools.
+
+        Work tools tolerate an opaque ``input`` passthrough, so they keep the
+        payload. Control tools drop it, because ``input`` is never a field any of
+        them declares: carrying it forward only disguises the loss as a populated
+        arguments object.
+
+        For ``final_answer`` dropping it is also load-bearing. That tool owns the
+        run's only user-visible exit, so a payload smuggled through as ``input``
+        would silently strip ``answer`` and finalize the run with nothing to
+        show; empty args instead let
+        ``_response_requires_tool_protocol_retry`` reject the call and spend the
+        pattern's one repair retry on it. ``send_message`` and
+        ``ask_user_question`` have no such guard - they degrade to an empty
+        message either way, exactly as they did before this branch existed.
+        """
+
+        if tool_name in self._control_tool_names():
+            return {}
+        return {"input": payload}
 
     def _build_tool_schema(self, tool: Any) -> dict[str, Any]:
         name = self._tool_name(tool)
@@ -1534,8 +1695,8 @@ class ReActPattern(AgentPattern):
                             "answer": {
                                 "type": "string",
                                 "description": (
-                                    "Complete user-facing answer. It must match "
-                                    "response_language. "
+                                    "Complete user-facing answer. It must be "
+                                    "non-empty and must match response_language. "
                                     f"{final_answer_language_rule()}"
                                 ),
                             },
@@ -1683,7 +1844,10 @@ class ReActPattern(AgentPattern):
         args = tool_call.get("args", {})
 
         if name == "final_answer":
-            answer = str(args.get("answer", ""))
+            answer = self._final_answer_text(args)
+            if not answer.strip():
+                self._reject_empty_final_answer(tool_call, context)
+                return None
             outcome = self._final_answer_outcome(args.get("outcome"))
             self._record_tool_call(
                 tool_call,
@@ -1696,8 +1860,9 @@ class ReActPattern(AgentPattern):
                 result={"answer": answer, "outcome": outcome},
                 tool_call_id=tool_call.get("id"),
             )
-            if answer:
-                context.add_assistant_message(answer)
+            # Unconditional: the empty-answer rejection above is the only way
+            # into finalization, so an answer here always has text.
+            context.add_assistant_message(answer)
             return await self._finalize_outcome(
                 context=context,
                 runtime=runtime,
@@ -1826,6 +1991,79 @@ class ReActPattern(AgentPattern):
 
         return None
 
+    def _reject_empty_final_answer(
+        self, tool_call: dict[str, Any], context: Any
+    ) -> None:
+        """Refuse to finalize on an empty ``final_answer`` and re-request one.
+
+        ``_response_requires_tool_protocol_retry`` catches this on the turn the
+        model produces it, so this guard covers the paths that reach the handler
+        without passing through response normalization — most importantly a
+        checkpoint resume that restores ``pending_tool_calls`` verbatim.
+
+        Returning ``None`` keeps the run in the loop; ``force_final_answer_next``
+        makes the next turn re-request ``final_answer``, and if that turn is empty
+        too the normalization guard fails the run instead of looping.
+
+        Two deliberate differences from the fresh-turn path.
+
+        Sibling calls still pending are discarded, matching the fresh path's
+        whole-response rejection for the order that matters: a resumed
+        ``[final_answer(""), work_tool]`` batch would otherwise execute a
+        side-effecting tool that the fresh path never runs. The match is not
+        exact in the reverse order - in ``[work_tool, final_answer("")]`` the
+        work tool has already executed by the time this runs, and nothing here
+        undoes it.
+
+        And the next turn is forced to ``final_answer`` alone, where the fresh
+        path restores the full tool set. That bounds the run: a second empty
+        answer ends it as ``invalid_tool_protocol`` rather than looping. It does
+        not prevent tool re-execution outright - if the forced turn calls a
+        non-``final_answer`` tool, ``_requires_full_tool_set_recovery`` restores
+        the full set and clears the flag, so a discarded work tool can be
+        re-invoked on that turn.
+        """
+
+        logger.warning(
+            "ReAct refusing to finalize on final_answer with no answer text; "
+            "re-requesting a final answer. tool_call_id=%s arg_keys=%s",
+            tool_call.get("id"),
+            sorted(self._tool_call_args_dict(tool_call), key=str),
+        )
+        error = (
+            "final_answer was called with an empty answer, so the user received "
+            "nothing. Call final_answer again with the complete user-facing "
+            "response in its answer field."
+        )
+        # Carry the classification keys ``tool_result_succeeded`` reads, so this
+        # failure is not read back as a success, and record the same shape in the
+        # ledger as the cancelled siblings below.
+        failure = {"success": False, "status": "error", "error": error}
+        self._record_tool_call(tool_call, status="failed", result=failure, error=error)
+        context.add_tool_result(
+            tool_name="final_answer",
+            result=failure,
+            tool_call_id=tool_call.get("id"),
+        )
+        # Leave only the rejected call for the caller to pop, and close out the
+        # rest of the batch so no unexecuted call is left without a result.
+        # Selected by identity rather than position: the caller happens to pass
+        # the head of the queue today, but nothing here depends on that.
+        remaining = [
+            pending for pending in self.pending_tool_calls if pending is not tool_call
+        ]
+        self.pending_tool_calls = [tool_call]
+        self._cancel_tool_calls(
+            remaining,
+            context,
+            reason=(
+                "Discarded because final_answer was called with an empty answer; "
+                "the agent will produce a final answer instead."
+            ),
+        )
+        self.status = "thinking"
+        self.force_final_answer_next = True
+
     def _tool_is_concurrency_safe(self, name: str, tools: list[Any]) -> bool:
         """Whether ``name`` may run concurrently with other safe tools.
 
@@ -1908,15 +2146,26 @@ class ReActPattern(AgentPattern):
         self.pending_tool_calls = []
         self.repeated_tool_decision = None
         self.force_final_answer_next = False
-        for tool_call in discarded_calls:
-            result = {
-                "success": False,
-                "status": "cancelled",
-                "error": (
-                    "Discarded because an earlier tool requires user input; "
-                    "the agent will replan after the user responds."
-                ),
-            }
+        self._cancel_tool_calls(
+            discarded_calls,
+            context,
+            reason=(
+                "Discarded because an earlier tool requires user input; "
+                "the agent will replan after the user responds."
+            ),
+        )
+
+    def _cancel_tool_calls(
+        self, tool_calls: list[dict[str, Any]], context: Any, *, reason: str
+    ) -> None:
+        """Close calls that will never run, one result each.
+
+        Preserves I2 (one result per ``tool_call_id``) for abandoned calls, so a
+        discarded batch cannot leave a tool call dangling without a result.
+        """
+
+        for tool_call in tool_calls:
+            result = {"success": False, "status": "cancelled", "error": reason}
             self._backfill_result(tool_call, result, context)
             self._record_tool_call(
                 tool_call,

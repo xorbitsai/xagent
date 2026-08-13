@@ -29,9 +29,10 @@ from typing import (
 )
 from uuid import uuid4
 
-from ..config import get_uploads_dir
+from ..config import get_file_materialize_dir, get_uploads_dir
 from .execution_scope import validate_scope_component
 from .file_ref import parse_file_id_ref
+from .file_storage.keys import build_user_key_prefix
 
 if TYPE_CHECKING:
     from ..web.services.uploaded_file_store import (
@@ -169,6 +170,7 @@ class TaskWorkspace:
         allowed_external_dirs: Optional[List[str]] = None,
         db_task_id: Optional[int] = None,
         scope_segments: Sequence[str] = (),
+        durable_storage_segments: Sequence[str] | None = None,
     ):
         self.id = id
         self.db_task_id = db_task_id
@@ -180,6 +182,17 @@ class TaskWorkspace:
         self.scope_segments: tuple[str, ...] = tuple(scope_segments)
         for segment in self.scope_segments:
             validate_scope_component(segment, field_name="workspace_segments entry")
+        # Logical workspace paths and durable object keys intentionally diverge
+        # when an ExecutionScope does not isolate external directories. Keep the
+        # write-side durable segments explicit so marked reads validate the key
+        # layout that UploadedFileStore actually produced.
+        self.durable_storage_segments: tuple[str, ...] = tuple(
+            self.scope_segments
+            if durable_storage_segments is None
+            else durable_storage_segments
+        )
+        for segment in self.durable_storage_segments:
+            validate_scope_component(segment, field_name="workspace_segments entry")
         if base_dir is None:
             base_dir = str(get_uploads_dir())
         self.base_dir = (
@@ -190,6 +203,11 @@ class TaskWorkspace:
         self._recently_registered_files: Dict[str, str] = {}  # path -> file_id mapping
         self._file_id_to_path: Dict[str, Path] = {}  # file_id -> path reverse mapping
         self.owner_user_id: Optional[int] = None
+        # Server-derived rollout policy for File Operation. ``None`` means the
+        # exact upstream legacy path and therefore requires no policy query.
+        # Public runtime construction sets version 1 only after loading a
+        # persisted, server-stamped task marker.
+        self.file_operation_access_version: Any = None
         self.current_task_id: Optional[int] = (
             db_task_id
             if db_task_id is not None
@@ -1030,6 +1048,84 @@ class TaskWorkspace:
         except (TypeError, ValueError, IndexError):
             return None
 
+    @staticmethod
+    def _normalize_file_selector(file_path: str) -> str:
+        """Normalize a file reference without resolving its authority."""
+
+        normalized = str(file_path).strip()
+        referenced_file_id = parse_file_id_ref(normalized)
+        if referenced_file_id is not None:
+            return referenced_file_id
+        if normalized.startswith("file:") and not normalized.startswith("file://"):
+            # Preserve legacy workspace path refs such as
+            # ``file:output/report.csv``. They are paths, not file ids, and
+            # still pass through the normal workspace containment checks.
+            return normalized[5:].strip()
+        return normalized
+
+    def requires_exact_file_operation_scope(self) -> bool:
+        """Return whether File Operation must use exact owner/task authority.
+
+        Runtime construction supplies the server-derived marker. Its absence
+        delegates directly to upstream behavior without a policy database
+        lookup. A marked workspace revalidates the persisted task, owner, and
+        explicit database task identity before any legacy file cache or
+        allowlist can be consulted.
+        """
+
+        marker = self.file_operation_access_version
+        if marker is None:
+            return False
+
+        from ..web.models.task import Task
+        from .storage.manager import create_db_session
+        from .task_runtime import (
+            SUPPORTED_FILE_OPERATION_ACCESS_VERSIONS,
+            FileOperationAccessPolicyError,
+            requires_exact_file_operation_scope,
+        )
+
+        # Validate the propagated workspace marker independently. The task's
+        # persisted marker is loaded and revalidated at the database authority
+        # boundary below so construction-time state cannot substitute for it.
+        if (
+            isinstance(marker, bool)
+            or not isinstance(marker, int)
+            or marker not in SUPPORTED_FILE_OPERATION_ACCESS_VERSIONS
+        ):
+            raise FileOperationAccessPolicyError(
+                "File Operation workspace policy version is unsupported"
+            )
+        if self.db_task_id is None or self.owner_user_id is None:
+            raise FileOperationAccessPolicyError(
+                "Marked File Operation workspace has no authoritative identity"
+            )
+
+        # File Operation callables run in worker threads. Always use an
+        # operation-local session for policy checks instead of carrying a
+        # potentially thread-bound caller session into that worker.
+        db = create_db_session()
+        try:
+            task = db.query(Task).filter(Task.id == self.db_task_id).first()
+            if task is None:
+                raise FileOperationAccessPolicyError(
+                    "Marked File Operation task no longer exists"
+                )
+            if not requires_exact_file_operation_scope(task):
+                raise FileOperationAccessPolicyError(
+                    "Marked File Operation task lost its persisted policy"
+                )
+            if (
+                int(task.id) != self.db_task_id
+                or int(task.user_id) != self.owner_user_id
+            ):
+                raise FileOperationAccessPolicyError(
+                    "Marked File Operation workspace authority disagrees with task"
+                )
+            return True
+        finally:
+            db.close()
+
     def _file_record_allowed_for_workspace(
         self, record: Any, path: Optional[Path] = None
     ) -> bool:
@@ -1225,6 +1321,164 @@ class TaskWorkspace:
         except Exception as e:
             logger.warning(f"Failed to resolve file_id from database: {e}")
             return None
+
+    def _file_operation_path_in_authorized_storage(self, path: Path) -> bool:
+        """Return whether a record-backed path stays in configured storage."""
+
+        resolved = path.resolve()
+        # The materialization cache is host-shared, so containment within it
+        # is never sufficient authority. Callers reach this check only after an
+        # exact UploadedFile owner/task/status/storage-key authorization.
+        roots = [
+            self.base_dir.resolve(),
+            self.workspace_dir.resolve(),
+            get_file_materialize_dir().expanduser().resolve(),
+            *self.allowed_external_dirs,
+        ]
+        return any(resolved == root or resolved.is_relative_to(root) for root in roots)
+
+    def _exact_file_operation_record_path(self, record: Any) -> Optional[Path]:
+        """Resolve an already exact-authorized file record to a local file."""
+
+        storage_status = getattr(record, "storage_status", None)
+        if storage_status not in {None, "available", "legacy"}:
+            return None
+
+        storage_key = getattr(record, "storage_key", None)
+        if storage_key:
+            if self.owner_user_id is None:
+                return None
+            owner_prefix = build_user_key_prefix(
+                self.owner_user_id,
+                self.durable_storage_segments,
+            )
+            key = str(storage_key)
+            if key != owner_prefix and not key.startswith(owner_prefix + "/"):
+                return None
+
+        storage_path = getattr(record, "storage_path", None)
+        if storage_path:
+            local_path = Path(str(storage_path)).resolve()
+            if (
+                local_path.exists()
+                and local_path.is_file()
+                and self._file_operation_path_in_authorized_storage(local_path)
+            ):
+                return local_path
+        if storage_key and storage_status == "available":
+            from ..web.services.managed_file_ref import ManagedFileRef
+
+            materialized = ManagedFileRef(record).materialize().resolve()
+            if (
+                materialized.exists()
+                and materialized.is_file()
+                and self._file_operation_path_in_authorized_storage(materialized)
+            ):
+                return materialized
+        return None
+
+    def resolve_file_operation_path(self, file_path: str) -> Path:
+        """Resolve one File Operation selector under its persisted task policy.
+
+        Unmarked tasks delegate byte-for-byte to the shared resolver. Marked
+        public tasks may use workspace-local files or external files backed by
+        an exact owner/task record; the ambient external-directory allowlist is
+        never sufficient authority on its own in that mode.
+        """
+
+        try:
+            exact_scope = self.requires_exact_file_operation_scope()
+        except Exception as exc:
+            # Preserve File Operation's public not-found shape while failing
+            # closed on malformed policy state or database infrastructure.
+            logger.warning(
+                "File Operation selector policy validation failed for "
+                "workspace %s and task %s",
+                self.id,
+                self.db_task_id,
+                exc_info=True,
+            )
+            raise FileNotFoundError(f"File not found: {file_path}") from exc
+        if not exact_scope:
+            return self.resolve_path_with_search(file_path)
+
+        from ..web.models.database import release_db_connection_if_clean
+        from ..web.models.uploaded_file import UploadedFile
+        from .storage.manager import create_db_session
+
+        if self.owner_user_id is None or self.db_task_id is None:
+            raise FileNotFoundError(f"File not found: {file_path}")
+
+        normalized = self._normalize_file_selector(file_path)
+
+        # Exact-scope resolution is worker-dispatched by File Operation, so
+        # its record lookup must not reuse a caller-owned session.
+        db = create_db_session()
+        try:
+            candidate_ref = Path(normalized)
+            if normalized and len(candidate_ref.parts) == 1 and "/" not in normalized:
+                record = (
+                    db.query(UploadedFile)
+                    .filter(UploadedFile.file_id == normalized)
+                    .first()
+                )
+                if record is not None and (
+                    int(getattr(record, "user_id", 0) or 0) == self.owner_user_id
+                    and int(getattr(record, "task_id", 0) or 0) == self.db_task_id
+                ):
+                    db.expunge(record)
+                    if not release_db_connection_if_clean(db):
+                        raise FileNotFoundError(f"File not found: {file_path}")
+                    resolved_record = self._exact_file_operation_record_path(record)
+                    if resolved_record is None:
+                        raise FileNotFoundError(f"File not found: {file_path}")
+                    return resolved_record
+
+            if not release_db_connection_if_clean(db):
+                raise FileNotFoundError(f"File not found: {file_path}")
+
+            if candidate_ref.is_absolute():
+                resolved = candidate_ref.resolve()
+            else:
+                try:
+                    # Exact mode already performed its authorized file-id lookup.
+                    # Restrict the fallback to workspace-local discovery so a
+                    # foreign or taskless durable record cannot be materialized
+                    # through the legacy owner-wide resolver.
+                    resolved = self.resolve_path_with_search(
+                        normalized,
+                        resolve_file_ids=False,
+                    ).resolve()
+                except FileNotFoundError as exc:
+                    raise FileNotFoundError(f"File not found: {file_path}") from exc
+
+            workspace_root = self.workspace_dir.resolve()
+            if resolved == workspace_root or resolved.is_relative_to(workspace_root):
+                return resolved
+
+            path_spellings = {str(resolved), str(candidate_ref)}
+            records = (
+                db.query(UploadedFile)
+                .filter(
+                    UploadedFile.user_id == self.owner_user_id,
+                    UploadedFile.task_id == self.db_task_id,
+                    UploadedFile.storage_path.in_(path_spellings),
+                )
+                .all()
+            )
+            db.expunge_all()
+            if not release_db_connection_if_clean(db):
+                raise FileNotFoundError(f"File not found: {file_path}")
+            for record in records:
+                record_path = Path(str(record.storage_path)).resolve()
+                if record_path != resolved:
+                    continue
+                resolved_record = self._exact_file_operation_record_path(record)
+                if resolved_record is not None:
+                    return resolved_record
+            raise FileNotFoundError(f"File not found: {file_path}")
+        finally:
+            db.close()
 
     def _ensure_directories(self) -> None:
         """Ensure all workspace directories exist"""
@@ -1427,7 +1681,12 @@ class TaskWorkspace:
             return filename
         return name_part + extension
 
-    def resolve_path_with_search(self, file_path: str) -> Path:
+    def resolve_path_with_search(
+        self,
+        file_path: str,
+        *,
+        resolve_file_ids: bool = True,
+    ) -> Path:
         """
         Resolve a file path within the workspace with intelligent directory search.
         Searches for the file in input -> output -> temp -> workspace root order.
@@ -1443,22 +1702,17 @@ class TaskWorkspace:
             ValueError: If path is outside both workspace and allowed external directories
             FileNotFoundError: If relative path doesn't exist in any searched directory
         """
-        normalized_input = file_path.strip()
-        referenced_file_id = parse_file_id_ref(normalized_input)
-        if referenced_file_id is not None:
-            normalized_input = referenced_file_id
-        elif normalized_input.startswith("file:") and not normalized_input.startswith(
-            "file://"
-        ):
-            # Preserve legacy workspace path refs such as
-            # ``file:output/report.csv``. They are paths, not file ids, and
-            # still pass through the normal workspace containment checks.
-            normalized_input = normalized_input[5:].strip()
+        normalized_input = self._normalize_file_selector(file_path)
 
         path = Path(normalized_input)
 
         file_id_candidate = normalized_input
-        if file_id_candidate and len(path.parts) == 1 and "/" not in file_id_candidate:
+        if (
+            resolve_file_ids
+            and file_id_candidate
+            and len(path.parts) == 1
+            and "/" not in file_id_candidate
+        ):
             resolved_by_id = self.resolve_file_id(file_id_candidate)
             if resolved_by_id is not None:
                 return resolved_by_id
@@ -1807,6 +2061,8 @@ class TaskWorkspace:
         include_workspace_files: bool = True,
         limit: int = DEFAULT_USER_FILE_LIST_LIMIT,
         offset: int = 0,
+        *,
+        _exact_task_scope: bool = False,
     ) -> Dict[str, Any]:
         """List all user files across all workspaces and uploaded files.
 
@@ -1826,25 +2082,35 @@ class TaskWorkspace:
         from ..web.models.uploaded_file import UploadedFile
         from .storage.manager import create_db_session
 
-        # Extract user_id from workspace id (e.g., 'web_task_265' -> 265)
-        task_id = None
+        # Marked File Operation uses the explicit database task identity.
+        # Unmarked callers retain the historical workspace-id parsing behavior.
+        task_id = self.db_task_id if _exact_task_scope else None
         user_id = None
-        try:
-            task_id = int(self.id.split("_")[-1])
-        except (ValueError, IndexError):
-            task_id = None
+        if task_id is None and not _exact_task_scope:
+            try:
+                task_id = int(self.id.split("_")[-1])
+            except (ValueError, IndexError):
+                task_id = None
 
         # Only open a database session when this workspace can actually map to a task.
         db = None
         should_close = False
         if task_id is not None:
-            db = self.db_session if self.db_session else create_db_session()
-            should_close = self.db_session is None
+            # Marked File Operation listing runs in a worker thread and must
+            # use an operation-local session. Preserve bound-session behavior
+            # only for historical, unmarked callers.
+            if _exact_task_scope or self.db_session is None:
+                db = create_db_session()
+                should_close = True
+            else:
+                db = self.db_session
 
         try:
             # Try to get user_id from task if we have a valid task_id and db session
             if task_id and db is not None:
                 task = db.query(Task).filter(Task.id == task_id).first()
+                if task is None and _exact_task_scope:
+                    raise RuntimeError("Marked File Operation listing task is missing")
                 if task:
                     user_id = task.user_id
 
@@ -1853,8 +2119,58 @@ class TaskWorkspace:
             total_count = 0
 
             if user_id and db is not None:
-                # Query uploaded files for this user
+                # Query uploaded files for this user. Marked File Operation
+                # narrows before count/offset/limit so sibling rows cannot
+                # distort pagination.
                 query = db.query(UploadedFile).filter(UploadedFile.user_id == user_id)
+                if _exact_task_scope:
+                    if self.owner_user_id is None or int(user_id) != self.owner_user_id:
+                        raise RuntimeError(
+                            "Marked File Operation listing authority disagrees"
+                        )
+                    from sqlalchemy import and_, or_
+
+                    owner_prefix = build_user_key_prefix(
+                        self.owner_user_id,
+                        self.durable_storage_segments,
+                    )
+                    storage_roots = [
+                        self.base_dir.resolve(),
+                        self.workspace_dir.resolve(),
+                        *self.allowed_external_dirs,
+                    ]
+                    local_storage_filters = [
+                        predicate
+                        for root in storage_roots
+                        for predicate in (
+                            UploadedFile.storage_path == str(root),
+                            UploadedFile.storage_path.startswith(
+                                str(root) + os.sep, autoescape=True
+                            ),
+                        )
+                    ]
+                    query = query.filter(
+                        UploadedFile.task_id == task_id,
+                        or_(
+                            UploadedFile.storage_status.is_(None),
+                            UploadedFile.storage_status.in_(["available", "legacy"]),
+                        ),
+                        or_(
+                            UploadedFile.storage_key.is_(None),
+                            UploadedFile.storage_key == "",
+                            UploadedFile.storage_key == owner_prefix,
+                            UploadedFile.storage_key.startswith(
+                                owner_prefix + "/", autoescape=True
+                            ),
+                        ),
+                        or_(
+                            and_(
+                                UploadedFile.storage_key.is_not(None),
+                                UploadedFile.storage_key != "",
+                            ),
+                            *local_storage_filters,
+                        ),
+                    )
                 total_count = query.count()
                 files = (
                     query.order_by(UploadedFile.id.desc())
@@ -2023,6 +2339,7 @@ class WorkspaceManager:
         allowed_external_dirs: Optional[List[str]] = None,
         db_task_id: Optional[int] = None,
         scope_segments: Sequence[str] = (),
+        durable_storage_segments: Sequence[str] | None = None,
     ) -> TaskWorkspace:
         """
         Get existing workspace or create new one.
@@ -2047,6 +2364,7 @@ class WorkspaceManager:
                 allowed_external_dirs,
                 db_task_id=db_task_id,
                 scope_segments=scope_segments,
+                durable_storage_segments=durable_storage_segments,
             )
             self._workspaces[cache_key] = workspace
         elif db_task_id is not None and self._workspaces[cache_key].db_task_id is None:

@@ -330,6 +330,16 @@ jobs:
         env:
           XAGENT_TEST_POSTGRES_URL: postgresql://xagent:xagent@localhost:5432/xagent_test
 
+      # The json -> jsonb conversion and its row cleanup only exist on
+      # PostgreSQL; the SQLite half of this file pins a no-op and runs in the
+      # ordinary suite.
+      - name: Test trace payload json to jsonb migration (Postgres-only)
+        if: needs.detect-migration-changes.outputs.should-test == 'true'
+        run: |
+          pytest tests/migrations/test_20260813_trace_json_columns_to_jsonb.py -m postgresql -q
+        env:
+          XAGENT_TEST_POSTGRES_URL: postgresql://xagent:xagent@localhost:5432/xagent_test
+
       # This step's fixture creates and drops its own disposable schema (see
       # test_supersede_savepoint_postgresql.py), so it has no ordering
       # dependency on the other steps in this job.

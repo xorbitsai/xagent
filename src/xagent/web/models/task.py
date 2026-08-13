@@ -16,10 +16,23 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
 )
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
 
 from .database import Base
+
+# Trace payload columns are jsonb on PostgreSQL (#1248): jsonb decodes JSON
+# escapes to native text at write time, so it rejects at INSERT the two
+# shapes a plain json column stored happily and then failed to read back
+# through ->> (#1149) -- the NUL escape and either half of an unpaired
+# UTF-16 surrogate. Producers sanitize those code points away before the
+# write (web/utils/json_payload_sanitizer.py); this type is the backstop
+# that keeps any unsanitized path from planting a payload the database
+# cannot read. Existing json columns are converted by the
+# 20260813_trace_json_columns_to_jsonb migration. Other dialects keep the
+# generic JSON type.
+TRACE_PAYLOAD_JSON = JSON().with_variant(JSONB(), "postgresql")
 
 
 class TaskStatus(enum.Enum):
@@ -550,7 +563,7 @@ class TraceEvent(Base):  # type: ignore
     parent_event_id = Column(
         String(255), nullable=True
     )  # Parent event ID for hierarchy
-    data = Column(JSON, nullable=False)  # Event data payload
+    data = Column(TRACE_PAYLOAD_JSON, nullable=False)  # Event data payload
 
     # Relationships. foreign_keys is explicit because tasks and trace_events
     # now have two FK paths between them (this task_id, and
@@ -578,7 +591,7 @@ class TraceMessageBlob(Base):  # type: ignore
     task_id = Column(Integer, ForeignKey("tasks.id"), nullable=False, index=True)
     execution_id = Column(String(255), nullable=False, index=True)
     message_hash = Column(String(80), nullable=False)
-    message_data = Column(JSON, nullable=False)
+    message_data = Column(TRACE_PAYLOAD_JSON, nullable=False)
     message_bytes = Column(Integer, nullable=False)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
@@ -610,7 +623,7 @@ class TraceCheckpointBlob(Base):  # type: ignore
     execution_id = Column(String(255), nullable=False, index=True)
     blob_kind = Column(String(255), nullable=False, index=True)
     blob_hash = Column(String(80), nullable=False)
-    blob_data = Column(JSON, nullable=False)
+    blob_data = Column(TRACE_PAYLOAD_JSON, nullable=False)
     blob_bytes = Column(Integer, nullable=False)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 

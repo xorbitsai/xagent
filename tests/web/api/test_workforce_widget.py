@@ -13,14 +13,18 @@ Builds on the share-link channel patterns (#947).
 from __future__ import annotations
 
 import io
+from pathlib import Path
 from typing import Any, cast
 
 import pytest
 
 from xagent.core.execution_scope import EXECUTION_SCOPE_AGENT_CONFIG_KEY
+from xagent.core.tools.core.workspace_file_tool import WorkspaceFileOperations
+from xagent.core.workspace import TaskWorkspace
 from xagent.web.models.agent import Agent, AgentStatus
 from xagent.web.models.deployment import Deployment, DeploymentOwnerType
 from xagent.web.models.task import Task
+from xagent.web.models.uploaded_file import UploadedFile
 from xagent.web.models.user import User
 from xagent.web.models.workforce import WorkforceRun
 from xagent.web.services.task_runtime import SELECTED_FILE_IDS_AGENT_CONFIG_KEY
@@ -579,6 +583,7 @@ def test_widget_task_create_starts_workforce_run(
         assert int(task.user_id) == _user_id()
         assert task.channel_id is None
         assert task.agent_config.get("auth_mode") == "widget"
+        assert task.agent_config.get("__xagent_file_operation_access_version") == 1
         assert int(task.agent_config.get("widget_workforce_id")) == workforce_id
         assert task.agent_config.get("guest_id") == "guest_test"
         # The server-observed creator IP is stamped on the workforce path too
@@ -670,6 +675,60 @@ def test_widget_task_create_discards_forged_agent_config(
 
 
 # ===== Task-less opening-message upload =====
+
+
+def test_workforce_widget_first_turn_attachments_reach_run(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    workforce_id = _create_workforce("First Turn Widget File Workforce")
+    key = _enable_widget(workforce_id)
+    guest_headers = _authenticate_widget_guest_by_key(key)
+    patch_schedule_bg(monkeypatch)
+
+    upload = client.post(
+        "/api/widget/files/upload",
+        headers=guest_headers,
+        data={"task_type": "task"},
+        files={"file": ("brief.txt", io.BytesIO(b"widget brief"), "text/plain")},
+    )
+    assert upload.status_code == 200, upload.text
+    file_id = upload.json()["file_id"]
+
+    created = client.post(
+        "/api/widget/chat/task/create",
+        headers=guest_headers,
+        json={
+            "title": "summarize",
+            "description": "summarize this",
+            "files": [file_id],
+        },
+    )
+    assert created.status_code == 200, created.text
+    task_id = int(created.json()["task_id"])
+
+    db = _direct_db_session()
+    try:
+        bound = db.query(UploadedFile).filter(UploadedFile.file_id == file_id).one()
+        task = db.query(Task).filter(Task.id == task_id).one()
+        assert bound.task_id == task_id
+        assert task.agent_config.get("__xagent_file_operation_access_version") == 1
+
+        workspace = TaskWorkspace(
+            id="agent_1_widget_first_turn",
+            base_dir=str(tmp_path / "workspaces"),
+            allowed_external_dirs=[str(Path(bound.storage_path).parent)],
+            db_task_id=task_id,
+        )
+        workspace.owner_user_id = int(task.user_id)
+        workspace.file_operation_access_version = 1
+        monkeypatch.setattr(
+            "xagent.core.storage.manager.create_db_session",
+            _direct_db_session,
+        )
+        assert WorkspaceFileOperations(workspace).read_file(file_id) == "widget brief"
+    finally:
+        db.close()
 
 
 def test_taskless_widget_upload_enforces_file_count_cap() -> None:

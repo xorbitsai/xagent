@@ -9,6 +9,7 @@ import pytest
 
 from xagent.core.agent import AgentExecutionAdapter, AgentExecutionConfig
 from xagent.core.agent.execution_adapter import INTERRUPTED_USER_MESSAGE
+from xagent.core.agent.result import NO_OUTPUT_PLACEHOLDER
 from xagent.core.agent.service import AgentService
 from xagent.core.task_runtime import PREFERRED_INPUT_MODALITIES_METADATA_KEY
 
@@ -1326,3 +1327,87 @@ async def test_set_interrupt_checker_propagates_to_prebuilt_adapter() -> None:
     assert service._execution_adapter.config.interrupt_checker is checker
     service.set_interrupt_checker(None)
     assert service._execution_adapter.config.interrupt_checker is None
+
+
+def _placeholder_warning_records(caplog: pytest.LogCaptureFixture) -> list[str]:
+    return [
+        record.getMessage()
+        for record in caplog.records
+        if "produced no output" in record.getMessage()
+    ]
+
+
+def test_execution_adapter_warns_when_a_successful_run_produced_no_output(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The placeholder erases the evidence, so the substitution must be logged."""
+
+    adapter = AgentExecutionAdapter(
+        AgentExecutionConfig(
+            name="silent",
+            pattern="react",
+            llm=FakeLLM([]),
+            skill_manager=NoSkillManager(),
+        )
+    )
+
+    with caplog.at_level("WARNING", logger="xagent.core.agent.execution_adapter"):
+        result = adapter._normalize_result(
+            result={"success": True, "status": "completed"},
+            execution_type="agent_react",
+            execution_id="silent-exec",
+        )
+
+    assert result["output"] == NO_OUTPUT_PLACEHOLDER
+    assert len(_placeholder_warning_records(caplog)) == 1
+
+
+@pytest.mark.parametrize(
+    "paused",
+    [
+        pytest.param(
+            {
+                "success": False,
+                "status": "waiting_for_user",
+                "message": "Which region did you mean?",
+                "message_type": "question",
+            },
+            id="send-message",
+        ),
+        pytest.param(
+            {
+                "success": False,
+                "status": "waiting_for_user",
+                "message": "Pick one",
+                "interactions": [{"type": "select", "field": "x", "label": "X"}],
+            },
+            id="ask-user-question",
+        ),
+    ],
+)
+def test_execution_adapter_stays_silent_when_a_paused_run_has_no_output(
+    paused: dict[str, Any], caplog: pytest.LogCaptureFixture
+) -> None:
+    """A pause carries only its message, so emptiness there is not a defect.
+
+    Warning on emptiness alone would fire on the ordinary first-turn
+    clarification and drown the diagnostic it exists to provide.
+    """
+
+    adapter = AgentExecutionAdapter(
+        AgentExecutionConfig(
+            name="paused",
+            pattern="react",
+            llm=FakeLLM([]),
+            skill_manager=NoSkillManager(),
+        )
+    )
+
+    with caplog.at_level("WARNING", logger="xagent.core.agent.execution_adapter"):
+        adapter._normalize_result(
+            result=paused,
+            execution_type="agent_react",
+            execution_id="paused-exec",
+        )
+
+    assert _placeholder_warning_records(caplog) == []

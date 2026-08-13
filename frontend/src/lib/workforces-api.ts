@@ -66,6 +66,13 @@ function formatApiDetail(detail: unknown, fallback: string): string {
       return messages.join("; ")
     }
   }
+  // Structured error shape used by delete/unarchive on this route:
+  // { detail: { code, message } }. Without this branch the object falls
+  // through to parseApiError's raw-JSON-text fallback, surfacing the whole
+  // response body as the error message instead of the intended one.
+  if (isJsonRecord(detail) && typeof detail.message === "string" && detail.message.trim()) {
+    return detail.message
+  }
   return fallback
 }
 
@@ -165,6 +172,30 @@ export async function archiveWorkforce(
     throw await parseApiError(response, "Failed to archive workforce")
   }
   return response.json()
+}
+
+export async function unarchiveWorkforce(
+  workforceId: number | string,
+): Promise<WorkforceDetail> {
+  const response = await apiRequest(`${getApiUrl()}/api/workforces/${workforceId}/unarchive`, {
+    method: "POST",
+  })
+  if (!response.ok) {
+    throw await parseApiError(response, "Failed to unarchive workforce")
+  }
+  return response.json()
+}
+
+export async function deleteWorkforcePermanently(
+  workforceId: number | string,
+): Promise<void> {
+  const response = await apiRequest(
+    `${getApiUrl()}/api/workforces/${workforceId}?permanent=true`,
+    { method: "DELETE" },
+  )
+  if (!response.ok) {
+    throw await parseApiError(response, "Failed to delete workforce")
+  }
 }
 
 export async function discardWorkforce(

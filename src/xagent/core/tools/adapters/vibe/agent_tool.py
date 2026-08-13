@@ -22,6 +22,7 @@ from .....web.services.model_service import (
 # (which also keeps it patchable in tests).
 from .....web.tools.config import WebToolConfig
 from ....agent.result import NO_OUTPUT_PLACEHOLDER, NO_RESPONSE_PLACEHOLDER
+from ....task_runtime import FILE_OPERATION_ACCESS_VERSION_KEY
 from ....tracing import create_agent_tracer
 from ....utils.type_check import ensure_list
 from ...core.document_search import find_missing_knowledge_bases
@@ -1523,6 +1524,34 @@ _MISSING_CHILD_OUTPUT_MESSAGE = (
     "output, so there is no answer from it to use."
 )
 
+_CHILD_NO_ANSWER_MESSAGE = (
+    "The delegated agent never produced an answer, so there is no result from "
+    "it to use."
+)
+
+
+def _child_never_answered(result: dict[str, Any]) -> bool:
+    """Whether the child's pattern ended without ever producing an answer.
+
+    ``invalid_tool_protocol`` alone is not enough: it also covers provider
+    protocol errors, mixed control calls, and a non-``final_answer`` tool on a
+    forced turn, all of which predate the empty-answer guard and may follow a
+    child that did produce text. For those the child's own ``error`` is the
+    parent's only signal, so it must survive rather than being replaced by
+    "never produced an answer". ReAct marks the empty-answer case explicitly
+    (``ReActPattern._invalid_tool_protocol_result``); only that maps here.
+    """
+
+    if result.get("empty_final_answer") is True:
+        return True
+    # ``AgentExecutionAdapter._normalize_result`` keeps the pattern's own result
+    # under ``agent_result``; the marker only survives there once normalized.
+    agent_result = result.get("agent_result")
+    return isinstance(agent_result, dict) and (
+        agent_result.get("empty_final_answer") is True
+    )
+
+
 # Recognized, not produced, here: ``AgentExecutionAdapter._normalize_result``
 # and this module's own post-run default substitute these when a run left no
 # text of its own behind on the normalized fallback surface. A completed
@@ -1646,6 +1675,11 @@ def _classify_delegated_child_failure(
 
     status_is_incomplete = isinstance(status, str) and status.lower() != "completed"
     if result.get("success") is False or status_is_incomplete:
+        if _child_never_answered(result):
+            return _classified_failure(
+                _CHILD_NO_ANSWER_MESSAGE,
+                failure_code="missing_delegated_output",
+            )
         error_text = result.get("error")
         output_text = result.get("output")
         if isinstance(error_text, str) and error_text:
@@ -1700,6 +1734,7 @@ class AgentTool(AbstractBaseTool):
         target_allow_cross_user_agent_ids: bool = False,
         runtime_metadata: Optional[dict[str, Any]] = None,
         execution_scope: Optional[Any] = None,
+        file_operation_access_version: Any = None,
     ):
         """
         Initialize an agent tool.
@@ -1727,6 +1762,9 @@ class AgentTool(AbstractBaseTool):
             target_allowed_agent_ids: Agent IDs this tool may execute as its target
             target_allow_cross_user_agent_ids: Whether this tool may execute explicit cross-user target IDs
             runtime_metadata: Extra delegation metadata for tracing
+            execution_scope: Parent execution scope inherited by the child
+            file_operation_access_version: Server-derived parent File Operation
+                policy version. ``None`` preserves legacy behavior.
         """
         self._agent_id = agent_id
         self._agent_name = agent_name
@@ -1758,6 +1796,7 @@ class AgentTool(AbstractBaseTool):
             target_allow_cross_user_agent_ids
         )
         self._runtime_metadata = dict(runtime_metadata or {})
+        self._file_operation_access_version = file_operation_access_version
         self._agent_call_stack = _normalize_agent_ids(agent_call_stack) or []
         if agent_id not in self._agent_call_stack:
             self._agent_call_stack.append(agent_id)
@@ -2178,6 +2217,11 @@ class AgentTool(AbstractBaseTool):
                 if self._execution_scope is not None
                 else ()
             )
+            _durable_storage_segments = (
+                self._execution_scope.durable_storage_segments
+                if self._execution_scope is not None
+                else ()
+            )
             tool_config = WebToolConfig(
                 db=None,
                 db_factory=self._session_factory,
@@ -2204,7 +2248,9 @@ class AgentTool(AbstractBaseTool):
                     "base_dir": self._workspace_base_dir,
                     "task_id": execution_task_id,
                     "db_task_id": parent_db_task_id,
+                    FILE_OPERATION_ACCESS_VERSION_KEY: self._file_operation_access_version,
                     "scope_segments": _scope_segments,
+                    "durable_storage_segments": _durable_storage_segments,
                 },
                 execution_scope=self._execution_scope,
                 # Delegated sub-agents stay closed: identity here is restored
@@ -2454,6 +2500,7 @@ def build_published_agent_tools_from_records(
     parent_tracer: Optional[Any] = None,
     agent_call_stack: Optional[list[int]] = None,
     execution_scope: Optional[Any] = None,
+    file_operation_access_version: Any = None,
 ) -> list[AbstractBaseTool]:
     """Construct AgentTool instances from ORM-free worker results."""
     if workspace_base_dir is None:
@@ -2540,6 +2587,7 @@ def build_published_agent_tools_from_records(
             target_allow_cross_user_agent_ids=allow_cross_user_agent_ids,
             runtime_metadata=runtime_metadata,
             execution_scope=execution_scope,
+            file_operation_access_version=file_operation_access_version,
         )
         tools.append(tool)
         logger.debug("Created agent tool: %s", tool.name)
@@ -2563,6 +2611,7 @@ def get_published_agents_tools(
     parent_tracer: Optional[Any] = None,
     agent_call_stack: Optional[list[int]] = None,
     execution_scope: Optional[Any] = None,
+    file_operation_access_version: Any = None,
 ) -> list[AbstractBaseTool]:
     """
     Get tools for published (and optionally draft) agents.
@@ -2623,6 +2672,7 @@ def get_published_agents_tools(
             parent_tracer=parent_tracer,
             agent_call_stack=agent_call_stack,
             execution_scope=execution_scope,
+            file_operation_access_version=file_operation_access_version,
         )
 
     except Exception as e:
@@ -2684,6 +2734,9 @@ async def create_agent_tools(config: "WebToolConfig") -> list[AbstractBaseTool]:
             execution_scope=config.get_execution_scope()
             if hasattr(config, "get_execution_scope")
             else None,
+            file_operation_access_version=(config.get_workspace_config() or {}).get(
+                FILE_OPERATION_ACCESS_VERSION_KEY
+            ),
         )
         records_getter = getattr(config, "get_published_agent_tool_records", None)
         records = records_getter() if callable(records_getter) else None

@@ -32,6 +32,16 @@ constructs its own ``TraceEvent`` row and adds it to the session directly,
 without going through ``_save_trace_event`` or this function. This function
 is the sole construction point on the ``_save_trace_event`` path, not the
 only place a trace row is ever built in the codebase.
+
+A third writer would have to sanitize for itself too (#1248): every payload
+reaching these columns must pass ``sanitize_json_payload`` first, and that
+is a convention here rather than something the type system enforces. It is
+not enforced structurally because the ordering is load-bearing -- the
+sanitize has to happen before ``encode_checkpoint_data_for_storage`` hashes
+the payload, which a column-level ``TypeDecorator`` (running at bind time,
+long after the hash) could not guarantee. On PostgreSQL a missed sanitize
+fails loudly at INSERT, since the columns are ``jsonb``; on SQLite it would
+store silently, so a new writer is worth checking by hand.
 """
 
 from __future__ import annotations
@@ -44,6 +54,7 @@ from sqlalchemy.orm import Session
 
 from ...core.agent.checkpoint import CHECKPOINT_TYPE
 from ..models.task import TraceEvent as DatabaseTraceEvent
+from ..utils.json_payload_sanitizer import sanitize_json_payload
 from .task_lease_service import TASK_RUN_ID_TRACE_FIELD, TaskLease
 from .trace_message_storage import encode_checkpoint_data_for_storage
 
@@ -105,6 +116,14 @@ def stage_trace_event_row(
     a sub-agent checkpoint (``build_id`` set) must be passed
     ``checkpoint_lease=None`` regardless of whether a lease is live.
     """
+    # Sanitize before anything derives from the payload: the checkpoint
+    # branches below hash and deduplicate blob rows out of ``data``, and the
+    # stored hash must be computed over what actually lands in the column.
+    # PostgreSQL's jsonb rejects NUL and unpaired-surrogate code points at
+    # INSERT (#1248); on other dialects the same cleaning keeps stored
+    # payloads identical across backends.
+    data = sanitize_json_payload(data)
+
     is_checkpoint = (
         event_type == "system_update_general"
         and isinstance(data, dict)

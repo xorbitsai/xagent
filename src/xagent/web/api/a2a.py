@@ -308,6 +308,17 @@ async def _restore_a2a_resume_prelease_isolated(
     )
 
 
+# The exact non-key column set the resume-input fence UPDATE below writes.
+# Shared with test_interaction_close_lock_ordering.py's static guard, which
+# asserts the UPDATE's values keys equal this set exactly: the fence's
+# no-lock-read argument (see the inline comment inside
+# _update_a2a_resume_input_sync) depends on every one of these columns being
+# a non-key column, so a future change widening the UPDATE's values must
+# widen this constant too, deliberately, not just add a key to a dict
+# literal the guard never looks at again.
+RESUME_INPUT_FENCE_UPDATE_COLUMNS = frozenset({"input", "output", "error_message"})
+
+
 def _update_a2a_resume_input_sync(
     task_lease: TaskLease,
     text: str,

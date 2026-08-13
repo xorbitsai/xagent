@@ -35,6 +35,7 @@ on:
       - 'src/xagent/web/services/ops_signals.py'
       - 'src/xagent/core/tools/adapters/vibe/ask_user_tool.py'
       - 'src/xagent/web/models/database.py'
+      - 'src/xagent/web/services/task_interaction_close.py'
       - 'tests/web/services/test_supersede_savepoint_postgresql.py'
       - 'tests/web/services/test_task_interaction_close_postgresql.py'
   pull_request:
@@ -103,6 +104,7 @@ jobs:
             src/xagent/web/services/ops_signals.py
             src/xagent/core/tools/adapters/vibe/ask_user_tool.py
             src/xagent/web/models/database.py
+            src/xagent/web/services/task_interaction_close.py
             tests/web/services/test_supersede_savepoint_postgresql.py
             tests/web/services/test_task_interaction_close_postgresql.py
           )

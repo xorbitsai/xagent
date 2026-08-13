@@ -159,9 +159,15 @@ def test_both_websocket_injection_sites_call_the_shared_close_helper() -> None:
 
 
 def test_a2a_resume_input_fence_precedes_the_close_call() -> None:
-    """The A2A resume-input fence UPDATE is the first statement this
-    transaction directs at tasks or task_interaction_requests -- it must
-    precede the close call it satisfies the lock obligation for.
+    """The A2A resume-input fence UPDATE must precede the close call it
+    satisfies the lock obligation for.
+
+    This only checks source order between the fence UPDATE and the close
+    call, not that the fence UPDATE is literally the first statement the
+    transaction issues against ``tasks`` or ``task_interaction_requests``
+    -- see the module docstring and ``_update_a2a_resume_input_sync``'s own
+    inline comment for that broader claim, which this assertion does not
+    prove.
 
     Moving the fence UPDATE after the close call turns this red.
     """
@@ -186,6 +192,34 @@ def test_a2a_resume_input_fence_precedes_the_close_call() -> None:
         "the resume-input fence UPDATE must precede the call into "
         "close_legacy_resume_interaction"
     )
+
+
+def _fence_update_value_columns(fn: ast.AST) -> set[str]:
+    """Attribute names (``Task.<name>``) used as keys in the resume-input
+    fence's ``.update({...})`` values dict."""
+    for node in ast.walk(fn):
+        if not (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "update"
+            and node.args
+            and isinstance(node.args[0], ast.Dict)
+        ):
+            continue
+        return {key.attr for key in node.args[0].keys if isinstance(key, ast.Attribute)}
+    raise AssertionError("no .update({...}) call found")
+
+
+def test_a2a_resume_input_fence_writes_exactly_the_approved_columns() -> None:
+    """The fence UPDATE's no-lock-read argument (see
+    _update_a2a_resume_input_sync's inline comment) holds only because every
+    column it writes is a non-key column. Adding a key column -- or any
+    column covered by a unique index -- to the UPDATE's values without
+    re-justifying that argument and widening
+    a2a.RESUME_INPUT_FENCE_UPDATE_COLUMNS to match must turn this red.
+    """
+    fn = _find_function(ast.parse(_source(a2a)), "_update_a2a_resume_input_sync")
+    assert _fence_update_value_columns(fn) == set(a2a.RESUME_INPUT_FENCE_UPDATE_COLUMNS)
 
 
 def _sa_update_targets(tree: ast.AST) -> list[str]:

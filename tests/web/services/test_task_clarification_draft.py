@@ -261,6 +261,23 @@ def test_none_attempt_id_skips_the_attempt_guard() -> None:
     assert isinstance(resolution, Publishable)
 
 
+def test_missing_draft_guard_wins_over_unfenced_lease_guard() -> None:
+    """Guard 1 (waiting-status vs. draft-presence pairing) must run before
+    guard 2 (lease fencing). A waiting run with neither a draft nor a
+    fenced lease has to classify as ``missing_draft`` -- whose caller
+    contract is "don't discard the round" -- not ``unfenced_lease``, whose
+    contract is "discard the round wholesale". Swapping the two guards'
+    order would still return a ``FailClosed`` here, but with the wrong
+    reason and therefore the wrong consequence for the caller."""
+
+    result = {"status": "waiting_for_user"}
+    resolution = resolve_publishable_clarification(
+        result, task=_task(), lease=_lease(run_id=None), anchor=_anchor(), now=_now()
+    )
+    assert isinstance(resolution, FailClosed)
+    assert resolution.fail_closed_reason == "missing_draft"
+
+
 def test_missing_anchor_is_not_applicable_not_fail_closed() -> None:
     result = {"status": "waiting_for_user", "clarification_draft": _draft()}
     resolution = resolve_publishable_clarification(
@@ -529,6 +546,26 @@ def test_oversized_question_is_truncated_and_the_idempotency_key_is_unaffected()
     assert key_before == key_after
 
 
+def test_oversized_multi_byte_question_truncates_on_a_character_boundary() -> None:
+    """Every character here encodes to 3 UTF-8 bytes, so a byte-slice that
+    ignores character boundaries would land mid-character. ``errors="ignore"``
+    in ``_truncate_to_byte_limit`` drops a partial trailing character rather
+    than raising, but nothing pinned that the result stays valid UTF-8 with
+    no stray replacement character -- this test is that pin."""
+
+    long_question = "你" * (10 * 1024)  # ~30 KiB, over the 16 KiB limit
+    draft = _draft(message=long_question)
+    payload = build_clarification_payload(draft)
+
+    assert payload["question_truncated"] is True
+    encoded = payload["question"].encode("utf-8")
+    assert len(encoded) <= 16 * 1024
+    # Round-trips cleanly and introduces no U+FFFD replacement character --
+    # a mid-character byte slice would either raise here or leave one.
+    assert encoded.decode("utf-8") == payload["question"]
+    assert "�" not in payload["question"]
+
+
 def test_oversized_interactions_are_dropped_entirely() -> None:
     huge_interactions = tuple({"field": "x" * 2000, "index": i} for i in range(64))
     draft = _draft(interactions=huge_interactions)
@@ -586,6 +623,20 @@ def test_message_type_control_characters_are_stripped_from_the_payload() -> None
     key_before = clarification_idempotency_key(draft)
     build_clarification_payload(draft)
     assert clarification_idempotency_key(draft) == key_before
+
+
+def test_interaction_leaf_control_characters_are_stripped_through_full_payload_assembly() -> (
+    None
+):
+    """``test_character_domain_matches_the_marker_cleaning_domain`` pins
+    ``_strip_control_characters`` in isolation; this pins the same
+    filtering as it actually runs inside ``build_clarification_payload``
+    for a form's ``interactions`` leaves."""
+
+    dirty_interactions = ({"prompt": "pick\x07one", "id": "opt\x00-1"},)
+    draft = _draft(interactions=dirty_interactions)
+    payload = build_clarification_payload(draft)
+    assert payload["interactions"] == [{"prompt": "pickone", "id": "opt-1"}]
 
 
 def test_payload_still_too_large_after_truncation_is_not_applicable() -> None:

@@ -47,7 +47,13 @@ from xagent.web.services import (  # noqa: F401 -- negative control import
     task_clarification_draft as resolver_module,
 )
 
-GATED_NAMES = frozenset({"resolve_publishable_clarification"})
+GATED_NAMES = frozenset(
+    {
+        "resolve_publishable_clarification",
+        "parse_clarification_payload",
+        "build_clarification_payload",
+    }
+)
 PRIMITIVE_MODULE = "task_clarification_draft"
 
 

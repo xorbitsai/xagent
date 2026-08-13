@@ -84,7 +84,7 @@ import json
 import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
-from typing import Any, Mapping
+from typing import Any, Literal, Mapping
 
 from ...core.agent.clarification import ClarificationDraft
 from ..models.task import Task
@@ -164,6 +164,21 @@ def _truncate_to_byte_limit(text: str, max_bytes: int) -> str:
     return encoded[:max_bytes].decode("utf-8", errors="ignore")
 
 
+# The full value sets below, enumerated from every construction site in
+# :func:`resolve_publishable_clarification` and from :class:`NotApplicable`
+# and :class:`FailClosed`'s own docstrings. Both are ``str`` at runtime --
+# ``Literal`` only narrows what a type checker accepts, so a caller reading
+# ``resolution.fail_closed_reason == "attempt_mismatch"`` needs no change.
+NotApplicableReason = Literal["no_anchor", "payload_too_large", "empty_question"]
+FailClosedReason = Literal[
+    "missing_draft",
+    "draft_status_mismatch",
+    "unfenced_lease",
+    "ownership_changed",
+    "attempt_mismatch",
+]
+
+
 @dataclass(frozen=True)
 class Publishable:
     """The draft passed every precondition; these three values are exactly
@@ -189,7 +204,7 @@ class NotApplicable:
     of those is a degrade, not a failure -- the run is not discarded.
     """
 
-    reason: str | None
+    reason: NotApplicableReason | None
     fail_closed_reason: None = field(default=None, init=False, repr=False)
 
 
@@ -212,10 +227,10 @@ class FailClosed:
     late-result exit -- this module adds no new one.
     """
 
-    reason: str
+    reason: FailClosedReason
 
     @property
-    def fail_closed_reason(self) -> str:
+    def fail_closed_reason(self) -> FailClosedReason:
         return self.reason
 
 

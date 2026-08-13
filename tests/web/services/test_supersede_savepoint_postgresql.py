@@ -59,14 +59,15 @@ def engine():
     admin_engine.dispose()
 
     eng = sa.create_engine(url, connect_args={"options": f"-csearch_path={schema}"})
-    Base.metadata.create_all(bind=eng)
-    yield eng
-    eng.dispose()
-
-    admin_engine = sa.create_engine(url)
-    with admin_engine.begin() as conn:
-        conn.execute(sa.text(f'DROP SCHEMA "{schema}" CASCADE'))
-    admin_engine.dispose()
+    try:
+        Base.metadata.create_all(bind=eng)
+        yield eng
+    finally:
+        eng.dispose()
+        admin_engine = sa.create_engine(url)
+        with admin_engine.begin() as conn:
+            conn.execute(sa.text(f'DROP SCHEMA "{schema}" CASCADE'))
+        admin_engine.dispose()
 
 
 @pytest.fixture()

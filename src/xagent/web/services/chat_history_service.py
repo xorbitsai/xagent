@@ -333,9 +333,9 @@ def supersede_legacy_question_rows(db: Session, *, task_id: int) -> int:
     ``TaskChatMessage`` object already loaded in the caller's session
     keeps its stale ``message_type`` until the caller refreshes it. Like
     ``mark_user_message_delivery``, it does not commit or roll back
-    ``db`` — the caller owns the transaction, and is expected to already
-    hold a lock on the task's ``tasks`` row (see the concurrency
-    paragraph below).
+    ``db`` — the caller owns the transaction. What serializes this against
+    a concurrent answer to the same question is not settled here; see the
+    concurrency paragraph below.
 
     Holding that no-commit promise on SQLite takes one extra statement: a
     no-op ``UPDATE`` issued before the savepoint opens, purely to get a
@@ -353,10 +353,12 @@ def supersede_legacy_question_rows(db: Session, *, task_id: int) -> int:
     removes that failure mode structurally — and, as a consequence, also
     flips any already-answered question row left over from an earlier
     turn, not only the row still genuinely waiting. That is deliberate,
-    not a side effect to fix. One user-visible cost: for a historical
-    row, the admin transcript export can no longer tell "answered, then
-    superseded" apart from "abandoned, then superseded" — both end up as
-    ``SUPERSEDED_MESSAGE_TYPE`` with nothing recording which happened.
+    not a side effect to fix. What changes for the admin transcript export
+    is this row's ``message_type`` value: it exports as
+    ``SUPERSEDED_MESSAGE_TYPE`` instead of ``QUESTION_MESSAGE_TYPE``. The
+    adjacent user rows are untouched — they do not match this UPDATE's
+    predicate — so whatever the export's readers infer from a following
+    user message is unaffected.
 
     A rowcount of zero is a normal outcome — an already-empty set, a
     reentrant call, a mid-turn write that already failed on its own —
@@ -376,15 +378,24 @@ def supersede_legacy_question_rows(db: Session, *, task_id: int) -> int:
     the savepoint contained the damage and the enclosing transaction
     survives, so this logs, degrades via
     ``CLARIFICATION_LEGACY_SUPERSEDE_FAILED`` and returns 0 rather than
-    taking the caller's transaction down with it. If the UPDATE ran and
-    the savepoint failed on the way out, nothing contained that either:
-    on PostgreSQL a failed ``RELEASE`` aborts the enclosing transaction,
-    and a caller that then commits gets no error while every staged write
-    is discarded, because PostgreSQL treats ``COMMIT`` on an aborted
-    transaction as a rollback. That propagates too. Re-raising cannot
-    rescue the transaction — it is already gone — but it is the
-    difference between a caller that knows and one that silently loses
-    its writes.
+    taking the caller's transaction down with it.
+
+    One cell that path cannot contain: if the UPDATE failed and the
+    rollback to the savepoint also failed, the enclosing transaction is
+    unusable too. In practice that combination requires the connection to
+    be gone — on a live connection the rollback to the savepoint clears
+    the failure — and a caller committing on a dead connection fails
+    loudly rather than discarding writes silently, which is why this is
+    not routed like the release failure above.
+
+    If the UPDATE ran and the savepoint failed on the way out, nothing
+    contained that either: on PostgreSQL a failed ``RELEASE`` aborts the
+    enclosing transaction, and a caller that then commits gets no error
+    while every staged write is discarded, because PostgreSQL treats
+    ``COMMIT`` on an aborted transaction as a rollback. That propagates
+    too. Re-raising cannot rescue the transaction — it is already gone —
+    but it is the difference between a caller that knows and one that
+    silently loses its writes.
 
     Python-side misuse — ``InvalidRequestError``, ``PendingRollbackError``,
     ``ArgumentError`` — is not a ``DBAPIError`` and was never caught here.
@@ -397,27 +408,35 @@ def supersede_legacy_question_rows(db: Session, *, task_id: int) -> int:
     the SAVEPOINT, and does so unconditionally: the flush is gated on
     transaction origin, not on ``autoflush``, so the production session's
     ``autoflush=False`` (``models/database.py``) does not suppress it.
-    This function therefore calls ``db.flush()`` itself, outside the
-    ``try``, before opening the savepoint. Without that, a constraint
-    violation among the caller's *own* pending rows raises
-    ``IntegrityError`` — a ``DBAPIError`` subclass — from inside
-    ``begin_nested()`` before the UPDATE runs, and the catch absorbs it:
-    the caller's failure gets reported as a legacy question supersede
-    failure, and the caller meets an opaque ``PendingRollbackError`` at
-    commit with nothing pointing at the real cause. With the flush first,
-    that failure leaves this function on the line that caused it and the
-    catch covers only the UPDATE and its savepoint. This function adds
-    nothing to the session, so a flush failure here is always the
-    caller's, never this helper's, and is left to propagate unchanged.
+    This function calls ``db.flush()`` itself, outside the ``try``, before
+    opening the savepoint, for two reasons. Attribution: a constraint
+    violation among the caller's own pending rows then raises from that
+    line rather than from inside the ``try``, so the traceback points at
+    the caller's row and not at this sweep. Independence: the placement
+    does not rely on where SQLAlchemy chooses to flush, so a change in
+    that behaviour cannot move a caller's failure into this function's
+    catch. Either way a flush happens before the savepoint opens, so the
+    assistant row the caller staged earlier in this same turn is already
+    in the database when the UPDATE runs and is matched by it.
     ``interaction_handoff`` (``task_interaction_staging.py``) takes the
     same position on the same SQLAlchemy behavior, translating it into
     ``InteractionOwnerStateError`` rather than swallowing it.
 
-    Serializing this against a concurrent ``respond()`` call on the same
-    task is not this function's job — it relies on the caller's
-    transaction already holding the task locked (a real row lock on
-    PostgreSQL, the single-writer model on SQLite); a green SQLite test
-    does not exercise that lock.
+    The exposure is a relabel racing an answer to the same question: this
+    function flips a row to superseded while another transaction is
+    answering that row, and the two need to be ordered against each other.
+    This function does not order them — it takes no row lock on the task,
+    reads no lease, and checks no caller state. Where this repository needs
+    that ordering elsewhere it uses a row lock plus an ownership filter
+    (``websocket.py:2190-2197`` and ``:2876-2885`` take
+    ``with_for_update()`` alongside ``runner_id``/``run_id`` predicates),
+    and ``task_interaction_staging.py:1176-1190`` records what that costs
+    on SQLite, where SQLAlchemy drops ``with_for_update()`` and only
+    single-writer semantics keep the window shut. Choosing among those
+    belongs to the change that introduces the first call site, together
+    with the structured answering path it would race; neither exists yet,
+    so nothing is arranged here. A passing SQLite test says nothing either
+    way about that ordering, for the reason the staging module documents.
 
     This function has no caller in ``src/`` yet. The intended call site
     sits inside ``interaction_handoff`` (``task_interaction_staging.py``),

@@ -445,6 +445,9 @@ class TaskTurnOrchestrator:
             TaskTurnError("bg_inflight"): a previous bg coroutine is running.
             TaskTurnError("busy"): the row exists and is owned but its status
                 did not match the claim filter.
+            TaskTurnError("interaction_response_required"): ``kind ==
+                APPEND`` and the row's status is ``WAITING_FOR_USER`` --
+                use the reply endpoint instead of append.
             TaskTurnNotFoundError: no row matched id + owner.
         """
         if kind == TurnKind.CREATE and force_fresh:
@@ -1082,7 +1085,10 @@ def _begin_turn_atomic_sync(
 
       - row missing / not owned by ``task_owner_user_id`` →
         :class:`TaskTurnNotFoundError`
-      - row exists + owned but wrong status → ``TaskTurnError("busy")``
+      - row exists + owned but wrong status → ``TaskTurnError("busy")``,
+        or ``TaskTurnError("interaction_response_required")`` when the
+        row's status is ``WAITING_FOR_USER`` (use the reply endpoint
+        instead of append)
 
     The committed-row snapshot is SELECTed pre-commit (read-your-writes within
     the transaction; a bulk ``.update(synchronize_session=False)`` leaves no

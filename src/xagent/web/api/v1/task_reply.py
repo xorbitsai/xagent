@@ -144,7 +144,8 @@ def _prepare_reply_context_sync(
                 422,
                 message=(
                     "files are not accepted on reply; attach files via a "
-                    "follow-up POST /v1/chat/tasks/{task_id}/messages call"
+                    "follow-up call to the task append endpoint "
+                    "(POST .../messages) instead"
                 ),
             )
         if task.status != TaskStatus.WAITING_FOR_USER:
@@ -158,6 +159,33 @@ def _prepare_reply_context_sync(
         )
 
 
+# Four different mechanisms keep this claim from racing every other writer
+# that can touch a WAITING_FOR_USER task, none of which overlap by accident:
+#
+# 1. Append (task_orchestrator._claim_turn_no_commit): its claim filters
+#    Task.status.in_(_APPENDABLE_STATUSES), and this PR removed
+#    WAITING_FOR_USER from that set. A row this claim can match (status ==
+#    WAITING_FOR_USER) is therefore structurally outside append's status
+#    filter -- the two claims can never both succeed on the same row, by
+#    construction of the two status sets being disjoint.
+# 2. A second reply on the same task: the claim below is a single
+#    conditional UPDATE (status == WAITING_FOR_USER AND control_state in
+#    _RESUMABLE_CONTROL_STATES); whichever request's UPDATE commits first
+#    flips control_state away from those values, so a concurrent request's
+#    UPDATE matches zero rows and returns None. Covered by
+#    test_concurrent_reply_race_exactly_one_winner.
+# 3. A2A's own resume (a2a._acquire_a2a_resume_prelease_sync): its claim
+#    filters Task.source == "a2a"; this claim filters Task.source == "sdk".
+#    A task row has exactly one source value, so the two filters can never
+#    both match the same row.
+# 4. The WebSocket live-control resume path: unlike the three cases above,
+#    it does NOT filter by Task.source at all, so it is not excluded from a
+#    "sdk" row by a source predicate. Its exclusivity instead comes from
+#    two other mechanisms: the in-process reservation in
+#    background_task_manager (reserve_resume / resume_tasks) that allows
+#    only one live resume coroutine per task_id, and the exact-run-fenced
+#    lease acquired below, which a second claimant with a stale or missing
+#    run_id cannot pass.
 def _acquire_reply_prelease_sync(
     *,
     task_id: int,
@@ -201,6 +229,17 @@ def _acquire_reply_prelease_sync(
         if claimed != 1:
             db.rollback()
             return None
+        # A legacy row with run_id already NULL passes previous_run_id=None
+        # here. acquire_task_lease_no_commit mints a fresh UUID for that
+        # case rather than reusing anything, and (since the row isn't a
+        # live RUNNING row with a run id) also clears both checkpoint
+        # pointer columns (last_checkpoint_event_id /
+        # last_checkpoint_trace_event_id) as part of the same UPDATE. If
+        # this reply later fails closed, releasing the lease back to
+        # waiting_for_user does not restore those two columns -- they stay
+        # cleared. This is not a behavior change worth guarding against:
+        # a row with no run_id never had a run-fenced checkpoint to
+        # recover in the first place, so nothing resumable is lost.
         task_lease = acquire_task_lease_no_commit(
             db,
             task_id,

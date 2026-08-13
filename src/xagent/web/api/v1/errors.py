@@ -190,7 +190,7 @@ _DEFAULT_MESSAGES: dict[V1ErrorCode, str] = {
     V1ErrorCode.DELEGATED_AUTHORIZATION_FAILED: "Delegated authorization failed.",
     V1ErrorCode.INTERACTION_RESPONSE_REQUIRED: (
         "This task is waiting for an answer to a pending question; use "
-        "POST /v1/chat/tasks/{task_id}/reply instead."
+        "the task reply endpoint (POST .../reply) instead."
     ),
     V1ErrorCode.INTERACTION_NOT_RESUMABLE: (
         "This task's saved progress cannot be resumed; it remains in "

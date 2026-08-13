@@ -529,7 +529,7 @@ class CreateWorkforceRunResponse(BaseModel):
 
 
 class PendingInteraction(BaseModel):
-    """The agent's latest unanswered question on a waiting task.
+    """The agent's most recent question on a waiting task.
 
     ``interactions`` is an opaque list of structured-control descriptors
     (the agent tool's own JSON shape, e.g. ``{"type": "text_input",
@@ -609,14 +609,18 @@ class TaskInfoResponse(BaseModel):
     pending_interaction: Optional[PendingInteraction] = Field(
         None,
         description=(
-            "Convenience projection of the agent's most recent unanswered "
-            "question. Always present in the response body, but null "
-            "unless status='waiting_for_user' AND the task has at least "
-            "one persisted question message -- a task can reach "
-            "waiting_for_user with no question recorded (e.g. an empty "
-            "message body), and this field is null in that case too. "
-            "This is a convenience read, not the historical interaction "
-            "record; see #1079 for the full typed interaction surface."
+            "Convenience projection of the agent's most recent question. "
+            "Always present in the response body, but null unless "
+            "status='waiting_for_user' AND the task has at least one "
+            "persisted question message. A task can reach waiting_for_user "
+            "with no question ever recorded (e.g. an empty message body), "
+            "in which case this field is null too -- but if an earlier "
+            "turn already persisted a question, this field surfaces that "
+            "earlier question rather than null, since the read returns "
+            "the latest persisted question row regardless of which turn "
+            "wrote it. This is a convenience read, not the historical "
+            "interaction record; see #1079 for the full typed interaction "
+            "surface."
         ),
     )
 

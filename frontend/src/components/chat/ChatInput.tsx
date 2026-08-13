@@ -8,6 +8,7 @@ import { useI18n } from "@/contexts/i18n-context";
 import { useApp } from "@/contexts/app-context-chat";
 import { useAuth } from "@/contexts/auth-context";
 import { ConfigDialog } from "@/components/config-dialog";
+import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { apiRequest, getUploadErrorMessage, isJsonRecord, parseApiResponse, UPLOAD_ERROR_MESSAGES } from "@/lib/api-wrapper";
 import { sanitizeFilesDisabledPresentationText } from "@/lib/files-disabled-presentation";
 import { isPausableTaskStatus, isStoppedTaskStatus, normalizeTaskStatus, type TaskStatus } from "@/lib/task-status";
@@ -106,7 +107,8 @@ interface ChatInputProps {
   deferFileUpload?: boolean;
 }
 
-type ExecutionMode = "flash" | "balanced" | "think";
+type ExecutionMode = "auto" | "flash" | "balanced" | "think";
+const EXECUTION_MODES: ExecutionMode[] = ["auto", "flash", "balanced", "think"];
 type ExecutionModeConfig = ExecutionMode | { mode: ExecutionMode };
 
 interface AgentConfig {
@@ -165,6 +167,9 @@ export function ChatInput({
   const [isFocused, setIsFocused] = useState(false);
   const [showNoModelAlert, setShowNoModelAlert] = useState(false);
   const [isDraggingFiles, setIsDraggingFiles] = useState(false);
+  // Undefined until picked, so an untouched composer keeps the server default.
+  const [pickedExecutionMode, setPickedExecutionMode] = useState<ExecutionMode>();
+  const [executionModeMenuOpen, setExecutionModeMenuOpen] = useState(false);
   const [localBrowserTarget, setLocalBrowserTarget] =
     useState<LocalBrowserTarget | null>(null);
   const [taskRuntimeSelection, setTaskRuntimeSelection] =
@@ -587,6 +592,10 @@ export function ChatInput({
     !!isLoading &&
     !allowsLiveGuidanceInput &&
     !isStoppedTaskStatus(normalizedTaskStatus);
+  // Only a new standalone task: the backend takes execution_mode at creation
+  // only, and an agent (a template resolves into one) overrides it anyway.
+  const showExecutionModePicker =
+    !compact && !hideConfig && !readOnlyConfig && !taskConfig && !selectedTemplate;
   const showLocalBrowser = Boolean(user?.is_admin) && !readOnlyConfig && !hideConfig;
   const showTaskRuntimeExtension =
     hasTaskRuntimeComposerExtension && !readOnlyConfig && !hideConfig;
@@ -698,7 +707,9 @@ export function ChatInput({
       isSubmittingRef.current = true;
       const trimmed = message.trim();
       const messageToSend = trimmed;
-      const executionMode = taskConfig?.executionMode;
+      const executionMode = showExecutionModePicker
+        ? pickedExecutionMode
+        : taskConfig?.executionMode;
       const extraRuntimeExtensions = activeLocalBrowserTarget
         ? { local_browser: { ...activeLocalBrowserTarget } }
         : activeTaskRuntimeSelection?.runtimeExtensions;
@@ -1136,6 +1147,45 @@ export function ChatInput({
                       />
                     )}
                   </>
+                )}
+                {showExecutionModePicker && (
+                  // Popover, not ui/select: the form is overflow-hidden and clips it.
+                  <Popover open={executionModeMenuOpen} onOpenChange={setExecutionModeMenuOpen}>
+                    <PopoverTrigger
+                      type="button"
+                      className="inline-flex h-9 items-center gap-2 rounded-xl px-3 text-xs text-muted-foreground hover:bg-secondary/80 hover:text-foreground disabled:pointer-events-none disabled:opacity-50"
+                      disabled={isInputBusy}
+                      title={t("builds.configForm.executionMode.label")}
+                    >
+                      <Sparkles className="h-4 w-4" />
+                      <span className="max-w-[150px] truncate hidden sm:inline-block">
+                        {t(`builds.configForm.executionMode.${pickedExecutionMode ?? "auto"}.title`)}
+                      </span>
+                    </PopoverTrigger>
+                    <PopoverContent align="start" side="top" className="w-64 space-y-0.5 p-1.5">
+                      {EXECUTION_MODES.map((mode) => (
+                        <button
+                          key={mode}
+                          type="button"
+                          onClick={() => {
+                            setPickedExecutionMode(mode);
+                            setExecutionModeMenuOpen(false);
+                          }}
+                          className={cn(
+                            "flex w-full flex-col items-start gap-0.5 rounded-lg px-3 py-2 text-left transition-colors hover:bg-muted",
+                            mode === pickedExecutionMode && "bg-muted"
+                          )}
+                        >
+                          <span className="text-sm font-medium">
+                            {t(`builds.configForm.executionMode.${mode}.title`)}
+                          </span>
+                          <span className="text-xs text-muted-foreground">
+                            {t(`builds.configForm.executionMode.${mode}.description`)}
+                          </span>
+                        </button>
+                      ))}
+                    </PopoverContent>
+                  </Popover>
                 )}
                 {/* Add files or bind this new task to a local host window. */}
                 {(!hideFileUpload && !filesDisabled)

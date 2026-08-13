@@ -2523,6 +2523,10 @@ const zh = {
       },
       executionMode: {
         label: "执行模式",
+        auto: {
+          title: "自动",
+          description: "由智能体按请求自行选择",
+        },
         flash: {
           title: "闪电模式",
           description: "简单快速的任务",

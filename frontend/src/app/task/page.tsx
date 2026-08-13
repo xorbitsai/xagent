@@ -32,7 +32,7 @@ function TaskHomePageContent() {
   const [selectedAgents, setSelectedAgents] = useState<AgentCard[]>([]);
   const [selectedAgentConfig, setSelectedAgentConfig] = useState<{
     model?: string;
-    executionMode?: "flash" | "balanced" | "think";
+    executionMode?: "auto" | "flash" | "balanced" | "think";
   }>();
   const [templates, setTemplates] = useState<Template[]>([]);
   const [templatesLoading, setTemplatesLoading] = useState(false);

@@ -2523,6 +2523,10 @@ Build when you need.`,
       },
       executionMode: {
         label: "Execution Mode",
+        auto: {
+          title: "Auto",
+          description: "Let the agent pick per request",
+        },
         flash: {
           title: "Flash",
           description: "Simple, quick tasks",

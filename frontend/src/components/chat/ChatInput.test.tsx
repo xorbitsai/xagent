@@ -1118,6 +1118,112 @@ describe("ChatInput", () => {
     )
   })
 
+  it("sends the picked execution mode for a new standalone task", async () => {
+    apiRequestMock.mockImplementation((url: string) => {
+      if (url === "http://api.local/api/models/?category=llm") {
+        return Promise.resolve(
+          new Response(JSON.stringify([{ model_id: "model-1", is_default: true }]), {
+            status: 200,
+            headers: { "Content-Type": "application/json" },
+          })
+        )
+      }
+      return Promise.resolve(emptyJsonResponse())
+    })
+    const onSend = vi.fn()
+    const { container } = render(
+      <ChatInput
+        hideFileUpload
+        inputValue="plan a trip"
+        onInputChange={vi.fn()}
+        onSend={onSend}
+      />
+    )
+
+    const trigger = await screen.findByText("builds.configForm.executionMode.auto.title")
+    fireEvent.click(trigger)
+    fireEvent.click(screen.getByText("builds.configForm.executionMode.think.title"))
+    fireEvent.submit(container.querySelector("form") as HTMLFormElement)
+
+    await waitFor(() => {
+      expect(onSend).toHaveBeenCalledWith(
+        "plan a trip",
+        expect.objectContaining({ executionMode: { mode: "think" } })
+      )
+    })
+  })
+
+  it("omits the execution mode when the picker was never touched", async () => {
+    apiRequestMock.mockImplementation((url: string) => {
+      if (url === "http://api.local/api/models/?category=llm") {
+        return Promise.resolve(
+          new Response(JSON.stringify([{ model_id: "model-1", is_default: true }]), {
+            status: 200,
+            headers: { "Content-Type": "application/json" },
+          })
+        )
+      }
+      return Promise.resolve(emptyJsonResponse())
+    })
+    const onSend = vi.fn()
+    const { container } = render(
+      <ChatInput
+        hideFileUpload
+        inputValue="plan a trip"
+        onInputChange={vi.fn()}
+        onSend={onSend}
+      />
+    )
+
+    await screen.findByText("builds.configForm.executionMode.auto.title")
+    fireEvent.submit(container.querySelector("form") as HTMLFormElement)
+
+    await waitFor(() => expect(onSend).toHaveBeenCalledOnce())
+    expect(onSend.mock.calls[0][1].executionMode).toBeUndefined()
+  })
+
+  it("hides the execution mode picker for a template-resolved task", async () => {
+    const onSend = vi.fn()
+    render(
+      <ChatInput
+        hideFileUpload
+        inputValue="summarize this doc"
+        onInputChange={vi.fn()}
+        onSend={onSend}
+        selectedTemplate={{ id: "doc-summarizer", name: "Doc Summarizer" }}
+      />
+    )
+
+    expect(
+      screen.queryByText("builds.configForm.executionMode.auto.title")
+    ).not.toBeInTheDocument()
+  })
+
+  it("hides the execution mode picker for an existing task and keeps its mode", async () => {
+    const onSend = vi.fn()
+    const { container } = render(
+      <ChatInput
+        hideFileUpload
+        inputValue="continue"
+        onInputChange={vi.fn()}
+        onSend={onSend}
+        taskConfig={{ model: "model-1", executionMode: "flash" }}
+      />
+    )
+
+    expect(
+      screen.queryByText("builds.configForm.executionMode.auto.title")
+    ).not.toBeInTheDocument()
+    fireEvent.submit(container.querySelector("form") as HTMLFormElement)
+
+    await waitFor(() => {
+      expect(onSend).toHaveBeenCalledWith(
+        "continue",
+        expect.objectContaining({ executionMode: { mode: "flash" } })
+      )
+    })
+  })
+
   it("keeps generic loading input disabled without a live task status", () => {
     const { container } = render(
       <ChatInput

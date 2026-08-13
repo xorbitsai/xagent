@@ -625,7 +625,7 @@ export interface Task {
   smallFastModelName?: string
   visualModelName?: string
   compactModelName?: string
-  executionMode?: "flash" | "balanced" | "think"
+  executionMode?: "auto" | "flash" | "balanced" | "think"
   isDag?: boolean
   agentId?: number
   agentName?: string

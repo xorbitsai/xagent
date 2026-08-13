@@ -122,14 +122,36 @@ def _call_lines(tree: ast.AST, *, attr: str) -> list[int]:
 
 
 def _key_share_lock_read_lines(tree: ast.AST) -> list[int]:
+    """Line numbers of every ``with_for_update(...)`` call that actually
+    takes the FOR NO KEY UPDATE lock the ordering obligation requires.
+
+    Verified against this repo's SQLAlchemy 2.0.47: ``key_share=True``
+    alone renders FOR NO KEY UPDATE, the strength this obligation needs.
+    ``key_share=False`` renders plain FOR UPDATE -- a stronger, deadlock-
+    prone lock the obligation's argument does not sanction -- so a literal
+    ``True`` is required, not just the keyword's presence. Adding
+    ``read=True`` alongside ``key_share=True`` renders FOR KEY SHARE
+    instead, a weaker lock that does not carry the ordering argument
+    either, so any call with a ``read`` keyword is excluded regardless of
+    its value.
+    """
     lines = []
     for node in ast.walk(tree):
-        if (
+        if not (
             isinstance(node, ast.Call)
             and isinstance(node.func, ast.Attribute)
             and node.func.attr == "with_for_update"
-            and any(kw.arg == "key_share" for kw in node.keywords)
         ):
+            continue
+        key_share_kw = next((kw for kw in node.keywords if kw.arg == "key_share"), None)
+        if key_share_kw is None:
+            continue
+        is_literal_true = (
+            isinstance(key_share_kw.value, ast.Constant)
+            and key_share_kw.value.value is True
+        )
+        has_read_kw = any(kw.arg == "read" for kw in node.keywords)
+        if is_literal_true and not has_read_kw:
             lines.append(node.lineno)
     return lines
 

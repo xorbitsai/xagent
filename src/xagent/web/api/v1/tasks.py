@@ -867,6 +867,28 @@ def _load_task_steps_snapshot(
         )
 
 
+def _filter_interaction_descriptors(
+    interactions: list[dict[str, Any]] | None,
+) -> list[dict[str, Any]] | None:
+    """Drop non-mapping elements from a stored interactions list.
+
+    ``PendingInteraction.interactions`` is typed ``list[dict[str, Any]] |
+    None``. A row written by an older or buggy writer can carry a list
+    with non-dict elements (e.g. a bare string); passing that straight
+    into the schema fails Pydantic validation and 500s the GET
+    permanently, for as long as the dirty row exists. Filtering here --
+    not in ``get_latest_waiting_question`` or the schema type -- keeps
+    the fix scoped to this read path's output contract; the shared
+    reader and its other consumers (websocket.py, chat.py) are
+    untouched. Same semantics as react.py's
+    ``_normalize_ask_user_interactions``: a non-dict element is dropped,
+    not coerced or repaired.
+    """
+    if interactions is None:
+        return None
+    return [item for item in interactions if isinstance(item, dict)]
+
+
 def _get_chat_task_sync(
     task_id: int,
     principal: ApiKeyPrincipal,
@@ -888,7 +910,7 @@ def _get_chat_task_sync(
     pending_interaction = (
         PendingInteraction(
             question=task.pending_question,
-            interactions=task.pending_interactions,
+            interactions=_filter_interaction_descriptors(task.pending_interactions),
         )
         if task.pending_question is not None
         else None

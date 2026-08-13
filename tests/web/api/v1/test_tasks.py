@@ -3291,6 +3291,32 @@ def test_get_task_waiting_empty_interactions_list_stays_empty_list(mock_start_ta
     assert body["interactions"] == []
 
 
+def test_get_task_waiting_drops_non_mapping_interaction_elements(mock_start_task):
+    """A dirty row whose stored interactions list mixes dicts with a
+    non-dict element (e.g. a bare string a buggy writer once persisted)
+    must not 500 the GET forever -- the v1 read path filters non-mapping
+    elements out, keeping only the valid dict entries."""
+    agent_id, full_key = _create_agent_with_key()
+    task_id = _create_task(full_key, agent_id)
+    _force_task_status(task_id, TaskStatus.WAITING_FOR_USER)
+    _insert_question_message(
+        task_id,
+        content="Should I continue?",
+        interactions=[
+            {"type": "text_input", "field": "destination", "label": "Destination"},
+            "not a mapping",
+        ],
+    )
+
+    resp = client.get(f"/v1/chat/tasks/{task_id}", headers=_bearer(full_key))
+    assert resp.status_code == 200, resp.text
+    body = resp.json()["pending_interaction"]
+    assert body["question"] == "Should I continue?"
+    assert body["interactions"] == [
+        {"type": "text_input", "field": "destination", "label": "Destination"}
+    ]
+
+
 def test_get_task_waiting_with_no_question_row_returns_null(mock_start_task):
     """A task can reach waiting_for_user with no question message
     persisted (e.g. an empty outbound message string). pending_interaction

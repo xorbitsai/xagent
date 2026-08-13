@@ -342,9 +342,8 @@ def supersede_legacy_question_rows(db: Session, *, task_id: int) -> int:
     transaction started, because pysqlite would otherwise let the
     savepoint's release commit the relabel. It is a self-assignment on a
     row id that cannot exist, so it writes nothing -- but it does take
-    SQLite's write lock for the rest of the caller's transaction, which a
-    zero-row call would not otherwise have taken. PostgreSQL needs none of
-    this and does not get it.
+    SQLite's write lock for the rest of the caller's transaction.
+    PostgreSQL needs none of this and does not get it.
 
     The update is deliberately whole-set and unordered rather than
     ``ORDER BY id DESC LIMIT 1``: under two simultaneously waiting
@@ -402,7 +401,7 @@ def supersede_legacy_question_rows(db: Session, *, task_id: int) -> int:
     ``mark_user_message_delivery`` lets a ``DBAPIError`` propagate too,
     though by having no handler at all rather than by re-raising: it
     guards a mandatory state transition, while this one is a best-effort
-    sweep whose contained failures can safely no-op and retry later.
+    sweep whose contained failures can safely no-op.
 
     ``Session.begin_nested()`` flushes the whole session before it issues
     the SAVEPOINT, and does so unconditionally: the flush is gated on
@@ -497,13 +496,11 @@ def supersede_legacy_question_rows(db: Session, *, task_id: int) -> int:
     # to a real data column, which is the trap the sibling site documents for
     # tasks.updated_at. Do not swap this for any Core form.
     #
-    # This statement is outside the try below, deliberately. If it fails, the
-    # failure is not a failed supersede: nothing has been relabelled, so it
-    # propagates to the caller rather than being folded into the degrade
-    # signal, exactly like the flush above it. A DBAPIError raised here
-    # therefore reaches the caller unwrapped and registers nothing (measured).
-    # Moving it inside the try would restore the misattribution the flush
-    # placement exists to prevent.
+    # This statement sits outside the try below, alongside the flush: if it
+    # fails, nothing has been relabelled, so the failure is not a failed
+    # supersede and the traceback should point at this line rather than into
+    # the block. A DBAPIError raised here reaches the caller unwrapped and
+    # registers nothing (measured).
     if db.get_bind(TaskChatMessage).dialect.name == "sqlite":
         db.execute(
             text(f"UPDATE {TaskChatMessage.__tablename__} SET id = id WHERE id = -1")

@@ -1,9 +1,10 @@
 """Retire a run's active interaction row when a legacy resume path answers it.
 
-Three production sites inject a WebSocket or A2A user message straight into
-a checkpoint instead of going through the native interaction protocol's
-answer path: the online WebSocket injection, the deferred WebSocket
-injection (``execute_resume_background``), and the A2A resume-input path.
+Four production sites inject a WebSocket, A2A, or v1 SDK user message
+straight into a checkpoint instead of going through the native interaction
+protocol's answer path: the online WebSocket injection, the deferred
+WebSocket injection (``execute_resume_background``), the A2A resume-input
+path, and the v1 ``POST .../reply`` resume-input path (``task_reply.py``).
 Each of those sites, once its own message write has succeeded, must retire
 the run's active ``task_interaction_requests`` row (if any) as
 ``terminated`` / ``answered_via_legacy_resume`` and clear
@@ -12,33 +13,35 @@ transaction as that retirement -- otherwise a stale marker would keep
 pointing a reader at a question the legacy path already answered by other
 means.
 
-Two resume-abandonment paths (the WebSocket lease restore and the A2A
-prelease restore) do the mirror-image cleanup when a resume is undone
-instead of completed: if the marker no longer corresponds to any active
-row, clear it. That clear is conditioned on ``NOT EXISTS`` rather than
-unconditional, because an abandonment can also race a resume that never
-even reached the injection call -- clearing unconditionally there would
-erase a marker that is still correct for a question that is still active.
+Three resume-abandonment paths (the WebSocket lease restore, the A2A
+prelease restore, and the v1 reply prelease restore) do the mirror-image
+cleanup when a resume is undone instead of completed: if the marker no
+longer corresponds to any active row, clear it. That clear is conditioned
+on ``NOT EXISTS`` rather than unconditional, because an abandonment can
+also race a resume that never even reached the injection call -- clearing
+unconditionally there would erase a marker that is still correct for a
+question that is still active.
 
-The two WebSocket sites and the one A2A site do not give this close the
-same atomicity guarantee. At both WebSocket sites (``websocket.py``),
-``close_legacy_resume_interaction_sync`` opens its own short transaction
-only after the message write has already committed -- the close is a
-best-effort step that follows the message write, not part of it. If that
-separate transaction fails, both call sites only log the failure; they do
-not retry, raise, or register a degradation signal. That is a deliberate
-choice, not a gap: a stale marker degrades to the legacy fallback question
-by design -- the same guarantee documented in the marker comment on
-``Task.interaction_protocol_version`` (``models/task.py``) -- so there is
-nothing left to protect by escalating. Both WebSocket call sites handle the
-failure of the delivery marker write immediately beside each close call
-(``mark_user_message_delivery_sync``) the identical log-only way, for the
-identical reason; see the inline comments beside each pair. The A2A site
-is different: its close call runs inside
-``_update_a2a_resume_input_sync``'s own transaction, committed together
-with the ownership fence UPDATE that precedes it, so that site's close is
-genuinely atomic with the write that answered the question -- not a
-best-effort follow-up.
+The two WebSocket sites and the A2A and v1 reply sites do not give this
+close the same atomicity guarantee. At both WebSocket sites
+(``websocket.py``), ``close_legacy_resume_interaction_sync`` opens its own
+short transaction only after the message write has already committed --
+the close is a best-effort step that follows the message write, not part
+of it. If that separate transaction fails, both call sites only log the
+failure; they do not retry, raise, or register a degradation signal. That
+is a deliberate choice, not a gap: a stale marker degrades to the legacy
+fallback question by design -- the same guarantee documented in the marker
+comment on ``Task.interaction_protocol_version`` (``models/task.py``) -- so
+there is nothing left to protect by escalating. Both WebSocket call sites
+handle the failure of the delivery marker write immediately beside each
+close call (``mark_user_message_delivery_sync``) the identical log-only
+way, for the identical reason; see the inline comments beside each pair.
+The A2A and v1 reply sites are different: each close call runs inside its
+own resume-input fence transaction (``_update_a2a_resume_input_sync`` in
+``a2a.py``, ``_update_reply_input_sync`` in ``task_reply.py``), committed
+together with the ownership fence UPDATE that precedes it, so those two
+sites' closes are genuinely atomic with the write that answered the
+question -- not a best-effort follow-up.
 
 Every rowcount the close statement below produces is classified the same
 way, at the one place the classification happens
@@ -220,11 +223,11 @@ def clear_interaction_marker_if_unpaired(
 ) -> None:
     """Zero the protocol marker if it no longer names any active row.
 
-    Used by the two resume-abandonment paths (the WebSocket lease restore
-    and the A2A prelease restore) instead of
-    ``close_legacy_resume_interaction``: an abandonment can happen before
-    the injection call ever ran, so there is no row to close here -- only
-    a marker to reconcile.
+    Used by the three resume-abandonment paths (the WebSocket lease
+    restore, the A2A prelease restore, and the v1 reply prelease restore)
+    instead of ``close_legacy_resume_interaction``: an abandonment can
+    happen before the injection call ever ran, so there is no row to close
+    here -- only a marker to reconcile.
 
     The semantics are not "clear the marker" but "if the marker no longer
     corresponds to any active row, zero it": the UPDATE below only matches

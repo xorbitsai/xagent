@@ -59,6 +59,11 @@ from ...services.db_runtime import (
     run_db_io_cancellation_safe,
 )
 from ...services.task_execution_controller import TaskControlState
+from ...services.task_interaction_close import (
+    clear_interaction_marker_if_unpaired,
+    close_legacy_resume_interaction,
+)
+from ...services.task_interaction_schema import interaction_requests_table_exists
 from ...services.task_lease_service import (
     TaskLease,
     TaskLeaseHeartbeatOutcome,
@@ -266,6 +271,15 @@ def _restore_reply_prelease_sync(task_lease: TaskLease) -> bool:
     a client retry after a lost response is idempotent at the runner
     boundary. If ownership changed, no row is mutated and the current
     owner remains the sole lifecycle authority.
+
+    Mirrors the A2A prelease restore (``a2a._restore_a2a_resume_prelease_sync``):
+    a successful restore is an abandoned resume, not a completed one, so it
+    also reconciles the interaction marker via
+    ``clear_interaction_marker_if_unpaired`` -- see that function's docstring
+    for the NOT EXISTS semantics. No lock read precedes this call:
+    ``release_task_lease_no_commit``'s own tasks UPDATE writes only
+    non-key columns and is already the first statement this transaction
+    directs at tasks or task_interaction_requests.
     """
     SessionLocal = get_session_local()
     with SessionLocal() as db:
@@ -275,6 +289,10 @@ def _restore_reply_prelease_sync(task_lease: TaskLease) -> bool:
             status=TaskStatus.WAITING_FOR_USER,
         )
         if restored:
+            assert task_lease.run_id is not None
+            clear_interaction_marker_if_unpaired(
+                db, task_id=task_lease.task_id, run_id=task_lease.run_id
+            )
             db.commit()
         else:
             db.rollback()
@@ -285,6 +303,14 @@ async def _restore_reply_prelease_isolated(task_lease: TaskLease) -> bool:
     return await run_db_io_cancellation_safe(
         lambda: _restore_reply_prelease_sync(task_lease)
     )
+
+
+# The exact non-key column set the resume-input fence UPDATE below writes.
+# Shared with test_interaction_close_lock_ordering.py's static guard, which
+# asserts the UPDATE's values keys equal this set exactly -- see
+# a2a.RESUME_INPUT_FENCE_UPDATE_COLUMNS for the fence's no-lock-read
+# argument this set backs.
+RESUME_INPUT_FENCE_UPDATE_COLUMNS = frozenset({"input", "output", "error_message"})
 
 
 def _update_reply_input_sync(task_lease: TaskLease, text: str) -> bool:
@@ -311,6 +337,25 @@ def _update_reply_input_sync(task_lease: TaskLease, text: str) -> bool:
         if updated != 1:
             db.rollback()
             return False
+        # Mirrors a2a._update_a2a_resume_input_sync's fence-ordering argument:
+        # this update() call is the fence, not a new transaction, so a
+        # rollback here would undo it together with the input write -- the
+        # point is that ownership and the interaction close are one atomic
+        # fact. No lock read either -- the fence UPDATE above writes only
+        # non-key columns (input, output, error_message) and is already the
+        # first statement this transaction directs at tasks or
+        # task_interaction_requests, so it satisfies the same ordering and
+        # strength obligation a dedicated lock read would. The table-presence
+        # gate sits here, immediately before the close call and after the
+        # fence UPDATE, for the same reason as the A2A site: the gate only
+        # inspects the catalog and takes no row lock, so it does not count
+        # as preceding the fence UPDATE in the sense the ordering obligation
+        # means.
+        assert task_lease.run_id is not None
+        if interaction_requests_table_exists(db):
+            close_legacy_resume_interaction(
+                db, task_id=task_lease.task_id, run_id=task_lease.run_id
+            )
         db.commit()
         return True
 

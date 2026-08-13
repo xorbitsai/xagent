@@ -4,24 +4,26 @@ the shape and reach of the statements and functions that carry it out.
 purge_task_rows closes an interaction row's task before deleting the row
 itself, an ordering fixed by task_deletion.py. The legacy resume close
 statements run in the opposite order (interaction row first, task marker
-second), so each of the three call sites needs a lock read on the task row,
+second), so each of the four call sites needs a lock read on the task row,
 taken before either statement, to keep that reversed order from closing a
 lock cycle with purge at any lock level purge itself might take.
 
-The obligation splits into two halves because the three call sites satisfy
-it two different ways (see task_interaction_close.py's module docstring
-and _update_a2a_resume_input_sync's inline comment):
+The obligation splits into two halves because the four call sites satisfy
+it two different ways (see task_interaction_close.py's module docstring,
+_update_a2a_resume_input_sync's inline comment, and
+_update_reply_input_sync's inline comment):
 
 * The two WebSocket injection sites (websocket.py) share one
   short-transaction helper, close_legacy_resume_interaction_sync, which
   takes one explicit FOR NO KEY UPDATE / key_share=True lock read before
   calling into the close-and-clear function -- one lock read, not two,
   because the obligation moved into the shared helper.
-* The A2A resume-input site (a2a.py) takes no lock read of its own: the
-  resume-input fence UPDATE it already issues, ahead of the close call, is
-  the first statement that transaction directs at tasks or
-  task_interaction_requests, and (being a non-key-column UPDATE) already
-  carries the ordering and strength this obligation asks for.
+* The A2A resume-input site (a2a.py) and the v1 reply resume-input site
+  (task_reply.py) each take no lock read of their own: the resume-input
+  fence UPDATE each already issues, ahead of its close call, is the first
+  statement that transaction directs at tasks or task_interaction_requests,
+  and (being a non-key-column UPDATE) already carries the ordering and
+  strength this obligation asks for.
 
 This is a static, AST-based check of source order, not a live-database
 lock test: it proves the statements appear in the required order in the
@@ -36,11 +38,20 @@ the module issues exactly the three UPDATE statements the design calls
 for, against exactly the tables named; and the unlocked
 close_legacy_resume_interaction (no lock read of its own -- it relies on
 its caller to have taken one, or to already hold an equivalent guarantee)
-is called from nowhere outside this module except the one site that has
-proven it satisfies that obligation another way. A new caller added
-without a lock read of its own, or without the A2A site's fence-ordering
-argument, would defeat the whole point of splitting the obligation into
-two halves above.
+is called from nowhere outside this module except the two sites that have
+proven they satisfy that obligation another way. A new caller added
+without a lock read of its own, or without the fence-ordering argument the
+A2A and v1 reply sites each carry, would defeat the whole point of
+splitting the obligation into two halves above.
+
+A third guard (below the two per-obligation halves) covers a different
+question entirely: every web/ module that injects a message via
+post_user_message, regardless of whether it satisfies the lock-ordering
+obligation through the shared WebSocket helper or the fence-ordering
+argument, must also wire in some close-family function -- otherwise a
+legacy resume answers a question without ever retiring the marker that
+names it. That guard is a static, module-level check, not a proof that
+the close call runs on every code path.
 """
 
 from __future__ import annotations
@@ -50,17 +61,34 @@ from pathlib import Path
 
 import xagent
 from xagent.web.api import a2a, websocket
+from xagent.web.api.v1 import task_reply
 from xagent.web.services import task_interaction_close
 
 CLOSE_MODULE_NAME = "task_interaction_close"
 UNLOCKED_CLOSE_FUNCTION = "close_legacy_resume_interaction"
-# The only caller allowed to reach the unlocked function directly, because
-# it has its own argument for why no lock read is needed (see
-# _update_a2a_resume_input_sync's inline comment): its ownership fence
-# UPDATE is already the first statement the transaction directs at tasks
-# or task_interaction_requests. Any other name added here must carry the
-# same kind of argument, not just a passing test.
-APPROVED_UNLOCKED_CALLERS = frozenset({"a2a"})
+# The only callers allowed to reach the unlocked function directly, because
+# each has its own argument for why no lock read is needed (see
+# _update_a2a_resume_input_sync's and _update_reply_input_sync's inline
+# comments): each site's ownership fence UPDATE is already the first
+# statement the transaction directs at tasks or task_interaction_requests.
+# Any other name added here must carry the same kind of argument, not just
+# a passing test.
+APPROVED_UNLOCKED_CALLERS = frozenset({"a2a", "task_reply"})
+
+POST_USER_MESSAGE_CALL_NAME = "post_user_message"
+CLOSE_FAMILY_CALL_NAMES = frozenset(
+    {
+        "close_legacy_resume_interaction",
+        "close_legacy_resume_interaction_sync",
+        "clear_interaction_marker_if_unpaired",
+    }
+)
+# web/ modules that call post_user_message but are exempt from the
+# close-family wiring obligation checked below. Empty by construction:
+# every known post_user_message call site today (a2a.py, websocket.py,
+# task_reply.py) wires in a close-family call. A new call site should wire
+# one in too, not be added here as an exception.
+APPROVED_UNWIRED_POST_USER_MESSAGE_CALLERS: frozenset[str] = frozenset()
 
 
 def _source(module) -> str:
@@ -222,6 +250,50 @@ def test_a2a_resume_input_fence_writes_exactly_the_approved_columns() -> None:
     assert _fence_update_value_columns(fn) == set(a2a.RESUME_INPUT_FENCE_UPDATE_COLUMNS)
 
 
+def test_reply_resume_input_fence_precedes_the_close_call() -> None:
+    """The v1 reply resume-input fence UPDATE must precede the close call it
+    satisfies the lock obligation for -- the same argument as the A2A site,
+    applied to task_reply.py's own fence-and-close pair.
+
+    Moving the fence UPDATE after the close call turns this red.
+    """
+    fn = _find_function(ast.parse(_source(task_reply)), "_update_reply_input_sync")
+    fence_update_lines = [
+        node.lineno
+        for node in ast.walk(fn)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "update"
+    ]
+    assert len(fence_update_lines) == 1, (
+        "expected exactly one .update(...) call in "
+        f"_update_reply_input_sync, found {len(fence_update_lines)}"
+    )
+    close_call_lines = _call_lines(fn, attr="close_legacy_resume_interaction")
+    assert len(close_call_lines) == 1, (
+        "expected exactly one call into close_legacy_resume_interaction from "
+        f"_update_reply_input_sync, found {len(close_call_lines)}"
+    )
+    assert fence_update_lines[0] < close_call_lines[0], (
+        "the resume-input fence UPDATE must precede the call into "
+        "close_legacy_resume_interaction"
+    )
+
+
+def test_reply_resume_input_fence_writes_exactly_the_approved_columns() -> None:
+    """The v1 reply fence UPDATE's no-lock-read argument (see
+    _update_reply_input_sync's inline comment) holds only because every
+    column it writes is a non-key column, the same argument the A2A site
+    makes. Adding a key column -- or any column covered by a unique index --
+    to the UPDATE's values without re-justifying that argument and widening
+    task_reply.RESUME_INPUT_FENCE_UPDATE_COLUMNS to match must turn this red.
+    """
+    fn = _find_function(ast.parse(_source(task_reply)), "_update_reply_input_sync")
+    assert _fence_update_value_columns(fn) == set(
+        task_reply.RESUME_INPUT_FENCE_UPDATE_COLUMNS
+    )
+
+
 def _sa_update_targets(tree: ast.AST) -> list[str]:
     """The target table name of every ``sa.update(<Table>)`` call, in
     source order. Matched on ``sa.update(...)`` specifically (the Core
@@ -258,13 +330,13 @@ def _calls_to(tree: ast.AST, *, name: str) -> bool:
     return bool(_call_lines(tree, attr=name))
 
 
-def test_unlocked_close_is_only_called_from_the_approved_a2a_site() -> None:
+def test_unlocked_close_is_only_called_from_the_approved_sites() -> None:
     """close_legacy_resume_interaction takes no lock read of its own -- it
     relies on its caller to already satisfy that obligation another way
     (see the module docstring above). Scans every source file under the
     installed xagent package, so a new caller added anywhere without
     updating APPROVED_UNLOCKED_CALLERS is caught regardless of which
-    package it lands in, not only websocket.py and a2a.py.
+    package it lands in, not only websocket.py, a2a.py, and task_reply.py.
 
     Known blind spot, not fixed here: this matches the call as written
     (``close_legacy_resume_interaction(...)`` or
@@ -287,4 +359,41 @@ def test_unlocked_close_is_only_called_from_the_approved_a2a_site() -> None:
     assert callers == APPROVED_UNLOCKED_CALLERS, (
         f"unlocked close_legacy_resume_interaction is called from {callers}, "
         f"expected exactly {set(APPROVED_UNLOCKED_CALLERS)}"
+    )
+
+
+def test_every_post_user_message_caller_wires_the_close_family() -> None:
+    """Every web/ module that injects a message via post_user_message must
+    also call one of the close-family functions somewhere in the same
+    module, or a legacy resume can answer a question through that module
+    without ever retiring the marker that names it.
+
+    This is a module-level check, not a call-site-level one: it proves a
+    close-family call exists somewhere in the module, not that it runs on
+    every code path that reaches post_user_message. Today's three call
+    sites (a2a.py, websocket.py x2, task_reply.py) each carry their own
+    per-site argument for why their wiring is complete; see the tests
+    above and task_interaction_close.py's module docstring.
+
+    Deleting a close-family call from a module that calls
+    post_user_message, without adding the module to
+    APPROVED_UNWIRED_POST_USER_MESSAGE_CALLERS, turns this red.
+    """
+    root = Path(next(iter(xagent.__path__))) / "web"
+    unwired: set[str] = set()
+    for path in root.rglob("*.py"):
+        source = path.read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        if not _calls_to(tree, name=POST_USER_MESSAGE_CALL_NAME):
+            continue
+        if path.stem in APPROVED_UNWIRED_POST_USER_MESSAGE_CALLERS:
+            continue
+        if not any(_calls_to(tree, name=n) for n in CLOSE_FAMILY_CALL_NAMES):
+            unwired.add(path.stem)
+    assert not unwired, (
+        f"modules {unwired} call post_user_message but wire in no "
+        "close-family function (close_legacy_resume_interaction[_sync] / "
+        "clear_interaction_marker_if_unpaired); either wire one in or add "
+        "the module to APPROVED_UNWIRED_POST_USER_MESSAGE_CALLERS with a "
+        "documented reason"
     )

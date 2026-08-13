@@ -9,6 +9,7 @@ up a real background execution, these tests patch the analogous
 """
 
 import asyncio
+from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -22,7 +23,8 @@ from xagent.core.agent.checkpoint import (
 from xagent.web.api.v1 import task_reply as task_reply_module
 from xagent.web.models.agent import Agent
 from xagent.web.models.chat_message import TaskChatMessage
-from xagent.web.models.task import Task, TaskStatus
+from xagent.web.models.task import Task, TaskStatus, TraceEvent
+from xagent.web.models.task_interaction import TaskInteractionRequest
 from xagent.web.schemas.v1 import ReplyRequest
 from xagent.web.services.task_execution_controller import TaskControlState
 from xagent.web.services.task_lease_service import TaskLease, current_task_lease
@@ -147,6 +149,50 @@ def _patch_agent_service(post_user_message: AsyncMock):
 
 def _reply_body(agent_id: int, content: str = "yes, continue") -> dict:
     return {"agent_id": agent_id, "message": {"role": "user", "content": content}}
+
+
+def _seed_active_interaction_row(
+    task_id: int, *, run_id: str, idempotency_key: str
+) -> int:
+    """One legal active TaskInteractionRequest row, for the legacy resume
+    close test below. Mirrors test_a2a_api.py's identically-purposed
+    helper, with origin="sdk" instead of "a2a" to match this endpoint's
+    Task.source == "sdk" scoping."""
+    db = _direct_db_session()
+    try:
+        anchor = TraceEvent(
+            task_id=task_id,
+            event_id=f"anchor-{idempotency_key}",
+            event_type="agent_execution_checkpoint",
+            timestamp=datetime.now(timezone.utc),
+            data={},
+        )
+        db.add(anchor)
+        db.flush()
+        row = TaskInteractionRequest(
+            task_id=task_id,
+            run_id=run_id,
+            kind="clarification",
+            protocol_version=1,
+            status="active",
+            active_slot=1,
+            origin="sdk",
+            request_payload={"prompt": "example"},
+            request_idempotency_key=idempotency_key,
+            resume_trace_event_id=int(anchor.id),
+            resume_event_id="resume-event-1",
+            resume_execution_id="resume-execution-1",
+            resume_locator_format="trace_event_pk_v1",
+            resume_checkpoint_type="agent_execution_checkpoint",
+            resume_run_partition=run_id,
+            expires_at=datetime.now(timezone.utc) + timedelta(minutes=15),
+        )
+        db.add(row)
+        db.commit()
+        db.refresh(row)
+        return int(row.id)
+    finally:
+        db.close()
 
 
 # ===== happy path =====
@@ -428,6 +474,111 @@ def test_reply_checkpoint_missing_is_fail_closed(mock_start_task):
         assert task.lease_expires_at is None
         assert task.run_id == "run-legacy"
         assert task.error_message is None
+    finally:
+        db.close()
+
+
+# ===== legacy resume interaction close =====
+
+
+def test_reply_closes_the_legacy_resume_interaction_row_on_successful_injection(
+    mock_start_task,
+):
+    """The success path this wiring exists for: once the reply's fence
+    UPDATE lands (``_update_reply_input_sync``), the run's active
+    interaction row is retired (``terminated`` /
+    ``answered_via_legacy_resume``) and the task's protocol marker is
+    cleared back to NULL in the same commit -- mirrors
+    test_a2a_api.py's
+    test_message_send_closes_the_legacy_resume_interaction_row_on_successful_injection.
+
+    Reverting the close wiring in ``_update_reply_input_sync`` turns this
+    red: the row stays "active" and the marker stays 1.
+    """
+    agent_id, full_key = _create_agent_with_key()
+    task_id = _create_waiting_task(full_key, agent_id, run_id="run-close-success")
+    db = _direct_db_session()
+    try:
+        task = db.query(Task).filter(Task.id == task_id).one()
+        task.interaction_protocol_version = 1
+        db.commit()
+    finally:
+        db.close()
+    row_id = _seed_active_interaction_row(
+        task_id, run_id="run-close-success", idempotency_key="reply-close-success-q1"
+    )
+
+    post_user_message = AsyncMock(return_value=True)
+    agent_patch, agent_service = _patch_agent_service(post_user_message)
+    with (
+        agent_patch,
+        patch(
+            "xagent.web.api.v1.task_reply._schedule_waiting_reply_resume",
+            new=AsyncMock(),
+        ),
+    ):
+        resp = client.post(
+            f"/v1/chat/tasks/{task_id}/reply",
+            headers=_bearer(full_key),
+            json=_reply_body(agent_id),
+        )
+
+    assert resp.status_code == 202, resp.text
+    agent_service.post_user_message.assert_awaited_once()
+
+    db = _direct_db_session()
+    try:
+        row = (
+            db.query(TaskInteractionRequest)
+            .filter(TaskInteractionRequest.id == row_id)
+            .one()
+        )
+        assert row.status == "terminated"
+        assert row.terminal_reason == "answered_via_legacy_resume"
+        refreshed = db.query(Task).filter(Task.id == task_id).one()
+        assert refreshed.interaction_protocol_version is None
+    finally:
+        db.close()
+
+
+def test_reply_checkpoint_missing_restore_clears_an_unpaired_marker(mock_start_task):
+    """The restore (abandonment) branch's compensation cleanup: when
+    post_user_message returns False, the prelease is released back to
+    waiting_for_user via ``_restore_reply_prelease_sync``, which must also
+    reconcile a marker that no longer names any active row -- there is no
+    active interaction row staged for this run, so the NOT EXISTS guard in
+    ``clear_interaction_marker_if_unpaired`` matches and the marker clears.
+
+    Reverting the ``clear_interaction_marker_if_unpaired`` call in
+    ``_restore_reply_prelease_sync`` turns this red: the marker stays 1
+    even though the task is back in waiting_for_user with no active row.
+    """
+    agent_id, full_key = _create_agent_with_key()
+    task_id = _create_waiting_task(full_key, agent_id, run_id="run-unpaired-marker")
+    db = _direct_db_session()
+    try:
+        task = db.query(Task).filter(Task.id == task_id).one()
+        task.interaction_protocol_version = 1
+        db.commit()
+    finally:
+        db.close()
+
+    agent_patch, _ = _patch_agent_service(AsyncMock(return_value=False))
+    with agent_patch:
+        resp = client.post(
+            f"/v1/chat/tasks/{task_id}/reply",
+            headers=_bearer(full_key),
+            json=_reply_body(agent_id),
+        )
+
+    assert resp.status_code == 409, resp.text
+    assert resp.json()["error"]["code"] == "interaction_not_resumable"
+
+    db = _direct_db_session()
+    try:
+        task = db.query(Task).filter(Task.id == task_id).one()
+        assert task.status == TaskStatus.WAITING_FOR_USER
+        assert task.interaction_protocol_version is None
     finally:
         db.close()
 

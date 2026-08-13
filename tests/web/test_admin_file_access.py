@@ -869,6 +869,57 @@ class TestAdminFileAccess:
 
         assert response.status_code == 401
 
+    def test_mint_endpoint_requires_a_bearer_credential(
+        self, test_db, temp_uploads_dir
+    ):
+        # issue_preview_stream_ticket uses the standard get_current_user
+        # dependency, same as every other authenticated file route -- no
+        # special-cased auth logic to verify here beyond that it's actually
+        # wired up. A garbage/expired Bearer is rejected 401 by
+        # get_current_user's own code (_required_http_rejection), which is
+        # deterministic regardless of FastAPI version. A completely missing
+        # Authorization header is instead rejected directly by FastAPI's
+        # HTTPBearer(auto_error=True) before get_current_user's body ever
+        # runs, and that status code is NOT asserted here: it's 403 on the
+        # project's locked fastapi==0.115.14 (uv.lock) but empirically 401
+        # against fastapi==0.135.1, whatever happens to be installed in a
+        # given environment -- this is the version sensitivity documented
+        # at _user_from_bearer_or_stream_ticket's own "Not authenticated"
+        # comment, and this endpoint has no equivalent explicit-403 guard.
+        admin_user, regular_user, test_app, session = test_db
+        del admin_user
+        regular_user_id = int(cast(Any, regular_user.id))
+        task = Task(
+            id=107,
+            user_id=regular_user_id,
+            title="Mint auth test",
+            description="mint auth test",
+        )
+        session.add(task)
+        session.commit()
+
+        uploaded_file = create_uploaded_file(
+            session,
+            temp_uploads_dir,
+            regular_user_id,
+            int(cast(Any, task.id)),
+            "clip.mp4",
+            "video bytes",
+        )
+
+        client = TestClient(test_app)
+
+        no_header_response = client.get(
+            f"/api/files/stream-tickets/{uploaded_file.file_id}"
+        )
+        assert no_header_response.status_code in (401, 403)
+
+        garbage_bearer_response = client.get(
+            f"/api/files/stream-tickets/{uploaded_file.file_id}",
+            headers={"Authorization": "Bearer not-a-real-token"},
+        )
+        assert garbage_bearer_response.status_code == 401
+
     def test_preview_rejects_ticket_signed_with_wrong_secret(
         self, test_db, temp_uploads_dir
     ):
@@ -1005,9 +1056,22 @@ class TestAdminFileAccess:
         # ever looking at the Bearer header -- confirm a valid ticket for
         # one user is honored even when a *different* user's Bearer
         # header is also present, rather than the two being reconciled or
-        # the Bearer header silently winning.
+        # the Bearer header silently winning. The mismatched Bearer must
+        # belong to a non-admin user with no access to the file: an admin
+        # Bearer would also pass _check_file_access on its own, making a
+        # 200 non-discriminating between "the ticket won" and "the admin
+        # Bearer silently won instead".
         admin_user, regular_user, test_app, session = test_db
+        del admin_user
         regular_user_id = int(cast(Any, regular_user.id))
+        other_user = User(
+            username="precedence-other",
+            password_hash=hash_password("precedence-other"),
+            is_admin=False,
+        )
+        session.add(other_user)
+        session.commit()
+
         task = Task(
             id=102,
             user_id=regular_user_id,
@@ -1034,15 +1098,54 @@ class TestAdminFileAccess:
         )
         ticket = ticket_response.json()["path"].split("ticket=")[1]
 
-        admin_headers = create_auth_headers(admin_user)
+        other_user_headers = create_auth_headers(other_user)
         response = client.get(
             f"/api/files/preview/{uploaded_file.file_id}",
             params={"ticket": ticket},
-            headers=admin_headers,
+            headers=other_user_headers,
         )
 
         assert response.status_code == 200
         assert response.content == b"video bytes"
+
+    def test_preview_rejects_garbage_ticket_even_with_a_valid_bearer_header(
+        self, test_db, temp_uploads_dir
+    ):
+        # Completes the precedence test above from the other direction: a
+        # present-but-broken ticket short-circuits before the Bearer header
+        # is ever examined, so a valid Bearer for the file's own owner does
+        # NOT rescue a garbage ticket via fallthrough.
+        admin_user, regular_user, test_app, session = test_db
+        del admin_user
+        regular_user_id = int(cast(Any, regular_user.id))
+        task = Task(
+            id=106,
+            user_id=regular_user_id,
+            title="Garbage ticket precedence test",
+            description="garbage ticket precedence test",
+        )
+        session.add(task)
+        session.commit()
+
+        uploaded_file = create_uploaded_file(
+            session,
+            temp_uploads_dir,
+            regular_user_id,
+            int(cast(Any, task.id)),
+            "clip.mp4",
+            "video bytes",
+        )
+
+        client = TestClient(test_app)
+        user_headers = create_auth_headers(regular_user)
+        response = client.get(
+            f"/api/files/preview/{uploaded_file.file_id}",
+            params={"ticket": "not-a-real-ticket"},
+            headers=user_headers,
+        )
+
+        assert response.status_code == 401
+        assert response.json()["detail"] == "Invalid or expired ticket"
 
     def test_ticket_authenticated_preview_can_use_accel_redirect(
         self, test_db, temp_uploads_dir, monkeypatch
@@ -1085,6 +1188,111 @@ class TestAdminFileAccess:
 
         assert response.status_code == 200
         assert "x-accel-redirect" in response.headers
+        assert response.headers["cache-control"] == "private, no-store"
+
+    def test_ticket_authenticated_preview_serves_partial_content_for_range_requests(
+        self, test_db, temp_uploads_dir
+    ):
+        # The entire point of the ticket mechanism is progressive playback
+        # via HTTP Range requests -- this exercises that end-to-end on a
+        # ticket-authenticated request against the direct content-serving
+        # exit (Starlette's FileResponse implements Range support; the
+        # accel/durable redirect exits delegate real Range serving to
+        # nginx/the object store instead and are covered separately).
+        admin_user, regular_user, test_app, session = test_db
+        del admin_user
+        regular_user_id = int(cast(Any, regular_user.id))
+        task = Task(
+            id=104,
+            user_id=regular_user_id,
+            title="Ticket range request test",
+            description="ticket range request test",
+        )
+        session.add(task)
+        session.commit()
+
+        uploaded_file = create_uploaded_file(
+            session,
+            temp_uploads_dir,
+            regular_user_id,
+            int(cast(Any, task.id)),
+            "clip.mp4",
+            "0123456789video bytes",
+        )
+
+        client = TestClient(test_app)
+        user_headers = create_auth_headers(regular_user)
+        ticket_response = client.get(
+            f"/api/files/stream-tickets/{uploaded_file.file_id}",
+            headers=user_headers,
+        )
+        path = ticket_response.json()["path"]
+
+        response = client.get(path, headers={"Range": "bytes=0-4"})
+
+        assert response.status_code == 206
+        assert response.content == b"01234"
+        assert response.headers["content-range"] == "bytes 0-4/21"
+        assert response.headers["cache-control"] == "private, no-store"
+
+    def test_ticket_authenticated_preview_can_use_durable_redirect(
+        self, test_db, temp_uploads_dir, monkeypatch
+    ):
+        # Mirrors test_ticket_authenticated_preview_can_use_accel_redirect
+        # for the other redirect fast path: the durable-object signed-URL
+        # 307, which was also previously gated on "not ticket" before this
+        # PR's fix and is where a real deployment would delegate Range
+        # serving to the object store for large ticketed media.
+        from xagent.web.services.managed_file_ref import ManagedFileRef
+
+        monkeypatch.setenv("XAGENT_FILE_DELIVERY_REDIRECT_ENABLED", "true")
+        admin_user, regular_user, test_app, session = test_db
+        del admin_user
+        regular_user_id = int(cast(Any, regular_user.id))
+        task = Task(
+            id=105,
+            user_id=regular_user_id,
+            title="Ticket durable redirect test",
+            description="ticket durable redirect test",
+        )
+        session.add(task)
+        session.commit()
+
+        uploaded_file = create_uploaded_file(
+            session,
+            temp_uploads_dir,
+            regular_user_id,
+            int(cast(Any, task.id)),
+            "clip.mp4",
+            "video bytes",
+        )
+        uploaded_file.storage_status = "available"
+        uploaded_file.storage_key = (
+            f"users/{regular_user_id}/uploads/{uploaded_file.file_id}/clip.mp4"
+        )
+        uploaded_file.storage_backend = "s3"
+        session.commit()
+
+        monkeypatch.setattr(
+            ManagedFileRef,
+            "signed_access_url",
+            lambda self, **kwargs: "https://durable.example/clip.mp4?sig=abc",
+        )
+
+        client = TestClient(test_app)
+        user_headers = create_auth_headers(regular_user)
+        ticket_response = client.get(
+            f"/api/files/stream-tickets/{uploaded_file.file_id}",
+            headers=user_headers,
+        )
+        path = ticket_response.json()["path"]
+
+        response = client.get(path, follow_redirects=False)
+
+        assert response.status_code == 307
+        assert (
+            response.headers["location"] == "https://durable.example/clip.mp4?sig=abc"
+        )
         assert response.headers["cache-control"] == "private, no-store"
 
     def test_preview_rejects_garbage_ticket(self, test_db, temp_uploads_dir):

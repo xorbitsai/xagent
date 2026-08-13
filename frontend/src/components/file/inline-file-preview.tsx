@@ -35,21 +35,50 @@ const DEFAULT_LOAD_ERROR_TEXT = 'Failed to load preview.'
 // A minted streaming URL is cached briefly per fileId so remounts/rerenders
 // of the same attachment (common in a chat transcript) don't each pay an
 // extra mint round trip. Deliberately much shorter than the server's own
-// ticket TTL default (10 minutes) rather than trying to track the real
-// expiry -- this is a de-dup window for near-simultaneous mounts, not an
-// attempt to use a ticket right up to the edge of its validity.
+// operator-configurable ticket TTL (XAGENT_FILE_STREAM_TICKET_TTL_SECONDS,
+// default 600s / 10min, validated only as >0) rather than trying to track
+// the real expiry -- this is a de-dup window for near-simultaneous mounts,
+// not an attempt to use a ticket right up to the edge of its validity. A
+// deployment that lowers the server TTL below this window can have a
+// client serve an already-expired ticket from cache; that self-heals via
+// reportLoadFailure (one dead load, then a fresh mint), so it costs one
+// failed request rather than a stuck player.
 const STREAMING_URL_CACHE_TTL_MS = 4 * 60 * 1000
-const streamingUrlCache = new Map<string, { url: string; expiresAt: number }>()
+// Stores the in-flight mint promise, not just the settled result: two
+// mounts of the same fileId within one render burst (e.g. the same
+// attachment shown on two messages) would otherwise each pay a separate
+// mint round trip before either resolves.
+const streamingUrlCache = new Map<string, Promise<{ url: string; expiresAt: number }>>()
 
 async function mintStreamingUrl(
   fileAccess: FileAccessPolicy,
   fileId: string
 ): Promise<string> {
   const cached = streamingUrlCache.get(fileId)
-  if (cached && cached.expiresAt > Date.now()) return cached.url
-  const url = await fileAccess.getStreamingUrl!(fileId)
-  streamingUrlCache.set(fileId, { url, expiresAt: Date.now() + STREAMING_URL_CACHE_TTL_MS })
-  return url
+  if (cached) {
+    const entry = await cached.catch(() => null)
+    if (entry && entry.expiresAt > Date.now()) return entry.url
+    // Expired, or the in-flight mint this promise represented failed --
+    // either way this exact entry is now stale. Clear it before re-minting
+    // rather than leaving a dead/expired promise for the next caller to
+    // hit this same branch again, but only if nothing else already
+    // replaced it (e.g. a concurrent caller's own retry).
+    if (streamingUrlCache.get(fileId) === cached) streamingUrlCache.delete(fileId)
+  }
+  const mintPromise = fileAccess.getStreamingUrl!(fileId).then((url) => ({
+    url,
+    expiresAt: Date.now() + STREAMING_URL_CACHE_TTL_MS,
+  }))
+  streamingUrlCache.set(fileId, mintPromise)
+  try {
+    return (await mintPromise).url
+  } catch (error) {
+    // Don't let a failed mint poison the cache for the next caller --
+    // without this, every subsequent mount of this fileId would
+    // immediately re-throw this same rejection instead of retrying.
+    if (streamingUrlCache.get(fileId) === mintPromise) streamingUrlCache.delete(fileId)
+    throw error
+  }
 }
 
 /**
@@ -105,7 +134,13 @@ export function __resetStreamingUrlCacheForTests(): void {
  * direct path's already-anonymous public URL), so it must never be handed
  * to something a user can put in the address bar, browser history, or a
  * copied link -- ``openUrl`` falls back to the same credential-free
- * ``previewUrl`` the blob path itself uses on failure.
+ * ``previewUrl`` the blob path itself uses on failure. For the default
+ * policy that credential-free URL is the tokenless public preview route,
+ * which 403s once a task has access control configured -- callers with an
+ * in-app file-preview dialog available (``onFileClick``) should route
+ * "Open" through that instead of this URL, the same way the image and
+ * generic-file branches of ``InlineFilePreview`` already do; ``openUrl``
+ * exists for surfaces with no such dialog (e.g. the public widget).
  */
 function useResolvedMediaUrl(
   source: InlineFilePreviewSource,
@@ -276,6 +311,7 @@ function InlineMediaPreview({
   loadErrorText,
   className,
   fileAccess,
+  onFileClick,
   icon: Icon,
   bodyClassName,
   spinnerClassName,
@@ -288,6 +324,7 @@ function InlineMediaPreview({
   loadErrorText: string
   className?: string
   fileAccess: FileAccessPolicy
+  onFileClick?: (filePath: string, fileName: string) => void
   icon: React.ComponentType<{ className?: string }>
   bodyClassName: string
   spinnerClassName: string
@@ -302,6 +339,19 @@ function InlineMediaPreview({
     fileAccess,
     true
   )
+  // When an in-app file-preview dialog is available, route "Open" through
+  // it instead of openUrl: for the default policy openUrl is the tokenless
+  // public preview URL, which 403s for any task with access control
+  // configured (agent_config as a dict) -- the same reason the image and
+  // generic-file branches of InlineFilePreview already prefer onFileClick
+  // over a raw href. Only surfaces with no dialog (e.g. the public widget)
+  // fall back to openUrl, where it remains credential-free by design.
+  const canOpenFilePreview = Boolean(onFileClick && source.fileId)
+  const handleOpenClick = (event: React.MouseEvent<HTMLAnchorElement>) => {
+    if (!onFileClick || !source.fileId) return
+    event.preventDefault()
+    onFileClick(source.fileId, filename)
+  }
   const [failedUrl, setFailedUrl] = useState('')
   const [loadedUrl, setLoadedUrl] = useState('')
   // Terminal load failure only: an error event from a media element that
@@ -327,8 +377,9 @@ function InlineMediaPreview({
         {resolvedUrl ? (
           <a
             href={openUrl}
-            target="_blank"
-            rel="noreferrer"
+            target={canOpenFilePreview ? undefined : '_blank'}
+            rel={canOpenFilePreview ? undefined : 'noreferrer'}
+            onClick={canOpenFilePreview ? handleOpenClick : undefined}
             className="shrink-0 text-foreground hover:underline"
           >
             {openLabel}
@@ -376,6 +427,7 @@ type MediaWrapperProps = {
   loadErrorText: string
   className?: string
   fileAccess: FileAccessPolicy
+  onFileClick?: (filePath: string, fileName: string) => void
 }
 
 function InlineAudioPreview(props: MediaWrapperProps) {
@@ -618,6 +670,7 @@ export function InlineFilePreview({
         loadErrorText={loadErrorText}
         className={className}
         fileAccess={fileAccess}
+        onFileClick={onFileClick}
       />
     )
   }
@@ -632,6 +685,7 @@ export function InlineFilePreview({
         loadErrorText={loadErrorText}
         className={className}
         fileAccess={fileAccess}
+        onFileClick={onFileClick}
       />
     )
   }

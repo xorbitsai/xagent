@@ -365,10 +365,14 @@ describe('InlineFilePreview', () => {
     expect(apiRequestMock).toHaveBeenCalledTimes(1)
   })
 
-  it('keeps the "Open" link on the safe public preview URL when streaming succeeds', async () => {
+  it('keeps the "Open" link on the safe public preview URL when there is no click handler', async () => {
     // The ticketed URL is a replayable credential (unlike the blob path's
     // session-scoped blob: URL) and must never be exposed via a link a
-    // user can put in the address bar, browser history, or copy/paste.
+    // user can put in the address bar, browser history, or copy/paste. This
+    // fallback URL only applies to surfaces with no in-app preview dialog
+    // (e.g. the public widget) -- see the next test for the in-app case,
+    // where this same public URL would 403 on an access-controlled task and
+    // "Open" must route through onFileClick instead.
     apiRequestMock.mockImplementation(async (url: string) => {
       if (url.includes('/stream-tickets/')) {
         return {
@@ -392,6 +396,40 @@ describe('InlineFilePreview', () => {
       'href',
       'http://api.local/api/files/public/preview/video-file-id'
     )
+  })
+
+  it('routes "Open" through onFileClick instead of the public preview URL when a dialog is available', async () => {
+    // For the default in-app policy, the credential-free fallback above is
+    // the tokenless public preview route, which 403s ("Public file access
+    // token required") for any task with access control configured --
+    // every standard agent chat. All in-app chat surfaces pass onFileClick,
+    // so "Open" must route through it (same as the image/generic-file
+    // branches of InlineFilePreview already do) instead of ever landing on
+    // that URL.
+    const handleFileClick = vi.fn()
+    apiRequestMock.mockImplementation(async (url: string) => {
+      if (url.includes('/stream-tickets/')) {
+        return {
+          ok: true,
+          json: async () => ({
+            path: '/api/files/preview/video-file-id?ticket=signed-ticket',
+          }),
+        }
+      }
+      throw new Error(`unexpected blob fetch for ${url}`)
+    })
+
+    render(
+      <InlineFilePreview
+        source={{ type: 'video', fileId: 'video-file-id', filename: 'clip.mp4' }}
+        onFileClick={handleFileClick}
+      />
+    )
+
+    await screen.findByLabelText('clip.mp4')
+    fireEvent.click(screen.getByRole('link', { name: 'Open' }))
+
+    expect(handleFileClick).toHaveBeenCalledWith('video-file-id', 'clip.mp4')
   })
 
   it('reuses a minted streaming ticket across remounts of the same file', async () => {
@@ -423,6 +461,94 @@ describe('InlineFilePreview', () => {
     await screen.findByLabelText('clip.mp4')
 
     expect(apiRequestMock).toHaveBeenCalledTimes(1)
+  })
+
+  it('shares one in-flight mint across concurrent mounts of the same file', async () => {
+    // The same attachment can render twice at once (e.g. the same file
+    // referenced from two visible messages, or a trace-event artifact
+    // duplicated into the transcript). Both mounts must share one mint
+    // round trip rather than each paying their own.
+    let resolveMint: ((value: unknown) => void) | undefined
+    apiRequestMock.mockImplementation((url: string) => {
+      if (url.includes('/stream-tickets/')) {
+        return new Promise((resolve) => {
+          resolveMint = resolve
+        })
+      }
+      throw new Error(`unexpected blob fetch for ${url}`)
+    })
+
+    render(
+      <>
+        <InlineFilePreview
+          source={{ type: 'video', fileId: 'shared-file-id', filename: 'clip.mp4' }}
+        />
+        <InlineFilePreview
+          source={{ type: 'video', fileId: 'shared-file-id', filename: 'clip.mp4' }}
+        />
+      </>
+    )
+
+    await waitFor(() => expect(apiRequestMock).toHaveBeenCalledTimes(1))
+
+    resolveMint?.({
+      ok: true,
+      json: async () => ({
+        path: '/api/files/preview/shared-file-id?ticket=signed-ticket',
+      }),
+    })
+
+    await waitFor(() => {
+      expect(screen.getAllByLabelText('clip.mp4')).toHaveLength(2)
+    })
+    for (const video of screen.getAllByLabelText('clip.mp4')) {
+      expect(video.getAttribute('src')).toBe(
+        'http://api.local/api/files/preview/shared-file-id?ticket=signed-ticket'
+      )
+    }
+    expect(apiRequestMock).toHaveBeenCalledTimes(1)
+  })
+
+  it('retries minting on the next mount after a failed mint instead of reusing the rejection', async () => {
+    let callCount = 0
+    apiRequestMock.mockImplementation(async (url: string) => {
+      if (url.includes('/stream-tickets/')) {
+        callCount += 1
+        if (callCount === 1) return { ok: false, status: 500 }
+        return {
+          ok: true,
+          json: async () => ({
+            path: '/api/files/preview/retry-file-id?ticket=signed-ticket',
+          }),
+        }
+      }
+      throw new Error(`unexpected blob fetch for ${url}`)
+    })
+
+    const { unmount } = render(
+      <InlineFilePreview
+        source={{ type: 'video', fileId: 'retry-file-id', filename: 'clip.mp4' }}
+      />
+    )
+    // First mount: mint fails, falls back to the direct public URL (the
+    // default policy's requiresBlobFetch is true, but blob-fetch itself
+    // isn't mocked as reachable here, so this assertion only needs the
+    // player to end up off the streaming path -- confirmed by the second
+    // mount actually re-minting below rather than reusing a cached failure).
+    await waitFor(() => expect(callCount).toBe(1))
+    unmount()
+
+    render(
+      <InlineFilePreview
+        source={{ type: 'video', fileId: 'retry-file-id', filename: 'clip.mp4' }}
+      />
+    )
+
+    const video = await screen.findByLabelText('clip.mp4')
+    expect(video.getAttribute('src')).toBe(
+      'http://api.local/api/files/preview/retry-file-id?ticket=signed-ticket'
+    )
+    expect(callCount).toBe(2)
   })
 
   it('falls back to blob fetch when a minted ticket fails to actually load', async () => {

@@ -43,7 +43,12 @@ from ...core.tools.core.file_analysis import collect_pptx_slide_blocks
 from ...core.utils.svg import rasterize_svg_bytes
 from ...core.workspace import scoped_user_root
 from ..auth_config import JWT_ALGORITHM, JWT_SECRET_KEY
-from ..auth_dependencies import get_current_user, is_admin_user
+from ..auth_dependencies import (
+    _AccessTokenRejected,
+    _validate_access_token_claim_bindability,
+    get_current_user,
+    is_admin_user,
+)
 from ..config import (
     BINARY_EXTENSIONS,
     MAX_FILE_SIZE,
@@ -264,6 +269,17 @@ async def _inline_preview_response(
 # its bytes to disk cache, where they can outlive the guest session. This
 # header must NOT be applied to the authenticated preview route: chat images
 # there rely on ordinary browser caching across repeated renders.
+#
+# Reused as-is (not a separate constant) for the ticket-authenticated branch
+# of the Bearer preview route below: a stream ticket rides in a URL a media
+# element auto-fetches on render too, so the same disk-cache exposure and
+# the same fix apply -- see where this is threaded through preview_file as
+# ``cache_headers``, which is the single choke point for every
+# content-serving exit of that endpoint that can serve a ticket-
+# authenticated request (the redirect fast paths included; error exits
+# raise a bare HTTPException and carry no Cache-Control at all, which is
+# fine since 404 is the only heuristically-cacheable one and no content is
+# at stake there).
 _PUBLIC_PREVIEW_CACHE_HEADERS = {"Cache-Control": "private, no-store"}
 
 
@@ -1504,19 +1520,10 @@ async def download_file(
 # minutes not hours) rather than matching the user's own access token.
 FILE_STREAM_TICKET_TYPE = "file_stream_ticket"
 
-# A ticket rides in the query string of a URL a media element auto-fetches
-# on render, so — like the public/tokened preview route (#1227) — it must
-# never be written to browser disk cache, where it could outlive its own
-# TTL's intent of being "short-lived". This is the single choke point for
-# that decision: every response exit of preview_file that can serve a
-# ticket-authenticated request must apply it, including the redirect
-# fast paths below (see the comment where the ``not ticket`` guards were
-# removed) -- not just the two direct _inline_preview_response calls.
-_TICKET_PREVIEW_CACHE_HEADERS = {"Cache-Control": "private, no-store"}
-
-
-def _preview_cache_headers(ticket: Optional[str]) -> Optional[Dict[str, str]]:
-    return _TICKET_PREVIEW_CACHE_HEADERS if ticket else None
+# See _PUBLIC_PREVIEW_CACHE_HEADERS above: a stream ticket rides in a URL a
+# media element auto-fetches on render too, so preview_file below reuses
+# that same constant/rationale as ``cache_headers`` whenever a ticket
+# authenticated the request, rather than a second identical constant.
 
 
 _optional_bearer = HTTPBearer(auto_error=False)
@@ -1534,10 +1541,21 @@ def _user_from_stream_ticket(db: Session, ticket: str, file_id: str) -> User:
     ):
         raise HTTPException(status_code=401, detail="Invalid or expired ticket")
 
-    username = claims.get("sub")
-    user_id = claims.get("user_id")
-    if username is None or user_id is None:
-        raise HTTPException(status_code=401, detail="Invalid or expired ticket")
+    # Reuse the same claim-bindability hardening access tokens get
+    # (_resolve_access_token_user in auth_dependencies.py) rather than a
+    # second, weaker copy: exact str/int typing, utf-8-strict encodability,
+    # and the Postgres NUL-byte guard all apply identically to a ticket's
+    # sub/user_id claims. This server is the sole minter, so malformed
+    # claims aren't attacker-reachable today, but a second bespoke check
+    # here would silently drift from the first if either is ever changed.
+    try:
+        username, user_id = _validate_access_token_claim_bindability(
+            claims.get("sub"), claims.get("user_id"), db
+        )
+    except _AccessTokenRejected:
+        raise HTTPException(
+            status_code=401, detail="Invalid or expired ticket"
+        ) from None
 
     user = db.query(User).filter(User.username == username, User.id == user_id).first()
     if user is None:
@@ -1550,20 +1568,57 @@ def _user_from_bearer_or_stream_ticket(
     ticket: Optional[str] = Query(default=None),
     credentials: Optional[HTTPAuthorizationCredentials] = Depends(_optional_bearer),
     db: Session = Depends(get_db),
-) -> User:
+) -> Tuple[User, Optional[str]]:
+    """Resolve the requesting user, and echo back which credential won.
+
+    Returning ``ticket`` alongside ``user`` lets ``preview_file`` below read
+    whether a ticket authenticated this request (to decide ``cache_headers``)
+    without redeclaring its own ``ticket: Query(...)`` parameter -- FastAPI
+    would resolve that redeclaration to the same value from the same request
+    every time, but two independent declarations of the same query param
+    with no shared source is the kind of thing that can silently drift if
+    one is ever edited (e.g. a default) without the other.
+    """
     if ticket:
-        return _user_from_stream_ticket(db, ticket, file_id)
+        # A present ticket is checked on its own and never falls through to
+        # the Bearer header below, even if the ticket is garbage/expired and
+        # a valid Bearer header is also present: a ticket is the credential
+        # this specific request opted into (e.g. a media element's src), so
+        # treating a broken one as "ignore it, try the header instead" would
+        # mask exactly the failure (expired mid-session, wrong file_id) the
+        # caller's fallback-and-remint logic (reportLoadFailure on the
+        # frontend) exists to detect and recover from.
+        return _user_from_stream_ticket(db, ticket, file_id), ticket
     if credentials is None:
         # This endpoint predates the ticket param and used the default
-        # HTTPBearer(auto_error=True), which FastAPI raises as 403 "Not
-        # authenticated" -- not 401 -- when the Authorization header is
-        # absent entirely (401 is reserved for a credential that IS
-        # present but rejected: an invalid ticket here, or an invalid/
-        # expired Bearer token via get_current_user below). Switching a
-        # completely-missing credential to 401 would be an unannounced
-        # breaking change to this pre-existing endpoint's error contract.
+        # HTTPBearer(auto_error=True), which raises 403 "Not authenticated"
+        # -- not 401 -- when the Authorization header is absent entirely
+        # (401 is reserved for a credential that IS present but rejected: an
+        # invalid ticket above, or an invalid/expired Bearer token via
+        # get_current_user below). Switching a completely-missing credential
+        # to 401 would be an unannounced breaking change to this
+        # pre-existing endpoint's error contract. Not preserved exactly: a
+        # malformed (non-"Bearer ...") Authorization header used to get its
+        # own "Invalid authentication credentials" detail from HTTPBearer;
+        # optional_security collapses that case into this same branch, so it
+        # now reads "Not authenticated" too. Status code is unaffected
+        # (still 403); only the message text differs, which no client here
+        # parses. Whether a missing header actually gets 403 (vs. FastAPI's
+        # own default auto_error=True behavior, which changed to 401 on
+        # some later FastAPI release) depends on the installed FastAPI
+        # version: uv.lock pins 0.115.14 (403), but pyproject.toml's own
+        # constraint is an unbounded ">=0.35.0", and an environment resolved
+        # against that constraint rather than the lock file can land on a
+        # version where this is 401 instead -- confirmed empirically against
+        # fastapi==0.135.1 while writing this. This function's own explicit
+        # 403 raise below is unaffected either way; only the *other* file
+        # routes' plain Depends(get_current_user) dependencies (which rely
+        # on HTTPBearer's built-in auto_error, not a manual check like this
+        # one) are exposed to that drift for a missing header specifically
+        # -- see test_mint_endpoint_requires_a_bearer_credential, which
+        # deliberately doesn't assert a specific code for that case.
         raise HTTPException(status_code=403, detail="Not authenticated")
-    return get_current_user(credentials, db)
+    return get_current_user(credentials, db), None
 
 
 @file_router.get("/stream-tickets/{file_id:path}", response_model=None)
@@ -1610,11 +1665,11 @@ async def issue_preview_stream_ticket(
 @file_router.get("/preview/{file_id:path}", response_model=None)
 async def preview_file(
     file_id: str,
-    ticket: Optional[str] = Query(default=None),
-    user: User = Depends(_user_from_bearer_or_stream_ticket),
+    auth: Tuple[User, Optional[str]] = Depends(_user_from_bearer_or_stream_ticket),
     db: Session = Depends(get_db),
 ) -> Any:
-    cache_headers = _preview_cache_headers(ticket)
+    user, ticket = auth
+    cache_headers = _PUBLIC_PREVIEW_CACHE_HEADERS if ticket else None
     file_record, full_path, owner_user_id = _resolve_file_path(
         db, file_id, _user_id_value(user)
     )
@@ -1632,9 +1687,9 @@ async def preview_file(
         # matters most for. Excluding it here would force large media
         # through the app process on every ticketed request, defeating the
         # performance goal this ticket mechanism exists for. cache_headers
-        # is still threaded through (see _preview_cache_headers) so the
-        # no-store invariant travels with the request regardless of which
-        # exit serves it.
+        # (computed above, per-request, from whether a ticket was used) is
+        # still threaded through so the no-store invariant travels with the
+        # request regardless of which exit serves it.
         if _preview_can_redirect(full_path, media_type):
             redirect_response = _durable_redirect_response(
                 file_ref,

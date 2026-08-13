@@ -311,8 +311,9 @@ def task_is_owned_by_public_principal(
        ``None`` guest id must never match a task whose own ``guest_id`` is
        also empty or missing.
 
-    Candidate issue, logged and not fixed here: the widget-agent direction
-    (``get_task_for_public_context``, not routed through this predicate)
+    Candidate issue, logged and not fixed here (#1304): the widget-agent
+    direction (``get_task_for_public_context``, not routed through this
+    predicate)
     has no JSON-level entity binding to mirror asymmetrically with the
     other three directions, and (separately) has no ``auth_mode`` check in
     the pre-existing code this predicate does not touch. Fixing either is a

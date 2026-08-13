@@ -668,8 +668,9 @@ def get_task_for_public_context(
     # security issue (a widget guest whose self-chosen guest_id happens to
     # equal a share guest's server-minted one can otherwise reach a
     # share-mode task through this branch) is logged against that gap, not
-    # fixed here: "old-path extract, don't refactor" -- fixing it belongs
-    # to a change scoped to that behavior, not to this predicate extraction.
+    # fixed here (#1304): "old-path extract, don't refactor" -- fixing it
+    # belongs to a change scoped to that behavior, not to this predicate
+    # extraction.
     if access_context.widget_workforce_id is not None:
         return _get_task_for_workforce_widget_context(db, task_id, access_context)
     task = (

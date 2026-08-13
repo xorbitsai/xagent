@@ -424,7 +424,7 @@ def test_workforce_share_task_without_guest_id_is_denied(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Workforce-side mirror of ``test_agent_share_task_without_guest_id_is_denied``.
-    Both paths route through the same ``_require_share_guest_owns_task`` gate, so
+    Both paths route through the same ``task_is_owned_by_public_principal`` gate, so
     a regression that lets a legacy task (stored ``agent_config`` missing
     ``guest_id``) slip through must fail on this side too, not only agent-share."""
     workforce_id = _create_workforce("PreMig WF")

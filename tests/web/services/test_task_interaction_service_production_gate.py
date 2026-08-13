@@ -13,14 +13,19 @@ this module's compatibility seam. That change is what makes ``respond()``
 reachable in production: the seam refuses a legacy resume on a task that
 holds an active native interaction row, so from that change on the only way
 such a task can be answered is a caller that goes through ``respond()``. The
-first HTTP caller arrives separately, with the endpoint issue, and does not
-retire anything here. ``create()`` is not covered by this gate's retirement
-at all: its production call body arrives with the change that wires
-interaction creation end-to-end and fills in
-``stage_interaction_request``'s caller obligations -- the change
-that deletes this gate file must add a replacement guard that locks
-``create()`` alone, or the seam stops being a statically enforced seam the moment
-this file goes away.
+first HTTP caller arrives separately, with the endpoint issue, and that
+change must explicitly retire this gate rather than merely satisfy it: an
+endpoint that reaches ``create``/``respond`` only in value position
+(``Depends(create)``, ``functools.partial(respond, ...)`` -- blind spot (e)
+above) leaves this gate passing without ever being seen by the AST walk
+below, so a still-green gate after that change lands is not evidence that
+nothing calls these names in production. ``create()`` is not covered by
+this gate's retirement at all: its production call body arrives with the
+change that wires interaction creation end-to-end and fills in
+``stage_interaction_request``'s caller obligations -- the change that
+deletes this gate file must add a replacement guard that locks
+``create()`` alone, or the seam stops being a statically enforced seam
+the moment this file goes away.
 
 AST-based, module-qualified matching -- not a bare-name or substring scan.
 ``create`` and ``respond`` are ordinary English verbs already used as method

@@ -314,13 +314,12 @@ def task_is_owned_by_public_principal(
 
     Candidate issue, logged and not fixed here (#1304): the widget-agent
     direction (``get_task_for_public_context``, not routed through this
-    predicate)
-    has no JSON-level entity binding to mirror asymmetrically with the
-    other three directions, and (separately) has no ``auth_mode`` check in
-    the pre-existing code this predicate does not touch. Fixing either is a
-    behavior change to a production authorization path and is out of scope
-    for this change, which only extracts and adds a new, additively-called
-    predicate.
+    predicate) has no JSON-level entity binding to mirror asymmetrically
+    with the other three directions, and (separately) has no
+    ``auth_mode`` check in the pre-existing code this predicate does not
+    touch. Fixing either is a behavior change to a production
+    authorization path and is out of scope for this change, which only
+    extracts and adds a new, additively-called predicate.
     """
 
     populated = [
@@ -882,6 +881,24 @@ def create(
     function has no call to any of the staging module's exception-raising
     code at all in this delivery, since it never calls
     ``stage_interaction_request``.
+
+    ``CreateUnavailable(reason="task_missing")`` and
+    ``CreateUnauthorized(reason="not_task_principal")`` are deliberately
+    distinguishable outcomes inside this function, but a caller that
+    exposes that distinction externally hands an unauthenticated or
+    unauthorized requester a task-existence oracle: "unavailable" versus
+    "unauthorized" reveals whether ``task_id`` exists at all. Any future
+    endpoint that calls this function directly and maps its outcome onto
+    an HTTP response shape must collapse both to the same client-facing
+    shape. The three existing public-chat entry points already do the
+    equivalent one layer up, at the HTTP boundary: a task that does not
+    exist and a task whose ``guest_id`` belongs to another visitor both
+    produce the identical not-found-shaped 403. The same obligation
+    applies to the respond-side twin pair
+    (``RespondUnavailable(reason="task_missing")`` versus
+    ``RespondUnauthorized(reason="not_task_principal")``) once
+    ``respond()`` has a caller. This applies to every outcome consumer
+    built on this module, not only to ``create()``'s own two variants.
     """
 
     if not isinstance(envelope.kind, str) or envelope.kind not in _KIND_VOCABULARY:

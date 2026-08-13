@@ -69,12 +69,8 @@ async def create_sound_effect_tools_from_config(
     workspace = ToolFactory.create_workspace(config.get_workspace_config())
     if workspace is None:
         return []
-    try:
-        return create_sound_effect_tools(
-            models=models,
-            workspace=workspace,
-            default_model=config.get_sound_effect_model(),
-        )
-    except Exception as exc:
-        logger.warning("Failed to create sound effect tools: %s", exc)
-        return []
+    return create_sound_effect_tools(
+        models=models,
+        workspace=workspace,
+        default_model=config.get_sound_effect_model(),
+    )

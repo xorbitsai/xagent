@@ -251,14 +251,10 @@ async def create_audio_tools_from_config(config: "BaseToolConfig") -> List[Any]:
     if not workspace:
         return []
 
-    try:
-        return create_audio_tool(
-            asr_models=asr_models,
-            tts_models=tts_models,
-            workspace=workspace,
-            default_asr_model=config.get_asr_model(),
-            default_tts_model=config.get_tts_model(),
-        )
-    except Exception as e:
-        logger.warning(f"Failed to create audio tools: {e}")
-        return []
+    return create_audio_tool(
+        asr_models=asr_models,
+        tts_models=tts_models,
+        workspace=workspace,
+        default_asr_model=config.get_asr_model(),
+        default_tts_model=config.get_tts_model(),
+    )

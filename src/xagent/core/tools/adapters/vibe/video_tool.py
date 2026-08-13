@@ -117,12 +117,8 @@ async def create_video_tools_from_config(config: "BaseToolConfig") -> List[Any]:
     if not workspace:
         return []
 
-    try:
-        return create_video_tool(
-            video_models,
-            workspace=workspace,
-            default_video_model=config.get_video_model(),
-        )
-    except Exception as e:
-        logger.warning("Failed to create video tools: %s", e)
-        return []
+    return create_video_tool(
+        video_models,
+        workspace=workspace,
+        default_video_model=config.get_video_model(),
+    )

@@ -184,16 +184,12 @@ async def create_image_tools_from_config(config: "BaseToolConfig") -> List[Any]:
     if not workspace:
         return []
 
-    try:
-        default_generate_model = config.get_image_generate_model()
-        default_edit_model = config.get_image_edit_model()
+    default_generate_model = config.get_image_generate_model()
+    default_edit_model = config.get_image_edit_model()
 
-        return create_image_tool(
-            image_models,
-            workspace=workspace,
-            default_generate_model=default_generate_model,
-            default_edit_model=default_edit_model,
-        )
-    except Exception as e:
-        logger.warning(f"Failed to create image tools: {e}")
-        return []
+    return create_image_tool(
+        image_models,
+        workspace=workspace,
+        default_generate_model=default_generate_model,
+        default_edit_model=default_edit_model,
+    )

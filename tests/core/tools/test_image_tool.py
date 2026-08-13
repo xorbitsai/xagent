@@ -1000,3 +1000,26 @@ class TestImageToolCapabilityGating:
 
         assert result["success"] is False
         assert "model1 (abilities: edit)" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_creator_propagates_a_broken_model_instead_of_hiding_it(tmp_path) -> None:
+    # A blanket handler here would turn a broken model class into "this
+    # deployment has no image tools", indistinguishable from having none.
+    from xagent.core.tools.adapters.vibe.config import ToolConfig
+    from xagent.core.tools.adapters.vibe.image_tool import (
+        create_image_tools_from_config,
+    )
+
+    broken = Mock(spec=BaseImageModel)
+    broken.has_ability = Mock(side_effect=RuntimeError("ability probe exploded"))
+
+    class _Config(ToolConfig):
+        def get_image_models(self):
+            return {"broken": broken}
+
+        def get_workspace_config(self):
+            return {"task_id": "creator-propagation", "base_dir": str(tmp_path)}
+
+    with pytest.raises(RuntimeError, match="ability probe exploded"):
+        await create_image_tools_from_config(_Config({}))

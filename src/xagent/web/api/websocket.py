@@ -6054,11 +6054,16 @@ async def _handle_chat_message_unserialized(
                                 turn_id,
                                 exc_info=True,
                             )
-                        # This call posted the durable message directly into a
-                        # live checkpoint instead of going through the native
-                        # interaction protocol's answer path, so any question
-                        # this run had open under that protocol is answered by
-                        # other means now. Retire it and clear the task's
+                        # `posted` is true, meaning a message with this
+                        # turn id is in a live checkpoint -- written by this
+                        # call, or already present from an earlier attempt
+                        # with the same turn id, which short-circuits without
+                        # persisting anything new (see
+                        # AgentRunner.inject_user_message) -- instead of
+                        # going through the native interaction
+                        # protocol's answer path, so any question this run
+                        # had open under that protocol is answered by other
+                        # means now. Retire it and clear the task's
                         # marker in the same short transaction. The run fence
                         # is live_task_lease.run_id, not task_run_id: posted
                         # being true only happens by way of the

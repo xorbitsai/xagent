@@ -22,6 +22,17 @@ also race a resume that never even reached the injection call -- clearing
 unconditionally there would erase a marker that is still correct for a
 question that is still active.
 
+A fourth WebSocket exit path does not clear the marker at all:
+``_settle_resumed_task_lease`` (``websocket.py``) settles a cancelled or
+failed resume by way of ``settle_task_lease_isolated`` ->
+``fail_and_release_task_lease_no_commit``, neither of which touches
+``interaction_protocol_version`` or ``task_interaction_requests``. This is
+not an oversight to fix here -- it is the same lazy-clear posture the
+marker's ownership comment on ``Task.interaction_protocol_version``
+already documents: every exit path with no injection point to hang a
+close or a clear on is allowed to leave a stale marker behind, because
+readers filter on ``status`` before ever consulting it.
+
 The two WebSocket sites and the A2A and v1 reply sites do not give this
 close the same atomicity guarantee. At both WebSocket sites
 (``websocket.py``), ``close_legacy_resume_interaction_sync`` opens its own
@@ -39,9 +50,22 @@ way, for the identical reason; see the inline comments beside each pair.
 The A2A and v1 reply sites are different: each close call runs inside its
 own resume-input fence transaction (``_update_a2a_resume_input_sync`` in
 ``a2a.py``, ``_update_reply_input_sync`` in ``task_reply.py``), committed
-together with the ownership fence UPDATE that precedes it, so those two
-sites' closes are genuinely atomic with the write that answered the
-question -- not a best-effort follow-up.
+together with the ownership fence UPDATE that precedes it -- that is what
+makes those two sites stronger than the WebSocket sites, not a claim that
+the close is atomic with the message injection itself. The message
+injection (``post_user_message`` at ``a2a.py:464`` / ``task_reply.py:512``)
+commits on its own, earlier, in ``AgentRunner._persist_injected_context``;
+only after that commit has already landed does the caller open the fence
+transaction that writes the resumed input and closes the interaction row
+together. A crash between those two commits leaves the interaction row
+``active`` and the marker still set to ``1`` even though the injected
+message already answered the question. That window is benign for the same
+reason as the reader fallback documented above: a reader keys off
+``status`` first, so a stale active row here just makes it fall back to
+asking the legacy question again -- the same family of harmless window
+as the message-injection replay that
+``AgentRunner.inject_user_message`` short-circuits on a repeated turn
+id.
 
 Every rowcount the close statement below produces is classified the same
 way, at the one place the classification happens
@@ -81,7 +105,7 @@ logger = logging.getLogger(__name__)
 def _classify_close_rowcount(rowcount: int, *, task_id: int, run_id: str) -> None:
     if rowcount == 1:
         logger.info(
-            "legacy resume closed the active interaction row task_id=%s run_id=%s",
+            "legacy resume closing the active interaction row task_id=%s run_id=%s",
             task_id,
             run_id,
         )

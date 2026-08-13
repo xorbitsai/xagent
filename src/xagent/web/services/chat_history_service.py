@@ -368,19 +368,30 @@ def supersede_legacy_question_rows(db: Session, *, task_id: int) -> int:
     three columns, so a unique-index collision is not what the catch
     clause below is for.
 
-    The UPDATE runs inside its own ``db.begin_nested()`` SAVEPOINT and
-    catches only ``DBAPIError`` — a statement-level database failure,
-    including ``ProgrammingError`` — logging and degrading via
-    ``CLARIFICATION_LEGACY_SUPERSEDE_FAILED`` instead of taking the
-    caller's transaction down with it; the savepoint is what makes that
-    degrade possible on PostgreSQL, where a failed statement otherwise
-    aborts the whole enclosing transaction. Python-side misuse —
-    ``InvalidRequestError``, ``PendingRollbackError``, ``ArgumentError``
-    — is not a ``DBAPIError`` and is left to propagate. This is the
-    opposite failure policy from ``mark_user_message_delivery``, which
-    lets a ``DBAPIError`` propagate: that helper guards a mandatory state
-    transition, while this one is a best-effort cleanup sweep that can
-    safely no-op and retry on a later call.
+    The UPDATE runs inside its own ``db.begin_nested()`` SAVEPOINT, and
+    what happens to a ``DBAPIError`` depends on whether the savepoint was
+    in a position to contain it. If the ``SAVEPOINT`` statement itself
+    fails, there is no savepoint yet and nothing is contained, so it
+    propagates. If the savepoint opened and the UPDATE failed inside it,
+    the savepoint contained the damage and the enclosing transaction
+    survives, so this logs, degrades via
+    ``CLARIFICATION_LEGACY_SUPERSEDE_FAILED`` and returns 0 rather than
+    taking the caller's transaction down with it. If the UPDATE ran and
+    the savepoint failed on the way out, nothing contained that either:
+    on PostgreSQL a failed ``RELEASE`` aborts the enclosing transaction,
+    and a caller that then commits gets no error while every staged write
+    is discarded, because PostgreSQL treats ``COMMIT`` on an aborted
+    transaction as a rollback. That propagates too. Re-raising cannot
+    rescue the transaction — it is already gone — but it is the
+    difference between a caller that knows and one that silently loses
+    its writes.
+
+    Python-side misuse — ``InvalidRequestError``, ``PendingRollbackError``,
+    ``ArgumentError`` — is not a ``DBAPIError`` and was never caught here.
+    ``mark_user_message_delivery`` lets a ``DBAPIError`` propagate too,
+    though by having no handler at all rather than by re-raising: it
+    guards a mandatory state transition, while this one is a best-effort
+    sweep whose contained failures can safely no-op and retry later.
 
     ``Session.begin_nested()`` flushes the whole session before it issues
     the SAVEPOINT, and does so unconditionally: the flush is gated on
@@ -420,9 +431,12 @@ def supersede_legacy_question_rows(db: Session, *, task_id: int) -> int:
     on ``task_id``/``role``/``message_type`` only, nothing about protocol
     version. This paragraph is therefore a contract on the follow-up that
     introduces both the caller and that reader gate, not a description of
-    current behavior — the wiring change's acceptance criteria carry the
-    remaining call-site obligations (ordering, and never calling this on
-    a transcript question meant to remain answerable).
+    current behavior. The two remaining call-site obligations are carried
+    here, by this docstring, and a caller that lands without honouring
+    them is out of contract regardless of what its own tracking issue
+    says: call this only after the interaction row for the same turn is
+    staged, and never call it on a transcript question that is meant to
+    remain answerable.
     """
 
     # ``Session.begin_nested()`` flushes the whole session before issuing the
@@ -477,8 +491,10 @@ def supersede_legacy_question_rows(db: Session, *, task_id: int) -> int:
 
     updated = 0
     statement_succeeded = False
+    savepoint_entered = False
     try:
         with db.begin_nested():
+            savepoint_entered = True
             updated = (
                 db.query(TaskChatMessage)
                 .filter(*_assistant_question_filters(task_id))
@@ -489,20 +505,20 @@ def supersede_legacy_question_rows(db: Session, *, task_id: int) -> int:
             )
             statement_succeeded = True
     except DBAPIError as exc:
-        if statement_succeeded:
-            logger.error(
-                "Savepoint exit failed after superseding %s legacy question "
-                "row(s) for task %s; degrading instead of trusting that count",
-                updated,
-                task_id,
-                exc_info=True,
-            )
-        else:
-            logger.error(
-                "Failed to supersede legacy question rows for task %s",
-                task_id,
-                exc_info=True,
-            )
+        if statement_succeeded or not savepoint_entered:
+            # Either the savepoint never opened, or it opened, the UPDATE
+            # ran, and it failed on the way out. Neither failure is inside
+            # anything this function can roll back -- on PostgreSQL the
+            # second aborts the enclosing transaction, and a caller that
+            # gets 0 and no exception commits into it, which succeeds while
+            # discarding every staged write. Propagate; the docstring above
+            # explains why this can be reported but not rescued.
+            raise
+        logger.error(
+            "Failed to supersede legacy question rows for task %s",
+            task_id,
+            exc_info=True,
+        )
         register_degradation(
             CLARIFICATION_LEGACY_SUPERSEDE_FAILED,
             f"task {task_id}: legacy question supersede failed ({type(exc).__name__})",

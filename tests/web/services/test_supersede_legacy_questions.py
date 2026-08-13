@@ -18,7 +18,6 @@ file's module docstring).
 
 from __future__ import annotations
 
-import logging
 from contextlib import contextmanager
 
 import pytest
@@ -258,14 +257,17 @@ def test_supersede_degrades_on_dbapi_error_and_lets_the_caller_commit(monkeypatc
 
 
 def test_supersede_distinguishes_a_savepoint_exit_failure_from_a_statement_failure(
-    monkeypatch, caplog
+    monkeypatch,
 ):
-    """A DBAPIError raised by the UPDATE itself and a DBAPIError raised
-    by the SAVEPOINT's own RELEASE on the way out of the ``with`` block
-    both degrade the same way (return 0, register the signal) -- but
-    they are not the same failure, and the log line must say which one
-    happened instead of silently discarding a rowcount that was, in this
-    second case, real.
+    """A ``DBAPIError`` from the UPDATE itself and one from the SAVEPOINT's
+    own RELEASE on the way out of the ``with`` block are different
+    failures and now get different treatment. The statement failure is
+    contained by the savepoint, so it degrades: return 0, signal
+    registered. The exit failure is not contained -- on PostgreSQL it
+    aborts the enclosing transaction -- so it propagates, and no signal is
+    registered, because there is nothing here for an operator to act on
+    that the exception does not already say. This test pins the second
+    case; the statement-failure case is pinned by the test above.
 
     Patches ``SessionTransaction.__exit__`` (the class the ``with
     db.begin_nested():`` block's context manager protocol actually
@@ -301,23 +303,48 @@ def test_supersede_distinguishes_a_savepoint_exit_failure_from_a_statement_failu
 
         monkeypatch.setattr(SessionTransaction, "__exit__", failing_release_exit)
 
-        with caplog.at_level(logging.ERROR):
-            result = supersede_legacy_question_rows(db, task_id=int(task.id))
-
-        assert result == 0
         signal_name = ops_signals.CLARIFICATION_LEGACY_SUPERSEDE_FAILED
-        assert signal_name in ops_signals.active_degradations()
 
-        exit_failure_logs = [
-            record
-            for record in caplog.records
-            if "Savepoint exit failed after superseding" in record.message
-        ]
-        assert len(exit_failure_logs) == 1
-        # The real rowcount (1 row matched and updated before RELEASE
-        # failed) made it into the log line -- not discarded, and not
-        # reported as the generic "0 rows, statement itself failed" case.
-        assert "1 legacy question" in exit_failure_logs[0].message
+        with pytest.raises(OperationalError):
+            supersede_legacy_question_rows(db, task_id=int(task.id))
+
+        # No degradation signal: the exception is the notification, and a
+        # signal here would tell an operator to look at a helper whose own
+        # statement succeeded.
+        assert signal_name not in ops_signals.active_degradations()
+    finally:
+        db.close()
+
+
+def test_supersede_propagates_a_savepoint_that_never_opened(monkeypatch):
+    """The third failure position: the ``SAVEPOINT`` statement itself
+    fails, so the savepoint never exists and there is nothing holding the
+    damage. Like the exit failure, and unlike a failure of the UPDATE
+    inside an open savepoint, this propagates and registers no signal --
+    degrading here would tell an operator the sweep failed when what
+    actually happened is that the transaction could not be sectioned off
+    in the first place."""
+    db = _create_db_session()
+    try:
+        task = _create_task(db)
+        persist_assistant_message(
+            db,
+            int(task.id),
+            int(task.user_id),
+            "A question",
+            message_type="question",
+        )
+        signal_name = ops_signals.CLARIFICATION_LEGACY_SUPERSEDE_FAILED
+
+        def refusing_begin_nested(self, *args, **kwargs):
+            raise OperationalError("SAVEPOINT", {}, Exception("savepoint refused"))
+
+        monkeypatch.setattr(Session, "begin_nested", refusing_begin_nested)
+
+        with pytest.raises(OperationalError):
+            supersede_legacy_question_rows(db, task_id=int(task.id))
+
+        assert signal_name not in ops_signals.active_degradations()
     finally:
         db.close()
 

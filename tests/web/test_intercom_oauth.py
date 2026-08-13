@@ -28,6 +28,29 @@ class MockResponse:
         return self._json_data
 
 
+class NonJsonResponse(MockResponse):
+    def json(self):
+        raise ValueError("response body is not JSON")
+
+
+def _intercom_app(*, is_visible_in_connector: bool) -> PublicMCPApp:
+    return PublicMCPApp(
+        app_id="intercom",
+        name="Intercom",
+        description="Intercom connector",
+        transport="oauth",
+        provider_name="intercom",
+        category="Support",
+        oauth_scopes=[],
+        is_visible_in_connector=is_visible_in_connector,
+        launch_config={
+            "command": "python",
+            "args": ["-m", "xagent.web.tools.mcp.intercom"],
+            "env_mapping": {"INTERCOM_ACCESS_TOKEN": "access_token"},
+        },
+    )
+
+
 @pytest.fixture()
 def db_session(tmp_path):
     db_path = tmp_path / "test.db"
@@ -40,23 +63,32 @@ def db_session(tmp_path):
 
     user = User(username="alice", password_hash="x", is_admin=False)
     db.add(user)
-    db.add(
-        PublicMCPApp(
-            app_id="intercom",
-            name="Intercom",
-            description="Intercom connector",
-            transport="oauth",
-            provider_name="intercom",
-            category="Support",
-            oauth_scopes=[],
-            is_visible_in_connector=False,
-            launch_config={
-                "command": "python",
-                "args": ["-m", "xagent.web.tools.mcp.intercom"],
-                "env_mapping": {"INTERCOM_ACCESS_TOKEN": "access_token"},
-            },
-        )
+    # Visible here: these tests exercise token normalization/persistence, a
+    # concern orthogonal to the release-visibility gate. The gate itself
+    # (production ships this app with is_visible_in_connector=False) is
+    # covered separately below, against its own fixture.
+    db.add(_intercom_app(is_visible_in_connector=True))
+    db.commit()
+    db.refresh(user)
+
+    yield db, user
+    db.close()
+    engine.dispose()
+
+
+@pytest.fixture()
+def hidden_db_session(tmp_path):
+    db_path = tmp_path / "test.db"
+    engine = create_engine(
+        f"sqlite:///{db_path}", connect_args={"check_same_thread": False}
     )
+    Base.metadata.create_all(engine)
+    SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
+    db = SessionLocal()
+
+    user = User(username="alice", password_hash="x", is_admin=False)
+    db.add(user)
+    db.add(_intercom_app(is_visible_in_connector=False))
     db.commit()
     db.refresh(user)
 
@@ -211,3 +243,221 @@ def test_intercom_callback_fails_cleanly_when_token_exchange_yields_no_token(
         .count()
         == 0
     )
+
+
+def test_hidden_intercom_app_rejects_single_app_oauth_connect(
+    hidden_db_session, monkeypatch
+):
+    """Production ships Intercom with is_visible_in_connector=False pending
+    live-workspace verification. generic_oauth_callback's builtin_oauth path
+    used to be the one connect path _reject_hidden_catalog_app's docstring
+    flagged as NOT enforcing that gate (#1203) -- an authenticated user who
+    simply knew (or guessed) the app_id could still connect a hidden,
+    unverified, customer-facing write connector. This asserts the gate now
+    actually blocks it, symmetric with the existing mcp_oauth-path coverage
+    in test_mcp_oauth_flow.py::test_connect_app_rejects_hidden_mcp_oauth_app.
+    """
+    db, user = hidden_db_session
+    state = create_access_token(
+        data={
+            "type": "oauth_state",
+            "user_id": user.id,
+            "provider": "intercom",
+            "app_id": "intercom",
+        },
+        expires_delta=timedelta(minutes=10),
+    )
+    request = SimpleNamespace(query_params={"code": "intercom-code", "state": state})
+    post_mock = Mock()
+    get_mock = Mock()
+    monkeypatch.setattr(auth_api.requests, "post", post_mock)
+    monkeypatch.setattr(auth_api.requests, "get", get_mock)
+
+    response = generic_oauth_callback("intercom", request, db, _intercom_provider())
+
+    assert response.status_code == 404
+    # The gate fires before any token exchange is attempted, not just before
+    # persistence -- a hidden app should not even reach the provider.
+    post_mock.assert_not_called()
+    get_mock.assert_not_called()
+    assert (
+        db.query(UserOAuth)
+        .filter(UserOAuth.user_id == user.id, UserOAuth.provider == "intercom")
+        .count()
+        == 0
+    )
+    assert db.query(MCPServer).filter(MCPServer.name == "Intercom").count() == 0
+
+
+def test_hidden_intercom_app_is_skipped_during_bare_provider_oauth_connect(
+    hidden_db_session, monkeypatch
+):
+    """Mirror of the single-app case above, for the app_id-less ("bare
+    provider") batch connect branch: a hidden app must be skipped like a
+    mis-tagged non-oauth app, not abort the whole batch and not silently
+    create its MCPServer association."""
+    db, user = hidden_db_session
+    state = create_access_token(
+        data={"type": "oauth_state", "user_id": user.id, "provider": "intercom"},
+        expires_delta=timedelta(minutes=10),
+    )
+    request = SimpleNamespace(query_params={"code": "intercom-code", "state": state})
+    monkeypatch.setattr(
+        auth_api.requests,
+        "post",
+        Mock(return_value=MockResponse({"token": "raw-intercom-token"})),
+    )
+    monkeypatch.setattr(
+        auth_api.requests,
+        "get",
+        Mock(
+            return_value=MockResponse(
+                {"type": "admin", "id": "admin-1", "email": "alice@example.com"}
+            )
+        ),
+    )
+
+    response = generic_oauth_callback("intercom", request, db, _intercom_provider())
+
+    assert response.status_code == 200
+    # The bare provider-level grant is still created (same as the
+    # AppNotOAuthError skip case) -- only the app-specific MCPServer
+    # association for the hidden app is withheld.
+    assert (
+        db.query(UserOAuth)
+        .filter(UserOAuth.user_id == user.id, UserOAuth.provider == "intercom")
+        .count()
+        == 1
+    )
+    assert db.query(MCPServer).filter(MCPServer.name == "Intercom").count() == 0
+
+
+def test_access_token_guard_applies_to_a_non_intercom_provider_too(monkeypatch):
+    """The access_token guard added alongside the intercom fix (auth.py) is
+    shared, provider-agnostic code -- it must not only be exercised through
+    provider="intercom". Zoom stands in for "some other provider" here."""
+    engine = create_engine(
+        "sqlite:///:memory:", connect_args={"check_same_thread": False}
+    )
+    Base.metadata.create_all(engine)
+    SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
+    db = SessionLocal()
+    user = User(username="bob", password_hash="x", is_admin=False)
+    db.add(user)
+    db.add(
+        PublicMCPApp(
+            app_id="zoom",
+            name="Zoom",
+            transport="oauth",
+            provider_name="zoom",
+            is_visible_in_connector=True,
+        )
+    )
+    db.commit()
+    db.refresh(user)
+
+    zoom_provider = SimpleNamespace(
+        provider_name="zoom",
+        client_id=encrypt_value("zoom-client-id"),
+        client_secret=encrypt_value("zoom-client-secret"),
+        token_url="https://zoom.us/oauth/token",
+        redirect_uri="https://app.example.com/api/auth/zoom/callback",
+        userinfo_url="https://api.zoom.us/v2/users/me",
+        user_id_path="id",
+        email_path="email",
+        default_scopes=[],
+    )
+    state = create_access_token(
+        data={
+            "type": "oauth_state",
+            "user_id": user.id,
+            "provider": "zoom",
+            "app_id": "zoom",
+        },
+        expires_delta=timedelta(minutes=10),
+    )
+    request = SimpleNamespace(query_params={"code": "zoom-code", "state": state})
+    # No "error" key (would hit the earlier guard) and no access_token: an
+    # atypical but real-world shape for a misbehaving/proxied token endpoint.
+    monkeypatch.setattr(
+        auth_api.requests, "post", Mock(return_value=MockResponse({"foo": "bar"}))
+    )
+    get_mock = Mock()
+    monkeypatch.setattr(auth_api.requests, "get", get_mock)
+
+    response = generic_oauth_callback("zoom", request, db, zoom_provider)
+
+    assert response.status_code == 400
+    assert "did not return an access token" in response.body.decode()
+    get_mock.assert_not_called()
+    assert db.query(UserOAuth).filter(UserOAuth.provider == "zoom").count() == 0
+    db.close()
+    engine.dispose()
+
+
+def test_intercom_callback_surfaces_500_for_non_json_token_response(
+    db_session, monkeypatch
+):
+    """Pre-existing behavior, not a new fix: a non-JSON token response has no
+    status check ahead of token_response.json(), so it falls through to the
+    generic exception handler as a 500 rather than the clean 400 guard."""
+    db, user = db_session
+    state = create_access_token(
+        data={
+            "type": "oauth_state",
+            "user_id": user.id,
+            "provider": "intercom",
+            "app_id": "intercom",
+        },
+        expires_delta=timedelta(minutes=10),
+    )
+    request = SimpleNamespace(query_params={"code": "bad-code", "state": state})
+    monkeypatch.setattr(
+        auth_api.requests,
+        "post",
+        Mock(return_value=NonJsonResponse(status_code=502, text="<html>bad gateway")),
+    )
+
+    response = generic_oauth_callback("intercom", request, db, _intercom_provider())
+
+    assert response.status_code == 500
+    assert (
+        db.query(UserOAuth)
+        .filter(UserOAuth.user_id == user.id, UserOAuth.provider == "intercom")
+        .count()
+        == 0
+    )
+
+
+def test_intercom_callback_hits_access_token_guard_on_non_200_json_response(
+    db_session, monkeypatch
+):
+    """A non-200 status with a JSON body carrying neither "error" nor a
+    token is untested territory: there is no explicit status check ahead of
+    the "error" in token_data guard, so this must still resolve cleanly via
+    the access_token guard rather than silently proceeding as if it were a
+    success."""
+    db, user = db_session
+    state = create_access_token(
+        data={
+            "type": "oauth_state",
+            "user_id": user.id,
+            "provider": "intercom",
+            "app_id": "intercom",
+        },
+        expires_delta=timedelta(minutes=10),
+    )
+    request = SimpleNamespace(query_params={"code": "bad-code", "state": state})
+    monkeypatch.setattr(
+        auth_api.requests,
+        "post",
+        Mock(return_value=MockResponse({"foo": "bar"}, status_code=503)),
+    )
+    get_mock = Mock()
+    monkeypatch.setattr(auth_api.requests, "get", get_mock)
+
+    response = generic_oauth_callback("intercom", request, db, _intercom_provider())
+
+    assert response.status_code == 400
+    assert "did not return an access token" in response.body.decode()
+    get_mock.assert_not_called()

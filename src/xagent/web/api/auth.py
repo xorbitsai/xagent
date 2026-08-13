@@ -281,6 +281,24 @@ def _normalize_intercom_token_response(
     return {**token_data, "access_token": token}
 
 
+def _extract_provider_error_message(token_data: dict[str, Any]) -> str | None:
+    """Best-effort human-readable detail for a token exchange that yielded no
+    access_token.
+
+    Standard OAuth2 providers surface `error`/`error_description`, already
+    handled by the `"error" in token_data` check earlier in the callback.
+    This covers Intercom's differently-shaped `error.list` envelope instead
+    (`{"type": "error.list", "errors": [{"message": "..."}]}`), which does
+    not use an `error` key and so slips past that earlier check.
+    """
+    errors = token_data.get("errors")
+    if isinstance(errors, list) and errors:
+        first_error = errors[0]
+        if isinstance(first_error, dict) and first_error.get("message"):
+            return str(first_error["message"])
+    return None
+
+
 def create_access_token(
     data: Dict[str, Any], expires_delta: Optional[timedelta] = None
 ) -> str:
@@ -1414,6 +1432,38 @@ def generic_oauth_callback(
     user_id = payload.get("user_id")
     app_id = payload.get("app_id")
 
+    if app_id:
+        # Reject a hidden app before spending the authorization code against
+        # the real provider, not just before persisting -- is_visible_in_
+        # connector is also used as a release gate (e.g. an unverified
+        # builtin_oauth connector shipping hidden), and this builtin_oauth
+        # provider-redirect flow used to be the one connect path
+        # _reject_hidden_catalog_app's own docstring flagged as NOT enforcing
+        # that gate (#1203): an authenticated user who knew (or guessed) the
+        # app_id could still connect a hidden connector. Checked here, ahead
+        # of the token exchange below, rather than only later next to
+        # _ensure_user_mcp_server, so a hidden app never even reaches the
+        # provider -- matching the "indistinguishable from nonexistent" intent
+        # the helper already documents for its other two call sites. The bare
+        # (app_id-less) batch branch below cannot move this early: it doesn't
+        # know which apps share the provider until it queries them, so its
+        # own per-app check stays where it is.
+        from ..mcp_apps import get_app_by_id
+        from .mcp import _reject_hidden_catalog_app
+
+        target_app_info = get_app_by_id(db, app_id)
+        if target_app_info:
+            try:
+                _reject_hidden_catalog_app(target_app_info)
+            except HTTPException:
+                return HTMLResponse(
+                    content=(
+                        "<h1>Cannot Connect</h1>"
+                        "<p>This app is not currently available.</p>"
+                    ),
+                    status_code=404,
+                )
+
     if not db_provider:
         return HTMLResponse(
             content="<h1>Error: Provider not configured</h1>", status_code=500
@@ -1480,11 +1530,12 @@ def generic_oauth_callback(
             # exception handler instead of a clear, actionable error.
             import html
 
+            message = f"{html.escape(provider)} did not return an access token."
+            detail = _extract_provider_error_message(token_data)
+            if detail:
+                message = f"{message} {html.escape(detail)}"
             return HTMLResponse(
-                content=(
-                    "<h1>Error exchanging token</h1>"
-                    f"<p>{html.escape(provider)} did not return an access token.</p>"
-                ),
+                content=f"<h1>Error exchanging token</h1><p>{message}</p>",
                 status_code=400,
             )
 
@@ -1547,10 +1598,14 @@ def generic_oauth_callback(
                 )
 
             from ..mcp_apps import get_all_mcp_apps, get_app_by_id
+            from .mcp import _reject_hidden_catalog_app
 
             if app_id:
                 app_info = get_app_by_id(db, app_id)
                 if app_info:
+                    # The hidden-app gate for this branch already ran earlier
+                    # (right after app_id was decoded from state, before the
+                    # token exchange) -- not repeated here.
                     # A stale/crafted app_id in the OAuth state can point at a
                     # non-oauth app. Fail with a clear error instead of a generic
                     # 500 after the user already completed provider consent —
@@ -1575,6 +1630,21 @@ def generic_oauth_callback(
                     if app.get("provider") == provider
                 ]
                 for app_info in apps:
+                    # Same release-gate enforcement as the single-app branch
+                    # above (same shared helper, so there is one source of
+                    # truth for this check), but a hidden app must not abort
+                    # the whole bare batch connect — skip it and keep
+                    # connecting the other visible apps under the same
+                    # provider, matching the mis-tagged-app skip below.
+                    try:
+                        _reject_hidden_catalog_app(app_info)
+                    except HTTPException:
+                        logger.info(
+                            "Skipping hidden app %s during bare %s OAuth batch connect",
+                            app_info.get("id"),
+                            provider,
+                        )
+                        continue
                     # This bare app_id-less login only ever requests
                     # db_provider.default_scopes (see the app_scopes=None
                     # branch above), never an app's own oauth_scopes. Creating

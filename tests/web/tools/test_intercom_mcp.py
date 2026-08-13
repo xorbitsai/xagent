@@ -65,7 +65,9 @@ def test_get_contact_percent_encodes_id_with_query_injection(monkeypatch):
 
     called_url = mock_request.call_args.kwargs["url"]
     assert called_url == "https://api.intercom.io/contacts/123%3Fdisplay_as%3Dplaintext"
-    assert mock_request.call_args.kwargs["params"] is None
+    # _request has no params kwarg (dead code, removed) -- the encoded "?"
+    # must not somehow still end up attached as a query string.
+    assert "params" not in mock_request.call_args.kwargs
 
 
 def test_get_conversation_percent_encodes_id(monkeypatch):
@@ -76,6 +78,44 @@ def test_get_conversation_percent_encodes_id(monkeypatch):
 
     called_url = mock_request.call_args.kwargs["url"]
     assert called_url == "https://api.intercom.io/conversations/..%2Fadmins"
+
+
+def test_get_conversation_projects_populated_parts(monkeypatch):
+    """The only prior get_conversation test mocked an empty conversation, so
+    the conversation_parts projection never actually ran."""
+    monkeypatch.setattr(
+        intercom.requests,
+        "request",
+        Mock(
+            return_value=MockResponse(
+                json_data={
+                    "id": "conv1",
+                    "conversation_parts": {
+                        "conversation_parts": [
+                            {
+                                "id": "part1",
+                                "author": {"name": "Alice"},
+                                "body": "<p>hi</p>",
+                                "created_at": 1700000000,
+                            }
+                        ]
+                    },
+                }
+            )
+        ),
+    )
+
+    result = json.loads(intercom.intercom_get_conversation("conv1"))
+
+    assert result["status"] == "success"
+    assert result["parts"] == [
+        {
+            "id": "part1",
+            "author": "Alice",
+            "body": "<p>hi</p>",
+            "created_at": 1700000000,
+        }
+    ]
 
 
 def test_reply_percent_encodes_conversation_id(monkeypatch):
@@ -94,6 +134,24 @@ def test_reply_percent_encodes_conversation_id(monkeypatch):
         reply_call.kwargs["url"]
         == "https://api.intercom.io/conversations/..%2Fadmins/reply"
     )
+    # Not just the URL -- swapping message_type comment<->note would change
+    # no URL, so the body must be asserted too.
+    assert reply_call.kwargs["json"] == {
+        "message_type": "comment",
+        "type": "admin",
+        "admin_id": "admin-1",
+        "body": "hello",
+    }
+
+
+def test_reply_rejects_blank_body(monkeypatch):
+    mock_request = Mock()
+    monkeypatch.setattr(intercom.requests, "request", mock_request)
+
+    result = json.loads(intercom.intercom_reply_to_conversation("conv1", "   "))
+
+    assert result["status"] == "error"
+    mock_request.assert_not_called()
 
 
 def test_add_internal_note_percent_encodes_conversation_id(monkeypatch):
@@ -112,6 +170,22 @@ def test_add_internal_note_percent_encodes_conversation_id(monkeypatch):
         note_call.kwargs["url"]
         == "https://api.intercom.io/conversations/..%2Fadmins/reply"
     )
+    assert note_call.kwargs["json"] == {
+        "message_type": "note",
+        "type": "admin",
+        "admin_id": "admin-1",
+        "body": "internal note",
+    }
+
+
+def test_add_internal_note_rejects_blank_body(monkeypatch):
+    mock_request = Mock()
+    monkeypatch.setattr(intercom.requests, "request", mock_request)
+
+    result = json.loads(intercom.intercom_add_internal_note("conv1", ""))
+
+    assert result["status"] == "error"
+    mock_request.assert_not_called()
 
 
 def test_close_conversation_percent_encodes_conversation_id(monkeypatch):
@@ -130,6 +204,11 @@ def test_close_conversation_percent_encodes_conversation_id(monkeypatch):
         close_call.kwargs["url"]
         == "https://api.intercom.io/conversations/..%2Fadmins/parts"
     )
+    assert close_call.kwargs["json"] == {
+        "message_type": "close",
+        "type": "admin",
+        "admin_id": "admin-1",
+    }
 
 
 def test_list_conversations_open_and_closed_filter_by_state(monkeypatch):
@@ -143,6 +222,60 @@ def test_list_conversations_open_and_closed_filter_by_state(monkeypatch):
     intercom.intercom_list_conversations(state="closed")
     body = mock_request.call_args.kwargs["json"]
     assert body["query"] == {"field": "state", "operator": "=", "value": "closed"}
+
+
+def test_list_conversations_snoozed_filters_by_state(monkeypatch):
+    """Intercom's conversation state enum is open/closed/snoozed; snoozed
+    must be a selectable state, not silently unreachable except via "all"."""
+    mock_request = Mock(return_value=MockResponse(json_data={"conversations": []}))
+    monkeypatch.setattr(intercom.requests, "request", mock_request)
+
+    intercom.intercom_list_conversations(state="snoozed")
+
+    body = mock_request.call_args.kwargs["json"]
+    assert body["query"] == {"field": "state", "operator": "=", "value": "snoozed"}
+
+
+def test_list_conversations_returns_total_count_and_has_more(monkeypatch):
+    monkeypatch.setattr(
+        intercom.requests,
+        "request",
+        Mock(
+            return_value=MockResponse(
+                json_data={
+                    "conversations": [{"id": "c1"}],
+                    "total_count": 5,
+                    "pages": {"next": {"starting_after": "cursor-2"}},
+                }
+            )
+        ),
+    )
+
+    result = json.loads(intercom.intercom_list_conversations())
+
+    assert result["status"] == "success"
+    assert result["total_count"] == 5
+    assert result["has_more"] is True
+
+
+def test_list_conversations_has_more_false_on_last_page(monkeypatch):
+    monkeypatch.setattr(
+        intercom.requests,
+        "request",
+        Mock(
+            return_value=MockResponse(
+                json_data={
+                    "conversations": [{"id": "c1"}],
+                    "total_count": 1,
+                    "pages": {"next": None},
+                }
+            )
+        ),
+    )
+
+    result = json.loads(intercom.intercom_list_conversations())
+
+    assert result["has_more"] is False
 
 
 def test_list_conversations_all_state_still_sends_a_query(monkeypatch):
@@ -314,3 +447,99 @@ def test_search_contacts_returns_error_payload_on_failure(monkeypatch):
 
     assert result["status"] == "error"
     assert "bad token" in result["message"]
+
+
+def test_search_contacts_rejects_blank_query(monkeypatch):
+    mock_request = Mock()
+    monkeypatch.setattr(intercom.requests, "request", mock_request)
+
+    result = json.loads(intercom.intercom_search_contacts("   "))
+
+    assert result["status"] == "error"
+    mock_request.assert_not_called()
+
+
+def test_get_contact_curates_the_response_like_search_does(monkeypatch):
+    """intercom_get_contact used to return the raw provider object while
+    search_contacts and get_conversation both curate via a summary helper --
+    internally inconsistent, and an unbounded passthrough of whatever fields
+    Intercom's API happens to include."""
+    monkeypatch.setattr(
+        intercom.requests,
+        "request",
+        Mock(
+            return_value=MockResponse(
+                json_data={
+                    "id": "c1",
+                    "name": "Ada",
+                    "email": "ada@example.com",
+                    "phone": None,
+                    "role": "user",
+                    "last_seen_at": 1700000000,
+                    "custom_attributes": {"internal_notes": "sensitive stuff"},
+                }
+            )
+        ),
+    )
+
+    result = json.loads(intercom.intercom_get_contact("c1"))
+
+    assert result["contact"] == {
+        "id": "c1",
+        "name": "Ada",
+        "email": "ada@example.com",
+        "phone": None,
+        "role": "user",
+        "last_seen_at": 1700000000,
+    }
+    assert "custom_attributes" not in result["contact"]
+
+
+def test_request_truncates_long_unstructured_error_body(monkeypatch):
+    """An HTML gateway error page (or similar) landing in an unstructured
+    error body must not be forwarded to the LLM/logs verbatim and
+    unbounded, mirroring the Zoom sibling module."""
+    long_body = "x" * 5000
+    monkeypatch.setattr(
+        intercom.requests,
+        "request",
+        Mock(return_value=MockResponse(status_code=500, text=long_body)),
+    )
+
+    result = json.loads(intercom.intercom_get_contact("c1"))
+
+    assert result["status"] == "error"
+    assert "[truncated]" in result["message"]
+    assert len(result["message"]) < len(long_body)
+
+
+def test_request_returns_empty_dict_on_204(monkeypatch):
+    monkeypatch.setattr(
+        intercom.requests,
+        "request",
+        Mock(return_value=MockResponse(status_code=204)),
+    )
+
+    assert intercom._request("POST", "/conversations/c1/parts") == {}
+
+
+def test_list_conversations_clamps_limit_to_the_documented_range(monkeypatch):
+    mock_request = Mock(return_value=MockResponse(json_data={"conversations": []}))
+    monkeypatch.setattr(intercom.requests, "request", mock_request)
+
+    intercom.intercom_list_conversations(limit=500)
+    assert mock_request.call_args.kwargs["json"]["pagination"]["per_page"] == 100
+
+    intercom.intercom_list_conversations(limit=0)
+    assert mock_request.call_args.kwargs["json"]["pagination"]["per_page"] == 1
+
+
+def test_current_admin_id_raises_when_me_has_no_id(monkeypatch):
+    monkeypatch.setattr(
+        intercom.requests,
+        "request",
+        Mock(return_value=MockResponse(json_data={"type": "admin"})),
+    )
+
+    with pytest.raises(RuntimeError, match="Could not resolve"):
+        intercom._current_admin_id()

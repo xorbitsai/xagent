@@ -32,6 +32,10 @@ DEFAULT_TIMEOUT_SECONDS = 30
 # small Retry-After we wait once and retry rather than failing outright,
 # mirroring the same bounded-retry policy as the Slack sibling module.
 MAX_RETRY_AFTER_SECONDS = 30
+# An HTML gateway error page (or similar) landing in an unstructured error
+# body must not be forwarded to the LLM/logs verbatim and unbounded, same
+# reasoning and cap as the Zoom sibling module.
+MAX_ERROR_RESPONSE_TEXT_CHARS = 1000
 
 # Keyed by access token, defense-in-depth rather than an active optimization:
 # every MCP tool call currently spawns and tears down a fresh subprocess
@@ -67,7 +71,6 @@ def _request(
     method: str,
     path: str,
     *,
-    params: dict[str, Any] | None = None,
     body: dict[str, Any] | None = None,
 ) -> Any:
     for attempt in (0, 1):
@@ -75,7 +78,6 @@ def _request(
             method=method,
             url=f"{INTERCOM_BASE_URL}{path}",
             headers=_headers(),
-            params=params,
             json=body,
             timeout=DEFAULT_TIMEOUT_SECONDS,
         )
@@ -93,6 +95,10 @@ def _request(
         response.raise_for_status()
     except requests.HTTPError as exc:
         response_text = response.text.strip()
+        if len(response_text) > MAX_ERROR_RESPONSE_TEXT_CHARS:
+            response_text = response_text[:MAX_ERROR_RESPONSE_TEXT_CHARS] + (
+                "... [truncated]"
+            )
         message = str(exc)
         if response_text:
             message = f"{message} - {response_text}"
@@ -152,6 +158,8 @@ def intercom_search_contacts(query: str, limit: int = 10) -> str:
     Search Intercom contacts whose name or email contains `query`.
     """
     try:
+        if not query.strip():
+            raise ValueError("query must not be blank")
         body = {
             "query": {
                 "operator": "OR",
@@ -179,7 +187,7 @@ def intercom_get_contact(contact_id: str) -> str:
     """
     try:
         contact = _request("GET", f"/contacts/{quote(contact_id, safe='')}")
-        return _success(contact=contact)
+        return _success(contact=_contact_summary(contact))
     except Exception as e:
         logger.error(f"Error getting contact: {e}")
         return _error(str(e))
@@ -188,11 +196,13 @@ def intercom_get_contact(contact_id: str) -> str:
 @mcp.tool()
 def intercom_list_conversations(state: str = "open", limit: int = 20) -> str:
     """
-    List Intercom conversations. `state` is one of "open", "closed", or "all".
-    Returns at most `limit` conversations (max 100), most recently updated first.
+    List Intercom conversations. `state` is one of "open", "closed", "snoozed",
+    or "all". Returns at most `limit` conversations (max 100), most recently
+    updated first. `has_more` is true when the search matched more
+    conversations than were returned.
     """
     try:
-        valid_states = {"open", "closed", "all"}
+        valid_states = {"open", "closed", "snoozed", "all"}
         if state not in valid_states:
             raise ValueError(f"state must be one of {sorted(valid_states)}")
 
@@ -210,9 +220,13 @@ def intercom_list_conversations(state: str = "open", limit: int = 20) -> str:
         else:
             query = {"field": "state", "operator": "=", "value": state}
 
+        per_page = max(1, min(limit, 100))
         body: dict[str, Any] = {
             "query": query,
-            "pagination": {"per_page": max(1, min(limit, 100))},
+            "pagination": {"per_page": per_page},
+            # `sort` is a common structure documented for both
+            # /contacts/search and /conversations/search (Intercom docs,
+            # "Pagination & Sorting (Search)"), not contacts-only.
             "sort": {"field": "updated_at", "order": "descending"},
         }
 
@@ -220,7 +234,14 @@ def intercom_list_conversations(state: str = "open", limit: int = 20) -> str:
         conversations = [
             _conversation_summary(c) for c in result.get("conversations", [])
         ]
-        return _success(conversations=conversations)
+        # Intercom's search pagination carries a "next" cursor object under
+        # "pages" only when more results remain past this page.
+        has_more = bool((result.get("pages") or {}).get("next"))
+        return _success(
+            conversations=conversations,
+            total_count=result.get("total_count", len(conversations)),
+            has_more=has_more,
+        )
     except Exception as e:
         logger.error(f"Error listing conversations: {e}")
         return _error(str(e))
@@ -262,6 +283,8 @@ def intercom_reply_to_conversation(conversation_id: str, body: str) -> str:
     Reply to a customer on an Intercom conversation, as the connected admin.
     """
     try:
+        if not body.strip():
+            raise ValueError("body must not be blank")
         reply = _request(
             "POST",
             f"/conversations/{quote(conversation_id, safe='')}/reply",
@@ -285,6 +308,8 @@ def intercom_add_internal_note(conversation_id: str, body: str) -> str:
     visible to teammates, never to the customer.
     """
     try:
+        if not body.strip():
+            raise ValueError("body must not be blank")
         reply = _request(
             "POST",
             f"/conversations/{quote(conversation_id, safe='')}/reply",

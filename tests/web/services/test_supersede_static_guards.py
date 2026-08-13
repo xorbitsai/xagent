@@ -14,9 +14,9 @@ small, focused test rather than a full behavior suite:
   constants have.
 * import ban: ``chat_history_service.py`` does not import anything from
   the native-rollout module.
-* mid-turn marker-write ban: the WebSocket mid-turn persistence path never
-  writes the superseded marker itself, literal or constant -- that is this
-  helper's only sanctioned write site.
+* mid-turn marker-mention ban: the WebSocket mid-turn persistence path
+  never mentions the superseded marker at all, literal or constant -- the
+  helper is the only sanctioned place that value appears on that path.
 
 Each check operates on parsed source text (``ast.parse``), not on a live
 import of every module in the tree -- module-level side effects on import
@@ -178,9 +178,26 @@ def single_row_task_chat_message_deletes(tree: ast.Module) -> list[tuple[int, st
     functions bound (a real closure read), and a binding made inside a
     nested function does not leak back out to the enclosing one.
 
-    Known blind spot: an instance delete whose argument arrives as an
-    already-typed function parameter (never locally assigned) is
-    invisible to this by-name trace.
+    What this recognizes, stated as the rule rather than as a list of
+    misses: the deleted object must be named by a bare ``Name`` in the
+    call, and that name must have been bound somewhere in this function
+    or one enclosing it, by an assignment whose right-hand side mentions
+    ``TaskChatMessage`` literally. Anything that does not fit that shape
+    is invisible -- the argument resolution is by name within a scope
+    chain, not by dataflow.
+
+    Shapes that consequently do not resolve, as examples rather than an
+    exhaustive list: an argument arriving as an already-typed function
+    parameter and never locally assigned; an inline expression such as
+    ``db.delete(db.query(Model).first())``, where the argument is a
+    ``Call``; a module-scope binding, since only bindings in the
+    enclosing function chain are collected; and an attribute form such as
+    ``db.delete(self.message)``, where the argument is an ``Attribute``.
+
+    Every session-scoped instance delete in this tree today passes a bare
+    local name, so these are latent rather than live. Closing them needs
+    the dataflow-sensitive analysis this guard deliberately declines, for
+    the same cost reason the checkpoint-pointer pairing guard declines it.
     """
     findings: list[tuple[int, str]] = []
 
@@ -771,11 +788,13 @@ except ImportError:
 # chat_history_service.py imports nothing from the native-rollout module.
 #
 # This guard exists so chat_history_service.py never becomes a module
-# that imports rollout controls: the supersede helper is unconditional by
-# contract and must never branch on rollout mode. The rollout module
-# (``interaction_rollout.py``) exists in this repository --
-# this guard is what keeps this service module from ever importing it,
-# and it now flags real code, not a hypothetical future import.
+# that imports rollout controls: this module must not become a place
+# where rollout mode is read; whether a future call site gates the call
+# is that call site's own contract, not something this guard can see.
+# The rollout module (``interaction_rollout.py``) exists in this
+# repository -- this guard is what keeps this service module from ever
+# importing it, and it now flags real code, not a hypothetical future
+# import.
 # ---------------------------------------------------------------------------
 
 _BANNED_ROLLOUT_NAMES = frozenset(
@@ -823,7 +842,7 @@ def test_chat_history_service_imports_nothing_from_native_rollout() -> None:
     hits = banned_rollout_imports(ast.parse(source))
     assert hits == [], (
         f"chat_history_service.py imports from the banned native-rollout "
-        f"module (supersede must stay unconditional): {hits}"
+        f"module (this module must not import rollout controls): {hits}"
     )
 
 
@@ -866,21 +885,22 @@ def test_rollout_import_guard_ignores_an_unrelated_name_containing_the_substring
 
 
 # ---------------------------------------------------------------------------
-# The mid-turn WebSocket path never writes the "question_superseded"
-# literal itself -- that is this helper's only sanctioned write site.
+# The mid-turn WebSocket path never mentions the superseded value at
+# all -- not to write it, and not to branch on it. That value belongs
+# to this helper's one sanctioned write site.
 # ---------------------------------------------------------------------------
 
 MID_TURN_FUNCTIONS = ("_persist_agent_outbound_event", "make_agent_outbound_handler")
 
 
-def mid_turn_functions_writing_superseded_literal(
+def mid_turn_functions_mentioning_superseded_value(
     tree: ast.Module,
 ) -> tuple[list[str], set[str]]:
     """Return (hit function names, found function names).
 
     ``found`` is every name out of ``MID_TURN_FUNCTIONS`` that this source
     actually defines -- tracked separately from ``hits`` so a caller can
-    tell "neither function writes the value" apart from "neither
+    tell "neither function mentions the value" apart from "neither
     function exists here anymore" (e.g. after a rename); a check would be
     vacuously green in that second case without this.
 
@@ -909,22 +929,22 @@ def mid_turn_functions_writing_superseded_literal(
     return hits, found
 
 
-def test_mid_turn_websocket_path_never_writes_the_superseded_literal() -> None:
+def test_mid_turn_websocket_path_never_mentions_the_superseded_value() -> None:
     source = Path(websocket.__file__).read_text(encoding="utf-8")
-    hits, found = mid_turn_functions_writing_superseded_literal(ast.parse(source))
+    hits, found = mid_turn_functions_mentioning_superseded_value(ast.parse(source))
 
     # Sanity: both tracked functions actually exist in this source -- an
     # empty or partial `found` set would make the hits == [] assertion
-    # below vacuous (a renamed or removed function trivially "writes
+    # below vacuous (a renamed or removed function trivially "mentions
     # nothing" because this guard never sees it at all).
     assert found == set(MID_TURN_FUNCTIONS)
     assert hits == [], (
-        f"mid-turn websocket path writes the question_superseded literal "
+        f"mid-turn websocket path mentions the superseded value "
         f"outside its one sanctioned site: {hits}"
     )
 
 
-def test_mid_turn_guard_flags_a_literal_write_in_an_async_def_shape() -> None:
+def test_mid_turn_guard_flags_a_literal_mention_in_an_async_def_shape() -> None:
     """The two functions this guard names are plain ``def`` today, but
     the guard must not silently stop working the day either becomes
     ``async def`` -- the same async-aware match the single-row-delete
@@ -934,11 +954,11 @@ async def _persist_agent_outbound_event(task_id, event):
     message_type = "question_superseded"
     return message_type
 """
-    hits, _found = mid_turn_functions_writing_superseded_literal(ast.parse(fixture))
+    hits, _found = mid_turn_functions_mentioning_superseded_value(ast.parse(fixture))
     assert hits == ["_persist_agent_outbound_event"]
 
 
-def test_mid_turn_guard_flags_a_literal_write_in_either_function() -> None:
+def test_mid_turn_guard_flags_a_literal_mention_in_either_function() -> None:
     fixture = """
 def _persist_agent_outbound_event(task_id, event):
     message_type = "question_superseded"
@@ -950,7 +970,7 @@ def make_agent_outbound_handler(task_id):
         return "question_superseded"
     return handle_outbound_message
 """
-    hits, _found = mid_turn_functions_writing_superseded_literal(ast.parse(fixture))
+    hits, _found = mid_turn_functions_mentioning_superseded_value(ast.parse(fixture))
     assert set(hits) == {"_persist_agent_outbound_event", "make_agent_outbound_handler"}
 
 
@@ -981,8 +1001,8 @@ def make_agent_outbound_handler(task_id):
     ],
     ids=["imported", "aliased-import"],
 )
-def test_mid_turn_guard_flags_a_constant_spelled_write(
+def test_mid_turn_guard_flags_a_constant_spelled_mention(
     fixture: str, expected: list[str]
 ) -> None:
-    hits, _found = mid_turn_functions_writing_superseded_literal(ast.parse(fixture))
+    hits, _found = mid_turn_functions_mentioning_superseded_value(ast.parse(fixture))
     assert hits == expected

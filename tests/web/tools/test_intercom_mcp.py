@@ -256,6 +256,29 @@ def test_list_conversations_returns_total_count_and_has_more(monkeypatch):
     assert result["status"] == "success"
     assert result["total_count"] == 5
     assert result["has_more"] is True
+    # has_more without an actionable cursor isn't useful -- the caller must
+    # get the cursor back to actually page through.
+    assert result["next_cursor"] == "cursor-2"
+
+
+def test_list_conversations_threads_starting_after_into_pagination(monkeypatch):
+    mock_request = Mock(return_value=MockResponse(json_data={"conversations": []}))
+    monkeypatch.setattr(intercom.requests, "request", mock_request)
+
+    intercom.intercom_list_conversations(starting_after="cursor-2")
+
+    body = mock_request.call_args.kwargs["json"]
+    assert body["pagination"] == {"per_page": 20, "starting_after": "cursor-2"}
+
+
+def test_list_conversations_omits_starting_after_by_default(monkeypatch):
+    mock_request = Mock(return_value=MockResponse(json_data={"conversations": []}))
+    monkeypatch.setattr(intercom.requests, "request", mock_request)
+
+    intercom.intercom_list_conversations()
+
+    body = mock_request.call_args.kwargs["json"]
+    assert "starting_after" not in body["pagination"]
 
 
 def test_list_conversations_has_more_false_on_last_page(monkeypatch):
@@ -276,6 +299,7 @@ def test_list_conversations_has_more_false_on_last_page(monkeypatch):
     result = json.loads(intercom.intercom_list_conversations())
 
     assert result["has_more"] is False
+    assert result["next_cursor"] is None
 
 
 def test_list_conversations_all_state_still_sends_a_query(monkeypatch):
@@ -431,7 +455,7 @@ def test_search_contacts_returns_success_payload(monkeypatch):
             "last_seen_at": None,
         }
     ]
-    assert result["total"] == 1
+    assert result["total_count"] == 1
 
 
 def test_search_contacts_returns_error_payload_on_failure(monkeypatch):

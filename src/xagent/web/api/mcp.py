@@ -2330,11 +2330,11 @@ def _reject_hidden_catalog_app(app_info: dict) -> None:
     Scope: wired into all three connect paths — the api_key/keyless path
     (_ensure_catalog_app_server), the remote-MCP OAuth path
     (_ensure_catalog_mcp_oauth_server), and the builtin_oauth
-    provider-redirect flow (auth.py generic_oauth_callback, both the
-    single-app and bare-provider-batch branches). #1203 tracked exactly this
-    gap on the third path — call this same helper rather than reintroducing
-    a fourth, divergent is_visible_in_connector check if a new connect path
-    is ever added.
+    provider-redirect flow (auth.py generic_oauth_login and
+    generic_oauth_callback's single-app and bare-provider-batch branches).
+    #1203 tracked exactly this gap on the third path — call this same helper
+    rather than reintroducing a fourth, divergent is_visible_in_connector
+    check if a new connect path is ever added.
 
     Blast radius: this fires on every connect call, before the caller's
     existing association is looked up — so on a hidden app it also blocks

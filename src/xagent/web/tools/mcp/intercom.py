@@ -173,7 +173,8 @@ def intercom_search_contacts(query: str, limit: int = 10) -> str:
         result = _request("POST", "/contacts/search", body=body)
         contacts = [_contact_summary(c) for c in result.get("data", [])]
         return _success(
-            contacts=contacts, total=result.get("total_count", len(contacts))
+            contacts=contacts,
+            total_count=result.get("total_count", len(contacts)),
         )
     except Exception as e:
         logger.error(f"Error searching contacts: {e}")
@@ -194,12 +195,15 @@ def intercom_get_contact(contact_id: str) -> str:
 
 
 @mcp.tool()
-def intercom_list_conversations(state: str = "open", limit: int = 20) -> str:
+def intercom_list_conversations(
+    state: str = "open", limit: int = 20, starting_after: str | None = None
+) -> str:
     """
     List Intercom conversations. `state` is one of "open", "closed", "snoozed",
     or "all". Returns at most `limit` conversations (max 100), most recently
     updated first. `has_more` is true when the search matched more
-    conversations than were returned.
+    conversations than were returned; pass the returned `next_cursor` back in
+    as `starting_after` to fetch the following page.
     """
     try:
         valid_states = {"open", "closed", "snoozed", "all"}
@@ -221,9 +225,12 @@ def intercom_list_conversations(state: str = "open", limit: int = 20) -> str:
             query = {"field": "state", "operator": "=", "value": state}
 
         per_page = max(1, min(limit, 100))
+        pagination: dict[str, Any] = {"per_page": per_page}
+        if starting_after:
+            pagination["starting_after"] = starting_after
         body: dict[str, Any] = {
             "query": query,
-            "pagination": {"per_page": per_page},
+            "pagination": pagination,
             # `sort` is a common structure documented for both
             # /contacts/search and /conversations/search (Intercom docs,
             # "Pagination & Sorting (Search)"), not contacts-only.
@@ -236,11 +243,12 @@ def intercom_list_conversations(state: str = "open", limit: int = 20) -> str:
         ]
         # Intercom's search pagination carries a "next" cursor object under
         # "pages" only when more results remain past this page.
-        has_more = bool((result.get("pages") or {}).get("next"))
+        next_page = (result.get("pages") or {}).get("next") or {}
         return _success(
             conversations=conversations,
             total_count=result.get("total_count", len(conversations)),
-            has_more=has_more,
+            has_more=bool(next_page),
+            next_cursor=next_page.get("starting_after"),
         )
     except Exception as e:
         logger.error(f"Error listing conversations: {e}")

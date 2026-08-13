@@ -1235,6 +1235,25 @@ def generic_oauth_login(
     if app_id:
         app_info = get_app_by_id(db, app_id)
         if app_info:
+            # Reject a hidden app here too, not only at the callback --
+            # otherwise a hidden connector's consent screen is still shown at
+            # the real provider (no security bypass, since the callback
+            # still blocks the connect, but a confusing UX: the app doesn't
+            # feel hidden if you can watch it start connecting). Unlike the
+            # callback's gate, an unknown app_id is deliberately left alone
+            # here too, for the same reason (e.g. gmail's bare-app-id flows).
+            from .mcp import _reject_hidden_catalog_app
+
+            try:
+                _reject_hidden_catalog_app(app_info)
+            except HTTPException:
+                return HTMLResponse(
+                    content=(
+                        "<h1>Cannot Connect</h1>"
+                        "<p>This app is not currently available.</p>"
+                    ),
+                    status_code=404,
+                )
             if "oauth_scopes" in app_info:
                 app_scopes = app_info["oauth_scopes"]
             app_optional_scopes = app_info.get("optional_oauth_scopes") or []
@@ -1451,6 +1470,14 @@ def generic_oauth_callback(
         from ..mcp_apps import get_app_by_id
         from .mcp import _reject_hidden_catalog_app
 
+        # An app_id that resolves to no catalog row at all is left alone,
+        # deliberately not folded into this gate: several existing OAuth
+        # flows (e.g. gmail in the test suite) legitimately reach this
+        # callback with an app_id that has no PublicMCPApp row, and rely on
+        # falling through to a bare/provider-scoped grant rather than being
+        # rejected -- confirmed by running the full oauth test suite before
+        # settling on this narrower check. Only a row that exists AND is
+        # hidden is rejected here.
         target_app_info = get_app_by_id(db, app_id)
         if target_app_info:
             try:
@@ -1597,15 +1624,16 @@ def generic_oauth_callback(
                     + timedelta(seconds=int(token_data["expires_in"])),
                 )
 
-            from ..mcp_apps import get_all_mcp_apps, get_app_by_id
+            from ..mcp_apps import get_all_mcp_apps
             from .mcp import _reject_hidden_catalog_app
 
             if app_id:
-                app_info = get_app_by_id(db, app_id)
+                # Reuse target_app_info from the earlier hidden-app-gate
+                # check above rather than re-fetching by app_id: nothing
+                # mutates public_mcp_apps between there and here, so a second
+                # fetch would just be redundant, not more correct.
+                app_info = target_app_info
                 if app_info:
-                    # The hidden-app gate for this branch already ran earlier
-                    # (right after app_id was decoded from state, before the
-                    # token exchange) -- not repeated here.
                     # A stale/crafted app_id in the OAuth state can point at a
                     # non-oauth app. Fail with a clear error instead of a generic
                     # 500 after the user already completed provider consent —

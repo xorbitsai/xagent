@@ -139,6 +139,22 @@ def upgrade() -> None:
                 sa.insert(PUBLIC_MCP_APPS_TABLE),
                 [_filter_row(_intercom_app_row(), app_columns)],
             )
+        else:
+            # A row with this app_id already exists (e.g. hand-created by an
+            # operator before this migration deployed). Such a row keeps its
+            # own is_visible_in_connector, which defaults to TRUE for
+            # hand-created rows -- and the builtin registry overlays the real
+            # transport/launch_config onto ANY row sharing this app_id at read
+            # time, so a visible pre-existing row would silently become a
+            # working, one-click-connectable, unverified write-capable
+            # connector, defeating the hidden-rollout gate with no further
+            # action. Same guard, same reasoning, as the chrome seed
+            # migration's collision branch (#1143).
+            bind.execute(
+                sa.update(PUBLIC_MCP_APPS_TABLE)
+                .where(PUBLIC_MCP_APPS_TABLE.c.app_id == APP_ID)
+                .values(is_visible_in_connector=False)
+            )
 
 
 def downgrade() -> None:

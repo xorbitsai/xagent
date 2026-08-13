@@ -122,6 +122,45 @@ def test_upgrade_is_idempotent(tmp_path):
         assert provider_count == 1
 
 
+def test_upgrade_force_hides_a_pre_existing_visible_intercom_row(tmp_path):
+    """A hand-created "intercom" row (e.g. an operator adding it via
+    POST /admin/mcp/apps before this migration deployed) defaults to
+    visible. The builtin registry overlays this migration's real
+    transport/launch_config onto ANY row sharing this app_id at read time,
+    while is_visible_in_connector comes straight from the DB row -- so a
+    visible collision row would become a working, one-click-connectable,
+    unverified write-capable connector, defeating the hidden-rollout gate
+    with no further action. Same collision guard, same reasoning, as the
+    chrome seed migration (#1143)."""
+    engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
+    migration = _load_migration_module()
+    with engine.begin() as connection:
+        _create_tables(connection)
+        connection.execute(
+            text(
+                "INSERT INTO public_mcp_apps"
+                " (app_id, name, transport, is_visible_in_connector)"
+                " VALUES ('intercom', 'Operator Intercom', 'oauth', 1)"
+            )
+        )
+        with patch.object(migration, "op", _operations(connection)):
+            migration.upgrade()
+        row = connection.execute(
+            text(
+                "SELECT name, is_visible_in_connector FROM public_mcp_apps"
+                " WHERE app_id='intercom'"
+            )
+        ).first()
+        # The collision branch only flips visibility -- it must not clobber
+        # the operator's own name/description/transport choices.
+        assert row[0] == "Operator Intercom"
+        assert row[1] == 0
+        app_count = connection.execute(
+            text("SELECT COUNT(*) FROM public_mcp_apps WHERE app_id='intercom'")
+        ).scalar()
+        assert app_count == 1
+
+
 def test_seed_rows_match_registry(tmp_path):
     """The migration snapshot and the runtime registry must define the same
     intercom rows (the migration is a frozen copy; this catches drift)."""

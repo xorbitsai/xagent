@@ -10,7 +10,11 @@ from sqlalchemy.orm import sessionmaker
 
 from xagent.core.utils.encryption import encrypt_value
 from xagent.web.api import auth as auth_api
-from xagent.web.api.auth import create_access_token, generic_oauth_callback
+from xagent.web.api.auth import (
+    create_access_token,
+    generic_oauth_callback,
+    generic_oauth_login,
+)
 from xagent.web.models.database import Base
 from xagent.web.models.mcp import MCPServer, UserMCPServer
 from xagent.web.models.public_mcp import PublicMCPApp
@@ -102,6 +106,7 @@ def _intercom_provider() -> SimpleNamespace:
         provider_name="intercom",
         client_id=encrypt_value("intercom-client-id"),
         client_secret=encrypt_value("intercom-client-secret"),
+        auth_url="https://app.intercom.com/oauth",
         token_url="https://api.intercom.io/auth/eagle/token",
         redirect_uri="https://app.example.com/api/auth/intercom/callback",
         userinfo_url="https://api.intercom.io/me",
@@ -234,8 +239,12 @@ def test_intercom_callback_fails_cleanly_when_token_exchange_yields_no_token(
     response = generic_oauth_callback("intercom", request, db, _intercom_provider())
 
     assert response.status_code == 400
-    assert "did not return an access token" in response.body.decode()
-    assert "IntegrityError" not in response.body.decode()
+    body = response.body.decode()
+    assert "did not return an access token" in body
+    # Pins _extract_provider_error_message: the error.list envelope's own
+    # detail must actually reach the response, not just a generic message.
+    assert "invalid code" in body
+    assert "IntegrityError" not in body
     get_mock.assert_not_called()
     assert (
         db.query(UserOAuth)
@@ -330,6 +339,30 @@ def test_hidden_intercom_app_is_skipped_during_bare_provider_oauth_connect(
         == 1
     )
     assert db.query(MCPServer).filter(MCPServer.name == "Intercom").count() == 0
+
+
+def test_hidden_intercom_app_rejects_oauth_login_redirect(hidden_db_session):
+    """The gate must also cover the login hop, not just the callback --
+    otherwise a hidden connector's real consent screen is still shown to the
+    user (no security bypass, since the callback still blocks the connect,
+    but confusing: the app doesn't feel hidden if you can watch it start
+    connecting at the provider)."""
+    db, user = hidden_db_session
+    token = create_access_token(
+        data={"sub": user.username, "type": "access"},
+        expires_delta=timedelta(minutes=5),
+    )
+
+    response = generic_oauth_login(
+        "intercom",
+        token=token,
+        app_id="intercom",
+        redirect=None,
+        db=db,
+        db_provider=_intercom_provider(),
+    )
+
+    assert response.status_code == 404
 
 
 def test_access_token_guard_applies_to_a_non_intercom_provider_too(monkeypatch):

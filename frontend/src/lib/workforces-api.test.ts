@@ -191,6 +191,25 @@ describe("workforces-api", () => {
     )
   })
 
+  it("extracts detail.message from the structured error shape when unarchive fails", async () => {
+    apiRequestMock.mockResolvedValueOnce(
+      jsonResponse(
+        { detail: { code: "workforce_unarchive_failed", message: "Failed to unarchive workforce" } },
+        { status: 500 },
+      ),
+    )
+
+    let caught: unknown
+    try {
+      await unarchiveWorkforce(5)
+    } catch (error) {
+      caught = error
+    }
+
+    expect(caught).toBeInstanceOf(Error)
+    expect((caught as Error).message).toBe("Failed to unarchive workforce")
+  })
+
   it("permanently deletes a workforce with the ?permanent=true DELETE verb", async () => {
     apiRequestMock.mockResolvedValueOnce(new Response(null, { status: 200 }))
 
@@ -202,7 +221,10 @@ describe("workforces-api", () => {
     )
   })
 
-  it("surfaces backend detail strings when permanent delete fails", async () => {
+  it("extracts detail.message from the structured error shape when permanent delete fails", async () => {
+    // toThrow(string) does a substring match, which would also pass if the
+    // whole raw JSON body leaked through unextracted -- assert the exact
+    // message instead to actually prove extraction.
     apiRequestMock.mockResolvedValueOnce(
       jsonResponse(
         { detail: { code: "workforce_delete_failed", message: "Failed to delete workforce" } },
@@ -210,9 +232,15 @@ describe("workforces-api", () => {
       ),
     )
 
-    await expect(deleteWorkforcePermanently(5)).rejects.toThrow(
-      "Failed to delete workforce",
-    )
+    let caught: unknown
+    try {
+      await deleteWorkforcePermanently(5)
+    } catch (error) {
+      caught = error
+    }
+
+    expect(caught).toBeInstanceOf(Error)
+    expect((caught as Error).message).toBe("Failed to delete workforce")
   })
 
   it("discards an eligible draft through the dedicated endpoint", async () => {

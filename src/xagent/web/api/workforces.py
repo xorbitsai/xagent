@@ -54,6 +54,7 @@ from ..services.workforce_lifecycle import (
     acquire_workforce_lifecycle_fence,
     delete_workforce_permanently,
     discard_draft_workforce,
+    ensure_workforce_lifecycle_access,
 )
 from ..services.workforce_names import workforce_name_exists
 from ..services.workforce_runs import create_preview_workforce_run
@@ -914,25 +915,23 @@ async def unarchive_workforce(
 ) -> dict[str, Any]:
     # Not ensure_workforce_access(..., action="edit"): that helper's archived
     # -> 409 guard exists precisely to keep archived workforces read-only, so
-    # it would reject the one workforce this route is meant to act on. Check
-    # the underlying edit permission directly instead.
-    workforce = _load_workforce(db, workforce_id)
-    if workforce is None:
-        raise HTTPException(status_code=404, detail="Workforce not found")
-    if not can_edit_workforce(db, user, workforce):
-        raise HTTPException(status_code=403, detail="Access denied")
+    # it would reject the one workforce this route is meant to act on.
+    # ensure_workforce_lifecycle_access has no such guard -- same 404/403
+    # gate discard_draft_workforce and delete_workforce_permanently use.
+    workforce = ensure_workforce_lifecycle_access(
+        db, user, _load_workforce(db, workforce_id)
+    )
     workforce_id_value = int(workforce.id)
     # Same lifecycle fence as archive: serializes against a concurrent
     # archive/delete so the status check below reads committed state instead
-    # of racing the other transaction's flip. Reassigned (not just checked
-    # for None) so the dependency on the fence's refreshed row is explicit,
-    # matching delete_workforce_permanently -- relying on the pre-fence
-    # `workforce` still being current only works because the fence's
-    # populate_existing() re-query happens to refresh the same identity-map
-    # instance.
-    workforce = acquire_workforce_lifecycle_fence(db, workforce_id_value)
-    if workforce is None:
-        raise HTTPException(status_code=404, detail="Workforce not found")
+    # of racing the other transaction's flip. Re-wrapped through
+    # ensure_workforce_lifecycle_access (not just checked for None), same as
+    # delete_workforce_permanently, so the dependency on the fence's
+    # refreshed row is explicit rather than relying on the pre-fence
+    # `workforce` happening to be the same identity-map instance.
+    workforce = ensure_workforce_lifecycle_access(
+        db, user, acquire_workforce_lifecycle_fence(db, workforce_id_value)
+    )
     if workforce.status != "archived":
         raise HTTPException(
             status_code=409,

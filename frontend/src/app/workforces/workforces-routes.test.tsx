@@ -26,6 +26,7 @@ const closeFilePreviewMock = vi.hoisted(() => vi.fn())
 const dispatchMock = vi.hoisted(() => vi.fn())
 const apiRequestMock = vi.hoisted(() => vi.fn())
 const toastErrorMock = vi.hoisted(() => vi.fn())
+const toastSuccessMock = vi.hoisted(() => vi.fn())
 const workforceAppState = vi.hoisted(() => ({
   currentTask: null as null | { id: string; status: string },
   traceEvents: [] as Array<Record<string, unknown>>,
@@ -183,7 +184,7 @@ vi.mock("@/lib/workforces-api", () => ({
 vi.mock("sonner", () => ({
   toast: {
     error: toastErrorMock,
-    success: vi.fn(),
+    success: toastSuccessMock,
   },
 }))
 
@@ -335,6 +336,7 @@ describe("workforce route entry points", () => {
     dispatchMock.mockReset()
     apiRequestMock.mockReset()
     toastErrorMock.mockReset()
+    toastSuccessMock.mockReset()
     workforceAppState.currentTask = null
     workforceAppState.traceEvents = []
     workforceAppState.filePreview = {
@@ -650,6 +652,89 @@ describe("workforce route entry points", () => {
     await waitFor(() => {
       expect(listWorkforcesMock).toHaveBeenCalledTimes(2)
     })
+    expect(toastSuccessMock).toHaveBeenCalledWith("workforces.messages.unarchived")
+  })
+
+  it("publishes a draft workforce from the list card's three-dot menu", async () => {
+    listWorkforcesMock.mockResolvedValueOnce({
+      ...listResponse,
+      items: [{ ...listResponse.items[0], status: "draft" }],
+    })
+    publishWorkforceMock.mockResolvedValueOnce({ ...workforceDetail, status: "active" })
+    listWorkforcesMock.mockResolvedValueOnce({
+      ...listResponse,
+      items: [{ ...listResponse.items[0], status: "active" }],
+    })
+
+    render(<WorkforcesPage />)
+    expect(await screen.findByText("Launch Workforce")).toBeInTheDocument()
+    fireEvent.click(screen.getByRole("button", { name: "workforces.actions.publish" }))
+
+    await waitFor(() => {
+      expect(publishWorkforceMock).toHaveBeenCalledWith(42)
+    })
+    await waitFor(() => {
+      expect(listWorkforcesMock).toHaveBeenCalledTimes(2)
+    })
+    expect(toastSuccessMock).toHaveBeenCalledWith("workforces.messages.published")
+  })
+
+  it("unpublishes an active workforce from the list card's three-dot menu", async () => {
+    listWorkforcesMock.mockResolvedValueOnce(listResponse) // fixture default status: "active"
+    unpublishWorkforceMock.mockResolvedValueOnce({ ...workforceDetail, status: "draft" })
+    listWorkforcesMock.mockResolvedValueOnce({
+      ...listResponse,
+      items: [{ ...listResponse.items[0], status: "draft" }],
+    })
+
+    render(<WorkforcesPage />)
+    expect(await screen.findByText("Launch Workforce")).toBeInTheDocument()
+    fireEvent.click(screen.getByRole("button", { name: "workforces.actions.unpublish" }))
+
+    await waitFor(() => {
+      expect(unpublishWorkforceMock).toHaveBeenCalledWith(42)
+    })
+    await waitFor(() => {
+      expect(listWorkforcesMock).toHaveBeenCalledTimes(2)
+    })
+    expect(toastSuccessMock).toHaveBeenCalledWith("workforces.messages.unpublished")
+  })
+
+  it("archives a workforce from the list card's three-dot menu", async () => {
+    listWorkforcesMock.mockResolvedValueOnce(listResponse) // fixture default status: "active"
+    archiveWorkforceMock.mockResolvedValueOnce({ id: 42, status: "archived" })
+    listWorkforcesMock.mockResolvedValueOnce({
+      ...listResponse,
+      items: [{ ...listResponse.items[0], status: "archived" }],
+    })
+
+    render(<WorkforcesPage />)
+    expect(await screen.findByText("Launch Workforce")).toBeInTheDocument()
+    fireEvent.click(screen.getByRole("button", { name: "workforces.actions.archive" }))
+
+    await waitFor(() => {
+      expect(archiveWorkforceMock).toHaveBeenCalledWith(42)
+    })
+    await waitFor(() => {
+      expect(listWorkforcesMock).toHaveBeenCalledTimes(2)
+    })
+    expect(toastSuccessMock).toHaveBeenCalledWith("workforces.messages.archived")
+  })
+
+  it("shows an error toast when permanent delete fails", async () => {
+    listWorkforcesMock.mockResolvedValueOnce(listResponse)
+    deleteWorkforcePermanentlyMock.mockRejectedValueOnce(new Error("Failed to delete workforce"))
+
+    render(<WorkforcesPage />)
+    expect(await screen.findByText("Launch Workforce")).toBeInTheDocument()
+    fireEvent.click(screen.getByRole("button", { name: "workforces.actions.delete" }))
+    fireEvent.click(await screen.findByText("confirm-delete"))
+
+    await waitFor(() => {
+      expect(toastErrorMock).toHaveBeenCalledWith("Failed to delete workforce")
+    })
+    // A failed delete must not reload the list as if it succeeded.
+    expect(listWorkforcesMock).toHaveBeenCalledTimes(1)
   })
 
   it("hides Archive/Publish/Unpublish on an archived card's menu", async () => {

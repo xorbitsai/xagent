@@ -442,7 +442,7 @@ class AgentManagementService:
                 status != "archived" and can_edit_workforce(self.db, actor, workforce)
             )
             manager_id = int(workforce.manager_agent_id)
-            manager_discard_safe = is_workforce_manager_removal_safe(
+            manager_removal_safe = is_workforce_manager_removal_safe(
                 workforce,
                 managers_by_id.get(manager_id),
                 used_as_other_manager=manager_reference_counts.get(manager_id, 0) > 1,
@@ -459,7 +459,7 @@ class AgentManagementService:
                         can_edit
                         and status == "draft"
                         and run_counts.get(workforce_id, 0) == 0
-                        and manager_discard_safe
+                        and manager_removal_safe
                     ),
                 )
             )

@@ -3969,7 +3969,7 @@ Build when you need.`,
     },
     delete: {
       confirmTitle: "Delete this workforce?",
-      confirmDescription: "\"{name}\" and its run history will be permanently deleted. This cannot be undone.",
+      confirmDescription: "\"{name}\" and its run history will be permanently deleted, and any in-progress runs will be stopped. This cannot be undone.",
       confirmAction: "Delete permanently",
     },
     share_link: {

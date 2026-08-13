@@ -864,7 +864,6 @@ export function WorkforceBuilder({ workforceId }: WorkforceBuilderProps) {
                     onOpenChange={setTriggersOpen}
                 />
             )}
-
         </div>
     )
 }

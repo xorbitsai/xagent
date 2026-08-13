@@ -3969,7 +3969,7 @@ const zh = {
     },
     delete: {
       confirmTitle: "删除该 Workforce？",
-      confirmDescription: "「{name}」及其运行历史将被永久删除，此操作无法撤销。",
+      confirmDescription: "「{name}」及其运行历史将被永久删除，进行中的运行也会被停止，此操作无法撤销。",
       confirmAction: "永久删除",
     },
     share_link: {

@@ -9,7 +9,6 @@ from sqlalchemy.engine import CursorResult
 from sqlalchemy.orm import Session
 
 from xagent.web.models.agent import Agent, is_workforce_generated_manager_agent
-from xagent.web.models.agent_api_key import AgentApiKey
 from xagent.web.models.database import release_db_connection_if_clean
 from xagent.web.models.deployment import Deployment, DeploymentOwnerType
 from xagent.web.models.task import Task
@@ -57,12 +56,14 @@ def _conflict(code: str, message: str) -> HTTPException:
     )
 
 
-def _ensure_workforce_lifecycle_access(
+def ensure_workforce_lifecycle_access(
     db: Session,
     user: User,
     workforce: Workforce | None,
 ) -> Workforce:
-    """Shared 404/403 gate for lifecycle mutations (discard, permanent delete)."""
+    """Shared 404/403 gate for lifecycle mutations: discard, permanent
+    delete, and unarchive (imported by the API layer directly since it has
+    no archived-only 409 guard, unlike ``ensure_workforce_access``)."""
     if workforce is None:
         raise HTTPException(status_code=404, detail="Workforce not found")
     if not can_edit_workforce(db, user, workforce):
@@ -168,12 +169,12 @@ def discard_draft_workforce(
 ) -> None:
     """Atomically discard one run-free draft and its owned manager, if any."""
 
-    workforce = _ensure_workforce_lifecycle_access(db, user, workforce)
+    workforce = ensure_workforce_lifecycle_access(db, user, workforce)
     workforce_id = int(workforce.id)
     deleted_manager_identity: tuple[int, int] | None = None
 
     try:
-        workforce = _ensure_workforce_lifecycle_access(
+        workforce = ensure_workforce_lifecycle_access(
             db,
             user,
             acquire_workforce_lifecycle_fence(db, workforce_id),
@@ -237,8 +238,13 @@ def delete_workforce_permanently(
 
     Stays a plain sync function -- its caller (an ``async def`` route) is
     expected to run it via ``asyncio.to_thread`` rather than call it
-    directly, since the cascade below can walk a large run/trigger history
-    and would otherwise block that thread for every concurrent request.
+    directly. The workforce row's own cascade delete is a single DB-side
+    statement (see the ``passive_deletes=True`` note at ``db.delete
+    (workforce)`` below), but the active-run cancellation sweep and the
+    trigger-teardown capture below it still each do their own query over
+    a workforce's full run/trigger history, so this can still be
+    non-trivial work worth keeping off the event loop for a
+    heavily-used workforce.
     Returns the PAUSE targets alongside the cascade-deleted triggers'
     teardown data (trigger, type, config); it does not perform the actual
     provider unregister calls itself, so that network I/O also has to
@@ -246,12 +252,12 @@ def delete_workforce_permanently(
     way :func:`pause_workforce_tasks_after_archive` already does its own.
     """
 
-    workforce = _ensure_workforce_lifecycle_access(db, user, workforce)
+    workforce = ensure_workforce_lifecycle_access(db, user, workforce)
     workforce_id = int(workforce.id)
     deleted_manager_identity: tuple[int, int] | None = None
 
     try:
-        workforce = _ensure_workforce_lifecycle_access(
+        workforce = ensure_workforce_lifecycle_access(
             db,
             user,
             acquire_workforce_lifecycle_fence(db, workforce_id),
@@ -272,9 +278,12 @@ def delete_workforce_permanently(
         # (create_workforce_trigger / _create_trigger) does not acquire this
         # function's lifecycle fence, so a trigger created for this
         # workforce between this SELECT and this transaction's commit is
-        # cascade-deleted at the DB level (workforce.triggers is re-resolved
-        # fresh at flush time) but never appears in trigger_teardowns --
-        # its provider-side binding silently leaks. Widening the fence to
+        # still cascade-deleted at commit time -- the database's own
+        # ON DELETE CASCADE on agent_triggers.workforce_id catches it
+        # regardless of when it was inserted, since passive_deletes=True
+        # means this deletion never re-reads workforce.triggers itself --
+        # but it never appears in trigger_teardowns -- its provider-side
+        # binding silently leaks. Widening the fence to
         # cover trigger creation would close it, but that path is shared
         # with unrelated, actively-used trigger CRUD far outside this
         # workforce lifecycle feature; the window is also narrow (a create
@@ -320,34 +329,26 @@ def delete_workforce_permanently(
             {Task.is_visible: False}, synchronize_session=False
         )
 
-        # Neither table is reachable through the ORM cascades on Workforce,
-        # and SQLite runs without foreign-key enforcement, so the DB-level
-        # ON DELETE CASCADE on agent_api_keys (and the FK-less deployments
-        # table) cannot be relied on here.
-        db.query(AgentApiKey).filter(AgentApiKey.workforce_id == workforce_id).delete(
-            synchronize_session=False
-        )
+        # AgentApiKey.workforce_id is a real ON DELETE CASCADE FK and this
+        # project enables SQLite foreign-key enforcement per connection
+        # (db/sqlite.py's PRAGMA foreign_keys=ON), so those rows are cleaned
+        # up by the database when the workforce row below is deleted -- no
+        # explicit query needed. Deployment is the one exception: it has no
+        # FK at all (owner_type/owner_id is a polymorphic pointer, not a
+        # real foreign key to workforces.id), so it still needs an explicit
+        # delete here.
         db.query(Deployment).filter(
             Deployment.owner_type == DeploymentOwnerType.WORKFORCE.value,
             Deployment.owner_id == workforce_id,
         ).delete(synchronize_session=False)
 
-        # This ORM cascade (workers/runs/builder_messages/triggers, all
-        # cascade="all, delete-orphan" on Workforce -- models/workforce.py)
-        # loads every child row into Python and deletes them one by one
-        # rather than a single DB-side statement, which is the same
-        # already-accepted cost discard_draft_workforce's own db.delete(
-        # workforce) has always paid for the same relationships. Adding
-        # passive_deletes=True to lean on DB-level ON DELETE CASCADE instead
-        # would fix that here, but this project's SQLite path never enables
-        # foreign-key enforcement (no PRAGMA foreign_keys=ON in
-        # models/database.py, the same reason AgentApiKey/Deployment above
-        # need an explicit delete) -- passive_deletes would silently stop
-        # cleaning up these rows on SQLite instead of just being slower,
-        # which is worse than the N+1 cost it would remove. Left as a known,
-        # bounded-scale cost instead; the caller offloading this whole
-        # function via asyncio.to_thread (see the docstring above) keeps it
-        # off the event loop regardless of workforce size.
+        # workers/runs/builder_messages/triggers all carry
+        # passive_deletes=True (models/workforce.py) precisely so this does
+        # NOT load and delete every child row in Python: it trusts each
+        # child FK's real ON DELETE CASCADE (enforced here -- SQLite has
+        # foreign keys on for every connection, see db/sqlite.py) to clean
+        # them up as part of this one DELETE statement, the same way
+        # discard_draft_workforce's identical db.delete(workforce) does.
         db.delete(workforce)
         db.flush()
 

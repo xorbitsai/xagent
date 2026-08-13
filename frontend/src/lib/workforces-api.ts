@@ -66,6 +66,13 @@ function formatApiDetail(detail: unknown, fallback: string): string {
       return messages.join("; ")
     }
   }
+  // Structured error shape used by delete/unarchive on this route:
+  // { detail: { code, message } }. Without this branch the object falls
+  // through to parseApiError's raw-JSON-text fallback, surfacing the whole
+  // response body as the error message instead of the intended one.
+  if (isJsonRecord(detail) && typeof detail.message === "string" && detail.message.trim()) {
+    return detail.message
+  }
   return fallback
 }
 

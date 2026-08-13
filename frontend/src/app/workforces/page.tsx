@@ -1,7 +1,7 @@
 "use client"
 
 import Link from "next/link"
-import React, { useCallback, useEffect, useState } from "react"
+import React, { useCallback, useEffect, useRef, useState } from "react"
 import { ChevronLeft, ChevronRight, Play, Plus, Users, Zap, GitBranch, ShieldCheck, Pencil, Rocket, Trash2, ArchiveRestore, Archive, Globe, MoreVertical } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { Card, CardContent } from "@/components/ui/card"
@@ -40,6 +40,13 @@ export default function WorkforcesPage() {
   const { t } = useI18n()
   const router = useRouter()
   const [items, setItems] = useState<WorkforceListItem[]>([])
+  // handleDelete reads this instead of the closed-over `items` state: it's
+  // an async function created at click time, so `items` inside it stays
+  // whatever it was at that render even if a concurrent load() (another
+  // card's action, a search/page change) updates the list before this
+  // delete's own request resolves. A ref always reflects the latest value.
+  const itemsRef = useRef(items)
+  itemsRef.current = items
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
   const [search, setSearch] = useState("")
@@ -104,12 +111,12 @@ export default function WorkforcesPage() {
   // the slot. Delete doesn't fit -- it opens a confirm dialog instead of
   // calling the API directly -- so handleDelete below stays separate but
   // still claims/releases the same busyItemId slot.
-  const runMenuAction = (
+  const runMenuAction = async (
     item: WorkforceListItem,
     apiCall: (id: number | string) => Promise<unknown>,
     successKey: "workforces.messages.published" | "workforces.messages.unpublished" | "workforces.messages.archived" | "workforces.messages.unarchived",
     errorKey: "workforces.errors.publish" | "workforces.errors.unpublish" | "workforces.errors.archive" | "workforces.errors.unarchive",
-  ) => async () => {
+  ) => {
     setOpenMenuId(null)
     try {
       setBusyItemId(item.id)
@@ -125,13 +132,13 @@ export default function WorkforcesPage() {
   }
 
   const handlePublish = (item: WorkforceListItem) =>
-    runMenuAction(item, publishWorkforce, "workforces.messages.published", "workforces.errors.publish")()
+    runMenuAction(item, publishWorkforce, "workforces.messages.published", "workforces.errors.publish")
   const handleUnpublish = (item: WorkforceListItem) =>
-    runMenuAction(item, unpublishWorkforce, "workforces.messages.unpublished", "workforces.errors.unpublish")()
+    runMenuAction(item, unpublishWorkforce, "workforces.messages.unpublished", "workforces.errors.unpublish")
   const handleArchive = (item: WorkforceListItem) =>
-    runMenuAction(item, archiveWorkforce, "workforces.messages.archived", "workforces.errors.archive")()
+    runMenuAction(item, archiveWorkforce, "workforces.messages.archived", "workforces.errors.archive")
   const handleUnarchive = (item: WorkforceListItem) =>
-    runMenuAction(item, unarchiveWorkforce, "workforces.messages.unarchived", "workforces.errors.unarchive")()
+    runMenuAction(item, unarchiveWorkforce, "workforces.messages.unarchived", "workforces.errors.unarchive")
 
   const handleDelete = async () => {
     if (!deleteItem) return
@@ -141,7 +148,7 @@ export default function WorkforcesPage() {
       await deleteWorkforcePermanently(deleteItem.id)
       toast.success(t("workforces.messages.deleted"))
       setDeleteItem(null)
-      if (items.length === 1 && page > 1) {
+      if (itemsRef.current.length === 1 && page > 1) {
         // Deleting the last card of the last page would otherwise reload an
         // out-of-range page: the backend returns zero items for it, which
         // renders as the "no workforces" empty state with the pagination
@@ -386,7 +393,7 @@ export default function WorkforcesPage() {
                             )}
                           </div>
                           <div className="flex items-center gap-2">
-                            {runDisabledReason ? (
+                            {runDisabledReason || busyItemId === item.id ? (
                               <Button size="sm" className="h-8 bg-blue-600 hover:bg-blue-700 text-white rounded-md px-3" disabled>
                                 <Play className="mr-1.5 h-3.5 w-3.5 fill-current" />
                                 {t("workforces.actions.run")}
@@ -404,7 +411,7 @@ export default function WorkforcesPage() {
                               variant="outline"
                               className="h-8 w-8 rounded-md p-0"
                               title={deployDisabledReason || t("workforces.actions.deploy")}
-                              disabled={Boolean(deployDisabledReason)}
+                              disabled={Boolean(deployDisabledReason) || busyItemId === item.id}
                               onClick={() => {
                                 setDeployItem(item)
                                 setDeployView("options")
@@ -412,12 +419,22 @@ export default function WorkforcesPage() {
                             >
                               <Rocket className="h-3.5 w-3.5" />
                             </Button>
-                            <Button size="sm" variant="outline" className="h-8 rounded-md px-3" asChild>
-                              <Link href={`/workforces/${item.id}`}>
+                            {busyItemId === item.id ? (
+                              // Edit is otherwise an asChild Link -- Next.js Link has no
+                              // `disabled` prop, so a busy card falls back to a plain,
+                              // inert button instead of pointer-events tricks on the Link.
+                              <Button size="sm" variant="outline" className="h-8 rounded-md px-3" disabled>
                                 <Pencil className="mr-1.5 h-3.5 w-3.5" />
                                 {t("workforces.actions.edit")}
-                              </Link>
-                            </Button>
+                              </Button>
+                            ) : (
+                              <Button size="sm" variant="outline" className="h-8 rounded-md px-3" asChild>
+                                <Link href={`/workforces/${item.id}`}>
+                                  <Pencil className="mr-1.5 h-3.5 w-3.5" />
+                                  {t("workforces.actions.edit")}
+                                </Link>
+                              </Button>
+                            )}
                           </div>
                         </div>
                       </CardContent>

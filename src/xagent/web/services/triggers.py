@@ -849,10 +849,12 @@ def unregister_deleted_trigger_bindings(
             )
 
     with ThreadPoolExecutor(max_workers=min(len(teardowns), 8)) as pool:
-        # Consume the map() iterator so we actually wait for every worker to
-        # finish before returning -- _teardown_one already swallows its own
-        # exceptions, so this never raises.
-        list(pool.map(_teardown_one, teardowns))
+        # map() submits every item to the pool immediately (only iterating
+        # its return value is lazy); exiting this `with` block calls
+        # shutdown(wait=True), which already blocks until every submitted
+        # item finishes regardless of whether the returned iterator is
+        # consumed -- no need to iterate/collect it here.
+        pool.map(_teardown_one, teardowns)
 
 
 def get_owned_agent(db: Session, *, user_id: int, agent_id: int) -> Agent | None:

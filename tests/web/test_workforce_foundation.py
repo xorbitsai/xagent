@@ -4,6 +4,7 @@ from sqlalchemy import create_engine, inspect
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
 
+from xagent.db.sqlite import apply_sqlite_concurrency_pragmas
 from xagent.web.models import Agent, Base, User, Workforce, WorkforceAgent, WorkforceRun
 from xagent.web.models.agent import AgentStatus
 from xagent.web.services.workforce_access import ensure_workforce_access
@@ -27,6 +28,13 @@ def db_session() -> Session:
         connect_args={"check_same_thread": False},
         poolclass=StaticPool,
     )
+    # Workforce's cascade relationships rely on the database's own
+    # ON DELETE CASCADE (passive_deletes=True, models/workforce.py), which
+    # needs foreign-key enforcement turned on -- the same hardening the
+    # production engine applies per connection (models/database.py). This
+    # fixture builds its own bare engine rather than going through
+    # get_engine()/init_db(), so it has to opt in explicitly too.
+    apply_sqlite_concurrency_pragmas(engine)
     Base.metadata.create_all(bind=engine)
     session_factory = sessionmaker(bind=engine)
     session = session_factory()
@@ -104,9 +112,13 @@ def test_workforce_models_are_registered(db_session: Session) -> None:
     assert "workforce_builder_messages" in tables
 
 
-def test_deleting_workforce_deletes_runs_with_orm_cascade(
+def test_deleting_workforce_deletes_runs_via_cascade(
     db_session: Session,
 ) -> None:
+    """Workforce.runs is passive_deletes=True (models/workforce.py): deleting
+    the workforce no longer makes the ORM walk and delete each run itself,
+    it relies on the run's ON DELETE CASCADE foreign key -- this only works
+    with the fixture's foreign-key pragma turned on, same as production."""
     user = _create_user(db_session, "owner")
     manager = _create_agent(db_session, user, "Manager")
     workforce = _create_workforce(db_session, user, manager)

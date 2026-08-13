@@ -163,8 +163,8 @@ const homeGetStartedDestinationOverrides: HomeGetStartedDestinationOverrides =
     .homeGetStartedDestinationOverrides ?? {}
 
 const defaultHomeGetStartedDestinations: Record<keyof HomeGetStartedDestinationOverrides, string> = {
-  docs: "https://docs.xagent.co/api-reference/introduction",
-  guides: "https://docs.xagent.co/models/overview",
+  docs: "https://help.xagent.co/overview.html",
+  guides: "https://help.xagent.co/user-guide/overview.html",
   whatsNew: "https://docs.xagent.co/release-notes",
 }
 

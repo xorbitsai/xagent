@@ -463,8 +463,8 @@ describe("Home", () => {
       render(<OldSurfaceHome />)
 
       expect(await screen.findByTestId("old-surface-extension")).toBeInTheDocument()
-      expectLinkedGetStartedCard("home.getStarted.docs.title", "https://docs.xagent.co/api-reference/introduction")
-      expectLinkedGetStartedCard("home.getStarted.guides.title", "https://docs.xagent.co/models/overview")
+      expectLinkedGetStartedCard("home.getStarted.docs.title", "https://help.xagent.co/overview.html")
+      expectLinkedGetStartedCard("home.getStarted.guides.title", "https://help.xagent.co/user-guide/overview.html")
       expectLinkedGetStartedCard("home.getStarted.whatsNew.title", "https://docs.xagent.co/release-notes")
     } finally {
       vi.doMock("@/lib/home-page-extension", createHomeExtensionMock)
@@ -483,8 +483,8 @@ describe("Home", () => {
   it("resolves canonical and distinct configured Get Started destinations per key", () => {
     render(<Home />)
 
-    expectLinkedGetStartedCard("home.getStarted.docs.title", "https://docs.xagent.co/api-reference/introduction")
-    expectLinkedGetStartedCard("home.getStarted.guides.title", "https://docs.xagent.co/models/overview")
+    expectLinkedGetStartedCard("home.getStarted.docs.title", "https://help.xagent.co/overview.html")
+    expectLinkedGetStartedCard("home.getStarted.guides.title", "https://help.xagent.co/user-guide/overview.html")
     expectLinkedGetStartedCard("home.getStarted.whatsNew.title", "https://docs.xagent.co/release-notes")
     expectInertGetStartedCard("home.getStarted.video.title")
 
@@ -628,7 +628,7 @@ describe("Home", () => {
           expectLinkedGetStartedCard("home.getStarted.whatsNew.title", "https://docs.xagent.co/release-notes")
         } else {
           expectLinkedGetStartedCard("home.getStarted.docs.title", "/valid-docs")
-          expectLinkedGetStartedCard("home.getStarted.guides.title", "https://docs.xagent.co/models/overview")
+          expectLinkedGetStartedCard("home.getStarted.guides.title", "https://help.xagent.co/user-guide/overview.html")
           expectInertGetStartedCard("home.getStarted.whatsNew.title")
         }
         expectInertGetStartedCard("home.getStarted.video.title")

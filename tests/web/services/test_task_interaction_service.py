@@ -337,10 +337,10 @@ def _valid_envelope(**overrides: Any) -> svc.CreateInteractionEnvelope:
     return svc.CreateInteractionEnvelope(**defaults)
 
 
-def _owning_principal(task_user_id: int) -> svc.InteractionPrincipal:
+def _owning_principal(user_id: int) -> svc.InteractionPrincipal:
     return svc.InteractionPrincipal(
         kind="user",
-        user_id=task_user_id,
+        user_id=user_id,
         is_admin=False,
         auth_mode=None,
     )
@@ -1215,12 +1215,6 @@ def test_get_scopes_by_task_id_not_by_interaction_id_alone(
 # ---------------------------------------------------------------------------
 
 
-def _owning_principal_for_fence(user_id: int) -> svc.InteractionPrincipal:
-    return svc.InteractionPrincipal(
-        kind="user", user_id=user_id, is_admin=False, auth_mode=None
-    )
-
-
 # ---------------------------------------------------------------------------
 # TaskStatusPredicate structural assertion. The active-row query
 # ``_active_native_row_criteria()`` builds never references ``Task.status``
@@ -1278,7 +1272,7 @@ def test_active_row_query_uses_zero_taskstatus_bind_parameters() -> None:
 def test_answer_fence_predicate_compiles_without_any_taskstatus_literal_string() -> (
     None
 ):
-    principal = _owning_principal_for_fence(1)
+    principal = _owning_principal(1)
     stmt = sa.select(TaskInteractionRequest).where(
         TaskInteractionRequest.id == 1,
         TaskInteractionRequest.task_id == 1,
@@ -1300,7 +1294,7 @@ def test_answer_fence_predicate_compiles_without_any_taskstatus_literal_string()
 
 
 def test_answer_fence_predicate_guest_branch_adds_a_json_lookup_term() -> None:
-    user_terms = svc._answer_fence_task_predicate(_owning_principal_for_fence(1))
+    user_terms = svc._answer_fence_task_predicate(_owning_principal(1))
     guest_principal = svc.InteractionPrincipal(
         kind="guest",
         user_id=1,
@@ -1490,15 +1484,6 @@ def _stage_matching_command(
         db.close()
 
 
-def _owning_user_principal(user_id: int) -> svc.InteractionPrincipal:
-    return svc.InteractionPrincipal(
-        kind="user",
-        user_id=user_id,
-        is_admin=False,
-        auth_mode=None,
-    )
-
-
 def _respond_envelope(**overrides: Any) -> svc.RespondEnvelope:
     defaults: dict[str, Any] = {
         "kind": "clarification",
@@ -1617,7 +1602,7 @@ def test_respond_rejects_an_envelope_outside_the_known_kind_or_version_vocabular
         outcome = svc.respond(
             interaction_id=interaction_id,
             task_id=task_id,
-            principal=_owning_user_principal(user_id),
+            principal=_owning_principal(user_id),
             envelope=_respond_envelope(**overrides),
         )
 
@@ -1638,7 +1623,7 @@ def test_respond_rejects_an_idempotency_key_that_is_not_url_safe(_respond_db) ->
         outcome = svc.respond(
             interaction_id=interaction_id,
             task_id=task_id,
-            principal=_owning_user_principal(user_id),
+            principal=_owning_principal(user_id),
             envelope=_respond_envelope(idempotency_key="has a space"),
         )
 
@@ -1656,7 +1641,7 @@ def test_respond_rejects_answer_values_that_are_not_a_dict(_respond_db) -> None:
         outcome = svc.respond(
             interaction_id=interaction_id,
             task_id=task_id,
-            principal=_owning_user_principal(user_id),
+            principal=_owning_principal(user_id),
             envelope=_respond_envelope(values="not-a-dict"),
         )
 
@@ -1683,7 +1668,7 @@ def test_respond_rejects_values_that_cannot_be_rendered_as_json(
         outcome = svc.respond(
             interaction_id=interaction_id,
             task_id=task_id,
-            principal=_owning_user_principal(user_id),
+            principal=_owning_principal(user_id),
             envelope=_respond_envelope(values=values),
         )
 
@@ -1736,7 +1721,7 @@ def test_respond_rejects_when_the_stored_row_disagrees_with_the_envelope_on_prot
         outcome = svc.respond(
             interaction_id=interaction_id,
             task_id=task_id,
-            principal=_owning_user_principal(user_id),
+            principal=_owning_principal(user_id),
             envelope=_respond_envelope(protocol_version=1),
         )
 
@@ -1962,7 +1947,7 @@ def test_respond_reports_unavailable_when_the_task_row_does_not_exist(
     outcome = svc.respond(
         interaction_id=1,
         task_id=999_999_999,
-        principal=_owning_user_principal(1),
+        principal=_owning_principal(1),
         envelope=_respond_envelope(),
     )
 
@@ -1977,7 +1962,7 @@ def test_respond_reports_unavailable_when_the_interaction_row_does_not_exist(
         outcome = svc.respond(
             interaction_id=999_999,
             task_id=task_id,
-            principal=_owning_user_principal(user_id),
+            principal=_owning_principal(user_id),
             envelope=_respond_envelope(),
         )
 
@@ -2008,7 +1993,7 @@ def test_respond_reports_unavailable_when_the_anchor_row_fetch_raises(
         outcome = svc.respond(
             interaction_id=interaction_id,
             task_id=task_id,
-            principal=_owning_user_principal(user_id),
+            principal=_owning_principal(user_id),
             envelope=_respond_envelope(),
         )
 
@@ -2028,7 +2013,7 @@ def test_respond_reports_stale_when_the_anchor_points_at_a_different_run_partiti
         outcome = svc.respond(
             interaction_id=interaction_id,
             task_id=task_id,
-            principal=_owning_user_principal(user_id),
+            principal=_owning_principal(user_id),
             envelope=_respond_envelope(),
         )
 
@@ -2046,7 +2031,7 @@ def test_respond_returns_the_original_receipt_for_a_matching_replay(
     _respond_db,
 ) -> None:
     user_id, task_id = _waiting_task(_respond_db)
-    principal = _owning_user_principal(user_id)
+    principal = _owning_principal(user_id)
     values = {"env": "prod"}
     command_id = "replay-key-1"
     interaction_id = _answered_row_with_valid_anchor(
@@ -2085,7 +2070,7 @@ def test_respond_replays_an_answered_row_whose_anchor_was_pruned(
     _respond_db,
 ) -> None:
     user_id, task_id = _waiting_task(_respond_db)
-    principal = _owning_user_principal(user_id)
+    principal = _owning_principal(user_id)
     values = {"env": "prod"}
     command_id = "replay-key-pruned-anchor"
     interaction_id = _answered_row_with_valid_anchor(
@@ -2173,7 +2158,7 @@ def test_respond_reports_outcome_unknown_when_the_fence_misses_and_leaves_no_res
     one."""
 
     user_id, task_id = _waiting_task(_respond_db)
-    principal = _owning_user_principal(user_id)
+    principal = _owning_principal(user_id)
     interaction_id = _answered_row_with_valid_anchor(
         _respond_db,
         task_id=task_id,
@@ -2200,7 +2185,7 @@ def test_respond_logs_the_reread_row_state_when_the_fence_misses(
     _respond_db, caplog: pytest.LogCaptureFixture
 ) -> None:
     user_id, task_id = _waiting_task(_respond_db)
-    principal = _owning_user_principal(user_id)
+    principal = _owning_principal(user_id)
     interaction_id = _answered_row_with_valid_anchor(
         _respond_db,
         task_id=task_id,
@@ -2230,7 +2215,7 @@ def test_respond_reports_conflict_for_the_same_key_with_a_different_payload(
     _respond_db,
 ) -> None:
     user_id, task_id = _waiting_task(_respond_db)
-    principal = _owning_user_principal(user_id)
+    principal = _owning_principal(user_id)
     interaction_id = _active_row_ready_for_respond(_respond_db, task_id=task_id)
     command_id = "shared-key-1"
     staged_payload = svc._respond_command_payload(
@@ -2292,7 +2277,7 @@ def test_respond_reports_conflict_when_a_guest_and_the_owner_share_one_key(
         command_id=command_id,
         payload=guest_payload,
     )
-    owner = _owning_user_principal(owner_id)
+    owner = _owning_principal(owner_id)
     before_counter = _conflict_counter()
     with _asserts_no_side_effects(
         _respond_db, task_id=task_id, interaction_id=interaction_id
@@ -2315,7 +2300,7 @@ def test_respond_checks_authorization_before_the_idempotency_prequery(
     idempotency key to read back someone else's receipt."""
 
     owner_id, task_id = _waiting_task(_respond_db)
-    principal = _owning_user_principal(owner_id)
+    principal = _owning_principal(owner_id)
     interaction_id = _active_row_ready_for_respond(_respond_db, task_id=task_id)
     command_id = "someone-elses-key"
     values = {"env": "prod"}
@@ -2357,7 +2342,7 @@ def test_respond_accepts_a_fully_valid_answer_and_fills_every_receipt_field(
 ) -> None:
     user_id, task_id = _waiting_task(_respond_db, state_version=5)
     interaction_id = _active_row_ready_for_respond(_respond_db, task_id=task_id)
-    principal = _owning_user_principal(user_id)
+    principal = _owning_principal(user_id)
 
     dispatched: list[bool] = []
     import xagent.web.services.task_interaction_service as svc_module
@@ -2405,7 +2390,7 @@ def test_respond_returns_accepted_when_the_dispatcher_notify_fails(
 ) -> None:
     user_id, task_id = _waiting_task(_respond_db)
     interaction_id = _active_row_ready_for_respond(_respond_db, task_id=task_id)
-    principal = _owning_user_principal(user_id)
+    principal = _owning_principal(user_id)
 
     def _raising_notify() -> None:
         raise RuntimeError("Event loop is closed")
@@ -2435,7 +2420,7 @@ def test_respond_receipt_fields_do_not_touch_the_session_after_commit(
 
     user_id, task_id = _waiting_task(_respond_db)
     interaction_id = _active_row_ready_for_respond(_respond_db, task_id=task_id)
-    principal = _owning_user_principal(user_id)
+    principal = _owning_principal(user_id)
 
     outcome = svc.respond(
         interaction_id=interaction_id,
@@ -2494,7 +2479,7 @@ def test_respond_reports_outcome_unknown_when_commit_raises_and_leaves_no_residu
 
     user_id, task_id = _waiting_task(_respond_db)
     interaction_id = _active_row_ready_for_respond(_respond_db, task_id=task_id)
-    principal = _owning_user_principal(user_id)
+    principal = _owning_principal(user_id)
 
     from sqlalchemy.orm import Session as OrmSession
 
@@ -2537,7 +2522,7 @@ def test_respond_reports_outcome_unknown_when_staging_the_command_raises_and_lea
 
     user_id, task_id = _waiting_task(_respond_db)
     interaction_id = _active_row_ready_for_respond(_respond_db, task_id=task_id)
-    principal = _owning_user_principal(user_id)
+    principal = _owning_principal(user_id)
 
     def _raising_stage_task_command(*args: Any, **kwargs: Any) -> Any:
         raise _IntegrityError(
@@ -2571,7 +2556,7 @@ def test_respond_reports_outcome_unknown_when_staging_finds_a_raced_row_and_leav
 
     user_id, task_id = _waiting_task(_respond_db)
     interaction_id = _active_row_ready_for_respond(_respond_db, task_id=task_id)
-    principal = _owning_user_principal(user_id)
+    principal = _owning_principal(user_id)
 
     def _racing_stage_task_command(*args: Any, **kwargs: Any) -> StagedTaskCommand:
         return StagedTaskCommand(
@@ -2604,7 +2589,7 @@ def test_respond_reports_outcome_unknown_when_staging_finds_a_raced_row_with_a_m
 
     user_id, task_id = _waiting_task(_respond_db)
     interaction_id = _active_row_ready_for_respond(_respond_db, task_id=task_id)
-    principal = _owning_user_principal(user_id)
+    principal = _owning_principal(user_id)
 
     def _racing_stage_task_command(*args: Any, **kwargs: Any) -> StagedTaskCommand:
         return StagedTaskCommand(

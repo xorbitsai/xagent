@@ -48,27 +48,30 @@ value object and the shared public-chat ownership predicate extracted from
 discriminated unions; the ``create()`` typed seam (validates and returns,
 does not stage a row); ``get()``/``list_active()``; the three-tier
 compatibility materialization view; the answer fence and its active-row
-predicate; ``respond()``'s own call body (validation, authorization,
-anchor resolution, the idempotency pre-read, the answer fence, the task
+predicate; ``respond()``'s own call body (validation, authorization, the
+idempotency pre-read, anchor resolution, the answer fence, the task
 control-state transition, staging the resume command, and committing --
 this delivery reports an unresolved fence miss or a failed commit as
 ``RespondOutcomeUnknown`` rather than further classifying or reconciling
-either; the response-conflict counter
-(``COUNTER_LIFECYCLE_RESPONSE_CONFLICT``); and the compatibility seam that
-routes the existing resume coordinator through this service
-(``websocket.py``'s ``_handle_resume_task_unserialized``). ``create()``'s
-own call body -- the write that actually stages a row -- is still not
-delivered here; its own zero-production-caller gate
+either); and the response-conflict counter
+(``COUNTER_LIFECYCLE_RESPONSE_CONFLICT``).
+
+Not delivered here, and named so a reader does not go looking for them in
+this module: the compatibility seam that routes the existing resume
+coordinator (``websocket.py``'s ``_handle_resume_task_unserialized``)
+through ``_active_native_row_criteria()`` ships as its own change in this
+same series and is not part of this one -- nothing in ``websocket.py``
+references this module today. ``create()``'s own call body -- the write
+that actually stages a row -- is not delivered here either; its own
+zero-production-caller gate
 (``tests/web/services/test_task_interaction_service_create_gate.py``)
-now watches ``create()`` alone. ``respond()`` left that gate not because
-it gained a caller -- the compatibility seam only reads
-``_active_native_row_criteria()`` and never calls it, and zero production
-code does today -- but because gating and callers are independent facts;
-the gate's own docstring states this and the seam's role. The gate gives
-that boundary a regression guard against import bindings, not an absolute
-one -- its docstring lists what it cannot see (dynamic access,
-alias/re-export chains, filename-stem exclusion, and code outside the
-scanned package tree).
+watches ``create()`` alone. ``respond()`` is not under that gate, and that
+is a statement about the gate, not about callers: zero production code
+calls ``respond()`` today, and the gate simply does not watch it. The gate
+gives ``create()``'s boundary a regression guard against import bindings,
+not an absolute one -- its docstring lists what it cannot see (dynamic
+access, alias/re-export chains, filename-stem exclusion, and code outside
+the scanned package tree).
 """
 
 from __future__ import annotations
@@ -619,12 +622,21 @@ RespondOutcome = (
 
 # ---------------------------------------------------------------------------
 # CreateOutcome: the create() seam's own discriminated union. Same family,
-# same style as RespondOutcome, but a separate set of classes -- the two
-# unions are not reused between each other even where a reason string
-# happens to be spelled the same way (e.g. "not_task_principal" appears in
-# both vocabularies below because both seams reuse the shared ownership
-# predicate's verdict, not because the two outcome types share a base
-# class).
+# same style as RespondOutcome, but two different mechanisms, and the
+# asymmetry is intentional rather than unfinished cleanup. Respond's
+# outcomes declare each reason as a ``Literal`` on the dataclass field, so
+# the type is the vocabulary. Create's still carry ``reason: str`` beside
+# the runtime dictionaries below, which record something a ``Literal``
+# cannot: which reasons are *producible* in this delivery as opposed to
+# merely declared, a distinction that exists only because create()'s call
+# body is not delivered yet. The two vocabularies overlap in nine strings
+# and are deliberately not shared -- ``"not_task_principal"`` appears in
+# both because both seams reuse the shared ownership predicate's verdict,
+# not because the two outcome types share a base class, and a change to
+# one side's word list must never silently move the other's. When
+# create()'s call body lands and the producible/declared distinction
+# disappears with it, that side converts to the Literal mechanism and this
+# note goes away.
 # ---------------------------------------------------------------------------
 
 
@@ -1389,7 +1401,15 @@ def _answer_fence_task_predicate(principal: InteractionPrincipal) -> list[Any]:
     ``respond()``'s own docstring for the two backends' different
     serialization points). Enforcing ownership at the write point rather
     than only in ``respond()``'s step 3 is what makes the two backends
-    agree on what a successful answer proves.
+    agree on the terms this statement actually carries -- which is not
+    every term step 3 evaluated. Three are re-asserted here: the task is
+    still ``WAITING_FOR_USER``, ``Task.user_id`` is still the principal's,
+    and, for a guest, the ``guest_id`` in ``agent_config`` still matches.
+    The rest of the guest conjunction -- ``auth_mode``, the entity binding,
+    and the channel binding -- is evaluated once in Python at step 3 and
+    not re-checked in SQL. A successful answer therefore proves the three
+    terms above held at write time and that the other three held at read
+    time, not that all six held at write time.
 
     ``Task.status`` is compared through ``TaskStatusPredicate.eq``, never a
     raw string literal beside the column -- this module's own convention
@@ -1641,16 +1661,28 @@ def respond(
     hold.
 
     `_handle_resume_task_unserialized` re-issues the same
-    `RESUME_REQUESTED` transition when it applies
-    the command this call staged. `apply_task_control_transition` has no
-    legality table, so that second transition succeeds and bumps
-    `state_version` again. Post-commit verification must therefore be
-    monotone in `state_version` and must not compare `control_state`. One
-    concrete consequence, recorded here because a future reader who treats
-    `state_version` as an operation counter will be surprised by it:
-    answering one interaction bumps `state_version` twice -- once in step 7
-    below, once when the coordinator re-applies the transition -- so a
-    consumer that expects "one answer, one version bump" will observe +2.
+    `RESUME_REQUESTED` transition when it applies the command this call
+    staged (`websocket.py`, reached from `_execute_durable_task_command`).
+    `apply_task_control_transition` has no legality table, so that second
+    transition succeeds and bumps `state_version` again. Post-commit
+    verification must therefore be monotone in `state_version` and must not
+    compare `control_state`. One concrete consequence, recorded here
+    because a future reader who treats `state_version` as an operation
+    counter will be surprised by it: answering one interaction bumps
+    `state_version` twice -- once in step 7 below, once when the
+    coordinator re-applies the transition -- so a consumer that expects
+    "one answer, one version bump" will observe +2.
+
+    That second bump is not reachable today: nothing in production calls
+    `respond()`, so no RESUME command carrying this function's payload is
+    ever staged or executed. It becomes reachable with the change that
+    gives `respond()` its first production caller, and deciding which of
+    the two writers owns the transition belongs to that change, not this
+    one. Making the transition single-writer here is not an option this
+    change can take on its own: `apply_task_control_transition` is shared
+    by eight direct call sites across five modules plus five more through
+    `transition_task_control_state_sync`, and adding a legality table to it
+    is a change to the task state machine, not to this service.
 
     `responder_user_id` and `actor_user_id` answer two different questions
     and are allowed to disagree. `responder_user_id` (written on the

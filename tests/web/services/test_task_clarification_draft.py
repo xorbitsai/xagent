@@ -18,6 +18,7 @@ than checking this module's own output against itself.
 
 from __future__ import annotations
 
+import logging
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -168,6 +169,33 @@ def test_waiting_without_draft_fails_closed_as_missing_draft() -> None:
     )
     assert isinstance(resolution, FailClosed)
     assert resolution.fail_closed_reason == "missing_draft"
+
+
+def test_missing_draft_logs_at_warning_not_error(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """This is a degrade-and-proceed path (the caller's non-native handling
+    of the waiting status is untouched, only the structured row is skipped),
+    which is why it logs at warning rather than error -- unlike the
+    non-waiting-with-draft guard just below, which stays at error because it
+    is only reachable through a caller's own programming mistake. Nothing
+    in this suite pinned the level before, so a regression back to error
+    would have passed silently."""
+
+    caplog.set_level(
+        logging.WARNING, logger="xagent.web.services.task_clarification_draft"
+    )
+    result = {"status": "waiting_for_user"}
+    resolve_publishable_clarification(
+        result, task=_task(), lease=_lease(), anchor=_anchor(), now=_now()
+    )
+    matching = [
+        record
+        for record in caplog.records
+        if "waiting run produced no clarification draft" in record.message
+    ]
+    assert len(matching) == 1
+    assert matching[0].levelno == logging.WARNING
 
 
 def test_non_waiting_with_draft_fails_closed_as_draft_status_mismatch() -> None:

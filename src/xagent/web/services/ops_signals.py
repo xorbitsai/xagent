@@ -80,6 +80,18 @@ INTERACTION_LEGACY_RESUME_CLOSE_ROWCOUNT_ANOMALY = (
 # task_clarification_draft.py registers this when a waiting run's result
 # carries no clarification draft to publish, and clears it the next time a
 # draft is successfully resolved to a publishable payload.
+#
+# What "stays lit" costs, operationally: the clearing point is the
+# publishable path only, so on a deployment where publication is blocked
+# (rollout mode is not native, or the task's source is not allowed yet)
+# nothing ever clears this signal -- the first occurrence latches it for the
+# lifetime of the process. active_degradations() feeds the unauthenticated
+# /health response (app.py), which reports signal names while keeping
+# status "ok", so a latched signal shows up on every probe until the
+# process restarts and cannot be distinguished there from a live one.
+# Deciding where a non-publishing round should clear it belongs to the
+# change that wires the first production caller, together with the same
+# decision for the two handoff signals below.
 CLARIFICATION_DRAFT_MISSING = "clarification_draft_missing"
 # task_clarification_draft.py registers this when the same batch produced
 # more than one waiting step and a losing step's draft was discarded.

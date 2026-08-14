@@ -313,7 +313,7 @@ def build_clarification_payload(draft: ClarificationDraft) -> dict[str, Any]:
     stripped_characters = len(original_question) - len(cleaned_question)
 
     if not cleaned_question:
-        logger.error(
+        logger.warning(
             "clarification question was empty after removing control characters",
             extra={
                 "original_length": len(original_question),
@@ -354,7 +354,7 @@ def build_clarification_payload(draft: ClarificationDraft) -> dict[str, Any]:
 
     total_bytes = _serialized_byte_length(payload)
     if total_bytes > _TOTAL_PAYLOAD_MAX_BYTES:
-        logger.error(
+        logger.warning(
             "clarification payload exceeded the maximum size even after truncation",
             extra={"serialized_length": total_bytes},
         )
@@ -503,7 +503,7 @@ def resolve_publishable_clarification(
     is_waiting = status == "waiting_for_user"
 
     if is_waiting and draft is None:
-        logger.error(
+        logger.warning(
             "a waiting run produced no clarification draft to publish",
             extra={"task_id": task.id, "run_id": lease.run_id},
         )
@@ -514,6 +514,12 @@ def resolve_publishable_clarification(
         return FailClosed("missing_draft")
 
     if not is_waiting and draft is not None:
+        # Still error level, unlike the three warnings above: those three sit
+        # on paths that degrade and let the round proceed, while this one is
+        # only reachable when a caller hands this function two different
+        # runs' results mixed together -- a programming error the core
+        # pattern layer cannot produce (see guard 1 in this function's
+        # docstring), not a degradation.
         logger.error(
             "a non-waiting run carried a clarification draft; discarding it",
             extra={"task_id": task.id, "run_id": lease.run_id, "status": status},

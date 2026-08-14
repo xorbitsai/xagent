@@ -9,10 +9,13 @@ from xagent.core.agent.checkpoint import CHECKPOINT_TYPE, TraceCheckpointStore
 from xagent.core.agent.clarification import (
     CLARIFICATION_SOURCES,
     ClarificationDraft,
+    ClarificationRequestItem,
+    _compose_turn_marker,
     draft_from_waiting_request,
 )
 from xagent.core.agent.pattern.react.react import _normalize_ask_user_interactions
 from xagent.web.api.trace_handlers import DatabaseTraceHandler
+from xagent.web.services.task_clarification_draft import clarification_idempotency_key
 
 
 class FakeLLM:
@@ -356,3 +359,92 @@ def test_distinct_nonempty_tool_call_ids_produce_distinct_markers() -> None:
 
     assert draft_a is not None and draft_b is not None
     assert draft_a.turn_marker != draft_b.turn_marker
+
+
+def test_compose_turn_marker_produces_a_fixed_literal_format() -> None:
+    """The replay contract in ``_replay_or_raise_closed``
+    (``task_interaction_staging.py``) rests on ``clarification_idempotency_key``
+    hashing ``turn_marker`` and nothing else, and on ``turn_marker`` staying a
+    function of the waiting turn's own identity. Every existing marker test
+    compares two markers to each other, so this encoding's literal output
+    could change -- a different separator, a dropped length prefix -- without
+    any test here noticing.
+
+    This test failing does not mean the code is wrong: it means the encoding
+    changed, which is exactly the moment ``clarification_idempotency_key``'s
+    output for every already-published row also changes, silently. Whoever
+    causes this test to fail must audit whether that key shift is safe for
+    rows already on disk before touching the assertion below.
+    """
+
+    marker = _compose_turn_marker(
+        turn_message_count=3,
+        origin_step_id="step-1",
+        requests=(ClarificationRequestItem("respond", "call-1", "call-1"),),
+    )
+    assert marker == "1:3|6:step-1|1:1|6:call-1|6:call-1"
+
+
+def _marker_draft(**overrides: Any) -> ClarificationDraft:
+    values: dict[str, Any] = {
+        "source": "send_message",
+        "message": "what is your favorite color?",
+        "message_type": "info",
+        "interactions": (),
+        "requests": (ClarificationRequestItem("respond", "call-1", "call-1"),),
+        "origin_step_id": "step-1",
+        "origin_execution_id": "exec-1",
+        "turn_message_count": 3,
+    }
+    values.update(overrides)
+    turn_marker = _compose_turn_marker(
+        turn_message_count=values["turn_message_count"],
+        origin_step_id=values["origin_step_id"],
+        requests=values["requests"],
+    )
+    return ClarificationDraft(turn_marker=turn_marker, **values)
+
+
+def test_idempotency_key_input_set_is_exactly_the_turn_marker_components() -> None:
+    """Completes the half of the replay contract
+    ``test_idempotency_key_ignores_message_content``
+    (``tests/web/services/test_task_clarification_draft.py``) leaves
+    uncovered: that test pins that ``message`` does not move the key. This
+    pins the other side -- ``message_type`` and ``interactions`` do not move
+    it either, since neither is a ``turn_marker`` component -- and that each
+    of the three components that do make up ``turn_marker``
+    (``turn_message_count``, ``origin_step_id``, ``requests``) changes the
+    key when it changes, one field at a time.
+    """
+
+    base = _marker_draft()
+    base_key = clarification_idempotency_key(base)
+
+    # Not turn_marker components: the key must not move.
+    assert clarification_idempotency_key(
+        _marker_draft(message="a different question")
+    ) == (base_key)
+    assert (
+        clarification_idempotency_key(_marker_draft(message_type="warning")) == base_key
+    )
+    assert (
+        clarification_idempotency_key(_marker_draft(interactions=({"field": "x"},)))
+        == base_key
+    )
+
+    # turn_marker components: the key must move for each, independently.
+    assert (
+        clarification_idempotency_key(_marker_draft(turn_message_count=4)) != base_key
+    )
+    assert (
+        clarification_idempotency_key(_marker_draft(origin_step_id="step-2"))
+        != base_key
+    )
+    assert (
+        clarification_idempotency_key(
+            _marker_draft(
+                requests=(ClarificationRequestItem("respond", "call-2", "call-2"),)
+            )
+        )
+        != base_key
+    )

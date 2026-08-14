@@ -365,6 +365,7 @@ describe("Home", () => {
   }
 
   beforeEach(() => {
+    delete homeGetStartedDestinationOverridesMock.video
     delete homeGetStartedDestinationOverridesMock.docs
     delete homeGetStartedDestinationOverridesMock.guides
     delete homeGetStartedDestinationOverridesMock.whatsNew
@@ -498,6 +499,29 @@ describe("Home", () => {
     expectLinkedGetStartedCard("home.getStarted.guides.title", "custom-guide:destination")
     expectLinkedGetStartedCard("home.getStarted.whatsNew.title", "  /whats-new  ")
     expect(getStartedCard("home.getStarted.video.title").wrapper.querySelector("a")).toBeNull()
+  })
+
+  it("resolves a configured video destination while keeping the inline tutorial video and canonical siblings", () => {
+    homeGetStartedDestinationOverridesMock.video = "https://help.xagent.co/user-guide/demo-videos.html"
+    render(<Home />)
+
+    expectLinkedGetStartedCard("home.getStarted.video.title", "https://help.xagent.co/user-guide/demo-videos.html")
+    const linkedVideo = getStartedCard("home.getStarted.video.title").card.querySelector("video")
+    if (!(linkedVideo instanceof HTMLVideoElement)) throw new Error("Tutorial video was not eagerly loaded")
+    expect(linkedVideo).toHaveAttribute("src", "/videos/Tutorial.mp4")
+    expectLinkedGetStartedCard("home.getStarted.docs.title", "https://docs.xagent.co/api-reference/introduction")
+    expectLinkedGetStartedCard("home.getStarted.guides.title", "https://docs.xagent.co/models/overview")
+    expectLinkedGetStartedCard("home.getStarted.whatsNew.title", "https://docs.xagent.co/release-notes")
+
+    cleanup()
+    for (const invalid of [null, "", "   "]) {
+      ;(homeGetStartedDestinationOverridesMock as Record<string, unknown>).video = invalid
+      const { unmount } = render(<Home />)
+      expectInertGetStartedCard("home.getStarted.video.title")
+      const inertVideo = getStartedCard("home.getStarted.video.title").card.querySelector("video")
+      if (!(inertVideo instanceof HTMLVideoElement)) throw new Error("Tutorial video was not eagerly loaded")
+      unmount()
+    }
   })
 
   it("rejects pointer, hover, focus, native, inline-style, SVG, and media-control affordances injected into an inert card", () => {
@@ -763,18 +787,19 @@ describe("Home", () => {
     const resolver = sourceSlice(pageSource, "function resolveHomeGetStartedDestination(", "export default function Home()")
     const cardRender = sourceSlice(pageSource, "{[", "          {/* Build agents with templates */}")
 
+    expect(contractInterface).toMatch(/video\?: string \| null/)
     expect(contractInterface).toMatch(/docs\?: string \| null/)
     expect(contractInterface).toMatch(/guides\?: string \| null/)
     expect(contractInterface).toMatch(/whatsNew\?: string \| null/)
-    expect(contractInterface.match(/\?: string \| null/g)).toHaveLength(3)
-    expect(contractInterface.match(/^\s+\w+\??:/gm)).toHaveLength(3)
+    expect(contractInterface.match(/\?: string \| null/g)).toHaveLength(4)
+    expect(contractInterface.match(/^\s+\w+\??:/gm)).toHaveLength(4)
     expect(contractInterface).not.toContain("tutorial")
     expect(extensionSource).toMatch(/export const homeGetStartedDestinationOverrides: HomeGetStartedDestinationOverrides = \{\}/)
     expect(pageSource).toMatch(/import \* as homePageExtensionModule from "@\/lib\/home-page-extension";/)
     expect(pageSource).toMatch(
       /const homeGetStartedDestinationOverrides: HomeGetStartedDestinationOverrides =\s*\(homePageExtensionModule as \{ homeGetStartedDestinationOverrides\?: HomeGetStartedDestinationOverrides \}\)\s*\.homeGetStartedDestinationOverrides \?\? \{\}/,
     )
-    expect(pageSource).toMatch(/const defaultHomeGetStartedDestinations: Record<keyof HomeGetStartedDestinationOverrides, string> = \{/)
+    expect(pageSource).toMatch(/const defaultHomeGetStartedDestinations: Record<keyof HomeGetStartedDestinationOverrides, string \| null> = \{/)
     expect(resolver).toContain("configured === undefined")
     expect(resolver).toContain("typeof configured !== \"string\"")
     expect(resolver).toContain("configured.trim().length === 0")
@@ -785,11 +810,11 @@ describe("Home", () => {
     expect(cardRender).toContain("focus-visible:ring-2")
     expect(cardRender).not.toMatch(/\bon[A-Z][A-Za-z]*|\btabIndex\b|\brole\b|\bcontrols\b|\bstyle\b|\bcursor\s*=|\bcontentEditable\b|\bsuppressContentEditableWarning\b|\bdraggable\b|\{\s*\.\.\./)
     const destinationCalls = Array.from(cardRender.matchAll(
-      /resolveHomeGetStartedDestination\(homeGetStartedDestinationOverrides\.(docs|guides|whatsNew), defaultHomeGetStartedDestinations\.\1\)/g,
+      /resolveHomeGetStartedDestination\(homeGetStartedDestinationOverrides\.(video|docs|guides|whatsNew), defaultHomeGetStartedDestinations\.\1\)/g,
     )).map((match) => match[1])
-    expect(destinationCalls).toEqual(["docs", "guides", "whatsNew"])
-    expect(cardRender.match(/resolveHomeGetStartedDestination\(/g)).toHaveLength(3)
-    expect(cardRender.match(/defaultHomeGetStartedDestinations\./g)).toHaveLength(3)
+    expect(destinationCalls).toEqual(["video", "docs", "guides", "whatsNew"])
+    expect(cardRender.match(/resolveHomeGetStartedDestination\(/g)).toHaveLength(4)
+    expect(cardRender.match(/defaultHomeGetStartedDestinations\./g)).toHaveLength(4)
     expect(cardRender).not.toMatch(/https:\/\/docs\.xagent\.co\//)
   })
 

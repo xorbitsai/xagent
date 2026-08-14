@@ -162,7 +162,8 @@ const homeGetStartedDestinationOverrides: HomeGetStartedDestinationOverrides =
   (homePageExtensionModule as { homeGetStartedDestinationOverrides?: HomeGetStartedDestinationOverrides })
     .homeGetStartedDestinationOverrides ?? {}
 
-const defaultHomeGetStartedDestinations: Record<keyof HomeGetStartedDestinationOverrides, string> = {
+const defaultHomeGetStartedDestinations: Record<keyof HomeGetStartedDestinationOverrides, string | null> = {
+  video: null,
   docs: "https://docs.xagent.co/api-reference/introduction",
   guides: "https://docs.xagent.co/models/overview",
   whatsNew: "https://docs.xagent.co/release-notes",
@@ -170,7 +171,7 @@ const defaultHomeGetStartedDestinations: Record<keyof HomeGetStartedDestinationO
 
 function resolveHomeGetStartedDestination(
   configured: unknown,
-  defaultDestination: string,
+  defaultDestination: string | null,
 ): string | null {
   if (configured === undefined) return defaultDestination
   if (typeof configured !== "string" || configured.trim().length === 0) return null
@@ -523,7 +524,7 @@ export default function Home() {
           <h2 className="text-[16px] font-bold mb-4 text-foreground">{t("home.getStarted.title")}</h2>
           <div ref={getStartedSectionRef} className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-4 gap-4 mb-10">
             {[
-              { title: t("home.getStarted.video.title"), desc: t("home.getStarted.video.description", { appName: branding.appName }), video: "/videos/Tutorial.mp4", link: null },
+              { title: t("home.getStarted.video.title"), desc: t("home.getStarted.video.description", { appName: branding.appName }), video: "/videos/Tutorial.mp4", link: resolveHomeGetStartedDestination(homeGetStartedDestinationOverrides.video, defaultHomeGetStartedDestinations.video) },
               { title: t("home.getStarted.docs.title"), desc: t("home.getStarted.docs.description"), video: "/videos/Documentation.mp4", link: resolveHomeGetStartedDestination(homeGetStartedDestinationOverrides.docs, defaultHomeGetStartedDestinations.docs) },
               { title: t("home.getStarted.guides.title"), desc: t("home.getStarted.guides.description"), icon: <ListChecks className="w-8 h-8 text-green-500" />, bg: "bg-green-50 dark:bg-green-950/30", link: resolveHomeGetStartedDestination(homeGetStartedDestinationOverrides.guides, defaultHomeGetStartedDestinations.guides) },
               { title: t("home.getStarted.whatsNew.title"), desc: t("home.getStarted.whatsNew.description"), icon: <Sparkles className="w-8 h-8 text-orange-500" />, bg: "bg-orange-50 dark:bg-orange-950/30", link: resolveHomeGetStartedDestination(homeGetStartedDestinationOverrides.whatsNew, defaultHomeGetStartedDestinations.whatsNew) }

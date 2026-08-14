@@ -15,15 +15,18 @@ export type HomePageExtensionComponent = ComponentType
  * Each key is resolved independently with three-state semantics:
  * - `undefined` (key omitted, or the whole `homeGetStartedDestinationOverrides`
  *   export is missing from a replacement module): the canonical OSS default
- *   destination is used.
+ *   destination is used. For `video`, the canonical OSS default is itself
+ *   `null` — the card plays its inline tutorial video without linking out.
  * - `null` (or a non-string / blank value): the card renders as a
  *   non-interactive card — no anchor, no tab stop, no pointer cursor, and no
- *   link-only hover styling.
+ *   link-only hover styling. A `video` card still autoplays its inline video
+ *   in this state; only the link wrapper is affected.
  * - a string that is non-empty after trimming: used as the destination
  *   verbatim, including any surrounding whitespace, which is deliberately
  *   not trimmed from the emitted href.
  */
 export interface HomeGetStartedDestinationOverrides {
+  video?: string | null
   docs?: string | null
   guides?: string | null
   whatsNew?: string | null

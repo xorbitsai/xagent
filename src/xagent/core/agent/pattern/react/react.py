@@ -1722,9 +1722,10 @@ class ReActPattern(AgentPattern):
                     "name": "send_message",
                     "description": (
                         "Send a message to the user, optionally waiting for a "
-                        "response. Use message_type='progress' to narrate a "
-                        "longer task as it moves through meaningful phases, "
-                        "not before every tool call."
+                        "response (by setting expect_response=true). Use "
+                        "message_type='progress' to narrate a longer task as "
+                        "it moves through meaningful phases, not before "
+                        "every tool call."
                     ),
                     "parameters": {
                         "type": "object",
@@ -1732,8 +1733,11 @@ class ReActPattern(AgentPattern):
                             "message": {
                                 "type": "string",
                                 "description": (
-                                    "The message text, in the same language "
-                                    "as the user's request."
+                                    "The message text, in the target "
+                                    "response language (matching the user's "
+                                    "request language unless they "
+                                    "explicitly asked to answer in another "
+                                    "language)."
                                 ),
                             },
                             "message_type": {
@@ -1746,17 +1750,19 @@ class ReActPattern(AgentPattern):
                                     "warning",
                                 ],
                                 "description": (
-                                    "progress: a brief, plain-language "
-                                    "narration of what you are doing right "
-                                    "now or what you just found — describe "
-                                    "it the way the user themselves would, "
-                                    "never by naming the tool, model, file "
-                                    "path, or raw arguments involved. info: "
-                                    "a one-off notification. "
-                                    "question/confirmation: expects a "
-                                    "response — set expect_response=true. "
-                                    "warning: something the user should "
-                                    "know may affect the outcome."
+                                    "The type of message (defaults to "
+                                    "'info'). progress: a brief, "
+                                    "plain-language narration of what you "
+                                    "are doing right now or what you just "
+                                    "found — describe it the way the user "
+                                    "themselves would, never by naming the "
+                                    "tool, model, file path, or raw "
+                                    "arguments involved. info: a one-off "
+                                    "notification. question/confirmation: "
+                                    "expects a response — you must set "
+                                    "expect_response=true. warning: "
+                                    "something the user should know that "
+                                    "may affect the outcome."
                                 ),
                             },
                             "expect_response": {"type": "boolean"},

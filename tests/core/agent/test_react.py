@@ -43,6 +43,10 @@ class SearchArgs(BaseModel):
     count: int = 10
 
 
+class FetchWebContentArgs(BaseModel):
+    url: str
+
+
 class FakeTool:
     def __init__(self) -> None:
         self.calls: list[dict[str, Any]] = []
@@ -117,6 +121,24 @@ class FakeSearchTool:
                 },
             ]
         }
+
+
+class FakeFetchWebContentTool:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, Any]] = []
+
+        class Metadata:
+            name = "fetch_web_content"
+            description = "Fetch and extract a web page's content."
+
+        self.metadata = Metadata()
+
+    def args_type(self) -> type[BaseModel]:
+        return FetchWebContentArgs
+
+    async def run_json_async(self, args: dict[str, Any]) -> Any:
+        self.calls.append(args)
+        return {"success": True, "content": f"content of {args['url']}"}
 
 
 class FakeTraceSanitizingTool:
@@ -2845,6 +2867,497 @@ def test_progress_narration_nudge_survives_checkpoint_resume() -> None:
     resumed_context = ExecutionContext(execution_id="task-1")
     resumed._maybe_nudge_progress_narration(context=resumed_context)
     assert not any(m.role == "system" for m in resumed_context.messages)
+
+
+def test_progress_narration_nudge_fires_immediately_on_a_tool_group_change() -> None:
+    # Live testing showed the model narrated once after two web_search
+    # calls, then stayed silent through fetch_web_content, two more
+    # searches, and write_file before narrating again — a raw count
+    # threshold alone let four calls of visibly different work pass
+    # unremarked. A tool-group change should nudge right away instead of
+    # waiting for the count to catch up.
+    pattern = ReActPattern(progress_narration_nudge_after_consecutive_tool_calls=3)
+    context = ExecutionContext(execution_id="task-1")
+
+    # The model narrated on its own initiative (not necessarily in
+    # response to a nudge — threshold=3 hasn't been crossed by these two
+    # calls yet), reporting on the web_search group.
+    _record_work_tool_call(pattern, "call-1", tool_name="web_search")
+    _record_work_tool_call(pattern, "call-2", tool_name="web_search")
+    _record_send_message_call(pattern, "call-3")
+    pattern._maybe_nudge_progress_narration(context=context)
+    assert not any(m.role == "system" for m in context.messages)
+
+    # First tool call after the message is a different tool entirely —
+    # should nudge immediately even though the count (1) is well under
+    # the threshold (3).
+    _record_work_tool_call(pattern, "call-4", tool_name="fetch_web_content")
+    pattern._maybe_nudge_progress_narration(context=context)
+    system_messages = [m for m in context.messages if m.role == "system"]
+    assert len(system_messages) == 1
+    assert "switched to a different kind of action" in system_messages[-1].content
+
+
+def test_progress_narration_nudge_checks_group_change_only_once_per_streak() -> None:
+    # Real runs alternate tools within what is really one phase (search,
+    # open a result, search again). Re-checking the group on every call
+    # would nudge on every alternation instead of just the one genuine
+    # transition away from what was last reported.
+    pattern = ReActPattern(progress_narration_nudge_after_consecutive_tool_calls=5)
+    context = ExecutionContext(execution_id="task-1")
+
+    _record_work_tool_call(pattern, "call-1", tool_name="web_search")
+    pattern._maybe_nudge_progress_narration(context=context)
+    _record_send_message_call(pattern, "call-2")
+    pattern._maybe_nudge_progress_narration(context=context)
+
+    _record_work_tool_call(pattern, "call-3", tool_name="fetch_web_content")
+    pattern._maybe_nudge_progress_narration(context=context)  # group change, count=1
+    _record_work_tool_call(pattern, "call-4", tool_name="web_search")
+    pattern._maybe_nudge_progress_narration(context=context)  # back to search, count=2
+    _record_work_tool_call(pattern, "call-5", tool_name="fetch_web_content")
+    pattern._maybe_nudge_progress_narration(
+        context=context
+    )  # count=3, still < threshold
+
+    # Only the one nudge from the initial group change — the alternation
+    # afterward (fetch -> search -> fetch) must not each fire their own.
+    assert sum(1 for m in context.messages if m.role == "system") == 1
+
+
+def test_progress_narration_nudge_ignores_group_change_on_the_very_first_streak() -> (
+    None
+):
+    # With no prior message, there is no "last reported" group to compare
+    # against — a fresh run's first tool call must not be treated as a
+    # change (there's nothing to change from).
+    pattern = ReActPattern(progress_narration_nudge_after_consecutive_tool_calls=3)
+    context = ExecutionContext(execution_id="task-1")
+
+    _record_work_tool_call(pattern, "call-1", tool_name="fetch_web_content")
+    pattern._maybe_nudge_progress_narration(context=context)
+
+    assert not any(m.role == "system" for m in context.messages)
+
+
+def test_progress_narration_nudge_does_not_treat_same_group_as_a_change() -> None:
+    pattern = ReActPattern(progress_narration_nudge_after_consecutive_tool_calls=3)
+    context = ExecutionContext(execution_id="task-1")
+
+    _record_work_tool_call(pattern, "call-1", tool_name="web_search")
+    pattern._maybe_nudge_progress_narration(context=context)
+    _record_send_message_call(pattern, "call-2")
+    pattern._maybe_nudge_progress_narration(context=context)
+
+    # Same tool group as what was just reported on — not a change, and
+    # under the count threshold, so no nudge yet.
+    _record_work_tool_call(pattern, "call-3", tool_name="web_search")
+    pattern._maybe_nudge_progress_narration(context=context)
+
+    assert not any(m.role == "system" for m in context.messages)
+
+
+def test_progress_narration_nudge_detects_group_change_without_a_mid_flight_check() -> (
+    None
+):
+    # The real dispatch loop never calls _maybe_nudge_progress_narration
+    # right after send_message itself — that's its own "control" segment,
+    # which skips this entirely — so the very first evaluation after a
+    # message always already has at least one newer work-tool call sitting
+    # in the ledger ahead of it. An earlier version of this reset keyed off
+    # "the most recent work-tool call" for the pre-message group too, which
+    # is wrong once a newer call already exists: it would end up comparing
+    # the new call's group against itself. Exercise that exact shape here
+    # (no evaluation between the message and the next call) to pin the fix.
+    pattern = ReActPattern(progress_narration_nudge_after_consecutive_tool_calls=3)
+    context = ExecutionContext(execution_id="task-1")
+
+    _record_work_tool_call(pattern, "call-1", tool_name="web_search")
+    _record_work_tool_call(pattern, "call-2", tool_name="web_search")
+    _record_send_message_call(pattern, "call-3")
+    _record_work_tool_call(pattern, "call-4", tool_name="fetch_web_content")
+    pattern._maybe_nudge_progress_narration(context=context)
+
+    system_messages = [m for m in context.messages if m.role == "system"]
+    assert len(system_messages) == 1
+    assert "switched to a different kind of action" in system_messages[-1].content
+
+
+@pytest.mark.asyncio
+async def test_progress_narration_nudges_fire_through_the_real_dispatch_loop() -> None:
+    # All the unit tests above call _maybe_nudge_progress_narration directly,
+    # bypassing the real per-segment dispatch loop entirely (the "requested
+    # decision" gate, control-vs-work segment routing, etc.). Live testing
+    # kept showing a single narration for an entire multi-phase run despite
+    # those unit tests passing, so drive the actual loop end to end here:
+    # two searches, a fetch (crosses the count threshold), a narration, a
+    # write (different group — should nudge immediately), another
+    # narration, one more search (group changes again), a third narration,
+    # then the final answer.
+    llm = FakeLLM(
+        responses=[
+            {
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "function": {
+                            "name": "zhipu_web_search",
+                            "arguments": json.dumps({"query": "LangChain pricing"}),
+                        },
+                    }
+                ],
+                "done": False,
+            },
+            {
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call_2",
+                        "function": {
+                            "name": "zhipu_web_search",
+                            "arguments": json.dumps({"query": "CrewAI pricing"}),
+                        },
+                    }
+                ],
+                "done": False,
+            },
+            {
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call_3",
+                        "function": {
+                            "name": "fetch_web_content",
+                            "arguments": json.dumps({"url": "https://crewai.com"}),
+                        },
+                    }
+                ],
+                "done": False,
+            },
+            {
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call_4",
+                        "function": {
+                            "name": "send_message",
+                            "arguments": json.dumps(
+                                {
+                                    "message": "Checked pricing pages, digging into search results now.",
+                                    "message_type": "progress",
+                                }
+                            ),
+                        },
+                    }
+                ],
+                "done": False,
+            },
+            {
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call_5",
+                        "function": {
+                            "name": "write_file",
+                            "arguments": json.dumps(
+                                {
+                                    "file_path": "comparison.md",
+                                    "content": "draft",
+                                }
+                            ),
+                        },
+                    }
+                ],
+                "done": False,
+            },
+            {
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call_6",
+                        "function": {
+                            "name": "send_message",
+                            "arguments": json.dumps(
+                                {
+                                    "message": "Wrote a first draft, double-checking a few sources.",
+                                    "message_type": "progress",
+                                }
+                            ),
+                        },
+                    }
+                ],
+                "done": False,
+            },
+            {
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call_7",
+                        "function": {
+                            "name": "zhipu_web_search",
+                            "arguments": json.dumps({"query": "LangSmith pricing"}),
+                        },
+                    }
+                ],
+                "done": False,
+            },
+            {
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call_8",
+                        "function": {
+                            "name": "send_message",
+                            "arguments": json.dumps(
+                                {
+                                    "message": "Confirmed the last details, finishing up now.",
+                                    "message_type": "progress",
+                                }
+                            ),
+                        },
+                    }
+                ],
+                "done": False,
+            },
+            {
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call_9",
+                        "function": {
+                            "name": "final_answer",
+                            "arguments": json.dumps(
+                                {
+                                    "response_language": "English",
+                                    "answer": "Here is the comparison.",
+                                    "outcome": "completed",
+                                }
+                            ),
+                        },
+                    }
+                ],
+                "done": False,
+            },
+        ]
+    )
+    pattern = ReActPattern(
+        max_iterations=12,
+        progress_narration_nudge_after_consecutive_tool_calls=3,
+    )
+    # In production, zhipu_web_search and fetch_web_content both declare
+    # category=ToolCategory.WEB_SEARCH — they share one tool-decision group.
+    # A generic per-name FakeTool (its own name as its own group) hides
+    # this and made an earlier version of this test pass for the wrong
+    # reason; use FakeGroupedTool to reproduce the real category sharing.
+    tools = [
+        FakeGroupedTool("zhipu_web_search", "web_search"),
+        FakeGroupedTool("fetch_web_content", "web_search"),
+        FakeWriteFileTool(),
+    ]
+    context = ExecutionContext(execution_id="task-1")
+    context.add_user_message(
+        "Compare LangChain and CrewAI pricing and write up the findings."
+    )
+
+    result = await pattern.run(context=context, tools=tools, llm=llm)
+
+    assert result["success"] is True
+
+    nudges = [
+        m
+        for m in context.messages
+        if m.role == "system" and "Progress narration reminder" in (m.content or "")
+    ]
+    # Nudge 1: count threshold (search, search, fetch — all web_search).
+    # Nudge 2: write_file is the *first* call after message 1, and its
+    # group (file) differs from web_search — group-change fires
+    # immediately at count 1, without waiting for the threshold.
+    # Nudge 3: web_search is the first call after message 2, and its group
+    # differs from write_file's — group-change fires again at count 1.
+    # (fetch_web_content sharing web_search's category with zhipu_web_search
+    # means a search-after-fetch transition would NOT get its own
+    # group-change nudge — that's exactly what the live run showed — but
+    # this sequence never puts search directly after fetch within one
+    # streak, so it isn't exercised here.)
+    assert len(nudges) == 3
+    assert nudges[0].metadata["trigger"] == "consecutive_count"
+    assert nudges[1].metadata["trigger"] == "group_change"
+    assert nudges[2].metadata["trigger"] == "group_change"
+
+
+@pytest.mark.asyncio
+async def test_progress_narration_nudge_catches_up_when_group_change_is_masked() -> (
+    None
+):
+    # The exact shape from the live run that motivated this whole nudge
+    # mechanism: search, search, fetch_web_content (nudge — count
+    # threshold), a narration, then search, search, write_file.
+    #
+    # zhipu_web_search and fetch_web_content share the web_search category,
+    # so search+search+fetch also happens to cross the *repeated-tool*
+    # decision's own (group-based, message-transparent) threshold of 4
+    # right on the first search after the narration — which preempts that
+    # exact segment's progress-nudge check entirely. This pins the fix for
+    # that interaction: the nudge's reset bookkeeping must still run on a
+    # preempted segment, and the group-change check must still fire on
+    # whatever segment it first gets to look at (not require count==1
+    # exactly), so write_file two calls later still gets recognized as a
+    # genuine phase change instead of the state staying stuck for the rest
+    # of the run.
+    llm = FakeLLM(
+        responses=[
+            {
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "function": {
+                            "name": "zhipu_web_search",
+                            "arguments": json.dumps({"query": "LangChain pricing"}),
+                        },
+                    }
+                ],
+                "done": False,
+            },
+            {
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call_2",
+                        "function": {
+                            "name": "zhipu_web_search",
+                            "arguments": json.dumps({"query": "CrewAI pricing"}),
+                        },
+                    }
+                ],
+                "done": False,
+            },
+            {
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call_3",
+                        "function": {
+                            "name": "fetch_web_content",
+                            "arguments": json.dumps({"url": "https://crewai.com"}),
+                        },
+                    }
+                ],
+                "done": False,
+            },
+            {
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call_4",
+                        "function": {
+                            "name": "send_message",
+                            "arguments": json.dumps(
+                                {
+                                    "message": "Checked pricing pages, searching a bit more.",
+                                    "message_type": "progress",
+                                }
+                            ),
+                        },
+                    }
+                ],
+                "done": False,
+            },
+            {
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call_5",
+                        "function": {
+                            "name": "zhipu_web_search",
+                            "arguments": json.dumps({"query": "LangSmith pricing"}),
+                        },
+                    }
+                ],
+                "done": False,
+            },
+            {
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call_6",
+                        "function": {
+                            "name": "zhipu_web_search",
+                            "arguments": json.dumps({"query": "LangChain vs CrewAI"}),
+                        },
+                    }
+                ],
+                "done": False,
+            },
+            {
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call_7",
+                        "function": {
+                            "name": "write_file",
+                            "arguments": json.dumps(
+                                {
+                                    "file_path": "comparison.md",
+                                    "content": "draft",
+                                }
+                            ),
+                        },
+                    }
+                ],
+                "done": False,
+            },
+            {
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call_8",
+                        "function": {
+                            "name": "final_answer",
+                            "arguments": json.dumps(
+                                {
+                                    "response_language": "English",
+                                    "answer": "Here is the comparison.",
+                                    "outcome": "completed",
+                                }
+                            ),
+                        },
+                    }
+                ],
+                "done": False,
+            },
+        ]
+    )
+    pattern = ReActPattern(
+        max_iterations=12,
+        progress_narration_nudge_after_consecutive_tool_calls=3,
+    )
+    tools = [
+        FakeGroupedTool("zhipu_web_search", "web_search"),
+        FakeGroupedTool("fetch_web_content", "web_search"),
+        FakeWriteFileTool(),
+    ]
+    context = ExecutionContext(execution_id="task-1")
+    context.add_user_message(
+        "Compare LangChain and CrewAI pricing and write up the findings."
+    )
+
+    result = await pattern.run(context=context, tools=tools, llm=llm)
+
+    assert result["success"] is True
+
+    nudges = [
+        m
+        for m in context.messages
+        if m.role == "system" and "Progress narration reminder" in (m.content or "")
+    ]
+    assert len(nudges) == 2
+    assert nudges[0].metadata["trigger"] == "consecutive_count"
+    # write_file's group differs from the search streak's, so the (now
+    # preemption-robust) group-change check catches it before the raw
+    # count would have.
+    assert nudges[1].metadata["trigger"] == "group_change"
 
 
 @pytest.mark.asyncio

@@ -90,8 +90,11 @@ DEFAULT_REPEATED_TOOL_DECISION_CONSECUTIVE_WORK_TOOL_CALLS = 10
 # Live testing showed the model rarely reaches for send_message on its own
 # even with schema-level guidance: a 5-round web_search task sent zero
 # progress updates. This threshold drives a deterministic system-message
-# nudge instead of relying solely on prompt persuasion.
-DEFAULT_PROGRESS_NARRATION_NUDGE_AFTER_CONSECUTIVE_TOOL_CALLS = 2
+# nudge instead of relying solely on prompt persuasion. It backstops a
+# single sustained phase (e.g. several searches in a row); a tool-group
+# change is its own, more responsive trigger (see _maybe_nudge_progress_
+# narration), so this can afford to be a little looser than that.
+DEFAULT_PROGRESS_NARRATION_NUDGE_AFTER_CONSECUTIVE_TOOL_CALLS = 3
 # Tool calls that already deliver a message to the user; encountering one
 # resets the progress-narration nudge counter.
 MESSAGE_TOOL_NAMES = frozenset({"send_message", "ask_user_question"})
@@ -239,6 +242,19 @@ class ReActPattern(AgentPattern):
         # streak that stays past the threshold doesn't get re-nudged every
         # single subsequent tool call; only when it grows further.
         self._progress_narration_last_nudged_count = 0
+        # The tool-decision group active as of the last message to the user,
+        # and whether we've already checked the first tool call of the
+        # current streak against it. Lets a genuine phase change (e.g.
+        # web_search -> write_file) nudge immediately instead of waiting for
+        # the count threshold, without re-checking every call in a streak.
+        self._progress_narration_group_at_last_message: str | None = None
+        self._progress_narration_group_change_checked = False
+        # Identity of the most recent send_message/ask_user_question ledger
+        # record we've already accounted for. Comparing this (rather than
+        # waiting to observe a consecutive-call count of 0, which this
+        # method's call site never actually produces) is what detects that a
+        # fresh message just landed and the per-streak state should reset.
+        self._progress_narration_last_message_id: str | None = None
         self.status = "idle"
         self.current_iteration = 0
         self.last_response: Any = None
@@ -1205,6 +1221,15 @@ class ReActPattern(AgentPattern):
             "progress_narration_last_nudged_count": (
                 self._progress_narration_last_nudged_count
             ),
+            "progress_narration_group_at_last_message": (
+                self._progress_narration_group_at_last_message
+            ),
+            "progress_narration_group_change_checked": (
+                self._progress_narration_group_change_checked
+            ),
+            "progress_narration_last_message_id": (
+                self._progress_narration_last_message_id
+            ),
             "force_final_answer_next": self.force_final_answer_next,
             "repeated_tool_decision": self.repeated_tool_decision,
             "waiting_for_user_request": self.waiting_for_user_request,
@@ -1262,6 +1287,17 @@ class ReActPattern(AgentPattern):
             )
         self._progress_narration_last_nudged_count = int(
             state.get("progress_narration_last_nudged_count", 0) or 0
+        )
+        raw_group = state.get("progress_narration_group_at_last_message")
+        self._progress_narration_group_at_last_message = (
+            str(raw_group) if isinstance(raw_group, str) else None
+        )
+        self._progress_narration_group_change_checked = bool(
+            state.get("progress_narration_group_change_checked", False)
+        )
+        raw_message_id = state.get("progress_narration_last_message_id")
+        self._progress_narration_last_message_id = (
+            str(raw_message_id) if isinstance(raw_message_id, str) else None
         )
         self.force_final_answer_next = bool(state.get("force_final_answer_next", False))
         repeated_tool_decision = state.get("repeated_tool_decision")
@@ -2559,10 +2595,15 @@ class ReActPattern(AgentPattern):
                 successful_tool_result = True
             if requested_decision:
                 successful_tool_result = False
-            else:
                 # A pending repeated-tool decision will settle continue-vs-
                 # finish on its own next turn; layering a progress nudge on
-                # top of that would just be redundant noise.
+                # top of that would just be redundant noise. But the nudge's
+                # own reset bookkeeping must still run this segment — it
+                # keys off message identity, not off whether a nudge fires,
+                # and skipping it here would leave last_nudged_count stuck
+                # at a stale pre-message value for the rest of the run.
+                self._sync_progress_narration_message_state()
+            else:
                 self._maybe_nudge_progress_narration(context=context)
 
         if (
@@ -2937,44 +2978,149 @@ class ReActPattern(AgentPattern):
             count += 1
         return count
 
+    def _latest_work_tool_group(self) -> str | None:
+        """The tool-decision group of the most recent completed work-tool call.
+
+        Skips every control tool transparently (send_message included) —
+        this asks "what kind of work was the agent last actually doing",
+        not "what was the last thing recorded at all".
+        """
+        control_tool_names = self._control_tool_names()
+        for record in reversed(list(self.tool_ledger.values())):
+            if record.tool_name in control_tool_names:
+                continue
+            return self._tool_decision_group_for_name(record.tool_name)
+        return None
+
+    def _latest_message_record_id(self) -> str | None:
+        for record in reversed(list(self.tool_ledger.values())):
+            if record.tool_name in MESSAGE_TOOL_NAMES:
+                return record.tool_call_id
+        return None
+
+    def _work_tool_group_before_message(self, message_tool_call_id: str) -> str | None:
+        """The work-tool group active right before the given message record.
+
+        This method may run well after that message was actually sent —
+        the ledger can already hold newer work-tool calls by the time we
+        get to evaluate — so it can't just ask "what's the most recent
+        work-tool call" (that would answer for whatever ran *after* the
+        message, not before it). Scan forward and stop exactly at the
+        message instead, so later entries in the ledger can't leak in.
+        """
+        control_tool_names = self._control_tool_names()
+        group: str | None = None
+        for record in self.tool_ledger.values():
+            if record.tool_call_id == message_tool_call_id:
+                break
+            if record.tool_name in control_tool_names:
+                continue
+            group = self._tool_decision_group_for_name(record.tool_name)
+        return group
+
+    def _sync_progress_narration_message_state(self) -> None:
+        """Reset per-streak nudge bookkeeping once a new message has landed.
+
+        Must run on *every* work-tool segment regardless of whether a nudge
+        will actually be considered this turn — including a segment the
+        repeated-tool decision preempts (see the call site). Skipping it
+        there was a real bug: a run whose search/fetch calls share a tool
+        group can reach the repeated-tool-decision's own (group-based,
+        message-transparent) threshold right on the first work-tool call
+        after a message, preempting that exact turn. If this sync only ran
+        from inside the nudge check, it would never get a chance to fire —
+        last_nudged_count would stay stuck at its pre-message value and
+        every later threshold comparison for the rest of the run would be
+        wrong.
+        """
+        latest_message_id = self._latest_message_record_id()
+        if latest_message_id != self._progress_narration_last_message_id:
+            self._progress_narration_last_message_id = latest_message_id
+            self._progress_narration_last_nudged_count = 0
+            self._progress_narration_group_change_checked = False
+            self._progress_narration_group_at_last_message = (
+                self._work_tool_group_before_message(latest_message_id)
+                if latest_message_id is not None
+                else None
+            )
+
     def _maybe_nudge_progress_narration(self, *, context: Any) -> None:
         """Push the model toward send_message when it has gone quiet.
 
         Schema-level guidance on send_message alone proved too weak in
         practice — a real multi-round search task made zero progress-update
-        calls. This adds a deterministic backstop: once enough consecutive
-        tool calls pass without any message to the user, inject a system
-        reminder before the next LLM call.
+        calls, and once it did narrate, it stayed silent through several
+        later tool calls of a visibly different kind (fetching a page,
+        writing a file) before narrating again. Two independent triggers
+        fix that, both funneled through the same "already nudged this
+        streak" throttle:
+
+        - the first tool call after the last message belongs to a
+          different tool group than the one just reported on — a new
+          phase started, worth narrating regardless of raw count;
+        - N consecutive tool calls pass with no message at all, for
+          sustained work within a single phase (e.g. several searches).
         """
-        threshold = self.progress_narration_nudge_after_consecutive_tool_calls
-        if threshold is None or threshold <= 0:
-            return
+        self._sync_progress_narration_message_state()
 
         count = self._consecutive_work_tool_calls_since_last_message()
         if count == 0:
-            self._progress_narration_last_nudged_count = 0
             return
-        if count < threshold:
-            return
+
+        threshold = self.progress_narration_nudge_after_consecutive_tool_calls
+
+        # Checked once per streak, whichever tool call this method first
+        # gets to evaluate (not necessarily count==1: the repeated-tool
+        # decision can preempt this method for the streak's actual first
+        # call, so "first call we get to look at" is the only count we can
+        # rely on). Repeating this on every later call would fire on
+        # ordinary alternation (search, fetch, search, ...) instead of just
+        # the one genuine transition away from what was last reported.
+        group_changed = False
+        if not self._progress_narration_group_change_checked:
+            self._progress_narration_group_change_checked = True
+            current_group = self._latest_work_tool_group()
+            previous_group = self._progress_narration_group_at_last_message
+            group_changed = (
+                current_group is not None
+                and previous_group is not None
+                and current_group != previous_group
+            )
+
         # Only re-nudge once the streak has grown by another full threshold
         # since the last reminder — otherwise every subsequent tool call
         # past the threshold would re-fire it (count strictly increases by
         # one each call, so a plain "count > last nudged" check nags on
         # every single one).
-        if count - self._progress_narration_last_nudged_count < threshold:
+        threshold_crossed = (
+            threshold is not None
+            and threshold > 0
+            and count >= threshold
+            and count - self._progress_narration_last_nudged_count >= threshold
+        )
+
+        if not group_changed and not threshold_crossed:
             return
 
         self._progress_narration_last_nudged_count = count
+        reason = (
+            "You just switched to a different kind of action since your last update."
+            if group_changed
+            else (
+                f"You have made {count} consecutive tool calls without "
+                "sending the user any update."
+            )
+        )
         context.add_system_message(
-            "Progress narration reminder:\n"
-            f"You have made {count} consecutive tool calls without sending "
-            "the user any update. Before your next tool call, call "
-            "send_message with message_type='progress' to briefly tell "
-            "them what you're doing or what you just found, in plain "
-            "language and in their own language — then continue the task.",
+            f"Progress narration reminder:\n{reason} Before your next tool "
+            "call, call send_message with message_type='progress' to "
+            "briefly tell them what you're doing or what you just found, "
+            "in plain language and in their own language — then continue "
+            "the task.",
             metadata={
                 "source": "progress_narration_nudge",
                 "consecutive_tool_calls": count,
+                "trigger": "group_change" if group_changed else "consecutive_count",
             },
         )
 

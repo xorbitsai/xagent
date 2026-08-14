@@ -583,6 +583,30 @@ describe("ChatMessage Session file capability", () => {
     expect(screen.queryByText(/Checking pricing pages first\./)).not.toBeInTheDocument()
   })
 
+  it("shows the terminal 'Done' label once the turn has completed, not a leftover narration", () => {
+    // A completed turn with no answer text (an empty final response) still
+    // renders GeneratingIndicator — without gating on process status, the
+    // narration priority would keep naming a step forever since narration
+    // has no other way to learn the turn is over.
+    render(
+      <ChatMessage
+        role="assistant"
+        content={null}
+        processStatus="completed"
+        traceEvents={[
+          {
+            event_type: "agent_progress",
+            data: { message: "Checking pricing pages first." },
+          },
+          { event_type: "task_completion", data: {} },
+        ]}
+      />,
+    )
+
+    expect(screen.queryByText(/Checking pricing pages first\./)).not.toBeInTheDocument()
+    expect(screen.getByText(/agent\.logs\.event\.actions\.task_completion/)).toBeInTheDocument()
+  })
+
   it("shows the most recent narration when there are several, not an earlier one", () => {
     // Pins the backward-scan direction in latestProgressNarration — a
     // regression that scanned forward instead would still pass every other

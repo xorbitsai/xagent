@@ -5,6 +5,7 @@ import { cn } from "@/lib/utils";
 import {
   TraceEventRenderer,
   getFriendlyToolName,
+  getRawToolName,
   isAgentProgressEvent,
   getProgressNarrationText,
   type AgentExecutionSummary,
@@ -401,16 +402,7 @@ export function ChatMessage({
     // here would read as still in progress, so tool_execution_end falls
     // through to the generic "Done" label below instead.
     if (type === "tool_execution_start") {
-      // Normalize the (possibly missing) nested payload once, then read off
-      // it, rather than optional-chaining each field individually. Checks
-      // response.tool_name first to match the extraction order used for the
-      // same event shape in TraceEventRenderer.tsx.
-      const eventData = e.data || {};
-      const response = eventData.response || {};
-      const rawToolName =
-        (typeof response.tool_name === "string" && response.tool_name) ||
-        (typeof eventData.tool_name === "string" && eventData.tool_name) ||
-        "";
+      const rawToolName = getRawToolName(e);
       if (rawToolName) {
         return getFriendlyToolName(rawToolName, tDynamic);
       }
@@ -423,13 +415,21 @@ export function ChatMessage({
     return action || t("traceEventRenderer.taskExecution");
   };
 
-  const latestTitle =
-    latestProgressNarration() || getEventTitle(sanitizedTraceEvents.at(-1));
   const resolvedProcessStatus = resolveTraceProcessStatus({
     processStatus,
     taskStatus,
     traceEvents,
   });
+
+  // Once the turn has actually finished, the terminal event's own title
+  // ("Done") is what belongs here — not a mid-run narration that's still
+  // sitting in the trace. Without this gate, a completed turn with no
+  // answer text (an empty final response) could keep showing "Searching
+  // the web" indefinitely, since narration has no other way to know the
+  // turn is over.
+  const latestTitle =
+    (resolvedProcessStatus === "completed" ? "" : latestProgressNarration()) ||
+    getEventTitle(sanitizedTraceEvents.at(-1));
 
   // A turn that stopped without an answer — failed, paused, or waiting for
   // user input — must leave a visible mark once the trace is hidden: dropping

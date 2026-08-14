@@ -289,6 +289,21 @@ export function getFriendlyToolName(toolName: string, tDynamic?: TranslateDynami
   return tDynamic(`traceEventRenderer.toolNames.${toolName}`, fallback);
 }
 
+// Shared with ChatMessage.tsx's status line so both surfaces resolve the
+// same event to the same raw tool name. Checks response.tool_name and
+// data.tool_name independently rather than `a || b` then type-checking the
+// combined result — the latter (this file's own previous version) gives up
+// on an otherwise-valid data.tool_name if response.tool_name exists but
+// happens to be a truthy non-string, e.g. {response: {tool_name: 42},
+// tool_name: 'web_search'} resolved to '' instead of falling through.
+export function getRawToolName(event: TraceEvent): string {
+  const response = event.data?.response;
+  if (response && typeof response.tool_name === 'string') {
+    return response.tool_name;
+  }
+  return typeof event.data?.tool_name === 'string' ? event.data.tool_name : '';
+}
+
 export const isAgentProgressEvent = (event: TraceEvent): boolean => (
   event.event_type === 'agent_progress' ||
   (
@@ -620,11 +635,7 @@ export function processTraceEvents(
         if (toolArgs?.file_path) {
           step.filePath = String(toolArgs.file_path);
         }
-        // Support both data.response.tool_name and data.tool_name. These come
-        // straight off an external WS payload, so validate the type here
-        // rather than trusting the string annotation at every downstream use.
-        const toolNameCandidate = event.data?.response?.tool_name || event.data?.tool_name;
-        const rawToolName = typeof toolNameCandidate === 'string' ? toolNameCandidate : '';
+        const rawToolName = getRawToolName(event);
         const toolName = rawToolName || t('traceEventRenderer.unknownTool');
         const toolDisplayName = rawToolName ? getFriendlyToolName(rawToolName, tDynamic) : toolName;
         const toolCallId = event.data?.tool_call_id as string | undefined;

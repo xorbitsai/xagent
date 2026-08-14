@@ -1695,7 +1695,16 @@ def respond(
        only, not the question-side ``parse_v1_request_payload`` contract --
        an answer's ``values`` shape is keyed by the *question's own*
        interaction fields, which are only known once the row is read in
-       step 4, not from ``envelope`` alone. Validating an answer against
+       step 4, not from ``envelope`` alone.
+       A dict whose contents cannot be rendered as JSON -- a ``datetime``,
+       a ``set``, ``bytes``, or a ``nan``/infinite float -- is rejected
+       here too, by the same ``json.dumps(..., allow_nan=False)`` probe
+       the question side runs (see ``_render_request_payload``). Without
+       it the first two would surface as a ``StatementError`` raised
+       inside step 6's fence UPDATE, outside the ``RespondOutcome``
+       contract entirely, and the third would be stored silently as a
+       non-JSON token.
+       Validating an answer against
        those per-field types (its ``InteractionArg.type`` /
        ``InteractionArg.field`` definitions) is not implemented in this
        change; a malformed-but-dict-shaped answer reaches the fence and is
@@ -1783,6 +1792,31 @@ def respond(
        leaving the caller to re-check.
     10. After a successful commit, outside any transaction:
         ``notify_task_command_dispatcher()``.
+
+    What this function lets escape, deliberately, and what it does not.
+    The eight ``RespondOutcome`` variants cover every outcome this build
+    classifies; they do not cover operational failure. Three families are
+    left to propagate rather than folded into ``OutcomeUnknown``, because
+    a caller that cannot tell "the database is down" from "your answer was
+    ambiguous" will retry the first one forever:
+
+    - Database-level failures outside the two units caught above --
+      a deadlock, a lost connection, a pool checkout timeout -- raised by
+      any statement from step 2 onward. The two catches are narrow on
+      purpose: step 8's is ``IntegrityError`` only, step 9's covers the
+      commit only.
+    - ``TaskCommandOwnerStateError`` and ``TaskCommandTaskMissing`` from
+      ``stage_task_command``. Neither is an ``IntegrityError`` subclass, so
+      step 8's catch does not see them, and both mean a precondition this
+      function already checked has changed underneath it.
+    - ``RuntimeError`` from the two structural invariants asserted above:
+      a fence rowcount above one, and an interaction row that disappeared
+      while this transaction held the tasks row lock.
+
+    On every one of those paths the ``finally`` below retires the session,
+    which rolls back an uncommitted transaction, so an escaping exception
+    leaves no partial write behind. ``StaleTaskRunError`` from step 7 is
+    documented above as unreachable and is in this same category.
     """
 
     if not isinstance(envelope.kind, str):
@@ -1802,6 +1836,24 @@ def respond(
     except ValueError:
         return RespondValidationRejected(reason="malformed_idempotency_key")
     if not isinstance(envelope.values, dict):
+        return RespondValidationRejected(reason="invalid_values")
+    try:
+        json.dumps(envelope.values, allow_nan=False)
+    except (TypeError, ValueError):
+        # The same probe ``_render_request_payload`` runs on the question
+        # side (see its own docstring), applied here for the two failure
+        # modes this side has. A ``values`` dict holding a ``datetime``,
+        # ``set``, ``bytes``, or any other object the JSON encoder does not
+        # know raises ``TypeError`` at bind time, inside the fence UPDATE
+        # -- far past every typed return above, so it would leave this
+        # function through ``sqlalchemy.exc.StatementError`` instead of one
+        # of the eight ``RespondOutcome`` variants. A float that is ``nan``
+        # or an infinity is worse because it is silent: the default encoder
+        # renders it as the bare ``NaN`` / ``Infinity`` tokens, which are
+        # not JSON, and stores them. ``allow_nan=False`` turns that second
+        # case into the ``ValueError`` caught here. Structural, like every
+        # other check in step 1 -- it asks whether these values can be
+        # stored at all, not whether they answer this particular question.
         return RespondValidationRejected(reason="invalid_values")
 
     from ..models.database import get_session_local
@@ -2015,7 +2067,35 @@ def respond(
             _retire_respond_session_best_effort(db)
             return RespondOutcomeUnknown()
 
-        notify_task_command_dispatcher()
+        try:
+            notify_task_command_dispatcher()
+        except Exception:
+            # Post-commit, and the only statement here that runs after the
+            # answer is already durable. ``notify_task_command_dispatcher``
+            # reads two module globals and calls
+            # ``loop.call_soon_threadsafe`` after checking
+            # ``loop.is_closed()``; the loop can close between that check
+            # and that call, raising ``RuntimeError``. Letting it out would
+            # turn a committed answer into a raised exception -- the caller
+            # would read it as a failure, retry, land on the replay branch,
+            # and get a receipt without a second notify anyway. Skipping
+            # the wakeup costs at most ``DISPATCHER_IDLE_SECONDS`` of
+            # latency because the dispatcher's idle poll still finds the
+            # staged command; that is the documented fallback (see
+            # ``stage_task_command``'s caller obligation (a)). Narrow on
+            # purpose: this wraps one post-commit best-effort notification
+            # and nothing else -- no statement above the commit is inside
+            # it.
+            import logging
+
+            logging.getLogger(__name__).warning(
+                "failed to notify the task command dispatcher after "
+                "committing the answer for interaction %s on task %s; "
+                "the dispatcher's idle poll will still pick the command up",
+                interaction_id,
+                task_id,
+                exc_info=True,
+            )
         return RespondAccepted(
             receipt=InteractionResponseReceipt(
                 interaction_id=interaction_id,

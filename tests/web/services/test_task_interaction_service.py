@@ -1661,6 +1661,33 @@ def test_respond_rejects_answer_values_that_are_not_a_dict(_respond_db) -> None:
         assert outcome == svc.RespondValidationRejected(reason="invalid_values")
 
 
+@pytest.mark.parametrize(
+    "values",
+    [
+        pytest.param({"a": datetime.now(timezone.utc)}, id="datetime"),
+        pytest.param({"a": {1, 2}}, id="set"),
+        pytest.param({"a": b"x"}, id="bytes"),
+        pytest.param({"a": float("nan")}, id="nan_float"),
+    ],
+)
+def test_respond_rejects_values_that_cannot_be_rendered_as_json(
+    _respond_db, values: dict[str, Any]
+) -> None:
+    user_id, task_id = _waiting_task(_respond_db)
+    interaction_id = _active_row_ready_for_respond(_respond_db, task_id=task_id)
+    with _asserts_no_side_effects(
+        _respond_db, task_id=task_id, interaction_id=interaction_id
+    ):
+        outcome = svc.respond(
+            interaction_id=interaction_id,
+            task_id=task_id,
+            principal=_owning_user_principal(user_id),
+            envelope=_respond_envelope(values=values),
+        )
+
+        assert outcome == svc.RespondValidationRejected(reason="invalid_values")
+
+
 def test_respond_rejects_when_the_stored_row_disagrees_with_the_envelope_on_protocol_version(
     _respond_db,
 ) -> None:
@@ -2207,6 +2234,32 @@ def test_respond_accepts_a_fully_valid_answer_and_fills_every_receipt_field(
     assert after["ir_response_payload"] == {"env": "prod"}
     assert after["task_state_version"] == 6
     assert after["commands_count"] == 1
+
+
+def test_respond_returns_accepted_when_the_dispatcher_notify_fails(
+    _respond_db, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    user_id, task_id = _waiting_task(_respond_db)
+    interaction_id = _active_row_ready_for_respond(_respond_db, task_id=task_id)
+    principal = _owning_user_principal(user_id)
+
+    def _raising_notify() -> None:
+        raise RuntimeError("Event loop is closed")
+
+    monkeypatch.setattr(svc, "notify_task_command_dispatcher", _raising_notify)
+
+    outcome = svc.respond(
+        interaction_id=interaction_id,
+        task_id=task_id,
+        principal=principal,
+        envelope=_respond_envelope(idempotency_key="notify-fails-key"),
+    )
+
+    assert isinstance(outcome, svc.RespondAccepted)
+
+    after = _graph_snapshot(_respond_db, task_id=task_id, interaction_id=interaction_id)
+    assert after["ir_status"] == "answered"
+    assert after["ir_response_payload"] == {"env": "prod"}
 
 
 def test_respond_receipt_fields_do_not_touch_the_session_after_commit(

@@ -433,3 +433,132 @@ async def test_stale_run_active_row_does_not_trip_the_seam(
         await asyncio.wait_for(resume_scheduled.wait(), timeout=1)
 
     assert resume_scheduled.is_set()
+
+
+# ---------------------------------------------------------------------------
+# _active_native_interaction_id_sync's own four fail-open branches, called
+# directly rather than through the full handler: no database configured yet,
+# a session that fails to open, the interaction table not existing yet, and
+# the row lookup itself raising. The helper's docstring argues at length for
+# why each one resolves to "assume no active row" instead of propagating --
+# these pin that argument down to actual behavior, and distinguish the two
+# branches that are expected in normal operation (no session factory yet,
+# table not migrated yet -- no warning) from the two that represent a genuine
+# failure worth a log line (session open failure, lookup failure).
+# ---------------------------------------------------------------------------
+
+
+def test_active_native_interaction_id_sync_returns_none_without_a_session_factory(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """``get_optional_session_local() is None`` -- no database configured yet
+    for this process -- is the cheap, expected-in-tests case: it must return
+    ``None`` without ever calling the (nonexistent) session factory, and
+    without logging a warning. A caller that removed this branch would fall
+    through to ``SessionLocal()`` with ``SessionLocal is None``, which raises
+    ``TypeError`` and is instead caught by the *next* branch below -- still
+    returning ``None``, but only after logging a warning this branch is
+    specifically here to avoid."""
+
+    import xagent.web.models.database as database_module
+
+    monkeypatch.setattr(database_module, "get_optional_session_local", lambda: None)
+
+    with caplog.at_level("WARNING"):
+        result = websocket_api._active_native_interaction_id_sync(1)
+
+    assert result is None
+    assert caplog.records == []
+
+
+def test_active_native_interaction_id_sync_returns_none_when_opening_a_session_fails(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A session factory that is installed but raises when called -- e.g. a
+    prior test left a factory pointed at a since-removed temporary database
+    file -- must also resolve to "no active row", but unlike the branch
+    above this is a genuine failure and must be logged."""
+
+    import xagent.web.models.database as database_module
+
+    def _broken_session_local() -> None:
+        raise RuntimeError("database file has been removed")
+
+    monkeypatch.setattr(
+        database_module, "get_optional_session_local", lambda: _broken_session_local
+    )
+
+    with caplog.at_level("WARNING"):
+        result = websocket_api._active_native_interaction_id_sync(1)
+
+    assert result is None
+    assert len(caplog.records) == 1
+    assert "could not open a session" in caplog.records[0].message
+
+
+def test_active_native_interaction_id_sync_returns_none_when_the_table_is_missing(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    _session_factory,
+    _seeded_task: int,
+) -> None:
+    """A deployment that has not yet run the migration creating
+    ``task_interaction_requests`` must not raise -- and, since this is a
+    known, temporary deployment window rather than a bug, must not log a
+    warning either. A real active row is seeded so that a caller which
+    removed this gate would find it -- proving the gate, not an empty table,
+    is what produces ``None`` here."""
+
+    import xagent.web.models.database as database_module
+    import xagent.web.services.task_interaction_schema as schema_module
+
+    monkeypatch.setattr(
+        database_module, "get_optional_session_local", lambda: _session_factory
+    )
+    monkeypatch.setattr(
+        schema_module, "interaction_requests_table_exists", lambda db: False
+    )
+    _make_active_row(_session_factory, task_id=_seeded_task)
+
+    with caplog.at_level("WARNING"):
+        result = websocket_api._active_native_interaction_id_sync(_seeded_task)
+
+    assert result is None
+    assert caplog.records == []
+
+
+def test_active_native_interaction_id_sync_returns_none_when_the_lookup_raises(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    _session_factory,
+    _seeded_task: int,
+) -> None:
+    """A failure inside the row lookup itself -- reproduced here by making
+    the shared active-row predicate raise, the same seam
+    ``_answer_fence_stmt`` reuses -- must resolve to "no active row" and log
+    a warning naming the lookup, not the session-open failure above's
+    message."""
+
+    import xagent.web.models.database as database_module
+    import xagent.web.services.task_interaction_service as interaction_service_module
+
+    monkeypatch.setattr(
+        database_module, "get_optional_session_local", lambda: _session_factory
+    )
+
+    def _broken_criteria() -> list[object]:
+        raise RuntimeError("criteria unavailable")
+
+    monkeypatch.setattr(
+        interaction_service_module, "_active_native_row_criteria", _broken_criteria
+    )
+    _make_active_row(_session_factory, task_id=_seeded_task)
+
+    with caplog.at_level("WARNING"):
+        result = websocket_api._active_native_interaction_id_sync(_seeded_task)
+
+    assert result is None
+    assert len(caplog.records) == 1
+    assert "active-row lookup failed" in caplog.records[0].message

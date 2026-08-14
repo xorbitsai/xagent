@@ -1480,10 +1480,16 @@ async def load_mcp_tools_as_agent_tools(
                     )
                 except Exception as e:
                     error_type = type(e).__name__
+                    # exc_info so the actual message and traceback survive in
+                    # logs -- without it, only the exception's class name
+                    # (e.g. "AttributeError") is recorded, which identifies
+                    # that something broke but not where, forcing a second
+                    # reproduction just to see the message.
                     logger.error(
                         "Failed to list sandboxed MCP tools from server %s (%s)",
                         server_name,
                         error_type,
+                        exc_info=True,
                     )
                     failures.append(
                         MCPServerLoadFailure(
@@ -1550,10 +1556,14 @@ async def load_mcp_tools_as_agent_tools(
                 if isinstance(e, TimeoutError)
                 else MCPFailurePhase.SESSION_START
             )
+            # exc_info: see the sandboxed-load handler above for why the
+            # message/traceback, not just the exception class name, needs
+            # to survive in logs.
             logger.error(
                 "Unexpected failure loading tools from MCP server %s (%s)",
                 server_name,
                 error_type,
+                exc_info=True,
             )
             failures.append(
                 MCPServerLoadFailure(

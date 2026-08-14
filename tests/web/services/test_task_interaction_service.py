@@ -1668,6 +1668,7 @@ def test_respond_rejects_answer_values_that_are_not_a_dict(_respond_db) -> None:
         pytest.param({"a": {1, 2}}, id="set"),
         pytest.param({"a": b"x"}, id="bytes"),
         pytest.param({"a": float("nan")}, id="nan_float"),
+        pytest.param({"a": "x", 1: "y"}, id="mixed_int_str_keys"),
     ],
 )
 def test_respond_rejects_values_that_cannot_be_rendered_as_json(

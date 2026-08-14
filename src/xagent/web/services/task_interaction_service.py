@@ -1873,7 +1873,7 @@ def respond(
     if not isinstance(envelope.values, dict):
         return RespondValidationRejected(reason="invalid_values")
     try:
-        json.dumps(envelope.values, allow_nan=False)
+        json.dumps(envelope.values, allow_nan=False, sort_keys=True)
     except (TypeError, ValueError):
         # The same probe ``_render_request_payload`` runs on the question
         # side (see its own docstring), applied here for the two failure
@@ -1889,6 +1889,13 @@ def respond(
         # case into the ``ValueError`` caught here. Structural, like every
         # other check in step 1 -- it asks whether these values can be
         # stored at all, not whether they answer this particular question.
+        # ``sort_keys=True`` matches ``_canonical_payload``
+        # (``task_command_transport.py``), which sorts keys recursively: a
+        # dict mixing int and str keys passes an unsorted dump (int keys
+        # are silently coerced to strings -- the same silent-corruption
+        # class as the nan case) and then raises ``TypeError`` inside the
+        # replay comparison. The probe has to be a strict superset of every
+        # serializer downstream of step 1.
         return RespondValidationRejected(reason="invalid_values")
 
     from ..models.database import get_session_local

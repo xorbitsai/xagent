@@ -258,10 +258,10 @@ def test_bare_module_import_alone_is_not_flagged() -> None:
     ownership predicate's consumer in ``public_chat_access.py``, which
     imports ``InteractionPrincipal``, ``public_chat_identity_matches``, and
     ``task_is_owned_by_public_principal``) legitimately imports other names
-    from this module. This gate no longer watches ``respond`` at all, so
-    a caller importing it too would not be flagged either -- see this
-    file's own module docstring for why: no production code calls
-    ``respond()`` today."""
+    from this module. The same holds for both gated names: importing the
+    module, or even binding ``create`` or ``respond`` without calling
+    either, is not a call -- only a call expression through a traced
+    binding trips the gate."""
 
     source = "from xagent.web.services import task_interaction_service\n"
     assert _production_uses(source) == set()

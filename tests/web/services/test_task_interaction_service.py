@@ -2478,7 +2478,7 @@ def test_respond_receipt_fields_do_not_touch_the_session_after_commit(
 
 
 def test_respond_reports_outcome_unknown_when_commit_raises_and_leaves_no_residue(
-    _respond_db, monkeypatch: pytest.MonkeyPatch
+    _respond_db, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     """A raised exception at commit does not, by itself, mean the write
     failed -- the acknowledgment could have been lost after the server
@@ -2489,7 +2489,9 @@ def test_respond_reports_outcome_unknown_when_commit_raises_and_leaves_no_residu
     the ambiguity unconditionally. Simulates a commit that never actually
     reaches the database and proves that in this build's conservative
     handling nothing landed either -- the interaction row, the task row,
-    and the command table are all exactly as they were before the call."""
+    and the command table are all exactly as they were before the call.
+    Also asserts the ambiguity is logged: unlike the fence-miss branch,
+    this door used to leave no trace for an operator to find."""
 
     user_id, task_id = _waiting_task(_respond_db)
     interaction_id = _active_row_ready_for_respond(_respond_db, task_id=task_id)
@@ -2505,14 +2507,22 @@ def test_respond_reports_outcome_unknown_when_commit_raises_and_leaves_no_residu
     with _asserts_no_side_effects(
         _respond_db, task_id=task_id, interaction_id=interaction_id
     ):
-        outcome = svc.respond(
-            interaction_id=interaction_id,
-            task_id=task_id,
-            principal=principal,
-            envelope=_respond_envelope(idempotency_key="commit-raises"),
-        )
+        with caplog.at_level(logging.WARNING):
+            outcome = svc.respond(
+                interaction_id=interaction_id,
+                task_id=task_id,
+                principal=principal,
+                envelope=_respond_envelope(idempotency_key="commit-raises"),
+            )
 
         assert isinstance(outcome, svc.RespondOutcomeUnknown)
+        matching = [
+            record
+            for record in caplog.records
+            if "commit failed while answering" in record.getMessage()
+        ]
+        assert len(matching) == 1
+        assert matching[0].levelno == logging.WARNING
 
 
 # ---------------------------------------------------------------------------

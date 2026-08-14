@@ -2028,13 +2028,15 @@ def respond(
                 )
             # The reread above already has the row in hand, so recording
             # what it found costs no extra statement. Without this line a
-            # fence miss is the one path out of this function that leaves
-            # nothing at all behind: the caller is told ``OutcomeUnknown``,
-            # and a retry against a terminated, superseded, or
-            # foreign-owned row produces the same miss and the same
-            # ``OutcomeUnknown`` every time, so no amount of retrying ever
-            # reveals which of them it was. The classification this build
-            # does not compute is exactly the set of fields logged here.
+            # fence miss is the one exit a retry cannot clarify on its
+            # own: the caller is told ``OutcomeUnknown``, and a retry
+            # against a terminated, superseded, or foreign-owned row
+            # produces the same miss and the same ``OutcomeUnknown`` every
+            # time, so no amount of retrying ever reveals which of them it
+            # was -- unlike the commit-exception door below, where a retry
+            # under the same idempotency key resolves the ambiguity by
+            # itself. The classification this build does not compute is
+            # exactly the set of fields logged here.
             import logging
 
             logging.getLogger(__name__).warning(
@@ -2128,6 +2130,16 @@ def respond(
             # against the durable graph (that reconciliation is not
             # delivered here): it retires its session and reports the
             # ambiguity, leaving the caller to re-check.
+            import logging
+
+            logging.getLogger(__name__).warning(
+                "commit failed while answering interaction %s on task %s; "
+                "the write may or may not be durable -- a retry under the "
+                "same idempotency key resolves which",
+                interaction_id,
+                task_id,
+                exc_info=True,
+            )
             session_retired = True
             _retire_respond_session_best_effort(db)
             return RespondOutcomeUnknown()

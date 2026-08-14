@@ -179,7 +179,7 @@ def test_offline_branch_does_not_reflect(dialect_name, operation) -> None:
 # ---- T-M-1g: online SQLite upgrade/downgrade ----
 
 
-def test_online_sqlite_upgrade_adds_column_without_check_and_downgrade_removes_it() -> (
+def test_online_sqlite_upgrade_adds_column_and_check_and_downgrade_removes_both() -> (
     None
 ):
     migration = load_migration_module(MIGRATION_PATH)
@@ -193,10 +193,11 @@ def test_online_sqlite_upgrade_adds_column_without_check_and_downgrade_removes_i
             columns = {c["name"]: c for c in sa.inspect(connection).get_columns(TABLE)}
             assert COLUMN in columns
             assert columns[COLUMN]["nullable"] is True
-            assert CONSTRAINT_NAME not in _check_constraint_names(connection)
+            assert CONSTRAINT_NAME in _check_constraint_names(connection)
 
             migration.downgrade()
             assert COLUMN not in _column_names(connection)
+            assert CONSTRAINT_NAME not in _check_constraint_names(connection)
 
 
 # ---- T-M-1h: online PostgreSQL upgrade/downgrade (disposable database) ----
@@ -248,10 +249,7 @@ def _assert_idempotent_upgrade(migration, engine) -> None:
                 for name in _check_constraint_names(connection)
                 if name == CONSTRAINT_NAME
             ]
-            if connection.dialect.name == "postgresql":
-                assert len(constraint_hits) == 1
-            else:
-                assert len(constraint_hits) == 0
+            assert len(constraint_hits) == 1
 
 
 def test_online_upgrade_is_idempotent_sqlite() -> None:
@@ -398,23 +396,20 @@ def test_check_constraint_semantics_on_a_create_all_built_sqlite_database() -> N
     )
 
 
-# ---- SQLite downgrade/upgrade round trip permanently drops the CHECK ----
+# ---- SQLite downgrade/upgrade round trip restores the CHECK ----
 
 
-def test_sqlite_create_all_downgrade_upgrade_round_trip_loses_the_check() -> None:
+def test_sqlite_create_all_downgrade_upgrade_round_trip_restores_the_check() -> None:
     """downgrade() rebuilds the tasks table via batch_alter_table on SQLite,
     which drops the CHECK constraint along with the column it references;
-    upgrade() then adds the column back but, on SQLite, deliberately does
-    not re-add the CHECK (unqualified CHECK-add has no offline rendering
-    and no online implementation here -- see the migration's upgrade()
-    branch and test_sqlite_check_asymmetry_is_expected in
+    upgrade() now rebuilds the table again via the same technique to add
+    the CHECK back (see the migration's upgrade() branch and
+    test_sqlite_check_matches_between_migration_and_create_all in
     tests/migrations/test_task_interaction_protocol_version_parity.py). So
-    one downgrade()/upgrade() cycle permanently converts a SQLite database
-    with the fresh-install shape (create_all, which does carry the CHECK)
-    into the migration shape (which never has it on SQLite), and nothing
-    restores it afterwards. The convergence that would restore the CHECK
-    belongs to the change that lands this column's first production writer,
-    not to this migration (tracked in #1290).
+    a downgrade()/upgrade() cycle on a SQLite database with the fresh-
+    install shape (create_all) leaves the CHECK in place: it is dropped by
+    downgrade() and rebuilt by upgrade(), rather than being permanently
+    lost.
     """
     migration = load_migration_module(MIGRATION_PATH)
     reset_checkpoint_anchor_fk_create_rule()
@@ -443,15 +438,16 @@ def test_sqlite_create_all_downgrade_upgrade_round_trip_loses_the_check() -> Non
             sa.text("SELECT sql FROM sqlite_master WHERE type='table' AND name=:name"),
             {"name": TABLE},
         ).scalar()
-        assert CONSTRAINT_NAME not in ddl
+        assert CONSTRAINT_NAME in ddl
 
     tasks_after = sa.Table(TABLE, sa.MetaData(), autoload_with=engine)
-    with engine.begin() as connection:
-        connection.execute(
-            sa.insert(tasks_after).values(
-                interaction_protocol_version=99, user_id=1, title="probe"
+    with pytest.raises(sa.exc.IntegrityError):
+        with engine.begin() as connection:
+            connection.execute(
+                sa.insert(tasks_after).values(
+                    interaction_protocol_version=99, user_id=1, title="probe"
+                )
             )
-        )
 
 
 # ---- _target_schema(): catalog hit / empty-catalog fallback (mocked) ----

@@ -78,15 +78,14 @@ def upgrade() -> None:
     # Offline (--sql) generation has a MockConnection, so reflection is
     # unavailable. Emit the unconditional DDL instead of inspecting. Adding
     # a CHECK to an existing table has no --sql-mode-safe path on SQLite --
-    # the batch_alter_table rebuild that could add it cannot render under
+    # a batch_alter_table rebuild that could add it cannot render under
     # --sql mode on either dialect, and offline SQL support is a hard
-    # requirement -- so only PostgreSQL gets the constraint here. Online,
-    # batch_alter_table could add the CHECK to an existing SQLite table the
-    # same way downgrade() already removes it; that convergence is
-    # deliberately deferred to the first production writer of this column,
-    # tracked in #1290 (see the model's __table_args__ comment and
-    # test_sqlite_check_asymmetry_is_expected in
-    # tests/migrations/test_task_interaction_protocol_version_parity.py).
+    # requirement -- so only PostgreSQL gets the constraint on this branch.
+    # The ONLINE branch below does converge SQLite, via exactly that
+    # rebuild; only offline-generated SQLite upgrade scripts still produce
+    # the unconstrained shape. See
+    # test_sqlite_check_matches_between_migration_and_create_all in
+    # tests/migrations/test_task_interaction_protocol_version_parity.py.
     if context.as_sql:
         op.add_column(TABLE, sa.Column(COLUMN, sa.Integer(), nullable=True))
         if context.dialect.name == "postgresql":
@@ -112,22 +111,46 @@ def upgrade() -> None:
     # The column guard above can skip add_column (e.g. a create_all-built
     # database already has the column), but the CHECK must still be checked
     # independently -- otherwise upgrading such a database would silently
-    # leave it without the constraint.
-    if context.dialect.name != "postgresql":
+    # leave it without the constraint. ``checks`` was read before the
+    # add_column above and is still valid here: adding a column creates no
+    # CHECK constraint.
+    if context.dialect.name == "postgresql":
+        # On PostgreSQL create_check_constraint takes an ACCESS EXCLUSIVE
+        # lock on tasks and validates every existing row before returning
+        # (see 20260804_add_task_checkpoint_trace_event_anchor.py for the
+        # same note against create_foreign_key). Here the column was added
+        # moments earlier in this same migration, so every row is still
+        # NULL and validation cannot fail -- but on a large deployment, a
+        # NOT VALID constraint followed by a separate VALIDATE CONSTRAINT
+        # would move validation out of the lock window if that ever becomes
+        # a concern.
+        if CONSTRAINT_NAME not in checks:
+            op.create_check_constraint(
+                CONSTRAINT_NAME, TABLE, CONSTRAINT_CONDITION, schema=schema
+            )
         return
 
-    # On PostgreSQL create_check_constraint takes an ACCESS EXCLUSIVE lock on
-    # tasks and validates every existing row before returning (see
-    # 20260804_add_task_checkpoint_trace_event_anchor.py for the same note
-    # against create_foreign_key). Here the column was added moments earlier
-    # in this same migration, so every row is still NULL and validation
-    # cannot fail -- but on a large deployment, a NOT VALID constraint
-    # followed by a separate VALIDATE CONSTRAINT would move validation out
-    # of the lock window if that ever becomes a concern.
+    # SQLite: a plain create_check_constraint raises NotImplementedError,
+    # so the CHECK is added by rebuilding the table, the mirror image of
+    # what downgrade() below already does to remove it. Without this branch
+    # the two SQLite install paths enforce different invariants on the same
+    # column at the same version: a fresh install (stamp head, then
+    # create_all) carries the CHECK, a database that walked the revision
+    # chain does not, and interaction_protocol_version = 2 is rejected on
+    # one and accepted on the other. The offline (--sql) branch above
+    # cannot converge -- batch mode has no rendering under --sql on either
+    # dialect -- so an offline-generated SQLite upgrade still produces the
+    # unconstrained shape; that residue is the one asymmetry this change
+    # does not close, and it is asserted rather than left uncovered.
+    #
+    # The rebuild copies existing rows through the new CHECK. Every row's
+    # value is NULL or 1 today (this column has no writer that emits
+    # anything else), so the copy cannot fail; a deployment that somehow
+    # holds another value must fix the data before upgrading, which is the
+    # loud failure this constraint exists to produce.
     if CONSTRAINT_NAME not in checks:
-        op.create_check_constraint(
-            CONSTRAINT_NAME, TABLE, CONSTRAINT_CONDITION, schema=schema
-        )
+        with op.batch_alter_table(TABLE, schema=schema) as batch_op:
+            batch_op.create_check_constraint(CONSTRAINT_NAME, CONSTRAINT_CONDITION)
 
 
 def downgrade() -> None:
@@ -181,13 +204,15 @@ def downgrade() -> None:
             op.drop_column(TABLE, COLUMN, schema=schema)
         return
 
-    # Non-PostgreSQL (SQLite): a fresh install stamps head and then builds
-    # the schema via create_all (see src/xagent/db/migration.py's empty-DB
-    # stamp path and src/xagent/web/models/database.py's create_all call,
-    # at its _initialize_database_schema site), so the fresh-install shape
-    # DOES carry ck_tasks_interaction_protocol_version on SQLite even
-    # though the migration's own upgrade() never adds it there (see the
-    # upgrade() branch above and test_sqlite_check_asymmetry_is_expected).
+    # Non-PostgreSQL (SQLite): both installation shapes now carry
+    # ck_tasks_interaction_protocol_version -- a fresh install via
+    # create_all (see src/xagent/db/migration.py's empty-DB stamp path and
+    # src/xagent/web/models/database.py's create_all call, at its
+    # _initialize_database_schema site), and one that walked upgrade()
+    # above, which now rebuilds the table to add the CHECK the same way
+    # this branch rebuilds it to remove one (see
+    # test_sqlite_check_matches_between_migration_and_create_all in
+    # tests/migrations/test_task_interaction_protocol_version_parity.py).
     # SQLite 3.35+ refuses to DROP a column a CHECK constraint references, so
     # a plain drop_column() breaks on that shape. batch_alter_table rebuilds
     # the table (copy/rename/drop) instead, which drops the constraint and

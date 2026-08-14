@@ -226,7 +226,7 @@ def _build_create_all_engine(engine):
     return engine
 
 
-# ---- T-M-2a / T-M-2b: SQLite -- column parity, CHECK asymmetry ----
+# ---- T-M-2a / T-M-2b: SQLite -- column and CHECK match exactly ----
 
 
 def test_sqlite_column_matches_between_migration_and_create_all() -> None:
@@ -241,41 +241,31 @@ def test_sqlite_column_matches_between_migration_and_create_all() -> None:
     assert migration_inv["column_nullable"] == create_all_inv["column_nullable"]
 
 
-def test_sqlite_check_asymmetry_is_expected() -> None:
-    """Two SQLite deployments of the same xagent version can enforce
-    different invariants on this column depending on install history: a
-    fresh install (stamp head, then create_all) HAS the CHECK, while a
-    database that walked the revision chain does NOT. Offline, upgrade()
-    cannot add a CHECK to an existing table on SQLite: a plain CHECK-add
-    raises NotImplementedError there, and the batch_alter_table rebuild
-    that could add it cannot render under --sql mode on either dialect,
-    which offline SQL support (a hard requirement) rules out. Online,
-    batch_alter_table could add the CHECK to an existing SQLite table the
-    same way downgrade() already removes it -- upgrade() does not do that
-    today; that convergence is deliberately deferred to the first
-    production writer of this column, tracked in #1290 (see the migration
-    and the model's __table_args__ comment). Concretely: inserting
-    interaction_protocol_version=2 succeeds on the chain-walked shape and
-    raises IntegrityError on the fresh-install shape.
-    This asymmetry is expected today because the column has zero writers --
-    nothing has ever inserted a non-NULL value, so nothing observes the
-    divergence. The change that adds the first writer to this column must
-    either converge the two shapes (e.g. teach upgrade() to add the CHECK on
-    SQLite via batch_alter_table the way downgrade() now removes it) or
-    explicitly justify writing to a column whose constraint isn't uniformly
-    enforced. If this assertion goes red because someone changed the SQLite
-    branch of upgrade() to emit the CHECK, that is this convergence
-    happening -- update this test to match, don't just re-pin the old
-    asymmetry.
+def test_sqlite_check_matches_between_migration_and_create_all() -> None:
+    """The two SQLite install paths now enforce the same invariant on this
+    column: a fresh install (stamp head, then create_all) and a database
+    that walked the revision chain both carry
+    ck_tasks_interaction_protocol_version. upgrade() adds the CHECK on
+    SQLite by rebuilding the table via batch_alter_table -- the mirror of
+    what downgrade() already does to remove it -- because a plain
+    CHECK-add raises NotImplementedError there.
+
+    One asymmetry remains, outside what this test can observe: an offline
+    (--sql generation) SQLite upgrade script still produces the
+    unconstrained shape, because batch_alter_table has no rendering under
+    --sql mode on either dialect. If this assertion goes red, that is
+    either a real regression in the SQLite branch of upgrade(), or someone
+    reintroducing a deliberate divergence -- either way it needs the same
+    full comparison the PostgreSQL parity test above uses, not a narrower
+    re-pin of just the CHECK's presence.
     """
     migration_engine = _build_migration_shaped_sqlite_engine()
     create_all_engine = _build_create_all_engine(sa.create_engine("sqlite:///:memory:"))
 
-    migration_checks = _reflect_narrow_inventory(migration_engine)["checks"]
-    create_all_checks = _reflect_narrow_inventory(create_all_engine)["checks"]
-
-    assert CONSTRAINT_NAME not in migration_checks
-    assert CONSTRAINT_NAME in create_all_checks
+    migration_inv = _reflect_narrow_inventory(migration_engine)
+    create_all_inv = _reflect_narrow_inventory(create_all_engine)
+    differences = _diff_narrow_inventory(migration_inv, create_all_inv)
+    assert differences == []
 
 
 # ---- T-M-2c: PostgreSQL -- column and CHECK match exactly ----

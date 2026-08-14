@@ -365,9 +365,6 @@ def _respond_pg(monkeypatch: pytest.MonkeyPatch, session_factory):
 
 def _pg_waiting_task(
     session_factory,
-    *,
-    run_id: str = "run-a",
-    state_version: int = 5,
 ) -> tuple[int, int]:
     db = session_factory()
     try:
@@ -376,24 +373,24 @@ def _pg_waiting_task(
         task = db.query(Task).filter(Task.id == task_id).first()
         task.status = TaskStatus.WAITING_FOR_USER
         task.control_state = "waiting_for_user"
-        task.run_id = run_id
-        task.state_version = state_version
+        task.run_id = "run-a"
+        task.state_version = 5
         db.commit()
         return user_id, task_id
     finally:
         db.close()
 
 
-def _pg_active_row(session_factory, *, task_id: int, run_id: str = "run-a") -> int:
+def _pg_active_row(session_factory, *, task_id: int) -> int:
     db = session_factory()
     try:
-        trace_event_id = _make_trace_event(db, task_id=task_id, run_partition=run_id)
+        trace_event_id = _make_trace_event(db, task_id=task_id, run_partition="run-a")
         row = _make_active_row(
             db,
             task_id=task_id,
-            run_id=run_id,
+            run_id="run-a",
             resume_trace_event_id=trace_event_id,
-            resume_run_partition=run_id,
+            resume_run_partition="run-a",
         )
         return int(row.id)
     finally:

@@ -1362,19 +1362,6 @@ def materialize_compatibility_view(
 # ---------------------------------------------------------------------------
 
 
-def _rowcount(result: Any) -> int:
-    """Same idiom as ``task_lease_service._rowcount``: a session double used
-    in a unit test (``MagicMock()``, or a plain object with no ``rowcount``
-    attribute at all) must fall through to zero, not raise ``AttributeError``
-    from a bare ``result.rowcount`` read. Every rowcount-based branch below
-    goes through this instead of reading the attribute directly, so a test
-    double that never bothered to set ``rowcount`` lands on the ``0``
-    classification branch rather than an unrelated crash.
-    """
-
-    return int(getattr(result, "rowcount", 0) or 0)
-
-
 def _answer_fence_task_predicate(principal: InteractionPrincipal) -> list[Any]:
     """The task-side terms of the answer fence: is this task still waiting,
     and does ``principal`` own it -- evaluated against the same ``tasks``
@@ -2002,7 +1989,7 @@ def respond(
                 responder_identity=principal.identity_string(),
             )
         )
-        rowcount = _rowcount(fence_result)
+        rowcount = int(getattr(fence_result, "rowcount", 0) or 0)
         if rowcount > 1:
             raise RuntimeError(
                 f"answer fence updated {rowcount} rows for interaction "

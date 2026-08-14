@@ -1313,7 +1313,7 @@ def test_answer_fence_predicate_guest_branch_adds_a_json_lookup_term() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Structural guards: raw SQL and the _rowcount idiom.
+# Structural guards: raw SQL.
 # ---------------------------------------------------------------------------
 
 
@@ -1372,11 +1372,8 @@ def _respond_db(monkeypatch: pytest.MonkeyPatch, _session_factory):
 def _waiting_task(
     session_factory,
     *,
-    run_id: str = "run-a",
     state_version: int = 5,
     agent_config: dict[str, Any] | None = None,
-    channel_id: int | None = None,
-    agent_id: int | None = None,
 ) -> tuple[int, int]:
     """A task parked in WAITING_FOR_USER, the state every respond() test
     starts from -- the answer fence's task-side predicate requires it."""
@@ -1388,10 +1385,10 @@ def _waiting_task(
         task = db.query(Task).filter(Task.id == task_id).first()
         task.status = TaskStatus.WAITING_FOR_USER
         task.control_state = TaskControlState.WAITING_FOR_USER.value
-        task.run_id = run_id
+        task.run_id = "run-a"
         task.state_version = state_version
-        task.channel_id = channel_id
-        task.agent_id = agent_id
+        task.channel_id = None
+        task.agent_id = None
         if agent_config is not None:
             task.agent_config = agent_config
         db.commit()
@@ -1404,8 +1401,6 @@ def _active_row_ready_for_respond(
     session_factory,
     *,
     task_id: int,
-    run_id: str = "run-a",
-    idempotency_key: str | None = None,
     anchor_run_partition: str | None = None,
 ) -> int:
     """An active interaction row with a resolvable anchor -- the state every
@@ -1419,18 +1414,15 @@ def _active_row_ready_for_respond(
     db = session_factory()
     try:
         trace_event_id = _make_trace_event(
-            db, task_id=task_id, run_partition=anchor_run_partition or run_id
+            db, task_id=task_id, run_partition=anchor_run_partition or "run-a"
         )
         row = _make_active_interaction_row(
             db,
             task_id=task_id,
-            run_id=run_id,
+            run_id="run-a",
             resume_trace_event_id=trace_event_id,
-            resume_run_partition=run_id,
+            resume_run_partition="run-a",
         )
-        if idempotency_key is not None:
-            row.request_idempotency_key = idempotency_key
-            db.commit()
         return int(row.id)
     finally:
         db.close()
@@ -1443,7 +1435,6 @@ def _answered_row_with_valid_anchor(
     run_id: str,
     responder_identity: str,
     response_payload: dict[str, Any],
-    idempotency_key: str = "prior-answer-key",
 ) -> int:
     """A row this service already answered in some earlier, successful call
     -- its resume anchor is still valid (nothing has pruned the checkpoint
@@ -1466,7 +1457,7 @@ def _answered_row_with_valid_anchor(
         row.response_payload = response_payload
         row.responded_at = now
         row.responder_identity = responder_identity
-        row.request_idempotency_key = idempotency_key
+        row.request_idempotency_key = "prior-answer-key"
         db.commit()
         return int(row.id)
     finally:
@@ -1480,7 +1471,6 @@ def _stage_matching_command(
     actor_user_id: int | None,
     command_id: str,
     payload: dict[str, Any],
-    status: str = "completed",
 ) -> int:
     db = session_factory()
     try:
@@ -1490,7 +1480,7 @@ def _stage_matching_command(
             command_id=command_id,
             kind=svc.TaskCommandKind.RESUME.value,
             payload=payload,
-            status=status,
+            status="completed",
         )
         db.add(command)
         db.commit()
@@ -2152,8 +2142,6 @@ def test_respond_receipt_refuses_a_row_that_carries_no_answer() -> None:
     unanswered = SimpleNamespace(
         id=7,
         task_id=11,
-        run_id="run-a",
-        status="active",
         responded_at=None,
         responder_identity=None,
     )
@@ -2488,16 +2476,6 @@ def test_respond_receipt_fields_do_not_touch_the_session_after_commit(
         assert query_count == 0
     finally:
         verify_db.close()
-
-
-def test_rowcount_helper_does_not_raise_on_a_bare_test_double() -> None:
-    from unittest.mock import MagicMock
-
-    class _NoRowcount:
-        pass
-
-    assert svc._rowcount(_NoRowcount()) == 0
-    assert svc._rowcount(MagicMock(rowcount=3)) == 3
 
 
 def test_respond_reports_outcome_unknown_when_commit_raises_and_leaves_no_residue(

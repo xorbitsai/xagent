@@ -515,7 +515,7 @@ describe("Home", () => {
 
     cleanup()
     for (const invalid of [null, "", "   "]) {
-      ;(homeGetStartedDestinationOverridesMock as Record<string, unknown>).video = invalid
+      homeGetStartedDestinationOverridesMock.video = invalid
       const { unmount } = render(<Home />)
       expectInertGetStartedCard("home.getStarted.video.title")
       const inertVideo = getStartedCard("home.getStarted.video.title").card.querySelector("video")
@@ -799,7 +799,9 @@ describe("Home", () => {
     expect(pageSource).toMatch(
       /const homeGetStartedDestinationOverrides: HomeGetStartedDestinationOverrides =\s*\(homePageExtensionModule as \{ homeGetStartedDestinationOverrides\?: HomeGetStartedDestinationOverrides \}\)\s*\.homeGetStartedDestinationOverrides \?\? \{\}/,
     )
-    expect(pageSource).toMatch(/const defaultHomeGetStartedDestinations: Record<keyof HomeGetStartedDestinationOverrides, string \| null> = \{/)
+    expect(pageSource).toMatch(
+      /const defaultHomeGetStartedDestinations: \{ video: null \} & Record<\s*Exclude<keyof HomeGetStartedDestinationOverrides, "video">,\s*string\s*> = \{/,
+    )
     expect(resolver).toContain("configured === undefined")
     expect(resolver).toContain("typeof configured !== \"string\"")
     expect(resolver).toContain("configured.trim().length === 0")

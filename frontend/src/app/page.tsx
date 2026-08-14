@@ -162,7 +162,10 @@ const homeGetStartedDestinationOverrides: HomeGetStartedDestinationOverrides =
   (homePageExtensionModule as { homeGetStartedDestinationOverrides?: HomeGetStartedDestinationOverrides })
     .homeGetStartedDestinationOverrides ?? {}
 
-const defaultHomeGetStartedDestinations: Record<keyof HomeGetStartedDestinationOverrides, string | null> = {
+const defaultHomeGetStartedDestinations: { video: null } & Record<
+  Exclude<keyof HomeGetStartedDestinationOverrides, "video">,
+  string
+> = {
   video: null,
   docs: "https://docs.xagent.co/api-reference/introduction",
   guides: "https://docs.xagent.co/models/overview",

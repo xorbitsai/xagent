@@ -78,6 +78,7 @@ the scanned package tree).
 from __future__ import annotations
 
 import json
+import logging
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, Literal, cast
@@ -122,6 +123,8 @@ from .task_lease_service import TASK_RUN_ID_TRACE_FIELD
 
 if TYPE_CHECKING:
     from sqlalchemy.orm import Session
+
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Principal and the shared public-chat ownership predicate
@@ -1616,9 +1619,6 @@ def _retire_respond_session_best_effort(db: "Session") -> None:
     helper is named for.
     """
 
-    import logging
-
-    logger = logging.getLogger(__name__)
     try:
         db.close()
         return
@@ -1868,9 +1868,7 @@ def respond(
     documented above as unreachable and is in this same category.
     """
 
-    if not isinstance(envelope.kind, str):
-        return RespondValidationRejected(reason="unknown_kind")
-    if envelope.kind not in _KIND_VOCABULARY:
+    if not isinstance(envelope.kind, str) or envelope.kind not in _KIND_VOCABULARY:
         return RespondValidationRejected(reason="unknown_kind")
     if (
         not isinstance(envelope.protocol_version, int)
@@ -2051,9 +2049,7 @@ def respond(
             # under the same idempotency key resolves the ambiguity by
             # itself. The classification this build does not compute is
             # exactly the set of fields logged here.
-            import logging
-
-            logging.getLogger(__name__).warning(
+            logger.warning(
                 "answer fence matched zero rows for interaction %s on task "
                 "%s; reread status=%s active_slot=%s terminal_reason=%s "
                 "run_id=%s responder_identity=%s",
@@ -2147,9 +2143,7 @@ def respond(
             # against the durable graph (that reconciliation is not
             # delivered here): it retires its session and reports the
             # ambiguity, leaving the caller to re-check.
-            import logging
-
-            logging.getLogger(__name__).warning(
+            logger.warning(
                 "commit failed while answering interaction %s on task %s; "
                 "the write may or may not be durable -- a retry under the "
                 "same idempotency key resolves which",
@@ -2180,9 +2174,7 @@ def respond(
             # purpose: this wraps one post-commit best-effort notification
             # and nothing else -- no statement above the commit is inside
             # it.
-            import logging
-
-            logging.getLogger(__name__).warning(
+            logger.warning(
                 "failed to notify the task command dispatcher after "
                 "committing the answer for interaction %s on task %s; "
                 "the dispatcher's idle poll will still pick the command up",

@@ -1376,7 +1376,6 @@ def _respond_db(monkeypatch: pytest.MonkeyPatch, _session_factory):
 def _waiting_task(
     session_factory,
     *,
-    state_version: int = 5,
     agent_config: dict[str, Any] | None = None,
 ) -> tuple[int, int]:
     """A task parked in WAITING_FOR_USER, the state every respond() test
@@ -1390,7 +1389,7 @@ def _waiting_task(
         task.status = TaskStatus.WAITING_FOR_USER
         task.control_state = TaskControlState.WAITING_FOR_USER.value
         task.run_id = "run-a"
-        task.state_version = state_version
+        task.state_version = 5
         task.channel_id = None
         task.agent_id = None
         if agent_config is not None:
@@ -2352,30 +2351,24 @@ def test_respond_checks_authorization_before_the_idempotency_prequery(
 
 
 def test_respond_accepts_a_fully_valid_answer_and_fills_every_receipt_field(
-    _respond_db,
+    _respond_db, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    user_id, task_id = _waiting_task(_respond_db, state_version=5)
+    user_id, task_id = _waiting_task(_respond_db)
     interaction_id = _active_row_ready_for_respond(_respond_db, task_id=task_id)
     principal = _owning_principal(user_id)
 
     dispatched: list[bool] = []
-    import xagent.web.services.task_interaction_service as svc_module
-
-    monkeypatch_target = svc_module.notify_task_command_dispatcher
 
     def _record_dispatch() -> None:
         dispatched.append(True)
 
-    svc_module.notify_task_command_dispatcher = _record_dispatch
-    try:
-        outcome = svc.respond(
-            interaction_id=interaction_id,
-            task_id=task_id,
-            principal=principal,
-            envelope=_respond_envelope(idempotency_key="ok-path-key"),
-        )
-    finally:
-        svc_module.notify_task_command_dispatcher = monkeypatch_target
+    monkeypatch.setattr(svc, "notify_task_command_dispatcher", _record_dispatch)
+    outcome = svc.respond(
+        interaction_id=interaction_id,
+        task_id=task_id,
+        principal=principal,
+        envelope=_respond_envelope(idempotency_key="ok-path-key"),
+    )
 
     assert isinstance(outcome, svc.RespondAccepted)
     receipt = outcome.receipt

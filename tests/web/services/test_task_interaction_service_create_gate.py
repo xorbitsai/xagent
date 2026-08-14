@@ -1,19 +1,15 @@
-"""Zero-production-caller gate for ``task_interaction_service.create`` alone.
+"""Zero-production-caller gate for ``task_interaction_service.create`` and
+``respond``.
 
-Replaces the two-name gate this file's predecessor enforced: that gate
-locked both ``create`` and ``respond`` against any production caller, and
-its own docstring named its retirement condition as "the change that routes
-the existing resume coordinator through this module's compatibility seam" --
-the change meant to give ``respond()`` its first production caller. That
-change has landed, but not that way: the compatibility seam in
-``websocket.py`` only reads ``_active_native_row_criteria()`` to decide
-whether an active native row exists, and rejects the legacy resume path
-outright when one does -- it never calls ``respond()`` itself. Zero
-production code anywhere in this package calls ``respond()`` today.
-Locking it under this gate anyway would be conflating "no gate" with "no
-caller"; the two are independent facts, and the former is what this file
-narrows to. ``create()`` still has no caller either, so this narrower gate
-takes over guarding it alone.
+Replaces the two-name gate this file's predecessor enforced, keeping both
+names under watch. The predecessor named its retirement condition as "the
+change that routes the existing resume coordinator through this module's
+compatibility seam" -- the change meant to give ``respond()`` its first
+production caller. That change has not landed: it ships separately in this
+same series, and nothing in ``websocket.py`` references this module today.
+Zero production code anywhere in this package calls either name, and this
+gate is what keeps that true until the change that wires a caller retires
+the name it wires.
 
 ``create()``'s production call body -- the write that actually calls
 ``stage_interaction_request`` -- arrives with the change that wires
@@ -70,7 +66,7 @@ from xagent.web.services import (  # noqa: F401 -- negative control import
     task_interaction_service as service,
 )
 
-GATED_NAMES = frozenset({"create"})
+GATED_NAMES = frozenset({"create", "respond"})
 SERVICE_MODULE = "task_interaction_service"
 
 
@@ -169,7 +165,7 @@ def _production_modules() -> list[Path]:
 # --------------------------------------------------------------------------
 
 
-def test_no_production_module_calls_create() -> None:
+def test_no_production_module_calls_create_or_respond() -> None:
     offenders: dict[str, set[str]] = {}
     for path in _production_modules():
         try:
@@ -283,13 +279,12 @@ def test_importing_unrelated_name_is_not_flagged() -> None:
     assert _production_uses(source) == set()
 
 
-def test_a_production_call_to_respond_is_not_flagged() -> None:
-    """A hypothetical production call to ``respond()`` -- something this
-    package does not actually have today (see this file's own module
-    docstring) -- must not trip this narrower gate either: retiring the
-    predecessor's two-name gate dropped the watch over ``respond`` entirely,
-    not merely relaxed it, so nothing calling ``respond()`` is this gate's
-    concern regardless of whether such a caller exists yet."""
+def test_detects_a_production_call_to_respond() -> None:
+    """``respond()`` is under this gate for the same reason ``create()``
+    is: it has no production caller, and the change that gives it one is
+    the change that takes it out of here. This is the positive control for
+    that half of the gate -- a hypothetical production call must be
+    detected, or the gate would be watching a name it cannot see."""
 
     source = textwrap.dedent(
         """
@@ -299,7 +294,7 @@ def test_a_production_call_to_respond_is_not_flagged() -> None:
             return respond(**kwargs)
         """
     )
-    assert _production_uses(source) == set()
+    assert _production_uses(source) == {"respond"}
 
 
 def test_same_named_call_on_an_unrelated_object_is_not_flagged() -> None:

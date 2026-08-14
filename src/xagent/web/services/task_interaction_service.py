@@ -65,11 +65,11 @@ references this module today. ``create()``'s own call body -- the write
 that actually stages a row -- is not delivered here either; its own
 zero-production-caller gate
 (``tests/web/services/test_task_interaction_service_create_gate.py``)
-watches ``create()`` alone. ``respond()`` is not under that gate, and that
-is a statement about the gate, not about callers: zero production code
-calls ``respond()`` today, and the gate simply does not watch it. The gate
-gives ``create()``'s boundary a regression guard against import bindings,
-not an absolute one -- its docstring lists what it cannot see (dynamic
+watches both ``create()`` and ``respond()``: zero production code calls
+either name today, and the change that wires a caller is the change that
+takes the corresponding name out of the gated set. The gate gives
+``create()``'s boundary a regression guard against import bindings, not
+an absolute one -- its docstring lists what it cannot see (dynamic
 access, alias/re-export chains, filename-stem exclusion, and code outside
 the scanned package tree).
 """

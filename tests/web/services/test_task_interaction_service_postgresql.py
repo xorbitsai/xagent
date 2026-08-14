@@ -503,7 +503,18 @@ def test_concurrent_ownership_change_is_blocked_until_respond_commits(
     # process patched.
     real_fence_stmt = svc._answer_fence_stmt
 
+    # The holder signals here rather than letting the racer guess with a
+    # wall-clock stagger. This function runs after respond()'s step 2 has
+    # taken the tasks row lock and before its fence write, so setting the
+    # event here is the exact moment the racer's UPDATE must start blocking
+    # from. With a fixed 0.1s stagger instead, the test could fail in both
+    # directions on a loaded runner: a holder more than 0.1s late to reach
+    # step 2 lets the racer's UPDATE through unblocked, and a racer late to
+    # issue its UPDATE measures less than the full hold.
+    lock_taken = threading.Event()
+
     def _slow_fence_stmt(*args, **kwargs):
+        lock_taken.set()
         time.sleep(1.0)
         return real_fence_stmt(*args, **kwargs)
 
@@ -520,7 +531,7 @@ def test_concurrent_ownership_change_is_blocked_until_respond_commits(
         results["holder_outcome"] = outcome
 
     def racer() -> None:
-        time.sleep(0.1)
+        assert lock_taken.wait(timeout=30.0), "holder never reached the fence"
         t0 = time.monotonic()
         db = _respond_pg()
         try:

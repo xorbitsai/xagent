@@ -1794,9 +1794,11 @@ def get_file_stream_ticket_ttl_seconds() -> int:
 
     Kept independent of, and far shorter than, the user's own access token
     TTL: unlike a Bearer header, this credential rides in a URL a media
-    element loads directly (address bar, browser history, proxy/CDN access
-    logs, the file's "Open" link), so a leaked or logged ticket should stop
-    being replayable long before a stolen access token would need to.
+    element loads directly. The frontend never puts it anywhere a user could
+    put it in the address bar, browser history, or a copied link, so the
+    realistic exposure is proxy/CDN/server access logs and a devtools
+    network panel -- a leaked or logged ticket should still stop being
+    replayable long before a stolen access token would need to.
 
     Returns:
         Ticket lifetime in seconds.

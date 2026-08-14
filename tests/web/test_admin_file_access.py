@@ -742,6 +742,64 @@ class TestAdminFileAccess:
 
         assert response.status_code == 403
 
+    def test_stream_ticket_cannot_bypass_ownership_check_for_legacy_file_id(
+        self, test_db, temp_uploads_dir, monkeypatch
+    ):
+        # test_stream_ticket_cannot_bypass_file_ownership_check above only
+        # exercises the DB-record branch of preview_file's access check
+        # (_check_file_access via file_record); this covers the other
+        # branch -- a legacy file_id with no UploadedFile record at all,
+        # where ownership is instead enforced by comparing owner_user_id
+        # (derived from the filesystem path, via a Task-id lookup for a
+        # cross-user request -- see infer_user_id_from_legacy_path) against
+        # the requester.
+        import xagent.web.api.legacy_file as legacy_file_module
+
+        monkeypatch.setattr(
+            legacy_file_module, "get_uploads_dir", lambda: temp_uploads_dir
+        )
+
+        admin_user, regular_user, test_app, session = test_db
+        del admin_user
+        owner_id = int(cast(Any, regular_user.id))
+        other_user = User(
+            username="legacy-ticket-other",
+            password_hash=hash_password("legacy-ticket-other"),
+            is_admin=False,
+        )
+        session.add(other_user)
+        session.commit()
+
+        task = Task(
+            id=236,
+            user_id=owner_id,
+            title="Owner-only legacy task",
+            description="owner-only legacy task",
+        )
+        session.add(task)
+        session.commit()
+
+        legacy_relative_path = "web_task_236/output/private.mp4"
+        legacy_file_path = temp_uploads_dir / f"user_{owner_id}" / legacy_relative_path
+        legacy_file_path.parent.mkdir(parents=True, exist_ok=True)
+        legacy_file_path.write_bytes(b"private legacy video bytes")
+
+        client = TestClient(test_app)
+        other_user_headers = create_auth_headers(other_user)
+        ticket_response = client.get(
+            f"/api/files/stream-tickets/{quote(legacy_relative_path, safe='')}",
+            headers=other_user_headers,
+        )
+        assert ticket_response.status_code == 200
+        ticket = ticket_response.json()["path"].split("ticket=")[1]
+
+        response = client.get(
+            f"/api/files/preview/{quote(legacy_relative_path, safe='')}",
+            params={"ticket": ticket},
+        )
+
+        assert response.status_code == 403
+
     def test_stream_ticket_mint_and_redeem_for_slash_bearing_legacy_file_id(
         self, test_db, temp_uploads_dir, monkeypatch
     ):
@@ -788,6 +846,56 @@ class TestAdminFileAccess:
 
         assert preview_response.status_code == 200
         assert preview_response.content == b"legacy video bytes"
+
+    def test_minted_ticket_expiry_honors_the_configured_ttl(
+        self, test_db, temp_uploads_dir, monkeypatch
+    ):
+        # tests/core/test_config.py already covers
+        # get_file_stream_ticket_ttl_seconds() parsing/validating the env
+        # var in isolation; this instead confirms the mint endpoint actually
+        # wires that configured value into the minted JWT's own exp claim,
+        # not just some other hardcoded default.
+        import time
+
+        import jwt as pyjwt
+
+        monkeypatch.setenv("XAGENT_FILE_STREAM_TICKET_TTL_SECONDS", "120")
+        admin_user, regular_user, test_app, session = test_db
+        del admin_user
+        regular_user_id = int(cast(Any, regular_user.id))
+        task = Task(
+            id=108,
+            user_id=regular_user_id,
+            title="TTL config test",
+            description="ttl config test",
+        )
+        session.add(task)
+        session.commit()
+
+        uploaded_file = create_uploaded_file(
+            session,
+            temp_uploads_dir,
+            regular_user_id,
+            int(cast(Any, task.id)),
+            "clip.mp4",
+            "video bytes",
+        )
+
+        client = TestClient(test_app)
+        user_headers = create_auth_headers(regular_user)
+        before_mint = time.time()
+        ticket_response = client.get(
+            f"/api/files/stream-tickets/{uploaded_file.file_id}",
+            headers=user_headers,
+        )
+        assert ticket_response.status_code == 200
+        ticket = ticket_response.json()["path"].split("ticket=")[1]
+
+        claims = pyjwt.decode(ticket, JWT_SECRET_KEY, algorithms=[JWT_ALGORITHM])
+
+        # Bounded rather than exact: real wall-clock elapses between
+        # before_mint and the token's own iat/exp computation.
+        assert 110 <= claims["exp"] - before_mint <= 120
 
     def test_preview_rejects_an_access_token_used_as_a_ticket(
         self, test_db, temp_uploads_dir
@@ -1190,6 +1298,49 @@ class TestAdminFileAccess:
         assert "x-accel-redirect" in response.headers
         assert response.headers["cache-control"] == "private, no-store"
 
+    def test_bearer_authenticated_preview_keeps_default_caching_on_accel_redirect(
+        self, test_db, temp_uploads_dir, monkeypatch
+    ):
+        # test_authenticated_preview_keeps_default_caching only exercises
+        # the direct content-serving exit; without this, a regression that
+        # threaded no-store unconditionally into _accel_redirect_response
+        # (instead of only via cache_headers, gated on ticket presence)
+        # would pass the whole suite undetected, since no other Bearer
+        # request reaches this exit.
+        monkeypatch.setenv("XAGENT_FILE_DELIVERY_ACCEL_REDIRECT_ENABLED", "true")
+        admin_user, regular_user, test_app, session = test_db
+        del admin_user
+        regular_user_id = int(cast(Any, regular_user.id))
+        task = Task(
+            id=109,
+            user_id=regular_user_id,
+            title="Bearer accel redirect caching test",
+            description="bearer accel redirect caching test",
+        )
+        session.add(task)
+        session.commit()
+
+        uploaded_file = create_uploaded_file(
+            session,
+            temp_uploads_dir,
+            regular_user_id,
+            int(cast(Any, task.id)),
+            "clip.mp4",
+            "video bytes",
+        )
+
+        client = TestClient(test_app)
+        user_headers = create_auth_headers(regular_user)
+        response = client.get(
+            f"/api/files/preview/{uploaded_file.file_id}",
+            headers=user_headers,
+            follow_redirects=False,
+        )
+
+        assert response.status_code == 200
+        assert "x-accel-redirect" in response.headers
+        assert "cache-control" not in response.headers
+
     def test_ticket_authenticated_preview_serves_partial_content_for_range_requests(
         self, test_db, temp_uploads_dir
     ):
@@ -1295,6 +1446,64 @@ class TestAdminFileAccess:
         )
         assert response.headers["cache-control"] == "private, no-store"
 
+    def test_bearer_authenticated_preview_keeps_default_caching_on_durable_redirect(
+        self, test_db, temp_uploads_dir, monkeypatch
+    ):
+        # Durable-redirect counterpart to
+        # test_bearer_authenticated_preview_keeps_default_caching_on_accel_redirect:
+        # without this, a regression that threaded no-store unconditionally
+        # into _durable_redirect_response would also pass the whole suite
+        # undetected, since no other Bearer request reaches this exit either.
+        from xagent.web.services.managed_file_ref import ManagedFileRef
+
+        monkeypatch.setenv("XAGENT_FILE_DELIVERY_REDIRECT_ENABLED", "true")
+        admin_user, regular_user, test_app, session = test_db
+        del admin_user
+        regular_user_id = int(cast(Any, regular_user.id))
+        task = Task(
+            id=110,
+            user_id=regular_user_id,
+            title="Bearer durable redirect caching test",
+            description="bearer durable redirect caching test",
+        )
+        session.add(task)
+        session.commit()
+
+        uploaded_file = create_uploaded_file(
+            session,
+            temp_uploads_dir,
+            regular_user_id,
+            int(cast(Any, task.id)),
+            "clip.mp4",
+            "video bytes",
+        )
+        uploaded_file.storage_status = "available"
+        uploaded_file.storage_key = (
+            f"users/{regular_user_id}/uploads/{uploaded_file.file_id}/clip.mp4"
+        )
+        uploaded_file.storage_backend = "s3"
+        session.commit()
+
+        monkeypatch.setattr(
+            ManagedFileRef,
+            "signed_access_url",
+            lambda self, **kwargs: "https://durable.example/clip.mp4?sig=abc",
+        )
+
+        client = TestClient(test_app)
+        user_headers = create_auth_headers(regular_user)
+        response = client.get(
+            f"/api/files/preview/{uploaded_file.file_id}",
+            headers=user_headers,
+            follow_redirects=False,
+        )
+
+        assert response.status_code == 307
+        assert (
+            response.headers["location"] == "https://durable.example/clip.mp4?sig=abc"
+        )
+        assert "cache-control" not in response.headers
+
     def test_preview_rejects_garbage_ticket(self, test_db, temp_uploads_dir):
         admin_user, regular_user, test_app, session = test_db
         del admin_user
@@ -1372,6 +1581,64 @@ class TestAdminFileAccess:
         )
 
         assert response.status_code == 401
+
+    def test_preview_rejects_ticket_with_malformed_claims(
+        self, test_db, temp_uploads_dir
+    ):
+        # A ticket signed with the real secret but carrying a string
+        # user_id (instead of int) exercises the _AccessTokenRejected path
+        # inside _validate_access_token_claim_bindability -- distinct from
+        # the JWTError paths already covered by the garbage/expired ticket
+        # tests above. This server is the sole minter today, so malformed
+        # claims aren't attacker-reachable, but the shared hardening this
+        # ticket path reuses from access tokens should still be verified.
+        from datetime import datetime, timedelta, timezone
+
+        import jwt as pyjwt
+
+        from xagent.web.auth_config import JWT_ALGORITHM, JWT_SECRET_KEY
+
+        admin_user, regular_user, test_app, session = test_db
+        del admin_user
+        regular_user_id = int(cast(Any, regular_user.id))
+        task = Task(
+            id=96,
+            user_id=regular_user_id,
+            title="Malformed claim ticket test",
+            description="malformed claim ticket test",
+        )
+        session.add(task)
+        session.commit()
+
+        uploaded_file = create_uploaded_file(
+            session,
+            temp_uploads_dir,
+            regular_user_id,
+            int(cast(Any, task.id)),
+            "clip.mp4",
+            "video bytes",
+        )
+
+        malformed_ticket = pyjwt.encode(
+            {
+                "type": "file_stream_ticket",
+                "sub": regular_user.username,
+                "user_id": str(regular_user_id),
+                "file_id": uploaded_file.file_id,
+                "exp": datetime.now(timezone.utc) + timedelta(minutes=5),
+            },
+            JWT_SECRET_KEY,
+            algorithm=JWT_ALGORITHM,
+        )
+
+        client = TestClient(test_app)
+        response = client.get(
+            f"/api/files/preview/{uploaded_file.file_id}",
+            params={"ticket": malformed_ticket},
+        )
+
+        assert response.status_code == 401
+        assert response.json()["detail"] == "Invalid or expired ticket"
 
     def test_preview_requires_bearer_or_ticket(self, test_db, temp_uploads_dir):
         # 403, matching this pre-existing endpoint's error contract from

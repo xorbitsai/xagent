@@ -22,7 +22,7 @@ from fastapi.responses import (
     RedirectResponse,
     Response,
 )
-from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from fastapi.security import HTTPAuthorizationCredentials
 from jose import JWTError, jwt
 from sqlalchemy import func, or_
 from sqlalchemy.orm import Session
@@ -48,6 +48,7 @@ from ..auth_dependencies import (
     _validate_access_token_claim_bindability,
     get_current_user,
     is_admin_user,
+    optional_security,
 )
 from ..config import (
     BINARY_EXTENSIONS,
@@ -1514,19 +1515,20 @@ async def download_file(
 # ownership exactly as they do for the Bearer path. Binding the ticket to one
 # file_id means a leaked ticket can only be replayed against that one file,
 # not enumerated against others. Unlike a Bearer header, though, this
-# credential rides in a URL a media element loads directly — address bar,
-# browser history, the file's "Open" link, proxy/CDN access logs — so its
-# TTL is kept independently short (get_file_stream_ticket_ttl_seconds(),
-# minutes not hours) rather than matching the user's own access token.
+# credential rides in a URL a media element loads directly — the frontend
+# (inline-file-preview.tsx) never puts the ticketed URL anywhere a user
+# could put it in the address bar, browser history, or a copied link (the
+# "Open" affordance deliberately never exposes it either), so the realistic
+# exposure is proxy/CDN/server access logs and a devtools network panel.
+# Its TTL is kept independently short regardless
+# (get_file_stream_ticket_ttl_seconds(), minutes not hours) rather than
+# matching the user's own access token, since those vectors are still real.
 FILE_STREAM_TICKET_TYPE = "file_stream_ticket"
 
 # See _PUBLIC_PREVIEW_CACHE_HEADERS above: a stream ticket rides in a URL a
 # media element auto-fetches on render too, so preview_file below reuses
 # that same constant/rationale as ``cache_headers`` whenever a ticket
 # authenticated the request, rather than a second identical constant.
-
-
-_optional_bearer = HTTPBearer(auto_error=False)
 
 
 def _user_from_stream_ticket(db: Session, ticket: str, file_id: str) -> User:
@@ -1566,7 +1568,7 @@ def _user_from_stream_ticket(db: Session, ticket: str, file_id: str) -> User:
 def _user_from_bearer_or_stream_ticket(
     file_id: str,
     ticket: Optional[str] = Query(default=None),
-    credentials: Optional[HTTPAuthorizationCredentials] = Depends(_optional_bearer),
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(optional_security),
     db: Session = Depends(get_db),
 ) -> Tuple[User, Optional[str]]:
     """Resolve the requesting user, and echo back which credential won.
@@ -1690,6 +1692,17 @@ async def preview_file(
         # (computed above, per-request, from whether a ticket was used) is
         # still threaded through so the no-store invariant travels with the
         # request regardless of which exit serves it.
+        #
+        # On this exit specifically, the bytes a ticketed request actually
+        # streams are governed by get_file_delivery_signed_url_ttl_seconds()
+        # (XAGENT_FILE_DELIVERY_SIGNED_URL_TTL_SECONDS, default 300s) -- not
+        # the stream ticket's own TTL (default 600s) -- since the ticket
+        # only authorizes minting this redirect once; the object store's own
+        # signed URL governs everything after that first hop. The effective
+        # session for a long video is therefore min(ticket TTL at the first
+        # hop, signed-URL TTL thereafter), and an operator tuning either
+        # XAGENT_*_TTL_SECONDS knob in isolation can unexpectedly cut
+        # playback off at the other one.
         if _preview_can_redirect(full_path, media_type):
             redirect_response = _durable_redirect_response(
                 file_ref,

@@ -365,14 +365,14 @@ describe('InlineFilePreview', () => {
     expect(apiRequestMock).toHaveBeenCalledTimes(1)
   })
 
-  it('keeps the "Open" link on the safe public preview URL when there is no click handler', async () => {
-    // The ticketed URL is a replayable credential (unlike the blob path's
-    // session-scoped blob: URL) and must never be exposed via a link a
-    // user can put in the address bar, browser history, or copy/paste. This
-    // fallback URL only applies to surfaces with no in-app preview dialog
-    // (e.g. the public widget) -- see the next test for the in-app case,
-    // where this same public URL would 403 on an access-controlled task and
-    // "Open" must route through onFileClick instead.
+  it('keeps the public preview URL as the static href when there is no click handler', async () => {
+    // The static href stays the credential-free public URL (never the
+    // ticketed one, which is a replayable credential that must never be
+    // exposed via a link a user can put in the address bar, browser
+    // history, or copy/paste) -- this is the middle-click/right-click
+    // "open in new tab" escape hatch. The next test covers what actually
+    // happens on a primary click, where this URL would 403 on an
+    // access-controlled task.
     apiRequestMock.mockImplementation(async (url: string) => {
       if (url.includes('/stream-tickets/')) {
         return {
@@ -396,6 +396,82 @@ describe('InlineFilePreview', () => {
       'href',
       'http://api.local/api/files/public/preview/video-file-id'
     )
+  })
+
+  it('resolves a fresh authenticated blob for "Open" on a primary click when there is no dialog and streaming is active', async () => {
+    // Regression test (F2): the public preview URL used as the static href
+    // above 403s ("Public file access token required") on an
+    // access-controlled task for surfaces with no in-app dialog (a
+    // read-only transcript/log viewer, the skill-hub docs viewer, etc.),
+    // and pre-PR the Open href was the blob URL and worked everywhere. A
+    // primary click must resolve to a URL that will actually load instead
+    // of navigating to that 403-prone one.
+    apiRequestMock.mockImplementation(async (url: string) => {
+      if (url.includes('/stream-tickets/')) {
+        return {
+          ok: true,
+          json: async () => ({
+            path: '/api/files/preview/video-file-id?ticket=signed-ticket',
+          }),
+        }
+      }
+      return {
+        ok: true,
+        blob: async () => new Blob(['video-bytes'], { type: 'video/mp4' }),
+      }
+    })
+    const fakeTab = { location: { href: '' }, closed: false, opener: 'set-by-code' as unknown }
+    const openSpy = vi.spyOn(window, 'open').mockReturnValue(fakeTab as unknown as Window)
+
+    render(
+      <InlineFilePreview
+        source={{ type: 'video', fileId: 'video-file-id', filename: 'clip.mp4' }}
+      />
+    )
+
+    await screen.findByLabelText('clip.mp4')
+    fireEvent.click(screen.getByRole('link', { name: 'Open' }))
+
+    expect(openSpy).toHaveBeenCalledWith('about:blank', '_blank')
+    expect(fakeTab.opener).toBeNull()
+    await waitFor(() => {
+      expect(fakeTab.location.href).toMatch(/^blob:/)
+    })
+
+    openSpy.mockRestore()
+  })
+
+  it('falls back to the public preview URL for "Open" when the on-demand blob fetch fails', async () => {
+    apiRequestMock.mockImplementation(async (url: string) => {
+      if (url.includes('/stream-tickets/')) {
+        return {
+          ok: true,
+          json: async () => ({
+            path: '/api/files/preview/video-file-id?ticket=signed-ticket',
+          }),
+        }
+      }
+      return { ok: false, status: 401 }
+    })
+    const fakeTab = { location: { href: '' }, closed: false, opener: 'set-by-code' as unknown }
+    vi.spyOn(window, 'open').mockReturnValue(fakeTab as unknown as Window)
+
+    render(
+      <InlineFilePreview
+        source={{ type: 'video', fileId: 'video-file-id', filename: 'clip.mp4' }}
+      />
+    )
+
+    await screen.findByLabelText('clip.mp4')
+    fireEvent.click(screen.getByRole('link', { name: 'Open' }))
+
+    await waitFor(() => {
+      expect(fakeTab.location.href).toBe(
+        'http://api.local/api/files/public/preview/video-file-id'
+      )
+    })
+
+    vi.restoreAllMocks()
   })
 
   it('routes "Open" through onFileClick instead of the public preview URL when a dialog is available', async () => {
@@ -588,6 +664,111 @@ describe('InlineFilePreview', () => {
     await waitFor(() => {
       expect(screen.getByLabelText('clip.mp4').getAttribute('src')).toMatch(/^blob:/)
     })
+    expect(screen.queryByText('Failed to load preview.')).not.toBeInTheDocument()
+  })
+
+  it('recovers via the blob path when a ticket expires mid-playback, resuming near the same currentTime', async () => {
+    // Regression test (F1): a MEDIA_ERR_NETWORK error after data has
+    // already loaded once (e.g. the ticket's short TTL expiring mid-
+    // session, so the browser's next Range request 401/403s) used to be
+    // silently swallowed by the "keep the player mounted, let the element
+    // handle it" guard meant for mid-playback decode hiccups -- leaving
+    // playback stalled with no recovery for the rest of the mount. It must
+    // instead trigger the same evict+re-mint+fallback recovery a pre-load
+    // failure gets, and resume near where the ticketed stream left off
+    // rather than restarting from 0.
+    apiRequestMock.mockImplementation(async (url: string) => {
+      if (url.includes('/stream-tickets/')) {
+        return {
+          ok: true,
+          json: async () => ({
+            path: '/api/files/preview/video-file-id?ticket=signed-ticket',
+          }),
+        }
+      }
+      return {
+        ok: true,
+        blob: async () => new Blob(['video-bytes'], { type: 'video/mp4' }),
+      }
+    })
+
+    render(
+      <InlineFilePreview
+        source={{ type: 'video', fileId: 'video-file-id', filename: 'clip.mp4' }}
+      />
+    )
+
+    const streamedVideo = await screen.findByLabelText('clip.mp4')
+    expect(streamedVideo.getAttribute('src')).toBe(
+      'http://api.local/api/files/preview/video-file-id?ticket=signed-ticket'
+    )
+
+    fireEvent.loadedData(streamedVideo)
+    Object.defineProperty(streamedVideo, 'currentTime', {
+      value: 42,
+      writable: true,
+      configurable: true,
+    })
+    // code 2 === MediaError.MEDIA_ERR_NETWORK; jsdom has no MediaError
+    // global to construct a real instance from (see the matching comment
+    // in inline-file-preview.tsx), so the plain numeric code is faked here
+    // the same way production code reads it.
+    Object.defineProperty(streamedVideo, 'error', {
+      value: { code: 2 },
+      configurable: true,
+    })
+    fireEvent.error(streamedVideo)
+
+    const recoveredVideo = await waitFor(() => {
+      const element = screen.getByLabelText('clip.mp4')
+      expect(element.getAttribute('src')).toMatch(/^blob:/)
+      return element as HTMLVideoElement
+    })
+    expect(screen.queryByText('Failed to load preview.')).not.toBeInTheDocument()
+
+    // A real browser resets currentTime to 0 when a new src loads; set that
+    // up explicitly so the assertion below only passes if the seek-on-load
+    // logic actually ran, not because the old value was left untouched.
+    recoveredVideo.currentTime = 0
+    fireEvent.loadedData(recoveredVideo)
+    expect(recoveredVideo.currentTime).toBe(42)
+  })
+
+  it('keeps the player mounted for a decode-hiccup error after loading, even while streaming', async () => {
+    // Contrast with the recovery test above: an error with no network-error
+    // code (or none at all) after data has loaded is the ordinary
+    // mid-playback hiccup case and must NOT trigger a re-mint/fallback --
+    // the element handles those itself. This holds regardless of whether
+    // the current src is the ticketed one.
+    apiRequestMock.mockImplementation(async (url: string) => {
+      if (url.includes('/stream-tickets/')) {
+        return {
+          ok: true,
+          json: async () => ({
+            path: '/api/files/preview/video-file-id?ticket=signed-ticket',
+          }),
+        }
+      }
+      throw new Error(`unexpected blob fetch for ${url}`)
+    })
+
+    render(
+      <InlineFilePreview
+        source={{ type: 'video', fileId: 'video-file-id', filename: 'clip.mp4' }}
+      />
+    )
+
+    const streamedVideo = await screen.findByLabelText('clip.mp4')
+    fireEvent.loadedData(streamedVideo)
+    Object.defineProperty(streamedVideo, 'error', {
+      value: { code: 3 }, // MEDIA_ERR_DECODE, not a network failure
+      configurable: true,
+    })
+    fireEvent.error(streamedVideo)
+
+    expect(screen.getByLabelText('clip.mp4').getAttribute('src')).toBe(
+      'http://api.local/api/files/preview/video-file-id?ticket=signed-ticket'
+    )
     expect(screen.queryByText('Failed to load preview.')).not.toBeInTheDocument()
   })
 

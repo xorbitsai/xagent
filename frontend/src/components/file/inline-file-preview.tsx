@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useState } from 'react'
+import React, { useCallback, useEffect, useRef, useState } from 'react'
 import { FileText, Loader2, Video, Volume2 } from 'lucide-react'
 
 import { DocxPreviewRenderer } from '@/components/file/docx-preview-renderer'
@@ -129,25 +129,37 @@ export function __resetStreamingUrlCacheForTests(): void {
  * pure overhead with no benefit.
  *
  * Returns ``openUrl`` alongside ``resolvedUrl`` for the "Open in new tab"
- * affordance: the ticketed URL from strategy (1) is a replayable
- * credential (unlike the blob path's session-scoped ``blob:`` URL, or the
- * direct path's already-anonymous public URL), so it must never be handed
- * to something a user can put in the address bar, browser history, or a
- * copied link -- ``openUrl`` falls back to the same credential-free
- * ``previewUrl`` the blob path itself uses on failure. For the default
- * policy that credential-free URL is the tokenless public preview route,
- * which 403s once a task has access control configured -- callers with an
- * in-app file-preview dialog available (``onFileClick``) should route
- * "Open" through that instead of this URL, the same way the image and
- * generic-file branches of ``InlineFilePreview`` already do; ``openUrl``
- * exists for surfaces with no such dialog (e.g. the public widget).
+ * affordance when no in-app file-preview dialog is available (see
+ * ``resolveOpenUrl`` below for when one isn't): the ticketed URL from
+ * strategy (1) is a replayable credential (unlike the blob path's
+ * session-scoped ``blob:`` URL, or the direct path's already-anonymous
+ * public URL), so it must never be handed to something a user can put in
+ * the address bar, browser history, or a copied link -- ``openUrl`` falls
+ * back to the credential-free ``previewUrl`` the blob path itself uses on
+ * failure, which is safe to use directly except in one case: for the
+ * default policy while actively streaming, ``previewUrl`` is the tokenless
+ * public preview route, which 403s once a task has access control
+ * configured. ``resolveOpenUrl`` covers that case on demand.
+ *
+ * Callers with an in-app file-preview dialog available should route "Open"
+ * through it instead of either of these (see ``InlineMediaPreview`` below,
+ * which decides between the two using ``canOpenFilePreview``/
+ * ``onOpenPreview`` passed down from ``InlineFilePreview``) -- this hook's
+ * ``openUrl``/``resolveOpenUrl`` exist for surfaces with no such dialog
+ * (e.g. the public widget, or a read-only transcript/log viewer).
  */
 function useResolvedMediaUrl(
   source: InlineFilePreviewSource,
   previewUrl: string,
   fileAccess: FileAccessPolicy,
   allowStreaming: boolean
-): { resolvedUrl: string; openUrl: string; reportLoadFailure: () => boolean } {
+): {
+  resolvedUrl: string
+  openUrl: string
+  isStreamingUrl: boolean
+  resolveOpenUrl: () => Promise<string>
+  reportLoadFailure: () => boolean
+} {
   const fileId = source.fileId
   const canStream =
     allowStreaming && Boolean(fileId) && Boolean(fileAccess.getStreamingUrl)
@@ -204,11 +216,13 @@ function useResolvedMediaUrl(
     }
 
     const loadMedia = async () => {
-      if (!fileId) {
-        setResolvedUrl(previewUrl)
-        return
-      }
-      if (effectiveCanStream && fileAccess.getStreamingUrl) {
+      // No separate "no fileId" early-return here: canStream (and so
+      // effectiveCanStream) is already false whenever fileId is falsy, so
+      // this always falls through to loadBlobOrDirect, whose own !fileId
+      // guard produces the identical setResolvedUrl(previewUrl) outcome.
+      // The "&& fileId" below is for TypeScript's narrowing, not runtime
+      // behavior -- effectiveCanStream already guarantees it's truthy.
+      if (effectiveCanStream && fileAccess.getStreamingUrl && fileId) {
         try {
           const streamingUrl = await mintStreamingUrl(fileAccess, fileId)
           if (isCancelled) return
@@ -246,9 +260,44 @@ function useResolvedMediaUrl(
     return true // every strategy has been exhausted
   }, [isStreamingUrl, fileId])
 
+  // Only ever holds a blob URL minted on demand for a "Open" click while
+  // resolveOpenUrl below was in flight -- revoked on the next click and on
+  // unmount, not on every render, since it's independent of the playback
+  // src's own blob (which useEffect above already manages).
+  const openBlobUrlRef = useRef<string | null>(null)
+  useEffect(() => () => {
+    if (openBlobUrlRef.current) URL.revokeObjectURL(openBlobUrlRef.current)
+  }, [])
+
+  const resolveOpenUrl = useCallback(async (): Promise<string> => {
+    // Not currently on the ticketed path: resolvedUrl is already either a
+    // blob: URL or a direct src that's safe to hand to a new tab as-is.
+    if (!isStreamingUrl) return resolvedUrl
+    if (!needsBlobFetch || !fileId) return previewUrl
+    try {
+      const response = await fileAccess.request(fileAccess.previewUrl(fileId), {
+        cache: 'no-cache',
+        headers: {
+          'Cache-Control': 'no-cache',
+          Pragma: 'no-cache',
+        },
+      })
+      if (!response.ok) return previewUrl
+      const blob = await response.blob()
+      if (openBlobUrlRef.current) URL.revokeObjectURL(openBlobUrlRef.current)
+      const objectUrl = URL.createObjectURL(blob)
+      openBlobUrlRef.current = objectUrl
+      return objectUrl
+    } catch {
+      return previewUrl
+    }
+  }, [isStreamingUrl, needsBlobFetch, fileId, fileAccess, previewUrl, resolvedUrl])
+
   return {
     resolvedUrl,
     openUrl: isStreamingUrl ? previewUrl : resolvedUrl,
+    isStreamingUrl,
+    resolveOpenUrl,
     reportLoadFailure,
   }
 }
@@ -311,7 +360,8 @@ function InlineMediaPreview({
   loadErrorText,
   className,
   fileAccess,
-  onFileClick,
+  canOpenFilePreview,
+  onOpenPreview,
   icon: Icon,
   bodyClassName,
   spinnerClassName,
@@ -324,43 +374,71 @@ function InlineMediaPreview({
   loadErrorText: string
   className?: string
   fileAccess: FileAccessPolicy
-  onFileClick?: (filePath: string, fileName: string) => void
+  // Computed once by the parent InlineFilePreview from onFileClick/fileId,
+  // the same way its own image/generic-file branches do -- not re-derived
+  // here, so there's exactly one place that decides whether a dialog is
+  // available.
+  canOpenFilePreview: boolean
+  onOpenPreview: (event: React.MouseEvent<HTMLElement>) => void
   icon: React.ComponentType<{ className?: string }>
   bodyClassName: string
   spinnerClassName: string
   renderMedia: (
     resolvedUrl: string,
-    media: { onError: () => void; onLoaded: () => void }
+    media: {
+      onError: (event: React.SyntheticEvent<HTMLMediaElement>) => void
+      onLoaded: (event: React.SyntheticEvent<HTMLMediaElement>) => void
+    }
   ) => React.ReactNode
 }) {
-  const { resolvedUrl, openUrl, reportLoadFailure } = useResolvedMediaUrl(
-    source,
-    previewUrl,
-    fileAccess,
-    true
-  )
-  // When an in-app file-preview dialog is available, route "Open" through
-  // it instead of openUrl: for the default policy openUrl is the tokenless
-  // public preview URL, which 403s for any task with access control
-  // configured (agent_config as a dict) -- the same reason the image and
-  // generic-file branches of InlineFilePreview already prefer onFileClick
-  // over a raw href. Only surfaces with no dialog (e.g. the public widget)
-  // fall back to openUrl, where it remains credential-free by design.
-  const canOpenFilePreview = Boolean(onFileClick && source.fileId)
-  const handleOpenClick = (event: React.MouseEvent<HTMLAnchorElement>) => {
-    if (!onFileClick || !source.fileId) return
+  const {
+    resolvedUrl,
+    openUrl,
+    isStreamingUrl,
+    resolveOpenUrl,
+    reportLoadFailure,
+  } = useResolvedMediaUrl(source, previewUrl, fileAccess, true)
+  // No dialog available (e.g. a read-only transcript/log viewer, or the
+  // public widget): openUrl's static href is the safe default, but while
+  // actively streaming under the default policy it's the same 403-prone
+  // public URL as above. Open a blank tab synchronously inside this click
+  // handler (required so the later async navigation isn't blocked as a
+  // popup) and redirect it once resolveOpenUrl settles on a URL that will
+  // actually load.
+  const handleOpenFallbackClick = (event: React.MouseEvent<HTMLAnchorElement>) => {
     event.preventDefault()
-    onFileClick(source.fileId, filename)
+    const tab = window.open('about:blank', '_blank')
+    // Severs window.opener (the reverse-tabnabbing risk rel="noreferrer"
+    // normally guards against on a static <a target="_blank">) while still
+    // keeping our own reference to redirect once resolveOpenUrl settles --
+    // window.open's own "noopener" feature string would null out that
+    // reference too, which this handler needs.
+    if (tab) tab.opener = null
+    void resolveOpenUrl().then((url) => {
+      if (tab && !tab.closed) tab.location.href = url
+    })
   }
   const [failedUrl, setFailedUrl] = useState('')
   const [loadedUrl, setLoadedUrl] = useState('')
+  // Where to seek to after a post-load recovery reload (see the onError
+  // handler below) -- a plain ref, not state, since setting it must never
+  // itself trigger a render; it's only read once, from the *next* onLoaded.
+  const resumeAtRef = useRef<number | null>(null)
   // Terminal load failure only: an error event from a media element that
   // never loaded data means every fallback useResolvedMediaUrl has (blob
   // fetch, direct src, and -- via reportLoadFailure below -- a streaming
   // ticket that minted but wouldn't actually load) is exhausted. Errors
-  // after data has loaded (e.g. a mid-playback decode hiccup) keep the
-  // player mounted -- the element surfaces those itself. Keyed by URL so a
-  // later re-resolve (including a post-failure fallback attempt) clears it.
+  // after data has loaded keep the player mounted by default -- most are
+  // mid-playback decode hiccups the element surfaces and recovers from
+  // itself -- except a MEDIA_ERR_NETWORK error while still on the ticketed
+  // path, which the player can't recover from on its own: a ticket expiring
+  // mid-session makes the browser's next Range request 401/403, and without
+  // this special case that error would be silently swallowed by the
+  // loadedUrl-already-set guard below, leaving playback stalled for the
+  // rest of the ticket's (short, by design) TTL. Reported the same way a
+  // pre-load failure is: evict + re-mint + fall back via reportLoadFailure,
+  // remembering currentTime so the resulting reload can resume close to
+  // where playback stopped instead of restarting from 0.
   const failed = Boolean(resolvedUrl) && failedUrl === resolvedUrl
 
   return (
@@ -377,9 +455,7 @@ function InlineMediaPreview({
         {resolvedUrl ? (
           <a
             href={openUrl}
-            target={canOpenFilePreview ? undefined : '_blank'}
-            rel={canOpenFilePreview ? undefined : 'noreferrer'}
-            onClick={canOpenFilePreview ? handleOpenClick : undefined}
+            onClick={canOpenFilePreview ? onOpenPreview : handleOpenFallbackClick}
             className="shrink-0 text-foreground hover:underline"
           >
             {openLabel}
@@ -392,8 +468,23 @@ function InlineMediaPreview({
         <div className={bodyClassName}>
           {resolvedUrl ? (
             renderMedia(resolvedUrl, {
-              onError: () => {
-                if (loadedUrl === resolvedUrl) return
+              onError: (event) => {
+                if (loadedUrl === resolvedUrl) {
+                  const element = event.currentTarget
+                  // 2 === MediaError.MEDIA_ERR_NETWORK -- the numeric value
+                  // rather than the global is deliberate: MediaError's
+                  // codes are a stable, unchanging part of the spec (unlike
+                  // most enums, no browser has ever needed a 5th), and the
+                  // constructor itself isn't implemented in every test
+                  // environment (jsdom has no MediaError global), so a
+                  // ReferenceError there must not be how this finds out.
+                  const isNetworkError = element.error?.code === 2
+                  if (!isStreamingUrl || !isNetworkError) return // a hiccup the element handles itself
+                  resumeAtRef.current = element.currentTime || null
+                  setLoadedUrl('') // this url is dead; a future load must not be swallowed by this guard
+                  reportLoadFailure() // always non-terminal here: isStreamingUrl was just checked true
+                  return
+                }
                 if (reportLoadFailure()) setFailedUrl(resolvedUrl)
                 // else: reportLoadFailure disabled the streaming ticket for
                 // this fileId, which reruns useResolvedMediaUrl's effect
@@ -401,7 +492,13 @@ function InlineMediaPreview({
                 // changes on the next render, so this failedUrl is stale
                 // and `failed` above naturally goes back to false.
               },
-              onLoaded: () => setLoadedUrl(resolvedUrl),
+              onLoaded: (event) => {
+                setLoadedUrl(resolvedUrl)
+                if (resumeAtRef.current !== null) {
+                  event.currentTarget.currentTime = resumeAtRef.current
+                  resumeAtRef.current = null
+                }
+              },
             })
           ) : (
             <div
@@ -427,7 +524,8 @@ type MediaWrapperProps = {
   loadErrorText: string
   className?: string
   fileAccess: FileAccessPolicy
-  onFileClick?: (filePath: string, fileName: string) => void
+  canOpenFilePreview: boolean
+  onOpenPreview: (event: React.MouseEvent<HTMLElement>) => void
 }
 
 function InlineAudioPreview(props: MediaWrapperProps) {
@@ -670,7 +768,8 @@ export function InlineFilePreview({
         loadErrorText={loadErrorText}
         className={className}
         fileAccess={fileAccess}
-        onFileClick={onFileClick}
+        canOpenFilePreview={canOpenFilePreview}
+        onOpenPreview={handleOpenPreview}
       />
     )
   }
@@ -685,7 +784,8 @@ export function InlineFilePreview({
         loadErrorText={loadErrorText}
         className={className}
         fileAccess={fileAccess}
-        onFileClick={onFileClick}
+        canOpenFilePreview={canOpenFilePreview}
+        onOpenPreview={handleOpenPreview}
       />
     )
   }

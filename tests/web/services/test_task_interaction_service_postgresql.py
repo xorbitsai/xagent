@@ -11,16 +11,19 @@ in this delivery that a SQLite-backed test cannot actually exercise:
   backends agree. (The TaskStatus-bind-parameter structural guard this
   bullet used to also cover needs no database at all and lives in the
   sibling SQLite-backed file instead.)
-- ``respond()``'s six non-active-row rowcount=0 classifications and the
-  three answered-row CHECK constraints, run against a real PostgreSQL
-  server rather than as a second copy of the SQLite-backed cell tests --
-  the point here is the backend, not new behavior coverage.
+- The three answered-row CHECK constraints. (This build does not classify
+  a rowcount=0 fence miss -- see ``RespondOutcomeUnknown``'s own
+  docstring -- so the six non-active-row classification cells a more
+  detailed build would need proven against a real PostgreSQL server are
+  not delivered here either.)
 - Four genuinely concurrent tests, each opening a second real connection:
   the ownership-change TOCTOU window that PostgreSQL's row lock closes
   (which SQLite's single-writer model cannot reproduce), two
   ``respond()`` calls serializing on the same ``tasks`` row, and two
   lock-order deadlock regressions (``respond()`` racing a staging
-  reclaim, and ``respond()`` racing a concurrent purge).
+  reclaim, and ``respond()`` racing a concurrent purge) -- both
+  deadlock regressions assert this build's own conservative outcome
+  where their more detailed sibling would assert a specific reason.
 - One sequential (not concurrent) test running both
   ``respond()``-vs-``purge_task_rows`` orderings one after another --
   each ordering runs to completion and commits before the next
@@ -46,7 +49,6 @@ import pytest
 import sqlalchemy as sa
 from sqlalchemy.orm import sessionmaker
 
-import xagent.web.models.database as database_module
 from tests.web.services.task_interaction_schema_shared import (
     assert_rejected,
     make_row,
@@ -56,18 +58,12 @@ from tests.web.services.task_interaction_schema_shared import (
 from xagent.core.agent.checkpoint import CHECKPOINT_EVENT_TYPE
 from xagent.web.models.database import Base
 from xagent.web.models.task import Task, TaskStatus, TraceEvent
-from xagent.web.models.task_command import TaskExecutionCommand
 from xagent.web.models.task_interaction import TaskInteractionRequest
 from xagent.web.services import task_interaction_service as svc
-from xagent.web.services.interaction_rollout import counters_snapshot
 from xagent.web.services.ops_signals import (
     CHECKPOINT_LOAD_UNAVAILABLE,
     CHECKPOINT_PK_ANCHOR_DANGLING,
     clear_degradation,
-)
-from xagent.web.services.task_command_transport import (
-    TaskCommandKind,
-    enqueue_task_command,
 )
 from xagent.web.services.task_lease_service import TASK_RUN_ID_TRACE_FIELD
 
@@ -352,9 +348,10 @@ def test_answer_fence_guest_entity_binding_matches_on_postgresql(db_session) -> 
 
 
 # ---------------------------------------------------------------------------
-# The six rowcount=0 classification cells, exercised through a real
-# svc.respond() call against PostgreSQL, plus the CHECK-guarded answered-row
-# shape.
+# Fixtures shared by every real svc.respond() call in this file, plus the
+# CHECK-guarded answered-row shape. (The six rowcount=0 classification
+# cells this build does not classify are not exercised here -- see this
+# file's own module docstring.)
 # ---------------------------------------------------------------------------
 
 
@@ -426,103 +423,6 @@ def _pg_envelope(idempotency_key: str) -> svc.RespondEnvelope:
     )
 
 
-def test_answer_fence_rowcount_across_six_non_active_states(_respond_pg) -> None:
-    """Each of the six ways the fence UPDATE can land on rowcount=0,
-    exercised sequentially (one ``svc.respond()`` call after another, no
-    concurrent writer) against a real PostgreSQL server rather than SQLite --
-    the point of running this here instead of in the SQLite-backed sibling
-    file is the backend, not concurrency. Each case runs through
-    ``svc.respond()`` end to end rather than the fence statement in
-    isolation. Actual concurrent-writer coverage lives in the dedicated
-    tests below this one (``test_concurrent_ownership_change_is_blocked...``,
-    ``test_two_concurrent_respond_calls_serialize...``, and the
-    deadlock/residue tests), which do open a second connection."""
-
-    # 1. Already answered, fresh key -> Conflict(already_answered).
-    user_id, task_id = _pg_waiting_task(_respond_pg)
-    interaction_id = _pg_active_row(_respond_pg, task_id=task_id)
-    db = _respond_pg()
-    try:
-        row = (
-            db.query(TaskInteractionRequest)
-            .filter(TaskInteractionRequest.id == interaction_id)
-            .first()
-        )
-        row.status = "answered"
-        row.active_slot = None
-        row.response_payload = {"env": "prod"}
-        row.responded_at = _now()
-        row.responder_identity = _pg_owning_principal(user_id).identity_string()
-        db.commit()
-    finally:
-        db.close()
-    outcome = svc.respond(
-        interaction_id=interaction_id,
-        task_id=task_id,
-        principal=_pg_owning_principal(user_id),
-        envelope=_pg_envelope("pg-already-answered"),
-    )
-    assert outcome == svc.RespondConflict(reason="already_answered")
-
-    # 2/3/4. Terminated, three reasons.
-    for terminal_reason, expected in (
-        ("deadline_elapsed", "expired"),
-        ("run_superseded", "run_superseded"),
-        ("answered_via_legacy_resume", "answered_via_chat"),
-    ):
-        user_id, task_id = _pg_waiting_task(_respond_pg)
-        interaction_id = _pg_active_row(_respond_pg, task_id=task_id)
-        db = _respond_pg()
-        try:
-            row = (
-                db.query(TaskInteractionRequest)
-                .filter(TaskInteractionRequest.id == interaction_id)
-                .first()
-            )
-            row.status = "terminated"
-            row.active_slot = None
-            row.terminal_reason = terminal_reason
-            row.terminated_at = _now()
-            db.commit()
-        finally:
-            db.close()
-        outcome = svc.respond(
-            interaction_id=interaction_id,
-            task_id=task_id,
-            principal=_pg_owning_principal(user_id),
-            envelope=_pg_envelope(f"pg-terminated-{terminal_reason}"),
-        )
-        assert outcome == svc.RespondStale(reason=expected)
-
-    # 5. Still active, task not WAITING.
-    user_id, task_id = _pg_waiting_task(_respond_pg)
-    interaction_id = _pg_active_row(_respond_pg, task_id=task_id)
-    db = _respond_pg()
-    try:
-        db.query(Task).filter(Task.id == task_id).update({"status": TaskStatus.RUNNING})
-        db.commit()
-    finally:
-        db.close()
-    outcome = svc.respond(
-        interaction_id=interaction_id,
-        task_id=task_id,
-        principal=_pg_owning_principal(user_id),
-        envelope=_pg_envelope("pg-not-waiting"),
-    )
-    assert outcome == svc.RespondStale(reason="run_ended")
-
-    # 6. Still active, waiting, but a foreign run.
-    user_id, task_id = _pg_waiting_task(_respond_pg, run_id="run-current")
-    interaction_id = _pg_active_row(_respond_pg, task_id=task_id, run_id="run-old")
-    outcome = svc.respond(
-        interaction_id=interaction_id,
-        task_id=task_id,
-        principal=_pg_owning_principal(user_id),
-        envelope=_pg_envelope("pg-foreign-run"),
-    )
-    assert outcome == svc.RespondStale(reason="foreign_run")
-
-
 # ---------------------------------------------------------------------------
 # The answered-row shape is CHECK-guarded, exact constraint names.
 # ---------------------------------------------------------------------------
@@ -582,7 +482,6 @@ def test_answered_row_cannot_keep_its_active_slot(db_session) -> None:
 def test_concurrent_ownership_change_is_blocked_until_respond_commits(
     _respond_pg, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    import threading
     import time
 
     owner_id, task_id = _pg_waiting_task(_respond_pg)
@@ -639,7 +538,15 @@ def test_concurrent_ownership_change_is_blocked_until_respond_commits(
 
 
 def test_two_concurrent_respond_calls_serialize_on_the_tasks_row(_respond_pg) -> None:
-    import threading
+    """Two real connections answering the same row with different
+    idempotency keys must never both win: step 2's row lock serializes
+    them, and the loser's fence UPDATE matches zero rows once the winner
+    commits. This build does not classify why the loser's fence missed
+    (see ``RespondOutcomeUnknown``'s own docstring) -- a more detailed
+    build's loser would land on ``Stale`` or ``Conflict``, this build's
+    lands on ``OutcomeUnknown`` -- so the loser is accepted here as any
+    non-``Accepted`` outcome; the invariant this test exists to pin is
+    "never both win", not which label the loser gets."""
 
     user_id, task_id = _pg_waiting_task(_respond_pg)
     interaction_id = _pg_active_row(_respond_pg, task_id=task_id)
@@ -665,7 +572,11 @@ def test_two_concurrent_respond_calls_serialize_on_the_tasks_row(_respond_pg) ->
 
     accepted = [o for o in outcomes if isinstance(o, svc.RespondAccepted)]
     stale_or_conflict = [
-        o for o in outcomes if isinstance(o, (svc.RespondStale, svc.RespondConflict))
+        o
+        for o in outcomes
+        if isinstance(
+            o, (svc.RespondStale, svc.RespondConflict, svc.RespondOutcomeUnknown)
+        )
     ]
     assert len(accepted) == 1, outcomes
     assert len(stale_or_conflict) == 1, outcomes
@@ -737,7 +648,6 @@ def test_respond_vs_purge_both_interleavings_leave_no_residue(_respond_pg) -> No
 
 
 def test_respond_vs_staging_reclaim_does_not_deadlock(_respond_pg) -> None:
-    import threading
     import time
 
     import psycopg2.extras
@@ -830,12 +740,16 @@ def test_respond_vs_staging_reclaim_does_not_deadlock(_respond_pg) -> None:
     # The reclaim's UPDATE lands, uncommitted, before respond()'s own fence
     # UPDATE reaches the same row; respond() blocks on it (a plain row lock,
     # not the tasks lock this test is about), resumes once the reclaim
-    # commits, and correctly reports the row as superseded rather than
-    # timing out or raising -- the interesting fact this test pins is that
-    # neither thread deadlocks getting there, not which of them "wins".
-    assert results.get("respond_outcome") == svc.RespondStale(
-        reason="run_superseded"
-    ), results
+    # commits, and correctly reports the miss rather than timing out or
+    # raising -- the interesting fact this test pins is that neither thread
+    # deadlocks getting there, not which of them "wins". This build does
+    # not classify why the fence missed (a more detailed build's sibling
+    # asserts the specific ``Stale(run_superseded)`` this scenario produces
+    # -- see ``RespondOutcomeUnknown``'s own docstring for why this build
+    # reports the ambiguity instead).
+    assert isinstance(results.get("respond_outcome"), svc.RespondOutcomeUnknown), (
+        results
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -853,7 +767,6 @@ def test_respond_vs_staging_reclaim_does_not_deadlock(_respond_pg) -> None:
 
 
 def test_respond_vs_concurrent_purge_does_not_deadlock(_respond_pg) -> None:
-    import threading
     import time
 
     user_id, task_id = _pg_waiting_task(_respond_pg)
@@ -920,256 +833,3 @@ def test_respond_vs_concurrent_purge_does_not_deadlock(_respond_pg) -> None:
     assert results.get("respond_outcome") == svc.RespondUnavailable(
         reason="interaction_missing"
     ), results
-
-
-# ---------------------------------------------------------------------------
-# classify_task_command_conflict's IntegrityError branch (step 8), reached
-# from svc.respond() when stage_task_command's own insert -- inside this
-# call's own ``db.begin_nested()`` -- collides with the
-# ``uq_task_command_identity`` unique constraint. See
-# test_task_interaction_service.py's own section by this name for the full
-# reachability audit of all three TaskCommandConflictKind values against
-# the real code: UNRELATED and TASK_MISSING are both provably unreachable
-# through respond() on either backend (actor_user_id is always the task's
-# own owner, which the fence's ownership predicate requires and which
-# cannot be deleted out from under a task row this transaction still
-# references; the task row itself cannot disappear before this call's own
-# insert either). RACED_DUPLICATE is the only reachable one, and only here
-# on PostgreSQL: a second writer must commit a row for the same
-# (task_id, command_id) strictly between stage_task_command's own
-# existing-row check and its own insert flush, a window SQLite's single
-# whole-database writer lock closes (respond() has already written the
-# fence UPDATE and the CAS on its own connection by the time it reaches
-# step 8, so that connection already holds SQLite's one writer lock).
-# PostgreSQL's row lock from step 2 is scoped to the specific ``tasks`` row
-# alone, so a second writer can complete an insert into the unrelated
-# ``task_execution_commands`` table while this transaction is still open.
-#
-# Both of RACED_DUPLICATE's sub-branches are pinned below -- they produce
-# different RespondOutcomes and only one touches the response-conflict
-# counter (the same counter the idempotency_key_reused cells in the
-# SQLite-backed file exercise through the earlier, pre-existing-command
-# shortcut at step 5; this is the same counter's other, previously
-# untested, wiring point at step 8):
-#
-# - payload_matches=True: the second writer's row carries the identical
-#   actor/kind/payload this call would itself have staged. respond()
-#   replays the winning row (``RespondReplayed``) rather than treating the
-#   loss as a failure, and does not touch the counter.
-# - payload_matches=False: the second writer's row carries different
-#   ``values``, so it canonicalizes to a different payload.
-#   classify_task_command_conflict still finds it (it does not compare
-#   payloads to decide whether a row raced -- only to decide what to do
-#   once one has), and respond() reports ``RespondConflict`` and does
-#   increment the counter, rolling back the whole transaction -- including
-#   the fence UPDATE and the CAS this call had already issued -- since none
-#   of that write was this call's own to keep.
-# ---------------------------------------------------------------------------
-
-
-def _pg_conflict_counter() -> int:
-    return counters_snapshot().get(svc.COUNTER_LIFECYCLE_RESPONSE_CONFLICT, 0)
-
-
-def _pause_command_add_session_factory(
-    base_session_factory, *, precheck_done, release_event
-):
-    """A session factory wrapping ``base_session_factory`` whose returned
-    session pauses the instant something calls ``.add()`` with a
-    ``TaskExecutionCommand`` -- the exact point stage_task_command reaches
-    right after its own existing-row check has already found nothing and
-    right before the insert flush this test needs a second writer to beat.
-    Only ``get_session_local`` is repointed at this wrapper, and only after
-    every setup call already used the plain ``_respond_pg`` factory
-    directly, so only respond()'s own internally-created session is
-    instrumented -- the racing writer below opens its own, unpatched
-    session straight off the base factory."""
-
-    def factory():
-        db = base_session_factory()
-        real_add = db.add
-
-        def paused_add(instance):
-            if isinstance(instance, TaskExecutionCommand):
-                precheck_done.set()
-                assert release_event.wait(timeout=10)
-            real_add(instance)
-
-        db.add = paused_add
-        return db
-
-    return factory
-
-
-def test_respond_races_a_committed_duplicate_command_and_replays_on_matching_payload(
-    _respond_pg, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A second, independent writer commits a TaskExecutionCommand row for
-    the same (task_id, command_id) with the identical actor/kind/payload
-    while respond() is paused right after its own stage_task_command's
-    existing-row check already found nothing. respond()'s own insert then
-    collides on the unique constraint; classify_task_command_conflict
-    reports RACED_DUPLICATE with payload_matches=True, and respond() commits
-    and replays the winning row instead of treating this as a failure."""
-
-    user_id, task_id = _pg_waiting_task(_respond_pg)
-    interaction_id = _pg_active_row(_respond_pg, task_id=task_id)
-    principal = _pg_owning_principal(user_id)
-    envelope = _pg_envelope("pg-raced-duplicate-match")
-    matching_payload = svc._respond_command_payload(
-        interaction_id=interaction_id, principal=principal, values=envelope.values
-    )
-
-    precheck_done = threading.Event()
-    release_respond = threading.Event()
-    results: dict = {}
-
-    monkeypatch.setattr(
-        database_module,
-        "get_session_local",
-        lambda: _pause_command_add_session_factory(
-            _respond_pg, precheck_done=precheck_done, release_event=release_respond
-        ),
-    )
-
-    def call_respond() -> None:
-        results["outcome"] = svc.respond(
-            interaction_id=interaction_id,
-            task_id=task_id,
-            principal=principal,
-            envelope=envelope,
-        )
-
-    t_respond = threading.Thread(target=call_respond)
-    t_respond.start()
-    assert precheck_done.wait(timeout=10)
-
-    db_racer = _respond_pg()
-    try:
-        winner = enqueue_task_command(
-            db_racer,
-            task_id=task_id,
-            actor_user_id=principal.user_id,
-            command_id=envelope.idempotency_key,
-            kind=TaskCommandKind.RESUME,
-            payload=matching_payload,
-        )
-    finally:
-        db_racer.close()
-
-    before_counter = _pg_conflict_counter()
-    release_respond.set()
-    t_respond.join(timeout=10)
-
-    outcome = results["outcome"]
-    assert isinstance(outcome, svc.RespondReplayed), outcome
-    assert outcome.receipt.command_db_id == winner.command_id
-    assert _pg_conflict_counter() == before_counter
-
-    verify_db = _respond_pg()
-    try:
-        commands = (
-            verify_db.query(TaskExecutionCommand)
-            .filter(TaskExecutionCommand.task_id == task_id)
-            .all()
-        )
-        assert len(commands) == 1, commands
-        assert commands[0].id == winner.command_id
-        assert commands[0].actor_user_id == principal.user_id
-    finally:
-        verify_db.close()
-
-
-def test_respond_races_a_committed_duplicate_command_and_conflicts_on_mismatched_payload(
-    _respond_pg, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Same race as above, except the second writer's row carries different
-    answer values -- a different canonicalized payload.
-    classify_task_command_conflict still classifies this as
-    RACED_DUPLICATE (it finds the row purely by (task_id, command_id), not
-    by payload), but with payload_matches=False; respond() reports
-    RespondConflict, increments the response-conflict counter, and rolls
-    back the whole transaction -- undoing its own fence UPDATE and CAS,
-    since none of that write is this call's to keep once its own command
-    lost the race."""
-
-    user_id, task_id = _pg_waiting_task(_respond_pg)
-    interaction_id = _pg_active_row(_respond_pg, task_id=task_id)
-    principal = _pg_owning_principal(user_id)
-    envelope = _pg_envelope("pg-raced-duplicate-mismatch")
-    mismatched_payload = svc._respond_command_payload(
-        interaction_id=interaction_id,
-        principal=principal,
-        values={"env": "a-different-answer-than-this-call-submits"},
-    )
-
-    precheck_done = threading.Event()
-    release_respond = threading.Event()
-    results: dict = {}
-
-    monkeypatch.setattr(
-        database_module,
-        "get_session_local",
-        lambda: _pause_command_add_session_factory(
-            _respond_pg, precheck_done=precheck_done, release_event=release_respond
-        ),
-    )
-
-    def call_respond() -> None:
-        results["outcome"] = svc.respond(
-            interaction_id=interaction_id,
-            task_id=task_id,
-            principal=principal,
-            envelope=envelope,
-        )
-
-    t_respond = threading.Thread(target=call_respond)
-    t_respond.start()
-    assert precheck_done.wait(timeout=10)
-
-    db_racer = _respond_pg()
-    try:
-        winner = enqueue_task_command(
-            db_racer,
-            task_id=task_id,
-            actor_user_id=principal.user_id,
-            command_id=envelope.idempotency_key,
-            kind=TaskCommandKind.RESUME,
-            payload=mismatched_payload,
-        )
-    finally:
-        db_racer.close()
-
-    before_counter = _pg_conflict_counter()
-    release_respond.set()
-    t_respond.join(timeout=10)
-
-    outcome = results["outcome"]
-    assert outcome == svc.RespondConflict(reason="idempotency_key_reused"), outcome
-    assert _pg_conflict_counter() == before_counter + 1
-
-    verify_db = _respond_pg()
-    try:
-        commands = (
-            verify_db.query(TaskExecutionCommand)
-            .filter(TaskExecutionCommand.task_id == task_id)
-            .all()
-        )
-        assert len(commands) == 1, commands
-        assert commands[0].id == winner.command_id
-        assert commands[0].payload == mismatched_payload
-
-        row = (
-            verify_db.query(TaskInteractionRequest)
-            .filter(TaskInteractionRequest.id == interaction_id)
-            .first()
-        )
-        assert row.status == "active"
-        assert row.active_slot == 1
-        assert row.responded_at is None
-
-        task = verify_db.query(Task).filter(Task.id == task_id).first()
-        assert task.state_version == 5
-        assert task.control_state == "waiting_for_user"
-    finally:
-        verify_db.close()

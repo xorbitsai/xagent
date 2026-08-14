@@ -10,9 +10,7 @@ both live on the ask side, and both require the caller to already hold the
 transaction they run inside. This module's ``respond()`` is the opposite
 shape on every one of those points: it owns its own session end to end
 (opens it, commits or rolls it back, retires it) and never nests inside a
-caller's transaction -- the one savepoint it opens
-(``db.begin_nested()``, around staging its own resume command) is its
-own, not a caller's. ``create()``, by contrast, takes a caller-owned
+caller's transaction. ``create()``, by contrast, takes a caller-owned
 session and only reads through it, never opening or committing one of its
 own. Putting ``respond()`` in the same file as the staging primitive would
 make that staging module's merge-reason docstring false. What this module
@@ -52,8 +50,10 @@ does not stage a row); ``get()``/``list_active()``; the three-tier
 compatibility materialization view; the answer fence and its active-row
 predicate; ``respond()``'s own call body (validation, authorization,
 anchor resolution, the idempotency pre-read, the answer fence, the task
-control-state transition, staging the resume command, and committing or
-reconciling an ambiguous acknowledgment); the response-conflict counter
+control-state transition, staging the resume command, and committing --
+this delivery reports an unresolved fence miss or a failed commit as
+``RespondOutcomeUnknown`` rather than further classifying or reconciling
+either; the response-conflict counter
 (``COUNTER_LIFECYCLE_RESPONSE_CONFLICT``); and the compatibility seam that
 routes the existing resume coordinator through this service
 (``websocket.py``'s ``_handle_resume_task_unserialized``). ``create()``'s
@@ -74,7 +74,6 @@ scanned package tree).
 from __future__ import annotations
 
 import json
-import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, Literal, cast
@@ -103,12 +102,9 @@ from .ops_signals import (
     register_degradation,
 )
 from .task_command_transport import (
-    TaskCommandConflictKind,
     TaskCommandKind,
-    _canonical_payload,
     _matches_existing,
     _normalize_command_id,
-    classify_task_command_conflict,
     notify_task_command_dispatcher,
     stage_task_command,
 )
@@ -542,15 +538,8 @@ RespondUnauthorizedReason = Literal["not_task_principal"]
 RespondUnavailableReason = Literal[
     "task_missing", "interaction_missing", "checkpoint_unavailable"
 ]
-RespondConflictReason = Literal["already_answered", "idempotency_key_reused"]
-RespondStaleReason = Literal[
-    "expired",
-    "run_superseded",
-    "answered_via_chat",
-    "run_ended",
-    "foreign_run",
-    "anchor_dangling",
-]
+RespondConflictReason = Literal["idempotency_key_reused"]
+RespondStaleReason = Literal["anchor_dangling"]
 
 
 @dataclass(frozen=True)
@@ -590,11 +579,18 @@ class RespondStale:
 
 @dataclass(frozen=True)
 class RespondOutcomeUnknown:
-    """A commit whose acknowledgment was ambiguous, reconciled against the
-    durable graph, and still unresolved after every reconciliation attempt.
-    Not an exception this service lets escape -- a stable, typed result a
-    caller can act on (e.g. surface "we could not confirm this went
-    through" rather than crash)."""
+    """A call this function could not resolve to one of the specific
+    outcomes above, for either of two reasons this build does not further
+    distinguish: the answer fence's UPDATE matched zero rows and this
+    build does not classify why (step 6 -- a future delivery may reread
+    and classify that miss the way the fence classification build does),
+    or committing raised and this build does not attempt to reconcile the
+    durable graph afterward (steps 8/9) -- the acknowledgment could have
+    been lost after the server applied the write, or a racing writer could
+    have taken the idempotency key first; either way this build reports
+    the ambiguity rather than guessing. Not an exception this service lets
+    escape -- a stable, typed result a caller can act on (e.g. surface "we
+    could not confirm this went through" rather than crash)."""
 
 
 RespondOutcome = (
@@ -1552,10 +1548,6 @@ def _respond_receipt(
     )
 
 
-_RESPOND_DURABLE_GRAPH_ATTEMPTS = 3
-_RESPOND_DURABLE_GRAPH_RETRY_SLEEP_SECONDS = 0.01
-
-
 def _retire_respond_session_best_effort(db: "Session") -> None:
     """Release an owned Session without letting a close/invalidate failure
     replace the transaction error that is already in flight. Same shape as
@@ -1578,119 +1570,6 @@ def _retire_respond_session_best_effort(db: "Session") -> None:
         db.invalidate()
     except Exception:
         logger.warning("failed to invalidate respond() session", exc_info=True)
-
-
-def _verify_respond_durable_graph(
-    *,
-    task_id: int,
-    interaction_id: int,
-    expected_run_id: str,
-    expected_state_version_after: int,
-    principal: InteractionPrincipal,
-    canonical_submitted_values: str,
-    command_id: str,
-    command_kind: TaskCommandKind,
-    command_payload: dict[str, Any],
-    actor_user_id: int | None,
-) -> InteractionResponseReceipt | None:
-    """Check the complete accepted answer graph in a fresh, owned Session,
-    up to three times with a short sleep between attempts. Same retry shape
-    as ``task_orchestrator._reconcile_claimed_turn_after_commit_ack_failure``:
-    a new ``SessionLocal()`` per attempt, ``time.sleep(0.01)`` between
-    failures, the session retired in every case before the next attempt or
-    return.
-
-    Three independent facts must all hold -- the row's key, the answer's
-    hash, and the answering principal's identity: (1) the
-    ``tasks`` row has advanced past ``expected_state_version_after - 1`` on
-    the same ``run_id`` -- ``>=``, not ``==``, and ``control_state`` is not
-    compared at all, because the resume coordinator re-issues the same
-    ``RESUME_REQUESTED`` transition when it applies the command this call
-    staged (see ``respond()``'s own docstring for the verbatim reasoning);
-    (2) the interaction row is answered, by this identity, with a
-    ``response_payload`` that canonicalizes to the same string as the
-    answer ``values`` the caller submitted (``canonical_submitted_values``
-    -- the interaction row stores the answer values alone, not the wrapping
-    command payload the third check below compares); (3) exactly one
-    command row exists for this idempotency key and it matches what this
-    call staged. Returns the receipt on success, ``None`` if every attempt
-    fails to confirm all three.
-    """
-
-    from ..models.database import get_session_local
-
-    SessionLocal = get_session_local()
-    for attempt in range(_RESPOND_DURABLE_GRAPH_ATTEMPTS):
-        reconcile_db: "Session | None" = None
-        try:
-            reconcile_db = SessionLocal()
-            task = (
-                reconcile_db.query(Task)
-                .filter(
-                    Task.id == task_id,
-                    Task.run_id == expected_run_id,
-                    Task.state_version >= expected_state_version_after,
-                )
-                .first()
-            )
-            if task is not None:
-                ir = (
-                    reconcile_db.query(TaskInteractionRequest)
-                    .filter(
-                        TaskInteractionRequest.id == interaction_id,
-                        TaskInteractionRequest.task_id == task_id,
-                        TaskInteractionRequest.status == "answered",
-                        TaskInteractionRequest.responder_identity
-                        == principal.identity_string(),
-                    )
-                    .first()
-                )
-                if (
-                    ir is not None
-                    and _canonical_payload(
-                        ir.response_payload
-                        if isinstance(ir.response_payload, dict)
-                        else {}
-                    )
-                    == canonical_submitted_values
-                ):
-                    commands = (
-                        reconcile_db.query(TaskExecutionCommand)
-                        .filter(
-                            TaskExecutionCommand.task_id == task_id,
-                            TaskExecutionCommand.command_id == command_id,
-                        )
-                        .all()
-                    )
-                    if len(commands) == 1 and _matches_existing(
-                        commands[0],
-                        actor_user_id=actor_user_id,
-                        kind=command_kind,
-                        payload=command_payload,
-                    ):
-                        return _respond_receipt(
-                            interaction=ir,
-                            task=task,
-                            command_db_id=int(commands[0].id),
-                            idempotency_key=command_id,
-                        )
-        except Exception:
-            import logging
-
-            logging.getLogger(__name__).warning(
-                "respond() durable-graph reconciliation attempt %s failed for "
-                "task %s interaction %s",
-                attempt + 1,
-                task_id,
-                interaction_id,
-                exc_info=True,
-            )
-        finally:
-            if reconcile_db is not None:
-                _retire_respond_session_best_effort(reconcile_db)
-        if attempt < _RESPOND_DURABLE_GRAPH_ATTEMPTS - 1:
-            time.sleep(_RESPOND_DURABLE_GRAPH_RETRY_SLEEP_SECONDS)
-    return None
 
 
 def respond(
@@ -1813,12 +1692,15 @@ def respond(
        row state); a hit that does not match is
        ``Conflict(idempotency_key_reused)``.
     6. The answer fence UPDATE. ``rowcount == 1`` continues; ``rowcount == 0``
-       rereads the interaction row and classifies the miss (already-answered
-       replay/conflict, three terminated reasons, wrong task state, foreign
-       run, or -- reachable only on SQLite, see
-       ``_answer_fence_task_predicate`` -- an ownership change);
-       ``rowcount > 1`` is a schema invariant violation
-       (``uq_task_interaction_active_slot``) and raises.
+       rereads the interaction row only to confirm it did not disappear out
+       from under this transaction's own row lock, then reports
+       ``OutcomeUnknown`` without further classifying why the fence missed
+       (a fine-grained classification -- already-answered replay/conflict,
+       three terminated reasons, wrong task state, foreign run, or --
+       reachable only on SQLite, see ``_answer_fence_task_predicate`` -- an
+       ownership change -- is not delivered in this build); ``rowcount > 1``
+       is a schema invariant violation (``uq_task_interaction_active_slot``)
+       and raises.
     7. The Task CAS via ``apply_task_control_transition``, called with no
        ``expected_run_id`` / ``expected_state_version`` -- this function
        takes no caller-supplied optimistic-concurrency token, so neither of
@@ -1832,17 +1714,19 @@ def respond(
        WHERE clause cannot fail to match. This call is therefore left
        uncaught; ``StaleTaskRunError`` surfacing here would mean that
        invariant broke, not a normal stale-answer outcome.
-    8. Stage the RESUME command inside this function's own
-       ``db.begin_nested()``. An ``IntegrityError`` there is classified via
-       ``classify_task_command_conflict`` after rolling back to that
-       savepoint (not the whole transaction) -- see that function's own
-       docstring for why a savepoint rollback is equivalent to the "the
-       caller has rolled back the transaction" precondition it documents.
+    8. Stage the RESUME command. An ``IntegrityError`` there -- a second
+       writer raced this call's own insert for the same idempotency key --
+       is not classified in this build (a fine-grained classification via
+       ``classify_task_command_conflict``, distinguishing a genuine replay
+       from a real conflict, is not delivered here): the whole transaction
+       rolls back, undoing this call's own fence UPDATE and CAS along with
+       it, and this call reports ``OutcomeUnknown``.
     9. Commit. A raised exception here does not mean the write failed --
        the acknowledgment could have been lost after the server applied it
-       -- so this function retires its session and checks the durable graph
-       in a fresh one (``_verify_respond_durable_graph``) before deciding
-       between ``Accepted`` and ``OutcomeUnknown``.
+       -- but this build does not attempt to reconcile that against the
+       durable graph (that reconciliation is not delivered here): it
+       retires its session and reports ``OutcomeUnknown`` unconditionally,
+       leaving the caller to re-check.
     10. After a successful commit, outside any transaction:
         ``notify_task_command_dispatcher()``.
     """
@@ -1913,7 +1797,6 @@ def respond(
         command_payload = _respond_command_payload(
             interaction_id=interaction_id, principal=principal, values=envelope.values
         )
-        canonical_submitted_values = _canonical_payload(envelope.values)
         actor_user_id = principal.user_id
 
         existing_command = (
@@ -1968,7 +1851,12 @@ def respond(
             # changed since step 4's read); without expiring first, the
             # ORM would hand this query's result back through the same
             # already-loaded, now-stale Python object instead of the fresh
-            # row this reread exists to see.
+            # row this reread exists to see. This build does not classify
+            # why the fence missed -- a fine-grained classification against
+            # the reread row's status is not delivered here -- it only
+            # confirms the row did not disappear out from under this
+            # transaction's own row lock, then reports the miss as
+            # ``OutcomeUnknown`` (see that outcome's own docstring).
             db.expire_all()
             reread = get(db, task_id=task_id, interaction_id=interaction_id)
             if reread is None:
@@ -1976,58 +1864,7 @@ def respond(
                     f"interaction {interaction_id} on task {task_id} disappeared "
                     "while this transaction held the tasks row lock"
                 )
-            if reread.status == "answered":
-                fresh_command = (
-                    db.query(TaskExecutionCommand)
-                    .filter(
-                        TaskExecutionCommand.task_id == task_id,
-                        TaskExecutionCommand.command_id == normalized_key,
-                    )
-                    .first()
-                )
-                if fresh_command is not None and _matches_existing(
-                    fresh_command,
-                    actor_user_id=actor_user_id,
-                    kind=TaskCommandKind.RESUME,
-                    payload=command_payload,
-                ):
-                    return RespondReplayed(
-                        receipt=_respond_receipt(
-                            interaction=reread,
-                            task=task,
-                            command_db_id=int(fresh_command.id),
-                            idempotency_key=normalized_key,
-                        )
-                    )
-                increment_counter(COUNTER_LIFECYCLE_RESPONSE_CONFLICT)
-                return RespondConflict(reason="already_answered")
-            if reread.status == "terminated":
-                terminal_reason_map: dict[str, RespondStaleReason] = {
-                    "deadline_elapsed": "expired",
-                    "run_superseded": "run_superseded",
-                    "answered_via_legacy_resume": "answered_via_chat",
-                }
-                mapped_reason = terminal_reason_map.get(
-                    str(reread.terminal_reason or "")
-                )
-                if mapped_reason is None:
-                    raise RuntimeError(
-                        f"interaction {interaction_id} on task {task_id} is "
-                        f"terminated with an unrecognized terminal_reason "
-                        f"{reread.terminal_reason!r}"
-                    )
-                return RespondStale(reason=mapped_reason)
-            if reread.status == "active":
-                if task.status != TaskStatus.WAITING_FOR_USER:
-                    return RespondStale(reason="run_ended")
-                if task.run_id != reread.run_id:
-                    return RespondStale(reason="foreign_run")
-                return RespondUnauthorized(reason="not_task_principal")
-            raise RuntimeError(
-                f"interaction {interaction_id} on task {task_id} has an "
-                f"unrecognized status {reread.status!r} after a zero-rowcount "
-                "answer fence"
-            )
+            return RespondOutcomeUnknown()
 
         # No expected_run_id/expected_state_version to pass: this function
         # takes no caller-supplied optimistic-concurrency token, so
@@ -2038,9 +1875,6 @@ def respond(
         # docstring, step 7).
         apply_task_control_transition(task, TaskControlState.RESUME_REQUESTED)
 
-        expected_state_version_after = int(task.state_version)
-        run_id_for_verification = str(task.run_id)
-        savepoint = db.begin_nested()
         # Capture every receipt value this transaction can still commit as
         # plain Python locals now, before the commit below. SQLAlchemy's
         # default ``expire_on_commit=True`` invalidates every ORM attribute
@@ -2068,63 +1902,29 @@ def respond(
                 payload=command_payload,
             )
         except IntegrityError:
-            savepoint.rollback()
-            classification = classify_task_command_conflict(
-                db,
-                task_id=task_id,
-                command_id=normalized_key,
-                actor_user_id=actor_user_id,
-                kind=TaskCommandKind.RESUME,
-                payload=command_payload,
-            )
-            if classification.kind == TaskCommandConflictKind.RACED_DUPLICATE:
-                assert classification.raced is not None
-                if classification.raced.payload_matches:
-                    db.commit()
-                    return RespondReplayed(
-                        receipt=InteractionResponseReceipt(
-                            interaction_id=interaction_id,
-                            task_id=task_id,
-                            run_id=answered_run_id,
-                            status="answered",
-                            responded_at=answered_responded_at,
-                            responder_identity=answered_responder_identity,
-                            idempotency_key=normalized_key,
-                            command_db_id=classification.raced.command_db_id,
-                            task_state_version=committed_state_version,
-                            task_control_state=committed_control_state,
-                        )
-                    )
-                db.rollback()
-                increment_counter(COUNTER_LIFECYCLE_RESPONSE_CONFLICT)
-                return RespondConflict(reason="idempotency_key_reused")
-            if classification.kind == TaskCommandConflictKind.TASK_MISSING:
-                db.rollback()
-                return RespondUnavailable(reason="task_missing")
+            # A second writer raced this call's own insert for the same
+            # idempotency key. This build does not classify what that
+            # means (a fine-grained classification via
+            # ``classify_task_command_conflict``, distinguishing a genuine
+            # replay from a real conflict, is not delivered here): the
+            # whole transaction rolls back, undoing this call's own fence
+            # UPDATE and CAS along with it, and this call reports the
+            # ambiguity rather than guessing which case it was.
             db.rollback()
-            raise
+            return RespondOutcomeUnknown()
 
         command_db_id = staged.staged_db_id
         try:
             db.commit()
         except Exception:
+            # A raised exception here does not mean the write failed -- the
+            # acknowledgment could have been lost after the server applied
+            # it -- but this build does not attempt to reconcile that
+            # against the durable graph (that reconciliation is not
+            # delivered here): it retires its session and reports the
+            # ambiguity, leaving the caller to re-check.
             session_retired = True
             _retire_respond_session_best_effort(db)
-            receipt = _verify_respond_durable_graph(
-                task_id=task_id,
-                interaction_id=interaction_id,
-                expected_run_id=run_id_for_verification,
-                expected_state_version_after=expected_state_version_after,
-                principal=principal,
-                canonical_submitted_values=canonical_submitted_values,
-                command_id=normalized_key,
-                command_kind=TaskCommandKind.RESUME,
-                command_payload=command_payload,
-                actor_user_id=actor_user_id,
-            )
-            if receipt is not None:
-                notify_task_command_dispatcher()
-                return RespondAccepted(receipt=receipt)
             return RespondOutcomeUnknown()
 
         notify_task_command_dispatcher()

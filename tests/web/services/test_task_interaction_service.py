@@ -9,17 +9,24 @@ extracted from and tested alongside ``public_chat_access.py``) and the
 ``test_task_interaction_service_create_gate.py``).
 
 RespondOutcome's failure matrix, and what this delivery does and does not
-do with it: the matrix enumerates 24 triggering cells across
-``respond()``'s not-yet-implemented logic, producing 20 distinct (outcome
-type, reason) pairs -- fewer than 24 because several cells share a pair
-(five different "principal does not own this task" cells all produce
-``(RespondUnauthorized, not_task_principal)``; two "same idempotency key,
-different actor" cells both produce ``(RespondConflict,
-idempotency_key_reused)``; one cell, kind/version validation, is
-parametrized over two reasons on its own). ``respond()`` takes no
-caller-supplied optimistic-concurrency token, so there is no cell for a
-stale one -- the matrix's ``Stale`` row has six pairs, not seven, for that
-reason. The full cell-to-pair mapping:
+do with it: this build's ``RespondConflictReason``/``RespondStaleReason``
+``Literal``s are narrower than a build that also classifies why the
+answer fence's UPDATE matched zero rows and reconciles an ambiguous
+commit against the durable graph would need (see ``RespondOutcomeUnknown``
+'s own docstring in ``task_interaction_service.py``) -- six triggering
+scenarios that such a build would classify into five distinct ``Stale``
+reasons plus ``Conflict(already_answered)`` collapse onto this build's
+single ``(OutcomeUnknown, None)`` pair instead, alongside the two other
+triggers (an unclassified staging ``IntegrityError`` and an unreconciled
+commit exception) this build already reports the same way. The matrix
+below enumerates this build's own 16 triggering cells, producing 14
+distinct (outcome type, reason) pairs -- fewer than 16 because several
+cells share a pair (two "principal does not own this task" cells both
+produce ``(RespondUnauthorized, not_task_principal)``; two "same
+idempotency key, different actor" cells both produce ``(RespondConflict,
+idempotency_key_reused)``; four distinct triggers collapse onto
+``(OutcomeUnknown, None)``; one cell, kind/version validation, is
+parametrized over two reasons on its own). The full cell-to-pair mapping:
 
     OK        -> (Accepted, None)                                    1
     V1        -> (ValidationRejected, unknown_kind)                  }  2
@@ -27,17 +34,19 @@ reason. The full cell-to-pair mapping:
     V2        -> (ValidationRejected, malformed_idempotency_key)     1
     V3        -> (ValidationRejected, invalid_values)                1
     V5        -> (ValidationRejected, kind_version_mismatch)         1
-    A1..A5    -> (Unauthorized, not_task_principal)      1 (5 cells share it)
+    A1,A2     -> (Unauthorized, not_task_principal)      1 (2 cells share it)
     U1        -> (Unavailable, task_missing)                         1
     U2        -> (Unavailable, interaction_missing)                  1
     U3        -> (Unavailable, checkpoint_unavailable)                1
     R1        -> (Replayed, None)                                    1
-    C1        -> (Conflict, already_answered)                        1
     C2,C3     -> (Conflict, idempotency_key_reused)      1 (2 cells share it)
-    S1..S6    -> six distinct (Stale, *) pairs                       6
-    X1        -> (OutcomeUnknown, None)                              1
+    S6        -> (Stale, anchor_dangling)                             1
+    X1..X4    -> (OutcomeUnknown, None)      1 (4 cells share it -- a
+                 fence miss with no further classification, a guest whose
+                 fence-level mismatch this build cannot label, a staging
+                 IntegrityError, and a commit exception)
     -----------------------------------------------------------------
-    24 cells; 20 distinct pairs (18 single-reason cells + V1's own 2)
+    16 cells; 14 distinct pairs (12 single-reason cells + V1's own 2)
 
 The cell-by-cell tests this matrix implies, and the mapping meta-test that
 checks their coverage against the vocabulary, are both in this file now,
@@ -51,8 +60,8 @@ layers:
 | Assertion | Checks | Catches | Misses |
 |---|---|---|---|
 | Union-membership guard (this file, written) | ``RespondOutcome`` has exactly its eight known member classes | A variant added or removed without updating this list | Reason-level coverage |
-| Cell-by-cell tests (this file, written) | One test per of the 24 cells, asserting outcome + reason + zero side effects | A regression in one specific cell's behavior | A forgotten test |
-| Mapping meta-test (this file, written) | Each of the 20 pairs is produced by >= 1 cell's test (18 singles + one cell's own 2) | A new cell that produces a new pair with no test written for it; the two-reason cell's parametrization missing a reason | A new cell that produces no *new* pair (e.g. a sixth not_task_principal scenario) -- caught by review, not this meta-test |
+| Cell-by-cell tests (this file, written) | One test per of the 16 cells, asserting outcome + reason + zero side effects | A regression in one specific cell's behavior | A forgotten test |
+| Mapping meta-test (this file, written) | Each of the 14 pairs is produced by >= 1 cell's test (12 singles + one cell's own 2) | A new cell that produces a new pair with no test written for it; the two-reason cell's parametrization missing a reason | A new cell that produces no *new* pair (e.g. a third not_task_principal scenario) -- caught by review, not this meta-test |
 """
 
 from __future__ import annotations
@@ -1427,7 +1436,7 @@ def _answered_row_with_valid_anchor(
     """A row this service already answered in some earlier, successful call
     -- its resume anchor is still valid (nothing has pruned the checkpoint
     it points at), which is what makes it reachable past step 4.5 for the
-    already-answered classification tests below."""
+    already-answered replay and fence-miss tests below."""
 
     db = session_factory()
     try:
@@ -1445,36 +1454,6 @@ def _answered_row_with_valid_anchor(
         row.response_payload = response_payload
         row.responded_at = now
         row.responder_identity = responder_identity
-        row.request_idempotency_key = idempotency_key
-        db.commit()
-        return int(row.id)
-    finally:
-        db.close()
-
-
-def _terminated_row_with_valid_anchor(
-    session_factory,
-    *,
-    task_id: int,
-    run_id: str,
-    terminal_reason: str,
-    idempotency_key: str = "terminated-row-key",
-) -> int:
-    db = session_factory()
-    try:
-        trace_event_id = _make_trace_event(db, task_id=task_id, run_partition=run_id)
-        row = _make_active_interaction_row(
-            db,
-            task_id=task_id,
-            run_id=run_id,
-            resume_trace_event_id=trace_event_id,
-            resume_run_partition=run_id,
-        )
-        now = _now()
-        row.status = "terminated"
-        row.active_slot = None
-        row.terminal_reason = terminal_reason
-        row.terminated_at = now
         row.request_idempotency_key = idempotency_key
         db.commit()
         return int(row.id)
@@ -1770,7 +1749,13 @@ def test_respond_rejects_a_guest_whose_bindings_match_but_principal_user_id_does
     principal.user_id`` term (present for both principal kinds, not only
     the guest-specific JSON check) is what refuses it, on both backends,
     since this is a plain mismatch present from the start, not a
-    concurrent change to catch only via SQLite's missing lock."""
+    concurrent change to catch only via SQLite's missing lock. The refusal
+    lands as a zero-rowcount fence miss, which this build reports as
+    ``OutcomeUnknown`` rather than the fine-grained ``Unauthorized`` a more
+    detailed classification would give it (see respond()'s own docstring,
+    step 6) -- the security property this test exists to pin (the guest
+    never gets an answer accepted) holds either way; only the label does
+    not."""
 
     owner_id, task_id = _waiting_task(
         _respond_db,
@@ -1801,7 +1786,7 @@ def test_respond_rejects_a_guest_whose_bindings_match_but_principal_user_id_does
             envelope=_respond_envelope(),
         )
 
-        assert outcome == svc.RespondUnauthorized(reason="not_task_principal")
+        assert isinstance(outcome, svc.RespondOutcomeUnknown)
 
 
 def test_respond_reports_unavailable_when_the_task_row_does_not_exist(
@@ -1929,9 +1914,23 @@ def test_respond_returns_the_original_receipt_for_a_matching_replay(
         assert outcome.receipt.idempotency_key == command_id
 
 
-def test_respond_reports_conflict_for_an_already_answered_row_under_a_fresh_key(
+def test_respond_reports_outcome_unknown_when_the_fence_misses_and_leaves_no_residue(
     _respond_db,
 ) -> None:
+    """This build does not classify why the answer fence's UPDATE matched
+    zero rows (see ``RespondOutcomeUnknown``'s own docstring) -- every
+    fine-grained fence-miss scenario (already answered, terminated, wrong
+    task state, foreign run, a concurrent ownership change) collapses onto
+    this single conservative outcome instead of the outcome/reason such a
+    build's more detailed sibling would report. Picks one concrete trigger
+    -- the row already answered by someone else, under a fresh idempotency
+    key this call has never seen -- and proves both the collapse and the
+    safety property that makes it acceptable: this call changes nothing.
+    The pre-existing answer, its already-staged command, and the conflict
+    counter are all untouched -- a conservative miss must never be
+    misreported as a conflict, since this build never confirmed it was
+    one."""
+
     user_id, task_id = _waiting_task(_respond_db)
     principal = _owning_user_principal(user_id)
     interaction_id = _answered_row_with_valid_anchor(
@@ -1952,8 +1951,8 @@ def test_respond_reports_conflict_for_an_already_answered_row_under_a_fresh_key(
             envelope=_respond_envelope(idempotency_key="never-seen-before"),
         )
 
-        assert outcome == svc.RespondConflict(reason="already_answered")
-    assert _conflict_counter() == before_counter + 1
+        assert isinstance(outcome, svc.RespondOutcomeUnknown)
+    assert _conflict_counter() == before_counter
 
 
 def test_respond_reports_conflict_for_the_same_key_with_a_different_payload(
@@ -2036,149 +2035,6 @@ def test_respond_reports_conflict_when_a_guest_and_the_owner_share_one_key(
 
         assert outcome == svc.RespondConflict(reason="idempotency_key_reused")
     assert _conflict_counter() == before_counter + 1
-
-
-@pytest.mark.parametrize(
-    "terminal_reason,expected_reason",
-    [
-        pytest.param("deadline_elapsed", "expired", id="expired"),
-        pytest.param("run_superseded", "run_superseded", id="run_superseded"),
-        pytest.param(
-            "answered_via_legacy_resume", "answered_via_chat", id="answered_via_chat"
-        ),
-    ],
-)
-def test_respond_reports_stale_for_a_terminated_row(
-    _respond_db, terminal_reason: str, expected_reason: str
-) -> None:
-    user_id, task_id = _waiting_task(_respond_db)
-    interaction_id = _terminated_row_with_valid_anchor(
-        _respond_db, task_id=task_id, run_id="run-a", terminal_reason=terminal_reason
-    )
-    before_counter = _conflict_counter()
-    with _asserts_no_side_effects(
-        _respond_db, task_id=task_id, interaction_id=interaction_id
-    ):
-        outcome = svc.respond(
-            interaction_id=interaction_id,
-            task_id=task_id,
-            principal=_owning_user_principal(user_id),
-            envelope=_respond_envelope(idempotency_key="never-seen-before-terminal"),
-        )
-
-        if expected_reason == "expired":
-            assert outcome == svc.RespondStale(reason="expired")
-        elif expected_reason == "run_superseded":
-            assert outcome == svc.RespondStale(reason="run_superseded")
-        else:
-            assert outcome == svc.RespondStale(reason="answered_via_chat")
-    # Reverse assertion: a Stale outcome must never increment the
-    # response-conflict counter -- only the three Conflict cells do.
-    assert _conflict_counter() == before_counter
-
-
-def test_respond_reports_stale_when_the_task_has_moved_on_from_waiting(
-    _respond_db,
-) -> None:
-    user_id, task_id = _waiting_task(_respond_db)
-    interaction_id = _active_row_ready_for_respond(_respond_db, task_id=task_id)
-    db = _respond_db()
-    try:
-        db.query(Task).filter(Task.id == task_id).update({"status": TaskStatus.RUNNING})
-        db.commit()
-    finally:
-        db.close()
-    before_counter = _conflict_counter()
-    with _asserts_no_side_effects(
-        _respond_db, task_id=task_id, interaction_id=interaction_id
-    ):
-        outcome = svc.respond(
-            interaction_id=interaction_id,
-            task_id=task_id,
-            principal=_owning_user_principal(user_id),
-            envelope=_respond_envelope(),
-        )
-
-        assert outcome == svc.RespondStale(reason="run_ended")
-    assert _conflict_counter() == before_counter
-
-
-def test_respond_reports_stale_when_the_task_is_waiting_on_a_different_run(
-    _respond_db,
-) -> None:
-    user_id, task_id = _waiting_task(_respond_db, run_id="run-current")
-    interaction_id = _active_row_ready_for_respond(
-        _respond_db, task_id=task_id, run_id="run-old"
-    )
-    before_counter = _conflict_counter()
-    with _asserts_no_side_effects(
-        _respond_db, task_id=task_id, interaction_id=interaction_id
-    ):
-        outcome = svc.respond(
-            interaction_id=interaction_id,
-            task_id=task_id,
-            principal=_owning_user_principal(user_id),
-            envelope=_respond_envelope(),
-        )
-
-        assert outcome == svc.RespondStale(reason="foreign_run")
-    assert _conflict_counter() == before_counter
-
-
-def _racing_fence_stmt_that_changes_ownership(
-    session_factory, *, task_id: int, intruder_owner_id: int
-) -> Any:
-    """Build a monkeypatch replacement for ``svc._answer_fence_stmt`` that
-    races a concurrent ownership change onto the task row between step 2's
-    read and the fence statement's own execution -- the SQLite-only TOCTOU
-    window (SQLite's dialect drops ``FOR UPDATE`` entirely; PostgreSQL's row
-    lock closes it, see ``_answer_fence_task_predicate``'s own docstring) the
-    test below needs to reproduce it."""
-
-    real_fence_stmt = svc._answer_fence_stmt
-
-    def _racing_fence_stmt(*args: Any, **kwargs: Any) -> Any:
-        race_db = session_factory()
-        try:
-            race_db.query(Task).filter(Task.id == task_id).update(
-                {"user_id": intruder_owner_id}
-            )
-            race_db.commit()
-        finally:
-            race_db.close()
-        return real_fence_stmt(*args, **kwargs)
-
-    return _racing_fence_stmt
-
-
-def test_respond_reports_unauthorized_when_ownership_changes_between_the_check_and_the_write(
-    _respond_db, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """The SQLite-only TOCTOU window between step 3's authorization read and
-    step 6's write-point fence (see ``_answer_fence_task_predicate``'s own
-    docstring for why PostgreSQL's row lock closes this window and SQLite's
-    dialect does not)."""
-
-    owner_id, task_id = _waiting_task(_respond_db)
-    interaction_id = _active_row_ready_for_respond(_respond_db, task_id=task_id)
-    intruder_owner_id = make_user(_respond_db())
-
-    monkeypatch.setattr(
-        svc,
-        "_answer_fence_stmt",
-        _racing_fence_stmt_that_changes_ownership(
-            _respond_db, task_id=task_id, intruder_owner_id=intruder_owner_id
-        ),
-    )
-
-    outcome = svc.respond(
-        interaction_id=interaction_id,
-        task_id=task_id,
-        principal=_owning_user_principal(owner_id),
-        envelope=_respond_envelope(),
-    )
-
-    assert outcome == svc.RespondUnauthorized(reason="not_task_principal")
 
 
 def test_respond_checks_authorization_before_the_idempotency_prequery(
@@ -2335,268 +2191,90 @@ def test_rowcount_helper_does_not_raise_on_a_bare_test_double() -> None:
     assert svc._rowcount(MagicMock(rowcount=3)) == 3
 
 
-def test_respond_reports_outcome_unknown_when_commit_ack_is_lost_and_the_graph_never_lands(
+def test_respond_reports_outcome_unknown_when_commit_raises_and_leaves_no_residue(
     _respond_db, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Injects a commit failure and never lets the durable-graph
-    reconciliation find a matching command row (by using a task_id the
-    reconciliation query cannot see any command for), forcing all three
-    reconciliation attempts to fail."""
+    """A raised exception at commit does not, by itself, mean the write
+    failed -- the acknowledgment could have been lost after the server
+    applied it -- but this build does not attempt to reconcile that
+    against the durable graph (a fine-grained reconciliation via a fresh
+    session's own read, distinguishing a landed write from a lost one, is
+    not delivered here; see respond()'s own docstring, step 9): it reports
+    the ambiguity unconditionally. Simulates a commit that never actually
+    reaches the database and proves that in this build's conservative
+    handling nothing landed either -- the interaction row, the task row,
+    and the command table are all exactly as they were before the call."""
 
     user_id, task_id = _waiting_task(_respond_db)
     interaction_id = _active_row_ready_for_respond(_respond_db, task_id=task_id)
     principal = _owning_user_principal(user_id)
 
     from sqlalchemy.orm import Session as OrmSession
-
-    original_commit = OrmSession.commit
-    call_count = {"n": 0}
 
     def _failing_commit(self: Any) -> None:
-        call_count["n"] += 1
-        if call_count["n"] == 1:
-            raise RuntimeError("simulated lost commit acknowledgment")
-        return original_commit(self)
+        raise RuntimeError("simulated lost commit acknowledgment")
 
     monkeypatch.setattr(OrmSession, "commit", _failing_commit)
-    monkeypatch.setattr(svc, "_RESPOND_DURABLE_GRAPH_RETRY_SLEEP_SECONDS", 0.0)
 
-    outcome = svc.respond(
-        interaction_id=interaction_id,
-        task_id=task_id,
-        principal=principal,
-        envelope=_respond_envelope(idempotency_key="ambiguous-commit-no-graph"),
-    )
+    with _asserts_no_side_effects(
+        _respond_db, task_id=task_id, interaction_id=interaction_id
+    ):
+        outcome = svc.respond(
+            interaction_id=interaction_id,
+            task_id=task_id,
+            principal=principal,
+            envelope=_respond_envelope(idempotency_key="commit-raises"),
+        )
 
-    assert isinstance(outcome, svc.RespondOutcomeUnknown)
+        assert isinstance(outcome, svc.RespondOutcomeUnknown)
 
 
-def test_respond_reports_accepted_when_commit_ack_is_lost_but_the_graph_landed(
+# ---------------------------------------------------------------------------
+# Step 8's own IntegrityError catch, reached when stage_task_command's own
+# insert collides with a UNIQUE or FOREIGN KEY constraint (the real trigger
+# is a second writer racing this call for the same idempotency key -- only
+# reproducible against a real PostgreSQL server, see
+# test_task_interaction_service_postgresql.py; simulated directly here).
+# This build does not classify what an IntegrityError there means (a
+# fine-grained classification via classify_task_command_conflict,
+# distinguishing a genuine replay from a real conflict, is not delivered --
+# see respond()'s own docstring, step 8): the whole transaction rolls back
+# and this call reports the ambiguity.
+# ---------------------------------------------------------------------------
+
+
+def test_respond_reports_outcome_unknown_when_staging_the_command_raises_and_leaves_no_residue(
     _respond_db, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Same injected failure as the OutcomeUnknown case above, except this
-    time the underlying commit genuinely succeeded at the database layer
-    (only the acknowledgment back to this process was lost) -- proving the
-    reconciliation path returns Accepted, not a false negative, once the
-    complete graph is actually there to find."""
+    from sqlalchemy.exc import IntegrityError as _IntegrityError
 
     user_id, task_id = _waiting_task(_respond_db)
     interaction_id = _active_row_ready_for_respond(_respond_db, task_id=task_id)
     principal = _owning_user_principal(user_id)
 
-    from sqlalchemy.orm import Session as OrmSession
+    def _raising_stage_task_command(*args: Any, **kwargs: Any) -> Any:
+        raise _IntegrityError(
+            "INSERT", {}, Exception("simulated raced duplicate command_id")
+        )
 
-    original_commit = OrmSession.commit
-    call_count = {"n": 0}
+    monkeypatch.setattr(svc, "stage_task_command", _raising_stage_task_command)
 
-    def _lost_ack_but_committed(self: Any) -> None:
-        call_count["n"] += 1
-        if call_count["n"] == 1:
-            original_commit(self)
-            raise RuntimeError("simulated lost commit acknowledgment")
-        return original_commit(self)
+    before_counter = _conflict_counter()
+    with _asserts_no_side_effects(
+        _respond_db, task_id=task_id, interaction_id=interaction_id
+    ):
+        outcome = svc.respond(
+            interaction_id=interaction_id,
+            task_id=task_id,
+            principal=principal,
+            envelope=_respond_envelope(idempotency_key="staging-raises"),
+        )
 
-    monkeypatch.setattr(OrmSession, "commit", _lost_ack_but_committed)
-    monkeypatch.setattr(svc, "_RESPOND_DURABLE_GRAPH_RETRY_SLEEP_SECONDS", 0.0)
-
-    outcome = svc.respond(
-        interaction_id=interaction_id,
-        task_id=task_id,
-        principal=principal,
-        envelope=_respond_envelope(idempotency_key="ambiguous-commit-landed"),
-    )
-
-    assert isinstance(outcome, svc.RespondAccepted)
-    assert outcome.receipt.responder_identity == principal.identity_string()
-
-
-def test_respond_durable_graph_check_is_monotone_when_the_coordinator_has_already_advanced_state(
-    _respond_db, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """The resume coordinator re-issues the same RESUME_REQUESTED
-    transition once it applies the command this call staged, bumping
-    state_version a second time -- the durable-graph check must still
-    report Accepted against a state_version that has moved past what this
-    call itself wrote, and must not compare control_state (see respond()'s
-    own docstring)."""
-
-    user_id, task_id = _waiting_task(_respond_db, state_version=5)
-    interaction_id = _active_row_ready_for_respond(_respond_db, task_id=task_id)
-    principal = _owning_user_principal(user_id)
-
-    from sqlalchemy.orm import Session as OrmSession
-
-    original_commit = OrmSession.commit
-    call_count = {"n": 0}
-
-    def _lost_ack_then_coordinator_advances(self: Any) -> None:
-        call_count["n"] += 1
-        if call_count["n"] == 1:
-            original_commit(self)
-            # Simulate the coordinator re-applying its own transition on a
-            # separate connection before this call's reconciliation runs.
-            side_db = _respond_db()
-            try:
-                side_db.query(Task).filter(Task.id == task_id).update(
-                    {
-                        "state_version": Task.state_version + 1,
-                        "control_state": "running",
-                    }
-                )
-                side_db.commit()
-            finally:
-                side_db.close()
-            raise RuntimeError("simulated lost commit acknowledgment")
-        return original_commit(self)
-
-    monkeypatch.setattr(OrmSession, "commit", _lost_ack_then_coordinator_advances)
-    monkeypatch.setattr(svc, "_RESPOND_DURABLE_GRAPH_RETRY_SLEEP_SECONDS", 0.0)
-
-    outcome = svc.respond(
-        interaction_id=interaction_id,
-        task_id=task_id,
-        principal=principal,
-        envelope=_respond_envelope(idempotency_key="monotone-check"),
-    )
-
-    assert isinstance(outcome, svc.RespondAccepted)
-
-
-def test_respond_reports_outcome_unknown_when_the_landed_row_answers_a_different_identity(
-    _respond_db, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Same lost-commit-acknowledgment injection as the two cases above, but
-    this time the row the durable-graph check reads back was answered under
-    a *different* ``responder_identity`` than the one this call's own
-    principal carries. A mismatched identity, not an absent one, is the
-    only way an answered row can fail to attest to this call: two CHECK
-    constraints chain to rule out a null identity on an answered row --
-    ``ck_task_interaction_requests_responded_at_pairs_status`` ties
-    ``status = 'answered'`` to ``responded_at IS NOT NULL``, and
-    ``ck_task_interaction_requests_responder_pairs_responded_at`` ties
-    ``responded_at IS NOT NULL`` to ``responder_identity IS NOT NULL`` --
-    so an answered row always carries *some* identity, just not
-    necessarily this call's own. See ``_verify_respond_durable_graph``'s
-    own docstring for why the comparison exists. The reconciliation must
-    not treat "an answer landed" as "my answer landed": with nothing tying
-    the row to this principal, every attempt has to keep failing and the
-    call must report OutcomeUnknown, never Accepted.
-    """
-
-    user_id, task_id = _waiting_task(_respond_db)
-    interaction_id = _active_row_ready_for_respond(_respond_db, task_id=task_id)
-    principal = _owning_user_principal(user_id)
-
-    from sqlalchemy.orm import Session as OrmSession
-
-    original_commit = OrmSession.commit
-    call_count = {"n": 0}
-
-    def _lost_ack_but_landed_under_another_identity(self: Any) -> None:
-        call_count["n"] += 1
-        if call_count["n"] == 1:
-            original_commit(self)
-            # The row genuinely committed (columns and all), but stamped
-            # with a different identity than this call's own principal --
-            # standing in for the row this call's ambiguous commit might
-            # have raced against, not a corruption of this call's own
-            # write.
-            side_db = _respond_db()
-            try:
-                side_db.query(TaskInteractionRequest).filter(
-                    TaskInteractionRequest.id == interaction_id
-                ).update({"responder_identity": "user:999999"})
-                side_db.commit()
-            finally:
-                side_db.close()
-            raise RuntimeError("simulated lost commit acknowledgment")
-        return original_commit(self)
-
-    monkeypatch.setattr(
-        OrmSession, "commit", _lost_ack_but_landed_under_another_identity
-    )
-    monkeypatch.setattr(svc, "_RESPOND_DURABLE_GRAPH_RETRY_SLEEP_SECONDS", 0.0)
-
-    outcome = svc.respond(
-        interaction_id=interaction_id,
-        task_id=task_id,
-        principal=principal,
-        envelope=_respond_envelope(idempotency_key="ambiguous-commit-wrong-identity"),
-    )
-
-    assert isinstance(outcome, svc.RespondOutcomeUnknown)
-
-
-# ---------------------------------------------------------------------------
-# classify_task_command_conflict's IntegrityError branch (step 8), reached
-# when stage_task_command's own insert (inside this call's own
-# `db.begin_nested()`) collides with a UNIQUE or FOREIGN KEY constraint.
-# This repo already has real coverage for classify_task_command_conflict
-# itself (test_task_command_transport.py) and for the pre-existing-command
-# shortcut at step 5 (the idempotency_key_reused cells above), but never for
-# this specific call site -- respond() reaching an IntegrityError on its own
-# insert has no test anywhere in the repo before this delivery.
-#
-# Of TaskCommandConflictKind's three values, only RACED_DUPLICATE is
-# reachable here, and only on PostgreSQL. The other two are not reachable
-# through respond() at all, verified against the real code rather than
-# assumed:
-#
-# - UNRELATED needs the staged row's actor_user_id foreign key to fail --
-#   the referenced user deleted out from under a still-pending insert. In
-#   respond(), actor_user_id is always `principal.user_id`, and the answer
-#   fence's own task-side predicate (`_answer_fence_task_predicate`)
-#   requires `Task.user_id == principal.user_id` unconditionally for
-#   *both* principal kinds (guest included -- its "owning user" is the
-#   value in this same term) as a condition of the fence UPDATE actually
-#   matching a row. Confirmed by running an admin principal whose user_id
-#   does not equal the task's owner through respond(): the fence's own
-#   ownership term rejects it before step 8, at rowcount=0's
-#   `not_task_principal` classification, in the *reread* branch (`if
-#   reread.status == "active": ... return RespondUnauthorized(...)`) --
-#   `principal.is_admin` only bypasses the earlier, separate Python check
-#   at step 3, never the fence's own SQL. So the only user_id that can ever
-#   reach step 8 is the task's actual owner, and that user cannot be
-#   deleted while this same transaction still holds the task row it owns
-#   (`tasks.user_id` has no `ondelete`, i.e. FK `RESTRICT` -- deleting it
-#   while a referencing task row exists is rejected at the database level,
-#   independent of any lock this transaction holds). UNRELATED gets no
-#   test.
-# - TASK_MISSING needs the task to disappear between step 2 and step 8.
-#   respond() holds the tasks row through step 2's `with_for_update` for
-#   the whole transaction, and by step 8 has already written on this same
-#   connection at steps 6 and 7 -- on PostgreSQL that is the row lock
-#   itself blocking a concurrent DELETE; on SQLite (where `with_for_update`
-#   compiles to nothing, see
-#   `test_every_with_for_update_call_passes_key_share_true`'s own
-#   docstring) it is SQLite's whole-database writer lock, already held by
-#   this connection since step 6's fence UPDATE. Either way a concurrent
-#   delete of this task cannot land before this call's own insert attempt,
-#   so classify_task_command_conflict can never observe the task gone
-#   here. TASK_MISSING gets no test either.
-#
-# RACED_DUPLICATE needs a second writer to commit a row for the same
-# (task_id, command_id) strictly between stage_task_command's own
-# existing-row check and its own insert flush -- a real second connection
-# genuinely open at that instant, not a pre-committed row (which either of
-# respond()'s own two earlier existing-command checks, at step 5 and inside
-# stage_task_command itself, would catch first and never reach the flush
-# at all). SQLite cannot reproduce this: by the time respond() reaches
-# step 8 it has already written the fence UPDATE (step 6) and the CAS
-# (step 7) on this same connection, which already holds SQLite's one
-# whole-database writer lock (the same fact
-# `postgres_task_command_sessions`'s own docstring in
-# test_task_command_transport.py documents for the sibling raced-insert
-# test on enqueue_task_command) -- a second writer's commit cannot land
-# inside that window until this transaction ends. PostgreSQL's row lock,
-# held by step 2's `with_for_update` only on the specific `tasks` row,
-# does not extend to the `task_execution_commands` table, so a second
-# writer can complete there while this transaction is still open. Both of
-# RACED_DUPLICATE's sub-branches (payload_matches True and False -- they
-# produce different RespondOutcomes and only one increments the conflict
-# counter) live in test_task_interaction_service_postgresql.py for that
-# reason; nothing in this file exercises this call site.
-# ---------------------------------------------------------------------------
+        assert isinstance(outcome, svc.RespondOutcomeUnknown)
+    # A conservative miss must not be misreported as a conflict either --
+    # the counter only increments for an outcome this build actually
+    # confirmed was a conflict.
+    assert _conflict_counter() == before_counter
 
 
 # ---------------------------------------------------------------------------

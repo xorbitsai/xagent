@@ -385,11 +385,7 @@ def classify_task_command_conflict(
     deleted concurrently with the insert (TASK_MISSING), and a conflict on
     neither -- the row references two foreign keys, so absence of a duplicate
     does not prove the task caused it: a concurrently deleted actor fails the
-    users FK while the task is still present (UNRELATED). Rolling back to a
-    savepoint opened before the failing insert is equivalent to rolling back
-    the whole transaction for this purpose, as long as that savepoint
-    predates the insert: either way, the post-rollback state this function
-    queries no longer contains the failed statement's own effects.
+    users FK while the task is still present (UNRELATED).
 
     RACED_DUPLICATE means the command survived the race, not that the
     caller's work did: the rollback that had to precede this call also undid

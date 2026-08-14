@@ -351,9 +351,15 @@ export function ChatMessage({
     // Tool events carry a specific tool name — prefer "Searching the web" over
     // the generic "Working on it" fallback whenever we know which tool it is.
     if (type === "tool_execution_start" || type === "tool_execution_end") {
+      // Normalize the (possibly missing) nested payload once, then read off
+      // it, rather than optional-chaining each field individually. Checks
+      // response.tool_name first to match the extraction order used for the
+      // same event shape in TraceEventRenderer.tsx.
+      const eventData = e.data || {};
+      const response = eventData.response || {};
       const rawToolName =
-        (typeof e.data?.tool_name === "string" && e.data.tool_name) ||
-        (typeof e.data?.response?.tool_name === "string" && e.data.response.tool_name) ||
+        (typeof response.tool_name === "string" && response.tool_name) ||
+        (typeof eventData.tool_name === "string" && eventData.tool_name) ||
         "";
       if (rawToolName) {
         return getFriendlyToolName(rawToolName, tDynamic);

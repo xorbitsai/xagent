@@ -253,10 +253,10 @@ describe("getFriendlyToolName", () => {
     expect(getFriendlyToolName("some_future_tool")).toBe("Some Future Tool")
   })
 
-  it("returns malformed (non-string) input as-is instead of throwing", () => {
+  it("returns empty string for malformed (non-string) input instead of throwing", () => {
     expect(() => getFriendlyToolName(42 as never)).not.toThrow()
     expect(() => getFriendlyToolName({ unexpected: "object" } as never)).not.toThrow()
     expect(() => getFriendlyToolName(null as never)).not.toThrow()
-    expect(getFriendlyToolName(42 as never)).toBe(42)
+    expect(getFriendlyToolName(42 as never)).toBe("")
   })
 })

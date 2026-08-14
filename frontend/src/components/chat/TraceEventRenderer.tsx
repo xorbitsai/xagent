@@ -277,7 +277,7 @@ export function getFriendlyToolName(toolName: string, tDynamic?: TranslateDynami
   // toolName ultimately traces back to an external WS/API payload; the string
   // type is a compile-time annotation only; not a runtime guarantee. Guard
   // here too since this helper is exported and may be reused elsewhere.
-  if (typeof toolName !== 'string' || !toolName) return toolName;
+  if (typeof toolName !== 'string' || !toolName) return '';
   const fallback = prettifyToolName(toolName);
   if (!tDynamic) return fallback;
   return tDynamic(`traceEventRenderer.toolNames.${toolName}`, fallback);

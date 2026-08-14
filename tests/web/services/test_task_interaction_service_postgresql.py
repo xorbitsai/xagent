@@ -486,7 +486,11 @@ def test_concurrent_ownership_change_is_blocked_until_respond_commits(
 
     owner_id, task_id = _pg_waiting_task(_respond_pg)
     interaction_id = _pg_active_row(_respond_pg, task_id=task_id)
-    intruder_id = make_user(_respond_pg())
+    setup_db = _respond_pg()
+    try:
+        intruder_id = make_user(setup_db)
+    finally:
+        setup_db.close()
 
     results: dict = {}
 
@@ -647,7 +651,7 @@ def test_respond_vs_purge_both_interleavings_leave_no_residue(_respond_pg) -> No
 # ---------------------------------------------------------------------------
 
 
-def test_respond_vs_staging_reclaim_does_not_deadlock(_respond_pg) -> None:
+def test_respond_vs_staging_reclaim_does_not_deadlock(_respond_pg, engine) -> None:
     import time
 
     import psycopg2.extras
@@ -655,9 +659,11 @@ def test_respond_vs_staging_reclaim_does_not_deadlock(_respond_pg) -> None:
     user_id, task_id = _pg_waiting_task(_respond_pg)
     interaction_id = _pg_active_row(_respond_pg, task_id=task_id)
     principal = _pg_owning_principal(user_id)
-    replacement_trace_event_id = _make_trace_event(_respond_pg(), task_id=task_id)
-
-    engine = _respond_pg().get_bind()
+    setup_db = _respond_pg()
+    try:
+        replacement_trace_event_id = _make_trace_event(setup_db, task_id=task_id)
+    finally:
+        setup_db.close()
 
     # Through the same engine's connection pool's raw DBAPI connection,
     # rather than a fresh psycopg2.connect(...) built from the URL, so the
@@ -766,13 +772,12 @@ def test_respond_vs_staging_reclaim_does_not_deadlock(_respond_pg) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_respond_vs_concurrent_purge_does_not_deadlock(_respond_pg) -> None:
+def test_respond_vs_concurrent_purge_does_not_deadlock(_respond_pg, engine) -> None:
     import time
 
     user_id, task_id = _pg_waiting_task(_respond_pg)
     interaction_id = _pg_active_row(_respond_pg, task_id=task_id)
     principal = _pg_owning_principal(user_id)
-    engine = _respond_pg().get_bind()
 
     update_issued = threading.Event()
     results: dict = {}

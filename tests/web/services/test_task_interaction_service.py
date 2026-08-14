@@ -1766,7 +1766,11 @@ def test_respond_rejects_a_guest_whose_bindings_match_but_principal_user_id_does
         },
     )
     interaction_id = _active_row_ready_for_respond(_respond_db, task_id=task_id)
-    wrong_user_id = make_user(_respond_db())
+    setup_db = _respond_db()
+    try:
+        wrong_user_id = make_user(setup_db)
+    finally:
+        setup_db.close()
     guest = svc.InteractionPrincipal(
         kind="guest",
         user_id=wrong_user_id,

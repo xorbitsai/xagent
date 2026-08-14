@@ -2310,6 +2310,72 @@ def test_respond_reports_outcome_unknown_when_staging_the_command_raises_and_lea
     assert _conflict_counter() == before_counter
 
 
+def test_respond_reports_outcome_unknown_when_staging_finds_a_raced_row_and_leaves_no_residue(
+    _respond_db, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from xagent.web.services.task_command_transport import StagedTaskCommand
+
+    user_id, task_id = _waiting_task(_respond_db)
+    interaction_id = _active_row_ready_for_respond(_respond_db, task_id=task_id)
+    principal = _owning_user_principal(user_id)
+
+    def _racing_stage_task_command(*args: Any, **kwargs: Any) -> StagedTaskCommand:
+        return StagedTaskCommand(
+            staged_db_id=4242,
+            client_command_id=kwargs.get("command_id", "staging-race"),
+            created=False,
+            payload_matches=False,
+            status="pending",
+        )
+
+    monkeypatch.setattr(svc, "stage_task_command", _racing_stage_task_command)
+
+    with _asserts_no_side_effects(
+        _respond_db, task_id=task_id, interaction_id=interaction_id
+    ):
+        outcome = svc.respond(
+            interaction_id=interaction_id,
+            task_id=task_id,
+            principal=principal,
+            envelope=_respond_envelope(idempotency_key="staging-race"),
+        )
+
+        assert isinstance(outcome, svc.RespondOutcomeUnknown)
+
+
+def test_respond_reports_outcome_unknown_when_staging_finds_a_raced_row_with_a_matching_payload(
+    _respond_db, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from xagent.web.services.task_command_transport import StagedTaskCommand
+
+    user_id, task_id = _waiting_task(_respond_db)
+    interaction_id = _active_row_ready_for_respond(_respond_db, task_id=task_id)
+    principal = _owning_user_principal(user_id)
+
+    def _racing_stage_task_command(*args: Any, **kwargs: Any) -> StagedTaskCommand:
+        return StagedTaskCommand(
+            staged_db_id=4242,
+            client_command_id=kwargs.get("command_id", "staging-race-match"),
+            created=False,
+            payload_matches=True,
+            status="pending",
+        )
+
+    monkeypatch.setattr(svc, "stage_task_command", _racing_stage_task_command)
+
+    with _asserts_no_side_effects(
+        _respond_db, task_id=task_id, interaction_id=interaction_id
+    ):
+        outcome = svc.respond(
+            interaction_id=interaction_id,
+            task_id=task_id,
+            principal=principal,
+            envelope=_respond_envelope(idempotency_key="staging-race-match"),
+        )
+
+        assert isinstance(outcome, svc.RespondOutcomeUnknown)
+
+
 # ---------------------------------------------------------------------------
 # The mapping meta-test. For every one of the 20 (outcome, reason) pairs in
 # the vocabulary, at least one test above must produce it. This is

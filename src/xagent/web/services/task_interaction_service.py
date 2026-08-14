@@ -1755,13 +1755,24 @@ def respond(
        WHERE clause cannot fail to match. This call is therefore left
        uncaught; ``StaleTaskRunError`` surfacing here would mean that
        invariant broke, not a normal stale-answer outcome.
-    8. Stage the RESUME command. An ``IntegrityError`` there -- a second
-       writer raced this call's own insert for the same idempotency key --
-       is not classified in this build (a fine-grained classification via
-       ``classify_task_command_conflict``, distinguishing a genuine replay
-       from a real conflict, is not delivered here): the whole transaction
-       rolls back, undoing this call's own fence UPDATE and CAS along with
-       it, and this call reports ``OutcomeUnknown``.
+    8. Stage the RESUME command, and require the result to be a row this
+       call itself created carrying this call's own payload. Two different
+       signals report the same race -- a second writer took this
+       idempotency key between step 5's pre-read and this statement -- and
+       both get the same conservative answer. An ``IntegrityError`` is
+       raised when that writer's row lands on the unique constraint;
+       ``created=False`` is returned instead when the row was already
+       committed and visible, because ``stage_task_command`` checks for an
+       existing row before inserting and returns it rather than raising. A
+       ``created=False`` result whose ``payload_matches`` is also true is
+       treated the same way rather than as a replay: step 5 is where a
+       replay is recognized, and a hit that only becomes visible after it
+       is a race. Neither case is classified further in this build (a
+       fine-grained classification via ``classify_task_command_conflict``,
+       distinguishing a genuine replay from a real conflict, is not
+       delivered here): the whole transaction rolls back, undoing this
+       call's own fence UPDATE and CAS along with it, and this call reports
+       ``OutcomeUnknown``.
     9. Commit. A raised exception here does not mean the write failed --
        the acknowledgment could have been lost after the server applied it
        -- but this build does not attempt to reconcile that against the
@@ -1951,6 +1962,26 @@ def respond(
             # whole transaction rolls back, undoing this call's own fence
             # UPDATE and CAS along with it, and this call reports the
             # ambiguity rather than guessing which case it was.
+            db.rollback()
+            return RespondOutcomeUnknown()
+
+        if not (staged.created and staged.payload_matches):
+            # The same race the IntegrityError branch above catches,
+            # arriving through the other door. ``stage_task_command`` does
+            # not raise when a row for this ``(task_id, command_id)``
+            # already exists -- it returns that row with ``created=False``
+            # -- so a writer that committed one between step 5's pre-read
+            # and this call would otherwise leave this transaction
+            # committing the fence and the CAS while the RESUME carrying
+            # this answer was never staged at all, and returning
+            # ``RespondAccepted`` naming the other writer's row. Both doors
+            # get this build's one conservative answer: roll the whole
+            # transaction back, undoing this call's own fence UPDATE and
+            # CAS, and report the ambiguity. ``created=False`` with a
+            # matching payload is folded in here rather than reported as
+            # ``Replayed`` on purpose -- step 5 is where a replay is
+            # recognized, and a hit that only appears after it is a race,
+            # not a replay.
             db.rollback()
             return RespondOutcomeUnknown()
 

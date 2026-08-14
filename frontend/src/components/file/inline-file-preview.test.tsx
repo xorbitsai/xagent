@@ -4,6 +4,11 @@ import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/re
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 const apiRequestMock = vi.hoisted(() => vi.fn())
+const toastErrorMock = vi.hoisted(() => vi.fn())
+
+vi.mock('@/components/ui/sonner', () => ({
+  toast: { error: toastErrorMock },
+}))
 
 vi.mock('@/lib/utils', () => ({
   cn: (...classes: Array<string | undefined | false>) => classes.filter(Boolean).join(' '),
@@ -36,15 +41,21 @@ vi.mock('@/components/file/pptx-preview-renderer', () => ({
   ),
 }))
 
-import { InlineFilePreview, __resetStreamingUrlCacheForTests } from './inline-file-preview'
+import {
+  InlineFilePreview,
+  __mintStreamingUrlForTests,
+  __resetStreamingUrlCacheForTests,
+} from './inline-file-preview'
 import {
   FileAccessProvider,
   createPublicFileAccessPolicy,
+  defaultFileAccessPolicy,
 } from '@/contexts/file-access-context'
 
 describe('InlineFilePreview', () => {
   beforeEach(() => {
     apiRequestMock.mockReset()
+    toastErrorMock.mockReset()
     // Several cases below reuse the same fileId; without this, an earlier
     // case's minted (or attempted) streaming ticket would leak into a
     // later case that expects its own mock to be exercised.
@@ -474,6 +485,173 @@ describe('InlineFilePreview', () => {
     vi.restoreAllMocks()
   })
 
+  it('keeps every "Open"-minted blob alive across repeated clicks, revoking only on unmount', async () => {
+    // Regression test (N-AP9): a previous version revoked the prior
+    // Open-tab's blob URL on the *next* click. A still-open first tab's
+    // media keeps issuing Range requests against its own blob URL as the
+    // user seeks/reloads it, so revoking it out from under that tab broke
+    // playback there the moment a second "Open" click happened (e.g. on a
+    // different attachment's tab, or the same one again).
+    apiRequestMock.mockImplementation(async (url: string) => {
+      if (url.includes('/stream-tickets/')) {
+        return {
+          ok: true,
+          json: async () => ({
+            path: '/api/files/preview/video-file-id?ticket=signed-ticket',
+          }),
+        }
+      }
+      return {
+        ok: true,
+        blob: async () => new Blob(['video-bytes'], { type: 'video/mp4' }),
+      }
+    })
+    const revokeSpy = vi.spyOn(URL, 'revokeObjectURL')
+    const fakeTab1 = { location: { href: '' }, closed: false, opener: 'x' as unknown }
+    const fakeTab2 = { location: { href: '' }, closed: false, opener: 'x' as unknown }
+    const openSpy = vi
+      .spyOn(window, 'open')
+      .mockReturnValueOnce(fakeTab1 as unknown as Window)
+      .mockReturnValueOnce(fakeTab2 as unknown as Window)
+
+    const { unmount } = render(
+      <InlineFilePreview
+        source={{ type: 'video', fileId: 'video-file-id', filename: 'clip.mp4' }}
+      />
+    )
+    await screen.findByLabelText('clip.mp4')
+    const openLink = screen.getByRole('link', { name: 'Open' })
+
+    fireEvent.click(openLink)
+    await waitFor(() => expect(fakeTab1.location.href).toMatch(/^blob:/))
+    fireEvent.click(openLink)
+    await waitFor(() => expect(fakeTab2.location.href).toMatch(/^blob:/))
+
+    // Neither blob revoked yet -- both fake tabs are still "open".
+    expect(revokeSpy).not.toHaveBeenCalled()
+
+    unmount()
+
+    expect(revokeSpy).toHaveBeenCalledTimes(2)
+    expect(revokeSpy).toHaveBeenCalledWith(fakeTab1.location.href)
+    expect(revokeSpy).toHaveBeenCalledWith(fakeTab2.location.href)
+
+    openSpy.mockRestore()
+    revokeSpy.mockRestore()
+  })
+
+  it('resolves a fresh authenticated blob for "Open" on a middle click when there is no dialog and streaming is active', async () => {
+    // Regression test (N-D1): middle-click/ctrl-click fire a native
+    // 'auxclick' event that bypasses onClick entirely, so without an
+    // onAuxClick handler wired to the same recovery path, a middle click
+    // would navigate straight to the static href -- the 403-prone public
+    // preview URL while streaming is active -- even though a primary click
+    // on the exact same link works.
+    apiRequestMock.mockImplementation(async (url: string) => {
+      if (url.includes('/stream-tickets/')) {
+        return {
+          ok: true,
+          json: async () => ({
+            path: '/api/files/preview/video-file-id?ticket=signed-ticket',
+          }),
+        }
+      }
+      return {
+        ok: true,
+        blob: async () => new Blob(['video-bytes'], { type: 'video/mp4' }),
+      }
+    })
+    const fakeTab = { location: { href: '' }, closed: false, opener: 'set-by-code' as unknown }
+    const openSpy = vi.spyOn(window, 'open').mockReturnValue(fakeTab as unknown as Window)
+
+    render(
+      <InlineFilePreview
+        source={{ type: 'video', fileId: 'video-file-id', filename: 'clip.mp4' }}
+      />
+    )
+
+    await screen.findByLabelText('clip.mp4')
+    // testing-library 10.4's built-in fireEvent map has no auxClick helper
+    // (added later), so the native event is dispatched directly -- a
+    // middle-click (button 1) is exactly what fires 'auxclick'.
+    fireEvent(
+      screen.getByRole('link', { name: 'Open' }),
+      new MouseEvent('auxclick', { bubbles: true, cancelable: true, button: 1 })
+    )
+
+    expect(openSpy).toHaveBeenCalledWith('about:blank', '_blank')
+    expect(fakeTab.opener).toBeNull()
+    await waitFor(() => {
+      expect(fakeTab.location.href).toMatch(/^blob:/)
+    })
+
+    openSpy.mockRestore()
+  })
+
+  it('leaves a right-click on "Open" alone instead of hijacking the context menu', async () => {
+    // auxclick fires for ANY non-primary button -- right-click (button 2)
+    // included. The middle-click recovery above must not swallow it: the
+    // user wants the browser context menu, not a surprise tab.
+    apiRequestMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({
+        path: '/api/files/preview/video-file-id?ticket=signed-ticket',
+      }),
+    })
+    const openSpy = vi.spyOn(window, 'open')
+
+    render(
+      <InlineFilePreview
+        source={{ type: 'video', fileId: 'video-file-id', filename: 'clip.mp4' }}
+      />
+    )
+    await screen.findByLabelText('clip.mp4')
+
+    const rightClick = new MouseEvent('auxclick', {
+      bubbles: true,
+      cancelable: true,
+      button: 2,
+    })
+    fireEvent(screen.getByRole('link', { name: 'Open' }), rightClick)
+
+    expect(openSpy).not.toHaveBeenCalled()
+    // preventDefault must not have run either -- that's what would suppress
+    // the browser's own handling around the gesture.
+    expect(rightClick.defaultPrevented).toBe(false)
+
+    openSpy.mockRestore()
+  })
+
+  it('notifies instead of resolving a URL when the "Open" popup is blocked', async () => {
+    // Regression test (N-AP8): window.open returning null (popup blocker,
+    // some webviews) used to be silently swallowed -- preventDefault had
+    // already run, so nothing loaded and the user got no feedback at all.
+    apiRequestMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({
+        path: '/api/files/preview/video-file-id?ticket=signed-ticket',
+      }),
+    })
+    const openSpy = vi.spyOn(window, 'open').mockReturnValue(null)
+
+    render(
+      <InlineFilePreview
+        source={{ type: 'video', fileId: 'video-file-id', filename: 'clip.mp4' }}
+      />
+    )
+
+    await screen.findByLabelText('clip.mp4')
+    fireEvent.click(screen.getByRole('link', { name: 'Open' }))
+
+    expect(openSpy).toHaveBeenCalledWith('about:blank', '_blank')
+    expect(toastErrorMock).toHaveBeenCalled()
+    // The blob/mint fetch must never even be attempted once there's no tab
+    // left to redirect -- only the initial ticket mint call happened.
+    expect(apiRequestMock).toHaveBeenCalledTimes(1)
+
+    openSpy.mockRestore()
+  })
+
   it('routes "Open" through onFileClick instead of the public preview URL when a dialog is available', async () => {
     // For the default in-app policy, the credential-free fallback above is
     // the tokenless public preview route, which 403s ("Public file access
@@ -627,6 +805,52 @@ describe('InlineFilePreview', () => {
     expect(callCount).toBe(2)
   })
 
+  it('does not mint a redundant ticket per waiter when several concurrent callers race on one failed mint', async () => {
+    // Regression test (N-AP12): only the caller that originated a cached
+    // mint promise ever notices *that* promise's own failure and evicts it
+    // (in its own try/catch, a different code path from this test's
+    // target). Every OTHER concurrent waiter shares that failed promise
+    // and used to independently mint its own replacement instead of
+    // reusing whichever replacement won first -- N waiters on one failed
+    // mint paid N-1 redundant tickets. Exercises mintStreamingUrl's
+    // dedup/retry logic directly (via the test-only export) for precise
+    // control over the race, rather than through React's own effect
+    // timing across several mounted components.
+    let mintCallCount = 0
+    let rejectFirstMint: ((error: Error) => void) | undefined
+    const fileAccess = {
+      ...defaultFileAccessPolicy,
+      getStreamingUrl: (): Promise<string> => {
+        mintCallCount += 1
+        if (mintCallCount === 1) {
+          return new Promise((_resolve, reject) => {
+            rejectFirstMint = reject
+          })
+        }
+        return Promise.resolve(`https://example.test/ticket-${mintCallCount}`)
+      },
+    }
+
+    const results = Promise.all([
+      __mintStreamingUrlForTests(fileAccess, 'shared-file-id').catch((error) => error),
+      __mintStreamingUrlForTests(fileAccess, 'shared-file-id').catch((error) => error),
+      __mintStreamingUrlForTests(fileAccess, 'shared-file-id').catch((error) => error),
+    ])
+
+    await waitFor(() => expect(mintCallCount).toBe(1))
+    rejectFirstMint?.(new Error('mint failed'))
+
+    const [first, second, third] = await results
+
+    // The originating call's own promise always rejects -- it never
+    // retries itself, only evicts. Exactly one shared retry mint must
+    // cover both other waiters (mintCallCount === 2, not 3).
+    expect(first).toBeInstanceOf(Error)
+    expect(second).toBe('https://example.test/ticket-2')
+    expect(third).toBe('https://example.test/ticket-2')
+    expect(mintCallCount).toBe(2)
+  })
+
   it('falls back to blob fetch when a minted ticket fails to actually load', async () => {
     // Minting never checks file ownership -- only redemption does -- so a
     // ticket can mint successfully for a file the caller can't actually
@@ -667,29 +891,31 @@ describe('InlineFilePreview', () => {
     expect(screen.queryByText('Failed to load preview.')).not.toBeInTheDocument()
   })
 
-  it('recovers via the blob path when a ticket expires mid-playback, resuming near the same currentTime', async () => {
-    // Regression test (F1): a MEDIA_ERR_NETWORK error after data has
-    // already loaded once (e.g. the ticket's short TTL expiring mid-
-    // session, so the browser's next Range request 401/403s) used to be
-    // silently swallowed by the "keep the player mounted, let the element
-    // handle it" guard meant for mid-playback decode hiccups -- leaving
-    // playback stalled with no recovery for the rest of the mount. It must
-    // instead trigger the same evict+re-mint+fallback recovery a pre-load
-    // failure gets, and resume near where the ticketed stream left off
-    // rather than restarting from 0.
+  it('recovers via a fresh ticket when one expires mid-playback, resuming near the same currentTime', async () => {
+    // Regression test (F1, tightened per round-5 review N-AP1): a network/
+    // src error after data has already loaded once (e.g. the ticket's
+    // short TTL expiring mid-session, so the browser's next Range request
+    // 401/403s) used to be silently swallowed by the "keep the player
+    // mounted, let the element handle it" guard meant for mid-playback
+    // decode hiccups -- leaving playback stalled with no recovery for the
+    // rest of the mount. It must instead re-mint a fresh ticket for the
+    // same fileId (minting is cheap and doesn't re-check ownership) and
+    // resume near where the ticketed stream left off rather than
+    // restarting from 0 -- NOT fall straight to a full-file blob download,
+    // which would silently reintroduce the exact #1201 symptom this PR
+    // exists to remove for any video longer than the ticket TTL.
+    let mintCount = 0
     apiRequestMock.mockImplementation(async (url: string) => {
       if (url.includes('/stream-tickets/')) {
+        mintCount += 1
         return {
           ok: true,
           json: async () => ({
-            path: '/api/files/preview/video-file-id?ticket=signed-ticket',
+            path: `/api/files/preview/video-file-id?ticket=signed-ticket-${mintCount}`,
           }),
         }
       }
-      return {
-        ok: true,
-        blob: async () => new Blob(['video-bytes'], { type: 'video/mp4' }),
-      }
+      throw new Error(`unexpected blob fetch for ${url}`)
     })
 
     render(
@@ -700,7 +926,7 @@ describe('InlineFilePreview', () => {
 
     const streamedVideo = await screen.findByLabelText('clip.mp4')
     expect(streamedVideo.getAttribute('src')).toBe(
-      'http://api.local/api/files/preview/video-file-id?ticket=signed-ticket'
+      'http://api.local/api/files/preview/video-file-id?ticket=signed-ticket-1'
     )
 
     fireEvent.loadedData(streamedVideo)
@@ -721,7 +947,9 @@ describe('InlineFilePreview', () => {
 
     const recoveredVideo = await waitFor(() => {
       const element = screen.getByLabelText('clip.mp4')
-      expect(element.getAttribute('src')).toMatch(/^blob:/)
+      expect(element.getAttribute('src')).toBe(
+        'http://api.local/api/files/preview/video-file-id?ticket=signed-ticket-2'
+      )
       return element as HTMLVideoElement
     })
     expect(screen.queryByText('Failed to load preview.')).not.toBeInTheDocument()
@@ -732,6 +960,51 @@ describe('InlineFilePreview', () => {
     recoveredVideo.currentTime = 0
     fireEvent.loadedData(recoveredVideo)
     expect(recoveredVideo.currentTime).toBe(42)
+  })
+
+  it('falls back to the blob path when re-minting also fails after a ticket expires mid-playback', async () => {
+    // Companion to the recovery test above: if the re-mint itself fails
+    // (e.g. access was actually revoked, not just the ticket expired), the
+    // player must still fall back to the blob/direct strategy via
+    // reportLoadFailure rather than being left on a dead ticketed src.
+    let mintCount = 0
+    apiRequestMock.mockImplementation(async (url: string) => {
+      if (url.includes('/stream-tickets/')) {
+        mintCount += 1
+        if (mintCount > 1) {
+          return { ok: false, status: 403 }
+        }
+        return {
+          ok: true,
+          json: async () => ({
+            path: '/api/files/preview/video-file-id?ticket=signed-ticket-1',
+          }),
+        }
+      }
+      return {
+        ok: true,
+        blob: async () => new Blob(['video-bytes'], { type: 'video/mp4' }),
+      }
+    })
+
+    render(
+      <InlineFilePreview
+        source={{ type: 'video', fileId: 'video-file-id', filename: 'clip.mp4' }}
+      />
+    )
+
+    const streamedVideo = await screen.findByLabelText('clip.mp4')
+    fireEvent.loadedData(streamedVideo)
+    Object.defineProperty(streamedVideo, 'error', {
+      value: { code: 2 },
+      configurable: true,
+    })
+    fireEvent.error(streamedVideo)
+
+    await waitFor(() => {
+      expect(screen.getByLabelText('clip.mp4').getAttribute('src')).toMatch(/^blob:/)
+    })
+    expect(screen.queryByText('Failed to load preview.')).not.toBeInTheDocument()
   })
 
   it('keeps the player mounted for a decode-hiccup error after loading, even while streaming', async () => {
@@ -769,6 +1042,49 @@ describe('InlineFilePreview', () => {
     expect(screen.getByLabelText('clip.mp4').getAttribute('src')).toBe(
       'http://api.local/api/files/preview/video-file-id?ticket=signed-ticket'
     )
+    expect(screen.queryByText('Failed to load preview.')).not.toBeInTheDocument()
+  })
+
+  it('also recovers via a fresh ticket for a MEDIA_ERR_SRC_NOT_SUPPORTED error while streaming', async () => {
+    // Regression test (N-AP2): browsers are inconsistent about which
+    // MediaError code an expired ticket's mid-stream 401/403 surfaces as --
+    // some report MEDIA_ERR_NETWORK (2), others MEDIA_ERR_SRC_NOT_SUPPORTED
+    // (4) because the failed fetch never yields a decodable resource.
+    // Gating recovery on code 2 alone would silently swallow the 4 case the
+    // exact same way the pre-F1 bug swallowed all of them.
+    let mintCount = 0
+    apiRequestMock.mockImplementation(async (url: string) => {
+      if (url.includes('/stream-tickets/')) {
+        mintCount += 1
+        return {
+          ok: true,
+          json: async () => ({
+            path: `/api/files/preview/video-file-id?ticket=signed-ticket-${mintCount}`,
+          }),
+        }
+      }
+      throw new Error(`unexpected blob fetch for ${url}`)
+    })
+
+    render(
+      <InlineFilePreview
+        source={{ type: 'video', fileId: 'video-file-id', filename: 'clip.mp4' }}
+      />
+    )
+
+    const streamedVideo = await screen.findByLabelText('clip.mp4')
+    fireEvent.loadedData(streamedVideo)
+    Object.defineProperty(streamedVideo, 'error', {
+      value: { code: 4 }, // MEDIA_ERR_SRC_NOT_SUPPORTED
+      configurable: true,
+    })
+    fireEvent.error(streamedVideo)
+
+    await waitFor(() => {
+      expect(screen.getByLabelText('clip.mp4').getAttribute('src')).toBe(
+        'http://api.local/api/files/preview/video-file-id?ticket=signed-ticket-2'
+      )
+    })
     expect(screen.queryByText('Failed to load preview.')).not.toBeInTheDocument()
   })
 

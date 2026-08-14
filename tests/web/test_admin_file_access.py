@@ -894,8 +894,13 @@ class TestAdminFileAccess:
         claims = pyjwt.decode(ticket, JWT_SECRET_KEY, algorithms=[JWT_ALGORITHM])
 
         # Bounded rather than exact: real wall-clock elapses between
-        # before_mint and the token's own iat/exp computation.
-        assert 110 <= claims["exp"] - before_mint <= 120
+        # before_mint and the token's own iat/exp computation, and
+        # python-jose floors exp to an integer second (timegm), so a naive
+        # ..120 upper bound flakes whenever that floor rounds up relative to
+        # before_mint's own fractional second -- tightened to 119..121 (0
+        # failures simulated across 400k runs) rather than widened, to keep
+        # the lower bound meaningfully close to the configured 120s.
+        assert 119 <= claims["exp"] - before_mint <= 121
 
     def test_preview_rejects_an_access_token_used_as_a_ticket(
         self, test_db, temp_uploads_dir
@@ -1626,6 +1631,62 @@ class TestAdminFileAccess:
                 "user_id": str(regular_user_id),
                 "file_id": uploaded_file.file_id,
                 "exp": datetime.now(timezone.utc) + timedelta(minutes=5),
+            },
+            JWT_SECRET_KEY,
+            algorithm=JWT_ALGORITHM,
+        )
+
+        client = TestClient(test_app)
+        response = client.get(
+            f"/api/files/preview/{uploaded_file.file_id}",
+            params={"ticket": malformed_ticket},
+        )
+
+        assert response.status_code == 401
+        assert response.json()["detail"] == "Invalid or expired ticket"
+
+    def test_preview_rejects_ticket_with_non_convertible_temporal_claim(
+        self, test_db, temp_uploads_dir
+    ):
+        # python-jose's own jwt.decode can raise a bare OverflowError (not
+        # JWTError) for a garbage-typed exp claim -- it does int(exp)
+        # internally without catching that -- which would 500 instead of
+        # the 401 every other malformed-ticket case here returns, without
+        # _user_from_stream_ticket's own guard mirroring the one
+        # get_current_user already has for access tokens
+        # (has_matching_temporal_claim_conversion_failure).
+        import jwt as pyjwt
+
+        from xagent.web.auth_config import JWT_ALGORITHM, JWT_SECRET_KEY
+
+        admin_user, regular_user, test_app, session = test_db
+        del admin_user
+        regular_user_id = int(cast(Any, regular_user.id))
+        task = Task(
+            id=111,
+            user_id=regular_user_id,
+            title="Non-convertible temporal claim ticket test",
+            description="non-convertible temporal claim ticket test",
+        )
+        session.add(task)
+        session.commit()
+
+        uploaded_file = create_uploaded_file(
+            session,
+            temp_uploads_dir,
+            regular_user_id,
+            int(cast(Any, task.id)),
+            "clip.mp4",
+            "video bytes",
+        )
+
+        malformed_ticket = pyjwt.encode(
+            {
+                "type": "file_stream_ticket",
+                "sub": regular_user.username,
+                "user_id": regular_user_id,
+                "file_id": uploaded_file.file_id,
+                "exp": float("inf"),
             },
             JWT_SECRET_KEY,
             algorithm=JWT_ALGORITHM,

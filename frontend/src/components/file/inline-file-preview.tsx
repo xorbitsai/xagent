@@ -4,6 +4,7 @@ import { FileText, Loader2, Video, Volume2 } from 'lucide-react'
 import { DocxPreviewRenderer } from '@/components/file/docx-preview-renderer'
 import { ExcelPreviewRenderer } from '@/components/file/excel-preview-renderer'
 import { PptxPreviewRenderer } from '@/components/file/pptx-preview-renderer'
+import { toast } from '@/components/ui/sonner'
 import { cn, getApiUrl } from '@/lib/utils'
 import { useFileAccess, type FileAccessPolicy } from '@/contexts/file-access-context'
 import {
@@ -63,7 +64,18 @@ async function mintStreamingUrl(
     // rather than leaving a dead/expired promise for the next caller to
     // hit this same branch again, but only if nothing else already
     // replaced it (e.g. a concurrent caller's own retry).
-    if (streamingUrlCache.get(fileId) === cached) streamingUrlCache.delete(fileId)
+    if (streamingUrlCache.get(fileId) === cached) {
+      streamingUrlCache.delete(fileId)
+    } else {
+      // A concurrent caller already replaced this stale/failed entry with
+      // its own fresh mint while this call was awaiting it above -- reuse
+      // that instead of minting a second ticket for the same fileId. Every
+      // caller in a burst hits this same await, one at a time, in the
+      // order they were scheduled: whichever runs first deletes and mints;
+      // every caller after it sees a mismatch here and recurses onto that
+      // fresh entry rather than deleting-and-minting again itself.
+      return mintStreamingUrl(fileAccess, fileId)
+    }
   }
   const mintPromise = fileAccess.getStreamingUrl!(fileId).then((url) => ({
     url,
@@ -79,6 +91,19 @@ async function mintStreamingUrl(
     if (streamingUrlCache.get(fileId) === mintPromise) streamingUrlCache.delete(fileId)
     throw error
   }
+}
+
+/**
+ * Test-only escape hatch: exercises the module-level mint de-dup/retry
+ * logic directly, with exact control over concurrency (several calls for
+ * the same fileId racing on one mint), which is impractical to pin down
+ * reliably through React's own effect-scheduling timing.
+ */
+export function __mintStreamingUrlForTests(
+  fileAccess: FileAccessPolicy,
+  fileId: string
+): Promise<string> {
+  return mintStreamingUrl(fileAccess, fileId)
 }
 
 /**
@@ -103,13 +128,16 @@ export function __resetStreamingUrlCacheForTests(): void {
  *    URL, preserving HTTP range requests for progressive playback. Falls
  *    through to (2) if minting fails (e.g. offline) rather than leaving
  *    the player on a permanent spinner. If the media element itself then
- *    fails to load that URL (e.g. the ticket expired mid-session, or
- *    redemption 403s for a file minting never checked ownership on), the
- *    caller's ``onError`` should invoke the returned ``reportLoadFailure``
- *    to retry via (2)/(3) instead of leaving a dead ``src`` — this is not
- *    hypothetical: minting never checks file ownership by design (only
- *    redemption does), so a ticket can mint successfully for a file the
- *    caller can't actually read.
+ *    fails to load that URL after the ticket expires mid-session, the
+ *    caller's ``onError`` should invoke the returned ``remintStreamingUrl``
+ *    first -- minting is cheap and doesn't re-check ownership, so it's the
+ *    right recovery for the common case of "the ticket simply expired
+ *    while a long video was still playing" -- and only fall back to
+ *    ``reportLoadFailure`` (which retries via (2)/(3) instead of leaving a
+ *    dead ``src``) if the re-mint itself fails: this is not hypothetical,
+ *    minting never checks file ownership by design (only redemption does),
+ *    so a ticket can mint successfully for a file the caller can't
+ *    actually read.
  * 2. Blob fetch: the default policy's authenticated preview route needs a
  *    Bearer header that media elements cannot send, so managed files are
  *    fetched into a blob object URL. If that fetch fails, the public
@@ -158,6 +186,7 @@ function useResolvedMediaUrl(
   openUrl: string
   isStreamingUrl: boolean
   resolveOpenUrl: () => Promise<string>
+  remintStreamingUrl: () => Promise<boolean>
   reportLoadFailure: () => boolean
 } {
   const fileId = source.fileId
@@ -260,13 +289,63 @@ function useResolvedMediaUrl(
     return true // every strategy has been exhausted
   }, [isStreamingUrl, fileId])
 
-  // Only ever holds a blob URL minted on demand for a "Open" click while
-  // resolveOpenUrl below was in flight -- revoked on the next click and on
-  // unmount, not on every render, since it's independent of the playback
-  // src's own blob (which useEffect above already manages).
-  const openBlobUrlRef = useRef<string | null>(null)
+  // setResolvedUrl below fires from a callback whose completion the
+  // component's own lifecycle doesn't otherwise gate (unlike the main
+  // useEffect's isCancelled, which only covers *that* effect's run) -- this
+  // is the guard for the one async state update outside it. Re-armed in the
+  // effect body, not just initialized at declaration: StrictMode's dev-only
+  // mount->cleanup->mount double-invoke would otherwise leave it stuck
+  // false after the first cleanup, silently disabling the remint recovery.
+  const isMountedRef = useRef(true)
+  useEffect(() => {
+    isMountedRef.current = true
+    return () => {
+      isMountedRef.current = false
+    }
+  }, [])
+
+  // A ticket that expired mid-session is cheap to replace: minting doesn't
+  // re-check file ownership (redemption does, and this fileId already
+  // loaded successfully once under it), so a fresh ticket is the right
+  // recovery -- not the full-file blob download reportLoadFailure below
+  // falls back to, which is exactly the download-before-playback symptom
+  // this streaming path exists to avoid. Returns false (falls through to
+  // reportLoadFailure) only if re-minting itself fails, e.g. the file was
+  // deleted or access was revoked since the last successful load.
+  const remintStreamingUrl = useCallback(async (): Promise<boolean> => {
+    if (!fileId) return false
+    streamingUrlCache.delete(fileId) // the cached ticket just failed to load
+    try {
+      const freshUrl = await mintStreamingUrl(fileAccess, fileId)
+      // JWT iat/exp have whole-second precision, so a mint within the same
+      // second as the failing one (a transient network error, not expiry)
+      // can be byte-identical -- setResolvedUrl would then be a no-op, the
+      // element's src never changes, and nothing ever reloads it. Treat
+      // that as a failed recovery so the caller falls back to the blob
+      // path, which does recover.
+      if (freshUrl === resolvedUrl) return false
+      if (!isMountedRef.current) return true
+      setResolvedUrl(freshUrl)
+      return true
+    } catch (error) {
+      console.warn(
+        'InlineFilePreview: failed to re-mint a media streaming ticket after mid-playback expiry, falling back.',
+        error
+      )
+      return false
+    }
+  }, [fileId, fileAccess, resolvedUrl])
+
+  // Every blob URL minted on demand for a "Open" click, kept alive until
+  // unmount rather than revoked on the *next* click: a still-open first
+  // tab's media keeps making Range requests against its blob URL as the
+  // user seeks/reloads it, and revoking it out from under that tab would
+  // break playback there the moment a second "Open" click happens on a
+  // different tab. Independent of the playback src's own blob (which
+  // useEffect above already manages on its own lifecycle).
+  const openBlobUrlsRef = useRef<string[]>([])
   useEffect(() => () => {
-    if (openBlobUrlRef.current) URL.revokeObjectURL(openBlobUrlRef.current)
+    for (const url of openBlobUrlsRef.current) URL.revokeObjectURL(url)
   }, [])
 
   const resolveOpenUrl = useCallback(async (): Promise<string> => {
@@ -284,9 +363,8 @@ function useResolvedMediaUrl(
       })
       if (!response.ok) return previewUrl
       const blob = await response.blob()
-      if (openBlobUrlRef.current) URL.revokeObjectURL(openBlobUrlRef.current)
       const objectUrl = URL.createObjectURL(blob)
-      openBlobUrlRef.current = objectUrl
+      openBlobUrlsRef.current.push(objectUrl)
       return objectUrl
     } catch {
       return previewUrl
@@ -298,6 +376,7 @@ function useResolvedMediaUrl(
     openUrl: isStreamingUrl ? previewUrl : resolvedUrl,
     isStreamingUrl,
     resolveOpenUrl,
+    remintStreamingUrl,
     reportLoadFailure,
   }
 }
@@ -396,6 +475,7 @@ function InlineMediaPreview({
     openUrl,
     isStreamingUrl,
     resolveOpenUrl,
+    remintStreamingUrl,
     reportLoadFailure,
   } = useResolvedMediaUrl(source, previewUrl, fileAccess, true)
   // No dialog available (e.g. a read-only transcript/log viewer, or the
@@ -404,18 +484,34 @@ function InlineMediaPreview({
   // public URL as above. Open a blank tab synchronously inside this click
   // handler (required so the later async navigation isn't blocked as a
   // popup) and redirect it once resolveOpenUrl settles on a URL that will
-  // actually load.
+  // actually load. Also wired to onAuxClick: middle-click/ctrl-click fire a
+  // native 'auxclick' event that bypasses onClick entirely, so without this
+  // the static href below (never the ticketed URL, by design) is what a
+  // middle-click would navigate to -- a 403 on any access-controlled task.
   const handleOpenFallbackClick = (event: React.MouseEvent<HTMLAnchorElement>) => {
+    // auxclick fires for ANY non-primary button, right-click (button 2)
+    // included -- there the user wants the context menu, and hijacking it
+    // into a surprise tab (plus preventDefault) would be a regression on a
+    // gesture this handler was never meant for. Only the middle button
+    // (button 1) is the open-in-new-tab gesture being recovered here.
+    if (event.type === 'auxclick' && event.button !== 1) return
     event.preventDefault()
     const tab = window.open('about:blank', '_blank')
+    if (!tab) {
+      // Popup blocked (or a webview that refuses window.open): there is no
+      // tab left to redirect once resolveOpenUrl settles, so say so rather
+      // than resolving a URL nothing will ever navigate to.
+      toast.error('Unable to open in a new tab. Check your browser’s pop-up blocker.')
+      return
+    }
     // Severs window.opener (the reverse-tabnabbing risk rel="noreferrer"
     // normally guards against on a static <a target="_blank">) while still
     // keeping our own reference to redirect once resolveOpenUrl settles --
     // window.open's own "noopener" feature string would null out that
     // reference too, which this handler needs.
-    if (tab) tab.opener = null
+    tab.opener = null
     void resolveOpenUrl().then((url) => {
-      if (tab && !tab.closed) tab.location.href = url
+      if (!tab.closed) tab.location.href = url
     })
   }
   const [failedUrl, setFailedUrl] = useState('')
@@ -430,15 +526,18 @@ function InlineMediaPreview({
   // ticket that minted but wouldn't actually load) is exhausted. Errors
   // after data has loaded keep the player mounted by default -- most are
   // mid-playback decode hiccups the element surfaces and recovers from
-  // itself -- except a MEDIA_ERR_NETWORK error while still on the ticketed
-  // path, which the player can't recover from on its own: a ticket expiring
+  // itself -- except a network/src error while still on the ticketed path,
+  // which the player can't recover from on its own: a ticket expiring
   // mid-session makes the browser's next Range request 401/403, and without
   // this special case that error would be silently swallowed by the
   // loadedUrl-already-set guard below, leaving playback stalled for the
-  // rest of the ticket's (short, by design) TTL. Reported the same way a
-  // pre-load failure is: evict + re-mint + fall back via reportLoadFailure,
-  // remembering currentTime so the resulting reload can resume close to
-  // where playback stopped instead of restarting from 0.
+  // rest of the ticket's (short, by design) TTL. Recovered in place first --
+  // remintStreamingUrl swaps in a fresh ticket for the same fileId, which is
+  // cheap because minting doesn't re-check ownership -- and only falls back
+  // to reportLoadFailure's full blob download if the re-mint itself fails
+  // (e.g. access was actually revoked, not just the ticket expired).
+  // currentTime is saved first so playback can resume close to where it
+  // stopped instead of restarting from 0, whichever recovery path is taken.
   const failed = Boolean(resolvedUrl) && failedUrl === resolvedUrl
 
   return (
@@ -456,6 +555,7 @@ function InlineMediaPreview({
           <a
             href={openUrl}
             onClick={canOpenFilePreview ? onOpenPreview : handleOpenFallbackClick}
+            onAuxClick={canOpenFilePreview ? undefined : handleOpenFallbackClick}
             className="shrink-0 text-foreground hover:underline"
           >
             {openLabel}
@@ -471,18 +571,33 @@ function InlineMediaPreview({
               onError: (event) => {
                 if (loadedUrl === resolvedUrl) {
                   const element = event.currentTarget
-                  // 2 === MediaError.MEDIA_ERR_NETWORK -- the numeric value
-                  // rather than the global is deliberate: MediaError's
-                  // codes are a stable, unchanging part of the spec (unlike
-                  // most enums, no browser has ever needed a 5th), and the
+                  // 2 === MediaError.MEDIA_ERR_NETWORK, 4 ===
+                  // MEDIA_ERR_SRC_NOT_SUPPORTED -- numeric literals rather
+                  // than the MediaError global are deliberate: these codes
+                  // are a stable, unchanging part of the spec, and the
                   // constructor itself isn't implemented in every test
                   // environment (jsdom has no MediaError global), so a
                   // ReferenceError there must not be how this finds out.
-                  const isNetworkError = element.error?.code === 2
-                  if (!isStreamingUrl || !isNetworkError) return // a hiccup the element handles itself
+                  // Both codes are treated as recoverable: browsers are
+                  // inconsistent about which one an expired ticket's
+                  // mid-stream 401/403 surfaces as -- some report NETWORK,
+                  // others SRC_NOT_SUPPORTED because the failed fetch never
+                  // yields a decodable resource. MEDIA_ERR_DECODE (3) is
+                  // deliberately excluded: that's a genuine mid-playback
+                  // decode hiccup the element already retries on its own,
+                  // and forcing a re-mint there would interrupt playback
+                  // that didn't need recovering.
+                  const isRecoverableWhileStreaming =
+                    isStreamingUrl && (element.error?.code === 2 || element.error?.code === 4)
+                  if (!isRecoverableWhileStreaming) return // a hiccup the element handles itself
                   resumeAtRef.current = element.currentTime || null
                   setLoadedUrl('') // this url is dead; a future load must not be swallowed by this guard
-                  reportLoadFailure() // always non-terminal here: isStreamingUrl was just checked true
+                  void remintStreamingUrl().then((reminted) => {
+                    // Re-mint failed too (e.g. access was actually revoked,
+                    // not just the ticket expired) -- fall back to the full
+                    // blob/direct strategy rather than leaving a dead src.
+                    if (!reminted) reportLoadFailure()
+                  })
                   return
                 }
                 if (reportLoadFailure()) setFailedUrl(resolvedUrl)

@@ -45,29 +45,37 @@ const buildUrl = (path: string): string => `${getApiUrl()}${path}`
 
 const STREAM_TICKET_MINT_TIMEOUT_MS = 10_000
 
+// Single source of truth for the files router's mount prefix, shared between
+// every URL builder below and the mint-response shape check -- otherwise the
+// two could drift the way files.py's own prefix derivation was written to
+// avoid on the server side.
+const FILES_API_PREFIX = "/api/files"
+
 // Exported so tests unrelated to streaming-ticket mechanics can spread this
 // and override just `getStreamingUrl` (e.g. to undefined), rather than
 // depending on an incidental mock-shape quirk (a mocked response missing
 // `.json()`) to keep a ticket mint attempt from participating in the test.
 export const defaultFileAccessPolicy: FileAccessPolicy = {
-  previewUrl: (fileId) => buildUrl(`/api/files/preview/${encodeFileId(fileId)}`),
-  downloadUrl: (fileId) => buildUrl(`/api/files/download/${encodeFileId(fileId)}`),
-  inlinePreviewUrl: (fileId) => buildUrl(`/api/files/public/preview/${encodeFileId(fileId)}`),
-  inlineDownloadUrl: (fileId) => buildUrl(`/api/files/public/download/${encodeFileId(fileId)}`),
+  previewUrl: (fileId) => buildUrl(`${FILES_API_PREFIX}/preview/${encodeFileId(fileId)}`),
+  downloadUrl: (fileId) => buildUrl(`${FILES_API_PREFIX}/download/${encodeFileId(fileId)}`),
+  inlinePreviewUrl: (fileId) =>
+    buildUrl(`${FILES_API_PREFIX}/public/preview/${encodeFileId(fileId)}`),
+  inlineDownloadUrl: (fileId) =>
+    buildUrl(`${FILES_API_PREFIX}/public/download/${encodeFileId(fileId)}`),
   relativePreviewUrl: (fileId, relativePath) => {
     const url = new URL(
-      buildUrl(`/api/files/public/preview/${encodeFileId(fileId)}`),
+      buildUrl(`${FILES_API_PREFIX}/public/preview/${encodeFileId(fileId)}`),
       typeof window === "undefined" ? "http://localhost" : window.location.origin,
     )
     url.searchParams.set("relative_path", relativePath)
     return getApiUrl() ? url.toString() : `${url.pathname}${url.search}${url.hash}`
   },
-  pdfPreviewUrl: (fileId) => buildUrl(`/api/files/preview-pdf/${encodeFileId(fileId)}`),
+  pdfPreviewUrl: (fileId) => buildUrl(`${FILES_API_PREFIX}/preview-pdf/${encodeFileId(fileId)}`),
   request: apiRequest,
   listFiles: (query) => {
     const params = new URLSearchParams({ page: "1", size: "20" })
     if (query.trim()) params.set("search", query.trim())
-    return apiRequest(buildUrl(`/api/files/list?${params.toString()}`))
+    return apiRequest(buildUrl(`${FILES_API_PREFIX}/list?${params.toString()}`))
   },
   // previewUrl needs the Bearer header apiRequest attaches; media elements
   // cannot send it, so they must go through the blob fetch unless a
@@ -83,7 +91,7 @@ export const defaultFileAccessPolicy: FileAccessPolicy = {
     let response: Response
     try {
       response = await apiRequest(
-        buildUrl(`/api/files/stream-tickets/${encodeFileId(fileId)}`),
+        buildUrl(`${FILES_API_PREFIX}/stream-tickets/${encodeFileId(fileId)}`),
         { signal: controller.signal },
       )
     } finally {
@@ -97,15 +105,12 @@ export const defaultFileAccessPolicy: FileAccessPolicy = {
     // surface as a caught rejection (so the caller falls back to the blob
     // path) rather than silently becoming a broken `undefined`-based URL.
     const data: unknown = await response.json()
-    if (
-      !data
-      || typeof data !== "object"
-      || typeof (data as { path?: unknown }).path !== "string"
-      || !(data as { path: string }).path.startsWith("/api/files/preview/")
-    ) {
+    const path =
+      data && typeof data === "object" ? (data as { path?: unknown }).path : undefined
+    if (typeof path !== "string" || !path.startsWith(`${FILES_API_PREFIX}/preview/`)) {
       throw new Error("Stream ticket response has an unexpected shape")
     }
-    return buildUrl((data as { path: string }).path)
+    return buildUrl(path)
   },
 }
 
@@ -148,9 +153,9 @@ const appendPublicToken = (url: string, accessToken: string): string => {
 export function createPublicFileAccessPolicy(accessToken: string): FileAccessPolicy {
   const publicUrl = (path: string) => appendPublicToken(buildUrl(path), accessToken)
   const inlinePreviewUrl = (fileId: string) =>
-    publicUrl(`/api/files/public/preview/${encodeFileId(fileId)}`)
+    publicUrl(`${FILES_API_PREFIX}/public/preview/${encodeFileId(fileId)}`)
   const inlineDownloadUrl = (fileId: string) =>
-    publicUrl(`/api/files/public/download/${encodeFileId(fileId)}`)
+    publicUrl(`${FILES_API_PREFIX}/public/download/${encodeFileId(fileId)}`)
 
   return {
     previewUrl: inlinePreviewUrl,

@@ -1357,14 +1357,27 @@ def _answer_fence_task_predicate(principal: InteractionPrincipal) -> list[Any]:
     row the fence statement joins in via ``Task.id == task_id`` (see
     ``_answer_fence_stmt``), not a second, independently-scoped read.
 
-    The ownership terms are redundant on PostgreSQL -- step 2 of
-    ``respond()`` already holds this row's ``FOR NO KEY UPDATE`` lock -- and
-    load-bearing on SQLite, where the dialect drops every locking clause
-    silently and nothing serializes a caller until this statement, the
-    transaction's first write (see ``respond()``'s own docstring for the
-    two backends' different serialization points). Enforcing ownership at
-    the write point rather than only in ``respond()``'s step 3 is what
-    makes the two backends agree on what a successful answer proves.
+    The ``Task.user_id`` term requires the owner in person, on both
+    backends: step 3's authorization admits an admin acting on another
+    user's task, and the guest ownership predicate never reads
+    ``principal.user_id`` (see ``task_is_owned_by_public_principal``), so
+    for both of those callers this term is the only ownership constraint
+    in the path and the fence misses. Answering on another user's behalf
+    is not delivered in this build; whether an admin may do so is a policy
+    decision left to the change that wires the first production caller. A
+    ``principal.user_id`` of ``None`` compiles to ``tasks.user_id IS
+    NULL`` and matches nothing (the column is ``nullable=False``), so such
+    a caller fails closed here rather than matching another user's row.
+
+    Against a *concurrent* ownership change the term is redundant on
+    PostgreSQL -- step 2 of ``respond()`` already holds this row's
+    ``FOR NO KEY UPDATE`` lock -- and load-bearing on SQLite, where the
+    dialect drops every locking clause silently and nothing serializes a
+    caller until this statement, the transaction's first write (see
+    ``respond()``'s own docstring for the two backends' different
+    serialization points). Enforcing ownership at the write point rather
+    than only in ``respond()``'s step 3 is what makes the two backends
+    agree on what a successful answer proves.
 
     ``Task.status`` is compared through ``TaskStatusPredicate.eq``, never a
     raw string literal beside the column -- this module's own convention
@@ -1696,9 +1709,10 @@ def respond(
        from under this transaction's own row lock, then reports
        ``OutcomeUnknown`` without further classifying why the fence missed
        (a fine-grained classification -- already-answered replay/conflict,
-       three terminated reasons, wrong task state, foreign run, or --
-       reachable only on SQLite, see ``_answer_fence_task_predicate`` -- an
-       ownership change -- is not delivered in this build); ``rowcount > 1``
+       three terminated reasons, wrong task state, foreign run, or an
+       ownership miss, reachable on both backends (see
+       ``_answer_fence_task_predicate``) -- is not delivered in this build);
+       ``rowcount > 1``
        is a schema invariant violation (``uq_task_interaction_active_slot``)
        and raises.
     7. The Task CAS via ``apply_task_control_transition``, called with no

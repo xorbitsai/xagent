@@ -1918,6 +1918,35 @@ def test_respond_returns_the_original_receipt_for_a_matching_replay(
         assert outcome.receipt.idempotency_key == command_id
 
 
+def test_respond_receipt_refuses_a_row_that_carries_no_answer() -> None:
+    """``_respond_receipt`` may only ever see an answered row: its one
+    caller is the idempotent-replay branch, and the paired CHECK
+    constraints make an answered row with a NULL ``responded_at`` or
+    ``responder_identity`` impossible. That reasoning spans two modules
+    with nothing else pinning it, so the builder raises loudly on a row
+    with no answer rather than coercing ``None`` into the string
+    ``'None'`` (or a falsy ``""``) inside an audit-bearing receipt."""
+
+    from types import SimpleNamespace
+
+    unanswered = SimpleNamespace(
+        id=7,
+        task_id=11,
+        run_id="run-a",
+        status="active",
+        responded_at=None,
+        responder_identity=None,
+    )
+    task = SimpleNamespace(state_version=1, control_state="waiting_for_user")
+    with pytest.raises(RuntimeError, match="carries no answer"):
+        svc._respond_receipt(
+            interaction=unanswered,  # type: ignore[arg-type]
+            task=task,  # type: ignore[arg-type]
+            command_db_id=1,
+            idempotency_key="key-1",
+        )
+
+
 def test_respond_reports_outcome_unknown_when_the_fence_misses_and_leaves_no_residue(
     _respond_db,
 ) -> None:

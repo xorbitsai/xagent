@@ -1545,8 +1545,26 @@ def _respond_receipt(
     table's audit-authoritative record of who answered (see ``respond()``'s
     own docstring for why ``responder_user_id`` cannot be used for the same
     purpose).
+
+    The only caller is ``respond()``'s idempotent-replay branch, whose
+    precondition -- a staged RESUME command this service itself committed
+    in the same transaction as the answer fence UPDATE -- implies an
+    answered row, and the paired CHECK constraints
+    (``ck_task_interaction_requests_responded_at_pairs_status`` and
+    ``ck_task_interaction_requests_responder_pairs_responded_at``) make an
+    answered row with a NULL ``responded_at`` or ``responder_identity``
+    impossible. That reasoning spans two modules, so the guard below turns
+    it into a loud failure instead of trusting it silently: a receipt must
+    never carry a coerced ``'None'`` identity or a ``None`` timestamp.
     """
 
+    if interaction.responded_at is None or interaction.responder_identity is None:
+        raise RuntimeError(
+            f"interaction {interaction.id} on task {interaction.task_id} "
+            "matched a staged RESUME command but carries no answer; "
+            "ck_task_interaction_requests_responder_pairs_responded_at "
+            "makes this impossible"
+        )
     return InteractionResponseReceipt(
         interaction_id=int(interaction.id),
         task_id=int(interaction.task_id),
@@ -1688,9 +1706,18 @@ def respond(
     3. Pure Python authorization against the row step 2 loaded: a
        ``"user"`` principal must own the task or be an admin; a
        ``"guest"`` principal must satisfy the shared
-       ``task_is_owned_by_public_principal`` predicate. Runs before the
-       idempotency pre-read (step 5) so an unauthorized caller can never use
-       a guessed idempotency key to read back someone else's receipt.
+       ``task_is_owned_by_public_principal`` predicate. A principal whose
+       ``kind`` is neither ``"user"`` nor ``"guest"`` is always
+       unauthorized -- there is no third branch that defaults to allow. A
+       malformed guest principal that populates zero or more than one
+       entity-binding field makes the ownership predicate raise
+       ``ValueError``; this function catches only that one exception type
+       from that one call and treats it as unauthorized -- the same
+       fail-closed-on-a-malformed-caller behavior the predicate itself
+       documents and ``create()`` applies to the same two cases. Runs
+       before the idempotency pre-read (step 5) so an unauthorized caller
+       can never use a guessed idempotency key to read back someone else's
+       receipt.
     4. Load the interaction row by ``(id, task_id)`` -- absent,
        ``Unavailable(interaction_missing)``. Present but its own ``kind`` /
        ``protocol_version`` columns disagree with ``envelope``'s,

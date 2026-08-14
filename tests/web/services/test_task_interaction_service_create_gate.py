@@ -1,52 +1,38 @@
-"""Zero-production-caller gate for ``task_interaction_service.create`` and
-``task_interaction_service.respond``.
+"""Zero-production-caller gate for ``task_interaction_service.create`` alone.
 
-Both names are typed seams with no call body wired to them yet: ``create()``
-validates and returns a typed outcome without ever staging a row, and
-``respond()`` does not exist as a callable at all in this delivery. A static
-test asserts that no production module calls either name through this
-module, so the seam cannot grow a caller before its production behavior is
-actually implemented and tested.
+Replaces the two-name gate this file's predecessor enforced: that gate
+locked both ``create`` and ``respond`` against any production caller, and
+its own docstring named its retirement condition as "the change that routes
+the existing resume coordinator through this module's compatibility seam" --
+the change meant to give ``respond()`` its first production caller. That
+change has landed, but not that way: the compatibility seam in
+``websocket.py`` only reads ``_active_native_row_criteria()`` to decide
+whether an active native row exists, and rejects the legacy resume path
+outright when one does -- it never calls ``respond()`` itself. Zero
+production code anywhere in this package calls ``respond()`` today.
+Locking it under this gate anyway would be conflating "no gate" with "no
+caller"; the two are independent facts, and the former is what this file
+narrows to. ``create()`` still has no caller either, so this narrower gate
+takes over guarding it alone.
 
-Retired by the change that routes the existing resume coordinator through
-this module's compatibility seam. That change is what makes ``respond()``
-reachable in production: the seam refuses a legacy resume on a task that
-holds an active native interaction row, so from that change on the only way
-such a task can be answered is a caller that goes through ``respond()``. The
-first HTTP caller arrives separately, with the endpoint issue, and that
-change must explicitly retire this gate rather than merely satisfy it: an
-endpoint that reaches ``create``/``respond`` only in value position
-(``Depends(create)``, ``functools.partial(respond, ...)`` -- blind spot (e)
-above) leaves this gate passing without ever being seen by the AST walk
-below, so a still-green gate after that change lands is not evidence that
-nothing calls these names in production. ``create()`` is not covered by
-this gate's retirement at all: its production call body arrives with the
-change that wires interaction creation end-to-end and fills in
-``stage_interaction_request``'s caller obligations -- the change that
-deletes this gate file must add a replacement guard that locks
-``create()`` alone, or the seam stops being a statically enforced seam
-the moment this file goes away.
+``create()``'s production call body -- the write that actually calls
+``stage_interaction_request`` -- arrives with the change that wires
+interaction creation end-to-end and fills in that primitive's caller
+obligations. Retiring this gate is that change's job, not this one's: the
+change that deletes this file must add whatever replacement guard it needs,
+the same way this file replaced its own predecessor.
 
 AST-based, module-qualified matching -- not a bare-name or substring scan.
-``create`` and ``respond`` are ordinary English verbs already used as method
-names elsewhere in this codebase (``docker_client.containers.create(...)``,
-unrelated ``.respond(...)`` calls); a scanner that flagged every call named
-``create`` or ``respond`` would be red on day one. This gate only counts a
-call when the callee name is resolved -- through an import binding recorded
-in the same module -- to ``task_interaction_service.create`` or
-``task_interaction_service.respond`` specifically. This is a different scan
-shape from the staging primitive's own gate
-(``test_interaction_staging_production_gate.py``), which gates on two names
-that are unique enough in this codebase for a bare attribute match to be
-safe. ``create`` and ``respond`` are not unique, so this gate additionally
-tracks which local names are bound to this module before it will count a
-call against them; merely importing this module, or importing some other
-name from it (``InteractionPrincipal``, an outcome type, the shared
-ownership predicate), never trips this gate on its own.
+``create`` is an ordinary English verb already used as a method name
+elsewhere in this codebase (``docker_client.containers.create(...)``); a
+scanner that flagged every call named ``create`` would be red on day one.
+This gate only counts a call when the callee name is resolved -- through an
+import binding recorded in the same module -- to
+``task_interaction_service.create`` specifically.
 
 Known blind spots, not fixed here because closing them is out of scope for a
-static AST scan of one package tree (the staging gate documents the same
-class of gaps for the same reason):
+static AST scan of one package tree (identical to the predecessor gate's own
+list, for the identical reasons):
 
 (a) Dynamic access: ``importlib.import_module(...)`` plus ``getattr(...)``
     matches none of the node shapes below.
@@ -77,12 +63,14 @@ import ast
 import textwrap
 from pathlib import Path
 
+import pytest
+
 import xagent
 from xagent.web.services import (  # noqa: F401 -- negative control import
     task_interaction_service as service,
 )
 
-GATED_NAMES = frozenset({"create", "respond"})
+GATED_NAMES = frozenset({"create"})
 SERVICE_MODULE = "task_interaction_service"
 
 
@@ -177,11 +165,11 @@ def _production_modules() -> list[Path]:
 
 
 # --------------------------------------------------------------------------
-# T-GATE-1: the gate itself
+# The gate itself
 # --------------------------------------------------------------------------
 
 
-def test_no_production_module_calls_create_or_respond() -> None:
+def test_no_production_module_calls_create() -> None:
     offenders: dict[str, set[str]] = {}
     for path in _production_modules():
         try:
@@ -197,8 +185,8 @@ def test_no_production_module_calls_create_or_respond() -> None:
 
 
 # --------------------------------------------------------------------------
-# T-GATE-2: positive controls -- each call shape must be individually
-# detected once it is bound to this module
+# Positive controls -- each call shape must be individually detected once it
+# is bound to this module
 # --------------------------------------------------------------------------
 
 
@@ -232,10 +220,10 @@ def test_detects_module_attribute_call() -> None:
         from xagent.web.services import task_interaction_service
 
         def handler(db, **kwargs):
-            return task_interaction_service.respond(db, **kwargs)
+            return task_interaction_service.create(db, **kwargs)
         """
     )
-    assert _production_uses(source) == {"respond"}
+    assert _production_uses(source) == {"create"}
 
 
 def test_detects_aliased_module_attribute_call() -> None:
@@ -256,24 +244,28 @@ def test_detects_star_import_call() -> None:
         from xagent.web.services.task_interaction_service import *
 
         def handler(db, **kwargs):
-            return respond(db, **kwargs)
+            return create(db, **kwargs)
         """
     )
-    assert _production_uses(source) == {"respond"}
+    assert _production_uses(source) == {"create"}
 
 
 # --------------------------------------------------------------------------
-# T-GATE-3: negative controls -- the whole reason this gate cannot reuse the
-# staging gate's bare-name shape
+# Negative controls -- the whole reason this gate cannot reuse the staging
+# gate's bare-name shape
 # --------------------------------------------------------------------------
 
 
 def test_bare_module_import_alone_is_not_flagged() -> None:
-    """Unlike the staging gate, merely referencing this module -- with no
-    call to ``create``/``respond`` bound through it -- must not trip the
-    gate: production code (the shared ownership predicate's consumer in
-    ``public_chat_access.py``) legitimately imports other names from this
-    module in this same delivery."""
+    """Merely referencing this module -- with no call to ``create`` bound
+    through it -- must not trip the gate: production code (the shared
+    ownership predicate's consumer in ``public_chat_access.py``, which
+    imports ``InteractionPrincipal``, ``public_chat_identity_matches``, and
+    ``task_is_owned_by_public_principal``) legitimately imports other names
+    from this module. This gate no longer watches ``respond`` at all, so
+    a caller importing it too would not be flagged either -- see this
+    file's own module docstring for why: no production code calls
+    ``respond()`` today."""
 
     source = "from xagent.web.services import task_interaction_service\n"
     assert _production_uses(source) == set()
@@ -291,16 +283,34 @@ def test_importing_unrelated_name_is_not_flagged() -> None:
     assert _production_uses(source) == set()
 
 
-def test_same_named_call_on_an_unrelated_object_is_not_flagged() -> None:
-    """The whole point of module-qualified matching: a call named
-    ``create`` or ``respond`` on an object with no binding to this module
-    must not match, or this gate would be red against half the codebase."""
+def test_a_production_call_to_respond_is_not_flagged() -> None:
+    """A hypothetical production call to ``respond()`` -- something this
+    package does not actually have today (see this file's own module
+    docstring) -- must not trip this narrower gate either: retiring the
+    predecessor's two-name gate dropped the watch over ``respond`` entirely,
+    not merely relaxed it, so nothing calling ``respond()`` is this gate's
+    concern regardless of whether such a caller exists yet."""
 
     source = textwrap.dedent(
         """
-        def handler(docker_client, ticket):
+        from xagent.web.services.task_interaction_service import respond
+
+        def handler(**kwargs):
+            return respond(**kwargs)
+        """
+    )
+    assert _production_uses(source) == set()
+
+
+def test_same_named_call_on_an_unrelated_object_is_not_flagged() -> None:
+    """The whole point of module-qualified matching: a call named
+    ``create`` on an object with no binding to this module must not match,
+    or this gate would be red against half the codebase."""
+
+    source = textwrap.dedent(
+        """
+        def handler(docker_client):
             docker_client.containers.create(image="x")
-            return ticket.respond(status=200)
         """
     )
     assert _production_uses(source) == set()
@@ -308,7 +318,7 @@ def test_same_named_call_on_an_unrelated_object_is_not_flagged() -> None:
 
 def test_test_module_consumers_are_not_flagged() -> None:
     """Test consumers are allowed: this file, and any other test module
-    that imports the gated names, live under ``tests/``, which
+    that imports the gated name, live under ``tests/``, which
     ``_production_modules`` never walks -- it starts from
     ``xagent.__path__`` (``src/xagent``), not the repository root."""
 
@@ -321,3 +331,41 @@ def test_test_module_consumers_are_not_flagged() -> None:
 def test_service_module_itself_is_excluded_from_the_scan_set() -> None:
     modules = _production_modules()
     assert all(path.stem != SERVICE_MODULE for path in modules)
+
+
+# --------------------------------------------------------------------------
+# Forward-verification: adding a real production caller of ``create`` must
+# turn this gate red, not just its unit-level ``_production_uses`` checks
+# above. ``_production_modules`` walks ``xagent.__path__`` rather than a
+# hardcoded root, so pointing that at a scratch directory for the duration
+# of this one test exercises the exact same scan code the real gate runs,
+# without writing a canary file into the actual ``src/xagent`` tree -- a
+# crash between planting and cleanup there would leave a stray file behind
+# and make every later run of the real gate red for an unrelated reason.
+# --------------------------------------------------------------------------
+
+
+def test_gate_turns_red_when_a_production_caller_is_added(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(xagent, "__path__", [str(tmp_path)])
+    planted = tmp_path / "_zzz_test_task_interaction_service_create_gate_canary.py"
+    planted.write_text(
+        textwrap.dedent(
+            """
+            from xagent.web.services.task_interaction_service import create
+
+
+            def handler(db, **kwargs):
+                return create(db, **kwargs)
+            """
+        ),
+        encoding="utf-8",
+    )
+
+    offenders: dict[str, set[str]] = {}
+    for path in _production_modules():
+        uses = _production_uses(path.read_text(encoding="utf-8"))
+        if uses:
+            offenders[str(path)] = uses
+    assert offenders == {str(planted): {"create"}}

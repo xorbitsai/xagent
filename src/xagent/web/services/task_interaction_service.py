@@ -590,7 +590,19 @@ class RespondOutcomeUnknown:
     have taken the idempotency key first; either way this build reports
     the ambiguity rather than guessing. Not an exception this service lets
     escape -- a stable, typed result a caller can act on (e.g. surface "we
-    could not confirm this went through" rather than crash)."""
+    could not confirm this went through" rather than crash).
+
+    Retrying under the same idempotency key resolves the second reason and
+    not the first, and a caller should not be told otherwise. A retry
+    after an ambiguous commit finds the command this call staged and
+    returns ``Replayed``, and a retry after a rolled-back staging race
+    simply runs again. A retry after a fence miss re-evaluates the same
+    predicate against the same row and misses again: a terminated,
+    superseded, foreign-run, or foreign-owned row stays that way, so the
+    second ``OutcomeUnknown`` is as final as the first. Step 6 logs the
+    reread row's state for that reason -- until the fence classification
+    build lands, that log line is the only place the distinction exists.
+    """
 
 
 RespondOutcome = (
@@ -1984,6 +1996,29 @@ def respond(
                     f"interaction {interaction_id} on task {task_id} disappeared "
                     "while this transaction held the tasks row lock"
                 )
+            # The reread above already has the row in hand, so recording
+            # what it found costs no extra statement. Without this line a
+            # fence miss is the one path out of this function that leaves
+            # nothing at all behind: the caller is told ``OutcomeUnknown``,
+            # and a retry against a terminated, superseded, or
+            # foreign-owned row produces the same miss and the same
+            # ``OutcomeUnknown`` every time, so no amount of retrying ever
+            # reveals which of them it was. The classification this build
+            # does not compute is exactly the set of fields logged here.
+            import logging
+
+            logging.getLogger(__name__).warning(
+                "answer fence matched zero rows for interaction %s on task "
+                "%s; reread status=%s active_slot=%s terminal_reason=%s "
+                "run_id=%s responder_identity=%s",
+                interaction_id,
+                task_id,
+                reread.status,
+                reread.active_slot,
+                reread.terminal_reason,
+                reread.run_id,
+                reread.responder_identity,
+            )
             return RespondOutcomeUnknown()
 
         # No expected_run_id/expected_state_version to pass: this function

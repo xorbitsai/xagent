@@ -68,6 +68,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import logging
 import sqlite3
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -2060,6 +2061,36 @@ def test_respond_reports_outcome_unknown_when_the_fence_misses_and_leaves_no_res
 
         assert isinstance(outcome, svc.RespondOutcomeUnknown)
     assert _conflict_counter() == before_counter
+
+
+def test_respond_logs_the_reread_row_state_when_the_fence_misses(
+    _respond_db, caplog: pytest.LogCaptureFixture
+) -> None:
+    user_id, task_id = _waiting_task(_respond_db)
+    principal = _owning_user_principal(user_id)
+    interaction_id = _answered_row_with_valid_anchor(
+        _respond_db,
+        task_id=task_id,
+        run_id="run-a",
+        responder_identity=principal.identity_string(),
+        response_payload={"env": "prod"},
+    )
+    with caplog.at_level(logging.WARNING):
+        outcome = svc.respond(
+            interaction_id=interaction_id,
+            task_id=task_id,
+            principal=principal,
+            envelope=_respond_envelope(idempotency_key="never-seen-before-logged"),
+        )
+
+    assert isinstance(outcome, svc.RespondOutcomeUnknown)
+    matching = [
+        record
+        for record in caplog.records
+        if "answer fence matched zero rows" in record.message
+    ]
+    assert len(matching) == 1
+    assert "status=answered" in matching[0].message
 
 
 def test_respond_reports_conflict_for_the_same_key_with_a_different_payload(

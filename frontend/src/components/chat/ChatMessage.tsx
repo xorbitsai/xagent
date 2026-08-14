@@ -344,6 +344,29 @@ export function ChatMessage({
   const hasTraceEvents = Array.isArray(traceEvents) && traceEvents.length > 0;
   const shouldShowProcess = !!showProcessView && hasTraceEvents;
 
+  // Mirrors TraceEventRenderer.tsx's isAgentProgressEvent — kept in sync by
+  // hand since the two files declare separate TraceEvent shapes.
+  const isProgressNarrationEvent = (e: TraceEvent): boolean => {
+    if (e.event_type === "agent_progress") return true;
+    if (e.event_type !== "agent_message") return false;
+    return e.data?.expect_response !== true && e.data?.message_type !== "question";
+  };
+
+  // The model's own narration ("I'll look into pricing now...") is more
+  // useful here than a generic action label, and it should keep showing
+  // even after a later, un-narrated tool call — the narration is still
+  // accurate until the model says something newer.
+  const latestProgressNarration = (): string => {
+    if (!Array.isArray(traceEvents)) return "";
+    for (let i = traceEvents.length - 1; i >= 0; i--) {
+      const event = traceEvents[i];
+      if (!isProgressNarrationEvent(event)) continue;
+      const raw = event.data?.message ?? event.data?.content;
+      if (typeof raw === "string" && raw.trim()) return raw.trim();
+    }
+    return "";
+  };
+
   // Map event/action to i18n key
   const getEventTitle = (e: TraceEvent | undefined) => {
     if (!e) return "";
@@ -376,11 +399,13 @@ export function ChatMessage({
     return action || t("traceEventRenderer.taskExecution");
   };
 
-  const latestTitle = getEventTitle(
-    Array.isArray(traceEvents) && traceEvents.length > 0
-      ? traceEvents[traceEvents.length - 1]
-      : undefined
-  );
+  const latestTitle =
+    latestProgressNarration() ||
+    getEventTitle(
+      Array.isArray(traceEvents) && traceEvents.length > 0
+        ? traceEvents[traceEvents.length - 1]
+        : undefined
+    );
   const resolvedProcessStatus = resolveTraceProcessStatus({
     processStatus,
     taskStatus,

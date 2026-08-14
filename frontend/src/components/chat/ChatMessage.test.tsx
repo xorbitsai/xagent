@@ -484,4 +484,72 @@ describe("ChatMessage Session file capability", () => {
     ).not.toBeInTheDocument()
     expect(screen.getByText(/agent\.logs\.event\.actions\.tool_execution_end/)).toBeInTheDocument()
   })
+
+  it("surfaces the model's own progress narration in the status line, not a generic action label", () => {
+    render(
+      <ChatMessage
+        role="assistant"
+        content={null}
+        taskStatus="running"
+        traceEvents={[
+          { event_type: "tool_execution_start", data: { tool_name: "web_search" } },
+          { event_type: "tool_execution_end", data: { tool_name: "web_search" } },
+          {
+            event_type: "agent_progress",
+            data: { message: "Looking into LangChain and CrewAI pricing now." },
+          },
+        ]}
+      />,
+    )
+
+    expect(
+      screen.getByText(/Looking into LangChain and CrewAI pricing now\./),
+    ).toBeInTheDocument()
+    expect(screen.queryByText(/agent\.logs\.event\.actions/)).not.toBeInTheDocument()
+  })
+
+  it("keeps showing the last narration even after a newer, un-narrated tool call", () => {
+    render(
+      <ChatMessage
+        role="assistant"
+        content={null}
+        taskStatus="running"
+        traceEvents={[
+          {
+            event_type: "agent_progress",
+            data: { message: "Checking pricing pages first." },
+          },
+          { event_type: "tool_execution_start", data: { tool_name: "browser_use" } },
+        ]}
+      />,
+    )
+
+    // The narration is still accurate — a later tool call with no message
+    // of its own shouldn't bump it back to a generic tool-name label.
+    expect(screen.getByText(/Checking pricing pages first\./)).toBeInTheDocument()
+    expect(
+      screen.queryByText(/traceEventRenderer\.toolNames\.browser_use/),
+    ).not.toBeInTheDocument()
+  })
+
+  it("does not treat a pending question as narration in the status line", () => {
+    // expect_response=true means this agent_message is a question awaiting
+    // the user's answer, not a progress update — it must not surface in the
+    // status line the way real narration would.
+    render(
+      <ChatMessage
+        role="assistant"
+        content={null}
+        taskStatus="running"
+        traceEvents={[
+          {
+            event_type: "agent_message",
+            data: { message: "Which region should I search?", expect_response: true },
+          },
+        ]}
+      />,
+    )
+
+    expect(screen.queryByText(/Which region should I search\?/)).not.toBeInTheDocument()
+  })
 })

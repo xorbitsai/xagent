@@ -14,6 +14,7 @@ change touch" does not have to diff a 2000-line file to find it.
 from __future__ import annotations
 
 import ast
+import inspect
 from datetime import datetime, timedelta, timezone
 from itertools import count
 from pathlib import Path
@@ -23,7 +24,7 @@ import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
-import xagent
+from tests.web.services.interaction_static_scan_shared import _scan_root
 from tests.web.services.task_interaction_schema_shared import (
     make_task,
     make_trace_event,
@@ -287,6 +288,56 @@ def test_th6_all_names_resolve_and_are_public() -> None:
 
 
 # ---------------------------------------------------------------------------
+# T-H-7: __all__ -- completeness, not just soundness. T-H-6 above proves
+# every name in __all__ resolves and is public; this proves the converse,
+# that every public name this module defines at module level is in
+# __all__. Neither direction implies the other.
+# ---------------------------------------------------------------------------
+
+_NOT_PUBLIC_API = frozenset({"logger"})
+
+
+def _module_level_public_definitions(module: Any) -> set[str]:
+    """Names this module defines at module level (function, class, or a
+    module-level assignment target) that are not underscore-prefixed --
+    imported names are excluded, since ``__all__`` states what this module
+    offers, not what it happened to import."""
+
+    source = inspect.getsource(module)
+    tree = ast.parse(source)
+    names: set[str] = set()
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            if not node.name.startswith("_"):
+                names.add(node.name)
+        elif isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Name) and not target.id.startswith("_"):
+                    names.add(target.id)
+        elif isinstance(node, ast.AnnAssign):
+            if isinstance(node.target, ast.Name) and not node.target.id.startswith("_"):
+                names.add(node.target.id)
+    return names
+
+
+def test_th7_all_names_include_every_public_module_level_definition() -> None:
+    """``logger`` is excluded deliberately, not overlooked:
+    ``logging.getLogger(__name__)`` is boilerplate every module in this
+    tree carries at module level, an implementation detail rather than
+    something this module wants a caller to import. Admitting it into
+    ``__all__`` would turn ``__all__`` from "this module's public surface"
+    into "this module's module-level names", which is not the same
+    promise.
+    """
+
+    defined = _module_level_public_definitions(staging)
+    missing = (defined - _NOT_PUBLIC_API) - set(staging.__all__)
+    assert missing == set(), (
+        f"public module-level definitions missing from __all__: {missing}"
+    )
+
+
+# ---------------------------------------------------------------------------
 # InteractionHandoff has zero direct-construction points in src/ outside
 # its own defining module (task_interaction_staging.py). Publicizing the
 # class (this module's own rename) makes direct construction syntactically
@@ -308,13 +359,6 @@ def _direct_construction_uses(source: str) -> bool:
             if isinstance(func, ast.Attribute) and func.attr == _HANDOFF_CLASS_NAME:
                 return True
     return False
-
-
-def _scan_root(exclude_stem: str) -> list[Path]:
-    root = Path(next(iter(xagent.__path__)))
-    modules = [p for p in root.rglob("*.py") if p.stem != exclude_stem]
-    assert modules, "production scan set is empty"
-    return modules
 
 
 def test_ta12_interaction_handoff_has_zero_direct_construction_points() -> None:

@@ -20,6 +20,25 @@ not an implementation detail (see the corrupt-before-legacy note below):
 6. the row passes all six conditions and its ``checkpoint_type`` is the
    current one -> a resolved ``InteractionAnchor``.
 
+Three of the six outcomes above increment a counter
+(``COUNTER_ANCHOR_ABSENT_NO_RUN`` for step 1,
+``COUNTER_ANCHOR_UNAVAILABLE_DANGLING_POINTER`` for step 3,
+``COUNTER_ANCHOR_ABSENT_LEGACY_CHECKPOINT_TYPE`` for step 5;
+``interaction_rollout.py``). Step 4 (corrupt) has no counter but does
+register ``INTERACTION_ANCHOR_CORRUPT``, an ops degradation signal rather
+than a rate metric -- see that signal's own paragraph below. Steps 2 (no
+checkpoint pointer) and 6 (resolved) have neither: this is not an
+oversight, both are simply uninstrumented today, and nothing downstream
+depends on their absence the way the corrupt path's degradation signal is
+depended on. The practical cost is that none of the three counters that do
+exist can serve as a rate denominator -- there is no "how many times this
+function ran" total to divide any of them by, only the three numerators
+themselves, so today's counters answer "how many times did outcome N
+happen" and nothing answers "out of how many resolutions." Adding
+counters for steps 2 and 6 belongs to whichever change wires this
+function's first production caller, alongside deciding what that caller
+needs the rate for.
+
 Step 4 must run before step 5: a row belonging to a *different* task, even
 one whose ``checkpoint_type`` is legacy, must still be reported corrupt.
 Folding the two steps into one (checking legacy-type first) would let a

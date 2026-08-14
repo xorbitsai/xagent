@@ -18,8 +18,10 @@ file's module docstring for why file-backed rather than in-memory).
 from __future__ import annotations
 
 import ast
+import inspect
 import logging
-from datetime import datetime, timezone
+import textwrap
+from datetime import datetime, timedelta, timezone
 from itertools import count
 from pathlib import Path
 from typing import Any
@@ -29,16 +31,20 @@ import sqlalchemy as sa
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
 
-import xagent
+from tests.web.services.interaction_static_scan_shared import _scan_root
 from tests.web.services.task_interaction_schema_shared import make_user
 from xagent.core.agent.checkpoint import CHECKPOINT_TYPE, LEGACY_CHECKPOINT_TYPES
 from xagent.db.sqlite import apply_sqlite_concurrency_pragmas
+from xagent.web.api import trace_handlers
 from xagent.web.models.database import Base
 from xagent.web.models.task import Task, TraceEvent
 from xagent.web.services import interaction_rollout as ir
 from xagent.web.services import ops_signals
 from xagent.web.services.task_interaction_anchor import resolve_interaction_anchor
-from xagent.web.services.task_interaction_staging import InteractionAnchor
+from xagent.web.services.task_interaction_staging import (
+    InteractionAnchor,
+    stage_interaction_request,
+)
 from xagent.web.services.task_lease_service import TASK_RUN_ID_TRACE_FIELD
 
 _event_counter = count()
@@ -557,6 +563,136 @@ def test_matching_non_empty_execution_identity_resolves_anchor(
 
 
 # ---------------------------------------------------------------------------
+# A resolved anchor fed straight into stage_interaction_request: the two
+# primitives have zero tests that exercise both together today, so nothing
+# proves the write-direction resolver's output actually satisfies the
+# staging primitive's own anchor validation and run-partition comparison.
+# ---------------------------------------------------------------------------
+
+
+def test_resolved_anchor_stages_successfully(tmp_path: Path) -> None:
+    """Feeds resolve_interaction_anchor's output directly into
+    stage_interaction_request with no intervening conversion, proving there
+    is none for a caller to have to supply."""
+
+    engine = _engine(tmp_path)
+    db = _session_factory(engine)()
+    task, row = _build_scenario(
+        db, task_run_id="run-a", run_partition="run-a", checkpoint_type=CHECKPOINT_TYPE
+    )
+
+    anchor = resolve_interaction_anchor(db, task)
+    assert anchor is not None
+
+    staged = stage_interaction_request(
+        db,
+        task_id=task.id,
+        run_id=task.run_id,
+        anchor=anchor,
+        kind="clarification",
+        protocol_version=1,
+        origin="internal",
+        request_payload={"message": "pick one", "interactions": []},
+        request_idempotency_key=f"key-{next(_event_counter)}",
+        expires_at=datetime.now(timezone.utc) + timedelta(hours=1),
+        now=datetime.now(timezone.utc),
+    )
+    db.commit()
+
+    assert staged.created is True
+    db.close()
+
+
+# ---------------------------------------------------------------------------
+# Structural equivalence between this module's six row-validity conditions
+# and trace_handlers.py's own copy. The two stay separate functions on
+# purpose -- their failure actions differ (this one returns None and
+# degrades, that one raises CheckpointCorruptError) -- but the six-condition
+# disjunction itself, and the order its six terms run in, must be kept
+# identical by construction, not merely by review. This is a structural
+# check, not a textual one: one known-legitimate rename (``task.id`` here
+# versus ``self.task_id`` there, since one is a bare function and the other
+# a bound method) is normalized away before comparing; everything else must
+# match verbatim.
+# ---------------------------------------------------------------------------
+
+
+class _NormalizeSelfTaskId(ast.NodeTransformer):
+    """Rewrites ``self.task_id`` to ``task.id`` wherever it appears, the one
+    legitimate rename between trace_handlers.py's bound-method form and this
+    module's bare-function form. Every other identifier must already match
+    verbatim between the two copies."""
+
+    def visit_Attribute(self, node: ast.Attribute) -> ast.AST:
+        self.generic_visit(node)
+        if (
+            isinstance(node.value, ast.Name)
+            and node.value.id == "self"
+            and node.attr == "task_id"
+        ):
+            return ast.copy_location(
+                ast.Attribute(
+                    value=ast.Name(id="task", ctx=ast.Load()),
+                    attr="id",
+                    ctx=ast.Load(),
+                ),
+                node,
+            )
+        return node
+
+
+def _six_condition_disjunction(func: Any) -> list[ast.expr]:
+    """The six ``ast.BoolOp(op=Or)`` operands inside ``func``'s corrupt-row
+    ``if`` statement. Located by shape (a 6-way ``or`` inside the function
+    body), not by line number, since the two copies live at different
+    offsets in their own files."""
+
+    source = textwrap.dedent(inspect.getsource(func))
+    tree = ast.parse(source)
+    candidates = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.BoolOp)
+        and isinstance(node.op, ast.Or)
+        and len(node.values) == 6
+    ]
+    assert len(candidates) == 1, (
+        f"expected exactly one 6-way `or` in {func.__qualname__}, "
+        f"found {len(candidates)}"
+    )
+    return candidates[0].values
+
+
+def _normalized_dump(node: ast.expr) -> str:
+    rewritten = _NormalizeSelfTaskId().visit(node)
+    ast.fix_missing_locations(rewritten)
+    return ast.dump(rewritten, annotate_fields=False)
+
+
+def test_row_validity_conditions_match_trace_handlers_structurally() -> None:
+    """If this test turns red, the six row-validity conditions
+    ``resolve_interaction_anchor`` checks and the six
+    ``_load_pk_anchored_checkpoint`` (``trace_handlers.py``) checks have
+    drifted apart -- in content, or in the order they run in, which this
+    module's own docstring states is a contract (condition 4 must precede
+    condition 5). Bring the two back into alignment rather than editing
+    this test to match whichever side changed, unless the divergence was
+    deliberate -- in which case update the docstrings on both sides that
+    say the two are kept identical, not just this test.
+    """
+
+    anchor_conditions = _six_condition_disjunction(resolve_interaction_anchor)
+    trace_handler_conditions = _six_condition_disjunction(
+        trace_handlers.DatabaseTraceHandler._load_pk_anchored_checkpoint
+    )
+
+    anchor_dumps = [_normalized_dump(node) for node in anchor_conditions]
+    trace_handler_dumps = [_normalized_dump(node) for node in trace_handler_conditions]
+
+    assert anchor_dumps == trace_handler_dumps
+
+
+# ---------------------------------------------------------------------------
 # resolve_interaction_anchor ships with zero production callers.
 # ---------------------------------------------------------------------------
 
@@ -581,13 +717,6 @@ def _anchor_production_uses(source: str) -> bool:
             if isinstance(func, ast.Attribute) and func.attr == _ANCHOR_GATED_NAME:
                 return True
     return False
-
-
-def _scan_root(exclude_stem: str) -> list[Path]:
-    root = Path(next(iter(xagent.__path__)))
-    modules = [p for p in root.rglob("*.py") if p.stem != exclude_stem]
-    assert modules, "production scan set is empty"
-    return modules
 
 
 def test_ta11_resolve_interaction_anchor_has_zero_production_callers() -> None:

@@ -30,6 +30,8 @@ vi.mock("@/components/file/pptx-preview-renderer", () => ({
 }))
 
 import { getFriendlyToolName, processTraceEvents } from "./TraceEventRenderer"
+import { resolveDynamicTranslation, type Locale } from "@/i18n/translations"
+import type { TranslateDynamic } from "@/contexts/i18n-context"
 
 const t = (key: string, vars?: Record<string, string | number>) =>
   vars?.tool ? `${key}:${vars.tool}` : key
@@ -258,5 +260,31 @@ describe("getFriendlyToolName", () => {
     expect(() => getFriendlyToolName({ unexpected: "object" } as never)).not.toThrow()
     expect(() => getFriendlyToolName(null as never)).not.toThrow()
     expect(getFriendlyToolName(42 as never)).toBe("")
+    expect(getFriendlyToolName({ unexpected: "object" } as never)).toBe("")
+    expect(getFriendlyToolName(null as never)).toBe("")
+  })
+})
+
+// The mocked useI18n() above (t: key => key) means every other test in this
+// file exercises processTraceEvents' own logic, not what the toolNames map
+// actually resolves to — deleting the whole map would leave them green. Use
+// the real resolver here so a regression in en.ts/zh.ts's toolNames entries,
+// or in getFriendlyToolName's lookup path, actually fails a test.
+describe("getFriendlyToolName against the real translation trees", () => {
+  const realTDynamic = (locale: Locale): TranslateDynamic => (key, fallback) =>
+    resolveDynamicTranslation(locale, key, fallback)
+
+  it("resolves a mapped tool name to its curated phrase in both locales", () => {
+    expect(getFriendlyToolName("web_search", realTDynamic("en"))).toBe("Searching the web")
+    expect(getFriendlyToolName("web_search", realTDynamic("zh"))).toBe("正在搜索网络")
+  })
+
+  it("falls back to the prettified raw name for a tool absent from the map", () => {
+    expect(getFriendlyToolName("some_future_tool", realTDynamic("en"))).toBe(
+      "Some Future Tool",
+    )
+    expect(getFriendlyToolName("some_future_tool", realTDynamic("zh"))).toBe(
+      "Some Future Tool",
+    )
   })
 })

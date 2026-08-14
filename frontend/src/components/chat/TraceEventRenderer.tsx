@@ -260,9 +260,15 @@ const getWaitingQuestionFromEvents = (events: TraceEvent[]): string | null => {
 // user-facing copy. Turn any unmapped one into readable words as a safety net
 // so new/uncommon tools never fall back to a bare snake_case string.
 function prettifyToolName(name: string): string {
-  return name
-    .replace(/[_-]+/g, ' ')
-    .trim()
+  const spaced = name
+    .replace(/([a-z0-9])([A-Z])/g, '$1 $2')
+    .replace(/[_.-]+/g, ' ')
+    .trim();
+  // An all-separator name (rare, but possible for a malformed/adversarial
+  // tool id) leaves nothing after stripping — an empty title is worse than
+  // the raw name, so fall back to that instead of rendering blank.
+  if (!spaced) return name;
+  return spaced
     .split(' ')
     .filter(Boolean)
     .map((word) => word.charAt(0).toUpperCase() + word.slice(1))
@@ -283,7 +289,7 @@ export function getFriendlyToolName(toolName: string, tDynamic?: TranslateDynami
   return tDynamic(`traceEventRenderer.toolNames.${toolName}`, fallback);
 }
 
-const isAgentProgressEvent = (event: TraceEvent): boolean => (
+export const isAgentProgressEvent = (event: TraceEvent): boolean => (
   event.event_type === 'agent_progress' ||
   (
     event.event_type === 'agent_message' &&
@@ -291,6 +297,15 @@ const isAgentProgressEvent = (event: TraceEvent): boolean => (
     event.data?.message_type !== 'question'
   )
 );
+
+// Shared with ChatMessage.tsx's status line so both surfaces agree on what
+// counts as narration text for the same event — a hand-duplicated copy
+// there previously used ?? instead of ||, silently disagreeing with this
+// file on events shaped like {message: "", content: "..."}.
+export function getProgressNarrationText(event: TraceEvent): string {
+  const raw = event.data?.message || event.data?.content;
+  return typeof raw === 'string' ? raw.trim() : '';
+}
 
 // Process trace events into steps
 // Pure reducer over trace events -> ordered steps. Exported for unit testing
@@ -456,7 +471,7 @@ export function processTraceEvents(
         step.actions.push({
           id: eventId,
           type: 'llm',
-          title: t('traceEventRenderer.callLLM', { model: eventData.model_name || t('traceEventRenderer.unknownModel') }),
+          title: t('traceEventRenderer.callLLM'),
           status: 'running',
           timestamp,
           data: { model: eventData.model_name }
@@ -493,8 +508,8 @@ export function processTraceEvents(
       }
 
       if (isProgressMessage) {
-        const message = event.data?.message || event.data?.content;
-        if (typeof message === 'string' && message.trim()) {
+        const message = getProgressNarrationText(event);
+        if (message) {
           if (!step.stepName) {
             step.stepName = t('traceEventRenderer.taskExecution');
           }
@@ -508,7 +523,7 @@ export function processTraceEvents(
             status: 'completed',
             timestamp,
             data: {
-              output: message.trim(),
+              output: message,
               inline: true,
               workforceSummary: isWorkforceManagerSummary,
             }

@@ -559,6 +559,97 @@ describe("ChatMessage Session file capability", () => {
     ).not.toBeInTheDocument()
   })
 
+  it("expires a narration once a second later tool call starts, instead of staying stale for the rest of the run", () => {
+    render(
+      <ChatMessage
+        role="assistant"
+        content={null}
+        taskStatus="running"
+        traceEvents={[
+          {
+            event_type: "agent_progress",
+            data: { message: "Checking pricing pages first." },
+          },
+          { event_type: "tool_execution_start", data: { tool_name: "browser_use" } },
+          { event_type: "tool_execution_end", data: { tool_name: "browser_use" } },
+          { event_type: "tool_execution_start", data: { tool_name: "write_file" } },
+        ]}
+      />,
+    )
+
+    // Two tool calls have started since the narration — it no longer
+    // describes what's happening now, so the generic label takes over
+    // instead of naming a step the trace has long since moved past.
+    expect(screen.queryByText(/Checking pricing pages first\./)).not.toBeInTheDocument()
+  })
+
+  it("shows the most recent narration when there are several, not an earlier one", () => {
+    // Pins the backward-scan direction in latestProgressNarration — a
+    // regression that scanned forward instead would still pass every other
+    // narration test here (each of them only has one narration).
+    render(
+      <ChatMessage
+        role="assistant"
+        content={null}
+        taskStatus="running"
+        traceEvents={[
+          { event_type: "agent_progress", data: { message: "First: scoping the task." } },
+          {
+            event_type: "agent_progress",
+            data: { message: "Second: now writing the file." },
+          },
+        ]}
+      />,
+    )
+
+    expect(screen.getByText(/Second: now writing the file\./)).toBeInTheDocument()
+    expect(screen.queryByText(/First: scoping the task\./)).not.toBeInTheDocument()
+  })
+
+  it("excludes a question from narration by message_type alone, without expect_response set", () => {
+    // The exclusion is `expect_response !== true && message_type !== 'question'`
+    // — two independent disjuncts. The other test for this only sets
+    // expect_response; this one isolates message_type so deleting either
+    // half of the exclusion would fail a test.
+    render(
+      <ChatMessage
+        role="assistant"
+        content={null}
+        taskStatus="running"
+        traceEvents={[
+          {
+            event_type: "agent_message",
+            data: { message: "Which region should I search?", message_type: "question" },
+          },
+        ]}
+      />,
+    )
+
+    expect(screen.queryByText(/Which region should I search\?/)).not.toBeInTheDocument()
+  })
+
+  it("does not throw when the last trace event is malformed and no narration short-circuits first", () => {
+    // The existing malformed-entries test ends with a valid narration, so
+    // latestProgressNarration() short-circuits the `||` before
+    // getEventTitle ever runs on the malformed tail — its own guards go
+    // unexercised. Drop the narration so this one actually reaches them.
+    expect(() =>
+      render(
+        <ChatMessage
+          role="assistant"
+          content={null}
+          taskStatus="running"
+          traceEvents={[
+            null,
+            42,
+            "not-an-event",
+            { event_type: 17, data: "not-an-object" },
+          ] as unknown as React.ComponentProps<typeof ChatMessage>["traceEvents"]}
+        />,
+      ),
+    ).not.toThrow()
+  })
+
   it("does not treat a pending question as narration in the status line", () => {
     // expect_response=true means this agent_message is a question awaiting
     // the user's answer, not a progress update — it must not surface in the

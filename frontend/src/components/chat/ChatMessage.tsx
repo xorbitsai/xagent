@@ -2,7 +2,13 @@ import React, { useState, useRef, useEffect, useCallback } from "react";
 import { Bot, ChevronDown, ChevronUp, Copy, Check, Laptop } from "lucide-react";
 import { useRouter } from "next/navigation";
 import { cn } from "@/lib/utils";
-import { TraceEventRenderer, getFriendlyToolName, type AgentExecutionSummary } from "./TraceEventRenderer";
+import {
+  TraceEventRenderer,
+  getFriendlyToolName,
+  isAgentProgressEvent,
+  getProgressNarrationText,
+  type AgentExecutionSummary,
+} from "./TraceEventRenderer";
 import { useI18n } from "@/contexts/i18n-context";
 import { useApp } from "@/contexts/app-context-chat";
 import { MarkdownRenderer } from "@/components/ui/markdown-renderer";
@@ -348,30 +354,39 @@ export function ChatMessage({
   // that each entry is actually an object here, once, rather than repeating
   // a null/type guard in every helper below that reads from the list.
   const sanitizedTraceEvents: TraceEvent[] = Array.isArray(traceEvents)
-    ? traceEvents.filter(
-        (event): event is TraceEvent =>
-          !!event && typeof event === "object" && !Array.isArray(event),
-      )
+    ? traceEvents
+        .filter(
+          (event): event is TraceEvent =>
+            !!event && typeof event === "object" && !Array.isArray(event),
+        )
+        // A non-string event_type (e.g. a stray number) would otherwise
+        // render as a garbage status label further down — drop it here
+        // rather than have every reader guard against it individually.
+        .map((event) =>
+          typeof event.event_type === "string"
+            ? event
+            : { ...event, event_type: undefined },
+        )
     : [];
 
-  // Mirrors TraceEventRenderer.tsx's isAgentProgressEvent — kept in sync by
-  // hand since the two files declare separate TraceEvent shapes.
-  const isProgressNarrationEvent = (e: TraceEvent): boolean => {
-    if (e.event_type === "agent_progress") return true;
-    if (e.event_type !== "agent_message") return false;
-    return e.data?.expect_response !== true && e.data?.message_type !== "question";
-  };
-
   // The model's own narration ("I'll look into pricing now...") is more
-  // useful here than a generic action label, and it should keep showing
-  // even after a later, un-narrated tool call — the narration is still
-  // accurate until the model says something newer.
+  // useful here than a generic action label. It keeps showing through one
+  // later, un-narrated tool call — the narration is still accurate for
+  // that long — but expires once a second one starts: without a cutoff a
+  // narration from early in a long turn would keep naming a step the
+  // trace has long since moved past.
   const latestProgressNarration = (): string => {
+    let toolStartsSinceNarration = 0;
     for (let i = sanitizedTraceEvents.length - 1; i >= 0; i--) {
       const event = sanitizedTraceEvents[i];
-      if (!isProgressNarrationEvent(event)) continue;
-      const raw = event.data?.message ?? event.data?.content;
-      if (typeof raw === "string" && raw.trim()) return raw.trim();
+      if (isAgentProgressEvent(event)) {
+        const message = getProgressNarrationText(event);
+        if (!message) continue;
+        return toolStartsSinceNarration <= 1 ? message : "";
+      }
+      if (event.event_type === "tool_execution_start") {
+        toolStartsSinceNarration += 1;
+      }
     }
     return "";
   };
@@ -409,12 +424,7 @@ export function ChatMessage({
   };
 
   const latestTitle =
-    latestProgressNarration() ||
-    getEventTitle(
-      sanitizedTraceEvents.length > 0
-        ? sanitizedTraceEvents[sanitizedTraceEvents.length - 1]
-        : undefined
-    );
+    latestProgressNarration() || getEventTitle(sanitizedTraceEvents.at(-1));
   const resolvedProcessStatus = resolveTraceProcessStatus({
     processStatus,
     taskStatus,

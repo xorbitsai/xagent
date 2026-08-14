@@ -3350,7 +3350,6 @@ const zh = {
     thoughtProcess: "思考过程",
     showProcess: "展开过程",
     hideProcess: "收起过程",
-    unknownModel: "未知模型",
     callLLM: "正在思考",
     llmResponse: "思考完成",
     stepResult: "步骤结果",

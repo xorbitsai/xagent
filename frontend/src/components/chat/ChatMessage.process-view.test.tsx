@@ -17,9 +17,19 @@ vi.mock("next/navigation", () => ({
   useRouter: () => ({ push: vi.fn() }),
 }))
 
-vi.mock("./TraceEventRenderer", () => ({
-  TraceEventRenderer: () => <div data-testid="trace-renderer" />,
-}))
+vi.mock("./TraceEventRenderer", async () => {
+  // Keep the real getFriendlyToolName/isAgentProgressEvent/
+  // getProgressNarrationText (imported by ChatMessage) so status-line
+  // narration logic runs for real; only the heavy TraceEventRenderer
+  // component itself is stubbed out.
+  const actual = await vi.importActual<typeof import("./TraceEventRenderer")>(
+    "./TraceEventRenderer",
+  )
+  return {
+    ...actual,
+    TraceEventRenderer: () => <div data-testid="trace-renderer" />,
+  }
+})
 
 vi.mock("@/components/ui/markdown-renderer", () => ({
   MarkdownRenderer: ({ content }: { content: string }) => <div>{content}</div>,

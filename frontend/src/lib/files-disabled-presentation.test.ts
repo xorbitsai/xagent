@@ -125,6 +125,19 @@ describe("files-disabled presentation", () => {
     ].join("\n"))
   })
 
+  it("falls back to the link title, not the literal word file, when the label is empty", () => {
+    // reconcile_assistant_file_references (file_reference_output_service.py)
+    // emits media references with an empty label and the real filename in
+    // the title -- e.g. [](file:id "generated_video.mp4") -- so the title
+    // must still surface here even though there's no label/alt text at all.
+    expect(sanitizeFilesDisabledPresentationText(
+      '[](file:tenant-secret "generated_video.mp4")',
+    )).toBe("generated_video.mp4")
+    expect(sanitizeFilesDisabledPresentationText(
+      '![](file:tenant-secret "generated_video.mp4")',
+    )).toBe("generated_video.mp4")
+  })
+
   it("preserves dotted business routes outside explicit local runtime roots", () => {
     expect(sanitizeFilesDisabledPresentationText(
       "Keep /docs/index.html, /customers/acme.com, /api/users/profile.json, and /v1/openapi.json.",

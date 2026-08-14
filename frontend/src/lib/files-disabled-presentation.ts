@@ -368,7 +368,14 @@ const sanitizeFilesDisabledPresentationTextWithPaths = (
       if (node.type === "link" || node.type === "image") {
         const target = node.url ?? ""
         if (isInertFileTarget(target, knownPaths)) {
-          const label = sanitizePlainPresentationText(markdownNodeText(node), redactUnquotedPaths) || "file"
+          // markdownNodeText is alt-first for images, then link/image
+          // children text -- but an empty label/alt (e.g. a media
+          // reference emitted as ``[](file:id "generated_video.mp4")``,
+          // see file_reference_output_service.py) leaves nothing there.
+          // Falling back to the title before "file" keeps that filename
+          // visible instead of degrading to the literal word "file".
+          const rawLabel = markdownNodeText(node) || node.title || ""
+          const label = sanitizePlainPresentationText(rawLabel, redactUnquotedPaths) || "file"
           replaceNode(node, label)
           return
         }

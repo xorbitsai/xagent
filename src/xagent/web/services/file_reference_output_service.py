@@ -297,7 +297,11 @@ def reconcile_assistant_file_references(
         junk = match.group("junk")
         if junk and junk.strip():
             unrecoverable_fallback = match.group(0)
-        elif parsed_title:
+        elif (
+            parsed_title
+            and parsed_title.strip()
+            and parsed_title.strip() != label.strip()
+        ):
             # The title is this function's own designated channel for the
             # real filename (see below) -- on give-up, dropping it bare
             # would destroy the one piece of information naming which file
@@ -307,7 +311,10 @@ def reconcile_assistant_file_references(
             # asked this function to eliminate. Preserving it as plain text
             # alongside the label costs nothing: the reference is already
             # being unlinked, so there is no markdown structure left to
-            # keep it safe for.
+            # keep it safe for. Guarded against a whitespace-only title
+            # (nothing worth preserving) and a title identical to the label
+            # (would render a pointless "x (x)") -- both fall through to
+            # the plain label case below instead.
             unrecoverable_fallback = (
                 f"{label} ({parsed_title})" if label else parsed_title
             )
@@ -392,9 +399,9 @@ def reconcile_assistant_file_references(
             # different file than the record (see
             # test_reconcile_keeps_mismatched_label_...): there is no
             # signal that a coincidental extension match is wrong.
-            label_reveals_type = bool(suffix) and label.strip().casefold().endswith(
-                suffix
-            )
+            # _is_inline_preview_media(filename) above guarantees suffix is
+            # non-empty, so no separate bool(suffix) check is needed here.
+            label_reveals_type = label.strip().casefold().endswith(suffix)
             if not label_reveals_type:
                 if not _UNSAFE_TITLE_RE.search(filename):
                     # Primary mechanism: carry the real filename in the

@@ -526,8 +526,9 @@ def test_reconcile_keeps_alt_text_for_image_syntax_image_reference():
 
 def test_reconcile_adds_title_for_empty_label_media_reference():
     # The frontend falls back to the title when the label is empty
-    # (fileName = title || linkText || fileNameFromPath), so an empty label
-    # still gets a working preview once the title carries the filename.
+    # (displayFilename = visibleText || title || fileNameFromPath), so an
+    # empty label still gets a working preview once the title carries the
+    # filename.
     db, user, task = _create_context()
     try:
         _add_file(

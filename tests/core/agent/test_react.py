@@ -2722,6 +2722,131 @@ async def test_react_pattern_streams_final_answer_after_repeated_guard() -> None
     assert outbound.events[-1]["content"] == "Fallback answer."
 
 
+def _record_work_tool_call(
+    pattern: ReActPattern, call_id: str, tool_name: str = "web_search"
+) -> None:
+    pattern.tool_ledger[call_id] = ToolCallRecord(
+        tool_call_id=call_id,
+        tool_name=tool_name,
+        args={"query": "x"},
+        args_hash="hash",
+        status="completed",
+        result={"success": True},
+    )
+
+
+def _record_send_message_call(pattern: ReActPattern, call_id: str) -> None:
+    pattern.tool_ledger[call_id] = ToolCallRecord(
+        tool_call_id=call_id,
+        tool_name="send_message",
+        args={"message": "update", "message_type": "progress"},
+        args_hash="hash",
+        status="completed",
+        result={"message": "update", "status": "sent"},
+    )
+
+
+def test_progress_narration_nudge_fires_once_a_streak_crosses_the_threshold() -> None:
+    # Live testing showed the model can go a whole multi-round search task
+    # (5 tool calls) without ever calling send_message on its own; this
+    # nudge is the deterministic backstop for that silence.
+    pattern = ReActPattern(progress_narration_nudge_after_consecutive_tool_calls=2)
+    context = ExecutionContext(execution_id="task-1")
+
+    _record_work_tool_call(pattern, "call-1")
+    pattern._maybe_nudge_progress_narration(context=context)
+    assert not any(m.role == "system" for m in context.messages)
+
+    _record_work_tool_call(pattern, "call-2")
+    pattern._maybe_nudge_progress_narration(context=context)
+    system_messages = [m for m in context.messages if m.role == "system"]
+    assert len(system_messages) == 1
+    assert "send_message" in system_messages[0].content
+    assert "message_type='progress'" in system_messages[0].content
+
+
+def test_progress_narration_nudge_does_not_repeat_for_the_same_streak() -> None:
+    pattern = ReActPattern(progress_narration_nudge_after_consecutive_tool_calls=2)
+    context = ExecutionContext(execution_id="task-1")
+
+    for i in range(1, 4):
+        _record_work_tool_call(pattern, f"call-{i}")
+        pattern._maybe_nudge_progress_narration(context=context)
+
+    # Threshold (2) was crossed once and the streak kept growing (3), so the
+    # nudge should not have fired again in between — only when the count
+    # actually exceeds the last-nudged value.
+    assert sum(1 for m in context.messages if m.role == "system") == 1
+
+
+def test_progress_narration_nudge_renudges_once_the_streak_grows_further() -> None:
+    pattern = ReActPattern(progress_narration_nudge_after_consecutive_tool_calls=2)
+    context = ExecutionContext(execution_id="task-1")
+
+    for i in range(1, 5):
+        _record_work_tool_call(pattern, f"call-{i}")
+        pattern._maybe_nudge_progress_narration(context=context)
+        if i == 2:
+            # First crossing: exactly one nudge so far.
+            assert sum(1 for m in context.messages if m.role == "system") == 1
+
+    # The model kept ignoring it past the first nudge (4 consecutive calls,
+    # last nudged at 2) — that "still not narrating" state deserves a second
+    # reminder rather than staying silent for the rest of the run.
+    assert sum(1 for m in context.messages if m.role == "system") == 2
+
+
+def test_progress_narration_nudge_resets_after_a_send_message_call() -> None:
+    pattern = ReActPattern(progress_narration_nudge_after_consecutive_tool_calls=2)
+    context = ExecutionContext(execution_id="task-1")
+
+    _record_work_tool_call(pattern, "call-1")
+    _record_work_tool_call(pattern, "call-2")
+    pattern._maybe_nudge_progress_narration(context=context)
+    assert sum(1 for m in context.messages if m.role == "system") == 1
+
+    _record_send_message_call(pattern, "call-3")
+    pattern._maybe_nudge_progress_narration(context=context)
+    assert sum(1 for m in context.messages if m.role == "system") == 1
+
+    # New streak after the model finally narrated — should be able to nudge
+    # again once it goes quiet for another full threshold.
+    _record_work_tool_call(pattern, "call-4")
+    _record_work_tool_call(pattern, "call-5")
+    pattern._maybe_nudge_progress_narration(context=context)
+    assert sum(1 for m in context.messages if m.role == "system") == 2
+
+
+def test_progress_narration_nudge_disabled_when_threshold_is_none() -> None:
+    pattern = ReActPattern(progress_narration_nudge_after_consecutive_tool_calls=None)
+    context = ExecutionContext(execution_id="task-1")
+
+    for i in range(1, 6):
+        _record_work_tool_call(pattern, f"call-{i}")
+        pattern._maybe_nudge_progress_narration(context=context)
+
+    assert not any(m.role == "system" for m in context.messages)
+
+
+def test_progress_narration_nudge_survives_checkpoint_resume() -> None:
+    pattern = ReActPattern(progress_narration_nudge_after_consecutive_tool_calls=2)
+    context = ExecutionContext(execution_id="task-1")
+    _record_work_tool_call(pattern, "call-1")
+    _record_work_tool_call(pattern, "call-2")
+    pattern._maybe_nudge_progress_narration(context=context)
+    assert sum(1 for m in context.messages if m.role == "system") == 1
+
+    resumed = ReActPattern()
+    resumed.load_state(pattern.get_state())
+    assert resumed.progress_narration_nudge_after_consecutive_tool_calls == 2
+    # The streak hasn't grown past what was already nudged, so resuming
+    # must not immediately re-nudge for the same unchanged state.
+    resumed.tool_ledger = dict(pattern.tool_ledger)
+    resumed_context = ExecutionContext(execution_id="task-1")
+    resumed._maybe_nudge_progress_narration(context=resumed_context)
+    assert not any(m.role == "system" for m in resumed_context.messages)
+
+
 @pytest.mark.asyncio
 async def test_react_pattern_supports_plain_function_tools(
     monkeypatch: pytest.MonkeyPatch,

@@ -87,6 +87,14 @@ class ReActReasoningMode(str, Enum):
 REPEATED_TOOL_DECISION_REQUESTED_STATUS = "repeated_tool_decision_requested"
 DEFAULT_REPEATED_TOOL_DECISION_CONSECUTIVE_TOOL_CALLS = 4
 DEFAULT_REPEATED_TOOL_DECISION_CONSECUTIVE_WORK_TOOL_CALLS = 10
+# Live testing showed the model rarely reaches for send_message on its own
+# even with schema-level guidance: a 5-round web_search task sent zero
+# progress updates. This threshold drives a deterministic system-message
+# nudge instead of relying solely on prompt persuasion.
+DEFAULT_PROGRESS_NARRATION_NUDGE_AFTER_CONSECUTIVE_TOOL_CALLS = 2
+# Tool calls that already deliver a message to the user; encountering one
+# resets the progress-narration nudge counter.
+MESSAGE_TOOL_NAMES = frozenset({"send_message", "ask_user_question"})
 REACT_DECISION_TOOL_NAME = "react_decision"
 REACT_DECISION_FINAL_ANSWER = "final_answer"
 REACT_DECISION_TOOL_CALL = "tool_call"
@@ -202,6 +210,9 @@ class ReActPattern(AgentPattern):
         repeated_tool_decision_after_consecutive_work_tool_calls: int | None = (
             DEFAULT_REPEATED_TOOL_DECISION_CONSECUTIVE_WORK_TOOL_CALLS
         ),
+        progress_narration_nudge_after_consecutive_tool_calls: int | None = (
+            DEFAULT_PROGRESS_NARRATION_NUDGE_AFTER_CONSECUTIVE_TOOL_CALLS
+        ),
         tool_parallel_enabled: bool = False,
         tool_max_concurrency: int = 3,
     ) -> None:
@@ -221,6 +232,13 @@ class ReActPattern(AgentPattern):
         self.repeated_tool_decision_after_consecutive_work_tool_calls = (
             repeated_tool_decision_after_consecutive_work_tool_calls
         )
+        self.progress_narration_nudge_after_consecutive_tool_calls = (
+            progress_narration_nudge_after_consecutive_tool_calls
+        )
+        # Consecutive-tool-call count at which we last injected a nudge, so a
+        # streak that stays past the threshold doesn't get re-nudged every
+        # single subsequent tool call; only when it grows further.
+        self._progress_narration_last_nudged_count = 0
         self.status = "idle"
         self.current_iteration = 0
         self.last_response: Any = None
@@ -1181,6 +1199,12 @@ class ReActPattern(AgentPattern):
             "repeated_tool_decision_after_consecutive_work_tool_calls": (
                 self.repeated_tool_decision_after_consecutive_work_tool_calls
             ),
+            "progress_narration_nudge_after_consecutive_tool_calls": (
+                self.progress_narration_nudge_after_consecutive_tool_calls
+            ),
+            "progress_narration_last_nudged_count": (
+                self._progress_narration_last_nudged_count
+            ),
             "force_final_answer_next": self.force_final_answer_next,
             "repeated_tool_decision": self.repeated_tool_decision,
             "waiting_for_user_request": self.waiting_for_user_request,
@@ -1229,6 +1253,16 @@ class ReActPattern(AgentPattern):
             self.repeated_tool_decision_after_consecutive_work_tool_calls = (
                 int(raw_work_threshold) if raw_work_threshold is not None else None
             )
+        if "progress_narration_nudge_after_consecutive_tool_calls" in state:
+            raw_nudge_threshold = state[
+                "progress_narration_nudge_after_consecutive_tool_calls"
+            ]
+            self.progress_narration_nudge_after_consecutive_tool_calls = (
+                int(raw_nudge_threshold) if raw_nudge_threshold is not None else None
+            )
+        self._progress_narration_last_nudged_count = int(
+            state.get("progress_narration_last_nudged_count", 0) or 0
+        )
         self.force_final_answer_next = bool(state.get("force_final_answer_next", False))
         repeated_tool_decision = state.get("repeated_tool_decision")
         self.repeated_tool_decision = (
@@ -2525,6 +2559,11 @@ class ReActPattern(AgentPattern):
                 successful_tool_result = True
             if requested_decision:
                 successful_tool_result = False
+            else:
+                # A pending repeated-tool decision will settle continue-vs-
+                # finish on its own next turn; layering a progress nudge on
+                # top of that would just be redundant noise.
+                self._maybe_nudge_progress_narration(context=context)
 
         if (
             self.finalize_after_tool_result
@@ -2877,6 +2916,67 @@ class ReActPattern(AgentPattern):
                 continue
             count += 1
         return count
+
+    def _consecutive_work_tool_calls_since_last_message(self) -> int:
+        """Work-tool calls made since the model last sent the user anything.
+
+        Unlike ``_consecutive_work_tool_call_count`` (which treats every
+        control tool as transparent), a send_message/ask_user_question call
+        here breaks the streak: it is the one signal that the user actually
+        heard from the agent.
+        """
+        count = 0
+        control_tool_names = self._control_tool_names()
+        for record in reversed(list(self.tool_ledger.values())):
+            if record.tool_name in MESSAGE_TOOL_NAMES:
+                break
+            if record.tool_name in control_tool_names:
+                continue
+            if record.status not in {"completed", "failed"}:
+                continue
+            count += 1
+        return count
+
+    def _maybe_nudge_progress_narration(self, *, context: Any) -> None:
+        """Push the model toward send_message when it has gone quiet.
+
+        Schema-level guidance on send_message alone proved too weak in
+        practice — a real multi-round search task made zero progress-update
+        calls. This adds a deterministic backstop: once enough consecutive
+        tool calls pass without any message to the user, inject a system
+        reminder before the next LLM call.
+        """
+        threshold = self.progress_narration_nudge_after_consecutive_tool_calls
+        if threshold is None or threshold <= 0:
+            return
+
+        count = self._consecutive_work_tool_calls_since_last_message()
+        if count == 0:
+            self._progress_narration_last_nudged_count = 0
+            return
+        if count < threshold:
+            return
+        # Only re-nudge once the streak has grown by another full threshold
+        # since the last reminder — otherwise every subsequent tool call
+        # past the threshold would re-fire it (count strictly increases by
+        # one each call, so a plain "count > last nudged" check nags on
+        # every single one).
+        if count - self._progress_narration_last_nudged_count < threshold:
+            return
+
+        self._progress_narration_last_nudged_count = count
+        context.add_system_message(
+            "Progress narration reminder:\n"
+            f"You have made {count} consecutive tool calls without sending "
+            "the user any update. Before your next tool call, call "
+            "send_message with message_type='progress' to briefly tell "
+            "them what you're doing or what you just found, in plain "
+            "language and in their own language — then continue the task.",
+            metadata={
+                "source": "progress_narration_nudge",
+                "consecutive_tool_calls": count,
+            },
+        )
 
     async def _finalize_success(
         self,

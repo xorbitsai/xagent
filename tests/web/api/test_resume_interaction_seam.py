@@ -289,16 +289,85 @@ async def test_legacy_resume_without_a_receipt_is_refused_on_the_fallback_path(
     assert "unanswered question" in sent["message"]
 
 
+# ---------------------------------------------------------------------------
+# Receipt shapes the seam must refuse.
+#
+# The comparison at the seam is deliberately type-strict: a receipt it
+# cannot recognize as the exact int respond() stages is no receipt at all.
+# Each factory below returns an ``interaction_id`` a coercion-first rewrite
+# would wrongly accept, so this table is the pin against that rewrite.
+# ---------------------------------------------------------------------------
+
+
+def _string_form_id(interaction_id: int) -> object:
+    """The active row's own id, as a string.
+
+    Refused by the plain ``!=`` on its own (``"1" != 1``). Pinned so a
+    future rewrite cannot start coercing the payload before comparing.
+    """
+
+    return str(interaction_id)
+
+
+def _float_form_id(interaction_id: int) -> object:
+    """The active row's own id, as a JSON number with a fraction part.
+
+    ``1.0 == 1`` in Python, so the plain ``!=`` accepts this for any row.
+    Only the ``isinstance(..., int)`` term refuses it.
+    """
+
+    return float(interaction_id)
+
+
+def _json_true_id(interaction_id: int) -> object:
+    """JSON ``true``.
+
+    ``True == 1`` in Python, so the plain ``!=`` accepts JSON ``true`` as
+    the receipt for row 1 specifically. Only the ``isinstance(..., bool)``
+    term refuses it. Every test in this file seeds exactly one row into its
+    own fresh temporary database, so the active row's id is 1 here; that is
+    asserted rather than assumed, because the case is meaningless against
+    any other id.
+    """
+
+    assert interaction_id == 1
+    return True
+
+
+def _exact_id(interaction_id: int) -> object:
+    """The active row's own id, as the int respond() stages.
+
+    Paired with a payload that omits ``responder_identity`` so the
+    ``or not receipt_responder_identity`` disjunct is what refuses this
+    case -- every other case short-circuits on the id comparison, leaving
+    that disjunct never exercised in the True direction.
+    """
+
+    return interaction_id
+
+
+_UNVERIFIABLE_RECEIPTS = [
+    pytest.param(_string_form_id, True, id="string-form-id"),
+    pytest.param(_float_form_id, True, id="float-form-id"),
+    pytest.param(_json_true_id, True, id="json-true-id"),
+    pytest.param(_exact_id, False, id="exact-id-without-responder-identity"),
+]
+
+
 @pytest.mark.asyncio
-async def test_wrongly_typed_receipt_id_is_refused_like_a_missing_one(
-    monkeypatch: pytest.MonkeyPatch, _session_factory, _seeded_task: int
+@pytest.mark.parametrize(
+    ("receipt_id_factory", "include_responder_identity"), _UNVERIFIABLE_RECEIPTS
+)
+async def test_receipts_the_seam_cannot_verify_are_refused(
+    monkeypatch: pytest.MonkeyPatch,
+    _session_factory,
+    _seeded_task: int,
+    receipt_id_factory,
+    include_responder_identity: bool,
 ) -> None:
-    """A receipt whose ``interaction_id`` arrives as a string -- even the
-    string form of the active row's own id -- must land on the refusal
-    path. The seam's comparison is deliberately type-strict: a receipt it
-    cannot recognize as the exact continuation ``respond()`` staged is no
-    receipt at all. Today that falls out of plain ``!=`` across types;
-    this test pins it against a future rewrite that coerces first."""
+    """Every receipt shape the seam cannot verify as the exact continuation
+    ``respond()`` staged must land on the refusal path, identically to a
+    command that carries no receipt at all."""
 
     import xagent.web.models.database as database_module
 
@@ -314,6 +383,13 @@ async def test_wrongly_typed_receipt_id_is_refused_like_a_missing_one(
     transition = AsyncMock()
     agent_service = MagicMock()
     agent_service.supports_live_control = MagicMock(return_value=True)
+
+    payload: dict[str, object] = {
+        "user": SimpleNamespace(id=OWNER_ID, is_admin=False),
+        "interaction_id": receipt_id_factory(interaction_id),
+    }
+    if include_responder_identity:
+        payload["responder_identity"] = f"user:{OWNER_ID}"
 
     from xagent.web.services import task_setup_snapshot as snapshot_module
 
@@ -341,20 +417,20 @@ async def test_wrongly_typed_receipt_id_is_refused_like_a_missing_one(
         await websocket_api._handle_resume_task_unserialized(
             MagicMock(),
             _seeded_task,
-            {
-                "user": SimpleNamespace(id=OWNER_ID, is_admin=False),
-                "interaction_id": str(interaction_id),
-                "responder_identity": f"user:{OWNER_ID}",
-            },
+            payload,
         )
 
         agent_manager.get_agent_for_task.assert_not_called()
 
     transition.assert_not_called()
+    background_manager.reserve_resume.assert_not_called()
     assert connection_manager.send_personal_message.await_count == 1
     sent = connection_manager.send_personal_message.await_args.args[0]
     assert sent["type"] == "error"
     assert "unanswered question" in sent["message"]
+    assert (
+        ops_signals.INTERACTION_LEGACY_RESUME_SHIM in ops_signals.active_degradations()
+    )
 
 
 @pytest.mark.asyncio

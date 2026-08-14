@@ -7869,8 +7869,18 @@ async def _handle_resume_task_unserialized(
         if active_interaction_id is not None:
             receipt_interaction_id = message_data.get("interaction_id")
             receipt_responder_identity = message_data.get("responder_identity")
+            # isinstance before comparing, the same shape the cancel
+            # command's own state-version guard uses below: `True == 1` and
+            # `1.0 == 1` both hold in Python, so a bare `!=` against the
+            # row's int id accepts a JSON `true` as the receipt for row 1
+            # and a JSON `5.0` as the receipt for row 5. A receipt this
+            # seam cannot recognize as the exact int respond() staged is no
+            # receipt at all, so the type check is part of the comparison,
+            # not a separate validation step a caller could skip.
             if (
-                receipt_interaction_id != active_interaction_id
+                isinstance(receipt_interaction_id, bool)
+                or not isinstance(receipt_interaction_id, int)
+                or receipt_interaction_id != active_interaction_id
                 or not receipt_responder_identity
             ):
                 from ..services import ops_signals

@@ -101,7 +101,12 @@ from .ops_signals import (
     register_degradation,
 )
 from .task_interaction_staging import InteractionAnchor
-from .task_lease_service import TaskLease
+from .task_lease_service import (
+    TaskLease,
+    lease_is_fenced,
+    task_row_matches_lease_attempt,
+    task_row_matches_lease_owner,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -450,6 +455,13 @@ def resolve_publishable_clarification(
        claimed the row, and this settlement must be discarded wholesale
        rather than degrade -- an attempt that is no longer current has no
        business writing anything at all.
+
+       Guards 2 through 4 evaluate ``lease_is_fenced``,
+       ``task_row_matches_lease_owner`` and ``task_row_matches_lease_attempt``
+       (``task_lease_service.py``). The booleans are shared with the
+       interaction handoff's own re-check so the two cannot drift; the
+       fail-closed classification each one produces here is this function's
+       alone.
     5. ``anchor is not None`` -- no resume anchor means this run's most
        recent checkpoint was never one a structured interaction can resume
        against; this degrades, it does not fail the round.
@@ -531,13 +543,13 @@ def resolve_publishable_clarification(
 
     assert draft is not None  # narrowed by the two branches above
 
-    if lease.run_id is None:
+    if not lease_is_fenced(lease):
         return FailClosed("unfenced_lease")
 
-    if task.runner_id != lease.runner_id or task.run_id != lease.run_id:
+    if not task_row_matches_lease_owner(task, lease):
         return FailClosed("ownership_changed")
 
-    if lease.attempt_id is not None and task.lease_attempt_id != lease.attempt_id:
+    if not task_row_matches_lease_attempt(task, lease):
         return FailClosed("attempt_mismatch")
 
     if anchor is None:

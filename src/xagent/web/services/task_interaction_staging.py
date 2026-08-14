@@ -156,7 +156,7 @@ from .ops_signals import (
     register_degradation,
 )
 from .task_command_transport import COMMAND_ID_PATTERN
-from .task_lease_service import TaskLease
+from .task_lease_service import TaskLease, task_row_matches_lease_attempt
 
 logger = logging.getLogger(__name__)
 
@@ -1183,20 +1183,15 @@ class InteractionHandoff:
         self.staged: StagedInteractionRequest | None = None
 
     def _assert_current_attempt(self) -> None:
-        """``lease.attempt_id is None`` is a fail-open sentinel (a
-        pre-attempt-column lease, or the permanent-``None`` ambient snapshot
-        ``_task_lease_snapshot`` builds in ``websocket.py``) and must be
-        treated as "cannot prove attempt identity", not as "matches" --
-        skipping this assertion, never failing it. See
-        ``TaskLease.attempt_id``'s docstring (``task_lease_service.py``) for
-        the two distinct sources of that ``None``.
+        """Raise unless the task row's current attempt is this lease's.
 
-        This is a plain Python object comparison, not a SQL expression: the
-        `` == None`` -> ``IS NULL`` folding that affects a SQLAlchemy
-        column comparison compiled to SQL does not apply here.
+        The comparison itself, and why ``lease.attempt_id is None`` skips
+        the check rather than failing it, live with the predicate
+        (``task_row_matches_lease_attempt``, ``task_lease_service.py``).
 
-        This reads ``self.task.lease_attempt_id`` from whatever snapshot of
-        the task row the caller already loaded. Whether that attribute
+        What stays here is what the predicate cannot know: this reads
+        ``self.task.lease_attempt_id`` from whatever snapshot of the task
+        row the caller already loaded. Whether that attribute
         access itself touches the database is conditional on the object's
         own session-bound state, not a fixed property of this line: if
         SQLAlchemy has expired ``task`` (its default behavior after every
@@ -1223,10 +1218,7 @@ class InteractionHandoff:
         locking here is assuming something SQLite does not provide.
         """
 
-        if (
-            self.lease.attempt_id is not None
-            and self.task.lease_attempt_id != self.lease.attempt_id
-        ):
+        if not task_row_matches_lease_attempt(self.task, self.lease):
             raise InteractionAttemptMismatch(
                 f"task {self.task.id}'s current attempt "
                 f"({self.task.lease_attempt_id!r}) does not match this "

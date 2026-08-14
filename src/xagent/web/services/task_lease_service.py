@@ -91,6 +91,72 @@ class TaskLease:
     attempt_id: str | None = None
 
 
+# ---------------------------------------------------------------------------
+# Fence predicates. Three plain booleans over a task row and the lease that
+# claims it, shared by every caller that has to prove a settlement still
+# belongs to the run that produced it.
+#
+# Only the boolean is shared. What a caller does when one of these is False
+# stays at the caller: the clarification resolver classifies each into its
+# own fail-closed reason, the interaction handoff raises, and the WebSocket
+# finalizers report a late result. Those three consequences are genuinely
+# different and must not be folded together here.
+#
+# These are plain Python comparisons against an already-loaded task row.
+# They are NOT the shape the WebSocket finalizers use: those compile the
+# same ownership condition into the WHERE clause of a locking SELECT, so
+# "no row came back" is what tells them ownership changed, and the row lock
+# they take is scoped by that same condition. Rewriting them to load a row
+# and then call the predicate below would move the lock and change what a
+# late result means, so they keep their own form. That the two forms agree
+# is asserted statically, in
+# tests/web/services/test_interaction_fence_equivalence.py.
+# ---------------------------------------------------------------------------
+
+
+def lease_is_fenced(lease: TaskLease) -> bool:
+    """Whether ``lease`` can name the run that produced a result at all.
+
+    A lease with no ``run_id`` predates run fencing; it cannot prove which
+    run a result came from, so a caller holding one may not settle
+    anything that depends on run identity.
+    """
+
+    return lease.run_id is not None
+
+
+def task_row_matches_lease_owner(task: Task, lease: TaskLease) -> bool:
+    """Whether ``task`` is still owned by the runner and run in ``lease``.
+
+    Both fields are compared, never one: a successor runner can reuse a
+    ``run_id`` and a single runner can move between runs, so either field
+    alone leaves a real ownership change looking like a match.
+    """
+
+    return bool(task.runner_id == lease.runner_id and task.run_id == lease.run_id)
+
+
+def task_row_matches_lease_attempt(task: Task, lease: TaskLease) -> bool:
+    """Whether ``task``'s current attempt is the one ``lease`` names.
+
+    ``lease.attempt_id is None`` returns True. That is a fail-open
+    sentinel and it is deliberate: ``None`` means this lease cannot prove
+    attempt identity at all (a pre-attempt-column lease, or the
+    permanently-``None`` ambient snapshot ``_task_lease_snapshot`` builds
+    in ``websocket.py`` -- see ``TaskLease.attempt_id`` for both sources),
+    and the established reading is "skip this check", never "treat it as a
+    mismatch". A caller that needs attempt identity proven rather than
+    merely not-contradicted has to check ``lease.attempt_id is not None``
+    itself; this predicate does not make that distinction for it.
+
+    This is a plain Python object comparison, not a SQL expression: the
+    ``== None`` -> ``IS NULL`` folding that affects a SQLAlchemy column
+    comparison compiled to SQL does not apply here.
+    """
+
+    return bool(lease.attempt_id is None or task.lease_attempt_id == lease.attempt_id)
+
+
 _CURRENT_TASK_LEASE: ContextVar[TaskLease | None] = ContextVar(
     "xagent_current_task_lease",
     default=None,

@@ -1148,10 +1148,11 @@ def _resolve_read_direction_anchor(
       this into "no active row" and retrying legacy is prohibited outright.
 
     A further divergence, this one against the write-direction ("finalizer
-    side") anchor resolver a later change supplies rather than against
-    trace_handlers: that resolver treats a legacy checkpoint type as "no
-    anchor available" and never stages an active row anchored to one at
-    all. This resolver, by contrast, accepts every member of
+    side") resolver ``resolve_interaction_anchor``
+    (``task_interaction_anchor.py``) rather than against trace_handlers:
+    that resolver treats a legacy checkpoint type as "no anchor available"
+    (its own step 5) and never stages an active row anchored to one at all.
+    This resolver, by contrast, accepts every member of
     ``READABLE_CHECKPOINT_TYPES`` -- the current type and the legacy ones
     -- exactly as trace_handlers does. The two disagreeing is not a bug to
     reconcile: because the write side never produces an active row

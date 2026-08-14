@@ -51,6 +51,25 @@ thing to this function's caller: there is no anchor to stage against.
 Folding them into one legacy-style scan is exactly the shape this function
 is built not to reproduce.
 
+The read-direction resolver classifies legacy checkpoint types the
+opposite way. ``_resolve_read_direction_anchor``
+(``task_interaction_service.py``) accepts every member of
+``READABLE_CHECKPOINT_TYPES`` -- the current type and the legacy ones --
+where step 5 above rejects the legacy ones. Neither side is wrong and
+neither is copying the other: this function decides what may be anchored
+*to* when a row is written, and protocol v1 has no representation for a
+legacy-anchored request; that one decides whether an already-written
+row's anchor still resolves, and it keeps its condition set identical to
+trace_handlers' so the two read paths cannot drift. The disagreement is
+unreachable in production for exactly one reason -- this function is the
+only thing that produces the anchors that resolver later reads, so no
+active row anchored to a legacy-type checkpoint can exist for it to
+apply to. Reconciling the two into a single classification is deliberately
+NOT done here: it would require choosing one classification for
+pre-existing checkpoint rows, which is the open decision this module's
+last paragraph describes. Whoever makes that decision must change both
+sides in one change, not this one alone.
+
 ``INTERACTION_RUN_PARTITION_MISMATCH_DEGRADED`` (``ops_signals.py``) is a
 signal owned by ``interaction_handoff``, not by this function: it is
 registered when that context manager swallows

@@ -2670,7 +2670,10 @@ def test_every_vocabulary_pair_is_produced_by_at_least_one_cell_test() -> None:
     any other arithmetic against the 27-cell count -- six
     not_task_principal cells and two idempotency_key_reused cells
     legitimately collapse onto one pair each; this only asserts that no
-    vocabulary pair is left with zero producing cells."""
+    vocabulary pair is left with zero producing cells. Its blind spot: a
+    new cell that produces no *new* pair -- for example a seventh
+    not_task_principal scenario -- adds nothing this scan would notice
+    missing, so that gap is caught by review, not by this test."""
 
     import ast
     import inspect

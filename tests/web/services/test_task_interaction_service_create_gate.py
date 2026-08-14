@@ -5,11 +5,13 @@ Replaces the two-name gate this file's predecessor enforced, keeping both
 names under watch. The predecessor named its retirement condition as "the
 change that routes the existing resume coordinator through this module's
 compatibility seam" -- the change meant to give ``respond()`` its first
-production caller. That change has not landed: it ships separately in this
-same series, and nothing in ``websocket.py`` references this module today.
-Zero production code anywhere in this package calls either name, and this
-gate is what keeps that true until the change that wires a caller retires
-the name it wires.
+production caller. That compatibility seam has since landed: ``websocket.py``
+now imports ``_active_native_row_criteria`` from this module. It does not,
+though, give ``respond()`` a caller -- the seam only reads that filter
+predicate, it never calls ``respond()`` -- so this gate's retirement
+condition is still open. Zero production code anywhere in this package
+calls either name, and this gate is what keeps that true until the change
+that wires a caller retires the name it wires.
 
 ``create()``'s production call body -- the write that actually calls
 ``stage_interaction_request`` -- arrives with the change that wires

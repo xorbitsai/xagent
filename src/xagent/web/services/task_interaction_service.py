@@ -59,9 +59,10 @@ either); and the response-conflict counter
 Not delivered here, and named so a reader does not go looking for them in
 this module: the compatibility seam that routes the existing resume
 coordinator (``websocket.py``'s ``_handle_resume_task_unserialized``)
-through ``_active_native_row_criteria()`` ships as its own change in this
-same series and is not part of this one -- nothing in ``websocket.py``
-references this module today. ``create()``'s own call body -- the write
+through ``_active_native_row_criteria()`` shipped as its own change in this
+same series and has already merged -- ``websocket.py`` now imports
+``_active_native_row_criteria`` from this module -- but is not part of this
+change. ``create()``'s own call body -- the write
 that actually stages a row -- is not delivered here either; its own
 zero-production-caller gate
 (``tests/web/services/test_task_interaction_service_create_gate.py``)
@@ -483,13 +484,12 @@ def public_chat_identity_matches(task: "Task", principal: InteractionPrincipal) 
 
 
 # ---------------------------------------------------------------------------
-# RespondOutcome: the answer-side discriminated union. Types only in this
-# delivery -- respond() itself, and every branch that could actually
-# produce most of these variants, lands with a later change (see the module
-# docstring). Defining the full union now, rather than growing it
-# incrementally alongside respond()'s call body, is what lets the reason
-# vocabulary be pinned once and the counting below be a real guard instead
-# of a moving target.
+# RespondOutcome: the answer-side discriminated union. respond() itself,
+# and the call body that produces every one of these variants, are both
+# delivered in this module (see the module docstring). Defining the full
+# union up front, rather than growing it incrementally alongside that call
+# body, is what lets the reason vocabulary be pinned once and the counting
+# below be a real guard instead of a moving target.
 # ---------------------------------------------------------------------------
 
 
@@ -1526,7 +1526,7 @@ def _respond_command_payload(
     *, interaction_id: int, principal: InteractionPrincipal, values: Any
 ) -> dict[str, Any]:
     """The RESUME command payload ``respond()`` stages in step 8, and the
-    payload it re-derives at steps 5 and 6 to look an existing command up by
+    payload it re-derives at steps 5 and 8 to look an existing command up by
     the same shape.
 
     Carries ``responder_identity`` alongside the answer ``values`` so that
@@ -1563,7 +1563,15 @@ def _respond_receipt(
     a caller's ``principal`` -- that column, not ``principal``, is this
     table's audit-authoritative record of who answered (see ``respond()``'s
     own docstring for why ``responder_user_id`` cannot be used for the same
-    purpose).
+    purpose). This is not the only receipt this module builds: the accept
+    path builds ``RespondAccepted``'s receipt from plain locals captured in
+    the same transaction before the commit below, including
+    ``principal.identity_string()`` for ``responder_identity`` rather than
+    a read of this row's column. The two are not competing sources of
+    truth -- the answer fence this function's own precondition depends on
+    is the statement that wrote the column from that same
+    ``principal.identity_string()`` value, so the column and the local are
+    equal by the fence write's own semantics, not by coincidence.
 
     The only caller is ``respond()``'s idempotent-replay branch, whose
     precondition -- a staged RESUME command this service itself committed
@@ -1679,12 +1687,18 @@ def respond(
     the module docstring's audit-identity paragraph for why
     `responder_identity` and not this column is this table's audit source
     of truth. `actor_user_id` (written on the staged command, step 8)
-    records whose identity the resulting RESUME command executes as, which
-    is always the task's owning user for both principal kinds -- a guest's
-    turn already runs as that owner, matching the existing
-    `public_chat_access.py` precedent of dispatching guest-originated work
-    under the owner's identity. Do not "fix" this into agreement; they are
-    answers to different questions.
+    records whose identity the resulting RESUME command executes as. For a
+    guest principal, and for a non-admin `"user"` principal, that is always
+    the task's owning user: a guest's turn already runs as the entity owner
+    it is chatting through, matching the existing `public_chat_access.py`
+    precedent of dispatching guest-originated work under the owner's
+    identity, and step 3's non-admin branch requires `task.user_id ==
+    principal.user_id` to even reach here. The admin branch carries no such
+    requirement -- `principal.is_admin` authorizes on its own -- so an
+    admin's `actor_user_id` is the admin's own `principal.user_id` (which
+    can be absent, or belong to someone other than the task's owner), not
+    the task owner's. Do not "fix" this into agreement; they are answers to
+    different questions.
 
     Of the two audit-relevant columns this function fills on the interaction
     row, `responder_identity` is the one a reader can trust to stay
@@ -1730,7 +1744,7 @@ def respond(
        A dict whose contents cannot be rendered as JSON -- a ``datetime``,
        a ``set``, ``bytes``, or a ``nan``/infinite float -- is rejected
        here too, by the same ``json.dumps(..., allow_nan=False)`` probe
-       the question side runs (see ``_render_request_payload``). Without
+       the question side runs (see ``build_v1_request_payload``). Without
        it the first two would surface as a ``StatementError`` raised
        inside step 6's fence UPDATE, outside the ``RespondOutcome``
        contract entirely, and the third would be stored silently as a
@@ -1875,7 +1889,7 @@ def respond(
     try:
         json.dumps(envelope.values, allow_nan=False, sort_keys=True)
     except (TypeError, ValueError):
-        # The same probe ``_render_request_payload`` runs on the question
+        # The same probe ``build_v1_request_payload`` runs on the question
         # side (see its own docstring), applied here for the two failure
         # modes this side has. A ``values`` dict holding a ``datetime``,
         # ``set``, ``bytes``, or any other object the JSON encoder does not
@@ -2068,11 +2082,14 @@ def respond(
         # on ``ir``/``task`` the instant ``db.commit()`` returns -- reading
         # ``ir.run_id`` or ``task.state_version`` afterward would silently
         # re-issue a SELECT against a session this function is about to
-        # decide whether to keep or retire. The fence UPDATE and the CAS
-        # above are Core statements, so ``ir``/``task``'s in-memory
-        # attributes were never updated by them either; these locals are
-        # the values this call itself just wrote, not a read of what those
-        # statements left behind.
+        # decide whether to keep or retire. The fence UPDATE above is a
+        # Core statement, so ``ir``'s in-memory attributes are not synced
+        # by it; ``task``'s, by contrast, already are --
+        # ``apply_task_control_transition`` re-reads it with its own
+        # ``session.refresh(task)`` right after its atomic UPDATE. Either
+        # way these locals still have to be captured now: ``expire_on_commit``
+        # is what invalidates them the instant ``db.commit()`` returns, not
+        # whether this transaction has kept them current up to this point.
         answered_run_id = str(ir.run_id)
         answered_responder_identity = principal.identity_string()
         answered_responded_at = now

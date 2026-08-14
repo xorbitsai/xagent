@@ -29,7 +29,7 @@ vi.mock("@/components/file/pptx-preview-renderer", () => ({
   PptxPreviewRenderer: () => null,
 }))
 
-import { processTraceEvents } from "./TraceEventRenderer"
+import { getFriendlyToolName, processTraceEvents } from "./TraceEventRenderer"
 
 const t = (key: string, vars?: Record<string, string | number>) =>
   vars?.tool ? `${key}:${vars.tool}` : key
@@ -66,6 +66,19 @@ describe("processTraceEvents tool_call_id attribution", () => {
     ]
 
     expect(() => processTraceEvents(malformedEvents as never, t)).not.toThrow()
+  })
+
+  it("does not throw when tool_name in the payload is not a string", () => {
+    // tool_name's "string" type is a compile-time annotation, not a runtime
+    // guarantee: a malformed/legacy backend payload could send a number,
+    // object, or null. getFriendlyToolName must not crash on it.
+    const malformedToolNameEvents = [
+      ev("tool_execution_start", { tool_name: 42 }),
+      ev("tool_execution_start", { tool_name: { unexpected: "object" } }),
+      ev("tool_execution_start", { tool_name: null }),
+    ]
+
+    expect(() => processTraceEvents(malformedToolNameEvents as never, t)).not.toThrow()
   })
 
   it("attributes concurrent same-name tool results by tool_call_id", () => {
@@ -232,5 +245,18 @@ describe("processTraceEvents tool_call_id attribution", () => {
     expect(toolActions).toHaveLength(1)
     expect(toolActions[0].status).toBe("completed")
     expect(toolActions[0].data.output).toBe("2")
+  })
+})
+
+describe("getFriendlyToolName", () => {
+  it("prettifies an unmapped snake_case tool name", () => {
+    expect(getFriendlyToolName("some_future_tool")).toBe("Some Future Tool")
+  })
+
+  it("returns malformed (non-string) input as-is instead of throwing", () => {
+    expect(() => getFriendlyToolName(42 as never)).not.toThrow()
+    expect(() => getFriendlyToolName({ unexpected: "object" } as never)).not.toThrow()
+    expect(() => getFriendlyToolName(null as never)).not.toThrow()
+    expect(getFriendlyToolName(42 as never)).toBe(42)
   })
 })

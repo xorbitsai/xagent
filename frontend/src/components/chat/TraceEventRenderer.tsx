@@ -274,7 +274,10 @@ function prettifyToolName(name: string): string {
 // tools; anything not listed there degrades to the prettified raw name
 // instead of surfacing the identifier verbatim.
 export function getFriendlyToolName(toolName: string, tDynamic?: TranslateDynamic): string {
-  if (!toolName) return toolName;
+  // toolName ultimately traces back to an external WS/API payload; the string
+  // type is a compile-time annotation only; not a runtime guarantee. Guard
+  // here too since this helper is exported and may be reused elsewhere.
+  if (typeof toolName !== 'string' || !toolName) return toolName;
   const fallback = prettifyToolName(toolName);
   if (!tDynamic) return fallback;
   return tDynamic(`traceEventRenderer.toolNames.${toolName}`, fallback);
@@ -602,8 +605,11 @@ export function processTraceEvents(
         if (toolArgs?.file_path) {
           step.filePath = String(toolArgs.file_path);
         }
-        // Support both data.response.tool_name and data.tool_name
-        const rawToolName = event.data?.response?.tool_name || event.data?.tool_name;
+        // Support both data.response.tool_name and data.tool_name. These come
+        // straight off an external WS payload, so validate the type here
+        // rather than trusting the string annotation at every downstream use.
+        const toolNameCandidate = event.data?.response?.tool_name || event.data?.tool_name;
+        const rawToolName = typeof toolNameCandidate === 'string' ? toolNameCandidate : '';
         const toolName = rawToolName || t('traceEventRenderer.unknownTool');
         const toolDisplayName = rawToolName ? getFriendlyToolName(rawToolName, tDynamic) : toolName;
         const toolCallId = event.data?.tool_call_id as string | undefined;

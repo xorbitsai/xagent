@@ -147,7 +147,7 @@ describe("TraceEventRenderer", () => {
 
     fireEvent.click(
       screen.getByRole("button", {
-        name: /traceEventRenderer.executeTool:generate_image/,
+        name: /traceEventRenderer.executeTool:Generate Image/,
       }),
     )
 
@@ -218,7 +218,7 @@ describe("TraceEventRenderer", () => {
 
     fireEvent.click(
       screen.getByRole("button", {
-        name: /traceEventRenderer.executeTool:document_tool/,
+        name: /traceEventRenderer.executeTool:Document Tool/,
       }),
     )
 
@@ -293,7 +293,7 @@ describe("TraceEventRenderer", () => {
     )
 
     fireEvent.click(screen.getByRole("button", {
-      name: /traceEventRenderer.executeTool:inspect_output/,
+      name: /traceEventRenderer.executeTool:Inspect Output/,
     }))
 
     expect(container).toHaveTextContent("trace-output.pdf")
@@ -393,7 +393,7 @@ describe("TraceEventRenderer", () => {
     )
 
     fireEvent.click(screen.getByRole("button", {
-      name: /traceEventRenderer.executeTool:inspect_cyclic/,
+      name: /traceEventRenderer.executeTool:Inspect Cyclic/,
     }))
 
     expect(container).toHaveTextContent("[Circular]")
@@ -438,7 +438,7 @@ describe("TraceEventRenderer", () => {
     )
 
     fireEvent.click(screen.getByRole("button", {
-      name: /traceEventRenderer.executeTool:pptx_tool/,
+      name: /traceEventRenderer.executeTool:Pptx Tool/,
     }))
 
     expect(container).toHaveTextContent("Created PPTX file: deck.pptx")
@@ -487,7 +487,7 @@ describe("TraceEventRenderer", () => {
     )
 
     fireEvent.click(screen.getByRole("button", {
-      name: /traceEventRenderer.executeTool:pptx_tool/,
+      name: /traceEventRenderer.executeTool:Pptx Tool/,
     }))
 
     expect(container).toHaveTextContent(
@@ -543,7 +543,7 @@ describe("TraceEventRenderer", () => {
     )
 
     fireEvent.click(screen.getByRole("button", {
-      name: /traceEventRenderer.executeTool:prepare_html_asset/,
+      name: /traceEventRenderer.executeTool:Prepare Html Asset/,
     }))
 
     expect(container).toHaveTextContent("chart.png")
@@ -615,10 +615,10 @@ describe("TraceEventRenderer", () => {
     )
 
     fireEvent.click(screen.getByRole("button", {
-      name: /traceEventRenderer.executeTool:python_executor/,
+      name: /traceEventRenderer.executeTool:Python Executor/,
     }))
     fireEvent.click(screen.getByRole("button", {
-      name: /traceEventRenderer.executeTool:file_writer/,
+      name: /traceEventRenderer.executeTool:File Writer/,
     }))
 
     expect(container).toHaveTextContent("report.py")
@@ -753,7 +753,7 @@ describe("TraceEventRenderer", () => {
     )
 
     fireEvent.click(screen.getByRole("button", {
-      name: /traceEventRenderer.executeTool:inspect_output/,
+      name: /traceEventRenderer.executeTool:Inspect Output/,
     }))
     fireEvent.click(screen.getByRole("button", {
       name: /traceEventRenderer.executionFailed/,
@@ -814,7 +814,7 @@ describe("TraceEventRenderer", () => {
 
     fireEvent.click(
       screen.getByRole("button", {
-        name: /traceEventRenderer.executeTool:pptx_tool/,
+        name: /traceEventRenderer.executeTool:Pptx Tool/,
       }),
     )
 
@@ -875,7 +875,7 @@ describe("TraceEventRenderer", () => {
 
     fireEvent.click(
       screen.getByRole("button", {
-        name: /traceEventRenderer.executeTool:document_tool/,
+        name: /traceEventRenderer.executeTool:Document Tool/,
       }),
     )
 
@@ -934,7 +934,7 @@ describe("TraceEventRenderer", () => {
 
     fireEvent.click(
       screen.getByRole("button", {
-        name: /traceEventRenderer.executeTool:excel/,
+        name: /traceEventRenderer.executeTool:Excel/,
       }),
     )
 
@@ -1039,11 +1039,11 @@ describe("TraceEventRenderer", () => {
     expect(screen.queryByText("traceEventRenderer.progressMessage")).not.toBeInTheDocument()
 
     const renderedText = document.body.textContent || ""
-    expect(renderedText.indexOf("traceEventRenderer.executeTool:first_tool")).toBeLessThan(
+    expect(renderedText.indexOf("traceEventRenderer.executeTool:First Tool")).toBeLessThan(
       renderedText.indexOf("Still searching the remaining sources."),
     )
     expect(renderedText.indexOf("Legacy progress also stays in the process.")).toBeLessThan(
-      renderedText.indexOf("traceEventRenderer.executeTool:second_tool"),
+      renderedText.indexOf("traceEventRenderer.executeTool:Second Tool"),
     )
   })
 
@@ -1077,8 +1077,8 @@ describe("TraceEventRenderer", () => {
     )
 
     const renderedText = document.body.textContent || ""
-    expect(renderedText.indexOf("traceEventRenderer.executeTool:invalid_time_tool")).toBeLessThan(
-      renderedText.indexOf("traceEventRenderer.executeTool:missing_time_tool"),
+    expect(renderedText.indexOf("traceEventRenderer.executeTool:Invalid Time Tool")).toBeLessThan(
+      renderedText.indexOf("traceEventRenderer.executeTool:Missing Time Tool"),
     )
   })
 
@@ -1124,13 +1124,13 @@ describe("TraceEventRenderer", () => {
 
     expect(toggle).toHaveAttribute("aria-expanded", "false")
     expect(screen.getByText("traceEventRenderer.showProcess")).toBeInTheDocument()
-    expect(screen.queryByText(/traceEventRenderer.executeTool:web_search/)).not.toBeInTheDocument()
+    expect(screen.queryByText(/traceEventRenderer.executeTool:Web Search/)).not.toBeInTheDocument()
 
     fireEvent.click(toggle)
 
     expect(toggle).toHaveAttribute("aria-expanded", "true")
     expect(screen.getByText("traceEventRenderer.hideProcess")).toBeInTheDocument()
-    expect(screen.getByText(/traceEventRenderer.executeTool:web_search/)).toBeInTheDocument()
+    expect(screen.getByText(/traceEventRenderer.executeTool:Web Search/)).toBeInTheDocument()
   })
 
   it("shows the execution plan action only in a process with DAG execution events", () => {
@@ -1523,7 +1523,7 @@ describe("TraceEventRenderer", () => {
       fireEvent.click(workerToggle)
     }
 
-    const toolToggle = screen.getByRole("button", { name: /generate_video/ })
+    const toolToggle = screen.getByRole("button", { name: /Generate Video/ })
     fireEvent.click(toolToggle)
     expect(screen.getByText("Invalid duration")).toBeInTheDocument()
   })

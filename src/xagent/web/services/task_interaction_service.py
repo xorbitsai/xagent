@@ -51,13 +51,14 @@ discriminated unions; the ``create()`` typed seam (validates and returns,
 does not stage a row); ``get()``/``list_active()``; the three-tier
 compatibility materialization view; the answer fence and its active-row
 predicate; ``respond()``'s own call body (validation, authorization, the
-idempotency pre-read, anchor resolution, the answer fence, the task
-control-state transition, staging the resume command, and committing or
-reconciling an ambiguous acknowledgment -- this delivery classifies a
-staging conflict and reconciles an ambiguous commit against the durable
-graph, and still reports an unresolved fence miss as
-``RespondOutcomeUnknown`` rather than classifying it, which is a separate
-follow-up build); and the response-conflict counter
+idempotency pre-read, anchor resolution, the answer fence and its
+zero-rowcount classification, the task control-state transition, staging
+the resume command, and committing or reconciling an ambiguous
+acknowledgment -- this delivery classifies why the fence missed,
+classifies a staging conflict, and reconciles an ambiguous commit against
+the durable graph, so ``RespondOutcomeUnknown`` is left reporting only a
+commit whose acknowledgment was lost and whose reconciliation could not
+confirm what landed); and the response-conflict counter
 (``COUNTER_LIFECYCLE_RESPONSE_CONFLICT``).
 
 Not delivered here, and named so a reader does not go looking for them in
@@ -554,8 +555,15 @@ RespondUnauthorizedReason = Literal["not_task_principal"]
 RespondUnavailableReason = Literal[
     "task_missing", "interaction_missing", "checkpoint_unavailable"
 ]
-RespondConflictReason = Literal["idempotency_key_reused"]
-RespondStaleReason = Literal["anchor_dangling"]
+RespondConflictReason = Literal["already_answered", "idempotency_key_reused"]
+RespondStaleReason = Literal[
+    "expired",
+    "run_superseded",
+    "answered_via_chat",
+    "run_ended",
+    "foreign_run",
+    "anchor_dangling",
+]
 
 
 @dataclass(frozen=True)
@@ -596,27 +604,31 @@ class RespondStale:
 @dataclass(frozen=True)
 class RespondOutcomeUnknown:
     """A call this function could not resolve to one of the specific
-    outcomes above, for either of two reasons this build does not further
-    distinguish: the answer fence's UPDATE matched zero rows and this
-    build does not classify why (step 6 -- a future delivery may reread
-    and classify that miss the way the fence classification build does),
-    or committing raised and the durable-graph reconciliation this build
-    runs afterward could not confirm the write landed on every one of its
-    three attempts (step 9). Step 8's staging race is no longer one of
-    them: both of its doors are classified into ``Replayed`` or
-    ``Conflict`` now. Not an exception this service lets escape -- a
-    stable, typed result a caller can act on (e.g. surface "we could not
-    confirm this went through" rather than crash).
+    outcomes above, for the one reason that still reaches it: committing
+    raised, and the durable-graph reconciliation this build runs
+    afterward could not confirm the write landed on every one of its
+    three attempts (step 9) -- the acknowledgment could have been lost
+    after the server applied the write, and reading the graph back did
+    not settle it either way, so this build reports the ambiguity rather
+    than guessing. Neither of the other two races arrives here any more.
+    The answer fence's UPDATE matching zero rows (step 6) is *not* one of
+    them: this build rereads the row and classifies every such miss into
+    a specific outcome. Step 8's staging race is not one either: both of
+    its doors are classified into ``Replayed`` or ``Conflict`` now. Not an
+    exception this service lets escape -- a stable, typed result a caller
+    can act on (e.g. surface "we could not confirm this went through"
+    rather than crash).
 
-    Retrying under the same idempotency key resolves the second reason and
-    not the first, and a caller should not be told otherwise. A retry
+    Retrying under the same idempotency key resolves every reason that
+    still reaches this outcome, and that is now the whole set. A retry
     after an ambiguous commit finds the command this call staged and
-    returns ``Replayed``. A retry after a fence miss re-evaluates the same
-    predicate against the same row and misses again: a terminated,
-    superseded, foreign-run, or foreign-owned row stays that way, so the
-    second ``OutcomeUnknown`` is as final as the first. Step 6 logs the
-    reread row's state for that reason -- until the fence classification
-    build lands, that log line is the only place the distinction exists.
+    returns ``Replayed``. What a retry could never have clarified on its
+    own is a fence miss -- a terminated, superseded, foreign-run, or
+    foreign-owned row stays that way and misses again -- but that case no
+    longer lands on this outcome: step 6 hands the caller the specific
+    reason directly, and its own warning log records the reread row state
+    (``active_slot``, ``terminal_reason``, ``run_id``,
+    ``responder_identity``) that no outcome variant carries.
     """
 
 
@@ -1609,15 +1621,21 @@ def _respond_receipt(
     ``principal.identity_string()`` value, so the column and the local are
     equal by the fence write's own semantics, not by coincidence.
 
-    Two callers, each with its own precondition for why the row it hands in
-    is already answered. ``respond()``'s idempotent-replay pre-read branch
-    (step 5) calls this on a row it found by this call's own idempotency
-    key -- a staged RESUME command this service itself committed in some
-    earlier transaction alongside the answer fence UPDATE, which implies an
-    answered row. ``_verify_respond_durable_graph`` calls this only after
-    its own three checks already confirmed the row it is holding matches:
-    ``status == "answered"``, the answering identity, and the canonical
-    submitted payload. Either way, the paired CHECK constraints
+    Three callers, each with its own precondition for why the row it hands
+    in is already answered. ``respond()``'s idempotent-replay pre-read
+    branch (step 5) calls this on a row it found by this call's own
+    idempotency key -- a staged RESUME command this service itself
+    committed in some earlier transaction alongside the answer fence
+    UPDATE, which implies an answered row. ``respond()``'s fence-miss
+    classification (step 6) calls it on the row its own reread just read
+    back as ``status == "answered"``, paired with a command row found
+    under this call's own idempotency key whose payload matches -- the
+    same two facts the pre-read branch stands on, established one
+    statement earlier instead of before the fence attempt.
+    ``_verify_respond_durable_graph`` calls this only after its own three
+    checks already confirmed the row it is holding matches: ``status ==
+    "answered"``, the answering identity, and the canonical submitted
+    payload. In all three cases, the paired CHECK constraints
     (``ck_task_interaction_requests_responded_at_pairs_status`` and
     ``ck_task_interaction_requests_responder_pairs_responded_at``) make an
     answered row with a NULL ``responded_at`` or ``responder_identity``
@@ -1988,16 +2006,20 @@ def respond(
        to a legacy scan on failure (see that resolver's own docstring for
        why).
     6. The answer fence UPDATE. ``rowcount == 1`` continues; ``rowcount == 0``
-       rereads the interaction row only to confirm it did not disappear out
-       from under this transaction's own row lock, then reports
-       ``OutcomeUnknown`` without further classifying why the fence missed
-       (a fine-grained classification -- already-answered replay/conflict,
-       three terminated reasons, wrong task state, foreign run, or an
-       ownership miss, reachable on both backends (see
-       ``_answer_fence_task_predicate``) -- is not delivered in this build);
-       ``rowcount > 1``
-       is a schema invariant violation (``uq_task_interaction_active_slot``)
-       and raises.
+       rereads the interaction row -- which also confirms it did not
+       disappear out from under this transaction's own row lock -- and
+       classifies the miss: already-answered replay/conflict, three
+       terminated reasons, wrong task state, foreign run, or an ownership
+       miss. That last one is reachable on both backends, not only on
+       SQLite: ``_answer_fence_task_predicate``'s ``Task.user_id`` term
+       requires the owner in person, so an admin acting on another user's
+       task and a guest whose ``principal.user_id`` is not the owner's
+       both reach it on PostgreSQL too, alongside SQLite's own concurrent
+       ownership change (see that predicate's own docstring). The reread
+       row's state is logged before the classification runs, because no
+       outcome variant carries those columns. ``rowcount > 1`` is a schema
+       invariant violation (``uq_task_interaction_active_slot``) and
+       raises.
     7. The Task CAS via ``apply_task_control_transition``, called with no
        ``expected_run_id`` / ``expected_state_version`` -- this function
        takes no caller-supplied optimistic-concurrency token, so neither of
@@ -2080,9 +2102,18 @@ def respond(
       ``stage_task_command``. Neither is an ``IntegrityError`` subclass, so
       step 8's catch does not see them, and both mean a precondition this
       function already checked has changed underneath it.
-    - ``RuntimeError`` from the two structural invariants asserted above:
-      a fence rowcount above one, and an interaction row that disappeared
-      while this transaction held the tasks row lock.
+    - ``RuntimeError`` from the five structural invariants asserted above:
+      a fence rowcount above one, an interaction row that disappeared
+      while this transaction held the tasks row lock, a
+      ``RACED_DUPLICATE`` classification arriving from step 8 with no
+      raced projection attached, and -- both added by step 6's
+      classification -- a reread row that is ``terminated`` under a
+      ``terminal_reason`` outside the three this service maps, or one
+      whose ``status`` is a value this module does not know. The last two
+      are deliberately loud rather than folded into ``OutcomeUnknown``:
+      each means the interaction table grew a state this classification
+      has not been taught, and answering "we could not confirm this went
+      through" would hide a schema change behind a normal-looking result.
 
     On every one of those paths the ``finally`` below retires the session,
     which rolls back an uncommitted transaction, so an escaping exception
@@ -2248,12 +2279,7 @@ def respond(
             # changed since step 4's read); without expiring first, the
             # ORM would hand this query's result back through the same
             # already-loaded, now-stale Python object instead of the fresh
-            # row this reread exists to see. This build does not classify
-            # why the fence missed -- a fine-grained classification against
-            # the reread row's status is not delivered here -- it only
-            # confirms the row did not disappear out from under this
-            # transaction's own row lock, then reports the miss as
-            # ``OutcomeUnknown`` (see that outcome's own docstring).
+            # row this reread exists to see.
             db.expire_all()
             reread = get(db, task_id=task_id, interaction_id=interaction_id)
             if reread is None:
@@ -2262,16 +2288,24 @@ def respond(
                     "while this transaction held the tasks row lock"
                 )
             # The reread above already has the row in hand, so recording
-            # what it found costs no extra statement. Without this line a
-            # fence miss is the one exit a retry cannot clarify on its
-            # own: the caller is told ``OutcomeUnknown``, and a retry
-            # against a terminated, superseded, or foreign-owned row
-            # produces the same miss and the same ``OutcomeUnknown`` every
-            # time, so no amount of retrying ever reveals which of them it
-            # was -- unlike the commit-exception door below, where a retry
-            # under the same idempotency key resolves the ambiguity by
-            # itself. The classification this build does not compute is
-            # exactly the set of fields logged here.
+            # what it found costs no extra statement. The classification
+            # below tells the *caller* which miss this was; this line tells
+            # an *operator* what the row actually looked like, and the two
+            # are not the same information. No ``RespondOutcome`` variant
+            # carries ``active_slot``, ``terminal_reason``, ``run_id`` or
+            # ``responder_identity``: ``Stale(run_superseded)`` names the
+            # reason without naming the run, and ``Conflict
+            # (already_answered)`` names neither who answered nor when. A
+            # fence miss is also still the one exit a retry cannot clarify
+            # on its own -- a terminated, superseded, or foreign-owned row
+            # produces the same miss every time, unlike the commit-exception
+            # door below, where a retry under the same idempotency key
+            # resolves the ambiguity by itself -- so the row state at the
+            # moment of the miss is worth a line whether or not the caller
+            # got a specific reason back. Logged before the classification
+            # runs so that the two ``RuntimeError`` exits below (an
+            # unrecognized ``terminal_reason``, an unrecognized ``status``)
+            # are covered by it too.
             logger.warning(
                 "answer fence matched zero rows for interaction %s on task "
                 "%s; reread status=%s active_slot=%s terminal_reason=%s "
@@ -2284,7 +2318,74 @@ def respond(
                 reread.run_id,
                 reread.responder_identity,
             )
-            return RespondOutcomeUnknown()
+            if reread.status == "answered":
+                fresh_command = (
+                    db.query(TaskExecutionCommand)
+                    .filter(
+                        TaskExecutionCommand.task_id == task_id,
+                        TaskExecutionCommand.command_id == normalized_key,
+                    )
+                    .first()
+                )
+                if fresh_command is not None and _matches_existing(
+                    fresh_command,
+                    actor_user_id=actor_user_id,
+                    kind=TaskCommandKind.RESUME,
+                    payload=command_payload,
+                ):
+                    return RespondReplayed(
+                        receipt=_respond_receipt(
+                            interaction=reread,
+                            task=task,
+                            command_db_id=int(fresh_command.id),
+                            idempotency_key=normalized_key,
+                        )
+                    )
+                increment_counter(COUNTER_LIFECYCLE_RESPONSE_CONFLICT)
+                return RespondConflict(reason="already_answered")
+            if reread.status == "terminated":
+                terminal_reason_map: dict[str, RespondStaleReason] = {
+                    "deadline_elapsed": "expired",
+                    "run_superseded": "run_superseded",
+                    "answered_via_legacy_resume": "answered_via_chat",
+                }
+                mapped_reason = terminal_reason_map.get(
+                    str(reread.terminal_reason or "")
+                )
+                if mapped_reason is None:
+                    raise RuntimeError(
+                        f"interaction {interaction_id} on task {task_id} is "
+                        f"terminated with an unrecognized terminal_reason "
+                        f"{reread.terminal_reason!r}"
+                    )
+                return RespondStale(reason=mapped_reason)
+            if reread.status == "active":
+                # Same order as the fence's own WHERE clause narrows: the
+                # task-level terms first, the ownership term last. Reaching
+                # the final return means the row is still live and the task
+                # is still waiting on this very run, so the only fence term
+                # left that can have failed is
+                # ``_answer_fence_task_predicate``'s ownership conjunction
+                # -- which requires ``principal.user_id`` to be the task's
+                # owner on both backends. Three callers land here: an admin
+                # answering someone else's task, a guest whose bindings
+                # match but whose ``principal.user_id`` is not the owner's
+                # (both of which pass step 3's Python authorization and
+                # fail only at the write point), and, on SQLite alone,
+                # ownership changing between step 2's read and this
+                # statement. See ``_answer_fence_task_predicate``'s own
+                # docstring for which of its six terms are re-asserted in
+                # SQL and which are checked once in Python.
+                if task.status != TaskStatus.WAITING_FOR_USER:
+                    return RespondStale(reason="run_ended")
+                if task.run_id != reread.run_id:
+                    return RespondStale(reason="foreign_run")
+                return RespondUnauthorized(reason="not_task_principal")
+            raise RuntimeError(
+                f"interaction {interaction_id} on task {task_id} has an "
+                f"unrecognized status {reread.status!r} after a zero-rowcount "
+                "answer fence"
+            )
 
         # No expected_run_id/expected_state_version to pass: this function
         # takes no caller-supplied optimistic-concurrency token, so

@@ -9,41 +9,41 @@ extracted from and tested alongside ``public_chat_access.py``) and the
 ``test_task_interaction_service_create_gate.py``).
 
 RespondOutcome's failure matrix, and what this delivery does and does not
-do with it: this build's ``RespondConflictReason``/``RespondStaleReason``
-``Literal``s stay narrower than a build that also classifies why the
-answer fence's UPDATE matched zero rows would need (see
-``RespondOutcomeUnknown``'s own docstring in
-``task_interaction_service.py``) -- six such triggering scenarios still
-collapse onto this build's single ``(OutcomeUnknown, None)`` pair, same as
-its conservative sibling. What this build restores over that sibling is
-steps 8 and 9. Step 8's staging race is classified through both of its
-doors: an ``IntegrityError`` through ``classify_task_command_conflict``,
-a ``created=False`` result through the ``payload_matches`` verdict
+do with it: this build classifies every zero-rowcount answer fence miss
+specifically (step 6 -- see ``respond()``'s own docstring), so the six
+triggering scenarios its conservative sibling collapsed onto
+``(OutcomeUnknown, None)`` now split back out into five distinct ``Stale``
+reasons plus ``Conflict(already_answered)``, and the guest whose
+fence-level mismatch that sibling could not label now reports
+``Unauthorized(not_task_principal)``. Steps 8 and 9 are classified as
+well. Step 8's staging race is classified through both of its doors: an
+``IntegrityError`` through ``classify_task_command_conflict``, a
+``created=False`` result through the ``payload_matches`` verdict
 ``stage_task_command`` already computed, and a winner's row carrying this
 call's own payload is a ``Replayed`` while a mismatched one is a
 ``Conflict``. Step 9's commit exception is reconciled against the durable
-graph in a fresh session before falling back to ``OutcomeUnknown``. So
-this build's four ``OutcomeUnknown``-producing cells are a
-still-unclassified fence miss, a guest whose fence-level mismatch this
-build still cannot label, and two durable-graph reconciliation failures
-(an ambiguous commit with nothing in the graph to find, and one that
-lands under a different identity) -- not the staging and commit
-shortcuts its conservative sibling used. The matrix
-below enumerates this build's own 29 triggering cells, producing 14
-distinct (outcome type, reason) pairs -- fewer than 29 because several
-cells share a pair (six "principal does not own this task" cells all
+graph in a fresh session before falling back to ``OutcomeUnknown``. So the
+only ``OutcomeUnknown``-producing cells left are the two durable-graph
+reconciliation failures: an ambiguous commit with nothing in the graph to
+find, and one that lands under a different identity. The matrix
+below enumerates this build's own 36 triggering cells, producing 20
+distinct (outcome type, reason) pairs -- fewer than 36 because several
+cells share a pair (eight "principal does not own this task" cells all
 produce ``(RespondUnauthorized, not_task_principal)``; three "same
 idempotency key, different actor" cells all produce ``(RespondConflict,
-idempotency_key_reused)``; four distinct triggers collapse onto
-``(OutcomeUnknown, None)``; one cell, kind/version validation, is
-parametrized over two reasons on its own). The full cell-to-pair mapping:
+idempotency_key_reused)``; two "the task is no longer waiting" cells both
+produce ``(RespondStale, run_ended)``; two distinct triggers collapse
+onto ``(OutcomeUnknown, None)``; one cell, kind/version validation, is
+parametrized over two reasons on its own). ``respond()`` takes no
+caller-supplied optimistic-concurrency token, so there is no cell for a
+stale one -- the ``Stale`` row has six pairs, not seven, for that reason.
+The full cell-to-pair mapping:
 
-    (Cell ids are this build's subset of the full matrix an end-to-end
-    delivery would enumerate; the gaps -- there is no C1 or S1-S5
-    here -- are cells only a build that classifies fence misses can
-    reach. Step 8's own ``UNRELATED`` classification is not a cell at
-    all: it re-raises rather than returning a ``RespondOutcome``, and its
-    test lives with the escape-surface tests instead.)
+    (The C1 and S1-S5 cells its conservative sibling left empty -- the
+    ones only a build that classifies fence misses can reach -- are
+    filled in here. Step 8's own ``UNRELATED`` classification is not a
+    cell at all: it re-raises rather than returning a ``RespondOutcome``,
+    and its test lives with the escape-surface tests instead.)
 
     OK1..OK4  -> (Accepted, None)      1 (4 cells share it -- the plain
                  accepted path, a commit that succeeds but whose
@@ -58,13 +58,15 @@ parametrized over two reasons on its own). The full cell-to-pair mapping:
                  it -- a non-dict ``values`` payload, and a dict
                  ``values`` payload that cannot be rendered as JSON)
     V5        -> (ValidationRejected, kind_version_mismatch)         1
-    A1..A6    -> (Unauthorized, not_task_principal)      1 (6 cells share
+    A1..A8    -> (Unauthorized, not_task_principal)      1 (8 cells share
                  it -- a user principal that does not own the task, the
                  authorization-before-idempotency ordering guard, a guest
                  principal on a non-matching task, a guest principal with
                  two populated entity-binding directions, an unknown
-                 principal kind, and a guest principal with zero
-                 populated entity-binding directions)
+                 principal kind, a guest principal with zero populated
+                 entity-binding directions, a guest whose bindings match
+                 but whose principal.user_id is not the owner's, and an
+                 ownership change racing the fence)
     U1        -> (Unavailable, task_missing)                         1
     U2        -> (Unavailable, interaction_missing)                  1
     U3        -> (Unavailable, checkpoint_unavailable)                1
@@ -72,19 +74,26 @@ parametrized over two reasons on its own). The full cell-to-pair mapping:
                  replay, a replay of an already-answered row whose resume
                  anchor was pruned before the retry, and a staging race
                  whose winner's row carries this call's own payload)
+    C1        -> (Conflict, already_answered)                        1
     C2..C4    -> (Conflict, idempotency_key_reused)      1 (3 cells share
                  it -- two "same key, different submitter" cells, and a
                  staging race whose winner's row carries a different
                  payload)
-    S6        -> (Stale, anchor_dangling)                             1
-    X1..X4    -> (OutcomeUnknown, None)      1 (4 cells share it -- a
-                 fence miss with no further classification, a guest whose
-                 fence-level mismatch this build cannot label, a commit
-                 whose durable-graph reconciliation never finds a landed
-                 write, and one whose reconciliation finds a landed row
-                 under a different identity)
+    S1        -> (Stale, expired)                                    1
+    S2        -> (Stale, run_superseded)                             1
+    S3        -> (Stale, answered_via_chat)                          1
+    S4,S4'    -> (Stale, run_ended)      1 (2 cells share it -- the task
+                 no longer waiting, and the overlap where it is also on a
+                 different run, which pins that the status guard runs
+                 before the run guard)
+    S5        -> (Stale, foreign_run)                                1
+    S6        -> (Stale, anchor_dangling)                            1
+    X1,X2     -> (OutcomeUnknown, None)      1 (2 cells share it -- a
+                 commit whose durable-graph reconciliation never finds a
+                 landed write, and one whose reconciliation finds a
+                 landed row under a different identity)
     -----------------------------------------------------------------
-    29 cells; 14 distinct pairs (12 single-reason cells + V1's own 2)
+    36 cells; 20 distinct pairs (18 single-reason cells + V1's own 2)
 
 The cell-by-cell tests this matrix implies, and the mapping meta-test that
 checks their coverage against the vocabulary, are both in this file now,
@@ -98,8 +107,8 @@ layers:
 | Assertion | Checks | Catches | Misses |
 |---|---|---|---|
 | Union-membership guard (this file, written) | ``RespondOutcome`` has exactly its eight known member classes | A variant added or removed without updating this list | Reason-level coverage |
-| Cell-by-cell tests (this file, written) | One test per of the 29 cells, asserting outcome + reason + zero side effects | A regression in one specific cell's behavior | A forgotten test |
-| Mapping meta-test (this file, written) | Each of the 14 pairs is produced by >= 1 cell's test (12 singles + one cell's own 2) | A new cell that produces a new pair with no test written for it; the two-reason cell's parametrization missing a reason | A new cell that produces no *new* pair (e.g. a seventh not_task_principal scenario) -- caught by review, not this meta-test |
+| Cell-by-cell tests (this file, written) | One test per of the 36 cells, asserting outcome + reason + zero side effects | A regression in one specific cell's behavior | A forgotten test |
+| Mapping meta-test (this file, written) | Each of the 20 pairs is produced by >= 1 cell's test (18 singles + one cell's own 2) | A new cell that produces a new pair with no test written for it; the two-reason cell's parametrization missing a reason | A new cell that produces no *new* pair (e.g. a ninth not_task_principal scenario) -- caught by review, not this meta-test |
 """
 
 from __future__ import annotations
@@ -1458,11 +1467,11 @@ def _answered_row_with_valid_anchor(
 ) -> int:
     """A row this service already answered in some earlier, successful call
     -- its resume anchor is still valid (nothing has pruned the checkpoint
-    it points at). A live anchor is still what makes the fence-miss tests
-    below reachable past step 5.5; the already-answered replay tests no
-    longer need it, since step 5's pre-read now recognizes the replay
-    before anchor resolution runs (the pruned-anchor replay test below is
-    what pins that down)."""
+    it points at). A live anchor is still what makes the fence-miss
+    classification tests below reachable past step 5.5; the
+    already-answered replay tests no longer need it, since step 5's
+    pre-read now recognizes the replay before anchor resolution runs (the
+    pruned-anchor replay test below is what pins that down)."""
 
     db = session_factory()
     try:
@@ -1481,6 +1490,40 @@ def _answered_row_with_valid_anchor(
         row.responded_at = now
         row.responder_identity = responder_identity
         row.request_idempotency_key = "prior-answer-key"
+        db.commit()
+        return int(row.id)
+    finally:
+        db.close()
+
+
+def _terminated_row_with_valid_anchor(
+    session_factory,
+    *,
+    task_id: int,
+    run_id: str,
+    terminal_reason: str,
+) -> int:
+    """The terminated counterpart to ``_answered_row_with_valid_anchor``:
+    a row some earlier writer closed out, its resume anchor still live so
+    the call under test reaches the fence (step 6) and misses there
+    rather than being turned away at step 5.5's anchor resolution."""
+
+    db = session_factory()
+    try:
+        trace_event_id = _make_trace_event(db, task_id=task_id, run_partition=run_id)
+        row = _make_active_interaction_row(
+            db,
+            task_id=task_id,
+            run_id=run_id,
+            resume_trace_event_id=trace_event_id,
+            resume_run_partition=run_id,
+        )
+        now = _now()
+        row.status = "terminated"
+        row.active_slot = None
+        row.terminal_reason = terminal_reason
+        row.terminated_at = now
+        row.request_idempotency_key = "terminated-row-key"
         db.commit()
         return int(row.id)
     finally:
@@ -1793,13 +1836,15 @@ def test_respond_rejects_a_guest_whose_bindings_match_but_principal_user_id_does
     principal.user_id`` term (present for both principal kinds, not only
     the guest-specific JSON check) is what refuses it, on both backends,
     since this is a plain mismatch present from the start, not a
-    concurrent change to catch only via SQLite's missing lock. The refusal
-    lands as a zero-rowcount fence miss, which this build reports as
-    ``OutcomeUnknown`` rather than the fine-grained ``Unauthorized`` a more
-    detailed classification would give it (see respond()'s own docstring,
-    step 6) -- the security property this test exists to pin (the guest
-    never gets an answer accepted) holds either way; only the label does
-    not."""
+    concurrent change to catch only via SQLite's missing lock.
+
+    The label comes from step 6's reread: the row is still ``active`` and
+    the task is still waiting on this same run, so the only fence term
+    left that can have failed is the ownership conjunction, and this build
+    reports that as ``Unauthorized(not_task_principal)`` rather than the
+    unlabelled ``OutcomeUnknown`` its conservative sibling gave it. The
+    security property this test exists to pin -- the guest never gets an
+    answer accepted -- held either way; only the label changed."""
 
     owner_id, task_id = _waiting_task(
         _respond_db,
@@ -1834,7 +1879,7 @@ def test_respond_rejects_a_guest_whose_bindings_match_but_principal_user_id_does
             envelope=_respond_envelope(),
         )
 
-        assert isinstance(outcome, svc.RespondOutcomeUnknown)
+        assert outcome == svc.RespondUnauthorized(reason="not_task_principal")
 
 
 def test_respond_rejects_a_guest_principal_on_a_non_matching_task(
@@ -2175,22 +2220,19 @@ def test_respond_receipt_refuses_a_row_that_carries_no_answer() -> None:
         )
 
 
-def test_respond_reports_outcome_unknown_when_the_fence_misses_and_leaves_no_residue(
+def test_respond_reports_conflict_for_an_already_answered_row_under_a_fresh_key(
     _respond_db,
 ) -> None:
-    """This build does not classify why the answer fence's UPDATE matched
-    zero rows (see ``RespondOutcomeUnknown``'s own docstring) -- every
-    fine-grained fence-miss scenario (already answered, terminated, wrong
-    task state, foreign run, a concurrent ownership change) collapses onto
-    this single conservative outcome instead of the outcome/reason such a
-    build's more detailed sibling would report. Picks one concrete trigger
-    -- the row already answered by someone else, under a fresh idempotency
-    key this call has never seen -- and proves both the collapse and the
-    safety property that makes it acceptable: this call changes nothing.
-    The pre-existing answer, its already-staged command, and the conflict
-    counter are all untouched -- a conservative miss must never be
-    misreported as a conflict, since this build never confirmed it was
-    one."""
+    """The fence misses because the row is already answered, and this
+    build classifies that miss instead of collapsing it onto
+    ``OutcomeUnknown``: a fresh idempotency key this call has never seen
+    means step 5's pre-read finds nothing, so the reread at step 6 is the
+    first place the pre-existing answer becomes visible. The classified
+    ``Conflict`` is what increments the response-conflict counter -- the
+    conservative sibling left the counter untouched here, because it had
+    never confirmed the miss was a conflict. Everything else is
+    unchanged: the pre-existing answer and its already-staged command are
+    left exactly as they were."""
 
     user_id, task_id = _waiting_task(_respond_db)
     principal = _owning_principal(user_id)
@@ -2212,13 +2254,23 @@ def test_respond_reports_outcome_unknown_when_the_fence_misses_and_leaves_no_res
             envelope=_respond_envelope(idempotency_key="never-seen-before"),
         )
 
-        assert isinstance(outcome, svc.RespondOutcomeUnknown)
-    assert _conflict_counter() == before_counter
+        assert outcome == svc.RespondConflict(reason="already_answered")
+    assert _conflict_counter() == before_counter + 1
 
 
 def test_respond_logs_the_reread_row_state_when_the_fence_misses(
     _respond_db, caplog: pytest.LogCaptureFixture
 ) -> None:
+    """The reread-state log survives this build's classification rather
+    than being replaced by it. The two carry different information: the
+    caller gets ``Conflict(already_answered)``, which names neither who
+    answered the row nor which run it belonged to, while the operator's
+    log line carries ``status``, ``active_slot``, ``terminal_reason``,
+    ``run_id`` and ``responder_identity`` -- columns no ``RespondOutcome``
+    variant has a field for. Asserting the log here, on a cell whose
+    outcome is now specific, is what keeps the classification from being
+    read as a licence to drop it."""
+
     user_id, task_id = _waiting_task(_respond_db)
     principal = _owning_principal(user_id)
     interaction_id = _answered_row_with_valid_anchor(
@@ -2236,7 +2288,7 @@ def test_respond_logs_the_reread_row_state_when_the_fence_misses(
             envelope=_respond_envelope(idempotency_key="never-seen-before-logged"),
         )
 
-    assert isinstance(outcome, svc.RespondOutcomeUnknown)
+    assert outcome == svc.RespondConflict(reason="already_answered")
     matching = [
         record
         for record in caplog.records
@@ -2326,6 +2378,216 @@ def test_respond_reports_conflict_when_a_guest_and_the_owner_share_one_key(
 
         assert outcome == svc.RespondConflict(reason="idempotency_key_reused")
     assert _conflict_counter() == before_counter + 1
+
+
+@pytest.mark.parametrize(
+    "terminal_reason,expected_reason",
+    [
+        pytest.param("deadline_elapsed", "expired", id="expired"),
+        pytest.param("run_superseded", "run_superseded", id="run_superseded"),
+        pytest.param(
+            "answered_via_legacy_resume", "answered_via_chat", id="answered_via_chat"
+        ),
+    ],
+)
+def test_respond_reports_stale_for_a_terminated_row(
+    _respond_db, terminal_reason: str, expected_reason: str
+) -> None:
+    user_id, task_id = _waiting_task(_respond_db)
+    interaction_id = _terminated_row_with_valid_anchor(
+        _respond_db, task_id=task_id, run_id="run-a", terminal_reason=terminal_reason
+    )
+    before_counter = _conflict_counter()
+    with _asserts_no_side_effects(
+        _respond_db, task_id=task_id, interaction_id=interaction_id
+    ):
+        outcome = svc.respond(
+            interaction_id=interaction_id,
+            task_id=task_id,
+            principal=_owning_principal(user_id),
+            envelope=_respond_envelope(idempotency_key="never-seen-before-terminal"),
+        )
+
+        # Written out as three literal constructions rather than the one
+        # line ``svc.RespondStale(reason=expected_reason)`` this branch
+        # collapses to: the mapping meta-test at the bottom of this file
+        # finds a covered pair by AST-scanning for
+        # ``svc.Respond*(reason=<constant>)``, and a variable in that slot
+        # is invisible to it -- collapsing this would silently drop three
+        # Stale pairs from the coverage set while every test still passed.
+        if expected_reason == "expired":
+            assert outcome == svc.RespondStale(reason="expired")
+        elif expected_reason == "run_superseded":
+            assert outcome == svc.RespondStale(reason="run_superseded")
+        else:
+            assert outcome == svc.RespondStale(reason="answered_via_chat")
+    # Reverse assertion: a Stale outcome must never increment the
+    # response-conflict counter -- only the three Conflict cells do.
+    assert _conflict_counter() == before_counter
+
+
+def test_respond_reports_stale_when_the_task_has_moved_on_from_waiting(
+    _respond_db,
+) -> None:
+    user_id, task_id = _waiting_task(_respond_db)
+    interaction_id = _active_row_ready_for_respond(_respond_db, task_id=task_id)
+    db = _respond_db()
+    try:
+        db.query(Task).filter(Task.id == task_id).update({"status": TaskStatus.RUNNING})
+        db.commit()
+    finally:
+        db.close()
+    before_counter = _conflict_counter()
+    with _asserts_no_side_effects(
+        _respond_db, task_id=task_id, interaction_id=interaction_id
+    ):
+        outcome = svc.respond(
+            interaction_id=interaction_id,
+            task_id=task_id,
+            principal=_owning_principal(user_id),
+            envelope=_respond_envelope(),
+        )
+
+        assert outcome == svc.RespondStale(reason="run_ended")
+    assert _conflict_counter() == before_counter
+
+
+def test_respond_prefers_run_ended_over_foreign_run_when_both_hold(
+    _respond_db,
+) -> None:
+    """The overlap: the task is no longer ``WAITING_FOR_USER`` *and* it has
+    moved to a different ``run_id`` than the interaction row's. This is the
+    ordinary production shape, not a corner -- one run ends and the next
+    one starts, so ``status`` and ``run_id`` change together -- and it is
+    the only cell in which the order of the two guards is observable at
+    all. Either guard alone is already pinned by the two tests around this
+    one; neither of them can tell which runs first.
+
+    The contract this pins is that order: with both conditions true the
+    caller gets ``run_ended``, because "this task is not waiting for an
+    answer any more" is the more accurate and the less leaky of the two
+    answers. It is more accurate because it describes the task's own
+    current state rather than a relationship between two rows, and a
+    caller told ``foreign_run`` would reasonably conclude that answering
+    the *current* run's question would still work, which is false here.
+    It is less leaky because ``foreign_run`` implicitly reports that some
+    other run exists and that this row belongs to an older one -- a fact
+    about the task's history that a caller who is simply too late does not
+    need. Swapping the two ``if`` statements in ``respond()``'s step 6
+    classification must turn this test red; nothing else in the suite
+    notices the swap."""
+
+    user_id, task_id = _waiting_task(_respond_db)
+    interaction_id = _active_row_ready_for_respond(_respond_db, task_id=task_id)
+    db = _respond_db()
+    try:
+        db.query(Task).filter(Task.id == task_id).update(
+            {"status": TaskStatus.RUNNING, "run_id": "run-next"}
+        )
+        db.commit()
+    finally:
+        db.close()
+    before_counter = _conflict_counter()
+    with _asserts_no_side_effects(
+        _respond_db, task_id=task_id, interaction_id=interaction_id
+    ):
+        outcome = svc.respond(
+            interaction_id=interaction_id,
+            task_id=task_id,
+            principal=_owning_principal(user_id),
+            envelope=_respond_envelope(),
+        )
+
+        assert outcome == svc.RespondStale(reason="run_ended")
+    assert _conflict_counter() == before_counter
+
+
+def test_respond_reports_stale_when_the_task_is_waiting_on_a_different_run(
+    _respond_db,
+) -> None:
+    """The interaction row belongs to the run it was created under; the
+    task has since moved on to a new one. Both helpers build their rows on
+    ``run-a``, so the divergence is introduced afterwards by advancing the
+    task alone -- the same shape as the ``run_ended`` test above, and the
+    reason neither helper carries a ``run_id`` parameter."""
+
+    user_id, task_id = _waiting_task(_respond_db)
+    interaction_id = _active_row_ready_for_respond(_respond_db, task_id=task_id)
+    db = _respond_db()
+    try:
+        db.query(Task).filter(Task.id == task_id).update({"run_id": "run-current"})
+        db.commit()
+    finally:
+        db.close()
+    before_counter = _conflict_counter()
+    with _asserts_no_side_effects(
+        _respond_db, task_id=task_id, interaction_id=interaction_id
+    ):
+        outcome = svc.respond(
+            interaction_id=interaction_id,
+            task_id=task_id,
+            principal=_owning_principal(user_id),
+            envelope=_respond_envelope(),
+        )
+
+        assert outcome == svc.RespondStale(reason="foreign_run")
+    assert _conflict_counter() == before_counter
+
+
+def _racing_fence_stmt_that_changes_ownership(
+    session_factory, *, task_id: int, intruder_owner_id: int
+) -> Any:
+    """Build a monkeypatch replacement for ``svc._answer_fence_stmt`` that
+    races a concurrent ownership change onto the task row between step 2's
+    read and the fence statement's own execution -- the SQLite-only TOCTOU
+    window (SQLite's dialect drops ``FOR UPDATE`` entirely; PostgreSQL's row
+    lock closes it, see ``_answer_fence_task_predicate``'s own docstring) the
+    test below needs to reproduce it."""
+
+    real_fence_stmt = svc._answer_fence_stmt
+
+    def _racing_fence_stmt(*args: Any, **kwargs: Any) -> Any:
+        race_db = session_factory()
+        try:
+            race_db.query(Task).filter(Task.id == task_id).update(
+                {"user_id": intruder_owner_id}
+            )
+            race_db.commit()
+        finally:
+            race_db.close()
+        return real_fence_stmt(*args, **kwargs)
+
+    return _racing_fence_stmt
+
+
+def test_respond_reports_unauthorized_when_ownership_changes_between_the_check_and_the_write(
+    _respond_db, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The SQLite-only TOCTOU window between step 3's authorization read and
+    step 6's write-point fence (see ``_answer_fence_task_predicate``'s own
+    docstring for why PostgreSQL's row lock closes this window and SQLite's
+    dialect does not)."""
+
+    owner_id, task_id = _waiting_task(_respond_db)
+    interaction_id = _active_row_ready_for_respond(_respond_db, task_id=task_id)
+    intruder_owner_id = make_user(_respond_db())
+
+    monkeypatch.setattr(
+        svc,
+        "_answer_fence_stmt",
+        _racing_fence_stmt_that_changes_ownership(
+            _respond_db, task_id=task_id, intruder_owner_id=intruder_owner_id
+        ),
+    )
+
+    outcome = svc.respond(
+        interaction_id=interaction_id,
+        task_id=task_id,
+        principal=_owning_principal(owner_id),
+        envelope=_respond_envelope(),
+    )
+
+    assert outcome == svc.RespondUnauthorized(reason="not_task_principal")
 
 
 def test_respond_checks_authorization_before_the_idempotency_prequery(
@@ -3108,15 +3370,17 @@ def test_respond_reports_outcome_unknown_when_the_replay_branch_commit_fails_and
 
 
 # ---------------------------------------------------------------------------
-# The mapping meta-test. For every one of the 14 (outcome, reason) pairs in
+# The mapping meta-test. For every one of the 20 (outcome, reason) pairs in
 # the vocabulary, at least one test above must produce it. This is
 # deliberately not an arithmetic comparison against the total cell count
 # (see the module docstring's three-way division of labor table) -- several
-# triggering conditions collapse onto the same pair (six distinct
+# triggering conditions collapse onto the same pair (eight distinct
 # "principal does not own this task" scenarios all produce
 # ``not_task_principal``; three distinct "same idempotency key, different
-# submitter" scenarios all produce ``idempotency_key_reused``), and one
-# validation scenario is parametrized over two reasons on its own.
+# submitter" scenarios all produce ``idempotency_key_reused``; two
+# distinct "the task is no longer waiting" scenarios both produce
+# ``run_ended``), and one validation scenario is parametrized over two
+# reasons on its own.
 # ---------------------------------------------------------------------------
 
 
@@ -3151,13 +3415,14 @@ def test_every_vocabulary_pair_is_produced_by_at_least_one_cell_test() -> None:
     every ``isinstance(outcome, svc.Respond<Type>)`` check the cell tests
     above use, and cross-checks the resulting (type, reason) set against
     the vocabulary. Deliberately not ``len(produced) == len(vocabulary)`` or
-    any other arithmetic against the 29-cell count -- six
-    not_task_principal cells and three idempotency_key_reused cells
-    legitimately collapse onto one pair each; this only asserts that no
-    vocabulary pair is left with zero producing cells. Its blind spot: a
-    new cell that produces no *new* pair -- for example a seventh
-    not_task_principal scenario -- adds nothing this scan would notice
-    missing, so that gap is caught by review, not by this test."""
+    any other arithmetic against the 36-cell count -- eight
+    not_task_principal cells, three idempotency_key_reused cells and two
+    run_ended cells legitimately collapse onto one pair each; this only
+    asserts that no vocabulary pair is left with zero producing cells. Its
+    blind spot: a new cell that produces no *new* pair -- for example a
+    ninth not_task_principal scenario, or the guard-order overlap cell
+    this build adds to ``run_ended`` -- adds nothing this scan would
+    notice missing, so that gap is caught by review, not by this test."""
 
     import ast
     import inspect

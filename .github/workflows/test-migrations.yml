@@ -4,6 +4,10 @@ on:
   workflow_dispatch:
   push:
     branches: [main]
+    # Direct dependencies of the jobs below, not a transitive closure. A
+    # module reached only through another module on this list is not here,
+    # and adding one is a deliberate act -- the two lists are maintained by
+    # hand and must stay line-for-line mirrors of each other.
     paths:
       - 'src/xagent/migrations/**'
       - 'tests/migrations/**'
@@ -38,6 +42,10 @@ on:
       - 'src/xagent/web/services/task_interaction_close.py'
       - 'tests/web/services/test_supersede_savepoint_postgresql.py'
       - 'tests/web/services/test_task_interaction_close_postgresql.py'
+      - 'src/xagent/web/models/chat_message.py'
+      - 'src/xagent/web/models/user.py'
+      - 'tests/shared/postgres_disposable.py'
+      - 'tests/web/services/checkpoint_anchor_shared.py'
   pull_request:
     branches: [main]
   # Required by the merge queue: without this the two required contexts below
@@ -73,6 +81,10 @@ jobs:
           # migration, and that over-triggering is load-bearing today -- it is
           # what catches a migration that landed on main but is absent from
           # this branch. Do not "fix" it to merge-base while that matters.
+          #
+          # Line-for-line mirror of on.push.paths above; same scope caveat
+          # (direct dependencies, not a transitive closure). Changing one
+          # list without the other silently disables half the trigger.
           RELEVANT_PATHS=(
             src/xagent/migrations
             tests/migrations
@@ -107,6 +119,10 @@ jobs:
             src/xagent/web/services/task_interaction_close.py
             tests/web/services/test_supersede_savepoint_postgresql.py
             tests/web/services/test_task_interaction_close_postgresql.py
+            src/xagent/web/models/chat_message.py
+            src/xagent/web/models/user.py
+            tests/shared/postgres_disposable.py
+            tests/web/services/checkpoint_anchor_shared.py
           )
 
           case "$EVENT_NAME" in

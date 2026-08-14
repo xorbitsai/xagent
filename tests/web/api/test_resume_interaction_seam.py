@@ -52,6 +52,29 @@ OWNER_ID = 7
 RUN_ID = "run-a"
 
 
+@pytest.fixture(autouse=True)
+def _reset_ops_signals():
+    """Keep this file's degradation signals out of every other test in the
+    same process.
+
+    The only signal these tests themselves register is
+    ``INTERACTION_LEGACY_RESUME_SHIM``, on each refusal. The registry is
+    process-global with no clear site for that name, and
+    ``tests/web/test_health_degradations.py`` asserts ``/health``'s payload
+    by exact equality, so a leaked signal fails a test in a different file.
+    Clearing every name rather than that one also makes this file's own
+    "the signal was NOT registered" assertion sound: it cannot pass or fail
+    on what some earlier module left behind. Same shape as
+    ``tests/web/services/test_interaction_handoff_surface.py``'s fixture.
+    """
+
+    for name in list(ops_signals.active_degradations()):
+        ops_signals.clear_degradation(name)
+    yield
+    for name in list(ops_signals.active_degradations()):
+        ops_signals.clear_degradation(name)
+
+
 @pytest.fixture()
 def _engine(tmp_path):
     db_path = tmp_path / "resume_seam.db"
@@ -507,6 +530,12 @@ async def test_resume_with_a_matching_receipt_is_not_refused(
 
     transition.assert_awaited()
     assert resume_scheduled.is_set()
+    # The signal marks a refusal, not "the seam ran". Without this, an
+    # unconditional register_degradation would pass the whole suite.
+    assert (
+        ops_signals.INTERACTION_LEGACY_RESUME_SHIM
+        not in ops_signals.active_degradations()
+    )
 
 
 @pytest.mark.asyncio

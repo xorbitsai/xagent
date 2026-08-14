@@ -7695,16 +7695,22 @@ def _active_native_interaction_id_sync(task_id: int) -> int | None:
     """The id of this task's active native interaction row, scoped to the
     task's current run, or ``None`` if there is none.
 
-    Uses the identical four-field predicate the answer fence and
-    ``materialize_compatibility_view`` both key off
-    (``task_interaction_service._active_native_row_criteria``): status,
-    active_slot, and a join against ``Task.run_id``. All three call sites
-    must keep changing together, or the fence, the read surface, and this
-    resume seam would disagree about which row -- if any -- is "the" live
-    one for a given task. An active row anchored to a run the task has
-    since moved past is invisible here for the same reason it is invisible
-    to those two: ``_reclaim_stale_slot_stmt`` recycles it on the next
-    question, so it carries no obligation for this seam either.
+    Uses the identical four-field predicate
+    (``task_interaction_service._active_native_row_criteria``) every reader
+    of "this task's one live row" keys off: status, active_slot, and a join
+    against ``Task.run_id``. That predicate has three call sites in this
+    tree -- ``task_interaction_service``'s own ``list_active`` and
+    ``_active_native_row`` (the latter is how
+    ``materialize_compatibility_view`` reads the row), plus this seam. The
+    answer fence is a fourth, future caller: it does not exist here yet and
+    lands with ``respond()``. All of them must keep changing together, or
+    the read surface, this resume seam, and the fence once it arrives would
+    disagree about which row -- if any -- is "the" live one for a given
+    task. An active row anchored to a run the task has since moved past is
+    invisible here for the same reason it is invisible to the other
+    readers: ``_reclaim_stale_slot_stmt``
+    (``task_interaction_staging.py``) recycles it on the next question, so
+    it carries no obligation for this seam either.
 
     Gated on ``interaction_requests_table_exists`` for the same reason
     ``materialize_compatibility_view`` gates on it: a deployment can run
@@ -7863,6 +7869,13 @@ async def _handle_resume_task_unserialized(
         # append to or replan around an unanswered question. This runs
         # before agent_service is built (below) so a refused request never
         # pays for constructing one.
+        #
+        # Residual window, named here rather than closed here: this lookup
+        # opens and closes its own session, and no lock spans it and either
+        # RESUME transition below, so the row can in principle change
+        # between this read and the transition. Nothing can drive that
+        # change until respond()'s finalizer exists, and that finalizer --
+        # not this seam -- is what must own the window when it lands.
         active_interaction_id = await run_db_io_cancellation_safe(
             lambda: _active_native_interaction_id_sync(task_id)
         )

@@ -465,14 +465,13 @@ export function ChatMessage({
         >
           <div
             className={cn(
-              "flex gap-4 transition-all duration-300",
               isUser
-                ? "max-w-[85%] bg-secondary text-secondary-foreground p-3 rounded-2xl flex-row-reverse items-center"
+                ? "max-w-[85%] bg-secondary text-secondary-foreground p-3 rounded-2xl"
                 : "bg-transparent p-0 w-full max-w-full"
             )}
           >
             {/* Message content */}
-            <div className={cn("flex-1 min-w-0")}>
+            <div>
               {isAssistantFailure ? (
                 <div className="py-3 text-sm leading-relaxed text-red-500 break-words [overflow-wrap:anywhere]">
                   {displayCopyableContent}

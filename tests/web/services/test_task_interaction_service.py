@@ -19,14 +19,19 @@ reasons plus ``Conflict(already_answered)`` collapse onto this build's
 single ``(OutcomeUnknown, None)`` pair instead, alongside the two other
 triggers (an unclassified staging ``IntegrityError`` and an unreconciled
 commit exception) this build already reports the same way. The matrix
-below enumerates this build's own 16 triggering cells, producing 14
-distinct (outcome type, reason) pairs -- fewer than 16 because several
-cells share a pair (two "principal does not own this task" cells both
+below enumerates this build's own 22 triggering cells, producing 14
+distinct (outcome type, reason) pairs -- fewer than 22 because several
+cells share a pair (six "principal does not own this task" cells both
 produce ``(RespondUnauthorized, not_task_principal)``; two "same
 idempotency key, different actor" cells both produce ``(RespondConflict,
 idempotency_key_reused)``; four distinct triggers collapse onto
 ``(OutcomeUnknown, None)``; one cell, kind/version validation, is
 parametrized over two reasons on its own). The full cell-to-pair mapping:
+
+    (Cell ids are this build's subset of the full matrix an end-to-end
+    delivery would enumerate; the gaps -- there is no V4, C1, or S1-S5
+    here -- are cells only a build that stages rows and classifies fence
+    misses can reach.)
 
     OK        -> (Accepted, None)                                    1
     V1        -> (ValidationRejected, unknown_kind)                  }  2
@@ -34,7 +39,13 @@ parametrized over two reasons on its own). The full cell-to-pair mapping:
     V2        -> (ValidationRejected, malformed_idempotency_key)     1
     V3        -> (ValidationRejected, invalid_values)                1
     V5        -> (ValidationRejected, kind_version_mismatch)         1
-    A1,A2     -> (Unauthorized, not_task_principal)      1 (2 cells share it)
+    A1..A6    -> (Unauthorized, not_task_principal)      1 (6 cells share
+                 it -- a user principal that does not own the task, the
+                 authorization-before-idempotency ordering guard, a guest
+                 principal on a non-matching task, a guest principal with
+                 two populated entity-binding directions, an unknown
+                 principal kind, and a guest principal with zero
+                 populated entity-binding directions)
     U1        -> (Unavailable, task_missing)                         1
     U2        -> (Unavailable, interaction_missing)                  1
     U3        -> (Unavailable, checkpoint_unavailable)                1
@@ -46,7 +57,7 @@ parametrized over two reasons on its own). The full cell-to-pair mapping:
                  fence-level mismatch this build cannot label, a staging
                  IntegrityError, and a commit exception)
     -----------------------------------------------------------------
-    16 cells; 14 distinct pairs (12 single-reason cells + V1's own 2)
+    22 cells; 14 distinct pairs (12 single-reason cells + V1's own 2)
 
 The cell-by-cell tests this matrix implies, and the mapping meta-test that
 checks their coverage against the vocabulary, are both in this file now,
@@ -60,8 +71,8 @@ layers:
 | Assertion | Checks | Catches | Misses |
 |---|---|---|---|
 | Union-membership guard (this file, written) | ``RespondOutcome`` has exactly its eight known member classes | A variant added or removed without updating this list | Reason-level coverage |
-| Cell-by-cell tests (this file, written) | One test per of the 16 cells, asserting outcome + reason + zero side effects | A regression in one specific cell's behavior | A forgotten test |
-| Mapping meta-test (this file, written) | Each of the 14 pairs is produced by >= 1 cell's test (12 singles + one cell's own 2) | A new cell that produces a new pair with no test written for it; the two-reason cell's parametrization missing a reason | A new cell that produces no *new* pair (e.g. a third not_task_principal scenario) -- caught by review, not this meta-test |
+| Cell-by-cell tests (this file, written) | One test per of the 22 cells, asserting outcome + reason + zero side effects | A regression in one specific cell's behavior | A forgotten test |
+| Mapping meta-test (this file, written) | Each of the 14 pairs is produced by >= 1 cell's test (12 singles + one cell's own 2) | A new cell that produces a new pair with no test written for it; the two-reason cell's parametrization missing a reason | A new cell that produces no *new* pair (e.g. a seventh not_task_principal scenario) -- caught by review, not this meta-test |
 """
 
 from __future__ import annotations
@@ -133,7 +144,7 @@ def _clean_degradation_registry():
 # The two assertions below read that type back rather than duplicating it:
 # the first confirms the Union has exactly the eight known member classes,
 # the second (further down, next to the mapping meta-test) confirms the
-# 20 (outcome, reason) pairs it derives from those classes' own Literal
+# 14 (outcome, reason) pairs it derives from those classes' own Literal
 # annotations still match what every test in this file actually produces.
 
 
@@ -255,7 +266,7 @@ def test_create_rejects_nan_default_value_as_invalid_values(
 
 
 # ---------------------------------------------------------------------------
-# create(): the six (outcome, reason) pairs producible in this delivery.
+# create(): the seven (outcome, reason) pairs producible in this delivery.
 # CC1 (slot_taken / idempotency_key_reused), CS1 (anchor_dangling /
 # run_ended), and CU2 (checkpoint_unavailable / anchor_run_mismatch) are not
 # producible -- create() never stages a row, so nothing that requires one
@@ -1821,6 +1832,140 @@ def test_respond_rejects_a_guest_whose_bindings_match_but_principal_user_id_does
         assert isinstance(outcome, svc.RespondOutcomeUnknown)
 
 
+def test_respond_rejects_a_guest_principal_on_a_non_matching_task(
+    _respond_db,
+) -> None:
+    """Same owner, same auth_mode, but a different widget_workforce_id --
+    the entity-binding conjunct must reject this at step 3, not the
+    (correctly matching) owner or auth_mode conjuncts. Mirrors
+    ``test_ca1_guest_principal_is_rejected_on_a_non_matching_task`` on the
+    create() side."""
+
+    owner_id, task_id = _waiting_task(
+        _respond_db,
+        agent_config={
+            "auth_mode": "widget",
+            "guest_id": "guest-1",
+            "widget_workforce_id": 10,
+        },
+    )
+    interaction_id = _active_row_ready_for_respond(_respond_db, task_id=task_id)
+    guest = svc.InteractionPrincipal(
+        kind="guest",
+        user_id=owner_id,
+        is_admin=False,
+        auth_mode="widget",
+        widget_workforce_id=999,
+        guest_id="guest-1",
+    )
+    with _asserts_no_side_effects(
+        _respond_db, task_id=task_id, interaction_id=interaction_id
+    ):
+        outcome = svc.respond(
+            interaction_id=interaction_id,
+            task_id=task_id,
+            principal=guest,
+            envelope=_respond_envelope(),
+        )
+
+        assert outcome == svc.RespondUnauthorized(reason="not_task_principal")
+
+
+def test_respond_rejects_a_guest_principal_with_two_populated_directions(
+    _respond_db,
+) -> None:
+    """A malformed principal that populates more than one of the four
+    entity-binding fields makes ``task_is_owned_by_public_principal`` raise
+    ``ValueError``; respond() must catch exactly that and translate it to
+    ``Unauthorized(not_task_principal)``, not let it escape. Mirrors
+    ``test_ca1_guest_principal_with_two_populated_directions_is_unauthorized_not_raised``
+    on the create() side."""
+
+    owner_id, task_id = _waiting_task(_respond_db)
+    interaction_id = _active_row_ready_for_respond(_respond_db, task_id=task_id)
+    guest = svc.InteractionPrincipal(
+        kind="guest",
+        user_id=owner_id,
+        is_admin=False,
+        auth_mode="widget",
+        widget_agent_id=1,
+        widget_workforce_id=1,
+        guest_id="guest-1",
+    )
+    with _asserts_no_side_effects(
+        _respond_db, task_id=task_id, interaction_id=interaction_id
+    ):
+        outcome = svc.respond(
+            interaction_id=interaction_id,
+            task_id=task_id,
+            principal=guest,
+            envelope=_respond_envelope(),
+        )
+
+        assert outcome == svc.RespondUnauthorized(reason="not_task_principal")
+
+
+def test_respond_rejects_an_unknown_principal_kind(
+    _respond_db,
+) -> None:
+    """A principal.kind that is neither "user" nor "guest" must be
+    rejected -- there is no third branch that defaults to allow. Mirrors
+    ``test_ca1_unknown_principal_kind_is_always_unauthorized`` on the
+    create() side."""
+
+    owner_id, task_id = _waiting_task(_respond_db)
+    interaction_id = _active_row_ready_for_respond(_respond_db, task_id=task_id)
+    principal = svc.InteractionPrincipal(
+        kind="robot",
+        user_id=owner_id,
+        is_admin=True,
+        auth_mode=None,
+    )
+    with _asserts_no_side_effects(
+        _respond_db, task_id=task_id, interaction_id=interaction_id
+    ):
+        outcome = svc.respond(
+            interaction_id=interaction_id,
+            task_id=task_id,
+            principal=principal,
+            envelope=_respond_envelope(),
+        )
+
+        assert outcome == svc.RespondUnauthorized(reason="not_task_principal")
+
+
+def test_respond_rejects_a_guest_principal_with_zero_populated_directions(
+    _respond_db,
+) -> None:
+    """Mirrors
+    ``test_ca1_guest_principal_with_zero_populated_directions_is_unauthorized_not_raised``
+    on the create() side: a guest principal that populates none of the
+    four entity-binding fields makes the ownership predicate raise
+    ``ValueError``, which respond() must translate to
+    ``Unauthorized(not_task_principal)`` rather than let escape."""
+
+    owner_id, task_id = _waiting_task(_respond_db)
+    interaction_id = _active_row_ready_for_respond(_respond_db, task_id=task_id)
+    guest = svc.InteractionPrincipal(
+        kind="guest",
+        user_id=owner_id,
+        is_admin=False,
+        auth_mode="widget",
+        guest_id="guest-1",
+    )
+    with _asserts_no_side_effects(
+        _respond_db, task_id=task_id, interaction_id=interaction_id
+    ):
+        outcome = svc.respond(
+            interaction_id=interaction_id,
+            task_id=task_id,
+            principal=guest,
+            envelope=_respond_envelope(),
+        )
+
+        assert outcome == svc.RespondUnauthorized(reason="not_task_principal")
+
+
 def test_respond_reports_unavailable_when_the_task_row_does_not_exist(
     _respond_db,
 ) -> None:
@@ -2508,11 +2653,11 @@ def test_respond_reports_outcome_unknown_when_staging_finds_a_raced_row_with_a_m
 
 
 # ---------------------------------------------------------------------------
-# The mapping meta-test. For every one of the 20 (outcome, reason) pairs in
+# The mapping meta-test. For every one of the 14 (outcome, reason) pairs in
 # the vocabulary, at least one test above must produce it. This is
 # deliberately not an arithmetic comparison against the total cell count
 # (see the module docstring's three-way division of labor table) -- several
-# triggering conditions collapse onto the same pair (five distinct
+# triggering conditions collapse onto the same pair (six distinct
 # "principal does not own this task" scenarios all produce
 # ``not_task_principal``; two distinct "same idempotency key, different
 # submitter" scenarios both produce ``idempotency_key_reused``), and one
@@ -2551,7 +2696,7 @@ def test_every_vocabulary_pair_is_produced_by_at_least_one_cell_test() -> None:
     every ``isinstance(outcome, svc.Respond<Type>)`` check the cell tests
     above use, and cross-checks the resulting (type, reason) set against
     the vocabulary. Deliberately not ``len(produced) == len(vocabulary)`` or
-    any other arithmetic against the 24-cell count -- five
+    any other arithmetic against the 22-cell count -- six
     not_task_principal cells and two idempotency_key_reused cells
     legitimately collapse onto one pair each; this only asserts that no
     vocabulary pair is left with zero producing cells."""

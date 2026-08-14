@@ -293,6 +293,19 @@ def build_clarification_payload(draft: ClarificationDraft) -> dict[str, Any]:
     protocol version and giving :func:`parse_clarification_payload` an
     explicit branch for the old shape -- never a silent redefinition of what
     v1 means.
+
+    The free-text field is called ``message``, not ``question``, because
+    the persisted row's reader is ``parse_v1_request_payload``
+    (``task_interaction_service.py``), which validates against
+    ``AskUserQuestionArgs`` (``core/tools/adapters/vibe/ask_user_tool.py``)
+    and whose required field is ``message``. That model is also the
+    ``ask_user_question`` tool's own argument schema, so it is the fixed
+    side of this pairing: this builder aligns to it, never the reverse. A
+    payload keyed ``question`` fails that validation, and the reader
+    swallows the failure and falls back to the legacy transcript with no
+    log, no signal and no counter -- a shape that is silent by
+    construction, which is why the round-trip test below crosses both
+    modules instead of checking this function against itself.
     """
 
     original_question = draft.message
@@ -328,14 +341,14 @@ def build_clarification_payload(draft: ClarificationDraft) -> dict[str, Any]:
         interactions_dropped = True
 
     payload: dict[str, Any] = {
-        "question": question,
+        "message": question,
         "interactions": interactions_payload,
         "message_type": _strip_control_characters(draft.message_type),
         "source": draft.source,
         "requests": [_clean_leaves(item.to_dict()) for item in draft.requests],
     }
     if question_truncated:
-        payload["question_truncated"] = True
+        payload["message_truncated"] = True
     if interactions_dropped:
         payload["interactions_dropped"] = True
 
@@ -378,14 +391,20 @@ def parse_clarification_payload(
     deliberately, so a caller checking "did this turn have interactions"
     never has to handle two different falsy shapes.
 
-    This is the one place allowed to know what a payload's version implies:
-    a reader elsewhere in the codebase must call this function rather than
-    reach into ``payload["question"]`` itself, so that a future protocol
-    version bump only needs a new branch here, not a new branch at every
-    call site.
+    This function and ``parse_v1_request_payload``
+    (``task_interaction_service.py``) are two readers of the same v1 shape,
+    not two competing authorities. That one validates the whole envelope
+    against ``AskUserQuestionArgs`` and is what the read surface
+    (``materialize_compatibility_view``) uses on a persisted row. This one
+    is the lossy projection down to the legacy ``(question, interactions)``
+    tuple ``get_latest_waiting_question`` (``chat_history_service.py``)
+    returns, for callers that need that tuple and nothing else. Both read
+    the same key, ``message``; neither may reach into ``payload["message"]``
+    at a call site, so that a future protocol version bump needs a new
+    branch in these two functions and nowhere else.
     """
 
-    question = payload.get("question")
+    question = payload.get("message")
     interactions = payload.get("interactions")
     return (
         question if isinstance(question, str) else None,
@@ -520,7 +539,7 @@ def resolve_publishable_clarification(
 
     payload = build_clarification_payload(draft)
 
-    if not payload["question"].strip():
+    if not payload["message"].strip():
         return NotApplicable("empty_question")
 
     if _serialized_byte_length(payload) > _TOTAL_PAYLOAD_MAX_BYTES:

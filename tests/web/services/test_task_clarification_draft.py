@@ -18,7 +18,7 @@ than checking this module's own output against itself.
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -40,6 +40,7 @@ from xagent.core.agent.clarification import (
 from xagent.db.sqlite import apply_sqlite_concurrency_pragmas
 from xagent.web.models.database import Base
 from xagent.web.models.task import Task
+from xagent.web.models.task_interaction import TaskInteractionRequest
 from xagent.web.services import ops_signals
 from xagent.web.services.chat_history_service import (
     get_latest_waiting_question,
@@ -56,9 +57,11 @@ from xagent.web.services.task_clarification_draft import (
     resolve_publishable_clarification,
 )
 from xagent.web.services.task_command_transport import COMMAND_ID_PATTERN
+from xagent.web.services.task_interaction_service import parse_v1_request_payload
 from xagent.web.services.task_interaction_staging import (
     InteractionAnchor,
     interaction_handoff,
+    stage_interaction_request,
 )
 from xagent.web.services.task_lease_service import TaskLease
 
@@ -513,6 +516,80 @@ def test_payload_round_trip_diverges_from_the_legacy_reader_for_an_empty_form_as
         engine.dispose()
 
 
+def test_built_payload_round_trips_through_a_staged_row_and_the_v1_reader(
+    tmp_path: Path,
+) -> None:
+    """The pairing this module and ``parse_v1_request_payload``
+    (``task_interaction_service.py``) both describe in their docstrings --
+    a builder producing a shape the reader can validate -- had no test
+    crossing both modules: every existing payload assertion here checks
+    this module's own dict literal, never a real row read back through the
+    reader ``materialize_compatibility_view`` actually uses. A key mismatch
+    between the two (``question`` written, ``message`` required) validated
+    against an in-memory dict just as cleanly as against a real row, so it
+    stayed invisible until a persisted row was read back through the
+    reader for real, which is what this test does.
+
+    The anchor below is built directly with :class:`InteractionAnchor`
+    rather than through the full checkpoint-shaped
+    ``materialize_compatibility_view`` chain (``event_type`` /
+    ``checkpoint_type`` / ``_task_run_id``): ``stage_interaction_request``
+    only needs an anchor whose ``trace_event_id`` satisfies the foreign key
+    and does not itself inspect the referenced row's ``data``, so a plain
+    ``make_trace_event`` row is enough. Covering the checkpoint-shaped read
+    path is a separate concern.
+    """
+
+    engine = _engine(tmp_path)
+    session_factory = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+    db = session_factory()
+    try:
+        user_id = make_user(db)
+        task_id = make_task(db, user_id=user_id)
+        trace_event_id = make_trace_event(db, task_id=task_id)
+
+        interactions = (
+            {"type": "text_input", "field": "color", "label": "Favorite color"},
+        )
+        draft = _draft(
+            message="what is your favorite color?", interactions=interactions
+        )
+        payload = build_clarification_payload(draft)
+
+        anchor = InteractionAnchor(
+            trace_event_id=trace_event_id,
+            resume_event_id="resume-event-1",
+            resume_execution_id="resume-exec-1",
+            resume_run_partition="run-a",
+        )
+        staged = stage_interaction_request(
+            db,
+            task_id=task_id,
+            run_id=anchor.resume_run_partition,
+            anchor=anchor,
+            kind="clarification",
+            protocol_version=1,
+            origin="internal",
+            request_payload=payload,
+            request_idempotency_key=clarification_idempotency_key(draft),
+            expires_at=_now() + timedelta(hours=1),
+            now=_now(),
+        )
+        db.commit()
+        assert staged.created is True
+
+        row = db.get(TaskInteractionRequest, staged.staged_db_id)
+        assert row is not None
+        parsed = parse_v1_request_payload(row.request_payload)
+
+        assert parsed.message == draft.message
+        assert parsed.interactions is not None
+        assert len(parsed.interactions) == len(draft.interactions)
+    finally:
+        db.close()
+        engine.dispose()
+
+
 def test_idempotency_key_matches_the_command_id_pattern() -> None:
     draft = _draft()
     key = clarification_idempotency_key(draft)
@@ -536,9 +613,9 @@ def test_oversized_question_is_truncated_and_the_idempotency_key_is_unaffected()
     long_question = "q" * (32 * 1024)
     draft = _draft(message=long_question)
     payload = build_clarification_payload(draft)
-    assert payload["question_truncated"] is True
-    assert len(payload["question"].encode("utf-8")) <= 16 * 1024
-    assert payload["question"] != long_question
+    assert payload["message_truncated"] is True
+    assert len(payload["message"].encode("utf-8")) <= 16 * 1024
+    assert payload["message"] != long_question
 
     key_before = clarification_idempotency_key(draft)
     truncated_variant = _draft(message=long_question[: len(long_question) // 2])
@@ -557,13 +634,13 @@ def test_oversized_multi_byte_question_truncates_on_a_character_boundary() -> No
     draft = _draft(message=long_question)
     payload = build_clarification_payload(draft)
 
-    assert payload["question_truncated"] is True
-    encoded = payload["question"].encode("utf-8")
+    assert payload["message_truncated"] is True
+    encoded = payload["message"].encode("utf-8")
     assert len(encoded) <= 16 * 1024
     # Round-trips cleanly and introduces no U+FFFD replacement character --
     # a mid-character byte slice would either raise here or leave one.
-    assert encoded.decode("utf-8") == payload["question"]
-    assert "�" not in payload["question"]
+    assert encoded.decode("utf-8") == payload["message"]
+    assert "�" not in payload["message"]
 
 
 def test_oversized_interactions_are_dropped_entirely() -> None:
@@ -572,7 +649,7 @@ def test_oversized_interactions_are_dropped_entirely() -> None:
     payload = build_clarification_payload(draft)
     assert payload["interactions_dropped"] is True
     assert payload["interactions"] == []
-    assert payload["question"] == draft.message
+    assert payload["message"] == draft.message
 
 
 def test_request_leaf_control_characters_are_stripped_from_the_payload() -> None:

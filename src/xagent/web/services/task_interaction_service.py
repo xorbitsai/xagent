@@ -730,6 +730,16 @@ CREATE_OUTCOME_REASON_VOCABULARY: dict[str, frozenset[str]] = {
 # payload the write path stages and the payload the read path
 # (``materialize_compatibility_view``) decodes come from the same function
 # pair, not two independently maintained copies.
+#
+# There is a second producer of this same shape that does NOT go through
+# ``build_v1_request_payload``: ``build_clarification_payload``
+# (``task_clarification_draft.py``) builds a v1 payload directly from a
+# clarification draft, because it also has to filter and truncate that
+# draft's free text before anything is staged. Its output must satisfy
+# ``parse_v1_request_payload`` below -- that is a cross-module contract with
+# no shared type to enforce it, pinned by the round-trip test named in that
+# function's own docstring. Anything changed here about what v1 accepts has
+# to be changed there in the same commit.
 # ---------------------------------------------------------------------------
 
 

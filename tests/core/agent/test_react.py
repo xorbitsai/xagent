@@ -5138,10 +5138,12 @@ class StreamingEmptyFinalAnswerLLM:
         recover: bool = True,
         broken_arguments: str = '{"response_language":"English","outcome":"completed"}',
         preamble: str = "",
+        trailing_work_tool: bool = False,
     ) -> None:
         self.recover = recover
         self.broken_arguments = broken_arguments
         self.preamble = preamble
+        self.trailing_work_tool = trailing_work_tool
         self.stream_calls: list[dict[str, Any]] = []
 
     async def chat(self, **kwargs: Any) -> Any:
@@ -5161,14 +5163,25 @@ class StreamingEmptyFinalAnswerLLM:
         )
         if self.preamble:
             yield StreamChunk(type=ChunkType.TOKEN, delta=self.preamble)
+        tool_calls = [
+            {
+                "id": f"call_final_{call_index}",
+                "function": {"name": "final_answer", "arguments": arguments},
+            }
+        ]
+        if call_index == 0 and self.trailing_work_tool:
+            tool_calls.append(
+                {
+                    "id": "call_work_0",
+                    "function": {
+                        "name": "calculator",
+                        "arguments": '{"expression":"2+2"}',
+                    },
+                }
+            )
         yield StreamChunk(
             type=ChunkType.TOOL_CALL,
-            tool_calls=[
-                {
-                    "id": f"call_final_{call_index}",
-                    "function": {"name": "final_answer", "arguments": arguments},
-                }
-            ],
+            tool_calls=tool_calls,
         )
         yield StreamChunk(type=ChunkType.END)
 
@@ -5225,6 +5238,42 @@ async def test_react_retries_final_answer_that_omits_the_answer_field() -> None:
         "final_answer_end",
     ]
     assert outbound.events[-1]["content"] == "The result is 4."
+
+
+@pytest.mark.asyncio
+async def test_react_discards_empty_final_answer_with_trailing_work_call() -> None:
+    """Discard the invalid response so retry feedback survives sanitization."""
+
+    llm = StreamingEmptyFinalAnswerLLM(trailing_work_tool=True)
+    pattern, context, runtime, _outbound, _tracer = _react_empty_final_answer_fixture()
+    tool = FakeTool()
+
+    result = await pattern.run(
+        context=context,
+        tools=[tool],
+        llm=llm,
+        runtime=runtime,
+    )
+
+    assert result["success"] is True
+    assert result["response"] == "The result is 4."
+    assert tool.calls == []
+    assert len(llm.stream_calls) == 2
+    assert (
+        "previous response called final_answer with an empty answer"
+        in (llm.stream_calls[1]["messages"][0]["content"])
+    )
+
+    assistant_tool_call_ids = {
+        tool_call["id"]
+        for message in context.messages
+        for tool_call in (message.tool_calls or [])
+    }
+    tool_result_ids = {
+        message.tool_call_id for message in context.messages if message.role == "tool"
+    }
+    assert assistant_tool_call_ids == {"call_final_1"}
+    assert assistant_tool_call_ids <= tool_result_ids
 
 
 @pytest.mark.asyncio

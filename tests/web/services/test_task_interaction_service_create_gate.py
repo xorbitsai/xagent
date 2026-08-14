@@ -23,8 +23,8 @@ AST-based, module-qualified matching -- not a bare-name or substring scan.
 elsewhere in this codebase (``docker_client.containers.create(...)``); a
 scanner that flagged every call named ``create`` would be red on day one.
 This gate only counts a call when the callee name is resolved -- through an
-import binding recorded in the same module -- to
-``task_interaction_service.create`` specifically.
+import binding recorded in the same module -- to one of the gated names,
+``task_interaction_service.create`` or ``respond``.
 
 Known blind spots, not fixed here because closing them is out of scope for a
 static AST scan of one package tree (identical to the predecessor gate's own

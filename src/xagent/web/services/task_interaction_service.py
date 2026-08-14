@@ -1822,7 +1822,10 @@ def respond(
        retires its session and reports ``OutcomeUnknown`` unconditionally,
        leaving the caller to re-check.
     10. After a successful commit, outside any transaction:
-        ``notify_task_command_dispatcher()``.
+        ``notify_task_command_dispatcher()``. Best-effort: a raise here
+        would turn a committed answer into a reported failure, so it is
+        caught, logged as a warning, and the dispatcher's idle poll
+        delivers the command instead.
 
     What this function lets escape, deliberately, and what it does not.
     The eight ``RespondOutcome`` variants cover every outcome this build
@@ -1833,9 +1836,10 @@ def respond(
 
     - Database-level failures outside the two units caught above --
       a deadlock, a lost connection, a pool checkout timeout -- raised by
-      any statement from step 2 onward. The two catches are narrow on
+      any statement from step 2 onward. The three catches are narrow on
       purpose: step 8's is ``IntegrityError`` only, step 9's covers the
-      commit only.
+      commit only, and step 10's wraps one post-commit best-effort
+      notification whose failure is logged and swallowed.
     - ``TaskCommandOwnerStateError`` and ``TaskCommandTaskMissing`` from
       ``stage_task_command``. Neither is an ``IntegrityError`` subclass, so
       step 8's catch does not see them, and both mean a precondition this

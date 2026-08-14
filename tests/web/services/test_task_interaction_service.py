@@ -16,28 +16,33 @@ commit against the durable graph would need (see ``RespondOutcomeUnknown``
 's own docstring in ``task_interaction_service.py``) -- six triggering
 scenarios that such a build would classify into five distinct ``Stale``
 reasons plus ``Conflict(already_answered)`` collapse onto this build's
-single ``(OutcomeUnknown, None)`` pair instead, alongside the two other
-triggers (an unclassified staging ``IntegrityError`` and an unreconciled
-commit exception) this build already reports the same way. The matrix
-below enumerates this build's own 22 triggering cells, producing 14
-distinct (outcome type, reason) pairs -- fewer than 22 because several
-cells share a pair (six "principal does not own this task" cells both
+single ``(OutcomeUnknown, None)`` pair instead, alongside the four other
+triggers (an unclassified staging ``IntegrityError``, the two
+staging-race doors, and an unreconciled commit exception) this build
+already reports the same way. The matrix
+below enumerates this build's own 27 triggering cells, producing 14
+distinct (outcome type, reason) pairs -- fewer than 27 because several
+cells share a pair (six "principal does not own this task" cells all
 produce ``(RespondUnauthorized, not_task_principal)``; two "same
 idempotency key, different actor" cells both produce ``(RespondConflict,
-idempotency_key_reused)``; four distinct triggers collapse onto
+idempotency_key_reused)``; six distinct triggers collapse onto
 ``(OutcomeUnknown, None)``; one cell, kind/version validation, is
 parametrized over two reasons on its own). The full cell-to-pair mapping:
 
     (Cell ids are this build's subset of the full matrix an end-to-end
-    delivery would enumerate; the gaps -- there is no V4, C1, or S1-S5
+    delivery would enumerate; the gaps -- there is no C1 or S1-S5
     here -- are cells only a build that stages rows and classifies fence
     misses can reach.)
 
-    OK        -> (Accepted, None)                                    1
+    OK,OK2    -> (Accepted, None)      1 (2 cells share it -- the plain
+                 accepted path, and a commit that succeeds but whose
+                 post-commit dispatcher notify raises)
     V1        -> (ValidationRejected, unknown_kind)                  }  2
                  (ValidationRejected, unknown_protocol_version)      }
     V2        -> (ValidationRejected, malformed_idempotency_key)     1
-    V3        -> (ValidationRejected, invalid_values)                1
+    V3,V4     -> (ValidationRejected, invalid_values)      1 (2 cells share
+                 it -- a non-dict ``values`` payload, and a dict
+                 ``values`` payload that cannot be rendered as JSON)
     V5        -> (ValidationRejected, kind_version_mismatch)         1
     A1..A6    -> (Unauthorized, not_task_principal)      1 (6 cells share
                  it -- a user principal that does not own the task, the
@@ -49,15 +54,20 @@ parametrized over two reasons on its own). The full cell-to-pair mapping:
     U1        -> (Unavailable, task_missing)                         1
     U2        -> (Unavailable, interaction_missing)                  1
     U3        -> (Unavailable, checkpoint_unavailable)                1
-    R1        -> (Replayed, None)                                    1
+    R1,R2     -> (Replayed, None)      1 (2 cells share it -- the plain
+                 replay, and a replay of an already-answered row whose
+                 resume anchor was pruned before the retry)
     C2,C3     -> (Conflict, idempotency_key_reused)      1 (2 cells share it)
     S6        -> (Stale, anchor_dangling)                             1
-    X1..X4    -> (OutcomeUnknown, None)      1 (4 cells share it -- a
+    X1..X6    -> (OutcomeUnknown, None)      1 (6 cells share it -- a
                  fence miss with no further classification, a guest whose
                  fence-level mismatch this build cannot label, a staging
-                 IntegrityError, and a commit exception)
+                 IntegrityError, a commit exception, and two staging-race
+                 doors -- a raced row found already staged with a
+                 mismatched payload, and one found with a matching
+                 payload)
     -----------------------------------------------------------------
-    22 cells; 14 distinct pairs (12 single-reason cells + V1's own 2)
+    27 cells; 14 distinct pairs (12 single-reason cells + V1's own 2)
 
 The cell-by-cell tests this matrix implies, and the mapping meta-test that
 checks their coverage against the vocabulary, are both in this file now,
@@ -71,7 +81,7 @@ layers:
 | Assertion | Checks | Catches | Misses |
 |---|---|---|---|
 | Union-membership guard (this file, written) | ``RespondOutcome`` has exactly its eight known member classes | A variant added or removed without updating this list | Reason-level coverage |
-| Cell-by-cell tests (this file, written) | One test per of the 22 cells, asserting outcome + reason + zero side effects | A regression in one specific cell's behavior | A forgotten test |
+| Cell-by-cell tests (this file, written) | One test per of the 27 cells, asserting outcome + reason + zero side effects | A regression in one specific cell's behavior | A forgotten test |
 | Mapping meta-test (this file, written) | Each of the 14 pairs is produced by >= 1 cell's test (12 singles + one cell's own 2) | A new cell that produces a new pair with no test written for it; the two-reason cell's parametrization missing a reason | A new cell that produces no *new* pair (e.g. a seventh not_task_principal scenario) -- caught by review, not this meta-test |
 """
 
@@ -1432,8 +1442,11 @@ def _answered_row_with_valid_anchor(
 ) -> int:
     """A row this service already answered in some earlier, successful call
     -- its resume anchor is still valid (nothing has pruned the checkpoint
-    it points at), which is what makes it reachable past step 5.5 for the
-    already-answered replay and fence-miss tests below."""
+    it points at). A live anchor is still what makes the fence-miss tests
+    below reachable past step 5.5; the already-answered replay tests no
+    longer need it, since step 5's pre-read now recognizes the replay
+    before anchor resolution runs (the pruned-anchor replay test below is
+    what pins that down)."""
 
     db = session_factory()
     try:
@@ -2205,10 +2218,10 @@ def test_respond_logs_the_reread_row_state_when_the_fence_misses(
     matching = [
         record
         for record in caplog.records
-        if "answer fence matched zero rows" in record.message
+        if "answer fence matched zero rows" in record.getMessage()
     ]
     assert len(matching) == 1
-    assert "status=answered" in matching[0].message
+    assert "status=answered" in matching[0].getMessage()
 
 
 def test_respond_reports_conflict_for_the_same_key_with_a_different_payload(
@@ -2549,9 +2562,26 @@ def test_respond_reports_outcome_unknown_when_staging_the_command_raises_and_lea
     assert _conflict_counter() == before_counter
 
 
-def test_respond_reports_outcome_unknown_when_staging_finds_a_raced_row_and_leaves_no_residue(
-    _respond_db, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize(
+    "payload_matches",
+    [False, True],
+    ids=["payload-mismatch", "payload-matches"],
+)
+def test_respond_reports_outcome_unknown_when_staging_finds_a_raced_row(
+    _respond_db, monkeypatch: pytest.MonkeyPatch, payload_matches: bool
 ) -> None:
+    """A ``created=False`` staging result -- the row was already committed
+    and visible by the time this call's own staging statement ran -- is
+    reported as ``OutcomeUnknown`` and leaves no residue, regardless of
+    whether the raced row's payload happens to match this call's own
+    envelope. A matching payload is deliberately not treated as a replay:
+    replay recognition happens once, at step 5's idempotency pre-read,
+    before the staging statement runs. A raced hit that only becomes
+    visible after that pre-read is a race this build cannot distinguish
+    from a genuine conflict, not a replay it missed, so both the
+    mismatched and the matching case collapse onto the same conservative
+    outcome."""
+
     from xagent.web.services.task_command_transport import StagedTaskCommand
 
     user_id, task_id = _waiting_task(_respond_db)
@@ -2563,7 +2593,7 @@ def test_respond_reports_outcome_unknown_when_staging_finds_a_raced_row_and_leav
             staged_db_id=4242,
             client_command_id=kwargs.get("command_id", "staging-race"),
             created=False,
-            payload_matches=False,
+            payload_matches=payload_matches,
             status="pending",
         )
 
@@ -2577,39 +2607,6 @@ def test_respond_reports_outcome_unknown_when_staging_finds_a_raced_row_and_leav
             task_id=task_id,
             principal=principal,
             envelope=_respond_envelope(idempotency_key="staging-race"),
-        )
-
-        assert isinstance(outcome, svc.RespondOutcomeUnknown)
-
-
-def test_respond_reports_outcome_unknown_when_staging_finds_a_raced_row_with_a_matching_payload(
-    _respond_db, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    from xagent.web.services.task_command_transport import StagedTaskCommand
-
-    user_id, task_id = _waiting_task(_respond_db)
-    interaction_id = _active_row_ready_for_respond(_respond_db, task_id=task_id)
-    principal = _owning_principal(user_id)
-
-    def _racing_stage_task_command(*args: Any, **kwargs: Any) -> StagedTaskCommand:
-        return StagedTaskCommand(
-            staged_db_id=4242,
-            client_command_id=kwargs.get("command_id", "staging-race-match"),
-            created=False,
-            payload_matches=True,
-            status="pending",
-        )
-
-    monkeypatch.setattr(svc, "stage_task_command", _racing_stage_task_command)
-
-    with _asserts_no_side_effects(
-        _respond_db, task_id=task_id, interaction_id=interaction_id
-    ):
-        outcome = svc.respond(
-            interaction_id=interaction_id,
-            task_id=task_id,
-            principal=principal,
-            envelope=_respond_envelope(idempotency_key="staging-race-match"),
         )
 
         assert isinstance(outcome, svc.RespondOutcomeUnknown)
@@ -2659,7 +2656,7 @@ def test_every_vocabulary_pair_is_produced_by_at_least_one_cell_test() -> None:
     every ``isinstance(outcome, svc.Respond<Type>)`` check the cell tests
     above use, and cross-checks the resulting (type, reason) set against
     the vocabulary. Deliberately not ``len(produced) == len(vocabulary)`` or
-    any other arithmetic against the 22-cell count -- six
+    any other arithmetic against the 27-cell count -- six
     not_task_principal cells and two idempotency_key_reused cells
     legitimately collapse onto one pair each; this only asserts that no
     vocabulary pair is left with zero producing cells."""

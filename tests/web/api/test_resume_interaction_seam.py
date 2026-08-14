@@ -369,10 +369,25 @@ def _exact_id(interaction_id: int) -> object:
     return interaction_id
 
 
+def _wrong_int_id(interaction_id: int) -> object:
+    """A well-typed int naming a different row.
+
+    The most realistic bad receipt: a client resuming with the receipt of
+    an earlier, already-retired question. Both ``isinstance`` terms pass,
+    so only the ``!=`` comparison itself refuses this case -- the
+    wrong-typed cases above all short-circuit on the type checks and never
+    reach it, which would otherwise leave the id equality with no coverage
+    in the True direction.
+    """
+
+    return interaction_id + 1
+
+
 _UNVERIFIABLE_RECEIPTS = [
     pytest.param(_string_form_id, True, id="string-form-id"),
     pytest.param(_float_form_id, True, id="float-form-id"),
     pytest.param(_json_true_id, True, id="json-true-id"),
+    pytest.param(_wrong_int_id, True, id="wrong-int-id"),
     pytest.param(_exact_id, False, id="exact-id-without-responder-identity"),
 ]
 

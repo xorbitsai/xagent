@@ -448,14 +448,12 @@ export function ChatMessage({
   return (
     <div className="w-full space-y-2 animate-fade-in group">
       {shouldShowProcess && !isUser && (
-        <div>
-          <TraceEventRenderer
-            events={traceEvents}
-            taskStatus={resolvedProcessStatus}
-            onOpenExecutionPlan={onOpenExecutionPlan}
-            onAgentExecutionClick={onAgentExecutionClick}
-          />
-        </div>
+        <TraceEventRenderer
+          events={traceEvents}
+          taskStatus={resolvedProcessStatus}
+          onOpenExecutionPlan={onOpenExecutionPlan}
+          onAgentExecutionClick={onAgentExecutionClick}
+        />
       )}
 
       {!isProcessOnlyMessage && (

@@ -1494,7 +1494,7 @@ class RespondEnvelope:
     caller today (#1079's own AC) never hands one back, and the only thing
     an echoed locator could prove -- "this is the same value the server
     handed out" -- is already proven by ``interaction_id`` plus the row and
-    anchor checks ``respond()`` runs on its own account (steps 4 and 4.5).
+    anchor checks ``respond()`` runs on its own account (steps 4 and 5.5).
     """
 
     kind: str
@@ -1722,15 +1722,17 @@ def respond(
        ``Unavailable(interaction_missing)``. Present but its own ``kind`` /
        ``protocol_version`` columns disagree with ``envelope``'s,
        ``ValidationRejected(kind_version_mismatch)``.
-    4.5. Resolve the row's resume anchor via
+    5. Idempotency pre-read against ``task_execution_commands``: a hit
+       matching this call's payload is ``Replayed`` (built from the current
+       row state); a hit that does not match is
+       ``Conflict(idempotency_key_reused)``. Runs before anchor resolution:
+       an answered row's anchor is prunable, and replay recognition must
+       not depend on one.
+    5.5. Resolve the row's resume anchor via
        ``_resolve_read_direction_anchor`` -- ``checkpoint_unavailable`` maps
        to ``Unavailable``, ``anchor_dangling`` to ``Stale``. Never falls back
        to a legacy scan on failure (see that resolver's own docstring for
        why).
-    5. Idempotency pre-read against ``task_execution_commands``: a hit
-       matching this call's payload is ``Replayed`` (built from the current
-       row state); a hit that does not match is
-       ``Conflict(idempotency_key_reused)``.
     6. The answer fence UPDATE. ``rowcount == 1`` continues; ``rowcount == 0``
        rereads the interaction row only to confirm it did not disappear out
        from under this transaction's own row lock, then reports
@@ -1840,17 +1842,25 @@ def respond(
         if ir.kind != envelope.kind or ir.protocol_version != envelope.protocol_version:
             return RespondValidationRejected(reason="kind_version_mismatch")
 
-        unresolved = _resolve_read_direction_anchor(db, ir)
-        if unresolved is not None:
-            if unresolved.reason == "checkpoint_unavailable":
-                return RespondUnavailable(reason="checkpoint_unavailable")
-            return RespondStale(reason="anchor_dangling")
-
         command_payload = _respond_command_payload(
             interaction_id=interaction_id, principal=principal, values=envelope.values
         )
         actor_user_id = principal.user_id
 
+        # Runs before anchor resolution below, not after it. Answering
+        # clears ``active_slot``, and the checkpoint retention pruner only
+        # protects rows whose ``active_slot`` is still set
+        # (``trace_handlers.py``), so an answered row's anchor becomes
+        # prunable the moment this service answers it and the foreign key's
+        # ``ON DELETE SET NULL`` then empties the pointer. With anchor
+        # resolution first, a retry arriving after that pruning would be
+        # told ``Stale(anchor_dangling)`` about an answer that was in fact
+        # accepted, and would never reach the replay branch below. Replay
+        # recognition is a question about this call's idempotency key and
+        # the row it already wrote; it does not need a live anchor, and
+        # must not be gated on one. Still after step 3's authorization, so
+        # an unauthorized caller can never use a guessed idempotency key to
+        # read back someone else's receipt.
         existing_command = (
             db.query(TaskExecutionCommand)
             .filter(
@@ -1876,6 +1886,12 @@ def respond(
                 )
             increment_counter(COUNTER_LIFECYCLE_RESPONSE_CONFLICT)
             return RespondConflict(reason="idempotency_key_reused")
+
+        unresolved = _resolve_read_direction_anchor(db, ir)
+        if unresolved is not None:
+            if unresolved.reason == "checkpoint_unavailable":
+                return RespondUnavailable(reason="checkpoint_unavailable")
+            return RespondStale(reason="anchor_dangling")
 
         now = datetime.now(timezone.utc)
         responder_user_id = principal.user_id if principal.kind == "user" else None

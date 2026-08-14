@@ -1397,7 +1397,7 @@ def _active_row_ready_for_respond(
     anchor_run_partition: str | None = None,
 ) -> int:
     """An active interaction row with a resolvable anchor -- the state every
-    respond() test that expects to reach the fence (steps 5 onward) starts
+    respond() test that expects to reach the fence (step 6 onward) starts
     from. ``anchor_run_partition``, when different from ``run_id``, is what
     ``test_respond_reports_stale_when_the_anchor_points_at_a_different_run_partition``
     below uses to force the anchor resolver's own partition check to fail
@@ -1435,7 +1435,7 @@ def _answered_row_with_valid_anchor(
 ) -> int:
     """A row this service already answered in some earlier, successful call
     -- its resume anchor is still valid (nothing has pruned the checkpoint
-    it points at), which is what makes it reachable past step 4.5 for the
+    it points at), which is what makes it reachable past step 5.5 for the
     already-answered replay and fence-miss tests below."""
 
     db = session_factory()
@@ -1580,7 +1580,7 @@ def _conflict_counter() -> int:
 
 # ---------------------------------------------------------------------------
 # The pure-read path: envelope validation, task/interaction existence,
-# authorization, and anchor resolution -- steps 1 through 4.5. Twelve cells,
+# authorization, and anchor resolution -- steps 1 through 5.5. Twelve cells,
 # each asserting outcome, reason, and zero side effects.
 # ---------------------------------------------------------------------------
 
@@ -1916,6 +1916,53 @@ def test_respond_returns_the_original_receipt_for_a_matching_replay(
         assert isinstance(outcome, svc.RespondReplayed)
         assert outcome.receipt.responder_identity == principal.identity_string()
         assert outcome.receipt.idempotency_key == command_id
+
+
+def test_respond_replays_an_answered_row_whose_anchor_was_pruned(
+    _respond_db,
+) -> None:
+    user_id, task_id = _waiting_task(_respond_db)
+    principal = _owning_user_principal(user_id)
+    values = {"env": "prod"}
+    command_id = "replay-key-pruned-anchor"
+    interaction_id = _answered_row_with_valid_anchor(
+        _respond_db,
+        task_id=task_id,
+        run_id="run-a",
+        responder_identity=principal.identity_string(),
+        response_payload=values,
+    )
+    payload = svc._respond_command_payload(
+        interaction_id=interaction_id, principal=principal, values=values
+    )
+    _stage_matching_command(
+        _respond_db,
+        task_id=task_id,
+        actor_user_id=principal.user_id,
+        command_id=command_id,
+        payload=payload,
+    )
+
+    # Simulate the checkpoint retention pruner: the row's anchor is gone,
+    # the way ON DELETE SET NULL leaves it once the checkpoint it pointed
+    # at is pruned.
+    db = _respond_db()
+    try:
+        row = db.get(TaskInteractionRequest, interaction_id)
+        row.resume_trace_event_id = None
+        db.commit()
+    finally:
+        db.close()
+
+    outcome = svc.respond(
+        interaction_id=interaction_id,
+        task_id=task_id,
+        principal=principal,
+        envelope=_respond_envelope(idempotency_key=command_id, values=values),
+    )
+
+    assert isinstance(outcome, svc.RespondReplayed)
+    assert outcome.receipt.idempotency_key == command_id
 
 
 def test_respond_receipt_refuses_a_row_that_carries_no_answer() -> None:

@@ -19,7 +19,7 @@ import {
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { useApp } from '@/contexts/app-context-chat';
-import { useI18n, type Translate } from '@/contexts/i18n-context';
+import { useI18n, type Translate, type TranslateDynamic } from '@/contexts/i18n-context';
 import { MarkdownRenderer } from "@/components/ui/markdown-renderer";
 import {
   getFilesDisabledPresentationFileLabel,
@@ -256,6 +256,30 @@ const getWaitingQuestionFromEvents = (events: TraceEvent[]): string | null => {
   return null;
 };
 
+// Raw tool identifiers (e.g. "python_executor") are internal names, not
+// user-facing copy. Turn any unmapped one into readable words as a safety net
+// so new/uncommon tools never fall back to a bare snake_case string.
+function prettifyToolName(name: string): string {
+  return name
+    .replace(/[_-]+/g, ' ')
+    .trim()
+    .split(' ')
+    .filter(Boolean)
+    .map((word) => word.charAt(0).toUpperCase() + word.slice(1))
+    .join(' ');
+}
+
+// The i18n toolNames table (i18n/locales/*.ts -> traceEventRenderer.toolNames)
+// holds friendly phrasing ("Searching the web") for the common built-in
+// tools; anything not listed there degrades to the prettified raw name
+// instead of surfacing the identifier verbatim.
+export function getFriendlyToolName(toolName: string, tDynamic?: TranslateDynamic): string {
+  if (!toolName) return toolName;
+  const fallback = prettifyToolName(toolName);
+  if (!tDynamic) return fallback;
+  return tDynamic(`traceEventRenderer.toolNames.${toolName}`, fallback);
+}
+
 const isAgentProgressEvent = (event: TraceEvent): boolean => (
   event.event_type === 'agent_progress' ||
   (
@@ -272,6 +296,7 @@ export function processTraceEvents(
   events: TraceEvent[],
   t: Translate,
   taskStatus?: string,
+  tDynamic?: TranslateDynamic,
 ): ProcessedStep[] {
     const stepsMap = new Map<string, ProcessedStep>();
     // Steps that ever had more than one tool in flight at once. Their step-level
@@ -578,7 +603,9 @@ export function processTraceEvents(
           step.filePath = String(toolArgs.file_path);
         }
         // Support both data.response.tool_name and data.tool_name
-        const toolName = event.data?.response?.tool_name || event.data?.tool_name || t('traceEventRenderer.unknownTool');
+        const rawToolName = event.data?.response?.tool_name || event.data?.tool_name;
+        const toolName = rawToolName || t('traceEventRenderer.unknownTool');
+        const toolDisplayName = rawToolName ? getFriendlyToolName(rawToolName, tDynamic) : toolName;
         const toolCallId = event.data?.tool_call_id as string | undefined;
         const assistantContent = event.data?.response?.assistant_content || event.data?.assistant_content;
 
@@ -606,7 +633,7 @@ export function processTraceEvents(
         step.actions.push({
           id: eventId,
           type: 'tool',
-          title: t('traceEventRenderer.executeTool', { tool: toolName }),
+          title: t('traceEventRenderer.executeTool', { tool: toolDisplayName }),
           status: 'running',
           timestamp,
           data: {
@@ -819,10 +846,10 @@ export function processTraceEvents(
 }
 
 function useProcessedSteps(events: TraceEvent[], taskStatus?: string): ProcessedStep[] {
-  const { t } = useI18n();
+  const { t, tDynamic } = useI18n();
   return useMemo(
-    () => processTraceEvents(events, t, taskStatus),
-    [events, taskStatus, t],
+    () => processTraceEvents(events, t, taskStatus, tDynamic),
+    [events, taskStatus, t, tDynamic],
   );
 }
 

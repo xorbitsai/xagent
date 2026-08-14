@@ -2,7 +2,7 @@ import React, { useState, useRef, useEffect, useCallback } from "react";
 import { Bot, ChevronDown, ChevronUp, Copy, Check, Laptop } from "lucide-react";
 import { useRouter } from "next/navigation";
 import { cn } from "@/lib/utils";
-import { TraceEventRenderer, type AgentExecutionSummary } from "./TraceEventRenderer";
+import { TraceEventRenderer, getFriendlyToolName, type AgentExecutionSummary } from "./TraceEventRenderer";
 import { useI18n } from "@/contexts/i18n-context";
 import { useApp } from "@/contexts/app-context-chat";
 import { MarkdownRenderer } from "@/components/ui/markdown-renderer";
@@ -348,6 +348,17 @@ export function ChatMessage({
   const getEventTitle = (e: TraceEvent | undefined) => {
     if (!e) return "";
     const type = e.event_type || "";
+    // Tool events carry a specific tool name — prefer "Searching the web" over
+    // the generic "Working on it" fallback whenever we know which tool it is.
+    if (type === "tool_execution_start" || type === "tool_execution_end") {
+      const rawToolName =
+        (typeof e.data?.tool_name === "string" && e.data.tool_name) ||
+        (typeof e.data?.response?.tool_name === "string" && e.data.response.tool_name) ||
+        "";
+      if (rawToolName) {
+        return getFriendlyToolName(rawToolName, tDynamic);
+      }
+    }
     const action = (typeof e.data?.action === "string" ? (e.data!.action as string) : "") || type;
     if (type) {
       const key = `agent.logs.event.actions.${type}`;

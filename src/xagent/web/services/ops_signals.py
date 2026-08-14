@@ -89,6 +89,18 @@ CLARIFICATION_DRAFT_MISSING = "clarification_draft_missing"
 # conflict-free resolution clears it.
 CLARIFICATION_MULTIPLE_DRAFTS = "clarification_multiple_drafts"
 
+# Set by the compatibility seam in _handle_resume_task_unserialized when a
+# legacy (non-receipt-carrying) resume command is accepted for a task that
+# still has an active native interaction row anchored to the task's current
+# run -- i.e. a resume that should have gone through respond() instead. This
+# is a boolean degradation flag, not a counter: this registry has no notion
+# of "count," only "name -> detail string" (see the module docstring). The
+# measurable half of "how often" lives in a structured log line the seam
+# also emits, not here. Removal condition: the log line is silent for one
+# full release cycle and every registered consumer of this signal has
+# migrated off the legacy resume path.
+INTERACTION_LEGACY_RESUME_SHIM = "interaction_legacy_resume_shim"
+
 _signals: dict[str, str] = {}
 _lock = threading.Lock()
 

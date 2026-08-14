@@ -63,9 +63,18 @@ vi.mock("@/components/file/docx-preview-renderer", () => ({
   ),
 }))
 
-vi.mock("./TraceEventRenderer", () => ({
-  TraceEventRenderer: () => <div data-testid="trace-renderer" />,
-}))
+vi.mock("./TraceEventRenderer", async () => {
+  // Keep the real getFriendlyToolName (imported by ChatMessage) so the
+  // active-tool-name status-line tests exercise the actual implementation;
+  // only the heavy TraceEventRenderer component itself is stubbed out.
+  const actual = await vi.importActual<typeof import("./TraceEventRenderer")>(
+    "./TraceEventRenderer",
+  )
+  return {
+    ...actual,
+    TraceEventRenderer: () => <div data-testid="trace-renderer" />,
+  }
+})
 
 vi.mock("./clarification-form", () => ({
   ClarificationForm: (props: unknown) => {
@@ -441,5 +450,38 @@ describe("ChatMessage Session file capability", () => {
     const copied = clipboardWriteTextMock.mock.calls[0][0]
     expect(copied).not.toContain("raw-file-id")
     expect(copied).not.toContain("/private/raw-secret.csv")
+  })
+
+  it("names the active tool in the status line while it is running", () => {
+    render(
+      <ChatMessage
+        role="assistant"
+        content={null}
+        taskStatus="running"
+        traceEvents={[
+          { event_type: "tool_execution_start", data: { tool_name: "web_search" } },
+        ]}
+      />,
+    )
+
+    expect(screen.getByText(/traceEventRenderer\.toolNames\.web_search/)).toBeInTheDocument()
+  })
+
+  it("falls back to the generic done label once the tool has finished, instead of still naming it", () => {
+    render(
+      <ChatMessage
+        role="assistant"
+        content={null}
+        taskStatus="running"
+        traceEvents={[
+          { event_type: "tool_execution_end", data: { tool_name: "web_search" } },
+        ]}
+      />,
+    )
+
+    expect(
+      screen.queryByText(/traceEventRenderer\.toolNames\.web_search/),
+    ).not.toBeInTheDocument()
+    expect(screen.getByText(/agent\.logs\.event\.actions\.tool_execution_end/)).toBeInTheDocument()
   })
 })

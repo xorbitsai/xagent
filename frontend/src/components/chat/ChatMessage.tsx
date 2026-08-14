@@ -350,7 +350,10 @@ export function ChatMessage({
     const type = e.event_type || "";
     // Tool events carry a specific tool name — prefer "Searching the web" over
     // the generic "Working on it" fallback whenever we know which tool it is.
-    if (type === "tool_execution_start" || type === "tool_execution_end") {
+    // Only for the start event: once the tool has finished, naming it again
+    // here would read as still in progress, so tool_execution_end falls
+    // through to the generic "Done" label below instead.
+    if (type === "tool_execution_start") {
       // Normalize the (possibly missing) nested payload once, then read off
       // it, rather than optional-chaining each field individually. Checks
       // response.tool_name first to match the extraction order used for the

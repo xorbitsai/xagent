@@ -344,6 +344,16 @@ export function ChatMessage({
   const hasTraceEvents = Array.isArray(traceEvents) && traceEvents.length > 0;
   const shouldShowProcess = !!showProcessView && hasTraceEvents;
 
+  // traceEvents comes straight off an external WS/API payload, so validate
+  // that each entry is actually an object here, once, rather than repeating
+  // a null/type guard in every helper below that reads from the list.
+  const sanitizedTraceEvents: TraceEvent[] = Array.isArray(traceEvents)
+    ? traceEvents.filter(
+        (event): event is TraceEvent =>
+          !!event && typeof event === "object" && !Array.isArray(event),
+      )
+    : [];
+
   // Mirrors TraceEventRenderer.tsx's isAgentProgressEvent — kept in sync by
   // hand since the two files declare separate TraceEvent shapes.
   const isProgressNarrationEvent = (e: TraceEvent): boolean => {
@@ -357,9 +367,8 @@ export function ChatMessage({
   // even after a later, un-narrated tool call — the narration is still
   // accurate until the model says something newer.
   const latestProgressNarration = (): string => {
-    if (!Array.isArray(traceEvents)) return "";
-    for (let i = traceEvents.length - 1; i >= 0; i--) {
-      const event = traceEvents[i];
+    for (let i = sanitizedTraceEvents.length - 1; i >= 0; i--) {
+      const event = sanitizedTraceEvents[i];
       if (!isProgressNarrationEvent(event)) continue;
       const raw = event.data?.message ?? event.data?.content;
       if (typeof raw === "string" && raw.trim()) return raw.trim();
@@ -402,8 +411,8 @@ export function ChatMessage({
   const latestTitle =
     latestProgressNarration() ||
     getEventTitle(
-      Array.isArray(traceEvents) && traceEvents.length > 0
-        ? traceEvents[traceEvents.length - 1]
+      sanitizedTraceEvents.length > 0
+        ? sanitizedTraceEvents[sanitizedTraceEvents.length - 1]
         : undefined
     );
   const resolvedProcessStatus = resolveTraceProcessStatus({
@@ -435,9 +444,9 @@ export function ChatMessage({
   // often than not). With the trace hidden the failure line must not become its
   // replacement channel, so only mine the events when the process view is on.
   let errorMessage = "";
-  if (showProcessView && resolvedProcessStatus === "failed" && Array.isArray(traceEvents)) {
-    for (let i = traceEvents.length - 1; i >= 0; i--) {
-      const event = traceEvents[i];
+  if (showProcessView && resolvedProcessStatus === "failed") {
+    for (let i = sanitizedTraceEvents.length - 1; i >= 0; i--) {
+      const event = sanitizedTraceEvents[i];
       if (['trace_error', 'task_failed', 'react_task_failed', 'dag_step_failed', 'agent_error'].includes(event.event_type || '')) {
         errorMessage = (event.data?.error as string) || (event.data?.message as string) || (event.data?.error_message as string) || "";
         if (errorMessage) break;

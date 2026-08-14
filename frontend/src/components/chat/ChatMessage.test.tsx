@@ -485,6 +485,33 @@ describe("ChatMessage Session file capability", () => {
     expect(screen.getByText(/agent\.logs\.event\.actions\.tool_execution_end/)).toBeInTheDocument()
   })
 
+  it("does not throw when traceEvents contains null, primitive, or malformed entries", () => {
+    // traceEvents comes off an external WS/API payload; mirrors the
+    // malformed-input coverage in TraceEventRenderer.test.tsx.
+    expect(() =>
+      render(
+        <ChatMessage
+          role="assistant"
+          content={null}
+          taskStatus="running"
+          traceEvents={[
+            null,
+            42,
+            "not-an-event",
+            { event_type: 17, data: "not-an-object" },
+            {
+              event_type: "agent_progress",
+              data: { message: "Still valid despite the noise around it." },
+            },
+          ] as unknown as React.ComponentProps<typeof ChatMessage>["traceEvents"]}
+        />,
+      ),
+    ).not.toThrow()
+    expect(
+      screen.getByText(/Still valid despite the noise around it\./),
+    ).toBeInTheDocument()
+  })
+
   it("surfaces the model's own progress narration in the status line, not a generic action label", () => {
     render(
       <ChatMessage

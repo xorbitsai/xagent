@@ -90,9 +90,9 @@ CLARIFICATION_DRAFT_MISSING = "clarification_draft_missing"
 CLARIFICATION_MULTIPLE_DRAFTS = "clarification_multiple_drafts"
 
 # Set by the compatibility seam in _handle_resume_task_unserialized when a
-# legacy (non-receipt-carrying) resume command is accepted for a task that
-# still has an active native interaction row anchored to the task's current
-# run -- i.e. a resume that should have gone through respond() instead. This
+# legacy (non-receipt-carrying) resume command is refused because the task
+# still has an active native interaction row anchored to its current run --
+# i.e. a resume that should have gone through respond() instead. This
 # is a boolean degradation flag, not a counter: this registry has no notion
 # of "count," only "name -> detail string" (see the module docstring). The
 # measurable half of "how often" lives in a structured log line the seam

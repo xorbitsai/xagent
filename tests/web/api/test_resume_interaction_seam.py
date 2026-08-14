@@ -290,6 +290,74 @@ async def test_legacy_resume_without_a_receipt_is_refused_on_the_fallback_path(
 
 
 @pytest.mark.asyncio
+async def test_wrongly_typed_receipt_id_is_refused_like_a_missing_one(
+    monkeypatch: pytest.MonkeyPatch, _session_factory, _seeded_task: int
+) -> None:
+    """A receipt whose ``interaction_id`` arrives as a string -- even the
+    string form of the active row's own id -- must land on the refusal
+    path. The seam's comparison is deliberately type-strict: a receipt it
+    cannot recognize as the exact continuation ``respond()`` staged is no
+    receipt at all. Today that falls out of plain ``!=`` across types;
+    this test pins it against a future rewrite that coerces first."""
+
+    import xagent.web.models.database as database_module
+
+    monkeypatch.setattr(
+        database_module, "get_optional_session_local", lambda: _session_factory
+    )
+    interaction_id = _make_active_row(_session_factory, task_id=_seeded_task)
+
+    snapshot = _snapshot(task_id=_seeded_task)
+    connection_manager = _connection_manager()
+    background_manager = MagicMock()
+    background_manager.running_tasks = {}
+    transition = AsyncMock()
+    agent_service = MagicMock()
+    agent_service.supports_live_control = MagicMock(return_value=True)
+
+    from xagent.web.services import task_setup_snapshot as snapshot_module
+
+    with ExitStack() as stack:
+        stack.enter_context(
+            patch.object(
+                snapshot_module, "load_task_setup_snapshot_sync", return_value=snapshot
+            )
+        )
+        stack.enter_context(patch.object(websocket_api, "manager", connection_manager))
+        stack.enter_context(
+            patch.object(
+                websocket_api.task_execution_controller, "transition", new=transition
+            )
+        )
+        stack.enter_context(
+            patch.object(websocket_api, "background_task_manager", background_manager)
+        )
+        agent_manager = MagicMock()
+        agent_manager.get_agent_for_task = AsyncMock(return_value=agent_service)
+        stack.enter_context(
+            patch.object(chat_api, "get_agent_manager", lambda: agent_manager)
+        )
+
+        await websocket_api._handle_resume_task_unserialized(
+            MagicMock(),
+            _seeded_task,
+            {
+                "user": SimpleNamespace(id=OWNER_ID, is_admin=False),
+                "interaction_id": str(interaction_id),
+                "responder_identity": f"user:{OWNER_ID}",
+            },
+        )
+
+        agent_manager.get_agent_for_task.assert_not_called()
+
+    transition.assert_not_called()
+    assert connection_manager.send_personal_message.await_count == 1
+    sent = connection_manager.send_personal_message.await_args.args[0]
+    assert sent["type"] == "error"
+    assert "unanswered question" in sent["message"]
+
+
+@pytest.mark.asyncio
 async def test_resume_with_a_matching_receipt_is_not_refused(
     monkeypatch: pytest.MonkeyPatch, _session_factory, _seeded_task: int
 ) -> None:

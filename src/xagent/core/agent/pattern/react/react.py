@@ -1720,11 +1720,22 @@ class ReActPattern(AgentPattern):
                 "type": "function",
                 "function": {
                     "name": "send_message",
-                    "description": "Send a message to the user, optionally waiting for a response.",
+                    "description": (
+                        "Send a message to the user, optionally waiting for a "
+                        "response. Use message_type='progress' to narrate a "
+                        "longer task as it moves through meaningful phases, "
+                        "not before every tool call."
+                    ),
                     "parameters": {
                         "type": "object",
                         "properties": {
-                            "message": {"type": "string"},
+                            "message": {
+                                "type": "string",
+                                "description": (
+                                    "The message text, in the same language "
+                                    "as the user's request."
+                                ),
+                            },
                             "message_type": {
                                 "type": "string",
                                 "enum": [
@@ -1734,6 +1745,19 @@ class ReActPattern(AgentPattern):
                                     "progress",
                                     "warning",
                                 ],
+                                "description": (
+                                    "progress: a brief, plain-language "
+                                    "narration of what you are doing right "
+                                    "now or what you just found — describe "
+                                    "it the way the user themselves would, "
+                                    "never by naming the tool, model, file "
+                                    "path, or raw arguments involved. info: "
+                                    "a one-off notification. "
+                                    "question/confirmation: expects a "
+                                    "response — set expect_response=true. "
+                                    "warning: something the user should "
+                                    "know may affect the outcome."
+                                ),
                             },
                             "expect_response": {"type": "boolean"},
                             "visible": {"type": "boolean"},

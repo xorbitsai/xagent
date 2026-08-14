@@ -985,8 +985,15 @@ def stage_interaction_request(
     That is a degradation, not a corruption: ``InteractionSlotTaken`` is
     swallowed, so the caller's turn survives and the question is lost.
     READ COMMITTED is PostgreSQL's default and this codebase sets no
-    ``isolation_level`` on its engine; the change that wires the first
-    production caller should assert that rather than continue to assume it.
+    ``isolation_level`` on its engine. Both halves of that are asserted,
+    not assumed: one test reads the server's effective
+    ``transaction_isolation`` on a real PostgreSQL session
+    (``test_interaction_staging_postgresql.py``), and one statically pins
+    that neither ``create_engine`` call in
+    ``xagent.web.models.database`` passes an ``isolation_level``
+    (``test_interaction_staging.py``). Setting one turns both red, which
+    is the point: this paragraph's failure mode has to be re-decided at
+    that moment, not discovered later.
 
     ``SELECT ... FOR UPDATE`` on the task row was considered, as an
     alternative to the savepoint-plus-re-check design above, and rejected:

@@ -14,6 +14,8 @@ connection does not give.
 
 from __future__ import annotations
 
+import ast
+import inspect
 import json
 import logging
 from datetime import datetime, timedelta, timezone
@@ -33,6 +35,7 @@ from tests.web.services.task_interaction_schema_shared import (
     make_user,
 )
 from xagent.db.sqlite import apply_sqlite_concurrency_pragmas
+from xagent.web.models import database as database_module
 from xagent.web.models.database import Base
 from xagent.web.models.task import Task
 from xagent.web.models.task_interaction import TaskInteractionRequest
@@ -3123,3 +3126,69 @@ def test_handoff_never_writes_any_task_column(tmp_path: Path) -> None:
     fresh.close()
 
     assert after == before
+
+
+# ---------------------------------------------------------------------------
+# The post-conflict re-check's READ COMMITTED dependency (stage_interaction_
+# request's step 6 docstring): this half statically pins that this codebase
+# does not override the isolation level itself. The other half -- that
+# PostgreSQL's default really is READ COMMITTED -- is asserted against a
+# real server in test_interaction_staging_postgresql.py. Neither half alone
+# proves the docstring's premise; both must hold together.
+# ---------------------------------------------------------------------------
+
+
+def _create_engine_calls(tree: ast.Module) -> list[ast.Call]:
+    return [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "create_engine"
+    ]
+
+
+def test_configure_db_sets_no_isolation_level_on_either_engine() -> None:
+    """If this test turns red, someone gave one of the two ``create_engine``
+    calls in ``configure_db`` (``xagent.web.models.database``) an explicit
+    ``isolation_level`` -- whether passed directly as a keyword, folded into
+    an ``execution_options`` dict literal, or (the SQLite branch's PostgreSQL
+    counterpart today) built up into the ``engine_kwargs`` dict that gets
+    spread into the call with ``**``. That is the moment to re-read
+    ``stage_interaction_request``'s docstring on its post-conflict re-check:
+    that re-check's classification of a REPLAY-after-conflict depends on
+    READ COMMITTED being in effect, and a different isolation level would
+    make it misclassify a legitimate replay as a slot conflict.
+
+    The scan is over ``configure_db``'s own parsed source, not a text
+    search of the whole module, so it cannot be defeated by a coincidental
+    ``"isolation_level"`` substring in an unrelated docstring or comment
+    elsewhere in the file -- and it walks every dict-literal key and every
+    keyword argument name in the function, not just the two direct
+    ``create_engine`` call sites, because the PostgreSQL branch's second
+    call passes its keywords indirectly through ``**engine_kwargs`` rather
+    than spelling them out at the call site.
+    """
+
+    source = inspect.getsource(database_module.configure_db)
+    tree = ast.parse(source)
+
+    calls = _create_engine_calls(tree)
+    assert len(calls) == 2, "expected exactly two create_engine() calls in configure_db"
+
+    forbidden = "isolation_level"
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Dict):
+            literal_keys = {
+                key.value
+                for key in node.keys
+                if isinstance(key, ast.Constant) and isinstance(key.value, str)
+            }
+            assert forbidden not in literal_keys
+        elif isinstance(node, ast.keyword) and node.arg is not None:
+            assert node.arg != forbidden
+        elif isinstance(node, ast.Subscript) and isinstance(node.value, ast.Name):
+            index = node.slice
+            if isinstance(index, ast.Constant) and isinstance(index.value, str):
+                assert index.value != forbidden

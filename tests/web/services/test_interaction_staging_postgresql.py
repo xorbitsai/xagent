@@ -668,3 +668,26 @@ def test_sp5_integrity_error_poisons_transaction_until_savepoint_rollback(
         )
     ).first()
     assert still_usable is None
+
+
+def test_server_default_isolation_level_is_read_committed(db_session) -> None:
+    """``stage_interaction_request``'s post-conflict re-check (step 6 of its
+    docstring) needs READ COMMITTED to see a competing session's commit
+    between its own pre-read and its INSERT; under REPEATABLE READ or
+    SERIALIZABLE it would reuse its original snapshot and misclassify a
+    legitimate replay as a slot conflict.
+
+    This proves only the server-configuration half of that premise -- that
+    a session opened the way this codebase opens one really does start out
+    at READ COMMITTED. It proves nothing about whether this codebase could
+    override that default: ``test_configure_db_sets_no_isolation_level_on_
+    either_engine`` (``test_interaction_staging.py``) is the other half,
+    pinning that neither ``create_engine`` call here sets an
+    ``isolation_level``. Either test alone leaves the docstring's premise
+    unproven; only both holding together do.
+    """
+
+    (level,) = db_session.execute(
+        sa.text("SELECT current_setting('transaction_isolation')")
+    ).one()
+    assert level == "read committed"

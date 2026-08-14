@@ -4,7 +4,7 @@ import os
 from datetime import timedelta
 from pathlib import Path
 from types import ModuleType
-from typing import Any, Dict, Optional, Tuple, cast
+from typing import Any, Dict, NamedTuple, Optional, Tuple, cast
 from urllib.parse import quote
 from uuid import uuid4
 
@@ -1585,21 +1585,36 @@ def _user_from_stream_ticket(db: Session, ticket: str, file_id: str) -> User:
     return user
 
 
+class _AuthenticatedFileRequest(NamedTuple):
+    """Which user asked, and whether a stream ticket is what let them in.
+
+    ``via_stream_ticket`` is a plain bool, not the raw ticket string: nothing
+    downstream needs the ticket's own content again (redemption already
+    happened above), only whether the ticket path is what authenticated this
+    request -- resolve_file_path takes the user separately, and the only
+    other read site (``cache_headers`` below) only ever checks truthiness.
+    """
+
+    user: User
+    via_stream_ticket: bool
+
+
 def _user_from_bearer_or_stream_ticket(
     file_id: str,
     ticket: Optional[str] = Query(default=None),
     credentials: Optional[HTTPAuthorizationCredentials] = Depends(optional_security),
     db: Session = Depends(get_db),
-) -> Tuple[User, Optional[str]]:
+) -> _AuthenticatedFileRequest:
     """Resolve the requesting user, and echo back which credential won.
 
-    Returning ``ticket`` alongside ``user`` lets ``preview_file`` below read
-    whether a ticket authenticated this request (to decide ``cache_headers``)
-    without redeclaring its own ``ticket: Query(...)`` parameter -- FastAPI
-    would resolve that redeclaration to the same value from the same request
-    every time, but two independent declarations of the same query param
-    with no shared source is the kind of thing that can silently drift if
-    one is ever edited (e.g. a default) without the other.
+    Returning ``via_stream_ticket`` alongside ``user`` lets ``preview_file``
+    below read whether a ticket authenticated this request (to decide
+    ``cache_headers``) without redeclaring its own ``ticket: Query(...)``
+    parameter -- FastAPI would resolve that redeclaration to the same value
+    from the same request every time, but two independent declarations of
+    the same query param with no shared source is the kind of thing that
+    can silently drift if one is ever edited (e.g. a default) without the
+    other.
     """
     if ticket:
         # A present ticket is checked on its own and never falls through to
@@ -1610,7 +1625,9 @@ def _user_from_bearer_or_stream_ticket(
         # mask exactly the failure (expired mid-session, wrong file_id) the
         # caller's fallback-and-remint logic (reportLoadFailure on the
         # frontend) exists to detect and recover from.
-        return _user_from_stream_ticket(db, ticket, file_id), ticket
+        return _AuthenticatedFileRequest(
+            _user_from_stream_ticket(db, ticket, file_id), True
+        )
     if credentials is None:
         # This endpoint predates the ticket param and used the default
         # HTTPBearer(auto_error=True), which raises 403 "Not authenticated"
@@ -1640,7 +1657,7 @@ def _user_from_bearer_or_stream_ticket(
         # -- see test_mint_endpoint_requires_a_bearer_credential, which
         # deliberately doesn't assert a specific code for that case.
         raise HTTPException(status_code=403, detail="Not authenticated")
-    return get_current_user(credentials, db), None
+    return _AuthenticatedFileRequest(get_current_user(credentials, db), False)
 
 
 @file_router.get("/stream-tickets/{file_id:path}", response_model=None)
@@ -1687,11 +1704,11 @@ async def issue_preview_stream_ticket(
 @file_router.get("/preview/{file_id:path}", response_model=None)
 async def preview_file(
     file_id: str,
-    auth: Tuple[User, Optional[str]] = Depends(_user_from_bearer_or_stream_ticket),
+    auth: _AuthenticatedFileRequest = Depends(_user_from_bearer_or_stream_ticket),
     db: Session = Depends(get_db),
 ) -> Any:
-    user, ticket = auth
-    cache_headers = _PUBLIC_PREVIEW_CACHE_HEADERS if ticket else None
+    user, via_stream_ticket = auth
+    cache_headers = _PUBLIC_PREVIEW_CACHE_HEADERS if via_stream_ticket else None
     file_record, full_path, owner_user_id = _resolve_file_path(
         db, file_id, _user_id_value(user)
     )

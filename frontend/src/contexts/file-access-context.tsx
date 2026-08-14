@@ -104,10 +104,39 @@ export const defaultFileAccessPolicy: FileAccessPolicy = {
     // doesn't otherwise validate; a malformed/unexpected payload must
     // surface as a caught rejection (so the caller falls back to the blob
     // path) rather than silently becoming a broken `undefined`-based URL.
+    // Bound to this exact fileId, not just the generic preview prefix: a
+    // prefix-only check would pass a path with extra segments after it
+    // (e.g. a dot-segment escaping to a different route) as long as it
+    // still started with "/api/files/preview/" -- exploitability is ~nil
+    // today (this server is the sole minter, and the ticket's own file_id
+    // claim is re-checked at redemption regardless of what path string got
+    // us there), but there's no reason to accept a shape looser than what
+    // this server actually returns. Decoded and compared, not re-encoded
+    // and string-matched: the server encodes file_id with Python's
+    // urllib.parse.quote(safe=""), which escapes a different character set
+    // than encodeURIComponent does (e.g. "!*'()" round-trip unescaped
+    // through encodeURIComponent but ARE escaped by quote) -- re-encoding
+    // fileId here and comparing strings would reject a genuinely valid
+    // response for any fileId containing one of those characters.
+    // decodeURIComponent has no such mismatch: it decodes any valid
+    // percent-encoded UTF-8 sequence regardless of which safe-set the
+    // encoder chose, so it round-trips correctly against either encoder.
+    const previewPrefix = `${FILES_API_PREFIX}/preview/`
     const data: unknown = await response.json()
     const path =
       data && typeof data === "object" ? (data as { path?: unknown }).path : undefined
-    if (typeof path !== "string" || !path.startsWith(`${FILES_API_PREFIX}/preview/`)) {
+    if (typeof path !== "string" || !path.startsWith(previewPrefix)) {
+      throw new Error("Stream ticket response has an unexpected shape")
+    }
+    const encodedFileIdAndQuery = path.slice(previewPrefix.length)
+    const encodedFileId = encodedFileIdAndQuery.split("?")[0]
+    let decodedFileId: string
+    try {
+      decodedFileId = decodeURIComponent(encodedFileId)
+    } catch {
+      throw new Error("Stream ticket response has an unexpected shape")
+    }
+    if (decodedFileId !== fileId) {
       throw new Error("Stream ticket response has an unexpected shape")
     }
     return buildUrl(path)

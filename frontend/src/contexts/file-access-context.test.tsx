@@ -13,6 +13,7 @@ vi.mock("@/lib/api-wrapper", () => ({
 import {
   FileAccessProvider,
   createPublicFileAccessPolicy,
+  defaultFileAccessPolicy,
   useFileAccess,
 } from "./file-access-context"
 
@@ -172,6 +173,57 @@ describe("FileAccessProvider", () => {
     apiRequestMock.mockResolvedValue({
       ok: true,
       json: async () => ({ notPath: "/api/files/preview/file-id" }),
+    })
+    render(
+      <FileAccessProvider>
+        <StreamingUrlProbe />
+      </FileAccessProvider>,
+    )
+
+    screen.getByTestId("streaming").click()
+
+    await waitFor(() => {
+      expect(screen.getByTestId("streaming")).toHaveAttribute(
+        "data-result",
+        "error:Stream ticket response has an unexpected shape",
+      )
+    })
+  })
+
+  it("accepts a mint response whose fileId segment the server encoded differently than encodeURIComponent would", async () => {
+    // Regression test: the server encodes file_id via Python's
+    // urllib.parse.quote(file_id, safe="") when building the ticket path
+    // (src/xagent/web/api/files.py), which escapes a different character
+    // set than JS's encodeURIComponent -- "!*'()" round-trip unescaped
+    // through encodeURIComponent but ARE escaped by quote(safe=""). A fix
+    // that re-encodes fileId with encodeURIComponent and string-matches
+    // against the response path would reject this genuinely valid
+    // response for any fileId containing one of those characters.
+    const fileId = "file!*'()id"
+    apiRequestMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({
+        // Exactly what Python's quote(fileId, safe="") produces.
+        path: "/api/files/preview/file%21%2A%27%28%29id?ticket=signed-ticket",
+      }),
+    })
+
+    const url = await defaultFileAccessPolicy.getStreamingUrl?.(fileId)
+
+    expect(url).toBe("/api/files/preview/file%21%2A%27%28%29id?ticket=signed-ticket")
+  })
+
+  it("rejects a mint response whose path is scoped to a different fileId", async () => {
+    // Regression test (F5): a prefix-only check ("starts with
+    // /api/files/preview/") would accept a path with extra segments after
+    // it -- including one naming a completely different fileId, or a
+    // dot-segment -- as long as it still started with the generic preview
+    // prefix. The path must be scoped to the exact fileId requested.
+    apiRequestMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({
+        path: "/api/files/preview/a-different-file-id?ticket=signed-ticket",
+      }),
     })
     render(
       <FileAccessProvider>

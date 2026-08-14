@@ -50,11 +50,45 @@ const STREAMING_URL_CACHE_TTL_MS = 4 * 60 * 1000
 // attachment shown on two messages) would otherwise each pay a separate
 // mint round trip before either resolves.
 const streamingUrlCache = new Map<string, Promise<{ url: string; expiresAt: number }>>()
+// Insertion time per fileId, tracked separately from the cache above: an
+// entry's own settled `expiresAt` isn't knowable until its promise resolves,
+// but pruning needs to sweep entries for fileIds nobody has asked about
+// since, which are never re-awaited to trigger that resolution. Without this,
+// a long chat session that streams many distinct attachments over time would
+// grow this module-level Map unbounded, one entry per fileId ever mounted.
+const streamingUrlCacheInsertedAt = new Map<string, number>()
+
+function setStreamingUrlCacheEntry(
+  fileId: string,
+  promise: Promise<{ url: string; expiresAt: number }>
+): void {
+  streamingUrlCache.set(fileId, promise)
+  streamingUrlCacheInsertedAt.set(fileId, Date.now())
+}
+
+function deleteStreamingUrlCacheEntry(fileId: string): void {
+  streamingUrlCache.delete(fileId)
+  streamingUrlCacheInsertedAt.delete(fileId)
+}
+
+// Opportunistic, not timer-driven: piggybacks on the natural traffic of
+// mint calls rather than running its own background interval. A fileId that
+// stops being mounted altogether would otherwise never trigger the
+// `expiresAt` check inside mintStreamingUrl (nobody's asking about it to run
+// that check), so it needs its own sweep independent of any particular
+// fileId's own access pattern.
+function pruneStaleStreamingUrlCacheEntries(): void {
+  const now = Date.now()
+  for (const [id, insertedAt] of streamingUrlCacheInsertedAt) {
+    if (now - insertedAt > STREAMING_URL_CACHE_TTL_MS) deleteStreamingUrlCacheEntry(id)
+  }
+}
 
 async function mintStreamingUrl(
   fileAccess: FileAccessPolicy,
   fileId: string
 ): Promise<string> {
+  pruneStaleStreamingUrlCacheEntries()
   const cached = streamingUrlCache.get(fileId)
   if (cached) {
     const entry = await cached.catch(() => null)
@@ -65,7 +99,7 @@ async function mintStreamingUrl(
     // hit this same branch again, but only if nothing else already
     // replaced it (e.g. a concurrent caller's own retry).
     if (streamingUrlCache.get(fileId) === cached) {
-      streamingUrlCache.delete(fileId)
+      deleteStreamingUrlCacheEntry(fileId)
     } else {
       // A concurrent caller already replaced this stale/failed entry with
       // its own fresh mint while this call was awaiting it above -- reuse
@@ -81,14 +115,14 @@ async function mintStreamingUrl(
     url,
     expiresAt: Date.now() + STREAMING_URL_CACHE_TTL_MS,
   }))
-  streamingUrlCache.set(fileId, mintPromise)
+  setStreamingUrlCacheEntry(fileId, mintPromise)
   try {
     return (await mintPromise).url
   } catch (error) {
     // Don't let a failed mint poison the cache for the next caller --
     // without this, every subsequent mount of this fileId would
     // immediately re-throw this same rejection instead of retrying.
-    if (streamingUrlCache.get(fileId) === mintPromise) streamingUrlCache.delete(fileId)
+    if (streamingUrlCache.get(fileId) === mintPromise) deleteStreamingUrlCacheEntry(fileId)
     throw error
   }
 }
@@ -115,6 +149,7 @@ export function __mintStreamingUrlForTests(
  */
 export function __resetStreamingUrlCacheForTests(): void {
   streamingUrlCache.clear()
+  streamingUrlCacheInsertedAt.clear()
 }
 
 /**
@@ -282,7 +317,7 @@ function useResolvedMediaUrl(
       // The ticket minted but the media element couldn't actually load it.
       // Evict the cache entry too, so a remount of this same fileId mints
       // fresh rather than immediately reusing the ticket that just failed.
-      streamingUrlCache.delete(fileId)
+      deleteStreamingUrlCacheEntry(fileId)
       setStreamingFailedFor(fileId)
       return false // not terminal -- a (2)/(3) fallback attempt is starting
     }
@@ -314,7 +349,7 @@ function useResolvedMediaUrl(
   // deleted or access was revoked since the last successful load.
   const remintStreamingUrl = useCallback(async (): Promise<boolean> => {
     if (!fileId) return false
-    streamingUrlCache.delete(fileId) // the cached ticket just failed to load
+    deleteStreamingUrlCacheEntry(fileId) // the cached ticket just failed to load
     try {
       const freshUrl = await mintStreamingUrl(fileAccess, fileId)
       // JWT iat/exp have whole-second precision, so a mint within the same
@@ -495,6 +530,13 @@ function InlineMediaPreview({
     // gesture this handler was never meant for. Only the middle button
     // (button 1) is the open-in-new-tab gesture being recovered here.
     if (event.type === 'auxclick' && event.button !== 1) return
+    // Not on the ticketed path: href is already resolvedUrl (a blob: URL or
+    // an already-anonymous direct src), safe for the browser's own native
+    // navigation -- popup-blocker-dependent window.open plumbing exists
+    // only to smuggle a fresh URL past the 403-prone static href while
+    // streaming, and would be pure overhead (and a needless popup-blocker
+    // dependency) here.
+    if (!isStreamingUrl) return
     event.preventDefault()
     const tab = window.open('about:blank', '_blank')
     if (!tab) {
@@ -555,7 +597,14 @@ function InlineMediaPreview({
           <a
             href={openUrl}
             onClick={canOpenFilePreview ? onOpenPreview : handleOpenFallbackClick}
-            onAuxClick={canOpenFilePreview ? undefined : handleOpenFallbackClick}
+            // Unconditional, unlike onClick: a dialog answers "open in-app"
+            // for a primary click, but a middle-click's intent is always
+            // "open in a new tab" regardless of whether a dialog exists --
+            // onOpenPreview has no answer for that, so without this a
+            // dialog-present surface's middle-click fell through to the
+            // native href (the 403-prone one while streaming) exactly like
+            // the no-dialog case this was first fixed for.
+            onAuxClick={handleOpenFallbackClick}
             className="shrink-0 text-foreground hover:underline"
           >
             {openLabel}

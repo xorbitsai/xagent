@@ -343,6 +343,34 @@ describe('InlineFilePreview', () => {
     expect(apiRequestMock).not.toHaveBeenCalled()
   })
 
+  it('lets a click on "Open" navigate natively under the public policy instead of the popup-blocker-dependent tab dance', async () => {
+    // Regression test (F2): the public policy never sets isStreamingUrl
+    // (it has no getStreamingUrl), so openUrl is already the safe,
+    // already-tokened direct URL -- opening a blank tab and redirecting it
+    // via JS exists only to smuggle a fresh URL past a 403-prone static
+    // href while streaming, which doesn't apply here. Hijacking this click
+    // anyway would make "Open" popup-blocker-dependent for no reason.
+    vi.stubGlobal('fetch', vi.fn())
+    const openSpy = vi.spyOn(window, 'open')
+
+    render(
+      <FileAccessProvider policy={createPublicFileAccessPolicy('guest-a')}>
+        <InlineFilePreview
+          source={{ type: 'video', fileId: 'video-id', filename: 'clip.mp4' }}
+        />
+      </FileAccessProvider>,
+    )
+    await screen.findByLabelText('clip.mp4')
+
+    const clickEvent = new MouseEvent('click', { bubbles: true, cancelable: true })
+    fireEvent(screen.getByRole('link', { name: 'Open' }), clickEvent)
+
+    expect(openSpy).not.toHaveBeenCalled()
+    expect(clickEvent.defaultPrevented).toBe(false)
+
+    openSpy.mockRestore()
+  })
+
   it('streams video directly from a minted ticket under the default policy', async () => {
     // The default policy's getStreamingUrl mints a ticket via a dedicated
     // endpoint; when that succeeds the media element loads the ticketed
@@ -684,6 +712,53 @@ describe('InlineFilePreview', () => {
     fireEvent.click(screen.getByRole('link', { name: 'Open' }))
 
     expect(handleFileClick).toHaveBeenCalledWith('video-file-id', 'clip.mp4')
+  })
+
+  it('resolves a fresh authenticated blob for "Open" on a middle click even when a dialog is available', async () => {
+    // Regression test (N-D1 residual): a dialog answers "open in-app" for a
+    // primary click, but a middle-click's intent is always "open in a new
+    // tab" -- onFileClick has no answer for that. Without onAuxClick wired
+    // on this branch too, a middle click fell through to the native href
+    // (the 403-prone public preview URL while streaming) on every standard
+    // in-app chat surface, even though the exact same primary click worked.
+    const handleFileClick = vi.fn()
+    apiRequestMock.mockImplementation(async (url: string) => {
+      if (url.includes('/stream-tickets/')) {
+        return {
+          ok: true,
+          json: async () => ({
+            path: '/api/files/preview/video-file-id?ticket=signed-ticket',
+          }),
+        }
+      }
+      return {
+        ok: true,
+        blob: async () => new Blob(['video-bytes'], { type: 'video/mp4' }),
+      }
+    })
+    const fakeTab = { location: { href: '' }, closed: false, opener: 'x' as unknown }
+    const openSpy = vi.spyOn(window, 'open').mockReturnValue(fakeTab as unknown as Window)
+
+    render(
+      <InlineFilePreview
+        source={{ type: 'video', fileId: 'video-file-id', filename: 'clip.mp4' }}
+        onFileClick={handleFileClick}
+      />
+    )
+
+    await screen.findByLabelText('clip.mp4')
+    fireEvent(
+      screen.getByRole('link', { name: 'Open' }),
+      new MouseEvent('auxclick', { bubbles: true, cancelable: true, button: 1 })
+    )
+
+    expect(openSpy).toHaveBeenCalledWith('about:blank', '_blank')
+    expect(handleFileClick).not.toHaveBeenCalled()
+    await waitFor(() => {
+      expect(fakeTab.location.href).toMatch(/^blob:/)
+    })
+
+    openSpy.mockRestore()
   })
 
   it('reuses a minted streaming ticket across remounts of the same file', async () => {

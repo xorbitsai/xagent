@@ -385,12 +385,21 @@ def classify_task_command_conflict(
     deleted concurrently with the insert (TASK_MISSING), and a conflict on
     neither -- the row references two foreign keys, so absence of a duplicate
     does not prove the task caused it: a concurrently deleted actor fails the
-    users FK while the task is still present (UNRELATED).
+    users FK while the task is still present (UNRELATED). Rolling back to a
+    savepoint opened before the failing insert is equivalent to rolling back
+    the whole transaction for this purpose, as long as that savepoint
+    predates the insert: either way, the post-rollback state this function
+    queries no longer contains the failed statement's own effects.
 
     RACED_DUPLICATE means the command survived the race, not that the
     caller's work did: the rollback that had to precede this call also undid
     whatever else the caller had written. A caller that had such writes must
-    redo them rather than report success. A caller with nothing else pending
+    redo them rather than report success. Opening the savepoint after those
+    writes is the way out of redoing them: a rollback to a savepoint that
+    postdates them leaves them pending in the still-open outer transaction,
+    so the caller decides whether to commit or discard them once it knows
+    what this function found. ``task_interaction_service.respond()`` is
+    that shape. A caller with nothing else pending
     -- enqueue_task_command is one -- has nothing to redo and reports the
     raced row as created=False.
     """

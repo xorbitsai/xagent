@@ -10,7 +10,9 @@ both live on the ask side, and both require the caller to already hold the
 transaction they run inside. This module's ``respond()`` is the opposite
 shape on every one of those points: it owns its own session end to end
 (opens it, commits or rolls it back, retires it) and never nests inside a
-caller's transaction. ``create()``, by contrast, takes a caller-owned
+caller's transaction -- the one savepoint it opens
+(``db.begin_nested()``, around staging its own resume command) is its
+own, not a caller's. ``create()``, by contrast, takes a caller-owned
 session and only reads through it, never opening or committing one of its
 own. Putting ``respond()`` in the same file as the staging primitive would
 make that staging module's merge-reason docstring false. What this module
@@ -50,10 +52,12 @@ does not stage a row); ``get()``/``list_active()``; the three-tier
 compatibility materialization view; the answer fence and its active-row
 predicate; ``respond()``'s own call body (validation, authorization, the
 idempotency pre-read, anchor resolution, the answer fence, the task
-control-state transition, staging the resume command, and committing --
-this delivery reports an unresolved fence miss or a failed commit as
-``RespondOutcomeUnknown`` rather than further classifying or reconciling
-either); and the response-conflict counter
+control-state transition, staging the resume command, and committing or
+reconciling an ambiguous acknowledgment -- this delivery classifies a
+staging conflict and reconciles an ambiguous commit against the durable
+graph, and still reports an unresolved fence miss as
+``RespondOutcomeUnknown`` rather than classifying it, which is a separate
+follow-up build); and the response-conflict counter
 (``COUNTER_LIFECYCLE_RESPONSE_CONFLICT``).
 
 Not delivered here, and named so a reader does not go looking for them in
@@ -79,6 +83,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, Literal, cast
@@ -107,9 +112,12 @@ from .ops_signals import (
     register_degradation,
 )
 from .task_command_transport import (
+    TaskCommandConflictKind,
     TaskCommandKind,
+    _canonical_payload,
     _matches_existing,
     _normalize_command_id,
+    classify_task_command_conflict,
     notify_task_command_dispatcher,
     stage_task_command,
 )
@@ -592,19 +600,18 @@ class RespondOutcomeUnknown:
     distinguish: the answer fence's UPDATE matched zero rows and this
     build does not classify why (step 6 -- a future delivery may reread
     and classify that miss the way the fence classification build does),
-    or committing raised and this build does not attempt to reconcile the
-    durable graph afterward (steps 8/9) -- the acknowledgment could have
-    been lost after the server applied the write, or a racing writer could
-    have taken the idempotency key first; either way this build reports
-    the ambiguity rather than guessing. Not an exception this service lets
-    escape -- a stable, typed result a caller can act on (e.g. surface "we
-    could not confirm this went through" rather than crash).
+    or committing raised and the durable-graph reconciliation this build
+    runs afterward could not confirm the write landed on every one of its
+    three attempts (step 9). Step 8's staging race is no longer one of
+    them: both of its doors are classified into ``Replayed`` or
+    ``Conflict`` now. Not an exception this service lets escape -- a
+    stable, typed result a caller can act on (e.g. surface "we could not
+    confirm this went through" rather than crash).
 
     Retrying under the same idempotency key resolves the second reason and
     not the first, and a caller should not be told otherwise. A retry
     after an ambiguous commit finds the command this call staged and
-    returns ``Replayed``, and a retry after a rolled-back staging race
-    simply runs again. A retry after a fence miss re-evaluates the same
+    returns ``Replayed``. A retry after a fence miss re-evaluates the same
     predicate against the same row and misses again: a terminated,
     superseded, foreign-run, or foreign-owned row stays that way, so the
     second ``OutcomeUnknown`` is as final as the first. Step 6 logs the
@@ -1635,6 +1642,10 @@ def _respond_receipt(
     )
 
 
+_RESPOND_DURABLE_GRAPH_ATTEMPTS = 3
+_RESPOND_DURABLE_GRAPH_RETRY_SLEEP_SECONDS = 0.01
+
+
 def _retire_respond_session_best_effort(db: "Session") -> None:
     """Release an owned Session without letting a close/invalidate failure
     replace the transaction error that is already in flight. Same shape as
@@ -1654,6 +1665,164 @@ def _retire_respond_session_best_effort(db: "Session") -> None:
         db.invalidate()
     except Exception:
         logger.warning("failed to invalidate respond() session", exc_info=True)
+
+
+def _notify_dispatcher_best_effort(*, interaction_id: int, task_id: int) -> None:
+    """Wake the task command dispatcher after an answer is already durable,
+    and never let that wakeup turn a committed answer into a raised
+    exception.
+
+    ``notify_task_command_dispatcher`` reads two module globals and calls
+    ``loop.call_soon_threadsafe`` after checking ``loop.is_closed()``; the
+    loop can close between that check and that call, raising
+    ``RuntimeError``. Letting it out would make the caller read a
+    committed answer as a failure, retry, land on the replay branch, and
+    get a receipt without a second notify anyway. Skipping the wakeup
+    costs at most ``DISPATCHER_IDLE_SECONDS`` of latency because the
+    dispatcher's idle poll still finds the staged command; that is the
+    documented fallback (see ``stage_task_command``'s caller obligation
+    (a)).
+
+    Narrow on purpose: this wraps one post-commit best-effort
+    notification and nothing else -- no statement above a commit is
+    inside it. ``respond()`` calls it from both of its two post-commit
+    exits: the ordinary one after step 9's own commit, and the one after
+    step 9's durable-graph reconciliation recovers a receipt from a
+    commit whose acknowledgment was lost. The second exit is the reason
+    this is a function rather than an inline ``try`` -- the answer is
+    just as durable there, so it must not raise there either.
+    """
+
+    try:
+        notify_task_command_dispatcher()
+    except Exception:
+        logger.warning(
+            "failed to notify the task command dispatcher after "
+            "committing the answer for interaction %s on task %s; "
+            "the dispatcher's idle poll will still pick the command up",
+            interaction_id,
+            task_id,
+            exc_info=True,
+        )
+
+
+def _verify_respond_durable_graph(
+    *,
+    task_id: int,
+    interaction_id: int,
+    expected_run_id: str,
+    expected_state_version_after: int,
+    principal: InteractionPrincipal,
+    canonical_submitted_values: str,
+    command_id: str,
+    command_kind: TaskCommandKind,
+    command_payload: dict[str, Any],
+    actor_user_id: int | None,
+) -> InteractionResponseReceipt | None:
+    """Check the complete accepted answer graph in a fresh, owned Session,
+    up to three times with a short sleep between attempts. Same retry shape
+    as ``task_orchestrator._reconcile_claimed_turn_after_commit_ack_failure``:
+    a new ``SessionLocal()`` per attempt, ``time.sleep(0.01)`` between
+    failures, the session retired in every case before the next attempt or
+    return.
+
+    Three independent facts must all hold -- the row's key, the answer's
+    hash, and the answering principal's identity: (1) the
+    ``tasks`` row has advanced past ``expected_state_version_after - 1`` on
+    the same ``run_id`` -- ``>=``, not ``==``, and ``control_state`` is not
+    compared at all, because the resume coordinator re-issues the same
+    ``RESUME_REQUESTED`` transition when it applies the command this call
+    staged (see ``respond()``'s own docstring for the verbatim reasoning);
+    (2) the interaction row is answered, by this identity, with a
+    ``response_payload`` that canonicalizes to the same string as the
+    answer ``values`` the caller submitted (``canonical_submitted_values``
+    -- the interaction row stores the answer values alone, not the wrapping
+    command payload the third check below compares); (3) exactly one
+    command row exists for this idempotency key and it matches what this
+    call staged. Returns the receipt on success, ``None`` if every attempt
+    fails to confirm all three.
+    """
+
+    from ..models.database import get_session_local
+
+    SessionLocal = get_session_local()
+    for attempt in range(_RESPOND_DURABLE_GRAPH_ATTEMPTS):
+        reconcile_db: "Session | None" = None
+        try:
+            reconcile_db = SessionLocal()
+            task = (
+                reconcile_db.query(Task)
+                .filter(
+                    Task.id == task_id,
+                    Task.run_id == expected_run_id,
+                    Task.state_version >= expected_state_version_after,
+                )
+                .first()
+            )
+            if task is not None:
+                ir = (
+                    reconcile_db.query(TaskInteractionRequest)
+                    .filter(
+                        TaskInteractionRequest.id == interaction_id,
+                        TaskInteractionRequest.task_id == task_id,
+                        TaskInteractionRequest.status == "answered",
+                        TaskInteractionRequest.responder_identity
+                        == principal.identity_string(),
+                    )
+                    .first()
+                )
+                if (
+                    ir is not None
+                    and _canonical_payload(
+                        ir.response_payload
+                        if isinstance(ir.response_payload, dict)
+                        else {}
+                    )
+                    == canonical_submitted_values
+                ):
+                    commands = (
+                        reconcile_db.query(TaskExecutionCommand)
+                        .filter(
+                            TaskExecutionCommand.task_id == task_id,
+                            TaskExecutionCommand.command_id == command_id,
+                        )
+                        .all()
+                    )
+                    if len(commands) == 1 and _matches_existing(
+                        commands[0],
+                        actor_user_id=actor_user_id,
+                        kind=command_kind,
+                        payload=command_payload,
+                    ):
+                        return _respond_receipt(
+                            interaction=ir,
+                            task=task,
+                            command_db_id=int(commands[0].id),
+                            idempotency_key=command_id,
+                        )
+        except Exception:
+            # Deliberately broad, and it does not widen ``respond()``'s
+            # escape surface: this whole function runs only after step 9
+            # already caught a commit exception, so anything raised while
+            # reading the graph back means the attempt could not answer
+            # "did it land?", not that a new failure needs reporting. Each
+            # attempt logs on its own, and exhausting all three returns
+            # ``None`` -- the same ``OutcomeUnknown`` the caller would have
+            # been given had this reconciliation never run.
+            logger.warning(
+                "respond() durable-graph reconciliation attempt %s failed for "
+                "task %s interaction %s",
+                attempt + 1,
+                task_id,
+                interaction_id,
+                exc_info=True,
+            )
+        finally:
+            if reconcile_db is not None:
+                _retire_respond_session_best_effort(reconcile_db)
+        if attempt < _RESPOND_DURABLE_GRAPH_ATTEMPTS - 1:
+            time.sleep(_RESPOND_DURABLE_GRAPH_RETRY_SLEEP_SECONDS)
+    return None
 
 
 def respond(
@@ -1837,35 +2006,49 @@ def respond(
        WHERE clause cannot fail to match. This call is therefore left
        uncaught; ``StaleTaskRunError`` surfacing here would mean that
        invariant broke, not a normal stale-answer outcome.
-    8. Stage the RESUME command, and require the result to be a row this
-       call itself created carrying this call's own payload. Two different
+    8. Stage the RESUME command inside this function's own
+       ``db.begin_nested()``, and require the result to be a row this call
+       itself created carrying this call's own payload. Two different
        signals report the same race -- a second writer took this
        idempotency key between step 5's pre-read and this statement -- and
-       both get the same conservative answer. An ``IntegrityError`` is
-       raised when that writer's row lands on the unique constraint;
+       both are classified the same way. An ``IntegrityError`` is raised
+       when that writer's row lands on the unique constraint;
        ``created=False`` is returned instead when the row was already
        committed and visible, because ``stage_task_command`` checks for an
-       existing row before inserting and returns it rather than raising. A
-       ``created=False`` result whose ``payload_matches`` is also true is
-       treated the same way rather than as a replay: step 5 is where a
-       replay is recognized, and a hit that only becomes visible after it
-       is a race. Neither case is classified further in this build (a
-       fine-grained classification via ``classify_task_command_conflict``,
-       distinguishing a genuine replay from a real conflict, is not
-       delivered here): the whole transaction rolls back, undoing this
-       call's own fence UPDATE and CAS along with it, and this call reports
-       ``OutcomeUnknown``.
+       existing row before inserting and returns it rather than raising.
+       Either way this function rolls back to its savepoint (not the whole
+       transaction -- see ``classify_task_command_conflict``'s own
+       docstring for why a savepoint rollback satisfies the
+       post-rollback-state precondition it documents) and asks one
+       question about the row that won: does it carry this call's own
+       ``actor_user_id``, kind and canonical payload? The
+       ``IntegrityError`` door answers it through
+       ``classify_task_command_conflict``, the ``created=False`` door
+       through the ``payload_matches`` ``stage_task_command`` already
+       computed; both compute it with the same ``_matches_existing``, so
+       the two doors cannot disagree. A match means the RESUME that will
+       execute carries exactly this answer, so this call commits its own
+       fence UPDATE and CAS and reports ``Replayed`` naming the winner's
+       row -- not ``Accepted``, because the command row is the other
+       writer's. A mismatch means two different answers under one key: the
+       whole transaction rolls back, undoing this call's own fence UPDATE
+       and CAS along with it, and this call reports
+       ``Conflict(idempotency_key_reused)``. A ``TASK_MISSING``
+       classification maps to ``Unavailable(task_missing)``; an
+       ``UNRELATED`` one is re-raised, because it means a foreign key
+       other than this call's own duplicate failed.
     9. Commit. A raised exception here does not mean the write failed --
        the acknowledgment could have been lost after the server applied it
-       -- but this build does not attempt to reconcile that against the
-       durable graph (that reconciliation is not delivered here): it
-       retires its session and reports ``OutcomeUnknown`` unconditionally,
-       leaving the caller to re-check.
+       -- so this function retires its session and checks the durable graph
+       in a fresh one (``_verify_respond_durable_graph``) before deciding
+       between ``Accepted`` and ``OutcomeUnknown``.
     10. After a successful commit, outside any transaction:
-        ``notify_task_command_dispatcher()``. Best-effort: a raise here
-        would turn a committed answer into a reported failure, so it is
-        caught, logged as a warning, and the dispatcher's idle poll
-        delivers the command instead.
+        ``_notify_dispatcher_best_effort()``. A raise there would turn a
+        committed answer into a reported failure, so it is caught, logged
+        as a warning, and the dispatcher's idle poll delivers the command
+        instead. Both post-commit exits go through it -- step 9's own
+        commit and step 9's reconciliation recovering a lost
+        acknowledgment -- because the answer is equally durable on both.
 
     What this function lets escape, deliberately, and what it does not.
     The eight ``RespondOutcome`` variants cover every outcome this build
@@ -1874,12 +2057,20 @@ def respond(
     a caller that cannot tell "the database is down" from "your answer was
     ambiguous" will retry the first one forever:
 
-    - Database-level failures outside the two units caught above --
-      a deadlock, a lost connection, a pool checkout timeout -- raised by
-      any statement from step 2 onward. The three catches are narrow on
-      purpose: step 8's is ``IntegrityError`` only, step 9's covers the
-      commit only, and step 10's wraps one post-commit best-effort
-      notification whose failure is logged and swallowed.
+    - Database-level failures outside the units caught above -- a
+      deadlock, a lost connection, a pool checkout timeout -- raised by
+      any statement from step 2 onward. Three of the four catches are
+      narrow on purpose: step 8's is ``IntegrityError`` only (and it
+      re-raises an ``UNRELATED`` classification rather than swallowing
+      it), step 9's covers the commit only, and step 10's wraps one
+      post-commit best-effort notification whose failure is logged and
+      swallowed. The fourth is the broad ``except Exception`` inside
+      ``_verify_respond_durable_graph``, which is deliberately broad and
+      does not widen this surface: it runs only after step 9 already
+      caught a commit exception, its own failure is logged per attempt,
+      and exhausting all three attempts returns ``None``, which this
+      function reports as ``OutcomeUnknown`` -- exactly the answer it
+      would have given had the reconciliation not existed.
     - ``TaskCommandOwnerStateError`` and ``TaskCommandTaskMissing`` from
       ``stage_task_command``. Neither is an ``IntegrityError`` subclass, so
       step 8's catch does not see them, and both mean a precondition this
@@ -1977,6 +2168,7 @@ def respond(
         command_payload = _respond_command_payload(
             interaction_id=interaction_id, principal=principal, values=envelope.values
         )
+        canonical_submitted_values = _canonical_payload(envelope.values)
         actor_user_id = principal.user_id
 
         # Runs before anchor resolution below, not after it. Answering
@@ -2098,6 +2290,9 @@ def respond(
         # docstring, step 7).
         apply_task_control_transition(task, TaskControlState.RESUME_REQUESTED)
 
+        expected_state_version_after = int(task.state_version)
+        run_id_for_verification = str(task.run_id)
+        savepoint = db.begin_nested()
         # Capture every receipt value this transaction can still commit as
         # plain Python locals now, before the commit below. SQLAlchemy's
         # default ``expire_on_commit=True`` invalidates every ORM attribute
@@ -2118,6 +2313,11 @@ def respond(
         committed_state_version = int(task.state_version)
         committed_control_state = str(task.control_state)
 
+        # Both doors of step 8's race funnel into these two locals, so the
+        # decision below is written once. ``None`` means no race: this call
+        # created the row itself.
+        raced_command_db_id: int | None = None
+        raced_payload_matches = False
         try:
             staged = stage_task_command(
                 db,
@@ -2128,36 +2328,93 @@ def respond(
                 payload=command_payload,
             )
         except IntegrityError:
-            # A second writer raced this call's own insert for the same
-            # idempotency key. This build does not classify what that
-            # means (a fine-grained classification via
-            # ``classify_task_command_conflict``, distinguishing a genuine
-            # replay from a real conflict, is not delivered here): the
-            # whole transaction rolls back, undoing this call's own fence
-            # UPDATE and CAS along with it, and this call reports the
-            # ambiguity rather than guessing which case it was.
-            db.rollback()
-            return RespondOutcomeUnknown()
+            # Door one: the other writer's row was not visible at
+            # ``stage_task_command``'s own existing-row check and landed on
+            # the unique constraint at the flush. Roll back to this
+            # function's own savepoint rather than the whole transaction,
+            # so the fence UPDATE and the CAS survive long enough for the
+            # classification below to decide whether they should commit.
+            savepoint.rollback()
+            classification = classify_task_command_conflict(
+                db,
+                task_id=task_id,
+                command_id=normalized_key,
+                actor_user_id=actor_user_id,
+                kind=TaskCommandKind.RESUME,
+                payload=command_payload,
+            )
+            if classification.kind == TaskCommandConflictKind.TASK_MISSING:
+                db.rollback()
+                return RespondUnavailable(reason="task_missing")
+            if classification.kind != TaskCommandConflictKind.RACED_DUPLICATE:
+                # ``UNRELATED``: no duplicate row exists and the task is
+                # still there, so some other constraint on the row this
+                # call tried to insert failed -- most plausibly the
+                # ``actor_user_id`` foreign key. That is not a race this
+                # function has an answer for, and folding it into a typed
+                # outcome would tell the caller "your answer was
+                # ambiguous" about a database-level failure. Re-raised.
+                db.rollback()
+                raise
+            assert classification.raced is not None
+            raced_command_db_id = classification.raced.command_db_id
+            raced_payload_matches = classification.raced.payload_matches
+        else:
+            if not (staged.created and staged.payload_matches):
+                # Door two: the same race, seen one statement earlier.
+                # ``stage_task_command`` does not raise when a row for this
+                # ``(task_id, command_id)`` already exists -- it returns
+                # that row with ``created=False`` -- so without this branch
+                # the transaction would commit the fence and the CAS while
+                # the RESUME carrying this answer was never staged at all,
+                # and return ``RespondAccepted`` naming the other writer's
+                # row. ``created=True`` is only ever returned together with
+                # ``payload_matches=True`` (see ``stage_task_command``), so
+                # reaching here means ``created=False`` and
+                # ``staged.payload_matches`` is the verdict on the winner's
+                # row -- computed by the same ``_matches_existing``
+                # ``classify_task_command_conflict`` uses on the other
+                # door, which is why the two doors cannot disagree and are
+                # decided together below. The savepoint holds nothing at
+                # this point (this call inserted nothing), and is rolled
+                # back anyway to keep both doors on one shape.
+                savepoint.rollback()
+                raced_command_db_id = staged.staged_db_id
+                raced_payload_matches = staged.payload_matches
 
-        if not (staged.created and staged.payload_matches):
-            # The same race the IntegrityError branch above catches,
-            # arriving through the other door. ``stage_task_command`` does
-            # not raise when a row for this ``(task_id, command_id)``
-            # already exists -- it returns that row with ``created=False``
-            # -- so a writer that committed one between step 5's pre-read
-            # and this call would otherwise leave this transaction
-            # committing the fence and the CAS while the RESUME carrying
-            # this answer was never staged at all, and returning
-            # ``RespondAccepted`` naming the other writer's row. Both doors
-            # get this build's one conservative answer: roll the whole
-            # transaction back, undoing this call's own fence UPDATE and
-            # CAS, and report the ambiguity. ``created=False`` with a
-            # matching payload is folded in here rather than reported as
-            # ``Replayed`` on purpose -- step 5 is where a replay is
-            # recognized, and a hit that only appears after it is a race,
-            # not a replay.
-            db.rollback()
-            return RespondOutcomeUnknown()
+        if raced_command_db_id is not None:
+            if not raced_payload_matches:
+                # Two different answers under one idempotency key. The
+                # whole transaction rolls back, undoing this call's own
+                # fence UPDATE and CAS along with it.
+                db.rollback()
+                increment_counter(COUNTER_LIFECYCLE_RESPONSE_CONFLICT)
+                return RespondConflict(reason="idempotency_key_reused")
+            # The winner's row carries this call's own actor, kind and
+            # canonical payload, so the RESUME that executes is this
+            # answer. Commit the fence UPDATE and the CAS -- they are what
+            # makes the interaction row agree with the command that will
+            # run -- and report ``Replayed`` naming the winner's row rather
+            # than ``Accepted``, because the command row is not this
+            # call's. No dispatcher notification is sent here: the writer
+            # that staged that row owes it (see ``stage_task_command``'s
+            # caller obligation (a)), and the dispatcher's idle poll is the
+            # documented fallback either way.
+            db.commit()
+            return RespondReplayed(
+                receipt=InteractionResponseReceipt(
+                    interaction_id=interaction_id,
+                    task_id=task_id,
+                    run_id=answered_run_id,
+                    status="answered",
+                    responded_at=answered_responded_at,
+                    responder_identity=answered_responder_identity,
+                    idempotency_key=normalized_key,
+                    command_db_id=raced_command_db_id,
+                    task_state_version=committed_state_version,
+                    task_control_state=committed_control_state,
+                )
+            )
 
         command_db_id = staged.staged_db_id
         try:
@@ -2165,49 +2422,43 @@ def respond(
         except Exception:
             # A raised exception here does not mean the write failed -- the
             # acknowledgment could have been lost after the server applied
-            # it -- but this build does not attempt to reconcile that
-            # against the durable graph (that reconciliation is not
-            # delivered here): it retires its session and reports the
-            # ambiguity, leaving the caller to re-check.
+            # it -- so this call retires its session and asks the durable
+            # graph, in a fresh one, what actually landed. Logged first,
+            # unconditionally: the reconciliation below can turn this into
+            # an ``Accepted``, but an operator still needs the record that
+            # a commit acknowledgment went missing at all, and the
+            # reconciliation's own per-attempt logs only fire when *it*
+            # fails.
             logger.warning(
                 "commit failed while answering interaction %s on task %s; "
-                "the write may or may not be durable -- a retry under the "
-                "same idempotency key resolves which",
+                "the write may or may not be durable -- reconciling against "
+                "the durable graph",
                 interaction_id,
                 task_id,
                 exc_info=True,
             )
             session_retired = True
             _retire_respond_session_best_effort(db)
+            receipt = _verify_respond_durable_graph(
+                task_id=task_id,
+                interaction_id=interaction_id,
+                expected_run_id=run_id_for_verification,
+                expected_state_version_after=expected_state_version_after,
+                principal=principal,
+                canonical_submitted_values=canonical_submitted_values,
+                command_id=normalized_key,
+                command_kind=TaskCommandKind.RESUME,
+                command_payload=command_payload,
+                actor_user_id=actor_user_id,
+            )
+            if receipt is not None:
+                _notify_dispatcher_best_effort(
+                    interaction_id=interaction_id, task_id=task_id
+                )
+                return RespondAccepted(receipt=receipt)
             return RespondOutcomeUnknown()
 
-        try:
-            notify_task_command_dispatcher()
-        except Exception:
-            # Post-commit, and the only statement here that runs after the
-            # answer is already durable. ``notify_task_command_dispatcher``
-            # reads two module globals and calls
-            # ``loop.call_soon_threadsafe`` after checking
-            # ``loop.is_closed()``; the loop can close between that check
-            # and that call, raising ``RuntimeError``. Letting it out would
-            # turn a committed answer into a raised exception -- the caller
-            # would read it as a failure, retry, land on the replay branch,
-            # and get a receipt without a second notify anyway. Skipping
-            # the wakeup costs at most ``DISPATCHER_IDLE_SECONDS`` of
-            # latency because the dispatcher's idle poll still finds the
-            # staged command; that is the documented fallback (see
-            # ``stage_task_command``'s caller obligation (a)). Narrow on
-            # purpose: this wraps one post-commit best-effort notification
-            # and nothing else -- no statement above the commit is inside
-            # it.
-            logger.warning(
-                "failed to notify the task command dispatcher after "
-                "committing the answer for interaction %s on task %s; "
-                "the dispatcher's idle poll will still pick the command up",
-                interaction_id,
-                task_id,
-                exc_info=True,
-            )
+        _notify_dispatcher_best_effort(interaction_id=interaction_id, task_id=task_id)
         return RespondAccepted(
             receipt=InteractionResponseReceipt(
                 interaction_id=interaction_id,

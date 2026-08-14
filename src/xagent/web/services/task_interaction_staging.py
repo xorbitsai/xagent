@@ -861,6 +861,32 @@ def _replay_or_raise_closed(
     so that decision stays with the caller. Extracted so the two sites cannot
     classify the same row state differently; behavior-preserving, including
     the exact exception message text.
+
+    A replay hit is matched on identity alone. Nothing here compares the
+    stored row's ``request_payload``, ``expires_at`` or anchor fields
+    against what this call passed in, and ``StagedInteractionRequest``
+    carries no field reporting whether they agree. That is a contract, not
+    an omission, and it rests entirely on how the idempotency key is
+    derived: a key must be a function of the waiting turn's own identity,
+    so that two calls presenting the same key are by construction two
+    snapshots of the same waiting turn, and the fields that could
+    disagree cannot. The one key derivation that exists today,
+    ``clarification_idempotency_key`` (``task_clarification_draft.py``),
+    honours this by hashing only ``ClarificationDraft.turn_marker``, which
+    is composed from the turn's message count, origin step and ordered
+    pending-request ids and from nothing else -- deliberately not from the
+    message text, so reshaping the payload cannot move the key.
+
+    This is the obligation any future key derivation inherits. A key
+    derived from anything that can change while the waiting turn stays the
+    same (a timestamp, a retry counter, the payload text) breaks the
+    contract silently: the replay branch would then return a row bound to a
+    different anchor than the caller believes it staged, with no error and
+    no observable difference at the call site. If a derivation like that is
+    ever needed, this function has to grow content comparison first --
+    following ``task_command_transport``'s precedent of reporting the
+    comparison result as a field and letting the caller decide -- rather
+    than the contract being quietly relaxed.
     """
 
     if row is None:

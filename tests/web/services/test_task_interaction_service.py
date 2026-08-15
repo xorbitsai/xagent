@@ -2928,6 +2928,180 @@ def test_respond_replays_when_staging_finds_a_raced_row_with_a_matching_payload(
     assert after["task_control_state"] == TaskControlState.RESUME_REQUESTED.value
 
 
+def test_respond_reports_replayed_when_the_replay_branch_commit_ack_is_lost_but_the_graph_landed(
+    _respond_db, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The replay branch's own commit (the raced-duplicate door's ``Commit
+    the fence UPDATE and the CAS`` statement) can lose its acknowledgment
+    the same way step 9's does, and until this delivery it had no
+    reconciliation at all -- a lost ack there fell straight through to a
+    raised exception.
+
+    ``stage_task_command`` is monkeypatched to report the same bare
+    ``created=False, payload_matches=True`` race
+    ``test_respond_replays_when_staging_finds_a_raced_row_with_a_matching_payload``
+    injects -- no row backs it yet, because any row inserted from inside
+    that mock would live inside the ``db.begin_nested()`` savepoint the
+    real door-two branch unconditionally rolls back right after staging
+    returns, and a genuinely concurrent second writer cannot land on
+    SQLite here either: by the time ``respond()`` reaches step 8 it has
+    already issued the fence UPDATE on this same connection, which
+    already holds SQLite's one whole-database writer lock (see the
+    module's own RACED_DUPLICATE commentary above -- the reason that
+    race's real PostgreSQL coverage lives in a separate file). Instead,
+    the winning row is inserted by the ``Session.commit`` monkeypatch
+    itself, immediately before it defers to the real commit -- by that
+    point door two's ``savepoint.rollback()`` has already run and the
+    only savepoint standing between the row and the outer transaction is
+    gone, so the row commits durably alongside this call's own fence
+    UPDATE and CAS when the real commit underneath the injected failure
+    actually runs. The underlying commit genuinely lands -- only the
+    acknowledgment back to this process is lost -- so reconciliation must
+    recover a receipt naming the winning row and report ``Replayed``, not
+    ``Accepted``: the command that runs is the winner's, not the bare
+    ``staged_db_id=4242`` this call's own staging mock returned."""
+
+    from xagent.web.services.task_command_transport import StagedTaskCommand
+
+    user_id, task_id = _waiting_task(_respond_db)
+    interaction_id = _active_row_ready_for_respond(_respond_db, task_id=task_id)
+    principal = _owning_principal(user_id)
+
+    idempotency_key = "replay-commit-lands"
+    envelope = _respond_envelope(idempotency_key=idempotency_key)
+    command_payload = svc._respond_command_payload(
+        interaction_id=interaction_id, principal=principal, values=envelope.values
+    )
+
+    def _racing_stage_task_command(*args: Any, **kwargs: Any) -> StagedTaskCommand:
+        return StagedTaskCommand(
+            staged_db_id=4242,
+            client_command_id=kwargs.get("command_id", idempotency_key),
+            created=False,
+            payload_matches=True,
+            status="pending",
+        )
+
+    monkeypatch.setattr(svc, "stage_task_command", _racing_stage_task_command)
+
+    from sqlalchemy.orm import Session as OrmSession
+
+    original_commit = OrmSession.commit
+    call_count = {"n": 0}
+    winner: dict[str, int] = {}
+
+    def _lost_ack_but_committed(self: Any) -> None:
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            # Stand in for the other writer whose row this call's own
+            # race doors detected: inserted here, outside any savepoint,
+            # so it commits durably with the real commit below instead of
+            # being wiped out by door two's savepoint.rollback().
+            command = TaskExecutionCommand(
+                task_id=task_id,
+                actor_user_id=principal.user_id,
+                command_id=idempotency_key,
+                kind=svc.TaskCommandKind.RESUME.value,
+                payload=command_payload,
+                status="completed",
+            )
+            self.add(command)
+            self.flush()
+            winner["command_db_id"] = int(command.id)
+            original_commit(self)
+            raise RuntimeError("simulated lost commit acknowledgment")
+        return original_commit(self)
+
+    monkeypatch.setattr(OrmSession, "commit", _lost_ack_but_committed)
+    monkeypatch.setattr(svc, "_RESPOND_DURABLE_GRAPH_RETRY_SLEEP_SECONDS", 0.0)
+
+    outcome = svc.respond(
+        interaction_id=interaction_id,
+        task_id=task_id,
+        principal=principal,
+        envelope=envelope,
+    )
+
+    assert isinstance(outcome, svc.RespondReplayed)
+    assert outcome.receipt.command_db_id == winner["command_db_id"]
+    assert outcome.receipt.command_db_id != 4242
+    assert outcome.receipt.responder_identity == principal.identity_string()
+
+    after = _graph_snapshot(_respond_db, task_id=task_id, interaction_id=interaction_id)
+    assert after["ir_status"] == "answered"
+    assert after["ir_responder_identity"] == principal.identity_string()
+    assert after["task_control_state"] == TaskControlState.RESUME_REQUESTED.value
+    # Exactly one command row for this idempotency key -- the winner's
+    # row, created by the mock itself -- not a second one this call's own
+    # staging never actually inserted (door two's mock is a bare return
+    # value).
+    assert after["commands_count"] == 1
+
+
+def test_respond_reports_outcome_unknown_when_the_replay_branch_commit_fails_and_the_graph_never_lands(
+    _respond_db, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Same injected failure as the replay branch's ``Replayed`` sibling
+    above, except this time the commit never reaches the database at all --
+    standing in for a commit that genuinely failed rather than one whose
+    acknowledgment alone was lost. With nothing landed, the durable-graph
+    reconciliation has nothing to find on any of its three attempts, so the
+    call reports ``OutcomeUnknown`` and leaves the fence UPDATE and CAS this
+    call attempted with no residue -- same shape as step 9's own
+    conservative sibling, now proven on the replay branch's door too."""
+
+    from xagent.web.services.task_command_transport import StagedTaskCommand
+
+    user_id, task_id = _waiting_task(_respond_db)
+    interaction_id = _active_row_ready_for_respond(_respond_db, task_id=task_id)
+    principal = _owning_principal(user_id)
+
+    def _racing_stage_task_command(*args: Any, **kwargs: Any) -> StagedTaskCommand:
+        return StagedTaskCommand(
+            staged_db_id=4242,
+            client_command_id=kwargs.get("command_id", "replay-commit-fails"),
+            created=False,
+            payload_matches=True,
+            status="pending",
+        )
+
+    monkeypatch.setattr(svc, "stage_task_command", _racing_stage_task_command)
+
+    from sqlalchemy.orm import Session as OrmSession
+
+    call_count = {"n": 0}
+
+    def _failing_commit(self: Any) -> None:
+        call_count["n"] += 1
+        raise RuntimeError("simulated lost commit acknowledgment")
+
+    monkeypatch.setattr(OrmSession, "commit", _failing_commit)
+    monkeypatch.setattr(svc, "_RESPOND_DURABLE_GRAPH_RETRY_SLEEP_SECONDS", 0.0)
+
+    before_counter = _conflict_counter()
+    with _asserts_no_side_effects(
+        _respond_db, task_id=task_id, interaction_id=interaction_id
+    ):
+        with caplog.at_level(logging.WARNING):
+            outcome = svc.respond(
+                interaction_id=interaction_id,
+                task_id=task_id,
+                principal=principal,
+                envelope=_respond_envelope(idempotency_key="replay-commit-fails"),
+            )
+
+        assert isinstance(outcome, svc.RespondOutcomeUnknown)
+        matching = [
+            record
+            for record in caplog.records
+            if "commit failed while answering" in record.getMessage()
+        ]
+        assert len(matching) == 1
+        assert matching[0].levelno == logging.WARNING
+    assert _conflict_counter() == before_counter
+    assert call_count["n"] == 1
+
+
 # ---------------------------------------------------------------------------
 # The mapping meta-test. For every one of the 14 (outcome, reason) pairs in
 # the vocabulary, at least one test above must produce it. This is

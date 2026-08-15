@@ -2400,7 +2400,45 @@ def respond(
             # that staged that row owes it (see ``stage_task_command``'s
             # caller obligation (a)), and the dispatcher's idle poll is the
             # documented fallback either way.
-            db.commit()
+            try:
+                db.commit()
+            except Exception:
+                # Same ambiguity as step 9's commit below, on the other
+                # door of this function's single race funnel: the fence
+                # UPDATE and CAS this call issued may have landed durably
+                # even though this call never saw the acknowledgment. The
+                # winner's command row is not this transaction's own write
+                # and is not rolled back by this exception, so a bare
+                # re-raise would turn an already-committed answer into a
+                # crash loop on retry -- a retry under the same
+                # idempotency key would land on the replay branch above
+                # and hit this same commit again. Reconcile against a
+                # fresh session instead, exactly as step 9 does.
+                logger.warning(
+                    "commit failed while answering interaction %s on task %s; "
+                    "the write may or may not be durable -- reconciling against "
+                    "the durable graph",
+                    interaction_id,
+                    task_id,
+                    exc_info=True,
+                )
+                session_retired = True
+                _retire_respond_session_best_effort(db)
+                receipt = _verify_respond_durable_graph(
+                    task_id=task_id,
+                    interaction_id=interaction_id,
+                    expected_run_id=run_id_for_verification,
+                    expected_state_version_after=expected_state_version_after,
+                    principal=principal,
+                    canonical_submitted_values=canonical_submitted_values,
+                    command_id=normalized_key,
+                    command_kind=TaskCommandKind.RESUME,
+                    command_payload=command_payload,
+                    actor_user_id=actor_user_id,
+                )
+                if receipt is not None:
+                    return RespondReplayed(receipt=receipt)
+                return RespondOutcomeUnknown()
             return RespondReplayed(
                 receipt=InteractionResponseReceipt(
                     interaction_id=interaction_id,

@@ -1016,6 +1016,17 @@ def test_respond_races_a_committed_duplicate_command_and_replays_on_matching_pay
         assert len(commands) == 1, commands
         assert commands[0].id == winner.command_id
         assert commands[0].actor_user_id == principal.user_id
+
+        row = (
+            verify_db.query(TaskInteractionRequest)
+            .filter(TaskInteractionRequest.id == interaction_id)
+            .first()
+        )
+        assert row.status == "answered"
+        assert row.responded_at is not None
+
+        task = verify_db.query(Task).filter(Task.id == task_id).first()
+        assert task.state_version == 6
     finally:
         verify_db.close()
 

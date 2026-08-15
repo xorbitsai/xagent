@@ -2144,13 +2144,18 @@ def test_respond_replays_an_answered_row_whose_anchor_was_pruned(
 
 
 def test_respond_receipt_refuses_a_row_that_carries_no_answer() -> None:
-    """``_respond_receipt`` may only ever see an answered row: its one
-    caller is the idempotent-replay branch, and the paired CHECK
-    constraints make an answered row with a NULL ``responded_at`` or
-    ``responder_identity`` impossible. That reasoning spans two modules
-    with nothing else pinning it, so the builder raises loudly on a row
-    with no answer rather than coercing ``None`` into the string
-    ``'None'`` (or a falsy ``""``) inside an audit-bearing receipt."""
+    """``_respond_receipt`` may only ever see an answered row: its two
+    callers each guarantee that on their own terms -- the idempotent-replay
+    pre-read branch finds the row by this call's own idempotency key, which
+    only matches an already-staged (and therefore already-answered) RESUME
+    command, and ``_verify_respond_durable_graph`` only reaches this call
+    after its own checks already confirmed ``status == "answered"`` on the
+    row it is holding -- and the paired CHECK constraints make an answered
+    row with a NULL ``responded_at`` or ``responder_identity`` impossible
+    either way. That reasoning spans two modules with nothing else pinning
+    it, so the builder raises loudly on a row with no answer rather than
+    coercing ``None`` into the string ``'None'`` (or a falsy ``""``) inside
+    an audit-bearing receipt."""
 
     from types import SimpleNamespace
 

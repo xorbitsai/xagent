@@ -1609,10 +1609,15 @@ def _respond_receipt(
     ``principal.identity_string()`` value, so the column and the local are
     equal by the fence write's own semantics, not by coincidence.
 
-    The only caller is ``respond()``'s idempotent-replay branch, whose
-    precondition -- a staged RESUME command this service itself committed
-    in the same transaction as the answer fence UPDATE -- implies an
-    answered row, and the paired CHECK constraints
+    Two callers, each with its own precondition for why the row it hands in
+    is already answered. ``respond()``'s idempotent-replay pre-read branch
+    (step 5) calls this on a row it found by this call's own idempotency
+    key -- a staged RESUME command this service itself committed in some
+    earlier transaction alongside the answer fence UPDATE, which implies an
+    answered row. ``_verify_respond_durable_graph`` calls this only after
+    its own three checks already confirmed the row it is holding matches:
+    ``status == "answered"``, the answering identity, and the canonical
+    submitted payload. Either way, the paired CHECK constraints
     (``ck_task_interaction_requests_responded_at_pairs_status`` and
     ``ck_task_interaction_requests_responder_pairs_responded_at``) make an
     answered row with a NULL ``responded_at`` or ``responder_identity``
@@ -2356,7 +2361,15 @@ def respond(
                 # ambiguous" about a database-level failure. Re-raised.
                 db.rollback()
                 raise
-            assert classification.raced is not None
+            if classification.raced is None:
+                raise RuntimeError(
+                    f"classify_task_command_conflict reported RACED_DUPLICATE "
+                    f"for interaction {interaction_id} on task {task_id} "
+                    "with no raced projection attached; "
+                    "TaskCommandConflictClassification's own constructor "
+                    "always pairs RACED_DUPLICATE with a raced projection, "
+                    "making this impossible"
+                )
             raced_command_db_id = classification.raced.command_db_id
             raced_payload_matches = classification.raced.payload_matches
         else:

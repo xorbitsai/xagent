@@ -171,6 +171,34 @@ async def test_mcp_loader_classifies_direct_failure_phase(
 
 
 @pytest.mark.asyncio
+async def test_mcp_loader_direct_retry_exhaustion_logs_debug_traceback(
+    monkeypatch, caplog
+):
+    # Companion to test_mcp_loader_classifies_direct_failure_phase above:
+    # that test pins WARNING and checks no secret leaks into the always-on
+    # log; this one pins DEBUG and checks the opt-in traceback is actually
+    # there once retries are exhausted -- the retry loop's final attempt
+    # falls through to a silent `else` branch otherwise, so this is the only
+    # place that failure detail is ever logged for a direct-transport server.
+    @asynccontextmanager
+    async def fake_create_session(_connection):
+        raise ValueError("boom")
+        yield  # pragma: no cover - unreachable, satisfies asynccontextmanager
+
+    monkeypatch.setattr(mcp_adapter_module, "create_session", fake_create_session)
+    monkeypatch.setattr(mcp_adapter_module.asyncio, "sleep", AsyncMock())
+    caplog.set_level("DEBUG")
+
+    result = await load_mcp_tools_as_agent_tools(
+        {"broken": {"transport": "stdio", "command": "python", "args": []}}
+    )
+
+    assert len(result.failures) == 1
+    assert result.failures[0].attempts == 3
+    assert "ValueError: boom" in caplog.text
+
+
+@pytest.mark.asyncio
 async def test_mcp_loader_reports_no_tools(monkeypatch):
     class FakeSession:
         async def initialize(self):

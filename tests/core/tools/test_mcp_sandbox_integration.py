@@ -142,6 +142,13 @@ class TestLoadMcpToolsAsAgentTools:
 
     @pytest.mark.asyncio
     async def test_sandbox_list_failure_is_preserved_without_secret(self, caplog):
+        # Pinned below default: the sandboxed-load path also emits a DEBUG
+        # traceback (test_sandbox_list_failure_debug_traceback_is_opt_in
+        # below), which would otherwise make this secret-safety assertion
+        # fail under an ambient DEBUG log level (e.g. `pytest -o
+        # log_level=DEBUG`) for a reason unrelated to what it actually
+        # guards: the always-on ERROR log staying class-name-only.
+        caplog.set_level("WARNING")
         connection: Connection = {
             "transport": "stdio",
             "command": "npx",
@@ -165,6 +172,30 @@ class TestLoadMcpToolsAsAgentTools:
         assert result.failures[0].error_type == "RuntimeError"
         assert "planted-sandbox-list-secret" not in repr(result)
         assert "planted-sandbox-list-secret" not in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_sandbox_list_failure_debug_traceback_is_opt_in(self, caplog):
+        # Companion to the test above: pins the other half of the two-layer
+        # contract -- opting into DEBUG surfaces the full traceback, so
+        # reproducing a failure with XAGENT_LOG_LEVEL=DEBUG (or --debug)
+        # actually captures it rather than silently getting nothing more
+        # than the always-on ERROR log already gives.
+        caplog.set_level("DEBUG")
+        connection: Connection = {
+            "transport": "stdio",
+            "command": "npx",
+            "args": ["demo"],
+        }
+
+        with patch(
+            "xagent.core.tools.adapters.vibe.sandboxed_tool.sandboxed_mcp_tool_helper.list_tools_in_sandbox",
+            new=AsyncMock(side_effect=RuntimeError("boom")),
+        ):
+            await load_mcp_tools_as_agent_tools(
+                {"demo": connection}, sandbox=MagicMock()
+            )
+
+        assert "RuntimeError: boom" in caplog.text
 
     @pytest.mark.asyncio
     async def test_sandbox_wrap_failure_preserves_other_wrapped_tools(self):

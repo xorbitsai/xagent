@@ -1657,6 +1657,7 @@ function StepItem({
       animate={{ opacity: 1, y: 0 }}
       transition={{ delay: 0.1 * (index + 1) }}
       className="space-y-3"
+      data-step-id={step.stepId}
     >
       {/* Step Title */}
       <div className="flex w-full items-start gap-2 rounded-lg px-2 py-1 -ml-2 transition-colors hover:bg-muted/50 group/step">

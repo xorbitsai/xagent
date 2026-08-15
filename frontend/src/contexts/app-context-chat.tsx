@@ -1972,6 +1972,11 @@ export function AppProvider({
       })
       dispatch({ type: "SET_TRACE_EVENTS", payload: [] })
       dispatch({ type: "SET_STEPS", payload: [] })
+      // Clear dagExecution alongside steps - otherwise the Progress panel
+      // stays open (it only needs dagExecution to be non-null) rendering an
+      // empty step list for the gap between reconnecting and history replay
+      // repopulating both together.
+      dispatch({ type: "SET_DAG_EXECUTION", payload: null })
     } else {
       // New task connection -> Update tracker, Don't clear (handled by setTaskId)
       lastConnectedTaskId.current = stateRef.current.taskId
@@ -2198,13 +2203,51 @@ export function AppProvider({
 
   const handleMessage = useCallback((
     message: WebSocketMessage,
-    dispatch: React.Dispatch<AppAction>,
+    rawDispatch: React.Dispatch<AppAction>,
     currentState: AppState,
     options?: {
       skipHistory?: boolean
       filesDisabled?: boolean
     },
   ) => {
+    // A task's WebSocket connection is per-task (or, for session transports,
+    // multiplexes a sequence of tasks over one socket) - either way, a
+    // just-superseded socket/task can still have events in flight after the
+    // app has moved on to a different task (e.g. the user starts a new chat
+    // while a previous DAG run is still executing in the background). Those
+    // stray events must not repaint the DAG plan/step state for whatever task
+    // is now on screen, or the Progress panel would auto-open showing another
+    // task's steps. Scope just the DAG-state actions to the message's own
+    // task_id (present on every event type that feeds this state - see
+    // use-websocket.ts's per-type message normalization); every other action
+    // type is unaffected. UPDATE_TASK_STATUS is included too: the Progress
+    // panel's "is this run finished" check reads state.currentTask.status/
+    // updatedAt (there is no reliable per-run "completed" signal on
+    // dagExecution itself - see isDagFinished in page-client.tsx), and
+    // UPDATE_TASK_STATUS unconditionally overwrites currentTask, which
+    // inherently only ever describes the task actually being viewed - so a
+    // stale cross-task status update must not borrow that task's completion
+    // into the currently-viewed task's "finished" signal.
+    const messageTaskId = (message as unknown as { task_id?: unknown }).task_id
+    const isStaleCrossTaskDagAction = (action: AppAction): boolean => {
+      if (
+        action.type !== "SET_DAG_EXECUTION"
+        && action.type !== "SET_STEPS"
+        && action.type !== "ADD_STEP"
+        && action.type !== "UPDATE_STEP"
+        && action.type !== "UPDATE_TASK_STATUS"
+      ) return false
+      if (messageTaskId === undefined || messageTaskId === null || messageTaskId === "") return false
+      // No task is even being viewed (currentState.taskId null/undefined) but
+      // this message names a specific task - that can only be a stray event
+      // for a task other than "the current view", so it must be dropped too
+      // (not just the "viewing a *different* task" case).
+      return String(messageTaskId) !== String(currentState.taskId)
+    }
+    const dispatch: React.Dispatch<AppAction> = (action) => {
+      if (isStaleCrossTaskDagAction(action)) return
+      rawDispatch(action)
+    }
     // If we're in replay mode, don't process immediately - collect for delayed playback
     if (
       !options?.skipHistory
@@ -2365,7 +2408,23 @@ export function AppProvider({
             if (steps) {
               dispatch({ type: "SET_STEPS", payload: steps })
             }
-            dispatch({ type: "SET_DAG_EXECUTION", payload: eventData })
+            // The backend's dag_execution payload (dag.py's on_dag_execution)
+            // never actually carries a created_at - only completed_step_count/
+            // plan_step_count/steps. Without a fallback here, the DAG run
+            // never gets a stable "started at" timestamp, so the Progress
+            // panel's total elapsed time never renders. Keep whatever
+            // created_at this run already established (planning's first event
+            // sets it; later phase updates for the same run must not reset
+            // it), falling back to this event's own timestamp only the first
+            // time.
+            const dagCreatedAt =
+              currentState.dagExecution?.created_at
+              ?? (eventData as { created_at?: string | number }).created_at
+              ?? message.timestamp
+            dispatch({
+              type: "SET_DAG_EXECUTION",
+              payload: { ...eventData, created_at: dagCreatedAt } as DAGExecution,
+            })
           } else if (eventType === "dag_step_info") {
             dispatch({ type: "SET_HISTORY_LOADING", payload: false })
             const stepInfo = eventData
@@ -4806,7 +4865,13 @@ export function AppProvider({
           }
         }
 
-        // Update DAG execution status to completed
+        // Sync DAG execution status to completed/failed - but only for a
+        // task that actually had a DAG plan running (currentState.dagExecution
+        // already set by an earlier dag_execution/dag_step_* event this turn).
+        // Fabricating a fresh DAGExecution for every completed task regardless
+        // of pattern (the previous `else` branch here) made every flash/ReAct
+        // task look like a completed zero-step DAG run to any DAG-only UI
+        // (e.g. the Progress panel), popping it open for plain replies.
         if (currentState.dagExecution) {
           const updatedDAGExecution = {
             ...currentState.dagExecution,
@@ -4814,14 +4879,6 @@ export function AppProvider({
             updated_at: new Date().toISOString()
           }
           dispatch({ type: "SET_DAG_EXECUTION", payload: updatedDAGExecution })
-        } else {
-          const dagExecution: DAGExecution = {
-            phase: taskData.status,
-            current_plan: {},
-            created_at: new Date().toISOString(),
-            updated_at: new Date().toISOString()
-          }
-          dispatch({ type: "SET_DAG_EXECUTION", payload: dagExecution })
         }
 
         // Mark that historical data should not be requested again for completed/failed tasks
@@ -4967,7 +5024,15 @@ export function AppProvider({
         if (dagSteps) {
           dispatch({ type: "SET_STEPS", payload: dagSteps })
         }
-        dispatch({ type: "SET_DAG_EXECUTION", payload: message.data as DAGExecution })
+        {
+          const legacyDagData = (message.data ?? {}) as { created_at?: string | number }
+          const legacyDagCreatedAt =
+            currentState.dagExecution?.created_at ?? legacyDagData.created_at ?? message.timestamp
+          dispatch({
+            type: "SET_DAG_EXECUTION",
+            payload: { ...(message.data as DAGExecution), created_at: legacyDagCreatedAt },
+          })
+        }
         break
 
 
@@ -5387,6 +5452,26 @@ export function AppProvider({
   const sendMessage = useCallback(async (message: string, config?: any, files?: File[]) => {
     console.log('🚀 sendMessage called:', { message, files: files?.map(f => f.name), taskId: state.taskId })
 
+    // A prior turn's DAG plan/steps must not linger into this turn - otherwise
+    // the Progress panel would auto-open (or stay open) showing stale steps
+    // from a different execution mode/run before this turn's own dag_execution
+    // event (if any) arrives. But sending into a run that's still actively
+    // going - answering a mid-run clarification, or the "live guidance" input
+    // ChatInput allows while running/paused/waiting_for_user (see
+    // ChatInput.tsx's `allowsLiveGuidanceInput`; the task page never passes
+    // onSend/onSendInteraction, so all of these fall back to this same
+    // sendMessage) - is a CONTINUATION of that run, not a new turn. Clearing
+    // here would wipe out the in-progress DAG plan/steps the Progress panel
+    // is actively showing.
+    const isContinuingActiveRun =
+      state.currentTask?.status === "running"
+      || state.currentTask?.status === "paused"
+      || state.currentTask?.status === "waiting_for_user"
+    if (!isContinuingActiveRun) {
+      dispatch({ type: "SET_DAG_EXECUTION", payload: null })
+      dispatch({ type: "SET_STEPS", payload: [] })
+    }
+
     if (sessionTransport && !mountedRef.current) {
       throw new Error("Message not sent: the Session chat is closed.")
     }
@@ -5783,7 +5868,7 @@ export function AppProvider({
       // composer keeps both its text and attached files.
       await sendChatMessage(message, files, config?.force, clientMessageId)
 
-      if (state.currentTask?.status === 'completed') {
+      if (state.currentTask?.status === 'completed' || state.currentTask?.status === 'failed') {
         dispatch({
           type: "UPDATE_TASK_STATUS",
           payload: { status: 'running' }
@@ -5997,6 +6082,12 @@ export function AppProvider({
       dispatch({ type: "CLEAR_MESSAGES" })
       dispatch({ type: "SET_TRACE_EVENTS", payload: [] })
       dispatch({ type: "SET_STEPS", payload: [] })
+      // Also clear the previous task's DAG plan/phase - otherwise switching
+      // tasks via the sidebar (no page reload) leaves the Progress panel
+      // showing the OLD task's steps and elapsed time until the new task's
+      // own dag_execution history replay arrives (or the page is refreshed,
+      // which happens to force a clean re-init).
+      dispatch({ type: "SET_DAG_EXECUTION", payload: null })
     }
 
     if (options?.navigate !== false) {

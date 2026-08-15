@@ -238,7 +238,7 @@ jobs:
       matrix:
         include:
           - name: web
-            paths: tests/web
+            paths: tests/web tests/architecture
           - name: integration
             paths: tests/integration
 

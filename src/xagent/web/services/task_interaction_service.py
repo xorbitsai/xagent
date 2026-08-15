@@ -63,6 +63,7 @@ code outside the scanned package tree).
 from __future__ import annotations
 
 import json
+import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -89,6 +90,8 @@ from .task_command_transport import _normalize_command_id
 from .task_interaction_schema import interaction_requests_table_exists
 from .task_interaction_staging import _KIND_VOCABULARY
 from .task_lease_service import TASK_RUN_ID_TRACE_FIELD
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from datetime import datetime
@@ -1306,7 +1309,20 @@ def materialize_compatibility_view(
 
     try:
         parsed = parse_v1_request_payload(row.request_payload)
-    except _PydanticValidationError:
+    except _PydanticValidationError as exc:
+        # This is the unreadable-payload fallback: an active native row
+        # exists but its stored request_payload does not parse against the
+        # v1 shape this reader expects, so the caller silently gets the T1
+        # legacy transcript instead of the native projection. Logging here
+        # only guarantees the degradation is not silent; what the read
+        # surface does with it -- a dedicated ops_signals degradation
+        # constant, a counter, or something else -- is that surface's own
+        # call to make, not this module's.
+        logger.warning(
+            "active native interaction row failed v1 payload validation; "
+            "falling back to the legacy transcript",
+            extra={"task_id": task_id, "validation_error": str(exc)[:500]},
+        )
         return _legacy_view(db, task_id)
 
     unresolved = _resolve_read_direction_anchor(db, row)

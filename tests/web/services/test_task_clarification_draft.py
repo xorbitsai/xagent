@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from pydantic import ValidationError
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
@@ -58,7 +59,10 @@ from xagent.web.services.task_clarification_draft import (
     resolve_publishable_clarification,
 )
 from xagent.web.services.task_command_transport import COMMAND_ID_PATTERN
-from xagent.web.services.task_interaction_service import parse_v1_request_payload
+from xagent.web.services.task_interaction_service import (
+    materialize_compatibility_view,
+    parse_v1_request_payload,
+)
 from xagent.web.services.task_interaction_staging import (
     InteractionAnchor,
     interaction_handoff,
@@ -632,6 +636,178 @@ def test_built_payload_round_trips_through_a_staged_row_and_the_v1_reader(
         assert parsed.message == draft.message
         assert parsed.interactions is not None
         assert len(parsed.interactions) == len(draft.interactions)
+    finally:
+        db.close()
+        engine.dispose()
+
+
+def test_select_control_payload_round_trips_with_its_options_intact(
+    tmp_path: Path,
+) -> None:
+    """A second real shape through the same builder -> stage -> read-back ->
+    parse round trip as the test above, this time with a ``select_one``
+    control that carries ``options`` -- the nested-list field none of the
+    other payload tests exercise end to end. Catches the same class of bug
+    the ``question``/``message`` key mismatch was: a control field that
+    looks fine as this module's own dict literal but fails
+    ``AskUserQuestionArgs`` validation once read back for real, because
+    something about its shape (here, the nested ``InteractionOption`` list)
+    was never actually round-tripped through the reader.
+    """
+
+    engine = _engine(tmp_path)
+    session_factory = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+    db = session_factory()
+    try:
+        user_id = make_user(db)
+        task_id = make_task(db, user_id=user_id)
+        trace_event_id = make_trace_event(db, task_id=task_id)
+
+        interactions = (
+            {
+                "type": "select_one",
+                "field": "color",
+                "label": "Favorite color",
+                "options": [
+                    {"label": "Red", "value": "red"},
+                    {"label": "Blue", "value": "blue"},
+                ],
+            },
+        )
+        draft = _draft(
+            message="what is your favorite color?", interactions=interactions
+        )
+        payload = build_clarification_payload(draft)
+
+        anchor = InteractionAnchor(
+            trace_event_id=trace_event_id,
+            resume_event_id="resume-event-1",
+            resume_execution_id="resume-exec-1",
+            resume_run_partition="run-a",
+        )
+        staged = stage_interaction_request(
+            db,
+            task_id=task_id,
+            run_id=anchor.resume_run_partition,
+            anchor=anchor,
+            kind="clarification",
+            protocol_version=1,
+            origin="internal",
+            request_payload=payload,
+            request_idempotency_key=clarification_idempotency_key(draft),
+            expires_at=_now() + timedelta(hours=1),
+            now=_now(),
+        )
+        db.commit()
+        assert staged.created is True
+
+        row = db.get(TaskInteractionRequest, staged.staged_db_id)
+        assert row is not None
+        parsed = parse_v1_request_payload(row.request_payload)
+
+        assert parsed.message == draft.message
+        assert parsed.interactions is not None
+        assert len(parsed.interactions) == 1
+        control = parsed.interactions[0]
+        assert control.type == "select_one"
+        assert control.field == "color"
+        assert control.label == "Favorite color"
+        assert control.options is not None
+        assert [(o.label, o.value) for o in control.options] == [
+            ("Red", "red"),
+            ("Blue", "blue"),
+        ]
+    finally:
+        db.close()
+        engine.dispose()
+
+
+def test_a_payload_missing_interaction_fields_fails_v1_validation_and_the_materialize_fallback_logs_it(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Pins the second path to an unreadable payload: a
+    ``request_payload`` written by something other than
+    ``build_clarification_payload`` -- here, one hand-built with an
+    ``interactions`` entry that has only ``field`` and neither of
+    ``InteractionArg``'s two other required fields, ``type`` and
+    ``label`` -- fails ``AskUserQuestionArgs`` validation exactly like the
+    ``question``/``message`` key mismatch this module's other round-trip
+    tests are pinned against, just via a different malformed shape. Per-
+    field validation of ``interactions`` entries at the write side is
+    tracked in #1368; this test only pins today's failure mode at the read
+    side, not a fix for the write side.
+
+    The row is staged through the real ``stage_interaction_request``, not
+    a bare ORM insert: ``request_payload`` is a JSON column with no
+    ``AskUserQuestionArgs``-shape CHECK constraint, so a row this shape can
+    reach the table for real, the same way
+    ``test_t1_falls_back_to_legacy_when_request_payload_does_not_parse``
+    (``test_task_interaction_service.py``) already established for a
+    differently-malformed payload.
+    """
+
+    malformed_payload = {
+        "message": "what is your favorite color?",
+        "interactions": [{"field": "color"}],
+    }
+    with pytest.raises(ValidationError):
+        parse_v1_request_payload(malformed_payload)
+
+    engine = _engine(tmp_path)
+    session_factory = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+    db = session_factory()
+    try:
+        user_id = make_user(db)
+        task_id = make_task(db, user_id=user_id)
+        trace_event_id = make_trace_event(db, task_id=task_id)
+
+        anchor = InteractionAnchor(
+            trace_event_id=trace_event_id,
+            resume_event_id="resume-event-1",
+            resume_execution_id="resume-exec-1",
+            resume_run_partition="run-a",
+        )
+        draft = _draft()
+        staged = stage_interaction_request(
+            db,
+            task_id=task_id,
+            run_id=anchor.resume_run_partition,
+            anchor=anchor,
+            kind="clarification",
+            protocol_version=1,
+            origin="internal",
+            request_payload=malformed_payload,
+            request_idempotency_key=clarification_idempotency_key(draft),
+            expires_at=_now() + timedelta(hours=1),
+            now=_now(),
+        )
+        assert staged.created is True
+
+        # _active_native_row_criteria() joins on
+        # TaskInteractionRequest.run_id == Task.run_id; make_task() leaves
+        # a task's run_id NULL, which the staged row above (run_id="run-a")
+        # would never match, so materialize_compatibility_view would take
+        # the earlier "no active row" exit instead of reaching the
+        # payload-parse guard this test targets.
+        task = db.get(Task, task_id)
+        assert task is not None
+        task.run_id = anchor.resume_run_partition
+        db.commit()
+
+        caplog.set_level(
+            logging.WARNING, logger="xagent.web.services.task_interaction_service"
+        )
+        view = materialize_compatibility_view(db, task_id)
+        assert view.tier == "legacy"
+
+        matching = [
+            record
+            for record in caplog.records
+            if "failed v1 payload validation" in record.message
+        ]
+        assert len(matching) == 1
+        assert matching[0].levelno == logging.WARNING
     finally:
         db.close()
         engine.dispose()

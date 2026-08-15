@@ -313,10 +313,12 @@ def build_clarification_payload(draft: ClarificationDraft) -> dict[str, Any]:
     ``ask_user_question`` tool's own argument schema, so it is the fixed
     side of this pairing: this builder aligns to it, never the reverse. A
     payload keyed ``question`` fails that validation, and the reader
-    swallows the failure and falls back to the legacy transcript with no
-    log, no signal and no counter -- a shape that is silent by
-    construction, which is why the round-trip test below crosses both
-    modules instead of checking this function against itself.
+    (``materialize_compatibility_view``) falls back to the legacy
+    transcript, logging the validation error at warning level -- but still
+    with no degradation signal and no counter, so a caller reading only
+    ``/health`` or a metric would not notice this is happening. That
+    remaining gap is why the round-trip test below crosses both modules
+    instead of checking this function against itself.
     """
 
     original_question = draft.message

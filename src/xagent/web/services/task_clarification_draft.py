@@ -326,7 +326,7 @@ def build_clarification_payload(draft: ClarificationDraft) -> dict[str, Any]:
             },
         )
 
-    question_truncated = False
+    message_truncated = False
     question = cleaned_question
     if len(cleaned_question.encode("utf-8")) > _QUESTION_MAX_BYTES:
         suffix_bytes = len(_QUESTION_TRUNCATION_SUFFIX.encode("utf-8"))
@@ -336,7 +336,7 @@ def build_clarification_payload(draft: ClarificationDraft) -> dict[str, Any]:
             )
             + _QUESTION_TRUNCATION_SUFFIX
         )
-        question_truncated = True
+        message_truncated = True
 
     interactions_cleaned = [_clean_leaves(dict(item)) for item in draft.interactions]
     interactions_dropped = False
@@ -352,7 +352,7 @@ def build_clarification_payload(draft: ClarificationDraft) -> dict[str, Any]:
         "source": draft.source,
         "requests": [_clean_leaves(item.to_dict()) for item in draft.requests],
     }
-    if question_truncated:
+    if message_truncated:
         payload["message_truncated"] = True
     if interactions_dropped:
         payload["interactions_dropped"] = True

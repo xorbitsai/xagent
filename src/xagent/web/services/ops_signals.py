@@ -77,21 +77,24 @@ INTERACTION_LEGACY_RESUME_CLOSE_ROWCOUNT_ANOMALY = (
     "interaction_legacy_resume_close_rowcount_anomaly"
 )
 
-# task_clarification_draft.py registers this when a waiting run's result
-# carries no clarification draft to publish, and clears it the next time a
-# draft is successfully resolved to a publishable payload.
+# Registered and cleared entirely inside resolve_publishable_clarification
+# (task_clarification_draft.py): registered when a waiting run's result
+# carries no clarification draft to publish, cleared the next time that
+# same function resolves a draft all the way to a publishable payload.
+# There is no gating on rollout mode or task source inside that function --
+# it runs the same guard sequence regardless of caller.
 #
-# What "stays lit" costs, operationally: the clearing point is the
-# publishable path only, so on a deployment where publication is blocked
-# (rollout mode is not native, or the task's source is not allowed yet)
-# nothing ever clears this signal -- the first occurrence latches it for the
-# lifetime of the process. active_degradations() feeds the unauthenticated
-# /health response (app.py), which reports signal names while keeping
-# status "ok", so a latched signal shows up on every probe until the
-# process restarts and cannot be distinguished there from a live one.
-# Deciding where a non-publishing round should clear it belongs to the
-# change that wires the first production caller, together with the same
-# decision for the two handoff signals below.
+# What "stays lit" costs, operationally: resolve_publishable_clarification
+# has no production callers today, so this signal cannot currently be set
+# or cleared outside of tests. The scenario below is what would happen once
+# a caller is wired up, not something observed in production: the clearing
+# point is the publishable path only, so on a deployment where every round
+# ends short of publishing, nothing ever clears this signal once it has
+# fired -- the first occurrence latches it for the lifetime of the process.
+# active_degradations() feeds the unauthenticated /health response
+# (app.py), which reports signal names while keeping status "ok", so a
+# latched signal would show up on every probe until the process restarts,
+# indistinguishable there from a live one.
 CLARIFICATION_DRAFT_MISSING = "clarification_draft_missing"
 # task_clarification_draft.py registers this when the same batch produced
 # more than one waiting step and a losing step's draft was discarded.

@@ -297,13 +297,19 @@ def build_clarification_payload(draft: ClarificationDraft) -> dict[str, Any]:
     key, or changing what an existing key means requires bumping the
     protocol version and giving :func:`parse_clarification_payload` an
     explicit branch for the old shape -- never a silent redefinition of what
-    v1 means.
+    v1 means. The one exception already taken under this promise is the
+    ``question`` -> ``message`` rename below: it shipped without a version
+    bump only because the table this payload is written to held no rows at
+    the time, so there was no persisted v1 shape to keep reading. Any
+    later rename, once the table has writers, must bump the version like
+    every other case above.
 
     The free-text field is called ``message``, not ``question``, because
     the persisted row's reader is ``parse_v1_request_payload``
     (``task_interaction_service.py``), which validates against
-    ``AskUserQuestionArgs`` (``core/tools/adapters/vibe/ask_user_tool.py``)
-    and whose required field is ``message``. That model is also the
+    ``AskUserQuestionArgs`` (``core/tools/adapters/vibe/ask_user_tool.py``),
+    whose required fields are ``message`` and ``interactions`` (neither has
+    a default). That model is also the
     ``ask_user_question`` tool's own argument schema, so it is the fixed
     side of this pairing: this builder aligns to it, never the reverse. A
     payload keyed ``question`` fails that validation, and the reader

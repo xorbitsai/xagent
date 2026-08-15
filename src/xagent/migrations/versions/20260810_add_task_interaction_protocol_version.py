@@ -132,16 +132,26 @@ def upgrade() -> None:
 
     # SQLite: a plain create_check_constraint raises NotImplementedError,
     # so the CHECK is added by rebuilding the table, the mirror image of
-    # what downgrade() below already does to remove it. Without this branch
-    # the two SQLite install paths enforce different invariants on the same
-    # column at the same version: a fresh install (stamp head, then
-    # create_all) carries the CHECK, a database that walked the revision
-    # chain does not, and interaction_protocol_version = 2 is rejected on
-    # one and accepted on the other. The offline (--sql) branch above
-    # cannot converge -- batch mode has no rendering under --sql on either
-    # dialect -- so an offline-generated SQLite upgrade still produces the
-    # unconstrained shape; that residue is the one asymmetry this change
-    # does not close, and it is asserted rather than left uncovered.
+    # what downgrade() below already does to remove it. Operationally, that
+    # rebuild is the SQLite counterpart to the PostgreSQL branch's ACCESS
+    # EXCLUSIVE lock note above: batch_alter_table builds a new table,
+    # copies every existing row into it -- O(N) in the table's row count --
+    # and only swaps it in once the copy finishes, so tasks is unwritable
+    # for the duration. This column has no writer today (see the note a few
+    # lines below), so no deployment has grown tasks by writing this
+    # column, and a table this migration converges is ordinarily small
+    # enough for that exclusive window to be acceptable.
+    #
+    # Without this branch the two SQLite install paths enforce different
+    # invariants on the same column at the same version: a fresh install
+    # (stamp head, then create_all) carries the CHECK, a database that
+    # walked the revision chain does not, and
+    # interaction_protocol_version = 2 is rejected on one and accepted on
+    # the other. The offline (--sql) branch above cannot converge -- batch
+    # mode has no rendering under --sql on either dialect -- so an
+    # offline-generated SQLite upgrade still produces the unconstrained
+    # shape; that residue is the one asymmetry this change does not close,
+    # and it is asserted rather than left uncovered.
     #
     # The rebuild copies existing rows through the new CHECK. Every row's
     # value is NULL or 1 today (this column has no writer that emits

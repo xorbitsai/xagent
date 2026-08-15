@@ -654,6 +654,28 @@ def test_idempotency_key_ignores_message_content() -> None:
     assert clarification_idempotency_key(base) == clarification_idempotency_key(changed)
 
 
+def test_idempotency_key_ignores_source() -> None:
+    """``turn_marker`` is composed from ``turn_message_count``,
+    ``origin_step_id``, and ``requests`` only (see ``_compose_turn_marker``);
+    ``source`` is not one of its inputs. Two drafts differing only in
+    ``source`` -- e.g. the same turn reported by ``send_message`` versus
+    ``ask_user_question`` -- must therefore produce the same key."""
+
+    base = _draft(source="send_message")
+    changed = _draft(source="ask_user_question")
+    assert clarification_idempotency_key(base) == clarification_idempotency_key(changed)
+
+
+def test_idempotency_key_ignores_origin_execution_id() -> None:
+    """Same reasoning as ``test_idempotency_key_ignores_source`` above:
+    ``origin_execution_id`` is not one of ``_compose_turn_marker``'s inputs
+    either, so two drafts differing only in it must produce the same key."""
+
+    base = _draft(origin_execution_id="exec-1")
+    changed = _draft(origin_execution_id="exec-2")
+    assert clarification_idempotency_key(base) == clarification_idempotency_key(changed)
+
+
 def test_oversized_question_is_truncated_and_the_idempotency_key_is_unaffected() -> (
     None
 ):
@@ -763,14 +785,27 @@ def test_interaction_leaf_control_characters_are_stripped_through_full_payload_a
     assert payload["interactions"] == [{"prompt": "pickone", "id": "opt-1"}]
 
 
-def test_payload_still_too_large_after_truncation_is_not_applicable() -> None:
+def test_payload_still_too_large_after_truncation_is_not_applicable(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     """Only ``tool_waiting`` -- the multi-tool waiting point -- can
     realistically produce thousands of ``requests`` entries;
     ``send_message`` and ``ask_user_question`` always contribute exactly
     one (see ``ClarificationDraft.requests``'s docstring), so a
     ``send_message`` draft with 6000 requests is not a shape production
-    can ever hand this function."""
+    can ever hand this function.
 
+    Also pins the level of ``build_clarification_payload``'s
+    still-oversized-after-truncation log at warning, the same degrade-
+    and-proceed reasoning as ``test_missing_draft_logs_at_warning_not_error``
+    above: this guard lets the round proceed as ``NotApplicable`` rather
+    than failing it, so a regression to error would misclassify a routine
+    degradation as a fault.
+    """
+
+    caplog.set_level(
+        logging.WARNING, logger="xagent.web.services.task_clarification_draft"
+    )
     many_requests = tuple(
         ClarificationRequestItem(f"tool-{i}", f"call-{i}", f"call-{i}")
         for i in range(6000)
@@ -782,9 +817,29 @@ def test_payload_still_too_large_after_truncation_is_not_applicable() -> None:
     )
     assert isinstance(resolution, NotApplicable)
     assert resolution.reason == "payload_too_large"
+    matching = [
+        record
+        for record in caplog.records
+        if "exceeded the maximum size even after truncation" in record.message
+    ]
+    assert len(matching) == 1
+    assert matching[0].levelno == logging.WARNING
 
 
-def test_question_emptied_by_character_filtering_is_not_applicable() -> None:
+def test_question_emptied_by_character_filtering_is_not_applicable(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Also pins the level of ``build_clarification_payload``'s
+    empty-after-filtering log at warning, the same degrade-and-proceed
+    reasoning as ``test_missing_draft_logs_at_warning_not_error`` above:
+    this guard lets the round proceed as ``NotApplicable`` rather than
+    failing it, so a regression to error would misclassify a routine
+    degradation as a fault.
+    """
+
+    caplog.set_level(
+        logging.WARNING, logger="xagent.web.services.task_clarification_draft"
+    )
     draft = _draft(message="\x00\x01\x02\x1f")
     result = {"status": "waiting_for_user", "clarification_draft": draft}
     resolution = resolve_publishable_clarification(
@@ -792,6 +847,13 @@ def test_question_emptied_by_character_filtering_is_not_applicable() -> None:
     )
     assert isinstance(resolution, NotApplicable)
     assert resolution.reason == "empty_question"
+    matching = [
+        record
+        for record in caplog.records
+        if "empty after removing control characters" in record.message
+    ]
+    assert len(matching) == 1
+    assert matching[0].levelno == logging.WARNING
 
 
 def test_whitespace_only_question_is_not_applicable() -> None:

@@ -51,6 +51,10 @@ from pathlib import Path
 
 import pytest
 
+from tests.architecture.string_constant_resolution import (
+    string_constant_bindings,
+    string_values,
+)
 from xagent.web.api import admin_users
 from xagent.web.services import chat_history_service
 
@@ -355,130 +359,17 @@ def test_single_row_delete_guard_attributes_each_delete_to_its_own_scope(
 # than respelled here, so a guard can never end up hunting for a value the
 # service no longer uses. ``test_message_type_constants_have_their_documented_values``
 # in the behavior suite is what pins the values themselves.
+#
+# This is the ``known_constants`` argument every call below into
+# ``string_constant_bindings`` / ``string_values``
+# (``tests/architecture/string_constant_resolution.py``) passes: those two
+# functions have no built-in knowledge of message-type semantics, only of
+# how to resolve a name or attribute access against whatever mapping a
+# caller hands them.
 _MESSAGE_TYPE_CONSTANTS = {
     "QUESTION_MESSAGE_TYPE": chat_history_service.QUESTION_MESSAGE_TYPE,
     "SUPERSEDED_MESSAGE_TYPE": chat_history_service.SUPERSEDED_MESSAGE_TYPE,
 }
-
-
-def _module_level_statements(tree: ast.Module):
-    """Statements in module scope, descending through module-level ``if``
-    and ``try`` blocks -- a constant defined under ``if TYPE_CHECKING:``
-    or in a ``try``/``except ImportError`` fallback is still a
-    module-scope binding. Function and class bodies are deliberately not
-    descended into: a local ``x = "question"`` in some unrelated function
-    must not make every ``x`` in the file resolve to that value.
-    """
-    pending = list(tree.body)
-    while pending:
-        node = pending.pop()
-        yield node
-        if isinstance(node, ast.If):
-            pending.extend(node.body)
-            pending.extend(node.orelse)
-        elif isinstance(node, (ast.Try, ast.TryStar)):
-            pending.extend(node.body)
-            pending.extend(node.orelse)
-            pending.extend(node.finalbody)
-            for handler in node.handlers:
-                pending.extend(handler.body)
-
-
-def _string_constant_bindings(tree: ast.Module) -> dict[str, set[str]]:
-    """Module-scope names mapped to every string value they are ever bound
-    to, so a guard can recognize ``.update({message_type: SUPERSEDED})``
-    as the same write as ``.update({message_type: "question_superseded"})``.
-
-    Four carrier shapes are resolved:
-
-    * a module-scope assignment to a string literal, plain or annotated
-      (``S = "question_superseded"``, ``S: str = "question_superseded"``);
-    * ``from ... import SUPERSEDED_MESSAGE_TYPE``, including
-      ``... as S`` -- the imported name takes the value the owning module
-      actually holds (``_MESSAGE_TYPE_CONSTANTS``), not a respelling;
-    * a module-scope assignment from an attribute of one of those
-      constants (``S = chat_history_service.SUPERSEDED_MESSAGE_TYPE``);
-    * a chain of module-scope name-to-name assignments over any of the
-      above (``A = S``; ``B = A``), resolved to a fixed point. Value sets
-      only grow and the name set is finite, so a cycle (``A = B``;
-      ``B = A``) terminates instead of looping.
-
-    A name rebound at module scope keeps *every* value it was ever bound
-    to rather than only the last one. "The last one" is not a defined
-    notion here: ``_module_level_statements`` drains its work list with
-    ``pop()``, so statements arrive last-in-first-out and not in source
-    order. Keeping the union is the only well-defined answer, and it is
-    also the safe one for something that feeds a ban.
-
-    Shapes this does not resolve. Values built by anything other than a
-    plain literal or one of the forms above -- an f-string,
-    ``.format()``, ``"".join(...)``, an augmented assignment
-    (``B += "..."``), ``getattr(module, "NAME")`` -- plus tuple-unpacking
-    targets (``A, B = "x", "y"``), names arriving through
-    ``from ... import *``, imports made inside a module-level ``with``
-    block, constants defined in a class body, and a value reaching the
-    write as a dict key or ``**`` carrier rather than as the mapped
-    value. None of these is resolved; the table therefore stays a ban on
-    the spellings it can see, not a proof that no other spelling exists.
-    """
-    bindings: dict[str, set[str]] = {}
-    aliases: list[tuple[str, str]] = []
-
-    def bind(name: str, value: str) -> None:
-        bindings.setdefault(name, set()).add(value)
-
-    for node in _module_level_statements(tree):
-        if isinstance(node, ast.ImportFrom):
-            for alias in node.names:
-                if alias.name in _MESSAGE_TYPE_CONSTANTS:
-                    bind(
-                        alias.asname or alias.name, _MESSAGE_TYPE_CONSTANTS[alias.name]
-                    )
-            continue
-        if isinstance(node, ast.Assign):
-            targets: list[ast.expr] = list(node.targets)
-        elif isinstance(node, ast.AnnAssign):
-            targets = [node.target]
-        else:
-            continue
-        if node.value is None:
-            continue
-        names = [t.id for t in targets if isinstance(t, ast.Name)]
-        if not names:
-            continue
-        value = node.value
-        if isinstance(value, ast.Constant) and isinstance(value.value, str):
-            for name in names:
-                bind(name, value.value)
-        elif isinstance(value, ast.Name):
-            aliases.extend((name, value.id) for name in names)
-        elif isinstance(value, ast.Attribute) and value.attr in _MESSAGE_TYPE_CONSTANTS:
-            for name in names:
-                bind(name, _MESSAGE_TYPE_CONSTANTS[value.attr])
-
-    changed = True
-    while changed:
-        changed = False
-        for target, source in aliases:
-            values = bindings.get(source)
-            if values and not values <= bindings.get(target, set()):
-                bindings.setdefault(target, set()).update(values)
-                changed = True
-    return bindings
-
-
-def _string_values(node: ast.AST, bindings: dict[str, set[str]]) -> set[str]:
-    """Every string value this expression can denote: an inline literal, a
-    module-scope name bound to one, or ``<module>.NAME`` for one of the
-    message-type constants. Anything else resolves to nothing, so a guard
-    built on this stays a ban on known values rather than a guess."""
-    if isinstance(node, ast.Constant):
-        return {node.value} if isinstance(node.value, str) else set()
-    if isinstance(node, ast.Name):
-        return set(bindings.get(node.id, ()))
-    if isinstance(node, ast.Attribute) and node.attr in _MESSAGE_TYPE_CONSTANTS:
-        return {_MESSAGE_TYPE_CONSTANTS[node.attr]}
-    return set()
 
 
 def _writes_message_type_to(
@@ -492,12 +383,14 @@ def _writes_message_type_to(
                     if isinstance(key, ast.Attribute)
                     else (key.value if isinstance(key, ast.Constant) else None)
                 )
-                if key_name == "message_type" and value in _string_values(
-                    val, bindings
+                if key_name == "message_type" and value in string_values(
+                    val, bindings, _MESSAGE_TYPE_CONSTANTS
                 ):
                     return True
     for kw in node.keywords:
-        if kw.arg == "message_type" and value in _string_values(kw.value, bindings):
+        if kw.arg == "message_type" and value in string_values(
+            kw.value, bindings, _MESSAGE_TYPE_CONSTANTS
+        ):
             return True
     return False
 
@@ -513,7 +406,8 @@ def _filters_message_type_equal(
             and isinstance(arg.left, ast.Attribute)
             and arg.left.attr == "message_type"
             and len(arg.comparators) == 1
-            and value in _string_values(arg.comparators[0], bindings)
+            and value
+            in string_values(arg.comparators[0], bindings, _MESSAGE_TYPE_CONSTANTS)
         ):
             return True
     return False
@@ -529,14 +423,15 @@ def reverse_supersede_writes(tree: ast.Module) -> list[int]:
     repo's ORM bulk writes actually use: a dict-literal passed to
     ``.update(...)``/``.values(...)``, and a ``message_type=`` keyword on
     the same calls. Both the written value and the filtered value are
-    resolved through ``_string_constant_bindings``, so the constant
+    resolved through ``string_constant_bindings``
+    (``tests/architecture/string_constant_resolution.py``), so the constant
     spelling (``SUPERSEDED_MESSAGE_TYPE``, an aliased import of it, or
     ``chat_history_service.SUPERSEDED_MESSAGE_TYPE``) is caught alongside
     the bare literal. That matters because ``chat_history_service.py``
     exports both constants publicly, making the constant spelling the
     likelier one for a real revert helper. Which spellings that
     resolution does and does not cover is listed in
-    ``_string_constant_bindings``; a value it cannot resolve is a blind
+    ``string_constant_bindings``; a value it cannot resolve is a blind
     spot of this guard too.
 
     Three further shapes are known blind spots of the walk itself,
@@ -566,7 +461,7 @@ def reverse_supersede_writes(tree: ast.Module) -> list[int]:
     its own ``**`` carriers, and for the same reason: a materially more
     expensive walk than what these shapes are worth guarding against.
     """
-    bindings = _string_constant_bindings(tree)
+    bindings = string_constant_bindings(tree, _MESSAGE_TYPE_CONSTANTS)
     findings: list[int] = []
     for node in ast.walk(tree):
         if not (
@@ -772,7 +667,7 @@ BUILT = "que"
 BUILT += "stion"
 DECLARED_ONLY: str
 """
-    assert _string_constant_bindings(ast.parse(fixture)) == {
+    assert string_constant_bindings(ast.parse(fixture), _MESSAGE_TYPE_CONSTANTS) == {
         "PLAIN": {"question"},
         "ANNOTATED": {"question_superseded"},
         "REBOUND": {"question", "something else"},
@@ -783,7 +678,10 @@ DECLARED_ONLY: str
 def test_constant_bindings_terminate_on_a_cyclic_alias_chain() -> None:
     """The fixed-point loop must not hang on ``A = B``/``B = A``: value
     sets only grow over a finite name set, so it settles at empty."""
-    assert _string_constant_bindings(ast.parse("A = B\nB = A\n")) == {}
+    assert (
+        string_constant_bindings(ast.parse("A = B\nB = A\n"), _MESSAGE_TYPE_CONSTANTS)
+        == {}
+    )
 
 
 def test_constant_bindings_reach_module_level_if_and_try_blocks() -> None:
@@ -798,7 +696,7 @@ try:
 except ImportError:
     UNDER_TRY = "question"
 """
-    bindings = _string_constant_bindings(ast.parse(fixture))
+    bindings = string_constant_bindings(ast.parse(fixture), _MESSAGE_TYPE_CONSTANTS)
     assert bindings["UNDER_IF"] == {"question_superseded"}
     assert bindings["UNDER_TRY"] == {"question"}
 

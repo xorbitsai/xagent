@@ -419,7 +419,7 @@ def test_sqlite_create_all_downgrade_upgrade_round_trip_restores_the_check() -> 
         assert CONSTRAINT_NAME in _check_constraint_names(connection)
 
     tasks_before = sa.Table(TABLE, sa.MetaData(), autoload_with=engine)
-    with pytest.raises(sa.exc.IntegrityError):
+    with pytest.raises(sa.exc.IntegrityError, match=CONSTRAINT_NAME):
         with engine.begin() as connection:
             connection.execute(
                 sa.insert(tasks_before).values(
@@ -440,7 +440,7 @@ def test_sqlite_create_all_downgrade_upgrade_round_trip_restores_the_check() -> 
         assert CONSTRAINT_NAME in ddl
 
     tasks_after = sa.Table(TABLE, sa.MetaData(), autoload_with=engine)
-    with pytest.raises(sa.exc.IntegrityError):
+    with pytest.raises(sa.exc.IntegrityError, match=CONSTRAINT_NAME):
         with engine.begin() as connection:
             connection.execute(
                 sa.insert(tasks_after).values(

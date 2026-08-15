@@ -32,6 +32,7 @@ helper's own docstring on constant-valued filter conditions):
 | Finalizers additionally filter on ``Task.id == task_id`` | That identifies which row, not whether it is still owned; excluded explicitly below |
 | Finalizers additionally call ``.with_for_update()`` | Locking is the caller's concern; the predicate is a pure boolean, takes no lock and issues no SQL |
 | Finalizers never compare ``lease_attempt_id`` / ``attempt_id`` | A deliberate capability gap -- the WebSocket finalizers do not carry the attempt contract; the predicate's third check does not apply to them (cell 3 below) |
+| Finalizers read the lease off a local named ``task_lease``, predicate reads it off a parameter named ``lease`` | Same object, different local name at each call site; normalized by ``_ROOT_NAME_REWRITES`` below so cell 2 compares field *and* object, not field name alone |
 """
 
 from __future__ import annotations
@@ -146,16 +147,37 @@ def _ownership_filter_call(func_node: ast.AST) -> ast.Call:
     return candidates[0]
 
 
-def _compare_triple(node: ast.Compare) -> tuple[str, str, str]:
+# Known, deliberate root-name difference between the two forms (see the
+# module docstring's table): the finalizers' inline filter reads the lease
+# off a local named `task_lease`, the shared predicate reads the same
+# runtime object off a parameter named `lease`. Normalized here so the two
+# sides' triples compare on "same object, same field" rather than making
+# every ownership comparison fail to match on root name alone.
+_ROOT_NAME_REWRITES = {"task_lease": "lease"}
+
+
+def _compare_triple(node: ast.Compare) -> tuple[str, str, str, str]:
+    """The comparison's shape as (left field, op, right root, right field).
+
+    The right side's root -- the object its attribute access reads off of,
+    normalized through ``_ROOT_NAME_REWRITES`` for the one known legal
+    spelling difference above -- is recorded alongside the field name.
+    Without it, a comparison against the wrong object (``task.run_id``
+    written where ``lease.run_id`` was meant) would still report the field
+    name "run_id" and match by coincidence; recording the root turns that
+    into a real mismatch.
+    """
     assert isinstance(node.left, ast.Attribute)
     assert len(node.ops) == 1 and isinstance(node.ops[0], ast.Eq)
     assert len(node.comparators) == 1
     right = node.comparators[0]
     assert isinstance(right, ast.Attribute)
-    return (node.left.attr, "Eq", right.attr)
+    assert isinstance(right.value, ast.Name)
+    right_root = _ROOT_NAME_REWRITES.get(right.value.id, right.value.id)
+    return (node.left.attr, "Eq", right_root, right.attr)
 
 
-def _finalizer_ownership_triples(func_node: ast.AST) -> set[tuple[str, str, str]]:
+def _finalizer_ownership_triples(func_node: ast.AST) -> set[tuple[str, str, str, str]]:
     """The ownership filter call may also carry the primary-key term
     (``Task.id == task_id``) alongside the runner/run comparisons, when
     the finalizer folds both into the same ``.filter()`` call -- see
@@ -164,9 +186,10 @@ def _finalizer_ownership_triples(func_node: ast.AST) -> set[tuple[str, str, str]
     attribute access, so it is excluded here by shape rather than
     included and then subtracted -- its presence is asserted separately.
 
-    Known blind spot: this only collects comparisons whose right side is
-    an attribute access. A comparison filtered against a constant (for
-    example ``Task.runner_id == "some-literal"``) does not match that
+    Known blind spot: this only collects comparisons whose right side is a
+    plain-name-rooted attribute access (``task_lease.runner_id``, not a
+    longer chain or a constant). A comparison filtered against a constant
+    (for example ``Task.runner_id == "some-literal"``) does not match that
     shape, so it is silently dropped from the returned set rather than
     surfaced as a mismatch -- the equivalence assertion below would not go
     red for it. If a finalizer's ownership filter ever takes that shape,
@@ -180,6 +203,7 @@ def _finalizer_ownership_triples(func_node: ast.AST) -> set[tuple[str, str, str]
             isinstance(arg, ast.Compare)
             and len(arg.comparators) == 1
             and isinstance(arg.comparators[0], ast.Attribute)
+            and isinstance(arg.comparators[0].value, ast.Name)
         ):
             triples.add(_compare_triple(arg))
     return triples
@@ -213,7 +237,14 @@ def _finalizer_has_primary_key_filter(func_node: ast.AST) -> bool:
     return False
 
 
-def _predicate_ownership_triples() -> set[tuple[str, str, str]]:
+def _predicate_ownership_triples() -> set[tuple[str, str, str, str]]:
+    """Built through the same ``_compare_triple`` the finalizer side uses,
+    so a comparison against the wrong object on this side (``task.run_id``
+    written where ``lease.run_id`` was meant) is caught by the identical
+    mechanism, not a second, independently-written one that could drift
+    from it.
+    """
+
     predicate_node = _parse_function(lease_service.task_row_matches_lease_owner)
     (return_stmt,) = [
         node for node in ast.walk(predicate_node) if isinstance(node, ast.Return)
@@ -233,12 +264,7 @@ def _predicate_ownership_triples() -> set[tuple[str, str, str]]:
     triples = set()
     for value in body.values:
         assert isinstance(value, ast.Compare)
-        left = value.left
-        assert isinstance(left, ast.Attribute)
-        assert len(value.ops) == 1 and isinstance(value.ops[0], ast.Eq)
-        right = value.comparators[0]
-        assert isinstance(right, ast.Attribute)
-        triples.add((left.attr, "Eq", right.attr))
+        triples.add(_compare_triple(value))
     return triples
 
 
@@ -247,7 +273,9 @@ def test_ownership_filter_fields_match_the_shared_predicate() -> None:
     ownership -- excluding the primary-key lookup, which identifies which
     row to look at, not whether it is still owned -- equals the field set
     ``task_row_matches_lease_owner`` compares, and both equal
-    ``{runner_id, run_id}``. The primary-key term itself is required to be
+    ``{(runner_id, lease, runner_id), (run_id, lease, run_id)}`` once the
+    finalizers' ``task_lease`` root is normalized to ``lease`` (see
+    ``_ROOT_NAME_REWRITES``). The primary-key term itself is required to be
     present somewhere in the finalizer (see
     ``_finalizer_has_primary_key_filter``'s own docstring for why it is not
     required to share the same ``.filter()`` call as the ownership terms).
@@ -255,8 +283,8 @@ def test_ownership_filter_fields_match_the_shared_predicate() -> None:
 
     predicate_triples = _predicate_ownership_triples()
     assert predicate_triples == {
-        ("runner_id", "Eq", "runner_id"),
-        ("run_id", "Eq", "run_id"),
+        ("runner_id", "Eq", "lease", "runner_id"),
+        ("run_id", "Eq", "lease", "run_id"),
     }
 
     for name in _FINALIZER_NAMES:

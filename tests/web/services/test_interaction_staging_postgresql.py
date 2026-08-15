@@ -677,14 +677,19 @@ def test_server_default_isolation_level_is_read_committed(db_session) -> None:
     SERIALIZABLE it would reuse its original snapshot and misclassify a
     legitimate replay as a slot conflict.
 
-    This proves only the server-configuration half of that premise -- that
-    a session opened the way this codebase opens one really does start out
-    at READ COMMITTED. It proves nothing about whether this codebase could
-    override that default: ``test_configure_db_sets_no_isolation_level_on_
-    either_engine`` (``test_interaction_staging.py``) is the other half,
-    pinning that neither ``create_engine`` call here sets an
-    ``isolation_level``. Either test alone leaves the docstring's premise
-    unproven; only both holding together do.
+    This test's own boundary: ``db_session`` here comes from this file's
+    ``engine`` fixture, which opens its connection with a bare
+    ``sa.create_engine(url, connect_args=...)`` -- never through
+    ``configure_db`` (``xagent.web.models.database``). So this only proves
+    what a stock PostgreSQL server defaults new sessions to; it says
+    nothing about whether ``configure_db`` (or ``get_db_pool_kwargs``, which
+    feeds keyword arguments into ``configure_db``'s own ``create_engine``
+    call) overrides that default for the engines this codebase actually
+    runs. ``test_configure_db_sets_no_isolation_level_on_either_engine``
+    (``test_interaction_staging.py``) statically scans both of those
+    instead, over their own source, but scanning source and observing a
+    live session are two different kinds of evidence -- neither test
+    substitutes for a probe against a real ``configure_db``-built engine.
     """
 
     (level,) = db_session.execute(

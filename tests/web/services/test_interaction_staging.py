@@ -34,6 +34,7 @@ from tests.web.services.task_interaction_schema_shared import (
     make_trace_event,
     make_user,
 )
+from xagent.config import get_db_pool_kwargs
 from xagent.db.sqlite import apply_sqlite_concurrency_pragmas
 from xagent.web.models import database as database_module
 from xagent.web.models.database import Base
@@ -3130,11 +3131,20 @@ def test_handoff_never_writes_any_task_column(tmp_path: Path) -> None:
 
 # ---------------------------------------------------------------------------
 # The post-conflict re-check's READ COMMITTED dependency (stage_interaction_
-# request's step 6 docstring): this half statically pins that this codebase
-# does not override the isolation level itself. The other half -- that
-# PostgreSQL's default really is READ COMMITTED -- is asserted against a
-# real server in test_interaction_staging_postgresql.py. Neither half alone
-# proves the docstring's premise; both must hold together.
+# request's step 6 docstring): this test statically pins that neither
+# ``configure_db`` nor ``get_db_pool_kwargs`` -- the two places that build
+# the keyword arguments this codebase's own ``create_engine`` calls receive
+# -- sets an isolation level.
+#
+# This is one disclosed-boundary half of the docstring's premise, not a
+# joint proof with test_interaction_staging_postgresql.py's
+# test_server_default_isolation_level_is_read_committed. That test opens its
+# own engine directly with ``sa.create_engine(url, connect_args=...)``,
+# never through ``configure_db`` -- see its fixture -- so it is not
+# observing the isolation level this codebase's real engines would start at;
+# it only confirms what a bare PostgreSQL connection defaults to. Neither
+# test observes a real ``configure_db``-built engine's isolation level in
+# one place at once.
 # ---------------------------------------------------------------------------
 
 
@@ -3148,33 +3158,15 @@ def _create_engine_calls(tree: ast.Module) -> list[ast.Call]:
     ]
 
 
-def test_configure_db_sets_no_isolation_level_on_either_engine() -> None:
-    """If this test turns red, someone gave one of the two ``create_engine``
-    calls in ``configure_db`` (``xagent.web.models.database``) an explicit
-    ``isolation_level`` -- whether passed directly as a keyword, folded into
-    an ``execution_options`` dict literal, or (the SQLite branch's PostgreSQL
-    counterpart today) built up into the ``engine_kwargs`` dict that gets
-    spread into the call with ``**``. That is the moment to re-read
-    ``stage_interaction_request``'s docstring on its post-conflict re-check:
-    that re-check's classification of a REPLAY-after-conflict depends on
-    READ COMMITTED being in effect, and a different isolation level would
-    make it misclassify a legitimate replay as a slot conflict.
+def _assert_no_isolation_level_key(tree: ast.Module) -> None:
+    """Walk every dict-literal key, keyword argument name, and string
+    subscript in ``tree`` and assert none of them is ``"isolation_level"``.
 
-    The scan is over ``configure_db``'s own parsed source, not a text
-    search of the whole module, so it cannot be defeated by a coincidental
-    ``"isolation_level"`` substring in an unrelated docstring or comment
-    elsewhere in the file -- and it walks every dict-literal key and every
-    keyword argument name in the function, not just the two direct
-    ``create_engine`` call sites, because the PostgreSQL branch's second
-    call passes its keywords indirectly through ``**engine_kwargs`` rather
-    than spelling them out at the call site.
+    Shared between the two scans below so a source that hides an isolation
+    level behind a dict literal, a keyword argument, or a subscript is
+    caught the same way regardless of which function's source is being
+    walked.
     """
-
-    source = inspect.getsource(database_module.configure_db)
-    tree = ast.parse(source)
-
-    calls = _create_engine_calls(tree)
-    assert len(calls) == 2, "expected exactly two create_engine() calls in configure_db"
 
     forbidden = "isolation_level"
 
@@ -3192,3 +3184,47 @@ def test_configure_db_sets_no_isolation_level_on_either_engine() -> None:
             index = node.slice
             if isinstance(index, ast.Constant) and isinstance(index.value, str):
                 assert index.value != forbidden
+
+
+def test_configure_db_sets_no_isolation_level_on_either_engine() -> None:
+    """If this test turns red, someone gave one of the two ``create_engine``
+    calls in ``configure_db`` (``xagent.web.models.database``) an explicit
+    ``isolation_level`` -- whether passed directly as a keyword, folded into
+    an ``execution_options`` dict literal, or (the SQLite branch's PostgreSQL
+    counterpart today) built up into the ``engine_kwargs`` dict that gets
+    spread into the call with ``**`` -- or someone added an ``isolation_level``
+    key to ``get_db_pool_kwargs`` (``xagent.config``), the function whose
+    return value is spread into that same ``**``. That is the moment to
+    re-read ``stage_interaction_request``'s docstring on its post-conflict
+    re-check: that re-check's classification of a REPLAY-after-conflict
+    depends on READ COMMITTED being in effect, and a different isolation
+    level would make it misclassify a legitimate replay as a slot conflict.
+
+    Two separate scans, not one: ``ast.walk`` only descends into the nodes
+    actually present in the source text it was given, so walking
+    ``configure_db``'s own parsed source cannot see inside
+    ``get_db_pool_kwargs``'s body -- that call only appears in
+    ``configure_db``'s AST as a bare ``Call`` node, its keys nowhere in
+    sight. ``get_db_pool_kwargs`` is scanned separately, over its own
+    parsed source, for the same reason the PostgreSQL branch's
+    ``**engine_kwargs`` needed scanning in the first place: a key spread in
+    through ``**`` at one call site was defined as a literal at another.
+
+    Neither scan is a text search of the whole module, so neither can be
+    defeated by a coincidental ``"isolation_level"`` substring in an
+    unrelated docstring or comment elsewhere in either file -- each walks
+    every dict-literal key, keyword argument name, and string subscript in
+    the function it was given.
+    """
+
+    configure_db_source = inspect.getsource(database_module.configure_db)
+    configure_db_tree = ast.parse(configure_db_source)
+
+    calls = _create_engine_calls(configure_db_tree)
+    assert len(calls) == 2, "expected exactly two create_engine() calls in configure_db"
+
+    _assert_no_isolation_level_key(configure_db_tree)
+
+    pool_kwargs_source = inspect.getsource(get_db_pool_kwargs)
+    pool_kwargs_tree = ast.parse(pool_kwargs_source)
+    _assert_no_isolation_level_key(pool_kwargs_tree)

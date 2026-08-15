@@ -16,7 +16,10 @@ message-type monotonicity sweep, both tree-wide scans, plus the rollout
 import ban, a single-file layering rule -- are repository-level
 architecture rules rather than facts about this feature, and now live in
 ``tests/architecture/test_architecture_guards.py``. This file imports the
-constant-resolution helpers from there.
+constant-resolution helpers from ``string_constant_resolution.py``, the
+module those two functions were extracted into so neither this file nor
+that one has to reach across a package boundary for the other's private
+names.
 """
 
 from __future__ import annotations
@@ -26,12 +29,20 @@ from pathlib import Path
 
 import pytest
 
-from tests.architecture.test_architecture_guards import (
-    _string_constant_bindings,
-    _string_values,
+from tests.architecture.string_constant_resolution import (
+    string_constant_bindings,
+    string_values,
 )
 from xagent.web.api import websocket
 from xagent.web.services import chat_history_service
+
+# This guard only ever needs to recognize the superseded value -- it never
+# checks for the question value -- so, unlike the tree-wide monotonicity
+# sweep in test_architecture_guards.py, it does not need
+# QUESTION_MESSAGE_TYPE in this mapping.
+_KNOWN_CONSTANTS = {
+    "SUPERSEDED_MESSAGE_TYPE": chat_history_service.SUPERSEDED_MESSAGE_TYPE
+}
 
 # ---------------------------------------------------------------------------
 # The mid-turn WebSocket path never mentions the superseded value at
@@ -54,14 +65,14 @@ def mid_turn_functions_mentioning_superseded_value(
     vacuously green in that second case without this.
 
     The superseded value is recognized in any of the spellings
-    ``_string_constant_bindings`` resolves -- the bare literal, a
+    ``string_constant_bindings`` resolves -- the bare literal, a
     module-scope constant, an imported or aliased
     ``SUPERSEDED_MESSAGE_TYPE``, or ``<module>.SUPERSEDED_MESSAGE_TYPE``
     -- not only as an inline ``ast.Constant``. That function lists the
     spellings it cannot resolve; each of them is a blind spot of this
     guard too.
     """
-    bindings = _string_constant_bindings(tree)
+    bindings = string_constant_bindings(tree, _KNOWN_CONSTANTS)
     superseded = chat_history_service.SUPERSEDED_MESSAGE_TYPE
     hits: list[str] = []
     found: set[str] = set()
@@ -72,7 +83,7 @@ def mid_turn_functions_mentioning_superseded_value(
         ):
             found.add(node.name)
             for inner in ast.walk(node):
-                if superseded in _string_values(inner, bindings):
+                if superseded in string_values(inner, bindings, _KNOWN_CONSTANTS):
                     hits.append(node.name)
                     break
     return hits, found

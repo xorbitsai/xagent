@@ -64,6 +64,25 @@ const VERSIONED_TASK_EVENT_TYPES = new Set([
   "task_started",
   "task_waiting_for_user",
 ])
+// Action types that describe state scoped to one specific task's
+// conversation (chat/trace/DAG/status). Used by handleMessage's dispatch
+// wrapper to drop these when a message's task_id doesn't match the task
+// actually being viewed - see the wrapper's own comment for why. Kept at
+// module scope (built once) rather than inside handleMessage, matching
+// VERSIONED_TASK_EVENT_TYPES above.
+const TASK_SCOPED_ACTION_TYPES = new Set<AppAction["type"]>([
+  "SET_DAG_EXECUTION",
+  "SET_STEPS",
+  "ADD_STEP",
+  "UPDATE_STEP",
+  "UPDATE_TASK_STATUS",
+  "SET_PROCESSING",
+  "ADD_MESSAGE",
+  "UPSERT_STREAMING_FINAL_ANSWER",
+  "ADD_TRACE_EVENT",
+  "SET_CONTEXT_USAGE",
+  "SET_PLAN_MEMORY_INFO",
+])
 const MAX_TRACKED_TASK_STATE_VERSIONS = 500
 // A Session may reset repeatedly during its absolute lifetime. Retired ids are
 // retained only to reject late frames, so bound this lineage guard separately
@@ -2215,39 +2234,46 @@ export function AppProvider({
     // just-superseded socket/task can still have events in flight after the
     // app has moved on to a different task (e.g. the user starts a new chat
     // while a previous DAG run is still executing in the background). Those
-    // stray events must not repaint the DAG plan/step state for whatever task
-    // is now on screen, or the Progress panel would auto-open showing another
-    // task's steps. Scope just the DAG-state actions to the message's own
-    // task_id (present on every event type that feeds this state - see
-    // use-websocket.ts's per-type message normalization); every other action
-    // type is unaffected. UPDATE_TASK_STATUS is included too: the Progress
-    // panel's "is this run finished" check reads state.currentTask.status/
-    // updatedAt (there is no reliable per-run "completed" signal on
-    // dagExecution itself - see isDagFinished in page-client.tsx), and
-    // UPDATE_TASK_STATUS unconditionally overwrites currentTask, which
-    // inherently only ever describes the task actually being viewed - so a
-    // stale cross-task status update must not borrow that task's completion
-    // into the currently-viewed task's "finished" signal.
+    // stray events must not repaint TASK_SCOPED_ACTION_TYPES's state for
+    // whatever task is now on screen - not just DAG/step state, but the chat
+    // transcript, trace log, context/memory display, and processing/status
+    // flags too, since a background task's reply or tool trace has no
+    // business appearing in a different task's conversation. Deliberately
+    // keyed ONLY off currentState.taskId (not currentTask.id): switching
+    // tasks via setTaskId leaves a real window where taskId has already
+    // advanced to the new task but currentTask still describes the old one
+    // (until that task's own task_info arrives) - matching against
+    // currentTask.id in that window would let the old task's stray events
+    // right back through, defeating the whole guard.
     const messageTaskId = (message as unknown as { task_id?: unknown }).task_id
-    const isStaleCrossTaskDagAction = (action: AppAction): boolean => {
-      if (
-        action.type !== "SET_DAG_EXECUTION"
-        && action.type !== "SET_STEPS"
-        && action.type !== "ADD_STEP"
-        && action.type !== "UPDATE_STEP"
-        && action.type !== "UPDATE_TASK_STATUS"
-      ) return false
-      if (messageTaskId === undefined || messageTaskId === null || messageTaskId === "") return false
-      // No task is even being viewed (currentState.taskId null/undefined) but
-      // this message names a specific task - that can only be a stray event
-      // for a task other than "the current view", so it must be dropped too
-      // (not just the "viewing a *different* task" case).
-      return String(messageTaskId) !== String(currentState.taskId)
-    }
+    // No task is even being viewed (currentState.taskId null/undefined) but
+    // this message names a specific task - that can only be a stray event
+    // for a task other than "the current view", so it counts as "for another
+    // task" too (not just the "viewing a *different* task" case).
+    const isMessageForOtherTask =
+      messageTaskId !== undefined && messageTaskId !== null && messageTaskId !== ""
+      && String(messageTaskId) !== String(currentState.taskId)
     const dispatch: React.Dispatch<AppAction> = (action) => {
-      if (isStaleCrossTaskDagAction(action)) return
+      if (TASK_SCOPED_ACTION_TYPES.has(action.type) && isMessageForOtherTask) return
       rawDispatch(action)
     }
+    // The 30s dedup cache below is keyed on message content/type only, not
+    // task id - several dedupKeys (e.g. dag-execute-end's "task end, this
+    // iteration") are templated purely on generic fields like iteration
+    // count, so a background task and the currently-viewed task can produce
+    // the exact same key. A stale event for another task never reaches
+    // `dispatch` (filtered above), but if it were still allowed to *insert*
+    // into the cache, it would silently swallow the viewed task's own
+    // legitimate ADD_MESSAGE as a "duplicate" moments later. Skip caching
+    // (not skip the check itself) whenever the message belongs elsewhere.
+    const isDuplicateMessageForViewedTask = (
+      content: string | React.ReactNode,
+      type = "general",
+      force = false,
+      shouldCache = true,
+    ) => isDuplicateMessage(content, type, force, shouldCache && !isMessageForOtherTask)
+    const isDuplicateResultForViewedTask = (content: string) =>
+      isDuplicateMessage(content, "result", false, !isMessageForOtherTask)
     // If we're in replay mode, don't process immediately - collect for delayed playback
     if (
       !options?.skipHistory
@@ -2327,7 +2353,7 @@ export function AppProvider({
         const chatData = message as any
         const messageContent = chatData.message || ""
 
-        if (!isDuplicateMessage(messageContent, 'user-message')) {
+        if (!isDuplicateMessageForViewedTask(messageContent, 'user-message')) {
           dispatch({
             type: "ADD_MESSAGE",
             payload: {
@@ -2481,7 +2507,7 @@ export function AppProvider({
             // legacy events without either identity fall back to short-lived
             // content-based deduplication.
             const isDuplicate = userMessageId === null
-              ? isDuplicateMessage(messageContent, 'user-message', false, true)
+              ? isDuplicateMessageForViewedTask(messageContent, 'user-message', false, true)
               : false
             console.log('🔍 Duplicate check:', {
               messageContent,
@@ -2675,7 +2701,7 @@ export function AppProvider({
             if (shouldHideAgentMessage) {
               return
             }
-            if (!streamMessageId && isDuplicateMessage(messageContent, 'agent-message')) {
+            if (!streamMessageId && isDuplicateMessageForViewedTask(messageContent, 'agent-message')) {
               return
             }
             const msgId = generateMessageId("msg-agent")
@@ -2722,7 +2748,7 @@ export function AppProvider({
 
               // Use consistent string format for deduplication
               const dedupKey = `plan-start:${phase}`
-              if (!isDuplicateMessage(dedupKey, 'dag-plan-start')) {
+              if (!isDuplicateMessageForViewedTask(dedupKey, 'dag-plan-start')) {
                 dispatch({
                   type: "ADD_MESSAGE",
                   payload: {
@@ -2808,7 +2834,7 @@ export function AppProvider({
             }
 
             const dedupKey = t('agent.logs.event.messages.planEnd', { planId, stepsCount })
-            if (!isDuplicateMessage(dedupKey, 'plan-end')) {
+            if (!isDuplicateMessageForViewedTask(dedupKey, 'plan-end')) {
               dispatch({
                 type: "ADD_MESSAGE",
                 payload: {
@@ -2862,7 +2888,7 @@ export function AppProvider({
 
             // Use consistent string format for deduplication
             const dedupKey = t('agent.logs.event.messages.taskStart', { iteration })
-            if (!isDuplicateMessage(dedupKey, 'dag-execute-start')) {
+            if (!isDuplicateMessageForViewedTask(dedupKey, 'dag-execute-start')) {
               dispatch({
                 type: "ADD_MESSAGE",
                 payload: {
@@ -2903,7 +2929,7 @@ export function AppProvider({
 
             // Use consistent string format for deduplication
             const dedupKey = t('agent.logs.event.messages.taskEnd', { iteration })
-            if (!isDuplicateMessage(dedupKey, 'dag-execute-end')) {
+            if (!isDuplicateMessageForViewedTask(dedupKey, 'dag-execute-end')) {
               dispatch({
                 type: "ADD_MESSAGE",
                 payload: {
@@ -2975,7 +3001,7 @@ export function AppProvider({
               // the same step, or with identical token counts) each show, while
               // a re-dispatched same event is still deduped.
               const noticeKey = `compact-notice-${stepId}-${message.timestamp}`
-              if (!isDuplicateMessage(noticeText, noticeKey)) {
+              if (!isDuplicateMessageForViewedTask(noticeText, noticeKey)) {
                 dispatch({
                   type: "ADD_MESSAGE",
                   payload: {
@@ -3167,7 +3193,7 @@ export function AppProvider({
             if (eventData.task_type === "final_answer_generation") {
               // Check for duplicate final_answer_generation start events
               const content = t('agent.logs.event.messages.finalAnswerGenerating')
-              if (!isDuplicateMessage(content, 'final_answer_start')) {
+              if (!isDuplicateMessageForViewedTask(content, 'final_answer_start')) {
                 dispatch({
                   type: "ADD_MESSAGE",
                   payload: {
@@ -3227,7 +3253,7 @@ export function AppProvider({
             if (eventData.task_type === "final_answer_generation") {
               // Check for duplicate final_answer_generation end events
               const content = t('agent.logs.event.messages.finalAnswerCompleted')
-              if (!isDuplicateMessage(content, 'final_answer_end')) {
+              if (!isDuplicateMessageForViewedTask(content, 'final_answer_end')) {
                 dispatch({
                   type: "ADD_MESSAGE",
                   payload: {
@@ -3762,7 +3788,7 @@ export function AppProvider({
                   </div>
                 </div>
               )
-              if (!isDuplicateResult(`📋 ${t('agent.logs.event.messages.metaTitle')}: ${JSON.stringify(metaInfo)}`)) {
+              if (!isDuplicateResultForViewedTask(`📋 ${t('agent.logs.event.messages.metaTitle')}: ${JSON.stringify(metaInfo)}`)) {
                 dispatch({
                   type: "ADD_MESSAGE",
                   payload: {
@@ -3831,7 +3857,7 @@ export function AppProvider({
                 </>
               )
 
-              if (!isDuplicateResult(`📁 ${t('agent.logs.event.messages.fileOutputsGenerated', { count: fileCount })}`)) {
+              if (!isDuplicateResultForViewedTask(`📁 ${t('agent.logs.event.messages.fileOutputsGenerated', { count: fileCount })}`)) {
                 dispatch({
                   type: "ADD_MESSAGE",
                   payload: {
@@ -4005,7 +4031,7 @@ export function AppProvider({
               result && typeof result === "object" && result.status === "waiting_for_user"
                 ? result.message || ""
                 : ""
-            if (messageContent && !isDuplicateMessage(messageContent, 'agent-message')) {
+            if (messageContent && !isDuplicateMessageForViewedTask(messageContent, 'agent-message')) {
               const interactions = normalizeInteractions(result.interactions)
               const msgId = generateMessageId("msg-agent")
               dispatch({
@@ -4938,7 +4964,7 @@ export function AppProvider({
             </>
           )
 
-          if (!isDuplicateResult(`📁 ${t('agent.logs.event.messages.fileOutputsGenerated', { count: fileCount })}`)) {
+          if (!isDuplicateResultForViewedTask(`📁 ${t('agent.logs.event.messages.fileOutputsGenerated', { count: fileCount })}`)) {
             dispatch({
               type: "ADD_MESSAGE",
               payload: {
@@ -5084,7 +5110,7 @@ export function AppProvider({
         if (
           waitingMessage &&
           waitingMessage !== "Task waiting for user response" &&
-          !isDuplicateMessage(waitingMessage, 'agent-message')
+          !isDuplicateMessageForViewedTask(waitingMessage, 'agent-message')
         ) {
           dispatch({
             type: "ADD_MESSAGE",
@@ -5172,7 +5198,7 @@ export function AppProvider({
           dispatch({ type: "SET_PROCESSING", payload: false })
         }
 
-        if (!isDuplicateMessage(websocketErrorMessage, "agent-error")) {
+        if (!isDuplicateMessageForViewedTask(websocketErrorMessage, "agent-error")) {
           dispatch({
             type: "ADD_MESSAGE",
             payload: {

@@ -100,7 +100,7 @@ export function ProgressPanel({
           <h2 className="text-sm font-semibold text-foreground">
             {t("chatPage.progressPanel.title")}
           </h2>
-          {totalKnown && (
+          {totalKnown && steps.length > 0 && (
             <span className="text-xs text-muted-foreground">
               {resolvedCount}/{steps.length}
             </span>

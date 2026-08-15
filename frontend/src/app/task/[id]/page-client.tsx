@@ -69,9 +69,24 @@ function TaskDetailContent() {
       // can render more than one trace group tagged with the same
       // data-step-id - take the LAST match (the current/most recent one)
       // rather than the first, which querySelector would otherwise return.
-      const matches = document.querySelectorAll(`[data-step-id="${CSS.escape(stepId)}"]`)
-      const target = matches[matches.length - 1]
-      target?.scrollIntoView({ behavior: "smooth", block: "center" })
+      // Step ids are LLM-generated plan identifiers with no schema
+      // constraint on their content (see plan_generator.py's tool schema),
+      // so they can legitimately contain quotes/backslashes - CSS.escape
+      // handles that, but is absent in some test/DOM-shim environments (e.g.
+      // jsdom without the polyfill); querySelectorAll throws a SyntaxError on
+      // an unescaped special character, so wrap in try/catch rather than
+      // letting that escape this window event listener uncaught.
+      const escapedStepId = typeof CSS !== "undefined" && typeof CSS.escape === "function"
+        ? CSS.escape(stepId)
+        : stepId.replace(/["\\]/g, "\\$&")
+      try {
+        const matches = document.querySelectorAll(`[data-step-id="${escapedStepId}"]`)
+        const target = matches[matches.length - 1]
+        target?.scrollIntoView({ behavior: "smooth", block: "center" })
+      } catch {
+        // Malformed selector (unescaped special char with no CSS.escape) -
+        // nothing to scroll to safely; fail silently.
+      }
     }
     window.addEventListener("scrollToTraceStep", handleScrollToTraceStep as EventListener)
     return () => window.removeEventListener("scrollToTraceStep", handleScrollToTraceStep as EventListener)
@@ -139,7 +154,7 @@ function TaskDetailContent() {
                 variant="ghost"
                 size="icon"
                 className={cn("rounded-full flex-shrink-0", progressPanelOpen ? "bg-muted text-primary" : "hover:bg-muted")}
-                onClick={() => setProgressPanelOpen((open) => !open)}
+                onClick={() => (progressPanelOpen ? handleCollapseProgressPanel() : setProgressPanelOpen(true))}
                 title={t("chatPage.progressPanel.toggleTooltip")}
                 aria-pressed={progressPanelOpen}
               >

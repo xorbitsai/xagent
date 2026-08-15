@@ -426,6 +426,12 @@ function SeedRunningTask() {
   const { dispatch } = useApp()
 
   React.useEffect(() => {
+    // Real navigation always sets taskId alongside currentTask (setTaskId,
+    // ADOPT_SESSION_TASK, and every builder/workforce dispatch site do both
+    // together) - seed both here too, matching SeedExistingTask below, so
+    // this fixture doesn't exercise a "viewing task 1 but taskId is null"
+    // shape that never happens in production.
+    dispatch({ type: "SET_TASK_ID", payload: 1 })
     dispatch({
       type: "SET_CURRENT_TASK",
       payload: {

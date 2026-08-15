@@ -185,7 +185,7 @@ def _clean_degradation_registry():
 # The two assertions below read that type back rather than duplicating it:
 # the first confirms the Union has exactly the eight known member classes,
 # the second (further down, next to the mapping meta-test) confirms the
-# 14 (outcome, reason) pairs it derives from those classes' own Literal
+# 20 (outcome, reason) pairs it derives from those classes' own Literal
 # annotations still match what every test in this file actually produces.
 
 
@@ -2580,11 +2580,14 @@ def test_respond_reports_stale_for_a_terminated_row(
 
         # Written out as three literal constructions rather than the one
         # line ``svc.RespondStale(reason=expected_reason)`` this branch
-        # collapses to: the mapping meta-test at the bottom of this file
-        # finds a covered pair by AST-scanning for
+        # collapses to, kept apart deliberately: the mapping meta-test at
+        # the bottom of this file finds a covered pair by AST-scanning for
         # ``svc.Respond*(reason=<constant>)``, and a variable in that slot
-        # is invisible to it -- collapsing this would silently drop three
-        # Stale pairs from the coverage set while every test still passed.
+        # is invisible to that scan. Written as a literal here is what
+        # makes each of the three reasons visible to it; collapsing to the
+        # variable form would not fail silently -- the meta-test would
+        # turn red, reporting these same three ``Stale`` pairs as having
+        # zero covering cells.
         if expected_reason == "expired":
             assert outcome == svc.RespondStale(reason="expired")
         elif expected_reason == "run_superseded":

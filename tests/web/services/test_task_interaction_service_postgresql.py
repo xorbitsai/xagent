@@ -11,10 +11,13 @@ in this delivery that a SQLite-backed test cannot actually exercise:
   backends agree. (The TaskStatus-bind-parameter structural guard this
   bullet used to also cover needs no database at all and lives in the
   sibling SQLite-backed file instead.)
-- ``respond()``'s six non-active-row rowcount=0 classifications and the
-  three answered-row CHECK constraints, run against a real PostgreSQL
-  server rather than as a second copy of the SQLite-backed cell tests --
-  the point here is the backend, not new behavior coverage.
+- ``respond()``'s six fence-miss (rowcount=0) classifications -- four of
+  them from a non-active interaction row (already answered, or terminated
+  for one of three reasons), the other two from a row that is still
+  ``active`` but whose *task* has moved on -- and the three answered-row
+  CHECK constraints, run against a real PostgreSQL server rather than as a
+  second copy of the SQLite-backed cell tests -- the point here is the
+  backend, not new behavior coverage.
 - Four genuinely concurrent tests, each opening a second real connection:
   the ownership-change TOCTOU window that PostgreSQL's row lock closes
   (which SQLite's single-writer model cannot reproduce), two
@@ -430,15 +433,20 @@ def _pg_envelope(idempotency_key: str) -> svc.RespondEnvelope:
     )
 
 
-def test_answer_fence_rowcount_across_six_non_active_states(_respond_pg) -> None:
+def test_answer_fence_rowcount_across_six_fence_miss_states(_respond_pg) -> None:
     """Each of the six ways the fence UPDATE can land on rowcount=0,
     exercised sequentially (one ``svc.respond()`` call after another, no
     concurrent writer) against a real PostgreSQL server rather than SQLite --
     the point of running this here instead of in the SQLite-backed sibling
-    file is the backend, not concurrency. Each case runs through
-    ``svc.respond()`` end to end rather than the fence statement in
-    isolation. Actual concurrent-writer coverage lives in the dedicated
-    tests below this one (``test_concurrent_ownership_change_is_blocked...``,
+    file is the backend, not concurrency. Only cases 1-4 below put the
+    interaction row itself in a non-active state (answered, or terminated
+    for one of three reasons); cases 5 and 6 leave the row ``active`` and
+    move the *task* on instead (off ``WAITING_FOR_USER``, and onto a
+    different run), which is what still lands the fence on rowcount=0 for
+    those two. Each case runs through ``svc.respond()`` end to end rather
+    than the fence statement in isolation. Actual concurrent-writer
+    coverage lives in the dedicated tests below this one
+    (``test_concurrent_ownership_change_is_blocked...``,
     ``test_two_concurrent_respond_calls_serialize...``, and the
     deadlock/residue tests), which do open a second connection."""
 
@@ -666,16 +674,25 @@ def test_concurrent_ownership_change_is_blocked_until_respond_commits(
 
 def test_two_concurrent_respond_calls_serialize_on_the_tasks_row(_respond_pg) -> None:
     """Two real connections answering the same row with different
-    idempotency keys must never both win: step 2's row lock serializes
-    them, and the loser's fence UPDATE matches zero rows once the winner
-    commits. This build classifies that miss, so the loser now gets a
-    specific outcome rather than the conservative sibling's
-    ``OutcomeUnknown`` -- but the assertion below deliberately stays wide,
-    accepting any ``Stale`` or ``Conflict``. Which of them the loser lands
-    on depends on how far the winner's transaction had progressed when the
-    loser reread the row, and pinning that would be pinning an
-    interleaving, not a contract. The invariant this test exists to pin is
-    "never both win"."""
+    idempotency keys must never both win: step 2's ``FOR NO KEY UPDATE``
+    row lock blocks the loser at its own step 2 until the winner's entire
+    transaction -- fence UPDATE, Task CAS, staged command, and commit --
+    has gone through, so the loser's own fence UPDATE only ever runs
+    against an already-answered row. That ordering makes the loser's path
+    deterministic, not merely "some Stale or Conflict": the winner's CAS
+    (``apply_task_control_transition``, step 7) never touches
+    ``Task.status``, only ``state_version``/``control_state``, so the
+    loser's own fence still finds ``Task.status`` at ``WAITING_FOR_USER``
+    and only the interaction row's own active-row criteria fail; nothing
+    in this test reclaims the interaction's resume anchor between the two
+    calls, so the loser's step 5.5 still resolves it; and the winner's
+    idempotency key is not the loser's own, so the loser's reread finds no
+    command staged under its key. Every one of those is what the loser's
+    fence-miss classification (step 6) needs to land on
+    ``Conflict(already_answered)`` specifically. The assertion below still
+    only checks that exactly one call lands outside ``Accepted``, without
+    pinning that specific reason -- the invariant this test exists to pin
+    is "never both win", not the loser's exact outcome."""
 
     user_id, task_id = _pg_waiting_task(_respond_pg)
     interaction_id = _pg_active_row(_respond_pg, task_id=task_id)

@@ -2015,11 +2015,12 @@ def respond(
        requires the owner in person, so an admin acting on another user's
        task and a guest whose ``principal.user_id`` is not the owner's
        both reach it on PostgreSQL too, alongside SQLite's own concurrent
-       ownership change (see that predicate's own docstring). The reread
-       row's state is logged before the classification runs, because no
-       outcome variant carries those columns. ``rowcount > 1`` is a schema
-       invariant violation (``uq_task_interaction_active_slot``) and
-       raises.
+       ownership change and, for a guest, SQLite's own concurrent write to
+       ``agent_config["guest_id"]`` between step 2's read and the fence
+       (see that predicate's own docstring). The reread row's state is
+       logged before the classification runs, because no outcome variant
+       carries those columns. ``rowcount > 1`` is a schema invariant
+       violation (``uq_task_interaction_active_slot``) and raises.
     7. The Task CAS via ``apply_task_control_transition``, called with no
        ``expected_run_id`` / ``expected_state_version`` -- this function
        takes no caller-supplied optimistic-concurrency token, so neither of
@@ -2279,7 +2280,14 @@ def respond(
             # changed since step 4's read); without expiring first, the
             # ORM would hand this query's result back through the same
             # already-loaded, now-stale Python object instead of the fresh
-            # row this reread exists to see.
+            # row this reread exists to see. This has to expire the whole
+            # session, not just ``ir`` -- the classification below also
+            # reads ``task.status`` and ``task.run_id`` (the "active"
+            # branch further down), and those need refreshing too: without
+            # it, ``task.status`` would still read back step 2's own
+            # WAITING_FOR_USER value even after some other writer moved the
+            # task on, and a genuine ``run_ended`` miss would misclassify
+            # as an ownership miss (``not_task_principal``) instead.
             db.expire_all()
             reread = get(db, task_id=task_id, interaction_id=interaction_id)
             if reread is None:
@@ -2291,7 +2299,14 @@ def respond(
             # what it found costs no extra statement. The classification
             # below tells the *caller* which miss this was; this line tells
             # an *operator* what the row actually looked like, and the two
-            # are not the same information. No ``RespondOutcome`` variant
+            # are not the same information. The reason it hands back
+            # describes the row and task as this reread found them, not
+            # necessarily the exact condition that made the fence UPDATE's
+            # own WHERE clause fail to match: neither backend holds a lock
+            # across the gap between that UPDATE and this SELECT, so in
+            # principle the row could change again in between and the
+            # label would name whatever this reread actually saw, not the
+            # original miss. No ``RespondOutcome`` variant
             # carries ``active_slot``, ``terminal_reason``, ``run_id`` or
             # ``responder_identity``: ``Stale(run_superseded)`` names the
             # reason without naming the run, and ``Conflict
@@ -2362,13 +2377,22 @@ def respond(
                 increment_counter(COUNTER_LIFECYCLE_RESPONSE_CONFLICT)
                 return RespondConflict(reason="already_answered")
             if reread.status == "terminated":
-                terminal_reason_map: dict[str, RespondStaleReason] = {
+                # No ``or ""`` fallback needed on the lookup key --
+                # ``ck_task_interaction_requests_terminal_pairs_status`` is
+                # a biconditional (``status = 'terminated'`` iff
+                # ``terminal_reason IS NOT NULL``), so a row that reaches
+                # this branch is guaranteed by the database itself to carry
+                # a non-``None`` ``terminal_reason``. The ``cast`` below is
+                # only for mypy's benefit (the mapped column's static type
+                # is ``str | None``); it asserts that guarantee, it does
+                # not substitute a runtime value the way ``or ""`` did.
+                terminal_stale_reasons: dict[str, RespondStaleReason] = {
                     "deadline_elapsed": "expired",
                     "run_superseded": "run_superseded",
                     "answered_via_legacy_resume": "answered_via_chat",
                 }
-                mapped_reason = terminal_reason_map.get(
-                    str(reread.terminal_reason or "")
+                mapped_reason = terminal_stale_reasons.get(
+                    cast(str, reread.terminal_reason)
                 )
                 if mapped_reason is None:
                     raise RuntimeError(
@@ -2385,16 +2409,23 @@ def respond(
                 # left that can have failed is
                 # ``_answer_fence_task_predicate``'s ownership conjunction
                 # -- which requires ``principal.user_id`` to be the task's
-                # owner on both backends. Three callers land here: an admin
+                # owner on both backends. Four callers land here: an admin
                 # answering someone else's task, a guest whose bindings
                 # match but whose ``principal.user_id`` is not the owner's
                 # (both of which pass step 3's Python authorization and
                 # fail only at the write point), and, on SQLite alone,
-                # ownership changing between step 2's read and this
-                # statement. See ``_answer_fence_task_predicate``'s own
-                # docstring for which of its six terms are re-asserted in
-                # SQL and which are checked once in Python.
+                # ``Task.user_id`` changing between step 2's read and this
+                # statement, or, also SQLite-only, a guest's
+                # ``agent_config["guest_id"]`` changing in that same window.
+                # See ``_answer_fence_task_predicate``'s own docstring for
+                # which of its six terms are re-asserted in SQL and which
+                # are checked once in Python.
                 if task.status != TaskStatus.WAITING_FOR_USER:
+                    # Covers every other ``TaskStatus`` member: PENDING,
+                    # RUNNING, PAUSED, COMPLETED, FAILED -- five non-waiting
+                    # states this one comparison treats alike, without
+                    # distinguishing which of them the task actually moved
+                    # to.
                     return RespondStale(reason="run_ended")
                 if task.run_id != reread.run_id:
                     return RespondStale(reason="foreign_run")

@@ -2327,20 +2327,38 @@ def respond(
                     )
                     .first()
                 )
-                if fresh_command is not None and _matches_existing(
-                    fresh_command,
-                    actor_user_id=actor_user_id,
-                    kind=TaskCommandKind.RESUME,
-                    payload=command_payload,
-                ):
-                    return RespondReplayed(
-                        receipt=_respond_receipt(
-                            interaction=reread,
-                            task=task,
-                            command_db_id=int(fresh_command.id),
-                            idempotency_key=normalized_key,
+                if fresh_command is not None:
+                    # A command row under this exact idempotency key exists
+                    # now, even though step 5's pre-read (run before the
+                    # fence attempt) found none: the row that answered this
+                    # interaction was staged concurrently, in the same
+                    # window this call's own fence attempt lost. Whether
+                    # that command is this call's own request replaying, or
+                    # a different payload racing under the same reused key,
+                    # is exactly the question step 5's own two-way split
+                    # answers, so this reread applies the same test: a
+                    # payload match is a replay, a mismatch is
+                    # ``idempotency_key_reused`` (see step 5 above).
+                    if _matches_existing(
+                        fresh_command,
+                        actor_user_id=actor_user_id,
+                        kind=TaskCommandKind.RESUME,
+                        payload=command_payload,
+                    ):
+                        return RespondReplayed(
+                            receipt=_respond_receipt(
+                                interaction=reread,
+                                task=task,
+                                command_db_id=int(fresh_command.id),
+                                idempotency_key=normalized_key,
+                            )
                         )
-                    )
+                    increment_counter(COUNTER_LIFECYCLE_RESPONSE_CONFLICT)
+                    return RespondConflict(reason="idempotency_key_reused")
+                # No command row exists under this key at all: some other,
+                # unrelated write answered this row (not one racing this
+                # call's own idempotency key), so there is nothing to
+                # replay or compare payloads against.
                 increment_counter(COUNTER_LIFECYCLE_RESPONSE_CONFLICT)
                 return RespondConflict(reason="already_answered")
             if reread.status == "terminated":

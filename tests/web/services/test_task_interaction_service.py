@@ -26,10 +26,10 @@ graph in a fresh session before falling back to ``OutcomeUnknown``. So the
 only ``OutcomeUnknown``-producing cells left are the two durable-graph
 reconciliation failures: an ambiguous commit with nothing in the graph to
 find, and one that lands under a different identity. The matrix
-below enumerates this build's own 36 triggering cells, producing 20
-distinct (outcome type, reason) pairs -- fewer than 36 because several
+below enumerates this build's own 38 triggering cells, producing 20
+distinct (outcome type, reason) pairs -- fewer than 38 because several
 cells share a pair (eight "principal does not own this task" cells all
-produce ``(RespondUnauthorized, not_task_principal)``; three "same
+produce ``(RespondUnauthorized, not_task_principal)``; four "same
 idempotency key, different actor" cells all produce ``(RespondConflict,
 idempotency_key_reused)``; two "the task is no longer waiting" cells both
 produce ``(RespondStale, run_ended)``; two distinct triggers collapse
@@ -70,15 +70,20 @@ The full cell-to-pair mapping:
     U1        -> (Unavailable, task_missing)                         1
     U2        -> (Unavailable, interaction_missing)                  1
     U3        -> (Unavailable, checkpoint_unavailable)                1
-    R1..R3    -> (Replayed, None)      1 (3 cells share it -- the plain
+    R1..R4    -> (Replayed, None)      1 (4 cells share it -- the plain
                  replay, a replay of an already-answered row whose resume
-                 anchor was pruned before the retry, and a staging race
-                 whose winner's row carries this call's own payload)
+                 anchor was pruned before the retry, a staging race whose
+                 winner's row carries this call's own payload, and a
+                 replay recognized only at the fence-miss reread because
+                 the racing command lands under this call's own key after
+                 step 5's own pre-read already ran and found nothing)
     C1        -> (Conflict, already_answered)                        1
-    C2..C4    -> (Conflict, idempotency_key_reused)      1 (3 cells share
-                 it -- two "same key, different submitter" cells, and a
-                 staging race whose winner's row carries a different
-                 payload)
+    C2..C5    -> (Conflict, idempotency_key_reused)      1 (4 cells share
+                 it -- the two step-5 pre-read cells, a staging race whose
+                 winner's row carries a different payload, and a
+                 fence-miss reread finding a same-key command staged after
+                 step 5's pre-read whose payload does not match this
+                 call's own)
     S1        -> (Stale, expired)                                    1
     S2        -> (Stale, run_superseded)                             1
     S3        -> (Stale, answered_via_chat)                          1
@@ -93,7 +98,7 @@ The full cell-to-pair mapping:
                  landed write, and one whose reconciliation finds a
                  landed row under a different identity)
     -----------------------------------------------------------------
-    36 cells; 20 distinct pairs (18 single-reason cells + V1's own 2)
+    38 cells; 20 distinct pairs (18 single-reason cells + V1's own 2)
 
 The cell-by-cell tests this matrix implies, and the mapping meta-test that
 checks their coverage against the vocabulary, are both in this file now,
@@ -107,7 +112,7 @@ layers:
 | Assertion | Checks | Catches | Misses |
 |---|---|---|---|
 | Union-membership guard (this file, written) | ``RespondOutcome`` has exactly its eight known member classes | A variant added or removed without updating this list | Reason-level coverage |
-| Cell-by-cell tests (this file, written) | One test per of the 36 cells, asserting outcome + reason + zero side effects | A regression in one specific cell's behavior | A forgotten test |
+| Cell-by-cell tests (this file, written) | One test per of the 38 cells, asserting outcome + reason + zero side effects | A regression in one specific cell's behavior | A forgotten test |
 | Mapping meta-test (this file, written) | Each of the 20 pairs is produced by >= 1 cell's test (18 singles + one cell's own 2) | A new cell that produces a new pair with no test written for it; the two-reason cell's parametrization missing a reason | A new cell that produces no *new* pair (e.g. a ninth not_task_principal scenario) -- caught by review, not this meta-test |
 """
 
@@ -2298,6 +2303,171 @@ def test_respond_logs_the_reread_row_state_when_the_fence_misses(
     assert "status=answered" in matching[0].getMessage()
 
 
+def _racing_fence_stmt_that_answers_with_command(
+    session_factory,
+    *,
+    interaction_id: int,
+    task_id: int,
+    responder_identity: str,
+    response_payload: dict[str, Any],
+    command_id: str,
+    actor_user_id: int | None,
+    command_payload: dict[str, Any],
+    race_result: dict[str, Any],
+) -> Any:
+    """Build a monkeypatch replacement for ``svc._answer_fence_stmt`` that
+    races a concurrent answer plus a same-idempotency-key RESUME command
+    onto the row in the one window that can produce it: after step 5's
+    idempotency pre-read has already run and found nothing under this key,
+    but before step 6's own fence UPDATE (and its zero-rowcount reread)
+    sees the row. Staging the same race as ordinary test setup *before*
+    calling ``respond()`` -- the way the C2/C3 pre-read tests below do --
+    would make step 5's own pre-read find it first and answer from there,
+    never reaching the reread branch this pair of tests exists to cover.
+
+    Records the post-race graph snapshot and the racer's own staged
+    ``command_db_id`` into ``race_result`` so the two tests using this can
+    assert, respectively, that the receipt names the racer's row and that
+    this call's own losing attempt adds nothing on top of the race."""
+
+    real_fence_stmt = svc._answer_fence_stmt
+
+    def _racing_fence_stmt(*args: Any, **kwargs: Any) -> Any:
+        race_db = session_factory()
+        try:
+            race_db.query(TaskInteractionRequest).filter(
+                TaskInteractionRequest.id == interaction_id
+            ).update(
+                {
+                    "status": "answered",
+                    "active_slot": None,
+                    "response_payload": response_payload,
+                    "responded_at": _now(),
+                    "responder_identity": responder_identity,
+                }
+            )
+            command = TaskExecutionCommand(
+                task_id=task_id,
+                actor_user_id=actor_user_id,
+                command_id=command_id,
+                kind=svc.TaskCommandKind.RESUME.value,
+                payload=command_payload,
+                status="completed",
+            )
+            race_db.add(command)
+            race_db.commit()
+            race_db.refresh(command)
+            race_result["command_db_id"] = int(command.id)
+        finally:
+            race_db.close()
+        race_result["snapshot"] = _graph_snapshot(
+            session_factory, task_id=task_id, interaction_id=interaction_id
+        )
+        return real_fence_stmt(*args, **kwargs)
+
+    return _racing_fence_stmt
+
+
+def test_respond_reports_replay_when_a_racing_command_lands_between_the_preread_and_the_fence(
+    _respond_db, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The fence-miss reread branch (step 6), not step 5's own pre-read,
+    is what recognizes this replay: the racing command is staged in the
+    window between the two, so step 5 finds nothing and this call only
+    discovers its own answer already landed once it rereads the row after
+    losing the fence. The receipt it returns must name the racing
+    command's own row, not synthesize one of this call's own."""
+
+    user_id, task_id = _waiting_task(_respond_db)
+    principal = _owning_principal(user_id)
+    interaction_id = _active_row_ready_for_respond(_respond_db, task_id=task_id)
+    envelope = _respond_envelope(idempotency_key="racing-replay-key")
+    command_payload = svc._respond_command_payload(
+        interaction_id=interaction_id, principal=principal, values=envelope.values
+    )
+    race_result: dict[str, Any] = {}
+    monkeypatch.setattr(
+        svc,
+        "_answer_fence_stmt",
+        _racing_fence_stmt_that_answers_with_command(
+            _respond_db,
+            interaction_id=interaction_id,
+            task_id=task_id,
+            responder_identity=principal.identity_string(),
+            response_payload=envelope.values,
+            command_id=envelope.idempotency_key,
+            actor_user_id=principal.user_id,
+            command_payload=command_payload,
+            race_result=race_result,
+        ),
+    )
+
+    outcome = svc.respond(
+        interaction_id=interaction_id,
+        task_id=task_id,
+        principal=principal,
+        envelope=envelope,
+    )
+
+    assert isinstance(outcome, svc.RespondReplayed)
+    assert outcome.receipt.command_db_id == race_result["command_db_id"]
+
+
+def test_respond_reports_conflict_when_a_racing_command_with_a_different_payload_lands_between_the_preread_and_the_fence(
+    _respond_db, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Same race as the replay test above, except the command that lands
+    under this call's idempotency key carries different answer values --
+    a second submitter reusing the key, not this call's own retry. The
+    fence-miss reread branch must draw the same already-answered/idempotency
+    distinction step 5's own pre-read draws: a same-key command that does
+    not match this call's payload is ``idempotency_key_reused``, not
+    ``already_answered`` (which is reserved for a miss where no command
+    exists under this key at all). This call's own losing attempt must add
+    nothing beyond what the race itself committed -- checked directly
+    against the race's own post-commit snapshot, since the standard
+    ``_asserts_no_side_effects`` helper's pre-call snapshot would predate
+    the race and always show a diff that is the race's doing, not this
+    call's."""
+
+    user_id, task_id = _waiting_task(_respond_db)
+    principal = _owning_principal(user_id)
+    interaction_id = _active_row_ready_for_respond(_respond_db, task_id=task_id)
+    envelope = _respond_envelope(idempotency_key="racing-conflict-key")
+    mismatched_payload = svc._respond_command_payload(
+        interaction_id=interaction_id, principal=principal, values={"env": "staging"}
+    )
+    race_result: dict[str, Any] = {}
+    monkeypatch.setattr(
+        svc,
+        "_answer_fence_stmt",
+        _racing_fence_stmt_that_answers_with_command(
+            _respond_db,
+            interaction_id=interaction_id,
+            task_id=task_id,
+            responder_identity=principal.identity_string(),
+            response_payload={"env": "staging"},
+            command_id=envelope.idempotency_key,
+            actor_user_id=principal.user_id,
+            command_payload=mismatched_payload,
+            race_result=race_result,
+        ),
+    )
+    before_counter = _conflict_counter()
+
+    outcome = svc.respond(
+        interaction_id=interaction_id,
+        task_id=task_id,
+        principal=principal,
+        envelope=envelope,
+    )
+
+    assert outcome == svc.RespondConflict(reason="idempotency_key_reused")
+    assert _conflict_counter() == before_counter + 1
+    after = _graph_snapshot(_respond_db, task_id=task_id, interaction_id=interaction_id)
+    assert after == race_result["snapshot"]
+
+
 def test_respond_reports_conflict_for_the_same_key_with_a_different_payload(
     _respond_db,
 ) -> None:
@@ -3376,7 +3546,7 @@ def test_respond_reports_outcome_unknown_when_the_replay_branch_commit_fails_and
 # (see the module docstring's three-way division of labor table) -- several
 # triggering conditions collapse onto the same pair (eight distinct
 # "principal does not own this task" scenarios all produce
-# ``not_task_principal``; three distinct "same idempotency key, different
+# ``not_task_principal``; four distinct "same idempotency key, different
 # submitter" scenarios all produce ``idempotency_key_reused``; two
 # distinct "the task is no longer waiting" scenarios both produce
 # ``run_ended``), and one validation scenario is parametrized over two
@@ -3415,8 +3585,8 @@ def test_every_vocabulary_pair_is_produced_by_at_least_one_cell_test() -> None:
     every ``isinstance(outcome, svc.Respond<Type>)`` check the cell tests
     above use, and cross-checks the resulting (type, reason) set against
     the vocabulary. Deliberately not ``len(produced) == len(vocabulary)`` or
-    any other arithmetic against the 36-cell count -- eight
-    not_task_principal cells, three idempotency_key_reused cells and two
+    any other arithmetic against the 38-cell count -- eight
+    not_task_principal cells, four idempotency_key_reused cells and two
     run_ended cells legitimately collapse onto one pair each; this only
     asserts that no vocabulary pair is left with zero producing cells. Its
     blind spot: a new cell that produces no *new* pair -- for example a

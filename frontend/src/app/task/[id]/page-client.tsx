@@ -71,22 +71,16 @@ function TaskDetailContent() {
       // rather than the first, which querySelector would otherwise return.
       // Step ids are LLM-generated plan identifiers with no schema
       // constraint on their content (see plan_generator.py's tool schema),
-      // so they can legitimately contain quotes/backslashes - CSS.escape
-      // handles that, but is absent in some test/DOM-shim environments (e.g.
-      // jsdom without the polyfill); querySelectorAll throws a SyntaxError on
-      // an unescaped special character, so wrap in try/catch rather than
-      // letting that escape this window event listener uncaught.
-      const escapedStepId = typeof CSS !== "undefined" && typeof CSS.escape === "function"
-        ? CSS.escape(stepId)
-        : stepId.replace(/["\\]/g, "\\$&")
-      try {
-        const matches = document.querySelectorAll(`[data-step-id="${escapedStepId}"]`)
-        const target = matches[matches.length - 1]
-        target?.scrollIntoView({ behavior: "smooth", block: "center" })
-      } catch {
-        // Malformed selector (unescaped special char with no CSS.escape) -
-        // nothing to scroll to safely; fail silently.
-      }
+      // so they can legitimately contain quotes/backslashes. Only backslash
+      // and double-quote need escaping inside a double-quoted attribute
+      // selector value - CSS.escape is for identifier syntax (e.g. it
+      // hex-escapes a leading digit), not string-literal content, and is
+      // also absent in some test/DOM-shim environments, so a plain regex
+      // replace is both simpler and correct here.
+      const escapedStepId = stepId.replace(/["\\]/g, "\\$&")
+      const matches = document.querySelectorAll(`[data-step-id="${escapedStepId}"]`)
+      const target = matches[matches.length - 1]
+      target?.scrollIntoView({ behavior: "smooth", block: "center" })
     }
     window.addEventListener("scrollToTraceStep", handleScrollToTraceStep as EventListener)
     return () => window.removeEventListener("scrollToTraceStep", handleScrollToTraceStep as EventListener)

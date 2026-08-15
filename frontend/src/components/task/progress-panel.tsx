@@ -155,6 +155,7 @@ function ProgressStepRow({
   index: number
   onClick?: (stepId: string) => void
 }) {
+  const { t } = useI18n()
   const liveElapsed = useElapsed(step.status === "running" ? step.startedAt : undefined)
   // Completed/failed steps already have both endpoints - a static duration,
   // not another ticking timer, is all that's needed once a step is done.
@@ -207,6 +208,7 @@ function ProgressStepRow({
               step.status === "failed" && "text-foreground",
             )}
           >
+            <span className="sr-only">{t(`agent.layout.status.${step.status}`)}: </span>
             {step.title}
           </span>
           {step.description && (

@@ -57,12 +57,14 @@ COLUMN = "interaction_protocol_version"
 CONSTRAINT_NAME = "ck_tasks_interaction_protocol_version"
 
 # Strip the column definition and its CHECK constraint out of a create_all
-# -rendered CREATE TABLE statement, to reach the shape a database carried
-# through the real revision chain would have (SQLite never receives the
-# CHECK -- see the module docstring and T-M-5 below). Same rename/recreate
-# technique as reset_checkpoint_anchor_fk_create_rule's sibling helper in
-# tests/web/services/checkpoint_anchor_shared.py, extended to also drop a
-# column rather than just one FK clause.
+# -rendered CREATE TABLE statement, to reach the pre-migration shape that
+# upgrade() below rebuilds from. The online migration chain now adds the
+# CHECK back on SQLite too, converging with create_all's shape (see the
+# module docstring and T-M-5 below); only an offline (--sql generation)
+# SQLite upgrade script still produces the unconstrained shape. Same
+# rename/recreate technique as reset_checkpoint_anchor_fk_create_rule's
+# sibling helper in tests/web/services/checkpoint_anchor_shared.py, extended
+# to also drop a column rather than just one FK clause.
 #
 # Both patterns assume today's exact column/constraint shape and fail
 # differently if it changes. _COLUMN_CLAUSE requires a trailing comma, so a
@@ -317,7 +319,7 @@ def test_diff_narrow_inventory_flags_a_changed_check_expression() -> None:
     assert any("checks" in difference for difference in differences)
 
 
-# ---- T-M-5: create_all SQLite cannot be downgraded; migration-chain can ----
+# ---- T-M-5: SQLite downgrade succeeds on both install shapes ----
 
 
 def test_sqlite_downgrade_succeeds_on_both_install_shapes() -> None:
@@ -331,9 +333,10 @@ def test_sqlite_downgrade_succeeds_on_both_install_shapes() -> None:
     downgrade() now rebuilds the table via batch_alter_table on SQLite (see the
     migration's downgrade() online branch), which drops the CHECK and the
     column together regardless of which shape the database has. Both shapes
-    are asserted here: the migration-shaped database never had the CHECK to
-    begin with (T-M-1b/T-M-1d), while the create_all-built one does and must
-    have both the column and the CHECK clause removed from the table DDL.
+    are asserted here: the migration-shaped database now carries the CHECK
+    too, converging with the create_all-built one (T-M-2b above), so
+    downgrade() must remove the column from both -- and, on the create_all
+    shape, the CHECK clause is confirmed gone from the table DDL as well.
     """
     migration = load_migration_module(MIGRATION_PATH)
 

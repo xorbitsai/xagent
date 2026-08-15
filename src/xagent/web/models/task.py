@@ -110,7 +110,8 @@ class Task(Base):  # type: ignore
         # either dialect, and offline SQL support is a hard requirement, so
         # that branch has no path to the CHECK. That remaining asymmetry is
         # asserted as expected, not merely left uncovered -- see
-        # tests/migrations/test_task_interaction_protocol_version_parity.py.
+        # test_offline_upgrade_sqlite_emits_add_column_only in
+        # tests/alembic/test_20260810_add_task_interaction_protocol_version.py.
         #
         # SQLite is the default self-hosted backend (get_database_url()
         # falls back to it when DATABASE_URL is unset); PostgreSQL is the

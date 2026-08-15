@@ -8,19 +8,20 @@ see that predicate's module comment for why: they compile the ownership
 condition into the WHERE clause of a locking ``SELECT``, so "no row came
 back" is what tells them ownership changed, and the row lock they take is
 scoped by that same condition. Loading a row and then calling the shared
-predicate would move the lock and change what a late result means, which is
-exactly the shape ``老路径 extract 不 refactor`` forbids touching. This file
-proves the two independent forms still agree, structurally, rather than
-leaving that agreement to be kept by review alone.
+predicate would move the lock and change what a late result means, so the
+finalizers keep their existing inline form rather than being rewritten to
+call the shared predicate. This file pins the agreement between the two
+forms structurally, rather than leaving it to be kept by review alone.
 
 AST, not text: a substring scan would also match this module's own prose
 mentioning ``Task.runner_id`` or ``lease_attempt_id``, and would not
 distinguish "this identifier appears" from "this identifier appears in the
 fence condition".
 
-Known, deliberate differences between the two forms, none of which this
-file's assertions are blind to -- each is either normalized away or
-explicitly excluded by name below:
+Known, deliberate differences between the two forms -- each entry in this
+table is either normalized away or explicitly excluded by name below (one
+shape outside this table is a disclosed blind spot: see the ownership
+helper's own docstring on constant-valued filter conditions):
 
 | Difference | Why it is not drift |
 |---|---|
@@ -162,6 +163,14 @@ def _finalizer_ownership_triples(func_node: ast.AST) -> set[tuple[str, str, str]
     side is a bare local variable (``task_id``), not a ``task_lease.*``
     attribute access, so it is excluded here by shape rather than
     included and then subtracted -- its presence is asserted separately.
+
+    Known blind spot: this only collects comparisons whose right side is
+    an attribute access. A comparison filtered against a constant (for
+    example ``Task.runner_id == "some-literal"``) does not match that
+    shape, so it is silently dropped from the returned set rather than
+    surfaced as a mismatch -- the equivalence assertion below would not go
+    red for it. If a finalizer's ownership filter ever takes that shape,
+    it needs a human to notice and review it directly.
     """
 
     call = _ownership_filter_call(func_node)

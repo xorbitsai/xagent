@@ -325,8 +325,7 @@ def _assert_create_all_then_upgrade_is_noop(migration, engine) -> None:
 
         columns = {c["name"]: c for c in sa.inspect(connection).get_columns(TABLE)}
         assert COLUMN in columns
-        if connection.dialect.name == "postgresql":
-            assert CONSTRAINT_NAME in _check_constraint_names(connection)
+        assert CONSTRAINT_NAME in _check_constraint_names(connection)
 
 
 def test_create_all_then_upgrade_is_noop_sqlite() -> None:

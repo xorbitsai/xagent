@@ -11,11 +11,12 @@ handles (bare literal, module-scope constant, imported or aliased name,
 attribute access), not only as an inline literal, and the check is
 async-aware so it keeps working if either function becomes ``async def``.
 
-The tree-wide guards that used to live here -- the single-row delete ban,
-the message-type monotonicity sweep and the rollout import ban -- are
-repository-level architecture rules rather than facts about this feature,
-and now live in ``tests/architecture/test_architecture_guards.py``. This
-file imports the constant-resolution helpers from there.
+The guards that used to live here -- the single-row delete ban and the
+message-type monotonicity sweep, both tree-wide scans, plus the rollout
+import ban, a single-file layering rule -- are repository-level
+architecture rules rather than facts about this feature, and now live in
+``tests/architecture/test_architecture_guards.py``. This file imports the
+constant-resolution helpers from there.
 """
 
 from __future__ import annotations

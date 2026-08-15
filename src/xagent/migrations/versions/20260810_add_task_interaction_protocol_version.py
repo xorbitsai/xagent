@@ -148,6 +148,14 @@ def upgrade() -> None:
     # anything else), so the copy cannot fail; a deployment that somehow
     # holds another value must fix the data before upgrading, which is the
     # loud failure this constraint exists to produce.
+    #
+    # This guard's only job is to let a database that already converged
+    # skip the table rebuild if upgrade() ever runs again against it. No
+    # test watches it: batch_alter_table rebuilds the table and adds the
+    # constraint by name either way, so a rebuild that redundantly re-adds
+    # an already-present CHECK is not something a test can observe from
+    # outside. Removing this guard would still leave the migration correct,
+    # it would just rebuild the table once for nothing.
     if CONSTRAINT_NAME not in checks:
         with op.batch_alter_table(TABLE, schema=schema) as batch_op:
             batch_op.create_check_constraint(CONSTRAINT_NAME, CONSTRAINT_CONDITION)

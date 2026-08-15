@@ -244,6 +244,25 @@ def test_ownership_changed_fails_closed() -> None:
     assert resolution.fail_closed_reason == "ownership_changed"
 
 
+def test_run_changed_fails_closed() -> None:
+    """Same runner, different run: ``task_row_matches_lease_owner`` compares
+    both ``runner_id`` and ``run_id``, so a runner that moved to a new run
+    without a matching runner change must fail closed too, not just the
+    runner-changed half covered by ``test_ownership_changed_fails_closed``
+    above."""
+
+    result = {"status": "waiting_for_user", "clarification_draft": _draft()}
+    resolution = resolve_publishable_clarification(
+        result,
+        task=_task(run_id="a-later-run"),
+        lease=_lease(),
+        anchor=_anchor(),
+        now=_now(),
+    )
+    assert isinstance(resolution, FailClosed)
+    assert resolution.fail_closed_reason == "ownership_changed"
+
+
 def test_attempt_mismatch_fails_closed() -> None:
     result = {"status": "waiting_for_user", "clarification_draft": _draft()}
     resolution = resolve_publishable_clarification(

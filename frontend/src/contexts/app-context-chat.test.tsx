@@ -1145,6 +1145,10 @@ describe("AppProvider websocket message routing", () => {
       expect(screen.getByTestId("task-status").textContent).toBe("failed")
       expect(screen.getByTestId("processing").textContent).toBe("false")
     })
+    // This task never entered DAG mode (no dagExecution was ever seeded) -
+    // a failed non-DAG task completion must not fabricate one just because
+    // the completion payload includes a status.
+    expect(screen.getByTestId("dag-phase").textContent).toBe("")
   })
 
   it("surfaces the failure reason from a failed task_completed payload", async () => {
@@ -1460,6 +1464,17 @@ describe("AppProvider websocket message routing", () => {
           },
         },
       })
+      // A real task_completed broadcast nests the task id at task.id, and
+      // useWebSocket's normalizer (use-websocket.ts) lifts it into a
+      // top-level task_id - exercise that exact shape too, not just the
+      // trace_event envelope above.
+      onMessage?.({
+        type: "task_completed",
+        timestamp: "2026-05-27T05:00:03Z",
+        task_id: 2,
+        task: { id: 2, status: "completed" },
+        success: true,
+      } as TestWebSocketMessage)
     })
     await waitFor(() => {
       // dagBurst's dag_step_failed would otherwise flip this to "failed".

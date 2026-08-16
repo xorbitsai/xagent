@@ -1,6 +1,6 @@
 "use client"
 
-import { useEffect, useMemo, useState } from "react"
+import { useEffect, useState } from "react"
 import { CheckCircle2, ChevronLeft, Clock, Loader2, RotateCcw, XCircle } from "lucide-react"
 import { cn } from "@/lib/utils"
 import { normalizeTimestampMs } from "@/lib/time-utils"
@@ -83,12 +83,9 @@ export function ProgressPanel({
   // is counted for the same reason: a failed step is also terminal (it will
   // never transition to "completed"), so excluding it would leave the same
   // "4/6" stuck header on a plan that has actually finished running.
-  const resolvedCount = useMemo(
-    () => steps.filter((step) => (
-      step.status === "completed" || step.status === "skipped" || step.status === "failed"
-    )).length,
-    [steps],
-  )
+  const resolvedCount = steps.filter((step) => (
+    step.status === "completed" || step.status === "skipped" || step.status === "failed"
+  )).length
 
   return (
     <div className="flex h-full flex-col bg-background/80">
@@ -142,7 +139,7 @@ export function ProgressPanel({
         ) : (
           <ol className="space-y-1">
             {steps.map((step, index) => (
-              <ProgressStepRow key={step.id} step={step} index={index} onClick={onStepClick} />
+              <ProgressStepRow key={step.id} step={step} index={index} endedAt={endedAt} onClick={onStepClick} />
             ))}
           </ol>
         )}
@@ -154,21 +151,32 @@ export function ProgressPanel({
 function ProgressStepRow({
   step,
   index,
+  endedAt,
   onClick,
 }: {
   step: ProgressStepView
   index: number
+  endedAt?: string | number
   onClick?: (stepId: string) => void
 }) {
   const { t } = useI18n()
-  const liveElapsed = useElapsed(step.status === "running" ? step.startedAt : undefined)
+  const liveElapsed = useElapsed(!endedAt && step.status === "running" ? step.startedAt : undefined)
   // Completed/failed steps already have both endpoints - a static duration,
-  // not another ticking timer, is all that's needed once a step is done.
+  // not another ticking timer, is all that's needed once a step is done. Once
+  // the whole run has ended (`endedAt` set), no row should keep ticking
+  // either: the backend cancels pending sibling steps without emitting their
+  // own terminal event when a run finishes, so a step that's still "running"
+  // at that point never gets its own completedAt - freeze it at the run's end
+  // time instead, rather than letting it keep counting up against "now".
+  // Checked for truthiness, not `!== undefined`: a step still running/pending
+  // when a replan snapshot arrives gets `completed_at: ""` (see
+  // stepsFromPlanData's `getString` fallback), and `??` would treat that
+  // empty string as "already have a real endpoint" and never fall through to
+  // `endedAt`.
+  const frozenEndpoint = step.completedAt || (step.status === "running" ? endedAt : undefined)
   const finishedDuration =
-    (step.status === "completed" || step.status === "failed")
-    && step.startedAt
-    && step.completedAt
-      ? formatElapsedCompact(normalizeTimestampMs(step.completedAt) - normalizeTimestampMs(step.startedAt))
+    step.startedAt && frozenEndpoint
+      ? formatElapsedCompact(normalizeTimestampMs(frozenEndpoint) - normalizeTimestampMs(step.startedAt))
       : null
   const duration = liveElapsed ?? finishedDuration
 

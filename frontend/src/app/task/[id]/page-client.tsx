@@ -65,32 +65,20 @@ function TaskDetailContent() {
     const handleScrollToTraceStep = (event: Event) => {
       const stepId = (event as CustomEvent<{ stepId?: string }>).detail?.stepId
       if (!stepId) return
-      // A replan reuses the same step ids, and a multi-turn task's history
-      // can render more than one trace group tagged with the same
-      // data-step-id - take the LAST match (the current/most recent one)
-      // rather than the first, which querySelector would otherwise return.
-      // Step ids are LLM-generated plan identifiers with no schema
-      // constraint on their content (see plan_generator.py's tool schema),
-      // so they can legitimately contain quotes/backslashes/control
-      // characters. Backslash and double-quote need a literal backslash
-      // escape inside a double-quoted attribute selector value; any other
-      // control character (e.g. a raw newline) is not valid inside a quoted
-      // CSS string at all and must use a hex escape instead, or
-      // querySelectorAll throws a SyntaxError. CSS.escape is for identifier
-      // syntax (e.g. it hex-escapes a leading digit), not string-literal
-      // content, and is also absent in some test/DOM-shim environments, so a
-      // plain regex replace is both simpler and correct here. NUL (\x00) is
-      // dropped rather than hex-escaped: per the CSS syntax spec, a hex
-      // escape for value zero decodes back to U+FFFD, not U+0000, so it
-      // could never match a real NUL character in the DOM attribute anyway.
-      const escapedStepId = stepId.replace(/["\\\x00-\x1f]/g, (ch) => {
-        if (ch === '"' || ch === "\\") return `\\${ch}`
-        if (ch === "\0") return ""
-        return `\\${ch.charCodeAt(0).toString(16)} `
-      })
-      const matches = document.querySelectorAll(`[data-step-id="${escapedStepId}"]`)
-      const target = matches[matches.length - 1]
-      target?.scrollIntoView({ behavior: "smooth", block: "center" })
+      // Step ids are LLM-generated plan identifiers with no schema constraint
+      // on their content (see plan_generator.py's tool schema), so they can
+      // legitimately contain characters that aren't safe to interpolate into
+      // a CSS attribute selector (quotes, backslashes, control characters
+      // including NUL). Matching by actual attribute value instead of
+      // building a selector string sidesteps escaping entirely - there's
+      // nothing here for a pathological id to break. A replan reuses the same
+      // step ids, and a multi-turn task's history can render more than one
+      // trace group tagged with the same data-step-id - take the LAST match
+      // (the current/most recent one) rather than the first.
+      const matches = Array.from(document.querySelectorAll("[data-step-id]")).filter(
+        (el) => el.getAttribute("data-step-id") === stepId
+      )
+      matches[matches.length - 1]?.scrollIntoView({ behavior: "smooth", block: "center" })
     }
     window.addEventListener("scrollToTraceStep", handleScrollToTraceStep as EventListener)
     return () => window.removeEventListener("scrollToTraceStep", handleScrollToTraceStep as EventListener)
@@ -158,7 +146,7 @@ function TaskDetailContent() {
                 size="icon"
                 className={cn("rounded-full flex-shrink-0", progressPanelOpen ? "bg-muted text-primary" : "hover:bg-muted")}
                 onClick={() => (progressPanelOpen ? handleCollapseProgressPanel() : setProgressPanelOpen(true))}
-                title={t("chatPage.progressPanel.toggleTooltip")}
+                title={progressPanelOpen ? t("chatPage.progressPanel.collapse") : t("chatPage.progressPanel.toggleTooltip")}
                 aria-pressed={progressPanelOpen}
               >
                 <PanelRight className="w-5 h-5" />

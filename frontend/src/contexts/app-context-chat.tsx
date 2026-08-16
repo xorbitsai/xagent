@@ -898,7 +898,7 @@ type AppAction =
   | { type: "UPSERT_STREAMING_FINAL_ANSWER"; payload: { messageId: string; delta?: string; content?: string; status?: Message["status"]; timestamp: string } }
   | { type: "SET_CURRENT_TASK"; payload: Task | null }
   | { type: "SET_TASK_RUNTIME_EXTENSIONS"; payload: { taskId: number; extensions: TaskRuntimeExtensions } }
-  | { type: "UPDATE_TASK_STATUS"; payload: { status: Task["status"]; waitingQuestion?: string; waitingInteractions?: Interaction[]; runId?: string | null; stateVersion?: number; controlState?: TaskControlState } }
+  | { type: "UPDATE_TASK_STATUS"; payload: { status: Task["status"]; waitingQuestion?: string; waitingInteractions?: Interaction[]; runId?: string | null; stateVersion?: number; controlState?: TaskControlState; updatedAt?: string } }
   | { type: "TRIGGER_TASK_UPDATE" }
   | { type: "SET_DAG_EXECUTION"; payload: DAGExecution | null }
   | { type: "SET_CONTEXT_USAGE"; payload: { tokens: number; threshold: number } | null }
@@ -1219,7 +1219,13 @@ function projectAppState(state: AppState, action: AppAction): AppState {
         currentTask: {
           ...state.currentTask,
           status: nextStatus,
-          updatedAt: new Date().toISOString(),
+          // Prefer the originating event's own timestamp over the client's
+          // current wall-clock time - during historical replay, every event
+          // gets processed at "now", so stamping updatedAt with the reducer's
+          // own clock would make a long-finished task's Progress panel freeze
+          // its elapsed time against the moment it was REPLAYED, not the
+          // moment it actually completed.
+          updatedAt: action.payload.updatedAt ?? new Date().toISOString(),
           waitingQuestion: isWaitingForUser
             ? action.payload.waitingQuestion ?? state.currentTask.waitingQuestion
             : undefined,
@@ -2341,6 +2347,7 @@ export function AppProvider({
               runId: controlEnvelope.runId,
               stateVersion: controlEnvelope.stateVersion,
               controlState: controlEnvelope.controlState,
+              updatedAt: message.timestamp,
             },
           })
         }
@@ -2706,6 +2713,7 @@ export function AppProvider({
                   status: "waiting_for_user",
                   waitingQuestion: messageContent,
                   waitingInteractions: interactions.length > 0 ? interactions : undefined,
+                  updatedAt: message.timestamp,
                 }
               })
             }
@@ -2735,7 +2743,7 @@ export function AppProvider({
               }
             })
             if (eventData.status === "completed") {
-              dispatch({ type: "UPDATE_TASK_STATUS", payload: { status: "completed" } })
+              dispatch({ type: "UPDATE_TASK_STATUS", payload: { status: "completed", updatedAt: message.timestamp } })
               dispatch({ type: "SET_PROCESSING", payload: false })
             }
           }
@@ -2880,7 +2888,7 @@ export function AppProvider({
             const taskPreview = eventData.task_preview || t('agent.header.badge.task')
 
             // Set processing state to true when task execution starts
-            dispatch({ type: "UPDATE_TASK_STATUS", payload: { status: "running" } })
+            dispatch({ type: "UPDATE_TASK_STATUS", payload: { status: "running", updatedAt: message.timestamp } })
             dispatch({ type: "SET_PROCESSING", payload: true })
 
             // Update DAG execution state to executing phase
@@ -3353,7 +3361,7 @@ export function AppProvider({
 
           // Step-level LLM Call Events - add to traceEvents for step execution logs
           else if (eventType === "llm_call_start") {
-            dispatch({ type: "UPDATE_TASK_STATUS", payload: { status: "running" } })
+            dispatch({ type: "UPDATE_TASK_STATUS", payload: { status: "running", updatedAt: message.timestamp } })
             dispatch({ type: "SET_PROCESSING", payload: true })
             if (Number.isFinite(eventData.context_tokens) && Number.isFinite(eventData.context_threshold) && eventData.context_threshold > 0) {
               dispatch({
@@ -3894,7 +3902,7 @@ export function AppProvider({
             // Update task status and trigger sidebar update
             dispatch({
               type: "UPDATE_TASK_STATUS",
-              payload: { status: success ? "completed" : "failed" }
+              payload: { status: success ? "completed" : "failed", updatedAt: message.timestamp }
             })
           }
 
@@ -4011,7 +4019,7 @@ export function AppProvider({
 
           // ReAct Pattern Events - these should be displayed in the right panel
           else if (eventType === "react_task_start" || eventType === "task_start_react") {
-            dispatch({ type: "UPDATE_TASK_STATUS", payload: { status: "running" } })
+            dispatch({ type: "UPDATE_TASK_STATUS", payload: { status: "running", updatedAt: message.timestamp } })
             dispatch({ type: "SET_PROCESSING", payload: true })
 
             // Add to trace events for displaying execution logs
@@ -4091,7 +4099,7 @@ export function AppProvider({
             }
             dispatch({ type: "ADD_TRACE_EVENT", payload: traceEvent })
           } else if (eventType === "llm_call_start") {
-            dispatch({ type: "UPDATE_TASK_STATUS", payload: { status: "running" } })
+            dispatch({ type: "UPDATE_TASK_STATUS", payload: { status: "running", updatedAt: message.timestamp } })
             dispatch({ type: "SET_PROCESSING", payload: true })
             const stepId = message.step_id || traceEventData.step_id
             const traceEvent: TraceEvent = {
@@ -4243,7 +4251,7 @@ export function AppProvider({
           }
           // Skill Selection Events
           else if (eventType === "skill_select_start") {
-            dispatch({ type: "UPDATE_TASK_STATUS", payload: { status: "running" } })
+            dispatch({ type: "UPDATE_TASK_STATUS", payload: { status: "running", updatedAt: message.timestamp } })
             dispatch({ type: "SET_PROCESSING", payload: true })
 
             const traceEvent: TraceEvent = {
@@ -4848,6 +4856,7 @@ export function AppProvider({
             runId: controlEnvelope.runId,
             stateVersion: controlEnvelope.stateVersion,
             controlState: controlEnvelope.controlState,
+            updatedAt: message.timestamp,
           }
         })
         dispatch({ type: "TRIGGER_TASK_UPDATE" })
@@ -4917,7 +4926,7 @@ export function AppProvider({
           const updatedDAGExecution = {
             ...currentState.dagExecution,
             phase: taskData.status,
-            updated_at: new Date().toISOString()
+            updated_at: message.timestamp,
           }
           dispatch({ type: "SET_DAG_EXECUTION", payload: updatedDAGExecution })
         }
@@ -5086,6 +5095,7 @@ export function AppProvider({
             runId: controlEnvelope.runId,
             stateVersion: controlEnvelope.stateVersion,
             controlState: controlEnvelope.controlState || "paused",
+            updatedAt: message.timestamp,
           },
         })
         dispatch({ type: "SET_PROCESSING", payload: false })
@@ -5100,6 +5110,7 @@ export function AppProvider({
               runId: controlEnvelope.runId,
               stateVersion: controlEnvelope.stateVersion,
               controlState: controlEnvelope.controlState || "pause_requested",
+              updatedAt: message.timestamp,
             },
           })
         }
@@ -5119,6 +5130,7 @@ export function AppProvider({
             runId: controlEnvelope.runId,
             stateVersion: controlEnvelope.stateVersion,
             controlState: controlEnvelope.controlState || "waiting_for_user",
+            updatedAt: message.timestamp,
           }
         })
         dispatch({ type: "SET_PROCESSING", payload: false })
@@ -5152,6 +5164,7 @@ export function AppProvider({
             runId: controlEnvelope.runId,
             stateVersion: controlEnvelope.stateVersion,
             controlState: controlEnvelope.controlState || "running",
+            updatedAt: message.timestamp,
           },
         })
         break
@@ -5169,6 +5182,7 @@ export function AppProvider({
               runId: controlEnvelope.runId,
               stateVersion: controlEnvelope.stateVersion,
               controlState: controlEnvelope.controlState,
+              updatedAt: message.timestamp,
             },
           })
           dispatch({ type: "TRIGGER_TASK_UPDATE" })
@@ -5206,7 +5220,7 @@ export function AppProvider({
         const websocketTaskStatus = getWebSocketTaskStatus(message)
 
         if (websocketTaskStatus) {
-          dispatch({ type: "UPDATE_TASK_STATUS", payload: { status: websocketTaskStatus } })
+          dispatch({ type: "UPDATE_TASK_STATUS", payload: { status: websocketTaskStatus, updatedAt: message.timestamp } })
           dispatch({ type: "TRIGGER_TASK_UPDATE" })
         }
         if (shouldStopProcessingForTaskStatus(websocketTaskStatus)) {
@@ -5492,26 +5506,6 @@ export function AppProvider({
 
   const sendMessage = useCallback(async (message: string, config?: any, files?: File[]) => {
     console.log('🚀 sendMessage called:', { message, files: files?.map(f => f.name), taskId: state.taskId })
-
-    // A prior turn's DAG plan/steps must not linger into this turn - otherwise
-    // the Progress panel would auto-open (or stay open) showing stale steps
-    // from a different execution mode/run before this turn's own dag_execution
-    // event (if any) arrives. But sending into a run that's still actively
-    // going - answering a mid-run clarification, or the "live guidance" input
-    // ChatInput allows while running/paused/waiting_for_user (see
-    // ChatInput.tsx's `allowsLiveGuidanceInput`; the task page never passes
-    // onSend/onSendInteraction, so all of these fall back to this same
-    // sendMessage) - is a CONTINUATION of that run, not a new turn. Clearing
-    // here would wipe out the in-progress DAG plan/steps the Progress panel
-    // is actively showing.
-    const isContinuingActiveRun =
-      state.currentTask?.status === "running"
-      || state.currentTask?.status === "paused"
-      || state.currentTask?.status === "waiting_for_user"
-    if (!isContinuingActiveRun) {
-      dispatch({ type: "SET_DAG_EXECUTION", payload: null })
-      dispatch({ type: "SET_STEPS", payload: [] })
-    }
 
     if (sessionTransport && !mountedRef.current) {
       throw new Error("Message not sent: the Session chat is closed.")
@@ -5904,10 +5898,40 @@ export function AppProvider({
         taskId: state.taskId
       })
 
+      // The backend executes the turn as an independent background task and
+      // can start broadcasting its own dag_execution/trace events before this
+      // ack resolves - capture the pre-send dagExecution reference so the
+      // reset below can detect that case and skip clearing, rather than
+      // wiping out the new turn's own freshly-arrived state.
+      const dagExecutionBeforeSend = stateRef.current.dagExecution
+
       // Wait for the server's durable-delivery acknowledgement. If the socket
       // is disconnected or the backend rejects the turn, this throws and the
-      // composer keeps both its text and attached files.
+      // composer keeps both its text and attached files. The DAG reset below
+      // deliberately runs only after this succeeds - clearing dagExecution/
+      // steps first and then throwing would remove the Progress panel and its
+      // header toggle for a run that never actually changed.
       await sendChatMessage(message, files, config?.force, clientMessageId)
+
+      // A prior turn's DAG plan/steps must not linger into this turn - otherwise
+      // the Progress panel would auto-open (or stay open) showing stale steps
+      // from a different execution mode/run before this turn's own dag_execution
+      // event (if any) arrives. But sending into a run that's still actively
+      // going - answering a mid-run clarification, or the "live guidance" input
+      // ChatInput allows while running/paused/waiting_for_user (see
+      // ChatInput.tsx's `allowsLiveGuidanceInput`; the task page never passes
+      // onSend/onSendInteraction, so all of these fall back to this same
+      // sendMessage) - is a CONTINUATION of that run, not a new turn. Clearing
+      // here would wipe out the in-progress DAG plan/steps the Progress panel
+      // is actively showing.
+      const isContinuingActiveRun =
+        state.currentTask?.status === "running"
+        || state.currentTask?.status === "paused"
+        || state.currentTask?.status === "waiting_for_user"
+      if (!isContinuingActiveRun && stateRef.current.dagExecution === dagExecutionBeforeSend) {
+        dispatch({ type: "SET_DAG_EXECUTION", payload: null })
+        dispatch({ type: "SET_STEPS", payload: [] })
+      }
 
       if (state.currentTask?.status === 'completed' || state.currentTask?.status === 'failed') {
         dispatch({

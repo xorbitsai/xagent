@@ -78,6 +78,12 @@ const VERSIONED_TASK_EVENT_TYPES = new Set([
 const TASK_SCOPED_ACTION_TYPES = new Set<AppAction["type"]>([
   "SET_DAG_EXECUTION",
   "SET_STEPS",
+  // Not currently dispatched from inside handleMessage (its only two call
+  // sites use the raw, unwrapped dispatch), so this has no effect today -
+  // included so a future call site inside handleMessage inherits the same
+  // scoping SET_DAG_EXECUTION/SET_STEPS already get individually, instead of
+  // silently bypassing it.
+  "RESET_DAG_STATE",
   "ADD_STEP",
   "UPDATE_STEP",
   "UPDATE_TASK_STATUS",
@@ -89,6 +95,7 @@ const TASK_SCOPED_ACTION_TYPES = new Set<AppAction["type"]>([
   "ADD_TRACE_EVENT",
   "SET_CONTEXT_USAGE",
   "SET_PLAN_MEMORY_INFO",
+  "OPEN_FILE_PREVIEW",
 ])
 const MAX_TRACKED_TASK_STATE_VERSIONS = 500
 // A Session may reset repeatedly during its absolute lifetime. Retired ids are
@@ -901,6 +908,7 @@ type AppAction =
   | { type: "UPDATE_TASK_STATUS"; payload: { status: Task["status"]; waitingQuestion?: string; waitingInteractions?: Interaction[]; runId?: string | null; stateVersion?: number; controlState?: TaskControlState; updatedAt?: string } }
   | { type: "TRIGGER_TASK_UPDATE" }
   | { type: "SET_DAG_EXECUTION"; payload: DAGExecution | null }
+  | { type: "RESET_DAG_STATE" }
   | { type: "SET_CONTEXT_USAGE"; payload: { tokens: number; threshold: number } | null }
   | { type: "ADD_STEP"; payload: StepExecution }
   | { type: "UPDATE_STEP"; payload: { stepId: string; updates: Partial<StepExecution> } }
@@ -1241,6 +1249,14 @@ function projectAppState(state: AppState, action: AppAction): AppState {
 
     case "SET_DAG_EXECUTION":
       return { ...state, dagExecution: action.payload }
+
+    // Single action for the "clear dagExecution + steps together" couplet
+    // needed at every site that isn't a task switch (task switches already
+    // get this via SET_TASK_ID's own taskChanged branch) - same-task
+    // reconnect and a successful new turn on the same task both need it, and
+    // a single action keeps them from drifting out of sync with each other.
+    case "RESET_DAG_STATE":
+      return { ...state, dagExecution: null, steps: [] }
 
     case "SET_CONTEXT_USAGE":
       return { ...state, contextUsage: action.payload }
@@ -2011,12 +2027,11 @@ export function AppProvider({
         },
       })
       dispatch({ type: "SET_TRACE_EVENTS", payload: [] })
-      dispatch({ type: "SET_STEPS", payload: [] })
       // Clear dagExecution alongside steps - otherwise the Progress panel
       // stays open (it only needs dagExecution to be non-null) rendering an
       // empty step list for the gap between reconnecting and history replay
       // repopulating both together.
-      dispatch({ type: "SET_DAG_EXECUTION", payload: null })
+      dispatch({ type: "RESET_DAG_STATE" })
     } else {
       // New task connection -> Update tracker, Don't clear (handled by setTaskId)
       lastConnectedTaskId.current = stateRef.current.taskId
@@ -2276,6 +2291,18 @@ export function AppProvider({
       && String(messageTaskId) !== String(currentState.taskId)
     const dispatch: React.Dispatch<AppAction> = (action) => {
       if (TASK_SCOPED_ACTION_TYPES.has(action.type) && isMessageForOtherTask) return
+      // Stamp every UPDATE_TASK_STATUS dispatched from this handler with the
+      // originating event's own timestamp here, once, rather than relying on
+      // each call site to remember to pass it - a forgotten `updatedAt` at a
+      // future call site would otherwise silently fall back to client-now in
+      // the reducer, quietly reintroducing the wrong-elapsed-time-on-replay
+      // bug this field exists to fix. External UI callers of UPDATE_TASK_STATUS
+      // (outside this handler, e.g. sendMessage's optimistic status flip)
+      // don't go through this wrapper and keep their own client-now fallback.
+      if (action.type === "UPDATE_TASK_STATUS" && action.payload.updatedAt === undefined) {
+        rawDispatch({ ...action, payload: { ...action.payload, updatedAt: message.timestamp } })
+        return
+      }
       rawDispatch(action)
     }
     // The 30s dedup cache below is keyed on message content/type only, not
@@ -2290,11 +2317,7 @@ export function AppProvider({
     const isDuplicateMessageForViewedTask = (
       content: string | React.ReactNode,
       type = "general",
-      force = false,
-      shouldCache = true,
-    ) => isDuplicateMessage(content, type, force, shouldCache && !isMessageForOtherTask)
-    const isDuplicateResultForViewedTask = (content: string) =>
-      isDuplicateMessage(content, "result", false, !isMessageForOtherTask)
+    ) => isDuplicateMessage(content, type, false, !isMessageForOtherTask)
     // If we're in replay mode, don't process immediately - collect for delayed playback
     if (
       !options?.skipHistory
@@ -2347,7 +2370,6 @@ export function AppProvider({
               runId: controlEnvelope.runId,
               stateVersion: controlEnvelope.stateVersion,
               controlState: controlEnvelope.controlState,
-              updatedAt: message.timestamp,
             },
           })
         }
@@ -2465,6 +2487,23 @@ export function AppProvider({
             // sets it; later phase updates for the same run must not reset
             // it), falling back to this event's own timestamp only the first
             // time.
+            //
+            // There's no stable run id on this event stream, so distinguishing
+            // "this dagExecution is from a finished prior turn" from "this
+            // dagExecution is the SAME run mid-replan" can't be done reliably
+            // from phase alone: dag_execute_end (below) sets phase "completed"
+            // at the end of every DAGPattern round, not just at whole-task
+            // completion, so a mid-task replan can also observe a terminal
+            // phase while the run is still very much in progress. Treating
+            // terminal phase as "prior run over" was tried and reverted - it
+            // fixed a stale-created_at bug across turns but caused the total-
+            // elapsed timer to reset mid-task on every replan instead, which
+            // is worse. The reset-after-send-success flow in sendMessage
+            // (RESET_DAG_STATE, guarded against racing this turn's own
+            // events) is the actual fix for the cross-turn case; this handler
+            // deliberately stays a plain "keep the existing run's created_at"
+            // preservation, accepting the narrow pre-existing race where a
+            // fast-arriving event beats that reset.
             const dagCreatedAt =
               currentState.dagExecution?.created_at
               ?? (eventData as { created_at?: string | number }).created_at
@@ -2529,7 +2568,7 @@ export function AppProvider({
             // legacy events without either identity fall back to short-lived
             // content-based deduplication.
             const isDuplicate = userMessageId === null
-              ? isDuplicateMessageForViewedTask(messageContent, 'user-message', false, true)
+              ? isDuplicateMessageForViewedTask(messageContent, 'user-message')
               : false
             console.log('🔍 Duplicate check:', {
               messageContent,
@@ -2713,7 +2752,6 @@ export function AppProvider({
                   status: "waiting_for_user",
                   waitingQuestion: messageContent,
                   waitingInteractions: interactions.length > 0 ? interactions : undefined,
-                  updatedAt: message.timestamp,
                 }
               })
             }
@@ -2743,7 +2781,7 @@ export function AppProvider({
               }
             })
             if (eventData.status === "completed") {
-              dispatch({ type: "UPDATE_TASK_STATUS", payload: { status: "completed", updatedAt: message.timestamp } })
+              dispatch({ type: "UPDATE_TASK_STATUS", payload: { status: "completed" } })
               dispatch({ type: "SET_PROCESSING", payload: false })
             }
           }
@@ -2888,7 +2926,7 @@ export function AppProvider({
             const taskPreview = eventData.task_preview || t('agent.header.badge.task')
 
             // Set processing state to true when task execution starts
-            dispatch({ type: "UPDATE_TASK_STATUS", payload: { status: "running", updatedAt: message.timestamp } })
+            dispatch({ type: "UPDATE_TASK_STATUS", payload: { status: "running" } })
             dispatch({ type: "SET_PROCESSING", payload: true })
 
             // Update DAG execution state to executing phase
@@ -3361,7 +3399,7 @@ export function AppProvider({
 
           // Step-level LLM Call Events - add to traceEvents for step execution logs
           else if (eventType === "llm_call_start") {
-            dispatch({ type: "UPDATE_TASK_STATUS", payload: { status: "running", updatedAt: message.timestamp } })
+            dispatch({ type: "UPDATE_TASK_STATUS", payload: { status: "running" } })
             dispatch({ type: "SET_PROCESSING", payload: true })
             if (Number.isFinite(eventData.context_tokens) && Number.isFinite(eventData.context_threshold) && eventData.context_threshold > 0) {
               dispatch({
@@ -3811,7 +3849,7 @@ export function AppProvider({
                   </div>
                 </div>
               )
-              if (!isDuplicateResultForViewedTask(`📋 ${t('agent.logs.event.messages.metaTitle')}: ${JSON.stringify(metaInfo)}`)) {
+              if (!isDuplicateMessageForViewedTask(`📋 ${t('agent.logs.event.messages.metaTitle')}: ${JSON.stringify(metaInfo)}`, "result")) {
                 dispatch({
                   type: "ADD_MESSAGE",
                   payload: {
@@ -3880,7 +3918,7 @@ export function AppProvider({
                 </>
               )
 
-              if (!isDuplicateResultForViewedTask(`📁 ${t('agent.logs.event.messages.fileOutputsGenerated', { count: fileCount })}`)) {
+              if (!isDuplicateMessageForViewedTask(`📁 ${t('agent.logs.event.messages.fileOutputsGenerated', { count: fileCount })}`, "result")) {
                 dispatch({
                   type: "ADD_MESSAGE",
                   payload: {
@@ -3902,7 +3940,7 @@ export function AppProvider({
             // Update task status and trigger sidebar update
             dispatch({
               type: "UPDATE_TASK_STATUS",
-              payload: { status: success ? "completed" : "failed", updatedAt: message.timestamp }
+              payload: { status: success ? "completed" : "failed" }
             })
           }
 
@@ -4019,7 +4057,7 @@ export function AppProvider({
 
           // ReAct Pattern Events - these should be displayed in the right panel
           else if (eventType === "react_task_start" || eventType === "task_start_react") {
-            dispatch({ type: "UPDATE_TASK_STATUS", payload: { status: "running", updatedAt: message.timestamp } })
+            dispatch({ type: "UPDATE_TASK_STATUS", payload: { status: "running" } })
             dispatch({ type: "SET_PROCESSING", payload: true })
 
             // Add to trace events for displaying execution logs
@@ -4099,7 +4137,7 @@ export function AppProvider({
             }
             dispatch({ type: "ADD_TRACE_EVENT", payload: traceEvent })
           } else if (eventType === "llm_call_start") {
-            dispatch({ type: "UPDATE_TASK_STATUS", payload: { status: "running", updatedAt: message.timestamp } })
+            dispatch({ type: "UPDATE_TASK_STATUS", payload: { status: "running" } })
             dispatch({ type: "SET_PROCESSING", payload: true })
             const stepId = message.step_id || traceEventData.step_id
             const traceEvent: TraceEvent = {
@@ -4251,7 +4289,7 @@ export function AppProvider({
           }
           // Skill Selection Events
           else if (eventType === "skill_select_start") {
-            dispatch({ type: "UPDATE_TASK_STATUS", payload: { status: "running", updatedAt: message.timestamp } })
+            dispatch({ type: "UPDATE_TASK_STATUS", payload: { status: "running" } })
             dispatch({ type: "SET_PROCESSING", payload: true })
 
             const traceEvent: TraceEvent = {
@@ -4856,7 +4894,6 @@ export function AppProvider({
             runId: controlEnvelope.runId,
             stateVersion: controlEnvelope.stateVersion,
             controlState: controlEnvelope.controlState,
-            updatedAt: message.timestamp,
           }
         })
         dispatch({ type: "TRIGGER_TASK_UPDATE" })
@@ -4988,7 +5025,7 @@ export function AppProvider({
             </>
           )
 
-          if (!isDuplicateResultForViewedTask(`📁 ${t('agent.logs.event.messages.fileOutputsGenerated', { count: fileCount })}`)) {
+          if (!isDuplicateMessageForViewedTask(`📁 ${t('agent.logs.event.messages.fileOutputsGenerated', { count: fileCount })}`, "result")) {
             dispatch({
               type: "ADD_MESSAGE",
               payload: {
@@ -5095,7 +5132,6 @@ export function AppProvider({
             runId: controlEnvelope.runId,
             stateVersion: controlEnvelope.stateVersion,
             controlState: controlEnvelope.controlState || "paused",
-            updatedAt: message.timestamp,
           },
         })
         dispatch({ type: "SET_PROCESSING", payload: false })
@@ -5110,7 +5146,6 @@ export function AppProvider({
               runId: controlEnvelope.runId,
               stateVersion: controlEnvelope.stateVersion,
               controlState: controlEnvelope.controlState || "pause_requested",
-              updatedAt: message.timestamp,
             },
           })
         }
@@ -5130,7 +5165,6 @@ export function AppProvider({
             runId: controlEnvelope.runId,
             stateVersion: controlEnvelope.stateVersion,
             controlState: controlEnvelope.controlState || "waiting_for_user",
-            updatedAt: message.timestamp,
           }
         })
         dispatch({ type: "SET_PROCESSING", payload: false })
@@ -5164,7 +5198,6 @@ export function AppProvider({
             runId: controlEnvelope.runId,
             stateVersion: controlEnvelope.stateVersion,
             controlState: controlEnvelope.controlState || "running",
-            updatedAt: message.timestamp,
           },
         })
         break
@@ -5182,7 +5215,6 @@ export function AppProvider({
               runId: controlEnvelope.runId,
               stateVersion: controlEnvelope.stateVersion,
               controlState: controlEnvelope.controlState,
-              updatedAt: message.timestamp,
             },
           })
           dispatch({ type: "TRIGGER_TASK_UPDATE" })
@@ -5220,7 +5252,7 @@ export function AppProvider({
         const websocketTaskStatus = getWebSocketTaskStatus(message)
 
         if (websocketTaskStatus) {
-          dispatch({ type: "UPDATE_TASK_STATUS", payload: { status: websocketTaskStatus, updatedAt: message.timestamp } })
+          dispatch({ type: "UPDATE_TASK_STATUS", payload: { status: websocketTaskStatus } })
           dispatch({ type: "TRIGGER_TASK_UPDATE" })
         }
         if (shouldStopProcessingForTaskStatus(websocketTaskStatus)) {
@@ -5929,8 +5961,7 @@ export function AppProvider({
         || state.currentTask?.status === "paused"
         || state.currentTask?.status === "waiting_for_user"
       if (!isContinuingActiveRun && stateRef.current.dagExecution === dagExecutionBeforeSend) {
-        dispatch({ type: "SET_DAG_EXECUTION", payload: null })
-        dispatch({ type: "SET_STEPS", payload: [] })
+        dispatch({ type: "RESET_DAG_STATE" })
       }
 
       if (state.currentTask?.status === 'completed' || state.currentTask?.status === 'failed') {

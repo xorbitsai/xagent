@@ -106,8 +106,8 @@ function TaskDetailContent() {
   const progressEndedAt = isDagFinished ? state.currentTask?.updatedAt : undefined
 
   return (
-    <div className="h-full flex bg-background">
-      <div className="flex-1 min-w-0 flex flex-col">
+    <div className="h-full flex flex-col md:flex-row bg-background">
+      <div className="flex-1 min-w-0 min-h-0 flex flex-col">
         {(state.currentTask?.agentId || state.dagExecution) && (
           <div className="flex-none flex items-center justify-between gap-3 px-4 py-3 bg-background/95 backdrop-blur z-50 sticky top-0">
             <div className="flex items-center gap-3 min-w-0">
@@ -163,9 +163,15 @@ function TaskDetailContent() {
           above, not nested under it) so it visually pops out from the right
           edge of the entire page rather than just the content area below
           the header - and stays independent of the file/graph preview's
-          draggable PreviewSheet layout inside TaskConversationPanel. */}
+          draggable PreviewSheet layout inside TaskConversationPanel. Below
+          `md` there's no room for a fixed 360px side-by-side column without
+          squeezing the chat unusably narrow, so it stacks below the chat
+          instead - the same stack-on-mobile/side-column-on-desktop idea as
+          resizable-three-column-layout.tsx, capped to a fraction of the
+          viewport height (shrink-0 so that cap holds) rather than taking the
+          full remaining width. */}
       {progressPanelVisible && (
-        <div className="flex-shrink-0 w-[360px] h-full border-l border-border">
+        <div className="w-full md:w-[360px] shrink-0 h-[45vh] md:h-full border-t md:border-t-0 md:border-l border-border">
           <ProgressPanel
             steps={progressSteps}
             startedAt={state.dagExecution?.created_at}

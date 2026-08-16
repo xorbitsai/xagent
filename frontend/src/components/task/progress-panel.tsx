@@ -179,15 +179,26 @@ function ProgressStepRow({
       ? formatElapsedCompact(normalizeTimestampMs(frozenEndpoint) - normalizeTimestampMs(step.startedAt))
       : null
   const duration = liveElapsed ?? finishedDuration
+  // TraceEventRenderer only tags a step's trace group with data-step-id once
+  // it's actually started (a ProcessedStep) - a step with no startedAt has no
+  // corresponding group in the chat log, so clicking it would silently do
+  // nothing. Keyed off startedAt itself (the actual precondition) rather than
+  // re-deriving it from status: a step forced to "skipped" by branch-
+  // activation logic can still have a startedAt preserved from before that
+  // (see stepsFromPlanData's existingStep merge), and its trace group is
+  // still there to scroll to even though its final status isn't "running".
+  const hasTraceTarget = Boolean(step.startedAt)
 
   return (
     <li>
       <button
         type="button"
-        onClick={() => onClick?.(step.id)}
+        disabled={!hasTraceTarget}
+        onClick={hasTraceTarget ? () => onClick?.(step.id) : undefined}
         className={cn(
           "flex w-full items-start gap-3 rounded-lg px-2 py-2 text-left transition-colors",
           step.status === "running" ? "bg-primary/10" : "hover:bg-muted/50",
+          !hasTraceTarget && "cursor-default hover:bg-transparent",
         )}
       >
         <span

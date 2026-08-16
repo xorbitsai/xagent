@@ -150,6 +150,7 @@ the defect concretely (which text is misspelled, which element is clipped, which
 logo is not authentic), and mark the answer's outcome `partial` so the user can
 decide whether to spend another round.
 
-Return only PNG or JPEG files that were actually created. Lead with the files,
-then give one concise line per asset identifying its communication angle and
-dimensions.
+Return only PNG or JPEG files that were actually created. When the run ends in a
+question there are none, and the question is the whole answer — do not list or
+describe files that do not exist. Otherwise lead with the files, then give one
+concise line per asset identifying its communication angle and dimensions.

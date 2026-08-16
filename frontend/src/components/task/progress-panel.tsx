@@ -17,15 +17,11 @@ export interface ProgressStepView {
 
 interface ProgressPanelProps {
   steps: ProgressStepView[]
-  // true when the total step count is known upfront (DAG plans always know
-  // it; a future dynamic ReAct panel would not, hence this flag).
-  totalKnown: boolean
   startedAt: string | number | undefined
   // Set once the run has actually finished (completed/failed). While this is
   // undefined, the total elapsed keeps ticking; once set, it freezes at
   // endedAt - startedAt instead of continuing to count up against "now".
   endedAt?: string | number
-  isPlanning?: boolean
   onCollapse: () => void
   onStepClick?: (stepId: string) => void
 }
@@ -68,10 +64,8 @@ function useElapsed(startedAt: string | number | undefined): string | null {
 
 export function ProgressPanel({
   steps,
-  totalKnown,
   startedAt,
   endedAt,
-  isPlanning = false,
   onCollapse,
   onStepClick,
 }: ProgressPanelProps) {
@@ -85,7 +79,10 @@ export function ProgressPanel({
   // "Resolved" rather than strictly "succeeded" - a plan with conditional
   // branches can have steps that finish as "skipped" and will never become
   // "completed", so counting only completed would leave the header stuck
-  // below the total (e.g. "4/6") even once the whole plan is done.
+  // below the total (e.g. "4/6") even once the whole plan is done. "failed"
+  // is counted for the same reason: a failed step is also terminal (it will
+  // never transition to "completed"), so excluding it would leave the same
+  // "4/6" stuck header on a plan that has actually finished running.
   const resolvedCount = useMemo(
     () => steps.filter((step) => (
       step.status === "completed" || step.status === "skipped" || step.status === "failed"
@@ -100,7 +97,7 @@ export function ProgressPanel({
           <h2 className="text-sm font-semibold text-foreground">
             {t("chatPage.progressPanel.title")}
           </h2>
-          {totalKnown && steps.length > 0 && (
+          {steps.length > 0 && (
             <span className="text-xs text-muted-foreground">
               {resolvedCount}/{steps.length}
             </span>
@@ -129,7 +126,7 @@ export function ProgressPanel({
       )}
 
       <div className="flex-1 overflow-y-auto px-2 py-3">
-        {steps.length === 0 && isPlanning ? (
+        {steps.length === 0 ? (
           <div className="flex items-center gap-2 px-2 py-4 text-sm text-muted-foreground">
             <Loader2 className="h-4 w-4 animate-spin" />
             {t("chatPage.progressPanel.planning")}

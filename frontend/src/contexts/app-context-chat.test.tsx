@@ -1422,6 +1422,65 @@ describe("AppProvider websocket message routing", () => {
     })
   })
 
+  it("drops DAG/chat/task events for a background task while viewing a different one", async () => {
+    render(
+      <AppProvider token="token">
+        <SeedRunningTask />
+        <StateProbe />
+      </AppProvider>
+    )
+    const onMessage = webSocketOptions.current?.onMessage
+    expect(onMessage).toBeDefined()
+
+    // A background task (2) is still running while the viewer stays on task
+    // 1 (seeded by SeedRunningTask) - its DAG burst, chat reply, and task_info
+    // must not repaint task 1's view.
+    act(() => {
+      dagBurst(2).forEach((message) => onMessage?.(message))
+      onMessage?.(assistantMessage("Stray reply from task 2", 2))
+      // Unlike the shared taskInfoMessage() helper (which several
+      // session-adoption tests rely on omitting), a real task_info frame for
+      // task 2 also carries a top-level task_id (see
+      // ws_trace_handlers.py's create_stream_event) - set it explicitly here
+      // so this exercises the same envelope shape the guard actually checks.
+      onMessage?.({
+        type: "trace_event",
+        timestamp: "2026-05-27T05:00:02Z",
+        task_id: 2,
+        data: {
+          event_id: "task-info-2",
+          event_type: "task_info",
+          data: {
+            id: 2,
+            title: "Task 2",
+            status: "completed",
+            description: "Session task",
+            created_at: "2026-05-27T05:00:00Z",
+            updated_at: "2026-05-27T05:00:00Z",
+          },
+        },
+      })
+    })
+    await waitFor(() => {
+      // dagBurst's dag_step_failed would otherwise flip this to "failed".
+      expect(screen.getByTestId("dag-phase").textContent).toBe("")
+    })
+    expect(screen.getByTestId("steps-count").textContent).toBe("0")
+    expect(screen.getByTestId("task-status").textContent).toBe("running")
+    expect(screen.getByTestId("task-title").textContent).toBe("Test task")
+    expect(screen.getByTestId("messages").textContent).not.toContain("Stray reply from task 2")
+
+    // The viewed task's own events must still apply normally - the guard
+    // isn't blanket-dropping DAG/chat state, only cross-task events.
+    act(() => {
+      dagBurst(1).forEach((message) => onMessage?.(message))
+    })
+    await waitFor(() => {
+      expect(screen.getByTestId("dag-phase").textContent).toBe("failed")
+    })
+    expect(screen.getByTestId("steps-count").textContent).toBe("1")
+  })
+
   it("normalizes uppercase task info status before syncing processing state", async () => {
     render(
       <AppProvider token="token">

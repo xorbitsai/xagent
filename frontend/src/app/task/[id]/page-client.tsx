@@ -71,13 +71,18 @@ function TaskDetailContent() {
       // rather than the first, which querySelector would otherwise return.
       // Step ids are LLM-generated plan identifiers with no schema
       // constraint on their content (see plan_generator.py's tool schema),
-      // so they can legitimately contain quotes/backslashes. Only backslash
-      // and double-quote need escaping inside a double-quoted attribute
-      // selector value - CSS.escape is for identifier syntax (e.g. it
-      // hex-escapes a leading digit), not string-literal content, and is
-      // also absent in some test/DOM-shim environments, so a plain regex
-      // replace is both simpler and correct here.
-      const escapedStepId = stepId.replace(/["\\]/g, "\\$&")
+      // so they can legitimately contain quotes/backslashes/control
+      // characters. Backslash and double-quote need a literal backslash
+      // escape inside a double-quoted attribute selector value; any other
+      // control character (e.g. a raw newline) is not valid inside a quoted
+      // CSS string at all and must use a hex escape instead, or
+      // querySelectorAll throws a SyntaxError. CSS.escape is for identifier
+      // syntax (e.g. it hex-escapes a leading digit), not string-literal
+      // content, and is also absent in some test/DOM-shim environments, so a
+      // plain regex replace is both simpler and correct here.
+      const escapedStepId = stepId.replace(/["\\\x00-\x1f]/g, (ch) => (
+        ch === '"' || ch === "\\" ? `\\${ch}` : `\\${ch.charCodeAt(0).toString(16)} `
+      ))
       const matches = document.querySelectorAll(`[data-step-id="${escapedStepId}"]`)
       const target = matches[matches.length - 1]
       target?.scrollIntoView({ behavior: "smooth", block: "center" })
@@ -95,7 +100,6 @@ function TaskDetailContent() {
     completedAt: step.completed_at,
   }))
   const progressPanelVisible = progressPanelOpen && Boolean(state.dagExecution)
-  const isProgressPlanning = progressSteps.length === 0 && state.dagExecution?.phase === "planning"
   // Deliberately keyed off the TASK's own status, not dagExecution.phase:
   // a single step failing (dag_step_failed) sets the whole dagExecution.phase
   // to "failed" even when the DAG goes on to replan and keep running, and the
@@ -171,10 +175,8 @@ function TaskDetailContent() {
         <div className="flex-shrink-0 w-[360px] h-full border-l border-border">
           <ProgressPanel
             steps={progressSteps}
-            totalKnown
             startedAt={state.dagExecution?.created_at}
             endedAt={progressEndedAt}
-            isPlanning={isProgressPlanning}
             onCollapse={handleCollapseProgressPanel}
             onStepClick={handleProgressStepClick}
           />

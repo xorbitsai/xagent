@@ -70,13 +70,20 @@ const VERSIONED_TASK_EVENT_TYPES = new Set([
 // actually being viewed - see the wrapper's own comment for why. Kept at
 // module scope (built once) rather than inside handleMessage, matching
 // VERSIONED_TASK_EVENT_TYPES above.
+// TRIGGER_TASK_UPDATE is deliberately NOT in this set: it only bumps
+// lastTaskUpdate to tell the sidebar's task list to refetch (sidebar.tsx),
+// which should happen for ANY task's status change regardless of which task
+// is currently being viewed - unlike every action below, it isn't part of
+// the viewed task's own displayed state.
 const TASK_SCOPED_ACTION_TYPES = new Set<AppAction["type"]>([
   "SET_DAG_EXECUTION",
   "SET_STEPS",
   "ADD_STEP",
   "UPDATE_STEP",
   "UPDATE_TASK_STATUS",
+  "SET_CURRENT_TASK",
   "SET_PROCESSING",
+  "SET_HISTORY_LOADING",
   "ADD_MESSAGE",
   "UPSERT_STREAMING_FINAL_ANSWER",
   "ADD_TRACE_EVENT",
@@ -1000,12 +1007,20 @@ function projectAppState(state: AppState, action: AppAction): AppState {
       const messages = taskChanged ? [] : state.messages
       const contextUsage = taskChanged ? null : state.contextUsage
       const taskRuntimeExtensions = taskChanged ? {} : state.taskRuntimeExtensions
+      // Also clear the previous task's DAG plan/phase here - otherwise
+      // switching tasks via the sidebar (no page reload) leaves the Progress
+      // panel showing the OLD task's steps and elapsed time until the new
+      // task's own dag_execution history replay arrives.
+      const dagExecution = taskChanged ? null : state.dagExecution
+      const steps = taskChanged ? [] : state.steps
       const newState = {
         ...state,
         taskId: action.payload,
         messages,
         contextUsage,
         taskRuntimeExtensions,
+        dagExecution,
+        steps,
       }
       console.log('🔄 Reducer returning new state:', newState)
       return newState
@@ -6107,13 +6122,8 @@ export function AppProvider({
       // by the connection effect AFTER the new task's history has already arrived.
       dispatch({ type: "CLEAR_MESSAGES" })
       dispatch({ type: "SET_TRACE_EVENTS", payload: [] })
-      dispatch({ type: "SET_STEPS", payload: [] })
-      // Also clear the previous task's DAG plan/phase - otherwise switching
-      // tasks via the sidebar (no page reload) leaves the Progress panel
-      // showing the OLD task's steps and elapsed time until the new task's
-      // own dag_execution history replay arrives (or the page is refreshed,
-      // which happens to force a clean re-init).
-      dispatch({ type: "SET_DAG_EXECUTION", payload: null })
+      // steps/dagExecution are cleared by the SET_TASK_ID dispatch below (its
+      // reducer case resets them whenever taskChanged) rather than here.
     }
 
     if (options?.navigate !== false) {

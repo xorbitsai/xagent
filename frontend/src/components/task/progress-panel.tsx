@@ -127,10 +127,18 @@ export function ProgressPanel({
 
       <div className="flex-1 overflow-y-auto px-2 py-3">
         {steps.length === 0 ? (
-          <div className="flex items-center gap-2 px-2 py-4 text-sm text-muted-foreground">
-            <Loader2 className="h-4 w-4 animate-spin" />
-            {t("chatPage.progressPanel.planning")}
-          </div>
+          // A run can end (a plan-time failure, for example) before any step
+          // ever started, leaving steps permanently empty - `endedAt` (only
+          // set once the run has actually finished) is what distinguishes
+          // that from "still planning/about to execute", so this doesn't show
+          // an indefinitely-spinning "generating plan" placeholder for a run
+          // that's already over.
+          !endedAt && (
+            <div className="flex items-center gap-2 px-2 py-4 text-sm text-muted-foreground">
+              <Loader2 className="h-4 w-4 animate-spin" />
+              {t("chatPage.progressPanel.planning")}
+            </div>
+          )
         ) : (
           <ol className="space-y-1">
             {steps.map((step, index) => (

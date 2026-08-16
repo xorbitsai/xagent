@@ -79,10 +79,15 @@ function TaskDetailContent() {
       // querySelectorAll throws a SyntaxError. CSS.escape is for identifier
       // syntax (e.g. it hex-escapes a leading digit), not string-literal
       // content, and is also absent in some test/DOM-shim environments, so a
-      // plain regex replace is both simpler and correct here.
-      const escapedStepId = stepId.replace(/["\\\x00-\x1f]/g, (ch) => (
-        ch === '"' || ch === "\\" ? `\\${ch}` : `\\${ch.charCodeAt(0).toString(16)} `
-      ))
+      // plain regex replace is both simpler and correct here. NUL (\x00) is
+      // dropped rather than hex-escaped: per the CSS syntax spec, a hex
+      // escape for value zero decodes back to U+FFFD, not U+0000, so it
+      // could never match a real NUL character in the DOM attribute anyway.
+      const escapedStepId = stepId.replace(/["\\\x00-\x1f]/g, (ch) => {
+        if (ch === '"' || ch === "\\") return `\\${ch}`
+        if (ch === "\0") return ""
+        return `\\${ch.charCodeAt(0).toString(16)} `
+      })
       const matches = document.querySelectorAll(`[data-step-id="${escapedStepId}"]`)
       const target = matches[matches.length - 1]
       target?.scrollIntoView({ behavior: "smooth", block: "center" })

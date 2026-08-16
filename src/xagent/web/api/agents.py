@@ -12,6 +12,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from ...config import get_agent_pattern_for_execution_mode, get_uploads_dir
+from ...core.agent.language import response_language_rules
 from ...core.agent.service import AgentService
 from ...core.memory.in_memory import InMemoryMemoryStore
 from ...core.tools.core.document_search import find_missing_knowledge_bases
@@ -492,7 +493,10 @@ async def optimize_instructions(
             "You are an expert agent builder and prompt engineer. "
             "Your task is to refine and optimize the user's draft instructions for an AI agent. "
             "The output should be clear, structured, and effective for an LLM to follow. "
-            "Do not include any conversational filler. Just output the optimized instructions."
+            "Do not include any conversational filler. Just output the optimized instructions. "
+            "Preserve the draft's natural language and Chinese script; do not switch languages "
+            "because the surrounding API prompt is written in English. "
+            f"{response_language_rules(subject='draft instructions')}"
         )
 
         user_prompt = f"Draft instructions:\n{request.instructions}\n\nPlease optimize these instructions."

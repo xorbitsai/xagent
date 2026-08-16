@@ -7,6 +7,7 @@
  * "last running tool" (which mis-attributes output/status the moment completion
  * order differs from reverse-start order).
  */
+import { readFileSync } from "node:fs"
 import { describe, it, expect, vi } from "vitest"
 
 vi.mock("next/navigation", () => ({ useRouter: () => ({ push: vi.fn() }) }))
@@ -375,5 +376,23 @@ describe("every toolNames entry resolves through getFriendlyToolName", () => {
 
   it("keeps the same set of tool names mapped in both locales", () => {
     expect(Object.keys(toolNames.en).sort()).toEqual(Object.keys(toolNames.zh).sort())
+  })
+
+  it("keeps the fixture's Locale boundary a Partial", () => {
+    // Everything above iterates only the keys the fixture actually has, so it
+    // would all still pass if the annotation regressed to an exhaustive
+    // `Record<Locale, …>`: while Locale is exactly en | zh the two types are
+    // interchangeable here, and no runtime assertion can tell them apart. The
+    // difference only surfaces in a build that widens Locale, which this repo
+    // never runs -- so pin the boundary in the source text, the way
+    // src/lib/time-utils.test.ts pins displayDateLocales' Partial.
+    //
+    // The needle is assembled from fragments rather than written out whole:
+    // this guard sits in the file it guards, so a single literal would match
+    // its own occurrence and keep passing after the fixture had regressed.
+    const boundary = ["} satisfies Partial<Record<Locale, ", "Record<string, string>>>"].join("")
+    const source = readFileSync("src/components/chat/trace-event-processing.test.ts", "utf8")
+
+    expect(source).toContain(boundary)
   })
 })

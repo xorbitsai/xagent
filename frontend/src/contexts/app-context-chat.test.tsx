@@ -1467,13 +1467,16 @@ describe("AppProvider websocket message routing", () => {
       // A real task_completed broadcast nests the task id at task.id, and
       // useWebSocket's normalizer (use-websocket.ts) lifts it into a
       // top-level task_id - exercise that exact shape too, not just the
-      // trace_event envelope above.
+      // trace_event envelope above. Also carries a file output that would
+      // auto-open the file preview (dispatchAutoOpenPreview) if the stray
+      // dispatch weren't dropped - OPEN_FILE_PREVIEW must be task-scoped too.
       onMessage?.({
         type: "task_completed",
         timestamp: "2026-05-27T05:00:03Z",
         task_id: 2,
         task: { id: 2, status: "completed" },
         success: true,
+        file_outputs: ["report.pdf"],
       } as TestWebSocketMessage)
     })
     await waitFor(() => {
@@ -1484,6 +1487,7 @@ describe("AppProvider websocket message routing", () => {
     expect(screen.getByTestId("task-status").textContent).toBe("running")
     expect(screen.getByTestId("task-title").textContent).toBe("Test task")
     expect(screen.getByTestId("messages").textContent).not.toContain("Stray reply from task 2")
+    expect(screen.getByTestId("preview-open").textContent).toBe("false")
 
     // The viewed task's own events must still apply normally - the guard
     // isn't blanket-dropping DAG/chat state, only cross-task events.

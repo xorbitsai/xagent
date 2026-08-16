@@ -23,7 +23,7 @@ interface ProgressPanelProps {
   // endedAt - startedAt instead of continuing to count up against "now".
   endedAt?: string | number
   onCollapse: () => void
-  onStepClick?: (stepId: string) => void
+  onStepClick: (stepId: string) => void
 }
 
 function formatElapsedCompact(ms: number): string {
@@ -36,30 +36,34 @@ function formatElapsedCompact(ms: number): string {
   return `${seconds}s`
 }
 
-// Ticks once a second while `startedAt` is set, so callers get a live
-// "elapsed since startedAt" string without each one re-implementing a timer.
-// Checked for truthiness, not just `!== undefined`: upstream data can hand
-// this an empty string for "no timestamp yet" (see stepsFromPlanData's
-// `getString` fallback), and normalizeTimestampMs treats any falsy value as
-// "now" - so a strict `!== undefined` check would let "" through and render
-// a bogus "0s" instead of hiding the timer.
-function useElapsed(startedAt: string | number | undefined): string | null {
+// Distinguishes a genuinely missing timestamp (undefined/null, or the empty
+// string upstream data uses for "not set yet" - see stepsFromPlanData's
+// `getString` fallback) from a valid-but-falsy one: epoch 0 is a real instant
+// in this type's `string | number` contract, and normalizeTimestampMs itself
+// falls back to "now" for any falsy input, so a plain truthiness check would
+// treat a genuine (if unlikely) zero timestamp as absent.
+function hasTimestamp(value: string | number | undefined): value is string | number {
+  return value !== undefined && value !== null && value !== ""
+}
+
+// Ticks once a second for as long as `active` is true, shared by the header
+// and every running step row - a run with R running rows previously mounted
+// R+1 independent one-second timers (one per `useElapsed` call) all doing
+// the same job; one shared clock at the panel level does it once.
+function useLiveNow(active: boolean): number {
   const [now, setNow] = useState(() => Date.now())
 
   useEffect(() => {
-    if (!startedAt) return
-    // Re-seed immediately: `now` may still hold a value from long before this
-    // particular `startedAt` became truthy (e.g. a step that sat pending for
-    // minutes before going "running"), and the first tick is a full second
-    // away - without this the first render briefly shows an elapsed time
-    // computed against a stale `now`.
+    if (!active) return
+    // Re-seed immediately rather than waiting for the first tick (a full
+    // second away): `now` may still hold a stale value from before the panel
+    // had anything to tick for.
     setNow(Date.now())
     const timer = setInterval(() => setNow(Date.now()), 1000)
     return () => clearInterval(timer)
-  }, [startedAt])
+  }, [active])
 
-  if (!startedAt) return null
-  return formatElapsedCompact(now - normalizeTimestampMs(startedAt))
+  return now
 }
 
 export function ProgressPanel({
@@ -70,9 +74,24 @@ export function ProgressPanel({
   onStepClick,
 }: ProgressPanelProps) {
   const { t } = useI18n()
-  const liveTotalElapsed = useElapsed(endedAt ? undefined : startedAt)
+  const runEnded = hasTimestamp(endedAt)
+  const headerIsLive = !runEnded && hasTimestamp(startedAt)
+  // The shared clock must stay active for as long as EITHER the header or any
+  // individual row needs to tick - not just whenever the panel's own
+  // `startedAt` is set. A row's own `step.startedAt` is what actually gates
+  // its ticking (see ProgressStepRow below), and the two aren't guaranteed to
+  // agree: a dagExecution constructed via a legacy/malformed event that never
+  // got a `created_at` backfill would leave the panel's `startedAt` (and thus
+  // `headerIsLive`) false even while a step with its own valid `startedAt` is
+  // genuinely running - gating the whole clock on `headerIsLive` alone would
+  // silently freeze that row's timer instead of just hiding the header's.
+  const anyRowLive = !runEnded && steps.some((step) => step.status === "running" && hasTimestamp(step.startedAt))
+  const now = useLiveNow(headerIsLive || anyRowLive)
+  const liveTotalElapsed = headerIsLive
+    ? formatElapsedCompact(now - normalizeTimestampMs(startedAt))
+    : null
   const finishedTotalElapsed =
-    endedAt && startedAt
+    runEnded && hasTimestamp(startedAt)
       ? formatElapsedCompact(normalizeTimestampMs(endedAt) - normalizeTimestampMs(startedAt))
       : null
   const totalElapsed = liveTotalElapsed ?? finishedTotalElapsed
@@ -130,7 +149,7 @@ export function ProgressPanel({
           // that from "still planning/about to execute", so this doesn't show
           // an indefinitely-spinning "generating plan" placeholder for a run
           // that's already over.
-          !endedAt && (
+          !runEnded && (
             <div className="flex items-center gap-2 px-2 py-4 text-sm text-muted-foreground">
               <Loader2 className="h-4 w-4 animate-spin" />
               {t("chatPage.progressPanel.planning")}
@@ -139,7 +158,14 @@ export function ProgressPanel({
         ) : (
           <ol className="space-y-1">
             {steps.map((step, index) => (
-              <ProgressStepRow key={step.id} step={step} index={index} endedAt={endedAt} onClick={onStepClick} />
+              <ProgressStepRow
+                key={step.id}
+                step={step}
+                index={index}
+                endedAt={endedAt}
+                now={now}
+                onClick={onStepClick}
+              />
             ))}
           </ol>
         )}
@@ -152,15 +178,20 @@ function ProgressStepRow({
   step,
   index,
   endedAt,
+  now,
   onClick,
 }: {
   step: ProgressStepView
   index: number
   endedAt?: string | number
-  onClick?: (stepId: string) => void
+  now: number
+  onClick: (stepId: string) => void
 }) {
   const { t } = useI18n()
-  const liveElapsed = useElapsed(!endedAt && step.status === "running" ? step.startedAt : undefined)
+  const liveElapsed =
+    !hasTimestamp(endedAt) && step.status === "running" && hasTimestamp(step.startedAt)
+      ? formatElapsedCompact(now - normalizeTimestampMs(step.startedAt))
+      : null
   // Completed/failed steps already have both endpoints - a static duration,
   // not another ticking timer, is all that's needed once a step is done. Once
   // the whole run has ended (`endedAt` set), no row should keep ticking
@@ -168,14 +199,11 @@ function ProgressStepRow({
   // own terminal event when a run finishes, so a step that's still "running"
   // at that point never gets its own completedAt - freeze it at the run's end
   // time instead, rather than letting it keep counting up against "now".
-  // Checked for truthiness, not `!== undefined`: a step still running/pending
-  // when a replan snapshot arrives gets `completed_at: ""` (see
-  // stepsFromPlanData's `getString` fallback), and `??` would treat that
-  // empty string as "already have a real endpoint" and never fall through to
-  // `endedAt`.
-  const frozenEndpoint = step.completedAt || (step.status === "running" ? endedAt : undefined)
+  const frozenEndpoint = hasTimestamp(step.completedAt)
+    ? step.completedAt
+    : (step.status === "running" ? endedAt : undefined)
   const finishedDuration =
-    step.startedAt && frozenEndpoint
+    hasTimestamp(step.startedAt) && hasTimestamp(frozenEndpoint)
       ? formatElapsedCompact(normalizeTimestampMs(frozenEndpoint) - normalizeTimestampMs(step.startedAt))
       : null
   const duration = liveElapsed ?? finishedDuration
@@ -187,14 +215,14 @@ function ProgressStepRow({
   // activation logic can still have a startedAt preserved from before that
   // (see stepsFromPlanData's existingStep merge), and its trace group is
   // still there to scroll to even though its final status isn't "running".
-  const hasTraceTarget = Boolean(step.startedAt)
+  const hasTraceTarget = hasTimestamp(step.startedAt)
 
   return (
     <li>
       <button
         type="button"
         disabled={!hasTraceTarget}
-        onClick={hasTraceTarget ? () => onClick?.(step.id) : undefined}
+        onClick={hasTraceTarget ? () => onClick(step.id) : undefined}
         className={cn(
           "flex w-full items-start gap-3 rounded-lg px-2 py-2 text-left transition-colors",
           step.status === "running" ? "bg-primary/10" : "hover:bg-muted/50",

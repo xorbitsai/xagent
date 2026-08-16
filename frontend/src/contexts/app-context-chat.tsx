@@ -1708,10 +1708,6 @@ export function AppProvider({
     }
     return false
   }, [])
-  const isDuplicateResult = useCallback(
-    (content: string) => isDuplicateMessage(content, "result"),
-    [isDuplicateMessage],
-  )
   // All actions are projected synchronously so each action observes the state
   // produced by the preceding action before React commits the batch.
   const stateRef = useRef(state)

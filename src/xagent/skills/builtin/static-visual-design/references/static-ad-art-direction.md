@@ -51,6 +51,56 @@ that merely decorate. A kept direction states its device in one sentence, such
 as "the 1.4M milestone staged as a rally the viewer is invited to join." Every device must still
 pass the competitor-substitution test and carry verified claims only.
 
+## Build a set of directions
+
+Keep direction-setting in one coherent pass. One creative lead defines and
+compares the whole set; independent ideation converges on the same obvious brand
+cues and changes only surface decoration. Parallel execution earns its place
+only after the briefs are locked, with each executor holding a distinct
+proposition, structure, focal device, production finish, and exclusions.
+
+Represent that order in any execution plan: brand and reference acquisition is
+a shared prerequisite, creative direction depends on it, and every render
+depends on the locked specification. Leave asset-availability conclusions out
+of planned step definitions — whether a verified logo exists is an outcome of
+the acquisition step, so how the brand is represented stays open until it runs.
+
+When client taste is unknown, spread the set across a creative-risk ladder
+rather than betting on one aesthetic:
+
+1. **Brand-safe evolution** — immediately recognizable, with cleaner and more
+   disciplined use of familiar brand cues.
+2. **Contemporary reinterpretation** — preserves identity while meaningfully
+   changing composition, image language, or type system.
+3. **Bold exploration** — reaches for a more ownable campaign metaphor or
+   unexpected art direction while staying factually and strategically on brief.
+
+A ladder gives the client a comfortable choice and reveals how much change they
+will accept. Making every option safe, or every option experimental, reveals
+nothing.
+
+Compare the locked briefs as a set before rendering. Each direction should
+differ on at least three of: focal subject, structural approach, visual
+metaphor, production finish, palette balance, type strategy. Compare the actual
+render prompts, not the direction names — prompts describing the same focal
+mechanism and layout are one direction wearing three copy variations, and a set
+whose every hero is a large typographic number is the most common way this
+happens. For an open brief, at most one direction may take pure typography as
+its focal subject and at most one may take a deliberately flat treatment with an
+empty environment; the rest are carried by a scene, person, place, object, or
+material device. When the user explicitly asks for a typographic or minimalist
+system, work the variation inside that system through composition, scale,
+material, and color.
+
+Familiar devices are not disqualified by being familiar. A gradient, portrait,
+phone, giant headline, glow, or confetti field can be the right choice — reject
+one when it does no communication work, or when it could move unchanged to a
+competitor, not because it appears on a blacklist. Judge stacked display effects
+the same way: keep the ones serving the chosen device, drop the rest.
+
+Vary concepts before varying sizes. A crop change or accent-color swap is not a
+second concept.
+
 ## Choose a communication structure
 
 Choose one structure because it serves the proposition. Do not combine several

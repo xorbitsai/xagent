@@ -348,12 +348,22 @@ describe("every toolNames entry resolves through getFriendlyToolName", () => {
   // would go unnoticed. Iterate every key actually in the source file
   // (self-referential, so no per-key value needs hand-copying here) and
   // assert getFriendlyToolName resolves it exactly.
-  const toolNames: Record<Locale, Record<string, string>> = {
+  //
+  // Typed with `satisfies Partial<…>` rather than annotated
+  // `Record<Locale, …>`: a downstream build can replace @/i18n/translations
+  // with one that adds locales, widening Locale beyond the source objects
+  // this repo ships (src/lib/time-utils.ts types displayDateLocales as a
+  // Partial for the same reason, and its test pins that annotation). An
+  // exhaustive Record here would demand an entry for a locale core has no
+  // module to import, breaking their type-check on a file only this repo
+  // owns. `satisfies` still rejects a wrong value shape or a key that is not
+  // a Locale at all.
+  const toolNames = {
     en: en.traceEventRenderer.toolNames,
     zh: zh.traceEventRenderer.toolNames,
-  }
+  } satisfies Partial<Record<Locale, Record<string, string>>>
 
-  for (const locale of Object.keys(toolNames) as Locale[]) {
+  for (const locale of Object.keys(toolNames) as (keyof typeof toolNames)[]) {
     it(`resolves all ${Object.keys(toolNames[locale]).length} ${locale} entries to their literal source value`, () => {
       const tDynamic = (key: string, fallback: string) =>
         resolveDynamicTranslation(locale, key, fallback)

@@ -1476,7 +1476,13 @@ describe("AppProvider websocket message routing", () => {
         task_id: 2,
         task: { id: 2, status: "completed" },
         success: true,
-        file_outputs: ["report.pdf"],
+        // Must be object-shaped ({file_id, filename}), matching what the
+        // real backend broadcast sends (websocket.py's normalized_outputs) -
+        // normalizeGeneratedPreviewFiles filters out any entry without a
+        // file_id, so a bare string here would silently never reach
+        // dispatchAutoOpenPreview at all, making the assertion below pass
+        // even if the OPEN_FILE_PREVIEW guard were broken.
+        file_outputs: [{ file_id: "task-2-report", filename: "report.pdf" }],
       } as TestWebSocketMessage)
     })
     await waitFor(() => {

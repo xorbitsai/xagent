@@ -1,7 +1,7 @@
 import { readFileSync } from "node:fs"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 import type { Locale } from "@/i18n/translations"
-import { formatDisplayDate } from "./time-utils"
+import { formatDisplayDate, normalizeTimestampMs } from "./time-utils"
 
 const bigintValue = (globalThis as { BigInt: (value: number) => bigint }).BigInt(1)
 
@@ -114,5 +114,26 @@ describe("formatDisplayDate", () => {
     const helper = source.slice(start, end)
     expect(helper).toContain("const date = new Date(value)")
     expect(helper).not.toMatch(/normalizeTimestampMs|formatTime|toLocaleDateString|utils\.formatDate/)
+  })
+})
+
+describe("normalizeTimestampMs", () => {
+  it("treats epoch zero as a present timestamp, not an absent one", () => {
+    expect(normalizeTimestampMs(0)).toBe(0)
+    // The string form takes a completely different branch (numeric-string
+    // parsing, not the absence check) - assert it independently rather than
+    // assuming it agrees with the numeric case.
+    expect(normalizeTimestampMs("0")).toBe(0)
+  })
+
+  it("falls back to now for genuinely absent values", () => {
+    const before = Date.now()
+    expect(normalizeTimestampMs(undefined)).toBeGreaterThanOrEqual(before)
+    expect(normalizeTimestampMs(null)).toBeGreaterThanOrEqual(before)
+    expect(normalizeTimestampMs("")).toBeGreaterThanOrEqual(before)
+  })
+
+  it("falls back to now for NaN rather than propagating it", () => {
+    expect(normalizeTimestampMs(NaN)).not.toBeNaN()
   })
 })

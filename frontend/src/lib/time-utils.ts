@@ -32,7 +32,11 @@ export function formatDisplayDate(
  * @returns Timestamp in milliseconds
  */
 export function normalizeTimestampMs(ts?: string | number | Date | null): number {
-  if (!ts) return Date.now()
+  // Checked for exact absence, not truthiness: epoch zero (`0`) is a valid,
+  // if unlikely, timestamp - a `!ts` check would collapse it into "now" the
+  // same way it does undefined/null/"", silently discarding a real value.
+  if (ts === undefined || ts === null || ts === '') return Date.now()
+  if (typeof ts === 'number' && Number.isNaN(ts)) return Date.now()
   if (ts instanceof Date) return ts.getTime()
 
   if (typeof ts === 'string') {

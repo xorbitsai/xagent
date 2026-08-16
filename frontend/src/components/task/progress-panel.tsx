@@ -39,11 +39,14 @@ function formatElapsedCompact(ms: number): string {
 // Distinguishes a genuinely missing timestamp (undefined/null, or the empty
 // string upstream data uses for "not set yet" - see stepsFromPlanData's
 // `getString` fallback) from a valid-but-falsy one: epoch 0 is a real instant
-// in this type's `string | number` contract, and normalizeTimestampMs itself
-// falls back to "now" for any falsy input, so a plain truthiness check would
-// treat a genuine (if unlikely) zero timestamp as absent.
+// in this type's `string | number` contract, and a plain truthiness check
+// would treat a genuine (if unlikely) zero timestamp as absent. Also excludes
+// NaN - normalizeTimestampMs treats NaN as absent (falls back to "now"), and
+// this must agree with it, or a NaN value would read as "present" here while
+// resolving to the current instant there, producing a bogus, constantly
+// shifting duration instead of surfacing the anomaly.
 function hasTimestamp(value: string | number | undefined): value is string | number {
-  return value !== undefined && value !== null && value !== ""
+  return value !== undefined && value !== null && value !== "" && !Number.isNaN(value)
 }
 
 // Ticks once a second for as long as `active` is true, shared by the header

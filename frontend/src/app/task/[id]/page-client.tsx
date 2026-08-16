@@ -164,14 +164,21 @@ function TaskDetailContent() {
           edge of the entire page rather than just the content area below
           the header - and stays independent of the file/graph preview's
           draggable PreviewSheet layout inside TaskConversationPanel. Below
-          `md` there's no room for a fixed 360px side-by-side column without
+          `md` there's no room for a fixed side-by-side column without
           squeezing the chat unusably narrow, so it stacks below the chat
           instead - the same stack-on-mobile/side-column-on-desktop idea as
           resizable-three-column-layout.tsx, capped to a fraction of the
           viewport height (shrink-0 so that cap holds) rather than taking the
-          full remaining width. */}
+          full remaining width. Between `md` and `xl` the rail narrows to
+          280px rather than jumping straight to 360px - at ~1024px,
+          TaskConversationPanel's own chat/PreviewSheet split (when a
+          file/graph preview is also open) already halves what's left, so the
+          full 360px here would leave that split unusably narrow. This isn't a
+          full fix for that interaction (the two panels don't coordinate
+          widths - see PR review) but meaningfully softens it at the specific
+          width band that's tightest. */}
       {progressPanelVisible && (
-        <div className="w-full md:w-[360px] shrink-0 h-[45vh] md:h-full border-t md:border-t-0 md:border-l border-border">
+        <div className="w-full md:w-[280px] xl:w-[360px] shrink-0 h-[45vh] md:h-full border-t md:border-t-0 md:border-l border-border">
           <ProgressPanel
             steps={progressSteps}
             startedAt={state.dagExecution?.created_at}

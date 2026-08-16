@@ -1,15 +1,12 @@
 ---
 name: static-visual-design
 description: |
-  Create polished commercial and brand-facing static visual designs as complete
-  PNG or JPEG assets. Use only for advertising creatives, campaign posters,
-  promotional social posts, event or announcement cards, banners, and placement
-  variants where art direction, typography, hierarchy, brand fidelity, and
-  visual quality matter.
+  Design a finished ad, poster, banner, social post, or invitation as one
+  PNG/JPEG with layout, headline, and brand styling rendered in.
 when_to_use: |
-  Use only for marketing, campaign, event, or brand communication. Do not use
-  for educational infographics, technical diagrams, concept explainers, charts,
-  data visualizations, or standalone illustrations or photos.
+  Any marketing, promotion, campaign, event, or brand-facing image, including
+  ones naming a real brand. Not for explanatory diagrams, charts, infographics,
+  or plain illustrations.
 ---
 
 # Static Visual Design

@@ -2,7 +2,8 @@
 name: static-visual-design
 description: |
   Design a finished ad, poster, banner, social post, or invitation as one
-  PNG/JPEG with layout, headline, and brand styling rendered in.
+  PNG/JPEG with layout, headline, and brand styling rendered in, or adapt one
+  into another placement size or aspect ratio.
 when_to_use: |
   Any marketing, promotion, campaign, event, or brand-facing image, including
   ones naming a real brand. Not for explanatory diagrams, charts, infographics,
@@ -63,10 +64,16 @@ proposition it may not reinterpret.
 
 Order the work, and represent that order in any execution plan: brand and
 reference acquisition is a shared prerequisite, creative direction depends on it,
-and every render depends on the locked specification. Never plan a render, or an
-identity search, to run alongside acquisition. Leave asset availability out of
-planned step definitions — whether a verified logo exists is an outcome of the
-acquisition step, so how the brand gets represented stays open until it runs.
+and every render depends on the locked specification. Never plan a render to run
+alongside acquisition.
+
+Searching for identity assets is never a planned step, sequential or otherwise.
+A plan step carries no authorization, so a step that exists will run — and
+acquisition reporting no verified logo is the trigger for the question, not for a
+search. Plan the question instead; a search only ever follows the user answering
+it by asking for one. Leave asset availability out of step definitions too:
+whether a verified logo exists is an outcome of acquisition, so how the brand
+gets represented stays open until that step runs.
 
 ## Brand and identity assets
 

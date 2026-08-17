@@ -41,6 +41,8 @@ def test_static_visual_design_skill_routes_only_commercial_creatives() -> None:
     # Positive triggers and exclusions both have to sit in the routing surface.
     assert "ad, poster, banner" in description
     assert "PNG/JPEG" in description
+    # Terse resize requests ("adapt this to 9:16") route through the index too.
+    assert "adapt one into another placement size or aspect ratio" in description
     assert "marketing, promotion, campaign, event, or brand-facing" in when_to_use
     assert "Not for explanatory diagrams" in when_to_use
     assert "infographics" in when_to_use
@@ -85,7 +87,7 @@ def test_static_visual_design_skill_routes_only_commercial_creatives() -> None:
     # body but not the reference, which is only read later (#1411 review C1).
     assert "represent that order in any execution plan" in content
     assert "acquisition is a shared prerequisite" in content
-    assert "Never plan a render, or an identity search, to run alongside" in content
+    assert "Never plan a render to run alongside acquisition" in content
 
     # Coverage means absent, not wrong — otherwise any defect can be relabeled
     # into an unbudgeted render.
@@ -200,16 +202,38 @@ def test_asset_retrieval_surfaces_do_not_invite_unprompted_logo_search() -> None
             assert phrase not in lowered, f"{name} reintroduced: {phrase!r}"
 
 
+# One exact phrase per surface. An aggregate count would pass on a coincidental
+# "directly" elsewhere in a description (#1411 review P7).
+REQUIRED_AUTHORIZATION_WORDING = {
+    "fetch_web_content.description": "When the user asked you to obtain an exact asset",
+    "fetch_web_content.include_assets": "Enable it when the user asked you to obtain an "
+    "asset",
+    "download_web_asset.description": "surfaced the asset the user asked you to retrieve",
+    "download_web_asset.url": "reached while carrying out a retrieval the user asked for",
+    "generate_image.description": "an asset the user directed you to retrieve",
+    "edit_image.description": "an asset the user directed you to retrieve",
+}
+
+
 def test_asset_retrieval_surfaces_require_user_direction() -> None:
-    """The positive half: retrieval is conditioned on the user asking for it."""
+    """The positive half, asserted per surface rather than in aggregate."""
     surfaces = _asset_retrieval_surfaces()
 
-    directed = [t for t in surfaces.values() if "direct" in t.lower()]
-    assert len(directed) >= 4, (
-        "each retrieval surface should condition on the user having directed it; "
-        f"only {len(directed)} of {len(surfaces)} do"
+    assert set(surfaces) == set(REQUIRED_AUTHORIZATION_WORDING), (
+        "a retrieval surface was added or renamed without its authorization wording"
     )
-    joined = " ".join(surfaces.values()).lower()
+    for name, phrase in REQUIRED_AUTHORIZATION_WORDING.items():
+        assert phrase in " ".join(surfaces[name].split()), (
+            f"{name} no longer conditions retrieval on the user asking: {phrase!r}"
+        )
+
+    # Authorization follows the request, not the URL: a page web_search found for
+    # a retrieval the user asked for is in scope (#1411 review N1).
+    fetch = " ".join(surfaces["fetch_web_content.description"].split())
+    assert "one they named or one web_search found for that request" in fetch
+    assert "uninstructed" in fetch
+
+    joined = " ".join(" ".join(t.split()) for t in surfaces.values())
     assert "ask the user for it" in joined
 
 
@@ -264,4 +288,4 @@ def test_static_visual_design_keeps_planner_visible_topology() -> None:
     )
     assert "only after every brief and specification is locked" in content
     assert "represent that order in any execution plan" in content
-    assert "Never plan a render, or an identity search, to run alongside" in content
+    assert "Never plan a render to run alongside acquisition" in content

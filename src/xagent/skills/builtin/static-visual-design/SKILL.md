@@ -54,6 +54,13 @@ asks for exactly one final asset, compare directions internally and render the
 strongest. The reference explains how to invent a direction's visual device and
 how far apart a set should sit.
 
+Order the work, and represent that order in any execution plan: brand and
+reference acquisition is a shared prerequisite, creative direction depends on it,
+and every render depends on the locked specification. Never plan a render, or an
+identity search, to run alongside acquisition. Leave asset availability out of
+planned step definitions — whether a verified logo exists is an outcome of the
+acquisition step, so how the brand gets represented stays open until it runs.
+
 ## Brand and identity assets
 
 Inspect any reference images this task provides with `understand_media`, and
@@ -83,12 +90,21 @@ sponsor marks, and UI screenshots cannot survive generative rendering
 pixel-for-pixel — when exact reproduction matters, say so and ask the user to
 arrange deterministic post-processing.
 
+Separate stable identity cues from temporary campaign styling. Stable cues
+recur across several recent official materials: the logo, colour relationships,
+typography character, product imagery, graphic proportions. A gradient, metallic
+treatment, bevel, glow, ribbon, or confetti field appearing in one old banner is
+that campaign's styling, not the brand's identity — do not promote it into a
+permanent cue. Preserve recognition through the stable cues while modernizing
+hierarchy, whitespace, type discipline, and the number of competing effects.
+
 Unless the user asked for an unbranded concept, a brand-specific final requires
-a verified logo. Asking how to proceed without one is a complete answer to a
-blocked brief, not a failure to work around: it is the outcome this skill wants,
-and no amount of searching, reconstructing, or typesetting a substitute is a
-better one. Render a reserved-space or unbranded draft only once the user has
-chosen it, and label it a concept draft when you hand it back.
+a verified logo. Ask with `ask_user_question` so the turn ends waiting for the
+user and resumes on their choice; that is a complete answer to a blocked brief,
+not a failure to work around, and no amount of searching, reconstructing, or
+typesetting a substitute is a better one. Render a reserved-space or unbranded
+draft only once the user has chosen it, and label it a concept draft when you
+hand it back.
 
 ## Generate
 
@@ -117,6 +133,12 @@ illegible thumbnail-size type; clipped or overlapping essentials; several ads
 merged into one image; fake, duplicated, or distorted logos; fake QR codes,
 watermarks, and unrelated lettering. A successful tool call is not evidence the
 asset is finished.
+
+A render that omits a required brand asset is a rejection too. Passing a verified
+logo as a reference does not prove the image model placed it, so confirm the mark
+is present and faithful in the result. Re-render within the repair budget; if the
+budget runs out with the asset still missing, name the omission in the hand-back
+rather than presenting the render as branded.
 
 ## Repair budget
 
@@ -149,6 +171,12 @@ is spent and an asset still fails inspection, deliver its best candidate, name
 the defect concretely (which text is misspelled, which element is clipped, which
 logo is not authentic), and mark the answer's outcome `partial` so the user can
 decide whether to spend another round.
+
+A spent budget with complete coverage is terminal. The defects belong in the
+answer text where the user reads them, and `missing_verification` stays empty —
+naming a defect there reopens the loop the budget just closed, and another render
+or replan is not the correct response to it. Call `final_answer` with
+`outcome=partial` and stop.
 
 Return only PNG or JPEG files that were actually created. When the run ends in a
 question there are none, and the question is the whole answer — do not list or

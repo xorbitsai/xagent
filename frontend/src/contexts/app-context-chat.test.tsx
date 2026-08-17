@@ -1634,6 +1634,66 @@ describe("AppProvider websocket message routing", () => {
     expect(screen.getByTestId("steps-count").textContent).toBe("1")
   })
 
+  it("drops a foreign task_completed sent in the real production wire shape, not just the flat test shape", async () => {
+    // use-websocket.ts's own normalizer (the "type": "task_completed" branch)
+    // never hands handleMessage a flat message - it wraps the ENTIRE raw
+    // frame under `.data` and lifts only `task_id` (from `data.task.id ??
+    // data.task_id`) to the top level. The flat shape used elsewhere in this
+    // file happens to also work (normalizeTaskCompletedMessage falls back to
+    // the root object when `.data` is absent), but it never actually
+    // exercises that `.data` fallback branch, or proves the top-level
+    // ownership guard (which only ever reads the top-level task_id) still
+    // works once task/success/file_outputs move under `.data` instead of
+    // sitting next to it.
+    render(
+      <AppProvider token="token">
+        <SeedRunningTask />
+        <StateProbe />
+      </AppProvider>
+    )
+    const onMessage = webSocketOptions.current?.onMessage
+    expect(onMessage).toBeDefined()
+
+    act(() => {
+      onMessage?.({
+        type: "task_completed",
+        timestamp: "2026-05-27T05:00:03Z",
+        task_id: 2,
+        data: {
+          type: "task_completed",
+          timestamp: "2026-05-27T05:00:03Z",
+          task: { id: 2, status: "completed" },
+          success: true,
+          file_outputs: [{ file_id: "task-2-report", filename: "report.pdf" }],
+        },
+      } as unknown as TestWebSocketMessage)
+    })
+    // Give the (would-be, if the guard failed) dispatches a tick to land.
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0))
+    })
+    expect(screen.getByTestId("task-status").textContent).toBe("running")
+    expect(screen.getByTestId("preview-open").textContent).toBe("false")
+
+    // The viewed task's own production-shaped completion must still apply.
+    act(() => {
+      onMessage?.({
+        type: "task_completed",
+        timestamp: "2026-05-27T05:00:04Z",
+        task_id: 1,
+        data: {
+          type: "task_completed",
+          timestamp: "2026-05-27T05:00:04Z",
+          task: { id: 1, status: "completed" },
+          success: true,
+        },
+      } as unknown as TestWebSocketMessage)
+    })
+    await waitFor(() => {
+      expect(screen.getByTestId("task-status").textContent).toBe("completed")
+    })
+  })
+
   it("resets created_at/steps for a new turn_id instead of inheriting the prior run's", async () => {
     render(
       <AppProvider token="token">
@@ -1695,6 +1755,85 @@ describe("AppProvider websocket message routing", () => {
     expect(screen.getByTestId("steps-count").textContent).toBe("0")
   })
 
+  it("does not treat a one-sided missing turn_id as a new run, in either direction", async () => {
+    // A turn_id present on only one side (a legacy/history event that
+    // predates this field, mixed with a modern one) can't be reliably
+    // compared - both directions must fall back to "not a new run" rather
+    // than guessing, or a legacy event arriving mid-run would wipe live
+    // steps out from under it.
+    render(
+      <AppProvider token="token">
+        <SeedRunningTask />
+        <StateProbe />
+      </AppProvider>
+    )
+    const onMessage = webSocketOptions.current?.onMessage
+    expect(onMessage).toBeDefined()
+
+    const dagExecutionMessage = (
+      timestamp: string,
+      data: Record<string, unknown>,
+    ): TestWebSocketMessage => ({
+      type: "trace_event",
+      timestamp,
+      task_id: 1,
+      data: {
+        event_id: `dag-execution-${timestamp}`,
+        event_type: "dag_execution",
+        data,
+      },
+    })
+
+    // Tracked turn_id present ("turn-A"), incoming event has none (legacy
+    // shape) - must not reset, AND must not wipe the tracked turn_id either
+    // (SET_DAG_EXECUTION replaces the whole object, so without an explicit
+    // carry-forward the legacy event would silently erase the run's
+    // identity, blinding the new-run detection for the rest of the run).
+    act(() => {
+      onMessage?.(dagExecutionMessage("2026-05-27T05:00:02Z", {
+        phase: "executing",
+        turn_id: "turn-A",
+        steps: [{ id: "step-one", name: "Step one", dependencies: [] }],
+      }))
+    })
+    await waitFor(() => {
+      expect(screen.getByTestId("steps-count").textContent).toBe("1")
+    })
+    act(() => {
+      onMessage?.(dagExecutionMessage("2026-05-27T05:00:03Z", { phase: "executing" }))
+    })
+    await waitFor(() => {
+      expect(screen.getByTestId("dag-created-at").textContent).toBe("2026-05-27T05:00:02Z")
+    })
+    expect(screen.getByTestId("steps-count").textContent).toBe("1")
+    expect(screen.getByTestId("dag-turn-id").textContent).toBe("turn-A")
+
+    // The tracked identity survived the legacy event above, so a further
+    // same-run event must still read as a continuation...
+    act(() => {
+      onMessage?.(dagExecutionMessage("2026-05-27T05:00:04Z", { phase: "executing", turn_id: "turn-A" }))
+    })
+    await waitFor(() => {
+      expect(screen.getByTestId("dag-turn-id").textContent).toBe("turn-A")
+    })
+    expect(screen.getByTestId("dag-created-at").textContent).toBe("2026-05-27T05:00:02Z")
+    expect(screen.getByTestId("steps-count").textContent).toBe("1")
+
+    // ...and a genuinely NEW run must still be detected as new - the exact
+    // regression the carry-forward exists to prevent: had the legacy event
+    // wiped the tracked turn_id, this differing id would compare against
+    // undefined and fall back to "not a new run", inheriting turn-A's
+    // created_at (a wildly wrong elapsed time) and stale steps.
+    act(() => {
+      onMessage?.(dagExecutionMessage("2026-05-27T05:00:05Z", { phase: "planning", turn_id: "turn-B" }))
+    })
+    await waitFor(() => {
+      expect(screen.getByTestId("dag-turn-id").textContent).toBe("turn-B")
+    })
+    expect(screen.getByTestId("dag-created-at").textContent).toBe("2026-05-27T05:00:05Z")
+    expect(screen.getByTestId("steps-count").textContent).toBe("0")
+  })
+
   it("resets created_at/steps for a new turn_id via the bare dag_execution message type too", async () => {
     // The trace_event-wrapped shape above and this bare-message-type shape
     // are handled by two SEPARATE branches in handleMessage (this one is
@@ -1740,6 +1879,295 @@ describe("AppProvider websocket message routing", () => {
       expect(screen.getByTestId("dag-turn-id").textContent).toBe("turn-B")
     })
     expect(screen.getByTestId("dag-created-at").textContent).toBe("2026-05-27T05:00:05Z")
+    expect(screen.getByTestId("steps-count").textContent).toBe("0")
+  })
+
+  it("resets dagExecution/steps once an ordinary new send's ack resolves on an existing DAG task", async () => {
+    // The plain-path counterpart to the race-condition test below: no
+    // task_completed clone in the middle, just an existing task with a
+    // finished DAG plan and a normal new message sent into it - the ack
+    // resolving alone must be enough to clear the stale run.
+    let acknowledgeDelivery: (() => void) | undefined
+    sendChatMessageMock.mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          acknowledgeDelivery = () =>
+            resolve({ client_message_id: "turn-2", turn_id: "turn-2" })
+        })
+    )
+
+    let sendTurnTwo: (() => Promise<void> | undefined) | undefined
+    let markTaskOneCompleted: (() => void) | undefined
+    function OrdinaryResetProbe() {
+      const { sendMessage, dispatch } = useApp()
+      sendTurnTwo = () => sendMessage("A plain follow-up", { clientMessageId: "turn-2" })
+      markTaskOneCompleted = () => {
+        dispatch({
+          type: "SET_CURRENT_TASK",
+          payload: {
+            id: "1",
+            title: "Test task",
+            status: "completed",
+            description: "Test task",
+            createdAt: "2026-05-27T05:00:00Z",
+            updatedAt: "2026-05-27T05:00:00Z",
+          },
+        })
+      }
+      return null
+    }
+
+    render(
+      <AppProvider token="token">
+        <SeedExistingTask />
+        <OrdinaryResetProbe />
+        <StateProbe />
+      </AppProvider>
+    )
+    const onMessage = webSocketOptions.current?.onMessage
+    expect(onMessage).toBeDefined()
+
+    act(() => {
+      markTaskOneCompleted?.()
+      onMessage?.({
+        type: "trace_event",
+        timestamp: "2026-05-27T05:00:02Z",
+        task_id: 1,
+        data: {
+          event_id: "dag-execution-1",
+          event_type: "dag_execution",
+          data: {
+            phase: "completed",
+            turn_id: "turn-1",
+            steps: [{ id: "step-one", name: "Step one", dependencies: [] }],
+          },
+        },
+      })
+    })
+    await waitFor(() => {
+      expect(screen.getByTestId("dag-turn-id").textContent).toBe("turn-1")
+    })
+    expect(screen.getByTestId("steps-count").textContent).toBe("1")
+
+    let delivery: Promise<void> | undefined
+    await act(async () => {
+      delivery = sendTurnTwo?.()
+      await new Promise((resolve) => setTimeout(resolve, 0))
+    })
+    expect(sendChatMessageMock).toHaveBeenCalledOnce()
+
+    await act(async () => {
+      acknowledgeDelivery?.()
+      await delivery
+    })
+    expect(screen.getByTestId("dag-turn-id").textContent).toBe("")
+    expect(screen.getByTestId("steps-count").textContent).toBe("0")
+  })
+
+  it("does not wipe a turn_id-less DAG run that arrives before the ack of the send that started it", async () => {
+    // turn_id is optional (older backends/patterns never set it), and with
+    // no dagExecution at all before the send, both the pre-send capture and
+    // the post-ack read of `?.turn_id` are undefined - "undefined ===
+    // undefined" can't tell "nothing happened" apart from "a genuinely new,
+    // turn_id-less run just arrived". The guard must fall back to object
+    // reference equality for that case (the pre-turn_id behavior), which
+    // correctly sees the newly-arrived object as new and skips the reset.
+    let acknowledgeDelivery: (() => void) | undefined
+    sendChatMessageMock.mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          acknowledgeDelivery = () =>
+            resolve({ client_message_id: "turn-legacy", turn_id: "turn-legacy" })
+        })
+    )
+
+    let sendTurn: (() => Promise<void> | undefined) | undefined
+    let markTaskOneCompleted: (() => void) | undefined
+    function LegacyRunProbe() {
+      const { sendMessage, dispatch } = useApp()
+      sendTurn = () => sendMessage("Start a DAG task", { clientMessageId: "turn-legacy" })
+      markTaskOneCompleted = () => {
+        dispatch({
+          type: "SET_CURRENT_TASK",
+          payload: {
+            id: "1",
+            title: "Test task",
+            status: "completed",
+            description: "Test task",
+            createdAt: "2026-05-27T05:00:00Z",
+            updatedAt: "2026-05-27T05:00:00Z",
+          },
+        })
+      }
+      return null
+    }
+
+    render(
+      <AppProvider token="token">
+        <SeedExistingTask />
+        <LegacyRunProbe />
+        <StateProbe />
+      </AppProvider>
+    )
+    const onMessage = webSocketOptions.current?.onMessage
+    expect(onMessage).toBeDefined()
+
+    // Terminal status so the send exercises the reset path (a running/paused
+    // task short-circuits it as a continuation), and NO dagExecution at all.
+    act(() => {
+      markTaskOneCompleted?.()
+    })
+    await waitFor(() => {
+      expect(screen.getByTestId("task-status").textContent).toBe("completed")
+    })
+    expect(screen.getByTestId("dag-phase").textContent).toBe("")
+
+    let delivery: Promise<void> | undefined
+    await act(async () => {
+      delivery = sendTurn?.()
+      await new Promise((resolve) => setTimeout(resolve, 0))
+    })
+    expect(sendChatMessageMock).toHaveBeenCalledOnce()
+
+    // The new turn's own DAG run starts broadcasting before the ack resolves,
+    // from a backend that doesn't set turn_id.
+    act(() => {
+      onMessage?.({
+        type: "trace_event",
+        timestamp: "2026-05-27T05:00:02Z",
+        task_id: 1,
+        data: {
+          event_id: "dag-execution-legacy-1",
+          event_type: "dag_execution",
+          data: {
+            phase: "executing",
+            steps: [{ id: "step-one", name: "Step one", dependencies: [] }],
+          },
+        },
+      })
+    })
+    await waitFor(() => {
+      expect(screen.getByTestId("steps-count").textContent).toBe("1")
+    })
+
+    await act(async () => {
+      acknowledgeDelivery?.()
+      await delivery
+    })
+    // The freshly-arrived run survives the ack's reset attempt.
+    expect(screen.getByTestId("dag-phase").textContent).toBe("executing")
+    expect(screen.getByTestId("steps-count").textContent).toBe("1")
+  })
+
+  it("still resets stale dagExecution when a task_completed clone races ahead of a new turn's ack", async () => {
+    // Regression coverage for the sendMessage reset guard: it used to compare
+    // dagExecution by OBJECT REFERENCE, which the (unrelated, unmodified)
+    // task_completed handler defeats - that handler unconditionally clones
+    // currentState.dagExecution into a NEW object whenever it's truthy, even
+    // for a turn that isn't a DAG turn at all. If that clone lands before this
+    // send's own ack resolves, reference equality would wrongly read as
+    // "something new arrived" and skip the reset, leaving turn 1's stale
+    // plan/steps stuck in view. Comparing turn_id instead of the object
+    // itself isn't fooled by the clone, since the id doesn't change.
+    let acknowledgeDelivery: (() => void) | undefined
+    sendChatMessageMock.mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          acknowledgeDelivery = () =>
+            resolve({ client_message_id: "turn-2", turn_id: "turn-2" })
+        })
+    )
+
+    let sendTurnTwo: (() => Promise<void> | undefined) | undefined
+    let markTaskOneCompleted: (() => void) | undefined
+    function StaleCloneProbe() {
+      const { sendMessage, dispatch } = useApp()
+      sendTurnTwo = () => sendMessage("A plain follow-up", { clientMessageId: "turn-2" })
+      markTaskOneCompleted = () => {
+        dispatch({
+          type: "SET_CURRENT_TASK",
+          payload: {
+            id: "1",
+            title: "Test task",
+            status: "completed",
+            description: "Test task",
+            createdAt: "2026-05-27T05:00:00Z",
+            updatedAt: "2026-05-27T05:00:00Z",
+          },
+        })
+      }
+      return null
+    }
+
+    render(
+      <AppProvider token="token">
+        <SeedExistingTask />
+        <StaleCloneProbe />
+        <StateProbe />
+      </AppProvider>
+    )
+    const onMessage = webSocketOptions.current?.onMessage
+    expect(onMessage).toBeDefined()
+
+    // Turn 1's DAG run finished, and the task is now done - the state a
+    // second, unrelated turn would be sent into.
+    act(() => {
+      markTaskOneCompleted?.()
+      onMessage?.({
+        type: "trace_event",
+        timestamp: "2026-05-27T05:00:02Z",
+        task_id: 1,
+        data: {
+          event_id: "dag-execution-1",
+          event_type: "dag_execution",
+          data: {
+            phase: "completed",
+            turn_id: "turn-1",
+            steps: [{ id: "step-one", name: "Step one", dependencies: [] }],
+          },
+        },
+      })
+    })
+    await waitFor(() => {
+      expect(screen.getByTestId("dag-turn-id").textContent).toBe("turn-1")
+    })
+    expect(screen.getByTestId("steps-count").textContent).toBe("1")
+
+    let delivery: Promise<void> | undefined
+    await act(async () => {
+      delivery = sendTurnTwo?.()
+      await new Promise((resolve) => setTimeout(resolve, 0))
+    })
+    expect(sendChatMessageMock).toHaveBeenCalledOnce()
+
+    // Before turn 2's ack resolves, a task_completed broadcast for task 1
+    // arrives (e.g. a duplicate/replayed completion notice) - the existing
+    // task_completed handler clones the still-turn-1 dagExecution into a new
+    // object purely to sync its phase, without changing its turn_id.
+    act(() => {
+      onMessage?.({
+        type: "task_completed",
+        timestamp: "2026-05-27T05:00:03Z",
+        task_id: 1,
+        task: { id: 1, status: "completed" },
+        success: true,
+      } as TestWebSocketMessage)
+    })
+    await waitFor(() => {
+      expect(screen.getByTestId("dag-phase").textContent).toBe("completed")
+    })
+    // Still turn 1's data - the clone didn't introduce a new run.
+    expect(screen.getByTestId("dag-turn-id").textContent).toBe("turn-1")
+    expect(screen.getByTestId("steps-count").textContent).toBe("1")
+
+    // Turn 2's ack now resolves - since nothing turn-2-specific arrived (no
+    // new turn_id), the guard must still recognize turn 1's data as stale and
+    // reset it, despite the object having been recloned in between.
+    await act(async () => {
+      acknowledgeDelivery?.()
+      await delivery
+    })
+    expect(screen.getByTestId("dag-turn-id").textContent).toBe("")
     expect(screen.getByTestId("steps-count").textContent).toBe("0")
   })
 

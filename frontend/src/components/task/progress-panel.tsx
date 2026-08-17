@@ -46,10 +46,12 @@ function formatElapsedCompact(ms: number): string {
 // `getString` fallback) from a valid-but-falsy one: epoch 0 is a real instant
 // in this type's `string | number` contract, and a plain truthiness check
 // would treat a genuine (if unlikely) zero timestamp as absent. Also excludes
-// non-finite numbers (NaN, +/-Infinity) - normalizeTimestampMs treats NaN as
-// absent (falls back to "now") and does no better with Infinity (arithmetic
-// on it stays infinite), so this must exclude both too, or such a value would
-// read as "present" here while producing a bogus, constantly shifting or
+// non-finite numbers (NaN, +/-Infinity): normalizeTimestampMs deliberately
+// lets those propagate unchanged (so formatTime/getTimeDuration's own
+// isNaN(date.getTime()) guards can catch them as malformed input), which
+// means it does nothing to stop a non-finite value from reaching duration
+// arithmetic here - this predicate is this component's own filter for that,
+// treating both as "present" would produce a bogus, constantly shifting or
 // permanently non-numeric duration instead of surfacing the anomaly.
 function hasTimestamp(value: string | number | undefined): value is string | number {
   if (value === undefined || value === null || value === "") return false

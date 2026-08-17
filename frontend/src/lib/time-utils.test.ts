@@ -1,7 +1,7 @@
 import { readFileSync } from "node:fs"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 import type { Locale } from "@/i18n/translations"
-import { formatDisplayDate, normalizeTimestampMs } from "./time-utils"
+import { formatDisplayDate, formatTime, getTimeDuration, normalizeTimestampMs } from "./time-utils"
 
 const bigintValue = (globalThis as { BigInt: (value: number) => bigint }).BigInt(1)
 
@@ -133,21 +133,24 @@ describe("normalizeTimestampMs", () => {
     expect(normalizeTimestampMs("")).toBeGreaterThanOrEqual(before)
   })
 
-  it("falls back to now for NaN rather than propagating it", () => {
-    expect(normalizeTimestampMs(NaN)).not.toBeNaN()
+  it("propagates NaN/Infinity unchanged rather than disguising them as a valid now", () => {
+    // A prior version of this function collapsed non-finite numbers into
+    // Date.now(), which made a malformed timestamp look like a perfectly
+    // valid "just now" to every caller - regressing the safety net formatTime/
+    // getTimeDuration already have via `isNaN(date.getTime())`. Propagating
+    // the non-finite value unchanged lets `new Date(...)` produce an
+    // actually-invalid Date, which those callers correctly detect.
+    expect(normalizeTimestampMs(NaN)).toBeNaN()
+    expect(normalizeTimestampMs(Infinity)).toBe(Infinity)
+    expect(normalizeTimestampMs(-Infinity)).toBe(-Infinity)
+    expect(normalizeTimestampMs("Infinity")).toBe(Infinity)
+    expect(normalizeTimestampMs("-Infinity")).toBe(-Infinity)
   })
 
-  it("falls back to now for Infinity rather than propagating it", () => {
-    expect(normalizeTimestampMs(Infinity)).not.toBe(Infinity)
-    expect(normalizeTimestampMs(-Infinity)).not.toBe(-Infinity)
-    expect(Number.isFinite(normalizeTimestampMs(Infinity))).toBe(true)
-  })
-
-  it("falls back to now for the string form of Infinity too", () => {
-    // Number("Infinity") is a non-NaN, finite-looking-to-isNaN() value - only
-    // Number.isFinite catches it, exercising the string branch specifically
-    // rather than the numeric-type guard above.
-    expect(Number.isFinite(normalizeTimestampMs("Infinity"))).toBe(true)
-    expect(Number.isFinite(normalizeTimestampMs("-Infinity"))).toBe(true)
+  it("formatTime and getTimeDuration safely fall back for a non-finite timestamp instead of showing a fake current time", () => {
+    expect(formatTime(Infinity)).toBe(String(Infinity))
+    expect(formatTime(NaN)).toBe("")
+    expect(getTimeDuration(Infinity, Infinity)).toBe(0)
+    expect(getTimeDuration(0, NaN)).toBe(0)
   })
 })

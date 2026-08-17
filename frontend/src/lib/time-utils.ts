@@ -35,18 +35,26 @@ export function normalizeTimestampMs(ts?: string | number | Date | null): number
   // Checked for exact absence, not truthiness: epoch zero (`0`) is a valid,
   // if unlikely, timestamp - a `!ts` check would collapse it into "now" the
   // same way it does undefined/null/"", silently discarding a real value.
+  //
+  // Deliberately NOT special-casing NaN/Infinity here (a prior version of
+  // this function did, then a PR review caught that it was a regression):
+  // this function's callers (formatTime, getTimeDuration) already guard
+  // against an invalid result via `isNaN(date.getTime())` - new Date(NaN)
+  // and new Date(Infinity) both produce an actually-invalid Date, which
+  // those checks correctly treat as "malformed input" and fall back to a
+  // safe default. Converting NaN/Infinity into Date.now() here instead would
+  // make a malformed timestamp look like a perfectly valid "just now" to
+  // every caller, defeating that existing downstream safety net. Callers
+  // that need non-finite values to look like "absent" for their own UI
+  // purposes (e.g. progress-panel.tsx's hasTimestamp) should filter them out
+  // themselves before ever calling this function, as that one already does.
   if (ts === undefined || ts === null || ts === '') return Date.now()
-  if (typeof ts === 'number' && !Number.isFinite(ts)) return Date.now()
   if (ts instanceof Date) return ts.getTime()
 
   if (typeof ts === 'string') {
     const num = Number(ts)
-    // If it's a valid, finite number string (not empty), treat as a numeric
-    // timestamp. Number("Infinity")/Number("-Infinity") both parse to a
-    // finite-looking non-NaN value that isNaN() alone wouldn't catch - only
-    // Number.isFinite rejects them, same as the dedicated numeric-type check
-    // above.
-    if (Number.isFinite(num) && ts.trim() !== '') {
+    // If it's a valid number string (not empty), treat as numeric timestamp
+    if (!isNaN(num) && ts.trim() !== '') {
       return num < 1e10 ? num * 1000 : num
     }
     // Otherwise try parsing as date string

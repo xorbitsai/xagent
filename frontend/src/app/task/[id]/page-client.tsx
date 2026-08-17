@@ -57,12 +57,24 @@ function TaskDetailContent() {
   // reason to wait for the user to click the header toggle. A manual
   // collapse only suppresses re-opening for *this* run (tracked by
   // progressRunKey); the next DAG run gets a fresh key and opens again.
+  //
+  // Gated to LIVE runs only: history replay (reconnect, or simply opening an
+  // already-finished task's page) populates dagExecution/progressRunKey too,
+  // via the exact same state this effect watches - without these guards,
+  // just viewing a finished task's history would pop the panel open
+  // unprompted. isHistoryLoading/isReplaying skip the population that
+  // happens WHILE replay is in flight; the terminal-status check catches the
+  // case where replay has already finished (or the page was opened directly
+  // on an already-finished task) and progressRunKey is simply sitting there
+  // populated from history, no live transition ever having occurred.
   useEffect(() => {
     if (progressRunKey === undefined || progressRunKey === null) return
+    if (state.isHistoryLoading || state.isReplaying) return
+    if (isTerminalTaskStatus(state.currentTask?.status)) return
     const key = String(progressRunKey)
     if (dismissedProgressRunKeyRef.current === key) return
     setProgressPanelOpen(true)
-  }, [progressRunKey])
+  }, [progressRunKey, state.isHistoryLoading, state.isReplaying, state.currentTask?.status])
 
   // Scrolls the chat's trace log to a step when a Progress panel row is
   // clicked (TraceEventRenderer.tsx tags each DAG step group with

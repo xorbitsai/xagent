@@ -551,8 +551,13 @@ function CenterPanelInner({
         <div className="flex items-center justify-between">
           <h2 className="text-lg font-semibold text-foreground">{t("agent.layout.center.titles.dag")}</h2>
 
-          {/* Layout Controls */}
-          {dagNodes.length > 0 && (
+          {/* Layout Controls - gated on the graph actually being visible,
+              not just nodes existing: during a mid-run replan, isPlanning is
+              true even while the prior plan's nodes are still in state (the
+              canvas shows the planning loader instead of the graph - see
+              task-conversation-panel.tsx's isPlanning), and orphaned TB/LR
+              buttons over a loading spinner would do nothing. */}
+          {dagNodes.length > 0 && !isPlanning && !hasError && (
             <div className="flex items-center gap-2">
               <div className="flex items-center gap-1 bg-muted/50 rounded-md p-1">
                 <Button

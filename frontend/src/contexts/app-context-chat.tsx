@@ -2451,20 +2451,24 @@ export function AppProvider({
     // message type) - duplicating this logic per call site is exactly how a
     // past version of this fix ended up only covering one of the two and
     // missing the other, so it stays a single function both branches call.
-    // A turn_id present on the incoming event that DIFFERS from the one
-    // already tracked means this event belongs to a genuinely different DAG
-    // execution - e.g. turn 2's DAG starting while turn 1's dagExecution/
-    // steps are still in state because sendMessage's RESET_DAG_STATE guard
-    // raced and lost. When turn_id is absent on either side (an older
-    // backend, or some other pattern that never sets it), this compares as
-    // "not a new run" - inequality between two undefined values is false -
-    // preserving the same behavior as before turn_id existed.
+    // A turn_id present on BOTH sides that DIFFERS means this event belongs
+    // to a genuinely different DAG execution - e.g. turn 2's DAG starting
+    // while turn 1's dagExecution/steps are still in state because
+    // sendMessage's RESET_DAG_STATE guard raced and lost. Only that specific
+    // case counts as a new run: if turn_id is missing on EITHER side (an
+    // older backend, a legacy/history event that predates this field, or
+    // some other pattern that never sets it), there's no reliable identity to
+    // compare, so this falls back to "not a new run" rather than guessing -
+    // a false "new run" here would wipe live steps out from under a mid-run
+    // legacy event, which is worse than occasionally missing a real
+    // transition this fallback can't detect.
     const applyDagExecutionUpdate = (
       rawEventData: Record<string, unknown>,
       sourceTimestamp: string | number,
     ) => {
       const incomingTurnId = (rawEventData as { turn_id?: string }).turn_id
-      const isNewRun = incomingTurnId !== currentState.dagExecution?.turn_id
+      const trackedTurnId = currentState.dagExecution?.turn_id
+      const isNewRun = Boolean(incomingTurnId) && Boolean(trackedTurnId) && incomingTurnId !== trackedTurnId
       const steps = stepsFromPlanData(rawEventData, isNewRun ? [] : currentState.steps)
       if (steps) {
         dispatch({ type: "SET_STEPS", payload: steps })
@@ -2492,9 +2496,36 @@ export function AppProvider({
             ?? sourceTimestamp
           : (rawEventData as { created_at?: string | number }).created_at
             ?? sourceTimestamp
+      // Same gap as created_at above: the backend's dag_execution payload
+      // never carries updated_at either, so without this fallback every
+      // phase update after the first would leave it undefined despite
+      // DAGExecution declaring it required - center-panel.tsx uses it both
+      // as a React key and as displayed text. Unlike created_at, this
+      // always takes the event's own timestamp - it's meant to track "last
+      // touched," not "run started," so a continuation must still advance it.
+      const dagUpdatedAt =
+        (rawEventData as { updated_at?: string | number }).updated_at ?? sourceTimestamp
+      // SET_DAG_EXECUTION replaces the whole object, so a turn_id-less
+      // continuation event (a legacy/history shape mid-run) would otherwise
+      // silently WIPE the tracked turn_id - and once it's gone, the next
+      // genuinely new run's differing turn_id can no longer be recognized as
+      // new (the both-sides-present rule above would see tracked=undefined
+      // and fall back to "not a new run"), inheriting the old run's
+      // created_at and steps. Carrying the tracked id forward through such
+      // events keeps the run's identity stable for as long as it lives.
+      // (When incomingTurnId is present it always wins - including on a new
+      // run, where it IS the new identity; isNewRun can never be true while
+      // incomingTurnId is absent, so the fallback only ever applies to
+      // continuations.)
+      const dagTurnId = incomingTurnId ?? trackedTurnId
       dispatch({
         type: "SET_DAG_EXECUTION",
-        payload: normalizeDagExecutionPayload({ ...rawEventData, created_at: dagCreatedAt }),
+        payload: normalizeDagExecutionPayload({
+          ...rawEventData,
+          created_at: dagCreatedAt,
+          updated_at: dagUpdatedAt,
+          turn_id: dagTurnId,
+        }),
       })
     }
     // If we're in replay mode, don't process immediately - collect for delayed playback
@@ -4909,7 +4940,15 @@ export function AppProvider({
           // Handle direct trace events (without event_type wrapper) - infer type from content
           // Check if this is DAG execution data
           if (traceEventData.phase && (traceEventData.current_plan !== undefined)) {
-            dispatch({ type: "SET_DAG_EXECUTION", payload: traceEventData })
+            // Same shared handler the two explicit dag_execution shapes use -
+            // this legacy, unwrapped shape predates it and used to dispatch
+            // the raw payload directly, bypassing the phase/current_plan
+            // normalizer, the created_at/updated_at backfill, and the
+            // turn_id-based new-run detection all at once.
+            applyDagExecutionUpdate(
+              traceEventData as Record<string, unknown>,
+              message.timestamp,
+            )
           }
           // Check if this is step data (has id and status)
           else if (traceEventData.id && traceEventData.status) {
@@ -6095,10 +6134,12 @@ export function AppProvider({
 
       // The backend executes the turn as an independent background task and
       // can start broadcasting its own dag_execution/trace events before this
-      // ack resolves - capture the pre-send dagExecution reference so the
-      // reset below can detect that case and skip clearing, rather than
-      // wiping out the new turn's own freshly-arrived state.
+      // ack resolves - capture the pre-send dagExecution (both its object
+      // identity AND its turn_id) so the reset below can detect that case and
+      // skip clearing, rather than wiping out the new turn's own
+      // freshly-arrived state.
       const dagExecutionBeforeSend = stateRef.current.dagExecution
+      const dagTurnIdBeforeSend = dagExecutionBeforeSend?.turn_id
 
       // Wait for the server's durable-delivery acknowledgement. If the socket
       // is disconnected or the backend rejects the turn, this throws and the
@@ -6123,7 +6164,21 @@ export function AppProvider({
         state.currentTask?.status === "running"
         || state.currentTask?.status === "paused"
         || state.currentTask?.status === "waiting_for_user"
-      if (!isContinuingActiveRun && stateRef.current.dagExecution === dagExecutionBeforeSend) {
+      // Prefer turn_id equality when BOTH sides actually have one - it sees
+      // through the task_completed handler's clone-for-phase-sync (which
+      // makes a NEW object with the SAME turn_id, see that handler above),
+      // where reference equality alone would wrongly look like "something
+      // new arrived" and skip the reset. But turn_id is optional (older
+      // backends/patterns that never set it), and comparing "undefined ===
+      // undefined" can't tell "nothing happened" apart from "a genuinely new,
+      // turn_id-less dagExecution just arrived" - falling back to reference
+      // equality for that case (matching the pre-turn_id behavior) avoids
+      // wiping a real new run just because it happens to lack a turn_id.
+      const dagExecutionStillStale =
+        dagTurnIdBeforeSend && stateRef.current.dagExecution?.turn_id
+          ? stateRef.current.dagExecution.turn_id === dagTurnIdBeforeSend
+          : stateRef.current.dagExecution === dagExecutionBeforeSend
+      if (!isContinuingActiveRun && dagExecutionStillStale) {
         dispatch({ type: "RESET_DAG_STATE" })
       }
 

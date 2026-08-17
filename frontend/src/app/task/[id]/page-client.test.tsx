@@ -166,4 +166,40 @@ describe("TaskDetailPage progress panel lifecycle", () => {
     fireEvent.click(screen.getByTitle("Show execution progress"))
     expect(screen.getByText("Progress")).toBeInTheDocument()
   })
+
+  it("freezes the elapsed time at dagTerminatedAt instead of the live-ticking now", () => {
+    // dagTerminatedAt (not the mutable currentTask.updatedAt) is what this
+    // page passes through as ProgressPanel's endedAt - it's stamped once when
+    // the run actually finishes and survives later, unrelated task metadata
+    // refreshes untouched. Start the task "running" so the panel auto-opens
+    // (a terminal status from the very first render is deliberately excluded
+    // from auto-open - see the effect above - so this exercises the realistic
+    // sequence: open while live, then the run ends under it).
+    app.state = baseState({
+      dagExecution: { phase: "executing", current_plan: {}, created_at: "2026-05-27T05:00:00Z", updated_at: "2026-05-27T05:00:00Z", turn_id: "turn-A" },
+    })
+    const { rerender } = renderPage()
+    expect(screen.getByText("Progress")).toBeInTheDocument()
+
+    app.state = baseState({
+      currentTask: {
+        id: "1",
+        title: "Test task",
+        status: "completed",
+        description: "Test task",
+        createdAt: "2026-05-27T05:00:00Z",
+        updatedAt: "2026-05-27T05:05:00Z",
+        dagTerminatedAt: "2026-05-27T05:01:05Z",
+      },
+      dagExecution: { phase: "completed", current_plan: {}, created_at: "2026-05-27T05:00:00Z", updated_at: "2026-05-27T05:01:05Z", turn_id: "turn-A" },
+    })
+    rerender(
+      <I18nProvider initialLocale="en">
+        <TaskDetailPage />
+      </I18nProvider>
+    )
+    // 05:01:05 - 05:00:00 = 65s -> "1m 05s". If the page fell back to
+    // currentTask.updatedAt (05:05:00) instead, this would read "5m 00s".
+    expect(screen.getByText("1m 05s")).toBeInTheDocument()
+  })
 })

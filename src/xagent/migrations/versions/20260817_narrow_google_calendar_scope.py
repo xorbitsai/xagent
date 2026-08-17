@@ -45,19 +45,19 @@ def _offline_scopes_literal(scopes: list[str], dialect_name: str):
     return serialized_literal
 
 
-def _upgrade_offline() -> None:
+def _offline_update(scopes: list[str]) -> None:
     dialect_name = op.get_context().dialect.name
     statement = (
         sa.update(PUBLIC_MCP_APPS_TABLE)
         .where(PUBLIC_MCP_APPS_TABLE.c.app_id == op.inline_literal(APP_ID))
-        .values(oauth_scopes=_offline_scopes_literal(NEW_SCOPES, dialect_name))
+        .values(oauth_scopes=_offline_scopes_literal(scopes, dialect_name))
     )
     op.execute(statement)
 
 
 def upgrade() -> None:
     if op.get_context().as_sql:
-        _upgrade_offline()
+        _offline_update(NEW_SCOPES)
         return
 
     bind = op.get_bind()
@@ -77,6 +77,10 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
+    if op.get_context().as_sql:
+        _offline_update(OLD_SCOPES)
+        return
+
     bind = op.get_bind()
     inspector = sa.inspect(bind)
     if "public_mcp_apps" not in inspector.get_table_names():

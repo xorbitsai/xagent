@@ -15,6 +15,9 @@ MIGRATION_PATH = (
     Path(__file__).parent.parent.parent
     / "src/xagent/migrations/versions/20260817_narrow_google_calendar_scope.py"
 )
+REGISTRY_PATH = (
+    Path(__file__).parent.parent.parent / "src/xagent/web/builtin_mcp_registry.py"
+)
 
 OLD_SCOPES = ["https://www.googleapis.com/auth/calendar"]
 NEW_SCOPES = ["https://www.googleapis.com/auth/calendar.events"]
@@ -23,6 +26,19 @@ NEW_SCOPES = ["https://www.googleapis.com/auth/calendar.events"]
 def _load_migration_module():
     spec = importlib.util.spec_from_file_location(
         "narrow_google_calendar_scope_migration", MIGRATION_PATH
+    )
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    return module
+
+
+def _load_registry_module():
+    # Loaded from this checkout's file, not `import xagent...`: an editable
+    # install can point at a different checkout (e.g. another git worktree),
+    # which would silently compare the migration against the wrong tree.
+    spec = importlib.util.spec_from_file_location(
+        "builtin_mcp_registry_under_test", REGISTRY_PATH
     )
     module = importlib.util.module_from_spec(spec)
     assert spec.loader is not None
@@ -47,6 +63,24 @@ def _public_mcp_apps(metadata: sa.MetaData) -> sa.Table:
 def _scopes_by_app_id(connection, table: sa.Table) -> dict[str, object]:
     rows = connection.execute(sa.select(table.c.app_id, table.c.oauth_scopes))
     return {row.app_id: row.oauth_scopes for row in rows}
+
+
+def test_migration_target_scope_matches_the_live_registry() -> None:
+    """Guard against registry/migration drift (the bug this migration fixes).
+
+    Reverting the scope in ``builtin_mcp_registry.py`` without updating this
+    migration's ``NEW_SCOPES`` would otherwise leave every other test in this
+    file green while the app requests a scope the migration never seeded.
+    """
+    migration = _load_migration_module()
+    registry = _load_registry_module()
+    registry_row = next(
+        row
+        for row in registry.get_builtin_public_mcp_app_rows()
+        if row["app_id"] == migration.APP_ID
+    )
+
+    assert registry_row["oauth_scopes"] == migration.NEW_SCOPES
 
 
 def test_upgrade_narrows_google_calendar_scope_without_touching_other_apps(

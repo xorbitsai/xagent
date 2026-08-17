@@ -6,6 +6,16 @@ operate on events, never on calendar list management, so the full
 This updates the persisted built-in catalog row to match the narrower scope
 now declared in ``builtin_mcp_registry.py``.
 
+Scope only, deliberately: this rewrites the built-in catalog row, which
+governs the scope requested by *future* authorizations. It does not touch
+``user_oauth`` rows already issued under the old, broader scope -- Google's
+OAuth refresh grant returns a new access token for whatever scope was
+originally consented to, it never narrows it (see ``refresh_oauth_token`` in
+``web/tools/config.py``). Users who already connected Calendar keep their
+existing grant, broader scope and all, until they disconnect and
+reconnect. Forcibly revoking and re-prompting every existing grant is a
+separate, user-facing rollout decision and is out of scope here.
+
 Revision ID: 20260817_narrow_google_calendar_scope
 Revises: 20260813_trace_json_columns_to_jsonb
 Create Date: 2026-08-17

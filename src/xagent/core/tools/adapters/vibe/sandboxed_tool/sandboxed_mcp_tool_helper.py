@@ -33,7 +33,19 @@ _MCP_RUNNER_PATH = (
 _MCP_SANDBOX_COMMANDS = {"npx", "uvx"}
 _MCP_SANDBOX_TIMEOUT_SECONDS = 60
 
-_MCP_SANDBOX_EXTRA_PACKAGES = ["mcp>=1.12.4"]
+# Upper-bounded, unlike this repo's own top-level "mcp>=1.12.4" pin
+# (pyproject.toml): that floor is resolved once into uv.lock at image build
+# time and stays fixed, but this one is installed live into the sandbox on
+# every fresh container -- an unbounded floor here re-resolves against
+# PyPI's current release each time, drifting away from whatever version the
+# backend (and mcp_runner.py's own import of sessions.py, which runs
+# *inside* the sandbox against this install) was actually built and tested
+# against. mcp 2.0 renamed/removed mcp.client.streamable_http's
+# streamablehttp_client, which sessions.py imports -- confirmed in
+# production as the root cause of chrome-devtools' (and every other
+# sandboxed connector's) sandbox_list_tools failures once a fresh sandbox
+# picked up 2.0 from PyPI while the backend stayed on the 1.x line.
+_MCP_SANDBOX_EXTRA_PACKAGES = ["mcp>=1.12.4,<2"]
 _MCP_SANDBOX_ENV = ["XAGENT_USER_ID"]
 _MCP_SANDBOX_CONFIG = SandboxConfig(
     packages=tuple(_MCP_SANDBOX_EXTRA_PACKAGES),

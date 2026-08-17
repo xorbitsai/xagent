@@ -115,7 +115,10 @@ class TestImageGenerationToolCore:
     """Test cases for ImageGenerationToolCore class"""
 
     def test_generate_description_enforces_single_canvas_and_copy_budget(self):
-        description = ImageGenerationToolCore.GENERATE_IMAGE_DESCRIPTION
+        # Normalized: these anchors are sentences, and the source wraps them.
+        description = " ".join(
+            ImageGenerationToolCore.GENERATE_IMAGE_DESCRIPTION.split()
+        )
 
         assert "one single final" in description
         assert "one continuous canvas" in description
@@ -125,10 +128,12 @@ class TestImageGenerationToolCore:
         assert "file_id through the images parameter" in description
         assert "Use only references the user supplied" in description
         # The curb this description exists for.
-        assert "not go looking" in description
-        # The official source is the third origin static-visual-design sanctions;
-        # dropping it here would forbid what the skill requires.
-        assert "brand's own official source" in description
+        assert "do not retrieve one on your own initiative" in description
+        # An official site is no longer a standing origin: static-visual-design
+        # requires the user to direct the retrieval, and this description is in
+        # context even when the skill is not, so it cannot offer a wider route.
+        assert "an asset the user directed you to retrieve" in description
+        assert "brand's own official source" not in description
         # Without the authenticity guard the carve-out reads as "go fetch a logo"
         # in every run where the skill is not loaded.
         assert "plausible-looking search result" in description
@@ -137,11 +142,12 @@ class TestImageGenerationToolCore:
     def test_edit_description_restricts_reference_sources(self):
         # generate_image routes reference-based work here, so the restriction has
         # to hold on both descriptions or the model just switches tools.
-        description = ImageGenerationToolCore.EDIT_IMAGE_DESCRIPTION
+        description = " ".join(ImageGenerationToolCore.EDIT_IMAGE_DESCRIPTION.split())
 
         assert "Use only images the user supplied" in description
-        assert "not go looking" in description
-        assert "brand's own official source" in description
+        assert "do not retrieve source or reference material on" in description
+        assert "an asset the user directed you to retrieve" in description
+        assert "brand's own official source" not in description
         assert "plausible-looking search result" in description
         assert "never take" in description and "other tasks" in description
         assert "never present a generative edit as exact" in description

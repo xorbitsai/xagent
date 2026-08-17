@@ -54,6 +54,13 @@ asks for exactly one final asset, compare directions internally and render the
 strongest. The reference explains how to invent a direction's visual device and
 how far apart a set should sit.
 
+One creative lead defines and compares the whole set sequentially, in one pass.
+Do not split ideation across independent agents or parallel plan nodes —
+independent ideation converges on the same obvious brand cues and varies only the
+decoration. Parallel execution is available only after every brief and
+specification is locked, and each parallel executor then holds one distinct
+proposition it may not reinterpret.
+
 Order the work, and represent that order in any execution plan: brand and
 reference acquisition is a shared prerequisite, creative direction depends on it,
 and every render depends on the locked specification. Never plan a render, or an
@@ -154,6 +161,11 @@ most two per asset and four per run. Calls on optional assets, re-renders of a
 direction already delivered, and anything you would call a variant or retry all
 cost a repair.
 
+Where both definitions fit one call, coverage wins. A required placement with no
+candidate of its own is free coverage even when the same direction was already
+delivered at another placement — the 4:5 feed asset does not make the 9:16 story
+asset a repair. Only a second render of that same placement costs one.
+
 Regenerate from the design specification when the organizing idea, focal
 subject, hierarchy, or canvas structure is wrong; use `edit_image` for a
 localized defect on an otherwise strong candidate. When a limit is reached,
@@ -164,9 +176,13 @@ named, not retried on a fresh budget.
 ## Finish
 
 Coverage is unconditional: every required asset must exist as a successful tool
-result before you finish. One thing overrides it — a brand-specific brief with
-no verified logo ends in the question above, with nothing rendered, and that
-counts as finished. Quality is what the budget releases — when the budget
+result before you finish. One thing overrides it — a brand-specific *final* with
+no verified logo. Before the user has chosen, that turn ends in the question
+above with nothing rendered, and that counts as finished. After they choose a
+reserved-space or unbranded route, render it, inspect it, and hand it back as a
+concept draft; coverage then applies to the drafts they chose, and what stays
+unfinished is the branded final, not this turn. Quality is what the budget
+releases — when the budget
 is spent and an asset still fails inspection, deliver its best candidate, name
 the defect concretely (which text is misspelled, which element is clipped, which
 logo is not authentic), and mark the answer's outcome `partial` so the user can

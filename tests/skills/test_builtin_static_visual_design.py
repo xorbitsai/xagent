@@ -62,16 +62,30 @@ def test_static_visual_design_skill_routes_only_commercial_creatives() -> None:
     assert "composite it yourself" not in content
     assert "SVG is source text" not in content
 
-    # Brand provenance: sanctioned sources, and every substitute path closed.
+    # Brand provenance: both sanctioned sources named, every substitute closed.
     assert "a brand-specific final requires a verified logo" in content
     assert "recoverable with `list_all_user_files`" in content
+    assert "current task workspace" in content
     assert "other tasks and earlier outputs are never a source" in content
     assert "a logo you reconstruct is a logo you invented" in content
     assert "label it a concept draft" in content
+    # Stable brand cues are not one campaign's effects (#1411 review C7).
+    assert "Separate stable identity cues from temporary campaign styling" in content
     # Searching belongs to the user, and the run stops rather than guessing.
     assert "stop before rendering finals" in content
     assert "take it only when they tell you to" in content
+    assert "`ask_user_question`" in content
+    # No wording may reintroduce unprompted retrieval as a sanctioned route.
     assert "download_web_asset" not in content
+    assert "official web presence" not in content
+    assert "fetch_web_content" not in content
+    assert "web tools available to you" not in content
+
+    # Planning order has to survive in SKILL.md: LLMPlanGenerator sees the skill
+    # body but not the reference, which is only read later (#1411 review C1).
+    assert "represent that order in any execution plan" in content
+    assert "acquisition is a shared prerequisite" in content
+    assert "Never plan a render, or an identity search, to run alongside" in content
 
     # Coverage means absent, not wrong — otherwise any defect can be relabeled
     # into an unbudgeted render.
@@ -83,12 +97,26 @@ def test_static_visual_design_skill_routes_only_commercial_creatives() -> None:
     assert "at most two per asset and four per run" in content
     assert "anything you would call a variant or retry" in content
     assert "Counters do not carry across plan steps" in content
+    # A supplied logo the render dropped is a rejection (#1411 review C4).
+    assert "omits a required brand asset is a rejection" in content
+    assert "does not prove the image model placed it" in content
     # The one case where finishing with nothing rendered is correct.
     assert "ends in the question above, with nothing rendered" in content
     assert "do not list or describe files that do not exist" in content
-    # A spent budget hands the asset back with its defect named, not silently.
+    # A spent budget hands the asset back with its defect named, not silently,
+    # and the hand-back is terminal rather than a replan trigger (C3).
     assert "name the defect concretely" in content
     assert "decide whether to spend another round" in content
+    assert "spent budget with complete coverage is terminal" in content
+    assert "`missing_verification` stays empty" in content
+    assert "`outcome=partial`" in content
+
+    # The file list is conditional on files existing, never unconditional.
+    finish = content.split("## Finish", 1)[1]
+    assert "Otherwise lead with the files" in finish
+    assert finish.index(
+        "do not list or describe files that do not exist"
+    ) < finish.index("Otherwise lead with the files")
 
 
 def test_static_visual_design_includes_art_direction_reference() -> None:
@@ -116,3 +144,31 @@ def test_static_visual_design_includes_art_direction_reference() -> None:
     assert "Build a set of directions" in content
     assert "creative-risk ladder" in content
     assert "differ on at least three of" in content
+
+
+def test_web_asset_tool_descriptions_do_not_invite_unprompted_logo_search() -> None:
+    """Tool descriptions are always in context; the skill policy is not.
+
+    A description that tells the model to go find a brand's logo overrides the
+    skill's ask-the-user rule, because the skill is only present once loaded
+    (#1411 review C2).
+    """
+    from xagent.core.tools.adapters.vibe.download_web_asset import DownloadWebAssetArgs
+    from xagent.core.tools.adapters.vibe.fetch_web_content import (
+        FetchWebContentArgs,
+        FetchWebContentTool,
+    )
+
+    def field_text(model: type, name: str) -> str:
+        return model.model_fields[name].description or ""
+
+    surfaces = [
+        FetchWebContentTool().description,
+        field_text(FetchWebContentArgs, "include_assets"),
+        field_text(DownloadWebAssetArgs, "url"),
+    ]
+    for text in surfaces:
+        lowered = text.lower()
+        assert "when looking for logos" not in lowered
+        assert "usually asset_query='logo'" not in lowered
+        assert "prefer the official brand domain" not in lowered

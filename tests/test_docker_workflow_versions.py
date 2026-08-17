@@ -30,7 +30,7 @@ SANDBOX_DIRECT_REQUIREMENTS = {
     "pydantic": "pydantic>=2.11.7",
     "pydantic-settings": "pydantic-settings",
     "cloudpickle": "cloudpickle>=3.0.0",
-    "mcp": "mcp>=1.12.4",
+    "mcp": "mcp>=1.12.4,<2",
     "pandas": "pandas>=1.3.0",
     "numpy": "numpy>=1.21.0",
     "matplotlib": "matplotlib>=3.5.0",

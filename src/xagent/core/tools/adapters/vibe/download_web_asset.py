@@ -27,7 +27,8 @@ class DownloadWebAssetArgs(BaseModel):
     url: str = Field(
         description=(
             "Exact HTTP or HTTPS image URL discovered on an authoritative page. "
-            "Prefer the official brand domain for logos."
+            "For a brand asset, only an official domain the user directed you to "
+            "counts as authoritative."
         )
     )
     filename: str | None = Field(
@@ -75,9 +76,11 @@ class DownloadWebAssetTool(AbstractBaseTool):
         return (
             "Download an exact PNG, JPEG, WebP, GIF, BMP, or SVG asset from a "
             "known URL and register it in the current workspace. Use this after "
-            "fetch_web_content(include_assets=true) discovers an official logo or "
-            "brand image. It returns a trusted FileRef, so do not reproduce the "
-            "asset through api_call plus write_file."
+            "fetch_web_content(include_assets=true) surfaced the asset you were "
+            "sent to retrieve; a downloaded image is not proof that it is a "
+            "brand's authentic asset, so do not treat one as verified identity "
+            "material the user did not ask for. It returns a trusted FileRef, so "
+            "do not reproduce the asset through api_call plus write_file."
         )
 
     @property

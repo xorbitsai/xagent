@@ -2953,6 +2953,8 @@ Build when you need.`,
         completed: "Completed",
         failed: "Failed",
         skipped: "Skipped",
+        interrupted: "Interrupted",
+        clarification_invalidated: "Waiting on a new answer",
       },
       right: {
         titles: {

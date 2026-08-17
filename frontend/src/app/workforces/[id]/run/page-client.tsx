@@ -18,7 +18,7 @@ import "@xyflow/react/dist/style.css"
 import { AlertCircle, ArrowLeft, Bot, Crown, FileText, GitBranch, History, Loader2, MessageSquare, Pencil, Plus, Users, X } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { useI18n, type Translate } from "@/contexts/i18n-context"
-import { useApp } from "@/contexts/app-context-chat"
+import { isTerminalTaskStatus, useApp } from "@/contexts/app-context-chat"
 import type { Task } from "@/contexts/app-context-chat"
 import { normalizeTaskStatus, type TaskStatus } from "@/lib/task-status"
 import { getWorkforce, getWorkforceAgentExecution, getWorkforceRun, runWorkforce } from "@/lib/workforces-api"
@@ -564,10 +564,7 @@ function WorkforceRunPageInner() {
       if (event.event_type === "workforce_delegation_end") status = "completed"
       if (event.event_type === "workforce_delegation_error") status = "failed"
     }
-    if (
-      status === "running" &&
-      (taskStatus === "completed" || taskStatus === "failed")
-    ) {
+    if (status === "running" && isTerminalTaskStatus(taskStatus)) {
       status = "interrupted"
     }
     return status

@@ -136,4 +136,18 @@ describe("normalizeTimestampMs", () => {
   it("falls back to now for NaN rather than propagating it", () => {
     expect(normalizeTimestampMs(NaN)).not.toBeNaN()
   })
+
+  it("falls back to now for Infinity rather than propagating it", () => {
+    expect(normalizeTimestampMs(Infinity)).not.toBe(Infinity)
+    expect(normalizeTimestampMs(-Infinity)).not.toBe(-Infinity)
+    expect(Number.isFinite(normalizeTimestampMs(Infinity))).toBe(true)
+  })
+
+  it("falls back to now for the string form of Infinity too", () => {
+    // Number("Infinity") is a non-NaN, finite-looking-to-isNaN() value - only
+    // Number.isFinite catches it, exercising the string branch specifically
+    // rather than the numeric-type guard above.
+    expect(Number.isFinite(normalizeTimestampMs("Infinity"))).toBe(true)
+    expect(Number.isFinite(normalizeTimestampMs("-Infinity"))).toBe(true)
+  })
 })

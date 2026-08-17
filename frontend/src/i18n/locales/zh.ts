@@ -2953,6 +2953,8 @@ const zh = {
         completed: "已完成",
         failed: "失败",
         skipped: "已跳过",
+        interrupted: "已中断",
+        clarification_invalidated: "等待新的回答",
       },
       right: {
         titles: {

@@ -176,6 +176,7 @@ function StateProbe() {
         )}
       </div>
       <div data-testid="task-status">{state.currentTask?.status || ""}</div>
+      <div data-testid="task-dag-terminated-at">{state.currentTask?.dagTerminatedAt ?? ""}</div>
       <div data-testid="task-title">{state.currentTask?.title || ""}</div>
       <div data-testid="task-id">{state.taskId ?? ""}</div>
       <div data-testid="task-runtime-extensions">
@@ -193,6 +194,8 @@ function StateProbe() {
         completed_at: step.completed_at,
       })))}</div>
       <div data-testid="dag-phase">{state.dagExecution?.phase ?? ""}</div>
+      <div data-testid="dag-created-at">{state.dagExecution?.created_at ?? ""}</div>
+      <div data-testid="dag-turn-id">{state.dagExecution?.turn_id ?? ""}</div>
       <div data-testid="history-loading">{String(state.isHistoryLoading)}</div>
       <div data-testid="preview-open">{String(state.filePreview.isOpen)}</div>
       <div data-testid="processing">{String(state.isProcessing)}</div>
@@ -888,6 +891,131 @@ describe("AppProvider websocket message routing", () => {
     expect(messages).toEqual([])
   })
 
+  it("does not retarget a different task's status when a failed-retry ack arrives after switching away", async () => {
+    let acknowledgeDelivery: (() => void) | undefined
+    sendChatMessageMock.mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          acknowledgeDelivery = () =>
+            resolve({ client_message_id: "turn-retry", turn_id: "turn-retry" })
+        })
+    )
+
+    let retry: (() => Promise<void>) | undefined
+    let markTaskOneFailed: (() => void) | undefined
+    let switchToTaskTwo: (() => void) | undefined
+    function RetryAckProbe() {
+      const { sendMessage, dispatch, setTaskId } = useApp()
+      retry = () => sendMessage("Retry the failed turn", { clientMessageId: "turn-retry" })
+      markTaskOneFailed = () => {
+        dispatch({
+          type: "SET_CURRENT_TASK",
+          payload: {
+            id: "1",
+            title: "Test task",
+            status: "failed",
+            description: "Test task",
+            createdAt: "2026-05-27T05:00:00Z",
+            updatedAt: "2026-05-27T05:00:00Z",
+          },
+        })
+      }
+      switchToTaskTwo = () => {
+        setTaskId(2, { navigate: false })
+        dispatch({
+          type: "SET_CURRENT_TASK",
+          payload: {
+            id: "2",
+            title: "Task two",
+            status: "completed",
+            description: "Task two",
+            createdAt: "2026-05-27T05:00:00Z",
+            updatedAt: "2026-05-27T05:00:00Z",
+          },
+        })
+      }
+      return null
+    }
+
+    render(
+      <AppProvider token="token">
+        <SeedExistingTask />
+        <RetryAckProbe />
+        <StateProbe />
+      </AppProvider>
+    )
+
+    // SeedExistingTask starts task 1 as "running" - flip it to "failed" so
+    // the retry's optimistic completed/failed -> running branch is armed.
+    act(() => {
+      markTaskOneFailed?.()
+    })
+    await waitFor(() => {
+      expect(screen.getByTestId("task-status").textContent).toBe("failed")
+    })
+
+    let delivery: Promise<void> | undefined
+    await act(async () => {
+      delivery = retry?.()
+      await new Promise((resolve) => setTimeout(resolve, 0))
+    })
+    expect(sendChatMessageMock).toHaveBeenCalledOnce()
+
+    // The user navigates to task 2 (already completed) while task 1's retry
+    // is still in flight.
+    act(() => {
+      switchToTaskTwo?.()
+    })
+    await waitFor(() => {
+      expect(screen.getByTestId("task-id").textContent).toBe("2")
+      expect(screen.getByTestId("task-status").textContent).toBe("completed")
+    })
+
+    // Task 1's delayed ack now resolves - it must not flip task 2 (the task
+    // actually being viewed) to "running".
+    await act(async () => {
+      acknowledgeDelivery?.()
+      await delivery
+    })
+    expect(screen.getByTestId("task-status").textContent).toBe("completed")
+  })
+
+  it("clears a stale dagTerminatedAt once a rerun's task_info reports running again", async () => {
+    render(
+      <AppProvider token="token">
+        <SeedRunningTask />
+        <StateProbe />
+      </AppProvider>
+    )
+    const onMessage = webSocketOptions.current?.onMessage
+    expect(onMessage).toBeDefined()
+
+    // Run 1 completes via UPDATE_TASK_STATUS, which stamps dagTerminatedAt.
+    act(() => {
+      onMessage?.({
+        type: "task_completed",
+        timestamp: "2026-05-27T05:00:02Z",
+        task_id: 1,
+        task: { id: 1, status: "completed" },
+        success: true,
+      } as TestWebSocketMessage)
+    })
+    await waitFor(() => {
+      expect(screen.getByTestId("task-status").textContent).toBe("completed")
+    })
+    expect(screen.getByTestId("task-dag-terminated-at").textContent).not.toBe("")
+
+    // Run 2 starts, observed only via a task_info event (SET_CURRENT_TASK,
+    // not UPDATE_TASK_STATUS) - the stale run-1 timestamp must not survive.
+    act(() => {
+      onMessage?.(taskInfoMessage(1, { status: "running" }))
+    })
+    await waitFor(() => {
+      expect(screen.getByTestId("task-status").textContent).toBe("running")
+    })
+    expect(screen.getByTestId("task-dag-terminated-at").textContent).toBe("")
+  })
+
   it("rejects a queued message once the conversation is reset before delivery", async () => {
     let send: (() => Promise<void> | undefined) | undefined
     let reset: (() => void) | undefined
@@ -1504,6 +1632,151 @@ describe("AppProvider websocket message routing", () => {
       expect(screen.getByTestId("dag-phase").textContent).toBe("failed")
     })
     expect(screen.getByTestId("steps-count").textContent).toBe("1")
+  })
+
+  it("resets created_at/steps for a new turn_id instead of inheriting the prior run's", async () => {
+    render(
+      <AppProvider token="token">
+        <SeedRunningTask />
+        <StateProbe />
+      </AppProvider>
+    )
+    const onMessage = webSocketOptions.current?.onMessage
+    expect(onMessage).toBeDefined()
+
+    const dagExecutionMessage = (
+      timestamp: string,
+      data: Record<string, unknown>,
+    ): TestWebSocketMessage => ({
+      type: "trace_event",
+      timestamp,
+      task_id: 1,
+      data: {
+        event_id: `dag-execution-${timestamp}`,
+        event_type: "dag_execution",
+        data,
+      },
+    })
+
+    // Run A: planning, then executing with one step.
+    act(() => {
+      onMessage?.(dagExecutionMessage("2026-05-27T05:00:02Z", { phase: "planning", turn_id: "turn-A" }))
+    })
+    await waitFor(() => {
+      expect(screen.getByTestId("dag-turn-id").textContent).toBe("turn-A")
+    })
+    expect(screen.getByTestId("dag-created-at").textContent).toBe("2026-05-27T05:00:02Z")
+
+    act(() => {
+      onMessage?.(dagExecutionMessage("2026-05-27T05:00:03Z", {
+        phase: "executing",
+        turn_id: "turn-A",
+        steps: [{ id: "step-one", name: "Step one", dependencies: [] }],
+      }))
+    })
+    await waitFor(() => {
+      expect(screen.getByTestId("steps-count").textContent).toBe("1")
+    })
+    // Later events for the SAME run must not reset created_at, even though
+    // this event's own timestamp differs from run A's first event.
+    expect(screen.getByTestId("dag-created-at").textContent).toBe("2026-05-27T05:00:02Z")
+
+    // Run B starts (e.g. sendMessage's RESET_DAG_STATE guard raced and lost,
+    // so the reducer never got to clear run A's dagExecution/steps first) -
+    // a DIFFERENT turn_id must reset created_at to this event's own timestamp
+    // and clear run A's steps, not inherit either.
+    act(() => {
+      onMessage?.(dagExecutionMessage("2026-05-27T05:00:04Z", { phase: "planning", turn_id: "turn-B" }))
+    })
+    await waitFor(() => {
+      expect(screen.getByTestId("dag-turn-id").textContent).toBe("turn-B")
+    })
+    expect(screen.getByTestId("dag-created-at").textContent).toBe("2026-05-27T05:00:04Z")
+    expect(screen.getByTestId("steps-count").textContent).toBe("0")
+  })
+
+  it("resets created_at/steps for a new turn_id via the bare dag_execution message type too", async () => {
+    // The trace_event-wrapped shape above and this bare-message-type shape
+    // are handled by two SEPARATE branches in handleMessage (this one is
+    // what a live single-connection tracer actually sends while a task is
+    // running) - a past version of this fix updated only the trace_event
+    // branch and missed this one, so this exercises it directly.
+    render(
+      <AppProvider token="token">
+        <SeedRunningTask />
+        <StateProbe />
+      </AppProvider>
+    )
+    const onMessage = webSocketOptions.current?.onMessage
+    expect(onMessage).toBeDefined()
+
+    const bareDagExecutionMessage = (
+      timestamp: string,
+      data: Record<string, unknown>,
+    ): TestWebSocketMessage => ({
+      type: "dag_execution",
+      timestamp,
+      task_id: 1,
+      data,
+    })
+
+    act(() => {
+      onMessage?.(bareDagExecutionMessage("2026-05-27T05:00:02Z", {
+        phase: "executing",
+        turn_id: "turn-A",
+        steps: [{ id: "step-one", name: "Step one", dependencies: [] }],
+      }))
+    })
+    await waitFor(() => {
+      expect(screen.getByTestId("steps-count").textContent).toBe("1")
+    })
+    expect(screen.getByTestId("dag-turn-id").textContent).toBe("turn-A")
+    expect(screen.getByTestId("dag-created-at").textContent).toBe("2026-05-27T05:00:02Z")
+
+    act(() => {
+      onMessage?.(bareDagExecutionMessage("2026-05-27T05:00:05Z", { phase: "planning", turn_id: "turn-B" }))
+    })
+    await waitFor(() => {
+      expect(screen.getByTestId("dag-turn-id").textContent).toBe("turn-B")
+    })
+    expect(screen.getByTestId("dag-created-at").textContent).toBe("2026-05-27T05:00:05Z")
+    expect(screen.getByTestId("steps-count").textContent).toBe("0")
+  })
+
+  it("clears dagExecution/steps when switching to a different task", async () => {
+    let switchTask: (() => void) | undefined
+    function SwitchingTaskProbe() {
+      const { setTaskId } = useApp()
+      switchTask = () => setTaskId(2, { navigate: false })
+      return null
+    }
+
+    render(
+      <AppProvider token="token">
+        <SeedExistingTask />
+        <SwitchingTaskProbe />
+        <StateProbe />
+      </AppProvider>
+    )
+    const onMessage = webSocketOptions.current?.onMessage
+    expect(onMessage).toBeDefined()
+
+    act(() => {
+      dagBurst(1).forEach((message) => onMessage?.(message))
+    })
+    await waitFor(() => {
+      expect(screen.getByTestId("steps-count").textContent).toBe("1")
+    })
+    expect(screen.getByTestId("dag-phase").textContent).toBe("failed")
+
+    act(() => {
+      switchTask?.()
+    })
+    await waitFor(() => {
+      expect(screen.getByTestId("task-id").textContent).toBe("2")
+    })
+    expect(screen.getByTestId("dag-phase").textContent).toBe("")
+    expect(screen.getByTestId("steps-count").textContent).toBe("0")
   })
 
   it("normalizes uppercase task info status before syncing processing state", async () => {

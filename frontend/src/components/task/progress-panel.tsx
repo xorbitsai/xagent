@@ -1,7 +1,7 @@
 "use client"
 
-import { useEffect, useState } from "react"
-import { CheckCircle2, ChevronLeft, Clock, Loader2, RotateCcw, XCircle } from "lucide-react"
+import React, { useEffect, useState } from "react"
+import { CheckCircle2, ChevronLeft, Clock, Loader2, PauseCircle, RotateCcw, XCircle } from "lucide-react"
 import { cn } from "@/lib/utils"
 import { normalizeTimestampMs } from "@/lib/time-utils"
 import { useI18n } from "@/contexts/i18n-context"
@@ -10,7 +10,11 @@ export interface ProgressStepView {
   id: string
   title: string
   description?: string
-  status: "pending" | "running" | "completed" | "failed" | "skipped"
+  // "interrupted"/"clarification_invalidated" are non-terminal - the backend
+  // resumes them back to "running" once their blocking condition clears
+  // (dag.py) - so they must not be treated as done, but also aren't "not
+  // started yet" like pending.
+  status: "pending" | "running" | "completed" | "failed" | "skipped" | "interrupted" | "clarification_invalidated"
   startedAt?: string | number
   completedAt?: string | number
 }
@@ -27,6 +31,7 @@ interface ProgressPanelProps {
 }
 
 function formatElapsedCompact(ms: number): string {
+  if (!Number.isFinite(ms)) return "0s"
   const totalSeconds = Math.max(0, Math.floor(ms / 1000))
   const hours = Math.floor(totalSeconds / 3600)
   const minutes = Math.floor((totalSeconds % 3600) / 60)
@@ -41,12 +46,14 @@ function formatElapsedCompact(ms: number): string {
 // `getString` fallback) from a valid-but-falsy one: epoch 0 is a real instant
 // in this type's `string | number` contract, and a plain truthiness check
 // would treat a genuine (if unlikely) zero timestamp as absent. Also excludes
-// NaN - normalizeTimestampMs treats NaN as absent (falls back to "now"), and
-// this must agree with it, or a NaN value would read as "present" here while
-// resolving to the current instant there, producing a bogus, constantly
-// shifting duration instead of surfacing the anomaly.
+// non-finite numbers (NaN, +/-Infinity) - normalizeTimestampMs treats NaN as
+// absent (falls back to "now") and does no better with Infinity (arithmetic
+// on it stays infinite), so this must exclude both too, or such a value would
+// read as "present" here while producing a bogus, constantly shifting or
+// permanently non-numeric duration instead of surfacing the anomaly.
 function hasTimestamp(value: string | number | undefined): value is string | number {
-  return value !== undefined && value !== null && value !== "" && !Number.isNaN(value)
+  if (value === undefined || value === null || value === "") return false
+  return typeof value !== "number" || Number.isFinite(value)
 }
 
 // Ticks once a second for as long as `active` is true, shared by the header
@@ -238,6 +245,7 @@ function ProgressStepRow({
             step.status === "completed" && "bg-green-500/10 text-green-600",
             step.status === "running" && "bg-primary text-primary-foreground",
             step.status === "failed" && "bg-red-500/10 text-red-600",
+            (step.status === "interrupted" || step.status === "clarification_invalidated") && "bg-amber-500/10 text-amber-600",
             (step.status === "pending" || step.status === "skipped") && "bg-muted text-muted-foreground",
           )}
         >
@@ -249,6 +257,8 @@ function ProgressStepRow({
             <Loader2 className="h-3 w-3 animate-spin" />
           ) : step.status === "skipped" ? (
             <RotateCcw className="h-3 w-3" />
+          ) : step.status === "interrupted" || step.status === "clarification_invalidated" ? (
+            <PauseCircle className="h-3.5 w-3.5" />
           ) : (
             index + 1
           )}
@@ -261,6 +271,7 @@ function ProgressStepRow({
               (step.status === "completed" || step.status === "pending" || step.status === "skipped")
                 && "text-muted-foreground",
               step.status === "failed" && "text-foreground",
+              (step.status === "interrupted" || step.status === "clarification_invalidated") && "text-amber-600",
             )}
           >
             <span className="sr-only">{t(`agent.layout.status.${step.status}`)}: </span>

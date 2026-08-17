@@ -28,14 +28,19 @@ import { Button } from "@/components/ui/button"
 import { cn } from "@/lib/utils"
 import { JsonRenderer } from "@/components/ui/markdown-renderer"
 import { formatTime, getTimeDuration, formatDuration } from "@/lib/time-utils"
-import { Loader2, Brain, Network, Sparkles, Timer, XCircle, AlertCircle, RefreshCw, RotateCcw, LayoutDashboard,LayoutPanelLeft, Wrench, GitBranch, CheckCircle2 } from "lucide-react"
+import { Loader2, Brain, Network, Sparkles, Timer, XCircle, AlertCircle, RefreshCw, RotateCcw, LayoutDashboard,LayoutPanelLeft, Wrench, GitBranch, CheckCircle2, PauseCircle } from "lucide-react"
 import { useI18n } from "@/contexts/i18n-context";
+import type { DAGExecution } from "@/contexts/app-context-chat"
 
 
 interface DAGNode extends Node {
   data: {
     label: string
-    status: "pending" | "running" | "completed" | "failed" | "skipped"
+    // "interrupted"/"clarification_invalidated" are real, non-terminal
+    // backend step statuses (dag.py) - previously omitted here, so a step in
+    // either state fell through every status check below to the generic
+    // "not started" look, indistinguishable from a step that hasn't run yet.
+    status: "pending" | "running" | "completed" | "failed" | "skipped" | "interrupted" | "clarification_invalidated"
     description?: string
     tool_names?: string[]
     started_at?: string | number
@@ -53,12 +58,6 @@ interface DAGEdge extends Edge {
   }
 }
 
-interface DAGExecution {
-  phase: "planning" | "executing" | "completed" | "failed"
-  current_plan: Record<string, unknown>
-  created_at: string | number
-  updated_at: string | number
-}
 
 interface CenterPanelProps {
   dagExecution: DAGExecution | null
@@ -273,6 +272,8 @@ const nodeTypes: NodeTypes = {
       completed: "",
       failed: "",
       skipped: "border-dashed border-gray-500/50 opacity-60 bg-gray-500/5",
+      interrupted: "border-amber-500/40",
+      clarification_invalidated: "border-amber-500/40",
     }
 
     const statusBadges = {
@@ -281,6 +282,8 @@ const nodeTypes: NodeTypes = {
       completed: { variant: "default" as const, label: t("agent.layout.status.completed") },
       failed: { variant: "destructive" as const, label: t("agent.layout.status.failed") },
       skipped: { variant: "secondary" as const, label: t("agent.layout.status.skipped") },
+      interrupted: { variant: "secondary" as const, label: t("agent.layout.status.interrupted") },
+      clarification_invalidated: { variant: "secondary" as const, label: t("agent.layout.status.clarification_invalidated") },
     }
 
     const getDuration = () => {
@@ -350,12 +353,14 @@ const nodeTypes: NodeTypes = {
                 data.status === 'running' ? 'bg-blue-500/10 text-blue-600' :
                 data.status === 'failed' ? 'bg-red-500/10 text-red-600' :
                 data.status === 'skipped' ? 'bg-gray-500/10 text-gray-500' :
+                (data.status === 'interrupted' || data.status === 'clarification_invalidated') ? 'bg-amber-500/10 text-amber-600' :
                 'bg-primary/10 text-primary'
               )}>
                 {data.status === 'completed' ? <CheckCircle2 className="w-4 h-4" /> :
                  data.status === 'running' ? <Loader2 className="w-4 h-4 animate-spin" /> :
                  data.status === 'failed' ? <XCircle className="w-4 h-4 text-red-500" /> :
                  data.status === 'skipped' ? <RotateCcw className="w-4 h-4 text-gray-500" /> :
+                 (data.status === 'interrupted' || data.status === 'clarification_invalidated') ? <PauseCircle className="w-4 h-4" /> :
                  <Brain className="w-4 h-4" />}
               </div>
               <div className="font-bold text-sm text-foreground tracking-wide leading-tight">{data.label}</div>
@@ -503,21 +508,27 @@ function CenterPanelInner({
   const getPhaseBadge = (phase: DAGExecution["phase"]) => {
     const variants = {
       planning: "secondary",
+      replanning: "secondary",
       executing: "default",
+      completion_assessment: "default",
       completed: "default",
       failed: "destructive",
     } as const
 
     const labels = {
       planning: t("agent.layout.common.inProgress"),
+      replanning: t("agent.layout.common.inProgress"),
       executing: t("agent.layout.common.inProgress"),
+      completion_assessment: t("agent.layout.common.inProgress"),
       completed: t("agent.status.completed"),
       failed: t("agent.status.failed"),
     }
 
     const customStyles = {
       planning: "bg-muted/50 text-muted-foreground border-border",
+      replanning: "bg-muted/50 text-muted-foreground border-border",
       executing: "bg-primary/10 text-primary border-primary/20",
+      completion_assessment: "bg-primary/10 text-primary border-primary/20",
       completed: "bg-green-500/10 text-green-500 border-green-500/20",
       failed: "bg-destructive/10 text-destructive border-destructive/20",
     }
@@ -628,6 +639,8 @@ function CenterPanelInner({
                 completed: 'hsl(142, 76%, 36%)',
                 failed: 'hsl(var(--destructive))',
                 skipped: 'hsl(220, 10%, 50%)',
+                interrupted: 'hsl(38, 92%, 50%)',
+                clarification_invalidated: 'hsl(38, 92%, 50%)',
               }
               return colors[data.status] || colors.pending
             }}

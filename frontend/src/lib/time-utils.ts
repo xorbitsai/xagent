@@ -36,13 +36,17 @@ export function normalizeTimestampMs(ts?: string | number | Date | null): number
   // if unlikely, timestamp - a `!ts` check would collapse it into "now" the
   // same way it does undefined/null/"", silently discarding a real value.
   if (ts === undefined || ts === null || ts === '') return Date.now()
-  if (typeof ts === 'number' && Number.isNaN(ts)) return Date.now()
+  if (typeof ts === 'number' && !Number.isFinite(ts)) return Date.now()
   if (ts instanceof Date) return ts.getTime()
 
   if (typeof ts === 'string') {
     const num = Number(ts)
-    // If it's a valid number string (not empty), treat as numeric timestamp
-    if (!isNaN(num) && ts.trim() !== '') {
+    // If it's a valid, finite number string (not empty), treat as a numeric
+    // timestamp. Number("Infinity")/Number("-Infinity") both parse to a
+    // finite-looking non-NaN value that isNaN() alone wouldn't catch - only
+    // Number.isFinite rejects them, same as the dedicated numeric-type check
+    // above.
+    if (Number.isFinite(num) && ts.trim() !== '') {
       return num < 1e10 ? num * 1000 : num
     }
     // Otherwise try parsing as date string

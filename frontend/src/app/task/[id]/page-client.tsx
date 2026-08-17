@@ -6,7 +6,7 @@ import { useParams, useRouter } from "next/navigation"
 import { Button } from "@/components/ui/button"
 import { TaskConversationPanel } from "@/components/task/task-conversation-panel"
 import { ProgressPanel, type ProgressStepView } from "@/components/task/progress-panel"
-import { useApp } from "@/contexts/app-context-chat"
+import { isTerminalTaskStatus, useApp } from "@/contexts/app-context-chat"
 import { useI18n } from "@/contexts/i18n-context"
 import { cn, getApiUrl } from "@/lib/utils"
 
@@ -34,11 +34,19 @@ function TaskDetailContent() {
     }
   }, [closeFilePreview])
 
+  // Prefer turn_id (a stable per-turn identity - see DAGExecution's own
+  // comment) over created_at for identifying "this run" - created_at can get
+  // rebuilt with a fresh value on a replan re-arrival while still being the
+  // SAME run, which would incorrectly reopen a panel the user just dismissed
+  // and restart its elapsed timer. Falls back to created_at only when
+  // turn_id is absent (an older backend, or some other pattern that doesn't
+  // set it).
+  const progressRunKey = state.dagExecution?.turn_id ?? state.dagExecution?.created_at
+
   const handleCollapseProgressPanel = useCallback(() => {
-    const key = state.dagExecution?.created_at
-    dismissedProgressRunKeyRef.current = key !== undefined && key !== null ? String(key) : null
+    dismissedProgressRunKeyRef.current = progressRunKey !== undefined && progressRunKey !== null ? String(progressRunKey) : null
     setProgressPanelOpen(false)
-  }, [state.dagExecution?.created_at])
+  }, [progressRunKey])
 
   const handleProgressStepClick = useCallback((stepId: string) => {
     window.dispatchEvent(new CustomEvent("scrollToTraceStep", { detail: { stepId } }))
@@ -48,15 +56,13 @@ function TaskDetailContent() {
   // the plan's step list is known as soon as planning starts, so there is no
   // reason to wait for the user to click the header toggle. A manual
   // collapse only suppresses re-opening for *this* run (tracked by
-  // dagExecution.created_at); the next DAG run gets a fresh created_at and
-  // opens again.
+  // progressRunKey); the next DAG run gets a fresh key and opens again.
   useEffect(() => {
-    const createdAt = state.dagExecution?.created_at
-    if (createdAt === undefined || createdAt === null) return
-    const key = String(createdAt)
+    if (progressRunKey === undefined || progressRunKey === null) return
+    const key = String(progressRunKey)
     if (dismissedProgressRunKeyRef.current === key) return
     setProgressPanelOpen(true)
-  }, [state.dagExecution?.created_at])
+  }, [progressRunKey])
 
   // Scrolls the chat's trace log to a step when a Progress panel row is
   // clicked (TraceEventRenderer.tsx tags each DAG step group with
@@ -84,6 +90,20 @@ function TaskDetailContent() {
     return () => window.removeEventListener("scrollToTraceStep", handleScrollToTraceStep as EventListener)
   }, [])
 
+  // Between `md` and `xl` the panel renders as a dismissible overlay (see the
+  // render below) rather than a static column - Escape should close it the
+  // same way clicking the backdrop does. Harmless above `xl`, where the panel
+  // is a static sibling and there's no backdrop to match: closing it there
+  // via Escape is just the same action the header toggle already offers.
+  useEffect(() => {
+    if (!progressPanelOpen) return
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") handleCollapseProgressPanel()
+    }
+    window.addEventListener("keydown", handleKeyDown)
+    return () => window.removeEventListener("keydown", handleKeyDown)
+  }, [progressPanelOpen, handleCollapseProgressPanel])
+
   const progressSteps: ProgressStepView[] = state.steps.map((step) => ({
     id: step.id,
     title: step.name,
@@ -100,10 +120,16 @@ function TaskDetailContent() {
   // at all (only planning/replanning/executing/completion_assessment) nor an
   // updated_at - so freezing off dagExecution would freeze early on a
   // recoverable step failure, or never freeze, or un-freeze on a later
-  // in-flight dag_execution event. The task's own status/updatedAt is the one
-  // signal that's actually authoritative for "this run is truly over."
-  const isDagFinished = state.currentTask?.status === "completed" || state.currentTask?.status === "failed"
-  const progressEndedAt = isDagFinished ? state.currentTask?.updatedAt : undefined
+  // in-flight dag_execution event. The task's own status is the one signal
+  // that's actually authoritative for "this run is truly over."
+  const isDagFinished = isTerminalTaskStatus(state.currentTask?.status)
+  // dagTerminatedAt, not updatedAt: the latter is general task metadata that
+  // keeps changing after this run ends for unrelated reasons (a title edit,
+  // another field update via a later task_info refresh), which would make
+  // the frozen elapsed time silently drift on revisit. dagTerminatedAt is
+  // stamped once by UPDATE_TASK_STATUS specifically for this and preserved
+  // across those unrelated refreshes.
+  const progressEndedAt = isDagFinished ? state.currentTask?.dagTerminatedAt : undefined
 
   return (
     <div className="h-full flex flex-col md:flex-row bg-background">
@@ -159,34 +185,53 @@ function TaskDetailContent() {
         </div>
       </div>
 
-      {/* Spans the whole page's height (siblings the header+chat column
-          above, not nested under it) so it visually pops out from the right
-          edge of the entire page rather than just the content area below
-          the header - and stays independent of the file/graph preview's
-          draggable PreviewSheet layout inside TaskConversationPanel. Below
-          `md` there's no room for a fixed side-by-side column without
-          squeezing the chat unusably narrow, so it stacks below the chat
-          instead - the same stack-on-mobile/side-column-on-desktop idea as
-          resizable-three-column-layout.tsx, capped to a fraction of the
-          viewport height (shrink-0 so that cap holds) rather than taking the
-          full remaining width. Between `md` and `xl` the rail narrows to
-          280px rather than jumping straight to 360px - at ~1024px,
-          TaskConversationPanel's own chat/PreviewSheet split (when a
-          file/graph preview is also open) already halves what's left, so the
-          full 360px here would leave that split unusably narrow. This isn't a
-          full fix for that interaction (the two panels don't coordinate
-          widths - see PR review) but meaningfully softens it at the specific
-          width band that's tightest. */}
+      {/* Three responsive treatments, since a fixed side column has nowhere
+          good to go at every width once TaskConversationPanel's own
+          chat/PreviewSheet split is also in play:
+          - Below `md`: no room for a side-by-side column at all, so it
+            stacks below the chat instead, capped to a fraction of the
+            viewport height (shrink-0 so that cap holds) - unchanged from
+            before.
+          - `md` to below `xl` (tablet/narrow desktop): a fixed overlay
+            sliding in from the right edge, with a dismissible backdrop -
+            this is the "overlay/collapse mode at constrained widths" the PR
+            review asked for, specifically because this is the range where
+            TaskConversationPanel's own PreviewSheet split (when a file/graph
+            preview is also open) leaves too little room for a permanent
+            side-by-side rail; an overlay draws on top instead of taking flex
+            space from that split, so the two no longer compete for width.
+          - `xl` and up: reverts to a normal static sibling column (siblings
+            the header+chat column above, not nested under it, so it visually
+            pops out from the right edge of the entire page) - there's
+            finally enough width for both panels to coexist without either
+            being squeezed. */}
       {progressPanelVisible && (
-        <div className="w-full md:w-[280px] xl:w-[360px] shrink-0 h-[45vh] md:h-full border-t md:border-t-0 md:border-l border-border">
-          <ProgressPanel
-            steps={progressSteps}
-            startedAt={state.dagExecution?.created_at}
-            endedAt={progressEndedAt}
-            onCollapse={handleCollapseProgressPanel}
-            onStepClick={handleProgressStepClick}
+        <>
+          {/* z-[110]/z-[120], above every other fixed/high-z-index element on
+              this page: the header sits at z-50, TaskConversationPanel's own
+              PreviewSheet column-resize handle at z-[100] (its wide invisible
+              hit area would otherwise still capture drag clicks meant for
+              this panel), and the floating voice-input mic button at z-[70]
+              (which would otherwise float visibly on top of the dimmed
+              backdrop) - all need to render underneath this overlay, not just
+              the header. */}
+          <div
+            className="hidden md:block xl:hidden fixed inset-0 z-[110] bg-black/20"
+            onClick={handleCollapseProgressPanel}
+            aria-hidden="true"
           />
-        </div>
+          <div
+            className="w-full shrink-0 h-[45vh] border-t border-border md:fixed md:inset-y-0 md:right-0 md:z-[120] md:h-full md:w-[360px] md:border-t-0 md:border-l md:shadow-2xl xl:static xl:z-auto xl:shadow-none"
+          >
+            <ProgressPanel
+              steps={progressSteps}
+              startedAt={state.dagExecution?.created_at}
+              endedAt={progressEndedAt}
+              onCollapse={handleCollapseProgressPanel}
+              onStepClick={handleProgressStepClick}
+            />
+          </div>
+        </>
       )}
     </div>
   )

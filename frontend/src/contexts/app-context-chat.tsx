@@ -952,7 +952,7 @@ const normalizeDagExecutionPayload = (raw: Record<string, unknown>): DAGExecutio
   } as DAGExecution
 }
 
-interface AppState {
+export interface AppState {
   messages: Message[]
   currentTask: Task | null
   taskRuntimeExtensions: TaskRuntimeExtensions

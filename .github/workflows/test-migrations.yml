@@ -360,6 +360,16 @@ jobs:
         env:
           XAGENT_TEST_POSTGRES_URL: postgresql://xagent:xagent@localhost:5432/xagent_test
 
+      # The offline (--sql) cast to PostgreSQL's json type is only
+      # meaningfully checked against a real server: sqlite has no
+      # json/jsonb distinction to get wrong.
+      - name: Test Google Calendar scope narrowing PostgreSQL cast/round-trip (Postgres-only)
+        if: needs.detect-migration-changes.outputs.should-test == 'true'
+        run: |
+          pytest tests/alembic/test_20260817_narrow_google_calendar_scope.py -m postgresql -q
+        env:
+          XAGENT_TEST_POSTGRES_URL: postgresql://xagent:xagent@localhost:5432/xagent_test
+
       - name: Test legacy resume interaction close rowcount grid (Postgres-only)
         if: needs.detect-migration-changes.outputs.should-test == 'true'
         run: |

@@ -101,7 +101,7 @@ def test_static_visual_design_skill_routes_only_commercial_creatives() -> None:
     assert "omits a required brand asset is a rejection" in content
     assert "does not prove the image model placed it" in content
     # The one case where finishing with nothing rendered is correct.
-    assert "ends in the question above, with nothing rendered" in content
+    assert "ends in the question above with nothing rendered" in content
     assert "do not list or describe files that do not exist" in content
     # A spent budget hands the asset back with its defect named, not silently,
     # and the hand-back is terminal rather than a replan trigger (C3).
@@ -146,29 +146,122 @@ def test_static_visual_design_includes_art_direction_reference() -> None:
     assert "differ on at least three of" in content
 
 
-def test_web_asset_tool_descriptions_do_not_invite_unprompted_logo_search() -> None:
-    """Tool descriptions are always in context; the skill policy is not.
-
-    A description that tells the model to go find a brand's logo overrides the
-    skill's ask-the-user rule, because the skill is only present once loaded
-    (#1411 review C2).
-    """
-    from xagent.core.tools.adapters.vibe.download_web_asset import DownloadWebAssetArgs
+def _asset_retrieval_surfaces() -> dict[str, str]:
+    """Every description that reaches the model alongside an asset-fetch route."""
+    from xagent.core.tools.adapters.vibe.download_web_asset import (
+        DownloadWebAssetArgs,
+        DownloadWebAssetTool,
+    )
     from xagent.core.tools.adapters.vibe.fetch_web_content import (
         FetchWebContentArgs,
         FetchWebContentTool,
     )
+    from xagent.core.tools.core.image_tool import ImageGenerationToolCore
 
     def field_text(model: type, name: str) -> str:
         return model.model_fields[name].description or ""
 
-    surfaces = [
-        FetchWebContentTool().description,
-        field_text(FetchWebContentArgs, "include_assets"),
-        field_text(DownloadWebAssetArgs, "url"),
-    ]
-    for text in surfaces:
+    image_texts = {
+        "generate_image.description": ImageGenerationToolCore.GENERATE_IMAGE_DESCRIPTION,
+        "edit_image.description": ImageGenerationToolCore.EDIT_IMAGE_DESCRIPTION,
+    }
+
+    return {
+        "fetch_web_content.description": FetchWebContentTool().description,
+        "fetch_web_content.include_assets": field_text(
+            FetchWebContentArgs, "include_assets"
+        ),
+        "download_web_asset.description": DownloadWebAssetTool.description.fget(  # type: ignore[attr-defined]
+            DownloadWebAssetTool.__new__(DownloadWebAssetTool)
+        ),
+        "download_web_asset.url": field_text(DownloadWebAssetArgs, "url"),
+        **image_texts,
+    }
+
+
+def test_asset_retrieval_surfaces_do_not_invite_unprompted_logo_search() -> None:
+    """Tool descriptions are always in context; the skill policy is not.
+
+    A description that tells the model to go find a brand's logo, or that lists an
+    official source as a sanctioned origin, overrides the skill's ask-the-user
+    rule — the skill is only present once loaded (#1411 review C2/R1). Covers
+    fetch, download, generate, and edit together so no single surface regresses.
+    """
+    banned = (
+        "when looking for logos",
+        "usually asset_query='logo'",
+        "prefer the official brand domain",
+        "retrieved from the brand's own official source",
+        "discovers an official logo",
+    )
+    for name, text in _asset_retrieval_surfaces().items():
         lowered = text.lower()
-        assert "when looking for logos" not in lowered
-        assert "usually asset_query='logo'" not in lowered
-        assert "prefer the official brand domain" not in lowered
+        for phrase in banned:
+            assert phrase not in lowered, f"{name} reintroduced: {phrase!r}"
+
+
+def test_asset_retrieval_surfaces_require_user_direction() -> None:
+    """The positive half: retrieval is conditioned on the user asking for it."""
+    surfaces = _asset_retrieval_surfaces()
+
+    directed = [t for t in surfaces.values() if "direct" in t.lower()]
+    assert len(directed) >= 4, (
+        "each retrieval surface should condition on the user having directed it; "
+        f"only {len(directed)} of {len(surfaces)} do"
+    )
+    joined = " ".join(surfaces.values()).lower()
+    assert "ask the user for it" in joined
+
+
+def test_static_visual_design_no_logo_branch_is_ordered() -> None:
+    """no logo → ask → wait → render only after the user chooses (#1411 R4)."""
+    content = " ".join(_skill()["content"].split())
+    brand = content.split("## Brand and identity assets", 1)[1].split("## Generate", 1)[
+        0
+    ]
+
+    ask = brand.index("stop before rendering finals")
+    tool = brand.index("`ask_user_question`")
+    after = brand.index("only once the user has")
+    assert ask < tool < after, "the ask must precede the conditional render"
+    assert "ends waiting for the user and resumes on their choice" in brand
+
+    finish = content.split("## Finish", 1)[1]
+    # The gate blocks the branded *final*, not the whole brief, so a chosen
+    # fallback draft can still be rendered and handed back.
+    assert "a brand-specific *final* with no verified logo" in finish
+    assert "Before the user has chosen" in finish
+    assert "After they choose a reserved-space or unbranded route" in finish
+
+
+def test_static_visual_design_coverage_wins_across_placements() -> None:
+    """A new placement of a delivered direction is coverage, not a repair (R5)."""
+    content = " ".join(_skill()["content"].split())
+    budget = content.split("## Repair budget", 1)[1].split("## Finish", 1)[0]
+
+    assert "Where both definitions fit one call, coverage wins" in budget
+    assert "no candidate of its own is free coverage" in budget
+    assert "Only a second render of that same placement costs one" in budget
+    assert budget.index("A **repair** is") < budget.index("coverage wins"), (
+        "the precedence rule has to follow the repair definition it overrides"
+    )
+
+
+def test_static_visual_design_keeps_planner_visible_topology() -> None:
+    """LLMPlanGenerator only sees SKILL.md, so DAG-shaping rules live there.
+
+    `plan_generator.py` passes `selected_skill_context` — the skill body — into
+    plan generation; a reference read later by `read_skill_doc` cannot reshape a
+    frozen DAG (#1411 review C1/R2).
+    """
+    content = " ".join(_skill()["content"].split())
+
+    assert (
+        "One creative lead defines and compares the whole set sequentially" in content
+    )
+    assert "Do not split ideation across independent agents or parallel plan nodes" in (
+        content
+    )
+    assert "only after every brief and specification is locked" in content
+    assert "represent that order in any execution plan" in content
+    assert "Never plan a render, or an identity search, to run alongside" in content

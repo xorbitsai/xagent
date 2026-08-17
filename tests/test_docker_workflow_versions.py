@@ -302,6 +302,22 @@ def test_sandbox_group_covers_runtime_requirements_with_compatible_lock() -> Non
         assert locked_versions[name] in runtime_requirement.specifier
 
 
+def test_backend_mcp_dependency_excludes_2x() -> None:
+    # Companion to test_sandbox_group_covers_runtime_requirements_with_compatible_lock
+    # above, which only guards the sandbox group's mcp bound: mcp 2.0 removed
+    # mcp.client.streamable_http.streamablehttp_client, which the backend's own
+    # sessions.py imports eagerly, so [project].dependencies must independently
+    # keep mcp below 2.x even if that guard alone were ever satisfied.
+    pyproject = tomllib.loads(read_repo_file("pyproject.toml"))
+    backend_requirements = {
+        canonicalize_name((requirement := Requirement(raw)).name): requirement
+        for raw in pyproject["project"]["dependencies"]
+    }
+
+    mcp_requirement = backend_requirements[canonicalize_name("mcp")]
+    assert Version("2.0.0") not in mcp_requirement.specifier
+
+
 def test_sandbox_dockerfile_installs_locked_group_and_smoke_tests_imports() -> None:
     dockerfile = read_repo_file("docker/Dockerfile.sandbox")
 

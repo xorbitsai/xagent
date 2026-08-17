@@ -658,6 +658,12 @@ async def refresh_oauth_token_if_needed(
         headers = {}
         if normalized_provider == "linkedin":
             headers["Content-Type"] = "application/x-www-form-urlencoded"
+        if normalized_provider == "github":
+            # Matches the code-exchange branch in api/auth.py: GitHub's token
+            # endpoint answers form-urlencoded unless the request explicitly
+            # asks for JSON, which would otherwise make response.json() below
+            # raise on a successful refresh.
+            headers["Accept"] = "application/json"
 
         async with httpx.AsyncClient() as client:
             response = await client.post(

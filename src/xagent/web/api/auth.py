@@ -1519,6 +1519,12 @@ def generic_oauth_callback(
             "redirect_uri": redirect_uri,
         }
         headers = {"Content-Type": "application/x-www-form-urlencoded"}
+        if provider.lower() == "github":
+            # GitHub's token endpoint answers with a form-urlencoded body
+            # (access_token=...&scope=...&token_type=...) unless the request
+            # explicitly asks for JSON -- without this, token_response.json()
+            # below raises instead of parsing the response.
+            headers["Accept"] = "application/json"
         auth: tuple[str, str] | None = None
         if provider.lower() == "zoom":
             # Zoom's token endpoint requires HTTP Basic Auth for client

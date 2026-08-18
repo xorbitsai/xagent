@@ -268,8 +268,23 @@ def test_upgrade_revokes_grants_carrying_the_old_calendar_scope(tmp_path) -> Non
                 # fallback credential (config.py's
                 # _resolve_legacy_oauth_access_token), so revoking it on a
                 # scope-content match alone would risk collateral damage
-                # beyond Calendar.
+                # beyond Calendar. mcp_apps.py's
+                # APPS_REQUIRING_APP_SCOPED_OAUTH_GRANT closes the resulting
+                # gap architecturally instead -- see
+                # test_legacy_oauth_provider_scoping.py.
                 {"id": 6, "provider": "google", "scope": old_scope},
+                # A google-calendar row with no scope recorded at all. Per
+                # RFC 6749 5.1 a provider may omit ``scope`` when it exactly
+                # matches what was requested; the only thing ever requested
+                # under this app_id before this migration was the old, broad
+                # scope, so a missing scope here is evidence of that grant,
+                # not proof of a narrow one -- must be revoked, not skipped.
+                {"id": 7, "provider": "google-calendar", "scope": None},
+                # Same reasoning for an empty string, which is what the
+                # callback persists when the provider's response omits
+                # ``scope`` outright (web/api/auth.py's
+                # ``token_data.get("scope", "")``).
+                {"id": 8, "provider": "google-calendar", "scope": ""},
             ],
         )
 
@@ -460,10 +475,14 @@ def test_offline_postgresql_upgrade_emits_literal_update_only_sql() -> None:
     assert "INSERT INTO public_mcp_apps" not in sql
     assert "DELETE FROM public_mcp_apps" not in sql
     assert "%(" not in sql
-    # The revoke step needs a live SELECT to judge each row's granted scope,
-    # which offline (--sql) generation can't do; it must not emit anything
-    # touching user_oauth.
-    assert "user_oauth" not in sql
+    # The revoke step has no live connection to page through, so it emits
+    # one literal, unbatched DELETE with the equivalent predicate instead of
+    # a Python-side fetch loop (see test_offline_*_upgrade_revokes_matching_*
+    # for proof it round-trips the same set of rows the online path does).
+    assert sql.count("DELETE FROM user_oauth") == 1
+    assert "user_oauth.provider = 'google-calendar'" in sql
+    assert "user_oauth.scope IS NULL" in sql
+    assert "https://www.googleapis.com/auth/calendar" in sql
 
 
 def test_offline_postgresql_downgrade_emits_literal_update_only_sql() -> None:
@@ -533,6 +552,13 @@ def test_offline_sqlite_upgrade_round_trips_json_scope_value() -> None:
     connection.execute(
         "CREATE TABLE public_mcp_apps (app_id TEXT PRIMARY KEY, oauth_scopes JSON)"
     )
+    # The script also carries the revoke DELETE now (see
+    # test_offline_sqlite_upgrade_revokes_matching_user_oauth_rows for that
+    # behavior); this test only cares about the catalog scope, so an empty
+    # table is enough to let the script run.
+    connection.execute(
+        "CREATE TABLE user_oauth (id INTEGER PRIMARY KEY, provider TEXT, scope TEXT)"
+    )
     connection.execute(
         "INSERT INTO public_mcp_apps (app_id, oauth_scopes) VALUES (?, ?)",
         ("google-calendar", json.dumps(OLD_SCOPES)),
@@ -546,6 +572,63 @@ def test_offline_sqlite_upgrade_round_trips_json_scope_value() -> None:
 
     assert stored is not None
     assert json.loads(stored[0]) == NEW_SCOPES
+
+
+def test_offline_sqlite_upgrade_revokes_matching_user_oauth_rows() -> None:
+    """The offline (--sql) path has no live connection to page through, so
+    it emits one literal, unbatched DELETE instead of skipping the revoke
+    step entirely -- this executes that DELETE and checks it matches exactly
+    the same rows the online, Python-side predicate does."""
+    migration = _load_migration_module()
+    output = StringIO()
+    context = MigrationContext.configure(
+        dialect_name="sqlite",
+        opts={"as_sql": True, "output_buffer": output},
+    )
+    with Operations.context(context):
+        migration.upgrade()
+
+    old_scope = migration.OLD_SCOPE
+    new_scope = migration.NEW_SCOPE
+
+    connection = sqlite3.connect(":memory:")
+    connection.execute(
+        "CREATE TABLE public_mcp_apps (app_id TEXT PRIMARY KEY, oauth_scopes JSON)"
+    )
+    connection.execute(
+        "CREATE TABLE user_oauth (id INTEGER PRIMARY KEY, provider TEXT, scope TEXT)"
+    )
+    connection.execute(
+        "INSERT INTO public_mcp_apps (app_id, oauth_scopes) VALUES (?, ?)",
+        ("google-calendar", json.dumps(OLD_SCOPES)),
+    )
+    connection.executemany(
+        "INSERT INTO user_oauth (id, provider, scope) VALUES (?, ?, ?)",
+        [
+            (1, "google-calendar", old_scope),
+            (2, "google-calendar", f"{new_scope} {old_scope}"),
+            (3, "google-calendar", new_scope),
+            (4, "gmail", "https://www.googleapis.com/auth/gmail.modify"),
+            (5, "google-drive", None),
+            (6, "google", old_scope),
+            (7, "google-calendar", None),
+            (8, "google-calendar", ""),
+        ],
+    )
+    connection.executescript(output.getvalue())
+
+    remaining = {
+        row[0]: row[1]
+        for row in connection.execute("SELECT id, provider FROM user_oauth")
+    }
+    connection.close()
+
+    assert remaining == {
+        3: "google-calendar",
+        4: "gmail",
+        5: "google-drive",
+        6: "google",
+    }
 
 
 def test_revision_metadata() -> None:
@@ -637,6 +720,18 @@ def test_postgresql_online_upgrade_narrows_scope_and_revokes_grants(
             text("INSERT INTO user_oauth (id, provider, scope) VALUES (2, :p, :s)"),
             {"p": "gmail", "s": "https://www.googleapis.com/auth/gmail.modify"},
         )
+        # No scope recorded (NULL) on a google-calendar row: RFC 6749 5.1
+        # lets a provider omit `scope` when it matches what was requested,
+        # and the only thing ever requested here before this migration was
+        # the old, broad scope -- must be revoked, not skipped.
+        connection.execute(
+            text("INSERT INTO user_oauth (id, provider, scope) VALUES (3, :p, NULL)"),
+            {"p": "google-calendar"},
+        )
+        connection.execute(
+            text("INSERT INTO user_oauth (id, provider, scope) VALUES (4, :p, :s)"),
+            {"p": "google-calendar", "s": ""},
+        )
 
         with patch.object(migration, "op", _operations(connection)):
             migration.upgrade()
@@ -726,3 +821,60 @@ def test_postgresql_offline_downgrade_sql_executes_and_restores_old_scope(
 
     assert stored_scopes == OLD_SCOPES
     assert _oauth_scopes_column_type(postgres_engine) == "json"
+
+
+@pytest.mark.postgresql
+def test_postgresql_offline_upgrade_revokes_matching_user_oauth_rows(
+    postgres_engine,
+) -> None:
+    """The offline (--sql) DELETE, executed against a real server, must
+    match exactly the same rows the online, Python-side predicate does --
+    including the NULL/empty-scope cases a LIKE-based SQL predicate handles
+    differently from Python's `if row.scope` guard would."""
+    migration = _load_migration_module()
+    old_scope = migration.OLD_SCOPE
+    new_scope = migration.NEW_SCOPE
+
+    with postgres_engine.begin() as connection:
+        connection.execute(
+            text(
+                "INSERT INTO public_mcp_apps (app_id, oauth_scopes) "
+                "VALUES ('google-calendar', :scopes)"
+            ),
+            {"scopes": json.dumps(OLD_SCOPES)},
+        )
+        connection.execute(
+            text(
+                "INSERT INTO user_oauth (id, provider, scope) VALUES "
+                "(1, 'google-calendar', :old), "
+                "(2, 'google-calendar', :combined), "
+                "(3, 'google-calendar', :new), "
+                "(4, 'gmail', :gmail_scope), "
+                "(5, 'google-drive', NULL), "
+                "(6, 'google', :old), "
+                "(7, 'google-calendar', NULL), "
+                "(8, 'google-calendar', '')"
+            ),
+            {
+                "old": old_scope,
+                "combined": f"{new_scope} {old_scope}",
+                "new": new_scope,
+                "gmail_scope": "https://www.googleapis.com/auth/gmail.modify",
+            },
+        )
+
+    output = StringIO()
+    context = MigrationContext.configure(
+        dialect_name="postgresql",
+        opts={"as_sql": True, "output_buffer": output},
+    )
+    with Operations.context(context):
+        migration.upgrade()
+
+    with postgres_engine.begin() as connection:
+        connection.execute(text(output.getvalue()))
+        remaining_ids = {
+            row.id for row in connection.execute(text("SELECT id FROM user_oauth"))
+        }
+
+    assert remaining_ids == {3, 4, 5, 6}

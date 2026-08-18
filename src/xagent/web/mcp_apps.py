@@ -22,7 +22,20 @@ from .models.public_mcp import PublicMCPApp
 # Only an app-scoped grant (UserOAuth.provider == the app_id) counts for these
 # apps; Instagram is deliberately excluded so its existing bare "meta" grants
 # keep working, since its required scopes haven't changed.
-APPS_REQUIRING_APP_SCOPED_OAUTH_GRANT = frozenset({"facebook"})
+#
+# google-calendar is included for the same reason, not a new one: a bare
+# "google" row (app_id-less connect) never requested calendar.events either,
+# so it can't be trusted to carry Calendar access on its own merit. Without
+# this, Google's incremental consent (include_granted_scopes=true) could
+# still let a bare "google" row satisfy Calendar tool calls if it happened to
+# accumulate the old, broad calendar scope from a separate authorization --
+# exactly the gap the 20260817_narrow_google_calendar_scope.py migration's
+# data cleanup deliberately does not attempt to close by deleting that row
+# (see that migration's docstring), because a scope-content-only match risks
+# collateral damage on Gmail/Drive/Docs credentials sharing the same bare
+# row. This closes it architecturally instead: the bare row is simply never
+# accepted as a Calendar credential, so its scope content stops mattering.
+APPS_REQUIRING_APP_SCOPED_OAUTH_GRANT = frozenset({"facebook", "google-calendar"})
 
 
 def _normalize_oauth_grant_key(value: object) -> str | None:

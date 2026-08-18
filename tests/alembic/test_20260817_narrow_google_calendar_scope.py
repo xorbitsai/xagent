@@ -240,11 +240,16 @@ def test_upgrade_revokes_grants_carrying_the_old_calendar_scope(tmp_path) -> Non
                     "provider": "google-calendar",
                     "scope": f"{old_scope} https://www.googleapis.com/auth/userinfo.email",
                 },
-                # A bare provider-level grant that happens to carry the old
-                # scope too -- config.py's app-scoped-grant restriction
-                # doesn't cover google-calendar, so this is also a live
-                # Calendar credential and must be revoked the same way.
-                {"id": 2, "provider": "google", "scope": old_scope},
+                # A combined grant: include_granted_scopes=true can echo
+                # back both the old and the new scope on reconnect. Presence
+                # of the old scope alone must still trigger revocation --
+                # the new scope also being present is not evidence of a
+                # narrowed credential.
+                {
+                    "id": 2,
+                    "provider": "google-calendar",
+                    "scope": f"{new_scope} {old_scope}",
+                },
                 # Already narrowed (e.g. a user who reconnected since this
                 # migration first ran) -- must survive untouched.
                 {"id": 3, "provider": "google-calendar", "scope": new_scope},
@@ -257,6 +262,14 @@ def test_upgrade_revokes_grants_carrying_the_old_calendar_scope(tmp_path) -> Non
                 },
                 # No scope recorded at all -- must not raise on a null scope.
                 {"id": 5, "provider": "google-drive", "scope": None},
+                # A bare provider-level grant that happens to carry the old
+                # scope too -- deliberately left untouched: other Google
+                # connectors may be relying on this exact row as their own
+                # fallback credential (config.py's
+                # _resolve_legacy_oauth_access_token), so revoking it on a
+                # scope-content match alone would risk collateral damage
+                # beyond Calendar.
+                {"id": 6, "provider": "google", "scope": old_scope},
             ],
         )
 
@@ -265,7 +278,91 @@ def test_upgrade_revokes_grants_carrying_the_old_calendar_scope(tmp_path) -> Non
 
         remaining = _remaining_ids_and_providers(connection, table)
 
-    assert remaining == {3: "google-calendar", 4: "gmail", 5: "google-drive"}
+    assert remaining == {
+        3: "google-calendar",
+        4: "gmail",
+        5: "google-drive",
+        6: "google",
+    }
+
+
+def test_upgrade_revoke_does_not_touch_gmail_watch_state(tmp_path) -> None:
+    """Regression for a real collateral-damage bug: gmail_watch_states has
+    ON DELETE CASCADE on user_oauth.id, so revoking a row by scope content
+    alone (rather than by provider) could have silently deleted a user's
+    Gmail push-notification watch state as a side effect of narrowing
+    Calendar's scope."""
+    migration = _load_migration_module()
+    engine = sa.create_engine(f"sqlite:///{tmp_path / 'test.db'}")
+    metadata = sa.MetaData()
+    oauth_table = _user_oauth(metadata)
+    watch_table = sa.Table(
+        "gmail_watch_states",
+        metadata,
+        sa.Column("id", sa.Integer, primary_key=True),
+        sa.Column(
+            "user_oauth_id",
+            sa.Integer,
+            sa.ForeignKey("user_oauth.id", ondelete="CASCADE"),
+            nullable=False,
+        ),
+    )
+    metadata.create_all(engine)
+
+    with engine.begin() as connection:
+        connection.execute(
+            sa.insert(oauth_table),
+            {
+                "id": 1,
+                "provider": "gmail",
+                # A Gmail credential that, via include_granted_scopes=true,
+                # also carries the old calendar scope from a prior separate
+                # Calendar connection under the same OAuth client.
+                "scope": (
+                    "https://www.googleapis.com/auth/gmail.modify "
+                    f"{migration.OLD_SCOPE}"
+                ),
+            },
+        )
+        connection.execute(sa.insert(watch_table), {"id": 1, "user_oauth_id": 1})
+
+        with patch.object(migration, "op", _operations(connection)):
+            migration.upgrade()
+
+        remaining_oauth = _remaining_ids_and_providers(connection, oauth_table)
+        remaining_watch = connection.execute(sa.select(watch_table.c.id)).fetchall()
+
+    assert remaining_oauth == {1: "gmail"}
+    assert len(remaining_watch) == 1
+
+
+def test_upgrade_revoke_pages_through_more_than_one_batch(tmp_path) -> None:
+    migration = _load_migration_module()
+    engine = sa.create_engine(f"sqlite:///{tmp_path / 'test.db'}")
+    metadata = sa.MetaData()
+    table = _user_oauth(metadata)
+    metadata.create_all(engine)
+
+    row_count = migration.REVOKE_BATCH_SIZE + 5
+    with engine.begin() as connection:
+        connection.execute(
+            sa.insert(table),
+            [
+                {
+                    "id": i,
+                    "provider": "google-calendar",
+                    "scope": migration.OLD_SCOPE,
+                }
+                for i in range(1, row_count + 1)
+            ],
+        )
+
+        with patch.object(migration, "op", _operations(connection)):
+            migration.upgrade()
+
+        remaining = _remaining_ids_and_providers(connection, table)
+
+    assert remaining == {}
 
 
 def test_upgrade_revoke_is_idempotent(tmp_path) -> None:
@@ -463,9 +560,11 @@ def test_revision_metadata() -> None:
 # and JSON-vs-JSONB is precisely a distinction sqlite has no concept of. Only
 # a real server can confirm the offline-generated SQL is not merely
 # plausible-looking text but actually executes and stores the right column
-# type, mirroring the pattern in
+# type, mirroring the local-postgres-fixture pattern in
 # tests/migrations/test_20260813_trace_json_columns_to_jsonb.py (the parent
-# revision, which converts these same tables' JSON columns to JSONB).
+# revision -- it converts a different set of tables, trace_events,
+# trace_message_blobs, and trace_checkpoint_blobs, from JSON to JSONB;
+# public_mcp_apps.oauth_scopes stays plain JSON here).
 
 
 def _postgres_url() -> str | None:

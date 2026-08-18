@@ -10,15 +10,39 @@ Narrowing the catalog row only changes what *future* authorizations
 request -- Google's OAuth refresh grant returns a new access token for
 whatever scope was originally consented to, it never narrows it (see
 ``refresh_oauth_token`` in ``web/tools/config.py``). So this migration also
-revokes -- deletes -- any ``user_oauth`` row whose granted scope still
-contains the old, full calendar scope, forcing those users through the
-OAuth flow again on their next Calendar action; only then do they get the
-narrower grant. Matching is on granted-scope content, not the ``provider``
-column: ``APPS_REQUIRING_APP_SCOPED_OAUTH_GRANT`` (web/mcp_apps.py) does not
-include ``google-calendar``, so a bare provider-level ``google`` row is also
-accepted as a Calendar credential (web/tools/config.py's
-``_resolve_legacy_oauth_access_token``) and would evade a filter on
-``provider == "google-calendar"`` alone.
+revokes -- deletes -- every ``user_oauth`` row with ``provider ==
+"google-calendar"`` whose granted scope still contains the old, full
+calendar scope, forcing those users through the OAuth flow again on their
+next Calendar action.
+
+Deliberately scoped to ``provider == "google-calendar"`` only, not to any
+row whose *scope content* happens to mention the old calendar scope: a bare
+provider-level ``google`` row (no app_id) is also accepted as a Calendar
+credential (web/tools/config.py's ``_resolve_legacy_oauth_access_token``,
+since ``APPS_REQUIRING_APP_SCOPED_OAUTH_GRANT`` in web/mcp_apps.py does not
+include ``google-calendar``) and *could* carry the old scope too via
+``include_granted_scopes=true`` -- but that same bare row is the fallback
+credential every other Google connector (Gmail, Drive, Docs, ...) may also
+be relying on, so deleting it on a scope-content match alone would risk
+breaking those too. A ``google-calendar``-provider row exists only because
+this connector's own connect flow created it (``provider=(app_id or
+provider)`` in web/api/auth.py), so it is unambiguously this connector's,
+and only this connector's, credential -- safe to delete outright. One
+narrower row type that gets missed as a result: a bare ``google`` grant
+that already carries the old scope is left untouched here; genuinely
+revoking that would require providers-aware logic this migration doesn't
+attempt.
+
+A row that carries *both* the old and the new scope (which
+``include_granted_scopes=true`` can produce on reconnect once the registry
+requests only the new scope) is still revoked: presence of the old scope
+is grounds enough on its own, regardless of whether the new scope also
+shows up alongside it. Note this is a point-in-time cleanup of rows that
+predate this migration, not a standing guarantee -- a user who reconnects
+after this migration runs can still receive a combined grant the same way,
+since Google's incremental consent is per OAuth client, not per requested
+scope; only actual provider-side revocation (or requesting
+``include_granted_scopes=false``) would close that recurrence.
 
 This is a delete, matching this table's existing disconnect contract
 (``web/api/mcp.py`` deletes the row outright; there is no revoked/active
@@ -30,6 +54,10 @@ Google still considers the token valid until it expires or the user revokes
 app access from their own Google Account -- identical to any other
 local-only disconnect today.
 
+Rows are paged by id (keyset, not OFFSET, matching the parent revision's
+convention) and deleted in bounded batches, so this doesn't load the whole
+table or build one unbounded ``IN`` list on a large deployment.
+
 Revision ID: 20260817_narrow_google_calendar_scope
 Revises: 20260813_trace_json_columns_to_jsonb
 Create Date: 2026-08-17
@@ -37,10 +65,13 @@ Create Date: 2026-08-17
 """
 
 import json
+import logging
 from typing import Sequence, Union
 
 import sqlalchemy as sa
 from alembic import op
+
+logger = logging.getLogger(__name__)
 
 revision: str = "20260817_narrow_google_calendar_scope"
 down_revision: Union[str, None] = "20260813_trace_json_columns_to_jsonb"
@@ -57,6 +88,7 @@ PUBLIC_MCP_APPS_TABLE = sa.table(
 USER_OAUTH_TABLE = sa.table(
     "user_oauth",
     sa.column("id", sa.Integer),
+    sa.column("provider", sa.String),
     sa.column("scope", sa.String),
 )
 
@@ -65,6 +97,10 @@ OLD_SCOPE = "https://www.googleapis.com/auth/calendar"
 NEW_SCOPE = "https://www.googleapis.com/auth/calendar.events"
 OLD_SCOPES = [OLD_SCOPE]
 NEW_SCOPES = [NEW_SCOPE]
+
+# Ids per revoke batch. Bounds a page of (id, scope) rows plus one IN-list
+# of matched ids, not the whole table -- see the module docstring.
+REVOKE_BATCH_SIZE = 500
 
 
 def _offline_scopes_literal(scopes: list[str], dialect_name: str):
@@ -93,30 +129,52 @@ def _revoke_grants_carrying_the_old_calendar_scope(bind: sa.engine.Connection) -
         return
 
     columns = {column["name"] for column in inspector.get_columns("user_oauth")}
-    if not {"id", "scope"}.issubset(columns):
+    if not {"id", "provider", "scope"}.issubset(columns):
         return
 
-    rows = bind.execute(
+    select_page = (
         sa.select(USER_OAUTH_TABLE.c.id, USER_OAUTH_TABLE.c.scope)
-    ).fetchall()
-
-    # Google's token response echoes ``scope`` as a plain space-delimited
-    # string (RFC 6749); split rather than substring-match so a scope that
-    # merely contains "calendar" as a substring of something else can't
-    # collide with the exact grant we're hunting for.
-    ids_to_revoke = [
-        row.id
-        for row in rows
-        if row.scope
-        and OLD_SCOPE in row.scope.split()
-        and NEW_SCOPE not in row.scope.split()
-    ]
-    if not ids_to_revoke:
-        return
-
-    bind.execute(
-        sa.delete(USER_OAUTH_TABLE).where(USER_OAUTH_TABLE.c.id.in_(ids_to_revoke))
+        .where(
+            USER_OAUTH_TABLE.c.provider == APP_ID,
+            USER_OAUTH_TABLE.c.id > sa.bindparam("after"),
+        )
+        .order_by(USER_OAUTH_TABLE.c.id)
+        .limit(REVOKE_BATCH_SIZE)
     )
+
+    revoked_count = 0
+    after = 0
+    while True:
+        rows = bind.execute(select_page, {"after": after}).fetchall()
+        if not rows:
+            break
+        after = rows[-1].id
+
+        # Google's token response echoes ``scope`` as a plain space-delimited
+        # string (RFC 6749); split rather than substring-match so a scope
+        # that merely contains "calendar" as a substring of something else
+        # can't collide with the exact grant we're hunting for. Presence of
+        # the old scope alone is grounds for revocation, regardless of
+        # whether the new scope is also present in the same grant -- see the
+        # module docstring on combined grants.
+        ids_to_revoke = [
+            row.id for row in rows if row.scope and OLD_SCOPE in row.scope.split()
+        ]
+        if ids_to_revoke:
+            bind.execute(
+                sa.delete(USER_OAUTH_TABLE).where(
+                    USER_OAUTH_TABLE.c.id.in_(ids_to_revoke)
+                )
+            )
+            revoked_count += len(ids_to_revoke)
+
+    if revoked_count:
+        logger.warning(
+            "Revoked %d google-calendar user_oauth grant(s) still carrying "
+            "the old '%s' scope; affected users must reconnect Calendar.",
+            revoked_count,
+            OLD_SCOPE,
+        )
 
 
 def upgrade() -> None:

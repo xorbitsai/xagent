@@ -54,7 +54,7 @@ PUBLIC_MCP_APPS_TABLE = sa.table(
 
 APP_ID = "github"
 
-GITHUB_SCOPES = ["repo", "read:org", "user:email"]
+GITHUB_SCOPES = ["repo", "user:email"]
 
 # Identity-only, matching the other seeded providers (e.g. zoom) -- the
 # functional scopes above live on the app row (_github_app_row) and are

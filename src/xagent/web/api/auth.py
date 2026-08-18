@@ -34,6 +34,7 @@ from ..models.database import get_db
 from ..models.system_setting import SystemSetting
 from ..models.user import User
 from ..models.user_oauth import UserOAuth
+from ..oauth_provider_quirks import requires_json_accept_header
 from ..services import gmail_provisioning
 from ..services.auth_email import send_password_reset_email
 
@@ -1519,11 +1520,7 @@ def generic_oauth_callback(
             "redirect_uri": redirect_uri,
         }
         headers = {"Content-Type": "application/x-www-form-urlencoded"}
-        if provider.lower() == "github":
-            # GitHub's token endpoint answers with a form-urlencoded body
-            # (access_token=...&scope=...&token_type=...) unless the request
-            # explicitly asks for JSON -- without this, token_response.json()
-            # below raises instead of parsing the response.
+        if requires_json_accept_header(provider):
             headers["Accept"] = "application/json"
         auth: tuple[str, str] | None = None
         if provider.lower() == "zoom":

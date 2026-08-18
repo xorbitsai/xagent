@@ -2,7 +2,9 @@ import base64
 import json
 import logging
 import os
+import re
 from typing import Any
+from urllib.parse import quote
 
 import requests
 from mcp.server.fastmcp import FastMCP
@@ -20,6 +22,32 @@ mcp = FastMCP("github-mcp")
 GITHUB_BASE_URL = "https://api.github.com"
 DEFAULT_TIMEOUT_SECONDS = 30
 MAX_PER_PAGE = 100
+# Bounded multi-page fetch for github_list_issues, mirroring slack.py's
+# MAX_PAGES convention -- GitHub's issues endpoint mixes in pull requests,
+# so a single page of raw items can be mostly/entirely PRs and undercount
+# real issues even when more exist on later pages.
+MAX_ISSUE_PAGES = 10
+
+_FORBIDDEN_PATH_CHARS = re.compile(r"[/?#]")
+
+
+def _encode_path_component(value: str, *, field: str) -> str:
+    """Validate and percent-encode one URL path segment.
+
+    Rejects '/', '?', or '#' within the segment (these would change the
+    request's path/query/fragment structure regardless of encoding) and a
+    bare '.' or '..' segment -- unvalidated, an owner/repo or file path
+    value reaching a same-host route via raw string interpolation could
+    otherwise let a crafted input traverse to an unintended GitHub API
+    route (e.g. "..") or inject a query string (e.g. "owner?x=y"), while
+    still carrying this connector's bearer token. The remaining value is
+    percent-encoded so segments that legitimately contain spaces or other
+    reserved characters (common in file paths, unlike owner/repo names)
+    still produce a well-formed request.
+    """
+    if not value or _FORBIDDEN_PATH_CHARS.search(value) or value in (".", ".."):
+        raise ValueError(f"{field} contains characters that are not allowed: {value!r}")
+    return quote(value, safe="")
 
 
 def _success(**payload: Any) -> str:
@@ -42,13 +70,16 @@ def _headers() -> dict[str, str]:
 
 
 def _parse_repo(repo: str) -> tuple[str, str]:
-    """Split a "owner/repo" full name into its two parts.
+    """Split a "owner/repo" full name into its two, percent-encoded parts.
 
     Rejects a malformed name (extra/leading/trailing slashes, e.g.
     "owner//repo" or "owner/repo/extra") outright rather than silently
     repairing it — .strip("/") + .partition("/") previously accepted those
     and mangled the extra segment into `name`, which then reached the
-    GitHub API as a subtly wrong path instead of a caught bug.
+    GitHub API as a subtly wrong path instead of a caught bug. Each part is
+    further validated/encoded by _encode_path_component, which additionally
+    rejects "?"/"#"/dot-segment values that partition() alone would let
+    through (e.g. "owner?x=y/repo" has exactly one "/").
     """
     value = repo.strip()
     if value.count("/") != 1:
@@ -56,7 +87,10 @@ def _parse_repo(repo: str) -> tuple[str, str]:
     owner, name = value.split("/")
     if not owner or not name:
         raise ValueError(f'repo must be in "owner/repo" format, got: {repo!r}')
-    return owner, name
+    return (
+        _encode_path_component(owner, field="repo owner"),
+        _encode_path_component(name, field="repo name"),
+    )
 
 
 def _clamp_limit(limit: int, *, default: int = 30) -> int:
@@ -237,7 +271,8 @@ def github_list_issues(
     """
     List issues in a repository. Pull requests are excluded (use
     github_list_pull_requests for those), even though GitHub's underlying
-    endpoint returns both.
+    endpoint returns both -- a PR-heavy page is fetched past (up to
+    MAX_ISSUE_PAGES pages) so real issues on later pages aren't missed.
     repo: "owner/repo".
     state: "open", "closed", or "all" (default "open").
     labels: optional comma-separated label names to filter by.
@@ -245,17 +280,58 @@ def github_list_issues(
     """
     try:
         owner, name = _parse_repo(repo)
-        params: dict[str, Any] = {
-            "state": state,
-            "per_page": _clamp_limit(limit),
-        }
-        if labels:
-            params["labels"] = labels
-        result = _request("GET", f"/repos/{owner}/{name}/issues", params=params)
-        issues = [
-            _summarize_issue(issue) for issue in result if "pull_request" not in issue
-        ]
-        return _success(issues=issues)
+        max_results = _clamp_limit(limit)
+        issues: list[dict[str, Any]] = []
+        truncated = False
+        pages_fetched = 0
+        for page in range(1, MAX_ISSUE_PAGES + 1):
+            params: dict[str, Any] = {
+                "state": state,
+                "per_page": MAX_PER_PAGE,
+                "page": page,
+            }
+            if labels:
+                params["labels"] = labels
+            try:
+                raw_page = _request(
+                    "GET", f"/repos/{owner}/{name}/issues", params=params
+                )
+            except Exception as page_exc:
+                if not pages_fetched:
+                    raise
+                # A mid-pagination failure (e.g. a rate limit) must not
+                # discard the pages already fetched -- return the partial
+                # list with a marker instead, same as slack.py's channel
+                # listing.
+                logger.warning(
+                    f"GitHub issue pagination stopped early for {repo}: {page_exc}"
+                )
+                return _success(
+                    issues=issues[:max_results], truncated=True, error=str(page_exc)
+                )
+            pages_fetched += 1
+            if not raw_page:
+                break
+            for index, issue in enumerate(raw_page):
+                if "pull_request" in issue:
+                    continue
+                issues.append(_summarize_issue(issue))
+                if len(issues) >= max_results:
+                    # More raw items remain on this page, or GitHub filled
+                    # the page (implying at least one more page may exist) --
+                    # either means real issues could remain unfetched.
+                    truncated = (index + 1 < len(raw_page)) or (
+                        len(raw_page) == MAX_PER_PAGE
+                    )
+                    break
+            if len(issues) >= max_results:
+                break
+            if len(raw_page) < MAX_PER_PAGE:
+                break  # GitHub's own last page
+        else:
+            # MAX_ISSUE_PAGES exhausted without hitting a short (last) page.
+            truncated = True
+        return _success(issues=issues[:max_results], truncated=truncated)
     except Exception as e:
         logger.error(f"Error listing GitHub issues for {repo}: {e}")
         return _error(str(e))
@@ -397,16 +473,21 @@ def github_get_file_contents(repo: str, path: str, ref: str = "") -> str:
         owner, name = _parse_repo(repo)
         # path is interpolated directly into the request URL below (unlike
         # github_list_commits' path, sent as a query param that requests
-        # percent-encodes regardless of content) -- reject a malformed value
-        # instead of letting it silently produce a wrong URL, same as
-        # _parse_repo's owner/repo validation above.
-        if path and (path.startswith("/") or path.endswith("/") or "//" in path):
-            raise ValueError(
-                f"path must not have leading, trailing, or consecutive slashes, got: {path!r}"
+        # percent-encodes regardless of content) -- each segment is
+        # validated/encoded individually, same as _parse_repo's owner/repo
+        # handling above. An empty segment (from a leading/trailing/double
+        # slash) is rejected by _encode_path_component's own emptiness check.
+        encoded_path = (
+            "/".join(
+                _encode_path_component(segment, field="path")
+                for segment in path.split("/")
             )
+            if path
+            else ""
+        )
         params: dict[str, Any] = {"ref": ref} if ref else {}
         result = _request(
-            "GET", f"/repos/{owner}/{name}/contents/{path}", params=params
+            "GET", f"/repos/{owner}/{name}/contents/{encoded_path}", params=params
         )
         if isinstance(result, list):
             entries = [
@@ -417,10 +498,26 @@ def github_get_file_contents(repo: str, path: str, ref: str = "") -> str:
                 }
                 for entry in result
             ]
-            return _success(type="directory", entries=entries)
+            # GitHub's Contents API returns at most 1000 entries for a
+            # directory with no continuation token in the response body --
+            # flag it so a directory at exactly that cap isn't mistaken for
+            # a complete listing (use the Git Trees API for larger ones).
+            return _success(
+                type="directory", entries=entries, truncated=len(entries) >= 1000
+            )
         if result.get("type") != "file":
             return _error(f"Path '{path}' is not a file: type={result.get('type')}")
         encoding = result.get("encoding")
+        if encoding == "none":
+            # GitHub omits file content (encoding: "none") for files above
+            # the Contents API's ~1MB size limit -- returning "" here would
+            # silently report an empty read as if the file were genuinely
+            # empty, rather than surfacing the real "too large" condition.
+            return _error(
+                f"File '{path}' is too large for the Contents API (no content "
+                "returned) -- use github_list_commits or clone the repository "
+                "to read it"
+            )
         raw_content = result.get("content") or ""
         if encoding == "base64":
             content = base64.b64decode(raw_content).decode("utf-8", errors="replace")

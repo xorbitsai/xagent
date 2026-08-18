@@ -772,7 +772,14 @@ def get_builtin_public_mcp_app_rows() -> list[dict[str, Any]]:
             "transport": "oauth",
             "provider_name": "github",
             "category": "Development",
-            "oauth_scopes": ["repo", "read:org", "user:email"],
+            # read:org dropped: no tool here calls any organization endpoint
+            # (no org listing/membership lookup), so it was requested
+            # without a corresponding capability -- principle of least
+            # privilege. user:email is kept: unlike a separate unused
+            # endpoint, it changes what /user's own "email" field returns
+            # (populates it for accounts without a public email), which
+            # github_get_current_user's output relies on directly.
+            "oauth_scopes": ["repo", "user:email"],
             "is_visible_in_connector": True,
             "launch_config": {
                 "command": "python",

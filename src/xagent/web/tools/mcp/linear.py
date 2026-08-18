@@ -113,9 +113,28 @@ def _resolve_issue_uuid(issue_id: str) -> str:
         return issue_id
     data = _graphql("query($id: String!) { issue(id: $id) { id } }", {"id": issue_id})
     issue = data.get("issue")
-    if not issue:
+    if not issue or not isinstance(issue, dict):
         raise ValueError(f"Issue '{issue_id}' not found")
     return str(issue["id"])
+
+
+def _resolve_team_uuid(team_id: str) -> str:
+    """Resolve team_id to its real UUID.
+
+    Mirrors _resolve_issue_uuid: mutation input types (e.g.
+    IssueCreateInput.teamId) and filter inputs (e.g. IssueFilter.team.id)
+    require the team's actual UUID, not its human-readable key (e.g. "ENG")
+    — but linear_list_teams hands back both, and every tool that takes a
+    team_id here documents accepting either. An already-UUID team_id is
+    returned unchanged without a round-trip.
+    """
+    if _UUID_PATTERN.match(team_id):
+        return team_id
+    data = _graphql("query($id: String!) { team(id: $id) { id } }", {"id": team_id})
+    team = data.get("team")
+    if not team or not isinstance(team, dict):
+        raise ValueError(f"Team '{team_id}' not found")
+    return str(team["id"])
 
 
 @mcp.tool()
@@ -162,12 +181,15 @@ def linear_list_workflow_states(team_id: str) -> str:
     team_id: a team id or key from linear_list_teams.
     """
     try:
+        resolved_team_id = _resolve_team_uuid(team_id)
         data = _graphql(
             "query($teamId: String!) { team(id: $teamId) { states(first: 100)"
             " { nodes { id name type position } } } }",
-            {"teamId": team_id},
+            {"teamId": resolved_team_id},
         )
-        team = data.get("team") or {}
+        team = data.get("team")
+        if not team or not isinstance(team, dict):
+            return _error(f"Team '{team_id}' not found")
         states = (team.get("states") or {}).get("nodes") or []
         return _success(states=states)
     except Exception as e:
@@ -184,12 +206,15 @@ def linear_list_labels(team_id: str, limit: int = 100) -> str:
     team_id: a team id or key from linear_list_teams.
     """
     try:
+        resolved_team_id = _resolve_team_uuid(team_id)
         data = _graphql(
             "query($teamId: String!, $first: Int!) { team(id: $teamId) {"
             " labels(first: $first) { nodes { id name color } } } }",
-            {"teamId": team_id, "first": _clamp_limit(limit)},
+            {"teamId": resolved_team_id, "first": _clamp_limit(limit)},
         )
-        team = data.get("team") or {}
+        team = data.get("team")
+        if not team or not isinstance(team, dict):
+            return _error(f"Team '{team_id}' not found")
         labels = (team.get("labels") or {}).get("nodes") or []
         return _success(labels=labels)
     except Exception as e:
@@ -263,7 +288,7 @@ def linear_search_issues(
         variables: dict[str, Any] = {}
         if team_id:
             filter_parts.append("team: { id: { eq: $teamId } }")
-            variables["teamId"] = team_id
+            variables["teamId"] = _resolve_team_uuid(team_id)
         if assignee_id:
             filter_parts.append("assignee: { id: { eq: $assigneeId } }")
             variables["assigneeId"] = assignee_id
@@ -332,7 +357,7 @@ def linear_get_issue(issue_id: str) -> str:
             {"id": issue_id},
         )
         issue = data.get("issue")
-        if not issue:
+        if not issue or not isinstance(issue, dict):
             return _error(f"Issue '{issue_id}' not found")
         return _success(issue=issue)
     except Exception as e:
@@ -359,7 +384,10 @@ def linear_create_issue(
     label_ids: optional label ids from linear_list_labels.
     """
     try:
-        issue_input: dict[str, Any] = {"teamId": team_id, "title": title}
+        issue_input: dict[str, Any] = {
+            "teamId": _resolve_team_uuid(team_id),
+            "title": title,
+        }
         if description:
             issue_input["description"] = description
         if assignee_id:
@@ -444,7 +472,7 @@ def linear_list_comments(issue_id: str, limit: int = 50) -> str:
             {"id": issue_id, "first": _clamp_limit(limit)},
         )
         issue = data.get("issue")
-        if not issue:
+        if not issue or not isinstance(issue, dict):
             return _error(f"Issue '{issue_id}' not found")
         comments = (issue.get("comments") or {}).get("nodes") or []
         return _success(comments=comments)
@@ -487,13 +515,16 @@ def linear_list_projects(team_id: str = "", limit: int = 50) -> str:
     try:
         max_results = _clamp_limit(limit)
         if team_id:
+            resolved_team_id = _resolve_team_uuid(team_id)
             data = _graphql(
                 "query($teamId: String!, $first: Int!) { team(id: $teamId) {"
                 " projects(first: $first) { nodes { id name state progress"
                 " url } } } }",
-                {"teamId": team_id, "first": max_results},
+                {"teamId": resolved_team_id, "first": max_results},
             )
-            team = data.get("team") or {}
+            team = data.get("team")
+            if not team or not isinstance(team, dict):
+                return _error(f"Team '{team_id}' not found")
             projects = (team.get("projects") or {}).get("nodes") or []
         else:
             data = _graphql(

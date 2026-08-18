@@ -254,6 +254,7 @@ async def test_react_builder_creates_multiple_agents_before_workforce() -> None:
         "new:3",
     ]
     assert plan["name"] == "产品研究工作组"
+    assert plan["builder_response"] == "工作组已完成配置。"
     assert len(llm.calls) == 6
     first_tool_names = {schema["function"]["name"] for schema in llm.calls[0]["tools"]}
     assert {"create_agent", "create_workforce", "list_available_agents"} <= (

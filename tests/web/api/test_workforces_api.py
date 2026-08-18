@@ -1816,6 +1816,7 @@ def test_from_prompt_creates_all_staged_agents_atomically(
                 },
             ],
             "warnings": [],
+            "builder_response": "The requested Workforce is ready.",
         }
 
     monkeypatch.setattr(
@@ -1854,6 +1855,16 @@ def test_from_prompt_creates_all_staged_agents_atomically(
         assert len(worker_agents) == 2
         assert all(agent.origin == AgentOrigin.USER.value for agent in worker_agents)
         assert all(agent.status == AgentStatus.PUBLISHED for agent in worker_agents)
+        builder_messages = (
+            db.query(WorkforceBuilderMessage)
+            .filter(WorkforceBuilderMessage.workforce_id == payload["id"])
+            .order_by(WorkforceBuilderMessage.id)
+            .all()
+        )
+        assert [(message.role, message.content) for message in builder_messages] == [
+            ("user", "Create a research workforce for product analysis"),
+            ("assistant", "The requested Workforce is ready."),
+        ]
     finally:
         db.close()
 

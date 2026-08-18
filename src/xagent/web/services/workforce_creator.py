@@ -1,5 +1,4 @@
 import logging
-import re
 from dataclasses import dataclass
 from typing import Any, cast
 
@@ -44,29 +43,6 @@ class WorkforcePromptCreationResult:
     workforce: Workforce
     plan: dict[str, Any]
     messages: list[WorkforceBuilderMessage]
-
-
-# These characters are useful disambiguators for the deterministic builder
-# confirmation message. Persisted Workforce and agent prose is produced by the
-# ReAct runtime under the shared language harness.
-_TRADITIONAL_CHINESE_MARKERS = frozenset(
-    "體臺灣國語學習資訊網絡處理與後臺個創設計專案產品請團隊發佈新增執行"
-)
-
-
-def _creation_copy(prompt: str) -> dict[str, str]:
-    """Return deterministic confirmation prose in the request's language."""
-    if any(char in _TRADITIONAL_CHINESE_MARKERS for char in prompt):
-        return {
-            "created_message": "已根據你的提示建立工作組和所需的代理。",
-        }
-    if re.search(r"[\u3400-\u9fff]", prompt):
-        return {
-            "created_message": "已根据你的提示创建工作组和所需的代理。",
-        }
-    return {
-        "created_message": "Created the Workforce and its required agents from your prompt.",
-    }
 
 
 async def generate_workforce_creation_plan(
@@ -669,12 +645,7 @@ async def create_workforce_from_prompt(
             status="message",
         )
         db.add(user_message)
-        warnings = cast(list[str], plan.get("warnings") or [])
-        assistant_content = _creation_copy(normalized_prompt)["created_message"]
-        if warnings:
-            assistant_content = f"{assistant_content}\n\n" + "\n".join(
-                f"- {warning}" for warning in warnings
-            )
+        assistant_content = str(plan["builder_response"])
         assistant_message = WorkforceBuilderMessage(
             workforce_id=int(workforce.id),
             user_id=int(user.id),

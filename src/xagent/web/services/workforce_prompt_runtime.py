@@ -9,6 +9,7 @@ from uuid import uuid4
 from pydantic import BaseModel, Field, field_validator
 
 from ...core.agent.language import output_language_policy, response_language_rules
+from ...core.agent.result import extract_assistant_message
 from ...core.agent.service import AgentService
 from ...core.model.chat.basic.base import BaseLLM
 from ...core.tools.adapters.vibe.agent_tool import (
@@ -560,4 +561,11 @@ async def build_workforce_prompt_plan(
             "The ReAct Workforce builder did not complete all requested work: "
             f"{completion_outcome}."
         )
-    return state.to_plan()
+    builder_response = extract_assistant_message(result)
+    if not builder_response or not builder_response.strip():
+        raise WorkforcePromptBuilderError(
+            "The ReAct Workforce builder completed without a user-facing final answer."
+        )
+    plan = state.to_plan()
+    plan["builder_response"] = builder_response.strip()
+    return plan

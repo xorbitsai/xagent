@@ -144,6 +144,9 @@ class ResolvedToken:
 class _LegacyOAuthTokenResolution:
     access_token: str | None
     refresh_failed: bool = False
+    # Set only for providers that return a per-org API host instead of
+    # using a fixed domain (Salesforce) -- None for everyone else.
+    instance_url: str | None = None
 
 
 TokenResolverResult = ResolvedToken | Awaitable[ResolvedToken | None] | None
@@ -674,6 +677,12 @@ async def refresh_oauth_token_if_needed(
                 oauth_account.access_token = data["access_token"]
                 if "refresh_token" in data:
                     oauth_account.refresh_token = data["refresh_token"]
+                if "instance_url" in data:
+                    # Matches the code-exchange branch in api/auth.py:
+                    # Salesforce can return a different instance_url on
+                    # refresh (e.g. after an org migration), so this is
+                    # re-persisted here too, not just at initial connect.
+                    oauth_account.instance_url = data["instance_url"]
                 if "expires_in" in data:
                     oauth_account.expires_at = datetime.now(timezone.utc) + timedelta(
                         seconds=data["expires_in"]
@@ -3009,6 +3018,7 @@ class WebToolConfig(BaseToolConfig):
         server: Any,
         app_info: Mapping[str, Any],
         access_token: str,
+        instance_url: str | None = None,
     ) -> Dict[str, Any]:
         launch_config = _oauth_launch_config_mapping(app_info.get("launch_config"))
         if launch_config:
@@ -3024,6 +3034,8 @@ class WebToolConfig(BaseToolConfig):
             ).items():
                 if token_type == "access_token":
                     env[env_key] = access_token
+                elif token_type == "instance_url" and instance_url:
+                    env[env_key] = instance_url
 
             for env_key, host_env_var in _oauth_launch_config_static_env(
                 launch_config
@@ -3157,8 +3169,11 @@ class WebToolConfig(BaseToolConfig):
                 )
 
             access_token = str(oauth_account.access_token)
+            instance_url = getattr(oauth_account, "instance_url", None)
             oauth_db.commit()
-            return _LegacyOAuthTokenResolution(access_token=access_token)
+            return _LegacyOAuthTokenResolution(
+                access_token=access_token, instance_url=instance_url
+            )
         except Exception:
             oauth_db.rollback()
             raise
@@ -3291,6 +3306,7 @@ class WebToolConfig(BaseToolConfig):
                         server=server,
                         app_info=app_info,
                         access_token=legacy_token.access_token,
+                        instance_url=legacy_token.instance_url,
                     )
                 except _OAuthLaunchConfigInvalid as error:
                     logger.warning(

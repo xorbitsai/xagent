@@ -1616,6 +1616,11 @@ def generic_oauth_callback(
             setattr(oauth_account, "email", email)
             if "refresh_token" in token_data:
                 setattr(oauth_account, "refresh_token", token_data.get("refresh_token"))
+            if "instance_url" in token_data:
+                # Salesforce returns the per-org API host here instead of
+                # using a fixed domain -- no other provider sends this key,
+                # so persisting it generically is a no-op for everyone else.
+                setattr(oauth_account, "instance_url", token_data.get("instance_url"))
             if "expires_in" in token_data:
                 setattr(
                     oauth_account,

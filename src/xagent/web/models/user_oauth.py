@@ -29,6 +29,10 @@ class UserOAuth(Base):  # type: ignore[no-any-unimported]
         String, nullable=True
     )  # The user's ID in the provider system
     email = Column(String, nullable=True)
+    # Salesforce (and no other provider here) returns a per-org API host in
+    # the token response instead of using a fixed API domain -- every
+    # subsequent API call must go through this URL, not a hardcoded one.
+    instance_url = Column(String, nullable=True)
 
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())

@@ -96,3 +96,58 @@ def test_transport_config_omits_static_env_when_host_var_missing(monkeypatch):
     )
 
     assert "GOOGLE_ADS_DEVELOPER_TOKEN" not in transport_config["env"]
+
+
+def test_transport_config_forwards_instance_url_when_mapped_and_provided():
+    """Salesforce (and no other provider) maps a second env_mapping entry to
+    "instance_url" -- the per-org API host from the OAuth grant, distinct
+    from static_env's operator-wide, non-per-user secrets."""
+    cfg = WebToolConfig(db=None, request=None)
+    app_info = {
+        "launch_config": {
+            "command": "python",
+            "args": ["-m", "xagent.web.tools.mcp.salesforce"],
+            "env_mapping": {
+                "SALESFORCE_ACCESS_TOKEN": "access_token",
+                "SALESFORCE_INSTANCE_URL": "instance_url",
+            },
+        }
+    }
+
+    transport_config = cfg._build_oauth_mcp_stdio_transport_config(
+        server=SimpleNamespace(name="Salesforce"),
+        app_info=app_info,
+        access_token="user-access-token",
+        instance_url="https://acme.my.salesforce.com",
+    )
+
+    assert transport_config["env"]["SALESFORCE_ACCESS_TOKEN"] == "user-access-token"
+    assert (
+        transport_config["env"]["SALESFORCE_INSTANCE_URL"]
+        == "https://acme.my.salesforce.com"
+    )
+
+
+def test_transport_config_omits_instance_url_env_when_not_provided():
+    """A provider that doesn't return instance_url (i.e. every provider
+    except Salesforce) must not get a stray env var for a mapping entry
+    that has nothing to forward."""
+    cfg = WebToolConfig(db=None, request=None)
+    app_info = {
+        "launch_config": {
+            "command": "python",
+            "args": ["-m", "xagent.web.tools.mcp.salesforce"],
+            "env_mapping": {
+                "SALESFORCE_ACCESS_TOKEN": "access_token",
+                "SALESFORCE_INSTANCE_URL": "instance_url",
+            },
+        }
+    }
+
+    transport_config = cfg._build_oauth_mcp_stdio_transport_config(
+        server=SimpleNamespace(name="Salesforce"),
+        app_info=app_info,
+        access_token="user-access-token",
+    )
+
+    assert "SALESFORCE_INSTANCE_URL" not in transport_config["env"]

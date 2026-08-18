@@ -5,16 +5,13 @@ import { CheckCircle2, ChevronLeft, Clock, Loader2, PauseCircle, RotateCcw, XCir
 import { cn } from "@/lib/utils"
 import { normalizeTimestampMs } from "@/lib/time-utils"
 import { useI18n } from "@/contexts/i18n-context"
+import type { StepStatus } from "@/contexts/app-context-chat"
 
 export interface ProgressStepView {
   id: string
   title: string
   description?: string
-  // "interrupted"/"clarification_invalidated" are non-terminal - the backend
-  // resumes them back to "running" once their blocking condition clears
-  // (dag.py) - so they must not be treated as done, but also aren't "not
-  // started yet" like pending.
-  status: "pending" | "running" | "completed" | "failed" | "skipped" | "interrupted" | "clarification_invalidated"
+  status: StepStatus
   startedAt?: string | number
   completedAt?: string | number
 }

@@ -2520,6 +2520,124 @@ describe("AppProvider websocket message routing", () => {
     expect(screen.getByTestId("task-dag-terminated-at").textContent).toBe("2026-05-27T05:01:00Z")
   })
 
+  it("lets a task-level trace_error replace a provisional dagTerminatedAt on an ALREADY-failed task, but never decides the outcome itself", async () => {
+    // trace_error alone must never be what marks a task failed (a global
+    // trace_error can be logged without the task actually stopping) - it
+    // only backstops the TIMESTAMP once the task is independently already
+    // known failed (task_info established that on cold history load,
+    // backfilling dagTerminatedAt from mutable updatedAt as a provisional
+    // guess) and no proper terminal broadcast ever arrived to replace it.
+    let seedColdFailedTask: (() => void) | undefined
+    let seedColdRunningTask: (() => void) | undefined
+    function ColdTraceErrorProbe() {
+      const { dispatch } = useApp()
+      seedColdFailedTask = () => {
+        dispatch({
+          type: "SET_CURRENT_TASK",
+          payload: {
+            id: "1",
+            title: "Test task",
+            status: "failed",
+            description: "Test task",
+            createdAt: "2026-05-27T05:00:00Z",
+            updatedAt: "2026-05-27T09:00:00Z",
+          },
+        })
+      }
+      seedColdRunningTask = () => {
+        dispatch({
+          type: "SET_CURRENT_TASK",
+          payload: {
+            id: "1",
+            title: "Test task",
+            status: "running",
+            description: "Test task",
+            createdAt: "2026-05-27T05:00:00Z",
+            updatedAt: "2026-05-27T05:00:00Z",
+          },
+        })
+      }
+      return null
+    }
+
+    render(
+      <AppProvider token="token">
+        <SeedExistingTask />
+        <ColdTraceErrorProbe />
+        <StateProbe />
+      </AppProvider>
+    )
+    const onMessage = webSocketOptions.current?.onMessage
+    expect(onMessage).toBeDefined()
+
+    // A task-level trace_error arriving while the task is still RUNNING must
+    // not flip it to failed - some other event decides that, not this one.
+    act(() => {
+      seedColdRunningTask?.()
+      onMessage?.({
+        type: "trace_event",
+        timestamp: "2026-05-27T05:00:30Z",
+        task_id: 1,
+        data: {
+          event_id: "trace-error-recoverable",
+          event_type: "trace_error",
+          data: { error_message: "a recoverable hiccup" },
+        },
+      })
+    })
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0))
+    })
+    expect(screen.getByTestId("task-status").textContent).toBe("running")
+    expect(screen.getByTestId("task-dag-terminated-at").textContent).toBe("")
+
+    // Now the task is independently known failed (cold history's task_info),
+    // with a provisional dagTerminatedAt backfilled from mutable updatedAt.
+    act(() => {
+      seedColdFailedTask?.()
+    })
+    await waitFor(() => {
+      expect(screen.getByTestId("task-dag-terminated-at").textContent).toBe("2026-05-27T09:00:00Z")
+    })
+
+    // The replayed global trace_error carries the REAL failure timestamp -
+    // it must replace the provisional backfill.
+    act(() => {
+      onMessage?.({
+        type: "trace_event",
+        timestamp: "2026-05-27T05:01:15Z",
+        task_id: 1,
+        data: {
+          event_id: "trace-error-global",
+          event_type: "trace_error",
+          data: { error_message: "fatal error" },
+        },
+      })
+    })
+    await waitFor(() => {
+      expect(screen.getByTestId("task-dag-terminated-at").textContent).toBe("2026-05-27T05:01:15Z")
+    })
+
+    // A second trace_error afterward must not push the now-authoritative
+    // value forward (first-write-wins).
+    act(() => {
+      onMessage?.({
+        type: "trace_event",
+        timestamp: "2026-05-27T05:03:00Z",
+        task_id: 1,
+        data: {
+          event_id: "trace-error-duplicate",
+          event_type: "trace_error",
+          data: { error_message: "fatal error" },
+        },
+      })
+    })
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0))
+    })
+    expect(screen.getByTestId("task-dag-terminated-at").textContent).toBe("2026-05-27T05:01:15Z")
+  })
+
   it("does not let replayed liveness events flip a terminal task back to running during a history load", async () => {
     // Replayed activity events (llm_call_start & co) optimistically infer
     // "running" from the fact that work is happening - but during a history

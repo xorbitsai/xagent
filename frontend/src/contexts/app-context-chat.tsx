@@ -781,18 +781,34 @@ const getSessionTaskInfoData = (
   return Object.keys(nestedData).length > 0 ? nestedData : data
 }
 
+// The backend's DAG step status contract, shared verbatim by every UI model
+// that projects a step (StepExecution here, progress-panel.tsx's
+// ProgressStepView, center-panel.tsx's DAGNode.data) - previously each
+// redeclared the same seven-value union independently, so a future backend
+// status could be accepted by one and silently fall through to an "unknown"
+// rendering in another. Import this instead of redeclaring the union.
+//
+// "interrupted" and "clarification_invalidated" are both non-terminal (a
+// step in either state transitions back to "running" once its blocking
+// condition clears - see dag.py's _ready_steps/_invalidate_batch_siblings)
+// - they must render and count distinctly from "pending" (never started)
+// and from the terminal statuses. "skipped" has no current backend producer
+// (dag_step_skipped is never emitted) but is kept for the branch-derivation
+// path that can still locally construct it.
+export type StepStatus =
+  | "pending"
+  | "running"
+  | "completed"
+  | "failed"
+  | "skipped"
+  | "interrupted"
+  | "clarification_invalidated"
+
 interface StepExecution {
   id: string
   name: string
   description: string
-  // "interrupted" and "clarification_invalidated" are both non-terminal (a
-  // step in either state transitions back to "running" once its blocking
-  // condition clears - see dag.py's _ready_steps/_invalidate_batch_siblings)
-  // - they must render and count distinctly from "pending" (never started)
-  // and from the terminal statuses. "skipped" has no current backend
-  // producer (dag_step_skipped is never emitted) but is kept for the branch-
-  // derivation path that can still locally construct it.
-  status: "pending" | "running" | "completed" | "failed" | "skipped" | "interrupted" | "clarification_invalidated"
+  status: StepStatus
   tool_names?: string[]
   dependencies: string[]
   started_at?: string | number
@@ -4301,6 +4317,22 @@ export function AppProvider({
                   status: "failed",
                 }
               })
+              // This event alone never decides the task failed (a global
+              // trace_error can be logged without the task actually stopping,
+              // and some OTHER terminal event - task_completed/agent_error -
+              // is what actually settles that) - but if the task is ALREADY
+              // known failed (task_info established that on cold history
+              // load, backfilling dagTerminatedAt from mutable updatedAt as a
+              // PROVISIONAL guess) and no proper terminal broadcast ever
+              // followed this trace_error to replace that guess, the frozen
+              // elapsed time would stay wrong forever. Re-stamping the
+              // ALREADY-failed status with this event's own timestamp lets it
+              // replace a provisional value (see UPDATE_TASK_STATUS) without
+              // ever using this event to newly decide the outcome.
+              if (currentState.currentTask?.status === "failed") {
+                dispatch({ type: "UPDATE_TASK_STATUS", payload: { status: "failed" } })
+                dispatch({ type: "TRIGGER_TASK_UPDATE" })
+              }
             }
           }
 

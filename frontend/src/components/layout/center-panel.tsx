@@ -30,17 +30,13 @@ import { JsonRenderer } from "@/components/ui/markdown-renderer"
 import { formatTime, getTimeDuration, formatDuration } from "@/lib/time-utils"
 import { Loader2, Brain, Network, Sparkles, Timer, XCircle, AlertCircle, RefreshCw, RotateCcw, LayoutDashboard,LayoutPanelLeft, Wrench, GitBranch, CheckCircle2, PauseCircle } from "lucide-react"
 import { useI18n } from "@/contexts/i18n-context";
-import type { DAGExecution } from "@/contexts/app-context-chat"
+import type { DAGExecution, StepStatus } from "@/contexts/app-context-chat"
 
 
 interface DAGNode extends Node {
   data: {
     label: string
-    // "interrupted"/"clarification_invalidated" are real, non-terminal
-    // backend step statuses (dag.py) - previously omitted here, so a step in
-    // either state fell through every status check below to the generic
-    // "not started" look, indistinguishable from a step that hasn't run yet.
-    status: "pending" | "running" | "completed" | "failed" | "skipped" | "interrupted" | "clarification_invalidated"
+    status: StepStatus
     description?: string
     tool_names?: string[]
     started_at?: string | number

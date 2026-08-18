@@ -34,6 +34,23 @@ function TaskDetailContent() {
     }
   }, [closeFilePreview])
 
+  // progressPanelOpen/dismissedProgressRunKeyRef are mount-local state, not
+  // scoped to the viewed task - a soft A-to-B navigation (setTaskId without a
+  // remount) would otherwise carry task A's open/dismissed state straight
+  // into task B. Task A's dagExecution/steps are already cleared on a task
+  // switch (see app-context-chat.tsx's SET_TASK_ID taskChanged branch), but
+  // the moment task B's OWN history/live data repopulates a dagExecution,
+  // `progressPanelVisible` only checks `progressPanelOpen && Boolean(dagExecution)`
+  // - if it was left true from viewing A, B's panel would appear without any
+  // new user action, bypassing the auto-open effect's own gating below
+  // entirely (that effect decides whether to OPEN it, not whether it's
+  // already open). Resetting on every taskId change (including the very
+  // first one) is harmless: both start already at their default values.
+  useEffect(() => {
+    setProgressPanelOpen(false)
+    dismissedProgressRunKeyRef.current = null
+  }, [state.taskId])
+
   // Prefer turn_id (a stable per-turn identity - see DAGExecution's own
   // comment) over created_at for identifying "this run" - created_at can get
   // rebuilt with a fresh value on a replan re-arrival while still being the

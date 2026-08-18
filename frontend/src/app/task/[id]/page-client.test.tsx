@@ -203,6 +203,62 @@ describe("TaskDetailPage progress panel lifecycle", () => {
     expect(screen.getByText("1m 05s")).toBeInTheDocument()
   })
 
+  it("does not carry an open panel over to a different task navigated to without a remount", () => {
+    // progressPanelOpen/dismissedProgressRunKeyRef are mount-local, not
+    // scoped to the viewed task - without a reset on taskId change, task A's
+    // open panel would still be "open" the instant task B's own
+    // dagExecution repopulates (e.g. from B's terminal history), showing it
+    // without any new user action for B.
+    app.state = baseState({
+      dagExecution: { phase: "executing", current_plan: {}, created_at: "t", updated_at: "t", turn_id: "turn-A" },
+    })
+    const { rerender } = renderPage()
+    expect(screen.getByText("Progress")).toBeInTheDocument()
+
+    // Soft navigation to task B - no dagExecution yet.
+    app.state = baseState({
+      taskId: 2,
+      currentTask: {
+        id: "2",
+        title: "Task B",
+        status: "completed",
+        description: "Task B",
+        createdAt: "2026-05-27T05:00:00Z",
+        updatedAt: "2026-05-27T05:01:00Z",
+        dagTerminatedAt: "2026-05-27T05:01:00Z",
+      },
+      dagExecution: null,
+    })
+    rerender(
+      <I18nProvider initialLocale="en">
+        <TaskDetailPage />
+      </I18nProvider>
+    )
+    expect(screen.queryByText("Progress")).not.toBeInTheDocument()
+
+    // Task B's own (terminal, historical) dagExecution repopulates - must NOT
+    // reopen the panel just because it carried over from task A.
+    app.state = baseState({
+      taskId: 2,
+      currentTask: {
+        id: "2",
+        title: "Task B",
+        status: "completed",
+        description: "Task B",
+        createdAt: "2026-05-27T05:00:00Z",
+        updatedAt: "2026-05-27T05:01:00Z",
+        dagTerminatedAt: "2026-05-27T05:01:00Z",
+      },
+      dagExecution: { phase: "completed", current_plan: {}, created_at: "t", updated_at: "t", turn_id: "turn-B" },
+    })
+    rerender(
+      <I18nProvider initialLocale="en">
+        <TaskDetailPage />
+      </I18nProvider>
+    )
+    expect(screen.queryByText("Progress")).not.toBeInTheDocument()
+  })
+
   it("does not auto-open for state populated by history/replay or an already-terminal task", () => {
     // A finished task's page load populates dagExecution/progressRunKey from
     // history through the exact same state the auto-open effect watches -

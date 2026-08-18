@@ -206,6 +206,26 @@ def get_builtin_oauth_provider_rows() -> list[dict[str, Any]]:
             # ignores.
             "default_scopes": [],
         },
+        {
+            "provider_name": "linear",
+            "name": "Linear",
+            "client_id": os.environ.get("LINEAR_CLIENT_ID", ""),
+            "client_secret": os.environ.get("LINEAR_CLIENT_SECRET", ""),
+            "auth_url": "https://linear.app/oauth/authorize",
+            "token_url": "https://api.linear.app/oauth/token",
+            "redirect_uri": os.environ.get("LINEAR_REDIRECT_URI", ""),
+            # Linear's API is GraphQL-only (POST-only, nested response shape)
+            # -- there is no flat REST endpoint this callback's GET-plus-flat-
+            # dict.get() userinfo lookup can use. Left empty so that lookup is
+            # skipped entirely (generic_oauth_callback's `if userinfo_url and
+            # access_token:` guard); the connected account's identity is
+            # available on demand instead via this connector's own
+            # linear_get_current_user tool.
+            "userinfo_url": "",
+            "user_id_path": "id",
+            "email_path": "email",
+            "default_scopes": ["read", "write"],
+        },
     ]
 
 
@@ -767,6 +787,22 @@ def get_builtin_public_mcp_app_rows() -> list[dict[str, Any]]:
                 "command": "python",
                 "args": ["-m", "xagent.web.tools.mcp.intercom"],
                 "env_mapping": {"INTERCOM_ACCESS_TOKEN": "access_token"},
+            },
+        },
+        {
+            "app_id": "linear",
+            "name": "Linear",
+            "description": "Connect to Linear to search and manage issues, comments, teams, and projects.",
+            "icon": "https://www.google.com/s2/favicons?domain=linear.app&sz=128",
+            "transport": "oauth",
+            "provider_name": "linear",
+            "category": "Productivity",
+            "oauth_scopes": ["read", "write"],
+            "is_visible_in_connector": True,
+            "launch_config": {
+                "command": "python",
+                "args": ["-m", "xagent.web.tools.mcp.linear"],
+                "env_mapping": {"LINEAR_ACCESS_TOKEN": "access_token"},
             },
         },
     ]

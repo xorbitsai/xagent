@@ -193,7 +193,10 @@ def _merge_oauth_scopes(
 
 
 def _oauth_scope_separator(provider: str) -> str:
-    if provider.lower() == "meta":
+    # Linear's authorize endpoint documents scope as "a comma separated list
+    # of scopes" -- unlike most providers here, which accept a space-joined
+    # list.
+    if provider.lower() in ("meta", "linear"):
         return ","
     return " "
 

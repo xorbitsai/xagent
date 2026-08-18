@@ -4,15 +4,21 @@
 
 ### Deployment impact
 
-The built-in Google Calendar connector now requests `calendar.events` instead of the full `calendar` scope. The migration also deletes any `user_oauth` row with `provider = 'google-calendar'` whose granted scope still carries the old, full scope (including rows with no scope recorded at all — see the migration's module docstring for why that counts as evidence of the old grant). Affected users lose their Calendar connection and must reconnect through the OAuth flow again; there is no in-place upgrade of an existing token's scope.
+The built-in Google Calendar connector now requests `calendar.events` instead of the full `calendar` scope. The migration deletes any `user_oauth` row with `provider = 'google-calendar'` whose granted scope still carries the old, full scope (including rows with no scope recorded at all — see the migration's module docstring for why that counts as evidence of the old grant), then removes the `user_mcpservers` row for any user left with no `google-calendar` credential after that. Affected users lose their Calendar connection and must reconnect through the OAuth flow again; there is no in-place upgrade of an existing token's scope.
 
-This is irreversible. `downgrade()` restores the catalog's requested scope but cannot restore a deleted `user_oauth` row — there is no way to reconstruct a token this migration revoked.
+This is irreversible. `downgrade()` restores the catalog's requested scope but cannot restore a deleted `user_oauth` or `user_mcpservers` row — there is no way to reconstruct a token or a server association this migration removed.
 
-Online (live-connection) upgrades run the cleanup in bounded batches (`REVOKE_BATCH_SIZE = 500`) and log a warning with the number of grants revoked. Offline (`alembic upgrade --sql`) generation emits the equivalent cleanup as one literal, unbatched `DELETE` — running the generated script against a very large `user_oauth` table takes that one statement's lock for as long as it takes to complete, unlike the online path's batching.
+Do not downgrade this revision and re-upgrade it, and do not apply an offline-generated (`--sql`) script for it more than once, once Calendar connections have been made under the narrow scope: the empty/`NULL`-scope branch of the cleanup (see the migration's module docstring) cannot distinguish a genuinely new, narrow grant that omitted its scope echo from a pre-migration broad one, and a replay would delete the new grant too.
+
+Both the online and offline paths run the cleanup as a single, unbatched `DELETE` — this migration commits in one transaction regardless (`transaction_per_migration=True` on PostgreSQL, see `src/xagent/migrations/env.py`), so every revoked row's lock is held until that same commit either way; there is no batching to trade off, and no lock-duration difference between the two paths.
 
 ### Scope limitation
 
-Only `provider = 'google-calendar'` rows are touched. A bare provider-level `google` row (created by the app_id-less connect flow) is never deleted here even if it happens to carry the old scope too, since other Google connectors (Gmail, Drive, Docs, Slides, Sheets) may depend on that same row as their own fallback credential. That gap is closed separately, at the runtime level: `google-calendar` was added to `APPS_REQUIRING_APP_SCOPED_OAUTH_GRANT` (`web/mcp_apps.py`) in the same change, so a bare `google` row is no longer accepted as a Calendar credential regardless of its scope. Deploy both changes together — the data cleanup and the runtime policy change ship in the same migration/PR, but they are logically separable, and reverting one without the other reopens a gap the other was covering.
+Only `provider = 'google-calendar'` rows are touched by the `user_oauth` cleanup. A bare provider-level `google` row (created by the app_id-less connect flow) is never deleted here even if it happens to carry the old scope too, since other Google connectors (Gmail, Drive, Docs, Slides, Sheets) may depend on that same row as their own fallback credential.
+
+That gap is *mitigated*, not fully closed, at the runtime level: `google-calendar` was added to `APPS_REQUIRING_APP_SCOPED_OAUTH_GRANT` (`web/mcp_apps.py`) in the same change, so a bare `google` row is no longer accepted as a Calendar credential regardless of its scope. This has a real, separate consequence covered below: any user whose *only* Calendar connection was ever a bare `google` row is broken by this policy change alone, independently of whether the `user_oauth` cleanup above revokes anything for them. This migration's `user_mcpservers` cleanup step accounts for that -- it runs after the revoke step and removes any Calendar `user_mcpservers` row left with no `google-calendar` credential, whether that's because the row was revoked this run or because it only ever had a bare `google` row and none at all.
+
+This does **not** make a `google-calendar` row's own token trustworthy going forward -- see the migration's module docstring on why a reconnect can still, in principle, receive a token that again carries the old, broad scope. Deploy the data cleanup and the runtime policy change together (they ship in the same migration/PR); reverting one without the other reopens the gap the other was covering.
 
 This migration does not call Google's token-revocation endpoint. The deleted local row simply stops being usable by this application; Google still considers the underlying token valid (subject to its own expiry) until the user revokes app access directly from their Google Account.
 
@@ -20,19 +26,32 @@ This migration does not call Google's token-revocation endpoint. The deleted loc
 
 No new environment variable, dependency, or infrastructure requirement. No mixed-version ordering constraint: an older worker reading a `google-calendar` row that was already narrowed (or already deleted) behaves the same as it would against any other disconnected Calendar account — there is no schema shape for an old worker to misinterpret.
 
-Before deployment, get a rough sense of exposure with:
+Before deployment, get a rough sense of exposure. Two separate counts matter -- rows the `user_oauth` cleanup can revoke, and users the runtime policy change disconnects regardless of what that cleanup does:
 
 ```sql
+-- Candidates for user_oauth revocation (not all of these necessarily carry
+-- the old scope, but any that do will be deleted)
 SELECT count(*) FROM user_oauth WHERE provider = 'google-calendar';
+
+-- Users whose ONLY Calendar credential is a bare provider-level row: these
+-- lose Calendar access from the APPS_REQUIRING_APP_SCOPED_OAUTH_GRANT policy
+-- change alone, whether or not the query above finds anything for them
+SELECT count(DISTINCT um.user_id)
+FROM user_mcpservers um
+JOIN mcp_servers s ON s.id = um.mcpserver_id
+WHERE s.name = 'Google Calendar'
+  AND um.user_id NOT IN (
+    SELECT user_id FROM user_oauth WHERE provider = 'google-calendar'
+  );
 ```
 
-Every row this returns is a candidate for revocation (not all of them necessarily carry the old scope, but any that do will be deleted).
+A zero from the first query does not mean zero affected users -- check both.
 
 ### Deployment and migration steps
 
 1. Deploy the application version carrying this migration; the migration runs automatically as part of normal startup/migration application.
-2. Expect a log warning (`Revoked %d google-calendar user_oauth grant(s) ...`) if any rows were revoked. No warning means no existing grants carried the old scope.
-3. Communicate to affected users (if the revoked count is non-zero) that they need to reconnect Google Calendar.
+2. Expect up to two log warnings: `Revoked %d google-calendar user_oauth grant(s) ...` and `Removed %d orphaned Calendar user_mcpservers row(s) ...`. Either can fire independently of the other -- a user can be affected by one, both, or neither.
+3. Communicate to affected users (the sum of both preflight counts above, not just the revoked-grant count) that they need to reconnect Google Calendar.
 
 ### Verification and monitoring
 
@@ -42,13 +61,13 @@ Confirm the catalog row was narrowed:
 SELECT oauth_scopes FROM public_mcp_apps WHERE app_id = 'google-calendar';
 ```
 
-Connect a fresh test account to Calendar and confirm the Google consent screen requests only `calendar.events`, not the full `calendar` scope.
+Connect a fresh test account to Calendar and confirm the Google consent screen requests only `calendar.events`, not the full `calendar` scope. A fresh test account only exercises the scope-narrowing half of this change -- it has no prior grant history, so it cannot demonstrate the reconnect-regains-broad-scope risk documented in the migration's module docstring; that risk needs an account that previously granted the old, broad scope.
 
 For any user who reports a broken Calendar connection after this deploys, direct them to reconnect — this is the expected, intended effect of the migration, not a bug.
 
 ### Rollback
 
-`downgrade()` restores the catalog's requested scope to the full `calendar` scope, but every `user_oauth` row this migration deleted stays deleted — there is no data to roll back to. A rollback only affects what *new* authorizations request; it does not restore anyone's Calendar connection.
+`downgrade()` restores the catalog's requested scope to the full `calendar` scope, but every `user_oauth` and `user_mcpservers` row this migration removed stays removed — there is no data to roll back to. A rollback only affects what *new* authorizations request; it does not restore anyone's Calendar connection.
 
 ## 2026-08-11 — New public-task File Operation isolation
 

@@ -22,6 +22,7 @@ from xagent.core.agent.context.enrichment import (
 )
 from xagent.core.agent.language import (
     OUTPUT_LANGUAGE_METADATA_KEY,
+    detect_prose_script_mismatch,
     detect_response_language_script_mismatch,
     normalize_response_language_label,
     output_language_policy,
@@ -241,6 +242,25 @@ def test_detect_response_language_script_mismatch_is_conservative() -> None:
         is None
     )
     assert detect_response_language_script_mismatch("Japanese", "日本語の文章") is None
+
+
+def test_script_validation_ignores_required_technical_identifiers() -> None:
+    chinese_prose = (
+        "调用 https://api.example.com/v1/shipments/{shipment_id}，读取 "
+        "response_language 和 HTTPStatus 字段，然后向用户说明查询结果。"
+    )
+
+    assert (
+        detect_response_language_script_mismatch("Simplified Chinese", chinese_prose)
+        is None
+    )
+    assert (
+        detect_prose_script_mismatch(
+            "请查询货运状态并向用户解释结果。",
+            "Reply to the user in English with the complete shipment status.",
+        )
+        is not None
+    )
 
 
 def test_language_rules_distinguish_simplified_and_traditional_chinese() -> None:

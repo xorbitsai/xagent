@@ -3,12 +3,16 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Mapping, Type
+from typing import Any, Mapping, Sequence, Type
 from uuid import uuid4
 
 from pydantic import BaseModel, Field, field_validator
 
-from ...core.agent.language import output_language_policy, response_language_rules
+from ...core.agent.language import (
+    detect_prose_script_mismatch,
+    output_language_policy,
+    response_language_rules,
+)
 from ...core.agent.result import extract_assistant_message
 from ...core.agent.service import AgentService
 from ...core.model.chat.basic.base import BaseLLM
@@ -22,13 +26,20 @@ from ...core.tools.adapters.vibe.base import (
     ToolVisibility,
 )
 from ...core.utils.type_check import ensure_list
-from ..models.agent import Agent
 
 _EXECUTION_MODES = frozenset({"flash", "balanced", "think", "auto"})
+MAX_WORKFORCE_PROMPT_LENGTH = 12_000
+MAX_WORKFORCE_BUILDER_AGENTS = 16
+MAX_WORKFORCE_BUILDER_WORKERS = 32
+WORKFORCE_BUILDER_MAX_ITERATIONS = 48
 
 
 class WorkforcePromptBuilderError(RuntimeError):
     """The ReAct builder stopped before producing a valid Workforce."""
+
+
+class WorkforcePromptBuilderUnavailableError(RuntimeError):
+    """The builder runtime could not start or complete its execution boundary."""
 
 
 @dataclass(frozen=True)
@@ -37,7 +48,7 @@ class StagedAgentSpec:
     name: str
     description: str
     instructions: str
-    tool_categories: list[str] | None
+    tool_categories: list[str]
     skills: list[str] | None
     execution_mode: str
 
@@ -88,15 +99,17 @@ class WorkforcePromptBuilderState:
     _next_agent_number: int = 1
 
     @classmethod
-    def from_agents(cls, agents: list[Agent]) -> WorkforcePromptBuilderState:
+    def from_agents(
+        cls, agents: Sequence[Mapping[str, Any]]
+    ) -> WorkforcePromptBuilderState:
         return cls(
             existing_agents={
-                f"existing:{int(agent.id)}": {
-                    "agent_ref": f"existing:{int(agent.id)}",
-                    "agent_id": int(agent.id),
-                    "name": str(agent.name),
-                    "description": str(agent.description or ""),
-                    "status": getattr(agent.status, "value", str(agent.status)),
+                f"existing:{int(agent['agent_id'])}": {
+                    "agent_ref": f"existing:{int(agent['agent_id'])}",
+                    "agent_id": int(agent["agent_id"]),
+                    "name": str(agent["name"]),
+                    "description": str(agent.get("description") or ""),
+                    "status": str(agent.get("status") or ""),
                 }
                 for agent in agents
             }
@@ -125,6 +138,14 @@ class WorkforcePromptBuilderState:
                 "status": "error",
                 "message": f"An agent named {name!r} is already staged.",
             }
+        if len(self.created_agents) >= MAX_WORKFORCE_BUILDER_AGENTS:
+            return {
+                "status": "error",
+                "message": (
+                    "The Workforce builder reached its staged-agent limit of "
+                    f"{MAX_WORKFORCE_BUILDER_AGENTS}."
+                ),
+            }
 
         execution_mode = str(args.get("execution_mode") or "balanced").strip()
         if execution_mode not in _EXECUTION_MODES:
@@ -140,7 +161,7 @@ class WorkforcePromptBuilderState:
             name=name,
             description=description,
             instructions=instructions,
-            tool_categories=ensure_list(args.get("tool_categories")),
+            tool_categories=ensure_list(args.get("tool_categories")) or [],
             skills=ensure_list(args.get("skills")),
             execution_mode=execution_mode,
         )
@@ -188,6 +209,14 @@ class WorkforcePromptBuilderState:
             return {
                 "status": "error",
                 "message": "At least one worker is required.",
+            }
+        if len(raw_workers) > MAX_WORKFORCE_BUILDER_WORKERS:
+            return {
+                "status": "error",
+                "message": (
+                    "The Workforce builder supports at most "
+                    f"{MAX_WORKFORCE_BUILDER_WORKERS} workers."
+                ),
             }
 
         workers: list[StagedWorkforceWorker] = []
@@ -348,8 +377,8 @@ class StageAgentArgs(BaseModel):
             "same language and Chinese script as the user's request."
         )
     )
-    tool_categories: list[str] | None = Field(
-        default=None,
+    tool_categories: list[str] = Field(
+        default_factory=list,
         description="Tool categories assigned to this agent.",
     )
     skills: list[str] | None = Field(
@@ -523,10 +552,15 @@ async def build_workforce_prompt_plan(
     *,
     prompt: str,
     llm: BaseLLM,
-    available_agents: list[Agent],
+    available_agents: Sequence[Mapping[str, Any]],
     compact_llm: BaseLLM | None = None,
 ) -> dict[str, Any]:
     """Run the ReAct builder and return its validated in-memory plan."""
+
+    if len(prompt) > MAX_WORKFORCE_PROMPT_LENGTH:
+        raise WorkforcePromptBuilderError(
+            f"The Workforce prompt exceeds {MAX_WORKFORCE_PROMPT_LENGTH} characters."
+        )
 
     state = WorkforcePromptBuilderState.from_agents(available_agents)
     execution_id = f"workforce-prompt-builder-{uuid4().hex}"
@@ -547,8 +581,14 @@ async def build_workforce_prompt_plan(
         system_prompt=workforce_prompt_builder_system_prompt(),
         memory_enabled=False,
         enable_workspace=False,
+        react_max_iterations=WORKFORCE_BUILDER_MAX_ITERATIONS,
     )
-    result = await service.execute_task(prompt, task_id=execution_id)
+    try:
+        result = await service.execute_task(prompt, task_id=execution_id)
+    except Exception as exc:
+        raise WorkforcePromptBuilderUnavailableError(
+            "The ReAct Workforce builder runtime is unavailable."
+        ) from exc
     if not result.get("success"):
         status = str(result.get("status") or "failed")
         error = str(result.get("error") or result.get("output") or "").strip()
@@ -568,4 +608,47 @@ async def build_workforce_prompt_plan(
         )
     plan = state.to_plan()
     plan["builder_response"] = builder_response.strip()
+    _validate_builder_plan_language(prompt=prompt, plan=plan)
     return plan
+
+
+def _validate_builder_plan_language(
+    *,
+    prompt: str,
+    plan: Mapping[str, Any],
+) -> None:
+    """Reject high-confidence script drift before any builder prose is stored."""
+    fields: list[tuple[str, str]] = [
+        ("workforce.name", str(plan.get("name") or "")),
+        ("workforce.description", str(plan.get("description") or "")),
+        ("builder_response", str(plan.get("builder_response") or "")),
+    ]
+    for index, agent in enumerate(plan.get("created_agents") or []):
+        if not isinstance(agent, Mapping):
+            continue
+        for field_name in ("name", "description", "instructions"):
+            fields.append(
+                (
+                    f"created_agents[{index}].{field_name}",
+                    str(agent.get(field_name) or ""),
+                )
+            )
+    for index, worker in enumerate(plan.get("workers") or []):
+        if not isinstance(worker, Mapping):
+            continue
+        for field_name in ("alias", "assignment_instructions"):
+            fields.append(
+                (
+                    f"workers[{index}].{field_name}",
+                    str(worker.get(field_name) or ""),
+                )
+            )
+
+    for field_name, value in fields:
+        mismatch = detect_prose_script_mismatch(prompt, value)
+        if mismatch is None:
+            continue
+        raise WorkforcePromptBuilderError(
+            f"The ReAct Workforce builder returned {mismatch.observed_script}-script "
+            f"text in {field_name}, which does not match the request language."
+        )

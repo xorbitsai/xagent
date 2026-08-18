@@ -25,6 +25,11 @@ from xagent.core.agent.clarification import (
     ClarificationDraft,
     draft_from_waiting_request,
 )
+from xagent.core.agent.language import (
+    OUTPUT_LANGUAGE_METADATA_KEY,
+    OUTPUT_LANGUAGE_SOURCE_METADATA_KEY,
+    OUTPUT_LANGUAGE_SOURCE_PLAN,
+)
 from xagent.core.agent.pattern.base import RequiredToolCallError
 from xagent.core.agent.pattern.dag.dag import _DAGStepRuntime
 from xagent.core.agent.pattern.dag.plan_generator import (
@@ -3451,6 +3456,146 @@ async def test_llm_plan_generator_retries_plan_prose_language_mismatch() -> None
     assert "did not match its language declaration" in retry_message
     assert "Emit response_language first" in retry_message
     assert "set it to English" in retry_message
+
+
+@pytest.mark.asyncio
+async def test_llm_plan_generator_validates_each_step_language_independently() -> None:
+    generator = LLMPlanGenerator()
+    context = ExecutionContext(execution_id="dag-per-step-language")
+    context.add_user_message("Create an English report.")
+    llm = SequenceLLM(
+        [
+            plan_tool_response(
+                [
+                    {
+                        "id": "long-english",
+                        "task": "Collect and analyze all relevant source material",
+                        "description": (
+                            "Build a detailed evidence table, compare every source, "
+                            "record limitations, and prepare a complete English report."
+                        ),
+                        "dependencies": [],
+                        "tool_names": [],
+                    },
+                    {
+                        "id": "wrong-language",
+                        "task": "总结分析结果并向用户清楚说明所有重要发现",
+                        "description": "使用中文生成最终报告并解释关键证据和限制。",
+                        "dependencies": ["long-english"],
+                        "tool_names": [],
+                    },
+                ],
+                response_language="English",
+            ),
+            plan_tool_response(
+                [
+                    {
+                        "id": "long-english",
+                        "task": "Collect and analyze all relevant source material",
+                        "dependencies": [],
+                        "tool_names": [],
+                    },
+                    {
+                        "id": "final-report",
+                        "task": "Summarize the findings in a clear English report",
+                        "dependencies": ["long-english"],
+                        "tool_names": [],
+                    },
+                ],
+                response_language="English",
+            ),
+        ]
+    )
+
+    plan = await generator.generate_plan(
+        request=PlanGenerationRequest(
+            context=context,
+            execution_id=context.execution_id,
+            available_tool_names=[],
+        ),
+        llm=llm,
+    )
+
+    assert llm.calls == 2
+    assert [step.id for step in plan.steps] == ["long-english", "final-report"]
+    assert "wrong-language" in llm.seen_messages[1][-1]["content"]
+
+
+@pytest.mark.asyncio
+async def test_llm_plan_generator_allows_technical_identifiers_in_chinese_step() -> (
+    None
+):
+    generator = LLMPlanGenerator()
+    context = ExecutionContext(execution_id="dag-chinese-technical-identifiers")
+    context.add_user_message("查询货运状态并用中文解释结果。")
+    llm = PlanLLM(
+        plan_tool_response(
+            [
+                {
+                    "id": "query",
+                    "task": "查询货运状态并向用户解释结果",
+                    "description": (
+                        "调用 https://api.example.com/v1/shipments/{shipment_id}，"
+                        "读取 response_language 和 HTTPStatus 字段后说明结果。"
+                    ),
+                    "dependencies": [],
+                    "tool_names": [],
+                }
+            ],
+            response_language="Simplified Chinese",
+        )
+    )
+
+    plan = await generator.generate_plan(
+        request=PlanGenerationRequest(
+            context=context,
+            execution_id=context.execution_id,
+            available_tool_names=[],
+        ),
+        llm=llm,
+    )
+
+    assert plan.steps[0].id == "query"
+
+
+@pytest.mark.asyncio
+async def test_direct_dag_replan_refreshes_inferred_response_language() -> None:
+    generator = LLMPlanGenerator()
+    context = ExecutionContext(execution_id="dag-language-change-replan")
+    context.metadata[OUTPUT_LANGUAGE_METADATA_KEY] = "English"
+    context.metadata[OUTPUT_LANGUAGE_SOURCE_METADATA_KEY] = OUTPUT_LANGUAGE_SOURCE_PLAN
+    context.add_user_message("请改用中文继续处理。")
+    llm = PlanLLM(
+        plan_tool_response(
+            [
+                {
+                    "id": "continue",
+                    "task": "根据用户的新要求继续处理并用中文回答",
+                    "description": "重新规划后续工作并确保最终输出为中文。",
+                    "dependencies": [],
+                    "tool_names": [],
+                }
+            ],
+            response_language="Simplified Chinese",
+        )
+    )
+
+    await generator.generate_plan(
+        request=PlanGenerationRequest(
+            context=context,
+            execution_id=context.execution_id,
+            replan=True,
+            previous_plan=ExecutionPlan(steps=[]),
+            available_tool_names=[],
+        ),
+        llm=llm,
+    )
+
+    assert context.metadata[OUTPUT_LANGUAGE_METADATA_KEY] == "Simplified Chinese"
+    assert (
+        context.metadata[OUTPUT_LANGUAGE_SOURCE_METADATA_KEY]
+        == OUTPUT_LANGUAGE_SOURCE_PLAN
+    )
 
 
 @pytest.mark.asyncio

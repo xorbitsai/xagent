@@ -10,6 +10,8 @@ from typing import Any, Callable
 from ...context.enrichment import latest_user_text
 from ...language import (
     OUTPUT_LANGUAGE_METADATA_KEY,
+    OUTPUT_LANGUAGE_SOURCE_METADATA_KEY,
+    OUTPUT_LANGUAGE_SOURCE_PLAN,
     detect_response_language_script_mismatch,
     normalize_response_language_label,
     output_language_policy,
@@ -588,30 +590,42 @@ class LLMPlanGenerator(PlanGenerator):
             if isinstance(metadata, dict)
             else ""
         )
-        if expected_language and response_language != expected_language:
+        language_source = (
+            str(metadata.get(OUTPUT_LANGUAGE_SOURCE_METADATA_KEY) or "")
+            if isinstance(metadata, dict)
+            else ""
+        )
+        if (
+            expected_language
+            and language_source != OUTPUT_LANGUAGE_SOURCE_PLAN
+            and response_language != expected_language
+        ):
             raise PlanLanguageMismatchError(
                 f"response_language is {response_language}, but the current output "
                 f"language policy requires {expected_language}.",
                 response_language=expected_language,
             )
 
-        prose = "\n".join(
-            value
-            for step in plan.steps
-            for value in (
-                step.task,
-                step.description or "",
-                step.termination_condition or "",
-                step.completion_evidence or "",
+        for step in plan.steps:
+            prose = "\n".join(
+                value
+                for value in (
+                    step.task,
+                    step.description or "",
+                    step.termination_condition or "",
+                    step.completion_evidence or "",
+                )
+                if value
             )
-            if value
-        )
-        mismatch = detect_response_language_script_mismatch(response_language, prose)
-        if mismatch is not None:
+            mismatch = detect_response_language_script_mismatch(
+                response_language, prose
+            )
+            if mismatch is None:
+                continue
             raise PlanLanguageMismatchError(
-                f"response_language is {response_language}, but the plan's "
-                f"user-facing fields are predominantly {mismatch.observed_script}-script "
-                f"text ({mismatch.han_count} Han characters versus "
+                f"response_language is {response_language}, but plan step "
+                f"{step.id!r} has predominantly {mismatch.observed_script}-script "
+                f"user-facing text ({mismatch.han_count} Han characters versus "
                 f"{mismatch.latin_count} Latin letters).",
                 response_language=response_language,
             )
@@ -624,10 +638,15 @@ class LLMPlanGenerator(PlanGenerator):
         if not response_language:
             return
         metadata = getattr(context, "metadata", None)
-        if isinstance(metadata, dict) and not metadata.get(
-            OUTPUT_LANGUAGE_METADATA_KEY
+        if not isinstance(metadata, dict):
+            return
+        language_source = str(metadata.get(OUTPUT_LANGUAGE_SOURCE_METADATA_KEY) or "")
+        if (
+            not metadata.get(OUTPUT_LANGUAGE_METADATA_KEY)
+            or language_source == OUTPUT_LANGUAGE_SOURCE_PLAN
         ):
             metadata[OUTPUT_LANGUAGE_METADATA_KEY] = response_language
+            metadata[OUTPUT_LANGUAGE_SOURCE_METADATA_KEY] = OUTPUT_LANGUAGE_SOURCE_PLAN
 
     def _required_tool_call_retry_feedback(self, tool_name: str) -> str:
         return (

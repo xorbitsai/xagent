@@ -12,7 +12,10 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from ...config import get_agent_pattern_for_execution_mode, get_uploads_dir
-from ...core.agent.language import response_language_rules
+from ...core.agent.language import (
+    detect_prose_script_mismatch,
+    response_language_rules,
+)
 from ...core.agent.service import AgentService
 from ...core.memory.in_memory import InMemoryMemoryStore
 from ...core.tools.core.document_search import find_missing_knowledge_bases
@@ -510,9 +513,19 @@ async def optimize_instructions(
         )
 
         if isinstance(response, dict) and "content" in response:
-            content = response["content"]
+            content = str(response["content"])
         else:
             content = response if isinstance(response, str) else str(response)
+
+        mismatch = detect_prose_script_mismatch(request.instructions, content)
+        if mismatch is not None:
+            logger.warning(
+                "Instruction optimization returned %s-script prose for a "
+                "%s-script draft; returning the original draft",
+                mismatch.observed_script,
+                mismatch.expected_script,
+            )
+            content = request.instructions
 
         return {"optimized_instructions": content}
 

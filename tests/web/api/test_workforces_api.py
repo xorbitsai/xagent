@@ -1869,6 +1869,16 @@ def test_from_prompt_creates_all_staged_agents_atomically(
         db.close()
 
 
+def test_from_prompt_rejects_oversized_prompt_before_builder() -> None:
+    response = client.post(
+        "/api/workforces/from-prompt",
+        headers=_admin_headers(),
+        json={"prompt": "x" * 12_001},
+    )
+
+    assert response.status_code == 422
+
+
 @pytest.mark.asyncio
 async def test_from_prompt_rolls_back_all_staged_agents_when_worker_link_fails(
     monkeypatch: pytest.MonkeyPatch,

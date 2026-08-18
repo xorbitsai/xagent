@@ -1,9 +1,13 @@
 """Prompt snippets for preserving user-facing response language."""
 
+import re
 from dataclasses import dataclass
 from typing import Literal
 
 OUTPUT_LANGUAGE_METADATA_KEY = "output_language"
+OUTPUT_LANGUAGE_SOURCE_METADATA_KEY = "output_language_source"
+OUTPUT_LANGUAGE_SOURCE_PLAN = "dag_plan"
+OUTPUT_LANGUAGE_SOURCE_ROUTER = "auto_router"
 
 _ALLOWED_RESPONSE_LANGUAGE_LABELS = frozenset(
     {
@@ -155,6 +159,16 @@ _HAN_SCRIPT_RESPONSE_LANGUAGES = frozenset(
 )
 _MIN_HAN_CHARACTERS_FOR_MISMATCH = 8
 _MIN_LATIN_LETTERS_FOR_MISMATCH = 20
+_MIN_REFERENCE_HAN_CHARACTERS = 4
+_MIN_REFERENCE_LATIN_LETTERS = 12
+_TECHNICAL_SPAN_PATTERN = re.compile(
+    r"```.*?```|`[^`\n]*`|(?:https?://|www\.)[^\s，。；、！？]+|"
+    r"(?:[A-Za-z]:\\|/)[^\s，。；、！？]+|"
+    r"\b[A-Za-z_][A-Za-z0-9_]*(?:[./:\\][A-Za-z0-9_]+)+\b|"
+    r"\b(?:[A-Z]{2,}|[a-z]+[A-Z][A-Za-z0-9]*)\b",
+    flags=re.DOTALL,
+)
+_KANA_PATTERN = re.compile(r"[\u3040-\u30ff]")
 
 
 @dataclass(frozen=True)
@@ -166,6 +180,35 @@ class ResponseLanguageScriptMismatch:
     observed_script: Literal["Han", "Latin"]
     han_count: int
     latin_count: int
+
+
+def _script_counts(prose: str) -> tuple[int, int]:
+    prose_without_technical_spans = _TECHNICAL_SPAN_PATTERN.sub(" ", prose)
+    han_count = sum(
+        1
+        for character in prose_without_technical_spans
+        if "\u3400" <= character <= "\u4dbf"
+        or "\u4e00" <= character <= "\u9fff"
+        or "\uf900" <= character <= "\ufaff"
+    )
+    latin_count = sum(
+        1
+        for character in prose_without_technical_spans
+        if character.isascii() and character.isalpha()
+    )
+    return han_count, latin_count
+
+
+def _reference_language_for_script_validation(prose: str) -> str:
+    """Infer only script classes safe enough for validation, not a language."""
+    if not prose or _KANA_PATTERN.search(prose):
+        return ""
+    han_count, latin_count = _script_counts(prose)
+    if han_count >= _MIN_REFERENCE_HAN_CHARACTERS and han_count > latin_count:
+        return "Chinese"
+    if latin_count >= _MIN_REFERENCE_LATIN_LETTERS and latin_count > han_count * 2:
+        return "English"
+    return ""
 
 
 def detect_response_language_script_mismatch(
@@ -182,16 +225,7 @@ def detect_response_language_script_mismatch(
     if not language or not prose:
         return None
 
-    han_count = sum(
-        1
-        for character in prose
-        if "\u3400" <= character <= "\u4dbf"
-        or "\u4e00" <= character <= "\u9fff"
-        or "\uf900" <= character <= "\ufaff"
-    )
-    latin_count = sum(
-        1 for character in prose if character.isascii() and character.isalpha()
-    )
+    han_count, latin_count = _script_counts(prose)
 
     if (
         language in _LATIN_SCRIPT_RESPONSE_LANGUAGES
@@ -218,6 +252,20 @@ def detect_response_language_script_mismatch(
             latin_count=latin_count,
         )
     return None
+
+
+def detect_prose_script_mismatch(
+    reference_prose: str,
+    candidate_prose: str,
+) -> ResponseLanguageScriptMismatch | None:
+    """Compare prose using only a high-confidence Han/Latin reference signal."""
+    reference_language = _reference_language_for_script_validation(reference_prose)
+    if not reference_language:
+        return None
+    return detect_response_language_script_mismatch(
+        reference_language,
+        candidate_prose,
+    )
 
 
 def output_language_policy(response_language: str | None = None) -> str:

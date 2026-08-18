@@ -7,6 +7,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from xagent.web.models.agent import Agent, AgentOrigin, AgentStatus
+from xagent.web.models.database import release_db_connection_if_clean
 from xagent.web.models.user import User
 from xagent.web.services.agent_management import (
     TEMPLATE_RESOLVE_RACE_RETRIES,
@@ -30,6 +31,7 @@ from .workforce_names import (
 )
 from .workforce_prompt_runtime import (
     WorkforcePromptBuilderError,
+    WorkforcePromptBuilderUnavailableError,
     build_workforce_prompt_plan,
 )
 from .workforce_snapshot import normalize_text
@@ -52,6 +54,15 @@ async def generate_workforce_creation_plan(
 ) -> dict[str, Any]:
     normalized_prompt = normalize_text(prompt, "prompt", required=True)
     agents = list_accessible_published_agents(db, user)
+    available_agents = [
+        {
+            "agent_id": int(agent.id),
+            "name": str(agent.name),
+            "description": str(agent.description or ""),
+            "status": getattr(agent.status, "value", str(agent.status)),
+        }
+        for agent in agents
+    ]
     storage = UserAwareModelStorage(db)
     llm, _, _, compact_llm = storage.get_configured_defaults(int(user.id))
     if not llm:
@@ -67,13 +78,31 @@ async def generate_workforce_creation_plan(
             },
         )
 
+    if not release_db_connection_if_clean(db):
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "code": "workforce_prompt_builder_unavailable",
+                "message": "Could not release the database before Workforce creation.",
+            },
+        )
+
     try:
         return await build_workforce_prompt_plan(
             prompt=normalized_prompt,
             llm=llm,
             compact_llm=compact_llm,
-            available_agents=agents,
+            available_agents=available_agents,
         )
+    except WorkforcePromptBuilderUnavailableError as exc:
+        logger.exception("ReAct Workforce builder runtime is unavailable")
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "code": "workforce_prompt_builder_unavailable",
+                "message": "The Workforce builder is temporarily unavailable.",
+            },
+        ) from exc
     except WorkforcePromptBuilderError as exc:
         logger.warning("ReAct Workforce builder did not finalize: %s", exc)
         raise HTTPException(
@@ -92,35 +121,66 @@ def _create_staged_agent(
     *,
     is_manager: bool,
 ) -> Agent:
-    return AgentStore(db).add_agent(
-        user_id=int(user.id),
-        name=resolve_unique_agent_name(
-            db,
-            user_id=int(user.id),
-            name=str(spec["name"]),
-        ),
-        description=normalize_text(
-            cast(str | None, spec.get("description")),
-            "description",
-        ),
-        instructions=normalize_text(
-            cast(str | None, spec.get("instructions")),
-            "instructions",
-        ),
-        execution_mode=str(spec.get("execution_mode") or "balanced"),
-        models=None,
-        knowledge_bases=[],
-        skills=cast(list[str] | None, spec.get("skills")),
-        tool_categories=cast(list[str] | None, spec.get("tool_categories")),
-        suggested_prompts=[],
-        origin=(
-            AgentOrigin.WORKFORCE_GENERATED_MANAGER.value
-            if is_manager
-            else AgentOrigin.USER.value
-        ),
-        status=AgentStatus.PUBLISHED,
-        widget_enabled=False,
-        allowed_domains=[],
+    user_id = int(user.id)
+    raw_name = str(spec["name"])
+    origin = (
+        AgentOrigin.WORKFORCE_GENERATED_MANAGER.value
+        if is_manager
+        else AgentOrigin.USER.value
+    )
+    store = AgentStore(db)
+
+    def add_agent(name: str) -> Agent:
+        return store.add_agent(
+            user_id=user_id,
+            name=name,
+            description=normalize_text(
+                cast(str | None, spec.get("description")),
+                "description",
+            ),
+            instructions=normalize_text(
+                cast(str | None, spec.get("instructions")),
+                "instructions",
+            ),
+            execution_mode=str(spec.get("execution_mode") or "balanced"),
+            models=None,
+            knowledge_bases=[],
+            skills=cast(list[str], spec.get("skills") or []),
+            tool_categories=cast(list[str], spec.get("tool_categories") or []),
+            suggested_prompts=[],
+            origin=origin,
+            status=AgentStatus.PUBLISHED,
+            widget_enabled=False,
+            allowed_domains=[],
+        )
+
+    if is_manager:
+        return add_agent(resolve_unique_agent_name(db, user_id=user_id, name=raw_name))
+
+    for attempt in range(TEMPLATE_RESOLVE_RACE_RETRIES):
+        try:
+            with db.begin_nested():
+                return add_agent(
+                    resolve_unique_agent_name(db, user_id=user_id, name=raw_name)
+                )
+        except IntegrityError as exc:
+            if not is_agent_name_unique_violation(exc):
+                raise
+            logger.warning(
+                "Prompt-created agent name %r collided (attempt %s/%s); "
+                "retrying with a fresh name",
+                raw_name,
+                attempt + 1,
+                TEMPLATE_RESOLVE_RACE_RETRIES,
+            )
+
+    raise HTTPException(
+        status_code=409,
+        detail={
+            "code": WORKFORCE_CREATE_CONFLICT_CODE,
+            "message": "Could not create the Workforce agents due to a "
+            "concurrent request; please try again.",
+        },
     )
 
 

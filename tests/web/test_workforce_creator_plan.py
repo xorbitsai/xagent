@@ -3,19 +3,23 @@
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
 from fastapi import HTTPException
 
-from xagent.web.services import workforce_creator
+from xagent.web.services import workforce_creator, workforce_prompt_runtime
 from xagent.web.services.workforce_creator import (
     generate_workforce_creation_plan,
     get_localized_description,
 )
 from xagent.web.services.workforce_prompt_runtime import (
+    MAX_WORKFORCE_BUILDER_AGENTS,
     WorkforcePromptBuilderError,
     WorkforcePromptBuilderState,
+    WorkforcePromptBuilderUnavailableError,
+    _validate_builder_plan_language,
     build_workforce_prompt_plan,
     workforce_prompt_builder_system_prompt,
 )
@@ -125,6 +129,7 @@ def test_builder_state_requires_all_agents_before_finalization() -> None:
     assert finalized["status"] == "success"
     plan = state.to_plan()
     assert len(plan["created_agents"]) == 2
+    assert all(agent["tool_categories"] == [] for agent in plan["created_agents"])
     assert plan["manager"]["agent_ref"] == manager_ref
     assert plan["workers"][0]["agent_ref"] == worker_ref
 
@@ -169,6 +174,47 @@ def test_builder_state_rejects_unused_or_failed_staged_agents() -> None:
     assert "Unused refs" in result["message"]
     with pytest.raises(WorkforcePromptBuilderError):
         state.to_plan()
+
+
+def test_builder_state_enforces_staged_agent_limit() -> None:
+    state = WorkforcePromptBuilderState.from_agents([])
+    for index in range(MAX_WORKFORCE_BUILDER_AGENTS):
+        result = state.stage_agent(
+            {
+                "name": f"Agent {index}",
+                "description": "Performs one bounded role.",
+                "instructions": "Complete the assigned bounded role.",
+            }
+        )
+        assert result["status"] == "success"
+
+    rejected = state.stage_agent(
+        {
+            "name": "One agent too many",
+            "description": "Must be rejected.",
+            "instructions": "Do not stage this agent.",
+        }
+    )
+
+    assert rejected["status"] == "error"
+    assert "staged-agent limit" in rejected["message"]
+
+
+def test_builder_language_validation_rejects_wrong_script_before_persistence() -> None:
+    with pytest.raises(WorkforcePromptBuilderError, match="workforce.name"):
+        _validate_builder_plan_language(
+            prompt="创建一个用于分析市场数据的工作组。",
+            plan={
+                "name": "Market Research Workforce",
+                "description": (
+                    "Research the market, compare all evidence, and produce a "
+                    "complete English report for the user."
+                ),
+                "created_agents": [],
+                "workers": [],
+                "builder_response": "The requested Workforce is ready.",
+            },
+        )
 
 
 @pytest.mark.asyncio
@@ -290,6 +336,34 @@ async def test_react_builder_does_not_report_success_without_finalization() -> N
 
 
 @pytest.mark.asyncio
+async def test_react_builder_wraps_execution_boundary_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class UnavailableAgentService:
+        def __init__(self, **_kwargs: Any) -> None:
+            pass
+
+        async def execute_task(self, *_args: Any, **_kwargs: Any) -> dict[str, Any]:
+            raise RuntimeError("registry initialization failed")
+
+    monkeypatch.setattr(
+        workforce_prompt_runtime,
+        "AgentService",
+        UnavailableAgentService,
+    )
+
+    with pytest.raises(
+        WorkforcePromptBuilderUnavailableError,
+        match="runtime is unavailable",
+    ):
+        await build_workforce_prompt_plan(
+            prompt="Create a research Workforce.",
+            llm=FakeLLM([]),
+            available_agents=[],
+        )
+
+
+@pytest.mark.asyncio
 async def test_generation_fails_clearly_when_no_model_is_configured(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -314,6 +388,110 @@ async def test_generation_fails_clearly_when_no_model_is_configured(
             object(),
             type("User", (), {"id": 7})(),
             "创建一个研究工作组",
+        )
+
+    assert exc_info.value.status_code == 503
+    assert exc_info.value.detail["code"] == "workforce_prompt_builder_unavailable"
+
+
+@pytest.mark.asyncio
+async def test_generation_releases_database_before_react_runtime(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    llm = FakeLLM([])
+    events: list[str] = []
+
+    class ModelStorage:
+        def __init__(self, _db: object) -> None:
+            pass
+
+        def get_configured_defaults(self, _user_id: int | None) -> tuple[Any, ...]:
+            return (llm, None, None, None)
+
+    async def fake_build_workforce_prompt_plan(**kwargs: Any) -> dict[str, Any]:
+        events.append("runtime")
+        assert kwargs["available_agents"] == [
+            {
+                "agent_id": 12,
+                "name": "Researcher",
+                "description": "Collects evidence.",
+                "status": "published",
+            }
+        ]
+        return {"name": "Research Workforce"}
+
+    monkeypatch.setattr(workforce_creator, "UserAwareModelStorage", ModelStorage)
+    monkeypatch.setattr(
+        workforce_creator,
+        "list_accessible_published_agents",
+        lambda _db, _user: [
+            SimpleNamespace(
+                id=12,
+                name="Researcher",
+                description="Collects evidence.",
+                status=SimpleNamespace(value="published"),
+            )
+        ],
+    )
+    monkeypatch.setattr(
+        workforce_creator,
+        "release_db_connection_if_clean",
+        lambda _db: events.append("release") or True,
+    )
+    monkeypatch.setattr(
+        workforce_creator,
+        "build_workforce_prompt_plan",
+        fake_build_workforce_prompt_plan,
+    )
+
+    result = await generate_workforce_creation_plan(
+        object(),
+        SimpleNamespace(id=7),
+        "Create a research Workforce.",
+    )
+
+    assert result == {"name": "Research Workforce"}
+    assert events == ["release", "runtime"]
+
+
+@pytest.mark.asyncio
+async def test_generation_maps_runtime_boundary_failure_to_stable_503(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    llm = FakeLLM([])
+
+    class ModelStorage:
+        def __init__(self, _db: object) -> None:
+            pass
+
+        def get_configured_defaults(self, _user_id: int | None) -> tuple[Any, ...]:
+            return (llm, None, None, None)
+
+    async def unavailable_builder(**_kwargs: Any) -> dict[str, Any]:
+        raise WorkforcePromptBuilderUnavailableError("adapter setup failed")
+
+    monkeypatch.setattr(workforce_creator, "UserAwareModelStorage", ModelStorage)
+    monkeypatch.setattr(
+        workforce_creator,
+        "list_accessible_published_agents",
+        lambda _db, _user: [],
+    )
+    monkeypatch.setattr(
+        workforce_creator,
+        "release_db_connection_if_clean",
+        lambda _db: True,
+    )
+    monkeypatch.setattr(
+        workforce_creator,
+        "build_workforce_prompt_plan",
+        unavailable_builder,
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        await generate_workforce_creation_plan(
+            object(),
+            SimpleNamespace(id=7),
+            "Create a research Workforce.",
         )
 
     assert exc_info.value.status_code == 503

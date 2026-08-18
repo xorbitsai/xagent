@@ -39,7 +39,7 @@ dependencies = [
   "prompt_toolkit >= 3.0.0",
   "langfuse >= 4.0.6, < 5.0.0",    # Tracing implementation targets the v4 SDK API
   "python-dotenv >= 1.0.1",
-  "mcp>=1.12.4",
+  "mcp>=1.12.4,<2",  # streamablehttp_client (sessions.py) was removed/renamed in mcp 2.0
   "asyncssh>=2.14.0",  # SSH MCP runner (production runtime, not just tests)
   "requests >= 2.32.0",
   "boto3 >= 1.34.0",  # AWS built-in MCP connector (CloudWatch/DynamoDB/SQS, read-only)
@@ -170,7 +170,7 @@ sandbox = [
   "pydantic>=2.11.7",
   "pydantic-settings",
   "cloudpickle>=3.0.0",
-  "mcp>=1.12.4",
+  "mcp>=1.12.4,<2",  # streamablehttp_client (sessions.py) was removed/renamed in mcp 2.0
   "pandas>=1.3.0",
   "numpy>=1.21.0",
   "matplotlib>=3.5.0",

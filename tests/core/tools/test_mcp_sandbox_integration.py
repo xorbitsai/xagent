@@ -60,7 +60,7 @@ class TestListToolsInSandbox:
             )
 
         requirements = mock_ensure_requirements.await_args.args[1]
-        assert requirements == [*SANDBOX_BASE_DEPENDENCIES, "mcp>=1.12.4"]
+        assert requirements == [*SANDBOX_BASE_DEPENDENCIES, "mcp>=1.12.4,<2"]
 
     @pytest.mark.asyncio
     async def test_reads_result_file_and_builds_tools(self):

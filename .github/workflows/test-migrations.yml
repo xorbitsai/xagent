@@ -53,6 +53,11 @@ on:
   # stalls. Harmless before a queue exists -- merge_group simply never fires.
   merge_group:
 
+env:
+  # Same version docker/Dockerfile.backend and docker/Dockerfile.sandbox pin.
+  # Declared once here so the two install steps below cannot drift apart.
+  UV_VERSION: "0.11.10"
+
 jobs:
   detect-migration-changes:
     name: Detect migration changes
@@ -167,14 +172,36 @@ jobs:
         uses: actions/setup-python@v4
         with:
           python-version: "3.11"
-          cache: "pip"
 
       - name: Install dependencies
         if: needs.detect-migration-changes.outputs.should-test == 'true'
         run: |
-          python -m pip install --upgrade pip
-          pip install -e ".[all]"
-          pip install pytest pytest-mock
+          # Install from uv.lock, the same resolution every other job uses.
+          # A plain "pip install -e .[all]" re-resolves the whole graph from
+          # PyPI on every run, so an upper bound added anywhere in pyproject
+          # -- or any upstream release -- can make the resolver backtrack
+          # until it gives up, turning this workflow red on changes that have
+          # nothing to do with it. Putting the environment on PATH keeps the
+          # test steps below unchanged and leaves no call site able to fall
+          # back to the system interpreter.
+          #
+          # --locked is what turns that into a guarantee. A bare "uv sync"
+          # rewrites uv.lock as soon as project metadata has drifted from it,
+          # which puts the independent resolution straight back; --locked
+          # fails the job instead and names the stale lock.
+          #
+          # Pinning uv is the other half of that guarantee: a floating uv can
+          # ship a lock-format change that makes --locked fail on uv's release
+          # schedule rather than on anything in this repository.
+          #
+          # Only the test group is installed. The dev group adds pre-commit,
+          # ruff, flake8, mypy and the type stubs, and no step in either
+          # migration job runs any of them. alembic comes from the project
+          # dependencies and pytest from the test group, so both jobs still
+          # have everything they invoke.
+          python -m pip install "uv==${UV_VERSION}"
+          uv sync --locked --all-extras --no-default-groups --group test
+          echo "$PWD/.venv/bin" >> "$GITHUB_PATH"
 
       - name: Test migration upgrade
         if: needs.detect-migration-changes.outputs.should-test == 'true'
@@ -230,14 +257,36 @@ jobs:
         uses: actions/setup-python@v4
         with:
           python-version: "3.11"
-          cache: "pip"
 
       - name: Install dependencies
         if: needs.detect-migration-changes.outputs.should-test == 'true'
         run: |
-          python -m pip install --upgrade pip
-          pip install -e ".[all]"
-          pip install pytest pytest-mock
+          # Install from uv.lock, the same resolution every other job uses.
+          # A plain "pip install -e .[all]" re-resolves the whole graph from
+          # PyPI on every run, so an upper bound added anywhere in pyproject
+          # -- or any upstream release -- can make the resolver backtrack
+          # until it gives up, turning this workflow red on changes that have
+          # nothing to do with it. Putting the environment on PATH keeps the
+          # test steps below unchanged and leaves no call site able to fall
+          # back to the system interpreter.
+          #
+          # --locked is what turns that into a guarantee. A bare "uv sync"
+          # rewrites uv.lock as soon as project metadata has drifted from it,
+          # which puts the independent resolution straight back; --locked
+          # fails the job instead and names the stale lock.
+          #
+          # Pinning uv is the other half of that guarantee: a floating uv can
+          # ship a lock-format change that makes --locked fail on uv's release
+          # schedule rather than on anything in this repository.
+          #
+          # Only the test group is installed. The dev group adds pre-commit,
+          # ruff, flake8, mypy and the type stubs, and no step in either
+          # migration job runs any of them. alembic comes from the project
+          # dependencies and pytest from the test group, so both jobs still
+          # have everything they invoke.
+          python -m pip install "uv==${UV_VERSION}"
+          uv sync --locked --all-extras --no-default-groups --group test
+          echo "$PWD/.venv/bin" >> "$GITHUB_PATH"
 
       - name: Test migration upgrade
         if: needs.detect-migration-changes.outputs.should-test == 'true'
@@ -274,7 +323,6 @@ jobs:
       - name: Test Gmail provisioning Postgres-only behavior
         if: needs.detect-migration-changes.outputs.should-test == 'true'
         run: |
-          pip install pytest-asyncio
           pytest tests/web/services/test_gmail_provisioning.py -m postgresql -q
         env:
           XAGENT_TEST_POSTGRES_URL: postgresql://xagent:xagent@localhost:5432/xagent_test
@@ -317,7 +365,6 @@ jobs:
       - name: Test monitoring JSON extraction (Postgres-only)
         if: needs.detect-migration-changes.outputs.should-test == 'true'
         run: |
-          pip install pytest-asyncio
           pytest tests/web/api/test_monitor_postgresql.py -m postgresql -q
         env:
           XAGENT_TEST_POSTGRES_URL: postgresql://xagent:xagent@localhost:5432/xagent_test

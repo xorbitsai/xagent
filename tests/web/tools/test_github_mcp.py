@@ -41,12 +41,25 @@ def test_parse_repo_splits_owner_and_name():
     assert github._parse_repo("octocat/Hello-World") == ("octocat", "Hello-World")
 
 
-def test_parse_repo_strips_slashes_and_whitespace():
-    assert github._parse_repo(" /octocat/Hello-World/ ") == ("octocat", "Hello-World")
+def test_parse_repo_strips_surrounding_whitespace():
+    assert github._parse_repo(" octocat/Hello-World ") == ("octocat", "Hello-World")
 
 
-@pytest.mark.parametrize("value", ["octocat", "", "octocat/", "/Hello-World"])
+@pytest.mark.parametrize(
+    "value",
+    [
+        "octocat",
+        "",
+        "octocat/",
+        "/Hello-World",
+        "owner//repo",
+        "owner/repo/extra",
+        "/octocat/Hello-World/",
+    ],
+)
 def test_parse_repo_rejects_malformed_input(value):
+    """Extra/leading/trailing slashes must be rejected outright, not
+    silently repaired into a subtly wrong (owner, name) pair."""
     with pytest.raises(ValueError, match="owner/repo"):
         github._parse_repo(value)
 

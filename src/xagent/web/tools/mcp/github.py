@@ -42,9 +42,18 @@ def _headers() -> dict[str, str]:
 
 
 def _parse_repo(repo: str) -> tuple[str, str]:
-    """Split a "owner/repo" full name into its two parts."""
-    value = repo.strip().strip("/")
-    owner, _, name = value.partition("/")
+    """Split a "owner/repo" full name into its two parts.
+
+    Rejects a malformed name (extra/leading/trailing slashes, e.g.
+    "owner//repo" or "owner/repo/extra") outright rather than silently
+    repairing it — .strip("/") + .partition("/") previously accepted those
+    and mangled the extra segment into `name`, which then reached the
+    GitHub API as a subtly wrong path instead of a caught bug.
+    """
+    value = repo.strip()
+    if value.count("/") != 1:
+        raise ValueError(f'repo must be in "owner/repo" format, got: {repo!r}')
+    owner, name = value.split("/")
     if not owner or not name:
         raise ValueError(f'repo must be in "owner/repo" format, got: {repo!r}')
     return owner, name

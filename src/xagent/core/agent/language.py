@@ -1,5 +1,8 @@
 """Prompt snippets for preserving user-facing response language."""
 
+from dataclasses import dataclass
+from typing import Literal
+
 OUTPUT_LANGUAGE_METADATA_KEY = "output_language"
 
 _ALLOWED_RESPONSE_LANGUAGE_LABELS = frozenset(
@@ -99,6 +102,122 @@ _LANGUAGE_LABEL_ALIASES = {
     "简体中文": "Simplified Chinese",
     "繁體中文": "Traditional Chinese",
 }
+
+_LATIN_SCRIPT_RESPONSE_LANGUAGES = frozenset(
+    {
+        "Afrikaans",
+        "Basque",
+        "Brazilian Portuguese",
+        "Catalan",
+        "Croatian",
+        "Czech",
+        "Danish",
+        "Dutch",
+        "English",
+        "Estonian",
+        "European Portuguese",
+        "Filipino",
+        "Finnish",
+        "French",
+        "Galician",
+        "German",
+        "Hungarian",
+        "Icelandic",
+        "Indonesian",
+        "Irish",
+        "Italian",
+        "Latvian",
+        "Lithuanian",
+        "Malay",
+        "Norwegian",
+        "Polish",
+        "Portuguese",
+        "Romanian",
+        "Slovak",
+        "Slovenian",
+        "Spanish",
+        "Swahili",
+        "Swedish",
+        "Tagalog",
+        "Turkish",
+        "Vietnamese",
+        "Welsh",
+    }
+)
+_HAN_SCRIPT_RESPONSE_LANGUAGES = frozenset(
+    {
+        "Cantonese",
+        "Chinese",
+        "Mandarin Chinese",
+        "Simplified Chinese",
+        "Traditional Chinese",
+    }
+)
+_MIN_HAN_CHARACTERS_FOR_MISMATCH = 8
+_MIN_LATIN_LETTERS_FOR_MISMATCH = 20
+
+
+@dataclass(frozen=True)
+class ResponseLanguageScriptMismatch:
+    """A high-confidence contradiction between a language label and prose."""
+
+    response_language: str
+    expected_script: Literal["Han", "Latin"]
+    observed_script: Literal["Han", "Latin"]
+    han_count: int
+    latin_count: int
+
+
+def detect_response_language_script_mismatch(
+    response_language: str | None,
+    prose: str,
+) -> ResponseLanguageScriptMismatch | None:
+    """Detect an obvious Han/Latin script mismatch in user-facing prose.
+
+    The deliberately conservative thresholds allow short proper nouns and mixed
+    technical terms. Languages whose common script is ambiguous or unsupported
+    by this lightweight check are left to the model's language harness.
+    """
+    language = normalize_response_language_label(response_language)
+    if not language or not prose:
+        return None
+
+    han_count = sum(
+        1
+        for character in prose
+        if "\u3400" <= character <= "\u4dbf"
+        or "\u4e00" <= character <= "\u9fff"
+        or "\uf900" <= character <= "\ufaff"
+    )
+    latin_count = sum(
+        1 for character in prose if character.isascii() and character.isalpha()
+    )
+
+    if (
+        language in _LATIN_SCRIPT_RESPONSE_LANGUAGES
+        and han_count >= _MIN_HAN_CHARACTERS_FOR_MISMATCH
+        and han_count > latin_count
+    ):
+        return ResponseLanguageScriptMismatch(
+            response_language=language,
+            expected_script="Latin",
+            observed_script="Han",
+            han_count=han_count,
+            latin_count=latin_count,
+        )
+    if (
+        language in _HAN_SCRIPT_RESPONSE_LANGUAGES
+        and latin_count >= _MIN_LATIN_LETTERS_FOR_MISMATCH
+        and latin_count > han_count * 2
+    ):
+        return ResponseLanguageScriptMismatch(
+            response_language=language,
+            expected_script="Han",
+            observed_script="Latin",
+            han_count=han_count,
+            latin_count=latin_count,
+        )
+    return None
 
 
 def output_language_policy(response_language: str | None = None) -> str:

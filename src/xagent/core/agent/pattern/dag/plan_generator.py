@@ -10,6 +10,7 @@ from typing import Any, Callable
 from ...context.enrichment import latest_user_text
 from ...language import (
     OUTPUT_LANGUAGE_METADATA_KEY,
+    detect_response_language_script_mismatch,
     normalize_response_language_label,
     output_language_policy,
     plan_language_rules,
@@ -605,83 +606,13 @@ class LLMPlanGenerator(PlanGenerator):
             )
             if value
         )
-        han_count = sum(
-            1
-            for character in prose
-            if "\u3400" <= character <= "\u4dbf"
-            or "\u4e00" <= character <= "\u9fff"
-            or "\uf900" <= character <= "\ufaff"
-        )
-        latin_count = sum(
-            1 for character in prose if character.isascii() and character.isalpha()
-        )
-
-        latin_script_languages = {
-            "Afrikaans",
-            "Basque",
-            "Brazilian Portuguese",
-            "Catalan",
-            "Croatian",
-            "Czech",
-            "Danish",
-            "Dutch",
-            "English",
-            "Estonian",
-            "European Portuguese",
-            "Filipino",
-            "Finnish",
-            "French",
-            "Galician",
-            "German",
-            "Hungarian",
-            "Icelandic",
-            "Indonesian",
-            "Irish",
-            "Italian",
-            "Latvian",
-            "Lithuanian",
-            "Malay",
-            "Norwegian",
-            "Polish",
-            "Portuguese",
-            "Romanian",
-            "Slovak",
-            "Slovenian",
-            "Spanish",
-            "Swahili",
-            "Swedish",
-            "Tagalog",
-            "Turkish",
-            "Vietnamese",
-            "Welsh",
-        }
-        chinese_languages = {
-            "Cantonese",
-            "Chinese",
-            "Mandarin Chinese",
-            "Simplified Chinese",
-            "Traditional Chinese",
-        }
-        if (
-            response_language in latin_script_languages
-            and han_count >= 8
-            and han_count > latin_count
-        ):
+        mismatch = detect_response_language_script_mismatch(response_language, prose)
+        if mismatch is not None:
             raise PlanLanguageMismatchError(
                 f"response_language is {response_language}, but the plan's "
-                f"user-facing fields are predominantly Han-script text "
-                f"({han_count} Han characters versus {latin_count} Latin letters).",
-                response_language=response_language,
-            )
-        if (
-            response_language in chinese_languages
-            and latin_count >= 20
-            and latin_count > han_count * 2
-        ):
-            raise PlanLanguageMismatchError(
-                f"response_language is {response_language}, but the plan's "
-                f"user-facing fields are predominantly Latin-script text "
-                f"({latin_count} Latin letters versus {han_count} Han characters).",
+                f"user-facing fields are predominantly {mismatch.observed_script}-script "
+                f"text ({mismatch.han_count} Han characters versus "
+                f"{mismatch.latin_count} Latin letters).",
                 response_language=response_language,
             )
 

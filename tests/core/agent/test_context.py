@@ -22,6 +22,7 @@ from xagent.core.agent.context.enrichment import (
 )
 from xagent.core.agent.language import (
     OUTPUT_LANGUAGE_METADATA_KEY,
+    detect_response_language_script_mismatch,
     normalize_response_language_label,
     output_language_policy,
     response_language_rules,
@@ -212,6 +213,34 @@ def test_normalize_response_language_label_canonicalizes_safe_labels() -> None:
     assert normalize_response_language_label("english") == "English"
     assert normalize_response_language_label("zh-CN") == "Simplified Chinese"
     assert normalize_response_language_label(" 中文 ") == "Chinese"
+
+
+def test_detect_response_language_script_mismatch_is_conservative() -> None:
+    han_mismatch = detect_response_language_script_mismatch(
+        "English",
+        "识别到用户发送了简单问候，请直接友好地回应用户。",
+    )
+    assert han_mismatch is not None
+    assert han_mismatch.response_language == "English"
+    assert han_mismatch.expected_script == "Latin"
+    assert han_mismatch.observed_script == "Han"
+
+    latin_mismatch = detect_response_language_script_mismatch(
+        "zh-CN",
+        "Reply to the user in friendly English and ask how they can be helped.",
+    )
+    assert latin_mismatch is not None
+    assert latin_mismatch.response_language == "Simplified Chinese"
+    assert latin_mismatch.expected_script == "Han"
+    assert latin_mismatch.observed_script == "Latin"
+
+    assert (
+        detect_response_language_script_mismatch(
+            "English", "Track 中国国航 shipment CA123"
+        )
+        is None
+    )
+    assert detect_response_language_script_mismatch("Japanese", "日本語の文章") is None
 
 
 def test_language_rules_distinguish_simplified_and_traditional_chinese() -> None:

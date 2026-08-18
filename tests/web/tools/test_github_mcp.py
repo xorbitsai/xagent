@@ -435,6 +435,36 @@ def test_get_file_contents_rejects_non_file_type(monkeypatch):
     assert "symlink" in result["message"]
 
 
+def test_get_file_contents_accepts_empty_path_for_repo_root(monkeypatch):
+    mock_request = Mock(
+        return_value=MockResponse(
+            json_data=[{"name": "README.md", "path": "README.md", "type": "file"}]
+        )
+    )
+    monkeypatch.setattr(github.requests, "request", mock_request)
+
+    result = json.loads(github.github_get_file_contents("octocat/Hello-World", ""))
+
+    assert result["status"] == "success"
+    assert mock_request.call_args.kwargs["url"].endswith("/contents/")
+
+
+@pytest.mark.parametrize(
+    "path", ["/src/main.py", "src/main.py/", "src//main.py", "/", "//"]
+)
+def test_get_file_contents_rejects_malformed_path(path, monkeypatch):
+    """Leading/trailing/consecutive slashes must be rejected outright, not
+    silently interpolated into a malformed request URL."""
+    mock_request = Mock()
+    monkeypatch.setattr(github.requests, "request", mock_request)
+
+    result = json.loads(github.github_get_file_contents("octocat/Hello-World", path))
+
+    assert result["status"] == "error"
+    assert "slashes" in result["message"]
+    mock_request.assert_not_called()
+
+
 def test_list_commits_returns_summaries(monkeypatch):
     monkeypatch.setattr(
         github.requests,

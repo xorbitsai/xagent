@@ -395,6 +395,15 @@ def github_get_file_contents(repo: str, path: str, ref: str = "") -> str:
     """
     try:
         owner, name = _parse_repo(repo)
+        # path is interpolated directly into the request URL below (unlike
+        # github_list_commits' path, sent as a query param that requests
+        # percent-encodes regardless of content) -- reject a malformed value
+        # instead of letting it silently produce a wrong URL, same as
+        # _parse_repo's owner/repo validation above.
+        if path and (path.startswith("/") or path.endswith("/") or "//" in path):
+            raise ValueError(
+                f"path must not have leading, trailing, or consecutive slashes, got: {path!r}"
+            )
         params: dict[str, Any] = {"ref": ref} if ref else {}
         result = _request(
             "GET", f"/repos/{owner}/{name}/contents/{path}", params=params

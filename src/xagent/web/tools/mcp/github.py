@@ -28,24 +28,39 @@ MAX_PER_PAGE = 100
 # real issues even when more exist on later pages.
 MAX_ISSUE_PAGES = 10
 
-_FORBIDDEN_PATH_CHARS = re.compile(r"[/?#]")
+_FORBIDDEN_REPO_CHARS = re.compile(r"[/?#]")
 
 
 def _encode_path_component(value: str, *, field: str) -> str:
-    """Validate and percent-encode one URL path segment.
+    """Validate and percent-encode one owner/repo path segment.
 
     Rejects '/', '?', or '#' within the segment (these would change the
     request's path/query/fragment structure regardless of encoding) and a
-    bare '.' or '..' segment -- unvalidated, an owner/repo or file path
-    value reaching a same-host route via raw string interpolation could
-    otherwise let a crafted input traverse to an unintended GitHub API
-    route (e.g. "..") or inject a query string (e.g. "owner?x=y"), while
-    still carrying this connector's bearer token. The remaining value is
-    percent-encoded so segments that legitimately contain spaces or other
-    reserved characters (common in file paths, unlike owner/repo names)
-    still produce a well-formed request.
+    bare '.' or '..' segment -- unvalidated, an owner/repo value reaching a
+    same-host route via raw string interpolation could otherwise let a
+    crafted input traverse to an unintended GitHub API route (e.g. "..") or
+    inject a query string (e.g. "owner?x=y"), while still carrying this
+    connector's bearer token. '?'/'#' are rejected outright here (rather
+    than left to percent-encoding) because a legitimate owner or repo name
+    never contains them -- unlike file paths, see _encode_file_path_segment.
     """
-    if not value or _FORBIDDEN_PATH_CHARS.search(value) or value in (".", ".."):
+    if not value or _FORBIDDEN_REPO_CHARS.search(value) or value in (".", ".."):
+        raise ValueError(f"{field} contains characters that are not allowed: {value!r}")
+    return quote(value, safe="")
+
+
+def _encode_file_path_segment(value: str, *, field: str) -> str:
+    """Validate and percent-encode one file-path segment (already split on
+    '/', so this never sees an actual '/').
+
+    Unlike owner/repo names, a real filename can legitimately contain '?'
+    or '#' (e.g. "docs/why?.md", "issue#1.txt") -- these are safe to allow
+    here because quote(..., safe="") percent-encodes them to "%3F"/"%23"
+    before the segment reaches the URL, so they can't be reinterpreted as
+    query/fragment delimiters. Only emptiness and dot-segments (path
+    traversal) are rejected.
+    """
+    if not value or value in (".", ".."):
         raise ValueError(f"{field} contains characters that are not allowed: {value!r}")
     return quote(value, safe="")
 
@@ -101,18 +116,37 @@ def _clamp_limit(limit: int, *, default: int = 30) -> int:
     return max(1, min(value, MAX_PER_PAGE))
 
 
-def _request(
+_LINK_REL_PATTERN = re.compile(r'rel="([^"]+)"')
+
+
+def _link_header_rels(link_header: str | None) -> set[str]:
+    """Parse a GitHub `Link` response header into the set of `rel` values
+    present, e.g. {"next", "last"} -- the authoritative way to tell whether
+    another page exists. Inferring it from a page's item count instead
+    (e.g. "this page came back full") falsely flags an exactly-full final
+    page as truncated.
+    """
+    if not link_header:
+        return set()
+    return set(_LINK_REL_PATTERN.findall(link_header))
+
+
+def _request_raw(
     method: str,
     path: str,
     *,
     params: dict[str, Any] | None = None,
     json_data: dict[str, Any] | None = None,
-) -> Any:
-    """Call the GitHub REST API. Returns the parsed JSON body (dict or list).
+) -> requests.Response:
+    """Call the GitHub REST API and return the raw response (status/headers
+    included) on success -- callers that only need the parsed JSON body
+    should use `_request` instead; this exists for callers that also need
+    pagination (`Link`) or rate-limit headers.
 
     GitHub answers errors with a JSON body carrying "message" and, for
     validation failures (422), an "errors" list -- both are folded into the
-    raised message rather than surfaced as a bare HTTP status.
+    raised message, along with any rate-limit/retry headers present, rather
+    than surfaced as a bare HTTP status.
     """
     response = requests.request(
         method=method,
@@ -139,7 +173,32 @@ def _request(
                 for item in errors
             )
             message = f"{message}: {detail}"
+        # Rate-limit/retry headers would otherwise be silently dropped,
+        # leaving the caller unable to distinguish a rate limit or transient
+        # server error from a validation/permission failure.
+        retry_after = response.headers.get("Retry-After")
+        rate_limit_remaining = response.headers.get("X-RateLimit-Remaining")
+        rate_limit_reset = response.headers.get("X-RateLimit-Reset")
+        rate_limit_bits = []
+        if retry_after:
+            rate_limit_bits.append(f"retry_after={retry_after}s")
+        if rate_limit_remaining == "0" and rate_limit_reset:
+            rate_limit_bits.append(f"rate_limit_reset={rate_limit_reset}")
+        if rate_limit_bits:
+            message = f"{message} ({', '.join(rate_limit_bits)})"
         raise RuntimeError(message)
+    return response
+
+
+def _request(
+    method: str,
+    path: str,
+    *,
+    params: dict[str, Any] | None = None,
+    json_data: dict[str, Any] | None = None,
+) -> Any:
+    """Call the GitHub REST API. Returns the parsed JSON body (dict or list)."""
+    response = _request_raw(method, path, params=params, json_data=json_data)
     if response.status_code == 204 or not response.content:
         return {}
     return response.json()
@@ -266,34 +325,44 @@ def github_get_repository(repo: str) -> str:
 
 @mcp.tool()
 def github_list_issues(
-    repo: str, state: str = "open", labels: str = "", limit: int = 30
+    repo: str, state: str = "open", labels: str = "", limit: int = 30, page: int = 1
 ) -> str:
     """
     List issues in a repository. Pull requests are excluded (use
     github_list_pull_requests for those), even though GitHub's underlying
     endpoint returns both -- a PR-heavy page is fetched past (up to
-    MAX_ISSUE_PAGES pages) so real issues on later pages aren't missed.
+    MAX_ISSUE_PAGES pages from the starting page) so real issues on later
+    pages aren't missed.
     repo: "owner/repo".
     state: "open", "closed", or "all" (default "open").
     labels: optional comma-separated label names to filter by.
-    limit: max issues to return (default 30, capped at 100).
+    limit: max issues to return (default 30, capped at 100 -- prefer a
+    larger limit over relying on next_page, since GitHub's page-based
+    pagination can't resume partway through a page).
+    page: which GitHub results page to start from (default 1); when the
+    result is truncated because full pages remain beyond what was fetched,
+    the response's next_page tells you where to continue.
     """
     try:
         owner, name = _parse_repo(repo)
         max_results = _clamp_limit(limit)
+        start_page = max(1, int(page))
         issues: list[dict[str, Any]] = []
         truncated = False
+        next_page: int | None = None
         pages_fetched = 0
-        for page in range(1, MAX_ISSUE_PAGES + 1):
+        has_next_page = False
+        current_page = start_page
+        for current_page in range(start_page, start_page + MAX_ISSUE_PAGES):
             params: dict[str, Any] = {
                 "state": state,
                 "per_page": MAX_PER_PAGE,
-                "page": page,
+                "page": current_page,
             }
             if labels:
                 params["labels"] = labels
             try:
-                raw_page = _request(
+                response = _request_raw(
                     "GET", f"/repos/{owner}/{name}/issues", params=params
                 )
             except Exception as page_exc:
@@ -302,36 +371,58 @@ def github_list_issues(
                 # A mid-pagination failure (e.g. a rate limit) must not
                 # discard the pages already fetched -- return the partial
                 # list with a marker instead, same as slack.py's channel
-                # listing.
+                # listing. The failed page is a valid continuation point:
+                # reaching it at all means the previous page's Link header
+                # confirmed it exists.
                 logger.warning(
                     f"GitHub issue pagination stopped early for {repo}: {page_exc}"
                 )
                 return _success(
-                    issues=issues[:max_results], truncated=True, error=str(page_exc)
+                    issues=issues[:max_results],
+                    truncated=True,
+                    next_page=current_page,
+                    error=str(page_exc),
                 )
             pages_fetched += 1
+            raw_page = response.json() if response.content else []
+            has_next_page = "next" in _link_header_rels(response.headers.get("Link"))
             if not raw_page:
                 break
+            hit_limit_mid_page = False
             for index, issue in enumerate(raw_page):
                 if "pull_request" in issue:
                     continue
                 issues.append(_summarize_issue(issue))
                 if len(issues) >= max_results:
-                    # More raw items remain on this page, or GitHub filled
-                    # the page (implying at least one more page may exist) --
-                    # either means real issues could remain unfetched.
-                    truncated = (index + 1 < len(raw_page)) or (
-                        len(raw_page) == MAX_PER_PAGE
+                    # Only a real issue left behind on this page counts as a
+                    # mid-page cut -- trailing PRs are excluded from the
+                    # result anyway, so "items remain on the page" alone
+                    # would falsely report truncation (and needlessly
+                    # withhold next_page) when everything left is PRs.
+                    hit_limit_mid_page = any(
+                        "pull_request" not in later for later in raw_page[index + 1 :]
                     )
+                    truncated = hit_limit_mid_page or has_next_page
                     break
             if len(issues) >= max_results:
+                # next_page only makes sense at a page boundary -- if the
+                # limit was reached partway through this page, GitHub's
+                # page cursor can't resume mid-page (a larger limit avoids
+                # this instead).
+                if not hit_limit_mid_page and has_next_page:
+                    next_page = current_page + 1
                 break
-            if len(raw_page) < MAX_PER_PAGE:
-                break  # GitHub's own last page
+            if not has_next_page:
+                break  # confirmed last page via the Link header
         else:
-            # MAX_ISSUE_PAGES exhausted without hitting a short (last) page.
-            truncated = True
-        return _success(issues=issues[:max_results], truncated=truncated)
+            # MAX_ISSUE_PAGES exhausted -- only report truncated/next_page
+            # if the last page we saw actually indicated more exist.
+            truncated = has_next_page
+            if has_next_page:
+                next_page = current_page + 1
+        return _success(
+            issues=issues[:max_results], truncated=truncated, next_page=next_page
+        )
     except Exception as e:
         logger.error(f"Error listing GitHub issues for {repo}: {e}")
         return _error(str(e))
@@ -474,12 +565,15 @@ def github_get_file_contents(repo: str, path: str, ref: str = "") -> str:
         # path is interpolated directly into the request URL below (unlike
         # github_list_commits' path, sent as a query param that requests
         # percent-encodes regardless of content) -- each segment is
-        # validated/encoded individually, same as _parse_repo's owner/repo
-        # handling above. An empty segment (from a leading/trailing/double
-        # slash) is rejected by _encode_path_component's own emptiness check.
+        # validated/encoded individually via _encode_file_path_segment,
+        # which (unlike _parse_repo's owner/repo validator) allows
+        # legitimate filename characters like '?'/'#' since they're
+        # percent-encoded away rather than reaching the URL raw. An empty
+        # segment (from a leading/trailing/double slash) is rejected by its
+        # own emptiness check.
         encoded_path = (
             "/".join(
-                _encode_path_component(segment, field="path")
+                _encode_file_path_segment(segment, field="path")
                 for segment in path.split("/")
             )
             if path
@@ -520,15 +614,27 @@ def github_get_file_contents(repo: str, path: str, ref: str = "") -> str:
             )
         raw_content = result.get("content") or ""
         if encoding == "base64":
-            content = base64.b64decode(raw_content).decode("utf-8", errors="replace")
+            decoded_bytes = base64.b64decode(raw_content)
+            try:
+                content = decoded_bytes.decode("utf-8")
+                content_encoding = "utf-8"
+            except UnicodeDecodeError:
+                # A binary (non-UTF-8) file decoded with errors="replace"
+                # would silently turn into U+FFFD garbage while still
+                # reporting success -- return the original base64 instead
+                # so the caller can tell it's binary and decode it properly.
+                content = raw_content
+                content_encoding = "base64"
         else:
             content = raw_content
+            content_encoding = "utf-8"
         return _success(
             type="file",
             path=result.get("path"),
             sha=result.get("sha"),
             size=result.get("size"),
             content=content,
+            encoding=content_encoding,
         )
     except Exception as e:
         logger.error(f"Error fetching GitHub file contents {repo}:{path}: {e}")

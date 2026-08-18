@@ -767,7 +767,12 @@ def get_builtin_public_mcp_app_rows() -> list[dict[str, Any]]:
         {
             "app_id": "github",
             "name": "GitHub",
-            "description": "Connect to GitHub to search repositories and code, read and create issues and pull requests, comment, and browse file contents and commit history.",
+            # Explicitly discloses the "repo" scope's blast radius (all
+            # repositories -- public and private -- the connecting account
+            # can access, not just ones the user picks) rather than leaving
+            # it implicit, since this is an OAuth App with no per-repository
+            # allowlist (unlike a GitHub App's repository-selection step).
+            "description": "Connect to GitHub to search repositories and code, read and create issues and pull requests, comment, and browse file contents and commit history. Grants access to every repository (public and private) the connected account can access -- there is no per-repository selection.",
             "icon": "https://www.google.com/s2/favicons?domain=github.com&sz=128",
             "transport": "oauth",
             "provider_name": "github",
@@ -778,7 +783,12 @@ def get_builtin_public_mcp_app_rows() -> list[dict[str, Any]]:
             # privilege. user:email is kept: unlike a separate unused
             # endpoint, it changes what /user's own "email" field returns
             # (populates it for accounts without a public email), which
-            # github_get_current_user's output relies on directly.
+            # github_get_current_user's output relies on directly -- see
+            # test_get_current_user_returns_profile in test_github_mcp.py,
+            # which asserts the email field is surfaced, and
+            # test_generic_oauth_login_requests_exact_github_scope in
+            # test_github_oauth.py, which asserts this exact scope is what
+            # gets requested at authorize time.
             "oauth_scopes": ["repo", "user:email"],
             "is_visible_in_connector": True,
             "launch_config": {

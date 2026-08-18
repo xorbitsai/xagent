@@ -8,10 +8,17 @@ from xagent.web.tools.mcp import github
 
 
 class MockResponse:
-    def __init__(self, json_data=None, status_code: int = 200, content: bytes = b"{}"):
+    def __init__(
+        self,
+        json_data=None,
+        status_code: int = 200,
+        content: bytes = b"{}",
+        headers: dict | None = None,
+    ):
         self._json_data = json_data if json_data is not None else {}
         self.status_code = status_code
         self.content = content if json_data is None else json.dumps(json_data).encode()
+        self.headers = headers or {}
 
     def json(self):
         return self._json_data
@@ -97,6 +104,29 @@ def test_encode_path_component_percent_encodes_reserved_characters():
     )
 
 
+@pytest.mark.parametrize("value", ["", ".", ".."])
+def test_encode_file_path_segment_rejects_forbidden_values(value):
+    with pytest.raises(ValueError, match="not allowed"):
+        github._encode_file_path_segment(value, field="path")
+
+
+def test_encode_file_path_segment_allows_and_encodes_question_mark_and_hash():
+    """Unlike _encode_path_component (owner/repo), '?' and '#' are legitimate
+    filename characters -- they must be percent-encoded rather than rejected,
+    since the encoded form can't be reinterpreted as a query/fragment once
+    it reaches the URL."""
+    assert github._encode_file_path_segment("why?.md", field="path") == "why%3F.md"
+    assert github._encode_file_path_segment("issue#1.txt", field="path") == (
+        "issue%231.txt"
+    )
+
+
+def test_encode_file_path_segment_percent_encodes_reserved_characters():
+    assert github._encode_file_path_segment("my notes.md", field="path") == (
+        "my%20notes.md"
+    )
+
+
 def test_request_raises_with_message_on_error(monkeypatch):
     monkeypatch.setattr(
         github.requests,
@@ -139,6 +169,67 @@ def test_request_returns_empty_dict_on_no_content(monkeypatch):
     )
 
     assert github._request("DELETE", "/repos/octocat/Hello-World") == {}
+
+
+def test_request_raw_includes_rate_limit_metadata_in_error(monkeypatch):
+    """Retry-After/X-RateLimit-* headers must not be silently dropped -- a
+    rate limit or transient server error would otherwise be indistinguishable
+    from a validation/permission failure in the raised message."""
+    monkeypatch.setattr(
+        github.requests,
+        "request",
+        Mock(
+            return_value=MockResponse(
+                json_data={"message": "API rate limit exceeded"},
+                status_code=403,
+                headers={
+                    "Retry-After": "60",
+                    "X-RateLimit-Remaining": "0",
+                    "X-RateLimit-Reset": "1699999999",
+                },
+            )
+        ),
+    )
+
+    with pytest.raises(RuntimeError) as excinfo:
+        github._request("GET", "/repos/octocat/Hello-World/issues")
+
+    assert "retry_after=60s" in str(excinfo.value)
+    assert "rate_limit_reset=1699999999" in str(excinfo.value)
+
+
+def test_request_raw_omits_rate_limit_metadata_when_not_rate_limited(monkeypatch):
+    monkeypatch.setattr(
+        github.requests,
+        "request",
+        Mock(
+            return_value=MockResponse(
+                json_data={"message": "Not Found"}, status_code=404
+            )
+        ),
+    )
+
+    with pytest.raises(RuntimeError) as excinfo:
+        github._request("GET", "/repos/octocat/missing")
+
+    assert "retry_after" not in str(excinfo.value)
+    assert "rate_limit_reset" not in str(excinfo.value)
+
+
+@pytest.mark.parametrize(
+    "limit, expected",
+    [
+        (0, 1),
+        (1, 1),
+        (30, 30),
+        (100, 100),
+        (101, 100),
+        (-5, 1),
+        ("not-a-number", 30),  # falls back to the default, then clamps
+    ],
+)
+def test_clamp_limit_boundaries(limit, expected):
+    assert github._clamp_limit(limit) == expected
 
 
 def test_search_repositories_returns_summaries(monkeypatch):
@@ -313,16 +404,21 @@ def test_list_issues_sends_non_default_state_and_labels(monkeypatch):
     monkeypatch.setattr(github.requests, "request", mock_request)
 
     github.github_list_issues(
-        "octocat/Hello-World", state="closed", labels="bug,urgent", limit=5
+        "octocat/Hello-World", state="closed", labels="bug,urgent", limit=5, page=2
     )
 
+    assert mock_request.call_args.kwargs["method"] == "GET"
     assert mock_request.call_args.kwargs["url"] == (
         f"{github.GITHUB_BASE_URL}/repos/octocat/Hello-World/issues"
+    )
+    assert mock_request.call_args.kwargs["timeout"] == github.DEFAULT_TIMEOUT_SECONDS
+    assert mock_request.call_args.kwargs["headers"]["Authorization"] == (
+        "Bearer access-token"
     )
     assert mock_request.call_args.kwargs["params"] == {
         "state": "closed",
         "per_page": github.MAX_PER_PAGE,
-        "page": 1,
+        "page": 2,
         "labels": "bug,urgent",
     }
 
@@ -330,7 +426,8 @@ def test_list_issues_sends_non_default_state_and_labels(monkeypatch):
 def test_list_issues_follows_pages_when_first_page_is_all_pull_requests(monkeypatch):
     """A PR-heavy (or all-PR) first page must not be reported as "no more
     issues" -- github_list_issues has to keep paging until it either fills
-    the requested limit or GitHub runs out of pages."""
+    the requested limit or GitHub runs out of pages (confirmed here via the
+    Link header, since the second page is genuinely the last one)."""
     first_page = [
         {
             "number": i,
@@ -343,8 +440,11 @@ def test_list_issues_follows_pages_when_first_page_is_all_pull_requests(monkeypa
     second_page = [{"number": 200, "title": "a real issue", "labels": []}]
     mock_request = Mock(
         side_effect=[
-            MockResponse(json_data=first_page),
-            MockResponse(json_data=second_page),
+            MockResponse(
+                json_data=first_page,
+                headers={"Link": '<https://api.github.com/x?page=2>; rel="next"'},
+            ),
+            MockResponse(json_data=second_page),  # no Link header -- last page
         ]
     )
     monkeypatch.setattr(github.requests, "request", mock_request)
@@ -354,6 +454,7 @@ def test_list_issues_follows_pages_when_first_page_is_all_pull_requests(monkeypa
     assert result["status"] == "success"
     assert [issue["number"] for issue in result["issues"]] == [200]
     assert result["truncated"] is False
+    assert result["next_page"] is None
     assert mock_request.call_count == 2
     first_call, second_call = mock_request.call_args_list
     assert first_call.kwargs["params"]["page"] == 1
@@ -373,12 +474,101 @@ def test_list_issues_reports_truncated_when_limit_reached_mid_page(monkeypatch):
     assert result["status"] == "success"
     assert len(result["issues"]) == 3
     assert result["truncated"] is True
+    # A mid-page limit hit has no page-aligned continuation to offer --
+    # GitHub's pagination can't resume partway through a page.
+    assert result["next_page"] is None
+
+
+def test_list_issues_trailing_prs_after_limit_do_not_count_as_truncation(monkeypatch):
+    """Hitting the limit with only pull requests left on the final page is
+    not a truncation -- PRs are excluded from the result anyway, so nothing
+    the caller asked for was left behind."""
+    page = [
+        {"number": 1, "title": "issue 1", "labels": []},
+        {"number": 2, "title": "issue 2", "labels": []},
+        {
+            "number": 3,
+            "title": "pr 3",
+            "labels": [],
+            "pull_request": {"url": "https://api.github.com/x"},
+        },
+    ]
+    monkeypatch.setattr(
+        github.requests,
+        "request",
+        Mock(return_value=MockResponse(json_data=page)),  # no Link header
+    )
+
+    result = json.loads(github.github_list_issues("octocat/Hello-World", limit=2))
+
+    assert result["status"] == "success"
+    assert len(result["issues"]) == 2
+    assert result["truncated"] is False
+    assert result["next_page"] is None
+
+
+def test_list_issues_trailing_prs_after_limit_still_offer_next_page(monkeypatch):
+    """Same trailing-PRs-only shape, but with a next page confirmed by the
+    Link header: the page-boundary continuation is lossless (no real issue
+    was left behind on this page), so next_page must be offered."""
+    page = [
+        {"number": 1, "title": "issue 1", "labels": []},
+        {
+            "number": 2,
+            "title": "pr 2",
+            "labels": [],
+            "pull_request": {"url": "https://api.github.com/x"},
+        },
+    ]
+    monkeypatch.setattr(
+        github.requests,
+        "request",
+        Mock(
+            return_value=MockResponse(
+                json_data=page,
+                headers={"Link": '<https://api.github.com/x?page=2>; rel="next"'},
+            )
+        ),
+    )
+
+    result = json.loads(github.github_list_issues("octocat/Hello-World", limit=1))
+
+    assert result["status"] == "success"
+    assert len(result["issues"]) == 1
+    assert result["truncated"] is True
+    assert result["next_page"] == 2
+
+
+def test_list_issues_full_final_page_without_next_link_is_not_truncated(monkeypatch):
+    """A page that happens to come back exactly MAX_PER_PAGE long is not
+    itself proof more pages exist -- only the Link header's absent "next"
+    rel proves this genuinely was the last page. Regression test for the
+    previous length-based heuristic falsely marking this truncated."""
+    page = [
+        {"number": i, "title": f"issue {i}", "labels": []}
+        for i in range(1, github.MAX_PER_PAGE + 1)
+    ]
+    monkeypatch.setattr(
+        github.requests,
+        "request",
+        Mock(return_value=MockResponse(json_data=page)),  # no Link header
+    )
+
+    result = json.loads(
+        github.github_list_issues("octocat/Hello-World", limit=github.MAX_PER_PAGE)
+    )
+
+    assert result["status"] == "success"
+    assert len(result["issues"]) == github.MAX_PER_PAGE
+    assert result["truncated"] is False
+    assert result["next_page"] is None
 
 
 def test_list_issues_stops_at_max_pages_and_reports_truncated(monkeypatch):
-    """When every page is entirely pull requests, the outer loop must still
-    terminate at MAX_ISSUE_PAGES (not loop forever) and report truncated,
-    since real issues might exist on pages beyond the bound."""
+    """When every page is entirely pull requests and the Link header still
+    reports more pages exist, the outer loop must still terminate at
+    MAX_ISSUE_PAGES (not loop forever) and report truncated with the page
+    to continue from."""
     pr_only_page = [
         {
             "number": i,
@@ -388,7 +578,12 @@ def test_list_issues_stops_at_max_pages_and_reports_truncated(monkeypatch):
         }
         for i in range(1, github.MAX_PER_PAGE + 1)
     ]
-    mock_request = Mock(return_value=MockResponse(json_data=pr_only_page))
+    mock_request = Mock(
+        return_value=MockResponse(
+            json_data=pr_only_page,
+            headers={"Link": '<https://api.github.com/x?page=2>; rel="next"'},
+        )
+    )
     monkeypatch.setattr(github.requests, "request", mock_request)
 
     result = json.loads(github.github_list_issues("octocat/Hello-World", limit=5))
@@ -396,16 +591,57 @@ def test_list_issues_stops_at_max_pages_and_reports_truncated(monkeypatch):
     assert result["status"] == "success"
     assert result["issues"] == []
     assert result["truncated"] is True
+    assert result["next_page"] == github.MAX_ISSUE_PAGES + 1
+
+
+def test_list_issues_starts_from_specified_page(monkeypatch):
+    mock_request = Mock(
+        return_value=MockResponse(
+            json_data=[{"number": 1, "title": "issue", "labels": []}]
+        )
+    )
+    monkeypatch.setattr(github.requests, "request", mock_request)
+
+    github.github_list_issues("octocat/Hello-World", page=3)
+
+    assert mock_request.call_args.kwargs["params"]["page"] == 3
+
+
+def test_list_issues_returns_next_page_when_more_full_pages_remain(monkeypatch):
+    page = [
+        {"number": i, "title": f"issue {i}", "labels": []}
+        for i in range(1, github.MAX_PER_PAGE + 1)
+    ]
+    monkeypatch.setattr(
+        github.requests,
+        "request",
+        Mock(
+            return_value=MockResponse(
+                json_data=page,
+                headers={"Link": '<https://api.github.com/x?page=6>; rel="next"'},
+            )
+        ),
+    )
+
+    result = json.loads(
+        github.github_list_issues(
+            "octocat/Hello-World", limit=github.MAX_PER_PAGE, page=5
+        )
+    )
+
+    assert result["status"] == "success"
+    assert result["truncated"] is True
+    assert result["next_page"] == 6
 
 
 def test_list_issues_preserves_partial_results_on_mid_pagination_failure(monkeypatch):
     """A rate limit (or any transient error) on page 2+ must not discard the
     issues already collected from page 1, matching slack.py's channel
     listing precedent for the same failure mode."""
-    # A full (100-item), half-PR page: the requested limit (clamped to 100)
-    # isn't satisfied by the 50 real issues it yields, and it isn't short
-    # either -- so the loop must actually attempt page 2 (which then fails)
-    # instead of stopping after page 1 for either reason.
+    # A full (100-item), half-PR page whose Link header reports a next page
+    # -- the requested limit (clamped to 100) isn't satisfied by the 50 real
+    # issues it yields, so the loop must actually attempt page 2 (which then
+    # fails) instead of stopping after page 1.
     first_page = [
         {
             "number": i,
@@ -421,7 +657,10 @@ def test_list_issues_preserves_partial_results_on_mid_pagination_failure(monkeyp
     ]
     mock_request = Mock(
         side_effect=[
-            MockResponse(json_data=first_page),
+            MockResponse(
+                json_data=first_page,
+                headers={"Link": '<https://api.github.com/x?page=2>; rel="next"'},
+            ),
             MockResponse(json_data={"message": "rate limited"}, status_code=429),
         ]
     )
@@ -432,6 +671,9 @@ def test_list_issues_preserves_partial_results_on_mid_pagination_failure(monkeyp
     assert result["status"] == "success"
     assert len(result["issues"]) == github.MAX_PER_PAGE // 2
     assert result["truncated"] is True
+    # The failed page is the continuation point -- page 1's Link header
+    # confirmed page 2 exists, so a retry can resume there.
+    assert result["next_page"] == 2
     assert "rate limited" in result["error"]
     assert mock_request.call_count == 2
 
@@ -638,6 +880,40 @@ def test_get_file_contents_decodes_base64_file(monkeypatch):
     assert result["status"] == "success"
     assert result["type"] == "file"
     assert result["content"] == "print('hi')\n"
+    assert result["encoding"] == "utf-8"
+
+
+def test_get_file_contents_returns_raw_base64_for_non_utf8_content(monkeypatch):
+    """A binary (non-UTF-8) file must not be silently corrupted into
+    replacement characters while still reporting success -- return the
+    original base64 with an explicit encoding marker instead."""
+    binary_bytes = b"\x89PNG\r\n\x1a\n\x00\x01\xff\xfe"
+    encoded = base64.b64encode(binary_bytes).decode()
+    monkeypatch.setattr(
+        github.requests,
+        "request",
+        Mock(
+            return_value=MockResponse(
+                json_data={
+                    "type": "file",
+                    "path": "image.png",
+                    "sha": "def456",
+                    "size": len(binary_bytes),
+                    "encoding": "base64",
+                    "content": encoded,
+                }
+            )
+        ),
+    )
+
+    result = json.loads(
+        github.github_get_file_contents("octocat/Hello-World", "image.png")
+    )
+
+    assert result["status"] == "success"
+    assert result["encoding"] == "base64"
+    assert result["content"] == encoded
+    assert "�" not in result["content"]
 
 
 def test_get_file_contents_sends_ref_param_when_provided(monkeypatch):
@@ -738,13 +1014,14 @@ def test_get_file_contents_accepts_empty_path_for_repo_root(monkeypatch):
         "/",
         "//",
         "src/../etc",  # dot-segment traversal attempt within a path
-        "src/main.py?x=y",  # query-string injection within a path segment
     ],
 )
 def test_get_file_contents_rejects_malformed_path(path, monkeypatch):
-    """Leading/trailing/consecutive slashes, dot-segments, and reserved
-    characters must be rejected outright, not silently interpolated into a
-    malformed request URL."""
+    """Leading/trailing/consecutive slashes and dot-segments must be
+    rejected outright, not silently interpolated into a malformed request
+    URL. '?'/'#' are deliberately not tested here -- unlike owner/repo,
+    those are legitimate filename characters; see the percent-encoding
+    test below."""
     mock_request = Mock()
     monkeypatch.setattr(github.requests, "request", mock_request)
 
@@ -774,6 +1051,31 @@ def test_get_file_contents_percent_encodes_path_segments(monkeypatch):
 
     assert result["status"] == "success"
     assert mock_request.call_args.kwargs["url"].endswith("/contents/docs/my%20notes.md")
+
+
+def test_get_file_contents_percent_encodes_question_mark_and_hash_in_path(monkeypatch):
+    """Regression test: '?'/'#' in a filename must be percent-encoded and
+    the request allowed to proceed, not rejected as if they were injection
+    attempts (they were previously indistinguishable from the owner/repo
+    validator's stricter rule)."""
+    mock_request = Mock(
+        return_value=MockResponse(
+            json_data={
+                "type": "file",
+                "path": "docs/why?.md",
+                "encoding": "utf-8",
+                "content": "hi",
+            }
+        )
+    )
+    monkeypatch.setattr(github.requests, "request", mock_request)
+
+    result = json.loads(
+        github.github_get_file_contents("octocat/Hello-World", "docs/why?.md")
+    )
+
+    assert result["status"] == "success"
+    assert mock_request.call_args.kwargs["url"].endswith("/contents/docs/why%3F.md")
 
 
 def test_get_file_contents_reports_error_for_oversized_file(monkeypatch):

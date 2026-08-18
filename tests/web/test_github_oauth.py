@@ -50,7 +50,13 @@ def db_session(tmp_path):
             transport="oauth",
             provider_name="github",
             category="Development",
-            oauth_scopes=["repo", "read:org", "user:email"],
+            # read:org was dropped from the canonical registry (no tool
+            # calls an organization endpoint) -- kept in sync here too,
+            # even though get_app_by_id overlays the canonical registry's
+            # oauth_scopes for this builtin app_id regardless of this row's
+            # value (see test_generic_oauth_login.py's
+            # test_github_login_requests_exact_canonical_scope).
+            oauth_scopes=["repo", "user:email"],
             is_visible_in_connector=True,
             launch_config={
                 "command": "python",
@@ -105,7 +111,7 @@ def test_github_callback_requests_json_and_sends_secret_in_body(
             {
                 "access_token": "github-token",
                 "token_type": "bearer",
-                "scope": "repo,read:org,user:email",
+                "scope": "repo,user:email",
             }
         )
     )

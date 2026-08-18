@@ -231,6 +231,51 @@ def test_meta_login_uses_comma_separated_canonical_scopes_for_builtin_app(
     ]
 
 
+def test_github_login_requests_exact_canonical_scope(db_session):
+    """The requested scope must be exactly the provider's default_scopes
+    ("read:user") merged with the github app row's canonical oauth_scopes
+    ("repo", "user:email", sorted) -- read:org must NOT reappear even if a
+    stale/incorrect DB row still lists it, since get_app_by_id overlays the
+    canonical registry's oauth_scopes for a builtin app_id regardless of
+    what is persisted."""
+    db, user = db_session
+    token = _token_for(user)
+    db.add(
+        PublicMCPApp(
+            app_id="github",
+            name="GitHub",
+            description="GitHub connector",
+            transport="oauth",
+            provider_name="github",
+            category="Development",
+            # Deliberately stale/wrong to prove the registry, not this
+            # row's oauth_scopes, is what actually gets requested.
+            oauth_scopes=["repo", "read:org", "user:email"],
+            is_visible_in_connector=True,
+            launch_config={},
+        )
+    )
+    db.commit()
+
+    provider = _provider(
+        auth_url="https://github.com/login/oauth/authorize",
+        default_scopes=["read:user"],
+        redirect_uri="https://app.example.com/api/auth/github/callback",
+    )
+
+    resp = generic_oauth_login(
+        provider="github",
+        token=token,
+        app_id="github",
+        redirect=None,
+        db=db,
+        db_provider=provider,
+    )
+    qs = parse_qs(urlparse(_location(resp)).query)
+
+    assert qs["scope"] == ["read:user repo user:email"]
+
+
 def test_hubspot_login_sends_tier_gated_scopes_as_optional(db_session):
     """business-intelligence, marketing-email, and marketing.campaigns.read
     are all gated on a Marketing Hub tier above Free/CRM-only - requesting

@@ -87,7 +87,7 @@ def _github_app_row() -> dict[str, object]:
     return {
         "app_id": APP_ID,
         "name": "GitHub",
-        "description": "Connect to GitHub to search repositories and code, read and create issues and pull requests, comment, and browse file contents and commit history.",
+        "description": "Connect to GitHub to search repositories and code, read and create issues and pull requests, comment, and browse file contents and commit history. Grants access to every repository (public and private) the connected account can access -- there is no per-repository selection.",
         "icon": "https://www.google.com/s2/favicons?domain=github.com&sz=128",
         "transport": "oauth",
         "provider_name": "github",

@@ -12,6 +12,7 @@ from ...language import (
     OUTPUT_LANGUAGE_METADATA_KEY,
     OUTPUT_LANGUAGE_SOURCE_METADATA_KEY,
     OUTPUT_LANGUAGE_SOURCE_PLAN,
+    detect_prose_script_mismatch,
     detect_response_language_script_mismatch,
     normalize_response_language_label,
     output_language_policy,
@@ -27,6 +28,8 @@ from ..base import (
 logger = logging.getLogger(__name__)
 
 MAX_PLAN_TOOL_CALL_ATTEMPTS = 2
+LATEST_USER_REQUEST_PREVIEW_LIMIT = 1200
+_MIDDLE_TRUNCATION_MARKER = "\n... [middle truncated] ...\n"
 PLAN_GENERATION_REQUIRED_TOOL_MESSAGE = (
     "Plan generation failed because the model did not return the required "
     "planning tool call. Please retry."
@@ -534,6 +537,8 @@ class LLMPlanGenerator(PlanGenerator):
         }
 
     def _build_prompt(self, request: PlanGenerationRequest) -> str:
+        latest_request = latest_user_text(request.context) or ""
+        expected_language, language_source = self._language_authority(request.context)
         latest_messages = [
             {"role": message.role, "content": message.content}
             for message in request.context.messages
@@ -542,12 +547,11 @@ class LLMPlanGenerator(PlanGenerator):
         payload = {
             "execution_id": request.execution_id,
             "replan": request.replan,
-            "latest_user_request": truncate_prompt_preview(
-                latest_user_text(request.context) or "",
-                limit=1200,
-            ),
+            "latest_user_request": self._latest_user_request_preview(latest_request),
             "output_language_policy": output_language_policy(
-                request.context.metadata.get(OUTPUT_LANGUAGE_METADATA_KEY)
+                None
+                if language_source == OUTPUT_LANGUAGE_SOURCE_PLAN
+                else expected_language
             ),
             "messages": latest_messages,
             "retrieved_memory_context": request.context.metadata.get(
@@ -569,6 +573,34 @@ class LLMPlanGenerator(PlanGenerator):
         return json.dumps(payload, ensure_ascii=False)
 
     @staticmethod
+    def _latest_user_request_preview(request_text: str) -> str:
+        """Keep both ends of a bounded request so trailing directives survive."""
+        stripped = request_text.strip()
+        if len(stripped) <= LATEST_USER_REQUEST_PREVIEW_LIMIT:
+            return stripped
+        available = LATEST_USER_REQUEST_PREVIEW_LIMIT - len(_MIDDLE_TRUNCATION_MARKER)
+        head_length = available // 2
+        tail_length = available - head_length
+        return (
+            stripped[:head_length] + _MIDDLE_TRUNCATION_MARKER + stripped[-tail_length:]
+        )
+
+    @staticmethod
+    def _language_authority(context: Any) -> tuple[str, str]:
+        """Return language value/source and migrate legacy direct-DAG metadata."""
+        metadata = getattr(context, "metadata", None)
+        if not isinstance(metadata, dict):
+            return "", ""
+        language = normalize_response_language_label(
+            str(metadata.get(OUTPUT_LANGUAGE_METADATA_KEY) or "")
+        )
+        source = str(metadata.get(OUTPUT_LANGUAGE_SOURCE_METADATA_KEY) or "")
+        if language and not source and metadata.get("pattern") == "dag_plan_execute":
+            source = OUTPUT_LANGUAGE_SOURCE_PLAN
+            metadata[OUTPUT_LANGUAGE_SOURCE_METADATA_KEY] = source
+        return language, source
+
+    @staticmethod
     def _validate_plan_language(
         *,
         context: Any,
@@ -584,16 +616,8 @@ class LLMPlanGenerator(PlanGenerator):
                 response_language="",
             )
 
-        metadata = getattr(context, "metadata", None)
-        expected_language = normalize_response_language_label(
-            str(metadata.get(OUTPUT_LANGUAGE_METADATA_KEY) or "")
-            if isinstance(metadata, dict)
-            else ""
-        )
-        language_source = (
-            str(metadata.get(OUTPUT_LANGUAGE_SOURCE_METADATA_KEY) or "")
-            if isinstance(metadata, dict)
-            else ""
+        expected_language, language_source = LLMPlanGenerator._language_authority(
+            context
         )
         if (
             expected_language
@@ -620,15 +644,28 @@ class LLMPlanGenerator(PlanGenerator):
             mismatch = detect_response_language_script_mismatch(
                 response_language, prose
             )
-            if mismatch is None:
+            if mismatch is not None:
+                raise PlanLanguageMismatchError(
+                    f"response_language is {response_language}, but plan step "
+                    f"{step.id!r} has predominantly {mismatch.observed_script}-script "
+                    f"user-facing text ({mismatch.han_count} Han characters versus "
+                    f"{mismatch.latin_count} Latin letters).",
+                    response_language=response_language,
+                )
+
+            if expected_language and language_source != OUTPUT_LANGUAGE_SOURCE_PLAN:
                 continue
-            raise PlanLanguageMismatchError(
-                f"response_language is {response_language}, but plan step "
-                f"{step.id!r} has predominantly {mismatch.observed_script}-script "
-                f"user-facing text ({mismatch.han_count} Han characters versus "
-                f"{mismatch.latin_count} Latin letters).",
-                response_language=response_language,
+            request_mismatch = detect_prose_script_mismatch(
+                latest_user_text(context) or "",
+                prose,
             )
+            if request_mismatch is not None:
+                raise PlanLanguageMismatchError(
+                    f"plan step {step.id!r} has predominantly "
+                    f"{request_mismatch.observed_script}-script user-facing text, "
+                    "which does not match the latest user request.",
+                    response_language="",
+                )
 
     @staticmethod
     def _apply_response_language(context: Any, plan_arguments: dict[str, Any]) -> None:
@@ -640,7 +677,7 @@ class LLMPlanGenerator(PlanGenerator):
         metadata = getattr(context, "metadata", None)
         if not isinstance(metadata, dict):
             return
-        language_source = str(metadata.get(OUTPUT_LANGUAGE_SOURCE_METADATA_KEY) or "")
+        _, language_source = LLMPlanGenerator._language_authority(context)
         if (
             not metadata.get(OUTPUT_LANGUAGE_METADATA_KEY)
             or language_source == OUTPUT_LANGUAGE_SOURCE_PLAN

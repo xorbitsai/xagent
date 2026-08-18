@@ -4,6 +4,7 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
+from fastapi import HTTPException
 from sqlalchemy import event
 
 from xagent.web.api import workforces as workforces_api
@@ -1754,6 +1755,7 @@ def test_from_prompt_creates_all_staged_agents_atomically(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     headers = _admin_headers()
+    invalidated_agent_ids: list[int] = []
 
     async def fake_generate_workforce_creation_plan(
         _db: Any,
@@ -1770,7 +1772,7 @@ def test_from_prompt_creates_all_staged_agents_atomically(
                 "instructions": "Delegate research and synthesize the evidence.",
                 "tool_categories": [],
                 "skills": [],
-                "execution_mode": "think",
+                "execution_mode": "auto",
             },
             "created_agents": [
                 {
@@ -1780,7 +1782,7 @@ def test_from_prompt_creates_all_staged_agents_atomically(
                     "instructions": "Delegate research and synthesize the evidence.",
                     "tool_categories": [],
                     "skills": [],
-                    "execution_mode": "think",
+                    "execution_mode": "auto",
                 },
                 {
                     "agent_ref": "new:2",
@@ -1824,6 +1826,17 @@ def test_from_prompt_creates_all_staged_agents_atomically(
         fake_generate_workforce_creation_plan,
     )
 
+    def flaky_cache_invalidation(_user_id: int, agent_id: int) -> None:
+        invalidated_agent_ids.append(agent_id)
+        if len(invalidated_agent_ids) == 2:
+            raise RuntimeError("cache unavailable")
+
+    monkeypatch.setattr(
+        workforce_creator,
+        "invalidate_agent_cache",
+        flaky_cache_invalidation,
+    )
+
     response = client.post(
         "/api/workforces/from-prompt",
         headers=headers,
@@ -1845,6 +1858,7 @@ def test_from_prompt_creates_all_staged_agents_atomically(
         manager_agent = db.get(Agent, payload["manager"]["id"])
         assert manager_agent is not None
         assert manager_agent.instructions
+        assert manager_agent.execution_mode == "auto"
         assert manager_agent.origin == AgentOrigin.WORKFORCE_GENERATED_MANAGER.value
         worker_agents = (
             db.query(Agent)
@@ -1865,6 +1879,67 @@ def test_from_prompt_creates_all_staged_agents_atomically(
             ("user", "Create a research workforce for product analysis"),
             ("assistant", "The requested Workforce is ready."),
         ]
+        persisted_agent_ids = {
+            int(manager_agent.id),
+            *(int(agent.id) for agent in worker_agents),
+        }
+        assert set(invalidated_agent_ids) == persisted_agent_ids
+        assert len(invalidated_agent_ids) == 3
+    finally:
+        db.close()
+
+
+@pytest.mark.asyncio
+async def test_from_prompt_rechecks_create_permission_after_remote_builder(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _admin_headers()
+    db = _direct_db_session()
+    try:
+        user = db.query(User).filter(User.username == "admin").one()
+
+        async def fake_generate_workforce_creation_plan(
+            _db: Any,
+            _user: User,
+            _prompt: str,
+        ) -> dict[str, Any]:
+            return {"name": "Must Not Be Persisted"}
+
+        monkeypatch.setattr(
+            workforce_creator,
+            "generate_workforce_creation_plan",
+            fake_generate_workforce_creation_plan,
+        )
+        monkeypatch.setattr(
+            workforce_creator,
+            "resolve_create_scope",
+            lambda _db, _user: ("user", str(user.id)),
+        )
+        permission_checks = iter([True, False])
+        monkeypatch.setattr(
+            workforce_creator,
+            "can_create_workforce",
+            lambda *_args: next(permission_checks),
+        )
+
+        with pytest.raises(HTTPException) as exc_info:
+            await workforce_creator.create_workforce_from_prompt(
+                db,
+                user,
+                prompt="Create a Workforce.",
+            )
+
+        assert exc_info.value.status_code == 403
+        assert exc_info.value.detail == {
+            "code": workforce_creator.WORKFORCE_CREATE_ACCESS_DENIED_CODE,
+            "message": "Access denied",
+        }
+        assert (
+            db.query(Workforce)
+            .filter(Workforce.name == "Must Not Be Persisted")
+            .count()
+            == 0
+        )
     finally:
         db.close()
 

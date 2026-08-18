@@ -3536,7 +3536,8 @@ async def test_llm_plan_generator_allows_technical_identifiers_in_chinese_step()
                     "task": "查询货运状态并向用户解释结果",
                     "description": (
                         "调用 https://api.example.com/v1/shipments/{shipment_id}，"
-                        "读取 response_language 和 HTTPStatus 字段后说明结果。"
+                        "读取 response_language_configuration_endpoint、"
+                        "HTTPStatusCode 和 PascalCaseIdentifier 字段后说明结果。"
                     ),
                     "dependencies": [],
                     "tool_names": [],
@@ -3596,6 +3597,230 @@ async def test_direct_dag_replan_refreshes_inferred_response_language() -> None:
         context.metadata[OUTPUT_LANGUAGE_SOURCE_METADATA_KEY]
         == OUTPUT_LANGUAGE_SOURCE_PLAN
     )
+    prompt_payload = json.loads(llm.calls[0]["messages"][1]["content"])
+    assert "Output language: English" not in prompt_payload["output_language_policy"]
+
+
+@pytest.mark.asyncio
+async def test_initial_direct_dag_retries_self_consistent_wrong_language() -> None:
+    generator = LLMPlanGenerator()
+    context = ExecutionContext(execution_id="dag-initial-request-language")
+    context.add_user_message("请研究市场数据，并用中文总结所有关键发现和风险。")
+    llm = SequenceLLM(
+        [
+            plan_tool_response(
+                [
+                    {
+                        "id": "research",
+                        "task": "Research the market data and summarize every finding",
+                        "description": (
+                            "Produce a detailed English analysis of the evidence, "
+                            "risks, limitations, and recommended next actions."
+                        ),
+                        "dependencies": [],
+                        "tool_names": [],
+                    }
+                ],
+                response_language="English",
+            ),
+            plan_tool_response(
+                [
+                    {
+                        "id": "research",
+                        "task": "研究市场数据并总结所有关键发现",
+                        "description": "使用中文分析证据、风险、限制和后续建议。",
+                        "dependencies": [],
+                        "tool_names": [],
+                    }
+                ],
+                response_language="Simplified Chinese",
+            ),
+        ]
+    )
+
+    plan = await generator.generate_plan(
+        request=PlanGenerationRequest(
+            context=context,
+            execution_id=context.execution_id,
+            available_tool_names=[],
+        ),
+        llm=llm,
+    )
+
+    assert llm.calls == 2
+    assert plan.steps[0].task == "研究市场数据并总结所有关键发现"
+    assert (
+        "does not match the latest user request" in llm.seen_messages[1][-1]["content"]
+    )
+
+
+@pytest.mark.asyncio
+async def test_direct_dag_migrates_legacy_language_source_on_replan() -> None:
+    generator = LLMPlanGenerator()
+    context = ExecutionContext(execution_id="dag-legacy-language-source")
+    context.metadata["pattern"] = "dag_plan_execute"
+    context.metadata[OUTPUT_LANGUAGE_METADATA_KEY] = "English"
+    context.add_user_message("请改用中文继续完成后续工作。")
+    llm = PlanLLM(
+        plan_tool_response(
+            [
+                {
+                    "id": "continue",
+                    "task": "根据最新要求继续完成后续工作",
+                    "description": "使用中文完成重新规划和最终说明。",
+                    "dependencies": [],
+                    "tool_names": [],
+                }
+            ],
+            response_language="Simplified Chinese",
+        )
+    )
+
+    await generator.generate_plan(
+        request=PlanGenerationRequest(
+            context=context,
+            execution_id=context.execution_id,
+            replan=True,
+            previous_plan=ExecutionPlan(steps=[]),
+            available_tool_names=[],
+        ),
+        llm=llm,
+    )
+
+    assert (
+        context.metadata[OUTPUT_LANGUAGE_SOURCE_METADATA_KEY]
+        == OUTPUT_LANGUAGE_SOURCE_PLAN
+    )
+    assert context.metadata[OUTPUT_LANGUAGE_METADATA_KEY] == "Simplified Chinese"
+    prompt_payload = json.loads(llm.calls[0]["messages"][1]["content"])
+    assert "Output language: English" not in prompt_payload["output_language_policy"]
+
+
+@pytest.mark.asyncio
+async def test_direct_dag_preserves_legacy_auto_language_authority() -> None:
+    generator = LLMPlanGenerator()
+    context = ExecutionContext(execution_id="dag-legacy-auto-language-source")
+    context.metadata["pattern"] = "auto"
+    context.metadata[OUTPUT_LANGUAGE_METADATA_KEY] = "English"
+    context.add_user_message("请继续处理这个任务。")
+    llm = SequenceLLM(
+        [
+            plan_tool_response(
+                [
+                    {
+                        "id": "continue",
+                        "task": "继续处理任务并用中文回答",
+                        "description": "根据请求继续完成任务。",
+                        "dependencies": [],
+                        "tool_names": [],
+                    }
+                ],
+                response_language="Simplified Chinese",
+            ),
+            plan_tool_response(
+                [
+                    {
+                        "id": "continue",
+                        "task": "Continue processing the task in English",
+                        "description": (
+                            "Follow the authoritative router language and complete "
+                            "the remaining work."
+                        ),
+                        "dependencies": [],
+                        "tool_names": [],
+                    }
+                ],
+                response_language="English",
+            ),
+        ]
+    )
+
+    await generator.generate_plan(
+        request=PlanGenerationRequest(
+            context=context,
+            execution_id=context.execution_id,
+            replan=True,
+            previous_plan=ExecutionPlan(steps=[]),
+            available_tool_names=[],
+        ),
+        llm=llm,
+    )
+
+    assert llm.calls == 2
+    assert OUTPUT_LANGUAGE_SOURCE_METADATA_KEY not in context.metadata
+    assert context.metadata[OUTPUT_LANGUAGE_METADATA_KEY] == "English"
+
+
+@pytest.mark.asyncio
+async def test_dag_request_preview_preserves_trailing_language_directive() -> None:
+    generator = LLMPlanGenerator()
+    context = ExecutionContext(execution_id="dag-language-directive-tail")
+    directive = "Please write every plan field and the final answer in English."
+    context.add_user_message(
+        "请分析以下很长的背景材料。" + "背景资料" * 400 + directive
+    )
+    llm = PlanLLM(
+        plan_tool_response(
+            [
+                {
+                    "id": "analyze",
+                    "task": "Analyze the supplied background material",
+                    "description": (
+                        "Return a detailed English analysis with findings and risks."
+                    ),
+                    "dependencies": [],
+                    "tool_names": [],
+                }
+            ],
+            response_language="English",
+        )
+    )
+
+    await generator.generate_plan(
+        request=PlanGenerationRequest(
+            context=context,
+            execution_id=context.execution_id,
+            available_tool_names=[],
+        ),
+        llm=llm,
+    )
+
+    prompt_payload = json.loads(llm.calls[0]["messages"][1]["content"])
+    assert "middle truncated" in prompt_payload["latest_user_request"]
+    assert prompt_payload["latest_user_request"].endswith(directive)
+    assert len(prompt_payload["latest_user_request"]) == 1200
+
+
+@pytest.mark.asyncio
+async def test_dag_accepts_safe_nonlisted_language_label() -> None:
+    generator = LLMPlanGenerator()
+    context = ExecutionContext(execution_id="dag-khmer-language")
+    context.add_user_message("សូមរៀបចំផែនការខ្លីមួយសម្រាប់ការងារនេះ។")
+    llm = PlanLLM(
+        plan_tool_response(
+            [
+                {
+                    "id": "plan",
+                    "task": "រៀបចំផែនការនិងបង្ហាញលទ្ធផលចុងក្រោយ",
+                    "dependencies": [],
+                    "tool_names": [],
+                }
+            ],
+            response_language="Khmer",
+        )
+    )
+
+    plan = await generator.generate_plan(
+        request=PlanGenerationRequest(
+            context=context,
+            execution_id=context.execution_id,
+            available_tool_names=[],
+        ),
+        llm=llm,
+    )
+
+    assert plan.steps[0].id == "plan"
+    assert context.metadata[OUTPUT_LANGUAGE_METADATA_KEY] == "Khmer"
 
 
 @pytest.mark.asyncio

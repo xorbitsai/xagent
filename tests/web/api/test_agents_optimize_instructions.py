@@ -7,7 +7,10 @@ from xagent.web.api import agents as agents_api
 
 
 class _FakeLLM:
-    def __init__(self, content: str = "请用中文回答用户问题。") -> None:
+    def __init__(
+        self,
+        content: str = "请准确理解用户问题，核验关键事实，并用清晰的中文作答。",
+    ) -> None:
         self.content = content
         self.calls: list[dict[str, Any]] = []
 
@@ -44,7 +47,11 @@ async def test_optimize_instructions_preserves_draft_language(
         object(),
     )
 
-    assert result == {"optimized_instructions": "请用中文回答用户问题。"}
+    assert result == {
+        "optimized_instructions": (
+            "请准确理解用户问题，核验关键事实，并用清晰的中文作答。"
+        )
+    }
     system_prompt = llm.calls[0]["messages"][0]["content"]
     assert "Preserve the draft's natural language" in system_prompt
     assert "same natural language as the draft instructions" in system_prompt

@@ -31,6 +31,8 @@ _EXECUTION_MODES = frozenset({"flash", "balanced", "think", "auto"})
 MAX_WORKFORCE_PROMPT_LENGTH = 12_000
 MAX_WORKFORCE_BUILDER_AGENTS = 16
 MAX_WORKFORCE_BUILDER_WORKERS = 32
+MAX_WORKFORCE_BUILDER_EXISTING_AGENTS = 200
+MAX_WORKFORCE_BUILDER_AGENT_RESULTS = 50
 WORKFORCE_BUILDER_MAX_ITERATIONS = 48
 
 
@@ -313,10 +315,18 @@ class ListAvailableAgentsArgs(BaseModel):
         default=None,
         description="Optional name or description filter for published agents.",
     )
+    limit: int = Field(
+        default=20,
+        ge=1,
+        le=MAX_WORKFORCE_BUILDER_AGENT_RESULTS,
+        description="Maximum matching agents to return for this search.",
+    )
 
 
 class ListAvailableAgentsResult(BaseModel):
     agents: list[dict[str, Any]]
+    total_matches: int
+    has_more: bool
 
 
 class ListAvailableAgentsTool(AbstractBaseTool):
@@ -360,7 +370,12 @@ class ListAvailableAgentsTool(AbstractBaseTool):
                 if query
                 in f"{agent.get('name', '')} {agent.get('description', '')}".casefold()
             ]
-        return ListAvailableAgentsResult(agents=agents).model_dump()
+        limit = int(args.get("limit") or 20)
+        return ListAvailableAgentsResult(
+            agents=agents[:limit],
+            total_matches=len(agents),
+            has_more=len(agents) > limit,
+        ).model_dump()
 
 
 class StageAgentArgs(BaseModel):
@@ -583,6 +598,10 @@ async def build_workforce_prompt_plan(
         enable_workspace=False,
         react_max_iterations=WORKFORCE_BUILDER_MAX_ITERATIONS,
     )
+    # This is a closed staging runtime. Generic skill discovery/load_skill is
+    # intentionally disabled; capability metadata is exposed only by the two
+    # explicit listing tools above.
+    service.set_allowed_skills([])
     try:
         result = await service.execute_task(prompt, task_id=execution_id)
     except Exception as exc:

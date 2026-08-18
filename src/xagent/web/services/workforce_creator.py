@@ -30,6 +30,7 @@ from .workforce_names import (
     resolve_unique_workforce_name,
 )
 from .workforce_prompt_runtime import (
+    MAX_WORKFORCE_BUILDER_EXISTING_AGENTS,
     WorkforcePromptBuilderError,
     WorkforcePromptBuilderUnavailableError,
     build_workforce_prompt_plan,
@@ -53,7 +54,11 @@ async def generate_workforce_creation_plan(
     prompt: str,
 ) -> dict[str, Any]:
     normalized_prompt = normalize_text(prompt, "prompt", required=True)
-    agents = list_accessible_published_agents(db, user)
+    agents = list_accessible_published_agents(
+        db,
+        user,
+        limit=MAX_WORKFORCE_BUILDER_EXISTING_AGENTS,
+    )
     available_agents = [
         {
             "agent_id": int(agent.id),
@@ -604,11 +609,22 @@ def invalidate_workforce_creation_cache(
     workforce_id: int,
     additional_agent_ids: list[int] | None = None,
 ) -> None:
-    del workforce_id
-    invalidate_agent_cache(owner_user_id, manager_agent_id)
-    for agent_id in additional_agent_ids or []:
-        if agent_id != manager_agent_id:
+    agent_ids = [manager_agent_id]
+    agent_ids.extend(
+        agent_id
+        for agent_id in additional_agent_ids or []
+        if agent_id != manager_agent_id
+    )
+    for agent_id in dict.fromkeys(agent_ids):
+        try:
             invalidate_agent_cache(owner_user_id, agent_id)
+        except Exception:
+            logger.warning(
+                "Post-commit cache invalidation failed for Workforce %s agent %s",
+                workforce_id,
+                agent_id,
+                exc_info=True,
+            )
 
 
 def _existing_agent_id_from_ref(agent_ref: str) -> int:
@@ -632,6 +648,18 @@ async def create_workforce_from_prompt(
     owner_user_id = int(user.id)
     try:
         plan = await generate_workforce_creation_plan(db, user, normalized_prompt)
+        # The remote builder can run long enough for team/quota policy to
+        # change. Re-resolve the write scope in the transaction that performs
+        # the inserts instead of persisting under the stale preflight tuple.
+        scope_type, scope_id = resolve_create_scope(db, user)
+        if not can_create_workforce(db, user, scope_type, scope_id):
+            raise HTTPException(
+                status_code=403,
+                detail={
+                    "code": WORKFORCE_CREATE_ACCESS_DENIED_CODE,
+                    "message": "Access denied",
+                },
+            )
         name = resolve_unique_workforce_name(
             db,
             scope_type=scope_type,

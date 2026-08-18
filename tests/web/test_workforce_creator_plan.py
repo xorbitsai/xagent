@@ -16,6 +16,8 @@ from xagent.web.services.workforce_creator import (
 )
 from xagent.web.services.workforce_prompt_runtime import (
     MAX_WORKFORCE_BUILDER_AGENTS,
+    MAX_WORKFORCE_BUILDER_EXISTING_AGENTS,
+    ListAvailableAgentsTool,
     WorkforcePromptBuilderError,
     WorkforcePromptBuilderState,
     WorkforcePromptBuilderUnavailableError,
@@ -217,6 +219,33 @@ def test_builder_language_validation_rejects_wrong_script_before_persistence() -
         )
 
 
+def test_builder_language_validation_allows_explicit_target_language() -> None:
+    _validate_builder_plan_language(
+        prompt=(
+            "Create a research Workforce, but write every persisted field and "
+            "the final response in Chinese."
+        ),
+        plan={
+            "name": "市场研究工作组",
+            "description": "研究市场数据并总结关键结论。",
+            "created_agents": [
+                {
+                    "name": "市场研究员",
+                    "description": "收集并核验市场证据。",
+                    "instructions": "检索可靠资料并用中文总结。",
+                }
+            ],
+            "workers": [
+                {
+                    "alias": "市场研究",
+                    "assignment_instructions": "收集并核验市场证据。",
+                }
+            ],
+            "builder_response": "工作组已完成配置。",
+        },
+    )
+
+
 @pytest.mark.asyncio
 async def test_react_builder_creates_multiple_agents_before_workforce() -> None:
     llm = FakeLLM(
@@ -303,9 +332,39 @@ async def test_react_builder_creates_multiple_agents_before_workforce() -> None:
     assert plan["builder_response"] == "工作组已完成配置。"
     assert len(llm.calls) == 6
     first_tool_names = {schema["function"]["name"] for schema in llm.calls[0]["tools"]}
-    assert {"create_agent", "create_workforce", "list_available_agents"} <= (
-        first_tool_names
+    assert first_tool_names == {
+        "ask_user_question",
+        "create_agent",
+        "create_workforce",
+        "final_answer",
+        "list_available_agents",
+        "list_available_skills",
+        "list_tool_categories",
+        "send_message",
+    }
+
+
+@pytest.mark.asyncio
+async def test_available_agent_tool_bounds_each_model_result() -> None:
+    state = WorkforcePromptBuilderState.from_agents(
+        [
+            {
+                "agent_id": index,
+                "name": f"Research Agent {index}",
+                "description": "Collects and verifies evidence.",
+                "status": "published",
+            }
+            for index in range(1, 31)
+        ]
     )
+
+    result = await ListAvailableAgentsTool(state).run_json_async(
+        {"query": "research", "limit": 7}
+    )
+
+    assert len(result["agents"]) == 7
+    assert result["total_matches"] == 30
+    assert result["has_more"] is True
 
 
 @pytest.mark.asyncio
@@ -341,6 +400,9 @@ async def test_react_builder_wraps_execution_boundary_failure(
 ) -> None:
     class UnavailableAgentService:
         def __init__(self, **_kwargs: Any) -> None:
+            pass
+
+        def set_allowed_skills(self, _allowed_skills: list[str]) -> None:
             pass
 
         async def execute_task(self, *_args: Any, **_kwargs: Any) -> dict[str, Any]:
@@ -380,7 +442,7 @@ async def test_generation_fails_clearly_when_no_model_is_configured(
     monkeypatch.setattr(
         workforce_creator,
         "list_accessible_published_agents",
-        lambda _db, _user: [],
+        lambda _db, _user, **_kwargs: [],
     )
 
     with pytest.raises(HTTPException) as exc_info:
@@ -400,6 +462,7 @@ async def test_generation_releases_database_before_react_runtime(
 ) -> None:
     llm = FakeLLM([])
     events: list[str] = []
+    catalog_limits: list[int | None] = []
 
     class ModelStorage:
         def __init__(self, _db: object) -> None:
@@ -421,17 +484,27 @@ async def test_generation_releases_database_before_react_runtime(
         return {"name": "Research Workforce"}
 
     monkeypatch.setattr(workforce_creator, "UserAwareModelStorage", ModelStorage)
-    monkeypatch.setattr(
-        workforce_creator,
-        "list_accessible_published_agents",
-        lambda _db, _user: [
+
+    def list_agents(
+        _db: object,
+        _user: object,
+        *,
+        limit: int | None = None,
+    ) -> list[SimpleNamespace]:
+        catalog_limits.append(limit)
+        return [
             SimpleNamespace(
                 id=12,
                 name="Researcher",
                 description="Collects evidence.",
                 status=SimpleNamespace(value="published"),
             )
-        ],
+        ]
+
+    monkeypatch.setattr(
+        workforce_creator,
+        "list_accessible_published_agents",
+        list_agents,
     )
     monkeypatch.setattr(
         workforce_creator,
@@ -452,6 +525,7 @@ async def test_generation_releases_database_before_react_runtime(
 
     assert result == {"name": "Research Workforce"}
     assert events == ["release", "runtime"]
+    assert catalog_limits == [MAX_WORKFORCE_BUILDER_EXISTING_AGENTS]
 
 
 @pytest.mark.asyncio
@@ -474,7 +548,7 @@ async def test_generation_maps_runtime_boundary_failure_to_stable_503(
     monkeypatch.setattr(
         workforce_creator,
         "list_accessible_published_agents",
-        lambda _db, _user: [],
+        lambda _db, _user, **_kwargs: [],
     )
     monkeypatch.setattr(
         workforce_creator,

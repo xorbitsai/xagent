@@ -276,7 +276,7 @@ def plan_tool_response(
                 "function": {
                     "name": "generate_execution_plan",
                     "arguments": json.dumps(
-                        {"steps": steps, "response_language": response_language}
+                        {"response_language": response_language, "steps": steps}
                     ),
                 },
             }
@@ -3197,6 +3197,8 @@ async def test_llm_plan_generator_builds_plan_from_model_json() -> None:
     assert "must be concrete and action-specific" in system_prompt
     assert "suggested execution tool scope" in system_prompt
     assert "response_language" in system_prompt
+    assert "Emit response_language before steps" in system_prompt
+    assert "Determine it from latest_user_request" in system_prompt
     assert "output_language_policy field" in system_prompt
     assert "Plan language rules" in system_prompt
     assert "Simplified Chinese" in system_prompt
@@ -3210,9 +3212,10 @@ async def test_llm_plan_generator_builds_plan_from_model_json() -> None:
     assert "Any final synthesis or final result produced from the plan" in system_prompt
     assert "completed step results" in system_prompt
     prompt_payload = json.loads(llm.calls[0]["messages"][1]["content"])
-    assert "current_user_request" not in prompt_payload
+    assert prompt_payload["latest_user_request"] == "Create a short plan"
     assert "output_language_policy" in prompt_payload
     plan_schema = llm.calls[0]["tools"][0]["function"]["parameters"]["properties"]
+    assert list(plan_schema)[:2] == ["response_language", "steps"]
     assert "response_language" in plan_schema
     assert "Simplified Chinese" in plan_schema["response_language"]["description"]
     assert "Traditional Chinese" in plan_schema["response_language"]["description"]
@@ -3223,6 +3226,10 @@ async def test_llm_plan_generator_builds_plan_from_model_json() -> None:
         "response_language"
         in llm.calls[0]["tools"][0]["function"]["parameters"]["required"]
     )
+    assert llm.calls[0]["tools"][0]["function"]["parameters"]["required"][:2] == [
+        "response_language",
+        "steps",
+    ]
     assert context.metadata["output_language"] == "English"
     assert llm.calls[0]["tool_choice"] == "required"
     assert llm.calls[0]["thinking"] == {"type": "disabled", "enable": False}
@@ -3378,6 +3385,110 @@ async def test_llm_plan_generator_retries_invalid_tool_arguments() -> None:
     assert "invalid JSON" in retry_message
     assert "not json at all" in retry_message
     assert "one complete valid JSON object" in retry_message
+
+
+@pytest.mark.asyncio
+async def test_llm_plan_generator_retries_plan_prose_language_mismatch() -> None:
+    generator = LLMPlanGenerator()
+    context = ExecutionContext(execution_id="dag-llm-plan-language-mismatch")
+    context.add_user_message("hi")
+    llm = SequenceLLM(
+        [
+            plan_tool_response(
+                [
+                    {
+                        "id": "greet",
+                        "task": "回应用户问候",
+                        "description": (
+                            "识别到用户发送了简单的问候消息，直接以英文友好地"
+                            "回应用户，并询问用户是否有具体需求。"
+                        ),
+                        "dependencies": [],
+                        "termination_condition": "生成英文问候后调用 final_answer。",
+                        "completion_evidence": "已经生成友好的英文问候。",
+                        "tool_names": [],
+                    }
+                ],
+                response_language="English",
+            ),
+            plan_tool_response(
+                [
+                    {
+                        "id": "greet",
+                        "task": "Respond to the user's greeting",
+                        "description": (
+                            "Reply to the greeting in friendly English and ask how "
+                            "the user can be helped."
+                        ),
+                        "dependencies": [],
+                        "termination_condition": (
+                            "Stop after returning the English greeting in final_answer."
+                        ),
+                        "completion_evidence": (
+                            "A friendly English greeting was returned."
+                        ),
+                        "tool_names": [],
+                    }
+                ],
+                response_language="English",
+            ),
+        ]
+    )
+
+    plan = await generator.generate_plan(
+        request=PlanGenerationRequest(
+            context=context,
+            execution_id=context.execution_id,
+            available_tool_names=[],
+        ),
+        llm=llm,
+    )
+
+    assert llm.calls == 2
+    assert plan.steps[0].task == "Respond to the user's greeting"
+    assert context.metadata["output_language"] == "English"
+    retry_message = llm.seen_messages[1][-1]["content"]
+    assert "did not match its language declaration" in retry_message
+    assert "Emit response_language first" in retry_message
+    assert "set it to English" in retry_message
+
+
+@pytest.mark.asyncio
+async def test_llm_plan_generator_allows_short_han_proper_noun_in_english_plan() -> (
+    None
+):
+    generator = LLMPlanGenerator()
+    context = ExecutionContext(execution_id="dag-llm-plan-language-proper-noun")
+    context.add_user_message("Track 中国国航 shipment CA123")
+    llm = PlanLLM(
+        plan_tool_response(
+            [
+                {
+                    "id": "track",
+                    "task": "Track 中国国航 shipment CA123",
+                    "description": "Look up the shipment and report its status.",
+                    "dependencies": [],
+                    "termination_condition": (
+                        "Stop after returning the carrier-reported status."
+                    ),
+                    "completion_evidence": "The shipment status was returned.",
+                    "tool_names": [],
+                }
+            ],
+            response_language="English",
+        )
+    )
+
+    plan = await generator.generate_plan(
+        request=PlanGenerationRequest(
+            context=context,
+            execution_id=context.execution_id,
+            available_tool_names=[],
+        ),
+        llm=llm,
+    )
+
+    assert plan.steps[0].task == "Track 中国国航 shipment CA123"
 
 
 @pytest.mark.asyncio

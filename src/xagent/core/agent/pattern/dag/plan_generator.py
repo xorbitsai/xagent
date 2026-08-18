@@ -7,6 +7,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
+from ...context.enrichment import latest_user_text
 from ...language import (
     OUTPUT_LANGUAGE_METADATA_KEY,
     normalize_response_language_label,
@@ -38,6 +39,14 @@ class PlanToolArgumentsError(ValueError):
 
     def __init__(self, message: str, *, arguments: str | None = None) -> None:
         self.arguments = arguments
+        super().__init__(message)
+
+
+class PlanLanguageMismatchError(PlanValidationError):
+    """Raised when generated plan prose contradicts its language declaration."""
+
+    def __init__(self, message: str, *, response_language: str) -> None:
+        self.response_language = response_language
         super().__init__(message)
 
 
@@ -303,6 +312,9 @@ class LLMPlanGenerator(PlanGenerator):
                     "user-facing prose should use for this request. If the "
                     "user prompt includes an output_language_policy field, "
                     "follow it exactly and make response_language match it. "
+                    "Emit response_language before steps in the tool arguments so "
+                    "it anchors every plan field generated after it. Determine it "
+                    "from latest_user_request, not from the surrounding context. "
                     "For Chinese requests, response_language must be Simplified "
                     "Chinese or Traditional Chinese to match the request script; "
                     "do not use generic Chinese. "
@@ -368,9 +380,13 @@ class LLMPlanGenerator(PlanGenerator):
                     exc,
                 )
                 continue
-            self._apply_response_language(request.context, plan_arguments)
             try:
                 plan = coerce_execution_plan(plan_arguments)
+                self._validate_plan_language(
+                    context=request.context,
+                    plan=plan,
+                    plan_arguments=plan_arguments,
+                )
             except PlanValidationError as exc:
                 if attempt + 1 >= MAX_PLAN_TOOL_CALL_ATTEMPTS:
                     raise
@@ -382,6 +398,7 @@ class LLMPlanGenerator(PlanGenerator):
                     exc,
                 )
                 continue
+            self._apply_response_language(request.context, plan_arguments)
             return self._filter_suggested_tools(
                 plan=plan,
                 available_tool_names=request.available_tool_names,
@@ -425,6 +442,25 @@ class LLMPlanGenerator(PlanGenerator):
                 "parameters": {
                     "type": "object",
                     "properties": {
+                        # Keep response_language first. Tool arguments are emitted
+                        # autoregressively by supported models, so committing to the
+                        # language before generating plan prose gives every later
+                        # field a concrete anchor without another LLM call.
+                        "response_language": {
+                            "type": "string",
+                            "description": (
+                                "Emit this field before steps. Natural language to "
+                                "use for all plan text, user-facing prose, and "
+                                "persisted tool-argument prose produced by the plan, "
+                                "for example English, Simplified Chinese, Traditional "
+                                "Chinese, or Spanish. Determine it only from "
+                                "latest_user_request and any explicit target-language "
+                                "instruction in that request. For Chinese requests, "
+                                "choose Simplified Chinese or Traditional Chinese to "
+                                "match the request script; do not use generic Chinese. "
+                                "If output_language_policy names a language, match it."
+                            ),
+                        },
                         "steps": {
                             "type": "array",
                             "items": {
@@ -487,21 +523,8 @@ class LLMPlanGenerator(PlanGenerator):
                                 "additionalProperties": False,
                             },
                         },
-                        "response_language": {
-                            "type": "string",
-                            "description": (
-                                "Natural language to use for all plan text, "
-                                "user-facing prose, and persisted tool-argument "
-                                "prose produced by the plan, for example English, "
-                                "Simplified Chinese, Traditional Chinese, or Spanish. "
-                                "For Chinese requests, choose Simplified Chinese or "
-                                "Traditional Chinese to match the request script; do "
-                                "not use generic Chinese. If output_language_policy "
-                                "is provided in the prompt, match that policy."
-                            ),
-                        },
                     },
-                    "required": ["steps", "response_language"],
+                    "required": ["response_language", "steps"],
                     "additionalProperties": False,
                 },
             },
@@ -516,6 +539,10 @@ class LLMPlanGenerator(PlanGenerator):
         payload = {
             "execution_id": request.execution_id,
             "replan": request.replan,
+            "latest_user_request": truncate_prompt_preview(
+                latest_user_text(request.context) or "",
+                limit=1200,
+            ),
             "output_language_policy": output_language_policy(
                 request.context.metadata.get(OUTPUT_LANGUAGE_METADATA_KEY)
             ),
@@ -537,6 +564,126 @@ class LLMPlanGenerator(PlanGenerator):
             "completion_feedback": request.completion_feedback,
         }
         return json.dumps(payload, ensure_ascii=False)
+
+    @staticmethod
+    def _validate_plan_language(
+        *,
+        context: Any,
+        plan: ExecutionPlan,
+        plan_arguments: dict[str, Any],
+    ) -> None:
+        response_language = normalize_response_language_label(
+            str(plan_arguments.get("response_language") or "")
+        )
+        if not response_language:
+            raise PlanLanguageMismatchError(
+                "response_language must be a supported, non-empty language label.",
+                response_language="",
+            )
+
+        metadata = getattr(context, "metadata", None)
+        expected_language = normalize_response_language_label(
+            str(metadata.get(OUTPUT_LANGUAGE_METADATA_KEY) or "")
+            if isinstance(metadata, dict)
+            else ""
+        )
+        if expected_language and response_language != expected_language:
+            raise PlanLanguageMismatchError(
+                f"response_language is {response_language}, but the current output "
+                f"language policy requires {expected_language}.",
+                response_language=expected_language,
+            )
+
+        prose = "\n".join(
+            value
+            for step in plan.steps
+            for value in (
+                step.task,
+                step.description or "",
+                step.termination_condition or "",
+                step.completion_evidence or "",
+            )
+            if value
+        )
+        han_count = sum(
+            1
+            for character in prose
+            if "\u3400" <= character <= "\u4dbf"
+            or "\u4e00" <= character <= "\u9fff"
+            or "\uf900" <= character <= "\ufaff"
+        )
+        latin_count = sum(
+            1 for character in prose if character.isascii() and character.isalpha()
+        )
+
+        latin_script_languages = {
+            "Afrikaans",
+            "Basque",
+            "Brazilian Portuguese",
+            "Catalan",
+            "Croatian",
+            "Czech",
+            "Danish",
+            "Dutch",
+            "English",
+            "Estonian",
+            "European Portuguese",
+            "Filipino",
+            "Finnish",
+            "French",
+            "Galician",
+            "German",
+            "Hungarian",
+            "Icelandic",
+            "Indonesian",
+            "Irish",
+            "Italian",
+            "Latvian",
+            "Lithuanian",
+            "Malay",
+            "Norwegian",
+            "Polish",
+            "Portuguese",
+            "Romanian",
+            "Slovak",
+            "Slovenian",
+            "Spanish",
+            "Swahili",
+            "Swedish",
+            "Tagalog",
+            "Turkish",
+            "Vietnamese",
+            "Welsh",
+        }
+        chinese_languages = {
+            "Cantonese",
+            "Chinese",
+            "Mandarin Chinese",
+            "Simplified Chinese",
+            "Traditional Chinese",
+        }
+        if (
+            response_language in latin_script_languages
+            and han_count >= 8
+            and han_count > latin_count
+        ):
+            raise PlanLanguageMismatchError(
+                f"response_language is {response_language}, but the plan's "
+                f"user-facing fields are predominantly Han-script text "
+                f"({han_count} Han characters versus {latin_count} Latin letters).",
+                response_language=response_language,
+            )
+        if (
+            response_language in chinese_languages
+            and latin_count >= 20
+            and latin_count > han_count * 2
+        ):
+            raise PlanLanguageMismatchError(
+                f"response_language is {response_language}, but the plan's "
+                f"user-facing fields are predominantly Latin-script text "
+                f"({latin_count} Latin letters versus {han_count} Han characters).",
+                response_language=response_language,
+            )
 
     @staticmethod
     def _apply_response_language(context: Any, plan_arguments: dict[str, Any]) -> None:
@@ -580,6 +727,16 @@ class LLMPlanGenerator(PlanGenerator):
         )
 
     def _invalid_plan_retry_feedback(self, error: PlanValidationError) -> str:
+        if isinstance(error, PlanLanguageMismatchError):
+            language = error.response_language or "the supported target language"
+            return (
+                f"The previous {self.PLAN_TOOL_NAME} call returned plan prose that "
+                f"did not match its language declaration: {error} Call "
+                f"{self.PLAN_TOOL_NAME} again exactly once. Emit response_language "
+                f"first, set it to {language}, and write every step task, "
+                "description, termination_condition, and completion_evidence in "
+                f"{language}."
+            )
         return (
             f"The previous {self.PLAN_TOOL_NAME} call returned an invalid DAG "
             f"plan: {error} Call {self.PLAN_TOOL_NAME} again exactly once with "

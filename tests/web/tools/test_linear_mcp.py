@@ -228,6 +228,61 @@ def test_search_issues_filters_by_title_query_client_side(monkeypatch):
     assert result["issues"][0]["identifier"] == "ENG-1"
 
 
+def test_search_issues_reports_truncated_via_page_info_without_query(monkeypatch):
+    """With no client-side query filter, `issues` is always bounded to
+    max_results by the `first` fetch itself, so hasNextPage from the server
+    is the only real signal that more results exist beyond this page."""
+    monkeypatch.setattr(
+        linear.requests,
+        "post",
+        Mock(
+            return_value=MockResponse(
+                json_data={
+                    "data": {
+                        "issues": {
+                            "nodes": [
+                                {"id": "i1", "identifier": "ENG-1", "title": "Bug"}
+                            ],
+                            "pageInfo": {"hasNextPage": True},
+                        }
+                    }
+                }
+            )
+        ),
+    )
+
+    result = json.loads(linear.linear_search_issues(limit=1))
+
+    assert result["status"] == "success"
+    assert result["truncated"] is True
+
+
+def test_search_issues_not_truncated_when_no_next_page(monkeypatch):
+    monkeypatch.setattr(
+        linear.requests,
+        "post",
+        Mock(
+            return_value=MockResponse(
+                json_data={
+                    "data": {
+                        "issues": {
+                            "nodes": [
+                                {"id": "i1", "identifier": "ENG-1", "title": "Bug"}
+                            ],
+                            "pageInfo": {"hasNextPage": False},
+                        }
+                    }
+                }
+            )
+        ),
+    )
+
+    result = json.loads(linear.linear_search_issues())
+
+    assert result["status"] == "success"
+    assert result["truncated"] is False
+
+
 def test_get_issue_returns_not_found_error_when_missing(monkeypatch):
     monkeypatch.setattr(
         linear.requests,
@@ -327,12 +382,64 @@ def test_update_issue_omits_priority_when_left_default(monkeypatch):
     assert sent_input == {"stateId": "s1"}
 
 
-def test_add_comment_returns_created_comment(monkeypatch):
-    monkeypatch.setattr(
-        linear.requests,
-        "post",
-        Mock(
-            return_value=MockResponse(
+def test_update_issue_unassigns_on_explicit_empty_assignee_id(monkeypatch):
+    """assignee_id="" (explicitly passed) must clear the assignee (send
+    None), distinct from leaving assignee_id unset entirely (which omits
+    "assigneeId" from the input so it is left untouched)."""
+    mock_post = Mock(
+        return_value=MockResponse(
+            json_data={
+                "data": {
+                    "issueUpdate": {
+                        "success": True,
+                        "issue": {"id": "i1", "identifier": "ENG-1"},
+                    }
+                }
+            }
+        )
+    )
+    monkeypatch.setattr(linear.requests, "post", mock_post)
+
+    result = json.loads(linear.linear_update_issue("ENG-1", assignee_id=""))
+
+    assert result["status"] == "success"
+    sent_input = mock_post.call_args.kwargs["json"]["variables"]["input"]
+    assert sent_input == {"assigneeId": None}
+
+
+def test_update_issue_can_clear_description(monkeypatch):
+    mock_post = Mock(
+        return_value=MockResponse(
+            json_data={
+                "data": {
+                    "issueUpdate": {
+                        "success": True,
+                        "issue": {"id": "i1", "identifier": "ENG-1"},
+                    }
+                }
+            }
+        )
+    )
+    monkeypatch.setattr(linear.requests, "post", mock_post)
+
+    result = json.loads(linear.linear_update_issue("ENG-1", description=""))
+
+    assert result["status"] == "success"
+    sent_input = mock_post.call_args.kwargs["json"]["variables"]["input"]
+    assert sent_input == {"description": ""}
+
+
+_ISSUE_UUID = "12345678-1234-1234-1234-123456789012"
+
+
+def test_add_comment_resolves_human_readable_identifier_to_uuid_first(monkeypatch):
+    """commentCreate's input.issueId only accepts the real UUID (unlike the
+    top-level issue(id: ...) query field, which accepts either) — a
+    non-UUID issue_id must be resolved via a lookup before the mutation."""
+    mock_post = Mock(
+        side_effect=[
+            MockResponse(json_data={"data": {"issue": {"id": _ISSUE_UUID}}}),
+            MockResponse(
                 json_data={
                     "data": {
                         "commentCreate": {
@@ -341,14 +448,58 @@ def test_add_comment_returns_created_comment(monkeypatch):
                         }
                     }
                 }
-            )
-        ),
+            ),
+        ]
     )
+    monkeypatch.setattr(linear.requests, "post", mock_post)
 
     result = json.loads(linear.linear_add_comment("ENG-1", "Looks good"))
 
     assert result["status"] == "success"
     assert result["comment"]["body"] == "Looks good"
+    assert mock_post.call_count == 2
+    resolve_call, create_call = mock_post.call_args_list
+    assert resolve_call.kwargs["json"]["variables"] == {"id": "ENG-1"}
+    assert create_call.kwargs["json"]["variables"]["input"] == {
+        "issueId": _ISSUE_UUID,
+        "body": "Looks good",
+    }
+
+
+def test_add_comment_skips_resolution_when_issue_id_is_already_a_uuid(monkeypatch):
+    mock_post = Mock(
+        return_value=MockResponse(
+            json_data={
+                "data": {
+                    "commentCreate": {
+                        "success": True,
+                        "comment": {"id": "c1", "body": "Looks good"},
+                    }
+                }
+            }
+        )
+    )
+    monkeypatch.setattr(linear.requests, "post", mock_post)
+
+    result = json.loads(linear.linear_add_comment(_ISSUE_UUID, "Looks good"))
+
+    assert result["status"] == "success"
+    assert mock_post.call_count == 1
+    sent_input = mock_post.call_args.kwargs["json"]["variables"]["input"]
+    assert sent_input["issueId"] == _ISSUE_UUID
+
+
+def test_add_comment_reports_error_when_identifier_does_not_resolve(monkeypatch):
+    monkeypatch.setattr(
+        linear.requests,
+        "post",
+        Mock(return_value=MockResponse(json_data={"data": {"issue": None}})),
+    )
+
+    result = json.loads(linear.linear_add_comment("ENG-999", "Looks good"))
+
+    assert result["status"] == "error"
+    assert "not found" in result["message"]
 
 
 def test_search_users_filters_by_name_or_email(monkeypatch):

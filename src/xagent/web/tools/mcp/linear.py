@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+import re
 from typing import Any
 
 import requests
@@ -23,6 +24,10 @@ MAX_LIMIT = 100
 # {"errors": [...]} GraphQL shape (e.g. an HTML gateway error page) must not
 # be forwarded to the LLM/logs verbatim and unbounded.
 MAX_ERROR_RESPONSE_TEXT_CHARS = 1000
+
+_UUID_PATTERN = re.compile(
+    r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+)
 
 
 def _success(**payload: Any) -> str:
@@ -91,6 +96,26 @@ def _graphql(query: str, variables: dict[str, Any] | None = None) -> dict[str, A
     if errors:
         raise RuntimeError(_graphql_errors_message(errors))
     return payload.get("data") or {}
+
+
+def _resolve_issue_uuid(issue_id: str) -> str:
+    """Resolve issue_id to its real UUID.
+
+    The top-level `issue(id: ...)` query field (used by linear_get_issue,
+    linear_list_comments, etc.) accepts either an issue's UUID or its
+    human-readable identifier (e.g. "ENG-123") — but mutation input types
+    that take an issueId (e.g. CommentCreateInput) only accept the UUID.
+    Callers of those mutations must resolve a human-readable identifier
+    first; an already-UUID issue_id is returned unchanged without a
+    round-trip.
+    """
+    if _UUID_PATTERN.match(issue_id):
+        return issue_id
+    data = _graphql("query($id: String!) { issue(id: $id) { id } }", {"id": issue_id})
+    issue = data.get("issue")
+    if not issue:
+        raise ValueError(f"Issue '{issue_id}' not found")
+    return str(issue["id"])
 
 
 @mcp.tool()
@@ -264,10 +289,13 @@ def linear_search_issues(
 
         graphql_query = (
             f"query($first: Int!{filter_signature}) {{ issues(first: $first"
-            f"{filter_clause}) {{ nodes {{ {_ISSUE_FIELDS} }} }} }}"
+            f"{filter_clause}) {{ nodes {{ {_ISSUE_FIELDS} }}"
+            " pageInfo { hasNextPage } } }"
         )
         data = _graphql(graphql_query, variables)
-        issues = (data.get("issues") or {}).get("nodes") or []
+        issues_data = data.get("issues") or {}
+        issues = issues_data.get("nodes") or []
+        has_next_page = bool((issues_data.get("pageInfo") or {}).get("hasNextPage"))
 
         needle = query.strip().lower()
         if needle:
@@ -276,7 +304,16 @@ def linear_search_issues(
                 for issue in issues
                 if needle in str(issue.get("title") or "").lower()
             ]
-        truncated = len(issues) > max_results
+            # The unfiltered fetch (up to MAX_LIMIT) may itself contain more
+            # title matches than max_results, independent of whether the
+            # server has further pages beyond that fetch.
+            truncated = has_next_page or len(issues) > max_results
+        else:
+            # With no client-side filter, `issues` is bounded exactly to
+            # max_results by the `first: max_results` fetch above, so
+            # len(issues) > max_results can never be true — hasNextPage from
+            # the server is the only real signal of more results.
+            truncated = has_next_page
         return _success(issues=issues[:max_results], truncated=truncated)
     except Exception as e:
         logger.error(f"Error searching Linear issues: {e}")
@@ -349,32 +386,33 @@ def linear_create_issue(
 @mcp.tool()
 def linear_update_issue(
     issue_id: str,
-    title: str = "",
-    description: str = "",
-    state_id: str = "",
-    assignee_id: str = "",
-    priority: int = -1,
+    title: str | None = None,
+    description: str | None = None,
+    state_id: str | None = None,
+    assignee_id: str | None = None,
+    priority: int | None = None,
 ) -> str:
     """
-    Update an existing issue. Only the fields provided are changed.
+    Update an existing issue. Only the fields explicitly provided are
+    changed; leave a parameter unset (None) to leave that field untouched.
     issue_id: an issue UUID or its human-readable identifier (e.g. "ENG-123").
     state_id: a workflow state id from linear_list_workflow_states, to move
     the issue (e.g. to "Done").
-    assignee_id: a user id from linear_search_users, to reassign the issue.
-    priority: 0 (no priority), 1 (urgent), 2 (high), 3 (normal), 4 (low) —
-    left unset (-1) by default so an omitted priority does not clear it.
+    assignee_id: a user id from linear_search_users, to reassign the issue —
+    pass an empty string to unassign it.
+    priority: 0 (no priority), 1 (urgent), 2 (high), 3 (normal), 4 (low).
     """
     try:
         issue_input: dict[str, Any] = {}
-        if title:
+        if title is not None:
             issue_input["title"] = title
-        if description:
+        if description is not None:
             issue_input["description"] = description
-        if state_id:
+        if state_id is not None:
             issue_input["stateId"] = state_id
-        if assignee_id:
-            issue_input["assigneeId"] = assignee_id
-        if priority >= 0:
+        if assignee_id is not None:
+            issue_input["assigneeId"] = assignee_id or None
+        if priority is not None:
             issue_input["priority"] = priority
         if not issue_input:
             return _error("No fields provided to update")
@@ -423,10 +461,11 @@ def linear_add_comment(issue_id: str, body: str) -> str:
     body: the comment text (Markdown supported).
     """
     try:
+        issue_uuid = _resolve_issue_uuid(issue_id)
         data = _graphql(
             "mutation($input: CommentCreateInput!) { commentCreate(input: $input)"
             " { success comment { id body createdAt } } }",
-            {"input": {"issueId": issue_id, "body": body}},
+            {"input": {"issueId": issue_uuid, "body": body}},
         )
         result = data.get("commentCreate") or {}
         if not result.get("success"):

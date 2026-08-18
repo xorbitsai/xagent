@@ -954,6 +954,35 @@ def get_builtin_public_mcp_app_rows() -> list[dict[str, Any]]:
                 "env_mapping": {"JIRA_ACCESS_TOKEN": "access_token"},
             },
         },
+        {
+            "app_id": "stripe",
+            "name": "Stripe",
+            "description": "Connect to Stripe to look up customers, charges, invoices, and subscriptions, and issue refunds.",
+            "icon": "https://www.google.com/s2/favicons?domain=stripe.com&sz=128",
+            "transport": "stdio",
+            "provider_name": None,
+            "category": "Finance",
+            "oauth_scopes": None,
+            "is_visible_in_connector": True,
+            # Key-based (non-oauth), like aws/google-maps/posthog: Stripe's
+            # own OAuth flow (Connect "Standard accounts") is for a platform
+            # aggregating many *other* merchants' accounts, not for a single
+            # user granting a tool access to their own account -- Stripe's
+            # docs explicitly discourage it for new integrations, and since
+            # June 2021 a read_write OAuth connection fails outright if the
+            # account is already connected to another platform. A
+            # Restricted API Key (rk_live_.../rk_test_...) sidesteps both
+            # problems entirely and is what Stripe's own agent-toolkit/MCP
+            # server recommends for exactly this use case (see
+            # github.com/stripe/agent-toolkit tools/README.md) -- same
+            # no-review self-serve bar as an OAuth App, scoped to only the
+            # permissions the user grants it.
+            "launch_config": {
+                "command": "python",
+                "args": ["-m", "xagent.web.tools.mcp.stripe"],
+                "required_env": ["STRIPE_API_KEY"],
+            },
+        },
     ]
 
 

@@ -116,15 +116,6 @@ function TaskDetailContent() {
     return () => window.removeEventListener("keydown", handleKeyDown)
   }, [progressPanelOpen, handleCollapseProgressPanel])
 
-  const progressSteps: ProgressStepView[] = state.steps.map((step) => ({
-    id: step.id,
-    title: step.name,
-    description: step.description,
-    status: step.status,
-    startedAt: step.started_at,
-    completedAt: step.completed_at,
-  }))
-  const progressPanelVisible = progressPanelOpen && Boolean(state.dagExecution)
   // Deliberately keyed off the TASK's own status, not dagExecution.phase:
   // a single step failing (dag_step_failed) sets the whole dagExecution.phase
   // to "failed" even when the DAG goes on to replan and keep running, and the
@@ -135,6 +126,40 @@ function TaskDetailContent() {
   // in-flight dag_execution event. The task's own status is the one signal
   // that's actually authoritative for "this run is truly over."
   const isDagFinished = isTerminalTaskStatus(state.currentTask?.status)
+  // During a mid-run replan the old plan's steps are superseded but still
+  // sitting in state.steps (a replanning event carries no replacement list,
+  // and it's the SAME run, so nothing resets them) - the graph view already
+  // hides the old plan for this phase (task-conversation-panel.tsx's
+  // isPlanning), and the panel must apply the same policy rather than keep
+  // presenting superseded rows as if they were current. An empty list
+  // renders the panel's own planning/empty state; the rows come back with
+  // the replacement plan's first executing event. completion_assessment is
+  // deliberately NOT gated the same way: at that point the just-executed
+  // plan is still the current one (assessment may well conclude
+  // "completed"), so hiding it would blank the panel after every normal
+  // execution round.
+  //
+  // Excludes an already-finished task (isDagFinished): the backend's phase
+  // never advances out of "replanning" on its own once the task ends (a
+  // task can go terminal via a path - e.g. an assistant message settling the
+  // turn - that never syncs dagExecution.phase; a dropped/malformed
+  // executing-transition event leaves it stuck too), and ProgressPanel
+  // itself renders nothing at all for zero steps once endedAt is set (no
+  // spinner, no rows - see its own runEnded comment). Hiding here would then
+  // blank the whole panel body permanently instead of showing the run's last
+  // known steps, which is strictly worse than a rare stale-superseded-plan
+  // flash mid-replan.
+  const progressSteps: ProgressStepView[] = (state.dagExecution?.phase === "replanning" && !isDagFinished)
+    ? []
+    : state.steps.map((step) => ({
+      id: step.id,
+      title: step.name,
+      description: step.description,
+      status: step.status,
+      startedAt: step.started_at,
+      completedAt: step.completed_at,
+    }))
+  const progressPanelVisible = progressPanelOpen && Boolean(state.dagExecution)
   // dagTerminatedAt, not updatedAt: the latter is general task metadata that
   // keeps changing after this run ends for unrelated reasons (a title edit,
   // another field update via a later task_info refresh), which would make

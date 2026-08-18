@@ -2171,6 +2171,509 @@ describe("AppProvider websocket message routing", () => {
     expect(screen.getByTestId("steps-count").textContent).toBe("0")
   })
 
+  it("still resets a turn_id-LESS stale dagExecution when a task_completed clone races ahead of the ack", async () => {
+    // The no-turn_id twin of the clone-race test above: with no turn_id on
+    // either side, the reset guard falls back to comparing created_at (NOT
+    // object reference - the clone changes the reference while keeping
+    // created_at, which is exactly how a reference fallback wrongly read the
+    // clone as "something new arrived" and skipped the reset).
+    let acknowledgeDelivery: (() => void) | undefined
+    sendChatMessageMock.mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          acknowledgeDelivery = () =>
+            resolve({ client_message_id: "turn-2", turn_id: "turn-2" })
+        })
+    )
+
+    let sendTurnTwo: (() => Promise<void> | undefined) | undefined
+    let markTaskOneCompleted: (() => void) | undefined
+    function LegacyStaleCloneProbe() {
+      const { sendMessage, dispatch } = useApp()
+      sendTurnTwo = () => sendMessage("A plain follow-up", { clientMessageId: "turn-2" })
+      markTaskOneCompleted = () => {
+        dispatch({
+          type: "SET_CURRENT_TASK",
+          payload: {
+            id: "1",
+            title: "Test task",
+            status: "completed",
+            description: "Test task",
+            createdAt: "2026-05-27T05:00:00Z",
+            updatedAt: "2026-05-27T05:00:00Z",
+          },
+        })
+      }
+      return null
+    }
+
+    render(
+      <AppProvider token="token">
+        <SeedExistingTask />
+        <LegacyStaleCloneProbe />
+        <StateProbe />
+      </AppProvider>
+    )
+    const onMessage = webSocketOptions.current?.onMessage
+    expect(onMessage).toBeDefined()
+
+    // Turn 1's DAG finished - as a legacy event with NO turn_id.
+    act(() => {
+      markTaskOneCompleted?.()
+      onMessage?.({
+        type: "trace_event",
+        timestamp: "2026-05-27T05:00:02Z",
+        task_id: 1,
+        data: {
+          event_id: "dag-execution-1",
+          event_type: "dag_execution",
+          data: {
+            phase: "completed",
+            steps: [{ id: "step-one", name: "Step one", dependencies: [] }],
+          },
+        },
+      })
+    })
+    await waitFor(() => {
+      expect(screen.getByTestId("steps-count").textContent).toBe("1")
+    })
+    expect(screen.getByTestId("dag-turn-id").textContent).toBe("")
+
+    let delivery: Promise<void> | undefined
+    await act(async () => {
+      delivery = sendTurnTwo?.()
+      await new Promise((resolve) => setTimeout(resolve, 0))
+    })
+    expect(sendChatMessageMock).toHaveBeenCalledOnce()
+
+    // The racing task_completed clones the (no-id) dagExecution into a new
+    // object before the ack resolves.
+    act(() => {
+      onMessage?.({
+        type: "task_completed",
+        timestamp: "2026-05-27T05:00:03Z",
+        task_id: 1,
+        task: { id: 1, status: "completed" },
+        success: true,
+      } as TestWebSocketMessage)
+    })
+    await waitFor(() => {
+      expect(screen.getByTestId("dag-phase").textContent).toBe("completed")
+    })
+    expect(screen.getByTestId("steps-count").textContent).toBe("1")
+
+    await act(async () => {
+      acknowledgeDelivery?.()
+      await delivery
+    })
+    expect(screen.getByTestId("dag-phase").textContent).toBe("")
+    expect(screen.getByTestId("steps-count").textContent).toBe("0")
+  })
+
+  it("does not wipe a turn_id-less dagExecution that newly arrived from nothing during the ack await", async () => {
+    // The case the no-turn_id fallback exists to protect: nothing was in
+    // state when the send began, and the new turn's own (legacy, no-id) DAG
+    // events land before the ack resolves. created_at going from undefined
+    // to a value reads as "something new arrived" - the reset must skip.
+    let acknowledgeDelivery: (() => void) | undefined
+    sendChatMessageMock.mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          acknowledgeDelivery = () =>
+            resolve({ client_message_id: "turn-2", turn_id: "turn-2" })
+        })
+    )
+
+    let sendTurnTwo: (() => Promise<void> | undefined) | undefined
+    let markTaskOneCompleted: (() => void) | undefined
+    function FreshArrivalProbe() {
+      const { sendMessage, dispatch } = useApp()
+      sendTurnTwo = () => sendMessage("Kick off a new run", { clientMessageId: "turn-2" })
+      markTaskOneCompleted = () => {
+        dispatch({
+          type: "SET_CURRENT_TASK",
+          payload: {
+            id: "1",
+            title: "Test task",
+            status: "completed",
+            description: "Test task",
+            createdAt: "2026-05-27T05:00:00Z",
+            updatedAt: "2026-05-27T05:00:00Z",
+          },
+        })
+      }
+      return null
+    }
+
+    render(
+      <AppProvider token="token">
+        <SeedExistingTask />
+        <FreshArrivalProbe />
+        <StateProbe />
+      </AppProvider>
+    )
+    const onMessage = webSocketOptions.current?.onMessage
+    expect(onMessage).toBeDefined()
+
+    act(() => {
+      markTaskOneCompleted?.()
+    })
+    await waitFor(() => {
+      expect(screen.getByTestId("task-status").textContent).toBe("completed")
+    })
+    expect(screen.getByTestId("dag-phase").textContent).toBe("")
+
+    let delivery: Promise<void> | undefined
+    await act(async () => {
+      delivery = sendTurnTwo?.()
+      await new Promise((resolve) => setTimeout(resolve, 0))
+    })
+    expect(sendChatMessageMock).toHaveBeenCalledOnce()
+
+    // The new turn's own DAG starts broadcasting (legacy shape, no turn_id)
+    // before the ack resolves.
+    act(() => {
+      onMessage?.({
+        type: "trace_event",
+        timestamp: "2026-05-27T05:00:05Z",
+        task_id: 1,
+        data: {
+          event_id: "dag-execution-new",
+          event_type: "dag_execution",
+          data: {
+            phase: "planning",
+          },
+        },
+      })
+    })
+    await waitFor(() => {
+      expect(screen.getByTestId("dag-phase").textContent).toBe("planning")
+    })
+
+    await act(async () => {
+      acknowledgeDelivery?.()
+      await delivery
+    })
+    // The freshly-arrived run survived the ack's reset attempt.
+    expect(screen.getByTestId("dag-phase").textContent).toBe("planning")
+    expect(screen.getByTestId("dag-created-at").textContent).toBe("2026-05-27T05:00:05Z")
+  })
+
+  it("does not flip a task back to running when its own terminal event landed during the ack await", async () => {
+    // The optimistic terminal->running flip is a pre-send GUESS - a terminal
+    // event accepted during the await (a fast non-DAG turn completing before
+    // the ack resolves) is newer truth. Flipping over it would mark the
+    // finished run as running again and clear the dagTerminatedAt the
+    // reducer just stamped, unfreezing the Progress panel's elapsed clock.
+    let acknowledgeDelivery: (() => void) | undefined
+    sendChatMessageMock.mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          acknowledgeDelivery = () =>
+            resolve({ client_message_id: "turn-2", turn_id: "turn-2" })
+        })
+    )
+
+    let sendTurnTwo: (() => Promise<void> | undefined) | undefined
+    let markTaskOneFailed: (() => void) | undefined
+    function TerminalDuringAwaitProbe() {
+      const { sendMessage, dispatch } = useApp()
+      sendTurnTwo = () => sendMessage("Run it again", { clientMessageId: "turn-2" })
+      markTaskOneFailed = () => {
+        dispatch({
+          type: "SET_CURRENT_TASK",
+          payload: {
+            id: "1",
+            title: "Test task",
+            status: "failed",
+            description: "Test task",
+            createdAt: "2026-05-27T05:00:00Z",
+            updatedAt: "2026-05-27T05:00:00Z",
+          },
+        })
+      }
+      return null
+    }
+
+    render(
+      <AppProvider token="token">
+        <SeedExistingTask />
+        <TerminalDuringAwaitProbe />
+        <StateProbe />
+      </AppProvider>
+    )
+    const onMessage = webSocketOptions.current?.onMessage
+    expect(onMessage).toBeDefined()
+
+    act(() => {
+      markTaskOneFailed?.()
+    })
+    await waitFor(() => {
+      expect(screen.getByTestId("task-status").textContent).toBe("failed")
+    })
+
+    let delivery: Promise<void> | undefined
+    await act(async () => {
+      delivery = sendTurnTwo?.()
+      await new Promise((resolve) => setTimeout(resolve, 0))
+    })
+    expect(sendChatMessageMock).toHaveBeenCalledOnce()
+
+    // The new turn completes (fast non-DAG run) BEFORE the ack resolves.
+    act(() => {
+      onMessage?.({
+        type: "task_completed",
+        timestamp: "2026-05-27T05:00:07Z",
+        task_id: 1,
+        task: { id: 1, status: "completed" },
+        success: true,
+      } as TestWebSocketMessage)
+    })
+    await waitFor(() => {
+      expect(screen.getByTestId("task-status").textContent).toBe("completed")
+    })
+    expect(screen.getByTestId("task-dag-terminated-at").textContent).toBe("2026-05-27T05:00:07Z")
+
+    await act(async () => {
+      acknowledgeDelivery?.()
+      await delivery
+    })
+    // The ack must NOT override the newer terminal truth.
+    expect(screen.getByTestId("task-status").textContent).toBe("completed")
+    expect(screen.getByTestId("task-dag-terminated-at").textContent).toBe("2026-05-27T05:00:07Z")
+  })
+
+  it("lets a terminal event's own timestamp replace a provisional task-metadata dagTerminatedAt", async () => {
+    // Cold history load: the Task row arrives first, already terminal, and
+    // dagTerminatedAt gets backfilled from mutable updatedAt (which may by
+    // then reflect a post-execution title edit, NOT the real end time). The
+    // replayed terminal event knows the real end time - it must replace the
+    // provisional guess, while a second terminal delivery afterwards must
+    // NOT push the now-authoritative value forward (first-write-wins).
+    let seedColdCompletedTask: (() => void) | undefined
+    function ColdHistoryProbe() {
+      const { dispatch } = useApp()
+      seedColdCompletedTask = () => {
+        dispatch({
+          type: "SET_CURRENT_TASK",
+          payload: {
+            id: "1",
+            title: "Test task (renamed after completion)",
+            status: "completed",
+            description: "Test task",
+            createdAt: "2026-05-27T05:00:00Z",
+            // A post-execution title edit bumped this well past the run's
+            // actual 05:01:00 end.
+            updatedAt: "2026-05-27T09:00:00Z",
+          },
+        })
+      }
+      return null
+    }
+
+    render(
+      <AppProvider token="token">
+        <SeedExistingTask />
+        <ColdHistoryProbe />
+        <StateProbe />
+      </AppProvider>
+    )
+    const onMessage = webSocketOptions.current?.onMessage
+    expect(onMessage).toBeDefined()
+
+    act(() => {
+      seedColdCompletedTask?.()
+    })
+    // Backfilled (provisionally) from updatedAt - the only value available
+    // before any terminal event replays.
+    await waitFor(() => {
+      expect(screen.getByTestId("task-dag-terminated-at").textContent).toBe("2026-05-27T09:00:00Z")
+    })
+
+    // The terminal event replays with the run's REAL end time.
+    act(() => {
+      onMessage?.({
+        type: "task_completed",
+        timestamp: "2026-05-27T05:01:00Z",
+        task_id: 1,
+        task: { id: 1, status: "completed" },
+        success: true,
+      } as TestWebSocketMessage)
+    })
+    await waitFor(() => {
+      expect(screen.getByTestId("task-dag-terminated-at").textContent).toBe("2026-05-27T05:01:00Z")
+    })
+
+    // A duplicate terminal delivery must not move it again.
+    act(() => {
+      onMessage?.({
+        type: "task_completed",
+        timestamp: "2026-05-27T05:02:30Z",
+        task_id: 1,
+        task: { id: 1, status: "completed" },
+        success: true,
+      } as TestWebSocketMessage)
+    })
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0))
+    })
+    expect(screen.getByTestId("task-dag-terminated-at").textContent).toBe("2026-05-27T05:01:00Z")
+  })
+
+  it("does not let replayed liveness events flip a terminal task back to running during a history load", async () => {
+    // Replayed activity events (llm_call_start & co) optimistically infer
+    // "running" from the fact that work is happening - but during a history
+    // load that work already finished. Flipping the authoritative terminal
+    // status would clear dagTerminatedAt and let the Progress panel auto-open
+    // for a task that is merely being VIEWED.
+    let seedCompletedTask: (() => void) | undefined
+    function TerminalHistoryProbe() {
+      const { dispatch } = useApp()
+      seedCompletedTask = () => {
+        dispatch({
+          type: "SET_CURRENT_TASK",
+          payload: {
+            id: "1",
+            title: "Test task",
+            status: "completed",
+            description: "Test task",
+            createdAt: "2026-05-27T05:00:00Z",
+            updatedAt: "2026-05-27T05:01:00Z",
+          },
+        })
+      }
+      return null
+    }
+
+    render(
+      <AppProvider token="token">
+        <SeedExistingTask />
+        <TerminalHistoryProbe />
+        <StateProbe />
+      </AppProvider>
+    )
+    const onMessage = webSocketOptions.current?.onMessage
+    expect(onMessage).toBeDefined()
+
+    act(() => {
+      seedCompletedTask?.()
+      // Connecting is what arms the history load (isHistoricalDataLoadingRef).
+      webSocketOptions.current?.onConnect?.()
+    })
+    await waitFor(() => {
+      expect(screen.getByTestId("task-status").textContent).toBe("completed")
+    })
+
+    // A replayed llm_call_start lands mid-history-load.
+    act(() => {
+      onMessage?.({
+        type: "trace_event",
+        timestamp: "2026-05-27T05:00:30Z",
+        task_id: 1,
+        data: {
+          event_id: "llm-start-replayed",
+          event_type: "llm_call_start",
+          data: { model_name: "test-model" },
+        },
+      })
+    })
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0))
+    })
+    expect(screen.getByTestId("task-status").textContent).toBe("completed")
+    expect(screen.getByTestId("task-dag-terminated-at").textContent).toBe("2026-05-27T05:01:00Z")
+
+    // Once the history load actually completes, LIVE activity events must
+    // still be able to flip a (genuinely re-run) terminal task to running -
+    // the gate is scoped to the load, not to terminal tasks forever.
+    act(() => {
+      onMessage?.({
+        type: "trace_event",
+        timestamp: "2026-05-27T05:02:00Z",
+        task_id: 1,
+        data: {
+          event_id: "history-done",
+          event_type: "historical_data_complete",
+          data: {},
+        },
+      })
+    })
+    act(() => {
+      onMessage?.({
+        type: "trace_event",
+        timestamp: "2026-05-27T05:02:01Z",
+        task_id: 1,
+        data: {
+          event_id: "llm-start-live",
+          event_type: "llm_call_start",
+          data: { model_name: "test-model" },
+        },
+      })
+    })
+    await waitFor(() => {
+      expect(screen.getByTestId("task-status").textContent).toBe("running")
+    })
+  })
+
+  it("drops a dag_execution update whose phase is absent or unknown instead of synthesizing an active run", async () => {
+    render(
+      <AppProvider token="token">
+        <SeedRunningTask />
+        <StateProbe />
+      </AppProvider>
+    )
+    const onMessage = webSocketOptions.current?.onMessage
+    expect(onMessage).toBeDefined()
+
+    // A bare legacy dag_execution frame with an EMPTY payload - an earlier
+    // version normalized this to phase "executing", conjuring a blank
+    // in-progress DAG (and an auto-opened Progress panel) out of nothing.
+    act(() => {
+      onMessage?.({
+        type: "dag_execution",
+        timestamp: "2026-05-27T05:00:02Z",
+        task_id: 1,
+        data: {},
+      } as TestWebSocketMessage)
+    })
+    // An unknown future/malformed phase string must be dropped too.
+    act(() => {
+      onMessage?.({
+        type: "trace_event",
+        timestamp: "2026-05-27T05:00:03Z",
+        task_id: 1,
+        data: {
+          event_id: "dag-execution-mystery",
+          event_type: "dag_execution",
+          data: { phase: "mystery_phase", steps: [{ id: "s1", name: "Step", dependencies: [] }] },
+        },
+      })
+    })
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0))
+    })
+    expect(screen.getByTestId("dag-phase").textContent).toBe("")
+    expect(screen.getByTestId("steps-count").textContent).toBe("0")
+
+    // A well-formed update right after still applies - the drop is per-frame,
+    // not sticky.
+    act(() => {
+      onMessage?.({
+        type: "trace_event",
+        timestamp: "2026-05-27T05:00:04Z",
+        task_id: 1,
+        data: {
+          event_id: "dag-execution-valid",
+          event_type: "dag_execution",
+          data: { phase: "executing", turn_id: "turn-A" },
+        },
+      })
+    })
+    await waitFor(() => {
+      expect(screen.getByTestId("dag-phase").textContent).toBe("executing")
+    })
+  })
+
   it("clears dagExecution/steps when switching to a different task", async () => {
     let switchTask: (() => void) | undefined
     function SwitchingTaskProbe() {

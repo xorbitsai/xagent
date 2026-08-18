@@ -46,16 +46,25 @@ function formatElapsedCompact(ms: number): string {
 // `getString` fallback) from a valid-but-falsy one: epoch 0 is a real instant
 // in this type's `string | number` contract, and a plain truthiness check
 // would treat a genuine (if unlikely) zero timestamp as absent. Also excludes
-// non-finite numbers (NaN, +/-Infinity): normalizeTimestampMs deliberately
-// lets those propagate unchanged (so formatTime/getTimeDuration's own
-// isNaN(date.getTime()) guards can catch them as malformed input), which
-// means it does nothing to stop a non-finite value from reaching duration
-// arithmetic here - this predicate is this component's own filter for that,
-// treating both as "present" would produce a bogus, constantly shifting or
-// permanently non-numeric duration instead of surfacing the anomaly.
+// MALFORMED values - non-finite numbers (NaN, +/-Infinity) and strings that
+// parse to nothing usable ("Infinity", "NaN", broken ISO text):
+// normalizeTimestampMs deliberately lets non-finite numbers propagate
+// unchanged and falls back to Date.now() for unparsable strings (so
+// formatTime/getTimeDuration's own guards handle them as display concerns),
+// which means it does nothing to stop such a value from reaching this
+// panel's duration arithmetic - where it would mark a run as "ended" at a
+// bogus instant, freeze the clock against a fake now, or render a
+// permanently non-numeric duration. This predicate is this component's own
+// filter for that: a timestamp only counts as present if it parses to a
+// finite millisecond value, mirroring the branch order normalizeTimestampMs
+// itself uses (numeric string first, then date string) so the two can't
+// disagree about what a string means.
 function hasTimestamp(value: string | number | undefined): value is string | number {
   if (value === undefined || value === null || value === "") return false
-  return typeof value !== "number" || Number.isFinite(value)
+  if (typeof value === "number") return Number.isFinite(value)
+  const numeric = Number(value)
+  if (value.trim() !== "" && !Number.isNaN(numeric)) return Number.isFinite(numeric)
+  return Number.isFinite(new Date(value).getTime())
 }
 
 // Ticks once a second for as long as `active` is true, shared by the header

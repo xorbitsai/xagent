@@ -185,5 +185,44 @@ describe("ProgressPanel", () => {
       expect(screen.queryByText("Elapsed")).toBeInTheDocument()
       expect(screen.queryByText("0s")).not.toBeInTheDocument()
     })
+
+    it("treats malformed timestamp strings as absent instead of freezing or corrupting the clock", () => {
+      // "Infinity"/"NaN"/broken ISO text parse to nothing usable - treating
+      // them as present would mark the run "ended" at a bogus instant
+      // (freezing the clock) or push a non-finite value into the duration
+      // arithmetic. As absent, a malformed endedAt leaves the clock live.
+      renderPanel({ startedAt: "2026-05-27T05:08:30Z", endedAt: "Infinity" })
+      expect(screen.getByText("1m 30s")).toBeInTheDocument()
+      // Still ticking - the malformed endedAt did NOT freeze the run.
+      act(() => {
+        vi.advanceTimersByTime(5000)
+      })
+      expect(screen.getByText("1m 35s")).toBeInTheDocument()
+    })
+
+    it("renders no duration at all for a step whose only timestamp is malformed", () => {
+      renderPanel({
+        steps: [step({
+          id: "broken",
+          status: "completed",
+          startedAt: "not a real date",
+          completedAt: "NaN",
+        })],
+      })
+      // No "NaNs"/"Infinitys" text sneaks into the row - the malformed
+      // timestamps read as absent, so the row simply has no duration.
+      expect(screen.queryByText(/NaN/)).not.toBeInTheDocument()
+      expect(screen.queryByText(/Infinity/)).not.toBeInTheDocument()
+    })
+
+    it("still accepts a numeric-string timestamp as present", () => {
+      // The string branch must reject malformed text without also rejecting
+      // the numeric-string form the wire legitimately uses.
+      renderPanel({
+        startedAt: String(new Date("2026-05-27T05:05:00Z").getTime()),
+        endedAt: String(new Date("2026-05-27T05:07:30Z").getTime()),
+      })
+      expect(screen.getByText("2m 30s")).toBeInTheDocument()
+    })
   })
 })

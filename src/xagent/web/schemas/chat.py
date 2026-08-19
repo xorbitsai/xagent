@@ -100,6 +100,20 @@ class TaskCreateRequest(BaseModel):
             "row a client reading the task's history will see immediately."
         ),
     )
+    seed_interactions: Optional[List[Dict[str, Any]]] = Field(
+        default=None,
+        max_length=5,
+        description=(
+            "Structured interaction descriptors (the same shape the "
+            "ask_user_question agent tool produces) attached to the "
+            "seed_assistant_message's chat history row. Not validated "
+            "against a fixed schema here - same permissive contract as "
+            "every other interactions list in this codebase - the frontend "
+            "renders unrecognized types as a plain 'unsupported' notice "
+            "rather than erroring. Ignored if seed_assistant_message is not "
+            "also set, since there is no row to attach interactions to."
+        ),
+    )
 
     @model_validator(mode="before")
     @classmethod

@@ -184,7 +184,9 @@ describe("TemplateDetailPage", () => {
       expect.objectContaining({
         beforeWeStart: "templates.marketplace.beforeWeStart",
         closingNote: "templates.marketplace.hireClosingNote",
-      })
+        connectAppsLabel: "chatPage.clarification.connectApps.title",
+      }),
+      [{ name: "HubSpot", logo: "https://example.com/hubspot.png" }]
     );
   });
 

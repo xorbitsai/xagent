@@ -349,6 +349,16 @@ const en = {
       submit: "Submit Response",
       unsupportedType: "Unsupported field type: {type}",
       websiteUrl: "Website URL",
+      connectApps: {
+        title: "Connect your apps",
+        subtitle: "One sign-in per provider — everything listed under it comes with it.",
+        connect: "Connect",
+        connected: "Connected",
+        connecting: "Connecting…",
+        skip: "I'll do this later",
+        connectFailed: "Couldn't connect {provider}. Please try again.",
+        popupBlocked: "Popup blocked — please allow popups for this site to connect.",
+      },
     },
   },
   branding: {

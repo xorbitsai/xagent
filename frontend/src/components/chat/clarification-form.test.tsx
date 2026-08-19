@@ -8,6 +8,7 @@ import {
   waitFor,
 } from "@testing-library/react"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
+import type { McpApp } from "@/contexts/mcp-apps-context"
 
 const appContextMock = vi.hoisted(() => ({
   dispatch: vi.fn(),
@@ -16,6 +17,10 @@ const appContextMock = vi.hoisted(() => ({
   sendMessage: vi.fn(),
 }))
 const toastErrorMock = vi.hoisted(() => vi.fn())
+const mcpAppsMock = vi.hoisted(() => ({
+  apps: [] as McpApp[],
+  refresh: vi.fn(),
+}))
 
 vi.mock("@/contexts/app-context-chat", () => ({
   useApp: () => {
@@ -28,7 +33,8 @@ vi.mock("@/contexts/app-context-chat", () => ({
 
 vi.mock("@/contexts/i18n-context", () => ({
   useI18n: () => ({
-    t: (key: string) => key,
+    t: (key: string, vars?: Record<string, string | number>) =>
+      vars ? `${key}:${JSON.stringify(vars)}` : key,
   }),
 }))
 
@@ -36,6 +42,15 @@ vi.mock("@/components/ui/sonner", () => ({
   toast: {
     error: toastErrorMock,
   },
+}))
+
+// Only exercised by connect_apps interactions (below); every other test in
+// this file never mounts ConnectAppsField, so these mocks are inert for them.
+vi.mock("@/contexts/mcp-apps-context", () => ({
+  useMcpApps: () => mcpAppsMock,
+}))
+vi.mock("@/contexts/auth-context", () => ({
+  useAuth: () => ({ token: "test-token" }),
 }))
 
 import { ClarificationForm } from "./clarification-form"
@@ -224,5 +239,95 @@ describe("ClarificationForm Session file capability", () => {
     )
 
     expect(container.querySelector('input[type="file"]')).not.toBeNull()
+  })
+})
+
+describe("ClarificationForm connect_apps interaction", () => {
+  const CONNECT_APPS_INTERACTION = {
+    type: "connect_apps" as const,
+    field: "connect_apps",
+    label: "Connect your apps",
+    apps: ["Gmail"],
+  }
+
+  beforeEach(() => {
+    appContextMock.dispatch.mockReset()
+    appContextMock.filesDisabled = false
+    appContextMock.providerAvailable = true
+    appContextMock.sendMessage.mockReset()
+    toastErrorMock.mockReset()
+    mcpAppsMock.apps = [
+      {
+        id: "gmail",
+        name: "Gmail",
+        description: "",
+        icon: "",
+        users: "",
+        transport: "builtin",
+        provider: "google",
+        category: "Communication",
+        is_connected: false,
+      },
+    ]
+    mcpAppsMock.refresh.mockReset().mockResolvedValue(undefined)
+  })
+
+  afterEach(() => {
+    cleanup()
+  })
+
+  it("renders open by default even when active=false, unlike every other interaction type", () => {
+    // Simulates the AI Team Marketplace Hire flow: the interaction is seeded
+    // onto a task that never enters waiting_for_user, so `active` is false
+    // from the very first render - a plain question field would stay
+    // collapsed/disabled forever, but connect_apps must not.
+    render(
+      <ClarificationForm
+        interactions={[CONNECT_APPS_INTERACTION]}
+        active={false}
+        onSend={vi.fn()}
+      />,
+    )
+
+    expect(screen.getByText("Google")).toBeInTheDocument()
+    expect(
+      screen.getByRole("button", { name: "chatPage.clarification.connectApps.connect" }),
+    ).toBeInTheDocument()
+  })
+
+  it("shows the interaction's own label in the header instead of the generic 'Ask User' title", () => {
+    render(
+      <ClarificationForm interactions={[CONNECT_APPS_INTERACTION]} onSend={vi.fn()} />,
+    )
+
+    expect(screen.getByText("Connect your apps")).toBeInTheDocument()
+    expect(screen.queryByText("chatPage.clarification.title")).not.toBeInTheDocument()
+  })
+
+  it("does not render the generic Submit button - connecting happens per-provider, not via a form submit", () => {
+    render(
+      <ClarificationForm interactions={[CONNECT_APPS_INTERACTION]} onSend={vi.fn()} />,
+    )
+
+    expect(
+      screen.queryByRole("button", { name: "chatPage.clarification.submit" }),
+    ).not.toBeInTheDocument()
+  })
+
+  it("sends a skip acknowledgement message when 'I'll do this later' is clicked", async () => {
+    const onSend = vi.fn()
+    render(
+      <ClarificationForm interactions={[CONNECT_APPS_INTERACTION]} onSend={onSend} />,
+    )
+
+    fireEvent.click(screen.getByText("chatPage.clarification.connectApps.skip"))
+
+    await waitFor(() => {
+      expect(onSend).toHaveBeenCalledWith(
+        "chatPage.clarification.connectApps.skip",
+        [],
+        {},
+      )
+    })
   })
 })

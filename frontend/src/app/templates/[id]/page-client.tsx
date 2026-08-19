@@ -130,10 +130,16 @@ export default function TemplateDetailPage() {
       }
       if (!isMountedRef.current) return;
 
-      const result = await hireAgentFromTemplate(template.id, persona, {
-        beforeWeStart: t("templates.marketplace.beforeWeStart"),
-        closingNote: t("templates.marketplace.hireClosingNote"),
-      });
+      const result = await hireAgentFromTemplate(
+        template.id,
+        persona,
+        {
+          beforeWeStart: t("templates.marketplace.beforeWeStart"),
+          closingNote: t("templates.marketplace.hireClosingNote"),
+          connectAppsLabel: t("chatPage.clarification.connectApps.title"),
+        },
+        template.connections
+      );
       if (!isMountedRef.current) return;
       router.push(`/task/${result.taskId}`);
     } catch {

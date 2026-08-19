@@ -6,7 +6,7 @@ import { getApiUrl } from "@/lib/utils"
 import { useAuth } from "./auth-context"
 import { useI18n } from "./i18n-context"
 
-interface McpApp {
+export interface McpApp {
   id: string
   name: string
   description: string

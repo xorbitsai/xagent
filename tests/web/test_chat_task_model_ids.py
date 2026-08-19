@@ -1979,6 +1979,79 @@ def test_task_create_seeds_assistant_message(test_db, user1_headers):
         db.close()
 
 
+def test_task_create_seeds_interactions_alongside_the_assistant_message(
+    test_db, user1_headers
+):
+    """`seed_interactions` should ride along on the seeded assistant message's
+    row - the AI Team Marketplace's "connect your apps" card is delivered
+    this way, attached to the same seeded intro message."""
+    from xagent.web.models.chat_message import TaskChatMessage
+
+    connect_apps_interaction = {
+        "type": "connect_apps",
+        "field": "connect_apps",
+        "label": "Connect your apps",
+        "apps": ["Gmail", "Google Calendar"],
+    }
+    resp = client.post(
+        "/api/chat/task/create",
+        json={
+            "title": "Hire Leo",
+            "seed_assistant_message": "Hi — I'm Leo.",
+            "seed_interactions": [connect_apps_interaction],
+        },
+        headers=user1_headers,
+    )
+    assert resp.status_code == 200
+    task_id = resp.json()["task_id"]
+
+    db = next(get_db())
+    try:
+        message = db.query(TaskChatMessage).filter_by(task_id=task_id).one()
+        assert message.interactions == [connect_apps_interaction]
+    finally:
+        db.close()
+
+
+def test_task_create_ignores_seed_interactions_without_a_seed_message(
+    test_db, user1_headers
+):
+    """`seed_interactions` has no row to attach to without
+    `seed_assistant_message` - documented as a no-op, not a 400, since a
+    client omitting the message by mistake shouldn't fail task creation."""
+    from xagent.web.models.chat_message import TaskChatMessage
+
+    resp = client.post(
+        "/api/chat/task/create",
+        json={
+            "title": "No seed message",
+            "seed_interactions": [{"type": "connect_apps", "apps": ["Gmail"]}],
+        },
+        headers=user1_headers,
+    )
+    assert resp.status_code == 200
+    task_id = resp.json()["task_id"]
+
+    db = next(get_db())
+    try:
+        assert db.query(TaskChatMessage).filter_by(task_id=task_id).count() == 0
+    finally:
+        db.close()
+
+
+def test_task_create_rejects_more_than_five_seed_interactions(test_db, user1_headers):
+    resp = client.post(
+        "/api/chat/task/create",
+        json={
+            "title": "Too many interactions",
+            "seed_assistant_message": "Hi.",
+            "seed_interactions": [{"type": "connect_apps"}] * 6,
+        },
+        headers=user1_headers,
+    )
+    assert resp.status_code == 422
+
+
 def test_task_create_without_seed_message_creates_no_chat_messages(
     test_db, user1_headers
 ):

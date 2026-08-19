@@ -349,6 +349,16 @@ const zh = {
       submit: "提交回复",
       unsupportedType: "不支持的字段类型: {type}",
       websiteUrl: "网站 URL",
+      connectApps: {
+        title: "连接你的应用",
+        subtitle: "每个服务商登录一次——列在它下面的应用都会一并连接。",
+        connect: "连接",
+        connected: "已连接",
+        connecting: "连接中…",
+        skip: "我稍后再连接",
+        connectFailed: "连接 {provider} 失败，请重试。",
+        popupBlocked: "弹窗被拦截了——请允许本站弹窗以完成连接。",
+      },
     },
   },
   branding: {

@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import type { PersonaInfo } from "@/types/template";
+import type { ConnectionInfo, PersonaInfo } from "@/types/template";
 
 const apiRequestMock = vi.hoisted(() => vi.fn());
 const resolveAgentForTemplateMock = vi.hoisted(() => vi.fn());
@@ -32,7 +32,11 @@ vi.mock("@/lib/template-agent-resolution", async () => {
   };
 });
 
-import { buildSeedAssistantMessage, hireAgentFromTemplate } from "./hire-agent";
+import {
+  buildConnectAppsInteraction,
+  buildSeedAssistantMessage,
+  hireAgentFromTemplate,
+} from "./hire-agent";
 
 function jsonResponse(data: unknown, init?: ResponseInit) {
   return new Response(JSON.stringify(data), {
@@ -45,6 +49,7 @@ function jsonResponse(data: unknown, init?: ResponseInit) {
 const STRINGS = {
   beforeWeStart: "A few things before I start:",
   closingNote: "Answer what you can - I'll default the rest.",
+  connectAppsLabel: "Connect your apps",
 };
 
 const LEO_PERSONA: PersonaInfo = {
@@ -85,6 +90,26 @@ describe("buildSeedAssistantMessage", () => {
   });
 });
 
+describe("buildConnectAppsInteraction", () => {
+  it("builds a connect_apps interaction from the template's connection names", () => {
+    const connections: ConnectionInfo[] = [
+      { name: "LinkedIn", logo: "https://example.com/linkedin.png" },
+      { name: "Google Drive", logo: "https://example.com/drive.png" },
+    ];
+
+    expect(buildConnectAppsInteraction(connections, "Connect your apps")).toEqual({
+      type: "connect_apps",
+      field: "connect_apps",
+      label: "Connect your apps",
+      apps: ["LinkedIn", "Google Drive"],
+    });
+  });
+
+  it("returns null when there are no connections", () => {
+    expect(buildConnectAppsInteraction([], "Connect your apps")).toBeNull();
+  });
+});
+
 describe("hireAgentFromTemplate", () => {
   beforeEach(() => {
     apiRequestMock.mockReset();
@@ -116,6 +141,37 @@ describe("hireAgentFromTemplate", () => {
     expect(body.agent_id).toBe(42);
     expect(body.title).toBe("Leo — Email Lead Response Agent");
     expect(body.seed_assistant_message).toContain("Hi — I'm Leo");
+    expect(body.seed_interactions).toBeUndefined();
+  });
+
+  it("attaches a seed_interactions connect_apps card when the template has connections", async () => {
+    resolveAgentForTemplateMock.mockResolvedValueOnce({
+      agent: { id: 42, name: "Leo", template_id: "sales-email-lead-response-agent" },
+      created: true,
+    });
+    apiRequestMock.mockResolvedValueOnce(jsonResponse({ task_id: 7 }));
+
+    const connections: ConnectionInfo[] = [
+      { name: "HubSpot", logo: "https://example.com/hubspot.png" },
+    ];
+
+    await hireAgentFromTemplate(
+      "sales-email-lead-response-agent",
+      LEO_PERSONA,
+      STRINGS,
+      connections
+    );
+
+    const [, init] = apiRequestMock.mock.calls[0];
+    const body = JSON.parse((init as RequestInit).body as string);
+    expect(body.seed_interactions).toEqual([
+      {
+        type: "connect_apps",
+        field: "connect_apps",
+        label: STRINGS.connectAppsLabel,
+        apps: ["HubSpot"],
+      },
+    ]);
   });
 
   it("throws when the resolved agent id is missing", async () => {

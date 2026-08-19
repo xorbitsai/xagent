@@ -12,6 +12,7 @@ import { useI18n } from "@/contexts/i18n-context"
 import { toast } from "@/components/ui/sonner"
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible"
 import { ChevronDown, ChevronRight, MessageSquare, Upload, File as FileIcon, X, Globe } from "lucide-react"
+import { ConnectAppsField } from "./connect-apps-field"
 
 interface ClarificationFormProps {
   message?: string
@@ -63,11 +64,22 @@ export function ClarificationForm({
   }
   const filesDisabled = filesDisabledOverride ?? contextFilesDisabled ?? true
 
+  // "connect_apps" is a live widget (OAuth-popup buttons that reflect
+  // useMcpApps()'s current connection state), not a question-and-submit
+  // form field - it has no "answer" to gate behind `active`/waiting_for_user
+  // the way every other interaction type does (see the type's doc comment
+  // on Interaction.apps). A seed message attached at task-creation time
+  // (the marketplace Hire flow) never transitions the task through
+  // waiting_for_user at all, so gating this on `active` the normal way
+  // would leave it permanently collapsed and inert.
+  const isConnectAppsOnly =
+    interactions.length > 0 && interactions.every((interaction) => interaction.type === "connect_apps")
+
   const { t } = useI18n()
   const [formState, setFormState] = useState<Record<string, any>>({})
   const [isSubmitting, setIsSubmitting] = useState(false)
-  const [isSubmitted, setIsSubmitted] = useState(!active)
-  const [isOpen, setIsOpen] = useState(active)
+  const [isSubmitted, setIsSubmitted] = useState(!active && !isConnectAppsOnly)
+  const [isOpen, setIsOpen] = useState(active || isConnectAppsOnly)
 
   useEffect(() => {
     if (active) {
@@ -266,6 +278,24 @@ export function ClarificationForm({
       toast.error(t("chatPage.clarification.sendError"))
     } finally {
       setIsSubmitting(false)
+    }
+  }
+
+  // "connect_apps" has no form fields to gather - skipping just logs a
+  // plain acknowledgement message, matching every other interaction type's
+  // "answer becomes a chat message" contract, but without the lines/
+  // formState machinery handleSubmit above uses (there's nothing to gather).
+  const handleSkipConnectApps = async () => {
+    const message = t("chatPage.clarification.connectApps.skip")
+    try {
+      if (onSend) {
+        await onSend(message, [], {})
+      } else if (sendMessage) {
+        await sendMessage(message, { force: true }, [])
+      }
+    } catch (error) {
+      console.error("Failed to send connect-apps skip response", error)
+      toast.error(t("chatPage.clarification.sendError"))
     }
   }
 
@@ -475,7 +505,11 @@ export function ClarificationForm({
         <div className="flex items-center justify-between p-4 bg-muted/80 cursor-pointer hover:bg-muted/60 transition-colors">
           <div className="flex items-center gap-2 font-semibold">
             <MessageSquare className="h-4 w-4" />
-            <span className="text-sm">{t("chatPage.clarification.title")}</span>
+            <span className="text-sm">
+              {isConnectAppsOnly
+                ? normalizedInteractions[0]?.label || t("chatPage.clarification.connectApps.title")
+                : t("chatPage.clarification.title")}
+            </span>
           </div>
           <div>
             {isOpen ? <ChevronDown className="h-4 w-4" /> : <ChevronRight className="h-4 w-4" />}
@@ -484,26 +518,40 @@ export function ClarificationForm({
       </CollapsibleTrigger>
 
       <CollapsibleContent className="space-y-4 p-4">
-        <div className="space-y-4">
-          {normalizedInteractions.map((interaction, index) => (
-            filesDisabled && interaction.type === "file_upload" ? null : (
-            <div key={`${interaction.field}-${index}`} className="space-y-2">
-              <Label className="text-sm font-medium">
-                {interaction.label || interaction.field}
-                {interaction.type === "confirm" ? "" : ":"}
-              </Label>
+        {isConnectAppsOnly ? (
+          <div className="space-y-4">
+            {normalizedInteractions.map((interaction, index) => (
+              <ConnectAppsField
+                key={`${interaction.field}-${index}`}
+                interaction={interaction}
+                onSkip={handleSkipConnectApps}
+              />
+            ))}
+          </div>
+        ) : (
+          <>
+            <div className="space-y-4">
+              {normalizedInteractions.map((interaction, index) => (
+                filesDisabled && interaction.type === "file_upload" ? null : (
+                <div key={`${interaction.field}-${index}`} className="space-y-2">
+                  <Label className="text-sm font-medium">
+                    {interaction.label || interaction.field}
+                    {interaction.type === "confirm" ? "" : ":"}
+                  </Label>
 
-              {renderField(interaction)}
+                  {renderField(interaction)}
+                </div>
+                )
+              ))}
             </div>
-            )
-          ))}
-        </div>
 
-        <div className="pt-2 flex gap-2">
-          <Button className="flex-1" size="sm" onClick={handleSubmit} disabled={!active || isSubmitting || isSubmitted}>
-            {isSubmitting ? t("chatPage.clarification.submitting") : t("chatPage.clarification.submit")}
-          </Button>
-        </div>
+            <div className="pt-2 flex gap-2">
+              <Button className="flex-1" size="sm" onClick={handleSubmit} disabled={!active || isSubmitting || isSubmitted}>
+                {isSubmitting ? t("chatPage.clarification.submitting") : t("chatPage.clarification.submit")}
+              </Button>
+            </div>
+          </>
+        )}
       </CollapsibleContent>
     </Collapsible>
   )

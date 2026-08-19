@@ -4127,14 +4127,20 @@ async def create_task(
         if request.seed_assistant_message is not None:
             # Staged (not committed) here so the seed message lands in the
             # same transaction as task creation - a client that opens this
-            # task never observes it existing with zero history. Plain text
-            # only: no interactions, so replay's expect_response=False stays
-            # correct and this never puts the task into waiting_for_user.
+            # task never observes it existing with zero history.
+            # `seed_interactions` (e.g. a marketplace persona's "connect your
+            # apps" prompt) rides along on the same row; replay still forces
+            # expect_response=False for every historical row regardless (see
+            # websocket.py), so this never puts the task into
+            # waiting_for_user - any interaction type attached here must be
+            # able to stand on its own without that state, same as
+            # "connect_apps" (a live widget, not a question-and-submit form).
             seeded_message = persist_assistant_message_no_commit(
                 db,
                 task_id=int(task.id),
                 user_id=int(user.id),
                 content=request.seed_assistant_message,
+                interactions=request.seed_interactions,
             )
             if seeded_message is None:
                 # persist_assistant_message_no_commit silently drops a

@@ -64,7 +64,13 @@ def _extract_error_detail(response: requests.Response) -> str | None:
         return None
     if not isinstance(payload, dict):
         return None
-    messages = list(payload.get("errorMessages") or [])
+    raw_messages = payload.get("errorMessages")
+    if isinstance(raw_messages, list):
+        messages = [str(m) for m in raw_messages]
+    elif isinstance(raw_messages, str):
+        messages = [raw_messages]
+    else:
+        messages = []
     field_errors = payload.get("errors")
     if isinstance(field_errors, dict):
         messages.extend(f"{field}: {msg}" for field, msg in field_errors.items())
@@ -121,8 +127,15 @@ def _resolve_cloud_id(cloud_id: str) -> str:
     if not sites:
         raise ValueError("No accessible Jira sites found for this account")
     if len(sites) == 1:
-        return str(sites[0]["id"])
-    site_list = ", ".join(f"{s.get('name')} ({s.get('id')})" for s in sites)
+        site_id = sites[0].get("id") if isinstance(sites[0], dict) else None
+        if not site_id:
+            raise ValueError("The single accessible Jira site is missing a valid 'id'")
+        return str(site_id)
+    site_list = ", ".join(
+        f"{s.get('name') or 'Unknown'} ({s.get('id') or 'No ID'})"
+        for s in sites
+        if isinstance(s, dict)
+    )
     raise ValueError(
         f"Multiple Jira sites are accessible ({site_list}) -- call "
         "jira_list_accessible_sites and pass cloud_id explicitly"
@@ -172,6 +185,8 @@ def jira_get_current_user() -> str:
     """
     try:
         result = _request_absolute("GET", ME_URL)
+        if not isinstance(result, dict):
+            return _error("Unexpected response format from Atlassian profile API")
         return _success(
             user={
                 "account_id": result.get("account_id"),
@@ -395,12 +410,17 @@ def jira_transition_issue(
                 f"Transition '{transition_name}' is not available for {issue_key}. "
                 f"Available transitions: {available}"
             )
+        transition_id = match.get("id")
+        if not transition_id:
+            return _error(
+                f"Matched transition '{transition_name}' is missing a valid 'id'"
+            )
 
         _request(
             "POST",
             resolved_cloud_id,
             f"/rest/api/2/issue/{issue_key}/transitions",
-            json_data={"transition": {"id": match["id"]}},
+            json_data={"transition": {"id": transition_id}},
         )
         return _success(issue_key=issue_key, transitioned_to=match.get("name"))
     except Exception as e:

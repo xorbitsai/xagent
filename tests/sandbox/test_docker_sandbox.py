@@ -503,6 +503,8 @@ class TestNamespaceIsolation:
             assert captured["labels"]["xagent.sandbox.namespace"] == "alpha"
             assert captured["labels"]["xagent.sandbox.name"] == "user::1"
             assert captured["name"].startswith("xagent_sandbox_")
+            # tini as PID 1 so the tail command handles SIGTERM (issue #231).
+            assert captured["init"] is True
 
 
 class TestManagerPathsRespectNamespace:

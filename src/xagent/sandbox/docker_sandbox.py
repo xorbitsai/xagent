@@ -1113,6 +1113,8 @@ async def _create_container(
         "name": _container_name(name, namespace),
         # Keep the container alive
         "command": ["tail", "-f", "/dev/null"],
+        # PID-1 tini forwards SIGTERM so tail exits fast, not on a SIGKILL timeout.
+        "init": True,
         "detach": True,
         # Run as root to match the file access behavior of Boxlite.
         "user": "root",

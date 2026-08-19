@@ -5,6 +5,7 @@ import { Clock, Heart, Loader2, Play, Users } from "lucide-react";
 import type { Template } from "@/types/template";
 import { cn } from "@/lib/utils";
 import { isNestedInteractiveElement } from "./template-card-utils";
+import { PersonaAvatar } from "./persona-avatar";
 
 interface LibraryTemplateCardProps {
   template: Template;
@@ -13,6 +14,16 @@ interface LibraryTemplateCardProps {
   defaultSetupTime: string;
   workforceBadgeLabel?: string;
   formatAgentsCount?: (count: number) => string;
+  /** Opens the AI Team Marketplace detail page for a persona-bearing,
+   * non-workforce template instead of instantiating anything directly -
+   * `onOpen` and `formatMeetLabel` are bundled into one prop so a caller
+   * can't wire one without the other (a "Meet {name}" button that silently
+   * calls `onUse` instead of navigating, or vice versa). Falls back to
+   * `onUse` when omitted entirely, so this component still works without it. */
+  onOpenPersona?: {
+    onOpen: (templateId: string) => void;
+    formatMeetLabel: (name: string) => string;
+  };
   /** True while this specific template's "Use" action is in flight (currently only
    * meaningful for workforce templates, which create real records server-side and
    * can take a few seconds). Disables activation and swaps the button to a spinner
@@ -24,8 +35,13 @@ interface LibraryTemplateCardProps {
    * templates/page.tsx). Blocks activation like isBusy, but without
    * claiming this card itself is the one in flight: no spinner, no label
    * swap, just a visibly disabled state instead of a click that silently
-   * does nothing. */
+   * does nothing. Does NOT apply to a persona card routed via `onOpenPersona`:
+   * opening the marketplace detail page is pure client-side navigation with
+   * no server request to race against the in-flight workforce creation. */
   disabled?: boolean;
+  /** Instantiates the template directly: a workforce (use-as-workforce) or,
+   * as a back-compat fallback, an agent-type template with no persona (the
+   * old "jump into the builder with this template prefilled" path). */
   onUse: (templateId: string) => void;
   onLike?: (templateId: string, event: MouseEvent<HTMLButtonElement>) => void;
   className?: string;
@@ -96,6 +112,7 @@ export function LibraryTemplateCard({
   defaultSetupTime,
   workforceBadgeLabel,
   formatAgentsCount,
+  onOpenPersona,
   isBusy,
   busyLabel,
   disabled,
@@ -103,12 +120,22 @@ export function LibraryTemplateCard({
   onLike,
   className,
 }: LibraryTemplateCardProps) {
-  const isBlocked = isBusy || disabled;
+  const isWorkforce = template.type === "workforce";
+  const persona = !isWorkforce ? template.persona : null;
+  // Opening the detail page is pure client-side navigation - it has no
+  // server request to race against a sibling workforce's in-flight
+  // creation, so the cross-card `disabled` lock (see the prop doc above)
+  // must not immobilize this card while that's happening.
+  const isNavigationOnly = Boolean(persona && onOpenPersona);
+  const isBlocked = isBusy || (disabled && !isNavigationOnly);
   const handleActivate = () => {
     if (isBlocked) return;
+    if (persona && onOpenPersona) {
+      onOpenPersona.onOpen(template.id);
+      return;
+    }
     onUse(template.id);
   };
-  const isWorkforce = template.type === "workforce";
   // Server-computed manager + workers total, matching what "Use" actually
   // creates.
   const totalAgentCount = template.agent_count || 0;
@@ -138,7 +165,7 @@ export function LibraryTemplateCard({
       className={cn(
         "group flex h-full cursor-pointer flex-col rounded-[18px] border border-border bg-card p-5 shadow-sm transition-all duration-300 ease-out hover:-translate-y-1 hover:border-transparent hover:shadow-[0_16px_40px_rgba(0,0,0,0.11)]",
         isBusy && "cursor-wait opacity-70",
-        disabled && !isBusy && "cursor-not-allowed opacity-50",
+        isBlocked && !isBusy && "cursor-not-allowed opacity-50",
         className
       )}
     >
@@ -170,9 +197,23 @@ export function LibraryTemplateCard({
         ) : null}
       </div>
 
-      <h3 className="mb-2 line-clamp-2 text-[16.5px] font-semibold leading-[1.25] tracking-[-0.015em] text-foreground">
-        {template.name}
-      </h3>
+      {persona ? (
+        <div className="mb-2 flex items-center gap-3">
+          <PersonaAvatar persona={persona} sizeClassName="h-11 w-11" textClassName="text-sm" />
+          <div className="min-w-0">
+            <h3 className="line-clamp-1 text-[16.5px] font-semibold leading-[1.25] tracking-[-0.015em] text-foreground">
+              {persona.name}
+            </h3>
+            <p className="line-clamp-1 text-[12.5px] font-medium text-muted-foreground">
+              {persona.role}
+            </p>
+          </div>
+        </div>
+      ) : (
+        <h3 className="mb-2 line-clamp-2 text-[16.5px] font-semibold leading-[1.25] tracking-[-0.015em] text-foreground">
+          {template.name}
+        </h3>
+      )}
 
       {bullets.length > 0 ? (
         <ul className="flex flex-1 flex-col gap-2 p-0">
@@ -232,6 +273,8 @@ export function LibraryTemplateCard({
             <Loader2 className="h-3.5 w-3.5 flex-shrink-0 animate-spin" />
             {busyLabel || useLabel}
           </>
+        ) : persona && onOpenPersona ? (
+          onOpenPersona.formatMeetLabel(persona.name)
         ) : (
           useLabel
         )}

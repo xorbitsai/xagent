@@ -108,4 +108,158 @@ describe("LibraryTemplateCard", () => {
 
     expect(onUse).not.toHaveBeenCalled();
   });
+
+  it("renders the persona's name/role instead of the template name when present", () => {
+    render(
+      <LibraryTemplateCard
+        template={makeTemplate({
+          name: "Email Lead Response Agent",
+          persona: {
+            name: "Leo",
+            role: "Email Lead Response Agent",
+            avatar: "/marketplace/avatars/leo.png",
+            intro: "Hi — I'm Leo.",
+            kickoff_questions: [],
+          },
+        })}
+        useLabel="Use Template"
+        defaultSetupTime="5 min setup"
+        onOpenPersona={{ onOpen: vi.fn(), formatMeetLabel: (name) => `Meet ${name}` }}
+        onUse={vi.fn()}
+      />
+    );
+
+    expect(screen.getByText("Leo")).toBeInTheDocument();
+    expect(screen.getByText("Email Lead Response Agent")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Meet Leo" })).toBeInTheDocument();
+    expect(screen.getByRole("img", { name: "Leo" })).toHaveAttribute(
+      "src",
+      "/marketplace/avatars/leo.png"
+    );
+  });
+
+  it("calls onOpen (not onUse) when a persona-bearing card is activated", () => {
+    const onUse = vi.fn();
+    const onOpen = vi.fn();
+    render(
+      <LibraryTemplateCard
+        template={makeTemplate({
+          id: "sales-email-lead-response-agent",
+          persona: {
+            name: "Leo",
+            role: "Email Lead Response Agent",
+            avatar: null,
+            intro: "Hi — I'm Leo.",
+            kickoff_questions: [],
+          },
+        })}
+        useLabel="Use Template"
+        defaultSetupTime="5 min setup"
+        onOpenPersona={{ onOpen, formatMeetLabel: (name) => `Meet ${name}` }}
+        onUse={onUse}
+      />
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Meet Leo" }));
+
+    expect(onOpen).toHaveBeenCalledWith("sales-email-lead-response-agent");
+    expect(onUse).not.toHaveBeenCalled();
+  });
+
+  it("falls back entirely to onUse's label and behavior when onOpenPersona is omitted", () => {
+    // Regression test: onOpen and formatMeetLabel used to be independent
+    // optional props, so a caller could wire one without the other and get
+    // a "Meet {name}" button that silently called onUse. Bundling them into
+    // one onOpenPersona prop means omitting it falls back to useLabel too,
+    // not just onUse - there is no way to render "Meet Leo" without also
+    // getting onOpen behavior.
+    const onUse = vi.fn();
+    render(
+      <LibraryTemplateCard
+        template={makeTemplate({
+          id: "sales-email-lead-response-agent",
+          persona: {
+            name: "Leo",
+            role: "Email Lead Response Agent",
+            avatar: null,
+            intro: "Hi — I'm Leo.",
+            kickoff_questions: [],
+          },
+        })}
+        useLabel="Use Template"
+        defaultSetupTime="5 min setup"
+        onUse={onUse}
+      />
+    );
+
+    expect(screen.queryByRole("button", { name: "Meet Leo" })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Use Template" }));
+
+    expect(onUse).toHaveBeenCalledWith("sales-email-lead-response-agent");
+  });
+
+  it("ignores persona and keeps the workforce click behavior for a workforce-type template", () => {
+    const onUse = vi.fn();
+    const onOpen = vi.fn();
+    render(
+      <LibraryTemplateCard
+        template={makeTemplate({
+          id: "growth-workforce",
+          type: "workforce",
+          agent_count: 3,
+          persona: {
+            name: "Leo",
+            role: "Email Lead Response Agent",
+            avatar: null,
+            intro: "Hi — I'm Leo.",
+            kickoff_questions: [],
+          },
+        })}
+        useLabel="Use Template"
+        defaultSetupTime="5 min setup"
+        workforceBadgeLabel="Workforce"
+        onOpenPersona={{ onOpen, formatMeetLabel: (name) => `Meet ${name}` }}
+        onUse={onUse}
+      />
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Use Template" }));
+
+    expect(onUse).toHaveBeenCalledWith("growth-workforce");
+    expect(onOpen).not.toHaveBeenCalled();
+  });
+
+  it("does not lock a persona card's onOpenPersona navigation while a sibling workforce is being created", () => {
+    // Regression test: the cross-card `disabled` lock exists to stop a
+    // slow workforce-creation request from racing a click elsewhere, but
+    // onOpenPersona is pure client-side navigation with nothing to race -
+    // it must stay active even while `disabled` is true for that reason.
+    const onOpen = vi.fn();
+    render(
+      <LibraryTemplateCard
+        template={makeTemplate({
+          id: "sales-email-lead-response-agent",
+          persona: {
+            name: "Leo",
+            role: "Email Lead Response Agent",
+            avatar: null,
+            intro: "Hi — I'm Leo.",
+            kickoff_questions: [],
+          },
+        })}
+        useLabel="Use Template"
+        defaultSetupTime="5 min setup"
+        onOpenPersona={{ onOpen, formatMeetLabel: (name) => `Meet ${name}` }}
+        onUse={vi.fn()}
+        disabled
+      />
+    );
+
+    const button = screen.getByRole("button", { name: "Meet Leo" });
+    expect(button).not.toBeDisabled();
+
+    fireEvent.click(button);
+
+    expect(onOpen).toHaveBeenCalledWith("sales-email-lead-response-agent");
+  });
 });

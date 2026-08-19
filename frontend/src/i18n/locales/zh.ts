@@ -1611,6 +1611,30 @@ const zh = {
       useWorkforceAccessDenied: "你没有权限创建工作组。",
       useWorkforceRetry: "该模版当前并发请求过多，请重试。",
       useWorkforceUnpublishedAgent: "该工作组需要的智能体「{agentName}」当前未发布，请在你的智能体列表中重新发布它，然后再试一次。"
+    },
+    marketplace: {
+      pageTitle: "AI 团队市场",
+      pageSubtitle: "认识随时待命的 AI 员工——每一位到岗时都已配置就绪，几分钟即可上手。",
+      meet: "认识 {name}",
+      hire: "雇佣 {name}",
+      hiring: "雇佣中…",
+      chat: "聊天",
+      back: "返回 AI 团队市场",
+      whatItDoes: "能做什么",
+      whatsIncluded: "包含内容",
+      tryAsking: "试着这样问",
+      thinking: "思考模式",
+      tools: "工具",
+      connectedApps: "已连接应用",
+      skills: "技能",
+      runsCountOne: "{count} 次运行",
+      runsCountOther: "{count} 次运行",
+      hireNote: "雇佣会把 {name} 加入你的智能体列表并打开一个对话——上面的所有设置之后都可以修改。",
+      hireFailed: "雇佣 {name} 失败，请重试。",
+      notFound: "找不到这位 AI 员工。",
+      beforeWeStart: "开始之前，有几个问题：",
+      hireClosingNote: "能回答的先回答，其余的我会用合理的默认值——之后随时可以修改，或者直接在这里告诉我。",
+      customizeBeforeHiring: "想先自定义配置？"
     }
   },
   sidebar: {
@@ -2610,6 +2634,7 @@ const zh = {
           specialImage: "图像工具",
           database: "数据库",
           skill: "技能工具",
+          ssh: "SSH",
         },
         categoryDescriptions: {
           basic: "系统基础能力，包括数学计算、日期时间获取等核心功能。",

@@ -75,7 +75,10 @@ from ..services.agent_team_scope import (
     owned_agent_clause,
     resolve_authorized_agent,
 )
-from ..services.chat_history_service import load_task_transcript
+from ..services.chat_history_service import (
+    load_task_transcript,
+    persist_assistant_message_no_commit,
+)
 from ..services.connector_runtime import (
     bind_connector_runtime_selection_snapshot,
     prepare_connector_runtime_selection_snapshot,
@@ -4117,6 +4120,30 @@ async def create_task(
                     runtime_extension_requests.keys(),
                 ),
             )
+
+        if request.seed_assistant_message:
+            # Staged (not committed) here so the seed message lands in the
+            # same transaction as task creation - a client that opens this
+            # task never observes it existing with zero history. Plain text
+            # only: no interactions, so replay's expect_response=False stays
+            # correct and this never puts the task into waiting_for_user.
+            seeded_message = persist_assistant_message_no_commit(
+                db,
+                task_id=int(task.id),
+                user_id=int(user.id),
+                content=request.seed_assistant_message,
+            )
+            if seeded_message is None:
+                # persist_assistant_message_no_commit silently drops a
+                # message that normalizes to empty (e.g. an
+                # all-whitespace seed) - not an error worth failing task
+                # creation over, but worth a trail for whoever is
+                # debugging why a "speak first" flow produced no history.
+                logger.warning(
+                    "seed_assistant_message for task %s normalized to "
+                    "empty content and was not persisted",
+                    task.id,
+                )
 
         db.commit()
         db.refresh(task)

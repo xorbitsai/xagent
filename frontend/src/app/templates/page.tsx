@@ -130,6 +130,18 @@ function TemplatesPageContent() {
       ? t("templates.agentsCountOne", { count })
       : t("templates.agentsCountOther", { count });
 
+  const handleOpenTemplate = (templateId: string) => {
+    router.push(`/templates/${templateId}`);
+  };
+
+  // Bundled into one object (rather than two independent props) so a
+  // persona card's "Meet {name}" label and its actual navigate-to-detail
+  // click behavior can't drift apart.
+  const onOpenPersona = {
+    onOpen: handleOpenTemplate,
+    formatMeetLabel: (name: string) => t("templates.marketplace.meet", { name }),
+  };
+
   const categories = useMemo(() => {
     const preferred = ["Sales", "Marketing", "Support", "Research", "Productivity"];
     const dynamic = Array.from(new Set(templates.map((template) => template.category).filter(Boolean)));
@@ -280,8 +292,8 @@ function TemplatesPageContent() {
   return (
     <div className="flex h-full flex-col overflow-y-auto bg-background">
       <PageHeader
-        title={t("templates.title")}
-        description={t("templates.subtitle")}
+        title={t("templates.marketplace.pageTitle")}
+        description={t("templates.marketplace.pageSubtitle")}
         actions={
           <SearchInput
             placeholder={t("templates.searchPlaceholder")}
@@ -340,6 +352,7 @@ function TemplatesPageContent() {
               defaultSetupTime={t("templates.defaultSetupTime")}
               workforceBadgeLabel={t("templates.workforceBadge")}
               formatAgentsCount={formatAgentsCount}
+              onOpenPersona={onOpenPersona}
               creatingWorkforceId={creatingWorkforceId}
               busyLabel={t("templates.creatingWorkforce")}
               onUse={handleUseTemplate}
@@ -359,6 +372,7 @@ function TemplatesPageContent() {
               defaultSetupTime={t("templates.defaultSetupTime")}
               workforceBadgeLabel={t("templates.workforceBadge")}
               formatAgentsCount={formatAgentsCount}
+              onOpenPersona={onOpenPersona}
               creatingWorkforceId={creatingWorkforceId}
               busyLabel={t("templates.creatingWorkforce")}
               onUse={handleUseTemplate}
@@ -387,6 +401,10 @@ interface TemplateSectionProps {
   defaultSetupTime: string;
   workforceBadgeLabel: string;
   formatAgentsCount: (count: number) => string;
+  onOpenPersona: {
+    onOpen: (templateId: string) => void;
+    formatMeetLabel: (name: string) => string;
+  };
   creatingWorkforceId: string | null;
   busyLabel: string;
   onUse: (templateId: string) => void;
@@ -402,6 +420,7 @@ function TemplateSection({
   defaultSetupTime,
   workforceBadgeLabel,
   formatAgentsCount,
+  onOpenPersona,
   creatingWorkforceId,
   busyLabel,
   onUse,
@@ -426,11 +445,14 @@ function TemplateSection({
             defaultSetupTime={defaultSetupTime}
             workforceBadgeLabel={workforceBadgeLabel}
             formatAgentsCount={formatAgentsCount}
+            onOpenPersona={onOpenPersona}
             isBusy={creatingWorkforceId === template.id}
             busyLabel={busyLabel}
             // Locks every OTHER card - agent or workforce - while a
             // workforce is being created, matching the same-scoped lock
-            // handleUseTemplate enforces.
+            // handleUseTemplate enforces. LibraryTemplateCard itself exempts
+            // a persona card routed through onOpenPersona from this lock,
+            // since opening the detail page has no request to race.
             disabled={
               creatingWorkforceId !== null && creatingWorkforceId !== template.id
             }

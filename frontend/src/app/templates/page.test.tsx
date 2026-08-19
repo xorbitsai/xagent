@@ -59,7 +59,20 @@ function makeTemplate(overrides: Partial<Template> = {}): Template {
   };
 }
 
+const LEO_PERSONA = {
+  name: "Leo",
+  role: "Email Lead Response Agent",
+  avatar: null,
+  intro: "Hi — I'm Leo.",
+  kickoff_questions: [],
+};
+
 const AGENT_TEMPLATE = makeTemplate();
+const PERSONA_TEMPLATE = makeTemplate({
+  id: "sales-email-lead-response-agent",
+  name: "Email Lead Response Agent",
+  persona: LEO_PERSONA,
+});
 const WORKFORCE_TEMPLATE = makeTemplate({
   id: "growth_workforce",
   name: "Growth Marketing Workforce",
@@ -138,6 +151,55 @@ describe("TemplatesPage type filtering", () => {
       expect(screen.getByText("Growth Marketing Workforce")).toBeInTheDocument();
     });
     expect(screen.queryByText("Sales Assistant")).not.toBeInTheDocument();
+  });
+});
+
+describe("TemplatesPage persona routing", () => {
+  function installPersonaApiMock() {
+    apiRequestMock.mockImplementation(async (url: string) => {
+      if (url.includes("/api/templates/?lang=")) {
+        return jsonResponse([AGENT_TEMPLATE, PERSONA_TEMPLATE]);
+      }
+      return jsonResponse({});
+    });
+  }
+
+  it("opens the marketplace detail page for a persona-bearing agent card instead of instantiating it", async () => {
+    installPersonaApiMock();
+    render(<TemplatesPage />);
+    await waitFor(() => {
+      expect(screen.getByText("Leo")).toBeInTheDocument();
+    });
+
+    fireEvent.click(
+      screen.getByRole("button", {
+        name: 'templates.marketplace.meet:{"name":"Leo"}',
+      })
+    );
+
+    expect(routerPushMock).toHaveBeenCalledWith(
+      "/templates/sales-email-lead-response-agent"
+    );
+    // Unlike the old flow, opening the detail page never pings /use or
+    // touches /build/new - "Meet" is purely navigational.
+    expect(apiRequestMock).not.toHaveBeenCalledWith(
+      expect.stringContaining("/use"),
+      expect.anything()
+    );
+  });
+
+  it("falls back to the old builder-prefill flow for an agent template with no persona", async () => {
+    installPersonaApiMock();
+    render(<TemplatesPage />);
+    await waitFor(() => {
+      expect(screen.getByText("Sales Assistant")).toBeInTheDocument();
+    });
+
+    fireEvent.click(cardOf("Sales Assistant"));
+
+    await waitFor(() => {
+      expect(routerPushMock).toHaveBeenCalledWith("/build/new?template=sales_assistant");
+    });
   });
 });
 

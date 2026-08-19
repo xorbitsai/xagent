@@ -1,7 +1,9 @@
 import json
 import logging
 import os
+import time
 from typing import Any
+from urllib.parse import quote
 
 import requests
 from mcp.server.fastmcp import FastMCP
@@ -21,10 +23,14 @@ ME_URL = "https://api.atlassian.com/me"
 JIRA_API_BASE = "https://api.atlassian.com/ex/jira"
 DEFAULT_TIMEOUT_SECONDS = 30
 MAX_LIMIT = 100
-# Matches zoom.py's/linear.py's convention: an error body that isn't the
-# expected {"errorMessages": [...]} shape (e.g. an HTML gateway error page)
-# must not be forwarded to the LLM/logs verbatim and unbounded.
+# Matches zoom.py's convention: an error body that isn't the expected
+# {"errorMessages": [...]} shape (e.g. an HTML gateway error page) must not
+# be forwarded to the LLM/logs verbatim and unbounded.
 MAX_ERROR_RESPONSE_TEXT_CHARS = 1000
+# Jira endpoints are rate-limited; on a 429 with a small Retry-After we wait
+# once and retry rather than failing outright, mirroring the same bounded-
+# retry policy as the Slack/Intercom sibling modules.
+MAX_RETRY_AFTER_SECONDS = 30
 
 
 def _success(**payload: Any) -> str:
@@ -48,6 +54,26 @@ def _headers() -> dict[str, str]:
 
 def _clamp_limit(limit: int) -> int:
     return max(1, min(int(limit), MAX_LIMIT))
+
+
+def _path_segment(value: str) -> str:
+    """Percent-encode a value for safe interpolation into a URL path
+    segment (e.g. an issue key or cloud id), matching hubspot.py's
+    _url_path_id / intercom.py's inline quote() calls. Percent-encoding -
+    not a blocklist of "/", "?", "#" - is what actually prevents a value
+    like "ENG-1/../other" from escaping its intended path segment.
+    """
+    return quote(str(value), safe="")
+
+
+def _issue_path(issue_key: str, suffix: str = "") -> str:
+    """Build an issue-scoped REST path with the issue key percent-encoded.
+
+    Single choke point for every /rest/api/2/issue/{key}... path so a new
+    issue-scoped tool can't forget _path_segment and reopen the
+    path-escape the encoding exists to prevent.
+    """
+    return f"/rest/api/2/issue/{_path_segment(issue_key)}{suffix}"
 
 
 def _extract_error_detail(response: requests.Response) -> str | None:
@@ -84,14 +110,25 @@ def _request_absolute(
     params: dict[str, Any] | None = None,
     json_data: dict[str, Any] | None = None,
 ) -> Any:
-    response = requests.request(
-        method=method,
-        url=url,
-        headers=_headers(),
-        params=params,
-        json=json_data,
-        timeout=DEFAULT_TIMEOUT_SECONDS,
-    )
+    for attempt in (0, 1):
+        response = requests.request(
+            method=method,
+            url=url,
+            headers=_headers(),
+            params=params,
+            json=json_data,
+            timeout=DEFAULT_TIMEOUT_SECONDS,
+        )
+        if response.status_code == 429 and attempt == 0:
+            try:
+                retry_after = int(response.headers.get("Retry-After", "0"))
+            except ValueError:
+                retry_after = 0
+            if 0 < retry_after <= MAX_RETRY_AFTER_SECONDS:
+                time.sleep(retry_after)
+                continue
+        break
+
     try:
         response.raise_for_status()
     except requests.HTTPError as exc:
@@ -153,7 +190,7 @@ def _request(
     resolved_cloud_id = _resolve_cloud_id(cloud_id)
     return _request_absolute(
         method,
-        f"{JIRA_API_BASE}/{resolved_cloud_id}{path}",
+        f"{JIRA_API_BASE}/{_path_segment(resolved_cloud_id)}{path}",
         params=params,
         json_data=json_data,
     )
@@ -201,53 +238,85 @@ def jira_get_current_user() -> str:
 
 
 @mcp.tool()
-def jira_list_projects(cloud_id: str = "", limit: int = 50) -> str:
+def jira_list_projects(cloud_id: str = "", limit: int = 50, start_at: int = 0) -> str:
     """
     List projects on a Jira site -- id, key (e.g. "ENG"), and name. Use the
     returned key with jira_create_issue and jira_search_issues.
     cloud_id: optional site id from jira_list_accessible_sites; omit when
     the account has only one accessible site.
+    start_at: offset into the full project list -- pass the previous
+    response's next_start_at to fetch the next page (0 to start over).
     """
     try:
         max_results = _clamp_limit(limit)
+        offset = max(0, int(start_at))
         result = _request(
             "GET",
             cloud_id,
             "/rest/api/2/project/search",
-            params={"maxResults": max_results},
+            params={"maxResults": max_results, "startAt": offset},
         )
+        if not isinstance(result, dict):
+            return _error("Unexpected response format from Jira projects API")
         projects = result.get("values") or []
-        truncated = not result.get("isLast", True)
-        return _success(projects=projects, truncated=truncated)
+        # bool(projects) guards against a server that signals more pages
+        # while returning an empty page: without it next_start_at would
+        # equal start_at and a caller following it would loop forever.
+        truncated = bool(projects) and not result.get("isLast", True)
+        return _success(
+            projects=projects,
+            truncated=truncated,
+            next_start_at=(offset + len(projects)) if truncated else None,
+        )
     except Exception as e:
         logger.error(f"Error listing Jira projects: {e}")
         return _error(str(e))
 
 
 @mcp.tool()
-def jira_search_issues(jql: str, cloud_id: str = "", limit: int = 20) -> str:
+def jira_search_issues(
+    jql: str, cloud_id: str = "", limit: int = 20, next_page_token: str = ""
+) -> str:
     """
     Search issues with JQL (Jira Query Language) -- the recommended way to
     find issues by project, assignee, status, text, etc.
     jql: a JQL query, e.g. 'project = ENG AND status = "In Progress"
     ORDER BY updated DESC' or 'text ~ "login bug"'.
     limit: max issues to return (default 20, capped at 100).
+    next_page_token: pass the previous response's next_page_token to fetch
+    the next page.
     """
     try:
         max_results = _clamp_limit(limit)
+        # /rest/api/2/search and /rest/api/3/search are deprecated (removed
+        # by Atlassian on Jira Cloud); /rest/api/3/search/jql is the
+        # replacement and pages via nextPageToken instead of startAt/total.
+        params: dict[str, Any] = {
+            "jql": jql,
+            "maxResults": max_results,
+            "fields": "summary,status,assignee,priority,issuetype,project,updated",
+        }
+        if next_page_token:
+            params["nextPageToken"] = next_page_token
         result = _request(
             "GET",
             cloud_id,
-            "/rest/api/2/search",
-            params={
-                "jql": jql,
-                "maxResults": max_results,
-                "fields": "summary,status,assignee,priority,issuetype,project,updated",
-            },
+            "/rest/api/3/search/jql",
+            params=params,
         )
+        if not isinstance(result, dict):
+            return _error("Unexpected response format from Jira search API")
         issues = result.get("issues") or []
-        total = result.get("total", len(issues))
-        return _success(issues=issues, total=total, truncated=total > len(issues))
+        # The enhanced-search endpoint signals "more pages" by including
+        # nextPageToken; isLast is not guaranteed to be present, so the
+        # token's presence is the reliable pagination signal in both
+        # directions (no token => last page, token => more pages).
+        next_token = result.get("nextPageToken")
+        return _success(
+            issues=issues,
+            truncated=bool(next_token),
+            next_page_token=next_token or None,
+        )
     except Exception as e:
         logger.error(f"Error searching Jira issues with JQL '{jql}': {e}")
         return _error(str(e))
@@ -261,7 +330,7 @@ def jira_get_issue(issue_key: str, cloud_id: str = "") -> str:
     issue_key: an issue key (e.g. "ENG-123") or its numeric id.
     """
     try:
-        result = _request("GET", cloud_id, f"/rest/api/2/issue/{issue_key}")
+        result = _request("GET", cloud_id, _issue_path(issue_key))
         return _success(issue=result)
     except Exception as e:
         logger.error(f"Error fetching Jira issue {issue_key}: {e}")
@@ -347,7 +416,7 @@ def jira_update_issue(
         _request(
             "PUT",
             cloud_id,
-            f"/rest/api/2/issue/{issue_key}",
+            _issue_path(issue_key),
             json_data={"fields": fields},
         )
         return _success(issue_key=issue_key)
@@ -365,10 +434,17 @@ def jira_list_transitions(issue_key: str, cloud_id: str = "") -> str:
     jira_transition_issue resolves it internally too.
     """
     try:
-        result = _request("GET", cloud_id, f"/rest/api/2/issue/{issue_key}/transitions")
+        result = _request(
+            "GET",
+            cloud_id,
+            _issue_path(issue_key, "/transitions"),
+        )
+        if not isinstance(result, dict):
+            return _error("Unexpected response format from Jira transitions API")
         transitions = [
             {"id": t.get("id"), "name": t.get("name")}
             for t in result.get("transitions") or []
+            if isinstance(t, dict)
         ]
         return _success(transitions=transitions)
     except Exception as e:
@@ -391,20 +467,24 @@ def jira_transition_issue(
         result = _request(
             "GET",
             resolved_cloud_id,
-            f"/rest/api/2/issue/{issue_key}/transitions",
+            _issue_path(issue_key, "/transitions"),
         )
+        if not isinstance(result, dict):
+            return _error("Unexpected response format from Jira transitions API")
         needle = transition_name.strip().lower()
         match = next(
             (
                 t
                 for t in result.get("transitions") or []
-                if str(t.get("name") or "").lower() == needle
+                if isinstance(t, dict) and str(t.get("name") or "").lower() == needle
             ),
             None,
         )
         if not match:
             available = ", ".join(
-                str(t.get("name")) for t in result.get("transitions") or []
+                str(t.get("name"))
+                for t in result.get("transitions") or []
+                if isinstance(t, dict)
             )
             return _error(
                 f"Transition '{transition_name}' is not available for {issue_key}. "
@@ -419,7 +499,7 @@ def jira_transition_issue(
         _request(
             "POST",
             resolved_cloud_id,
-            f"/rest/api/2/issue/{issue_key}/transitions",
+            _issue_path(issue_key, "/transitions"),
             json_data={"transition": {"id": transition_id}},
         )
         return _success(issue_key=issue_key, transitioned_to=match.get("name"))
@@ -431,21 +511,34 @@ def jira_transition_issue(
 
 
 @mcp.tool()
-def jira_list_comments(issue_key: str, cloud_id: str = "", limit: int = 50) -> str:
+def jira_list_comments(
+    issue_key: str, cloud_id: str = "", limit: int = 50, start_at: int = 0
+) -> str:
     """
     List comments on an issue (body, author, timestamp).
+    start_at: offset into the full comment list -- pass the previous
+    response's next_start_at to fetch the next page (0 to start over).
     """
     try:
         max_results = _clamp_limit(limit)
+        offset = max(0, int(start_at))
         result = _request(
             "GET",
             cloud_id,
-            f"/rest/api/2/issue/{issue_key}/comment",
-            params={"maxResults": max_results},
+            _issue_path(issue_key, "/comment"),
+            params={"maxResults": max_results, "startAt": offset},
         )
+        if not isinstance(result, dict):
+            return _error("Unexpected response format from Jira comments API")
         comments = result.get("comments") or []
+        total = result.get("total", offset + len(comments))
+        # bool(comments) guards the no-progress case (empty page while total
+        # still exceeds offset): next_start_at must never equal start_at.
+        truncated = bool(comments) and offset + len(comments) < total
         return _success(
-            comments=comments, truncated=result.get("total", 0) > len(comments)
+            comments=comments,
+            truncated=truncated,
+            next_start_at=(offset + len(comments)) if truncated else None,
         )
     except Exception as e:
         logger.error(f"Error listing comments for Jira issue {issue_key}: {e}")
@@ -462,7 +555,7 @@ def jira_add_comment(issue_key: str, body: str, cloud_id: str = "") -> str:
         result = _request(
             "POST",
             cloud_id,
-            f"/rest/api/2/issue/{issue_key}/comment",
+            _issue_path(issue_key, "/comment"),
             json_data={"body": body},
         )
         return _success(comment=result)
@@ -472,29 +565,46 @@ def jira_add_comment(issue_key: str, body: str, cloud_id: str = "") -> str:
 
 
 @mcp.tool()
-def jira_search_users(query: str, cloud_id: str = "", limit: int = 20) -> str:
+def jira_search_users(
+    query: str, cloud_id: str = "", limit: int = 20, start_at: int = 0
+) -> str:
     """
     Search site users by name or email -- accountId, displayName, email.
     Resolve a person to an accountId here before passing
     assignee_account_id to jira_create_issue or jira_update_issue.
+    start_at: offset into the full user list -- pass the previous
+    response's next_start_at to fetch the next page (0 to start over).
     """
     try:
         max_results = _clamp_limit(limit)
+        offset = max(0, int(start_at))
         result = _request(
             "GET",
             cloud_id,
             "/rest/api/2/user/search",
-            params={"query": query, "maxResults": max_results},
+            params={"query": query, "maxResults": max_results, "startAt": offset},
         )
+        if not isinstance(result, list):
+            return _error("Unexpected response format from Jira user search API")
         users = [
             {
                 "account_id": u.get("accountId"),
                 "display_name": u.get("displayName"),
                 "email": u.get("emailAddress"),
             }
-            for u in (result if isinstance(result, list) else [])
+            for u in result
+            if isinstance(u, dict)
         ]
-        return _success(users=users)
+        # This endpoint returns a plain array with no total/isLast -- a full
+        # page is the only signal a caller has that more results may exist.
+        # Count the raw page (not the filtered rows) so a malformed element
+        # can't stall pagination or skew the next offset.
+        truncated = len(result) == max_results
+        return _success(
+            users=users,
+            truncated=truncated,
+            next_start_at=(offset + len(result)) if truncated else None,
+        )
     except Exception as e:
         logger.error(f"Error searching Jira users for '{query}': {e}")
         return _error(str(e))

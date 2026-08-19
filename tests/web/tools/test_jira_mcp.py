@@ -9,13 +9,19 @@ from xagent.web.tools.mcp import jira
 
 class MockResponse:
     def __init__(
-        self, json_data=None, status_code: int = 200, text: str = "", url: str = ""
+        self,
+        json_data=None,
+        status_code: int = 200,
+        text: str = "",
+        url: str = "",
+        headers: dict | None = None,
     ):
         self._json_data = json_data if json_data is not None else {}
         self.status_code = status_code
         self.text = text or (json.dumps(self._json_data) if json_data else "")
         self.content = self.text.encode()
         self.url = url
+        self.headers = headers or {}
 
     def json(self):
         return self._json_data
@@ -86,6 +92,37 @@ def test_request_absolute_truncates_unstructured_error_body(monkeypatch):
     assert len(str(excinfo.value)) < len(long_body)
 
 
+def test_request_absolute_retries_once_on_429_with_retry_after(monkeypatch):
+    sleep_calls = []
+    monkeypatch.setattr(jira.time, "sleep", lambda s: sleep_calls.append(s))
+    mock_request = Mock(
+        side_effect=[
+            MockResponse(status_code=429, headers={"Retry-After": "2"}),
+            MockResponse(json_data={"ok": True}),
+        ]
+    )
+    monkeypatch.setattr(jira.requests, "request", mock_request)
+
+    result = jira._request_absolute("GET", "https://api.atlassian.com/me")
+
+    assert result == {"ok": True}
+    assert sleep_calls == [2]
+    assert mock_request.call_count == 2
+
+
+def test_request_absolute_does_not_retry_429_twice(monkeypatch):
+    monkeypatch.setattr(jira.time, "sleep", lambda s: None)
+    mock_request = Mock(
+        return_value=MockResponse(status_code=429, headers={"Retry-After": "1"})
+    )
+    monkeypatch.setattr(jira.requests, "request", mock_request)
+
+    with pytest.raises(RuntimeError):
+        jira._request_absolute("GET", "https://api.atlassian.com/me")
+
+    assert mock_request.call_count == 2
+
+
 def test_resolve_cloud_id_passes_through_explicit_value(monkeypatch):
     mock_request = Mock()
     monkeypatch.setattr(jira.requests, "request", mock_request)
@@ -134,6 +171,35 @@ def test_request_builds_url_with_resolved_cloud_id(monkeypatch):
 
     assert mock_request.call_args.kwargs["url"] == (
         "https://api.atlassian.com/ex/jira/site-a/rest/api/2/issue/ENG-1"
+    )
+
+
+def test_request_percent_encodes_cloud_id_in_url(monkeypatch):
+    mock_request = Mock(return_value=MockResponse(json_data={}))
+    monkeypatch.setattr(jira.requests, "request", mock_request)
+
+    jira._request("GET", "site/../a", "/rest/api/2/issue/ENG-1")
+
+    assert mock_request.call_args.kwargs["url"] == (
+        "https://api.atlassian.com/ex/jira/site%2F..%2Fa/rest/api/2/issue/ENG-1"
+    )
+
+
+def test_get_issue_percent_encodes_issue_key_in_path(monkeypatch):
+    mock_request = Mock(
+        side_effect=[
+            MockResponse(json_data=[_SITE_A]),
+            MockResponse(json_data={"key": "ENG-1"}),
+        ]
+    )
+    monkeypatch.setattr(jira.requests, "request", mock_request)
+
+    jira.jira_get_issue("ENG-1/../secrets?x=1")
+
+    issue_call = mock_request.call_args_list[1]
+    assert issue_call.kwargs["url"] == (
+        "https://api.atlassian.com/ex/jira/site-a/rest/api/2/issue/"
+        "ENG-1%2F..%2Fsecrets%3Fx%3D1"
     )
 
 
@@ -206,20 +272,62 @@ def test_list_projects_uses_resolved_cloud_id(monkeypatch):
     assert result["status"] == "success"
     assert result["projects"] == [{"id": "1", "key": "ENG", "name": "Engineering"}]
     assert result["truncated"] is False
+    assert result["next_start_at"] is None
     project_call = mock_request.call_args_list[1]
     assert project_call.kwargs["url"] == (
         "https://api.atlassian.com/ex/jira/site-a/rest/api/2/project/search"
     )
+    assert project_call.kwargs["params"]["startAt"] == 0
 
 
-def test_search_issues_sends_jql_and_reports_total(monkeypatch):
+def test_list_projects_reports_next_start_at_when_truncated(monkeypatch):
+    mock_request = Mock(
+        side_effect=[
+            MockResponse(json_data=[_SITE_A]),
+            MockResponse(
+                json_data={
+                    "values": [{"id": "1", "key": "ENG", "name": "Engineering"}],
+                    "isLast": False,
+                }
+            ),
+        ]
+    )
+    monkeypatch.setattr(jira.requests, "request", mock_request)
+
+    result = json.loads(jira.jira_list_projects(start_at=5))
+
+    assert result["truncated"] is True
+    assert result["next_start_at"] == 6
+    project_call = mock_request.call_args_list[1]
+    assert project_call.kwargs["params"]["startAt"] == 5
+
+
+def test_list_projects_empty_page_never_repeats_offset(monkeypatch):
+    mock_request = Mock(
+        side_effect=[
+            MockResponse(json_data=[_SITE_A]),
+            MockResponse(json_data={"values": [], "isLast": False}),
+        ]
+    )
+    monkeypatch.setattr(jira.requests, "request", mock_request)
+
+    result = json.loads(jira.jira_list_projects(start_at=5))
+
+    assert result["truncated"] is False
+    assert result["next_start_at"] is None
+
+
+def test_search_issues_sends_jql_and_reports_next_page_token(monkeypatch):
+    # No isLast in the mock on purpose: the enhanced-search endpoint's
+    # pagination signal is nextPageToken presence, and isLast is not
+    # guaranteed to appear in the response.
     mock_request = Mock(
         side_effect=[
             MockResponse(json_data=[_SITE_A]),
             MockResponse(
                 json_data={
                     "issues": [{"key": "ENG-1", "fields": {"summary": "Bug"}}],
-                    "total": 5,
+                    "nextPageToken": "token-2",
                 }
             ),
         ]
@@ -230,10 +338,38 @@ def test_search_issues_sends_jql_and_reports_total(monkeypatch):
 
     assert result["status"] == "success"
     assert result["issues"][0]["key"] == "ENG-1"
-    assert result["total"] == 5
     assert result["truncated"] is True
+    assert result["next_page_token"] == "token-2"
     search_call = mock_request.call_args_list[1]
+    assert search_call.kwargs["url"] == (
+        "https://api.atlassian.com/ex/jira/site-a/rest/api/3/search/jql"
+    )
     assert search_call.kwargs["params"]["jql"] == "project = ENG"
+
+
+def test_search_issues_passes_next_page_token_when_provided(monkeypatch):
+    mock_request = Mock(
+        side_effect=[
+            MockResponse(json_data=[_SITE_A]),
+            MockResponse(
+                json_data={
+                    "issues": [{"key": "ENG-2", "fields": {"summary": "Bug 2"}}],
+                    "isLast": True,
+                }
+            ),
+        ]
+    )
+    monkeypatch.setattr(jira.requests, "request", mock_request)
+
+    result = json.loads(
+        jira.jira_search_issues("project = ENG", next_page_token="token-2")
+    )
+
+    assert result["status"] == "success"
+    assert result["truncated"] is False
+    assert result["next_page_token"] is None
+    search_call = mock_request.call_args_list[1]
+    assert search_call.kwargs["params"]["nextPageToken"] == "token-2"
 
 
 def test_get_issue_returns_issue(monkeypatch):
@@ -406,6 +542,44 @@ def test_list_comments_reports_truncated(monkeypatch):
 
     assert result["status"] == "success"
     assert result["truncated"] is True
+    assert result["next_start_at"] == 1
+
+
+def test_list_comments_paginates_with_start_at(monkeypatch):
+    mock_request = Mock(
+        side_effect=[
+            MockResponse(json_data=[_SITE_A]),
+            MockResponse(
+                json_data={
+                    "comments": [{"id": "2", "body": "Second"}],
+                    "total": 2,
+                }
+            ),
+        ]
+    )
+    monkeypatch.setattr(jira.requests, "request", mock_request)
+
+    result = json.loads(jira.jira_list_comments("ENG-1", start_at=1))
+
+    assert result["truncated"] is False
+    assert result["next_start_at"] is None
+    comment_call = mock_request.call_args_list[1]
+    assert comment_call.kwargs["params"]["startAt"] == 1
+
+
+def test_list_comments_empty_page_never_repeats_offset(monkeypatch):
+    mock_request = Mock(
+        side_effect=[
+            MockResponse(json_data=[_SITE_A]),
+            MockResponse(json_data={"comments": [], "total": 10}),
+        ]
+    )
+    monkeypatch.setattr(jira.requests, "request", mock_request)
+
+    result = json.loads(jira.jira_list_comments("ENG-1", start_at=5))
+
+    assert result["truncated"] is False
+    assert result["next_start_at"] is None
 
 
 def test_add_comment_sends_body(monkeypatch):
@@ -425,24 +599,21 @@ def test_add_comment_sends_body(monkeypatch):
 
 
 def test_search_users_maps_fields(monkeypatch):
-    monkeypatch.setattr(
-        jira.requests,
-        "request",
-        Mock(
-            side_effect=[
-                MockResponse(json_data=[_SITE_A]),
-                MockResponse(
-                    json_data=[
-                        {
-                            "accountId": "u1",
-                            "displayName": "Ada Lovelace",
-                            "emailAddress": "ada@example.com",
-                        }
-                    ]
-                ),
-            ]
-        ),
+    mock_request = Mock(
+        side_effect=[
+            MockResponse(json_data=[_SITE_A]),
+            MockResponse(
+                json_data=[
+                    {
+                        "accountId": "u1",
+                        "displayName": "Ada Lovelace",
+                        "emailAddress": "ada@example.com",
+                    }
+                ]
+            ),
+        ]
     )
+    monkeypatch.setattr(jira.requests, "request", mock_request)
 
     result = json.loads(jira.jira_search_users("ada"))
 
@@ -450,6 +621,74 @@ def test_search_users_maps_fields(monkeypatch):
     assert result["users"] == [
         {"account_id": "u1", "display_name": "Ada Lovelace", "email": "ada@example.com"}
     ]
+    assert result["truncated"] is False
+    user_call = mock_request.call_args_list[1]
+    assert user_call.kwargs["params"]["startAt"] == 0
+
+
+def test_search_users_reports_truncated_on_full_page(monkeypatch):
+    mock_request = Mock(
+        side_effect=[
+            MockResponse(json_data=[_SITE_A]),
+            MockResponse(
+                json_data=[
+                    {
+                        "accountId": f"u{i}",
+                        "displayName": f"User {i}",
+                        "emailAddress": f"u{i}@example.com",
+                    }
+                    for i in range(2)
+                ]
+            ),
+        ]
+    )
+    monkeypatch.setattr(jira.requests, "request", mock_request)
+
+    result = json.loads(jira.jira_search_users("a", limit=2, start_at=2))
+
+    assert result["truncated"] is True
+    assert result["next_start_at"] == 4
+    user_call = mock_request.call_args_list[1]
+    assert user_call.kwargs["params"]["startAt"] == 2
+
+
+def test_search_users_returns_error_on_non_list_response(monkeypatch):
+    mock_request = Mock(
+        side_effect=[
+            MockResponse(json_data=[_SITE_A]),
+            MockResponse(json_data={"unexpected": "shape"}),
+        ]
+    )
+    monkeypatch.setattr(jira.requests, "request", mock_request)
+
+    result = json.loads(jira.jira_search_users("ada"))
+
+    assert result["status"] == "error"
+    assert "Unexpected response format" in result["message"]
+
+
+def test_search_users_counts_raw_page_for_pagination(monkeypatch):
+    # A malformed (non-dict) element is dropped from users but must still
+    # count toward the page size, or pagination would stall or re-read rows.
+    mock_request = Mock(
+        side_effect=[
+            MockResponse(json_data=[_SITE_A]),
+            MockResponse(
+                json_data=[
+                    {"accountId": "u1", "displayName": "Ada", "emailAddress": "a@x.io"},
+                    "malformed-entry",
+                ]
+            ),
+        ]
+    )
+    monkeypatch.setattr(jira.requests, "request", mock_request)
+
+    result = json.loads(jira.jira_search_users("a", limit=2))
+
+    assert result["status"] == "success"
+    assert len(result["users"]) == 1
+    assert result["truncated"] is True
+    assert result["next_start_at"] == 2
 
 
 def test_jira_app_registry_includes_offline_access_scope():

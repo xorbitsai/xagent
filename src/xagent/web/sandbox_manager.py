@@ -2066,29 +2066,53 @@ class SandboxManager:
         method's. This intentionally replaces the legacy config-diff
         delete-guessing for this backend (see ``_legacy_cleanup``).
         """
+        quiesce_started = time.monotonic()
         try:
             sandboxes = await self._service.list_sandboxes()
         except Exception as exc:
             logger.error(f"Failed to list sandboxes for quiesce: {exc}")
             sandboxes = []
 
+        seen = len(sandboxes or [])
+        running = 0
+        stopped = 0
+        failed = 0
+        stop_seconds = 0.0
         for sb in sandboxes or []:
             if sb.state != "running":
                 continue
+            running += 1
+            stop_started = time.monotonic()
             try:
                 await self._service.stop_existing(
                     sb.name, timeout=_SANDBOX_STOP_TIMEOUT_SECONDS
                 )
+                stopped += 1
                 logger.debug(f"Stopped sandbox: {sb.name}")
             except Exception as exc:
+                failed += 1
                 logger.error(f"Failed to stop sandbox {sb.name} during quiesce: {exc}")
+            finally:
+                stop_seconds += time.monotonic() - stop_started
 
         self._cache.clear()
         self._config_cache.clear()
         self._lease_providers.clear()
         self._activity.clear()
         self._reconcile_budget.clear()
-        logger.info("Sandbox quiesce completed")
+        # One summary line per quiesce (issue #231): stops are serial and each
+        # rides the full stop timeout, so stop_time grows with the running
+        # count and dominates startup.
+        logger.info(
+            "Sandbox quiesce completed: seen=%d running=%d stopped=%d failed=%d "
+            "stop_time=%.2fs total=%.2fs",
+            seen,
+            running,
+            stopped,
+            failed,
+            stop_seconds,
+            time.monotonic() - quiesce_started,
+        )
 
     async def _legacy_cleanup(self) -> None:
         """Stop all running sandboxes.
@@ -2106,6 +2130,7 @@ class SandboxManager:
             between deployments, all user sandboxes will be detected as
             having stale volume mounts and will be deleted for recreation.
         """
+        cleanup_started = time.monotonic()
         try:
             sandboxes = await self._service.list_sandboxes()
             if not sandboxes:
@@ -2114,6 +2139,10 @@ class SandboxManager:
 
             image, config = self._get_sandbox_image_and_config()
 
+            seen = len(sandboxes)
+            stopped = 0
+            deleted = 0
+            failed = 0
             for sb in sandboxes:
                 try:
                     lifecycle_type, lifecycle_id = None, None
@@ -2126,6 +2155,7 @@ class SandboxManager:
                                 sb.name, template=sb.template, config=sb.config
                             )
                             await box.stop()
+                            stopped += 1
                             logger.debug(f"Stopped sandbox: {sb.name}")
                         continue
 
@@ -2196,6 +2226,7 @@ class SandboxManager:
                             f"{', '.join(changes)}, deleting"
                         )
                         await self._service.delete(sb.name)
+                        deleted += 1
                         continue
 
                     # Stop running sandboxes with matching image
@@ -2204,8 +2235,10 @@ class SandboxManager:
                             sb.name, template=sb.template, config=sb.config
                         )
                         await box.stop()
+                        stopped += 1
                         logger.debug(f"Stopped sandbox: {sb.name}")
                 except Exception as e:
+                    failed += 1
                     logger.error(f"Failed to handle sandbox {sb.name}: {e}")
 
             self._cache.clear()
@@ -2213,7 +2246,18 @@ class SandboxManager:
             self._locks.clear()
             self._lease_providers.clear()
             self._activity.clear()
-            logger.info("Sandbox cleanup completed")
+            # One summary line per cleanup (issue #231): serial stops, each
+            # rides the full stop timeout, so total grows with the running
+            # count.
+            logger.info(
+                "Sandbox cleanup completed: seen=%d stopped=%d deleted=%d "
+                "failed=%d total=%.2fs",
+                seen,
+                stopped,
+                deleted,
+                failed,
+                time.monotonic() - cleanup_started,
+            )
         except Exception as e:
             logger.error(f"Failed to cleanup sandboxes: {e}")
 

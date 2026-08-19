@@ -1,5 +1,6 @@
 """Test SandboxManager.cleanup — delete sandbox if config changed."""
 
+import logging
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
@@ -467,3 +468,43 @@ class TestQuiesceReconcilingBackend:
         service.stop_existing.assert_awaited_once_with(
             "user::1", timeout=_SANDBOX_STOP_TIMEOUT_SECONDS
         )
+
+    @pytest.mark.asyncio
+    async def test_quiesce_logs_diagnostic_summary(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Quiesce emits one summary line with seen/running/stopped counts so a
+        slow startup is diagnosable from logs alone (issue #231)."""
+        service = FakeSandboxService(runtime_spec_supported=True)
+        spec = ResolvedSandboxRuntimeSpec.from_parts(
+            template_type="image", image="img:v1"
+        )
+        for name, state in (
+            ("user::1", "running"),
+            ("user::2", "running"),
+            ("user::3", "stopped"),
+        ):
+            service._containers[name] = _FakeReconcileContainer(
+                state=state,
+                spec=spec,
+                fingerprint_label=spec.fingerprint(),
+                version_label="1",
+            )
+        service.containers = {"user::1", "user::2", "user::3"}
+
+        manager = SandboxManager(service)
+
+        with caplog.at_level(logging.INFO, logger="xagent.web.sandbox_manager"):
+            await manager.cleanup()
+
+        summaries = [
+            r.getMessage()
+            for r in caplog.records
+            if "Sandbox quiesce completed" in r.getMessage()
+        ]
+        assert len(summaries) == 1, "expected exactly one quiesce summary line"
+        msg = summaries[0]
+        assert "seen=3" in msg
+        assert "running=2" in msg
+        assert "stopped=2" in msg
+        assert "failed=0" in msg

@@ -2,7 +2,9 @@ import asyncio
 import json
 import logging
 import os
-from contextlib import suppress
+import time
+from collections.abc import Iterator
+from contextlib import contextmanager, suppress
 from typing import Any, cast
 
 from fastapi import FastAPI, Request
@@ -110,6 +112,28 @@ setup_logging()  # Uses XAGENT_LOG_LEVEL env var or defaults to INFO
 logger = logging.getLogger(__name__)
 
 __all__ = ["app"]
+
+
+@contextmanager
+def _startup_phase(name: str) -> Iterator[None]:
+    """Log a begin/end pair with duration around a startup phase.
+
+    Issue #231: the slow sandbox-quiesce phase was awaited inline with no
+    logs, so an ~8 min stall looked like a fast start. One line in, one line
+    out per phase (never per loop/tick) makes the next slow start obvious. A
+    failing phase still logs its end line before the error propagates.
+    """
+    logger.info("startup phase begin: %s", name)
+    started = time.monotonic()
+    try:
+        yield
+    except Exception:
+        logger.error(
+            "startup phase failed: %s (after %.2fs)", name, time.monotonic() - started
+        )
+        raise
+    else:
+        logger.info("startup phase done: %s (%.2fs)", name, time.monotonic() - started)
 
 
 # Ensure web, uploads directory exists before configuring static files
@@ -1093,9 +1117,8 @@ async def startup_event() -> None:
     global _migration_task
     logger.info("Agent runtime configured: %s", get_agent_runtime())
     validate_interaction_rollout_at_startup()
-    logger.info("Initializing database...")
-    init_db()
-    logger.info("Database initialized successfully")
+    with _startup_phase("database init"):
+        init_db()
 
     # Keep built-in task-runtime providers scoped to the application lifespan.
     # Register even when disabled so task creation receives a precise 403
@@ -1157,7 +1180,8 @@ async def startup_event() -> None:
     from ..skills.utils import create_skill_manager
 
     skill_manager = create_skill_manager()
-    await skill_manager.initialize()
+    with _startup_phase("skill manager init"):
+        await skill_manager.initialize()
     app.state.skill_manager = skill_manager
     logger.info(
         f"Skill manager initialized with {len(await skill_manager.list_skills())} skills"
@@ -1167,7 +1191,8 @@ async def startup_event() -> None:
     from ..templates.utils import create_template_manager
 
     template_manager = create_template_manager()
-    await template_manager.initialize()
+    with _startup_phase("template manager init"):
+        await template_manager.initialize()
     app.state.template_manager = template_manager
     logger.info(
         f"Template manager initialized with {len(await template_manager.list_templates())} templates"
@@ -1554,9 +1579,15 @@ async def startup_event() -> None:
         # This also resolves and caches the backend-capability probe as a
         # side effect, so cleanup() below reads the cached value instead of
         # resolving it again.
-        await check_sandbox_static_readiness(sandbox_mgr)
-        await sandbox_mgr.cleanup()
-        await sandbox_mgr.warmup()
+        # The phases that hid issue #231: cleanup() quiesce was awaited
+        # inline for ~8 min with no logs. Time each so the next slow start
+        # names the exact sub-phase; the quiesce summary breaks it down more.
+        with _startup_phase("sandbox static readiness"):
+            await check_sandbox_static_readiness(sandbox_mgr)
+        with _startup_phase("sandbox cleanup"):
+            await sandbox_mgr.cleanup()
+        with _startup_phase("sandbox warmup"):
+            await sandbox_mgr.warmup()
         logger.info("Sandbox manager initialized and warmed up")
 
         from ..config import get_sandbox_idle_ttl

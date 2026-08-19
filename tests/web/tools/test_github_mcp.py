@@ -232,6 +232,40 @@ def test_clamp_limit_boundaries(limit, expected):
     assert github._clamp_limit(limit) == expected
 
 
+def test_link_header_rels_returns_empty_set_for_missing_header():
+    assert github._link_header_rels(None) == set()
+    assert github._link_header_rels("") == set()
+
+
+def test_link_header_rels_parses_multiple_quoted_links():
+    header = (
+        '<https://api.github.com/x?page=2>; rel="next", '
+        '<https://api.github.com/x?page=5>; rel="last"'
+    )
+    assert github._link_header_rels(header) == {"next", "last"}
+
+
+def test_link_header_rels_accepts_unquoted_rel_token():
+    """GitHub always quotes rel, but RFC 8288 also permits an unquoted
+    token -- a spec-compliant but differently-formatted response (e.g. from
+    a proxy) must not be silently parsed as having no rels at all."""
+    assert github._link_header_rels("<https://api.github.com/x?page=2>; rel=next") == {
+        "next"
+    }
+
+
+def test_link_header_rels_lowercases_rel_values():
+    """Rel values are case-insensitive per RFC 8288 -- an upper/mixed-case
+    variant must still satisfy callers' `"next" in ...` checks."""
+    assert github._link_header_rels(
+        '<https://api.github.com/x?page=2>; REL="Next"'
+    ) == {"next"}
+
+
+def test_link_header_rels_ignores_malformed_header():
+    assert github._link_header_rels("this is not a link header") == set()
+
+
 def test_search_repositories_returns_summaries(monkeypatch):
     monkeypatch.setattr(
         github.requests,
@@ -593,6 +627,62 @@ def test_list_issues_full_final_page_without_next_link_is_not_truncated(monkeypa
     assert result["next_page"] is None
 
 
+def test_list_issues_empty_page_with_next_link_still_reports_truncated(monkeypatch):
+    """An empty page normally means the previous page's Link header already
+    said there's no more -- but if a malformed/unusual response still
+    reports hasNextPage on an empty page, that must not be silently
+    treated as a complete result."""
+    monkeypatch.setattr(
+        github.requests,
+        "request",
+        Mock(
+            return_value=MockResponse(
+                json_data=[],
+                headers={"Link": '<https://api.github.com/x?page=2>; rel="next"'},
+            )
+        ),
+    )
+
+    result = json.loads(github.github_list_issues("octocat/Hello-World"))
+
+    assert result["status"] == "success"
+    assert result["issues"] == []
+    assert result["truncated"] is True
+    assert result["next_page"] == 2
+
+
+def test_list_issues_preserves_partial_results_on_malformed_json_body(monkeypatch):
+    """A malformed 200 JSON body on page 2+ must be treated the same as a
+    request-level failure -- it must not escape the per-page handler and
+    discard issues already collected from earlier pages."""
+    first_page = [
+        {"number": i, "title": f"issue {i}", "labels": []} for i in range(1, 3)
+    ]
+
+    class MalformedJsonResponse(MockResponse):
+        def json(self):
+            raise ValueError("Expecting value: line 1 column 1 (char 0)")
+
+    mock_request = Mock(
+        side_effect=[
+            MockResponse(
+                json_data=first_page,
+                headers={"Link": '<https://api.github.com/x?page=2>; rel="next"'},
+            ),
+            MalformedJsonResponse(content=b"not json"),
+        ]
+    )
+    monkeypatch.setattr(github.requests, "request", mock_request)
+
+    result = json.loads(github.github_list_issues("octocat/Hello-World", limit=100_000))
+
+    assert result["status"] == "success"
+    assert len(result["issues"]) == 2
+    assert result["truncated"] is True
+    assert result["next_page"] == 2
+    assert "Expecting value" in result["error"]
+
+
 def test_list_issues_stops_at_max_pages_and_reports_truncated(monkeypatch):
     """When every page is entirely pull requests and the Link header still
     reports more pages exist, the outer loop must still terminate at
@@ -647,9 +737,9 @@ def test_list_issues_stops_when_aggregate_time_budget_is_exceeded(monkeypatch):
             )
         ),
     )
-    # First call computes the deadline; the second (before page 2) finds the
-    # budget already exhausted.
-    clock = iter([0.0, github.MAX_ISSUE_LIST_SECONDS + 1])
+    # Call order: deadline baseline, page 1's request-timeout calc (still
+    # within budget), page 2's pre-request budget check (already exhausted).
+    clock = iter([0.0, 0.0, github.MAX_ISSUE_LIST_SECONDS + 1])
     monkeypatch.setattr(github.time, "monotonic", lambda: next(clock))
 
     result = json.loads(github.github_list_issues("octocat/Hello-World", limit=5))
@@ -659,6 +749,35 @@ def test_list_issues_stops_when_aggregate_time_budget_is_exceeded(monkeypatch):
     assert result["truncated"] is True
     assert result["next_page"] == 2
     assert result["next_skip"] == 0
+
+
+def test_list_issues_caps_request_timeout_to_remaining_budget(monkeypatch):
+    """Near the aggregate deadline, an individual request's own timeout
+    must shrink to what's left of the budget -- otherwise a single
+    in-flight request could still run the full DEFAULT_TIMEOUT_SECONDS and
+    overshoot the aggregate budget before the next page's pre-request check
+    ever gets a chance to act on it."""
+    single_issue_page = [{"number": 1, "title": "issue", "labels": []}]
+    mock_request = Mock(
+        return_value=MockResponse(
+            json_data=single_issue_page,
+            headers={"Link": '<https://api.github.com/x?page=2>; rel="next"'},
+        )
+    )
+    monkeypatch.setattr(github.requests, "request", mock_request)
+    # Call order: deadline baseline, page 1's request-timeout calc, page 2's
+    # pre-request budget check, page 2's request-timeout calc (5s left).
+    clock = iter(
+        [0.0, 0.0, github.MAX_ISSUE_LIST_SECONDS - 5, github.MAX_ISSUE_LIST_SECONDS - 5]
+    )
+    monkeypatch.setattr(github.time, "monotonic", lambda: next(clock))
+
+    result = json.loads(github.github_list_issues("octocat/Hello-World", limit=2))
+
+    assert result["status"] == "success"
+    assert mock_request.call_count == 2
+    second_call = mock_request.call_args_list[1]
+    assert second_call.kwargs["timeout"] == 5.0
 
 
 def test_list_issues_starts_from_specified_page(monkeypatch):
@@ -865,6 +984,25 @@ def test_list_pull_requests_returns_summaries(monkeypatch):
     assert result["status"] == "success"
     assert result["pull_requests"][0]["head"] == "fix-branch"
     assert result["pull_requests"][0]["base"] == "main"
+    assert result["truncated"] is False
+
+
+def test_list_pull_requests_reports_truncated_when_more_pages_exist(monkeypatch):
+    monkeypatch.setattr(
+        github.requests,
+        "request",
+        Mock(
+            return_value=MockResponse(
+                json_data=[{"number": 1, "title": "pr", "head": {}, "base": {}}],
+                headers={"Link": '<https://api.github.com/x?page=2>; rel="next"'},
+            )
+        ),
+    )
+
+    result = json.loads(github.github_list_pull_requests("octocat/Hello-World"))
+
+    assert result["status"] == "success"
+    assert result["truncated"] is True
 
 
 def test_list_pull_requests_sends_non_default_state_and_limit(monkeypatch):
@@ -1228,6 +1366,25 @@ def test_list_commits_returns_summaries(monkeypatch):
     assert result["status"] == "success"
     assert result["commits"][0]["message"] == "fix bug"
     assert result["commits"][0]["author"] == "Alice"
+    assert result["truncated"] is False
+
+
+def test_list_commits_reports_truncated_when_more_pages_exist(monkeypatch):
+    monkeypatch.setattr(
+        github.requests,
+        "request",
+        Mock(
+            return_value=MockResponse(
+                json_data=[{"sha": "deadbeef", "commit": {}, "html_url": "https://x"}],
+                headers={"Link": '<https://api.github.com/x?page=2>; rel="next"'},
+            )
+        ),
+    )
+
+    result = json.loads(github.github_list_commits("octocat/Hello-World"))
+
+    assert result["status"] == "success"
+    assert result["truncated"] is True
 
 
 def test_list_commits_sends_path_and_clamps_over_limit(monkeypatch):

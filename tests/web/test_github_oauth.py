@@ -10,7 +10,11 @@ from sqlalchemy.orm import sessionmaker
 
 from xagent.core.utils.encryption import encrypt_value
 from xagent.web.api import auth as auth_api
-from xagent.web.api.auth import create_access_token, generic_oauth_callback
+from xagent.web.api.auth import (
+    create_access_token,
+    generic_oauth_callback,
+    generic_oauth_login,
+)
 from xagent.web.models.database import Base
 from xagent.web.models.mcp import MCPServer, UserMCPServer
 from xagent.web.models.oauth_provider import OAuthProvider
@@ -201,6 +205,92 @@ def test_bare_github_login_does_not_activate_github_mcp_server(db_session, monke
 
     # ...but no GitHub MCP server is activated from it.
     assert db.query(MCPServer).filter(MCPServer.name == "GitHub").first() is None
+
+
+def test_bare_github_login_does_not_disturb_an_existing_scoped_connection(
+    db_session, monkeypatch
+):
+    """The critical regression: a user with a fully-scoped, active GitHub
+    connection must not have it silently downgraded by re-running the bare
+    (app_id-less) login route. Before the login-time guard, this callback
+    would delete-and-replace the existing UserOAuth row (same
+    provider="github" key as the app-scoped connection) with an
+    identity-only grant while leaving the MCPServer/UserMCPServer row
+    active -- reporting "connected" against a token that can no longer
+    actually use the connector's tools."""
+    db, user = db_session
+
+    # Establish a fully-scoped connection first, exactly as the app-scoped
+    # callback test above does.
+    scoped_state = create_access_token(
+        data={
+            "type": "oauth_state",
+            "user_id": user.id,
+            "provider": "github",
+            "app_id": "github",
+        },
+        expires_delta=timedelta(minutes=10),
+    )
+    scoped_request = SimpleNamespace(
+        query_params={"code": "github-code", "state": scoped_state}
+    )
+    monkeypatch.setattr(
+        auth_api.requests,
+        "post",
+        Mock(
+            return_value=MockResponse(
+                {
+                    "access_token": "scoped-github-token",
+                    "token_type": "bearer",
+                    "scope": "repo,user:email",
+                }
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        auth_api.requests,
+        "get",
+        Mock(return_value=MockResponse({"id": 42, "login": "octocat"})),
+    )
+    setup_response = generic_oauth_callback(
+        "github", scoped_request, db, _github_provider()
+    )
+    assert setup_response.status_code == 200
+
+    # Now attempt the bare login route a malicious/confused re-connect
+    # attempt would use.
+    login_token = create_access_token(
+        data={"sub": user.username, "type": "access"},
+        expires_delta=timedelta(minutes=5),
+    )
+    login_response = generic_oauth_login(
+        provider="github",
+        token=login_token,
+        app_id=None,
+        redirect=None,
+        db=db,
+        db_provider=_github_provider(),
+    )
+
+    assert login_response.status_code == 404
+
+    # The original scoped connection and its active server are untouched.
+    oauth_account = (
+        db.query(UserOAuth)
+        .filter(UserOAuth.user_id == user.id, UserOAuth.provider == "github")
+        .one()
+    )
+    assert oauth_account.access_token == "scoped-github-token"
+    server = db.query(MCPServer).filter(MCPServer.name == "GitHub").one()
+    user_mcp = (
+        db.query(UserMCPServer)
+        .filter(
+            UserMCPServer.user_id == user.id,
+            UserMCPServer.mcpserver_id == server.id,
+        )
+        .one()
+    )
+    assert user_mcp.is_active is True
 
 
 def test_non_github_callback_omits_accept_json_header(db_session, monkeypatch):

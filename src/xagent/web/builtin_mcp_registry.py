@@ -184,9 +184,9 @@ def get_builtin_oauth_provider_rows() -> list[dict[str, Any]]:
             # team-name-in-email-slot above.
             "email_path": "login",
             # Identity-only for this provider row, same pattern as zoom
-            # above: the functional scopes (repo access, org read, email)
-            # live on the app row's oauth_scopes and are merged in at
-            # authorize time by _merge_oauth_scopes.
+            # above: the functional scopes (repo access, email) live on
+            # the app row's oauth_scopes and are merged in at authorize
+            # time by _merge_oauth_scopes.
             "default_scopes": ["read:user"],
         },
         {
@@ -786,9 +786,9 @@ def get_builtin_public_mcp_app_rows() -> list[dict[str, Any]]:
             # github_get_current_user's output relies on directly -- see
             # test_get_current_user_returns_profile in test_github_mcp.py,
             # which asserts the email field is surfaced, and
-            # test_generic_oauth_login_requests_exact_github_scope in
-            # test_github_oauth.py, which asserts this exact scope is what
-            # gets requested at authorize time.
+            # test_github_login_requests_exact_canonical_scope in
+            # test_generic_oauth_login.py, which asserts this exact scope
+            # is what gets requested at authorize time.
             "oauth_scopes": ["repo", "user:email"],
             "is_visible_in_connector": True,
             "launch_config": {

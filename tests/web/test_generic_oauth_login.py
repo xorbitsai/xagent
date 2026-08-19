@@ -276,6 +276,63 @@ def test_github_login_requests_exact_canonical_scope(db_session):
     assert qs["scope"] == ["read:user repo user:email"]
 
 
+def test_bare_github_login_is_rejected_before_reaching_provider_config(db_session):
+    """A bare (app_id-less) login persists to the exact same
+    UserOAuth.provider="github" key an app-scoped login uses, since
+    github's app_id and provider name are the same string. Left unblocked,
+    re-running this route would silently replace a fully-scoped
+    connection's grant with an identity-only one on the next callback.
+    This must be rejected before even resolving provider config (client_id
+    missing would otherwise return a different, misleading error)."""
+    db, user = db_session
+    token = _token_for(user)
+
+    provider = _provider(
+        auth_url="https://github.com/login/oauth/authorize",
+        default_scopes=["read:user"],
+        redirect_uri="https://app.example.com/api/auth/github/callback",
+        client_id="",  # deliberately unconfigured -- the bare-route guard
+        # must fire first, not the missing-client-id error path.
+    )
+
+    resp = generic_oauth_login(
+        provider="github",
+        token=token,
+        app_id=None,
+        redirect=None,
+        db=db,
+        db_provider=provider,
+    )
+
+    assert resp.status_code == 404
+    assert "GITHUB_CLIENT_ID" not in resp.body.decode()
+
+
+def test_bare_login_for_unrestricted_provider_still_proceeds(db_session):
+    """Sanity: the bare-route guard is scoped to
+    APPS_REQUIRING_APP_SCOPED_OAUTH_GRANT members only -- an ordinary
+    provider's bare login (no collision risk) must be unaffected."""
+    db, user = db_session
+    token = _token_for(user)
+
+    provider = _provider(
+        auth_url="https://login.microsoftonline.com/common/oauth2/v2.0/authorize",
+        default_scopes=["User.Read"],
+        redirect_uri="https://app.example.com/cb",
+    )
+
+    resp = generic_oauth_login(
+        provider="microsoft",
+        token=token,
+        app_id=None,
+        redirect=None,
+        db=db,
+        db_provider=provider,
+    )
+
+    assert resp.status_code == 307
+
+
 def test_hubspot_login_sends_tier_gated_scopes_as_optional(db_session):
     """business-intelligence, marketing-email, and marketing.campaigns.read
     are all gated on a Marketing Hub tier above Free/CRM-only - requesting

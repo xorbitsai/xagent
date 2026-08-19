@@ -1196,6 +1196,30 @@ def generic_oauth_login(
             content="<h1>Error: Provider not configured</h1>", status_code=500
         )
 
+    if not app_id:
+        from ..mcp_apps import requires_app_scoped_oauth_grant
+
+        # A bare (app_id-less) login persists to UserOAuth.provider==provider
+        # -- for a provider in APPS_REQUIRING_APP_SCOPED_OAUTH_GRANT whose
+        # sole app's app_id is that same provider string (e.g. github), that
+        # is the EXACT SAME key an app-scoped login uses. Without this
+        # guard, re-running the bare route would silently delete-and-replace
+        # a fully-scoped connection's grant with an identity-only one via
+        # generic_oauth_callback's delete-then-recreate step below, while
+        # the existing MCPServer/UserMCPServer row is left active and now
+        # backed by an under-scoped token. Facebook/Instagram are unaffected
+        # (their bare provider string "meta" is never itself a member of the
+        # set, only their app_ids "facebook"/"instagram" are).
+        if requires_app_scoped_oauth_grant(provider):
+            return HTMLResponse(
+                content=(
+                    "<h1>Cannot Connect</h1>"
+                    "<p>This connector must be started from its catalog "
+                    "entry.</p>"
+                ),
+                status_code=404,
+            )
+
     client_id = _resolve_oauth_secret(provider, db_provider.client_id, "CLIENT_ID")
     if not client_id:
         return _oauth_provider_config_error(

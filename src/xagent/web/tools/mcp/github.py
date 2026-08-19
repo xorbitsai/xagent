@@ -122,7 +122,7 @@ def _clamp_limit(limit: int, *, default: int = 30) -> int:
     return max(1, min(value, MAX_PER_PAGE))
 
 
-_LINK_REL_PATTERN = re.compile(r'rel="([^"]+)"')
+_LINK_REL_PATTERN = re.compile(r'rel=(?:"([^"]*)"|([^;,\s]+))', re.IGNORECASE)
 
 
 def _link_header_rels(link_header: str | None) -> set[str]:
@@ -131,10 +131,20 @@ def _link_header_rels(link_header: str | None) -> set[str]:
     another page exists. Inferring it from a page's item count instead
     (e.g. "this page came back full") falsely flags an exactly-full final
     page as truncated.
+
+    GitHub always quotes the rel value (rel="next"), but RFC 8288 also
+    permits an unquoted token -- both forms are matched here rather than
+    only the quoted one, so a spec-compliant but differently-formatted
+    response (e.g. from a proxy) isn't silently treated as having no rels
+    at all. Rel values are case-insensitive per the same RFC, so they're
+    lowercased to match callers' `"next" in ...` checks.
     """
     if not link_header:
         return set()
-    return set(_LINK_REL_PATTERN.findall(link_header))
+    return {
+        (quoted or unquoted).lower()
+        for quoted, unquoted in _LINK_REL_PATTERN.findall(link_header)
+    }
 
 
 def _request_raw(
@@ -143,6 +153,7 @@ def _request_raw(
     *,
     params: dict[str, Any] | None = None,
     json_data: dict[str, Any] | None = None,
+    timeout: float = DEFAULT_TIMEOUT_SECONDS,
 ) -> requests.Response:
     """Call the GitHub REST API and return the raw response (status/headers
     included) on success -- callers that only need the parsed JSON body
@@ -160,7 +171,7 @@ def _request_raw(
         headers=_headers(),
         params=params,
         json=json_data,
-        timeout=DEFAULT_TIMEOUT_SECONDS,
+        timeout=timeout,
     )
     if response.status_code >= 400:
         try:
@@ -391,9 +402,25 @@ def github_list_issues(
             if labels:
                 params["labels"] = labels
             try:
-                response = _request_raw(
-                    "GET", f"/repos/{owner}/{name}/issues", params=params
+                # Cap this request's own timeout to what's left of the
+                # aggregate budget -- otherwise a single in-flight request
+                # near the deadline could still run the full
+                # DEFAULT_TIMEOUT_SECONDS and blow past it before the
+                # pre-request check above ever gets to act on it.
+                request_timeout = max(
+                    1.0, min(DEFAULT_TIMEOUT_SECONDS, deadline - time.monotonic())
                 )
+                response = _request_raw(
+                    "GET",
+                    f"/repos/{owner}/{name}/issues",
+                    params=params,
+                    timeout=request_timeout,
+                )
+                # Parsing is inside this try too: a malformed 200 JSON body
+                # must be treated the same as a request failure -- outside
+                # it, response.json() raising would escape to the outer
+                # handler and discard every page already collected.
+                raw_page = response.json() if response.content else []
             except Exception as page_exc:
                 if not pages_fetched:
                     raise
@@ -415,9 +442,16 @@ def github_list_issues(
                     error=str(page_exc),
                 )
             pages_fetched += 1
-            raw_page = response.json() if response.content else []
             has_next_page = "next" in _link_header_rels(response.headers.get("Link"))
             if not raw_page:
+                # An empty page normally means GitHub's Link header already
+                # said so too (no "next" rel) -- but derive truncated/
+                # next_page from has_next_page rather than assuming
+                # completion, in case a malformed/unusual response still
+                # reports one.
+                truncated = has_next_page
+                if has_next_page:
+                    next_page = current_page + 1
                 break
             # The caller's skip only applies to the very first page of this
             # call (a resumed page); every page fetched after that starts
@@ -542,12 +576,17 @@ def github_list_pull_requests(repo: str, state: str = "open", limit: int = 30) -
     """
     try:
         owner, name = _parse_repo(repo)
-        result = _request(
+        response = _request_raw(
             "GET",
             f"/repos/{owner}/{name}/pulls",
             params={"state": state, "per_page": _clamp_limit(limit)},
         )
-        return _success(pull_requests=[_summarize_pull_request(pr) for pr in result])
+        result = response.json() if response.content else []
+        truncated = "next" in _link_header_rels(response.headers.get("Link"))
+        return _success(
+            pull_requests=[_summarize_pull_request(pr) for pr in result],
+            truncated=truncated,
+        )
     except Exception as e:
         logger.error(f"Error listing GitHub pull requests for {repo}: {e}")
         return _error(str(e))
@@ -696,7 +735,8 @@ def github_list_commits(repo: str, path: str = "", limit: int = 30) -> str:
         params: dict[str, Any] = {"per_page": _clamp_limit(limit)}
         if path:
             params["path"] = path
-        result = _request("GET", f"/repos/{owner}/{name}/commits", params=params)
+        response = _request_raw("GET", f"/repos/{owner}/{name}/commits", params=params)
+        result = response.json() if response.content else []
         commits = [
             {
                 "sha": commit.get("sha"),
@@ -709,7 +749,8 @@ def github_list_commits(repo: str, path: str = "", limit: int = 30) -> str:
             }
             for commit in result
         ]
-        return _success(commits=commits)
+        truncated = "next" in _link_header_rels(response.headers.get("Link"))
+        return _success(commits=commits, truncated=truncated)
     except Exception as e:
         logger.error(f"Error listing GitHub commits for {repo}: {e}")
         return _error(str(e))

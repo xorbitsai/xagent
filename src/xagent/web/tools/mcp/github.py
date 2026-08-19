@@ -3,6 +3,7 @@ import json
 import logging
 import os
 import re
+import time
 from typing import Any
 from urllib.parse import quote
 
@@ -27,6 +28,11 @@ MAX_PER_PAGE = 100
 # so a single page of raw items can be mostly/entirely PRs and undercount
 # real issues even when more exist on later pages.
 MAX_ISSUE_PAGES = 10
+# Aggregate wall-clock budget across github_list_issues' whole paginated
+# fetch. MAX_ISSUE_PAGES alone bounds request COUNT, not TIME -- a slow or
+# PR-heavy repo could otherwise hold one tool call for up to
+# MAX_ISSUE_PAGES * DEFAULT_TIMEOUT_SECONDS (5 minutes) before returning.
+MAX_ISSUE_LIST_SECONDS = 60
 
 _FORBIDDEN_REPO_CHARS = re.compile(r"[/?#]")
 
@@ -325,7 +331,12 @@ def github_get_repository(repo: str) -> str:
 
 @mcp.tool()
 def github_list_issues(
-    repo: str, state: str = "open", labels: str = "", limit: int = 30, page: int = 1
+    repo: str,
+    state: str = "open",
+    labels: str = "",
+    limit: int = 30,
+    page: int = 1,
+    skip: int = 0,
 ) -> str:
     """
     List issues in a repository. Pull requests are excluded (use
@@ -336,24 +347,42 @@ def github_list_issues(
     repo: "owner/repo".
     state: "open", "closed", or "all" (default "open").
     labels: optional comma-separated label names to filter by.
-    limit: max issues to return (default 30, capped at 100 -- prefer a
-    larger limit over relying on next_page, since GitHub's page-based
-    pagination can't resume partway through a page).
-    page: which GitHub results page to start from (default 1); when the
-    result is truncated because full pages remain beyond what was fetched,
-    the response's next_page tells you where to continue.
+    limit: max issues to return (default 30, capped at 100).
+    page: which GitHub results page to start from (default 1).
+    skip: raw items to skip at the start of `page` (default 0) -- pass
+    both next_page and next_skip from a truncated response's next_page/
+    next_skip fields to resume exactly where it left off, including
+    partway through a page.
     """
     try:
         owner, name = _parse_repo(repo)
         max_results = _clamp_limit(limit)
         start_page = max(1, int(page))
+        start_skip = max(0, int(skip))
         issues: list[dict[str, Any]] = []
         truncated = False
         next_page: int | None = None
+        next_skip = 0
         pages_fetched = 0
         has_next_page = False
         current_page = start_page
+        deadline = time.monotonic() + MAX_ISSUE_LIST_SECONDS
         for current_page in range(start_page, start_page + MAX_ISSUE_PAGES):
+            if pages_fetched and time.monotonic() >= deadline:
+                # The aggregate budget (not just the per-page timeout) is
+                # exhausted -- return what was collected so far as a
+                # resumable partial result rather than holding this call
+                # open for the full MAX_ISSUE_PAGES worth of requests.
+                logger.warning(
+                    f"GitHub issue pagination hit its {MAX_ISSUE_LIST_SECONDS}s "
+                    f"budget for {repo} after {pages_fetched} page(s)"
+                )
+                return _success(
+                    issues=issues[:max_results],
+                    truncated=True,
+                    next_page=current_page,
+                    next_skip=0,
+                )
             params: dict[str, Any] = {
                 "state": state,
                 "per_page": MAX_PER_PAGE,
@@ -373,7 +402,8 @@ def github_list_issues(
                 # list with a marker instead, same as slack.py's channel
                 # listing. The failed page is a valid continuation point:
                 # reaching it at all means the previous page's Link header
-                # confirmed it exists.
+                # confirmed it exists, and nothing on it has been consumed
+                # yet, so next_skip stays 0 (retry the whole page).
                 logger.warning(
                     f"GitHub issue pagination stopped early for {repo}: {page_exc}"
                 )
@@ -381,6 +411,7 @@ def github_list_issues(
                     issues=issues[:max_results],
                     truncated=True,
                     next_page=current_page,
+                    next_skip=0,
                     error=str(page_exc),
                 )
             pages_fetched += 1
@@ -388,8 +419,14 @@ def github_list_issues(
             has_next_page = "next" in _link_header_rels(response.headers.get("Link"))
             if not raw_page:
                 break
+            # The caller's skip only applies to the very first page of this
+            # call (a resumed page); every page fetched after that starts
+            # fresh at index 0.
+            page_skip = start_skip if current_page == start_page else 0
             hit_limit_mid_page = False
             for index, issue in enumerate(raw_page):
+                if index < page_skip:
+                    continue
                 if "pull_request" in issue:
                     continue
                 issues.append(_summarize_issue(issue))
@@ -398,19 +435,21 @@ def github_list_issues(
                     # mid-page cut -- trailing PRs are excluded from the
                     # result anyway, so "items remain on the page" alone
                     # would falsely report truncation (and needlessly
-                    # withhold next_page) when everything left is PRs.
+                    # withhold a continuation) when everything left is PRs.
                     hit_limit_mid_page = any(
                         "pull_request" not in later for later in raw_page[index + 1 :]
                     )
                     truncated = hit_limit_mid_page or has_next_page
+                    if hit_limit_mid_page:
+                        # Resume the SAME page, skipping every raw item
+                        # already consumed from it -- GitHub's page cursor
+                        # can't do this on its own, but the raw index can.
+                        next_page = current_page
+                        next_skip = index + 1
+                    elif has_next_page:
+                        next_page = current_page + 1
                     break
             if len(issues) >= max_results:
-                # next_page only makes sense at a page boundary -- if the
-                # limit was reached partway through this page, GitHub's
-                # page cursor can't resume mid-page (a larger limit avoids
-                # this instead).
-                if not hit_limit_mid_page and has_next_page:
-                    next_page = current_page + 1
                 break
             if not has_next_page:
                 break  # confirmed last page via the Link header
@@ -421,7 +460,10 @@ def github_list_issues(
             if has_next_page:
                 next_page = current_page + 1
         return _success(
-            issues=issues[:max_results], truncated=truncated, next_page=next_page
+            issues=issues[:max_results],
+            truncated=truncated,
+            next_page=next_page,
+            next_skip=next_skip,
         )
     except Exception as e:
         logger.error(f"Error listing GitHub issues for {repo}: {e}")

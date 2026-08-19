@@ -22,7 +22,19 @@ from .models.public_mcp import PublicMCPApp
 # Only an app-scoped grant (UserOAuth.provider == the app_id) counts for these
 # apps; Instagram is deliberately excluded so its existing bare "meta" grants
 # keep working, since its required scopes haven't changed.
-APPS_REQUIRING_APP_SCOPED_OAUTH_GRANT = frozenset({"facebook"})
+#
+# github: the github oauth_providers row's own default_scopes is
+# identity-only ("read:user") -- the functional "repo"/"user:email" scopes
+# live solely on the app row and are merged in only when generic_oauth_login
+# is called with app_id="github". A bare GET /api/auth/github/login (no
+# app_id) would otherwise request just "read:user", and the callback's bare
+# batch-connect branch would still activate the github app's UserMCPServer
+# against that under-scoped grant -- reporting "connected" while every
+# repo-scoped tool then fails. This is a no-op for the normal connect flow
+# (the catalog UI always passes app_id="github", and app_id == provider_name
+# for this connector, so an already-connected grant already satisfies the
+# app-scoped match trivially).
+APPS_REQUIRING_APP_SCOPED_OAUTH_GRANT = frozenset({"facebook", "github"})
 
 
 def _normalize_oauth_grant_key(value: object) -> str | None:

@@ -474,9 +474,38 @@ def test_list_issues_reports_truncated_when_limit_reached_mid_page(monkeypatch):
     assert result["status"] == "success"
     assert len(result["issues"]) == 3
     assert result["truncated"] is True
-    # A mid-page limit hit has no page-aligned continuation to offer --
-    # GitHub's pagination can't resume partway through a page.
-    assert result["next_page"] is None
+    # A mid-page limit hit resumes the SAME page, skipping the raw items
+    # already consumed from it.
+    assert result["next_page"] == 1
+    assert result["next_skip"] == 3
+
+
+def test_list_issues_skip_resumes_exactly_where_a_mid_page_cut_left_off(monkeypatch):
+    """Round-trip: the next_page/next_skip a truncated call returns must let
+    a follow-up call pick up the remaining items from the same page."""
+    page = [{"number": i, "title": f"issue {i}", "labels": []} for i in range(1, 11)]
+    monkeypatch.setattr(
+        github.requests,
+        "request",
+        Mock(return_value=MockResponse(json_data=page)),
+    )
+
+    first = json.loads(github.github_list_issues("octocat/Hello-World", limit=3))
+    assert [issue["number"] for issue in first["issues"]] == [1, 2, 3]
+    assert first["next_page"] == 1
+    assert first["next_skip"] == 3
+
+    second = json.loads(
+        github.github_list_issues(
+            "octocat/Hello-World",
+            limit=3,
+            page=first["next_page"],
+            skip=first["next_skip"],
+        )
+    )
+    assert [issue["number"] for issue in second["issues"]] == [4, 5, 6]
+    assert second["next_page"] == 1
+    assert second["next_skip"] == 6
 
 
 def test_list_issues_trailing_prs_after_limit_do_not_count_as_truncation(monkeypatch):
@@ -594,6 +623,44 @@ def test_list_issues_stops_at_max_pages_and_reports_truncated(monkeypatch):
     assert result["next_page"] == github.MAX_ISSUE_PAGES + 1
 
 
+def test_list_issues_stops_when_aggregate_time_budget_is_exceeded(monkeypatch):
+    """MAX_ISSUE_PAGES only bounds request COUNT -- a slow or PR-heavy repo
+    could otherwise hold the call open for MAX_ISSUE_PAGES *
+    DEFAULT_TIMEOUT_SECONDS (up to 5 minutes). The aggregate wall-clock
+    budget must cut it short with a resumable partial result instead."""
+    first_page = [
+        {
+            "number": i,
+            "title": f"pr {i}",
+            "labels": [],
+            "pull_request": {"url": "https://api.github.com/x"},
+        }
+        for i in range(1, github.MAX_PER_PAGE + 1)
+    ]
+    monkeypatch.setattr(
+        github.requests,
+        "request",
+        Mock(
+            return_value=MockResponse(
+                json_data=first_page,
+                headers={"Link": '<https://api.github.com/x?page=2>; rel="next"'},
+            )
+        ),
+    )
+    # First call computes the deadline; the second (before page 2) finds the
+    # budget already exhausted.
+    clock = iter([0.0, github.MAX_ISSUE_LIST_SECONDS + 1])
+    monkeypatch.setattr(github.time, "monotonic", lambda: next(clock))
+
+    result = json.loads(github.github_list_issues("octocat/Hello-World", limit=5))
+
+    assert result["status"] == "success"
+    assert result["issues"] == []
+    assert result["truncated"] is True
+    assert result["next_page"] == 2
+    assert result["next_skip"] == 0
+
+
 def test_list_issues_starts_from_specified_page(monkeypatch):
     mock_request = Mock(
         return_value=MockResponse(
@@ -672,8 +739,10 @@ def test_list_issues_preserves_partial_results_on_mid_pagination_failure(monkeyp
     assert len(result["issues"]) == github.MAX_PER_PAGE // 2
     assert result["truncated"] is True
     # The failed page is the continuation point -- page 1's Link header
-    # confirmed page 2 exists, so a retry can resume there.
+    # confirmed page 2 exists, so a retry can resume there. Nothing on that
+    # page has been consumed yet, so next_skip is 0.
     assert result["next_page"] == 2
+    assert result["next_skip"] == 0
     assert "rate limited" in result["error"]
     assert mock_request.call_count == 2
 

@@ -152,6 +152,57 @@ def test_github_callback_requests_json_and_sends_secret_in_body(
     assert user_mcp.is_active is True
 
 
+def test_bare_github_login_does_not_activate_github_mcp_server(db_session, monkeypatch):
+    """A bare (app_id-less) GET /api/auth/github/login only ever requests
+    the provider row's identity-only default_scopes ("read:user"), never
+    the app's functional "repo"/"user:email" scopes -- registering "github"
+    in APPS_REQUIRING_APP_SCOPED_OAUTH_GRANT must keep the bare batch-connect
+    branch from activating the GitHub MCP server against that under-scoped
+    grant (which would otherwise report "connected" while every repo-scoped
+    tool then fails)."""
+    db, user = db_session
+    # No app_id in the state -- this is the bare provider-only login path.
+    state = create_access_token(
+        data={"type": "oauth_state", "user_id": user.id, "provider": "github"},
+        expires_delta=timedelta(minutes=10),
+    )
+    request = SimpleNamespace(query_params={"code": "github-code", "state": state})
+
+    monkeypatch.setattr(
+        auth_api.requests,
+        "post",
+        Mock(
+            return_value=MockResponse(
+                {
+                    "access_token": "bare-github-token",
+                    "token_type": "bearer",
+                    "scope": "read:user",
+                }
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        auth_api.requests,
+        "get",
+        Mock(return_value=MockResponse({"id": 42, "login": "octocat"})),
+    )
+
+    response = generic_oauth_callback("github", request, db, _github_provider())
+
+    assert response.status_code == 200
+
+    # The bare grant is still persisted...
+    oauth_account = (
+        db.query(UserOAuth)
+        .filter(UserOAuth.user_id == user.id, UserOAuth.provider == "github")
+        .one()
+    )
+    assert oauth_account.access_token == "bare-github-token"
+
+    # ...but no GitHub MCP server is activated from it.
+    assert db.query(MCPServer).filter(MCPServer.name == "GitHub").first() is None
+
+
 def test_non_github_callback_omits_accept_json_header(db_session, monkeypatch):
     """Guard the branch condition: a non-github provider must be unaffected by
     the GitHub-specific Accept header."""

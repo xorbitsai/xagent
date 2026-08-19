@@ -54,7 +54,12 @@ PUBLIC_MCP_APPS_TABLE = sa.table(
 
 APP_ID = "linear"
 
-LINEAR_SCOPES = ["read", "write"]
+LINEAR_APP_SCOPES = ["read", "write"]
+# The provider row only carries the identity-only "read" scope -- the
+# functional "write" scope lives on the app row and is merged in at
+# authorize time by _merge_oauth_scopes (see the matching comment on the
+# registry row in builtin_mcp_registry.py).
+LINEAR_PROVIDER_SCOPES = ["read"]
 
 
 def _filter_row(row: dict[str, object], allowed_columns: set[str]) -> dict[str, object]:
@@ -76,7 +81,7 @@ def _linear_provider_row() -> dict[str, object]:
         "userinfo_url": "",
         "user_id_path": "id",
         "email_path": "email",
-        "default_scopes": LINEAR_SCOPES,
+        "default_scopes": LINEAR_PROVIDER_SCOPES,
     }
 
 
@@ -89,7 +94,7 @@ def _linear_app_row() -> dict[str, object]:
         "transport": "oauth",
         "provider_name": "linear",
         "category": "Productivity",
-        "oauth_scopes": LINEAR_SCOPES,
+        "oauth_scopes": LINEAR_APP_SCOPES,
         "is_visible_in_connector": True,
         "launch_config": {
             "command": "python",

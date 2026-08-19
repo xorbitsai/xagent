@@ -21,9 +21,12 @@ mcp = FastMCP("linear-mcp")
 LINEAR_GRAPHQL_URL = "https://api.linear.app/graphql"
 DEFAULT_TIMEOUT_SECONDS = 30
 MAX_LIMIT = 100
-# On a 429 with a small Retry-After we wait once and retry rather than
-# failing outright, mirroring the same bounded-retry policy as the
-# Intercom/Slack sibling modules -- pagination here can now fire up to
+# Linear's GraphQL rate limit does NOT use HTTP 429 / Retry-After like the
+# REST-shaped Slack/Intercom siblings -- per Linear's rate-limiting docs, a
+# rate-limited request returns HTTP 400 with a RATELIMITED code inside
+# errors[].extensions, and reset info in the X-RateLimit-Requests-Reset
+# header (UTC epoch milliseconds). On that signal we wait once and retry
+# rather than failing outright -- pagination here can fire up to
 # MAX_ISSUE_SEARCH_PAGES/MAX_USER_SEARCH_PAGES sequential requests per tool
 # call, making a transient rate limit far more likely to surface mid-fetch
 # than in a single-request tool.
@@ -52,9 +55,18 @@ _VALID_STATE_TYPES = frozenset(
     {"triage", "backlog", "unstarted", "started", "completed", "canceled", "duplicate"}
 )
 
+_VALID_PRIORITIES = frozenset({0, 1, 2, 3, 4})
 
-def _success(**payload: Any) -> str:
-    return json.dumps({"status": "success", **payload}, ensure_ascii=False)
+
+def _success(_errors: list[Any] | None = None, **payload: Any) -> str:
+    body: dict[str, Any] = {"status": "success", **payload}
+    if _errors:
+        # A genuine partial GraphQL success (one sub-field failed, others
+        # resolved) -- surface it in the result instead of only the server
+        # log, consistent with this module's own truncated=true contract
+        # for "results are incomplete".
+        body["warnings"] = [_graphql_errors_message(_errors)]
+    return json.dumps(body, ensure_ascii=False)
 
 
 def _error(message: str) -> str:
@@ -85,12 +97,56 @@ def _graphql_errors_message(errors: list[Any]) -> str:
     return "; ".join(messages) if messages else "Unknown Linear API error"
 
 
-def _graphql(query: str, variables: dict[str, Any] | None = None) -> dict[str, Any]:
+def _is_rate_limited(response: requests.Response) -> bool:
+    """Linear signals a rate-limited GraphQL request as HTTP 400 with a
+    RATELIMITED code in errors[].extensions -- not HTTP 429."""
+    if response.status_code != 400:
+        return False
+    try:
+        payload = response.json()
+    except ValueError:
+        return False
+    if not isinstance(payload, dict):
+        return False
+    for entry in payload.get("errors") or []:
+        if (
+            isinstance(entry, dict)
+            and (entry.get("extensions") or {}).get("code") == "RATELIMITED"
+        ):
+            return True
+    return False
+
+
+def _rate_limit_wait_seconds(response: requests.Response) -> float:
+    """Linear reports the reset time via X-RateLimit-Requests-Reset, a UTC
+    epoch-milliseconds timestamp -- not a Retry-After header."""
+    reset_header = response.headers.get("X-RateLimit-Requests-Reset")
+    if not reset_header:
+        return 0.0
+    try:
+        reset_ms = int(reset_header)
+    except ValueError:
+        return 0.0
+    return max(0.0, (reset_ms / 1000.0) - time.time())
+
+
+def _graphql(
+    query: str, variables: dict[str, Any] | None = None
+) -> tuple[dict[str, Any], list[Any]]:
     """Run one GraphQL query/mutation against Linear's single API endpoint.
 
-    Linear answers auth/rate-limit failures with a non-200 status (body
-    shape not guaranteed), but schema/validation errors with HTTP 200 and a
-    top-level "errors" array — both are checked, in that order.
+    Linear answers auth failures with a non-200 status (body shape not
+    guaranteed) and rate limiting with HTTP 400 + RATELIMITED (see
+    _is_rate_limited), but schema/validation errors with HTTP 200 and a
+    top-level "errors" array.
+
+    Returns (data, errors). Every query/mutation in this module selects
+    exactly one top-level field, so if that field comes back null alongside
+    a non-empty "errors" array there is nothing usable to return -- that is
+    treated as a hard failure and raises instead. If at least one top-level
+    field is non-null, it's a genuine partial success (e.g. a nested
+    sub-field's resolver failed): errors is returned alongside data so the
+    caller can surface it as a warning rather than only logging it.
     """
     for attempt in (0, 1):
         response = requests.post(
@@ -99,13 +155,10 @@ def _graphql(query: str, variables: dict[str, Any] | None = None) -> dict[str, A
             json={"query": query, "variables": variables or {}},
             timeout=DEFAULT_TIMEOUT_SECONDS,
         )
-        if response.status_code == 429 and attempt == 0:
-            try:
-                retry_after = int(response.headers.get("Retry-After", "0"))
-            except ValueError:
-                retry_after = 0
-            if 0 < retry_after <= MAX_RETRY_AFTER_SECONDS:
-                time.sleep(retry_after)
+        if attempt == 0 and _is_rate_limited(response):
+            wait_seconds = _rate_limit_wait_seconds(response)
+            if 0 < wait_seconds <= MAX_RETRY_AFTER_SECONDS:
+                time.sleep(wait_seconds)
                 continue
         break
 
@@ -139,20 +192,20 @@ def _graphql(query: str, variables: dict[str, Any] | None = None) -> dict[str, A
             "Linear API returned an unexpected (non-object) response body"
         )
 
-    data = payload.get("data")
-    errors = payload.get("errors")
+    data = payload.get("data") or {}
+    errors = payload.get("errors") or []
     if errors:
         message = _graphql_errors_message(errors)
-        if not data:
-            # No usable data at all -- a hard failure.
+        if not any(data.values()):
+            # Every top-level field is null (or data is empty) -- nothing
+            # usable to return, e.g. a permission failure on the single
+            # requested object.
             raise RuntimeError(message)
-        # A 200 response can carry both a partially populated "data" and a
-        # truthy "errors" array when one sub-field's resolver failed but
-        # others succeeded -- raising here would discard an otherwise
-        # usable result over one bad field. Log instead of silently
-        # swallowing the partial failure.
+        # At least one top-level field resolved -- a genuine partial
+        # success. Log for operators; the caller surfaces `errors` in its
+        # own result via _success's `_errors`.
         logger.warning(f"Linear GraphQL partial error (data still returned): {message}")
-    return data or {}
+    return data, errors
 
 
 def _resolve_team_uuid(team_id: str) -> str:
@@ -165,14 +218,19 @@ def _resolve_team_uuid(team_id: str) -> str:
     either. An already-UUID team_id is returned unchanged without a
     round-trip.
 
-    Resolution goes through `teams(filter: { key: { eq: ... } })`, not the
-    top-level `team(id: ...)` field -- Linear's own SDK type definitions
-    document TeamFilter.key as the supported way to look up a team by its
-    key, but never document `team(id:)` accepting anything but a UUID
-    ("Fetches a specific team by its ID"), unlike issue-related id fields,
-    which explicitly document accepting either form. Filtering by key is
-    the unambiguous, documented path regardless of what team(id:) does
-    with a raw key.
+    Resolution goes through `teams(filter: { key: { eqIgnoreCase: ... } })`,
+    not the top-level `team(id: ...)` field -- Linear's own SDK type
+    definitions document TeamFilter.key as the supported way to look up a
+    team by its key, but never document `team(id:)` accepting anything but
+    a UUID ("Fetches a specific team by its ID"), unlike issue-related id
+    fields, which explicitly document accepting either form. Filtering by
+    key is the unambiguous, documented path regardless of what team(id:)
+    does with a raw key.
+
+    `eqIgnoreCase`, not `eq`, because team keys are conventionally uppercase
+    (e.g. "ENG") but nothing in the calling tools' docstrings tells a
+    caller that -- an LLM that lowercases user text ("the eng team") must
+    still resolve to the same team.
 
     (No equivalent resolver exists for issue_id: Linear's
     CommentCreateInput.issueId and every other issueId-typed input accept
@@ -182,9 +240,9 @@ def _resolve_team_uuid(team_id: str) -> str:
     """
     if _UUID_PATTERN.match(team_id):
         return team_id
-    data = _graphql(
-        "query($key: String!) { teams(filter: { key: { eq: $key } }, first: 1)"
-        " { nodes { id } } }",
+    data, _errors = _graphql(
+        "query($key: String!) { teams(filter: { key: { eqIgnoreCase: $key } },"
+        " first: 1) { nodes { id } } }",
         {"key": team_id},
     )
     teams = (data.get("teams") or {}).get("nodes") or []
@@ -201,8 +259,8 @@ def linear_get_current_user() -> str:
     requests instead of asking the user for their Linear user id.
     """
     try:
-        data = _graphql("query { viewer { id name email displayName admin } }")
-        return _success(user=data.get("viewer") or {})
+        data, errors = _graphql("query { viewer { id name email displayName admin } }")
+        return _success(user=data.get("viewer") or {}, _errors=errors)
     except Exception as e:
         logger.error(f"Error fetching authenticated Linear user: {e}")
         return _error(str(e))
@@ -217,7 +275,7 @@ def linear_list_teams(limit: int = 50) -> str:
     linear_search_issues.
     """
     try:
-        data = _graphql(
+        data, errors = _graphql(
             "query($first: Int!) { teams(first: $first) { nodes { id key name }"
             " pageInfo { hasNextPage } } }",
             {"first": _clamp_limit(limit)},
@@ -225,7 +283,7 @@ def linear_list_teams(limit: int = 50) -> str:
         teams_data = data.get("teams") or {}
         teams = teams_data.get("nodes") or []
         truncated = bool((teams_data.get("pageInfo") or {}).get("hasNextPage"))
-        return _success(teams=teams, truncated=truncated)
+        return _success(teams=teams, truncated=truncated, _errors=errors)
     except Exception as e:
         logger.error(f"Error listing Linear teams: {e}")
         return _error(str(e))
@@ -241,7 +299,7 @@ def linear_list_workflow_states(team_id: str) -> str:
     """
     try:
         resolved_team_id = _resolve_team_uuid(team_id)
-        data = _graphql(
+        data, errors = _graphql(
             "query($teamId: String!) { team(id: $teamId) { states(first: 100)"
             " { nodes { id name type position } pageInfo { hasNextPage } } } }",
             {"teamId": resolved_team_id},
@@ -252,7 +310,7 @@ def linear_list_workflow_states(team_id: str) -> str:
         states_data = team.get("states") or {}
         states = states_data.get("nodes") or []
         truncated = bool((states_data.get("pageInfo") or {}).get("hasNextPage"))
-        return _success(states=states, truncated=truncated)
+        return _success(states=states, truncated=truncated, _errors=errors)
     except Exception as e:
         logger.error(f"Error listing Linear workflow states for team {team_id}: {e}")
         return _error(str(e))
@@ -268,7 +326,7 @@ def linear_list_labels(team_id: str, limit: int = 100) -> str:
     """
     try:
         resolved_team_id = _resolve_team_uuid(team_id)
-        data = _graphql(
+        data, errors = _graphql(
             "query($teamId: String!, $first: Int!) { team(id: $teamId) {"
             " labels(first: $first) { nodes { id name color }"
             " pageInfo { hasNextPage } } } }",
@@ -280,18 +338,19 @@ def linear_list_labels(team_id: str, limit: int = 100) -> str:
         labels_data = team.get("labels") or {}
         labels = labels_data.get("nodes") or []
         truncated = bool((labels_data.get("pageInfo") or {}).get("hasNextPage"))
-        return _success(labels=labels, truncated=truncated)
+        return _success(labels=labels, truncated=truncated, _errors=errors)
     except Exception as e:
         logger.error(f"Error listing Linear labels for team {team_id}: {e}")
         return _error(str(e))
 
 
 @mcp.tool()
-def linear_search_users(query: str, limit: int = 20) -> str:
+def linear_search_users(query: str = "", limit: int = 20) -> str:
     """
     Search workspace members by name or email — id, name, email. Resolve a
     person to an id here before passing assignee_id to linear_create_issue
-    or linear_update_issue.
+    or linear_update_issue. Leave query empty to list every workspace
+    member.
     """
     try:
         needle = query.strip().lower()
@@ -299,17 +358,34 @@ def linear_search_users(query: str, limit: int = 20) -> str:
         matches: list[dict[str, Any]] = []
         cursor: str | None = None
         has_next_page = False
+        all_errors: list[Any] = []
+        pages_scanned = 0
         # Linear's API has no server-side name/email filter, so a match
         # beyond the first MAX_LIMIT-sized page would otherwise be silently
         # missed -- keep paging (bounded) until enough matches are found or
         # the server genuinely runs out of pages.
         for _ in range(MAX_USER_SEARCH_PAGES):
-            data = _graphql(
-                "query($first: Int!, $after: String) { users(first: $first,"
-                " after: $after) { nodes { id name email active }"
-                " pageInfo { hasNextPage endCursor } } }",
-                {"first": MAX_LIMIT, "after": cursor},
-            )
+            try:
+                data, errors = _graphql(
+                    "query($first: Int!, $after: String) { users(first: $first,"
+                    " after: $after) { nodes { id name email active }"
+                    " pageInfo { hasNextPage endCursor } } }",
+                    {"first": MAX_LIMIT, "after": cursor},
+                )
+            except Exception as page_exc:
+                if not pages_scanned:
+                    raise
+                # A mid-pagination failure must not discard matches already
+                # collected -- return the partial list with a marker
+                # instead, mirroring slack_list_channels.
+                logger.warning(
+                    f"Linear user search pagination stopped early: {page_exc}"
+                )
+                return _success(
+                    users=matches[:max_matches], truncated=True, error=str(page_exc)
+                )
+            pages_scanned += 1
+            all_errors.extend(errors)
             users_data = data.get("users") or {}
             raw_page = users_data.get("nodes") or []
             page_info = users_data.get("pageInfo") or {}
@@ -326,14 +402,35 @@ def linear_search_users(query: str, limit: int = 20) -> str:
                 matches.extend(raw_page)
             if len(matches) >= max_matches or not has_next_page:
                 break
+            if not cursor:
+                # hasNextPage is true but Linear gave no cursor to continue
+                # from -- refetching without one would just re-request page
+                # 1 and duplicate nodes, so stop instead of looping forever.
+                break
         truncated = has_next_page or len(matches) > max_matches
-        return _success(users=matches[:max_matches], truncated=truncated)
+        return _success(
+            users=matches[:max_matches], truncated=truncated, _errors=all_errors
+        )
     except Exception as e:
         logger.error(f"Error searching Linear users for '{query}': {e}")
         return _error(str(e))
 
 
-_ISSUE_FIELDS = (
+# Used for the list/search path -- excludes the (potentially large,
+# unbounded) description body, since up to MAX_ISSUE_SEARCH_PAGES *
+# MAX_LIMIT issues can be fetched server-side to answer one search.
+# Mirrors hubspot.py's trimmed _FORM_SUMMARY_FIELDS/_EMAIL_SUMMARY_FIELDS
+# and intercom.py's bounded conversation "preview" for the same reason:
+# don't forward an unbounded body per list row to the LLM.
+_ISSUE_SUMMARY_FIELDS = (
+    "id identifier title priority url createdAt updatedAt"
+    " state { id name type } assignee { id name email }"
+    " team { id key name } labels { nodes { id name } }"
+)
+# Used for single-issue fetches and mutation results, where the caller
+# asked about (or just created/updated) exactly one issue and the full
+# body is the point.
+_ISSUE_DETAIL_FIELDS = (
     "id identifier title description priority url createdAt updatedAt"
     " state { id name type } assignee { id name email }"
     " team { id key name } labels { nodes { id name } }"
@@ -356,6 +453,8 @@ def linear_search_issues(
     client-side — up to MAX_ISSUE_SEARCH_PAGES pages are fetched past a
     page with no matches yet, so a match outside the first page isn't
     missed, though a very large result set can still exhaust that bound).
+    Returned issues omit the full description body (use linear_get_issue
+    for that) to avoid fetching an unbounded amount of text per result.
     team_id: optional team id/key from linear_list_teams.
     assignee_id: optional user id from linear_search_users.
     state_type: optional workflow state type to filter by — one of
@@ -400,18 +499,20 @@ def linear_search_issues(
         graphql_query = (
             f"query($first: Int!, $after: String{filter_signature}) {{"
             f" issues(first: $first, after: $after{filter_clause}) {{"
-            f" nodes {{ {_ISSUE_FIELDS} }}"
+            f" nodes {{ {_ISSUE_SUMMARY_FIELDS} }}"
             " pageInfo { hasNextPage endCursor } } }"
         )
 
         if not needle:
             variables["first"] = max_results
             variables["after"] = None
-            data = _graphql(graphql_query, variables)
+            data, errors = _graphql(graphql_query, variables)
             issues_data = data.get("issues") or {}
             issues = issues_data.get("nodes") or []
             has_next_page = bool((issues_data.get("pageInfo") or {}).get("hasNextPage"))
-            return _success(issues=issues[:max_results], truncated=has_next_page)
+            return _success(
+                issues=issues[:max_results], truncated=has_next_page, _errors=errors
+            )
 
         # Linear's API has no server-side title filter, so a single
         # MAX_LIMIT-sized page can undercount real matches that live
@@ -420,12 +521,29 @@ def linear_search_issues(
         matches: list[dict[str, Any]] = []
         cursor: str | None = None
         has_next_page = False
+        all_errors: list[Any] = []
+        pages_scanned = 0
         for _ in range(MAX_ISSUE_SEARCH_PAGES):
             # A fresh dict per page, not a mutate-in-place reuse of
             # `variables` -- each request's payload must stay independent
             # of later loop iterations' state.
             page_variables = {**variables, "first": MAX_LIMIT, "after": cursor}
-            data = _graphql(graphql_query, page_variables)
+            try:
+                data, errors = _graphql(graphql_query, page_variables)
+            except Exception as page_exc:
+                if not pages_scanned:
+                    raise
+                # A mid-pagination failure must not discard matches already
+                # collected -- return the partial list with a marker
+                # instead, mirroring slack_list_channels.
+                logger.warning(
+                    f"Linear issue search pagination stopped early: {page_exc}"
+                )
+                return _success(
+                    issues=matches[:max_results], truncated=True, error=str(page_exc)
+                )
+            pages_scanned += 1
+            all_errors.extend(errors)
             issues_data = data.get("issues") or {}
             raw_page = issues_data.get("nodes") or []
             page_info = issues_data.get("pageInfo") or {}
@@ -438,8 +556,15 @@ def linear_search_issues(
             )
             if len(matches) >= max_results or not has_next_page:
                 break
+            if not cursor:
+                # hasNextPage is true but Linear gave no cursor to continue
+                # from -- refetching without one would just re-request page
+                # 1 and duplicate nodes, so stop instead of looping forever.
+                break
         truncated = has_next_page or len(matches) > max_results
-        return _success(issues=matches[:max_results], truncated=truncated)
+        return _success(
+            issues=matches[:max_results], truncated=truncated, _errors=all_errors
+        )
     except Exception as e:
         logger.error(f"Error searching Linear issues: {e}")
         return _error(str(e))
@@ -452,14 +577,14 @@ def linear_get_issue(issue_id: str) -> str:
     issue_id: an issue UUID or its human-readable identifier (e.g. "ENG-123").
     """
     try:
-        data = _graphql(
-            f"query($id: String!) {{ issue(id: $id) {{ {_ISSUE_FIELDS} }} }}",
+        data, errors = _graphql(
+            f"query($id: String!) {{ issue(id: $id) {{ {_ISSUE_DETAIL_FIELDS} }} }}",
             {"id": issue_id},
         )
         issue = data.get("issue")
         if not issue or not isinstance(issue, dict):
             return _error(f"Issue '{issue_id}' not found")
-        return _success(issue=issue)
+        return _success(issue=issue, _errors=errors)
     except Exception as e:
         logger.error(f"Error fetching Linear issue {issue_id}: {e}")
         return _error(str(e))
@@ -485,6 +610,11 @@ def linear_create_issue(
     label_ids: optional label ids from linear_list_labels.
     """
     try:
+        if priority is not None and priority not in _VALID_PRIORITIES:
+            return _error(
+                f"priority must be one of {sorted(_VALID_PRIORITIES)}, "
+                f"got: {priority!r}"
+            )
         issue_input: dict[str, Any] = {
             "teamId": _resolve_team_uuid(team_id),
             "title": title,
@@ -498,15 +628,15 @@ def linear_create_issue(
         if label_ids:
             issue_input["labelIds"] = label_ids
 
-        data = _graphql(
+        data, errors = _graphql(
             "mutation($input: IssueCreateInput!) { issueCreate(input: $input)"
-            f" {{ success issue {{ {_ISSUE_FIELDS} }} }} }}",
+            f" {{ success issue {{ {_ISSUE_DETAIL_FIELDS} }} }} }}",
             {"input": issue_input},
         )
         result = data.get("issueCreate") or {}
         if not result.get("success"):
             return _error("Linear reported the issue was not created")
-        return _success(issue=result.get("issue"))
+        return _success(issue=result.get("issue"), _errors=errors)
     except Exception as e:
         logger.error(f"Error creating Linear issue in team {team_id}: {e}")
         return _error(str(e))
@@ -537,13 +667,33 @@ def linear_update_issue(
     entire label set; pass an empty list to remove all labels. Leave unset
     to leave existing labels untouched, or use add_label_ids/remove_label_ids
     instead to change specific labels without needing to know the full
-    existing set.
+    existing set. Cannot be combined with add_label_ids/remove_label_ids.
     add_label_ids: label ids from linear_list_labels to add, without
     affecting labels not listed here.
     remove_label_ids: label ids from linear_list_labels to remove, without
     affecting labels not listed here.
     """
     try:
+        if priority is not None and priority not in _VALID_PRIORITIES:
+            return _error(
+                f"priority must be one of {sorted(_VALID_PRIORITIES)}, "
+                f"got: {priority!r}"
+            )
+        if label_ids is not None and (add_label_ids or remove_label_ids):
+            return _error(
+                "label_ids replaces the full label set and cannot be "
+                "combined with add_label_ids/remove_label_ids — use one or "
+                "the other"
+            )
+        if (
+            add_label_ids
+            and remove_label_ids
+            and set(add_label_ids) & set(remove_label_ids)
+        ):
+            return _error(
+                "add_label_ids and remove_label_ids cannot share the same label id"
+            )
+
         issue_input: dict[str, Any] = {}
         if title is not None:
             issue_input["title"] = title
@@ -557,22 +707,22 @@ def linear_update_issue(
             issue_input["priority"] = priority
         if label_ids is not None:
             issue_input["labelIds"] = label_ids
-        if add_label_ids:
+        if add_label_ids is not None:
             issue_input["addedLabelIds"] = add_label_ids
-        if remove_label_ids:
+        if remove_label_ids is not None:
             issue_input["removedLabelIds"] = remove_label_ids
         if not issue_input:
             return _error("No fields provided to update")
 
-        data = _graphql(
+        data, errors = _graphql(
             "mutation($id: String!, $input: IssueUpdateInput!) {"
-            f" issueUpdate(id: $id, input: $input) {{ success issue {{ {_ISSUE_FIELDS} }} }} }}",
+            f" issueUpdate(id: $id, input: $input) {{ success issue {{ {_ISSUE_DETAIL_FIELDS} }} }} }}",
             {"id": issue_id, "input": issue_input},
         )
         result = data.get("issueUpdate") or {}
         if not result.get("success"):
             return _error("Linear reported the issue was not updated")
-        return _success(issue=result.get("issue"))
+        return _success(issue=result.get("issue"), _errors=errors)
     except Exception as e:
         logger.error(f"Error updating Linear issue {issue_id}: {e}")
         return _error(str(e))
@@ -585,7 +735,7 @@ def linear_list_comments(issue_id: str, limit: int = 50) -> str:
     issue_id: an issue UUID or its human-readable identifier (e.g. "ENG-123").
     """
     try:
-        data = _graphql(
+        data, errors = _graphql(
             "query($id: String!, $first: Int!) { issue(id: $id) { comments"
             "(first: $first) { nodes { id body createdAt user { id name } }"
             " pageInfo { hasNextPage } } } }",
@@ -597,7 +747,7 @@ def linear_list_comments(issue_id: str, limit: int = 50) -> str:
         comments_data = issue.get("comments") or {}
         comments = comments_data.get("nodes") or []
         truncated = bool((comments_data.get("pageInfo") or {}).get("hasNextPage"))
-        return _success(comments=comments, truncated=truncated)
+        return _success(comments=comments, truncated=truncated, _errors=errors)
     except Exception as e:
         logger.error(f"Error listing comments for Linear issue {issue_id}: {e}")
         return _error(str(e))
@@ -611,7 +761,7 @@ def linear_add_comment(issue_id: str, body: str) -> str:
     body: the comment text (Markdown supported).
     """
     try:
-        data = _graphql(
+        data, errors = _graphql(
             "mutation($input: CommentCreateInput!) { commentCreate(input: $input)"
             " { success comment { id body createdAt } } }",
             {"input": {"issueId": issue_id, "body": body}},
@@ -619,7 +769,7 @@ def linear_add_comment(issue_id: str, body: str) -> str:
         result = data.get("commentCreate") or {}
         if not result.get("success"):
             return _error("Linear reported the comment was not created")
-        return _success(comment=result.get("comment"))
+        return _success(comment=result.get("comment"), _errors=errors)
     except Exception as e:
         logger.error(f"Error adding comment to Linear issue {issue_id}: {e}")
         return _error(str(e))
@@ -637,7 +787,7 @@ def linear_list_projects(team_id: str = "", limit: int = 50) -> str:
         max_results = _clamp_limit(limit)
         if team_id:
             resolved_team_id = _resolve_team_uuid(team_id)
-            data = _graphql(
+            data, errors = _graphql(
                 "query($teamId: String!, $first: Int!) { team(id: $teamId) {"
                 " projects(first: $first) { nodes { id name"
                 " status { id name type } progress url }"
@@ -649,7 +799,7 @@ def linear_list_projects(team_id: str = "", limit: int = 50) -> str:
                 return _error(f"Team '{team_id}' not found")
             projects_data = team.get("projects") or {}
         else:
-            data = _graphql(
+            data, errors = _graphql(
                 "query($first: Int!) { projects(first: $first) { nodes { id"
                 " name status { id name type } progress url }"
                 " pageInfo { hasNextPage } } }",
@@ -658,7 +808,7 @@ def linear_list_projects(team_id: str = "", limit: int = 50) -> str:
             projects_data = data.get("projects") or {}
         projects = projects_data.get("nodes") or []
         truncated = bool((projects_data.get("pageInfo") or {}).get("hasNextPage"))
-        return _success(projects=projects, truncated=truncated)
+        return _success(projects=projects, truncated=truncated, _errors=errors)
     except Exception as e:
         logger.error(f"Error listing Linear projects: {e}")
         return _error(str(e))

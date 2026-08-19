@@ -224,7 +224,14 @@ def get_builtin_oauth_provider_rows() -> list[dict[str, Any]]:
             "userinfo_url": "",
             "user_id_path": "id",
             "email_path": "email",
-            "default_scopes": ["read", "write"],
+            # Identity-only convention (see zoom's comment above) — the
+            # functional "write" scope this connector actually calls for
+            # lives on the app row's oauth_scopes below and is merged in at
+            # authorize time by _merge_oauth_scopes, so listing it here too
+            # would just be a second place scope changes have to be kept in
+            # sync, and would survive a narrowing of the app row's scopes
+            # since _merge_oauth_scopes is a pure union.
+            "default_scopes": ["read"],
         },
     ]
 

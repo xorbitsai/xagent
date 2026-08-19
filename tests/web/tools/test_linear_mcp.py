@@ -50,9 +50,10 @@ def test_graphql_sends_query_and_variables_as_json_body(monkeypatch):
     mock_post = Mock(return_value=MockResponse(json_data={"data": {"ok": True}}))
     monkeypatch.setattr(linear.requests, "post", mock_post)
 
-    result = linear._graphql("query { ok }", {"a": 1})
+    data, errors = linear._graphql("query { ok }", {"a": 1})
 
-    assert result == {"ok": True}
+    assert data == {"ok": True}
+    assert errors == []
     assert mock_post.call_args.args[0] == linear.LINEAR_GRAPHQL_URL
     assert mock_post.call_args.kwargs["json"] == {
         "query": "query { ok }",
@@ -106,25 +107,52 @@ def test_graphql_truncates_unstructured_error_body_on_http_error(monkeypatch):
     assert len(str(excinfo.value)) < len(long_body)
 
 
-def test_graphql_retries_once_on_429_with_positive_retry_after(monkeypatch):
+def _ratelimited_response(reset_epoch_ms: str | None) -> "MockResponse":
+    headers = {}
+    if reset_epoch_ms is not None:
+        headers["X-RateLimit-Requests-Reset"] = reset_epoch_ms
+    return MockResponse(
+        status_code=400,
+        json_data={
+            "errors": [
+                {"message": "Rate limited", "extensions": {"code": "RATELIMITED"}}
+            ]
+        },
+        headers=headers,
+    )
+
+
+def test_graphql_retries_once_on_ratelimited_and_waits_until_reset(monkeypatch):
+    """Linear signals rate limiting as HTTP 400 + a RATELIMITED extensions
+    code, with the reset time in X-RateLimit-Requests-Reset (epoch ms) --
+    not HTTP 429 / Retry-After like the REST-shaped Slack/Intercom
+    siblings."""
+    now = 1_700_000_000.0
+    reset_ms = str(int((now + 5) * 1000))
     mock_post = Mock(
         side_effect=[
-            MockResponse(status_code=429, headers={"Retry-After": "1"}),
+            _ratelimited_response(reset_ms),
             MockResponse(json_data={"data": {"viewer": {"id": "u1"}}}),
         ]
     )
     monkeypatch.setattr(linear.requests, "post", mock_post)
-    monkeypatch.setattr(linear.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(linear.time, "time", lambda: now)
+    sleep_calls = []
+    monkeypatch.setattr(linear.time, "sleep", sleep_calls.append)
 
-    result = linear._graphql("query { viewer { id } }")
+    data, errors = linear._graphql("query { viewer { id } }")
 
-    assert result == {"viewer": {"id": "u1"}}
+    assert data == {"viewer": {"id": "u1"}}
+    assert errors == []
     assert mock_post.call_count == 2
+    assert sleep_calls == [5.0]
 
 
-def test_graphql_does_not_retry_on_zero_retry_after(monkeypatch):
+def test_graphql_does_not_retry_on_plain_429_without_ratelimited_extension(monkeypatch):
+    """A REST-shaped 429 (no RATELIMITED extensions code) is not part of
+    Linear's documented rate-limit contract and must not trigger a retry."""
     mock_post = Mock(
-        return_value=MockResponse(status_code=429, headers={"Retry-After": "0"})
+        return_value=MockResponse(status_code=429, headers={"Retry-After": "1"})
     )
     monkeypatch.setattr(linear.requests, "post", mock_post)
 
@@ -134,13 +162,21 @@ def test_graphql_does_not_retry_on_zero_retry_after(monkeypatch):
     assert mock_post.call_count == 1
 
 
-def test_graphql_does_not_retry_beyond_max_retry_after(monkeypatch):
-    mock_post = Mock(
-        return_value=MockResponse(
-            status_code=429,
-            headers={"Retry-After": str(linear.MAX_RETRY_AFTER_SECONDS + 1)},
-        )
-    )
+def test_graphql_does_not_retry_when_reset_wait_exceeds_max_retry_after(monkeypatch):
+    now = 1_700_000_000.0
+    reset_ms = str(int((now + linear.MAX_RETRY_AFTER_SECONDS + 1) * 1000))
+    mock_post = Mock(return_value=_ratelimited_response(reset_ms))
+    monkeypatch.setattr(linear.requests, "post", mock_post)
+    monkeypatch.setattr(linear.time, "time", lambda: now)
+
+    with pytest.raises(RuntimeError):
+        linear._graphql("query { viewer { id } }")
+
+    assert mock_post.call_count == 1
+
+
+def test_graphql_does_not_retry_when_reset_header_missing(monkeypatch):
+    mock_post = Mock(return_value=_ratelimited_response(None))
     monkeypatch.setattr(linear.requests, "post", mock_post)
 
     with pytest.raises(RuntimeError):
@@ -149,10 +185,14 @@ def test_graphql_does_not_retry_beyond_max_retry_after(monkeypatch):
     assert mock_post.call_count == 1
 
 
-def test_graphql_returns_partial_data_instead_of_raising(monkeypatch, caplog):
+def test_graphql_returns_partial_data_and_errors_instead_of_raising(
+    monkeypatch, caplog
+):
     """A 200 response can carry both usable data and a truthy errors array
     when only one sub-field's resolver failed -- the whole response must
-    not be discarded over that one bad field."""
+    not be discarded over that one bad field, and the errors must be
+    returned to the caller (not only logged) so tool functions can surface
+    them as warnings."""
     monkeypatch.setattr(
         linear.requests,
         "post",
@@ -167,10 +207,34 @@ def test_graphql_returns_partial_data_instead_of_raising(monkeypatch, caplog):
     )
 
     with caplog.at_level("WARNING"):
-        result = linear._graphql("query { viewer { id } }")
+        data, errors = linear._graphql("query { viewer { id } }")
 
-    assert result == {"viewer": {"id": "u1"}}
+    assert data == {"viewer": {"id": "u1"}}
+    assert errors == [{"message": "some.unrelated.field failed"}]
     assert "some.unrelated.field failed" in caplog.text
+
+
+def test_graphql_raises_when_the_requested_root_field_is_null_with_errors(monkeypatch):
+    """Every query/mutation in this module selects exactly one top-level
+    field. If that field is null and errors is non-empty (e.g. a permission
+    failure on the requested object), there is nothing usable to return --
+    this must raise, not come back as a quiet {"issue": None} that a caller
+    could mistake for "not found"."""
+    monkeypatch.setattr(
+        linear.requests,
+        "post",
+        Mock(
+            return_value=MockResponse(
+                json_data={
+                    "data": {"issue": None},
+                    "errors": [{"message": "You do not have permission"}],
+                }
+            )
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="You do not have permission"):
+        linear._graphql("query($id: String!) { issue(id: $id) { id } }", {"id": "x"})
 
 
 def test_graphql_raises_on_non_dict_200_body(monkeypatch):
@@ -234,6 +298,31 @@ def test_get_current_user_returns_profile(monkeypatch):
     assert result["user"]["email"] == "ada@example.com"
 
 
+def test_get_current_user_surfaces_partial_graphql_errors_as_warnings(monkeypatch):
+    """A genuine partial success (root field populated, but a sub-field
+    resolver failed) must surface `errors` in the tool result, not only in
+    the server log -- otherwise the caller has no way to know part of the
+    response is unreliable."""
+    monkeypatch.setattr(
+        linear.requests,
+        "post",
+        Mock(
+            return_value=MockResponse(
+                json_data={
+                    "data": {"viewer": {"id": "u1", "name": "Ada"}},
+                    "errors": [{"message": "email field failed"}],
+                }
+            )
+        ),
+    )
+
+    result = json.loads(linear.linear_get_current_user())
+
+    assert result["status"] == "success"
+    assert result["user"]["id"] == "u1"
+    assert "email field failed" in result["warnings"][0]
+
+
 def test_get_current_user_returns_error_payload_on_failure(monkeypatch):
     monkeypatch.setattr(
         linear.requests,
@@ -279,6 +368,26 @@ def test_resolve_team_uuid_filters_by_key_not_by_id(monkeypatch):
     assert "teams(filter:" in sent["query"]
     assert "team(id:" not in sent["query"]
     assert sent["variables"] == {"key": "ENG"}
+
+
+def test_resolve_team_uuid_matches_case_insensitively(monkeypatch):
+    """Team keys are conventionally uppercase (e.g. "ENG"), but nothing
+    tells an LLM caller that -- a lowercased key like "eng" must still
+    resolve, so the filter must use eqIgnoreCase, not eq."""
+    mock_post = Mock(
+        return_value=MockResponse(
+            json_data={"data": {"teams": {"nodes": [{"id": _TEAM_UUID}]}}}
+        )
+    )
+    monkeypatch.setattr(linear.requests, "post", mock_post)
+
+    result = linear._resolve_team_uuid("eng")
+
+    assert result == _TEAM_UUID
+    sent = mock_post.call_args.kwargs["json"]
+    assert "eqIgnoreCase" in sent["query"]
+    assert "{ eq:" not in sent["query"]
+    assert sent["variables"] == {"key": "eng"}
 
 
 def test_resolve_team_uuid_raises_when_key_does_not_resolve(monkeypatch):
@@ -759,6 +868,59 @@ def test_search_issues_filters_by_title_query_client_side(monkeypatch):
     assert result["issues"][0]["identifier"] == "ENG-1"
 
 
+def test_search_issues_query_omits_description_field(monkeypatch):
+    """Up to MAX_ISSUE_SEARCH_PAGES * MAX_LIMIT issues can be fetched
+    server-side to answer one search -- the list/search query must not ask
+    for the (potentially large, unbounded) description body per row."""
+    mock_post = Mock(
+        return_value=MockResponse(json_data={"data": {"issues": {"nodes": []}}})
+    )
+    monkeypatch.setattr(linear.requests, "post", mock_post)
+
+    linear.linear_search_issues()
+
+    query_text = mock_post.call_args.kwargs["json"]["query"]
+    assert "description" not in query_text
+
+
+def test_get_issue_query_includes_description_field(monkeypatch):
+    """A single-issue fetch is exactly the case where the full body is the
+    point, unlike the bulk list/search path."""
+    mock_post = Mock(
+        return_value=MockResponse(json_data={"data": {"issue": {"id": "i1"}}})
+    )
+    monkeypatch.setattr(linear.requests, "post", mock_post)
+
+    linear.linear_get_issue("ENG-1")
+
+    query_text = mock_post.call_args.kwargs["json"]["query"]
+    assert "description" in query_text
+
+
+def test_search_issues_surfaces_error_instead_of_confident_empty_result(monkeypatch):
+    """A partial error on the `issues` root field itself yields
+    {"issues": null} -- this must be a hard failure, not a confident
+    _success(issues=[], truncated=False) for a request that actually
+    failed."""
+    monkeypatch.setattr(
+        linear.requests,
+        "post",
+        Mock(
+            return_value=MockResponse(
+                json_data={
+                    "data": {"issues": None},
+                    "errors": [{"message": "Internal server error"}],
+                }
+            )
+        ),
+    )
+
+    result = json.loads(linear.linear_search_issues(query="login"))
+
+    assert result["status"] == "error"
+    assert "Internal server error" in result["message"]
+
+
 def test_search_issues_title_query_keeps_paging_past_the_first_page(monkeypatch):
     """Linear has no server-side title filter -- a match beyond the first
     MAX_LIMIT-sized page must not be silently missed. The first page has no
@@ -809,29 +971,105 @@ def test_search_issues_title_query_keeps_paging_past_the_first_page(monkeypatch)
     assert second_call.kwargs["json"]["variables"]["after"] == "cursor-1"
 
 
-def test_search_issues_title_query_stops_at_max_pages_and_reports_truncated(
-    monkeypatch,
-):
-    """If MAX_ISSUE_SEARCH_PAGES is exhausted while the server still reports
-    more pages, matches may exist further out -- must report truncated
-    rather than a false "complete" result."""
-    no_match_page = MockResponse(
-        json_data={
-            "data": {
-                "issues": {
-                    "nodes": [{"id": "i1", "identifier": "ENG-1", "title": "Docs"}],
-                    "pageInfo": {"hasNextPage": True, "endCursor": "cursor"},
+def test_search_issues_title_query_stops_when_next_page_has_no_cursor(monkeypatch):
+    """hasNextPage: true with a missing/null endCursor must stop paging
+    instead of re-sending after: null, which would refetch page 1 forever
+    and duplicate nodes."""
+    mock_post = Mock(
+        return_value=MockResponse(
+            json_data={
+                "data": {
+                    "issues": {
+                        "nodes": [{"id": "i1", "identifier": "ENG-1", "title": "Docs"}],
+                        "pageInfo": {"hasNextPage": True, "endCursor": None},
+                    }
                 }
             }
-        }
+        )
     )
-    monkeypatch.setattr(linear.requests, "post", Mock(return_value=no_match_page))
+    monkeypatch.setattr(linear.requests, "post", mock_post)
 
     result = json.loads(linear.linear_search_issues(query="login"))
 
     assert result["status"] == "success"
     assert result["issues"] == []
     assert result["truncated"] is True
+    assert mock_post.call_count == 1
+
+
+def test_search_issues_title_query_returns_partial_matches_on_mid_pagination_failure(
+    monkeypatch,
+):
+    """A page failure after at least one page already succeeded must not
+    discard matches collected so far -- mirrors slack_list_channels."""
+    mock_post = Mock(
+        side_effect=[
+            MockResponse(
+                json_data={
+                    "data": {
+                        "issues": {
+                            "nodes": [
+                                {"id": "i1", "identifier": "ENG-1", "title": "Docs"}
+                            ],
+                            "pageInfo": {"hasNextPage": True, "endCursor": "cursor-1"},
+                        }
+                    }
+                }
+            ),
+            RuntimeError("Linear API error (status 500): boom"),
+        ]
+    )
+    monkeypatch.setattr(linear.requests, "post", mock_post)
+
+    result = json.loads(linear.linear_search_issues(query="docs"))
+
+    assert result["status"] == "success"
+    assert [issue["identifier"] for issue in result["issues"]] == ["ENG-1"]
+    assert result["truncated"] is True
+    assert "boom" in result["error"]
+
+
+def test_search_issues_title_query_stops_at_max_pages_and_reports_truncated(
+    monkeypatch,
+):
+    """If MAX_ISSUE_SEARCH_PAGES is exhausted while the server still reports
+    more pages, matches may exist further out -- must report truncated
+    rather than a false "complete" result. Uses a finite side_effect (one
+    response per page, each with a distinct cursor) rather than a
+    Mock(return_value=...) that would return the same non-matching page
+    forever regardless of how many pages the loop actually fetches -- that
+    shape can't distinguish "looped MAX_ISSUE_SEARCH_PAGES times" from
+    "looped once", nor pin that the cursor advances."""
+    pages = [
+        MockResponse(
+            json_data={
+                "data": {
+                    "issues": {
+                        "nodes": [
+                            {"id": f"i{i}", "identifier": f"ENG-{i}", "title": "Docs"}
+                        ],
+                        "pageInfo": {"hasNextPage": True, "endCursor": f"cursor-{i}"},
+                    }
+                }
+            }
+        )
+        for i in range(linear.MAX_ISSUE_SEARCH_PAGES)
+    ]
+    mock_post = Mock(side_effect=pages)
+    monkeypatch.setattr(linear.requests, "post", mock_post)
+
+    result = json.loads(linear.linear_search_issues(query="login"))
+
+    assert result["status"] == "success"
+    assert result["issues"] == []
+    assert result["truncated"] is True
+    assert mock_post.call_count == linear.MAX_ISSUE_SEARCH_PAGES
+    sent_afters = [
+        call.kwargs["json"]["variables"]["after"] for call in mock_post.call_args_list
+    ]
+    assert sent_afters == [None] + [
+        f"cursor-{i}" for i in range(linear.MAX_ISSUE_SEARCH_PAGES - 1)
+    ]
 
 
 def test_search_issues_reports_truncated_via_page_info_without_query(monkeypatch):
@@ -926,6 +1164,33 @@ def test_get_issue_returns_not_found_error_when_missing(monkeypatch):
 
     assert result["status"] == "error"
     assert "not found" in result["message"]
+
+
+def test_get_issue_surfaces_permission_error_instead_of_reporting_not_found(
+    monkeypatch,
+):
+    """A permission failure comes back as HTTP 200 with
+    {"data": {"issue": null}, "errors": [...]} -- this is NOT the same as a
+    genuinely nonexistent issue (no errors) and must surface the real cause
+    rather than the generic "not found" message."""
+    monkeypatch.setattr(
+        linear.requests,
+        "post",
+        Mock(
+            return_value=MockResponse(
+                json_data={
+                    "data": {"issue": None},
+                    "errors": [{"message": "You do not have permission"}],
+                }
+            )
+        ),
+    )
+
+    result = json.loads(linear.linear_get_issue("ENG-1"))
+
+    assert result["status"] == "error"
+    assert "permission" in result["message"]
+    assert "not found" not in result["message"]
 
 
 def test_get_issue_returns_error_payload_on_network_exception(monkeypatch):
@@ -1047,6 +1312,19 @@ def test_create_issue_sends_explicit_priority_zero(monkeypatch):
 
     sent_input = mock_post.call_args.kwargs["json"]["variables"]["input"]
     assert sent_input["priority"] == 0
+
+
+def test_create_issue_rejects_out_of_range_priority(monkeypatch):
+    mock_post = Mock()
+    monkeypatch.setattr(linear.requests, "post", mock_post)
+
+    result = json.loads(
+        linear.linear_create_issue(team_id=_TEAM_UUID, title="New bug", priority=5)
+    )
+
+    assert result["status"] == "error"
+    assert "priority" in result["message"]
+    mock_post.assert_not_called()
 
 
 def test_create_issue_reports_error_when_linear_reports_failure(monkeypatch):
@@ -1232,6 +1510,76 @@ def test_update_issue_clears_all_labels_via_empty_label_ids(monkeypatch):
     assert result["status"] == "success"
     sent_input = mock_post.call_args.kwargs["json"]["variables"]["input"]
     assert sent_input == {"labelIds": []}
+
+
+def test_update_issue_distinguishes_omitted_from_explicit_empty_add_remove_labels(
+    monkeypatch,
+):
+    """add_label_ids/remove_label_ids must use is-not-None (like label_ids),
+    not truthiness, so an explicit [] is sent through rather than treated
+    the same as an omitted argument."""
+    mock_post = Mock(return_value=_ISSUE_UPDATE_SUCCESS)
+    monkeypatch.setattr(linear.requests, "post", mock_post)
+
+    result = json.loads(
+        linear.linear_update_issue("ENG-1", add_label_ids=[], remove_label_ids=[])
+    )
+
+    assert result["status"] == "success"
+    sent_input = mock_post.call_args.kwargs["json"]["variables"]["input"]
+    assert sent_input == {"addedLabelIds": [], "removedLabelIds": []}
+
+
+def test_update_issue_rejects_label_ids_combined_with_add_label_ids(monkeypatch):
+    mock_post = Mock()
+    monkeypatch.setattr(linear.requests, "post", mock_post)
+
+    result = json.loads(
+        linear.linear_update_issue("ENG-1", label_ids=["l1"], add_label_ids=["l2"])
+    )
+
+    assert result["status"] == "error"
+    assert "label_ids" in result["message"]
+    mock_post.assert_not_called()
+
+
+def test_update_issue_rejects_label_ids_combined_with_remove_label_ids(monkeypatch):
+    mock_post = Mock()
+    monkeypatch.setattr(linear.requests, "post", mock_post)
+
+    result = json.loads(
+        linear.linear_update_issue("ENG-1", label_ids=["l1"], remove_label_ids=["l2"])
+    )
+
+    assert result["status"] == "error"
+    assert "label_ids" in result["message"]
+    mock_post.assert_not_called()
+
+
+def test_update_issue_rejects_overlapping_add_and_remove_label_ids(monkeypatch):
+    mock_post = Mock()
+    monkeypatch.setattr(linear.requests, "post", mock_post)
+
+    result = json.loads(
+        linear.linear_update_issue(
+            "ENG-1", add_label_ids=["l1", "l2"], remove_label_ids=["l2", "l3"]
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "label id" in result["message"]
+    mock_post.assert_not_called()
+
+
+def test_update_issue_rejects_out_of_range_priority(monkeypatch):
+    mock_post = Mock()
+    monkeypatch.setattr(linear.requests, "post", mock_post)
+
+    result = json.loads(linear.linear_update_issue("ENG-1", priority=5))
+
+    assert result["status"] == "error"
+    assert "priority" in result["message"]
+    mock_post.assert_not_called()
 
 
 def test_list_comments_returns_nodes(monkeypatch):
@@ -1468,24 +1816,125 @@ def test_search_users_keeps_paging_past_the_first_page(monkeypatch):
     assert second_call.kwargs["json"]["variables"]["after"] == "cursor-1"
 
 
-def test_search_users_stops_at_max_pages_and_reports_truncated(monkeypatch):
-    no_match_page = MockResponse(
-        json_data={
-            "data": {
-                "users": {
-                    "nodes": [{"id": "u1", "name": "Bob", "email": "bob@example.com"}],
-                    "pageInfo": {"hasNextPage": True, "endCursor": "cursor"},
+def test_search_users_stops_when_next_page_has_no_cursor(monkeypatch):
+    """hasNextPage: true with a missing/null endCursor must stop paging
+    instead of re-sending after: null, which would refetch page 1 forever
+    and duplicate nodes."""
+    mock_post = Mock(
+        return_value=MockResponse(
+            json_data={
+                "data": {
+                    "users": {
+                        "nodes": [
+                            {"id": "u1", "name": "Bob", "email": "b@example.com"}
+                        ],
+                        "pageInfo": {"hasNextPage": True, "endCursor": None},
+                    }
                 }
             }
-        }
+        )
     )
-    monkeypatch.setattr(linear.requests, "post", Mock(return_value=no_match_page))
+    monkeypatch.setattr(linear.requests, "post", mock_post)
 
     result = json.loads(linear.linear_search_users("ada"))
 
     assert result["status"] == "success"
     assert result["users"] == []
     assert result["truncated"] is True
+    assert mock_post.call_count == 1
+
+
+def test_search_users_returns_partial_matches_on_mid_pagination_failure(monkeypatch):
+    """A page failure after at least one page already succeeded must not
+    discard matches collected so far -- mirrors slack_list_channels."""
+    mock_post = Mock(
+        side_effect=[
+            MockResponse(
+                json_data={
+                    "data": {
+                        "users": {
+                            "nodes": [
+                                {"id": "u1", "name": "Ada", "email": "ada@example.com"}
+                            ],
+                            "pageInfo": {"hasNextPage": True, "endCursor": "cursor-1"},
+                        }
+                    }
+                }
+            ),
+            RuntimeError("Linear API error (status 500): boom"),
+        ]
+    )
+    monkeypatch.setattr(linear.requests, "post", mock_post)
+
+    result = json.loads(linear.linear_search_users("ada"))
+
+    assert result["status"] == "success"
+    assert [user["id"] for user in result["users"]] == ["u1"]
+    assert result["truncated"] is True
+    assert "boom" in result["error"]
+
+
+def test_search_users_lists_all_members_when_query_omitted(monkeypatch):
+    """query defaults to "" (matching linear_search_issues), listing every
+    workspace member instead of requiring a throwaway empty-string call."""
+    mock_post = Mock(
+        return_value=MockResponse(
+            json_data={
+                "data": {
+                    "users": {
+                        "nodes": [
+                            {"id": "u1", "name": "Ada", "email": "ada@example.com"},
+                            {"id": "u2", "name": "Bob", "email": "bob@example.com"},
+                        ],
+                        "pageInfo": {"hasNextPage": False, "endCursor": None},
+                    }
+                }
+            }
+        )
+    )
+    monkeypatch.setattr(linear.requests, "post", mock_post)
+
+    result = json.loads(linear.linear_search_users())
+
+    assert result["status"] == "success"
+    assert [user["id"] for user in result["users"]] == ["u1", "u2"]
+
+
+def test_search_users_stops_at_max_pages_and_reports_truncated(monkeypatch):
+    """Finite side_effect (distinct cursor per page), not
+    Mock(return_value=...) -- see the analogous issue-search test for why a
+    same-response-forever mock can't pin the page bound or cursor
+    advancement."""
+    pages = [
+        MockResponse(
+            json_data={
+                "data": {
+                    "users": {
+                        "nodes": [
+                            {"id": f"u{i}", "name": "Bob", "email": "bob@example.com"}
+                        ],
+                        "pageInfo": {"hasNextPage": True, "endCursor": f"cursor-{i}"},
+                    }
+                }
+            }
+        )
+        for i in range(linear.MAX_USER_SEARCH_PAGES)
+    ]
+    mock_post = Mock(side_effect=pages)
+    monkeypatch.setattr(linear.requests, "post", mock_post)
+
+    result = json.loads(linear.linear_search_users("ada"))
+
+    assert result["status"] == "success"
+    assert result["users"] == []
+    assert result["truncated"] is True
+    assert mock_post.call_count == linear.MAX_USER_SEARCH_PAGES
+    sent_afters = [
+        call.kwargs["json"]["variables"]["after"] for call in mock_post.call_args_list
+    ]
+    assert sent_afters == [None] + [
+        f"cursor-{i}" for i in range(linear.MAX_USER_SEARCH_PAGES - 1)
+    ]
 
 
 def test_linear_app_registry_requests_read_and_write_scopes():

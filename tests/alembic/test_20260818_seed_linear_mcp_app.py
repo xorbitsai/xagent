@@ -4,6 +4,7 @@ import importlib.util
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
 from alembic.migration import MigrationContext
 from alembic.operations import Operations
 from sqlalchemy import create_engine, text
@@ -69,6 +70,50 @@ def _create_tables(connection):
     )
 
 
+def _create_tables_without_visibility_column(connection):
+    """Same oauth_providers table as _create_tables, but public_mcp_apps is
+    missing is_visible_in_connector -- simulates a database that predates
+    the column (or a broken migration order)."""
+    connection.execute(
+        text(
+            """
+            CREATE TABLE oauth_providers (
+                id INTEGER PRIMARY KEY,
+                provider_name VARCHAR(50) NOT NULL UNIQUE,
+                name VARCHAR(100) NOT NULL,
+                client_id VARCHAR(500) NOT NULL,
+                client_secret VARCHAR(500) NOT NULL,
+                auth_url VARCHAR(500) NOT NULL,
+                token_url VARCHAR(500) NOT NULL,
+                redirect_uri VARCHAR(500),
+                userinfo_url VARCHAR(500),
+                user_id_path VARCHAR(100),
+                email_path VARCHAR(100),
+                default_scopes JSON
+            )
+            """
+        )
+    )
+    connection.execute(
+        text(
+            """
+            CREATE TABLE public_mcp_apps (
+                id INTEGER PRIMARY KEY,
+                app_id VARCHAR(100) NOT NULL UNIQUE,
+                name VARCHAR(200) NOT NULL,
+                description TEXT,
+                icon VARCHAR(1000),
+                transport VARCHAR(50) NOT NULL DEFAULT 'oauth',
+                provider_name VARCHAR(50),
+                category VARCHAR(100),
+                oauth_scopes JSON,
+                launch_config JSON
+            )
+            """
+        )
+    )
+
+
 def _app_ids(connection):
     return set(connection.execute(text("SELECT app_id FROM public_mcp_apps")).scalars())
 
@@ -99,6 +144,20 @@ def test_upgrade_inserts_provider_and_app(tmp_path):
         assert row[1] == "linear"
         assert "xagent.web.tools.mcp.linear" in str(row[2])
         assert "LINEAR_ACCESS_TOKEN" in str(row[2])
+
+
+def test_upgrade_raises_when_visibility_column_missing(tmp_path):
+    """Mirrors builtin_mcp_registry.py's seeding guard: is_visible_in_connector
+    is load-bearing for the hidden-rollout gate some builtin rows ship
+    behind, so a table missing that column must fail loudly rather than
+    silently seeding a row that's supposed to ship hidden as visible."""
+    engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
+    migration = _load_migration_module()
+    with engine.begin() as connection:
+        _create_tables_without_visibility_column(connection)
+        with patch.object(migration, "op", _operations(connection)):
+            with pytest.raises(RuntimeError, match="is_visible_in_connector"):
+                migration.upgrade()
 
 
 def test_upgrade_is_idempotent(tmp_path):

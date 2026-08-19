@@ -547,8 +547,14 @@ def github_list_issues(
                     # result anyway, so "items remain on the page" alone
                     # would falsely report truncation (and needlessly
                     # withhold a continuation) when everything left is PRs.
+                    # A non-object trailing item (e.g. `[null]`) can't be
+                    # inspected for "pull_request" without raising -- treat
+                    # it conservatively as "not a pull request" so it counts
+                    # toward a mid-page cut instead of crashing and
+                    # discarding every issue already collected on this call.
                     hit_limit_mid_page = any(
-                        "pull_request" not in later for later in raw_page[index + 1 :]
+                        not isinstance(later, dict) or "pull_request" not in later
+                        for later in raw_page[index + 1 :]
                     )
                     truncated = hit_limit_mid_page or has_next_page
                     if hit_limit_mid_page:
@@ -658,25 +664,35 @@ def github_comment_on_issue(repo: str, issue_number: int, body: str) -> str:
 
 
 @mcp.tool()
-def github_list_pull_requests(repo: str, state: str = "open", limit: int = 30) -> str:
+def github_list_pull_requests(
+    repo: str, state: str = "open", limit: int = 30, page: int = 1
+) -> str:
     """
     List pull requests in a repository.
     repo: "owner/repo".
     state: "open", "closed", or "all" (default "open").
     limit: max pull requests to return (default 30, capped at 100).
+    page: which GitHub results page to fetch (default 1) -- pass the
+    previous response's next_page when truncated is true to continue.
     """
     try:
         owner, name = _parse_repo(repo)
+        start_page = max(1, int(page))
         response = _request_raw(
             "GET",
             f"/repos/{owner}/{name}/pulls",
-            params={"state": state, "per_page": _clamp_limit(limit)},
+            params={
+                "state": state,
+                "per_page": _clamp_limit(limit),
+                "page": start_page,
+            },
         )
         result = response.json() if response.content else []
-        truncated = "next" in _link_header_rels(response.headers.get("Link"))
+        has_next_page = "next" in _link_header_rels(response.headers.get("Link"))
         return _success(
             pull_requests=[_summarize_pull_request(pr) for pr in result],
-            truncated=truncated,
+            truncated=has_next_page,
+            next_page=start_page + 1 if has_next_page else None,
         )
     except Exception as e:
         logger.error(f"Error listing GitHub pull requests for {repo}: {e}")
@@ -847,16 +863,21 @@ def github_get_file_contents(repo: str, path: str, ref: str = "") -> str:
 
 
 @mcp.tool()
-def github_list_commits(repo: str, path: str = "", limit: int = 30) -> str:
+def github_list_commits(
+    repo: str, path: str = "", limit: int = 30, page: int = 1
+) -> str:
     """
     List recent commits in a repository.
     repo: "owner/repo".
     path: optional file or directory path to restrict history to.
     limit: max commits to return (default 30, capped at 100).
+    page: which GitHub results page to fetch (default 1) -- pass the
+    previous response's next_page when truncated is true to continue.
     """
     try:
         owner, name = _parse_repo(repo)
-        params: dict[str, Any] = {"per_page": _clamp_limit(limit)}
+        start_page = max(1, int(page))
+        params: dict[str, Any] = {"per_page": _clamp_limit(limit), "page": start_page}
         if path:
             params["path"] = path
         response = _request_raw("GET", f"/repos/{owner}/{name}/commits", params=params)
@@ -873,8 +894,12 @@ def github_list_commits(repo: str, path: str = "", limit: int = 30) -> str:
             }
             for commit in result
         ]
-        truncated = "next" in _link_header_rels(response.headers.get("Link"))
-        return _success(commits=commits, truncated=truncated)
+        has_next_page = "next" in _link_header_rels(response.headers.get("Link"))
+        return _success(
+            commits=commits,
+            truncated=has_next_page,
+            next_page=start_page + 1 if has_next_page else None,
+        )
     except Exception as e:
         logger.error(f"Error listing GitHub commits for {repo}: {e}")
         return _error(str(e))

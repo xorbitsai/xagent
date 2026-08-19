@@ -797,6 +797,31 @@ def test_list_issues_preserves_partial_results_on_non_object_item(monkeypatch):
     assert [issue["number"] for issue in resumed["issues"]] == [2]
 
 
+def test_list_issues_handles_non_object_item_after_the_limit_is_reached(monkeypatch):
+    """A non-object item that appears AFTER the limit-cutting issue (rather
+    than before it) is reached only by the `hit_limit_mid_page` trailing-PR
+    lookahead, not the main per-item loop -- that lookahead must not raise
+    on it either, or it would discard every issue already collected on this
+    call, same as the before-the-limit case already covered above."""
+    page = [
+        {"number": 1, "title": "issue 1", "labels": []},
+        None,
+    ]
+    mock_request = Mock(return_value=MockResponse(json_data=page))
+    monkeypatch.setattr(github.requests, "request", mock_request)
+
+    result = json.loads(github.github_list_issues("octocat/Hello-World", limit=1))
+
+    assert result["status"] == "success"
+    assert [issue["number"] for issue in result["issues"]] == [1]
+    # Conservatively treated as "not confirmed to be a pull request", so
+    # truncation is reported rather than the result being mistaken for
+    # complete.
+    assert result["truncated"] is True
+    assert result["next_page"] == 1
+    assert result["next_skip"] == 1
+
+
 def test_list_issues_stops_at_max_pages_and_reports_truncated(monkeypatch):
     """When every page is entirely pull requests and the Link header still
     reports more pages exist, the outer loop must still terminate at
@@ -1124,6 +1149,7 @@ def test_list_pull_requests_returns_summaries(monkeypatch):
     assert result["pull_requests"][0]["head"] == "fix-branch"
     assert result["pull_requests"][0]["base"] == "main"
     assert result["truncated"] is False
+    assert result["next_page"] is None
 
 
 def test_list_pull_requests_reports_truncated_when_more_pages_exist(monkeypatch):
@@ -1142,6 +1168,7 @@ def test_list_pull_requests_reports_truncated_when_more_pages_exist(monkeypatch)
 
     assert result["status"] == "success"
     assert result["truncated"] is True
+    assert result["next_page"] == 2
 
 
 def test_list_pull_requests_sends_non_default_state_and_limit(monkeypatch):
@@ -1156,7 +1183,17 @@ def test_list_pull_requests_sends_non_default_state_and_limit(monkeypatch):
     assert mock_request.call_args.kwargs["params"] == {
         "state": "closed",
         "per_page": 5,
+        "page": 1,
     }
+
+
+def test_list_pull_requests_sends_requested_page(monkeypatch):
+    mock_request = Mock(return_value=MockResponse(json_data=[]))
+    monkeypatch.setattr(github.requests, "request", mock_request)
+
+    github.github_list_pull_requests("octocat/Hello-World", page=3)
+
+    assert mock_request.call_args.kwargs["params"]["page"] == 3
 
 
 def test_get_pull_request_returns_summary(monkeypatch):
@@ -1631,6 +1668,7 @@ def test_list_commits_returns_summaries(monkeypatch):
     assert result["commits"][0]["message"] == "fix bug"
     assert result["commits"][0]["author"] == "Alice"
     assert result["truncated"] is False
+    assert result["next_page"] is None
 
 
 def test_list_commits_reports_truncated_when_more_pages_exist(monkeypatch):
@@ -1649,6 +1687,7 @@ def test_list_commits_reports_truncated_when_more_pages_exist(monkeypatch):
 
     assert result["status"] == "success"
     assert result["truncated"] is True
+    assert result["next_page"] == 2
 
 
 def test_list_commits_sends_path_and_clamps_over_limit(monkeypatch):
@@ -1662,6 +1701,7 @@ def test_list_commits_sends_path_and_clamps_over_limit(monkeypatch):
     )
     assert mock_request.call_args.kwargs["params"] == {
         "per_page": github.MAX_PER_PAGE,
+        "page": 1,
         "path": "src/main.py",
     }
 
@@ -1673,6 +1713,15 @@ def test_list_commits_omits_path_param_when_not_provided(monkeypatch):
     github.github_list_commits("octocat/Hello-World")
 
     assert "path" not in mock_request.call_args.kwargs["params"]
+
+
+def test_list_commits_sends_requested_page(monkeypatch):
+    mock_request = Mock(return_value=MockResponse(json_data=[]))
+    monkeypatch.setattr(github.requests, "request", mock_request)
+
+    github.github_list_commits("octocat/Hello-World", page=4)
+
+    assert mock_request.call_args.kwargs["params"]["page"] == 4
 
 
 def test_search_code_returns_items(monkeypatch):

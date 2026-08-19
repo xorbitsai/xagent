@@ -95,13 +95,12 @@ def test_encode_path_component_rejects_forbidden_values(value):
         github._encode_path_component(value, field="test")
 
 
-def test_encode_path_component_percent_encodes_reserved_characters():
-    """File paths (unlike owner/repo names) can legitimately contain spaces
-    and other reserved characters; these must be percent-encoded rather
-    than sent raw."""
-    assert github._encode_path_component("my notes.md", field="path") == (
-        "my%20notes.md"
-    )
+def test_encode_path_component_percent_encodes_space_in_owner_or_repo_name():
+    """_encode_path_component (owner/repo names) only rejects '/', '?', '#',
+    and dot-segments -- a space is not forbidden, so it must be
+    percent-encoded rather than sent raw, same as any other unreserved-but-
+    not-URL-safe character."""
+    assert github._encode_path_component("my org", field="test") == "my%20org"
 
 
 @pytest.mark.parametrize("value", ["", ".", ".."])
@@ -1484,6 +1483,31 @@ def test_get_file_contents_lists_directory(monkeypatch):
     assert result["status"] == "success"
     assert result["type"] == "directory"
     assert len(result["entries"]) == 2
+
+
+def test_get_file_contents_rejects_non_object_directory_entry(monkeypatch):
+    """A non-object entry (e.g. a malformed API response) must not reach
+    the unguarded entry.get() calls below, which would surface as an
+    unhelpful `'str' object has no attribute 'get'` instead of identifying
+    what GitHub actually returned -- same class of gap as the issues
+    pagination hardening."""
+    monkeypatch.setattr(
+        github.requests,
+        "request",
+        Mock(
+            return_value=MockResponse(
+                json_data=[
+                    {"name": "main.py", "path": "src/main.py", "type": "file"},
+                    None,
+                ]
+            )
+        ),
+    )
+
+    result = json.loads(github.github_get_file_contents("octocat/Hello-World", "src"))
+
+    assert result["status"] == "error"
+    assert "non-object directory entry" in result["message"]
 
 
 def test_get_file_contents_rejects_non_file_type(monkeypatch):

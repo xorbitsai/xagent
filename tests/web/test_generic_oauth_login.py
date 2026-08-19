@@ -276,14 +276,21 @@ def test_github_login_requests_exact_canonical_scope(db_session):
     assert qs["scope"] == ["read:user repo user:email"]
 
 
-def test_bare_github_login_is_rejected_before_reaching_provider_config(db_session):
+def test_bare_github_login_config_error_takes_precedence_over_bare_route_guard(
+    db_session,
+):
     """A bare (app_id-less) login persists to the exact same
     UserOAuth.provider="github" key an app-scoped login uses, since
     github's app_id and provider name are the same string. Left unblocked,
     re-running this route would silently replace a fully-scoped
-    connection's grant with an identity-only one on the next callback.
-    This must be rejected before even resolving provider config (client_id
-    missing would otherwise return a different, misleading error)."""
+    connection's grant with an identity-only one on the next callback --
+    that guard exists and still runs before any state token is minted.
+
+    But the guard is checked AFTER config/auth resolution, not before: a
+    misconfigured provider (missing client_id) must still get the
+    actionable CLIENT_ID config error, not a 404 that would incorrectly
+    read as "this route doesn't support a normal connect attempt" to an
+    operator debugging their setup."""
     db, user = db_session
     token = _token_for(user)
 
@@ -291,8 +298,58 @@ def test_bare_github_login_is_rejected_before_reaching_provider_config(db_sessio
         auth_url="https://github.com/login/oauth/authorize",
         default_scopes=["read:user"],
         redirect_uri="https://app.example.com/api/auth/github/callback",
-        client_id="",  # deliberately unconfigured -- the bare-route guard
-        # must fire first, not the missing-client-id error path.
+        client_id="",  # deliberately unconfigured
+    )
+
+    resp = generic_oauth_login(
+        provider="github",
+        token=token,
+        app_id=None,
+        redirect=None,
+        db=db,
+        db_provider=provider,
+    )
+
+    assert resp.status_code == 500
+    assert "GITHUB_CLIENT_ID" in resp.body.decode()
+
+
+def test_bare_github_login_unauthenticated_gets_401_not_404(db_session):
+    """Same ordering point as the config-error case above: an
+    unauthenticated bare-route request must get the generic 401, not a 404
+    that implies the route itself is unsupported."""
+    db, _user = db_session
+
+    provider = _provider(
+        auth_url="https://github.com/login/oauth/authorize",
+        default_scopes=["read:user"],
+        redirect_uri="https://app.example.com/api/auth/github/callback",
+    )
+
+    resp = generic_oauth_login(
+        provider="github",
+        token=None,
+        app_id=None,
+        redirect=None,
+        db=db,
+        db_provider=provider,
+    )
+
+    assert resp.status_code == 401
+
+
+def test_bare_github_login_is_rejected_once_authenticated_and_configured(db_session):
+    """Once config and auth both resolve cleanly, the bare-route guard for
+    providers requiring an app-scoped grant still fires -- before any
+    state token is minted, which is the property it actually needs to
+    hold."""
+    db, user = db_session
+    token = _token_for(user)
+
+    provider = _provider(
+        auth_url="https://github.com/login/oauth/authorize",
+        default_scopes=["read:user"],
+        redirect_uri="https://app.example.com/api/auth/github/callback",
     )
 
     resp = generic_oauth_login(
@@ -305,7 +362,6 @@ def test_bare_github_login_is_rejected_before_reaching_provider_config(db_sessio
     )
 
     assert resp.status_code == 404
-    assert "GITHUB_CLIENT_ID" not in resp.body.decode()
 
 
 def test_bare_login_for_unrestricted_provider_still_proceeds(db_session):

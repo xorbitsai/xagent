@@ -1,6 +1,7 @@
 """Tests for the GitHub MCP connector seed migration."""
 
 import importlib.util
+import json
 from pathlib import Path
 from unittest.mock import patch
 
@@ -91,14 +92,25 @@ def test_upgrade_inserts_provider_and_app(tmp_path):
 
         row = connection.execute(
             text(
-                "SELECT transport, provider_name, launch_config FROM public_mcp_apps"
-                " WHERE app_id='github'"
+                "SELECT transport, provider_name, is_visible_in_connector,"
+                " oauth_scopes, description, icon, launch_config"
+                " FROM public_mcp_apps WHERE app_id='github'"
             )
         ).first()
         assert row[0] == "oauth"
         assert row[1] == "github"
-        assert "xagent.web.tools.mcp.github" in str(row[2])
-        assert "GITHUB_ACCESS_TOKEN" in str(row[2])
+        # A no-op or hidden-by-default seed would still pass a substring
+        # check on the stringified JSON column below -- assert the actual
+        # parsed values instead, matching the intercom sibling test's
+        # precedent for is_visible_in_connector.
+        assert row[2] == 1
+        assert json.loads(row[3]) == ["repo", "user:email"]
+        assert "GitHub" in row[4]
+        assert row[5].startswith("https://")
+        launch_config = json.loads(row[6])
+        assert launch_config["command"] == "python"
+        assert launch_config["args"] == ["-m", "xagent.web.tools.mcp.github"]
+        assert launch_config["env_mapping"] == {"GITHUB_ACCESS_TOKEN": "access_token"}
 
 
 def test_upgrade_is_idempotent(tmp_path):
@@ -119,7 +131,7 @@ def test_upgrade_is_idempotent(tmp_path):
         assert provider_count == 1
 
 
-def test_seed_rows_match_registry(tmp_path, monkeypatch):
+def test_seed_rows_match_registry(monkeypatch):
     """The migration snapshot and the runtime registry must define the same
     github rows (the migration is a frozen copy; this catches drift).
 
@@ -189,7 +201,12 @@ def test_downgrade_keeps_provider_when_custom_github_app_exists(tmp_path):
                 )
             )
             migration.downgrade()
+        # A no-op downgrade() would satisfy provider survival alone -- pin
+        # the other half of the expected behavior too: the seeded app row
+        # is actually removed, and the pre-existing custom one survives.
         assert "github" in _provider_names(connection)
+        assert "github" not in _app_ids(connection)
+        assert "custom-github" in _app_ids(connection)
 
 
 def test_downgrade_preserves_admin_created_github_provider(tmp_path):

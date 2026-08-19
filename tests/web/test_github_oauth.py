@@ -82,6 +82,7 @@ def _github_provider() -> SimpleNamespace:
         provider_name="github",
         client_id=encrypt_value("github-client-id"),
         client_secret=encrypt_value("github-client-secret"),
+        auth_url="https://github.com/login/oauth/authorize",
         token_url="https://github.com/login/oauth/access_token",
         redirect_uri="https://app.example.com/api/auth/github/callback",
         userinfo_url="https://api.github.com/user",

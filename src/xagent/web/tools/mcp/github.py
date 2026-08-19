@@ -773,6 +773,14 @@ def github_get_file_contents(repo: str, path: str, ref: str = "") -> str:
             "GET", f"/repos/{owner}/{name}/contents/{encoded_path}", params=params
         )
         if isinstance(result, list):
+            if not all(isinstance(entry, dict) for entry in result):
+                # Same class of gap the issues path was hardened against --
+                # an unguarded entry.get() below would surface as an
+                # unhelpful "'str' object has no attribute 'get'" instead of
+                # identifying what GitHub actually returned.
+                return _error(
+                    f"GitHub returned a non-object directory entry for '{path}'"
+                )
             entries = [
                 {
                     "name": entry.get("name"),

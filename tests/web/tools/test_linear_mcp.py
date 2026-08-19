@@ -2,15 +2,23 @@ import json
 from unittest.mock import Mock
 
 import pytest
+import requests
 
 from xagent.web.tools.mcp import linear
 
 
 class MockResponse:
-    def __init__(self, json_data=None, status_code: int = 200, text: str = ""):
+    def __init__(
+        self,
+        json_data=None,
+        status_code: int = 200,
+        text: str = "",
+        headers: dict | None = None,
+    ):
         self._json_data = json_data if json_data is not None else {}
         self.status_code = status_code
         self.text = text or (json.dumps(self._json_data) if json_data else "")
+        self.headers = headers or {}
 
     def json(self):
         return self._json_data
@@ -98,6 +106,107 @@ def test_graphql_truncates_unstructured_error_body_on_http_error(monkeypatch):
     assert len(str(excinfo.value)) < len(long_body)
 
 
+def test_graphql_retries_once_on_429_with_positive_retry_after(monkeypatch):
+    mock_post = Mock(
+        side_effect=[
+            MockResponse(status_code=429, headers={"Retry-After": "1"}),
+            MockResponse(json_data={"data": {"viewer": {"id": "u1"}}}),
+        ]
+    )
+    monkeypatch.setattr(linear.requests, "post", mock_post)
+    monkeypatch.setattr(linear.time, "sleep", lambda _seconds: None)
+
+    result = linear._graphql("query { viewer { id } }")
+
+    assert result == {"viewer": {"id": "u1"}}
+    assert mock_post.call_count == 2
+
+
+def test_graphql_does_not_retry_on_zero_retry_after(monkeypatch):
+    mock_post = Mock(
+        return_value=MockResponse(status_code=429, headers={"Retry-After": "0"})
+    )
+    monkeypatch.setattr(linear.requests, "post", mock_post)
+
+    with pytest.raises(RuntimeError):
+        linear._graphql("query { viewer { id } }")
+
+    assert mock_post.call_count == 1
+
+
+def test_graphql_does_not_retry_beyond_max_retry_after(monkeypatch):
+    mock_post = Mock(
+        return_value=MockResponse(
+            status_code=429,
+            headers={"Retry-After": str(linear.MAX_RETRY_AFTER_SECONDS + 1)},
+        )
+    )
+    monkeypatch.setattr(linear.requests, "post", mock_post)
+
+    with pytest.raises(RuntimeError):
+        linear._graphql("query { viewer { id } }")
+
+    assert mock_post.call_count == 1
+
+
+def test_graphql_returns_partial_data_instead_of_raising(monkeypatch, caplog):
+    """A 200 response can carry both usable data and a truthy errors array
+    when only one sub-field's resolver failed -- the whole response must
+    not be discarded over that one bad field."""
+    monkeypatch.setattr(
+        linear.requests,
+        "post",
+        Mock(
+            return_value=MockResponse(
+                json_data={
+                    "data": {"viewer": {"id": "u1"}},
+                    "errors": [{"message": "some.unrelated.field failed"}],
+                }
+            )
+        ),
+    )
+
+    with caplog.at_level("WARNING"):
+        result = linear._graphql("query { viewer { id } }")
+
+    assert result == {"viewer": {"id": "u1"}}
+    assert "some.unrelated.field failed" in caplog.text
+
+
+def test_graphql_raises_on_non_dict_200_body(monkeypatch):
+    """A non-object 200 JSON body (e.g. a bare list or string) must raise a
+    clear RuntimeError, not an unhandled AttributeError from .get()."""
+    monkeypatch.setattr(
+        linear.requests,
+        "post",
+        Mock(return_value=MockResponse(json_data=["unexpected", "list"])),
+    )
+
+    with pytest.raises(RuntimeError, match="unexpected"):
+        linear._graphql("query { viewer { id } }")
+
+
+def test_graphql_raises_on_non_json_200_body(monkeypatch):
+    """A non-JSON 200 body (e.g. an HTML proxy error page) must raise a
+    clear, bounded RuntimeError, not a raw JSONDecodeError."""
+    long_body = "<html>" + "x" * 5000
+
+    class NonJsonResponse(MockResponse):
+        def json(self):
+            raise ValueError("Expecting value: line 1 column 1 (char 0)")
+
+    monkeypatch.setattr(
+        linear.requests,
+        "post",
+        Mock(return_value=NonJsonResponse(status_code=200, text=long_body)),
+    )
+
+    with pytest.raises(RuntimeError) as excinfo:
+        linear._graphql("query { viewer { id } }")
+
+    assert "[truncated]" in str(excinfo.value)
+
+
 def test_get_current_user_returns_profile(monkeypatch):
     monkeypatch.setattr(
         linear.requests,
@@ -141,6 +250,46 @@ def test_get_current_user_returns_error_payload_on_failure(monkeypatch):
 
     assert result["status"] == "error"
     assert "Authentication required" in result["message"]
+
+
+def test_resolve_team_uuid_returns_already_uuid_input_unchanged(monkeypatch):
+    mock_post = Mock()
+    monkeypatch.setattr(linear.requests, "post", mock_post)
+
+    assert linear._resolve_team_uuid(_TEAM_UUID) == _TEAM_UUID
+    mock_post.assert_not_called()
+
+
+def test_resolve_team_uuid_filters_by_key_not_by_id(monkeypatch):
+    """The unambiguous, documented way to resolve a team key: filter the
+    teams collection by key, rather than passing the raw key to the
+    top-level team(id:) field (which Linear's own SDK only documents as
+    accepting a UUID)."""
+    mock_post = Mock(
+        return_value=MockResponse(
+            json_data={"data": {"teams": {"nodes": [{"id": _TEAM_UUID}]}}}
+        )
+    )
+    monkeypatch.setattr(linear.requests, "post", mock_post)
+
+    result = linear._resolve_team_uuid("ENG")
+
+    assert result == _TEAM_UUID
+    sent = mock_post.call_args.kwargs["json"]
+    assert "teams(filter:" in sent["query"]
+    assert "team(id:" not in sent["query"]
+    assert sent["variables"] == {"key": "ENG"}
+
+
+def test_resolve_team_uuid_raises_when_key_does_not_resolve(monkeypatch):
+    monkeypatch.setattr(
+        linear.requests,
+        "post",
+        Mock(return_value=MockResponse(json_data={"data": {"teams": {"nodes": []}}})),
+    )
+
+    with pytest.raises(ValueError, match="not found"):
+        linear._resolve_team_uuid("NOPE")
 
 
 def test_list_teams_returns_nodes(monkeypatch):
@@ -196,7 +345,9 @@ def test_list_teams_reports_truncated_when_more_pages_exist(monkeypatch):
 def test_list_workflow_states_resolves_team_key_to_uuid(monkeypatch):
     mock_post = Mock(
         side_effect=[
-            MockResponse(json_data={"data": {"team": {"id": _TEAM_UUID}}}),
+            MockResponse(
+                json_data={"data": {"teams": {"nodes": [{"id": _TEAM_UUID}]}}}
+            ),
             MockResponse(
                 json_data={
                     "data": {
@@ -222,7 +373,9 @@ def test_list_workflow_states_reports_error_when_team_missing(monkeypatch):
         "post",
         Mock(
             side_effect=[
-                MockResponse(json_data={"data": {"team": {"id": _TEAM_UUID}}}),
+                MockResponse(
+                    json_data={"data": {"teams": {"nodes": [{"id": _TEAM_UUID}]}}}
+                ),
                 MockResponse(json_data={"data": {"team": None}}),
             ]
         ),
@@ -237,7 +390,9 @@ def test_list_workflow_states_reports_error_when_team_missing(monkeypatch):
 def test_list_workflow_states_reports_truncated_when_more_pages_exist(monkeypatch):
     mock_post = Mock(
         side_effect=[
-            MockResponse(json_data={"data": {"team": {"id": _TEAM_UUID}}}),
+            MockResponse(
+                json_data={"data": {"teams": {"nodes": [{"id": _TEAM_UUID}]}}}
+            ),
             MockResponse(
                 json_data={
                     "data": {
@@ -263,7 +418,9 @@ def test_list_workflow_states_reports_truncated_when_more_pages_exist(monkeypatc
 def test_list_labels_resolves_team_key_to_uuid(monkeypatch):
     mock_post = Mock(
         side_effect=[
-            MockResponse(json_data={"data": {"team": {"id": _TEAM_UUID}}}),
+            MockResponse(
+                json_data={"data": {"teams": {"nodes": [{"id": _TEAM_UUID}]}}}
+            ),
             MockResponse(
                 json_data={
                     "data": {
@@ -285,7 +442,9 @@ def test_list_labels_resolves_team_key_to_uuid(monkeypatch):
 def test_list_labels_reports_truncated_when_more_pages_exist(monkeypatch):
     mock_post = Mock(
         side_effect=[
-            MockResponse(json_data={"data": {"team": {"id": _TEAM_UUID}}}),
+            MockResponse(
+                json_data={"data": {"teams": {"nodes": [{"id": _TEAM_UUID}]}}}
+            ),
             MockResponse(
                 json_data={
                     "data": {
@@ -311,11 +470,27 @@ def test_list_labels_reports_truncated_when_more_pages_exist(monkeypatch):
 def test_list_projects_resolves_team_key_to_uuid(monkeypatch):
     mock_post = Mock(
         side_effect=[
-            MockResponse(json_data={"data": {"team": {"id": _TEAM_UUID}}}),
+            MockResponse(
+                json_data={"data": {"teams": {"nodes": [{"id": _TEAM_UUID}]}}}
+            ),
             MockResponse(
                 json_data={
                     "data": {
-                        "team": {"projects": {"nodes": [{"id": "p1", "name": "Q3"}]}}
+                        "team": {
+                            "projects": {
+                                "nodes": [
+                                    {
+                                        "id": "p1",
+                                        "name": "Q3",
+                                        "status": {
+                                            "id": "s1",
+                                            "name": "In Progress",
+                                            "type": "started",
+                                        },
+                                    }
+                                ]
+                            }
+                        }
                     }
                 }
             ),
@@ -326,17 +501,19 @@ def test_list_projects_resolves_team_key_to_uuid(monkeypatch):
     result = json.loads(linear.linear_list_projects(team_id="ENG"))
 
     assert result["status"] == "success"
-    assert result["projects"] == [{"id": "p1", "name": "Q3"}]
+    # Asserting the parsed response carries status.type (not just that the
+    # hardcoded query string mentions "status") proves the deprecated
+    # Project.state -> status migration actually reaches the tool's output.
+    assert result["projects"][0]["status"]["type"] == "started"
     assert result["truncated"] is False
-    projects_call = mock_post.call_args_list[1]
-    assert "status" in projects_call.kwargs["json"]["query"]
-    assert "state" not in projects_call.kwargs["json"]["query"]
 
 
 def test_list_projects_reports_truncated_when_team_scoped_has_more_pages(monkeypatch):
     mock_post = Mock(
         side_effect=[
-            MockResponse(json_data={"data": {"team": {"id": _TEAM_UUID}}}),
+            MockResponse(
+                json_data={"data": {"teams": {"nodes": [{"id": _TEAM_UUID}]}}}
+            ),
             MockResponse(
                 json_data={
                     "data": {
@@ -362,7 +539,23 @@ def test_list_projects_reports_truncated_when_team_scoped_has_more_pages(monkeyp
 def test_list_projects_without_team_id_skips_resolution(monkeypatch):
     mock_post = Mock(
         return_value=MockResponse(
-            json_data={"data": {"projects": {"nodes": [{"id": "p1", "name": "Q3"}]}}}
+            json_data={
+                "data": {
+                    "projects": {
+                        "nodes": [
+                            {
+                                "id": "p1",
+                                "name": "Q3",
+                                "status": {
+                                    "id": "s1",
+                                    "name": "In Progress",
+                                    "type": "started",
+                                },
+                            }
+                        ]
+                    }
+                }
+            }
         )
     )
     monkeypatch.setattr(linear.requests, "post", mock_post)
@@ -372,8 +565,10 @@ def test_list_projects_without_team_id_skips_resolution(monkeypatch):
     assert result["status"] == "success"
     assert mock_post.call_count == 1
     assert result["truncated"] is False
-    assert "status" in mock_post.call_args.kwargs["json"]["query"]
-    assert "state" not in mock_post.call_args.kwargs["json"]["query"]
+    # Asserting the parsed response carries status.type proves the
+    # deprecated Project.state -> status migration reaches the output,
+    # not just that the hardcoded query string happens to mention "status".
+    assert result["projects"][0]["status"]["type"] == "started"
 
 
 def test_list_projects_without_team_id_reports_truncated_when_more_pages_exist(
@@ -397,6 +592,33 @@ def test_list_projects_without_team_id_reports_truncated_when_more_pages_exist(
 
     assert result["status"] == "success"
     assert result["truncated"] is True
+
+
+def test_search_issues_rejects_invalid_state_type(monkeypatch):
+    mock_post = Mock()
+    monkeypatch.setattr(linear.requests, "post", mock_post)
+
+    result = json.loads(linear.linear_search_issues(state_type="in-progress"))
+
+    assert result["status"] == "error"
+    assert "state_type" in result["message"]
+    mock_post.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "state_type",
+    ["triage", "backlog", "unstarted", "started", "completed", "canceled", "duplicate"],
+)
+def test_search_issues_accepts_every_documented_state_type(monkeypatch, state_type):
+    mock_post = Mock(
+        return_value=MockResponse(json_data={"data": {"issues": {"nodes": []}}})
+    )
+    monkeypatch.setattr(linear.requests, "post", mock_post)
+
+    result = json.loads(linear.linear_search_issues(state_type=state_type))
+
+    assert result["status"] == "success"
+    assert mock_post.call_args.kwargs["json"]["variables"]["stateType"] == state_type
 
 
 def test_search_issues_applies_team_filter(monkeypatch):
@@ -431,13 +653,63 @@ def test_search_issues_applies_team_filter(monkeypatch):
     assert query_text.count("{") == query_text.count("}")
 
 
+def test_search_issues_combines_assignee_and_state_type_filters(monkeypatch):
+    """The type_signature lookup is keyed by every variable name actually
+    present in `variables` -- this must not KeyError when two (or more)
+    optional filters are combined, only tested individually elsewhere."""
+    mock_post = Mock(
+        return_value=MockResponse(json_data={"data": {"issues": {"nodes": []}}})
+    )
+    monkeypatch.setattr(linear.requests, "post", mock_post)
+
+    result = json.loads(
+        linear.linear_search_issues(assignee_id="u1", state_type="started")
+    )
+
+    assert result["status"] == "success"
+    variables = mock_post.call_args.kwargs["json"]["variables"]
+    assert variables["assigneeId"] == "u1"
+    assert variables["stateType"] == "started"
+    query_text = mock_post.call_args.kwargs["json"]["query"]
+    assert query_text.count("{") == query_text.count("}")
+    assert "$assigneeId: ID!" in query_text
+    assert "$stateType: String!" in query_text
+
+
+def test_search_issues_combines_all_three_filters(monkeypatch):
+    mock_post = Mock(
+        return_value=MockResponse(json_data={"data": {"issues": {"nodes": []}}})
+    )
+    monkeypatch.setattr(linear.requests, "post", mock_post)
+
+    result = json.loads(
+        linear.linear_search_issues(
+            team_id=_TEAM_UUID, assignee_id="u1", state_type="started"
+        )
+    )
+
+    assert result["status"] == "success"
+    variables = mock_post.call_args.kwargs["json"]["variables"]
+    assert variables == {
+        "teamId": _TEAM_UUID,
+        "assigneeId": "u1",
+        "stateType": "started",
+        "first": 20,
+        "after": None,
+    }
+    query_text = mock_post.call_args.kwargs["json"]["query"]
+    assert query_text.count("{") == query_text.count("}")
+
+
 def test_search_issues_resolves_team_key_to_uuid(monkeypatch):
     """The `team: { id: { eq: ... } }` filter requires the team's real UUID,
     not its human-readable key (e.g. "ENG") — team_id must be resolved
     first, same as issue identifiers for mutation inputs."""
     mock_post = Mock(
         side_effect=[
-            MockResponse(json_data={"data": {"team": {"id": _TEAM_UUID}}}),
+            MockResponse(
+                json_data={"data": {"teams": {"nodes": [{"id": _TEAM_UUID}]}}}
+            ),
             MockResponse(json_data={"data": {"issues": {"nodes": []}}}),
         ]
     )
@@ -448,7 +720,7 @@ def test_search_issues_resolves_team_key_to_uuid(monkeypatch):
     assert result["status"] == "success"
     assert mock_post.call_count == 2
     resolve_call, search_call = mock_post.call_args_list
-    assert resolve_call.kwargs["json"]["variables"] == {"id": "ENG"}
+    assert resolve_call.kwargs["json"]["variables"] == {"key": "ENG"}
     assert search_call.kwargs["json"]["variables"]["teamId"] == _TEAM_UUID
 
 
@@ -617,6 +889,32 @@ def test_search_issues_not_truncated_when_no_next_page(monkeypatch):
     assert result["truncated"] is False
 
 
+def test_get_issue_returns_issue_on_success(monkeypatch):
+    monkeypatch.setattr(
+        linear.requests,
+        "post",
+        Mock(
+            return_value=MockResponse(
+                json_data={
+                    "data": {
+                        "issue": {
+                            "id": _TEAM_UUID,
+                            "identifier": "ENG-1",
+                            "title": "Fix bug",
+                        }
+                    }
+                }
+            )
+        ),
+    )
+
+    result = json.loads(linear.linear_get_issue("ENG-1"))
+
+    assert result["status"] == "success"
+    assert result["issue"]["identifier"] == "ENG-1"
+    assert result["issue"]["title"] == "Fix bug"
+
+
 def test_get_issue_returns_not_found_error_when_missing(monkeypatch):
     monkeypatch.setattr(
         linear.requests,
@@ -628,6 +926,23 @@ def test_get_issue_returns_not_found_error_when_missing(monkeypatch):
 
     assert result["status"] == "error"
     assert "not found" in result["message"]
+
+
+def test_get_issue_returns_error_payload_on_network_exception(monkeypatch):
+    """Every tool wraps its body in try/except Exception -> _error(str(e)) --
+    a network-level failure (not just an HTTP error status) must surface as
+    a structured error payload, not an unhandled exception escaping the
+    FastMCP tool call."""
+    monkeypatch.setattr(
+        linear.requests,
+        "post",
+        Mock(side_effect=requests.ConnectionError("Connection refused")),
+    )
+
+    result = json.loads(linear.linear_get_issue("ENG-1"))
+
+    assert result["status"] == "error"
+    assert "Connection refused" in result["message"]
 
 
 def test_create_issue_sends_expected_input(monkeypatch):
@@ -673,7 +988,9 @@ def test_create_issue_resolves_team_key_to_uuid(monkeypatch):
     (e.g. "ENG") — team_id must be resolved first."""
     mock_post = Mock(
         side_effect=[
-            MockResponse(json_data={"data": {"team": {"id": _TEAM_UUID}}}),
+            MockResponse(
+                json_data={"data": {"teams": {"nodes": [{"id": _TEAM_UUID}]}}}
+            ),
             MockResponse(
                 json_data={
                     "data": {
@@ -694,6 +1011,42 @@ def test_create_issue_resolves_team_key_to_uuid(monkeypatch):
     assert mock_post.call_count == 2
     create_call = mock_post.call_args_list[1]
     assert create_call.kwargs["json"]["variables"]["input"]["teamId"] == _TEAM_UUID
+
+
+def test_create_issue_omits_priority_when_not_provided(monkeypatch):
+    mock_post = Mock(
+        return_value=MockResponse(
+            json_data={
+                "data": {"issueCreate": {"success": True, "issue": {"id": "i1"}}}
+            }
+        )
+    )
+    monkeypatch.setattr(linear.requests, "post", mock_post)
+
+    linear.linear_create_issue(team_id=_TEAM_UUID, title="New bug")
+
+    sent_input = mock_post.call_args.kwargs["json"]["variables"]["input"]
+    assert "priority" not in sent_input
+
+
+def test_create_issue_sends_explicit_priority_zero(monkeypatch):
+    """priority=0 ("no priority") is a valid explicit choice, distinct from
+    the caller not specifying priority at all -- both happen to produce the
+    same server-side outcome today, but the input contract should still
+    distinguish them, matching linear_update_issue's is-not-None handling."""
+    mock_post = Mock(
+        return_value=MockResponse(
+            json_data={
+                "data": {"issueCreate": {"success": True, "issue": {"id": "i1"}}}
+            }
+        )
+    )
+    monkeypatch.setattr(linear.requests, "post", mock_post)
+
+    linear.linear_create_issue(team_id=_TEAM_UUID, title="New bug", priority=0)
+
+    sent_input = mock_post.call_args.kwargs["json"]["variables"]["input"]
+    assert sent_input["priority"] == 0
 
 
 def test_create_issue_reports_error_when_linear_reports_failure(monkeypatch):
@@ -722,6 +1075,23 @@ def test_update_issue_requires_at_least_one_field(monkeypatch):
     assert result["status"] == "error"
     assert "No fields" in result["message"]
     mock_post.assert_not_called()
+
+
+def test_update_issue_reports_error_when_linear_reports_failure(monkeypatch):
+    monkeypatch.setattr(
+        linear.requests,
+        "post",
+        Mock(
+            return_value=MockResponse(
+                json_data={"data": {"issueUpdate": {"success": False, "issue": None}}}
+            )
+        ),
+    )
+
+    result = json.loads(linear.linear_update_issue("ENG-1", title="Renamed"))
+
+    assert result["status"] == "error"
+    assert "not updated" in result["message"]
 
 
 def test_update_issue_omits_priority_when_left_default(monkeypatch):
@@ -1000,6 +1370,25 @@ def test_add_comment_passes_issue_id_through_without_a_lookup(monkeypatch):
     assert mock_post.call_count == 1
     sent_input = mock_post.call_args.kwargs["json"]["variables"]["input"]
     assert sent_input == {"issueId": "ENG-1", "body": "Looks good"}
+
+
+def test_add_comment_reports_error_when_linear_reports_failure(monkeypatch):
+    monkeypatch.setattr(
+        linear.requests,
+        "post",
+        Mock(
+            return_value=MockResponse(
+                json_data={
+                    "data": {"commentCreate": {"success": False, "comment": None}}
+                }
+            )
+        ),
+    )
+
+    result = json.loads(linear.linear_add_comment("ENG-1", "Looks good"))
+
+    assert result["status"] == "error"
+    assert "not created" in result["message"]
 
 
 def test_search_users_filters_by_name_or_email(monkeypatch):

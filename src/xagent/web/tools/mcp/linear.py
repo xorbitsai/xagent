@@ -2,6 +2,7 @@ import json
 import logging
 import os
 import re
+import time
 from typing import Any
 
 import requests
@@ -20,13 +21,20 @@ mcp = FastMCP("linear-mcp")
 LINEAR_GRAPHQL_URL = "https://api.linear.app/graphql"
 DEFAULT_TIMEOUT_SECONDS = 30
 MAX_LIMIT = 100
+# On a 429 with a small Retry-After we wait once and retry rather than
+# failing outright, mirroring the same bounded-retry policy as the
+# Intercom/Slack sibling modules -- pagination here can now fire up to
+# MAX_ISSUE_SEARCH_PAGES/MAX_USER_SEARCH_PAGES sequential requests per tool
+# call, making a transient rate limit far more likely to surface mid-fetch
+# than in a single-request tool.
+MAX_RETRY_AFTER_SECONDS = 30
 # Matches zoom.py's convention: an error body that isn't the expected
 # {"errors": [...]} GraphQL shape (e.g. an HTML gateway error page) must not
 # be forwarded to the LLM/logs verbatim and unbounded.
 MAX_ERROR_RESPONSE_TEXT_CHARS = 1000
 # Bounded multi-page fetch for a client-side text filter (linear_search_issues'
 # title match, since Linear's API has no server-side title filter) --
-# mirrors github.py's MAX_ISSUE_PAGES precedent: a single MAX_LIMIT-sized
+# mirrors slack.py's/aws.py's MAX_PAGES precedent: a single MAX_LIMIT-sized
 # page can undercount real matches that live further out.
 MAX_ISSUE_SEARCH_PAGES = 10
 # Workspaces typically have far fewer members than a repository has issues,
@@ -35,6 +43,13 @@ MAX_USER_SEARCH_PAGES = 5
 
 _UUID_PATTERN = re.compile(
     r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+)
+
+# Per Linear's own SDK type definitions (WorkflowStateFilter.type's doc
+# comment) -- "duplicate" is a real, documented value that a plain reading
+# of the Team/WorkflowState object docs (which only list 6) would miss.
+_VALID_STATE_TYPES = frozenset(
+    {"triage", "backlog", "unstarted", "started", "completed", "canceled", "duplicate"}
 )
 
 
@@ -77,12 +92,23 @@ def _graphql(query: str, variables: dict[str, Any] | None = None) -> dict[str, A
     shape not guaranteed), but schema/validation errors with HTTP 200 and a
     top-level "errors" array — both are checked, in that order.
     """
-    response = requests.post(
-        LINEAR_GRAPHQL_URL,
-        headers=_headers(),
-        json={"query": query, "variables": variables or {}},
-        timeout=DEFAULT_TIMEOUT_SECONDS,
-    )
+    for attempt in (0, 1):
+        response = requests.post(
+            LINEAR_GRAPHQL_URL,
+            headers=_headers(),
+            json={"query": query, "variables": variables or {}},
+            timeout=DEFAULT_TIMEOUT_SECONDS,
+        )
+        if response.status_code == 429 and attempt == 0:
+            try:
+                retry_after = int(response.headers.get("Retry-After", "0"))
+            except ValueError:
+                retry_after = 0
+            if 0 < retry_after <= MAX_RETRY_AFTER_SECONDS:
+                time.sleep(retry_after)
+                continue
+        break
+
     if response.status_code >= 400:
         detail: str | None = None
         try:
@@ -99,11 +125,34 @@ def _graphql(query: str, variables: dict[str, Any] | None = None) -> dict[str, A
             f"Linear API error (status {response.status_code}): {detail}"
         )
 
-    payload = response.json()
+    try:
+        payload = response.json()
+    except ValueError:
+        detail = response.text.strip()
+        if len(detail) > MAX_ERROR_RESPONSE_TEXT_CHARS:
+            detail = detail[:MAX_ERROR_RESPONSE_TEXT_CHARS] + "... [truncated]"
+        raise RuntimeError(
+            f"Linear API returned a non-JSON response: {detail}"
+        ) from None
+    if not isinstance(payload, dict):
+        raise RuntimeError(
+            "Linear API returned an unexpected (non-object) response body"
+        )
+
+    data = payload.get("data")
     errors = payload.get("errors")
     if errors:
-        raise RuntimeError(_graphql_errors_message(errors))
-    return payload.get("data") or {}
+        message = _graphql_errors_message(errors)
+        if not data:
+            # No usable data at all -- a hard failure.
+            raise RuntimeError(message)
+        # A 200 response can carry both a partially populated "data" and a
+        # truthy "errors" array when one sub-field's resolver failed but
+        # others succeeded -- raising here would discard an otherwise
+        # usable result over one bad field. Log instead of silently
+        # swallowing the partial failure.
+        logger.warning(f"Linear GraphQL partial error (data still returned): {message}")
+    return data or {}
 
 
 def _resolve_team_uuid(team_id: str) -> str:
@@ -114,19 +163,34 @@ def _resolve_team_uuid(team_id: str) -> str:
     human-readable key (e.g. "ENG") -- but linear_list_teams hands back
     both, and every tool that takes a team_id here documents accepting
     either. An already-UUID team_id is returned unchanged without a
-    round-trip. (Unlike team_id, no equivalent resolver exists for issue_id:
-    Linear's CommentCreateInput.issueId and every other issueId-typed
-    input accept either an issue's UUID or its human-readable identifier
-    directly, confirmed against Linear's own SDK type definitions -- so
-    passing issue_id straight through needs no lookup.)
+    round-trip.
+
+    Resolution goes through `teams(filter: { key: { eq: ... } })`, not the
+    top-level `team(id: ...)` field -- Linear's own SDK type definitions
+    document TeamFilter.key as the supported way to look up a team by its
+    key, but never document `team(id:)` accepting anything but a UUID
+    ("Fetches a specific team by its ID"), unlike issue-related id fields,
+    which explicitly document accepting either form. Filtering by key is
+    the unambiguous, documented path regardless of what team(id:) does
+    with a raw key.
+
+    (No equivalent resolver exists for issue_id: Linear's
+    CommentCreateInput.issueId and every other issueId-typed input accept
+    either an issue's UUID or its human-readable identifier directly,
+    confirmed against Linear's own SDK type definitions -- so passing
+    issue_id straight through needs no lookup.)
     """
     if _UUID_PATTERN.match(team_id):
         return team_id
-    data = _graphql("query($id: String!) { team(id: $id) { id } }", {"id": team_id})
-    team = data.get("team")
-    if not team or not isinstance(team, dict):
+    data = _graphql(
+        "query($key: String!) { teams(filter: { key: { eq: $key } }, first: 1)"
+        " { nodes { id } } }",
+        {"key": team_id},
+    )
+    teams = (data.get("teams") or {}).get("nodes") or []
+    if not teams:
         raise ValueError(f"Team '{team_id}' not found")
-    return str(team["id"])
+    return str(teams[0]["id"])
 
 
 @mcp.tool()
@@ -295,10 +359,16 @@ def linear_search_issues(
     team_id: optional team id/key from linear_list_teams.
     assignee_id: optional user id from linear_search_users.
     state_type: optional workflow state type to filter by — one of
-    "triage", "backlog", "unstarted", "started", "completed", "canceled".
+    "triage", "backlog", "unstarted", "started", "completed", "canceled",
+    "duplicate".
     limit: max issues to return (default 20, capped at 100).
     """
     try:
+        if state_type and state_type not in _VALID_STATE_TYPES:
+            return _error(
+                f"state_type must be one of {sorted(_VALID_STATE_TYPES)}, "
+                f"got: {state_type!r}"
+            )
         filter_parts = []
         variables: dict[str, Any] = {}
         if team_id:
@@ -401,7 +471,7 @@ def linear_create_issue(
     title: str,
     description: str = "",
     assignee_id: str = "",
-    priority: int = 0,
+    priority: int | None = None,
     label_ids: list[str] | None = None,
 ) -> str:
     """
@@ -410,7 +480,8 @@ def linear_create_issue(
     title: the issue title.
     description: optional body (Markdown supported).
     assignee_id: optional user id from linear_search_users.
-    priority: 0 (no priority), 1 (urgent), 2 (high), 3 (normal), 4 (low).
+    priority: 0 (no priority), 1 (urgent), 2 (high), 3 (normal), 4 (low);
+    omit to let Linear apply its own default.
     label_ids: optional label ids from linear_list_labels.
     """
     try:
@@ -422,7 +493,7 @@ def linear_create_issue(
             issue_input["description"] = description
         if assignee_id:
             issue_input["assigneeId"] = assignee_id
-        if priority:
+        if priority is not None:
             issue_input["priority"] = priority
         if label_ids:
             issue_input["labelIds"] = label_ids

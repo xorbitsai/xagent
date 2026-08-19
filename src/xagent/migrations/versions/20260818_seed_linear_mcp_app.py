@@ -121,6 +121,19 @@ def upgrade() -> None:
         app_columns = {
             column["name"] for column in inspector.get_columns("public_mcp_apps")
         }
+        # Same guard as seed_builtin_oauth_and_public_mcp_apps in
+        # builtin_mcp_registry.py, and for the same reason:
+        # is_visible_in_connector is load-bearing for the hidden-rollout
+        # gate some builtin rows ship behind -- _filter_row silently
+        # dropping a missing column and falling back to the table's
+        # visible-by-default default would seed a row that's supposed to
+        # ship hidden as visible instead. Belt-and-suspenders here too,
+        # since this column has been present since the table's creation.
+        if "is_visible_in_connector" not in app_columns:
+            raise RuntimeError(
+                "public_mcp_apps.is_visible_in_connector is missing; "
+                "builtin apps that ship hidden must not seed visible"
+            )
         existing_app_ids = set(
             bind.execute(sa.select(PUBLIC_MCP_APPS_TABLE.c.app_id)).scalars()
         )

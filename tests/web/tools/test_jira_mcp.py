@@ -18,7 +18,9 @@ class MockResponse:
     ):
         self._json_data = json_data if json_data is not None else {}
         self.status_code = status_code
-        self.text = text or (json.dumps(self._json_data) if json_data else "")
+        self.text = text or (
+            json.dumps(self._json_data) if json_data is not None else ""
+        )
         self.content = self.text.encode()
         self.url = url
         self.headers = headers or {}
@@ -92,6 +94,25 @@ def test_request_absolute_truncates_unstructured_error_body(monkeypatch):
     assert len(str(excinfo.value)) < len(long_body)
 
 
+def test_request_absolute_truncates_large_structured_error_body(monkeypatch):
+    long_messages = [f"error {i}" for i in range(500)]
+    monkeypatch.setattr(
+        jira.requests,
+        "request",
+        Mock(
+            return_value=MockResponse(
+                status_code=400, json_data={"errorMessages": long_messages}
+            )
+        ),
+    )
+
+    with pytest.raises(RuntimeError) as excinfo:
+        jira._request_absolute("GET", "https://api.atlassian.com/me")
+
+    assert "[truncated]" in str(excinfo.value)
+    assert len(str(excinfo.value)) < len("; ".join(long_messages))
+
+
 def test_request_absolute_retries_once_on_429_with_retry_after(monkeypatch):
     sleep_calls = []
     monkeypatch.setattr(jira.time, "sleep", lambda s: sleep_calls.append(s))
@@ -158,6 +179,28 @@ def test_resolve_cloud_id_raises_when_no_sites(monkeypatch):
     )
 
     with pytest.raises(ValueError, match="No accessible Jira sites"):
+        jira._resolve_cloud_id("")
+
+
+def test_accessible_resources_raises_on_non_list_response(monkeypatch):
+    monkeypatch.setattr(
+        jira.requests,
+        "request",
+        Mock(return_value=MockResponse(json_data={"unexpected": "shape"})),
+    )
+
+    with pytest.raises(ValueError, match="Unexpected response format"):
+        jira._accessible_resources()
+
+
+def test_resolve_cloud_id_multiple_sites_message_handles_non_dict_entries(monkeypatch):
+    monkeypatch.setattr(
+        jira.requests,
+        "request",
+        Mock(return_value=MockResponse(json_data=["not-a-dict", "also-not-a-dict"])),
+    )
+
+    with pytest.raises(ValueError, match="details unavailable"):
         jira._resolve_cloud_id("")
 
 
@@ -448,6 +491,39 @@ def test_update_issue_unassigns_on_explicit_empty_assignee_id(monkeypatch):
     assert update_call.kwargs["json"] == {"fields": {"assignee": None}}
 
 
+def test_create_issue_rejects_empty_summary(monkeypatch):
+    mock_request = Mock()
+    monkeypatch.setattr(jira.requests, "request", mock_request)
+
+    result = json.loads(jira.jira_create_issue(project_key="ENG", summary=""))
+
+    assert result["status"] == "error"
+    assert "summary cannot be empty" in result["message"]
+    mock_request.assert_not_called()
+
+
+def test_update_issue_rejects_empty_summary(monkeypatch):
+    mock_request = Mock()
+    monkeypatch.setattr(jira.requests, "request", mock_request)
+
+    result = json.loads(jira.jira_update_issue("ENG-1", summary=""))
+
+    assert result["status"] == "error"
+    assert "summary cannot be empty" in result["message"]
+    mock_request.assert_not_called()
+
+
+def test_update_issue_rejects_empty_priority(monkeypatch):
+    mock_request = Mock()
+    monkeypatch.setattr(jira.requests, "request", mock_request)
+
+    result = json.loads(jira.jira_update_issue("ENG-1", priority=""))
+
+    assert result["status"] == "error"
+    assert "priority cannot be empty" in result["message"]
+    mock_request.assert_not_called()
+
+
 def test_list_transitions_returns_id_and_name(monkeypatch):
     monkeypatch.setattr(
         jira.requests,
@@ -578,6 +654,24 @@ def test_list_comments_empty_page_never_repeats_offset(monkeypatch):
 
     result = json.loads(jira.jira_list_comments("ENG-1", start_at=5))
 
+    assert result["truncated"] is False
+    assert result["next_start_at"] is None
+
+
+def test_list_comments_ignores_non_int_total(monkeypatch):
+    mock_request = Mock(
+        side_effect=[
+            MockResponse(json_data=[_SITE_A]),
+            MockResponse(
+                json_data={"comments": [{"id": "1", "body": "First"}], "total": None}
+            ),
+        ]
+    )
+    monkeypatch.setattr(jira.requests, "request", mock_request)
+
+    result = json.loads(jira.jira_list_comments("ENG-1"))
+
+    assert result["status"] == "success"
     assert result["truncated"] is False
     assert result["next_start_at"] is None
 

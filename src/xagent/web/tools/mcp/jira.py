@@ -56,6 +56,13 @@ def _clamp_limit(limit: int) -> int:
     return max(1, min(int(limit), MAX_LIMIT))
 
 
+def _truncate(text: str) -> str:
+    """Bound error text to MAX_ERROR_RESPONSE_TEXT_CHARS, marking the cut."""
+    if len(text) > MAX_ERROR_RESPONSE_TEXT_CHARS:
+        return text[:MAX_ERROR_RESPONSE_TEXT_CHARS] + "... [truncated]"
+    return text
+
+
 def _path_segment(value: str) -> str:
     """Percent-encode a value for safe interpolation into a URL path
     segment (e.g. an issue key or cloud id), matching hubspot.py's
@@ -100,7 +107,9 @@ def _extract_error_detail(response: requests.Response) -> str | None:
     field_errors = payload.get("errors")
     if isinstance(field_errors, dict):
         messages.extend(f"{field}: {msg}" for field, msg in field_errors.items())
-    return "; ".join(messages) if messages else None
+    if not messages:
+        return None
+    return _truncate("; ".join(messages))
 
 
 def _request_absolute(
@@ -135,9 +144,7 @@ def _request_absolute(
         message = str(exc)
         detail = _extract_error_detail(response)
         if detail is None:
-            detail = response.text.strip()
-            if len(detail) > MAX_ERROR_RESPONSE_TEXT_CHARS:
-                detail = detail[:MAX_ERROR_RESPONSE_TEXT_CHARS] + "... [truncated]"
+            detail = _truncate(response.text.strip())
         if detail:
             message = f"{message} - {detail}"
         raise RuntimeError(message) from exc
@@ -149,14 +156,17 @@ def _request_absolute(
 
 def _accessible_resources() -> list[dict[str, Any]]:
     result = _request_absolute("GET", ACCESSIBLE_RESOURCES_URL)
-    return result if isinstance(result, list) else []
+    if not isinstance(result, list):
+        raise ValueError(
+            "Unexpected response format from Jira accessible-resources API"
+        )
+    return result
 
 
 def _resolve_cloud_id(cloud_id: str) -> str:
     """Resolve cloud_id, auto-detecting it when there's exactly one
-    accessible Jira site (the common case) -- Jira has no "@current" shortcut
-    like PostHog/Linear, so this is done by actually listing sites rather
-    than a magic path segment.
+    accessible Jira site (the common case) -- Jira has no magic "current
+    site" path segment, so this is done by actually listing sites.
     """
     if cloud_id:
         return cloud_id
@@ -168,10 +178,13 @@ def _resolve_cloud_id(cloud_id: str) -> str:
         if not site_id:
             raise ValueError("The single accessible Jira site is missing a valid 'id'")
         return str(site_id)
-    site_list = ", ".join(
-        f"{s.get('name') or 'Unknown'} ({s.get('id') or 'No ID'})"
-        for s in sites
-        if isinstance(s, dict)
+    site_list = (
+        ", ".join(
+            f"{s.get('name') or 'Unknown'} ({s.get('id') or 'No ID'})"
+            for s in sites
+            if isinstance(s, dict)
+        )
+        or "details unavailable -- response entries were not in the expected shape"
     )
     raise ValueError(
         f"Multiple Jira sites are accessible ({site_list}) -- call "
@@ -359,6 +372,8 @@ def jira_create_issue(
     be one of the site's configured priorities.
     """
     try:
+        if not summary:
+            return _error("summary cannot be empty")
         fields: dict[str, Any] = {
             "project": {"key": project_key},
             "summary": summary,
@@ -401,6 +416,8 @@ def jira_update_issue(
     try:
         fields: dict[str, Any] = {}
         if summary is not None:
+            if not summary:
+                return _error("summary cannot be empty")
             fields["summary"] = summary
         if description is not None:
             fields["description"] = description
@@ -409,6 +426,11 @@ def jira_update_issue(
                 {"accountId": assignee_account_id} if assignee_account_id else None
             )
         if priority is not None:
+            if not priority:
+                return _error(
+                    "priority cannot be empty -- Jira has no way to clear "
+                    "priority through this field; omit the parameter instead"
+                )
             fields["priority"] = {"name": priority}
         if not fields:
             return _error("No fields provided to update")
@@ -531,7 +553,8 @@ def jira_list_comments(
         if not isinstance(result, dict):
             return _error("Unexpected response format from Jira comments API")
         comments = result.get("comments") or []
-        total = result.get("total", offset + len(comments))
+        raw_total = result.get("total")
+        total = raw_total if isinstance(raw_total, int) else offset + len(comments)
         # bool(comments) guards the no-progress case (empty page while total
         # still exceeds offset): next_start_at must never equal start_at.
         truncated = bool(comments) and offset + len(comments) < total

@@ -262,4 +262,98 @@ describe("LibraryTemplateCard", () => {
 
     expect(onOpen).toHaveBeenCalledWith("sales-email-lead-response-agent");
   });
+
+  describe("hero variant", () => {
+    const MAYA_TEMPLATE = makeTemplate({
+      id: "marketing-social-media-content-manager",
+      description: "Turn one brief into ready-to-publish posts and visuals.",
+      features: [
+        "Transforms topics or briefs into platform-native copy",
+        "Creates matching visuals at correct dimensions",
+        "Applies brand tone, voice, and visual guidelines",
+      ],
+      tool_categories: ["basic", "web_search", "browser", "file", "image", "knowledge", "mcp:LinkedIn"],
+      skills: ["static-visual-design"],
+      persona: {
+        name: "Maya",
+        role: "Social Media Content Manager",
+        avatar: null,
+        intro: "Hi — I'm Maya.",
+        kickoff_questions: [],
+      },
+    });
+
+    it("shows the full description, feature bullets, capability tags, and a 'most used' badge", () => {
+      render(
+        <LibraryTemplateCard
+          template={MAYA_TEMPLATE}
+          useLabel="Use Template"
+          defaultSetupTime="5 min setup"
+          variant="hero"
+          heroBadgeLabel="Most used"
+          formatToolLabel={(category) => `[${category}]`}
+          onOpenPersona={{ onOpen: vi.fn(), formatMeetLabel: (name) => `Meet ${name}` }}
+          onUse={vi.fn()}
+        />
+      );
+
+      expect(screen.getByText("Most used")).toBeInTheDocument();
+      expect(
+        screen.getByText("Turn one brief into ready-to-publish posts and visuals.")
+      ).toBeInTheDocument();
+      expect(
+        screen.getByText("Transforms topics or briefs into platform-native copy")
+      ).toBeInTheDocument();
+      // basic/browser/knowledge/mcp: are excluded from the tag row; skills
+      // are appended verbatim - see tool-category-labels.test.ts for the
+      // filtering behavior itself.
+      expect(screen.getByText("[web_search]")).toBeInTheDocument();
+      expect(screen.getByText("[file]")).toBeInTheDocument();
+      expect(screen.getByText("[image]")).toBeInTheDocument();
+      expect(screen.getByText("static-visual-design")).toBeInTheDocument();
+      expect(screen.queryByText("[basic]")).not.toBeInTheDocument();
+      expect(screen.queryByText("[browser]")).not.toBeInTheDocument();
+    });
+
+    it("does not show the badge, bullets, or tags for the default variant, and truncates the description", () => {
+      render(
+        <LibraryTemplateCard
+          template={MAYA_TEMPLATE}
+          useLabel="Use Template"
+          defaultSetupTime="5 min setup"
+          heroBadgeLabel="Most used"
+          formatToolLabel={(category) => `[${category}]`}
+          onOpenPersona={{ onOpen: vi.fn(), formatMeetLabel: (name) => `Meet ${name}` }}
+          onUse={vi.fn()}
+        />
+      );
+
+      expect(screen.queryByText("Most used")).not.toBeInTheDocument();
+      expect(
+        screen.queryByText("Transforms topics or briefs into platform-native copy")
+      ).not.toBeInTheDocument();
+      expect(screen.queryByText("[web_search]")).not.toBeInTheDocument();
+      // The description still renders (truncated via CSS line-clamp, not
+      // removed from the DOM).
+      expect(
+        screen.getByText("Turn one brief into ready-to-publish posts and visuals.")
+      ).toBeInTheDocument();
+    });
+
+    it("ignores the hero variant for a template with no persona", () => {
+      render(
+        <LibraryTemplateCard
+          template={makeTemplate({ id: "growth-workforce", type: "workforce", agent_count: 2 })}
+          useLabel="Use Template"
+          defaultSetupTime="5 min setup"
+          workforceBadgeLabel="Workforce"
+          variant="hero"
+          heroBadgeLabel="Most used"
+          onUse={vi.fn()}
+        />
+      );
+
+      expect(screen.queryByText("Most used")).not.toBeInTheDocument();
+    });
+  });
 });

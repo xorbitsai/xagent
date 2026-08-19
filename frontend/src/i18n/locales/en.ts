@@ -1613,8 +1613,8 @@ Build when you need.`,
       useWorkforceUnpublishedAgent: "The \"{agentName}\" agent this workforce needs is currently unpublished. Republish it from your Agents list, then try again."
     },
     marketplace: {
-      pageTitle: "AI Team Marketplace",
-      pageSubtitle: "Meet the agents ready to work for you — each one arrives configured, in minutes.",
+      pageTitle: "Add teammates",
+      pageSubtitle: "Pick the job you want done and the teammate arrives configured. Each one drafts first and asks before it acts.",
       meet: "Meet {name}",
       hire: "Hire {name}",
       hiring: "Hiring…",
@@ -1634,7 +1634,8 @@ Build when you need.`,
       notFound: "This teammate could not be found.",
       beforeWeStart: "A few things before I start:",
       hireClosingNote: "Answer what you can and I'll use sensible defaults for the rest — you can always change any of this later, or just tell me here.",
-      customizeBeforeHiring: "Prefer to customize the setup first?"
+      customizeBeforeHiring: "Prefer to customize the setup first?",
+      mostUsed: "Most used"
     }
   },
   sidebar: {

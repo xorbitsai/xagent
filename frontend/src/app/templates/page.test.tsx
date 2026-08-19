@@ -32,6 +32,7 @@ vi.mock("@/contexts/i18n-context", () => ({
   useI18n: () => ({
     t: (key: string, vars?: Record<string, string | number>) =>
       vars ? `${key}:${JSON.stringify(vars)}` : key,
+    tDynamic: (_key: string, fallback: string) => fallback,
     locale: "en",
   }),
 }));
@@ -200,6 +201,95 @@ describe("TemplatesPage persona routing", () => {
     await waitFor(() => {
       expect(routerPushMock).toHaveBeenCalledWith("/build/new?template=sales_assistant");
     });
+  });
+});
+
+describe("TemplatesPage featured section", () => {
+  const MAYA = makeTemplate({
+    id: "marketing-social-media-content-manager",
+    name: "Social Media Content Manager",
+    category: "Marketing",
+    featured: true,
+    used_count: 84,
+    tool_categories: ["basic", "web_search", "image"],
+    skills: ["static-visual-design"],
+    persona: {
+      name: "Maya",
+      role: "Social Media Content Manager",
+      avatar: null,
+      intro: "Hi — I'm Maya.",
+      kickoff_questions: [],
+    },
+  });
+  const SOPHIE = makeTemplate({
+    id: "support-ai-chatbot-agent",
+    name: "AI Chatbot Agent",
+    category: "Support",
+    featured: true,
+    used_count: 62,
+    persona: {
+      name: "Sophie",
+      role: "AI Chatbot Agent",
+      avatar: null,
+      intro: "Hi — I'm Sophie.",
+      kickoff_questions: [],
+    },
+  });
+  const ELLIE = makeTemplate({
+    id: "support-inbox-manager",
+    name: "Inbox Manager",
+    category: "Support",
+    featured: true,
+    used_count: 18,
+    persona: {
+      name: "Ellie",
+      role: "Inbox Manager",
+      avatar: null,
+      intro: "Hi — I'm Ellie.",
+      kickoff_questions: [],
+    },
+  });
+
+  function installFeaturedApiMock(featured: Template[]) {
+    apiRequestMock.mockImplementation(async (url: string) => {
+      if (url.includes("/api/templates/?lang=")) {
+        return jsonResponse([...featured, AGENT_TEMPLATE]);
+      }
+      return jsonResponse({});
+    });
+  }
+
+  it("gives the hero treatment to the most-used featured template, regardless of API order", async () => {
+    // Sophie has the higher used_count but is listed first - the hero slot
+    // must go to Maya (used_count 84) either way.
+    installFeaturedApiMock([SOPHIE, MAYA, ELLIE]);
+    render(<TemplatesPage />);
+
+    await waitFor(() => {
+      expect(screen.getByText("Maya")).toBeInTheDocument();
+    });
+
+    // Only the hero card renders feature-bullet-adjacent capability tags
+    // (image -> "Image Generation" via the real i18n fallback, or the raw
+    // category via this test's tDynamic passthrough mock - either way,
+    // the skill name renders verbatim only once, on the hero card).
+    expect(screen.getByText("static-visual-design")).toBeInTheDocument();
+    // Sophie and Ellie render as compact cards with no capability tags.
+    expect(screen.getByText("Sophie")).toBeInTheDocument();
+    expect(screen.getByText("Ellie")).toBeInTheDocument();
+  });
+
+  it("shows the count of all featured templates in the section header", async () => {
+    installFeaturedApiMock([SOPHIE, MAYA, ELLIE]);
+    render(<TemplatesPage />);
+
+    await waitFor(() => {
+      expect(screen.getByText("Maya")).toBeInTheDocument();
+    });
+
+    expect(
+      screen.getByText("templates.categoryTitles.featured").parentElement
+    ).toHaveTextContent("3");
   });
 });
 

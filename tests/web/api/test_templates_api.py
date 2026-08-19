@@ -503,6 +503,41 @@ class TestTemplatesAPI:
             assert agent_config["skills"] == ["product_knowledge"]
             assert agent_config["tool_categories"] == ["web_search"]
 
+            # The top-level tool_categories/skills mirror agent_config's,
+            # so a marketplace card can render capability tags without a
+            # second detail fetch (see test_list_templates_exposes_capabilities).
+            assert template["skills"] == ["product_knowledge"]
+            assert template["tool_categories"] == ["web_search"]
+
+    def test_list_templates_exposes_capabilities(self, mock_app_state, admin_headers):
+        """The list endpoint's TemplateInfo carries the same tool_categories/
+        skills as the detail endpoint, since PersonaCard rendering needs
+        them at list-render time, not just on a per-template detail fetch."""
+        with patch.object(client.app, "state", mock_app_state):
+            response = client.get("/api/templates/", headers=admin_headers)
+            assert response.status_code == 200
+            listed = {t["id"]: t for t in response.json()}
+
+            assert listed["customer_support"]["tool_categories"] == ["web_search"]
+            assert listed["customer_support"]["skills"] == ["product_knowledge"]
+            assert listed["sales_assistant"]["tool_categories"] == ["file_operations"]
+            assert listed["sales_assistant"]["skills"] == ["sales_techniques"]
+
+    def test_workforce_template_exposes_no_capabilities(
+        self, workforce_mock_app_state, admin_headers
+    ):
+        """A workforce-type template's real configuration lives in
+        workforce_config, not agent_config - tool_categories/skills must
+        report empty rather than leaking a stray/unused agent_config."""
+        with patch.object(client.app, "state", workforce_mock_app_state):
+            response = client.get(
+                "/api/templates/growth_workforce", headers=admin_headers
+            )
+            assert response.status_code == 200
+            body = response.json()
+            assert body["tool_categories"] == []
+            assert body["skills"] == []
+
     def test_sample_prompts_localization_and_default(
         self, mock_app_state, admin_headers
     ):

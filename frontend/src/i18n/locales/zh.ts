@@ -1613,8 +1613,8 @@ const zh = {
       useWorkforceUnpublishedAgent: "该工作组需要的智能体「{agentName}」当前未发布，请在你的智能体列表中重新发布它，然后再试一次。"
     },
     marketplace: {
-      pageTitle: "AI 团队市场",
-      pageSubtitle: "认识随时待命的 AI 员工——每一位到岗时都已配置就绪，几分钟即可上手。",
+      pageTitle: "添加队友",
+      pageSubtitle: "选择你想要完成的工作，队友会自动配置好。每一位都会先起草再行动。",
       meet: "认识 {name}",
       hire: "雇佣 {name}",
       hiring: "雇佣中…",
@@ -1634,7 +1634,8 @@ const zh = {
       notFound: "找不到这位 AI 员工。",
       beforeWeStart: "开始之前，有几个问题：",
       hireClosingNote: "能回答的先回答，其余的我会用合理的默认值——之后随时可以修改，或者直接在这里告诉我。",
-      customizeBeforeHiring: "想先自定义配置？"
+      customizeBeforeHiring: "想先自定义配置？",
+      mostUsed: "最常使用"
     }
   },
   sidebar: {

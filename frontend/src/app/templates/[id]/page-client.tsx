@@ -10,28 +10,8 @@ import { apiRequest } from "@/lib/api-wrapper";
 import { getApiUrl } from "@/lib/utils";
 import { hireAgentFromTemplate } from "@/lib/hire-agent";
 import { PersonaAvatar } from "@/components/templates/persona-avatar";
+import { TOOL_CATEGORY_I18N_KEYS, capitalize } from "@/lib/tool-category-labels";
 import type { TemplateDetail } from "@/types/template";
-
-const TOOL_CATEGORY_KEYS: Record<string, string> = {
-  basic: "builds.configForm.tools.categories.basic",
-  web_search: "builds.configForm.tools.categories.webSearch",
-  file: "builds.configForm.tools.categories.file",
-  vision: "builds.configForm.tools.categories.vision",
-  image: "builds.configForm.tools.categories.image",
-  video: "builds.configForm.tools.categories.video",
-  audio: "builds.configForm.tools.categories.audio",
-  knowledge: "builds.configForm.tools.categories.knowledge",
-  browser: "builds.configForm.tools.categories.browser",
-  ppt: "builds.configForm.tools.categories.ppt",
-  office: "builds.configForm.tools.categories.office",
-  database: "builds.configForm.tools.categories.database",
-  skill: "builds.configForm.tools.categories.skill",
-  ssh: "builds.configForm.tools.categories.ssh",
-};
-
-function capitalize(value: string): string {
-  return value.length > 0 ? value[0].toUpperCase() + value.slice(1) : value;
-}
 
 type LoadStatus = "loading" | "error" | "ready";
 
@@ -95,7 +75,7 @@ export default function TemplateDetailPage() {
   const isReady = status === "ready" && template !== null && persona !== null;
 
   const getToolLabel = (category: string): string => {
-    const key = TOOL_CATEGORY_KEYS[category];
+    const key = TOOL_CATEGORY_I18N_KEYS[category];
     return key ? tDynamic(key, capitalize(category)) : capitalize(category);
   };
 

@@ -14,6 +14,7 @@ import type { Template } from "@/types/template";
 import { LibraryTemplateCard } from "@/components/templates/library-template-card";
 import type { TranslationKey } from "@/i18n/translations";
 import { normalizeCategoryKey, orderCategoriesWithPreferred } from "@/lib/template-categories";
+import { TOOL_CATEGORY_I18N_KEYS, capitalize } from "@/lib/tool-category-labels";
 
 interface CategorySection {
   id: string;
@@ -68,7 +69,7 @@ export default function TemplatesPage() {
 }
 
 function TemplatesPageContent() {
-  const { t, locale } = useI18n();
+  const { t, tDynamic, locale } = useI18n();
   const router = useRouter();
   const searchParams = useSearchParams();
   // Honors the category the "All templates" escape hatch on the /task
@@ -142,6 +143,11 @@ function TemplatesPageContent() {
     formatMeetLabel: (name: string) => t("templates.marketplace.meet", { name }),
   };
 
+  const formatToolLabel = (category: string) => {
+    const key = TOOL_CATEGORY_I18N_KEYS[category];
+    return key ? tDynamic(key, capitalize(category)) : capitalize(category);
+  };
+
   const categories = useMemo(() => {
     const preferred = ["Sales", "Marketing", "Support", "Research", "Productivity"];
     const dynamic = Array.from(new Set(templates.map((template) => template.category).filter(Boolean)));
@@ -166,7 +172,13 @@ function TemplatesPageContent() {
   );
 
   const featuredTemplates = useMemo(
-    () => templates.filter((template) => template.featured),
+    // Most-used first, so the hero slot (see FeaturedSection below) always
+    // highlights the genuinely most-used featured template, not just
+    // whichever one happens to be first in the templates array.
+    () =>
+      templates
+        .filter((template) => template.featured)
+        .sort((a, b) => (b.used_count ?? 0) - (a.used_count ?? 0)),
     [templates]
   );
 
@@ -341,17 +353,21 @@ function TemplatesPageContent() {
         </div>
       ) : (
         <div className="flex flex-col gap-12">
-          {/* Featured section */}
+          {/* Featured section: the most-used featured template gets the
+              hero treatment (larger card, full description + bullets +
+              capability tags, solid CTA); the rest render as a 2x2 grid of
+              compact cards beside it. */}
           {selectedCategory === "All" && selectedType === "All" && !searchQuery && featuredTemplates.length > 0 && (
-            <TemplateSection
+            <FeaturedSection
               title={t("templates.categoryTitles.featured")}
-              count={featuredTemplates.length}
               templates={featuredTemplates}
               categoryLabel={categoryLabel}
               useLabel={t("templates.useTemplate")}
               defaultSetupTime={t("templates.defaultSetupTime")}
               workforceBadgeLabel={t("templates.workforceBadge")}
               formatAgentsCount={formatAgentsCount}
+              formatToolLabel={formatToolLabel}
+              heroBadgeLabel={t("templates.marketplace.mostUsed")}
               onOpenPersona={onOpenPersona}
               creatingWorkforceId={creatingWorkforceId}
               busyLabel={t("templates.creatingWorkforce")}
@@ -460,6 +476,94 @@ function TemplateSection({
             onLike={onLike}
           />
         ))}
+      </div>
+    </section>
+  );
+}
+
+interface FeaturedSectionProps {
+  title: string;
+  templates: Template[];
+  categoryLabel: (category: string) => string;
+  useLabel: string;
+  defaultSetupTime: string;
+  workforceBadgeLabel: string;
+  formatAgentsCount: (count: number) => string;
+  formatToolLabel: (category: string) => string;
+  heroBadgeLabel: string;
+  onOpenPersona: {
+    onOpen: (templateId: string) => void;
+    formatMeetLabel: (name: string) => string;
+  };
+  creatingWorkforceId: string | null;
+  busyLabel: string;
+  onUse: (templateId: string) => void;
+  onLike: (templateId: string, event: React.MouseEvent<HTMLButtonElement>) => void;
+}
+
+/** The Featured section's most-used template gets a large "hero" card;
+ * the rest (up to 4) render as a compact 2x2 grid beside it. `templates`
+ * must already be sorted most-used-first (see `featuredTemplates` above) -
+ * this component just splits the first item off, it doesn't re-sort. */
+function FeaturedSection({
+  title,
+  templates,
+  categoryLabel,
+  useLabel,
+  defaultSetupTime,
+  workforceBadgeLabel,
+  formatAgentsCount,
+  formatToolLabel,
+  heroBadgeLabel,
+  onOpenPersona,
+  creatingWorkforceId,
+  busyLabel,
+  onUse,
+  onLike,
+}: FeaturedSectionProps) {
+  const [hero, ...rest] = templates;
+
+  // Deliberately excludes `key` - React requires it as a literal JSX
+  // attribute (not spread) to satisfy static analysis, so each call site
+  // below sets it directly instead of destructuring it out of this object.
+  const cardProps = (template: Template) => ({
+    template,
+    categoryLabel: categoryLabel(template.category),
+    useLabel,
+    defaultSetupTime,
+    workforceBadgeLabel,
+    formatAgentsCount,
+    onOpenPersona,
+    isBusy: creatingWorkforceId === template.id,
+    busyLabel,
+    // See the matching comment in TemplateSection: onOpenPersona-routed
+    // cards are exempt from this lock regardless.
+    disabled: creatingWorkforceId !== null && creatingWorkforceId !== template.id,
+    onUse,
+    onLike,
+  });
+
+  return (
+    <section>
+      <div className="mb-4 flex items-baseline gap-2.5">
+        <h2 className="text-[19px] font-semibold tracking-[-0.02em] text-foreground">{title}</h2>
+        <span className="text-[13px] font-medium text-muted-foreground">{templates.length}</span>
+      </div>
+      <div className="grid grid-cols-1 gap-5 lg:grid-cols-2">
+        <LibraryTemplateCard
+          key={hero.id}
+          {...cardProps(hero)}
+          variant="hero"
+          heroBadgeLabel={heroBadgeLabel}
+          formatToolLabel={formatToolLabel}
+        />
+        {rest.length > 0 && (
+          <div className="grid grid-cols-1 gap-5 sm:grid-cols-2">
+            {rest.map((template) => (
+              <LibraryTemplateCard key={template.id} {...cardProps(template)} />
+            ))}
+          </div>
+        )}
       </div>
     </section>
   );

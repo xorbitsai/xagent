@@ -2067,11 +2067,13 @@ class SandboxManager:
         delete-guessing for this backend (see ``_legacy_cleanup``).
         """
         quiesce_started = time.monotonic()
+        list_failed = False
         try:
             sandboxes = await self._service.list_sandboxes()
         except Exception as exc:
             logger.error(f"Failed to list sandboxes for quiesce: {exc}")
             sandboxes = []
+            list_failed = True
 
         seen = len(sandboxes or [])
         running = 0
@@ -2105,13 +2107,15 @@ class SandboxManager:
         # count and dominates startup.
         logger.info(
             "Sandbox quiesce completed: seen=%d running=%d stopped=%d failed=%d "
-            "stop_time=%.2fs total=%.2fs",
+            "stop_time=%.2fs total=%.2fs status=%s",
             seen,
             running,
             stopped,
             failed,
             stop_seconds,
             time.monotonic() - quiesce_started,
+            # status keeps a list-discovery failure from reading as clean empty work
+            "list_failed" if list_failed else "ok",
         )
 
     async def _legacy_cleanup(self) -> None:
@@ -2131,19 +2135,24 @@ class SandboxManager:
             having stale volume mounts and will be deleted for recreation.
         """
         cleanup_started = time.monotonic()
+        seen = 0
+        running = 0
+        stopped = 0
+        deleted = 0
+        failed = 0
+        stop_seconds = 0.0
+        status = "ok"
         try:
             sandboxes = await self._service.list_sandboxes()
+            seen = len(sandboxes or [])
             if not sandboxes:
-                logger.info("No sandboxes to clean up")
                 return
 
             image, config = self._get_sandbox_image_and_config()
 
-            seen = len(sandboxes)
-            stopped = 0
-            deleted = 0
-            failed = 0
             for sb in sandboxes:
+                if sb.state == "running":
+                    running += 1
                 try:
                     lifecycle_type, lifecycle_id = None, None
                     try:
@@ -2154,7 +2163,11 @@ class SandboxManager:
                             box = await self._service.get_or_create(
                                 sb.name, template=sb.template, config=sb.config
                             )
-                            await box.stop()
+                            stop_started = time.monotonic()
+                            try:
+                                await box.stop()
+                            finally:
+                                stop_seconds += time.monotonic() - stop_started
                             stopped += 1
                             logger.debug(f"Stopped sandbox: {sb.name}")
                         continue
@@ -2234,7 +2247,11 @@ class SandboxManager:
                         box = await self._service.get_or_create(
                             sb.name, template=sb.template, config=sb.config
                         )
-                        await box.stop()
+                        stop_started = time.monotonic()
+                        try:
+                            await box.stop()
+                        finally:
+                            stop_seconds += time.monotonic() - stop_started
                         stopped += 1
                         logger.debug(f"Stopped sandbox: {sb.name}")
                 except Exception as e:
@@ -2246,20 +2263,26 @@ class SandboxManager:
             self._locks.clear()
             self._lease_providers.clear()
             self._activity.clear()
-            # One summary line per cleanup (issue #231): serial stops, each
-            # rides the full stop timeout, so total grows with the running
-            # count.
+        except Exception as e:
+            status = "error"
+            logger.error(f"Failed to cleanup sandboxes: {e}")
+        finally:
+            # One summary per cleanup (issue #231): serial stops each ride the
+            # full stop timeout, so stop_time grows with the running count.
+            # Always emitted (empty/error paths too) so no outcome reads as
+            # clean empty work.
             logger.info(
-                "Sandbox cleanup completed: seen=%d stopped=%d deleted=%d "
-                "failed=%d total=%.2fs",
+                "Sandbox cleanup completed: seen=%d running=%d stopped=%d "
+                "deleted=%d failed=%d stop_time=%.2fs total=%.2fs status=%s",
                 seen,
+                running,
                 stopped,
                 deleted,
                 failed,
+                stop_seconds,
                 time.monotonic() - cleanup_started,
+                status,
             )
-        except Exception as e:
-            logger.error(f"Failed to cleanup sandboxes: {e}")
 
 
 def _check_no_conflicting_readiness_volumes(

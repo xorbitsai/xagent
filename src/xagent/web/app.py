@@ -127,6 +127,15 @@ def _startup_phase(name: str) -> Iterator[None]:
     started = time.monotonic()
     try:
         yield
+    except asyncio.CancelledError:
+        # WHY: CancelledError is a BaseException, so the Exception handler
+        # below misses it and the terminal line would be dropped.
+        logger.error(
+            "startup phase cancelled: %s (after %.2fs)",
+            name,
+            time.monotonic() - started,
+        )
+        raise
     except Exception:
         logger.error(
             "startup phase failed: %s (after %.2fs)", name, time.monotonic() - started
@@ -1570,7 +1579,10 @@ async def startup_event() -> None:
     # Warmup sandbox manager
     from .sandbox_manager import check_sandbox_static_readiness, get_sandbox_manager
 
-    sandbox_mgr = get_sandbox_manager()
+    # WHY: the getter can construct the backend service and inventory
+    # containers on a cold process, so a hang here needs its own phase line.
+    with _startup_phase("sandbox manager init"):
+        sandbox_mgr = get_sandbox_manager()
     if sandbox_mgr:
         # Readiness runs before cleanup/warmup and is deliberately not
         # wrapped in try/except: a static SANDBOX_VOLUMES/code-mount/

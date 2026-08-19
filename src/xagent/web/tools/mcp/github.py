@@ -92,18 +92,27 @@ def _decode_base64_content(raw_content: str) -> bytes:
     return base64.b64decode(normalized, validate=True)
 
 
-def _require_object_items(items: list[Any], *, context: str) -> None:
-    """Raise if any element of a GitHub list/array response isn't an
-    object.
+def _require_object_items(items: Any, *, context: str) -> None:
+    """Raise if the response isn't a list of objects.
 
     Every list-returning endpoint here iterates its items with an
     unguarded `.get()` (directly or via a `_summarize_*` helper) --
-    without this check first, a non-object entry would surface as an
+    without the item check, a non-object entry would surface as an
     unhelpful `'str' object has no attribute 'get'` (or, in
     github_list_issues' pagination, escape the per-page handler entirely
     and discard results already collected) instead of identifying what
-    GitHub actually returned.
+    GitHub actually returned. The top-level check matters separately:
+    `github_list_pull_requests`/`github_list_commits` fall back to `[]`
+    only when the response body is empty, not when it parses to a
+    non-list value (e.g. `{}`) -- `all(...)` over an empty dict's
+    (zero) keys is vacuously true, so without this check that case would
+    silently report a successful empty result instead of the malformed
+    response it actually was.
     """
+    if not isinstance(items, list):
+        raise ValueError(
+            f"GitHub returned a non-list body in {context} ({type(items).__name__})"
+        )
     if not all(isinstance(item, dict) for item in items):
         raise ValueError(f"GitHub returned a non-object item in {context}")
 
@@ -169,6 +178,28 @@ def _validate_positive_number(value: int, *, field: str) -> int:
     if int(value) < 1:
         raise ValueError(f"{field} must be a positive integer, got: {value!r}")
     return int(value)
+
+
+def _require_nonblank(value: str, *, field: str) -> str:
+    """Reject an empty/whitespace-only required string before it reaches
+    an authenticated route -- GitHub answers these (e.g. an empty issue
+    title or PR head/base) with an opaque 422 rather than a message
+    identifying which field was blank.
+    """
+    if not value or not value.strip():
+        raise ValueError(f"{field} must not be empty")
+    return value
+
+
+_ISSUE_OR_PR_STATES = frozenset({"open", "closed", "all"})
+
+
+def _validate_state(state: str, *, field: str = "state") -> str:
+    if state not in _ISSUE_OR_PR_STATES:
+        raise ValueError(
+            f"{field} must be one of {sorted(_ISSUE_OR_PR_STATES)!r}, got: {state!r}"
+        )
+    return state
 
 
 # Splits a Link header into its comma-separated entries structurally --
@@ -361,27 +392,38 @@ def github_get_current_user() -> str:
             }
         )
     except Exception as e:
-        logger.error(f"Error fetching authenticated GitHub user: {e}")
+        logger.error(f"Error fetching authenticated GitHub user: {e}", exc_info=True)
         return _error(str(e))
 
 
 @mcp.tool()
-def github_search_repositories(query: str, limit: int = 20) -> str:
+def github_search_repositories(query: str, limit: int = 20, page: int = 1) -> str:
     """
     Search GitHub repositories (name, description, topics, etc.).
     query: a GitHub search-syntax query, e.g. "xagent language:python" or
     "org:openai stars:>100".
     limit: max repositories to return (default 20, capped at 100).
+    page: which GitHub results page to fetch (default 1) -- pass the
+    previous response's next_page when truncated is true to continue.
+    GitHub's Search API caps combined results at 1000 regardless of page.
     """
     try:
-        result = _request(
+        query = _require_nonblank(query, field="query")
+        start_page = max(1, int(page))
+        response = _request_raw(
             "GET",
             "/search/repositories",
-            params={"q": query, "per_page": _clamp_limit(limit)},
+            params={
+                "q": query,
+                "per_page": _clamp_limit(limit),
+                "page": start_page,
+            },
         )
+        result = response.json() if response.content else {}
         raw_items = result.get("items") or []
         _require_object_items(raw_items, context="repository search results")
         repos = [_summarize_repo(repo) for repo in raw_items]
+        has_next_page = "next" in _link_header_rels(response.headers.get("Link"))
         return _success(
             repositories=repos,
             total_count=result.get("total_count", len(repos)),
@@ -389,9 +431,13 @@ def github_search_repositories(query: str, limit: int = 20) -> str:
             # search index times out -- dropping this would let a caller
             # mistake a partial index result for an exhaustive one.
             incomplete_results=bool(result.get("incomplete_results")),
+            truncated=has_next_page,
+            next_page=start_page + 1 if has_next_page else None,
         )
     except Exception as e:
-        logger.error(f"Error searching GitHub repositories for {query!r}: {e}")
+        logger.error(
+            f"Error searching GitHub repositories for {query!r}: {e}", exc_info=True
+        )
         return _error(str(e))
 
 
@@ -406,7 +452,7 @@ def github_get_repository(repo: str) -> str:
         result = _request("GET", f"/repos/{owner}/{name}")
         return _success(repository=_summarize_repo(result))
     except Exception as e:
-        logger.error(f"Error fetching GitHub repository {repo}: {e}")
+        logger.error(f"Error fetching GitHub repository {repo}: {e}", exc_info=True)
         return _error(str(e))
 
 
@@ -432,11 +478,15 @@ def github_list_issues(
     page: which GitHub results page to start from (default 1).
     skip: raw items to skip at the start of `page` (default 0) -- pass
     both next_page and next_skip from a truncated response's next_page/
-    next_skip fields to resume exactly where it left off, including
-    partway through a page.
+    next_skip fields to resume from that point, including partway through
+    a page. next_skip is a raw index into GitHub's live, created-desc
+    result set, not a stable cursor: an issue created or closed/reopened
+    (changing its sort position) between calls can still shift the page's
+    contents enough to duplicate or skip an item across the resume.
     """
     try:
         owner, name = _parse_repo(repo)
+        state = _validate_state(state)
         max_results = _clamp_limit(limit)
         start_page = max(1, int(page))
         start_skip = max(0, int(skip))
@@ -628,7 +678,7 @@ def github_list_issues(
             next_skip=next_skip,
         )
     except Exception as e:
-        logger.error(f"Error listing GitHub issues for {repo}: {e}")
+        logger.error(f"Error listing GitHub issues for {repo}: {e}", exc_info=True)
         return _error(str(e))
 
 
@@ -645,7 +695,9 @@ def github_get_issue(repo: str, issue_number: int) -> str:
         result = _request("GET", f"/repos/{owner}/{name}/issues/{issue_number}")
         return _success(issue=_summarize_issue(result))
     except Exception as e:
-        logger.error(f"Error fetching GitHub issue {repo}#{issue_number}: {e}")
+        logger.error(
+            f"Error fetching GitHub issue {repo}#{issue_number}: {e}", exc_info=True
+        )
         return _error(str(e))
 
 
@@ -660,6 +712,7 @@ def github_create_issue(repo: str, title: str, body: str = "", labels: str = "")
     """
     try:
         owner, name = _parse_repo(repo)
+        title = _require_nonblank(title, field="title")
         json_data: dict[str, Any] = {"title": title}
         if body:
             json_data["body"] = body
@@ -670,7 +723,7 @@ def github_create_issue(repo: str, title: str, body: str = "", labels: str = "")
         result = _request("POST", f"/repos/{owner}/{name}/issues", json_data=json_data)
         return _success(issue=_summarize_issue(result))
     except Exception as e:
-        logger.error(f"Error creating GitHub issue in {repo}: {e}")
+        logger.error(f"Error creating GitHub issue in {repo}: {e}", exc_info=True)
         return _error(str(e))
 
 
@@ -685,6 +738,7 @@ def github_comment_on_issue(repo: str, issue_number: int, body: str) -> str:
     try:
         owner, name = _parse_repo(repo)
         issue_number = _validate_positive_number(issue_number, field="issue_number")
+        body = _require_nonblank(body, field="body")
         result = _request(
             "POST",
             f"/repos/{owner}/{name}/issues/{issue_number}/comments",
@@ -692,7 +746,10 @@ def github_comment_on_issue(repo: str, issue_number: int, body: str) -> str:
         )
         return _success(comment_id=result.get("id"), html_url=result.get("html_url"))
     except Exception as e:
-        logger.error(f"Error commenting on GitHub issue {repo}#{issue_number}: {e}")
+        logger.error(
+            f"Error commenting on GitHub issue {repo}#{issue_number}: {e}",
+            exc_info=True,
+        )
         return _error(str(e))
 
 
@@ -710,6 +767,7 @@ def github_list_pull_requests(
     """
     try:
         owner, name = _parse_repo(repo)
+        state = _validate_state(state)
         start_page = max(1, int(page))
         response = _request_raw(
             "GET",
@@ -729,7 +787,9 @@ def github_list_pull_requests(
             next_page=start_page + 1 if has_next_page else None,
         )
     except Exception as e:
-        logger.error(f"Error listing GitHub pull requests for {repo}: {e}")
+        logger.error(
+            f"Error listing GitHub pull requests for {repo}: {e}", exc_info=True
+        )
         return _error(str(e))
 
 
@@ -745,7 +805,10 @@ def github_get_pull_request(repo: str, pull_number: int) -> str:
         result = _request("GET", f"/repos/{owner}/{name}/pulls/{pull_number}")
         return _success(pull_request=_summarize_pull_request(result))
     except Exception as e:
-        logger.error(f"Error fetching GitHub pull request {repo}#{pull_number}: {e}")
+        logger.error(
+            f"Error fetching GitHub pull request {repo}#{pull_number}: {e}",
+            exc_info=True,
+        )
         return _error(str(e))
 
 
@@ -764,13 +827,18 @@ def github_create_pull_request(
     """
     try:
         owner, name = _parse_repo(repo)
+        title = _require_nonblank(title, field="title")
+        head = _require_nonblank(head, field="head")
+        base = _require_nonblank(base, field="base")
         json_data: dict[str, Any] = {"title": title, "head": head, "base": base}
         if body:
             json_data["body"] = body
         result = _request("POST", f"/repos/{owner}/{name}/pulls", json_data=json_data)
         return _success(pull_request=_summarize_pull_request(result))
     except Exception as e:
-        logger.error(f"Error creating GitHub pull request in {repo}: {e}")
+        logger.error(
+            f"Error creating GitHub pull request in {repo}: {e}", exc_info=True
+        )
         return _error(str(e))
 
 
@@ -859,8 +927,8 @@ def github_get_file_contents(repo: str, path: str, ref: str = "") -> str:
             # empty, rather than surfacing the real "too large" condition.
             return _error(
                 f"File '{path}' is too large for the Contents API (no content "
-                "returned) -- use github_list_commits or clone the repository "
-                "to read it"
+                "returned) -- clone the repository to read it; this connector "
+                "has no raw-blob or Trees API tool for large files"
             )
         raw_content = result.get("content") or ""
         if encoding == "base64":
@@ -893,7 +961,9 @@ def github_get_file_contents(repo: str, path: str, ref: str = "") -> str:
             encoding=content_encoding,
         )
     except Exception as e:
-        logger.error(f"Error fetching GitHub file contents {repo}:{path}: {e}")
+        logger.error(
+            f"Error fetching GitHub file contents {repo}:{path}: {e}", exc_info=True
+        )
         return _error(str(e))
 
 
@@ -937,24 +1007,34 @@ def github_list_commits(
             next_page=start_page + 1 if has_next_page else None,
         )
     except Exception as e:
-        logger.error(f"Error listing GitHub commits for {repo}: {e}")
+        logger.error(f"Error listing GitHub commits for {repo}: {e}", exc_info=True)
         return _error(str(e))
 
 
 @mcp.tool()
-def github_search_code(query: str, limit: int = 20) -> str:
+def github_search_code(query: str, limit: int = 20, page: int = 1) -> str:
     """
     Search code across GitHub (or, when scoped with "repo:owner/repo" or
     "org:name" in the query, within a specific repository or organization).
     query: a GitHub code-search query, e.g. "repo:octocat/Hello-World def parse".
     limit: max results to return (default 20, capped at 100).
+    page: which GitHub results page to fetch (default 1) -- pass the
+    previous response's next_page when truncated is true to continue.
+    GitHub's Search API caps combined results at 1000 regardless of page.
     """
     try:
-        result = _request(
+        query = _require_nonblank(query, field="query")
+        start_page = max(1, int(page))
+        response = _request_raw(
             "GET",
             "/search/code",
-            params={"q": query, "per_page": _clamp_limit(limit)},
+            params={
+                "q": query,
+                "per_page": _clamp_limit(limit),
+                "page": start_page,
+            },
         )
+        result = response.json() if response.content else {}
         raw_items = result.get("items") or []
         _require_object_items(raw_items, context="code search results")
         items = [
@@ -966,13 +1046,16 @@ def github_search_code(query: str, limit: int = 20) -> str:
             }
             for item in raw_items
         ]
+        has_next_page = "next" in _link_header_rels(response.headers.get("Link"))
         return _success(
             items=items,
             total_count=result.get("total_count", len(items)),
             incomplete_results=bool(result.get("incomplete_results")),
+            truncated=has_next_page,
+            next_page=start_page + 1 if has_next_page else None,
         )
     except Exception as e:
-        logger.error(f"Error searching GitHub code for {query!r}: {e}")
+        logger.error(f"Error searching GitHub code for {query!r}: {e}", exc_info=True)
         return _error(str(e))
 
 

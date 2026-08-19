@@ -2,6 +2,7 @@
 
 import asyncio
 import hashlib
+import html
 import logging
 import os
 import re
@@ -158,8 +159,6 @@ def _resolve_oauth_redirect_uri(provider: str, db_provider: Any) -> str:
 def _oauth_provider_config_error(
     provider: str, missing_env_names: list[str]
 ) -> HTMLResponse:
-    import html
-
     escaped_provider = html.escape(provider)
     escaped_missing = html.escape(", ".join(missing_env_names))
     return HTMLResponse(
@@ -282,7 +281,9 @@ def _normalize_intercom_token_response(
     return {**token_data, "access_token": token}
 
 
-def _extract_provider_error_message(token_data: dict[str, Any]) -> str | None:
+def _extract_provider_error_message(
+    token_data: dict[str, Any], *, limit: int = 500
+) -> str | None:
     """Best-effort human-readable detail for a token exchange that yielded no
     access_token.
 
@@ -290,13 +291,16 @@ def _extract_provider_error_message(token_data: dict[str, Any]) -> str | None:
     handled by the `"error" in token_data` check earlier in the callback.
     This covers Intercom's differently-shaped `error.list` envelope instead
     (`{"type": "error.list", "errors": [{"message": "..."}]}`), which does
-    not use an `error` key and so slips past that earlier check.
+    not use an `error` key and so slips past that earlier check. Capped the
+    same way as `_bounded_oauth_error_message`'s standard-shape sibling --
+    this value is echoed to the browser too, and an unbounded provider
+    message is exactly the risk that helper was added to close.
     """
     errors = token_data.get("errors")
     if isinstance(errors, list) and errors:
         first_error = errors[0]
         if isinstance(first_error, dict) and first_error.get("message"):
-            return str(first_error["message"])
+            return str(first_error["message"])[:limit]
     return None
 
 
@@ -314,8 +318,6 @@ def _bounded_oauth_error_message(
     rendered now, with every other field dropped and the result capped in
     length.
     """
-    import html
-
     error = str(token_data.get("error") or "unknown_error")
     description = token_data.get("error_description")
     message = error if not description else f"{error}: {description}"
@@ -1492,8 +1494,6 @@ def generic_oauth_callback(
     error = request.query_params.get("error")
 
     if error:
-        import html
-
         return HTMLResponse(
             content=f"<h1>Error: {html.escape(str(error))}</h1>", status_code=400
         )
@@ -1621,7 +1621,12 @@ def generic_oauth_callback(
         # answers a form-encoded POST with a 400.
         post_kwargs: dict[str, Any] = {"data": data}
         if provider.lower() == "jira":
-            headers = {"Content-Type": "application/json"}
+            # In-place, not a full `headers = {...}` reassignment -- that
+            # would silently drop an Accept header set above by
+            # requires_json_accept_header(), matching the refresh-path
+            # branch in tools/config.py. Currently a latent distinction
+            # only (no provider needs both quirks at once yet).
+            headers["Content-Type"] = "application/json"
             post_kwargs = {"json": data}
 
         token_response = requests.post(
@@ -1652,8 +1657,6 @@ def generic_oauth_callback(
             # UserOAuth.access_token's NOT NULL constraint, and surface as a
             # raw SQLAlchemy IntegrityError message through the generic
             # exception handler instead of a clear, actionable error.
-            import html
-
             message = f"{html.escape(provider)} did not return an access token."
             detail = _extract_provider_error_message(token_data)
             if detail:
@@ -1680,8 +1683,6 @@ def generic_oauth_callback(
                     # "connected" account with no identity. Fail the
                     # callback instead. Providers without Slack semantics
                     # never carry an "ok" key, so they are unaffected.
-                    import html
-
                     escaped_error = html.escape(
                         str(info_data.get("error") or "unknown error")
                     )
@@ -1843,8 +1844,6 @@ def generic_oauth_callback(
         """
         )
     except Exception as e:
-        import html
-
         logger.exception("Generic OAuth callback failed")
         return HTMLResponse(
             content=f"<h1>Authentication Failed</h1><p>{html.escape(str(e))}</p>",

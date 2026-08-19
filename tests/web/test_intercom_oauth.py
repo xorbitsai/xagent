@@ -254,6 +254,43 @@ def test_intercom_callback_fails_cleanly_when_token_exchange_yields_no_token(
     )
 
 
+def test_intercom_error_list_message_is_length_capped(db_session, monkeypatch):
+    """The error.list envelope's detail is echoed to the browser the same
+    way the standard error/error_description branch is -- it must be
+    capped the same way (500 chars), not echoed unbounded."""
+    db, user = db_session
+    state = create_access_token(
+        data={
+            "type": "oauth_state",
+            "user_id": user.id,
+            "provider": "intercom",
+            "app_id": "intercom",
+        },
+        expires_delta=timedelta(minutes=10),
+    )
+    request = SimpleNamespace(query_params={"code": "bad-code", "state": state})
+
+    long_message = "x" * 10_000
+    monkeypatch.setattr(
+        auth_api.requests,
+        "post",
+        Mock(
+            return_value=MockResponse(
+                {"type": "error.list", "errors": [{"message": long_message}]}
+            )
+        ),
+    )
+    monkeypatch.setattr(auth_api.requests, "get", Mock())
+
+    response = generic_oauth_callback("intercom", request, db, _intercom_provider())
+
+    assert response.status_code == 400
+    body = response.body.decode()
+    assert long_message not in body
+    assert "x" * 500 in body
+    assert "x" * 501 not in body
+
+
 def test_hidden_intercom_app_rejects_single_app_oauth_connect(
     hidden_db_session, monkeypatch
 ):

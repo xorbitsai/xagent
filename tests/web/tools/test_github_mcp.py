@@ -376,8 +376,49 @@ def test_search_repositories_sends_query_and_clamps_over_limit(monkeypatch):
     assert mock_request.call_args.kwargs["params"] == {
         "q": "org:openai stars:>100",
         "per_page": github.MAX_PER_PAGE,
+        "page": 1,
     }
     assert mock_request.call_args.kwargs["timeout"] == github.DEFAULT_TIMEOUT_SECONDS
+
+
+def test_search_repositories_rejects_blank_query(monkeypatch):
+    mock_request = Mock()
+    monkeypatch.setattr(github.requests, "request", mock_request)
+
+    result = json.loads(github.github_search_repositories("   "))
+
+    assert result["status"] == "error"
+    mock_request.assert_not_called()
+
+
+def test_search_repositories_reports_truncated_when_more_pages_exist(monkeypatch):
+    monkeypatch.setattr(
+        github.requests,
+        "request",
+        Mock(
+            return_value=MockResponse(
+                json_data={"total_count": 500, "items": []},
+                headers={"Link": '<https://api.github.com/x?page=2>; rel="next"'},
+            )
+        ),
+    )
+
+    result = json.loads(github.github_search_repositories("stars:>1"))
+
+    assert result["status"] == "success"
+    assert result["truncated"] is True
+    assert result["next_page"] == 2
+
+
+def test_search_repositories_sends_requested_page(monkeypatch):
+    mock_request = Mock(
+        return_value=MockResponse(json_data={"total_count": 0, "items": []})
+    )
+    monkeypatch.setattr(github.requests, "request", mock_request)
+
+    github.github_search_repositories("stars:>1", page=3)
+
+    assert mock_request.call_args.kwargs["params"]["page"] == 3
 
 
 def test_get_current_user_returns_profile(monkeypatch):
@@ -517,6 +558,18 @@ def test_list_issues_sends_non_default_state_and_labels(monkeypatch):
         "page": 2,
         "labels": "bug,urgent",
     }
+
+
+def test_list_issues_rejects_invalid_state(monkeypatch):
+    mock_request = Mock()
+    monkeypatch.setattr(github.requests, "request", mock_request)
+
+    result = json.loads(
+        github.github_list_issues("octocat/Hello-World", state="merged")
+    )
+
+    assert result["status"] == "error"
+    mock_request.assert_not_called()
 
 
 def test_list_issues_follows_pages_when_first_page_is_all_pull_requests(monkeypatch):
@@ -1119,6 +1172,51 @@ def test_create_issue_splits_comma_separated_labels(monkeypatch):
     assert sent["labels"] == ["bug", "urgent"]
 
 
+def test_create_issue_omits_body_when_not_provided(monkeypatch):
+    mock_request = Mock(
+        return_value=MockResponse(json_data={"number": 10, "title": "x", "labels": []})
+    )
+    monkeypatch.setattr(github.requests, "request", mock_request)
+
+    github.github_create_issue("octocat/Hello-World", "new issue")
+
+    sent = mock_request.call_args.kwargs["json"]
+    assert "body" not in sent
+    assert "labels" not in sent
+
+
+@pytest.mark.parametrize("title", ["", "   "])
+def test_create_issue_rejects_blank_title(monkeypatch, title):
+    mock_request = Mock()
+    monkeypatch.setattr(github.requests, "request", mock_request)
+
+    result = json.loads(github.github_create_issue("octocat/Hello-World", title))
+
+    assert result["status"] == "error"
+    mock_request.assert_not_called()
+
+
+def test_create_issue_surfaces_github_error_response(monkeypatch):
+    monkeypatch.setattr(
+        github.requests,
+        "request",
+        Mock(
+            return_value=MockResponse(
+                json_data={
+                    "message": "Validation Failed",
+                    "errors": [{"field": "title", "message": "cannot be blank"}],
+                },
+                status_code=422,
+            )
+        ),
+    )
+
+    result = json.loads(github.github_create_issue("octocat/Hello-World", "new issue"))
+
+    assert result["status"] == "error"
+    assert "cannot be blank" in result["message"]
+
+
 def test_comment_on_issue_posts_body(monkeypatch):
     mock_request = Mock(
         return_value=MockResponse(
@@ -1137,6 +1235,17 @@ def test_comment_on_issue_posts_body(monkeypatch):
     assert mock_request.call_args.kwargs["url"].endswith(
         "/repos/octocat/Hello-World/issues/1/comments"
     )
+
+
+@pytest.mark.parametrize("body", ["", "   "])
+def test_comment_on_issue_rejects_blank_body(monkeypatch, body):
+    mock_request = Mock()
+    monkeypatch.setattr(github.requests, "request", mock_request)
+
+    result = json.loads(github.github_comment_on_issue("octocat/Hello-World", 1, body))
+
+    assert result["status"] == "error"
+    mock_request.assert_not_called()
 
 
 @pytest.mark.parametrize("issue_number", [0, -1])
@@ -1209,6 +1318,37 @@ def test_list_pull_requests_rejects_non_object_item(monkeypatch):
 
     assert result["status"] == "error"
     assert "non-object item" in result["message"]
+
+
+def test_list_pull_requests_rejects_non_list_body(monkeypatch):
+    """A truthy-but-non-list body (e.g. `{}`) isn't caught by the
+    `response.content else []` fallback (only an EMPTY body triggers it),
+    and `all(...)` over an empty dict's zero keys is vacuously true -- so
+    without a top-level type check this would silently report a
+    successful empty result instead of the malformed response it actually
+    was."""
+    monkeypatch.setattr(
+        github.requests,
+        "request",
+        Mock(return_value=MockResponse(json_data={})),
+    )
+
+    result = json.loads(github.github_list_pull_requests("octocat/Hello-World"))
+
+    assert result["status"] == "error"
+    assert "non-list body" in result["message"]
+
+
+def test_list_pull_requests_rejects_invalid_state(monkeypatch):
+    mock_request = Mock()
+    monkeypatch.setattr(github.requests, "request", mock_request)
+
+    result = json.loads(
+        github.github_list_pull_requests("octocat/Hello-World", state="merged")
+    )
+
+    assert result["status"] == "error"
+    mock_request.assert_not_called()
 
 
 def test_list_pull_requests_sends_non_default_state_and_limit(monkeypatch):
@@ -1288,6 +1428,54 @@ def test_create_pull_request_sends_head_and_base(monkeypatch):
     assert result["status"] == "success"
     sent = mock_request.call_args.kwargs["json"]
     assert sent == {"title": "add feature", "head": "feature-branch", "base": "main"}
+
+
+@pytest.mark.parametrize(
+    "title, head, base",
+    [
+        ("", "feature-branch", "main"),
+        ("add feature", "", "main"),
+        ("add feature", "feature-branch", ""),
+        ("  ", "feature-branch", "main"),
+    ],
+)
+def test_create_pull_request_rejects_blank_required_fields(
+    monkeypatch, title, head, base
+):
+    mock_request = Mock()
+    monkeypatch.setattr(github.requests, "request", mock_request)
+
+    result = json.loads(
+        github.github_create_pull_request("octocat/Hello-World", title, head, base)
+    )
+
+    assert result["status"] == "error"
+    mock_request.assert_not_called()
+
+
+def test_create_pull_request_surfaces_github_error_response(monkeypatch):
+    monkeypatch.setattr(
+        github.requests,
+        "request",
+        Mock(
+            return_value=MockResponse(
+                json_data={
+                    "message": "Validation Failed",
+                    "errors": [{"field": "base", "message": "base branch not found"}],
+                },
+                status_code=422,
+            )
+        ),
+    )
+
+    result = json.loads(
+        github.github_create_pull_request(
+            "octocat/Hello-World", "add feature", "feature-branch", "missing-branch"
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "base branch not found" in result["message"]
 
 
 def test_get_file_contents_decodes_base64_file(monkeypatch):
@@ -1565,6 +1753,54 @@ def test_get_file_contents_rejects_non_file_type(monkeypatch):
     assert "symlink" in result["message"]
 
 
+def test_get_file_contents_reports_404(monkeypatch):
+    monkeypatch.setattr(
+        github.requests,
+        "request",
+        Mock(
+            return_value=MockResponse(
+                json_data={"message": "Not Found"}, status_code=404
+            )
+        ),
+    )
+
+    result = json.loads(
+        github.github_get_file_contents("octocat/Hello-World", "missing.py")
+    )
+
+    assert result["status"] == "error"
+    assert "Not Found" in result["message"]
+
+
+def test_get_file_contents_falls_back_to_utf8_for_unrecognized_encoding(monkeypatch):
+    """GitHub's Contents API only documents "base64"/"none" for `encoding`
+    -- an unrecognized value must fall through to the plain-text branch
+    (treating `content` as already-decoded text) rather than erroring or
+    silently dropping the field."""
+    monkeypatch.setattr(
+        github.requests,
+        "request",
+        Mock(
+            return_value=MockResponse(
+                json_data={
+                    "type": "file",
+                    "path": "main.py",
+                    "encoding": "some-unrecognized-value",
+                    "content": "already plain text",
+                }
+            )
+        ),
+    )
+
+    result = json.loads(
+        github.github_get_file_contents("octocat/Hello-World", "main.py")
+    )
+
+    assert result["status"] == "success"
+    assert result["content"] == "already plain text"
+    assert result["encoding"] == "utf-8"
+
+
 def test_get_file_contents_accepts_empty_path_for_repo_root(monkeypatch):
     mock_request = Mock(
         return_value=MockResponse(
@@ -1769,6 +2005,19 @@ def test_list_commits_rejects_non_object_item(monkeypatch):
     assert "non-object item" in result["message"]
 
 
+def test_list_commits_rejects_non_list_body(monkeypatch):
+    monkeypatch.setattr(
+        github.requests,
+        "request",
+        Mock(return_value=MockResponse(json_data={})),
+    )
+
+    result = json.loads(github.github_list_commits("octocat/Hello-World"))
+
+    assert result["status"] == "error"
+    assert "non-list body" in result["message"]
+
+
 def test_list_commits_sends_path_and_clamps_over_limit(monkeypatch):
     mock_request = Mock(return_value=MockResponse(json_data=[]))
     monkeypatch.setattr(github.requests, "request", mock_request)
@@ -1875,7 +2124,37 @@ def test_search_code_sends_query_and_clamps_over_limit(monkeypatch):
     assert mock_request.call_args.kwargs["params"] == {
         "q": "repo:octocat/Hello-World def parse",
         "per_page": github.MAX_PER_PAGE,
+        "page": 1,
     }
+
+
+def test_search_code_rejects_blank_query(monkeypatch):
+    mock_request = Mock()
+    monkeypatch.setattr(github.requests, "request", mock_request)
+
+    result = json.loads(github.github_search_code(""))
+
+    assert result["status"] == "error"
+    mock_request.assert_not_called()
+
+
+def test_search_code_reports_truncated_when_more_pages_exist(monkeypatch):
+    monkeypatch.setattr(
+        github.requests,
+        "request",
+        Mock(
+            return_value=MockResponse(
+                json_data={"total_count": 500, "items": []},
+                headers={"Link": '<https://api.github.com/x?page=2>; rel="next"'},
+            )
+        ),
+    )
+
+    result = json.loads(github.github_search_code("def parse"))
+
+    assert result["status"] == "success"
+    assert result["truncated"] is True
+    assert result["next_page"] == 2
 
 
 def test_tool_returns_error_payload_on_missing_token(monkeypatch):

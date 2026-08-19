@@ -142,6 +142,20 @@ def visible_team_connector_ids(db: Any, user_id: int) -> dict[str, set[int]]:
     return _connector_visibility_hook(db, int(user_id))
 
 
+def connector_visibility_hook_installed() -> bool:
+    """Whether an application installed the user-keyed visibility hook.
+
+    The twin of ``team_connector_hook_installed`` for the legacy hook.
+    Callers select on this, never on an empty return value: an installed hook
+    legitimately answers with empty sets for a user no team shared anything
+    with. What separates the two states is meaning, not content — "this
+    deployment has no team sharing at all" versus "team sharing exists and
+    this user has none" — and a response field that should be absent in the
+    first state but present-false in the second needs the distinction.
+    """
+    return _connector_visibility_hook is not None
+
+
 def _validate_team_connector_answer(answer: Any) -> dict[str, set[int]]:
     """Validate the team-visibility hook's answer shape.
 

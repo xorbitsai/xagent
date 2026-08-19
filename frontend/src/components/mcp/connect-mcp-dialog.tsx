@@ -1477,6 +1477,22 @@ export function ConnectMcpDialog({
                                         : t('tools.mcp.sharing.teamTool')}
                                   </Badge>
                                 )}
+                                {app.is_team_shared && !isGloballyConnected && (
+                                  // The one case the badge above cannot reach:
+                                  // it reads /api/connectors/status, which the
+                                  // picker fetches only for connected entries
+                                  // (and only when inTeam), so a connector the
+                                  // team shared with a member holding no
+                                  // connection of their own rendered exactly
+                                  // like an app nobody had connected at all
+                                  // (#1387). This one needs no inTeam gate of
+                                  // its own: is_team_shared arrives with the
+                                  // listing and cannot be true for a user no
+                                  // team shared anything with.
+                                  <Badge variant="secondary" className="font-medium px-2 py-0.5 rounded-md border border-blue-200 bg-blue-50 text-blue-700 shadow-none">
+                                    {t('tools.mcp.sharing.teamTool')}
+                                  </Badge>
+                                )}
                                 {app.needs_config && (
                                   <Badge variant="secondary" className="font-medium px-2 py-0.5 rounded-md border border-amber-200 bg-amber-50 text-amber-700 shadow-none">
                                     {t('tools.mcp.sharing.needsConfig')}

@@ -46,6 +46,15 @@ export interface AppIntegration {
   // a deployment whose tokens arrive through the resolver hook, where no
   // interactive consent exists at all.
   can_authorize?: boolean
+  // Whether this connector reached the viewer through a team link rather than
+  // a connection of their own (#1387). A third state, not a synonym for
+  // is_connected: the connector is usable without the viewer owning it, so the
+  // card labels it as the team's and — for the shapes whose credentials are
+  // per-user — still offers the Connect route. Absent entirely on deployments
+  // without a team-visibility hook (standalone payloads stay pre-#1387);
+  // present-false means teams exist and nothing is shared with this viewer.
+  // Read absence as false, which Boolean() already does.
+  is_team_shared?: boolean
   // Team-sharing status (from POST /api/connectors/status), merged in after list load.
   shared?: boolean
   is_owner?: boolean

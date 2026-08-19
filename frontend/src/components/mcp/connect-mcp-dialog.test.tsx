@@ -2491,4 +2491,61 @@ describe("ConnectMcpDialog Custom API detail loading", () => {
     fireEvent.click(screen.getByText("Records MCP"))
     expect(screen.getByTestId("settings-open-app").textContent).toBe("Records MCP")
   })
+
+  // A catalog app a team shared with this member (#1387). Nobody connected it
+  // *for them*, so is_connected stays false, while the shared row carries the
+  // credentials this shape needs — the third state the backend now emits, and
+  // one the old is_connected/is_custom/auth_type derivation had no way to
+  // express.
+  const teamSharedCatalogApp = () => ({
+    ...keylessApp("acme-notes", "Acme Notes"),
+    is_team_shared: true,
+    can_attach: true,
+  })
+
+  it("attaches a team-shared catalog connector and labels it as the team's", async () => {
+    const onConnectSelected = vi.fn()
+    renderSelectModeWith([teamSharedCatalogApp()], onConnectSelected)
+    await screen.findByText("Acme Notes")
+
+    const card = screen.getByTestId("connector-card-acme-notes")
+    // Not connected: no checkmark, and no Configure button to imply ownership.
+    expect(within(card).queryByTestId("connected-check")).toBeNull()
+    expect(screen.queryByRole("button", { name: "tools.mcp.dialog.configure" })).toBeNull()
+    // The provenance label is not gated on the auth context's inTeam (false
+    // here) the way the sibling badge is: that one reads the separate
+    // /api/connectors/status fetch the picker only makes for a team, while
+    // this one reads a backend-authoritative field that cannot be true for a
+    // user no team shared anything with.
+    expect(within(card).getByText("tools.mcp.sharing.teamTool")).toBeTruthy()
+
+    fireEvent.click(screen.getByText("Acme Notes"))
+    expect(screen.getByTestId("settings-open-app").textContent).toBe("")
+    fireEvent.click(screen.getByRole("button", { name: "tools.mcp.dialog.connect" }))
+    expect(onConnectSelected).toHaveBeenLastCalledWith(["Acme Notes"])
+  })
+
+  it("keeps the Connect route for a team-shared connector authorized per user", async () => {
+    // mcp_oauth and builtin_oauth authorization is the member's own, and no
+    // team link supplies it — the backend reports can_attach false, so the card
+    // click must still reach the detail modal where Connect is dispatched on
+    // auth_type ("connect it for yourself") rather than toggling a selection
+    // that would fail at run time.
+    const onConnectSelected = vi.fn()
+    renderSelectModeWith(
+      [{ ...mcpOauthApp(), is_team_shared: true }],
+      onConnectSelected,
+    )
+    await screen.findByText("Granola")
+
+    expect(
+      within(screen.getByTestId("connector-card-granola")).getByText(
+        "tools.mcp.sharing.teamTool",
+      ),
+    ).toBeTruthy()
+    fireEvent.click(screen.getByText("Granola"))
+    expect(screen.getByTestId("settings-open-app").textContent).toBe("Granola")
+    fireEvent.click(screen.getByRole("button", { name: "tools.mcp.dialog.connect" }))
+    expect(onConnectSelected).toHaveBeenLastCalledWith([])
+  })
 })

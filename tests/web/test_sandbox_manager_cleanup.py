@@ -7,11 +7,6 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
-# WHY: importing app runs its module-level setup_logging(), which resets the
-# root handlers via dictConfig. Import it at collection so that reset happens
-# before caplog attaches per-test, not inside a caplog context.
-from xagent.web.app import _startup_phase
-
 from tests.web.sandbox_fakes import FakeSandboxService, _FakeReconcileContainer
 from xagent.core.tools.adapters.vibe.sandboxed_tool.sandboxed_tool_wrapper import (
     build_code_mount_volumes,
@@ -23,6 +18,11 @@ from xagent.sandbox.base import (
     SandboxMountIntent,
     SandboxTemplate,
 )
+
+# WHY: importing app runs its module-level setup_logging(), which resets the
+# root handlers via dictConfig. Import it at collection so that reset happens
+# before caplog attaches per-test, not inside a caplog context.
+from xagent.web.app import _startup_phase
 from xagent.web.sandbox_manager import _SANDBOX_STOP_TIMEOUT_SECONDS, SandboxManager
 
 

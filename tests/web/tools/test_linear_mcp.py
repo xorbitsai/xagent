@@ -1029,6 +1029,41 @@ def test_search_issues_title_query_returns_partial_matches_on_mid_pagination_fai
     assert "boom" in result["error"]
 
 
+def test_search_issues_preserves_earlier_page_warnings_on_later_page_failure(
+    monkeypatch,
+):
+    """A genuine partial GraphQL error surfaced on an earlier, successfully
+    fetched page must not be silently dropped just because a later page
+    then fails outright -- both must reach the caller."""
+    mock_post = Mock(
+        side_effect=[
+            MockResponse(
+                json_data={
+                    "data": {
+                        "issues": {
+                            "nodes": [
+                                {"id": "i1", "identifier": "ENG-1", "title": "Docs"}
+                            ],
+                            "pageInfo": {"hasNextPage": True, "endCursor": "cursor-1"},
+                        }
+                    },
+                    "errors": [{"message": "some.unrelated.field failed"}],
+                }
+            ),
+            RuntimeError("Linear API error (status 500): boom"),
+        ]
+    )
+    monkeypatch.setattr(linear.requests, "post", mock_post)
+
+    result = json.loads(linear.linear_search_issues(query="docs"))
+
+    assert result["status"] == "success"
+    assert [issue["identifier"] for issue in result["issues"]] == ["ENG-1"]
+    assert result["truncated"] is True
+    assert "boom" in result["error"]
+    assert "some.unrelated.field failed" in result["warnings"][0]
+
+
 def test_search_issues_title_query_stops_at_max_pages_and_reports_truncated(
     monkeypatch,
 ):
@@ -1571,6 +1606,41 @@ def test_update_issue_rejects_overlapping_add_and_remove_label_ids(monkeypatch):
     mock_post.assert_not_called()
 
 
+def test_update_issue_rejects_label_ids_combined_with_explicitly_empty_add_label_ids(
+    monkeypatch,
+):
+    """The conflict check must use is-not-None (like the field-building code
+    a few lines below it), not truthiness -- otherwise an explicitly empty
+    add_label_ids=[] (falsy, but a deliberate argument, not an omitted one)
+    slips past the check and both labelIds and addedLabelIds end up in the
+    same IssueUpdateInput."""
+    mock_post = Mock()
+    monkeypatch.setattr(linear.requests, "post", mock_post)
+
+    result = json.loads(
+        linear.linear_update_issue("ENG-1", label_ids=["l1"], add_label_ids=[])
+    )
+
+    assert result["status"] == "error"
+    assert "label_ids" in result["message"]
+    mock_post.assert_not_called()
+
+
+def test_update_issue_rejects_label_ids_combined_with_explicitly_empty_remove_label_ids(
+    monkeypatch,
+):
+    mock_post = Mock()
+    monkeypatch.setattr(linear.requests, "post", mock_post)
+
+    result = json.loads(
+        linear.linear_update_issue("ENG-1", label_ids=["l1"], remove_label_ids=[])
+    )
+
+    assert result["status"] == "error"
+    assert "label_ids" in result["message"]
+    mock_post.assert_not_called()
+
+
 def test_update_issue_rejects_out_of_range_priority(monkeypatch):
     mock_post = Mock()
     monkeypatch.setattr(linear.requests, "post", mock_post)
@@ -1872,6 +1942,41 @@ def test_search_users_returns_partial_matches_on_mid_pagination_failure(monkeypa
     assert [user["id"] for user in result["users"]] == ["u1"]
     assert result["truncated"] is True
     assert "boom" in result["error"]
+
+
+def test_search_users_preserves_earlier_page_warnings_on_later_page_failure(
+    monkeypatch,
+):
+    """A genuine partial GraphQL error surfaced on an earlier, successfully
+    fetched page must not be silently dropped just because a later page
+    then fails outright -- both must reach the caller."""
+    mock_post = Mock(
+        side_effect=[
+            MockResponse(
+                json_data={
+                    "data": {
+                        "users": {
+                            "nodes": [
+                                {"id": "u1", "name": "Ada", "email": "ada@example.com"}
+                            ],
+                            "pageInfo": {"hasNextPage": True, "endCursor": "cursor-1"},
+                        }
+                    },
+                    "errors": [{"message": "some.unrelated.field failed"}],
+                }
+            ),
+            RuntimeError("Linear API error (status 500): boom"),
+        ]
+    )
+    monkeypatch.setattr(linear.requests, "post", mock_post)
+
+    result = json.loads(linear.linear_search_users("ada"))
+
+    assert result["status"] == "success"
+    assert [user["id"] for user in result["users"]] == ["u1"]
+    assert result["truncated"] is True
+    assert "boom" in result["error"]
+    assert "some.unrelated.field failed" in result["warnings"][0]
 
 
 def test_search_users_lists_all_members_when_query_omitted(monkeypatch):

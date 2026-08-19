@@ -201,6 +201,37 @@ def test_seed_rows_match_registry(tmp_path):
     assert migration._linear_provider_row() == registry_provider
 
 
+def test_provider_and_app_scopes_are_read_and_read_write_respectively():
+    """The full-dict equality in test_seed_rows_match_registry would still
+    pass if migration and registry drifted in lockstep (e.g. both
+    accidentally widened back to ["read", "write"] on the provider row) --
+    pin the actual values so that specific regression is caught directly.
+    The provider row is intentionally narrower than the app row: the
+    functional "write" scope is meant to live only on the app row and be
+    merged in at authorize time by _merge_oauth_scopes, so a bare-provider
+    connect (no app_id) grants read-only."""
+    from xagent.web.builtin_mcp_registry import (
+        get_builtin_oauth_provider_rows,
+        get_builtin_public_mcp_app_rows,
+    )
+
+    migration = _load_migration_module()
+
+    assert migration._linear_provider_row()["default_scopes"] == ["read"]
+    assert migration._linear_app_row()["oauth_scopes"] == ["read", "write"]
+
+    registry_provider = next(
+        row
+        for row in get_builtin_oauth_provider_rows()
+        if row["provider_name"] == "linear"
+    )
+    registry_app = next(
+        row for row in get_builtin_public_mcp_app_rows() if row["app_id"] == "linear"
+    )
+    assert registry_provider["default_scopes"] == ["read"]
+    assert registry_app["oauth_scopes"] == ["read", "write"]
+
+
 def test_downgrade_removes_provider_and_app(tmp_path):
     engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
     migration = _load_migration_module()

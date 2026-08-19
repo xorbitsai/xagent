@@ -382,7 +382,10 @@ def linear_search_users(query: str = "", limit: int = 20) -> str:
                     f"Linear user search pagination stopped early: {page_exc}"
                 )
                 return _success(
-                    users=matches[:max_matches], truncated=True, error=str(page_exc)
+                    users=matches[:max_matches],
+                    truncated=True,
+                    error=str(page_exc),
+                    _errors=all_errors,
                 )
             pages_scanned += 1
             all_errors.extend(errors)
@@ -540,7 +543,10 @@ def linear_search_issues(
                     f"Linear issue search pagination stopped early: {page_exc}"
                 )
                 return _success(
-                    issues=matches[:max_results], truncated=True, error=str(page_exc)
+                    issues=matches[:max_results],
+                    truncated=True,
+                    error=str(page_exc),
+                    _errors=all_errors,
                 )
             pages_scanned += 1
             all_errors.extend(errors)
@@ -679,7 +685,9 @@ def linear_update_issue(
                 f"priority must be one of {sorted(_VALID_PRIORITIES)}, "
                 f"got: {priority!r}"
             )
-        if label_ids is not None and (add_label_ids or remove_label_ids):
+        if label_ids is not None and (
+            add_label_ids is not None or remove_label_ids is not None
+        ):
             return _error(
                 "label_ids replaces the full label set and cannot be "
                 "combined with add_label_ids/remove_label_ids — use one or "

@@ -73,6 +73,12 @@ def _linear_provider() -> SimpleNamespace:
         userinfo_url="",
         user_id_path="id",
         email_path="email",
+        # NOT the same as the registry provider row's default_scopes
+        # (["read"] there -- the "write" scope lives on the app row and is
+        # merged in via app_id at authorize time). This fixture bypasses
+        # that merge (db_provider is passed in directly, app_id lookup is
+        # separate), so it uses both scopes directly to exercise the ","
+        # separator regardless of the merge path.
         default_scopes=["read", "write"],
     )
 

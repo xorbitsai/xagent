@@ -92,6 +92,22 @@ def _decode_base64_content(raw_content: str) -> bytes:
     return base64.b64decode(normalized, validate=True)
 
 
+def _require_object_items(items: list[Any], *, context: str) -> None:
+    """Raise if any element of a GitHub list/array response isn't an
+    object.
+
+    Every list-returning endpoint here iterates its items with an
+    unguarded `.get()` (directly or via a `_summarize_*` helper) --
+    without this check first, a non-object entry would surface as an
+    unhelpful `'str' object has no attribute 'get'` (or, in
+    github_list_issues' pagination, escape the per-page handler entirely
+    and discard results already collected) instead of identifying what
+    GitHub actually returned.
+    """
+    if not all(isinstance(item, dict) for item in items):
+        raise ValueError(f"GitHub returned a non-object item in {context}")
+
+
 def _success(**payload: Any) -> str:
     return json.dumps({"status": "success", **payload}, ensure_ascii=False)
 
@@ -363,7 +379,9 @@ def github_search_repositories(query: str, limit: int = 20) -> str:
             "/search/repositories",
             params={"q": query, "per_page": _clamp_limit(limit)},
         )
-        repos = [_summarize_repo(repo) for repo in result.get("items") or []]
+        raw_items = result.get("items") or []
+        _require_object_items(raw_items, context="repository search results")
+        repos = [_summarize_repo(repo) for repo in raw_items]
         return _success(
             repositories=repos,
             total_count=result.get("total_count", len(repos)),
@@ -424,6 +442,10 @@ def github_list_issues(
         start_skip = max(0, int(skip))
         issues: list[dict[str, Any]] = []
         truncated = False
+        # Mirrors `truncated` at every exit below so a caller can dispatch
+        # on one stable field instead of checking "truncation_reason",
+        # "error", or neither depending on which exit was taken.
+        truncation_reason: str | None = None
         next_page: int | None = None
         next_skip = 0
         pages_fetched = 0
@@ -499,6 +521,7 @@ def github_list_issues(
                 return _success(
                     issues=issues[:max_results],
                     truncated=True,
+                    truncation_reason="request_failed",
                     next_page=current_page,
                     next_skip=0,
                     error=str(page_exc),
@@ -512,6 +535,7 @@ def github_list_issues(
                 # completion, in case a malformed/unusual response still
                 # reports one.
                 truncated = has_next_page
+                truncation_reason = "more_pages" if has_next_page else None
                 if has_next_page:
                     next_page = current_page + 1
                 break
@@ -563,8 +587,12 @@ def github_list_issues(
                         # can't do this on its own, but the raw index can.
                         next_page = current_page
                         next_skip = index + 1
+                        truncation_reason = "item_limit"
                     elif has_next_page:
                         next_page = current_page + 1
+                        truncation_reason = "more_pages"
+                    else:
+                        truncation_reason = None
                     break
             if bad_item_error:
                 logger.warning(
@@ -574,6 +602,7 @@ def github_list_issues(
                 return _success(
                     issues=issues[:max_results],
                     truncated=True,
+                    truncation_reason="bad_item",
                     next_page=next_page,
                     next_skip=next_skip,
                     error=bad_item_error,
@@ -584,13 +613,17 @@ def github_list_issues(
                 break  # confirmed last page via the Link header
         else:
             # MAX_ISSUE_PAGES exhausted -- only report truncated/next_page
-            # if the last page we saw actually indicated more exist.
+            # if the last page we saw actually indicated more exist. This
+            # is a more specific reason than "more_pages": it's our own
+            # page-count safety cap, not just "there happen to be more".
             truncated = has_next_page
+            truncation_reason = "max_pages" if has_next_page else None
             if has_next_page:
                 next_page = current_page + 1
         return _success(
             issues=issues[:max_results],
             truncated=truncated,
+            truncation_reason=truncation_reason,
             next_page=next_page,
             next_skip=next_skip,
         )
@@ -688,6 +721,7 @@ def github_list_pull_requests(
             },
         )
         result = response.json() if response.content else []
+        _require_object_items(result, context="pull request list")
         has_next_page = "next" in _link_header_rels(response.headers.get("Link"))
         return _success(
             pull_requests=[_summarize_pull_request(pr) for pr in result],
@@ -773,14 +807,7 @@ def github_get_file_contents(repo: str, path: str, ref: str = "") -> str:
             "GET", f"/repos/{owner}/{name}/contents/{encoded_path}", params=params
         )
         if isinstance(result, list):
-            if not all(isinstance(entry, dict) for entry in result):
-                # Same class of gap the issues path was hardened against --
-                # an unguarded entry.get() below would surface as an
-                # unhelpful "'str' object has no attribute 'get'" instead of
-                # identifying what GitHub actually returned.
-                return _error(
-                    f"GitHub returned a non-object directory entry for '{path}'"
-                )
+            _require_object_items(result, context=f"directory listing for '{path}'")
             entries = [
                 {
                     "name": entry.get("name"),
@@ -890,6 +917,7 @@ def github_list_commits(
             params["path"] = path
         response = _request_raw("GET", f"/repos/{owner}/{name}/commits", params=params)
         result = response.json() if response.content else []
+        _require_object_items(result, context="commit list")
         commits = [
             {
                 "sha": commit.get("sha"),
@@ -927,6 +955,8 @@ def github_search_code(query: str, limit: int = 20) -> str:
             "/search/code",
             params={"q": query, "per_page": _clamp_limit(limit)},
         )
+        raw_items = result.get("items") or []
+        _require_object_items(raw_items, context="code search results")
         items = [
             {
                 "name": item.get("name"),
@@ -934,7 +964,7 @@ def github_search_code(query: str, limit: int = 20) -> str:
                 "repository": (item.get("repository") or {}).get("full_name"),
                 "html_url": item.get("html_url"),
             }
-            for item in result.get("items") or []
+            for item in raw_items
         ]
         return _success(
             items=items,

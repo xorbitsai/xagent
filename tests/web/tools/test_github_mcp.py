@@ -345,6 +345,22 @@ def test_search_repositories_flags_incomplete_results(monkeypatch):
     assert result["incomplete_results"] is True
 
 
+def test_search_repositories_rejects_non_object_item(monkeypatch):
+    """A non-object item in the search results (same class of gap as the
+    issues pagination and directory-listing hardening) must not reach the
+    unguarded _summarize_repo() call below."""
+    monkeypatch.setattr(
+        github.requests,
+        "request",
+        Mock(return_value=MockResponse(json_data={"total_count": 1, "items": [None]})),
+    )
+
+    result = json.loads(github.github_search_repositories("stars:>1"))
+
+    assert result["status"] == "error"
+    assert "non-object item" in result["message"]
+
+
 def test_search_repositories_sends_query_and_clamps_over_limit(monkeypatch):
     mock_request = Mock(
         return_value=MockResponse(json_data={"total_count": 0, "items": []})
@@ -554,6 +570,7 @@ def test_list_issues_reports_truncated_when_limit_reached_mid_page(monkeypatch):
     assert result["status"] == "success"
     assert len(result["issues"]) == 3
     assert result["truncated"] is True
+    assert result["truncation_reason"] == "item_limit"
     # A mid-page limit hit resumes the SAME page, skipping the raw items
     # already consumed from it.
     assert result["next_page"] == 1
@@ -613,6 +630,7 @@ def test_list_issues_trailing_prs_after_limit_do_not_count_as_truncation(monkeyp
     assert result["status"] == "success"
     assert len(result["issues"]) == 2
     assert result["truncated"] is False
+    assert result["truncation_reason"] is None
     assert result["next_page"] is None
 
 
@@ -645,6 +663,7 @@ def test_list_issues_trailing_prs_after_limit_still_offer_next_page(monkeypatch)
     assert result["status"] == "success"
     assert len(result["issues"]) == 1
     assert result["truncated"] is True
+    assert result["truncation_reason"] == "more_pages"
     assert result["next_page"] == 2
 
 
@@ -670,6 +689,7 @@ def test_list_issues_full_final_page_without_next_link_is_not_truncated(monkeypa
     assert result["status"] == "success"
     assert len(result["issues"]) == github.MAX_PER_PAGE
     assert result["truncated"] is False
+    assert result["truncation_reason"] is None
     assert result["next_page"] is None
 
 
@@ -694,6 +714,7 @@ def test_list_issues_empty_page_with_next_link_still_reports_truncated(monkeypat
     assert result["status"] == "success"
     assert result["issues"] == []
     assert result["truncated"] is True
+    assert result["truncation_reason"] == "more_pages"
     assert result["next_page"] == 2
 
 
@@ -725,6 +746,7 @@ def test_list_issues_preserves_partial_results_on_malformed_json_body(monkeypatc
     assert result["status"] == "success"
     assert len(result["issues"]) == 2
     assert result["truncated"] is True
+    assert result["truncation_reason"] == "request_failed"
     assert result["next_page"] == 2
     assert "Expecting value" in result["error"]
 
@@ -753,6 +775,7 @@ def test_list_issues_preserves_partial_results_on_non_list_page(monkeypatch):
     assert result["status"] == "success"
     assert len(result["issues"]) == 2
     assert result["truncated"] is True
+    assert result["truncation_reason"] == "request_failed"
     assert result["next_page"] == 2
     assert "non-list page" in result["error"]
 
@@ -777,6 +800,7 @@ def test_list_issues_preserves_partial_results_on_non_object_item(monkeypatch):
     assert len(result["issues"]) == 1
     assert result["issues"][0]["number"] == 1
     assert result["truncated"] is True
+    assert result["truncation_reason"] == "bad_item"
     assert result["next_page"] == 1
     assert result["next_skip"] == 2
     assert "non-object item" in result["error"]
@@ -817,6 +841,7 @@ def test_list_issues_handles_non_object_item_after_the_limit_is_reached(monkeypa
     # truncation is reported rather than the result being mistaken for
     # complete.
     assert result["truncated"] is True
+    assert result["truncation_reason"] == "item_limit"
     assert result["next_page"] == 1
     assert result["next_skip"] == 1
 
@@ -848,6 +873,7 @@ def test_list_issues_stops_at_max_pages_and_reports_truncated(monkeypatch):
     assert result["status"] == "success"
     assert result["issues"] == []
     assert result["truncated"] is True
+    assert result["truncation_reason"] == "max_pages"
     assert result["next_page"] == github.MAX_ISSUE_PAGES + 1
 
 
@@ -956,6 +982,7 @@ def test_list_issues_returns_next_page_when_more_full_pages_remain(monkeypatch):
 
     assert result["status"] == "success"
     assert result["truncated"] is True
+    assert result["truncation_reason"] == "more_pages"
     assert result["next_page"] == 6
 
 
@@ -996,6 +1023,7 @@ def test_list_issues_preserves_partial_results_on_mid_pagination_failure(monkeyp
     assert result["status"] == "success"
     assert len(result["issues"]) == github.MAX_PER_PAGE // 2
     assert result["truncated"] is True
+    assert result["truncation_reason"] == "request_failed"
     # The failed page is the continuation point -- page 1's Link header
     # confirmed page 2 exists, so a retry can resume there. Nothing on that
     # page has been consumed yet, so next_skip is 0.
@@ -1168,6 +1196,19 @@ def test_list_pull_requests_reports_truncated_when_more_pages_exist(monkeypatch)
     assert result["status"] == "success"
     assert result["truncated"] is True
     assert result["next_page"] == 2
+
+
+def test_list_pull_requests_rejects_non_object_item(monkeypatch):
+    monkeypatch.setattr(
+        github.requests,
+        "request",
+        Mock(return_value=MockResponse(json_data=[None])),
+    )
+
+    result = json.loads(github.github_list_pull_requests("octocat/Hello-World"))
+
+    assert result["status"] == "error"
+    assert "non-object item" in result["message"]
 
 
 def test_list_pull_requests_sends_non_default_state_and_limit(monkeypatch):
@@ -1507,7 +1548,8 @@ def test_get_file_contents_rejects_non_object_directory_entry(monkeypatch):
     result = json.loads(github.github_get_file_contents("octocat/Hello-World", "src"))
 
     assert result["status"] == "error"
-    assert "non-object directory entry" in result["message"]
+    assert "non-object item" in result["message"]
+    assert "directory listing" in result["message"]
 
 
 def test_get_file_contents_rejects_non_file_type(monkeypatch):
@@ -1714,6 +1756,19 @@ def test_list_commits_reports_truncated_when_more_pages_exist(monkeypatch):
     assert result["next_page"] == 2
 
 
+def test_list_commits_rejects_non_object_item(monkeypatch):
+    monkeypatch.setattr(
+        github.requests,
+        "request",
+        Mock(return_value=MockResponse(json_data=[None])),
+    )
+
+    result = json.loads(github.github_list_commits("octocat/Hello-World"))
+
+    assert result["status"] == "error"
+    assert "non-object item" in result["message"]
+
+
 def test_list_commits_sends_path_and_clamps_over_limit(monkeypatch):
     mock_request = Mock(return_value=MockResponse(json_data=[]))
     monkeypatch.setattr(github.requests, "request", mock_request)
@@ -1791,6 +1846,19 @@ def test_search_code_flags_incomplete_results(monkeypatch):
 
     assert result["status"] == "success"
     assert result["incomplete_results"] is True
+
+
+def test_search_code_rejects_non_object_item(monkeypatch):
+    monkeypatch.setattr(
+        github.requests,
+        "request",
+        Mock(return_value=MockResponse(json_data={"total_count": 1, "items": [None]})),
+    )
+
+    result = json.loads(github.github_search_code("def parse"))
+
+    assert result["status"] == "error"
+    assert "non-object item" in result["message"]
 
 
 def test_search_code_sends_query_and_clamps_over_limit(monkeypatch):

@@ -311,6 +311,40 @@ def test_list_accessible_agents_hides_published_admins_only_from_member(
         aa.get_visible_agent_ids = orig_aa
 
 
+def test_list_accessible_published_agents_applies_database_limit(db):
+    from xagent.web.models.agent import AgentStatus
+    from xagent.web.models.user import User
+    from xagent.web.services.agent_access import list_accessible_published_agents
+    from xagent.web.services.agent_store import AgentStore
+
+    user = User(username="bounded", password_hash="h", is_admin=False)
+    db.add(user)
+    db.flush()
+    store = AgentStore(db)
+    published_ids = [
+        int(
+            store.create_agent(
+                user_id=int(user.id),
+                name=f"Published {index}",
+                description=None,
+                instructions=None,
+                status=AgentStatus.PUBLISHED,
+            ).id
+        )
+        for index in range(5)
+    ]
+    store.create_agent(
+        user_id=int(user.id),
+        name="Draft",
+        description=None,
+        instructions=None,
+    )
+
+    agents = list_accessible_published_agents(db, user, limit=3)
+
+    assert [int(agent.id) for agent in agents] == published_ids[:3]
+
+
 def test_personal_create_does_not_require_team_scope_for_visibility(db):
     from xagent.web.models.user import User
     from xagent.web.services import agent_team_scope as ats

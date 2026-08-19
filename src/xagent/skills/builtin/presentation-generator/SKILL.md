@@ -1,6 +1,13 @@
 ---
 name: presentation
-description: "Generate and edit PowerPoint presentations (.pptx). Use for: creating slide decks, pitch decks, or presentations from scratch; reading, parsing, or extracting content from .pptx files; editing, modifying, or updating existing presentations; combining or splitting slide files; working with templates, layouts, speaker notes, or comments. Trigger only when the user explicitly asks for a deck, slides, presentation, PPT/PPTX, or references a .pptx filename. Do not use for standalone posters, images, banners, illustrations, or social graphics unless the requested deliverable is a presentation file."
+description: |
+  Create, read, or edit PowerPoint .pptx files: slide decks from scratch,
+  content extraction, templates, speaker notes, combining or splitting decks.
+  Not for posters, images, or social graphics.
+when_to_use: |
+  The user asks for a deck, slides, a presentation, PPT/PPTX, or names a .pptx
+  file. Use pptx-editorial instead when magazine-grade editorial styling is
+  wanted.
 ---
 
 # Presentation Generator

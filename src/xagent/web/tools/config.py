@@ -662,12 +662,19 @@ async def refresh_oauth_token_if_needed(
         if requires_json_accept_header(normalized_provider):
             headers["Accept"] = "application/json"
 
+        # Matches the code-exchange branch in api/auth.py: Atlassian's token
+        # endpoint requires a JSON body on refresh too, not form-urlencoded.
+        body_kwarg: dict[str, Any] = {"data": data}
+        if normalized_provider == "jira":
+            headers["Content-Type"] = "application/json"
+            body_kwarg = {"json": data}
+
         async with httpx.AsyncClient() as client:
             response = await client.post(
                 provider_config.token_url,
-                data=data,
                 headers=headers,
                 timeout=10.0,
+                **body_kwarg,
                 **post_kwargs,
             )
 

@@ -738,6 +738,15 @@ def test_a_payload_missing_interaction_fields_fails_v1_validation_and_the_materi
     tracked in #1368; this test only pins today's failure mode at the read
     side, not a fix for the write side.
 
+    An active row holds this task's answer slot even when its payload
+    cannot be parsed, so this reports the unanswerable tier rather than
+    falling back to the legacy transcript -- see
+    ``test_unreadable_payload_is_unanswerable_not_legacy``
+    (``test_task_interaction_service.py``) for the same assertion pinned
+    directly against ``materialize_compatibility_view``. This test's own
+    value is the payload construction path: staged through the real
+    ``stage_interaction_request``, not a bare ORM insert.
+
     The row is staged through the real ``stage_interaction_request``, not
     a bare ORM insert: ``request_payload`` is a JSON column with no
     ``AskUserQuestionArgs``-shape CHECK constraint, so a row this shape can
@@ -799,7 +808,10 @@ def test_a_payload_missing_interaction_fields_fails_v1_validation_and_the_materi
             logging.WARNING, logger="xagent.web.services.task_interaction_service"
         )
         view = materialize_compatibility_view(db, task_id)
-        assert view.tier == "legacy"
+        assert view.tier == "unanswerable"
+        assert view.question is None
+        assert view.interactions is None
+        assert view.reason == "payload_unreadable"
 
         matching = [
             record

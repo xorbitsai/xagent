@@ -50,7 +50,6 @@ from ...schemas.v1 import (
     UploadedFileInfo,
     UploadFilesResponse,
 )
-from ...services.chat_history_service import get_latest_waiting_question
 from ...services.connector_runtime import (
     bind_create_connector_runtime_plan,
     persist_create_connector_runtime_context,
@@ -78,6 +77,7 @@ from ...services.hot_path_cache import (
     task_steps_key,
 )
 from ...services.managed_file_ref import DurableStorageOperationError
+from ...services.task_interaction_read import get_pending_interaction_question
 from ...services.task_orchestrator import (
     TaskTurnError,
     TaskTurnFileBindingError,
@@ -787,8 +787,8 @@ def _load_task_info_snapshot(
         pending_question: str | None = None
         pending_interactions: list[dict[str, Any]] | None = None
         if task.status == TaskStatus.WAITING_FOR_USER:
-            pending_question, pending_interactions = get_latest_waiting_question(
-                db, task_id
+            pending_question, pending_interactions = get_pending_interaction_question(
+                db, task
             )
         return _TaskInfoSnapshot(
             task_id=int(task.id),
@@ -879,12 +879,12 @@ def _filter_interaction_descriptors(
     with non-dict elements (e.g. a bare string); passing that straight
     into the schema fails Pydantic validation and 500s the GET
     permanently, for as long as the dirty row exists. Filtering here --
-    not in ``get_latest_waiting_question`` or the schema type -- keeps
-    the fix scoped to this read path's output contract; the shared
-    reader and its other consumers (websocket.py, chat.py) are
-    untouched. Same semantics as react.py's
-    ``_normalize_ask_user_interactions``: a non-dict element is dropped,
-    not coerced or repaired.
+    not in the shared transcript reader, and not in
+    ``task_interaction_read``'s tuple adapter either -- keeps the fix
+    scoped to this read path's output contract; the other four consumers
+    (websocket.py, chat.py) go through the same adapter untouched. Same
+    semantics as react.py's ``_normalize_ask_user_interactions``: a
+    non-dict element is dropped, not coerced or repaired.
     """
     if interactions is None:
         return None

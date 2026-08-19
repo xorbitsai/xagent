@@ -1342,6 +1342,17 @@ def generic_oauth_login(
         params["prompt"] = "consent"
     if provider.lower() == "zoom":
         params["prompt"] = "login"
+    if provider.lower() == "jira":
+        # Required by Atlassian's authorize endpoint for every 3LO app,
+        # regardless of scopes requested -- identifies the resource server
+        # the requested token is meant for (api.atlassian.com), not an
+        # actual audience restriction on this connector's own behalf.
+        params["audience"] = "api.atlassian.com"
+        # Atlassian does not silently re-prompt on a scope change like most
+        # providers here -- without forcing the consent screen, a user who
+        # previously granted a narrower scope set can be silently handed a
+        # token still limited to that earlier grant.
+        params["prompt"] = "consent"
     meta_config_id = _meta_login_config_id() if provider.lower() == "meta" else ""
     if meta_config_id:
         params["config_id"] = meta_config_id
@@ -1598,8 +1609,16 @@ def generic_oauth_callback(
             data["client_id"] = client_id
             data["client_secret"] = client_secret
 
+        # Atlassian's token endpoint requires a JSON body -- unlike every
+        # other provider here, it does not accept form-urlencoded and
+        # answers a form-encoded POST with a 400.
+        post_kwargs: dict[str, Any] = {"data": data}
+        if provider.lower() == "jira":
+            headers = {"Content-Type": "application/json"}
+            post_kwargs = {"json": data}
+
         token_response = requests.post(
-            token_url, data=data, headers=headers, timeout=10.0, auth=auth
+            token_url, headers=headers, timeout=10.0, auth=auth, **post_kwargs
         )
         token_data = token_response.json()
 

@@ -33,6 +33,13 @@ what this file can and must pin:
   surrogate pair is not a hazard and must survive, so a non-BMP payload is
   seeded alongside text that merely looks like an escape.
 
+A second, unrelated dialect hazard is pinned at the end of this file: the
+daily "today" windows compare a boundary against ``timestamptz`` columns,
+and PostgreSQL resolves a *naive* boundary using the session's ``TimeZone``
+setting (#1256). That coercion cannot happen on SQLite, so the sibling
+``test_monitor_daily_windows.py`` cannot see it; the case here sets a
+non-UTC session timezone to make it observable.
+
 The read guard in ``get_json_field_expression`` still exists for databases
 whose migration has not run. With ``jsonb`` it can never match, so no test
 over the model's own table can reach its drop path any more --
@@ -59,18 +66,28 @@ from sqlalchemy import text as sa_text
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.orm import Session
 
+from xagent.web.api import monitor as monitor_module
 from xagent.web.api.monitor import (
+    get_dashboard_stats,
     get_json_field_expression,
     get_model_stats,
     get_monitoring_stats,
     get_popular_tools,
 )
 from xagent.web.models.database import Base, get_db, get_engine, init_db
-from xagent.web.models.task import Task, TraceEvent
+from xagent.web.models.task import Task, TaskStatus, TraceEvent
 from xagent.web.models.user import User
 from xagent.web.utils.json_payload_sanitizer import (
     REPLACEMENT_CHARACTER,
     sanitize_json_payload,
+)
+
+from .monitor_daily_window_shared import (
+    PG_SESSION_TIME_ZONE,
+    UTC_TODAY_EARLY,
+    UTC_TODAY_LATE,
+    UTC_YESTERDAY_LATE,
+    FrozenDatetime,
 )
 
 # String values a ``json`` column accepted but ``->>`` then refused to convert
@@ -550,3 +567,132 @@ class TestReadGuardAgainstNativeJson:
             6: f"emoji{NON_BMP_CHAR}",
             7: "literal" + backslash + "u0000",
         }
+
+
+class TestDailyWindowsUnderNonUtcSessionTimeZone:
+    """The "today" boundary must be an instant, not a wall-clock literal.
+
+    ``TraceEvent.timestamp`` and ``Task.updated_at`` are ``timestamptz``
+    here. An *aware* boundary binds as an unambiguous instant, so the
+    session's ``TimeZone`` cannot move it. A *naive* one -- what these call
+    sites used before #1256 -- is resolved by PostgreSQL in the session
+    timezone instead, which silently shifts every daily window by that
+    offset. Only a non-UTC session timezone makes the two tell apart, so
+    these tests set one explicitly rather than trusting the server default.
+
+    The frozen clock reads 2026-08-17 18:00 UTC, which on the ``+08:00``
+    session timezone is already 02:00 on the 18th. A regression to a naive
+    boundary would therefore be resolved to 2026-08-17 16:00 UTC, and each
+    assertion below is chosen so that lands on a different number than the
+    UTC-day answer -- not merely a different row ordering.
+    """
+
+    @staticmethod
+    def _seed(db: Session) -> User:
+        """An admin, three RUNNING tasks, and events straddling UTC midnight.
+
+        The tasks are spread either side of both candidate boundaries: one
+        updated late on the previous UTC day (outside every reading), one at
+        00:01 UTC (inside the UTC day, outside the shifted one) and one at
+        17:00 UTC (inside both). ``activeAgents`` therefore reads 2 under the
+        correct boundary and 1 under the shifted one.
+        """
+        admin = User(
+            username="monitor-pg-window-admin", password_hash="hash", is_admin=True
+        )
+        db.add(admin)
+        db.commit()
+        db.refresh(admin)
+
+        tasks = []
+        for title, updated_at in [
+            ("pg-window-stale", UTC_YESTERDAY_LATE),
+            ("pg-window-early", UTC_TODAY_EARLY),
+            ("pg-window-late", UTC_TODAY_LATE),
+        ]:
+            task = Task(
+                user_id=admin.id,
+                title=title,
+                status=TaskStatus.RUNNING,
+                updated_at=updated_at,
+            )
+            db.add(task)
+            tasks.append(task)
+        db.commit()
+        for task in tasks:
+            db.refresh(task)
+
+        # Hung off the last task; the call counts are over trace events, so
+        # which task owns them does not matter.
+        owner = tasks[-1]
+        for event_id, event_type, timestamp, data in [
+            (
+                "pg-window-yesterday-llm",
+                "llm_call_start",
+                UTC_YESTERDAY_LATE,
+                {"model_name": "stale-model"},
+            ),
+            (
+                "pg-window-today-llm",
+                "llm_call_start",
+                UTC_TODAY_EARLY,
+                {"model_name": "fresh-model"},
+            ),
+            ("pg-window-today-tool", "tool_execution_start", UTC_TODAY_LATE, None),
+        ]:
+            db.add(
+                TraceEvent(
+                    task_id=owner.id,
+                    event_id=event_id,
+                    event_type=event_type,
+                    timestamp=timestamp,
+                    data=data,
+                )
+            )
+        db.commit()
+        return admin
+
+    @staticmethod
+    def _freeze_and_shift_session(db: Session, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Pin the clock, then move the session off UTC.
+
+        The ``SET`` runs after seeding so no commit intervenes between it and
+        the handler's queries.
+        """
+        monkeypatch.setattr(monitor_module, "datetime", FrozenDatetime)
+        db.execute(sa_text(f"SET TIME ZONE '{PG_SESSION_TIME_ZONE}'"))
+
+    @pytest.mark.postgresql
+    async def test_stats_today_window_ignores_the_session_time_zone(
+        self, pg_session: Session, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``todayCalls``/``activeModels`` stay on the UTC day.
+
+        Under a naive boundary these would read 1 and 0: the shifted
+        boundary (16:00 UTC) drops the 00:01 UTC call, which is also the
+        only one naming ``fresh-model``.
+        """
+        admin = self._seed(pg_session)
+        self._freeze_and_shift_session(pg_session, monkeypatch)
+
+        stats = await get_monitoring_stats(db=pg_session, current_user=admin)
+
+        assert stats["todayCalls"] == 2
+        assert stats["activeModels"] == 1
+
+    @pytest.mark.postgresql
+    async def test_dashboard_windows_ignore_the_session_time_zone(
+        self, pg_session: Session, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``todayCalls``/``activeAgents`` stay on the UTC day.
+
+        Under a naive boundary these would read 1 and 1, the shifted
+        boundary having dropped everything before 16:00 UTC.
+        """
+        admin = self._seed(pg_session)
+        self._freeze_and_shift_session(pg_session, monkeypatch)
+
+        stats = await get_dashboard_stats(db=pg_session, current_user=admin)
+
+        assert stats["todayCalls"] == 2
+        assert stats["activeAgents"] == 2

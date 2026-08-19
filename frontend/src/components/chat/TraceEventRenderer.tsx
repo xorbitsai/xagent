@@ -179,6 +179,17 @@ function formatActionContent(value: unknown, filesDisabled = false): string {
   }
 }
 
+// Deliberately narrower than (and not the same union as) StepStatus in
+// app-context-chat.tsx / ProgressPanel's ProgressStepView / center-panel.tsx's
+// DAGNode.data: this status is derived locally from the trace event stream
+// itself (dag_step_start/dag_step_end/etc.), not read off StepExecution, and
+// mixes in whole-TASK states ("paused", "waiting_for_user") that the other
+// three don't carry at the step level. No trace event currently distinguishes
+// a step being "interrupted" or "clarification_invalidated" from plain
+// "running" the way StepExecution's own field does, so this view can't
+// represent those two states without new derivation logic to detect them from
+// the event stream - a step in either state renders here as "running" rather
+// than reporting an unknown/wrong status.
 interface ProcessedStep {
   stepId: string;
   stepName: string;
@@ -1657,6 +1668,7 @@ function StepItem({
       animate={{ opacity: 1, y: 0 }}
       transition={{ delay: 0.1 * (index + 1) }}
       className="space-y-3"
+      data-step-id={step.stepId}
     >
       {/* Step Title */}
       <div className="flex w-full items-start gap-2 rounded-lg px-2 py-1 -ml-2 transition-colors hover:bg-muted/50 group/step">

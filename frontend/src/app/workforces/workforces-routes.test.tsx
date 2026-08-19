@@ -85,6 +85,7 @@ vi.mock("@/contexts/app-context-chat", () => ({
     getFileDownloadUrl: (fileId: string) => `/api/files/${fileId}/download`,
     state: workforceAppState,
   }),
+  isTerminalTaskStatus: (status: string | null | undefined) => status === "completed" || status === "failed",
 }))
 
 vi.mock("@/components/task/task-conversation-panel", () => ({

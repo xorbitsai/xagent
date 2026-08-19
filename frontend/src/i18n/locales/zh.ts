@@ -268,6 +268,13 @@ const zh = {
       dagSectionOther: "DAG 执行 · {count} 个步骤",
       view: "查看计划",
     },
+    progressPanel: {
+      title: "执行进度",
+      elapsed: "已用时",
+      planning: "正在生成计划…",
+      toggleTooltip: "查看执行进度",
+      collapse: "收起",
+    },
     aiOutput: {
       title: "AI 输出",
       subtitle: "生成的响应",
@@ -2946,6 +2953,8 @@ const zh = {
         completed: "已完成",
         failed: "失败",
         skipped: "已跳过",
+        interrupted: "已中断",
+        clarification_invalidated: "等待新的回答",
       },
       right: {
         titles: {

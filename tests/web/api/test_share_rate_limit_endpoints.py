@@ -304,8 +304,12 @@ def test_widget_task_create_ignores_client_injected_entity_markers() -> None:
         task = db.query(Task).filter(Task.id == int(resp.json()["task_id"])).one()
         cfg = task.agent_config
         # Entity markers: server-stamped, workforce cleared to None on the agent
-        # path, agent id is the real one — never the injected values.
-        assert cfg.get("widget_workforce_id") is None
+        # path, agent id is the real one — never the injected values. The
+        # membership check pins the Layer-2 stamp itself: the sanitizer alone
+        # would leave the key absent, and `.get(...) is None` cannot tell
+        # stamped-as-None from stripped (#1234).
+        assert "widget_workforce_id" in cfg
+        assert cfg["widget_workforce_id"] is None
         assert cfg.get("widget_agent_id") != 888888
         assert cfg.get("widget_agent_id") is not None
         # Identity/quota markers: server values win, injected copies stripped.

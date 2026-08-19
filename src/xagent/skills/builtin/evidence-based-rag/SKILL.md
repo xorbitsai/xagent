@@ -1,5 +1,12 @@
 ---
-description: Evidence-first retrieval-augmented reasoning skill for decision-critical scenarios. Retrieves information from a specified knowledge base, extracts verifiable evidence, detects conflicting claims, and evaluates answer sufficiency with explicit confidence and risk signals. Produces traceable outputs suitable for agent-level decision control and escalation.
+description: |
+  Evidence-first retrieval over a specified knowledge base: cited evidence,
+  conflict detection, and an explicit sufficiency, confidence, and risk verdict
+  on whether the answer is safe to act on.
+when_to_use: |
+  Knowledge base Q&A, fact-checking, evidence verification, due diligence, or
+  compliance review needing source attribution. Not for casual chat, creative
+  writing, or answers that need no citations.
 ---
 
 # Evidence-Based RAG

@@ -24,6 +24,7 @@ from xagent.web.models.agent import AgentOrigin, AgentStatus
 from xagent.web.services import workforce_creator
 from xagent.web.services.agent_store import AgentStore
 from xagent.web.services.workforce_creator import (
+    _create_staged_agent,
     _find_quick_access_worker_agent,
     _get_or_create_quick_access_worker_agent,
 )
@@ -359,6 +360,41 @@ def test_race_retry_recovers_from_a_genuine_name_collision(db_session) -> None:
         .count()
         == 1
     )
+
+
+def test_prompt_created_worker_retries_name_collision_in_savepoint(db_session) -> None:
+    user = _create_user(db_session)
+    real_add_agent = AgentStore.add_agent
+    call_count = {"n": 0}
+
+    def _fail_once_with_name_violation(self, **kwargs):
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            raise IntegrityError(
+                "INSERT INTO agents (...)",
+                {},
+                Exception("UNIQUE constraint failed: agents.user_id, agents.name"),
+            )
+        return real_add_agent(self, **kwargs)
+
+    with patch.object(AgentStore, "add_agent", _fail_once_with_name_violation):
+        agent = _create_staged_agent(
+            db_session,
+            user,
+            {
+                "name": "Research Worker",
+                "description": "Collects and verifies evidence.",
+                "instructions": "Collect evidence and report verified findings.",
+                "execution_mode": "balanced",
+                "skills": [],
+                "tool_categories": [],
+            },
+            is_manager=False,
+        )
+
+    assert call_count["n"] == 2
+    assert agent.name == "Research Worker"
+    assert agent.origin == AgentOrigin.USER.value
 
 
 def test_gives_up_with_409_if_retries_are_exhausted(db_session) -> None:

@@ -112,7 +112,9 @@ class PersonaInfo(BaseModel):
     )
     kickoff_questions: list[str] = Field(
         default_factory=list,
-        description="Localized opening questions asked right after the intro",
+        description="Localized setup questions the *agent* asks the *user* "
+        "right after the intro (unlike sample_prompts / "
+        "Agent.suggested_prompts, which are prompts for the user to send)",
     )
 
 
@@ -310,6 +312,25 @@ def get_hired_agent_map(
     At most one row per (user_id, template_id) can exist here:
     `AGENT_TEMPLATE_QUICK_ACCESS_UNIQUE_INDEX` enforces that pair unique at
     the database level for this origin, so there is no tie to break.
+
+    The contract is deliberately "hired == the agent Hire would return",
+    i.e. this predicate stays byte-identical to
+    `_resolve_agent_from_template_sync`'s reuse query, which has two
+    intended consequences (PR #1498 round-2 review, M1/N1):
+
+    - Instantiating a workforce also creates its worker agents with this
+      origin plus each worker's own template_id
+      (`workforce_creator._get_or_create_quick_access_worker_agent`), so
+      the member templates report hired afterward. That is accurate, not
+      a false positive: clicking Hire on such a template resolves to
+      exactly that worker agent - reporting "not hired" would promise a
+      fresh agent the resolve flow will never create.
+    - No `status` filter: the resolve flow deliberately returns a found
+      DRAFT as-is rather than auto-publishing it (see the B3 comment in
+      `_resolve_agent_from_template_sync`), so a draft quick-access agent
+      is still "what Hire returns" and counts as hired. A consumer that
+      needs publishability should read the agent's own status rather
+      than have this map silently desync from the resolve query.
     """
     if not template_ids:
         return {}

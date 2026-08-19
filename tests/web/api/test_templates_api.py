@@ -299,9 +299,10 @@ def workforce_mock_app_state(workforce_template_manager):
 
 @pytest.fixture(scope="function")
 def persona_templates_dir(tmp_path):
-    """A separate templates directory holding one template with a full
-    `persona` block and one without, isolated from `templates_dir` so its
-    exact-count assertions elsewhere aren't affected.
+    """A separate templates directory holding three templates - one with a
+    full `persona` block, one with a name+role-only persona, and one with
+    no persona at all - isolated from `templates_dir` so its exact-count
+    assertions elsewhere aren't affected.
     """
     templates_dir = tmp_path / "persona_templates"
     templates_dir.mkdir()
@@ -873,6 +874,9 @@ class TestTemplatesAPI:
                 "likes",
                 "used_count",
                 "is_liked",
+                "persona",
+                "hired",
+                "hired_agent_id",
             ]
             for field in required_fields:
                 assert field in template, f"Missing field: {field}"
@@ -1016,23 +1020,15 @@ class TestTemplateHiredFlag:
         origin-scoped reuse query.
 
         Creates a real TEMPLATE_QUICK_ACCESS-origin agent for the same
-        template too (with a *higher* id than the USER-origin row), so
-        this actually exercises the origin filter: a naive
-        lowest-id/first-row implementation with no origin filter at all
-        would pass this test if it only asserted `hired is False`
-        (PR #1498 review, m9) - asserting `hired_agent_id` resolves to the
-        quick-access agent specifically, not the user-origin one, is what
-        proves the filter (not id ordering) is what's selecting it."""
+        template too, deliberately with a *lower* id than the USER-origin
+        row: `get_hired_agent_map` has no ORDER BY (last row wins in a
+        filterless dict build), so with the quick-access row inserted
+        first, an implementation missing the origin filter would resolve
+        to the later USER-origin row and fail here - mutation testing on
+        the round-1 version of this test (quick-access inserted second)
+        showed removing the filter still passed (PR #1498 round-2 review,
+        N4)."""
         db = next(get_db())
-        user_origin_agent = Agent(
-            user_id=admin_user["id"],
-            name="My Own Copy",
-            template_id="customer_support",
-            origin=AgentOrigin.USER.value,
-        )
-        db.add(user_origin_agent)
-        db.commit()
-
         quick_access_agent = Agent(
             user_id=admin_user["id"],
             name="Customer Support Agent",
@@ -1042,8 +1038,18 @@ class TestTemplateHiredFlag:
         db.add(quick_access_agent)
         db.commit()
         db.refresh(quick_access_agent)
-        assert quick_access_agent.id > user_origin_agent.id
         quick_access_agent_id = quick_access_agent.id
+
+        user_origin_agent = Agent(
+            user_id=admin_user["id"],
+            name="My Own Copy",
+            template_id="customer_support",
+            origin=AgentOrigin.USER.value,
+        )
+        db.add(user_origin_agent)
+        db.commit()
+        db.refresh(user_origin_agent)
+        assert user_origin_agent.id > quick_access_agent_id
         db.close()
 
         with patch.object(client.app, "state", mock_app_state):
@@ -1051,6 +1057,29 @@ class TestTemplateHiredFlag:
             listed = {t["id"]: t for t in response.json()}
             assert listed["customer_support"]["hired"] is True
             assert listed["customer_support"]["hired_agent_id"] == quick_access_agent_id
+
+    def test_false_when_the_only_agent_is_user_origin(
+        self, mock_app_state, admin_headers, admin_user
+    ):
+        """The complementary case to the test above: a template whose only
+        agent for this user is a plain USER-origin one must not report
+        hired at all."""
+        db = next(get_db())
+        user_origin_agent = Agent(
+            user_id=admin_user["id"],
+            name="My Own Copy Only",
+            template_id="customer_support",
+            origin=AgentOrigin.USER.value,
+        )
+        db.add(user_origin_agent)
+        db.commit()
+        db.close()
+
+        with patch.object(client.app, "state", mock_app_state):
+            response = client.get("/api/templates/", headers=admin_headers)
+            listed = {t["id"]: t for t in response.json()}
+            assert listed["customer_support"]["hired"] is False
+            assert listed["customer_support"]["hired_agent_id"] is None
 
     def test_scoped_to_the_current_user(
         self, mock_app_state, admin_headers, admin_user
@@ -1080,6 +1109,14 @@ class TestTemplateHiredFlag:
             listed = {t["id"]: t for t in response.json()}
             assert listed["customer_support"]["hired"] is False
             assert listed["customer_support"]["hired_agent_id"] is None
+
+            # Same scoping on the detail endpoint (a separate call site
+            # computing hired from the same map).
+            detail = client.get(
+                "/api/templates/customer_support", headers=admin_headers
+            ).json()
+            assert detail["hired"] is False
+            assert detail["hired_agent_id"] is None
 
 
 class TestUseTemplateAsWorkforce:

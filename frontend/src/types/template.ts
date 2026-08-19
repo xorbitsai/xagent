@@ -25,6 +25,8 @@ export interface PersonaInfo {
   name: string;
   role: string;
   avatar?: string | null;
+  /** May span multiple paragraphs (separated by "\n\n") - render with
+   * whitespace preserved, not as a single line. */
   intro: string;
   kickoff_questions: string[];
 }

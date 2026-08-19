@@ -215,6 +215,138 @@ def test_request_raw_omits_rate_limit_metadata_when_not_rate_limited(monkeypatch
     assert "rate_limit_reset" not in str(excinfo.value)
 
 
+def test_request_raw_retries_get_once_on_bounded_429(monkeypatch):
+    mock_request = Mock(
+        side_effect=[
+            MockResponse(
+                json_data={"message": "rate limited"},
+                status_code=429,
+                headers={"Retry-After": "1"},
+            ),
+            MockResponse(json_data={"ok": True}, status_code=200),
+        ]
+    )
+    monkeypatch.setattr(github.requests, "request", mock_request)
+    sleep_mock = Mock()
+    monkeypatch.setattr(github, "_sleep", sleep_mock)
+
+    response = github._request_raw("GET", "/repos/octocat/Hello-World")
+
+    assert response.status_code == 200
+    assert mock_request.call_count == 2
+    sleep_mock.assert_called_once_with(1)
+
+
+def test_request_raw_does_not_retry_a_second_429(monkeypatch):
+    mock_request = Mock(
+        return_value=MockResponse(
+            json_data={"message": "rate limited"},
+            status_code=429,
+            headers={"Retry-After": "1"},
+        )
+    )
+    monkeypatch.setattr(github.requests, "request", mock_request)
+    monkeypatch.setattr(github, "_sleep", Mock())
+
+    with pytest.raises(RuntimeError, match="rate limited"):
+        github._request_raw("GET", "/repos/octocat/Hello-World")
+
+    assert mock_request.call_count == 2
+
+
+def test_request_raw_does_not_retry_429_on_write(monkeypatch):
+    mock_request = Mock(
+        return_value=MockResponse(
+            json_data={"message": "rate limited"},
+            status_code=429,
+            headers={"Retry-After": "1"},
+        )
+    )
+    monkeypatch.setattr(github.requests, "request", mock_request)
+    sleep_mock = Mock()
+    monkeypatch.setattr(github, "_sleep", sleep_mock)
+
+    with pytest.raises(RuntimeError, match="rate limited"):
+        github._request_raw("POST", "/repos/octocat/Hello-World/issues")
+
+    assert mock_request.call_count == 1
+    sleep_mock.assert_not_called()
+
+
+def test_request_raw_does_not_retry_429_with_excessive_retry_after(monkeypatch):
+    mock_request = Mock(
+        return_value=MockResponse(
+            json_data={"message": "rate limited"},
+            status_code=429,
+            headers={"Retry-After": str(github.MAX_RETRY_AFTER_SECONDS + 1)},
+        )
+    )
+    monkeypatch.setattr(github.requests, "request", mock_request)
+    sleep_mock = Mock()
+    monkeypatch.setattr(github, "_sleep", sleep_mock)
+
+    with pytest.raises(RuntimeError, match="rate limited"):
+        github._request_raw("GET", "/repos/octocat/Hello-World")
+
+    assert mock_request.call_count == 1
+    sleep_mock.assert_not_called()
+
+
+def test_request_raw_allow_retry_false_skips_429_retry(monkeypatch):
+    """github_list_issues opts out of the retry: its sleep + second attempt
+    run inside _request_raw, invisible to the caller's aggregate deadline,
+    and a mid-pagination 429 already has a better path there (an immediate
+    resumable partial via truncation_reason="request_failed")."""
+    mock_request = Mock(
+        return_value=MockResponse(
+            json_data={"message": "rate limited"},
+            status_code=429,
+            headers={"Retry-After": "1"},
+        )
+    )
+    monkeypatch.setattr(github.requests, "request", mock_request)
+    sleep_mock = Mock()
+    monkeypatch.setattr(github, "_sleep", sleep_mock)
+
+    with pytest.raises(RuntimeError, match="rate limited"):
+        github._request_raw("GET", "/repos/octocat/Hello-World", allow_retry=False)
+
+    assert mock_request.call_count == 1
+    sleep_mock.assert_not_called()
+
+
+def test_list_issues_does_not_sleep_on_mid_pagination_429(monkeypatch):
+    """End-to-end pin of the allow_retry=False opt-out: a 429 on page 2
+    must produce the prompt resumable partial, not an in-call sleep that
+    blows the aggregate deadline."""
+    first_page = [{"number": 1, "title": "issue 1", "labels": []}]
+    mock_request = Mock(
+        side_effect=[
+            MockResponse(
+                json_data=first_page,
+                headers={"Link": '<https://api.github.com/x?page=2>; rel="next"'},
+            ),
+            MockResponse(
+                json_data={"message": "rate limited"},
+                status_code=429,
+                headers={"Retry-After": "1"},
+            ),
+        ]
+    )
+    monkeypatch.setattr(github.requests, "request", mock_request)
+    sleep_mock = Mock()
+    monkeypatch.setattr(github, "_sleep", sleep_mock)
+
+    result = json.loads(github.github_list_issues("octocat/Hello-World", limit=100))
+
+    assert result["status"] == "success"
+    assert result["truncated"] is True
+    assert result["truncation_reason"] == "request_failed"
+    assert result["next_page"] == 2
+    assert mock_request.call_count == 2  # no third (retry) request
+    sleep_mock.assert_not_called()
+
+
 @pytest.mark.parametrize(
     "limit, expected",
     [
@@ -361,6 +493,69 @@ def test_search_repositories_rejects_non_object_item(monkeypatch):
     assert "non-object item" in result["message"]
 
 
+def test_search_repositories_rejects_non_dict_body(monkeypatch):
+    """A 200 body that parses to a non-dict (e.g. a bare list) must not
+    reach result.get("items"), which would surface as an unhelpful
+    AttributeError -- same error class the item guards exist to prevent."""
+    monkeypatch.setattr(
+        github.requests,
+        "request",
+        Mock(return_value=MockResponse(json_data=[])),
+    )
+
+    result = json.loads(github.github_search_repositories("stars:>1"))
+
+    assert result["status"] == "error"
+    assert "non-object body" in result["message"]
+    assert "attribute" not in result["message"]
+
+
+def test_search_code_rejects_non_dict_body(monkeypatch):
+    monkeypatch.setattr(
+        github.requests,
+        "request",
+        Mock(return_value=MockResponse(json_data=[])),
+    )
+
+    result = json.loads(github.github_search_code("def parse"))
+
+    assert result["status"] == "error"
+    assert "non-object body" in result["message"]
+
+
+def test_list_tools_tolerate_next_page_none_feedback(monkeypatch):
+    """A caller mechanically feeding a previous response's next_page back
+    (null when not truncated) must get a normal page-1 result, not a
+    field-nameless TypeError from int(None)."""
+    monkeypatch.setattr(
+        github.requests,
+        "request",
+        Mock(return_value=MockResponse(json_data={"total_count": 0, "items": []})),
+    )
+
+    result = json.loads(github.github_search_repositories("stars:>1", page=None))
+
+    assert result["status"] == "success"
+
+    monkeypatch.setattr(
+        github.requests,
+        "request",
+        Mock(return_value=MockResponse(json_data=[])),
+    )
+    issues = json.loads(
+        github.github_list_issues("octocat/Hello-World", page=None, skip=None)
+    )
+    assert issues["status"] == "success"
+
+    pulls = json.loads(
+        github.github_list_pull_requests("octocat/Hello-World", page=None)
+    )
+    assert pulls["status"] == "success"
+
+    commits = json.loads(github.github_list_commits("octocat/Hello-World", page=None))
+    assert commits["status"] == "success"
+
+
 def test_search_repositories_sends_query_and_clamps_over_limit(monkeypatch):
     mock_request = Mock(
         return_value=MockResponse(json_data={"total_count": 0, "items": []})
@@ -381,11 +576,12 @@ def test_search_repositories_sends_query_and_clamps_over_limit(monkeypatch):
     assert mock_request.call_args.kwargs["timeout"] == github.DEFAULT_TIMEOUT_SECONDS
 
 
-def test_search_repositories_rejects_blank_query(monkeypatch):
+@pytest.mark.parametrize("query", ["", "   "])
+def test_search_repositories_rejects_blank_query(monkeypatch, query):
     mock_request = Mock()
     monkeypatch.setattr(github.requests, "request", mock_request)
 
-    result = json.loads(github.github_search_repositories("   "))
+    result = json.loads(github.github_search_repositories(query))
 
     assert result["status"] == "error"
     mock_request.assert_not_called()
@@ -1336,7 +1532,7 @@ def test_list_pull_requests_rejects_non_list_body(monkeypatch):
     result = json.loads(github.github_list_pull_requests("octocat/Hello-World"))
 
     assert result["status"] == "error"
-    assert "non-list body" in result["message"]
+    assert "non-list value" in result["message"]
 
 
 def test_list_pull_requests_rejects_invalid_state(monkeypatch):
@@ -2015,7 +2211,7 @@ def test_list_commits_rejects_non_list_body(monkeypatch):
     result = json.loads(github.github_list_commits("octocat/Hello-World"))
 
     assert result["status"] == "error"
-    assert "non-list body" in result["message"]
+    assert "non-list value" in result["message"]
 
 
 def test_list_commits_sends_path_and_clamps_over_limit(monkeypatch):
@@ -2128,11 +2324,12 @@ def test_search_code_sends_query_and_clamps_over_limit(monkeypatch):
     }
 
 
-def test_search_code_rejects_blank_query(monkeypatch):
+@pytest.mark.parametrize("query", ["", "   "])
+def test_search_code_rejects_blank_query(monkeypatch, query):
     mock_request = Mock()
     monkeypatch.setattr(github.requests, "request", mock_request)
 
-    result = json.loads(github.github_search_code(""))
+    result = json.loads(github.github_search_code(query))
 
     assert result["status"] == "error"
     mock_request.assert_not_called()

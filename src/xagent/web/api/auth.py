@@ -281,8 +281,15 @@ def _normalize_intercom_token_response(
     return {**token_data, "access_token": token}
 
 
+# One shared cap for every provider-supplied error detail echoed to the
+# browser -- both renderers below default to it so the two error shapes
+# (standard error/error_description, Intercom's error.list) can't silently
+# diverge by someone tuning one magic default and not the other.
+_OAUTH_ERROR_MESSAGE_LIMIT = 500
+
+
 def _extract_provider_error_message(
-    token_data: dict[str, Any], *, limit: int = 500
+    token_data: dict[str, Any], *, limit: int = _OAUTH_ERROR_MESSAGE_LIMIT
 ) -> str | None:
     """Best-effort human-readable detail for a token exchange that yielded no
     access_token.
@@ -305,7 +312,7 @@ def _extract_provider_error_message(
 
 
 def _bounded_oauth_error_message(
-    token_data: Dict[str, Any], *, limit: int = 500
+    token_data: Dict[str, Any], *, limit: int = _OAUTH_ERROR_MESSAGE_LIMIT
 ) -> str:
     """Bounded, allowlisted, HTML-escaped rendering of a token-endpoint
     error response for a `token_data["error"]` payload.

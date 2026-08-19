@@ -33,13 +33,20 @@ MAX_ISSUE_PAGES = 10
 # PR-heavy repo could otherwise hold one tool call for up to
 # MAX_ISSUE_PAGES * DEFAULT_TIMEOUT_SECONDS (5 minutes) before returning.
 MAX_ISSUE_LIST_SECONDS = 60
+# Bounded 429 retry for idempotent reads, mirroring the same policy already
+# used by jira.py/slack.py/intercom.py -- a single wait-and-retry on a small
+# Retry-After, never for writes (POST could double-apply a mutation if the
+# original request actually reached the server before being rate-limited).
+MAX_RETRY_AFTER_SECONDS = 30
 
-# A module-local binding, rather than calling time.monotonic() directly at
-# each call site, so tests can monkeypatch just this connector's clock
-# (monkeypatch.setattr(github, "_monotonic", ...)) instead of the singleton
-# stdlib time module, which would otherwise leak the fake clock into
-# unrelated code running in the same process for the duration of the test.
+# Module-local bindings, rather than calling time.monotonic()/time.sleep()
+# directly at each call site, so tests can monkeypatch just this connector's
+# clock (monkeypatch.setattr(github, "_monotonic"/"_sleep", ...)) instead of
+# the singleton stdlib time module, which would otherwise leak the fake
+# clock/no-op sleep into unrelated code running in the same process for the
+# duration of the test.
 _monotonic = time.monotonic
+_sleep = time.sleep
 
 _FORBIDDEN_REPO_CHARS = re.compile(r"[/?#]")
 
@@ -110,8 +117,11 @@ def _require_object_items(items: Any, *, context: str) -> None:
     response it actually was.
     """
     if not isinstance(items, list):
+        # "value", not "body": two call sites pass the search envelope's
+        # extracted `items` field rather than the response body itself, so
+        # naming the body here would misdiagnose which layer is malformed.
         raise ValueError(
-            f"GitHub returned a non-list body in {context} ({type(items).__name__})"
+            f"GitHub returned a non-list value in {context} ({type(items).__name__})"
         )
     if not all(isinstance(item, dict) for item in items):
         raise ValueError(f"GitHub returned a non-object item in {context}")
@@ -248,6 +258,7 @@ def _request_raw(
     params: dict[str, Any] | None = None,
     json_data: dict[str, Any] | None = None,
     timeout: float = DEFAULT_TIMEOUT_SECONDS,
+    allow_retry: bool = True,
 ) -> requests.Response:
     """Call the GitHub REST API and return the raw response (status/headers
     included) on success -- callers that only need the parsed JSON body
@@ -258,15 +269,42 @@ def _request_raw(
     validation failures (422), an "errors" list -- both are folded into the
     raised message, along with any rate-limit/retry headers present, rather
     than surfaced as a bare HTTP status.
+
+    allow_retry=False opts out of the bounded 429 retry below. A caller
+    running under its own wall-clock budget (github_list_issues) must pass
+    False: the retry's sleep + second attempt happen inside this call, so
+    they are invisible to any deadline the caller computed its `timeout`
+    from -- a 429 near that deadline would otherwise hold the call up to
+    `timeout + MAX_RETRY_AFTER_SECONDS + timeout` and blow the budget the
+    caller's timeout-capping exists to enforce.
     """
-    response = requests.request(
-        method=method,
-        url=f"{GITHUB_BASE_URL}{path}",
-        headers=_headers(),
-        params=params,
-        json=json_data,
-        timeout=timeout,
-    )
+    for attempt in (0, 1):
+        response = requests.request(
+            method=method,
+            url=f"{GITHUB_BASE_URL}{path}",
+            headers=_headers(),
+            params=params,
+            json=json_data,
+            timeout=timeout,
+        )
+        # Retry once, only for reads: a POST/PATCH/DELETE rejected with 429
+        # never reached GitHub's mutation logic, but replaying it anyway
+        # risks a double-apply if that assumption is ever wrong for some
+        # endpoint -- reads have no such risk.
+        if (
+            allow_retry
+            and response.status_code == 429
+            and attempt == 0
+            and method.upper() == "GET"
+        ):
+            try:
+                retry_after_seconds = int(response.headers.get("Retry-After", "0"))
+            except ValueError:
+                retry_after_seconds = 0
+            if 0 < retry_after_seconds <= MAX_RETRY_AFTER_SECONDS:
+                _sleep(retry_after_seconds)
+                continue
+        break
     if response.status_code >= 400:
         try:
             payload = response.json()
@@ -409,7 +447,7 @@ def github_search_repositories(query: str, limit: int = 20, page: int = 1) -> st
     """
     try:
         query = _require_nonblank(query, field="query")
-        start_page = max(1, int(page))
+        start_page = max(1, int(page or 1))
         response = _request_raw(
             "GET",
             "/search/repositories",
@@ -420,6 +458,14 @@ def github_search_repositories(query: str, limit: int = 20, page: int = 1) -> st
             },
         )
         result = response.json() if response.content else {}
+        if not isinstance(result, dict):
+            # A non-dict 200 body (e.g. a bare list) would otherwise raise
+            # an unhelpful AttributeError from .get() below -- the same
+            # error class _require_object_items exists to prevent.
+            raise ValueError(
+                "GitHub returned a non-object body for repository search "
+                f"({type(result).__name__})"
+            )
         raw_items = result.get("items") or []
         _require_object_items(raw_items, context="repository search results")
         repos = [_summarize_repo(repo) for repo in raw_items]
@@ -488,8 +534,8 @@ def github_list_issues(
         owner, name = _parse_repo(repo)
         state = _validate_state(state)
         max_results = _clamp_limit(limit)
-        start_page = max(1, int(page))
-        start_skip = max(0, int(skip))
+        start_page = max(1, int(page or 1))
+        start_skip = max(0, int(skip or 0))
         issues: list[dict[str, Any]] = []
         truncated = False
         # Mirrors `truncated` at every exit below so a caller can dispatch
@@ -535,11 +581,18 @@ def github_list_issues(
                 request_timeout = max(
                     1.0, min(DEFAULT_TIMEOUT_SECONDS, deadline - _monotonic())
                 )
+                # allow_retry=False: the retry's sleep + second attempt run
+                # inside _request_raw, invisible to this deadline -- a 429
+                # near the budget's end would hold the call ~60s past it.
+                # A mid-pagination 429 already has a better path here: the
+                # per-page handler below returns the collected pages as a
+                # resumable partial ("request_failed") immediately.
                 response = _request_raw(
                     "GET",
                     f"/repos/{owner}/{name}/issues",
                     params=params,
                     timeout=request_timeout,
+                    allow_retry=False,
                 )
                 # Parsing is inside this try too: a malformed 200 JSON body
                 # must be treated the same as a request failure -- outside
@@ -768,7 +821,7 @@ def github_list_pull_requests(
     try:
         owner, name = _parse_repo(repo)
         state = _validate_state(state)
-        start_page = max(1, int(page))
+        start_page = max(1, int(page or 1))
         response = _request_raw(
             "GET",
             f"/repos/{owner}/{name}/pulls",
@@ -981,7 +1034,7 @@ def github_list_commits(
     """
     try:
         owner, name = _parse_repo(repo)
-        start_page = max(1, int(page))
+        start_page = max(1, int(page or 1))
         params: dict[str, Any] = {"per_page": _clamp_limit(limit), "page": start_page}
         if path:
             params["path"] = path
@@ -1024,7 +1077,7 @@ def github_search_code(query: str, limit: int = 20, page: int = 1) -> str:
     """
     try:
         query = _require_nonblank(query, field="query")
-        start_page = max(1, int(page))
+        start_page = max(1, int(page or 1))
         response = _request_raw(
             "GET",
             "/search/code",
@@ -1035,6 +1088,13 @@ def github_search_code(query: str, limit: int = 20, page: int = 1) -> str:
             },
         )
         result = response.json() if response.content else {}
+        if not isinstance(result, dict):
+            # Same guard as github_search_repositories: a non-dict 200 body
+            # would raise an unhelpful AttributeError from .get() below.
+            raise ValueError(
+                "GitHub returned a non-object body for code search "
+                f"({type(result).__name__})"
+            )
         raw_items = result.get("items") or []
         _require_object_items(raw_items, context="code search results")
         items = [

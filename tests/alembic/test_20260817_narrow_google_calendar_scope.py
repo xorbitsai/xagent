@@ -85,7 +85,18 @@ def _mcp_servers(metadata: sa.MetaData) -> sa.Table:
         metadata,
         sa.Column("id", sa.Integer, primary_key=True),
         sa.Column("name", sa.String(100), nullable=False, unique=True),
+        sa.Column("transport", sa.String(50), nullable=False),
+        sa.Column("auth", sa.JSON, nullable=True),
     )
+
+
+def _official_calendar_server_row(id: int) -> dict:
+    return {
+        "id": id,
+        "name": "Google Calendar",
+        "transport": "oauth",
+        "auth": {"app_id": "google-calendar", "provider": "google"},
+    }
 
 
 def _user_mcpservers(metadata: sa.MetaData) -> sa.Table:
@@ -431,9 +442,7 @@ def test_upgrade_removes_orphaned_calendar_server_row_for_bare_google_only_user(
             sa.insert(oauth_table),
             {"id": 1, "user_id": 100, "provider": "google", "scope": None},
         )
-        connection.execute(
-            sa.insert(servers_table), {"id": 1, "name": "Google Calendar"}
-        )
+        connection.execute(sa.insert(servers_table), _official_calendar_server_row(1))
         connection.execute(
             sa.insert(user_servers_table),
             {"id": 1, "user_id": 100, "mcpserver_id": 1},
@@ -468,9 +477,7 @@ def test_upgrade_keeps_calendar_server_row_for_properly_connected_user(
                 "scope": migration.NEW_SCOPE,
             },
         )
-        connection.execute(
-            sa.insert(servers_table), {"id": 1, "name": "Google Calendar"}
-        )
+        connection.execute(sa.insert(servers_table), _official_calendar_server_row(1))
         connection.execute(
             sa.insert(user_servers_table),
             {"id": 1, "user_id": 200, "mcpserver_id": 1},
@@ -510,9 +517,7 @@ def test_upgrade_removes_calendar_server_row_for_a_user_revoked_this_run(
                 "scope": migration.OLD_SCOPE,
             },
         )
-        connection.execute(
-            sa.insert(servers_table), {"id": 1, "name": "Google Calendar"}
-        )
+        connection.execute(sa.insert(servers_table), _official_calendar_server_row(1))
         connection.execute(
             sa.insert(user_servers_table),
             {"id": 1, "user_id": 300, "mcpserver_id": 1},
@@ -541,8 +546,13 @@ def test_upgrade_orphan_cleanup_ignores_other_servers_and_users(tmp_path) -> Non
         connection.execute(
             sa.insert(servers_table),
             [
-                {"id": 1, "name": "Google Calendar"},
-                {"id": 2, "name": "Gmail"},
+                _official_calendar_server_row(1),
+                {
+                    "id": 2,
+                    "name": "Gmail",
+                    "transport": "oauth",
+                    "auth": {"app_id": "gmail", "provider": "google"},
+                },
             ],
         )
         connection.execute(
@@ -569,6 +579,157 @@ def test_upgrade_orphan_cleanup_ignores_other_servers_and_users(tmp_path) -> Non
         }
 
     assert remaining_server_ids == {2}
+
+
+def test_upgrade_orphan_cleanup_ignores_custom_non_oauth_server_with_same_name(
+    tmp_path,
+) -> None:
+    """N1 regression: an admin's custom, non-OAuth server can be named
+    "Google Calendar" too. Identifying the official row by name alone would
+    delete this unrelated server's associations; requiring
+    transport == "oauth" excludes it, since the connect flow itself
+    (_ensure_server_matches_oauth_app) would never let the official app
+    share a name with a non-OAuth row in the first place."""
+    migration = _load_migration_module()
+    engine = sa.create_engine(f"sqlite:///{tmp_path / 'test.db'}")
+    metadata = sa.MetaData()
+    oauth_table, servers_table, user_servers_table = _calendar_server_setup(metadata)
+    metadata.create_all(engine)
+
+    with engine.begin() as connection:
+        connection.execute(
+            sa.insert(servers_table),
+            {
+                "id": 1,
+                "name": "Google Calendar",
+                "transport": "stdio",
+                "auth": None,
+            },
+        )
+        connection.execute(
+            sa.insert(user_servers_table),
+            {"id": 1, "user_id": 100, "mcpserver_id": 1},
+        )
+        # This user has no google-calendar credential at all -- if the
+        # custom server were mistaken for the official one, this
+        # association would be (wrongly) removed.
+        connection.execute(
+            sa.insert(oauth_table),
+            {"id": 1, "user_id": 100, "provider": "google", "scope": None},
+        )
+
+        with patch.object(migration, "op", _operations(connection)):
+            migration.upgrade()
+
+        remaining_servers = connection.execute(
+            sa.select(user_servers_table.c.id)
+        ).fetchall()
+
+    assert len(remaining_servers) == 1
+
+
+def test_upgrade_orphan_cleanup_finds_renamed_official_calendar_server(
+    tmp_path,
+) -> None:
+    """N1 regression: an official Calendar row renamed by an admin keeps its
+    auth.app_id metadata. Matching by name alone would miss it entirely,
+    leaving its orphaned association in place."""
+    migration = _load_migration_module()
+    engine = sa.create_engine(f"sqlite:///{tmp_path / 'test.db'}")
+    metadata = sa.MetaData()
+    oauth_table, servers_table, user_servers_table = _calendar_server_setup(metadata)
+    metadata.create_all(engine)
+
+    with engine.begin() as connection:
+        connection.execute(
+            sa.insert(servers_table),
+            {
+                "id": 1,
+                "name": "Calendar (Legacy)",
+                "transport": "oauth",
+                "auth": {"app_id": "google-calendar", "provider": "google"},
+            },
+        )
+        connection.execute(
+            sa.insert(user_servers_table),
+            {"id": 1, "user_id": 100, "mcpserver_id": 1},
+        )
+        connection.execute(
+            sa.insert(oauth_table),
+            {"id": 1, "user_id": 100, "provider": "google", "scope": None},
+        )
+
+        with patch.object(migration, "op", _operations(connection)):
+            migration.upgrade()
+
+        remaining_servers = connection.execute(
+            sa.select(user_servers_table.c.id)
+        ).fetchall()
+
+    assert remaining_servers == []
+
+
+def test_upgrade_orphan_cleanup_handles_duplicate_logical_calendar_servers(
+    tmp_path,
+) -> None:
+    """N1 regression: after a rename, a reconnect can create a second,
+    fresh mcp_servers row under the now-free canonical name (MCPServer.name
+    is unique, so the renamed row and the new one coexist). Both carry
+    auth.app_id == "google-calendar" and both must be considered when
+    cleaning up orphaned associations."""
+    migration = _load_migration_module()
+    engine = sa.create_engine(f"sqlite:///{tmp_path / 'test.db'}")
+    metadata = sa.MetaData()
+    oauth_table, servers_table, user_servers_table = _calendar_server_setup(metadata)
+    metadata.create_all(engine)
+
+    with engine.begin() as connection:
+        connection.execute(
+            sa.insert(servers_table),
+            [
+                {
+                    "id": 1,
+                    "name": "Calendar (old)",
+                    "transport": "oauth",
+                    "auth": {"app_id": "google-calendar", "provider": "google"},
+                },
+                _official_calendar_server_row(2),
+            ],
+        )
+        connection.execute(
+            sa.insert(user_servers_table),
+            [
+                # Bare-google-only user, associated with the renamed row.
+                {"id": 1, "user_id": 100, "mcpserver_id": 1},
+                # Bare-google-only user, associated with the fresh row.
+                {"id": 2, "user_id": 101, "mcpserver_id": 2},
+                # Properly connected user on the fresh row -- must survive.
+                {"id": 3, "user_id": 200, "mcpserver_id": 2},
+            ],
+        )
+        connection.execute(
+            sa.insert(oauth_table),
+            [
+                {"id": 1, "user_id": 100, "provider": "google", "scope": None},
+                {"id": 2, "user_id": 101, "provider": "google", "scope": None},
+                {
+                    "id": 3,
+                    "user_id": 200,
+                    "provider": "google-calendar",
+                    "scope": migration.NEW_SCOPE,
+                },
+            ],
+        )
+
+        with patch.object(migration, "op", _operations(connection)):
+            migration.upgrade()
+
+        remaining_user_ids = {
+            row.user_id
+            for row in connection.execute(sa.select(user_servers_table.c.user_id))
+        }
+
+    assert remaining_user_ids == {200}
 
 
 def test_upgrade_skips_orphan_cleanup_when_calendar_server_row_is_absent(
@@ -918,7 +1079,9 @@ def postgres_engine():
             text(
                 "CREATE TABLE mcp_servers ("
                 "id SERIAL PRIMARY KEY, "
-                "name VARCHAR(100) NOT NULL UNIQUE)"
+                "name VARCHAR(100) NOT NULL UNIQUE, "
+                "transport VARCHAR(50) NOT NULL, "
+                "auth JSON)"
             )
         )
         conn.execute(
@@ -1004,9 +1167,7 @@ def test_postgresql_online_upgrade_removes_orphaned_calendar_server_row(
             sa.insert(oauth_table),
             {"id": 1, "user_id": 100, "provider": "google", "scope": None},
         )
-        connection.execute(
-            sa.insert(servers_table), {"id": 1, "name": "Google Calendar"}
-        )
+        connection.execute(sa.insert(servers_table), _official_calendar_server_row(1))
         connection.execute(
             sa.insert(user_servers_table),
             {"id": 1, "user_id": 100, "mcpserver_id": 1},

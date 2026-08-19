@@ -112,7 +112,7 @@ unsupported, self-inflicted deployment shape, not a normal one.
 
 After the revoke above, one further cleanup: a user whose *only* historical
 Calendar connection was the app_id-less "Connect Google" flow (batch-connect
-in web/api/auth.py) has a ``user_mcpservers`` row for the shared "Google
+in web/api/auth.py) has a ``user_mcpservers`` row for the official "Google
 Calendar" ``mcp_servers`` row, backed only by a bare ``provider == "google"``
 ``user_oauth`` row -- never a ``google-calendar`` one. Before the
 ``APPS_REQUIRING_APP_SCOPED_OAUTH_GRANT`` change above, that bare row was an
@@ -129,6 +129,44 @@ not being offered. ``_remove_orphaned_calendar_server_rows`` deletes the
 ``user_mcpservers`` row for any user who, after the revoke step above, has
 no ``google-calendar`` credential -- mirroring, retroactively, what the
 batch-connect flow now does prospectively.
+
+The official Calendar ``mcp_servers`` row is identified by ``_calendar_
+server_ids`` the same way runtime code already does (``get_app_for_mcp_
+server`` in web/mcp_apps.py): prefer the stable ``auth.app_id`` metadata a
+row carries once it has gone through the OAuth connect flow, falling back
+to matching the display name only for a legacy row that predates that
+metadata entirely -- and only ever among rows with ``transport ==
+"oauth"``, since ``_ensure_server_matches_oauth_app`` (web/api/auth.py)
+already refuses to let the official app share a name with an existing
+non-OAuth server. Matching on name alone, with no ``transport``/``auth``
+check, would both delete unrelated associations for an admin's custom,
+non-OAuth server that happens to share the name "Google Calendar", and miss
+an official row that was renamed while keeping its ``auth.app_id`` --
+``_calendar_server_ids`` returns every row that legitimately matches
+(there can be more than one: an official row can be renamed away from the
+canonical name while keeping ``app_id``, and a later reconnect can then
+create a second, fresh row under that now-free canonical name, since
+``MCPServer.name`` is unique) and logs a warning for a same-named row this
+migration deliberately leaves alone because it isn't OAuth transport.
+
+This server-association cleanup is online-only: it needs a live SELECT
+across ``mcp_servers``, ``user_mcpservers``, and ``user_oauth`` (which
+server is Calendar's, which users are still connected) that offline
+(``--sql``) generation has no connection to run, and unlike the revoke
+step above, deciding this from row content alone is not expressible as a
+single portable SQL predicate the way a scope-content LIKE match is --
+identifying the official row depends on interpreting a JSON column
+(``auth``) whose extraction syntax differs per dialect. An offline-applied
+upgrade therefore reaches this migration's catalog and ``user_oauth``
+state but *not* its ``user_mcpservers`` state: online and offline
+applications of this revision do not converge to the same database. A
+deployment relying on offline-generated SQL for this revision must run
+this cleanup separately (by hand, or by running the online path once
+against the same database) if the orphaned-association state matters to
+it; this migration does not fail closed to force that, since the rest of
+its offline behavior (the scope narrowing and grant revocation that most
+directly answer this PR's motivating Google App Verification requirement)
+remains both correct and complete on its own.
 
 This is a delete, matching this table's existing disconnect contract
 (``web/api/mcp.py`` deletes the row outright; there is no revoked/active
@@ -179,6 +217,8 @@ MCP_SERVERS_TABLE = sa.table(
     "mcp_servers",
     sa.column("id", sa.Integer),
     sa.column("name", sa.String),
+    sa.column("transport", sa.String),
+    sa.column("auth", sa.JSON),
 )
 
 USER_MCPSERVERS_TABLE = sa.table(
@@ -273,6 +313,61 @@ def _revoke_grants_carrying_the_old_calendar_scope(bind: sa.engine.Connection) -
         )
 
 
+def _calendar_server_ids(bind: sa.engine.Connection) -> list[int]:
+    """Official Calendar ``mcp_servers`` rows, identified the same way
+    runtime code already does (``get_app_for_mcp_server`` in
+    web/mcp_apps.py): prefer the stable ``auth.app_id`` metadata a row
+    carries once connected through the OAuth flow, falling back to the
+    display name only for a legacy row that predates that metadata
+    entirely. A row is only eligible at all if ``transport == "oauth"`` --
+    the connect flow itself (``_ensure_server_matches_oauth_app`` in
+    web/api/auth.py) refuses to let the official Calendar app share a name
+    with an existing non-OAuth server, so a same-named row that isn't OAuth
+    transport cannot be the official Calendar connector and must be left
+    alone; log it so an operator can look at the naming collision.
+
+    Returns every match, not one: an official row can be renamed while
+    keeping its ``auth.app_id``, and a later reconnect can then create a
+    second, fresh row under the canonical name (``MCPServer.name`` is
+    unique, so the old, renamed row and the new one coexist) -- both are
+    legitimately "the" Calendar server, and both need their orphaned
+    associations cleaned up.
+    """
+    rows = bind.execute(
+        sa.select(
+            MCP_SERVERS_TABLE.c.id,
+            MCP_SERVERS_TABLE.c.name,
+            MCP_SERVERS_TABLE.c.transport,
+            MCP_SERVERS_TABLE.c.auth,
+        )
+    ).fetchall()
+
+    matched_ids: list[int] = []
+    for row in rows:
+        if row.transport != "oauth":
+            if row.name == CALENDAR_SERVER_NAME:
+                logger.warning(
+                    "mcp_servers row %d is named '%s' but is not an OAuth "
+                    "server (transport=%r); leaving it untouched -- it "
+                    "cannot be the official Calendar connector.",
+                    row.id,
+                    CALENDAR_SERVER_NAME,
+                    row.transport,
+                )
+            continue
+
+        auth = row.auth if isinstance(row.auth, dict) else {}
+        if "app_id" in auth:
+            if auth.get("app_id") == APP_ID:
+                matched_ids.append(row.id)
+            continue
+
+        if row.name == CALENDAR_SERVER_NAME:
+            matched_ids.append(row.id)
+
+    return matched_ids
+
+
 def _remove_orphaned_calendar_server_rows(bind: sa.engine.Connection) -> None:
     inspector = sa.inspect(bind)
     required_tables = {"mcp_servers", "user_mcpservers", "user_oauth"}
@@ -289,18 +384,14 @@ def _remove_orphaned_calendar_server_rows(bind: sa.engine.Connection) -> None:
         column["name"] for column in inspector.get_columns("user_oauth")
     }
     if (
-        not {"id", "name"}.issubset(mcp_servers_columns)
+        not {"id", "name", "transport", "auth"}.issubset(mcp_servers_columns)
         or not {"id", "user_id", "mcpserver_id"}.issubset(user_mcpservers_columns)
         or not {"user_id", "provider"}.issubset(user_oauth_columns)
     ):
         return
 
-    calendar_server_id = bind.execute(
-        sa.select(MCP_SERVERS_TABLE.c.id).where(
-            MCP_SERVERS_TABLE.c.name == CALENDAR_SERVER_NAME
-        )
-    ).scalar_one_or_none()
-    if calendar_server_id is None:
+    calendar_server_ids = _calendar_server_ids(bind)
+    if not calendar_server_ids:
         return
 
     connected_user_ids = sa.select(USER_OAUTH_TABLE.c.user_id).where(
@@ -308,7 +399,7 @@ def _remove_orphaned_calendar_server_rows(bind: sa.engine.Connection) -> None:
     )
     result = bind.execute(
         sa.delete(USER_MCPSERVERS_TABLE).where(
-            USER_MCPSERVERS_TABLE.c.mcpserver_id == calendar_server_id,
+            USER_MCPSERVERS_TABLE.c.mcpserver_id.in_(calendar_server_ids),
             USER_MCPSERVERS_TABLE.c.user_id.not_in(connected_user_ids),
         )
     )

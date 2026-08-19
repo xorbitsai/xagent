@@ -10,7 +10,9 @@ This is irreversible. `downgrade()` restores the catalog's requested scope but c
 
 Do not downgrade this revision and re-upgrade it, and do not apply an offline-generated (`--sql`) script for it more than once, once Calendar connections have been made under the narrow scope: the empty/`NULL`-scope branch of the cleanup (see the migration's module docstring) cannot distinguish a genuinely new, narrow grant that omitted its scope echo from a pre-migration broad one, and a replay would delete the new grant too.
 
-Both the online and offline paths run the cleanup as a single, unbatched `DELETE` — this migration commits in one transaction regardless (`transaction_per_migration=True` on PostgreSQL, see `src/xagent/migrations/env.py`), so every revoked row's lock is held until that same commit either way; there is no batching to trade off, and no lock-duration difference between the two paths.
+Both the online and offline paths run the `user_oauth` revoke as a single, unbatched `DELETE` — this migration commits in one transaction regardless (`transaction_per_migration=True` on PostgreSQL, see `src/xagent/migrations/env.py`), so every revoked row's lock is held until that same commit either way; there is no batching to trade off, and no lock-duration difference between the two paths.
+
+The `user_mcpservers` orphaned-association cleanup, however, is **online-only**. Offline (`alembic upgrade --sql`) generation narrows the catalog and revokes `user_oauth` rows, but does not touch `user_mcpservers` at all — see the migration's module docstring for why (identifying the official Calendar server from row content isn't expressible as one portable SQL predicate the way the scope-content match is). An offline-applied upgrade does not reach the same database state as an online one. If a deployment relies on generating and applying `--sql` scripts for this revision, run the online migration path once against the same database afterward (or apply this specific revision online) if the orphaned-association cleanup matters to you; otherwise stale associations for bare-`google`-only Calendar users will persist indefinitely.
 
 ### Scope limitation
 
@@ -24,34 +26,63 @@ This migration does not call Google's token-revocation endpoint. The deleted loc
 
 ### Prerequisites and configuration
 
-No new environment variable, dependency, or infrastructure requirement. No mixed-version ordering constraint: an older worker reading a `google-calendar` row that was already narrowed (or already deleted) behaves the same as it would against any other disconnected Calendar account — there is no schema shape for an old worker to misinterpret.
+No new environment variable, dependency, or infrastructure requirement. The *schema* has no mixed-version ordering constraint: an older worker reading a `google-calendar` row that was already narrowed (or already deleted) behaves the same as it would against any other disconnected Calendar account.
 
-Before deployment, get a rough sense of exposure. Two separate counts matter -- rows the `user_oauth` cleanup can revoke, and users the runtime policy change disconnects regardless of what that cleanup does:
+The *code* policy change is a different story and does have a mixed-version window: `google-calendar`'s membership in `APPS_REQUIRING_APP_SCOPED_OAUTH_GRANT` (`web/mcp_apps.py`) takes effect the moment a given worker process starts running the new code, independent of when the migration runs against the database. During a rolling deploy where old and new worker processes run concurrently, an old worker still accepts a bare `google` row as a valid Calendar credential while a new worker rejects it for the same user -- which worker happens to handle a given request decides whether Calendar works for that user in that window. This resolves itself once every worker runs the new code; it is a transient rollout-window inconsistency, not a persistent one, but it is real and should be expected, not assumed away.
+
+Before deployment, get a precise count of affected users -- everyone who will lose Calendar access from either mechanism this migration/policy change touches, as one distinct set rather than two counts to eyeball and sum (PostgreSQL syntax; a SQLite deployment needs `json_extract(s.auth, '$.app_id')` in place of `s.auth->>'app_id'`):
 
 ```sql
--- Candidates for user_oauth revocation (not all of these necessarily carry
--- the old scope, but any that do will be deleted)
-SELECT count(*) FROM user_oauth WHERE provider = 'google-calendar';
+SELECT DISTINCT user_id FROM (
+  -- Users whose google-calendar grant will be revoked: the migration's
+  -- exact predicate (NULL/empty scope, or scope still containing the old,
+  -- full calendar scope) -- see _revoke_predicate in the migration.
+  SELECT user_id
+  FROM user_oauth
+  WHERE provider = 'google-calendar'
+    AND (
+      scope IS NULL
+      OR scope = ''
+      OR (' ' || scope || ' ') LIKE '% https://www.googleapis.com/auth/calendar %'
+    )
 
--- Users whose ONLY Calendar credential is a bare provider-level row: these
--- lose Calendar access from the APPS_REQUIRING_APP_SCOPED_OAUTH_GRANT policy
--- change alone, whether or not the query above finds anything for them
-SELECT count(DISTINCT um.user_id)
-FROM user_mcpservers um
-JOIN mcp_servers s ON s.id = um.mcpserver_id
-WHERE s.name = 'Google Calendar'
-  AND um.user_id NOT IN (
-    SELECT user_id FROM user_oauth WHERE provider = 'google-calendar'
-  );
+  UNION
+
+  -- Users whose Calendar server association will be orphaned once the
+  -- revoke above runs: they have no google-calendar row that will survive
+  -- it, whether because they never had one (bare-google-only, connected
+  -- via the app_id-less batch flow) or because their only one is being
+  -- revoked by the query above. Matches _calendar_server_ids in the
+  -- migration: prefer auth.app_id, fall back to name only for a legacy
+  -- row with no app_id key, and only ever among transport = 'oauth' rows.
+  SELECT um.user_id
+  FROM user_mcpservers um
+  JOIN mcp_servers s ON s.id = um.mcpserver_id
+  WHERE s.transport = 'oauth'
+    AND (
+      s.auth->>'app_id' = 'google-calendar'
+      OR (s.auth->>'app_id' IS NULL AND s.name = 'Google Calendar')
+    )
+    AND um.user_id NOT IN (
+      SELECT user_id
+      FROM user_oauth
+      WHERE provider = 'google-calendar'
+        AND NOT (
+          scope IS NULL
+          OR scope = ''
+          OR (' ' || scope || ' ') LIKE '% https://www.googleapis.com/auth/calendar %'
+        )
+    )
+) affected_users;
 ```
 
-A zero from the first query does not mean zero affected users -- check both.
+This is the exact set of users this migration disconnects from Calendar -- not an over- or under-count -- and is what to base user communication on.
 
 ### Deployment and migration steps
 
 1. Deploy the application version carrying this migration; the migration runs automatically as part of normal startup/migration application.
-2. Expect up to two log warnings: `Revoked %d google-calendar user_oauth grant(s) ...` and `Removed %d orphaned Calendar user_mcpservers row(s) ...`. Either can fire independently of the other -- a user can be affected by one, both, or neither.
-3. Communicate to affected users (the sum of both preflight counts above, not just the revoked-grant count) that they need to reconnect Google Calendar.
+2. Expect up to two log warnings: `Revoked %d google-calendar user_oauth grant(s) ...` and `Removed %d orphaned Calendar user_mcpservers row(s) ...`. Either can fire independently of the other -- a user can be affected by one, both, or neither. Neither log warning covers the mixed-version code-policy window described above.
+3. Communicate to affected users (the preflight query above, run once before the deploy) that they need to reconnect Google Calendar.
 
 ### Verification and monitoring
 

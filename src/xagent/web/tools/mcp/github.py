@@ -34,6 +34,13 @@ MAX_ISSUE_PAGES = 10
 # MAX_ISSUE_PAGES * DEFAULT_TIMEOUT_SECONDS (5 minutes) before returning.
 MAX_ISSUE_LIST_SECONDS = 60
 
+# A module-local binding, rather than calling time.monotonic() directly at
+# each call site, so tests can monkeypatch just this connector's clock
+# (monkeypatch.setattr(github, "_monotonic", ...)) instead of the singleton
+# stdlib time module, which would otherwise leak the fake clock into
+# unrelated code running in the same process for the duration of the test.
+_monotonic = time.monotonic
+
 _FORBIDDEN_REPO_CHARS = re.compile(r"[/?#]")
 
 
@@ -69,6 +76,20 @@ def _encode_file_path_segment(value: str, *, field: str) -> str:
     if not value or value in (".", ".."):
         raise ValueError(f"{field} contains characters that are not allowed: {value!r}")
     return quote(value, safe="")
+
+
+def _decode_base64_content(raw_content: str) -> bytes:
+    """Strict base64 decode of a Contents API `content` field.
+
+    GitHub wraps the base64 body with a newline every ~60 characters, which
+    `validate=True`'s non-alphabet check would otherwise reject as invalid --
+    whitespace is stripped first so only genuinely malformed input (bad
+    alphabet or padding, e.g. "!!!!") raises, rather than permissively
+    decoding to truncated/wrong bytes the way the default validate=False
+    does.
+    """
+    normalized = re.sub(r"\s", "", raw_content)
+    return base64.b64decode(normalized, validate=True)
 
 
 def _success(**payload: Any) -> str:
@@ -122,7 +143,26 @@ def _clamp_limit(limit: int, *, default: int = 30) -> int:
     return max(1, min(value, MAX_PER_PAGE))
 
 
-_LINK_REL_PATTERN = re.compile(r'rel=(?:"([^"]*)"|([^;,\s]+))', re.IGNORECASE)
+def _validate_positive_number(value: int, *, field: str) -> int:
+    """Reject a non-positive issue/pull-request number before it reaches an
+    authenticated route -- FastMCP's plain `int` schema doesn't enforce a
+    lower bound, and a direct Python call (as in tests) bypasses FastMCP
+    validation entirely, so 0/negative values would otherwise reach
+    `/issues/0` or `/pulls/-1` unchecked.
+    """
+    if int(value) < 1:
+        raise ValueError(f"{field} must be a positive integer, got: {value!r}")
+    return int(value)
+
+
+# Splits a Link header into its comma-separated entries structurally --
+# each entry is a "<uri>" followed by zero or more ";param" pieces up to
+# the next entry's comma. Matching the params ([^,]*) only AFTER the closing
+# ">" means the uri itself (group omitted, matched but not captured) is
+# never exposed to _LINK_REL_PATTERN below, so "rel=" text inside a target
+# URI (e.g. "<https://x/?rel=foo>") can't be mistaken for the parameter.
+_LINK_ENTRY_PATTERN = re.compile(r"<[^>]*>((?:\s*;[^,]*)*)")
+_LINK_REL_PATTERN = re.compile(r'rel\s*=\s*(?:"([^"]*)"|([^;,\s]+))', re.IGNORECASE)
 
 
 def _link_header_rels(link_header: str | None) -> set[str]:
@@ -133,18 +173,25 @@ def _link_header_rels(link_header: str | None) -> set[str]:
     page as truncated.
 
     GitHub always quotes the rel value (rel="next"), but RFC 8288 also
-    permits an unquoted token -- both forms are matched here rather than
-    only the quoted one, so a spec-compliant but differently-formatted
+    permits an unquoted token, and a quoted value may itself be a
+    whitespace-separated list of multiple relation types (rel="next last")
+    -- both forms, and multi-value rel, are handled here rather than only
+    a single quoted token, so a spec-compliant but differently-formatted
     response (e.g. from a proxy) isn't silently treated as having no rels
-    at all. Rel values are case-insensitive per the same RFC, so they're
-    lowercased to match callers' `"next" in ...` checks.
+    at all, or as having only one. Rel values are case-insensitive per the
+    same RFC, so they're lowercased to match callers' `"next" in ...` checks.
     """
     if not link_header:
         return set()
-    return {
-        (quoted or unquoted).lower()
-        for quoted, unquoted in _LINK_REL_PATTERN.findall(link_header)
-    }
+    rels: set[str] = set()
+    for entry_match in _LINK_ENTRY_PATTERN.finditer(link_header):
+        rel_match = _LINK_REL_PATTERN.search(entry_match.group(1))
+        if not rel_match:
+            continue
+        quoted, unquoted = rel_match.groups()
+        value = quoted if quoted is not None else unquoted
+        rels.update(token.lower() for token in value.split())
+    return rels
 
 
 def _request_raw(
@@ -318,7 +365,12 @@ def github_search_repositories(query: str, limit: int = 20) -> str:
         )
         repos = [_summarize_repo(repo) for repo in result.get("items") or []]
         return _success(
-            repositories=repos, total_count=result.get("total_count", len(repos))
+            repositories=repos,
+            total_count=result.get("total_count", len(repos)),
+            # GitHub can answer a 200 with incomplete_results=true when its
+            # search index times out -- dropping this would let a caller
+            # mistake a partial index result for an exhaustive one.
+            incomplete_results=bool(result.get("incomplete_results")),
         )
     except Exception as e:
         logger.error(f"Error searching GitHub repositories for {query!r}: {e}")
@@ -377,9 +429,9 @@ def github_list_issues(
         pages_fetched = 0
         has_next_page = False
         current_page = start_page
-        deadline = time.monotonic() + MAX_ISSUE_LIST_SECONDS
+        deadline = _monotonic() + MAX_ISSUE_LIST_SECONDS
         for current_page in range(start_page, start_page + MAX_ISSUE_PAGES):
-            if pages_fetched and time.monotonic() >= deadline:
+            if pages_fetched and _monotonic() >= deadline:
                 # The aggregate budget (not just the per-page timeout) is
                 # exhausted -- return what was collected so far as a
                 # resumable partial result rather than holding this call
@@ -391,6 +443,7 @@ def github_list_issues(
                 return _success(
                     issues=issues[:max_results],
                     truncated=True,
+                    truncation_reason="deadline",
                     next_page=current_page,
                     next_skip=0,
                 )
@@ -408,7 +461,7 @@ def github_list_issues(
                 # DEFAULT_TIMEOUT_SECONDS and blow past it before the
                 # pre-request check above ever gets to act on it.
                 request_timeout = max(
-                    1.0, min(DEFAULT_TIMEOUT_SECONDS, deadline - time.monotonic())
+                    1.0, min(DEFAULT_TIMEOUT_SECONDS, deadline - _monotonic())
                 )
                 response = _request_raw(
                     "GET",
@@ -421,6 +474,15 @@ def github_list_issues(
                 # it, response.json() raising would escape to the outer
                 # handler and discard every page already collected.
                 raw_page = response.json() if response.content else []
+                if not isinstance(raw_page, list):
+                    # A valid-JSON, non-list body (e.g. an error object
+                    # returned with a 2xx status) would otherwise reach the
+                    # per-item loop below and raise there -- outside this
+                    # try, discarding every page already collected.
+                    raise ValueError(
+                        "GitHub issues endpoint returned a non-list page "
+                        f"({type(raw_page).__name__})"
+                    )
             except Exception as page_exc:
                 if not pages_fetched:
                     raise
@@ -458,9 +520,24 @@ def github_list_issues(
             # fresh at index 0.
             page_skip = start_skip if current_page == start_page else 0
             hit_limit_mid_page = False
+            bad_item_error: str | None = None
             for index, issue in enumerate(raw_page):
                 if index < page_skip:
                     continue
+                if not isinstance(issue, dict):
+                    # A non-object entry (e.g. `[null]`) would otherwise
+                    # raise from `"pull_request" in issue` or
+                    # `_summarize_issue()`, outside any try, discarding
+                    # every page already collected. Stop short and resume
+                    # after this item instead of retrying it forever.
+                    bad_item_error = (
+                        "GitHub issues endpoint returned a non-object item "
+                        f"at page {current_page} index {index}: "
+                        f"{type(issue).__name__}"
+                    )
+                    next_page = current_page
+                    next_skip = index + 1
+                    break
                 if "pull_request" in issue:
                     continue
                 issues.append(_summarize_issue(issue))
@@ -483,6 +560,18 @@ def github_list_issues(
                     elif has_next_page:
                         next_page = current_page + 1
                     break
+            if bad_item_error:
+                logger.warning(
+                    f"GitHub issue pagination stopped early for {repo}: "
+                    f"{bad_item_error}"
+                )
+                return _success(
+                    issues=issues[:max_results],
+                    truncated=True,
+                    next_page=next_page,
+                    next_skip=next_skip,
+                    error=bad_item_error,
+                )
             if len(issues) >= max_results:
                 break
             if not has_next_page:
@@ -513,6 +602,7 @@ def github_get_issue(repo: str, issue_number: int) -> str:
     """
     try:
         owner, name = _parse_repo(repo)
+        issue_number = _validate_positive_number(issue_number, field="issue_number")
         result = _request("GET", f"/repos/{owner}/{name}/issues/{issue_number}")
         return _success(issue=_summarize_issue(result))
     except Exception as e:
@@ -555,6 +645,7 @@ def github_comment_on_issue(repo: str, issue_number: int, body: str) -> str:
     """
     try:
         owner, name = _parse_repo(repo)
+        issue_number = _validate_positive_number(issue_number, field="issue_number")
         result = _request(
             "POST",
             f"/repos/{owner}/{name}/issues/{issue_number}/comments",
@@ -600,6 +691,7 @@ def github_get_pull_request(repo: str, pull_number: int) -> str:
     """
     try:
         owner, name = _parse_repo(repo)
+        pull_number = _validate_positive_number(pull_number, field="pull_number")
         result = _request("GET", f"/repos/{owner}/{name}/pulls/{pull_number}")
         return _success(pull_request=_summarize_pull_request(result))
     except Exception as e:
@@ -669,7 +761,19 @@ def github_get_file_contents(repo: str, path: str, ref: str = "") -> str:
                 {
                     "name": entry.get("name"),
                     "path": entry.get("path"),
-                    "type": entry.get("type"),
+                    # A submodule entry can carry submodule_git_url with
+                    # type left as the legacy "file" -- surface the
+                    # authoritative marker instead of the possibly-stale
+                    # type field so a submodule isn't mistaken for a
+                    # readable file.
+                    "type": "submodule"
+                    if entry.get("submodule_git_url")
+                    else entry.get("type"),
+                    **(
+                        {"submodule_git_url": entry["submodule_git_url"]}
+                        if entry.get("submodule_git_url")
+                        else {}
+                    ),
                 }
                 for entry in result
             ]
@@ -679,6 +783,20 @@ def github_get_file_contents(repo: str, path: str, ref: str = "") -> str:
             # a complete listing (use the Git Trees API for larger ones).
             return _success(
                 type="directory", entries=entries, truncated=len(entries) >= 1000
+            )
+        submodule_git_url = result.get("submodule_git_url")
+        if submodule_git_url:
+            # A submodule can be returned with type="file" for backward
+            # compatibility (as well as the documented type="submodule")
+            # and no real content -- checked ahead of the "not a file"
+            # rejection below (which a type="file" submodule would
+            # otherwise slip past) so it isn't reported as a successful
+            # empty read.
+            return _success(
+                type="submodule",
+                path=result.get("path"),
+                sha=result.get("sha"),
+                submodule_git_url=submodule_git_url,
             )
         if result.get("type") != "file":
             return _error(f"Path '{path}' is not a file: type={result.get('type')}")
@@ -695,7 +813,13 @@ def github_get_file_contents(repo: str, path: str, ref: str = "") -> str:
             )
         raw_content = result.get("content") or ""
         if encoding == "base64":
-            decoded_bytes = base64.b64decode(raw_content)
+            try:
+                decoded_bytes = _decode_base64_content(raw_content)
+            except ValueError as decode_exc:
+                # Permissive (validate=False) decoding would otherwise turn
+                # non-alphabet input (e.g. "!!!!") into silently-truncated
+                # or empty bytes while still reporting success.
+                return _error(f"File '{path}' has invalid base64 content: {decode_exc}")
             try:
                 content = decoded_bytes.decode("utf-8")
                 content_encoding = "utf-8"
@@ -779,7 +903,11 @@ def github_search_code(query: str, limit: int = 20) -> str:
             }
             for item in result.get("items") or []
         ]
-        return _success(items=items, total_count=result.get("total_count", len(items)))
+        return _success(
+            items=items,
+            total_count=result.get("total_count", len(items)),
+            incomplete_results=bool(result.get("incomplete_results")),
+        )
     except Exception as e:
         logger.error(f"Error searching GitHub code for {query!r}: {e}")
         return _error(str(e))

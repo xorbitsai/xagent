@@ -300,6 +300,28 @@ def _extract_provider_error_message(token_data: dict[str, Any]) -> str | None:
     return None
 
 
+def _bounded_oauth_error_message(
+    token_data: Dict[str, Any], *, limit: int = 500
+) -> str:
+    """Bounded, allowlisted, HTML-escaped rendering of a token-endpoint
+    error response for a `token_data["error"]` payload.
+
+    Echoing `str(token_data)` in full (as this used to) was safe only by
+    accident: it relied on no provider's error payload ever containing a
+    token. Making GitHub's JSON error path reachable here (via the
+    provider-quirk Accept header) removed that accidental guarantee, so
+    only the standard OAuth2 `error`/`error_description` fields are
+    rendered now, with every other field dropped and the result capped in
+    length.
+    """
+    import html
+
+    error = str(token_data.get("error") or "unknown_error")
+    description = token_data.get("error_description")
+    message = error if not description else f"{error}: {description}"
+    return html.escape(message[:limit])
+
+
 def create_access_token(
     data: Dict[str, Any], expires_delta: Optional[timedelta] = None
 ) -> str:
@@ -1476,6 +1498,27 @@ def generic_oauth_callback(
     user_id = payload.get("user_id")
     app_id = payload.get("app_id")
 
+    if not app_id:
+        from ..mcp_apps import requires_app_scoped_oauth_grant
+
+        # Symmetric to generic_oauth_login's own guard: that guard only
+        # stops a NEW bare state from being minted, so it can't protect a
+        # bare state that was already signed (and is still within its
+        # 10-minute TTL) before this guard was deployed, or a future
+        # internal caller that reaches this callback with an app_id-less
+        # state directly. Checked here, before any token exchange or the
+        # delete-then-recreate UserOAuth write below, so a bare grant can
+        # never replace an existing app-scoped one for these providers.
+        if requires_app_scoped_oauth_grant(provider):
+            return HTMLResponse(
+                content=(
+                    "<h1>Cannot Connect</h1>"
+                    "<p>This connector must be started from its catalog "
+                    "entry.</p>"
+                ),
+                status_code=404,
+            )
+
     if app_id:
         # Reject a hidden app before spending the authorization code against
         # the real provider, not just before persisting -- is_visible_in_
@@ -1561,10 +1604,11 @@ def generic_oauth_callback(
         token_data = token_response.json()
 
         if "error" in token_data:
-            import html
-
             return HTMLResponse(
-                content=f"<h1>Error exchanging token</h1><p>{html.escape(str(token_data))}</p>",
+                content=(
+                    "<h1>Error exchanging token</h1>"
+                    f"<p>{_bounded_oauth_error_message(token_data)}</p>"
+                ),
                 status_code=400,
             )
 

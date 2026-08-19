@@ -156,54 +156,43 @@ def test_github_callback_requests_json_and_sends_secret_in_body(
     assert user_mcp.is_active is True
 
 
-def test_bare_github_login_does_not_activate_github_mcp_server(db_session, monkeypatch):
-    """A bare (app_id-less) GET /api/auth/github/login only ever requests
-    the provider row's identity-only default_scopes ("read:user"), never
-    the app's functional "repo"/"user:email" scopes -- registering "github"
-    in APPS_REQUIRING_APP_SCOPED_OAUTH_GRANT must keep the bare batch-connect
-    branch from activating the GitHub MCP server against that under-scoped
-    grant (which would otherwise report "connected" while every repo-scoped
-    tool then fails)."""
+def test_bare_github_callback_is_rejected_even_for_a_pre_existing_state(
+    db_session, monkeypatch
+):
+    """generic_oauth_login's own guard only stops a NEW bare state from being
+    minted -- it can't protect a bare (app_id-less) state that was already
+    signed before that guard was deployed and is still within its 10-minute
+    TTL, nor a future internal caller that reaches this callback directly
+    with one. The callback must therefore carry the same rejection, checked
+    before any token exchange or UserOAuth write, so a fresh user has no
+    identity-only grant persisted for a provider that requires an
+    app-scoped one."""
     db, user = db_session
-    # No app_id in the state -- this is the bare provider-only login path.
+    # No app_id in the state -- simulates a bare state minted before the
+    # callback-side guard existed (or a caller bypassing generic_oauth_login).
     state = create_access_token(
         data={"type": "oauth_state", "user_id": user.id, "provider": "github"},
         expires_delta=timedelta(minutes=10),
     )
     request = SimpleNamespace(query_params={"code": "github-code", "state": state})
 
-    monkeypatch.setattr(
-        auth_api.requests,
-        "post",
-        Mock(
-            return_value=MockResponse(
-                {
-                    "access_token": "bare-github-token",
-                    "token_type": "bearer",
-                    "scope": "read:user",
-                }
-            )
-        ),
+    post = Mock(
+        return_value=MockResponse(
+            {
+                "access_token": "bare-github-token",
+                "token_type": "bearer",
+                "scope": "read:user",
+            }
+        )
     )
-    monkeypatch.setattr(
-        auth_api.requests,
-        "get",
-        Mock(return_value=MockResponse({"id": 42, "login": "octocat"})),
-    )
+    monkeypatch.setattr(auth_api.requests, "post", post)
 
     response = generic_oauth_callback("github", request, db, _github_provider())
 
-    assert response.status_code == 200
-
-    # The bare grant is still persisted...
-    oauth_account = (
-        db.query(UserOAuth)
-        .filter(UserOAuth.user_id == user.id, UserOAuth.provider == "github")
-        .one()
-    )
-    assert oauth_account.access_token == "bare-github-token"
-
-    # ...but no GitHub MCP server is activated from it.
+    assert response.status_code == 404
+    # Rejected before the token exchange -- no request was ever made.
+    post.assert_not_called()
+    assert db.query(UserOAuth).filter(UserOAuth.user_id == user.id).first() is None
     assert db.query(MCPServer).filter(MCPServer.name == "GitHub").first() is None
 
 
@@ -291,6 +280,140 @@ def test_bare_github_login_does_not_disturb_an_existing_scoped_connection(
         .one()
     )
     assert user_mcp.is_active is True
+
+
+def test_bare_github_callback_does_not_disturb_an_existing_scoped_connection(
+    db_session, monkeypatch
+):
+    """The residual the login-time guard alone couldn't close: a bare state
+    minted before that guard existed (or reaching the callback through any
+    other path than generic_oauth_login) must not be allowed to delete and
+    replace an existing app-scoped grant, even though generic_oauth_login
+    itself is never consulted here."""
+    db, user = db_session
+
+    scoped_state = create_access_token(
+        data={
+            "type": "oauth_state",
+            "user_id": user.id,
+            "provider": "github",
+            "app_id": "github",
+        },
+        expires_delta=timedelta(minutes=10),
+    )
+    scoped_request = SimpleNamespace(
+        query_params={"code": "github-code", "state": scoped_state}
+    )
+    monkeypatch.setattr(
+        auth_api.requests,
+        "post",
+        Mock(
+            return_value=MockResponse(
+                {
+                    "access_token": "scoped-github-token",
+                    "token_type": "bearer",
+                    "scope": "repo,user:email",
+                }
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        auth_api.requests,
+        "get",
+        Mock(return_value=MockResponse({"id": 42, "login": "octocat"})),
+    )
+    setup_response = generic_oauth_callback(
+        "github", scoped_request, db, _github_provider()
+    )
+    assert setup_response.status_code == 200
+
+    # A stale bare state (as if minted before this guard was deployed)
+    # reaches the callback directly, bypassing generic_oauth_login entirely.
+    bare_state = create_access_token(
+        data={"type": "oauth_state", "user_id": user.id, "provider": "github"},
+        expires_delta=timedelta(minutes=10),
+    )
+    bare_request = SimpleNamespace(
+        query_params={"code": "bare-code", "state": bare_state}
+    )
+    bare_post = Mock(
+        return_value=MockResponse(
+            {
+                "access_token": "bare-github-token",
+                "token_type": "bearer",
+                "scope": "read:user",
+            }
+        )
+    )
+    monkeypatch.setattr(auth_api.requests, "post", bare_post)
+
+    bare_response = generic_oauth_callback(
+        "github", bare_request, db, _github_provider()
+    )
+
+    assert bare_response.status_code == 404
+    bare_post.assert_not_called()
+
+    # The original scoped connection and its active server are untouched.
+    oauth_account = (
+        db.query(UserOAuth)
+        .filter(UserOAuth.user_id == user.id, UserOAuth.provider == "github")
+        .one()
+    )
+    assert oauth_account.access_token == "scoped-github-token"
+    server = db.query(MCPServer).filter(MCPServer.name == "GitHub").one()
+    user_mcp = (
+        db.query(UserMCPServer)
+        .filter(
+            UserMCPServer.user_id == user.id,
+            UserMCPServer.mcpserver_id == server.id,
+        )
+        .one()
+    )
+    assert user_mcp.is_active is True
+
+
+def test_github_callback_bounds_token_exchange_error_response(db_session, monkeypatch):
+    """GitHub's JSON Accept header makes its JSON error path reachable
+    through the generic `"error" in token_data` branch -- that branch must
+    not echo the full decoded provider response (which could carry
+    unexpected/unbounded fields), only the standard error/error_description
+    fields, HTML-escaped."""
+    db, user = db_session
+    state = create_access_token(
+        data={
+            "type": "oauth_state",
+            "user_id": user.id,
+            "provider": "github",
+            "app_id": "github",
+        },
+        expires_delta=timedelta(minutes=10),
+    )
+    request = SimpleNamespace(query_params={"code": "bad-code", "state": state})
+    monkeypatch.setattr(
+        auth_api.requests,
+        "post",
+        Mock(
+            return_value=MockResponse(
+                {
+                    "error": "incorrect_client_credentials",
+                    "error_description": (
+                        "The client_id and/or client_secret passed are incorrect."
+                    ),
+                    "unexpected_field": "<script>alert(1)</script>",
+                }
+            )
+        ),
+    )
+
+    response = generic_oauth_callback("github", request, db, _github_provider())
+
+    assert response.status_code == 400
+    body = response.body.decode()
+    assert "incorrect_client_credentials" in body
+    assert "client_id and/or client_secret" in body
+    assert "unexpected_field" not in body
+    assert "<script>" not in body
 
 
 def test_non_github_callback_omits_accept_json_header(db_session, monkeypatch):

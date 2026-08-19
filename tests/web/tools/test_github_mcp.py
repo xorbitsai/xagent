@@ -266,6 +266,32 @@ def test_link_header_rels_ignores_malformed_header():
     assert github._link_header_rels("this is not a link header") == set()
 
 
+def test_link_header_rels_splits_multi_value_rel():
+    """RFC 8288 allows a single quoted rel to carry multiple, whitespace-
+    separated relation types (e.g. the last page also being "next" for a
+    single-page result) -- it must not be treated as one opaque token."""
+    header = '<https://api.github.com/x?page=1>; rel="next last"'
+    assert github._link_header_rels(header) == {"next", "last"}
+
+
+def test_link_header_rels_does_not_match_rel_text_inside_uri():
+    """A target URI that happens to contain the literal text "rel=" must
+    not be mistaken for the rel parameter itself."""
+    header = '<https://example.com/x?rel=foo>; rel="next"'
+    assert github._link_header_rels(header) == {"next"}
+
+
+def test_link_header_rels_handles_case_insensitive_header_lookup():
+    """requests' Response.headers is a case-insensitive mapping -- a
+    lower-cased "link" header key must still be found by callers using
+    response.headers.get("Link")."""
+    headers = {"link": '<https://api.github.com/x?page=2>; rel="next"'}
+    import requests as _requests
+
+    case_insensitive_headers = _requests.structures.CaseInsensitiveDict(headers)
+    assert github._link_header_rels(case_insensitive_headers.get("Link")) == {"next"}
+
+
 def test_search_repositories_returns_summaries(monkeypatch):
     monkeypatch.setattr(
         github.requests,
@@ -297,6 +323,27 @@ def test_search_repositories_returns_summaries(monkeypatch):
     assert result["status"] == "success"
     assert result["total_count"] == 1
     assert result["repositories"][0]["full_name"] == "octocat/Hello-World"
+    assert result["incomplete_results"] is False
+
+
+def test_search_repositories_flags_incomplete_results(monkeypatch):
+    """GitHub can answer a 200 with incomplete_results=true when its search
+    index times out -- dropping that flag would let a caller mistake a
+    partial result for an exhaustive one."""
+    monkeypatch.setattr(
+        github.requests,
+        "request",
+        Mock(
+            return_value=MockResponse(
+                json_data={"total_count": 500, "items": [], "incomplete_results": True}
+            )
+        ),
+    )
+
+    result = json.loads(github.github_search_repositories("stars:>1"))
+
+    assert result["status"] == "success"
+    assert result["incomplete_results"] is True
 
 
 def test_search_repositories_sends_query_and_clamps_over_limit(monkeypatch):
@@ -683,6 +730,73 @@ def test_list_issues_preserves_partial_results_on_malformed_json_body(monkeypatc
     assert "Expecting value" in result["error"]
 
 
+def test_list_issues_preserves_partial_results_on_non_list_page(monkeypatch):
+    """A valid-JSON but non-list page body (e.g. an object) must be treated
+    like a request-level failure, not iterated -- iterating a dict yields
+    its string keys, which would raise inside _summarize_issue() outside
+    any try, discarding issues already collected from earlier pages."""
+    first_page = [
+        {"number": i, "title": f"issue {i}", "labels": []} for i in range(1, 3)
+    ]
+    mock_request = Mock(
+        side_effect=[
+            MockResponse(
+                json_data=first_page,
+                headers={"Link": '<https://api.github.com/x?page=2>; rel="next"'},
+            ),
+            MockResponse(json_data={"message": "not a list"}),
+        ]
+    )
+    monkeypatch.setattr(github.requests, "request", mock_request)
+
+    result = json.loads(github.github_list_issues("octocat/Hello-World", limit=100_000))
+
+    assert result["status"] == "success"
+    assert len(result["issues"]) == 2
+    assert result["truncated"] is True
+    assert result["next_page"] == 2
+    assert "non-list page" in result["error"]
+
+
+def test_list_issues_preserves_partial_results_on_non_object_item(monkeypatch):
+    """A page that is a valid list but contains a non-object entry (e.g.
+    `[null]`) must not let that entry reach `"pull_request" in issue` or
+    `_summarize_issue()`, which would raise and discard every issue already
+    collected -- it should stop before the bad entry and offer a
+    continuation that resumes right after it."""
+    page_with_bad_item = [
+        {"number": 1, "title": "issue 1", "labels": []},
+        None,
+        {"number": 2, "title": "issue 2", "labels": []},
+    ]
+    mock_request = Mock(return_value=MockResponse(json_data=page_with_bad_item))
+    monkeypatch.setattr(github.requests, "request", mock_request)
+
+    result = json.loads(github.github_list_issues("octocat/Hello-World", limit=100_000))
+
+    assert result["status"] == "success"
+    assert len(result["issues"]) == 1
+    assert result["issues"][0]["number"] == 1
+    assert result["truncated"] is True
+    assert result["next_page"] == 1
+    assert result["next_skip"] == 2
+    assert "non-object item" in result["error"]
+
+    # Resuming from the offered cursor skips the bad item and picks up the
+    # remaining real issue.
+    mock_request.side_effect = [MockResponse(json_data=page_with_bad_item)]
+    resumed = json.loads(
+        github.github_list_issues(
+            "octocat/Hello-World",
+            limit=100_000,
+            page=result["next_page"],
+            skip=result["next_skip"],
+        )
+    )
+    assert resumed["status"] == "success"
+    assert [issue["number"] for issue in resumed["issues"]] == [2]
+
+
 def test_list_issues_stops_at_max_pages_and_reports_truncated(monkeypatch):
     """When every page is entirely pull requests and the Link header still
     reports more pages exist, the outer loop must still terminate at
@@ -740,13 +854,14 @@ def test_list_issues_stops_when_aggregate_time_budget_is_exceeded(monkeypatch):
     # Call order: deadline baseline, page 1's request-timeout calc (still
     # within budget), page 2's pre-request budget check (already exhausted).
     clock = iter([0.0, 0.0, github.MAX_ISSUE_LIST_SECONDS + 1])
-    monkeypatch.setattr(github.time, "monotonic", lambda: next(clock))
+    monkeypatch.setattr(github, "_monotonic", lambda: next(clock))
 
     result = json.loads(github.github_list_issues("octocat/Hello-World", limit=5))
 
     assert result["status"] == "success"
     assert result["issues"] == []
     assert result["truncated"] is True
+    assert result["truncation_reason"] == "deadline"
     assert result["next_page"] == 2
     assert result["next_skip"] == 0
 
@@ -770,7 +885,7 @@ def test_list_issues_caps_request_timeout_to_remaining_budget(monkeypatch):
     clock = iter(
         [0.0, 0.0, github.MAX_ISSUE_LIST_SECONDS - 5, github.MAX_ISSUE_LIST_SECONDS - 5]
     )
-    monkeypatch.setattr(github.time, "monotonic", lambda: next(clock))
+    monkeypatch.setattr(github, "_monotonic", lambda: next(clock))
 
     result = json.loads(github.github_list_issues("octocat/Hello-World", limit=2))
 
@@ -920,6 +1035,17 @@ def test_get_issue_builds_exact_url(monkeypatch):
     )
 
 
+@pytest.mark.parametrize("issue_number", [0, -1])
+def test_get_issue_rejects_non_positive_number(monkeypatch, issue_number):
+    mock_request = Mock()
+    monkeypatch.setattr(github.requests, "request", mock_request)
+
+    result = json.loads(github.github_get_issue("octocat/Hello-World", issue_number))
+
+    assert result["status"] == "error"
+    mock_request.assert_not_called()
+
+
 def test_create_issue_splits_comma_separated_labels(monkeypatch):
     mock_request = Mock(
         return_value=MockResponse(
@@ -959,6 +1085,19 @@ def test_comment_on_issue_posts_body(monkeypatch):
     assert mock_request.call_args.kwargs["url"].endswith(
         "/repos/octocat/Hello-World/issues/1/comments"
     )
+
+
+@pytest.mark.parametrize("issue_number", [0, -1])
+def test_comment_on_issue_rejects_non_positive_number(monkeypatch, issue_number):
+    mock_request = Mock()
+    monkeypatch.setattr(github.requests, "request", mock_request)
+
+    result = json.loads(
+        github.github_comment_on_issue("octocat/Hello-World", issue_number, "hi")
+    )
+
+    assert result["status"] == "error"
+    mock_request.assert_not_called()
 
 
 def test_list_pull_requests_returns_summaries(monkeypatch):
@@ -1044,6 +1183,19 @@ def test_get_pull_request_builds_exact_url(monkeypatch):
     )
 
 
+@pytest.mark.parametrize("pull_number", [0, -1])
+def test_get_pull_request_rejects_non_positive_number(monkeypatch, pull_number):
+    mock_request = Mock()
+    monkeypatch.setattr(github.requests, "request", mock_request)
+
+    result = json.loads(
+        github.github_get_pull_request("octocat/Hello-World", pull_number)
+    )
+
+    assert result["status"] == "error"
+    mock_request.assert_not_called()
+
+
 def test_create_pull_request_sends_head_and_base(monkeypatch):
     mock_request = Mock(
         return_value=MockResponse(json_data={"number": 7, "title": "add feature"})
@@ -1121,6 +1273,118 @@ def test_get_file_contents_returns_raw_base64_for_non_utf8_content(monkeypatch):
     assert result["encoding"] == "base64"
     assert result["content"] == encoded
     assert "�" not in result["content"]
+
+
+def test_get_file_contents_preserves_newline_wrapped_base64(monkeypatch):
+    """GitHub wraps the base64 body with a newline every ~60 characters --
+    the strict decoder must strip that whitespace rather than reject it as
+    invalid alphabet input."""
+    encoded = base64.b64encode(b"a" * 90).decode()
+    wrapped = "\n".join(encoded[i : i + 60] for i in range(0, len(encoded), 60))
+    monkeypatch.setattr(
+        github.requests,
+        "request",
+        Mock(
+            return_value=MockResponse(
+                json_data={
+                    "type": "file",
+                    "path": "main.py",
+                    "encoding": "base64",
+                    "content": wrapped,
+                }
+            )
+        ),
+    )
+
+    result = json.loads(
+        github.github_get_file_contents("octocat/Hello-World", "main.py")
+    )
+
+    assert result["status"] == "success"
+    assert result["content"] == "a" * 90
+
+
+def test_get_file_contents_rejects_malformed_base64(monkeypatch):
+    """Permissive (validate=False) decoding would otherwise turn
+    non-alphabet content into silently truncated/empty bytes while still
+    reporting success -- it must surface as an explicit error instead."""
+    monkeypatch.setattr(
+        github.requests,
+        "request",
+        Mock(
+            return_value=MockResponse(
+                json_data={
+                    "type": "file",
+                    "path": "main.py",
+                    "encoding": "base64",
+                    "content": "!!!!",
+                }
+            )
+        ),
+    )
+
+    result = json.loads(
+        github.github_get_file_contents("octocat/Hello-World", "main.py")
+    )
+
+    assert result["status"] == "error"
+    assert "invalid base64" in result["message"]
+
+
+def test_get_file_contents_flags_legacy_submodule_shape(monkeypatch):
+    """A submodule can be returned with the legacy type="file" plus
+    submodule_git_url and no real content -- it must not be reported as a
+    successful empty file read."""
+    monkeypatch.setattr(
+        github.requests,
+        "request",
+        Mock(
+            return_value=MockResponse(
+                json_data={
+                    "type": "file",
+                    "path": "vendor/lib",
+                    "sha": "abc123",
+                    "submodule_git_url": "https://github.com/octocat/lib.git",
+                }
+            )
+        ),
+    )
+
+    result = json.loads(
+        github.github_get_file_contents("octocat/Hello-World", "vendor/lib")
+    )
+
+    assert result["status"] == "success"
+    assert result["type"] == "submodule"
+    assert result["submodule_git_url"] == "https://github.com/octocat/lib.git"
+
+
+def test_get_file_contents_directory_flags_submodule_entries(monkeypatch):
+    monkeypatch.setattr(
+        github.requests,
+        "request",
+        Mock(
+            return_value=MockResponse(
+                json_data=[
+                    {"name": "main.py", "path": "src/main.py", "type": "file"},
+                    {
+                        "name": "lib",
+                        "path": "vendor/lib",
+                        "type": "file",
+                        "submodule_git_url": "https://github.com/octocat/lib.git",
+                    },
+                ]
+            )
+        ),
+    )
+
+    result = json.loads(
+        github.github_get_file_contents("octocat/Hello-World", "vendor")
+    )
+
+    submodule_entry = next(e for e in result["entries"] if e["name"] == "lib")
+    assert submodule_entry["type"] == "submodule"
+    assert submodule_entry["submodule_git_url"] == "https://github.com/octocat/lib.git"
 
 
 def test_get_file_contents_sends_ref_param_when_provided(monkeypatch):
@@ -1436,6 +1700,24 @@ def test_search_code_returns_items(monkeypatch):
 
     assert result["status"] == "success"
     assert result["items"][0]["repository"] == "octocat/Hello-World"
+    assert result["incomplete_results"] is False
+
+
+def test_search_code_flags_incomplete_results(monkeypatch):
+    monkeypatch.setattr(
+        github.requests,
+        "request",
+        Mock(
+            return_value=MockResponse(
+                json_data={"total_count": 500, "items": [], "incomplete_results": True}
+            )
+        ),
+    )
+
+    result = json.loads(github.github_search_code("def parse"))
+
+    assert result["status"] == "success"
+    assert result["incomplete_results"] is True
 
 
 def test_search_code_sends_query_and_clamps_over_limit(monkeypatch):

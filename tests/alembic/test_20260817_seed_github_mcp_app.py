@@ -155,6 +155,12 @@ def test_seed_rows_match_registry(tmp_path, monkeypatch):
     assert migration_provider["client_id"] == "sentinel-client-id"
     assert migration_provider["client_secret"] == "sentinel-client-secret"
     assert migration_provider["redirect_uri"] == "https://sentinel.example.com/callback"
+    # The cross-source comparison above would pass even if both the
+    # migration and the registry independently hardcoded the same wrong
+    # scope -- pin the expected value directly too, so a shared regression
+    # in either (or both) is caught.
+    assert migration_provider["default_scopes"] == ["read:user"]
+    assert registry_app["oauth_scopes"] == ["repo", "user:email"]
 
 
 def test_downgrade_removes_provider_and_app(tmp_path):

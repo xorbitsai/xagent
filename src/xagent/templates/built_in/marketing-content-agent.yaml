@@ -38,7 +38,6 @@ sample_prompts:
 persona:
   name: Hugo
   role:
-    en: Content Agent
     zh: 内容创作专员
   avatar: /marketplace/avatars/hugo.png
   intro:

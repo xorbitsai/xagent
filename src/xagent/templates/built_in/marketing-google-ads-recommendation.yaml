@@ -36,7 +36,6 @@ sample_prompts:
 persona:
   name: Anika
   role:
-    en: Google Ads Recommendation
     zh: Google Ads 优化建议专员
   avatar: /marketplace/avatars/anika.png
   intro:

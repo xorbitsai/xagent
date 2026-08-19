@@ -36,7 +36,6 @@ sample_prompts:
 persona:
   name: Zara
   role:
-    en: LinkedIn Content Manager
     zh: LinkedIn 内容经理
   avatar: /marketplace/avatars/zara.png
   intro:

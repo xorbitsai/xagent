@@ -34,7 +34,6 @@ sample_prompts:
 persona:
   name: Ellie
   role:
-    en: Inbox Manager
     zh: 收件箱管理专员
   avatar: /marketplace/avatars/ellie.png
   intro:

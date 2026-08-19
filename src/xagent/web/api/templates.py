@@ -100,7 +100,12 @@ class PersonaInfo(BaseModel):
     role: str = Field(
         ..., description="Localized job-title line, e.g. 'Social Media Content Manager'"
     )
-    avatar: Optional[str] = Field(default=None, description="URL to the avatar image")
+    avatar: Optional[str] = Field(
+        default=None,
+        description="Path to the avatar image, e.g. '/marketplace/avatars/maya.png' - "
+        "an app-relative path resolved against the frontend origin, not a "
+        "standalone URL usable from any context",
+    )
     intro: str = Field(
         default="",
         description="Localized opening message sent after the agent is hired",
@@ -216,11 +221,13 @@ def build_persona_info(
 
     return PersonaInfo(
         name=persona["name"],
-        role=get_localized_value(persona.get("role", {}), lang, ""),
+        # get_localized_value already returns `default` for a None input,
+        # so a bare .get(key) (no {}/[] fallback) is enough here.
+        role=get_localized_value(persona.get("role"), lang, ""),
         avatar=persona.get("avatar"),
-        intro=get_localized_value(persona.get("intro", {}), lang, ""),
+        intro=get_localized_value(persona.get("intro"), lang, ""),
         kickoff_questions=get_localized_value(
-            persona.get("kickoff_questions", {}), lang, []
+            persona.get("kickoff_questions"), lang, []
         ),
     )
 
@@ -300,8 +307,9 @@ def get_hired_agent_map(
     flow's resolve-created agent) so a workforce-builder instance created
     from the same template under a user-chosen name doesn't count - the
     same origin scoping `resolve_agent_from_template`'s reuse query uses.
-    Lowest id wins if somehow more than one exists, matching that query's
-    own tie-break.
+    At most one row per (user_id, template_id) can exist here:
+    `AGENT_TEMPLATE_QUICK_ACCESS_UNIQUE_INDEX` enforces that pair unique at
+    the database level for this origin, so there is no tie to break.
     """
     if not template_ids:
         return {}
@@ -313,13 +321,9 @@ def get_hired_agent_map(
             Agent.template_id.in_(template_ids),
             Agent.origin == AgentOrigin.TEMPLATE_QUICK_ACCESS.value,
         )
-        .order_by(Agent.id)
         .all()
     )
-    hired_agent_id_by_template_id: dict[str, int] = {}
-    for template_id, agent_id in rows:
-        hired_agent_id_by_template_id.setdefault(template_id, agent_id)
-    return hired_agent_id_by_template_id
+    return {template_id: agent_id for template_id, agent_id in rows}
 
 
 def is_template_liked(db: Session, user_id: int, template_id: str) -> bool:

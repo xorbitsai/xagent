@@ -36,7 +36,6 @@ sample_prompts:
 persona:
   name: Vera
   role:
-    en: Research & Enricher
     zh: 调研与信息增强专员
   avatar: /marketplace/avatars/vera.png
   intro:

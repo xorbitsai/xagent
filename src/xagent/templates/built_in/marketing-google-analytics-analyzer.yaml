@@ -36,7 +36,6 @@ sample_prompts:
 persona:
   name: Kai
   role:
-    en: Google Analytics Analyzer
     zh: Google Analytics 分析专员
   avatar: /marketplace/avatars/kai.png
   intro:

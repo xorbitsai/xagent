@@ -403,61 +403,15 @@ persona:
         assert template["persona"] is None
 
     @pytest.mark.asyncio
-    async def test_persona_missing_name_is_rejected(self, temp_templates_dir):
-        """persona 缺少 name 时，该模板应被跳过而不是让整个模板目录加载失败。"""
-        bad_template = temp_templates_dir / "bad_persona_name.yaml"
-        bad_template.write_text(
-            """
-id: bad_persona_name
-name: Bad Persona Name Template
-category: Support
-descriptions:
-  en: A template with a persona missing its name
-  zh: 一个 persona 缺少 name 的模板
-persona:
-  role:
-    en: Some Role
-"""
-        )
-
-        manager = TemplateManager(templates_root=temp_templates_dir)
-        await manager.initialize()
-
-        template = await manager.get_template("bad_persona_name")
-        assert template is None
-
-    @pytest.mark.asyncio
-    async def test_persona_role_without_locale_dict_is_rejected(
+    async def test_persona_role_missing_en_falls_back_to_template_name_end_to_end(
         self, temp_templates_dir
     ):
-        """persona.role 必须按语言分组（{"en": ...}），写成裸字符串会静默
-        跳过本地化解析，因此在解析阶段就应当拒绝该写法。"""
-        bad_template = temp_templates_dir / "flat_persona_role.yaml"
-        bad_template.write_text(
-            """
-id: flat_persona_role
-name: Flat Persona Role Template
-category: Support
-descriptions:
-  en: A template with a flat persona.role
-  zh: 一个 persona.role 为扁平字符串的模板
-persona:
-  name: Nia
-  role: Some Role
-"""
-        )
-
-        manager = TemplateManager(templates_root=temp_templates_dir)
-        await manager.initialize()
-
-        template = await manager.get_template("flat_persona_role")
-        assert template is None
-
-    @pytest.mark.asyncio
-    async def test_persona_role_missing_en_is_rejected(self, temp_templates_dir):
-        """persona.role 至少要有 'en' 键，否则默认语言下没有可展示的职位文案。"""
-        bad_template = temp_templates_dir / "no_en_persona_role.yaml"
-        bad_template.write_text(
+        """A persona.role authored with no 'en' key loads successfully - the
+        full YAML pipeline backfills persona.role.en from the template's
+        own top-level `name` (see the unit-level assertion in
+        TestValidatePersona for the exact mechanics)."""
+        template_file = temp_templates_dir / "no_en_persona_role.yaml"
+        template_file.write_text(
             """
 id: no_en_persona_role
 name: No En Persona Role Template
@@ -476,67 +430,9 @@ persona:
         await manager.initialize()
 
         template = await manager.get_template("no_en_persona_role")
-        assert template is None
-
-    @pytest.mark.asyncio
-    async def test_persona_intro_missing_en_is_rejected(self, temp_templates_dir):
-        """persona.intro 若被作者填写，至少要有 'en' 键——否则
-        get_localized_value 对英文请求会静默回落成空字符串，Hire 流程会发出
-        一条空白的开场消息而不是报错。"""
-        bad_template = temp_templates_dir / "no_en_persona_intro.yaml"
-        bad_template.write_text(
-            """
-id: no_en_persona_intro
-name: No En Persona Intro Template
-category: Support
-descriptions:
-  en: A template with a persona.intro missing 'en'
-  zh: 一个 persona.intro 缺少 'en' 的模板
-persona:
-  name: Nia
-  role:
-    en: Some Role
-  intro:
-    zh: 你好，我是 Nia。
-"""
-        )
-
-        manager = TemplateManager(templates_root=temp_templates_dir)
-        await manager.initialize()
-
-        template = await manager.get_template("no_en_persona_intro")
-        assert template is None
-
-    @pytest.mark.asyncio
-    async def test_persona_kickoff_questions_missing_en_is_rejected(
-        self, temp_templates_dir
-    ):
-        """persona.kickoff_questions 若被作者填写，同样至少要有 'en' 键，
-        理由与 persona.intro 相同。"""
-        bad_template = temp_templates_dir / "no_en_persona_kickoff.yaml"
-        bad_template.write_text(
-            """
-id: no_en_persona_kickoff
-name: No En Persona Kickoff Template
-category: Support
-descriptions:
-  en: A template with persona.kickoff_questions missing 'en'
-  zh: 一个 persona.kickoff_questions 缺少 'en' 的模板
-persona:
-  name: Nia
-  role:
-    en: Some Role
-  kickoff_questions:
-    zh:
-    - 第一个问题？
-"""
-        )
-
-        manager = TemplateManager(templates_root=temp_templates_dir)
-        await manager.initialize()
-
-        template = await manager.get_template("no_en_persona_kickoff")
-        assert template is None
+        assert template is not None
+        assert template["persona"]["role"]["en"] == "No En Persona Role Template"
+        assert template["persona"]["role"]["zh"] == "某个角色"
 
     @pytest.mark.asyncio
     async def test_persona_intro_and_kickoff_without_en_key_still_optional(
@@ -544,7 +440,9 @@ persona:
     ):
         """persona.intro / persona.kickoff_questions themselves stay
         optional - omitting them entirely (not just their 'en' key) must
-        not fail load, unlike persona.role which is always required."""
+        not fail load. Unlike persona.role (backfilled from the template's
+        `name` - see the test above), intro/kickoff have no fallback
+        content, so an empty dict is the honest result of "not authored"."""
         template_file = temp_templates_dir / "persona_no_intro.yaml"
         template_file.write_text(
             """
@@ -567,6 +465,201 @@ persona:
         assert template is not None
         assert template["persona"]["intro"] == {}
         assert template["persona"]["kickoff_questions"] == {}
+
+    @pytest.mark.asyncio
+    async def test_invalid_persona_skips_only_that_template(self, temp_templates_dir):
+        """The end-to-end half of what TestValidatePersona covers at the
+        unit level: a persona that fails validation must make the loader
+        skip that one template (like any other parse failure), not crash
+        the whole directory load or slip through unvalidated."""
+        bad_template = temp_templates_dir / "flat_persona_role.yaml"
+        bad_template.write_text(
+            """
+id: flat_persona_role
+name: Flat Persona Role Template
+category: Support
+descriptions:
+  en: A template with a flat persona.role
+persona:
+  name: Nia
+  role: Some Role
+"""
+        )
+
+        manager = TemplateManager(templates_root=temp_templates_dir)
+        await manager.initialize()
+
+        assert await manager.get_template("flat_persona_role") is None
+        # The sibling fixture templates in temp_templates_dir still load.
+        assert await manager.list_templates()
+
+
+class TestValidatePersona:
+    """Unit tests calling TemplateManager._validate_persona directly - the
+    same stronger pattern TestTemplateManager.test_invalid_workforce_config_raises
+    already uses for _validate_workforce_config, so each rejection asserts
+    the actual error message (not just "the template failed to load",
+    which passes for any unrelated parse failure too)."""
+
+    @pytest.fixture
+    def manager(self, tmp_path):
+        return TemplateManager(templates_root=tmp_path)
+
+    def test_none_is_a_no_op(self, manager):
+        """persona is optional; None must not raise."""
+        manager._validate_persona(None)
+
+    def test_not_a_mapping_is_rejected(self, manager):
+        for bad_value in ("a string", ["a", "list"], 42):
+            with pytest.raises(ValueError, match="persona.*must be a mapping"):
+                manager._validate_persona(bad_value)
+
+    def test_unknown_key_is_rejected(self, manager):
+        """A typo'd or misspelled key (`avator`, `kickoff_question` singular)
+        must fail loudly rather than silently parsing as an absent field -
+        the whole point of `persona` being a real, validated schema."""
+        persona = {"name": "Nia", "avator": "/marketplace/avatars/nia.png"}
+        with pytest.raises(ValueError, match=r"unknown key\(s\).*avator"):
+            manager._validate_persona(persona)
+
+    def test_missing_name_is_rejected(self, manager):
+        with pytest.raises(ValueError, match="persona.name"):
+            manager._validate_persona({"role": {"en": "Some Role"}})
+
+    def test_name_whitespace_is_stripped_in_place(self, manager):
+        persona = {"name": "  Nia  "}
+        manager._validate_persona(persona)
+        assert persona["name"] == "Nia"
+
+    def test_role_flat_string_is_rejected(self, manager):
+        """persona.role must be locale-keyed ({"en": ...}); a flat string
+        would silently bypass localization if it were allowed through."""
+        with pytest.raises(ValueError, match="persona.role"):
+            manager._validate_persona({"name": "Nia", "role": "Some Role"})
+
+    def test_role_empty_locale_value_is_rejected(self, manager):
+        with pytest.raises(ValueError, match="persona.role.en"):
+            manager._validate_persona({"name": "Nia", "role": {"en": "   "}})
+
+    def test_role_explicit_null_is_treated_as_absent(self, manager):
+        """`role:` (YAML null) means "not provided", same as omitting the
+        key - it must not reach the isinstance(role, dict) check as None."""
+        persona = {"name": "Nia", "role": None}
+        manager._validate_persona(persona)
+        assert persona["role"] == {}
+
+    def test_role_falsy_junk_is_still_rejected(self, manager):
+        """Only None gets the treated-as-absent leniency: falsy junk like
+        `role: ""` or `role: []` is a type error, not "not provided" - an
+        `or {}` null-check would silently swallow these."""
+        for junk in ("", []):
+            with pytest.raises(ValueError, match="persona.role"):
+                manager._validate_persona({"name": "Nia", "role": junk})
+
+    def test_role_values_are_stripped_in_place(self, manager):
+        persona = {"name": "Nia", "role": {"en": "  Some Role  "}}
+        manager._validate_persona(persona)
+        assert persona["role"]["en"] == "Some Role"
+
+    def test_avatar_defaults_to_none_when_omitted(self, manager):
+        persona = {"name": "Nia"}
+        manager._validate_persona(persona)
+        assert persona["avatar"] is None
+
+    def test_avatar_wrong_type_is_rejected(self, manager):
+        with pytest.raises(ValueError, match="persona.avatar"):
+            manager._validate_persona({"name": "Nia", "avatar": 42})
+
+    def test_avatar_empty_string_is_rejected(self, manager):
+        with pytest.raises(ValueError, match="persona.avatar"):
+            manager._validate_persona({"name": "Nia", "avatar": "   "})
+
+    def test_avatar_is_stripped_in_place(self, manager):
+        persona = {"name": "Nia", "avatar": "  /marketplace/avatars/nia.png  "}
+        manager._validate_persona(persona)
+        assert persona["avatar"] == "/marketplace/avatars/nia.png"
+
+    def test_intro_flat_string_is_rejected(self, manager):
+        with pytest.raises(ValueError, match="persona.intro"):
+            manager._validate_persona({"name": "Nia", "intro": "Hi there"})
+
+    def test_intro_explicit_null_is_treated_as_absent(self, manager):
+        """Same null-vs-absent hazard as persona.role above, for the field
+        the PR review specifically flagged (m2): `intro:` (YAML null) used
+        to reach the isinstance check as None and raise the wrong message
+        ("must be a dict... not a flat string") instead of being treated
+        as simply not authored."""
+        persona = {"name": "Nia", "intro": None}
+        manager._validate_persona(persona)
+        assert persona["intro"] == {}
+
+    def test_intro_missing_en_is_rejected(self, manager):
+        """persona.intro, once authored at all, must include 'en' -
+        get_localized_value's fallback-to-'en' would otherwise resolve to
+        "" for an English requester, silently seeding a blank opening
+        message instead of failing loudly here at load time."""
+        persona = {"name": "Nia", "intro": {"zh": "你好，我是 Nia。"}}
+        with pytest.raises(ValueError, match="persona.intro.*'en'"):
+            manager._validate_persona(persona)
+
+    def test_intro_empty_locale_value_is_rejected(self, manager):
+        with pytest.raises(ValueError, match="persona.intro.en"):
+            manager._validate_persona({"name": "Nia", "intro": {"en": "  "}})
+
+    def test_intro_values_are_stripped_in_place(self, manager):
+        persona = {"name": "Nia", "intro": {"en": "  Hi there  "}}
+        manager._validate_persona(persona)
+        assert persona["intro"]["en"] == "Hi there"
+
+    def test_kickoff_questions_flat_list_is_rejected(self, manager):
+        """The likeliest real authoring mistake: writing kickoff_questions
+        as a plain list instead of locale-keyed, the same class of bug
+        `test_flat_list_sample_prompts_is_rejected` guards against for
+        sample_prompts."""
+        persona = {
+            "name": "Nia",
+            "kickoff_questions": ["What platforms are in scope?"],
+        }
+        with pytest.raises(ValueError, match="persona.kickoff_questions"):
+            manager._validate_persona(persona)
+
+    def test_kickoff_questions_explicit_null_is_treated_as_absent(self, manager):
+        persona = {"name": "Nia", "kickoff_questions": None}
+        manager._validate_persona(persona)
+        assert persona["kickoff_questions"] == {}
+
+    def test_kickoff_questions_empty_flat_list_is_still_rejected(self, manager):
+        """An empty flat list is the same shape mistake as a populated one
+        (test_kickoff_questions_flat_list_is_rejected) - being falsy must
+        not earn it the None-only treated-as-absent leniency."""
+        with pytest.raises(ValueError, match="persona.kickoff_questions"):
+            manager._validate_persona({"name": "Nia", "kickoff_questions": []})
+
+    def test_kickoff_questions_missing_en_is_rejected(self, manager):
+        persona = {
+            "name": "Nia",
+            "kickoff_questions": {"zh": ["第一个问题？"]},
+        }
+        with pytest.raises(ValueError, match="persona.kickoff_questions.*'en'"):
+            manager._validate_persona(persona)
+
+    def test_kickoff_questions_empty_item_is_rejected(self, manager):
+        persona = {"name": "Nia", "kickoff_questions": {"en": ["  "]}}
+        with pytest.raises(ValueError, match="persona.kickoff_questions.en"):
+            manager._validate_persona(persona)
+
+    def test_kickoff_questions_non_string_item_is_rejected(self, manager):
+        persona = {"name": "Nia", "kickoff_questions": {"en": [42]}}
+        with pytest.raises(ValueError, match="persona.kickoff_questions.en"):
+            manager._validate_persona(persona)
+
+    def test_kickoff_questions_items_are_stripped_in_place(self, manager):
+        persona = {
+            "name": "Nia",
+            "kickoff_questions": {"en": ["  What platforms?  "]},
+        }
+        manager._validate_persona(persona)
+        assert persona["kickoff_questions"]["en"] == ["What platforms?"]
 
     @pytest.mark.asyncio
     async def test_skip_invalid_templates(self, temp_templates_dir):
@@ -640,6 +733,80 @@ persona:
             "operations-devops-ai-agent",
         ):
             assert expected_id in ids
+
+    def test_builtin_agent_templates_all_have_a_persona(self):
+        """Every 'agent'-type built-in template must carry a marketplace
+        persona - a newly added agent template with no persona would
+        otherwise silently ship a nameless, avatar-less marketplace card
+        with no test catching the gap. The single 'workforce'-type
+        template is deliberately excluded (its card renders from
+        workforce_config instead - see TemplateManager._enrich_template)."""
+        built_in_dir = (
+            Path(__file__).resolve().parents[2] / "src/xagent/templates/built_in"
+        )
+        manager = TemplateManager(templates_root=built_in_dir)
+        offenders = [
+            template_file.name
+            for template_file in built_in_dir.glob("*.yaml")
+            if (data := manager._parse_yaml_file(template_file)).get("type", "agent")
+            == "agent"
+            and data.get("persona") is None
+        ]
+
+        assert not offenders
+
+    def test_builtin_persona_avatars_resolve_to_committed_files(self):
+        """persona.avatar is an app-relative path resolved against the
+        Next.js frontend's own static assets (frontend/public/...), a
+        distinct convention from Agent.logo_url's /uploads/agent_logos
+        path or connections[].logo's external hotlinks (PR #1498 review,
+        M2/M3) - nothing ties it to a real committed file, so a future
+        rename or a typo'd path would ship a 404 image with no test
+        failure. Mirrors the existing connections/MCP-app invariant test
+        below for the same class of drift."""
+        repo_root = Path(__file__).resolve().parents[2]
+        built_in_dir = repo_root / "src/xagent/templates/built_in"
+        frontend_public_dir = repo_root / "frontend/public"
+        manager = TemplateManager(templates_root=built_in_dir)
+
+        offenders: list[str] = []
+        for template_file in built_in_dir.glob("*.yaml"):
+            persona = manager._parse_yaml_file(template_file).get("persona")
+            if not persona or not persona.get("avatar"):
+                continue
+            avatar_path = persona["avatar"]
+            if not avatar_path.startswith("/"):
+                offenders.append(
+                    f"{template_file.name}: not app-relative: {avatar_path}"
+                )
+                continue
+            if not (frontend_public_dir / avatar_path.lstrip("/")).is_file():
+                offenders.append(f"{template_file.name}: missing file: {avatar_path}")
+
+        assert not offenders
+
+    def test_builtin_persona_names_and_avatars_are_unique(self):
+        """Two templates sharing a persona name or avatar would make two
+        distinct marketplace cards look like the same AI teammate."""
+        built_in_dir = (
+            Path(__file__).resolve().parents[2] / "src/xagent/templates/built_in"
+        )
+        manager = TemplateManager(templates_root=built_in_dir)
+
+        names: list[str] = []
+        avatars: list[str] = []
+        for template_file in built_in_dir.glob("*.yaml"):
+            persona = manager._parse_yaml_file(template_file).get("persona")
+            if not persona:
+                continue
+            names.append(persona["name"])
+            if persona.get("avatar"):
+                avatars.append(persona["avatar"])
+
+        assert len(names) == len(set(names)), f"duplicate persona names: {names}"
+        assert len(avatars) == len(set(avatars)), (
+            f"duplicate persona avatars: {avatars}"
+        )
 
     def test_builtin_template_connections_resolve_to_a_registered_mcp_app(self):
         """A connections[].name that the build wizard can't resolve to a registered

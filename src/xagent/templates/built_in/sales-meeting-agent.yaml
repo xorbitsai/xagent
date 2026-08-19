@@ -40,7 +40,6 @@ sample_prompts:
 persona:
   name: Kevin
   role:
-    en: Meeting Agent
     zh: 会议纪要专员
   avatar: /marketplace/avatars/kevin.png
   intro:

@@ -36,7 +36,6 @@ sample_prompts:
 persona:
   name: Wren
   role:
-    en: KB Writer
     zh: 知识库撰写专员
   avatar: /marketplace/avatars/wren.png
   intro:

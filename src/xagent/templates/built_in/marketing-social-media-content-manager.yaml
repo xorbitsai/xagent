@@ -38,7 +38,6 @@ sample_prompts:
 persona:
   name: Maya
   role:
-    en: Social Media Content Manager
     zh: 社媒内容经理
   avatar: /marketplace/avatars/maya.png
   intro:

@@ -173,6 +173,12 @@ class TemplateManager:
         self._validate_sample_prompts(data["sample_prompts"])
         data.setdefault("persona", None)
         self._validate_persona(data["persona"])
+        if data["persona"] is not None:
+            # See _validate_persona's docstring: role.en is the one persona
+            # field allowed to be authored blank, precisely because this
+            # fallback exists - avoids 17+ templates each repeating their
+            # own top-level `name` verbatim under persona.role.en.
+            data["persona"]["role"].setdefault("en", data["name"])
 
         # agent_config default values
         agent_config = data["agent_config"]
@@ -337,74 +343,107 @@ class TemplateManager:
                         f"'sample_prompts.{locale}[{index}].highlights' must be a list of strings"
                     )
 
+    # The only keys _validate_persona recognizes. Enforced explicitly (not
+    # just "known keys are well-formed") so a typo'd or misspelled key
+    # (`avator`, `kickoff_question`) is rejected at load time instead of
+    # silently parsing as an absent field - see the docstring below.
+    _PERSONA_KEYS = frozenset({"name", "role", "avatar", "intro", "kickoff_questions"})
+
     def _validate_persona(self, persona: Any) -> None:
-        """Validate the (optional) `persona` shape at parse time - the
-        "AI Team Marketplace" card content (display name, avatar, and the
-        chat-opening intro/questions a Hire flow seeds). `None` (the
-        default) means the template shows up in the marketplace with no
-        persona treatment, e.g. a workforce-type template's card is
-        rendered from `workforce_config` instead. Locale-keyed fields
-        follow the same {'en': ..., 'zh': ...} shape as `descriptions` /
-        `sample_prompts` above, validated the same way so a malformed entry
-        fails loudly at load time rather than as a 500 the first time
-        `TemplateInfo`/`PersonaInfo` tries to build a response from it.
+        """Validate and normalize (strip values in place) the optional
+        `persona` block - the "AI Team Marketplace" card content (display
+        name, avatar, and the chat-opening intro/questions a Hire flow
+        seeds). `None` (the default) means the template shows up in the
+        marketplace with no persona treatment, e.g. a workforce-type
+        template's card is rendered from `workforce_config` instead.
+
+        `role`, `intro`, and `kickoff_questions` are locale-keyed the same
+        {'en': ..., 'zh': ...} shape as `descriptions` / `sample_prompts`
+        above, validated the same way so a malformed entry (including an
+        unrecognized key - a real risk given how similar this shape is to
+        its four siblings) fails loudly at load time rather than as a 500
+        the first time `TemplateInfo`/`PersonaInfo` tries to build a
+        response from it.
+
+        `role` and `intro`/`kickoff_questions` are deliberately NOT
+        symmetric, despite the shared shape: `role.en` may be omitted here
+        because `_parse_yaml_file` backfills it from the template's own
+        top-level `name` immediately after this returns, so there is
+        always a sensible non-blank value to localize. `intro` and
+        `kickoff_questions` have no such fallback - a blank opening
+        message is worse than refusing to load, so each requires an 'en'
+        entry the moment it is authored at all, rather than silently
+        resolving to "" for an English requester via
+        `get_localized_value`'s fallback-to-'en' behavior.
         """
         if persona is None:
             return
         if not isinstance(persona, dict):
             raise ValueError("'persona' must be a mapping or omitted")
 
-        name = persona.get("name")
-        if not isinstance(name, str) or not name.strip():
-            raise ValueError("'persona.name' must be a non-empty string")
-        persona["name"] = name.strip()
+        unknown_keys = set(persona) - self._PERSONA_KEYS
+        if unknown_keys:
+            raise ValueError(
+                f"'persona' has unknown key(s) {sorted(unknown_keys)} - "
+                f"expected only {sorted(self._PERSONA_KEYS)}"
+            )
 
+        self._require_string(persona, "name", path="persona")
+
+        # Only an explicit `null` (or an absent key) means "not provided" -
+        # `or {}` would also swallow falsy junk like `role: ""` or
+        # `kickoff_questions: []` that should fail the isinstance check.
         role = persona.get("role")
-        if not isinstance(role, dict) or "en" not in role:
+        if role is None:
+            role = {}
+        persona["role"] = role
+        if not isinstance(role, dict):
             raise ValueError(
                 "'persona.role' must be a dict keyed by locale (e.g. "
-                "{'en': ..., 'zh': ...}) with at least an 'en' key"
+                "{'en': ..., 'zh': ...}), not a flat string"
             )
         for locale, value in role.items():
             if not isinstance(value, str) or not value.strip():
                 raise ValueError(f"'persona.role.{locale}' must be a non-empty string")
+            role[locale] = value.strip()
 
-        avatar = persona.get("avatar")
-        if avatar is not None and (not isinstance(avatar, str) or not avatar.strip()):
-            raise ValueError("'persona.avatar' must be a non-empty string or omitted")
+        self._require_string(persona, "avatar", path="persona", required=False)
         persona.setdefault("avatar", None)
 
-        intro = persona.get("intro", {})
+        intro = persona.get("intro")
+        if intro is None:
+            intro = {}
+        persona["intro"] = intro
         if not isinstance(intro, dict):
             raise ValueError(
-                "'persona.intro' must be a dict keyed by locale, not a flat string"
+                "'persona.intro' must be a dict keyed by locale, not a flat "
+                "string (or null)"
             )
         if intro and "en" not in intro:
-            # Unlike sample_prompts (which has no primary locale to fall
-            # back to), intro is user-facing chat copy seeded verbatim into
-            # the first message a Hire flow sends - get_localized_value's
-            # fallback-to-'en' would otherwise resolve to "" for an English
-            # requester, silently sending a blank opening message instead
-            # of failing loudly here at load time.
             raise ValueError(
-                "'persona.intro' must contain at least an 'en' key when authored"
+                "'persona.intro' must contain at least an 'en' key when "
+                "authored - unlike persona.role, there is no template "
+                "field to fall back to"
             )
         for locale, value in intro.items():
             if not isinstance(value, str) or not value.strip():
                 raise ValueError(f"'persona.intro.{locale}' must be a non-empty string")
-        persona["intro"] = intro
+            intro[locale] = value.strip()
 
-        kickoff_questions = persona.get("kickoff_questions", {})
+        kickoff_questions = persona.get("kickoff_questions")
+        if kickoff_questions is None:
+            kickoff_questions = {}
+        persona["kickoff_questions"] = kickoff_questions
         if not isinstance(kickoff_questions, dict):
             raise ValueError(
                 "'persona.kickoff_questions' must be a dict keyed by locale "
-                "(e.g. {'en': [...], 'zh': [...]}), not a flat list"
+                "(e.g. {'en': [...], 'zh': [...]}), not a flat list (or null)"
             )
         if kickoff_questions and "en" not in kickoff_questions:
-            # Same fallback-to-empty hazard as intro above.
+            # Same fallback-to-blank hazard as persona.intro above.
             raise ValueError(
                 "'persona.kickoff_questions' must contain at least an 'en' "
-                "key when authored"
+                "key when authored - same reasoning as persona.intro above"
             )
         for locale, questions in kickoff_questions.items():
             if not isinstance(questions, list) or not all(
@@ -414,7 +453,7 @@ class TemplateManager:
                     f"'persona.kickoff_questions.{locale}' must be a list of "
                     "non-empty strings"
                 )
-        persona["kickoff_questions"] = kickoff_questions
+            kickoff_questions[locale] = [q.strip() for q in questions]
 
     def _enrich_template(self, template: Dict[str, Any]) -> Dict[str, Any]:
         """Merge connections into agent_config.tool_categories.

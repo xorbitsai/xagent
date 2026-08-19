@@ -38,7 +38,6 @@ sample_prompts:
 persona:
   name: Theo
   role:
-    en: Email Agent (Sales)
     zh: 邮件专员（销售）
   avatar: /marketplace/avatars/theo.png
   intro:

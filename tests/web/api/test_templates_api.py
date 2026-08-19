@@ -321,8 +321,8 @@ persona:
     zh: 社媒内容经理
   avatar: https://example.com/maya.png
   intro:
-    en: "Hi Gerard — I'm Maya, your Social Media Content Manager."
-    zh: 你好 Gerard，我是 Maya，你的社媒内容经理。
+    en: "Hi there — I'm Maya, your Social Media Content Manager."
+    zh: 你好，我是 Maya，你的社媒内容经理。
   kickoff_questions:
     en:
     - Which platforms are in scope?
@@ -353,6 +353,27 @@ version: "1.0"
 agent_config:
   instructions: |
     You are a plain agent.
+  skills: []
+  tool_categories: []
+"""
+    )
+    (templates_dir / "role_only_persona.yaml").write_text(
+        """
+id: role_only_persona
+name: Role Only Template
+category: Support
+descriptions:
+  en: A template whose persona authors only a name and role.
+persona:
+  name: Nia
+  role:
+    en: Some Role
+author: Xagent
+version: "1.0"
+
+agent_config:
+  instructions: |
+    You are Nia.
   skills: []
   tool_categories: []
 """
@@ -897,6 +918,42 @@ class TestTemplatePersona:
             assert response.status_code == 200
             assert response.json()["persona"] is None
 
+    def test_persona_falls_back_to_english_when_lang_is_omitted(
+        self, persona_mock_app_state, admin_headers
+    ):
+        with patch.object(client.app, "state", persona_mock_app_state):
+            response = client.get("/api/templates/with_persona", headers=admin_headers)
+            assert response.status_code == 200
+            assert response.json()["persona"]["role"] == "Social Media Content Manager"
+
+    def test_persona_falls_back_to_english_for_an_unrecognized_locale(
+        self, persona_mock_app_state, admin_headers
+    ):
+        with patch.object(client.app, "state", persona_mock_app_state):
+            response = client.get(
+                "/api/templates/with_persona?lang=fr", headers=admin_headers
+            )
+            assert response.status_code == 200
+            assert response.json()["persona"]["role"] == "Social Media Content Manager"
+
+    def test_persona_with_only_role_authored_yields_pydantic_defaults_not_a_500(
+        self, persona_mock_app_state, admin_headers
+    ):
+        """A persona authoring only name/role (no intro/kickoff_questions -
+        both fully optional, see TestValidatePersona) must resolve through
+        PersonaInfo's own field defaults (`intro=""`,
+        `kickoff_questions=[]`), not raise a pydantic ValidationError."""
+        with patch.object(client.app, "state", persona_mock_app_state):
+            response = client.get(
+                "/api/templates/role_only_persona?lang=en", headers=admin_headers
+            )
+            assert response.status_code == 200
+            persona = response.json()["persona"]
+            assert persona["name"] == "Nia"
+            assert persona["role"] == "Some Role"
+            assert persona["intro"] == ""
+            assert persona["kickoff_questions"] == []
+
 
 class TestTemplateHiredFlag:
     """测试 hired / hired_agent_id 是否正确反映当前用户的 quick-access agent"""
@@ -948,7 +1005,7 @@ class TestTemplateHiredFlag:
             assert detail["hired"] is True
             assert detail["hired_agent_id"] == agent_id
 
-    def test_ignores_non_quick_access_origin(
+    def test_hired_resolves_to_the_quick_access_agent_not_a_user_origin_one(
         self, mock_app_state, admin_headers, admin_user
     ):
         """A plain user-origin agent that happens to carry the same
@@ -956,23 +1013,44 @@ class TestTemplateHiredFlag:
         user-chosen name via the plain POST /from-template path) must not
         count as hired - hired specifically means the quick-access
         instance, matching resolve_agent_from_template's own
-        origin-scoped reuse query."""
+        origin-scoped reuse query.
+
+        Creates a real TEMPLATE_QUICK_ACCESS-origin agent for the same
+        template too (with a *higher* id than the USER-origin row), so
+        this actually exercises the origin filter: a naive
+        lowest-id/first-row implementation with no origin filter at all
+        would pass this test if it only asserted `hired is False`
+        (PR #1498 review, m9) - asserting `hired_agent_id` resolves to the
+        quick-access agent specifically, not the user-origin one, is what
+        proves the filter (not id ordering) is what's selecting it."""
         db = next(get_db())
-        agent = Agent(
+        user_origin_agent = Agent(
             user_id=admin_user["id"],
             name="My Own Copy",
             template_id="customer_support",
             origin=AgentOrigin.USER.value,
         )
-        db.add(agent)
+        db.add(user_origin_agent)
         db.commit()
+
+        quick_access_agent = Agent(
+            user_id=admin_user["id"],
+            name="Customer Support Agent",
+            template_id="customer_support",
+            origin=AgentOrigin.TEMPLATE_QUICK_ACCESS.value,
+        )
+        db.add(quick_access_agent)
+        db.commit()
+        db.refresh(quick_access_agent)
+        assert quick_access_agent.id > user_origin_agent.id
+        quick_access_agent_id = quick_access_agent.id
         db.close()
 
         with patch.object(client.app, "state", mock_app_state):
             response = client.get("/api/templates/", headers=admin_headers)
             listed = {t["id"]: t for t in response.json()}
-            assert listed["customer_support"]["hired"] is False
-            assert listed["customer_support"]["hired_agent_id"] is None
+            assert listed["customer_support"]["hired"] is True
+            assert listed["customer_support"]["hired_agent_id"] == quick_access_agent_id
 
     def test_scoped_to_the_current_user(
         self, mock_app_state, admin_headers, admin_user

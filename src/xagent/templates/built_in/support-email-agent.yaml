@@ -34,7 +34,6 @@ sample_prompts:
 persona:
   name: Ben
   role:
-    en: Email Agent (Support)
     zh: 邮件专员（客服）
   avatar: /marketplace/avatars/ben.png
   intro:

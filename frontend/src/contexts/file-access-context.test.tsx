@@ -279,12 +279,12 @@ describe("FileAccessProvider", () => {
     expect(fetchMock).toHaveBeenNthCalledWith(
       1,
       expect.stringContaining("token=first-token"),
-      expect.objectContaining({ credentials: "omit" }),
+      expect.objectContaining({ credentials: "same-origin" }),
     )
     expect(fetchMock).toHaveBeenNthCalledWith(
       2,
       expect.stringContaining("token=second-token"),
-      expect.objectContaining({ credentials: "omit" }),
+      expect.objectContaining({ credentials: "same-origin" }),
     )
   })
 
@@ -314,12 +314,12 @@ describe("FileAccessProvider", () => {
 
     expect(fetchMock).toHaveBeenCalledWith(
       expect.stringContaining("token=surviving-token"),
-      expect.objectContaining({ credentials: "omit" }),
+      expect.objectContaining({ credentials: "same-origin" }),
     )
     expect(sessionStorage.getItem("xagent_public_access_token")).toBeNull()
   })
 
-  it("forces public file requests to omit cookies and ambient Authorization", async () => {
+  it("allows same-origin routing cookies but strips ambient Authorization", async () => {
     const fetchMock = vi.fn().mockResolvedValue(new Response())
     vi.stubGlobal("fetch", fetchMock)
     const policy = createPublicFileAccessPolicy("guest-token")
@@ -330,7 +330,7 @@ describe("FileAccessProvider", () => {
     })
 
     const [, options] = fetchMock.mock.calls[0] as [string, RequestInit]
-    expect(options.credentials).toBe("omit")
+    expect(options.credentials).toBe("same-origin")
     expect(new Headers(options.headers).get("Authorization")).toBeNull()
     expect(new Headers(options.headers).get("X-Trace")).toBe("request")
   })

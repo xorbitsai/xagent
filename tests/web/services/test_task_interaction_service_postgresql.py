@@ -68,7 +68,9 @@ from xagent.web.models.database import Base
 from xagent.web.models.task import Task, TaskStatus, TraceEvent
 from xagent.web.models.task_command import TaskExecutionCommand
 from xagent.web.models.task_interaction import TaskInteractionRequest
+from xagent.web.services import task_interaction_read as read_surface
 from xagent.web.services import task_interaction_service as svc
+from xagent.web.services.chat_history_service import persist_assistant_message
 from xagent.web.services.interaction_rollout import counters_snapshot
 from xagent.web.services.ops_signals import (
     CHECKPOINT_LOAD_UNAVAILABLE,
@@ -310,6 +312,212 @@ def test_active_row_predicate_three_way_tiering(db_session) -> None:
 
     view3 = svc.materialize_compatibility_view(db, task3)
     assert view3.tier == "legacy"
+
+
+# ---------------------------------------------------------------------------
+# The PostgreSQL half of the "no db.rollback()" regression test: the anchor
+# fetch's except clause is a whitelist of transient infrastructure failures
+# (OperationalError, InterfaceError, DisconnectionError, TimeoutError), and
+# deliberately does not roll back on any of them. The SQLite half of this
+# same cell lives in test_task_interaction_service.py; this is the
+# real-backend counterpart the design calls for explicitly, since PostgreSQL
+# is where server-side transaction state after a DBAPI failure differs from
+# SQLite's. This test drives the except clause with a synthetic,
+# monkeypatched exception -- it verifies the resolver's own behavior (no
+# rollback, no swallowed session state), not what a genuine DBAPI failure
+# does to the underlying PostgreSQL transaction; see the test's own
+# docstring.
+# ---------------------------------------------------------------------------
+
+
+def test_the_session_survives_a_failed_anchor_fetch_with_no_rollback_postgresql(
+    db_session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Verifies the resolver's own behavior at the anchor fetch: it does
+    not call db.rollback() and does not swallow the caller's session state
+    when the fetch raises. Driven with a synthetic, monkeypatched exception
+    raised in Python before any statement reaches the DBAPI connection, so
+    this is not a claim about what a genuine DBAPI-level failure does to
+    the underlying PostgreSQL transaction -- that survival differs by
+    backend (SQLite keeps the caller's staged writes; PostgreSQL discards
+    them at the next commit once the server-side transaction is
+    invalidated) and is documented at the call site, not proven here."""
+    db = db_session
+    user_id = make_user(db)
+    task_id = make_task(db, user_id=user_id)
+    task = db.query(Task).filter(Task.id == task_id).first()
+    task.run_id = "run-a"
+    db.commit()
+
+    trace_id = _make_trace_event(db, task_id=task_id, run_partition="run-a")
+    _make_active_row(
+        db,
+        task_id=task_id,
+        run_id="run-a",
+        resume_trace_event_id=trace_id,
+        resume_run_partition="run-a",
+    )
+
+    # The caller's own staged, uncommitted write -- simulates a caller
+    # that has already modified something in this same session before
+    # asking the read surface for the pending question.
+    task.title = "staged-before-the-failing-read"
+
+    from sqlalchemy.orm import Session as OrmSession
+
+    original_get = OrmSession.get
+    raise_once = {"armed": True}
+
+    def _raising_get(self, model, pk, *args, **kwargs):
+        if model is TraceEvent and raise_once["armed"]:
+            raise_once["armed"] = False
+            raise sa.exc.OperationalError(
+                "SELECT 1", {}, Exception("simulated session failure")
+            )
+        return original_get(self, model, pk, *args, **kwargs)
+
+    monkeypatch.setattr(OrmSession, "get", _raising_get)
+    view = svc.materialize_compatibility_view(db, task_id)
+
+    assert view.tier == "unanswerable"
+    assert view.reason == "checkpoint_unavailable"
+
+    # (a) the caller's own pending write is still staged and committable --
+    # a db.rollback() in the except clause would have discarded it, and on
+    # PostgreSQL a real DBAPI-level error left uncaught in an open
+    # transaction poisons every later statement until a rollback happens,
+    # so this also proves the OperationalError raised above never reached
+    # the actual DBAPI connection.
+    db.commit()
+    reloaded = db.query(Task).filter(Task.id == task_id).first()
+    assert reloaded.title == "staged-before-the-failing-read"
+
+    # (b) the same session can still run a plain query...
+    still_readable = (
+        db.query(TaskInteractionRequest)
+        .filter(TaskInteractionRequest.task_id == task_id)
+        .first()
+    )
+    assert still_readable is not None
+
+    # ...and complete a whole second response construction.
+    second_view = svc.materialize_compatibility_view(db, task_id)
+    assert second_view.tier == "native"
+
+
+# ---------------------------------------------------------------------------
+# The read surface adapter's own double-backend cells (A6/A9/A13 from the
+# adapter's SQLite-backed test file): the table-existence gate a T1 cell
+# depends on, the four-field active-row predicate a T2 cell depends on, and
+# a malformed JSON payload a T3''' cell depends on. The remaining twelve
+# adapter cells are backend-independent and covered once, on SQLite, in
+# test_task_interaction_read.py.
+# ---------------------------------------------------------------------------
+
+
+def test_a6_marker_matches_no_active_row_reads_the_legacy_transcript_postgresql(
+    db_session,
+) -> None:
+    db = db_session
+    user_id = make_user(db)
+    task_id = make_task(db, user_id=user_id)
+    task = db.query(Task).filter(Task.id == task_id).first()
+    task.run_id = "run-a"
+    task.interaction_protocol_version = 1
+    db.commit()
+    db.refresh(task)
+    persist_assistant_message(
+        db,
+        task_id,
+        user_id,
+        "A live question",
+        message_type="question",
+        interactions=[{"type": "text_input", "label": "Live"}],
+    )
+
+    question, interactions = read_surface.get_pending_interaction_question(db, task)
+
+    assert question is not None
+    assert question.startswith("A live question")
+    assert interactions == [{"type": "text_input", "label": "Live"}]
+
+
+def test_a9_native_projection_postgresql(db_session) -> None:
+    db = db_session
+    user_id = make_user(db)
+    task_id = make_task(db, user_id=user_id)
+    task = db.query(Task).filter(Task.id == task_id).first()
+    task.run_id = "run-a"
+    task.interaction_protocol_version = 1
+    db.commit()
+    db.refresh(task)
+
+    trace_id = _make_trace_event(db, task_id=task_id, run_partition="run-a")
+    _make_active_row(
+        db,
+        task_id=task_id,
+        run_id="run-a",
+        resume_trace_event_id=trace_id,
+        resume_run_partition="run-a",
+    )
+
+    question, interactions = read_surface.get_pending_interaction_question(db, task)
+
+    assert question == "Which environment?"
+    assert interactions == [
+        {
+            "type": "text_input",
+            "field": "env",
+            "label": "Environment",
+            "options": None,
+            "placeholder": None,
+            "multiline": False,
+            "min": None,
+            "max": None,
+            "default_value": None,
+            "accept": None,
+            "multiple": False,
+        }
+    ]
+
+
+def test_a13_unparseable_payload_drops_both_slots_postgresql(db_session) -> None:
+    db = db_session
+    user_id = make_user(db)
+    task_id = make_task(db, user_id=user_id)
+    task = db.query(Task).filter(Task.id == task_id).first()
+    task.run_id = "run-a"
+    task.interaction_protocol_version = 1
+    db.commit()
+    db.refresh(task)
+
+    trace_id = _make_trace_event(db, task_id=task_id, run_partition="run-a")
+    now = _now()
+    row = TaskInteractionRequest(
+        task_id=task_id,
+        run_id="run-a",
+        kind="clarification",
+        protocol_version=1,
+        status="active",
+        active_slot=1,
+        origin="internal",
+        request_payload={"not": "a valid v1 payload"},
+        request_idempotency_key=f"pg-malformed-key-{next(_key_counter)}",
+        resume_trace_event_id=trace_id,
+        resume_event_id="resume-event-1",
+        resume_execution_id="exec-1",
+        resume_locator_format="trace_event_pk_v1",
+        resume_checkpoint_type="agent_execution_checkpoint",
+        resume_run_partition="run-a",
+        created_at=now,
+        expires_at=now + timedelta(minutes=15),
+    )
+    db.add(row)
+    db.commit()
+
+    question, interactions = read_surface.get_pending_interaction_question(db, task)
+
+    assert (question, interactions) == (None, None)
 
 
 # ---------------------------------------------------------------------------

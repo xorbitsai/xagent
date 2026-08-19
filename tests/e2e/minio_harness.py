@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import socket
 import subprocess
 import time
 from collections.abc import Iterator
@@ -12,7 +11,6 @@ from uuid import uuid4
 
 import fsspec
 import pytest
-from docker.errors import APIError
 
 from tests.e2e.app_harness import (
     E2EAppClient,
@@ -88,36 +86,19 @@ def run_minio_storage(monkeypatch: pytest.MonkeyPatch) -> Iterator[MinioStorage]
 
     bucket = f"xagent-e2e-{uuid4().hex}"
     client = _docker_client()
-    container = None
-    api_port = 0
-    for _ in range(5):
-        api_port = _free_port()
-        console_port = _free_port()
-        container_name = f"xagent-minio-e2e-{uuid4().hex[:12]}"
-        try:
-            container = client.containers.run(
-                "minio/minio",  # Docker Hub — more reliable than quay.io
-                "server /data --console-address :9001",
-                detach=True,
-                name=container_name,
-                ports={"9000/tcp": api_port, "9001/tcp": console_port},
-                tmpfs={"/data": "size=64m"},
-                environment={
-                    "MINIO_ROOT_USER": MINIO_ACCESS_KEY,
-                    "MINIO_ROOT_PASSWORD": MINIO_SECRET_KEY,
-                },
-            )
-            break
-        except APIError as exc:
-            if "address already in use" not in str(exc):
-                raise
-            try:
-                stale = client.containers.get(container_name)
-                stale.remove(force=True)
-            except Exception:
-                pass
-    if container is None:
-        pytest.skip("Could not allocate free host ports for MinIO")
+    container, host_ports = run_container_with_dynamic_ports(
+        client,
+        "minio/minio",  # Docker Hub — more reliable than quay.io
+        "server /data --console-address :9001",
+        name=f"xagent-minio-e2e-{uuid4().hex[:12]}",
+        container_ports=("9000/tcp", "9001/tcp"),
+        tmpfs={"/data": "size=64m"},
+        environment={
+            "MINIO_ROOT_USER": MINIO_ACCESS_KEY,
+            "MINIO_ROOT_PASSWORD": MINIO_SECRET_KEY,
+        },
+    )
+    api_port = host_ports["9000/tcp"]
 
     endpoint_url = f"http://127.0.0.1:{api_port}"
     storage_options = {
@@ -209,10 +190,59 @@ def run_file_persistence_app(
         )
 
 
-def _free_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.bind(("127.0.0.1", 0))
-        return int(sock.getsockname()[1])
+def run_container_with_dynamic_ports(
+    client: Any,
+    image: str,
+    command: str | None = None,
+    *,
+    name: str,
+    container_ports: tuple[str, ...],
+    **kwargs: Any,
+) -> tuple[Any, dict[str, int]]:
+    """Start a detached container and let Docker pick the host ports.
+
+    Publishing to ``("127.0.0.1", None)`` makes Docker choose a free host port
+    while it holds the allocation lock, so the port cannot be taken between the
+    choice and the bind. Picking a port in-process first (bind to 0, read the
+    number, close the socket) leaves exactly that window open, and concurrent
+    e2e fixtures lost it often enough to fail CI with
+    ``Bind for 0.0.0.0:<port> failed: port is already allocated``.
+
+    Returns the container and the host port each ``container_ports`` entry was
+    published on. Binding to loopback also keeps the test container off the
+    machine's external interfaces.
+    """
+    container = client.containers.run(
+        image,
+        command,
+        detach=True,
+        name=name,
+        ports={port: ("127.0.0.1", None) for port in container_ports},
+        **kwargs,
+    )
+    try:
+        # The published ports are only in NetworkSettings once the container is
+        # started, which `run(detach=True)` has already done by the time it
+        # returns; `reload()` just refreshes the local copy of the inspect data.
+        container.reload()
+        host_ports = {
+            port: _published_host_port(container, port) for port in container_ports
+        }
+    except Exception:
+        container.remove(force=True)
+        raise
+    return container, host_ports
+
+
+def _published_host_port(container: Any, container_port: str) -> int:
+    for binding in (container.ports or {}).get(container_port) or []:
+        host_port = binding.get("HostPort")
+        if host_port:
+            return int(host_port)
+    raise RuntimeError(
+        f"Docker did not publish a host port for {container_port} "
+        f"(ports={container.ports!r})"
+    )
 
 
 def _docker_available() -> bool:

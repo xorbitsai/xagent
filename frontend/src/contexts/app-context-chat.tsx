@@ -64,6 +64,39 @@ const VERSIONED_TASK_EVENT_TYPES = new Set([
   "task_started",
   "task_waiting_for_user",
 ])
+// Action types that describe state scoped to one specific task's
+// conversation (chat/trace/DAG/status). Used by handleMessage's dispatch
+// wrapper to drop these when a message's task_id doesn't match the task
+// actually being viewed - see the wrapper's own comment for why. Kept at
+// module scope (built once) rather than inside handleMessage, matching
+// VERSIONED_TASK_EVENT_TYPES above.
+// TRIGGER_TASK_UPDATE is deliberately NOT in this set: it only bumps
+// lastTaskUpdate to tell the sidebar's task list to refetch (sidebar.tsx),
+// which should happen for ANY task's status change regardless of which task
+// is currently being viewed - unlike every action below, it isn't part of
+// the viewed task's own displayed state.
+const TASK_SCOPED_ACTION_TYPES = new Set<AppAction["type"]>([
+  "SET_DAG_EXECUTION",
+  "SET_STEPS",
+  // Not currently dispatched from inside handleMessage (its only two call
+  // sites use the raw, unwrapped dispatch), so this has no effect today -
+  // included so a future call site inside handleMessage inherits the same
+  // scoping SET_DAG_EXECUTION/SET_STEPS already get individually, instead of
+  // silently bypassing it.
+  "RESET_DAG_STATE",
+  "ADD_STEP",
+  "UPDATE_STEP",
+  "UPDATE_TASK_STATUS",
+  "SET_CURRENT_TASK",
+  "SET_PROCESSING",
+  "SET_HISTORY_LOADING",
+  "ADD_MESSAGE",
+  "UPSERT_STREAMING_FINAL_ANSWER",
+  "ADD_TRACE_EVENT",
+  "SET_CONTEXT_USAGE",
+  "SET_PLAN_MEMORY_INFO",
+  "OPEN_FILE_PREVIEW",
+])
 const MAX_TRACKED_TASK_STATE_VERSIONS = 500
 // A Session may reset repeatedly during its absolute lifetime. Retired ids are
 // retained only to reject late frames, so bound this lineage guard separately
@@ -636,6 +669,62 @@ export interface Task {
   runId?: string | null
   stateVersion?: number
   controlState?: TaskControlState
+  // Frontend-only, distinct from updatedAt: stamped once by UPDATE_TASK_STATUS
+  // when this run actually terminates (completed/failed), cleared when it
+  // starts running again, and deliberately preserved across SET_CURRENT_TASK
+  // refreshes for the same task (see that reducer case) - updatedAt is
+  // general task metadata that can legitimately change again later (a title
+  // edit, another field's update) for reasons that have nothing to do with
+  // when this execution actually ended, and the Progress panel's frozen
+  // elapsed time must not drift when that happens.
+  dagTerminatedAt?: string | number
+  // True when dagTerminatedAt was BACKFILLED from mutable task metadata
+  // (updatedAt, by withDagTerminatedAt below) rather than stamped by an
+  // actual terminal event - a cold history load fetches the Task row before
+  // any terminal event replays, and updatedAt may by then reflect a
+  // post-execution metadata change (a title edit) rather than the real end
+  // time. A later authoritative terminal event may replace a provisional
+  // value (see UPDATE_TASK_STATUS); a non-provisional one stays
+  // first-write-wins.
+  dagTerminatedAtProvisional?: boolean
+}
+
+// Exported so every consumer of dagTerminatedAt's "is this task done" gate
+// (currently just page-client.tsx's isDagFinished) shares the exact
+// definition this field is stamped/cleared against - the two must never
+// drift apart, or isDagFinished can read true while dagTerminatedAt was
+// never set (or vice versa), leaving the Progress panel's clock either
+// stuck or never frozen.
+export const isTerminalTaskStatus = (status: TaskStatus | null | undefined): boolean =>
+  status === "completed" || status === "failed"
+
+// Applies dagTerminatedAt's full set of rules to a Task about to be stored:
+// preserve an already-set value (never re-derive it from a later, unrelated
+// updatedAt change), backfill it once from updatedAt if this task arrives
+// already terminal without one, and clear it if the task isn't terminal (a
+// stale value from a prior run must not linger once it starts running
+// again). Shared by every reducer case that can hand the app a whole Task
+// object - SET_CURRENT_TASK and ADOPT_SESSION_TASK - so neither can
+// individually forget a rule the other already gets right.
+const withDagTerminatedAt = (task: Task | null): Task | null => {
+  if (!task) return task
+  if (!isTerminalTaskStatus(task.status)) {
+    return task.dagTerminatedAt === undefined && task.dagTerminatedAtProvisional === undefined
+      ? task
+      : { ...task, dagTerminatedAt: undefined, dagTerminatedAtProvisional: undefined }
+  }
+  // Checked for presence, not truthiness, when preserving: updatedAt (what
+  // the backfill below uses) is a real epoch value that can legitimately be
+  // 0 - a truthy check would treat that as "absent" and re-derive it from a
+  // LATER updatedAt on every subsequent refresh, drifting the frozen time
+  // exactly the way this field exists to prevent.
+  if (task.dagTerminatedAt !== undefined) return task
+  // Backfill from updatedAt, but MARKED provisional: updatedAt is mutable
+  // metadata, so this is only the best available guess until (if ever) an
+  // actual terminal event replays with its own timestamp - which
+  // UPDATE_TASK_STATUS lets replace a provisional value, unlike a
+  // non-provisional one.
+  return { ...task, dagTerminatedAt: task.updatedAt, dagTerminatedAtProvisional: true }
 }
 
 type SessionTaskBinding =
@@ -692,11 +781,34 @@ const getSessionTaskInfoData = (
   return Object.keys(nestedData).length > 0 ? nestedData : data
 }
 
+// The backend's DAG step status contract, shared verbatim by every UI model
+// that projects a step (StepExecution here, progress-panel.tsx's
+// ProgressStepView, center-panel.tsx's DAGNode.data) - previously each
+// redeclared the same seven-value union independently, so a future backend
+// status could be accepted by one and silently fall through to an "unknown"
+// rendering in another. Import this instead of redeclaring the union.
+//
+// "interrupted" and "clarification_invalidated" are both non-terminal (a
+// step in either state transitions back to "running" once its blocking
+// condition clears - see dag.py's _ready_steps/_invalidate_batch_siblings)
+// - they must render and count distinctly from "pending" (never started)
+// and from the terminal statuses. "skipped" has no current backend producer
+// (dag_step_skipped is never emitted) but is kept for the branch-derivation
+// path that can still locally construct it.
+export type StepStatus =
+  | "pending"
+  | "running"
+  | "completed"
+  | "failed"
+  | "skipped"
+  | "interrupted"
+  | "clarification_invalidated"
+
 interface StepExecution {
   id: string
   name: string
   description: string
-  status: "pending" | "running" | "completed" | "failed" | "skipped"
+  status: StepStatus
   tool_names?: string[]
   dependencies: string[]
   started_at?: string | number
@@ -718,7 +830,14 @@ interface TraceEvent {
 }
 
 const normalizeStepStatus = (status: unknown): StepExecution["status"] => {
-  return status === "running" || status === "completed" || status === "failed" || status === "skipped"
+  return (
+    status === "running"
+    || status === "completed"
+    || status === "failed"
+    || status === "skipped"
+    || status === "interrupted"
+    || status === "clarification_invalidated"
+  )
     ? status
     : "pending"
 }
@@ -809,14 +928,72 @@ const stepsFromPlanData = (planData: unknown, existingSteps: StepExecution[]): S
   })
 }
 
-interface DAGExecution {
-  phase: "planning" | "executing" | "completed" | "failed"
+// "replanning" and "completion_assessment" are real, live phase values the
+// backend emits via on_dag_execution (dag.py) - the type previously omitted
+// them, silently treating a normal mid-run replan or completion check as an
+// unmodeled state for any consumer that read `.phase` directly.
+// "completed"/"failed" are never sent by that backend broadcast (terminal
+// state arrives via a separate dag_execute_end/checkpoint flow) but ARE
+// constructed locally by handleMessage's own dag_execute_end/agent_error
+// handlers below, so they remain valid runtime values of this field.
+export type DAGExecutionPhase = "planning" | "replanning" | "executing" | "completion_assessment" | "completed" | "failed"
+
+const DAG_EXECUTION_PHASES: ReadonlySet<string> = new Set<DAGExecutionPhase>([
+  "planning", "replanning", "executing", "completion_assessment", "completed", "failed",
+])
+
+export interface DAGExecution {
+  phase: DAGExecutionPhase
   current_plan: Record<string, unknown>
   created_at: string | number
   updated_at: string | number
+  // The backend's existing per-turn identity (runtime.py's _dag_turn_id,
+  // read off the current user message's own turn_id - not a new concept,
+  // and NOT the same field as the top-level WebSocketMessage.run_id/
+  // Task.runId lease identity used elsewhere in this file) - undefined for
+  // older backends/patterns that don't set it, or for a dagExecution
+  // constructed locally rather than from a raw wire payload (dag_execute_end/
+  // agent_error's local phase updates below, which spread the EXISTING
+  // dagExecution and so already carry whatever turn_id it had). Lets the
+  // dag_execution handlers tell "still this same run" apart from "a new run
+  // started" instead of assuming every event belongs to whatever run is
+  // already in state.
+  turn_id?: string
 }
 
-interface AppState {
+// The backend's on_dag_execution broadcast never actually includes
+// current_plan (only counts/step lists depending on phase) despite the
+// frontend type declaring it required, and its phase is a raw string with no
+// guarantee it's one of DAG_EXECUTION_PHASES (a future backend phase addition
+// would otherwise flow through unchecked). Normalizes a raw wire payload
+// before it's ever cast to DAGExecution, rather than trusting `as
+// DAGExecution` to paper over the mismatch.
+//
+// Returns null for a payload whose phase is absent, non-string, or unknown -
+// callers must DROP that update rather than dispatch it. An earlier version
+// defaulted unknown phases to "executing", which synthesized an active DAG
+// run out of malformed data (an empty `{}` payload on the bare legacy
+// message type was enough to conjure a blank in-progress Progress panel and
+// auto-open it); keeping the previous state untouched loses at most one
+// unrecognized update, while fabricating "executing" invents a whole run. A
+// deliberate future backend phase addition should extend
+// DAG_EXECUTION_PHASES and its consumers, not lean on a silent default.
+const normalizeDagExecutionPayload = (raw: Record<string, unknown>): DAGExecution | null => {
+  const rawPhase = raw.phase
+  if (typeof rawPhase !== "string" || !DAG_EXECUTION_PHASES.has(rawPhase)) return null
+  const phase = rawPhase as DAGExecutionPhase
+  const currentPlan =
+    raw.current_plan && typeof raw.current_plan === "object" && !Array.isArray(raw.current_plan)
+      ? raw.current_plan as Record<string, unknown>
+      : {}
+  return {
+    ...raw,
+    phase,
+    current_plan: currentPlan,
+  } as DAGExecution
+}
+
+export interface AppState {
   messages: Message[]
   currentTask: Task | null
   taskRuntimeExtensions: TaskRuntimeExtensions
@@ -872,9 +1049,10 @@ type AppAction =
   | { type: "UPSERT_STREAMING_FINAL_ANSWER"; payload: { messageId: string; delta?: string; content?: string; status?: Message["status"]; timestamp: string } }
   | { type: "SET_CURRENT_TASK"; payload: Task | null }
   | { type: "SET_TASK_RUNTIME_EXTENSIONS"; payload: { taskId: number; extensions: TaskRuntimeExtensions } }
-  | { type: "UPDATE_TASK_STATUS"; payload: { status: Task["status"]; waitingQuestion?: string; waitingInteractions?: Interaction[]; runId?: string | null; stateVersion?: number; controlState?: TaskControlState } }
+  | { type: "UPDATE_TASK_STATUS"; payload: { status: Task["status"]; waitingQuestion?: string; waitingInteractions?: Interaction[]; runId?: string | null; stateVersion?: number; controlState?: TaskControlState; updatedAt?: string } }
   | { type: "TRIGGER_TASK_UPDATE" }
   | { type: "SET_DAG_EXECUTION"; payload: DAGExecution | null }
+  | { type: "RESET_DAG_STATE" }
   | { type: "SET_CONTEXT_USAGE"; payload: { tokens: number; threshold: number } | null }
   | { type: "ADD_STEP"; payload: StepExecution }
   | { type: "UPDATE_STEP"; payload: { stepId: string; updates: Partial<StepExecution> } }
@@ -981,21 +1159,34 @@ function projectAppState(state: AppState, action: AppAction): AppState {
       const messages = taskChanged ? [] : state.messages
       const contextUsage = taskChanged ? null : state.contextUsage
       const taskRuntimeExtensions = taskChanged ? {} : state.taskRuntimeExtensions
+      // Also clear the previous task's DAG plan/phase here - otherwise
+      // switching tasks via the sidebar (no page reload) leaves the Progress
+      // panel showing the OLD task's steps and elapsed time until the new
+      // task's own dag_execution history replay arrives.
+      const dagExecution = taskChanged ? null : state.dagExecution
+      const steps = taskChanged ? [] : state.steps
       const newState = {
         ...state,
         taskId: action.payload,
         messages,
         contextUsage,
         taskRuntimeExtensions,
+        dagExecution,
+        steps,
       }
       console.log('🔄 Reducer returning new state:', newState)
       return newState
 
     case "ADOPT_SESSION_TASK":
+      // A session can adopt a task that's already terminal (e.g. a fast
+      // single-call turn that finishes before the adoption handshake
+      // completes) - route through the same dagTerminatedAt rules
+      // SET_CURRENT_TASK applies, or the Progress panel's elapsed clock would
+      // never freeze for it (isDagFinished true, progressEndedAt undefined).
       return {
         ...state,
         taskId: action.payload.taskId,
-        currentTask: action.payload.task,
+        currentTask: withDagTerminatedAt(action.payload.task),
         taskRuntimeExtensions: {},
       }
 
@@ -1146,9 +1337,17 @@ function projectAppState(state: AppState, action: AppAction): AppState {
         }
         : null
 
-      const currentTask = (state.currentTask && incomingTask && state.currentTask.id === incomingTask.id)
+      const mergedTask = (state.currentTask && incomingTask && state.currentTask.id === incomingTask.id)
         ? { ...state.currentTask, ...incomingTask, agentName: incomingTask.agentName || state.currentTask.agentName, agentLogoUrl: incomingTask.agentLogoUrl || state.currentTask.agentLogoUrl }
         : incomingTask
+      // A task can arrive here already terminal without ever passing through
+      // UPDATE_TASK_STATUS (loading a finished task fresh - page load,
+      // switching to it, history replay's own task_info), and a task_info
+      // reporting this SAME task back to a non-terminal status (a rerun)
+      // never passes through UPDATE_TASK_STATUS either - withDagTerminatedAt
+      // backfills the former and clears the latter so a prior run's
+      // dagTerminatedAt can't linger into this one.
+      const currentTask = withDagTerminatedAt(mergedTask)
 
       return {
         ...state,
@@ -1177,6 +1376,38 @@ function projectAppState(state: AppState, action: AppAction): AppState {
       }
 
       const isWaitingForUser = nextStatus === "waiting_for_user"
+      // Set once, on the transition into a terminal status - and cleared
+      // when the task starts running again, so a stale prior run's terminal
+      // time doesn't linger into the next one. Deliberately NOT recomputed
+      // from `updatedAt`: unlike this field, `updatedAt` keeps changing
+      // after termination for reasons unrelated to this execution (see the
+      // Task.dagTerminatedAt comment), so it can't double as the frozen end
+      // time itself. An already-set AUTHORITATIVE (non-provisional) value is
+      // preserved (first-write-wins): a second terminal event for the same
+      // episode - a duplicate delivery, or an agent_error followed by the
+      // formal task_completed broadcast - must not push the frozen elapsed
+      // time forward. A PROVISIONAL value (withDagTerminatedAt's backfill
+      // from mutable task metadata on a cold history load) is the one thing
+      // a terminal event's own timestamp is allowed to replace - the event
+      // knows when the run actually ended; the backfill only guessed.
+      let dagTerminatedAt: Task["dagTerminatedAt"]
+      let dagTerminatedAtProvisional: boolean | undefined
+      if (isTerminalTaskStatus(nextStatus)) {
+        const previous = state.currentTask.dagTerminatedAt
+        const previousProvisional = state.currentTask.dagTerminatedAtProvisional === true
+        if (previous !== undefined && !previousProvisional) {
+          dagTerminatedAt = previous
+        } else if (action.payload.updatedAt !== undefined) {
+          dagTerminatedAt = action.payload.updatedAt
+        } else if (previous !== undefined) {
+          // Still provisional: a terminal event with no timestamp of its own
+          // is no more authoritative than the backfill it would replace.
+          dagTerminatedAt = previous
+          dagTerminatedAtProvisional = true
+        } else {
+          dagTerminatedAt = new Date().toISOString()
+        }
+      }
       return {
         ...state,
         isProcessing: shouldStopProcessingForTaskStatus(nextStatus)
@@ -1185,7 +1416,15 @@ function projectAppState(state: AppState, action: AppAction): AppState {
         currentTask: {
           ...state.currentTask,
           status: nextStatus,
-          updatedAt: new Date().toISOString(),
+          // Prefer the originating event's own timestamp over the client's
+          // current wall-clock time - during historical replay, every event
+          // gets processed at "now", so stamping updatedAt with the reducer's
+          // own clock would make a long-finished task's Progress panel freeze
+          // its elapsed time against the moment it was REPLAYED, not the
+          // moment it actually completed.
+          updatedAt: action.payload.updatedAt ?? new Date().toISOString(),
+          dagTerminatedAt,
+          dagTerminatedAtProvisional,
           waitingQuestion: isWaitingForUser
             ? action.payload.waitingQuestion ?? state.currentTask.waitingQuestion
             : undefined,
@@ -1201,6 +1440,14 @@ function projectAppState(state: AppState, action: AppAction): AppState {
 
     case "SET_DAG_EXECUTION":
       return { ...state, dagExecution: action.payload }
+
+    // Single action for the "clear dagExecution + steps together" couplet
+    // needed at every site that isn't a task switch (task switches already
+    // get this via SET_TASK_ID's own taskChanged branch) - same-task
+    // reconnect and a successful new turn on the same task both need it, and
+    // a single action keeps them from drifting out of sync with each other.
+    case "RESET_DAG_STATE":
+      return { ...state, dagExecution: null, steps: [] }
 
     case "SET_CONTEXT_USAGE":
       return { ...state, contextUsage: action.payload }
@@ -1652,10 +1899,6 @@ export function AppProvider({
     }
     return false
   }, [])
-  const isDuplicateResult = useCallback(
-    (content: string) => isDuplicateMessage(content, "result"),
-    [isDuplicateMessage],
-  )
   // All actions are projected synchronously so each action observes the state
   // produced by the preceding action before React commits the batch.
   const stateRef = useRef(state)
@@ -1971,7 +2214,11 @@ export function AppProvider({
         },
       })
       dispatch({ type: "SET_TRACE_EVENTS", payload: [] })
-      dispatch({ type: "SET_STEPS", payload: [] })
+      // Clear dagExecution alongside steps - otherwise the Progress panel
+      // stays open (it only needs dagExecution to be non-null) rendering an
+      // empty step list for the gap between reconnecting and history replay
+      // repopulating both together.
+      dispatch({ type: "RESET_DAG_STATE" })
     } else {
       // New task connection -> Update tracker, Don't clear (handled by setTaskId)
       lastConnectedTaskId.current = stateRef.current.taskId
@@ -2198,13 +2445,182 @@ export function AppProvider({
 
   const handleMessage = useCallback((
     message: WebSocketMessage,
-    dispatch: React.Dispatch<AppAction>,
+    rawDispatch: React.Dispatch<AppAction>,
     currentState: AppState,
     options?: {
       skipHistory?: boolean
       filesDisabled?: boolean
     },
   ) => {
+    // A task's WebSocket connection is per-task (or, for session transports,
+    // multiplexes a sequence of tasks over one socket) - either way, a
+    // just-superseded socket/task can still have events in flight after the
+    // app has moved on to a different task (e.g. the user starts a new chat
+    // while a previous DAG run is still executing in the background). Those
+    // stray events must not repaint TASK_SCOPED_ACTION_TYPES's state for
+    // whatever task is now on screen - not just DAG/step state, but the chat
+    // transcript, trace log, context/memory display, and processing/status
+    // flags too, since a background task's reply or tool trace has no
+    // business appearing in a different task's conversation. Deliberately
+    // keyed ONLY off currentState.taskId (not currentTask.id): switching
+    // tasks via setTaskId leaves a real window where taskId has already
+    // advanced to the new task but currentTask still describes the old one
+    // (until that task's own task_info arrives) - matching against
+    // currentTask.id in that window would let the old task's stray events
+    // right back through, defeating the whole guard.
+    const messageTaskId = (message as unknown as { task_id?: unknown }).task_id
+    // No task is even being viewed (currentState.taskId null/undefined) but
+    // this message names a specific task - that can only be a stray event
+    // for a task other than "the current view", so it counts as "for another
+    // task" too (not just the "viewing a *different* task" case).
+    const isMessageForOtherTask =
+      messageTaskId !== undefined && messageTaskId !== null && messageTaskId !== ""
+      && String(messageTaskId) !== String(currentState.taskId)
+    const dispatch: React.Dispatch<AppAction> = (action) => {
+      if (TASK_SCOPED_ACTION_TYPES.has(action.type) && isMessageForOtherTask) return
+      // Stamp every UPDATE_TASK_STATUS dispatched from this handler with the
+      // originating event's own timestamp here, once, rather than relying on
+      // each call site to remember to pass it - a forgotten `updatedAt` at a
+      // future call site would otherwise silently fall back to client-now in
+      // the reducer, quietly reintroducing the wrong-elapsed-time-on-replay
+      // bug this field exists to fix. External UI callers of UPDATE_TASK_STATUS
+      // (outside this handler, e.g. sendMessage's optimistic status flip)
+      // don't go through this wrapper and keep their own client-now fallback.
+      if (action.type === "UPDATE_TASK_STATUS" && action.payload.updatedAt === undefined) {
+        rawDispatch({ ...action, payload: { ...action.payload, updatedAt: message.timestamp } })
+        return
+      }
+      rawDispatch(action)
+    }
+    // The 30s dedup cache below is keyed on message content/type only, not
+    // task id - several dedupKeys (e.g. dag-execute-end's "task end, this
+    // iteration") are templated purely on generic fields like iteration
+    // count, so a background task and the currently-viewed task can produce
+    // the exact same key. A stale event for another task never reaches
+    // `dispatch` (filtered above), but if it were still allowed to *insert*
+    // into the cache, it would silently swallow the viewed task's own
+    // legitimate ADD_MESSAGE as a "duplicate" moments later. Skip caching
+    // (not skip the check itself) whenever the message belongs elsewhere.
+    const isDuplicateMessageForViewedTask = (
+      content: string | React.ReactNode,
+      type = "general",
+    ) => isDuplicateMessage(content, type, false, !isMessageForOtherTask)
+    // Shared by both dag_execution shapes this handler processes below (the
+    // modern trace_event-wrapped one, and the legacy bare "dag_execution"
+    // message type) - duplicating this logic per call site is exactly how a
+    // past version of this fix ended up only covering one of the two and
+    // missing the other, so it stays a single function both branches call.
+    // A turn_id present on BOTH sides that DIFFERS means this event belongs
+    // to a genuinely different DAG execution - e.g. turn 2's DAG starting
+    // while turn 1's dagExecution/steps are still in state because
+    // sendMessage's RESET_DAG_STATE guard raced and lost. Only that specific
+    // case counts as a new run: if turn_id is missing on EITHER side (an
+    // older backend, a legacy/history event that predates this field, or
+    // some other pattern that never sets it), there's no reliable identity to
+    // compare, so this falls back to "not a new run" rather than guessing -
+    // a false "new run" here would wipe live steps out from under a mid-run
+    // legacy event, which is worse than occasionally missing a real
+    // transition this fallback can't detect.
+    const applyDagExecutionUpdate = (
+      rawEventData: Record<string, unknown>,
+      sourceTimestamp: string | number,
+    ) => {
+      // Malformed frame (absent/unknown phase): drop the WHOLE update -
+      // including its steps - before any dispatch, matching the normalizer's
+      // own contract. Applying the steps but not the execution object would
+      // leave the two halves of DAG state describing different events.
+      if (typeof rawEventData.phase !== "string" || !DAG_EXECUTION_PHASES.has(rawEventData.phase)) {
+        return
+      }
+      const incomingTurnId = (rawEventData as { turn_id?: string }).turn_id
+      const trackedTurnId = currentState.dagExecution?.turn_id
+      const isNewRun = Boolean(incomingTurnId) && Boolean(trackedTurnId) && incomingTurnId !== trackedTurnId
+      const steps = stepsFromPlanData(rawEventData, isNewRun ? [] : currentState.steps)
+      if (steps) {
+        dispatch({ type: "SET_STEPS", payload: steps })
+      } else if (isNewRun) {
+        // This specific event (e.g. a bare "planning"/"replanning" phase
+        // update with no steps field) doesn't itself carry step data, but
+        // it's still the first event of a new run - the prior run's steps
+        // must not linger just because this event happened not to include a
+        // fresh list to replace them with.
+        dispatch({ type: "SET_STEPS", payload: [] })
+      }
+      // The backend's dag_execution payload (dag.py's on_dag_execution) never
+      // actually carries a created_at - only completed_step_count/
+      // plan_step_count/steps. Without a fallback here, the DAG run never
+      // gets a stable "started at" timestamp, so the Progress panel's total
+      // elapsed time never renders. Keep whatever created_at this run
+      // already established (planning's first event sets it; later phase
+      // updates for the SAME run must not reset it) whenever turn_id says
+      // this is a continuation; use this event's own timestamp for a
+      // genuinely new run instead of inheriting the prior run's.
+      const dagCreatedAt =
+        !isNewRun
+          ? currentState.dagExecution?.created_at
+            ?? (rawEventData as { created_at?: string | number }).created_at
+            ?? sourceTimestamp
+          : (rawEventData as { created_at?: string | number }).created_at
+            ?? sourceTimestamp
+      // Same gap as created_at above: the backend's dag_execution payload
+      // never carries updated_at either, so without this fallback every
+      // phase update after the first would leave it undefined despite
+      // DAGExecution declaring it required - center-panel.tsx uses it both
+      // as a React key and as displayed text. Unlike created_at, this
+      // always takes the event's own timestamp - it's meant to track "last
+      // touched," not "run started," so a continuation must still advance it.
+      const dagUpdatedAt =
+        (rawEventData as { updated_at?: string | number }).updated_at ?? sourceTimestamp
+      // SET_DAG_EXECUTION replaces the whole object, so a turn_id-less
+      // continuation event (a legacy/history shape mid-run) would otherwise
+      // silently WIPE the tracked turn_id - and once it's gone, the next
+      // genuinely new run's differing turn_id can no longer be recognized as
+      // new (the both-sides-present rule above would see tracked=undefined
+      // and fall back to "not a new run"), inheriting the old run's
+      // created_at and steps. Carrying the tracked id forward through such
+      // events keeps the run's identity stable for as long as it lives.
+      // (When incomingTurnId is present it always wins - including on a new
+      // run, where it IS the new identity; isNewRun can never be true while
+      // incomingTurnId is absent, so the fallback only ever applies to
+      // continuations.)
+      const dagTurnId = incomingTurnId ?? trackedTurnId
+      // Can't be null here (the phase was already validated at the top of
+      // this function), but the normalizer's null-on-malformed contract is
+      // typed, so honor it rather than asserting it away.
+      const normalizedDagExecution = normalizeDagExecutionPayload({
+        ...rawEventData,
+        created_at: dagCreatedAt,
+        updated_at: dagUpdatedAt,
+        turn_id: dagTurnId,
+      })
+      if (normalizedDagExecution) {
+        dispatch({ type: "SET_DAG_EXECUTION", payload: normalizedDagExecution })
+      }
+    }
+    // Activity events (dag_execute_start, llm_call_start, react_task_start,
+    // skill_select_start) optimistically infer "the task is running" from the
+    // fact that work is happening. During a history load those same events
+    // are REPLAYED for work that already finished - letting them flip an
+    // authoritative terminal task back to "running" makes the page briefly
+    // believe a finished task is live again (clearing dagTerminatedAt,
+    // unfreezing the Progress panel's elapsed clock, and passing the panel's
+    // auto-open terminal gate) until the terminal event replays. A terminal
+    // task's status during history load comes from task_info/terminal
+    // events, never from inferred liveness. Keyed off the REF, not
+    // state.isHistoryLoading: several handlers clear the state flag early
+    // (to show live UI as soon as anything renders) while the ref stays true
+    // until historical_data_complete actually arrives. Scoped to terminal
+    // tasks only, so a stuck ref (a backend that never sends
+    // historical_data_complete) can't permanently suppress liveness for a
+    // task that was never finished in the first place.
+    const dispatchInferredRunningStatus = () => {
+      if (
+        isHistoricalDataLoadingRef.current
+        && isTerminalTaskStatus(currentState.currentTask?.status)
+      ) return
+      dispatch({ type: "UPDATE_TASK_STATUS", payload: { status: "running" } })
+      dispatch({ type: "SET_PROCESSING", payload: true })
+    }
     // If we're in replay mode, don't process immediately - collect for delayed playback
     if (
       !options?.skipHistory
@@ -2214,6 +2630,15 @@ export function AppProvider({
         message,
       })
     ) {
+      // A stray background task's message reaching this branch would
+      // otherwise get buffered into the VIEWED task's own replay cache (and
+      // its historical_data_complete would flip isHistoricalDataLoadingRef -
+      // a plain ref, not gated by the dispatch wrapper below - ending the
+      // viewed task's history load early based on a different task's data).
+      // None of this branch's effects belong to any task but the one
+      // currently loading history, so drop it outright rather than only
+      // filtering the dispatches inside it.
+      if (isMessageForOtherTask) return
       // Add to replay cache
       dispatch({ type: "ADD_TO_REPLAY_CACHE", payload: message })
 
@@ -2284,7 +2709,7 @@ export function AppProvider({
         const chatData = message as any
         const messageContent = chatData.message || ""
 
-        if (!isDuplicateMessage(messageContent, 'user-message')) {
+        if (!isDuplicateMessageForViewedTask(messageContent, 'user-message')) {
           dispatch({
             type: "ADD_MESSAGE",
             payload: {
@@ -2339,8 +2764,12 @@ export function AppProvider({
               statusType: typeof taskData.status
             })
 
-            // Store pending task for auto-execution
-            if (taskStatus === 'pending' && task.description) {
+            // Store pending task for auto-execution - a plain ref write, not
+            // gated by the dispatch wrapper's task scoping, so a stray
+            // background task's own pending task_info must not overwrite
+            // what's about to be auto-sent for the task actually being
+            // viewed/connected.
+            if (taskStatus === 'pending' && task.description && !isMessageForOtherTask) {
               pendingTaskToExecuteRef.current = { description: task.description }
               console.log('💾 Stored pending task for auto-execution:', taskData.description)
             }
@@ -2361,11 +2790,7 @@ export function AppProvider({
             // This prevents the empty state flash when task_info arrives before user_message.
           } else if (eventType === "dag_execution") {
             dispatch({ type: "SET_HISTORY_LOADING", payload: false })
-            const steps = stepsFromPlanData(eventData, currentState.steps)
-            if (steps) {
-              dispatch({ type: "SET_STEPS", payload: steps })
-            }
-            dispatch({ type: "SET_DAG_EXECUTION", payload: eventData })
+            applyDagExecutionUpdate(eventData, message.timestamp)
           } else if (eventType === "dag_step_info") {
             dispatch({ type: "SET_HISTORY_LOADING", payload: false })
             const stepInfo = eventData
@@ -2422,7 +2847,7 @@ export function AppProvider({
             // legacy events without either identity fall back to short-lived
             // content-based deduplication.
             const isDuplicate = userMessageId === null
-              ? isDuplicateMessage(messageContent, 'user-message', false, true)
+              ? isDuplicateMessageForViewedTask(messageContent, 'user-message')
               : false
             console.log('🔍 Duplicate check:', {
               messageContent,
@@ -2616,7 +3041,7 @@ export function AppProvider({
             if (shouldHideAgentMessage) {
               return
             }
-            if (!streamMessageId && isDuplicateMessage(messageContent, 'agent-message')) {
+            if (!streamMessageId && isDuplicateMessageForViewedTask(messageContent, 'agent-message')) {
               return
             }
             const msgId = generateMessageId("msg-agent")
@@ -2654,16 +3079,16 @@ export function AppProvider({
 
             // Set DAG execution state to planning phase (only if not already executing or completed)
             if (!currentState.dagExecution || currentState.dagExecution.phase === "planning") {
-              const dagExecution: DAGExecution = {
-                phase: phase as "planning" | "executing" | "completed" | "failed",
+              const dagExecution = normalizeDagExecutionPayload({
+                phase,
                 current_plan: {},
                 created_at: message.timestamp,
                 updated_at: message.timestamp,
-              }
+              })
 
               // Use consistent string format for deduplication
               const dedupKey = `plan-start:${phase}`
-              if (!isDuplicateMessage(dedupKey, 'dag-plan-start')) {
+              if (!isDuplicateMessageForViewedTask(dedupKey, 'dag-plan-start')) {
                 dispatch({
                   type: "ADD_MESSAGE",
                   payload: {
@@ -2675,8 +3100,15 @@ export function AppProvider({
                   }
                 })
 
-                // Set DAG execution state to show loading state
-                dispatch({ type: "SET_DAG_EXECUTION", payload: dagExecution })
+                // Set DAG execution state to show loading state - unless the
+                // event carried an unrecognized phase string, in which case
+                // the normalizer returned null and only the chat message
+                // above is kept (fabricating an "executing" run out of an
+                // unknown phase is exactly what the normalizer exists to
+                // prevent).
+                if (dagExecution) {
+                  dispatch({ type: "SET_DAG_EXECUTION", payload: dagExecution })
+                }
               }
             }
           } else if (eventType === "dag_plan_end") {
@@ -2749,7 +3181,7 @@ export function AppProvider({
             }
 
             const dedupKey = t('agent.logs.event.messages.planEnd', { planId, stepsCount })
-            if (!isDuplicateMessage(dedupKey, 'plan-end')) {
+            if (!isDuplicateMessageForViewedTask(dedupKey, 'plan-end')) {
               dispatch({
                 type: "ADD_MESSAGE",
                 payload: {
@@ -2780,8 +3212,7 @@ export function AppProvider({
             const taskPreview = eventData.task_preview || t('agent.header.badge.task')
 
             // Set processing state to true when task execution starts
-            dispatch({ type: "UPDATE_TASK_STATUS", payload: { status: "running" } })
-            dispatch({ type: "SET_PROCESSING", payload: true })
+            dispatchInferredRunningStatus()
 
             // Update DAG execution state to executing phase
             if (currentState.dagExecution) {
@@ -2803,7 +3234,7 @@ export function AppProvider({
 
             // Use consistent string format for deduplication
             const dedupKey = t('agent.logs.event.messages.taskStart', { iteration })
-            if (!isDuplicateMessage(dedupKey, 'dag-execute-start')) {
+            if (!isDuplicateMessageForViewedTask(dedupKey, 'dag-execute-start')) {
               dispatch({
                 type: "ADD_MESSAGE",
                 payload: {
@@ -2844,7 +3275,7 @@ export function AppProvider({
 
             // Use consistent string format for deduplication
             const dedupKey = t('agent.logs.event.messages.taskEnd', { iteration })
-            if (!isDuplicateMessage(dedupKey, 'dag-execute-end')) {
+            if (!isDuplicateMessageForViewedTask(dedupKey, 'dag-execute-end')) {
               dispatch({
                 type: "ADD_MESSAGE",
                 payload: {
@@ -2916,7 +3347,7 @@ export function AppProvider({
               // the same step, or with identical token counts) each show, while
               // a re-dispatched same event is still deduped.
               const noticeKey = `compact-notice-${stepId}-${message.timestamp}`
-              if (!isDuplicateMessage(noticeText, noticeKey)) {
+              if (!isDuplicateMessageForViewedTask(noticeText, noticeKey)) {
                 dispatch({
                   type: "ADD_MESSAGE",
                   payload: {
@@ -3108,7 +3539,7 @@ export function AppProvider({
             if (eventData.task_type === "final_answer_generation") {
               // Check for duplicate final_answer_generation start events
               const content = t('agent.logs.event.messages.finalAnswerGenerating')
-              if (!isDuplicateMessage(content, 'final_answer_start')) {
+              if (!isDuplicateMessageForViewedTask(content, 'final_answer_start')) {
                 dispatch({
                   type: "ADD_MESSAGE",
                   payload: {
@@ -3168,7 +3599,7 @@ export function AppProvider({
             if (eventData.task_type === "final_answer_generation") {
               // Check for duplicate final_answer_generation end events
               const content = t('agent.logs.event.messages.finalAnswerCompleted')
-              if (!isDuplicateMessage(content, 'final_answer_end')) {
+              if (!isDuplicateMessageForViewedTask(content, 'final_answer_end')) {
                 dispatch({
                   type: "ADD_MESSAGE",
                   payload: {
@@ -3253,8 +3684,7 @@ export function AppProvider({
 
           // Step-level LLM Call Events - add to traceEvents for step execution logs
           else if (eventType === "llm_call_start") {
-            dispatch({ type: "UPDATE_TASK_STATUS", payload: { status: "running" } })
-            dispatch({ type: "SET_PROCESSING", payload: true })
+            dispatchInferredRunningStatus()
             if (Number.isFinite(eventData.context_tokens) && Number.isFinite(eventData.context_threshold) && eventData.context_threshold > 0) {
               dispatch({
                 type: "SET_CONTEXT_USAGE",
@@ -3703,7 +4133,7 @@ export function AppProvider({
                   </div>
                 </div>
               )
-              if (!isDuplicateResult(`📋 ${t('agent.logs.event.messages.metaTitle')}: ${JSON.stringify(metaInfo)}`)) {
+              if (!isDuplicateMessageForViewedTask(`📋 ${t('agent.logs.event.messages.metaTitle')}: ${JSON.stringify(metaInfo)}`, "result")) {
                 dispatch({
                   type: "ADD_MESSAGE",
                   payload: {
@@ -3772,7 +4202,7 @@ export function AppProvider({
                 </>
               )
 
-              if (!isDuplicateResult(`📁 ${t('agent.logs.event.messages.fileOutputsGenerated', { count: fileCount })}`)) {
+              if (!isDuplicateMessageForViewedTask(`📁 ${t('agent.logs.event.messages.fileOutputsGenerated', { count: fileCount })}`, "result")) {
                 dispatch({
                   type: "ADD_MESSAGE",
                   payload: {
@@ -3887,6 +4317,22 @@ export function AppProvider({
                   status: "failed",
                 }
               })
+              // This event alone never decides the task failed (a global
+              // trace_error can be logged without the task actually stopping,
+              // and some OTHER terminal event - task_completed/agent_error -
+              // is what actually settles that) - but if the task is ALREADY
+              // known failed (task_info established that on cold history
+              // load, backfilling dagTerminatedAt from mutable updatedAt as a
+              // PROVISIONAL guess) and no proper terminal broadcast ever
+              // followed this trace_error to replace that guess, the frozen
+              // elapsed time would stay wrong forever. Re-stamping the
+              // ALREADY-failed status with this event's own timestamp lets it
+              // replace a provisional value (see UPDATE_TASK_STATUS) without
+              // ever using this event to newly decide the outcome.
+              if (currentState.currentTask?.status === "failed") {
+                dispatch({ type: "UPDATE_TASK_STATUS", payload: { status: "failed" } })
+                dispatch({ type: "TRIGGER_TASK_UPDATE" })
+              }
             }
           }
 
@@ -3911,8 +4357,7 @@ export function AppProvider({
 
           // ReAct Pattern Events - these should be displayed in the right panel
           else if (eventType === "react_task_start" || eventType === "task_start_react") {
-            dispatch({ type: "UPDATE_TASK_STATUS", payload: { status: "running" } })
-            dispatch({ type: "SET_PROCESSING", payload: true })
+            dispatchInferredRunningStatus()
 
             // Add to trace events for displaying execution logs
             const traceEvent: TraceEvent = {
@@ -3946,7 +4391,7 @@ export function AppProvider({
               result && typeof result === "object" && result.status === "waiting_for_user"
                 ? result.message || ""
                 : ""
-            if (messageContent && !isDuplicateMessage(messageContent, 'agent-message')) {
+            if (messageContent && !isDuplicateMessageForViewedTask(messageContent, 'agent-message')) {
               const interactions = normalizeInteractions(result.interactions)
               const msgId = generateMessageId("msg-agent")
               dispatch({
@@ -3991,8 +4436,7 @@ export function AppProvider({
             }
             dispatch({ type: "ADD_TRACE_EVENT", payload: traceEvent })
           } else if (eventType === "llm_call_start") {
-            dispatch({ type: "UPDATE_TASK_STATUS", payload: { status: "running" } })
-            dispatch({ type: "SET_PROCESSING", payload: true })
+            dispatchInferredRunningStatus()
             const stepId = message.step_id || traceEventData.step_id
             const traceEvent: TraceEvent = {
               event_id: generateMessageId("llm-call-start"),
@@ -4143,8 +4587,7 @@ export function AppProvider({
           }
           // Skill Selection Events
           else if (eventType === "skill_select_start") {
-            dispatch({ type: "UPDATE_TASK_STATUS", payload: { status: "running" } })
-            dispatch({ type: "SET_PROCESSING", payload: true })
+            dispatchInferredRunningStatus()
 
             const traceEvent: TraceEvent = {
               event_id: generateMessageId("skill-select-start"),
@@ -4577,7 +5020,10 @@ export function AppProvider({
 
           // Historical Data Events - handled by the main message handler below
           else if (eventType === "historical_data_complete") {
-            isHistoricalDataLoadingRef.current = false
+            // A plain ref write, not gated by the dispatch wrapper's task
+            // scoping - a stray background task's own historical_data_complete
+            // must not end the VIEWED task's history-loading state early.
+            if (!isMessageForOtherTask) isHistoricalDataLoadingRef.current = false
             dispatch({ type: "SET_HISTORY_LOADING", payload: false })
             dispatch({ type: "SYNC_PROCESSING_STATUS" })
 
@@ -4605,7 +5051,15 @@ export function AppProvider({
           // Handle direct trace events (without event_type wrapper) - infer type from content
           // Check if this is DAG execution data
           if (traceEventData.phase && (traceEventData.current_plan !== undefined)) {
-            dispatch({ type: "SET_DAG_EXECUTION", payload: traceEventData })
+            // Same shared handler the two explicit dag_execution shapes use -
+            // this legacy, unwrapped shape predates it and used to dispatch
+            // the raw payload directly, bypassing the phase/current_plan
+            // normalizer, the created_at/updated_at backfill, and the
+            // turn_id-based new-run detection all at once.
+            applyDagExecutionUpdate(
+              traceEventData as Record<string, unknown>,
+              message.timestamp,
+            )
           }
           // Check if this is step data (has id and status)
           else if (traceEventData.id && traceEventData.status) {
@@ -4806,27 +5260,32 @@ export function AppProvider({
           }
         }
 
-        // Update DAG execution status to completed
+        // Sync DAG execution status to completed/failed - but only for a
+        // task that actually had a DAG plan running (currentState.dagExecution
+        // already set by an earlier dag_execution/dag_step_* event this turn).
+        // Fabricating a fresh DAGExecution for every completed task regardless
+        // of pattern (the previous `else` branch here) made every flash/ReAct
+        // task look like a completed zero-step DAG run to any DAG-only UI
+        // (e.g. the Progress panel), popping it open for plain replies.
         if (currentState.dagExecution) {
           const updatedDAGExecution = {
             ...currentState.dagExecution,
             phase: taskData.status,
-            updated_at: new Date().toISOString()
+            updated_at: message.timestamp,
           }
           dispatch({ type: "SET_DAG_EXECUTION", payload: updatedDAGExecution })
-        } else {
-          const dagExecution: DAGExecution = {
-            phase: taskData.status,
-            current_plan: {},
-            created_at: new Date().toISOString(),
-            updated_at: new Date().toISOString()
-          }
-          dispatch({ type: "SET_DAG_EXECUTION", payload: dagExecution })
         }
 
-        // Mark that historical data should not be requested again for completed/failed tasks
-        if (currentState.taskId) {
-          historicalDataRequestMapRef.current.set(currentState.taskId, true)
+        // Mark that historical data should not be requested again for
+        // completed/failed tasks - keyed by this event's OWN task (falling
+        // back to the viewed one only if the envelope doesn't carry its
+        // own id, matching the emitTaskError pattern above), not
+        // unconditionally the viewed task: a background task's own
+        // completion must not mark the currently-viewed task as "done
+        // requesting history" if the two differ.
+        const historicalDataTaskId = controlEnvelope.taskId ?? currentState.taskId
+        if (historicalDataTaskId) {
+          historicalDataRequestMapRef.current.set(historicalDataTaskId, true)
         }
 
         // Handle file outputs
@@ -4881,7 +5340,7 @@ export function AppProvider({
             </>
           )
 
-          if (!isDuplicateResult(`📁 ${t('agent.logs.event.messages.fileOutputsGenerated', { count: fileCount })}`)) {
+          if (!isDuplicateMessageForViewedTask(`📁 ${t('agent.logs.event.messages.fileOutputsGenerated', { count: fileCount })}`, "result")) {
             dispatch({
               type: "ADD_MESSAGE",
               payload: {
@@ -4963,11 +5422,14 @@ export function AppProvider({
         break
 
       case "dag_execution":
-        const dagSteps = stepsFromPlanData(message.data, currentState.steps)
-        if (dagSteps) {
-          dispatch({ type: "SET_STEPS", payload: dagSteps })
-        }
-        dispatch({ type: "SET_DAG_EXECUTION", payload: message.data as DAGExecution })
+        // The bare-message-type shape (as opposed to the trace_event-wrapped
+        // one handled above) - this is the one a LIVE single-connection
+        // tracer actually uses while a task is running (see
+        // create_stream_event's callers), not just a replay/legacy path, so
+        // it needs the exact same turn_id-aware reset logic or a live run
+        // transition here reintroduces the stale-steps/stale-created_at bug
+        // this feature exists to fix.
+        applyDagExecutionUpdate((message.data ?? {}) as Record<string, unknown>, message.timestamp)
         break
 
 
@@ -5019,7 +5481,7 @@ export function AppProvider({
         if (
           waitingMessage &&
           waitingMessage !== "Task waiting for user response" &&
-          !isDuplicateMessage(waitingMessage, 'agent-message')
+          !isDuplicateMessageForViewedTask(waitingMessage, 'agent-message')
         ) {
           dispatch({
             type: "ADD_MESSAGE",
@@ -5107,7 +5569,7 @@ export function AppProvider({
           dispatch({ type: "SET_PROCESSING", payload: false })
         }
 
-        if (!isDuplicateMessage(websocketErrorMessage, "agent-error")) {
+        if (!isDuplicateMessageForViewedTask(websocketErrorMessage, "agent-error")) {
           dispatch({
             type: "ADD_MESSAGE",
             payload: {
@@ -5128,8 +5590,11 @@ export function AppProvider({
         break
 
       case "historical_data_complete":
-        // Historical data loading complete
-        isHistoricalDataLoadingRef.current = false
+        // Historical data loading complete. The ref write is not gated by
+        // the dispatch wrapper's task scoping - a stray background task's
+        // own historical_data_complete must not end the VIEWED task's
+        // history-loading state early.
+        if (!isMessageForOtherTask) isHistoricalDataLoadingRef.current = false
         dispatch({ type: "SET_HISTORY_LOADING", payload: false })
         dispatch({ type: "SYNC_PROCESSING_STATUS" })
 
@@ -5778,12 +6243,95 @@ export function AppProvider({
         taskId: state.taskId
       })
 
+      // The backend executes the turn as an independent background task and
+      // can start broadcasting its own dag_execution/trace events before this
+      // ack resolves - capture the pre-send dagExecution (its turn_id and its
+      // created_at) so the reset below can detect that case and skip
+      // clearing, rather than wiping out the new turn's own freshly-arrived
+      // state. The pre-send currentTask is captured for the optimistic
+      // status flip further below, for the same reason: events landing
+      // during the await must be able to veto it.
+      const dagExecutionBeforeSend = stateRef.current.dagExecution
+      const dagTurnIdBeforeSend = dagExecutionBeforeSend?.turn_id
+      const currentTaskBeforeSend = stateRef.current.currentTask
+
       // Wait for the server's durable-delivery acknowledgement. If the socket
       // is disconnected or the backend rejects the turn, this throws and the
-      // composer keeps both its text and attached files.
+      // composer keeps both its text and attached files. The DAG reset below
+      // deliberately runs only after this succeeds - clearing dagExecution/
+      // steps first and then throwing would remove the Progress panel and its
+      // header toggle for a run that never actually changed.
       await sendChatMessage(message, files, config?.force, clientMessageId)
 
-      if (state.currentTask?.status === 'completed') {
+      // A prior turn's DAG plan/steps must not linger into this turn - otherwise
+      // the Progress panel would auto-open (or stay open) showing stale steps
+      // from a different execution mode/run before this turn's own dag_execution
+      // event (if any) arrives. But sending into a run that's still actively
+      // going - answering a mid-run clarification, or the "live guidance" input
+      // ChatInput allows while running/paused/waiting_for_user (see
+      // ChatInput.tsx's `allowsLiveGuidanceInput`; the task page never passes
+      // onSend/onSendInteraction, so all of these fall back to this same
+      // sendMessage) - is a CONTINUATION of that run, not a new turn. Clearing
+      // here would wipe out the in-progress DAG plan/steps the Progress panel
+      // is actively showing.
+      const isContinuingActiveRun =
+        state.currentTask?.status === "running"
+        || state.currentTask?.status === "paused"
+        || state.currentTask?.status === "waiting_for_user"
+      // Prefer turn_id equality when BOTH sides actually have one - it sees
+      // through the task_completed handler's clone-for-phase-sync (which
+      // makes a NEW object with the SAME turn_id, see that handler above),
+      // where reference equality alone would wrongly look like "something
+      // new arrived" and skip the reset. But turn_id is optional (older
+      // backends/patterns that never set it), so a no-turn_id fallback is
+      // still needed - and it compares created_at, not object reference:
+      // the same clone-for-phase-sync problem applies on this path too (a
+      // no-turn_id dagExecution recloned by a racing task_completed changed
+      // reference but kept its created_at, so it still correctly reads as
+      // stale), while the case the fallback exists to protect - a genuinely
+      // new dagExecution arriving from NOTHING during the await - still
+      // reads as fresh (created_at went from undefined to a value). A new
+      // no-turn_id run arriving OVER an existing old one inherits the old
+      // created_at (applyDagExecutionUpdate can't tell legacy runs apart -
+      // that's #1433) and so gets reset here; that's the right bias, since a
+      // live run repopulates itself on its next event, whereas a wrongly
+      // retained stale panel has no later event to ever correct it.
+      const dagExecutionStillStale =
+        dagTurnIdBeforeSend && stateRef.current.dagExecution?.turn_id
+          ? stateRef.current.dagExecution.turn_id === dagTurnIdBeforeSend
+          : stateRef.current.dagExecution?.created_at === dagExecutionBeforeSend?.created_at
+      if (!isContinuingActiveRun && dagExecutionStillStale) {
+        dispatch({ type: "RESET_DAG_STATE" })
+      }
+
+      // Optimistically flips a terminal task back to "running" once its
+      // retry/new-turn send is acked, so the user isn't staring at a
+      // "completed"/"failed" badge while the backend spins the turn up.
+      // Three fences, because this dispatch has no task id of its own for
+      // the reducer to validate against:
+      // - taskId still matches: the user can navigate to a different task
+      //   while this send is in flight, and a delayed ack for task A's
+      //   retried send must not mark whatever task the user has since
+      //   navigated to as "running" (same guard addOptimisticUserMessage
+      //   applies to its own dispatch).
+      // - the send began FROM a terminal status: the flip is only meaningful
+      //   for a rerun of a finished task - a send into an active run has
+      //   nothing to flip.
+      // - currentTask is untouched since the send began (reference
+      //   equality): ANY task update landing during the await - most
+      //   critically this new turn's OWN terminal event, when a fast
+      //   non-DAG turn completes before the ack resolves - is newer truth
+      //   than this optimistic guess. Flipping over it would mark a
+      //   genuinely finished run as running again AND clear the
+      //   dagTerminatedAt the reducer just stamped, unfreezing the Progress
+      //   panel's elapsed clock. Skipping the flip is always safe: if the
+      //   turn really is running, the backend's own status events say so
+      //   moments later.
+      if (
+        state.taskId === stateRef.current.taskId
+        && stateRef.current.currentTask === currentTaskBeforeSend
+        && isTerminalTaskStatus(currentTaskBeforeSend?.status)
+      ) {
         dispatch({
           type: "UPDATE_TASK_STATUS",
           payload: { status: 'running' }
@@ -5996,7 +6544,8 @@ export function AppProvider({
       // by the connection effect AFTER the new task's history has already arrived.
       dispatch({ type: "CLEAR_MESSAGES" })
       dispatch({ type: "SET_TRACE_EVENTS", payload: [] })
-      dispatch({ type: "SET_STEPS", payload: [] })
+      // steps/dagExecution are cleared by the SET_TASK_ID dispatch below (its
+      // reducer case resets them whenever taskChanged) rather than here.
     }
 
     if (options?.navigate !== false) {

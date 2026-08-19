@@ -26,6 +26,7 @@ on:
       - 'tests/web/services/test_task_status_storage_postgresql.py'
       - 'src/xagent/web/api/monitor.py'
       - 'tests/web/api/test_monitor_postgresql.py'
+      - 'tests/web/api/monitor_daily_window_shared.py'
       - 'src/xagent/web/services/task_interaction_staging.py'
       - 'tests/web/services/test_interaction_staging_postgresql.py'
       - 'src/xagent/web/services/task_interaction_service.py'
@@ -108,6 +109,7 @@ jobs:
             tests/web/services/test_task_status_storage_postgresql.py
             src/xagent/web/api/monitor.py
             tests/web/api/test_monitor_postgresql.py
+            tests/web/api/monitor_daily_window_shared.py
             src/xagent/web/services/task_interaction_staging.py
             tests/web/services/test_interaction_staging_postgresql.py
             src/xagent/web/services/task_interaction_service.py

@@ -73,16 +73,27 @@ class SkillParser:
         section_tags = SkillParser._extract_tags(content)
         frontmatter_tags = SkillParser._frontmatter_string_list(frontmatter, "tags")
         tags = frontmatter_tags or section_tags
+        frontmatter_description = SkillParser._frontmatter_string(
+            frontmatter, "description"
+        )
+        frontmatter_when_to_use = SkillParser._frontmatter_string(
+            frontmatter, "when_to_use"
+        )
 
         return {
             "name": name,
             "path": path,
             "content": content,  # Complete SKILL.md content
             "template": template_content,  # template.md content (if exists)
-            "description": section_description
-            or SkillParser._frontmatter_string(frontmatter, "description"),
-            "when_to_use": section_when_to_use
-            or SkillParser._frontmatter_string(frontmatter, "when_to_use"),
+            # Frontmatter wins like tags do: it is the bounded routing metadata,
+            # while a body section is prose with no length ceiling. Whitespace-only
+            # counts as absent, or it wins and then collapses to an empty entry.
+            "description": frontmatter_description
+            if frontmatter_description.strip()
+            else section_description,
+            "when_to_use": frontmatter_when_to_use
+            if frontmatter_when_to_use.strip()
+            else section_when_to_use,
             "execution_flow": SkillParser._extract_section(content, "Execution Flow"),
             "tags": tags,
             "files": sorted(files),

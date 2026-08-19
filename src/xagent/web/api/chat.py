@@ -75,10 +75,7 @@ from ..services.agent_team_scope import (
     owned_agent_clause,
     resolve_authorized_agent,
 )
-from ..services.chat_history_service import (
-    get_latest_waiting_question,
-    load_task_transcript,
-)
+from ..services.chat_history_service import load_task_transcript
 from ..services.connector_runtime import (
     bind_connector_runtime_selection_snapshot,
     prepare_connector_runtime_selection_snapshot,
@@ -105,6 +102,7 @@ from ..services.task_execution_context_service import (
     load_task_execution_recovery_state,
     materialize_task_execution_recovery_state,
 )
+from ..services.task_interaction_read import get_pending_interaction_question
 from ..services.task_lease_service import (
     TaskLease,
     TaskLeaseHeartbeatOutcome,
@@ -4525,8 +4523,8 @@ async def get_task(
             waiting_question = None
             waiting_interactions = None
             if task.status == TaskStatus.WAITING_FOR_USER:
-                waiting_question, waiting_interactions = get_latest_waiting_question(
-                    db, task_id
+                waiting_question, waiting_interactions = (
+                    get_pending_interaction_question(db, task)
                 )
 
             # Fetch agent info if agent relationship is available
@@ -4649,8 +4647,8 @@ async def get_task_status(
             waiting_question = None
             waiting_interactions = None
             if task.status == TaskStatus.WAITING_FOR_USER:
-                waiting_question, waiting_interactions = get_latest_waiting_question(
-                    db, task_id
+                waiting_question, waiting_interactions = (
+                    get_pending_interaction_question(db, task)
                 )
 
             # Fetch agent info if agent relationship is available

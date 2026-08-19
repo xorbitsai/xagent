@@ -161,7 +161,7 @@ def _marker_clean(value: str) -> str:
     cannot share code with -- ``src/xagent/web/api/trace_handlers.py``'s
     ``DatabaseTraceHandler._serialize_data_for_json`` (``clean_string``),
     ``src/xagent/web/api/ws_trace_handlers.py``'s
-    ``WebSocketTraceHandler._serialize_data`` (``clean_string``), and
+    ``serialize_trace_data`` (``clean_string``), and
     ``src/xagent/web/api/websocket.py``'s
     ``SharedWebSocketTracer._serialize_data`` (``clean_string``) -- and
     ``src/xagent/web/services/task_clarification_draft.py``'s

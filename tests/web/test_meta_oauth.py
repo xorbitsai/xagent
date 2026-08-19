@@ -513,6 +513,140 @@ def test_oauth_callback_survives_a_non_integer_user_id_claim(
     assert "Post-commit OAuth side effects failed" in caplog.text
 
 
+def test_bare_google_callback_does_not_provision_gmail_watches(db_session, monkeypatch):
+    """A bare ``google`` connect must not trigger Gmail watch provisioning.
+
+    With no ``app_id`` claim the callback takes the batch branch and
+    ``connector_key`` falls back to the provider name, so the
+    ``connector_key == "gmail"`` gate stays closed even though the batch
+    connects the Gmail catalog app. That is correct: the bare grant is stored
+    with ``UserOAuth.provider == "google"``, which can never back a Gmail
+    trigger, so provisioning would only be wasted work. Before this test,
+    deleting the gate entirely left the whole suite green.
+    """
+    db, user = db_session
+    db.add(
+        PublicMCPApp(
+            app_id="gmail",
+            name="Gmail",
+            transport="oauth",
+            provider_name="google",
+        )
+    )
+    db.commit()
+
+    state = create_access_token(
+        data={"type": "oauth_state", "user_id": user.id, "provider": "google"},
+        expires_delta=timedelta(minutes=10),
+    )
+    request = SimpleNamespace(query_params={"code": "code", "state": state})
+    monkeypatch.setattr(
+        auth_api.requests,
+        "post",
+        Mock(
+            return_value=MockResponse(
+                {
+                    "access_token": "tok",
+                    "token_type": "Bearer",
+                    "scope": "",
+                    "expires_in": 3600,
+                }
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        auth_api.requests,
+        "get",
+        Mock(return_value=MockResponse({"sub": "u1", "email": "alice@gmail.com"})),
+    )
+    provision = Mock()
+    monkeypatch.setattr(
+        "xagent.web.services.gmail_provisioning."
+        "best_effort_provision_gmail_watches_for_user",
+        provision,
+    )
+
+    response = generic_oauth_callback("google", request, db, _google_provider())
+
+    assert response.status_code == 200
+    # The connect itself succeeded: the bare grant is stored under the
+    # provider name and the Gmail catalog app is connected...
+    oauth_account = (
+        db.query(UserOAuth)
+        .filter(UserOAuth.user_id == user.id, UserOAuth.provider == "google")
+        .one()
+    )
+    assert oauth_account.email == "alice@gmail.com"
+    assert "Gmail" in {s.name for s in db.query(MCPServer).all()}
+    # ...but Gmail watch provisioning stayed out of it.
+    provision.assert_not_called()
+
+
+def test_app_scoped_non_gmail_callback_does_not_provision_gmail_watches(
+    db_session, monkeypatch
+):
+    """An app-scoped non-Gmail connect must not trigger Gmail provisioning.
+
+    Complements the bare-connect test above with the other route through
+    ``connector_key=(app_id or provider)``: here ``app_id`` is present and the
+    gate compares it, not the provider name. ``google-calendar`` is Gmail's
+    closest neighbor — same provider, different app — so this also pins that
+    the gate keys on the app rather than on the provider.
+    """
+    db, user = db_session
+    state = create_access_token(
+        data={
+            "type": "oauth_state",
+            "user_id": user.id,
+            "provider": "google",
+            "app_id": "google-calendar",
+        },
+        expires_delta=timedelta(minutes=10),
+    )
+    request = SimpleNamespace(query_params={"code": "calendar-code", "state": state})
+    monkeypatch.setattr(
+        auth_api.requests,
+        "post",
+        Mock(
+            return_value=MockResponse(
+                {
+                    "access_token": "calendar-token",
+                    "refresh_token": "calendar-refresh",
+                    "token_type": "Bearer",
+                    "expires_in": 3600,
+                    "scope": "https://www.googleapis.com/auth/calendar",
+                }
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        auth_api.requests,
+        "get",
+        Mock(
+            return_value=MockResponse(
+                {"sub": "google-user-1", "email": "alice@gmail.com"}
+            )
+        ),
+    )
+    provision = Mock()
+    monkeypatch.setattr(
+        "xagent.web.services.gmail_provisioning."
+        "best_effort_provision_gmail_watches_for_user",
+        provision,
+    )
+
+    response = generic_oauth_callback("google", request, db, _google_provider())
+
+    assert response.status_code == 200
+    oauth_account = (
+        db.query(UserOAuth)
+        .filter(UserOAuth.user_id == user.id, UserOAuth.provider == "google-calendar")
+        .one()
+    )
+    assert oauth_account.email == "alice@gmail.com"
+    provision.assert_not_called()
+
+
 def test_meta_callback_exchanges_short_lived_token_and_connects_selected_app(
     db_session, monkeypatch
 ):

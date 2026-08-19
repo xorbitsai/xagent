@@ -851,6 +851,23 @@ def test_execution_adapter_passes_dag_max_concurrency_to_pattern() -> None:
     assert pattern.max_concurrency == 2
 
 
+def test_execution_adapter_passes_react_iteration_budget_to_patterns() -> None:
+    for pattern_name in ("react", "auto"):
+        adapter = AgentExecutionAdapter(
+            AgentExecutionConfig(
+                name=pattern_name,
+                pattern=pattern_name,
+                llm=FakeLLM([]),
+                react_max_iterations=17,
+                skill_manager=NoSkillManager(),
+            )
+        )
+
+        pattern, _ = adapter._build_pattern()
+        react_pattern = pattern.react_pattern if pattern_name == "auto" else pattern
+        assert react_pattern.max_iterations == 17
+
+
 def test_execution_adapter_routes_auto_to_auto() -> None:
     adapter = AgentExecutionAdapter(
         AgentExecutionConfig(

@@ -64,6 +64,7 @@ class AgentService:
         system_prompt: str | None = None,
         preferred_input_modalities: tuple[str, ...] | list[str] | None = None,
         tools_initialized: bool | None = None,
+        react_max_iterations: int = 200,
         **agent_kwargs: Any,
     ) -> None:
         self.name = name
@@ -84,6 +85,7 @@ class AgentService:
         self.preferred_input_modalities = self._base_preferred_input_modalities
         self.memory_similarity_threshold = memory_similarity_threshold
         self.memory_enabled = memory_enabled
+        self.react_max_iterations = max(1, int(react_max_iterations))
         if tools is not None and tool_config is not None:
             handoff_factory_runtime = getattr(
                 tool_config, "handoff_factory_runtime", None
@@ -475,6 +477,9 @@ class AgentService:
             self._execution_adapter.config.llm = self.llm
             self._execution_adapter.config.compact_llm = self.compact_llm
             self._execution_adapter.config.pattern = self.pattern
+            self._execution_adapter.config.react_max_iterations = (
+                self.react_max_iterations
+            )
             self._execution_adapter.config.outbound_message_handler = (
                 self._outbound_message_handler
             )
@@ -539,6 +544,7 @@ class AgentService:
                 scope_segments=self.scope_segments,
                 current_task_id=self._current_task_id,
                 service_id=self.id,
+                react_max_iterations=self.react_max_iterations,
                 outbound_message_handler=self._outbound_message_handler,
                 interrupt_checker=self._interrupt_checker,
                 conversation_history=self._conversation_history,

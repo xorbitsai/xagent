@@ -1,21 +1,13 @@
 ---
 name: html-deck-editorial
 description: |
-  Generate a single-file HTML presentation deck with magazine-grade editorial
-  styling. Use only when the user explicitly asks for an "html deck",
-  "editorial slides", "magazine style presentation", "beautiful slides", "美观
-  PPT", or "网页版幻灯片" — i.e. a slide-style visual deliverable AND a
-  beautiful, designer-looking result is expected. Do not use this for generic
-  visual design requests such as ad creatives, posters, banners, social media
-  graphics, or image generation; use `static-visual-design` for designed static
-  graphics and the image-generation tools for standalone image generation.
-  Output is one self-contained .html file (inline CSS + JS, no build, no npm),
-  printable to PDF via the browser, with keyboard navigation. Prefer this over
-  native .pptx when the user wants visual quality over Office compatibility.
+  One self-contained HTML slide deck with magazine-grade editorial styling:
+  "html deck", "editorial slides", "美观 PPT", "网页版幻灯片". Not for posters,
+  ad creatives, or standalone images.
 when_to_use: |
-  Use for the explicit slide-style HTML requests described above when editorial
-  polish matters more than Office compatibility. Prefer over `pptx-editorial`
-  only when HTML output is requested.
+  A slide-style HTML deliverable where editorial polish outweighs Office
+  compatibility. Use pptx-editorial for native .pptx, static-visual-design for
+  designed graphics.
 tags:
   - presentation
   - html

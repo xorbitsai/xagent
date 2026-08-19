@@ -347,6 +347,228 @@ sample_prompts:
         assert template is None
 
     @pytest.mark.asyncio
+    async def test_get_template_with_persona(self, temp_templates_dir):
+        """persona 应正确加载并保留本地化结构，供 marketplace 卡片使用。"""
+        template_with_persona = temp_templates_dir / "with_persona.yaml"
+        template_with_persona.write_text(
+            """
+id: with_persona
+name: Social Media Content Manager
+category: Marketing
+descriptions:
+  en: A template with a persona
+  zh: 一个带有 persona 的模板
+persona:
+  name: Maya
+  role:
+    en: Social Media Content Manager
+    zh: 社媒内容经理
+  avatar: https://example.com/maya.png
+  intro:
+    en: "Hi — I'm Maya, your Social Media Content Manager."
+    zh: 你好，我是 Maya，你的社媒内容经理。
+  kickoff_questions:
+    en:
+    - Which platforms are in scope?
+    - Do you have brand guidelines?
+    zh:
+    - 涉及哪些平台？
+    - 有品牌规范吗？
+"""
+        )
+
+        manager = TemplateManager(templates_root=temp_templates_dir)
+        await manager.initialize()
+
+        template = await manager.get_template("with_persona")
+
+        assert template is not None
+        persona = template["persona"]
+        assert persona["name"] == "Maya"
+        assert persona["role"]["en"] == "Social Media Content Manager"
+        assert persona["role"]["zh"] == "社媒内容经理"
+        assert persona["avatar"] == "https://example.com/maya.png"
+        assert len(persona["kickoff_questions"]["en"]) == 2
+
+    @pytest.mark.asyncio
+    async def test_persona_defaults_to_none_when_absent(self, temp_templates_dir):
+        """没有 persona 字段的模板（如 workforce 类型）应保持 persona=None，
+        而不是要求每个模板都作者一份 marketplace 卡片内容。"""
+        manager = TemplateManager(templates_root=temp_templates_dir)
+        await manager.initialize()
+
+        template = await manager.get_template("customer_support")
+
+        assert template is not None
+        assert template["persona"] is None
+
+    @pytest.mark.asyncio
+    async def test_persona_missing_name_is_rejected(self, temp_templates_dir):
+        """persona 缺少 name 时，该模板应被跳过而不是让整个模板目录加载失败。"""
+        bad_template = temp_templates_dir / "bad_persona_name.yaml"
+        bad_template.write_text(
+            """
+id: bad_persona_name
+name: Bad Persona Name Template
+category: Support
+descriptions:
+  en: A template with a persona missing its name
+  zh: 一个 persona 缺少 name 的模板
+persona:
+  role:
+    en: Some Role
+"""
+        )
+
+        manager = TemplateManager(templates_root=temp_templates_dir)
+        await manager.initialize()
+
+        template = await manager.get_template("bad_persona_name")
+        assert template is None
+
+    @pytest.mark.asyncio
+    async def test_persona_role_without_locale_dict_is_rejected(
+        self, temp_templates_dir
+    ):
+        """persona.role 必须按语言分组（{"en": ...}），写成裸字符串会静默
+        跳过本地化解析，因此在解析阶段就应当拒绝该写法。"""
+        bad_template = temp_templates_dir / "flat_persona_role.yaml"
+        bad_template.write_text(
+            """
+id: flat_persona_role
+name: Flat Persona Role Template
+category: Support
+descriptions:
+  en: A template with a flat persona.role
+  zh: 一个 persona.role 为扁平字符串的模板
+persona:
+  name: Nia
+  role: Some Role
+"""
+        )
+
+        manager = TemplateManager(templates_root=temp_templates_dir)
+        await manager.initialize()
+
+        template = await manager.get_template("flat_persona_role")
+        assert template is None
+
+    @pytest.mark.asyncio
+    async def test_persona_role_missing_en_is_rejected(self, temp_templates_dir):
+        """persona.role 至少要有 'en' 键，否则默认语言下没有可展示的职位文案。"""
+        bad_template = temp_templates_dir / "no_en_persona_role.yaml"
+        bad_template.write_text(
+            """
+id: no_en_persona_role
+name: No En Persona Role Template
+category: Support
+descriptions:
+  en: A template with a persona.role missing 'en'
+  zh: 一个 persona.role 缺少 'en' 的模板
+persona:
+  name: Nia
+  role:
+    zh: 某个角色
+"""
+        )
+
+        manager = TemplateManager(templates_root=temp_templates_dir)
+        await manager.initialize()
+
+        template = await manager.get_template("no_en_persona_role")
+        assert template is None
+
+    @pytest.mark.asyncio
+    async def test_persona_intro_missing_en_is_rejected(self, temp_templates_dir):
+        """persona.intro 若被作者填写，至少要有 'en' 键——否则
+        get_localized_value 对英文请求会静默回落成空字符串，Hire 流程会发出
+        一条空白的开场消息而不是报错。"""
+        bad_template = temp_templates_dir / "no_en_persona_intro.yaml"
+        bad_template.write_text(
+            """
+id: no_en_persona_intro
+name: No En Persona Intro Template
+category: Support
+descriptions:
+  en: A template with a persona.intro missing 'en'
+  zh: 一个 persona.intro 缺少 'en' 的模板
+persona:
+  name: Nia
+  role:
+    en: Some Role
+  intro:
+    zh: 你好，我是 Nia。
+"""
+        )
+
+        manager = TemplateManager(templates_root=temp_templates_dir)
+        await manager.initialize()
+
+        template = await manager.get_template("no_en_persona_intro")
+        assert template is None
+
+    @pytest.mark.asyncio
+    async def test_persona_kickoff_questions_missing_en_is_rejected(
+        self, temp_templates_dir
+    ):
+        """persona.kickoff_questions 若被作者填写，同样至少要有 'en' 键，
+        理由与 persona.intro 相同。"""
+        bad_template = temp_templates_dir / "no_en_persona_kickoff.yaml"
+        bad_template.write_text(
+            """
+id: no_en_persona_kickoff
+name: No En Persona Kickoff Template
+category: Support
+descriptions:
+  en: A template with persona.kickoff_questions missing 'en'
+  zh: 一个 persona.kickoff_questions 缺少 'en' 的模板
+persona:
+  name: Nia
+  role:
+    en: Some Role
+  kickoff_questions:
+    zh:
+    - 第一个问题？
+"""
+        )
+
+        manager = TemplateManager(templates_root=temp_templates_dir)
+        await manager.initialize()
+
+        template = await manager.get_template("no_en_persona_kickoff")
+        assert template is None
+
+    @pytest.mark.asyncio
+    async def test_persona_intro_and_kickoff_without_en_key_still_optional(
+        self, temp_templates_dir
+    ):
+        """persona.intro / persona.kickoff_questions themselves stay
+        optional - omitting them entirely (not just their 'en' key) must
+        not fail load, unlike persona.role which is always required."""
+        template_file = temp_templates_dir / "persona_no_intro.yaml"
+        template_file.write_text(
+            """
+id: persona_no_intro
+name: Persona No Intro Template
+category: Support
+descriptions:
+  en: A template whose persona has no intro or kickoff_questions at all
+persona:
+  name: Nia
+  role:
+    en: Some Role
+"""
+        )
+
+        manager = TemplateManager(templates_root=temp_templates_dir)
+        await manager.initialize()
+
+        template = await manager.get_template("persona_no_intro")
+        assert template is not None
+        assert template["persona"]["intro"] == {}
+        assert template["persona"]["kickoff_questions"] == {}
+
+    @pytest.mark.asyncio
     async def test_skip_invalid_templates(self, temp_templates_dir):
         """测试跳过无效的模板文件"""
         manager = TemplateManager(templates_root=temp_templates_dir)

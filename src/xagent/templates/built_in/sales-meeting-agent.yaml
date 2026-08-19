@@ -37,6 +37,30 @@ sample_prompts:
     prompt: 根据这份会议记录，起草一封跟进邮件，总结决策和后续步骤发给与会者。
     highlights:
     - 会议记录
+persona:
+  name: Kevin
+  role:
+    en: Meeting Agent
+    zh: 会议纪要专员
+  avatar: /marketplace/avatars/kevin.png
+  intro:
+    en: |-
+      Hi there — I'm Kevin, your Meeting Agent.
+
+      Give me a transcript and I return the decisions, owners and due dates, plus a follow-up email.
+    zh: |-
+      你好，我是 Kevin，你的会议纪要专员。
+
+      给我一份会议记录，我会整理出决策、负责人和截止日期，外加一封跟进邮件草稿。
+  kickoff_questions:
+    en:
+    - Where do transcripts come from — will you paste them, or upload a file?
+    - Should the follow-up be a draft for you, or ready to send to the room?
+    - Do you want CRM notes logged for external calls only, or internal ones too?
+    zh:
+    - 会议记录从哪里来——你会直接粘贴，还是上传文件？
+    - 跟进邮件是给你审阅的草稿，还是可以直接发给与会者？
+    - 只需要给外部会议记 CRM 备注，还是内部会议也要记？
 connections:
 - name: Zoom
   logo: https://www.google.com/s2/favicons?domain=zoom.us&sz=64

@@ -298,6 +298,89 @@ def workforce_mock_app_state(workforce_template_manager):
 
 
 @pytest.fixture(scope="function")
+def persona_templates_dir(tmp_path):
+    """A separate templates directory holding one template with a full
+    `persona` block and one without, isolated from `templates_dir` so its
+    exact-count assertions elsewhere aren't affected.
+    """
+    templates_dir = tmp_path / "persona_templates"
+    templates_dir.mkdir()
+
+    (templates_dir / "with_persona.yaml").write_text(
+        """
+id: with_persona
+name: Social Media Content Manager
+category: Marketing
+descriptions:
+  en: Turns a brief into platform-native posts.
+  zh: 将简报转化为平台原生帖子。
+persona:
+  name: Maya
+  role:
+    en: Social Media Content Manager
+    zh: 社媒内容经理
+  avatar: https://example.com/maya.png
+  intro:
+    en: "Hi Gerard — I'm Maya, your Social Media Content Manager."
+    zh: 你好 Gerard，我是 Maya，你的社媒内容经理。
+  kickoff_questions:
+    en:
+    - Which platforms are in scope?
+    - Do you have brand guidelines?
+    zh:
+    - 涉及哪些平台？
+    - 有品牌规范吗？
+author: Xagent
+version: "1.0"
+
+agent_config:
+  instructions: |
+    You are the Social Media Content Manager.
+  skills: []
+  tool_categories: []
+"""
+    )
+    (templates_dir / "no_persona.yaml").write_text(
+        """
+id: no_persona
+name: Plain Template
+category: Support
+descriptions:
+  en: A template authored with no marketplace persona.
+author: Xagent
+version: "1.0"
+
+agent_config:
+  instructions: |
+    You are a plain agent.
+  skills: []
+  tool_categories: []
+"""
+    )
+    return templates_dir
+
+
+@pytest.fixture(scope="function")
+def persona_template_manager(persona_templates_dir):
+    """Create a TemplateManager fixture over `persona_templates_dir`"""
+    from xagent.templates.manager import TemplateManager
+
+    return TemplateManager(templates_root=persona_templates_dir)
+
+
+@pytest.fixture(scope="function")
+def persona_mock_app_state(persona_template_manager):
+    """Mock app.state.template_manager backed by the persona templates dir"""
+    import asyncio
+
+    asyncio.run(persona_template_manager.initialize())
+
+    mock_state = MagicMock()
+    mock_state.template_manager = persona_template_manager
+    return mock_state
+
+
+@pytest.fixture(scope="function")
 def admin_user(test_db):
     """Create admin user for testing"""
     ensure_system_initialized()
@@ -772,6 +855,153 @@ class TestTemplatesAPI:
             ]
             for field in required_fields:
                 assert field in template, f"Missing field: {field}"
+
+
+class TestTemplatePersona:
+    """测试 marketplace persona 字段的解析与本地化"""
+
+    def test_persona_included_and_localized(
+        self, persona_mock_app_state, admin_headers
+    ):
+        with patch.object(client.app, "state", persona_mock_app_state):
+            response = client.get(
+                "/api/templates/with_persona?lang=en", headers=admin_headers
+            )
+            assert response.status_code == 200
+            persona = response.json()["persona"]
+            assert persona["name"] == "Maya"
+            assert persona["role"] == "Social Media Content Manager"
+            assert persona["avatar"] == "https://example.com/maya.png"
+            assert "Maya" in persona["intro"]
+            assert len(persona["kickoff_questions"]) == 2
+
+            response_zh = client.get(
+                "/api/templates/with_persona?lang=zh", headers=admin_headers
+            )
+            assert response_zh.json()["persona"]["role"] == "社媒内容经理"
+
+            # The list endpoint carries the same field.
+            response = client.get("/api/templates/?lang=en", headers=admin_headers)
+            listed = {t["id"]: t for t in response.json()}
+            assert listed["with_persona"]["persona"]["name"] == "Maya"
+            assert listed["no_persona"]["persona"] is None
+
+    def test_persona_absent_when_not_authored(
+        self, persona_mock_app_state, admin_headers
+    ):
+        """A template with no `persona` block (e.g. a workforce-type
+        template, or one just not yet given marketplace treatment) reports
+        `persona: null` rather than a missing field or a 500."""
+        with patch.object(client.app, "state", persona_mock_app_state):
+            response = client.get("/api/templates/no_persona", headers=admin_headers)
+            assert response.status_code == 200
+            assert response.json()["persona"] is None
+
+
+class TestTemplateHiredFlag:
+    """测试 hired / hired_agent_id 是否正确反映当前用户的 quick-access agent"""
+
+    def test_false_when_no_quick_access_agent_exists(
+        self, mock_app_state, admin_headers
+    ):
+        with patch.object(client.app, "state", mock_app_state):
+            response = client.get("/api/templates/", headers=admin_headers)
+            for template in response.json():
+                assert template["hired"] is False
+                assert template["hired_agent_id"] is None
+
+            detail = client.get(
+                "/api/templates/customer_support", headers=admin_headers
+            ).json()
+            assert detail["hired"] is False
+            assert detail["hired_agent_id"] is None
+
+    def test_true_for_the_users_own_quick_access_agent(
+        self, mock_app_state, admin_headers, admin_user
+    ):
+        db = next(get_db())
+        agent = Agent(
+            user_id=admin_user["id"],
+            name="Customer Support Agent (mine)",
+            template_id="customer_support",
+            origin=AgentOrigin.TEMPLATE_QUICK_ACCESS.value,
+        )
+        db.add(agent)
+        db.commit()
+        db.refresh(agent)
+        agent_id = agent.id
+        db.close()
+
+        with patch.object(client.app, "state", mock_app_state):
+            response = client.get("/api/templates/", headers=admin_headers)
+            listed = {t["id"]: t for t in response.json()}
+            assert listed["customer_support"]["hired"] is True
+            assert listed["customer_support"]["hired_agent_id"] == agent_id
+            # A different template the user has no quick-access agent for
+            # must not be marked hired just because *some* template is.
+            assert listed["sales_assistant"]["hired"] is False
+            assert listed["sales_assistant"]["hired_agent_id"] is None
+
+            detail = client.get(
+                "/api/templates/customer_support", headers=admin_headers
+            ).json()
+            assert detail["hired"] is True
+            assert detail["hired_agent_id"] == agent_id
+
+    def test_ignores_non_quick_access_origin(
+        self, mock_app_state, admin_headers, admin_user
+    ):
+        """A plain user-origin agent that happens to carry the same
+        template_id (e.g. minted by the workforce-builder UI under a
+        user-chosen name via the plain POST /from-template path) must not
+        count as hired - hired specifically means the quick-access
+        instance, matching resolve_agent_from_template's own
+        origin-scoped reuse query."""
+        db = next(get_db())
+        agent = Agent(
+            user_id=admin_user["id"],
+            name="My Own Copy",
+            template_id="customer_support",
+            origin=AgentOrigin.USER.value,
+        )
+        db.add(agent)
+        db.commit()
+        db.close()
+
+        with patch.object(client.app, "state", mock_app_state):
+            response = client.get("/api/templates/", headers=admin_headers)
+            listed = {t["id"]: t for t in response.json()}
+            assert listed["customer_support"]["hired"] is False
+            assert listed["customer_support"]["hired_agent_id"] is None
+
+    def test_scoped_to_the_current_user(
+        self, mock_app_state, admin_headers, admin_user
+    ):
+        """Another user's quick-access agent for the same template must
+        not mark it hired for the current user."""
+        db = next(get_db())
+        other_user = User(
+            username="other_user_hired_flag_test",
+            password_hash=hash_password("other123"),
+        )
+        db.add(other_user)
+        db.commit()
+        db.refresh(other_user)
+        agent = Agent(
+            user_id=other_user.id,
+            name="Someone Else's Copy",
+            template_id="customer_support",
+            origin=AgentOrigin.TEMPLATE_QUICK_ACCESS.value,
+        )
+        db.add(agent)
+        db.commit()
+        db.close()
+
+        with patch.object(client.app, "state", mock_app_state):
+            response = client.get("/api/templates/", headers=admin_headers)
+            listed = {t["id"]: t for t in response.json()}
+            assert listed["customer_support"]["hired"] is False
+            assert listed["customer_support"]["hired_agent_id"] is None
 
 
 class TestUseTemplateAsWorkforce:

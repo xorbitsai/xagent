@@ -31,6 +31,30 @@ sample_prompts:
     prompt: 为 队列 中的常见客户问题起草回复，仅使用准确、经过验证的信息，供客服审批。
     highlights:
     - 队列
+persona:
+  name: Ben
+  role:
+    en: Email Agent (Support)
+    zh: 邮件专员（客服）
+  avatar: /marketplace/avatars/ben.png
+  intro:
+    en: |-
+      Hi there — I'm Ben, your Email Agent (Support).
+
+      I answer support email from your knowledge base and hold anything sensitive for you.
+    zh: |-
+      你好，我是 Ben，你的邮件专员（客服）。
+
+      我会依据知识库回复支持邮件，遇到敏感问题会留给你处理。
+  kickoff_questions:
+    en:
+    - Which inbox am I working, and how fast should first response be?
+    - What must never go out without a human — refunds, cancellations, anything legal?
+    - Should I answer directly, or leave everything in Drafts to start with?
+    zh:
+    - 我负责哪个收件箱，首次响应要多快？
+    - 哪些情况绝不能未经人工就发出——退款、取消，还是任何法律相关的问题？
+    - 一开始是让我直接回复，还是所有邮件都先存草稿？
 connections:
 - name: Gmail
   logo: https://www.google.com/s2/favicons?domain=mail.google.com&sz=64

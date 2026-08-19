@@ -13,6 +13,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from ..auth_dependencies import get_current_user
+from ..models.agent import Agent, AgentOrigin
 from ..models.database import get_db
 from ..models.template_stats import TemplateStats, UserTemplateRelation
 from ..models.user import User
@@ -87,6 +88,29 @@ class SamplePrompt(BaseModel):
     )
 
 
+class PersonaInfo(BaseModel):
+    """AI Team Marketplace card content for a template: the display name,
+    avatar, and the chat-opening intro/questions a Hire flow seeds. Absent
+    for templates with no marketplace persona (e.g. a workforce-type
+    template, whose card is rendered from `agent_count`/`workforce_config`
+    instead).
+    """
+
+    name: str = Field(..., description="Display name, e.g. 'Maya'")
+    role: str = Field(
+        ..., description="Localized job-title line, e.g. 'Social Media Content Manager'"
+    )
+    avatar: Optional[str] = Field(default=None, description="URL to the avatar image")
+    intro: str = Field(
+        default="",
+        description="Localized opening message sent after the agent is hired",
+    )
+    kickoff_questions: list[str] = Field(
+        default_factory=list,
+        description="Localized opening questions asked right after the intro",
+    )
+
+
 class TemplateInfo(BaseModel):
     """Template brief information"""
 
@@ -100,6 +124,9 @@ class TemplateInfo(BaseModel):
     features: list[str] = Field(default_factory=list, description="Template features")
     sample_prompts: list[SamplePrompt] = Field(
         default_factory=list, description="Quick-access sample prompts"
+    )
+    persona: Optional[PersonaInfo] = Field(
+        default=None, description="AI Team Marketplace card content, if any"
     )
     connections: list[ConnectionInfo] = Field(
         default_factory=list, description="App connections"
@@ -123,6 +150,17 @@ class TemplateInfo(BaseModel):
         default=0,
         description="Total number of agents (manager + workers) a "
         "'workforce'-type template creates. 0 for 'agent'-type templates.",
+    )
+    hired: bool = Field(
+        default=False,
+        description="Whether the current user already has a quick-access "
+        "agent instance of this template (see POST /from-template/resolve "
+        "on the agents API)",
+    )
+    hired_agent_id: Optional[int] = Field(
+        default=None,
+        description="ID of the current user's quick-access agent instance "
+        "of this template, if `hired` is true",
     )
 
 
@@ -163,6 +201,28 @@ router = APIRouter(prefix="/api/templates", tags=["templates"])
 
 
 # ===== Helper Functions =====
+
+
+def build_persona_info(
+    template: dict[str, Any], lang: Optional[str] = None
+) -> Optional[PersonaInfo]:
+    """Resolve a template's raw (locale-keyed) `persona` dict into the
+    localized `PersonaInfo` a marketplace card/detail page renders. `None`
+    when the template has no persona - see `PersonaInfo`'s docstring.
+    """
+    persona = template.get("persona")
+    if not persona:
+        return None
+
+    return PersonaInfo(
+        name=persona["name"],
+        role=get_localized_value(persona.get("role", {}), lang, ""),
+        avatar=persona.get("avatar"),
+        intro=get_localized_value(persona.get("intro", {}), lang, ""),
+        kickoff_questions=get_localized_value(
+            persona.get("kickoff_questions", {}), lang, []
+        ),
+    )
 
 
 def get_or_create_template_stats(db: Session, template_id: str) -> TemplateStats:
@@ -230,6 +290,36 @@ def get_liked_template_ids(
         .all()
     )
     return {row[0] for row in rows}
+
+
+def get_hired_agent_map(
+    db: Session, user_id: int, template_ids: list[str]
+) -> dict[str, int]:
+    """Map each template_id the user has a quick-access agent for to that
+    agent's id, scoped to `AgentOrigin.TEMPLATE_QUICK_ACCESS` (the "Hire"
+    flow's resolve-created agent) so a workforce-builder instance created
+    from the same template under a user-chosen name doesn't count - the
+    same origin scoping `resolve_agent_from_template`'s reuse query uses.
+    Lowest id wins if somehow more than one exists, matching that query's
+    own tie-break.
+    """
+    if not template_ids:
+        return {}
+
+    rows = (
+        db.query(Agent.template_id, Agent.id)
+        .filter(
+            Agent.user_id == user_id,
+            Agent.template_id.in_(template_ids),
+            Agent.origin == AgentOrigin.TEMPLATE_QUICK_ACCESS.value,
+        )
+        .order_by(Agent.id)
+        .all()
+    )
+    hired_agent_id_by_template_id: dict[str, int] = {}
+    for template_id, agent_id in rows:
+        hired_agent_id_by_template_id.setdefault(template_id, agent_id)
+    return hired_agent_id_by_template_id
 
 
 def is_template_liked(db: Session, user_id: int, template_id: str) -> bool:
@@ -319,6 +409,9 @@ async def list_templates(
     current_user_id = int(current_user.id)
     liked_template_ids = get_liked_template_ids(db, current_user_id, template_ids)
     stats_by_template_id = get_or_create_template_stats_map(db, template_ids)
+    hired_agent_id_by_template_id = get_hired_agent_map(
+        db, current_user_id, template_ids
+    )
 
     # Get statistics from database
     result = []
@@ -337,6 +430,7 @@ async def list_templates(
         )
         connections = template.get("connections", [])
         tags = get_localized_value(template.get("tags", {}), lang, [])
+        hired_agent_id = hired_agent_id_by_template_id.get(template_id)
 
         result.append(
             TemplateInfo(
@@ -347,6 +441,7 @@ async def list_templates(
                 description=description,
                 features=features,
                 sample_prompts=sample_prompts,
+                persona=build_persona_info(template, lang),
                 connections=connections,
                 setup_time=setup_time,
                 tags=tags,
@@ -358,6 +453,8 @@ async def list_templates(
                 is_liked=template_id in liked_template_ids,
                 type=template.get("type", "agent"),
                 agent_count=get_workforce_agent_count(template),
+                hired=hired_agent_id is not None,
+                hired_agent_id=hired_agent_id,
             )
         )
 
@@ -407,6 +504,10 @@ async def get_template(
     )
     connections = template.get("connections", [])
     tags = get_localized_value(template.get("tags", {}), lang, [])
+    current_user_id = int(current_user.id)
+    hired_agent_id = get_hired_agent_map(db, current_user_id, [template_id]).get(
+        template_id
+    )
 
     return TemplateDetail(
         id=template["id"],
@@ -416,6 +517,7 @@ async def get_template(
         description=description,
         features=features,
         sample_prompts=sample_prompts,
+        persona=build_persona_info(template, lang),
         connections=connections,
         setup_time=setup_time,
         tags=tags,
@@ -424,9 +526,11 @@ async def get_template(
         views=stats.views,
         likes=stats.likes,
         used_count=stats.used_count,
-        is_liked=is_template_liked(db, int(current_user.id), template_id),
+        is_liked=is_template_liked(db, current_user_id, template_id),
         type=template.get("type", "agent"),
         agent_count=get_workforce_agent_count(template),
+        hired=hired_agent_id is not None,
+        hired_agent_id=hired_agent_id,
         agent_config=(
             {
                 "instructions": template["agent_config"].get("instructions", ""),

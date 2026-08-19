@@ -35,6 +35,30 @@ sample_prompts:
     highlights:
     - N
     - 营销活动
+persona:
+  name: Theo
+  role:
+    en: Email Agent (Sales)
+    zh: 邮件专员（销售）
+  avatar: /marketplace/avatars/theo.png
+  intro:
+    en: |-
+      Hi there — I'm Theo, your Email Agent (Sales).
+
+      I write one personalised email per prospect, grounded in your past threads and your brand tone.
+    zh: |-
+      你好，我是 Theo，你的邮件专员（销售）。
+
+      我会为每位潜在客户写一封个性化邮件，基于过往邮件往来并保持你的品牌语气。
+  kickoff_questions:
+    en:
+    - Who am I writing to first — a list, a CRM segment, or names you'll give me?
+    - What is the offer, and what should the email be asking them to do?
+    - How direct do you want the tone — short and warm, or detailed and formal?
+    zh:
+    - 先写给谁——一份名单、CRM 里的某个分群，还是你直接给我名字？
+    - 这次的卖点是什么，邮件希望对方做出什么行动？
+    - 语气要多直接——简短亲切，还是详细正式？
 connections:
 - name: HubSpot
   logo: https://www.google.com/s2/favicons?domain=hubspot.com&sz=64

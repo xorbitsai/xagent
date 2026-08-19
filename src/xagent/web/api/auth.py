@@ -1615,7 +1615,17 @@ def generic_oauth_callback(
 
             setattr(oauth_account, "access_token", access_token)
             setattr(oauth_account, "token_type", token_data.get("token_type", "Bearer"))
-            setattr(oauth_account, "scope", token_data.get("scope", ""))
+            # Most providers return "scope" as a single space/comma-joined
+            # string, but Linear OAuth applications created before December
+            # 1, 2023 return it as a list of strings -- UserOAuth.scope is a
+            # plain String column, so committing a list there would raise
+            # at flush time instead of saving a valid connection.
+            token_scope = token_data.get("scope", "")
+            if isinstance(token_scope, list):
+                token_scope = _oauth_scope_separator(provider).join(
+                    str(scope) for scope in token_scope
+                )
+            setattr(oauth_account, "scope", token_scope)
             setattr(oauth_account, "email", email)
             if "refresh_token" in token_data:
                 setattr(oauth_account, "refresh_token", token_data.get("refresh_token"))

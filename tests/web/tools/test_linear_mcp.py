@@ -16,7 +16,6 @@ class MockResponse:
         return self._json_data
 
 
-_ISSUE_UUID = "12345678-1234-1234-1234-123456789012"
 _TEAM_UUID = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
 
 
@@ -165,6 +164,33 @@ def test_list_teams_returns_nodes(monkeypatch):
 
     assert result["status"] == "success"
     assert result["teams"] == [{"id": "t1", "key": "ENG", "name": "Engineering"}]
+    assert result["truncated"] is False
+
+
+def test_list_teams_reports_truncated_when_more_pages_exist(monkeypatch):
+    monkeypatch.setattr(
+        linear.requests,
+        "post",
+        Mock(
+            return_value=MockResponse(
+                json_data={
+                    "data": {
+                        "teams": {
+                            "nodes": [
+                                {"id": "t1", "key": "ENG", "name": "Engineering"}
+                            ],
+                            "pageInfo": {"hasNextPage": True},
+                        }
+                    }
+                }
+            )
+        ),
+    )
+
+    result = json.loads(linear.linear_list_teams())
+
+    assert result["status"] == "success"
+    assert result["truncated"] is True
 
 
 def test_list_workflow_states_resolves_team_key_to_uuid(monkeypatch):
@@ -208,6 +234,32 @@ def test_list_workflow_states_reports_error_when_team_missing(monkeypatch):
     assert "not found" in result["message"]
 
 
+def test_list_workflow_states_reports_truncated_when_more_pages_exist(monkeypatch):
+    mock_post = Mock(
+        side_effect=[
+            MockResponse(json_data={"data": {"team": {"id": _TEAM_UUID}}}),
+            MockResponse(
+                json_data={
+                    "data": {
+                        "team": {
+                            "states": {
+                                "nodes": [{"id": "s1", "name": "Todo"}],
+                                "pageInfo": {"hasNextPage": True},
+                            }
+                        }
+                    }
+                }
+            ),
+        ]
+    )
+    monkeypatch.setattr(linear.requests, "post", mock_post)
+
+    result = json.loads(linear.linear_list_workflow_states("ENG"))
+
+    assert result["status"] == "success"
+    assert result["truncated"] is True
+
+
 def test_list_labels_resolves_team_key_to_uuid(monkeypatch):
     mock_post = Mock(
         side_effect=[
@@ -227,6 +279,33 @@ def test_list_labels_resolves_team_key_to_uuid(monkeypatch):
 
     assert result["status"] == "success"
     assert result["labels"] == [{"id": "l1", "name": "bug"}]
+    assert result["truncated"] is False
+
+
+def test_list_labels_reports_truncated_when_more_pages_exist(monkeypatch):
+    mock_post = Mock(
+        side_effect=[
+            MockResponse(json_data={"data": {"team": {"id": _TEAM_UUID}}}),
+            MockResponse(
+                json_data={
+                    "data": {
+                        "team": {
+                            "labels": {
+                                "nodes": [{"id": "l1", "name": "bug"}],
+                                "pageInfo": {"hasNextPage": True},
+                            }
+                        }
+                    }
+                }
+            ),
+        ]
+    )
+    monkeypatch.setattr(linear.requests, "post", mock_post)
+
+    result = json.loads(linear.linear_list_labels("ENG"))
+
+    assert result["status"] == "success"
+    assert result["truncated"] is True
 
 
 def test_list_projects_resolves_team_key_to_uuid(monkeypatch):
@@ -248,6 +327,36 @@ def test_list_projects_resolves_team_key_to_uuid(monkeypatch):
 
     assert result["status"] == "success"
     assert result["projects"] == [{"id": "p1", "name": "Q3"}]
+    assert result["truncated"] is False
+    projects_call = mock_post.call_args_list[1]
+    assert "status" in projects_call.kwargs["json"]["query"]
+    assert "state" not in projects_call.kwargs["json"]["query"]
+
+
+def test_list_projects_reports_truncated_when_team_scoped_has_more_pages(monkeypatch):
+    mock_post = Mock(
+        side_effect=[
+            MockResponse(json_data={"data": {"team": {"id": _TEAM_UUID}}}),
+            MockResponse(
+                json_data={
+                    "data": {
+                        "team": {
+                            "projects": {
+                                "nodes": [{"id": "p1", "name": "Q3"}],
+                                "pageInfo": {"hasNextPage": True},
+                            }
+                        }
+                    }
+                }
+            ),
+        ]
+    )
+    monkeypatch.setattr(linear.requests, "post", mock_post)
+
+    result = json.loads(linear.linear_list_projects(team_id="ENG"))
+
+    assert result["status"] == "success"
+    assert result["truncated"] is True
 
 
 def test_list_projects_without_team_id_skips_resolution(monkeypatch):
@@ -262,6 +371,32 @@ def test_list_projects_without_team_id_skips_resolution(monkeypatch):
 
     assert result["status"] == "success"
     assert mock_post.call_count == 1
+    assert result["truncated"] is False
+    assert "status" in mock_post.call_args.kwargs["json"]["query"]
+    assert "state" not in mock_post.call_args.kwargs["json"]["query"]
+
+
+def test_list_projects_without_team_id_reports_truncated_when_more_pages_exist(
+    monkeypatch,
+):
+    mock_post = Mock(
+        return_value=MockResponse(
+            json_data={
+                "data": {
+                    "projects": {
+                        "nodes": [{"id": "p1", "name": "Q3"}],
+                        "pageInfo": {"hasNextPage": True},
+                    }
+                }
+            }
+        )
+    )
+    monkeypatch.setattr(linear.requests, "post", mock_post)
+
+    result = json.loads(linear.linear_list_projects())
+
+    assert result["status"] == "success"
+    assert result["truncated"] is True
 
 
 def test_search_issues_applies_team_filter(monkeypatch):
@@ -350,6 +485,81 @@ def test_search_issues_filters_by_title_query_client_side(monkeypatch):
     assert result["status"] == "success"
     assert len(result["issues"]) == 1
     assert result["issues"][0]["identifier"] == "ENG-1"
+
+
+def test_search_issues_title_query_keeps_paging_past_the_first_page(monkeypatch):
+    """Linear has no server-side title filter -- a match beyond the first
+    MAX_LIMIT-sized page must not be silently missed. The first page has no
+    matches at all, so the loop must fetch a second page using the cursor
+    from the first page's pageInfo."""
+    mock_post = Mock(
+        side_effect=[
+            MockResponse(
+                json_data={
+                    "data": {
+                        "issues": {
+                            "nodes": [
+                                {"id": "i1", "identifier": "ENG-1", "title": "Docs"}
+                            ],
+                            "pageInfo": {"hasNextPage": True, "endCursor": "cursor-1"},
+                        }
+                    }
+                }
+            ),
+            MockResponse(
+                json_data={
+                    "data": {
+                        "issues": {
+                            "nodes": [
+                                {
+                                    "id": "i2",
+                                    "identifier": "ENG-2",
+                                    "title": "Login bug",
+                                }
+                            ],
+                            "pageInfo": {"hasNextPage": False, "endCursor": None},
+                        }
+                    }
+                }
+            ),
+        ]
+    )
+    monkeypatch.setattr(linear.requests, "post", mock_post)
+
+    result = json.loads(linear.linear_search_issues(query="login"))
+
+    assert result["status"] == "success"
+    assert [issue["identifier"] for issue in result["issues"]] == ["ENG-2"]
+    assert result["truncated"] is False
+    assert mock_post.call_count == 2
+    first_call, second_call = mock_post.call_args_list
+    assert first_call.kwargs["json"]["variables"]["after"] is None
+    assert second_call.kwargs["json"]["variables"]["after"] == "cursor-1"
+
+
+def test_search_issues_title_query_stops_at_max_pages_and_reports_truncated(
+    monkeypatch,
+):
+    """If MAX_ISSUE_SEARCH_PAGES is exhausted while the server still reports
+    more pages, matches may exist further out -- must report truncated
+    rather than a false "complete" result."""
+    no_match_page = MockResponse(
+        json_data={
+            "data": {
+                "issues": {
+                    "nodes": [{"id": "i1", "identifier": "ENG-1", "title": "Docs"}],
+                    "pageInfo": {"hasNextPage": True, "endCursor": "cursor"},
+                }
+            }
+        }
+    )
+    monkeypatch.setattr(linear.requests, "post", Mock(return_value=no_match_page))
+
+    result = json.loads(linear.linear_search_issues(query="login"))
+
+    assert result["status"] == "success"
+    assert result["issues"] == []
+    assert result["truncated"] is True
 
 
 def test_search_issues_reports_truncated_via_page_info_without_query(monkeypatch):
@@ -583,41 +793,192 @@ def test_update_issue_can_clear_description(monkeypatch):
     assert sent_input == {"description": ""}
 
 
-def test_add_comment_resolves_human_readable_identifier_to_uuid_first(monkeypatch):
-    """commentCreate's input.issueId only accepts the real UUID (unlike the
-    top-level issue(id: ...) query field, which accepts either) — a
-    non-UUID issue_id must be resolved via a lookup before the mutation."""
+_ISSUE_UPDATE_SUCCESS = MockResponse(
+    json_data={
+        "data": {
+            "issueUpdate": {
+                "success": True,
+                "issue": {"id": "i1", "identifier": "ENG-1"},
+            }
+        }
+    }
+)
+
+
+def test_update_issue_leaves_labels_untouched_when_not_provided(monkeypatch):
+    mock_post = Mock(return_value=_ISSUE_UPDATE_SUCCESS)
+    monkeypatch.setattr(linear.requests, "post", mock_post)
+
+    linear.linear_update_issue("ENG-1", title="Renamed")
+
+    sent_input = mock_post.call_args.kwargs["json"]["variables"]["input"]
+    assert "labelIds" not in sent_input
+    assert "addedLabelIds" not in sent_input
+    assert "removedLabelIds" not in sent_input
+
+
+def test_update_issue_adds_labels_via_added_label_ids(monkeypatch):
+    mock_post = Mock(return_value=_ISSUE_UPDATE_SUCCESS)
+    monkeypatch.setattr(linear.requests, "post", mock_post)
+
+    result = json.loads(linear.linear_update_issue("ENG-1", add_label_ids=["l1"]))
+
+    assert result["status"] == "success"
+    sent_input = mock_post.call_args.kwargs["json"]["variables"]["input"]
+    assert sent_input == {"addedLabelIds": ["l1"]}
+
+
+def test_update_issue_removes_labels_via_removed_label_ids(monkeypatch):
+    mock_post = Mock(return_value=_ISSUE_UPDATE_SUCCESS)
+    monkeypatch.setattr(linear.requests, "post", mock_post)
+
+    result = json.loads(linear.linear_update_issue("ENG-1", remove_label_ids=["l1"]))
+
+    assert result["status"] == "success"
+    sent_input = mock_post.call_args.kwargs["json"]["variables"]["input"]
+    assert sent_input == {"removedLabelIds": ["l1"]}
+
+
+def test_update_issue_replaces_full_label_set_via_label_ids(monkeypatch):
+    mock_post = Mock(return_value=_ISSUE_UPDATE_SUCCESS)
+    monkeypatch.setattr(linear.requests, "post", mock_post)
+
+    result = json.loads(linear.linear_update_issue("ENG-1", label_ids=["l1", "l2"]))
+
+    assert result["status"] == "success"
+    sent_input = mock_post.call_args.kwargs["json"]["variables"]["input"]
+    assert sent_input == {"labelIds": ["l1", "l2"]}
+
+
+def test_update_issue_clears_all_labels_via_empty_label_ids(monkeypatch):
+    """An explicit empty list for label_ids (distinct from leaving it
+    unset/None) must clear every label, mirroring the create-time
+    labelIds field's full-replace semantics."""
+    mock_post = Mock(return_value=_ISSUE_UPDATE_SUCCESS)
+    monkeypatch.setattr(linear.requests, "post", mock_post)
+
+    result = json.loads(linear.linear_update_issue("ENG-1", label_ids=[]))
+
+    assert result["status"] == "success"
+    sent_input = mock_post.call_args.kwargs["json"]["variables"]["input"]
+    assert sent_input == {"labelIds": []}
+
+
+def test_list_comments_returns_nodes(monkeypatch):
     mock_post = Mock(
-        side_effect=[
-            MockResponse(json_data={"data": {"issue": {"id": _ISSUE_UUID}}}),
-            MockResponse(
-                json_data={
-                    "data": {
-                        "commentCreate": {
-                            "success": True,
-                            "comment": {"id": "c1", "body": "Looks good"},
+        return_value=MockResponse(
+            json_data={
+                "data": {
+                    "issue": {
+                        "comments": {
+                            "nodes": [
+                                {
+                                    "id": "c1",
+                                    "body": "Looks good",
+                                    "createdAt": "2026-08-01T00:00:00Z",
+                                    "user": {"id": "u1", "name": "Ada"},
+                                }
+                            ]
                         }
                     }
                 }
-            ),
-        ]
+            }
+        )
     )
     monkeypatch.setattr(linear.requests, "post", mock_post)
 
-    result = json.loads(linear.linear_add_comment("ENG-1", "Looks good"))
+    result = json.loads(linear.linear_list_comments("ENG-1"))
 
     assert result["status"] == "success"
-    assert result["comment"]["body"] == "Looks good"
-    assert mock_post.call_count == 2
-    resolve_call, create_call = mock_post.call_args_list
-    assert resolve_call.kwargs["json"]["variables"] == {"id": "ENG-1"}
-    assert create_call.kwargs["json"]["variables"]["input"] == {
-        "issueId": _ISSUE_UUID,
-        "body": "Looks good",
+    assert result["comments"] == [
+        {
+            "id": "c1",
+            "body": "Looks good",
+            "createdAt": "2026-08-01T00:00:00Z",
+            "user": {"id": "u1", "name": "Ada"},
+        }
+    ]
+    assert result["truncated"] is False
+    assert mock_post.call_args.kwargs["json"]["variables"] == {
+        "id": "ENG-1",
+        "first": 50,
     }
 
 
-def test_add_comment_skips_resolution_when_issue_id_is_already_a_uuid(monkeypatch):
+def test_list_comments_clamps_over_limit(monkeypatch):
+    mock_post = Mock(
+        return_value=MockResponse(
+            json_data={"data": {"issue": {"comments": {"nodes": []}}}}
+        )
+    )
+    monkeypatch.setattr(linear.requests, "post", mock_post)
+
+    linear.linear_list_comments("ENG-1", limit=500)
+
+    assert mock_post.call_args.kwargs["json"]["variables"]["first"] == linear.MAX_LIMIT
+
+
+def test_list_comments_reports_truncated_when_more_pages_exist(monkeypatch):
+    monkeypatch.setattr(
+        linear.requests,
+        "post",
+        Mock(
+            return_value=MockResponse(
+                json_data={
+                    "data": {
+                        "issue": {
+                            "comments": {
+                                "nodes": [{"id": "c1", "body": "First"}],
+                                "pageInfo": {"hasNextPage": True},
+                            }
+                        }
+                    }
+                }
+            )
+        ),
+    )
+
+    result = json.loads(linear.linear_list_comments("ENG-1"))
+
+    assert result["status"] == "success"
+    assert result["truncated"] is True
+
+
+def test_list_comments_reports_error_when_issue_not_found(monkeypatch):
+    monkeypatch.setattr(
+        linear.requests,
+        "post",
+        Mock(return_value=MockResponse(json_data={"data": {"issue": None}})),
+    )
+
+    result = json.loads(linear.linear_list_comments("ENG-999"))
+
+    assert result["status"] == "error"
+    assert "not found" in result["message"]
+
+
+def test_list_comments_surfaces_api_error(monkeypatch):
+    monkeypatch.setattr(
+        linear.requests,
+        "post",
+        Mock(
+            return_value=MockResponse(
+                json_data={"errors": [{"message": "Internal error"}]}
+            )
+        ),
+    )
+
+    result = json.loads(linear.linear_list_comments("ENG-1"))
+
+    assert result["status"] == "error"
+    assert "Internal error" in result["message"]
+
+
+def test_add_comment_passes_issue_id_through_without_a_lookup(monkeypatch):
+    """CommentCreateInput.issueId accepts either an issue's UUID or its
+    human-readable identifier directly (confirmed against Linear's own SDK
+    type definitions), so a human-readable identifier like "ENG-1" must be
+    sent as-is -- no resolution lookup, no extra request."""
     mock_post = Mock(
         return_value=MockResponse(
             json_data={
@@ -632,25 +993,13 @@ def test_add_comment_skips_resolution_when_issue_id_is_already_a_uuid(monkeypatc
     )
     monkeypatch.setattr(linear.requests, "post", mock_post)
 
-    result = json.loads(linear.linear_add_comment(_ISSUE_UUID, "Looks good"))
+    result = json.loads(linear.linear_add_comment("ENG-1", "Looks good"))
 
     assert result["status"] == "success"
+    assert result["comment"]["body"] == "Looks good"
     assert mock_post.call_count == 1
     sent_input = mock_post.call_args.kwargs["json"]["variables"]["input"]
-    assert sent_input["issueId"] == _ISSUE_UUID
-
-
-def test_add_comment_reports_error_when_identifier_does_not_resolve(monkeypatch):
-    monkeypatch.setattr(
-        linear.requests,
-        "post",
-        Mock(return_value=MockResponse(json_data={"data": {"issue": None}})),
-    )
-
-    result = json.loads(linear.linear_add_comment("ENG-999", "Looks good"))
-
-    assert result["status"] == "error"
-    assert "not found" in result["message"]
+    assert sent_input == {"issueId": "ENG-1", "body": "Looks good"}
 
 
 def test_search_users_filters_by_name_or_email(monkeypatch):
@@ -678,6 +1027,76 @@ def test_search_users_filters_by_name_or_email(monkeypatch):
     assert result["status"] == "success"
     assert len(result["users"]) == 1
     assert result["users"][0]["id"] == "u1"
+    assert result["truncated"] is False
+
+
+def test_search_users_keeps_paging_past_the_first_page(monkeypatch):
+    """A match beyond the first MAX_LIMIT-sized page (e.g. the 101st member
+    of a large workspace) must not be silently missed as a false "no
+    match" result."""
+    mock_post = Mock(
+        side_effect=[
+            MockResponse(
+                json_data={
+                    "data": {
+                        "users": {
+                            "nodes": [
+                                {"id": "u1", "name": "Bob", "email": "bob@example.com"}
+                            ],
+                            "pageInfo": {"hasNextPage": True, "endCursor": "cursor-1"},
+                        }
+                    }
+                }
+            ),
+            MockResponse(
+                json_data={
+                    "data": {
+                        "users": {
+                            "nodes": [
+                                {
+                                    "id": "u2",
+                                    "name": "Ada",
+                                    "email": "ada@example.com",
+                                }
+                            ],
+                            "pageInfo": {"hasNextPage": False, "endCursor": None},
+                        }
+                    }
+                }
+            ),
+        ]
+    )
+    monkeypatch.setattr(linear.requests, "post", mock_post)
+
+    result = json.loads(linear.linear_search_users("ada"))
+
+    assert result["status"] == "success"
+    assert [user["id"] for user in result["users"]] == ["u2"]
+    assert result["truncated"] is False
+    assert mock_post.call_count == 2
+    first_call, second_call = mock_post.call_args_list
+    assert first_call.kwargs["json"]["variables"]["after"] is None
+    assert second_call.kwargs["json"]["variables"]["after"] == "cursor-1"
+
+
+def test_search_users_stops_at_max_pages_and_reports_truncated(monkeypatch):
+    no_match_page = MockResponse(
+        json_data={
+            "data": {
+                "users": {
+                    "nodes": [{"id": "u1", "name": "Bob", "email": "bob@example.com"}],
+                    "pageInfo": {"hasNextPage": True, "endCursor": "cursor"},
+                }
+            }
+        }
+    )
+    monkeypatch.setattr(linear.requests, "post", Mock(return_value=no_match_page))
+
+    result = json.loads(linear.linear_search_users("ada"))
+
+    assert result["status"] == "success"
+    assert result["users"] == []
+    assert result["truncated"] is True
 
 
 def test_linear_app_registry_requests_read_and_write_scopes():

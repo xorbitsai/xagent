@@ -150,3 +150,34 @@ def test_callback_persists_token_without_userinfo_lookup(db_session, monkeypatch
     assert oauth_account.access_token == "linear-token"
     assert oauth_account.email is None
     assert oauth_account.provider_user_id is None
+
+
+def test_callback_normalizes_legacy_array_scope_to_string(db_session, monkeypatch):
+    """Linear OAuth applications created before December 1, 2023 return
+    "scope" as a list of strings rather than a joined string. UserOAuth.scope
+    is a plain String column, so persisting the list as-is would raise at
+    flush time instead of saving a valid connection."""
+    db, user = db_session
+    mock_post = Mock(
+        return_value=MockResponse(
+            {
+                "access_token": "legacy-linear-token",
+                "token_type": "Bearer",
+                "scope": ["read", "write"],
+            }
+        )
+    )
+    monkeypatch.setattr("xagent.web.api.auth.requests.post", mock_post)
+    monkeypatch.setattr("xagent.web.api.auth.requests.get", Mock())
+
+    response = generic_oauth_callback(
+        "linear", _callback_request(db, user), db, _linear_provider()
+    )
+
+    assert response.status_code == 200
+    oauth_account = (
+        db.query(UserOAuth)
+        .filter(UserOAuth.user_id == user.id, UserOAuth.provider == "linear")
+        .one()
+    )
+    assert oauth_account.scope == "read,write"

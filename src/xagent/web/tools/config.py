@@ -3076,6 +3076,20 @@ class WebToolConfig(BaseToolConfig):
                     if not instance_url:
                         raise _OAuthInstanceUrlRequired(env_key=env_key)
                     env[env_key] = instance_url
+                else:
+                    # A typo'd env_mapping value (e.g. "acess_token") would
+                    # otherwise silently emit neither an env var nor an
+                    # error -- the exact opaque failure mode
+                    # _OAuthInstanceUrlRequired exists to prevent for the
+                    # one token_type above it. launch_config is
+                    # developer-authored, not user input, so this can only
+                    # come from a typo in this codebase's own registry.
+                    logger.warning(
+                        "Unrecognized launch_config.env_mapping token_type "
+                        "'%s' for env var '%s'; no value forwarded",
+                        token_type,
+                        env_key,
+                    )
 
             for env_key, host_env_var in _oauth_launch_config_static_env(
                 launch_config

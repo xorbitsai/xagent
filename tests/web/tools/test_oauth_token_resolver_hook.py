@@ -602,6 +602,34 @@ async def test_hook_missing_instance_url_retains_unavailable_server(db_session):
 
 
 @pytest.mark.asyncio
+async def test_legacy_missing_instance_url_retains_unavailable_server(db_session):
+    """Same as test_hook_missing_instance_url_retains_unavailable_server but
+    via the legacy UserOAuth DB path (no resolver hook installed) -- the two
+    call sites of _build_oauth_mcp_stdio_transport_config each have their
+    own except _OAuthInstanceUrlRequired handler, and only the hook path had
+    a regression test for it."""
+    launch_config = {
+        "command": "python",
+        "args": ["-m", "xagent.web.tools.mcp.salesforce"],
+        "env_mapping": {
+            "SALESFORCE_ACCESS_TOKEN": "access_token",
+            "SALESFORCE_INSTANCE_URL": "instance_url",
+        },
+    }
+    db, user = db_session
+    server = _add_oauth_server(
+        db, user, provider="salesforce", launch_config=launch_config
+    )
+    _add_user_oauth(db, user, provider="salesforce", access_token="user-token")
+
+    config = (await _tool_config(db, user).get_mcp_server_configs())[0]
+
+    _assert_unavailable_mcp_config(
+        config, server, reason="oauth_token_required", oauth_token_required=True
+    )
+
+
+@pytest.mark.asyncio
 async def test_launch_config_args_none_matches_user_oauth_shape(db_session):
     db, user = db_session
     launch_config = _launch_config()

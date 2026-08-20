@@ -60,6 +60,32 @@ def test_base_url_strips_trailing_slash(monkeypatch):
     assert posthog._base_url() == "https://eu.posthog.com"
 
 
+def test_base_url_rejects_whitespace_only_host(monkeypatch):
+    monkeypatch.setenv("POSTHOG_HOST", "   ")
+
+    with pytest.raises(ValueError, match="POSTHOG_HOST"):
+        posthog._base_url()
+
+
+def test_base_url_rejects_slash_only_host(monkeypatch):
+    monkeypatch.setenv("POSTHOG_HOST", "/")
+
+    with pytest.raises(ValueError, match="POSTHOG_HOST"):
+        posthog._base_url()
+
+
+def test_base_url_prepends_https_when_scheme_missing(monkeypatch):
+    monkeypatch.setenv("POSTHOG_HOST", "us.posthog.com")
+
+    assert posthog._base_url() == "https://us.posthog.com"
+
+
+def test_base_url_strips_surrounding_whitespace(monkeypatch):
+    monkeypatch.setenv("POSTHOG_HOST", "  https://eu.posthog.com  ")
+
+    assert posthog._base_url() == "https://eu.posthog.com"
+
+
 def test_request_uses_configured_host_and_headers(monkeypatch):
     mock_request = Mock(return_value=MockResponse(json_data={"ok": True}))
     monkeypatch.setattr(posthog.requests, "request", mock_request)

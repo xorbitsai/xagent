@@ -50,10 +50,12 @@ def _base_url() -> str:
     host is not valid against the other, so which host to call is a
     connect-time configuration choice, not something this module can infer.
     """
-    host = os.environ.get("POSTHOG_HOST")
+    host = os.environ.get("POSTHOG_HOST", "").strip().rstrip("/")
     if not host:
         raise ValueError("POSTHOG_HOST environment variable is missing")
-    return host.rstrip("/")
+    if not host.startswith(("http://", "https://")):
+        host = f"https://{host}"
+    return host
 
 
 def _clamp_limit(limit: int) -> int:

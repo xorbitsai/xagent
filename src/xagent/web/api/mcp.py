@@ -2000,6 +2000,43 @@ def _local_mcp_can_authorize(
     return _local_mcp_consent_association_ok(server, user_mcp)
 
 
+def _local_mcp_can_configure(
+    association: Union[UserMCPServer, UserCustomApi, None],
+) -> bool:
+    """Whether this viewer's configuration route would resolve for a local entry.
+
+    One rule for both local branches: the four routes the picker's Configure
+    button reaches all take the same first gate -- a personal association row
+    for the calling user -- and answer 404 without one. ``GET``/``PUT
+    /api/mcp/servers/{id}`` (mcp.py) and ``GET``/``PUT /api/custom-apis/{id}``
+    (custom_api.py) each query by ``user_id`` + connector id and raise 404 on
+    an empty result, which is why a team-owned connector reaching a member
+    through the visibility overlay alone (``association is None``) is not
+    configurable however visible or attachable it is.
+
+    Deliberately reads nothing but the association's existence:
+
+    - Not the connector's shape. Unlike ``can_attach``/``can_authorize``, no
+      route this answers for treats the mcp_oauth shape differently.
+    - Not ``is_active``. Neither route filters it, so a deactivated connector's
+      owner can still open and save its form -- and withholding the button
+      there would remove the only affordance that population has left.
+    - Not ``can_edit``. Existence alone is what the four routes' first gate
+      reads, and it is what this answers. Custom API's ``PUT`` has a second,
+      owner-side gate on ``can_edit`` (403), so this field's accuracy there
+      rests on a convention rather than an identity: the one production write
+      point sets ``can_edit=True`` (custom_api.py), and no other code path
+      creates the row. A future writer that leaves the column at its ``False``
+      default would make this field claim an editable entry whose save is
+      refused -- add that gate here if that ever happens.
+
+    This is a UI hint, never a permission. Editing the shared configuration is
+    additionally gated owner-side (``_check_mcp_permission(require="edit")``
+    for MCP, ``can_edit`` for Custom API), and a forged value grants nothing.
+    """
+    return association is not None
+
+
 @mcp_router.get("/apps", response_model=List[dict])
 def list_mcp_apps(
     search: Optional[str] = None,
@@ -2152,6 +2189,13 @@ def list_mcp_apps(
             # inferring it from is_custom's absence on this branch (#1347).
             app_copy["can_attach"] = is_connected
             app_copy["can_authorize"] = False
+            # A catalog entry's Configure equivalent is "manage my key" or
+            # "re-run OAuth" (settings dialog dispatch on auth_type), and both
+            # only exist once connected -- an unconnected entry's action is
+            # Connect, a different button. Equal to is_connected on this
+            # branch only; the local branches below answer a different
+            # question (association existence), see _local_mcp_can_configure.
+            app_copy["can_configure"] = is_connected
             app_copy["shared_env_available"] = app_shared_env
             app_copy["platform_env_available"] = app_platform_env
             app_copy["user_env_configured"] = app_user_env
@@ -2274,6 +2318,7 @@ def list_mcp_apps(
                     user_mcp,
                     token_resolver_installed=token_resolver_installed,
                 ),
+                "can_configure": _local_mcp_can_configure(user_mcp),
             }
             # The picker dispatches its Connect button on auth_type, and custom
             # entries used to omit the field entirely — so an mcp_oauth server
@@ -2313,8 +2358,9 @@ def list_mcp_apps(
 
         # Same overlay as the MCP half above: a team-owned Custom API has no
         # UserCustomApi row for the member, so it is carried as (api, None).
-        # The association is read only for can_attach below — a team-owned API
-        # is one the runtime overlays by id, exactly like the MCP half.
+        # The association is read for can_attach and can_configure below — a
+        # team-owned API is one the runtime overlays by id, exactly like the
+        # MCP half.
         local_custom_apis: list[tuple[CustomApi, UserCustomApi | None]] = [
             (api, user_api) for user_api, api in user_custom_apis
         ]
@@ -2367,6 +2413,7 @@ def list_mcp_apps(
                         team_ids=team_ids["custom_api"],
                     ),
                     "can_authorize": False,
+                    "can_configure": _local_mcp_can_configure(user_api),
                     "runtime_input_schema": api.runtime_input_schema,
                     "runtime_bindings": api.runtime_bindings,
                     "allow_delegated_authorization": bool(

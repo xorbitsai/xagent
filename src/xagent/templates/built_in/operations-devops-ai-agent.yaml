@@ -33,6 +33,30 @@ sample_prompts:
     prompt: 对照已知噪声名录检查该服务的 SQS 队列和 DynamoDB 表是否存在异常，并汇报不符合已知良性模式的情况。
     highlights:
     - SQS 队列和 DynamoDB 表
+persona:
+  name: Milo
+  role:
+    en: DevOps Specialist
+    zh: DevOps 智能运维专员
+  avatar: /marketplace/avatars/milo.png
+  intro:
+    en: |-
+      Hi there — I'm Milo, your DevOps AI Agent.
+
+      Paste logs or command output and I give you a timeline, a root cause and a fix.
+    zh: |-
+      你好，我是 Milo，你的 DevOps 智能运维专员。
+
+      把日志或命令输出粘贴给我，我会给出时间线、根因分析和修复建议。
+  kickoff_questions:
+    en:
+    - What are you debugging first?
+    - What does the stack look like, and where do the logs come from?
+    - Do you want a postmortem written up after each incident, or just the diagnosis?
+    zh:
+    - 先排查哪个问题？
+    - 技术栈是什么样的，日志从哪里来？
+    - 每次事件后需要我写复盘报告，还是只要诊断结果？
 connections:
 - name: AWS
   logo: https://www.google.com/s2/favicons?domain=aws.amazon.com&sz=64

@@ -15,8 +15,9 @@ vi.mock("@/lib/utils", async () => {
   return { ...actual, getApiUrl: () => "http://api.local" }
 })
 
+const authState = vi.hoisted(() => ({ inTeam: false }))
 vi.mock("@/contexts/auth-context", () => ({
-  useAuth: () => ({ token: "token", inTeam: false }),
+  useAuth: () => ({ token: "token", inTeam: authState.inTeam }),
 }))
 
 vi.mock("@/contexts/i18n-context", () => ({
@@ -66,10 +67,14 @@ describe("OfficialMcpSettingsDialog connected-state actions", () => {
 
   afterEach(() => {
     cleanup()
+    authState.inTeam = false
   })
 
   it("offers only disconnect for a connected keyless app", () => {
-    renderDialog()
+    // canConfigure: true and it must still not show -- proving the keyless
+    // gate is independent of configurability, not a side effect of the
+    // connected-entry default being false somewhere.
+    renderDialog({ canConfigure: true })
 
     // No key to manage and no editable config — the configure/manage-key
     // button must be suppressed for keyless apps.
@@ -91,6 +96,112 @@ describe("OfficialMcpSettingsDialog connected-state actions", () => {
     const manageButton = screen.getByRole("button", { name: /manageKey/ })
     fireEvent.click(manageButton)
     expect(onManageKey).toHaveBeenCalledTimes(1)
+  })
+
+  it("offers Configure for an unconnected entry the viewer may still configure", () => {
+    // This is the bug's shape in the settings dialog: is_connected is false
+    // (no grant was ever written for a hook-resolved connector), yet the
+    // owner's personal association means the edit route would resolve.
+    const onConfigure = vi.fn()
+    renderDialog({
+      app: app({
+        is_connected: false,
+        is_custom: true,
+        auth_type: "mcp_oauth",
+        transport: "streamable_http",
+        server_id: 9,
+      }),
+      isGloballyConnected: false,
+      canConfigure: true,
+      onConfigure,
+    })
+
+    const configureButton = screen.getByRole("button", { name: "tools.mcp.dialog.configure" })
+    fireEvent.click(configureButton)
+    expect(onConfigure).toHaveBeenCalledTimes(1)
+    // Neither element gated on isGloballyConnected renders in this shape:
+    // Configure is the only door this population gets.
+    expect(
+      screen.queryByRole("button", { name: /disconnect|deleteService/ }),
+    ).toBeNull()
+    expect(screen.queryByRole("button", { name: /share|unshare/ })).toBeNull()
+  })
+
+  it("keeps sharing and disconnect on the connection gate when only Configure is unlocked", () => {
+    authState.inTeam = true
+    const onConfigure = vi.fn()
+    renderDialog({
+      app: app({
+        server_id: 9,
+        transport: "streamable_http",
+        auth_type: "mcp_oauth",
+        is_custom: true,
+      }),
+      isGloballyConnected: false, // the precondition this test proves against
+      canConfigure: true,
+      onConfigure,
+    })
+
+    // Configure appears (the new gate).
+    screen.getByRole("button", { name: "tools.mcp.dialog.configure" })
+    // Share does not: inTeam is true and server_id is an integer, so the only
+    // thing still withholding it is isGloballyConnected being false — exactly
+    // what this test exists to pin.
+    expect(screen.queryByRole("button", { name: /share|unshare/ })).toBeNull()
+    // Disconnect does not either -- its gate does not read inTeam at all, so
+    // this holds under either harness default.
+    expect(screen.queryByRole("button", { name: /disconnect|deleteService/ })).toBeNull()
+  })
+
+  it("withholds Configure for a connected entry the viewer may not configure", () => {
+    renderDialog({
+      app: app({ auth_type: "mcp_oauth", is_custom: true, server_id: 9 }),
+      isGloballyConnected: true,
+      canConfigure: false,
+    })
+
+    expect(screen.queryByRole("button", { name: "tools.mcp.dialog.configure" })).toBeNull()
+    // Disconnect is unaffected -- only Configure was withheld.
+    screen.getByRole("button", { name: /disconnect|deleteService/ })
+  })
+
+  it("falls back to the connection gate when no canConfigure is provided", () => {
+    // The Tools page's call site: it always passes isGloballyConnected={true}
+    // and never passes canConfigure at all.
+    renderDialog({
+      app: app({ auth_type: "api_key" }),
+      isGloballyConnected: true,
+    })
+
+    screen.getByRole("button", { name: "tools.mcp.dialog.manageKey" })
+  })
+
+  it("withholds Configure when no canConfigure is provided and the connection gate is closed", () => {
+    // Mirrors the fallback case above with isGloballyConnected flipped to
+    // false: the omitted-prop shape must read the connection gate rather
+    // than defaulting Configure on regardless of it.
+    renderDialog({
+      app: app({ auth_type: "mcp_oauth" }),
+      isGloballyConnected: false,
+    })
+
+    expect(screen.queryByRole("button", { name: "tools.mcp.dialog.configure" })).toBeNull()
+  })
+
+  it("withholds Configure for a non-owned team tool even when configurable", () => {
+    renderDialog({
+      app: app({
+        auth_type: "mcp_oauth",
+        is_custom: true,
+        server_id: 9,
+        shared: true,
+        is_owner: false,
+      }),
+      isGloballyConnected: true,
+      canConfigure: true,
+    })
+
+    expect(screen.queryByRole("button", { name: "tools.mcp.dialog.configure" })).toBeNull()
   })
 })
 

@@ -110,6 +110,8 @@ from .interaction_rollout import COUNTER_LIFECYCLE_RESPONSE_CONFLICT, increment_
 from .ops_signals import (
     CHECKPOINT_LOAD_UNAVAILABLE,
     CHECKPOINT_PK_ANCHOR_DANGLING,
+    INTERACTION_READ_PAYLOAD_UNREADABLE,
+    INTERACTION_READ_PROTOCOL_UNRECOGNIZED,
     register_degradation,
 )
 from .task_command_transport import (
@@ -1135,7 +1137,16 @@ def _active_native_row(db: "Session", task_id: int) -> TaskInteractionRequest | 
 
 @dataclass(frozen=True)
 class _AnchorUnresolved:
-    reason: str  # "anchor_dangling" | "checkpoint_unavailable"
+    # The unanswerable tier's full reason vocabulary lives on this one
+    # line, because ``CompatibilityQuestionView.reason`` is a bare string
+    # with no type to carry it. Two values come from this resolver:
+    # "anchor_dangling" | "checkpoint_unavailable". Two more are produced
+    # directly by ``materialize_compatibility_view`` without going through
+    # this class, because they are decided before the anchor is ever
+    # looked at: "protocol_version_unrecognized" | "payload_unreadable".
+    # Converging all four into a Literal belongs with the endpoint that
+    # first classifies on them.
+    reason: str
 
 
 def _resolve_read_direction_anchor(
@@ -1328,8 +1339,8 @@ class CompatibilityQuestionView:
     """The rich three-tier result ``materialize_compatibility_view``
     produces. Not the legacy ``(question, interactions)`` tuple
     ``chat_history_service.get_latest_waiting_question`` returns -- that
-    lossy projection, and the four call sites that consume it, belong to
-    a later adapter change (see the module docstring), which
+    lossy projection, and the four call sites that consume it, are handled
+    by ``task_interaction_read.get_pending_interaction_question``, which
     imports this type and projects it down. ``reason`` carries the reason
     code #1079's endpoint needs and the legacy tuple has no slot for; it is
     only set on the ``"unanswerable"`` tier.
@@ -1372,15 +1383,14 @@ def materialize_compatibility_view(
     question", three-tiered:
 
     T1 (tier ``"legacy"``) -- the ``task_interaction_requests`` table does
-    not exist yet, there is no active native row for this task, the active
-    row's ``protocol_version`` is not one this reader recognizes, or its
-    ``request_payload`` does not parse against the v1 shape: falls back,
-    internally, to ``get_latest_waiting_question`` and returns exactly what
-    that function would have, unconditionally. This tier's table-existence
-    gate is not defensive decoration for a table that might never exist --
-    ``interaction_rollout.py``'s own ``/ready`` gate treats "the service
-    deploys before its own migration has run" as a real, accepted window,
-    and this reader has to survive being called inside it.
+    not exist yet, or there is no active native row for this task: falls
+    back, internally, to ``get_latest_waiting_question`` and returns
+    exactly what that function would have, unconditionally. This tier's
+    table-existence gate is not defensive decoration for a table that
+    might never exist -- ``interaction_rollout.py``'s own ``/ready`` gate
+    treats "the service deploys before its own migration has run" as a
+    real, accepted window, and this reader has to survive being called
+    inside it.
 
     T2 (tier ``"native"``) -- an active native row exists and its resume
     anchor resolves (see ``_resolve_read_direction_anchor`` for exactly
@@ -1389,29 +1399,44 @@ def materialize_compatibility_view(
     ``interactions`` decoded from ``request_payload`` itself, not the
     legacy transcript.
 
-    T3 (tier ``"unanswerable"``) -- an active native row exists but its
-    anchor does not resolve (see ``_resolve_read_direction_anchor``):
-    ``question`` is still the row's own question text (there genuinely is
-    one, waiting), ``interactions`` is ``None`` (it cannot currently be
-    answered), and ``reason`` names why. **This tier must never fold into
-    "no active row" and retry the T1 fallback** -- doing so would show the
-    caller a legacy transcript question whose answer would land in a slot
-    a native row has already claimed, producing a self-contradictory
-    result. The one thing that makes this projection honest rather than a
-    lie by omission: the compatibility seam that accepts continuation
-    commands (landing with a later change) refuses a legacy-shaped answer
-    on exactly this same condition -- an active native row with an
-    unresolved anchor -- so "no controls shown" and "a free-text answer
-    would be refused anyway" agree. If that seam's refusal is ever
-    loosened, this tier's projection needs re-deciding alongside it, not
-    independently.
+    T3 (tier ``"unanswerable"``) -- an active native row exists but this
+    reader cannot answer with it, for one of four reasons, and ``reason``
+    names which: the row's ``protocol_version`` is not one this reader
+    recognizes (``"protocol_version_unrecognized"``); its
+    ``request_payload`` does not parse against the v1 shape
+    (``"payload_unreadable"``); or its resume anchor does not resolve
+    (``"anchor_dangling"`` / ``"checkpoint_unavailable"``, see
+    ``_resolve_read_direction_anchor``). Only the anchor-resolution pair
+    can still read the row's own question text -- the other two cannot
+    recover it at all, so both slots come out empty. **This tier must
+    never fold into "no active row" and retry the T1 fallback**, on any of
+    the four reasons -- doing so would show the caller a legacy transcript
+    question whose answer would land in a slot a native row has already
+    claimed, producing a self-contradictory result. For the anchor-
+    resolution pair, the one thing that makes this projection honest
+    rather than a lie by omission: the compatibility seam that accepts
+    continuation commands (landing with a later change) refuses a
+    legacy-shaped answer on exactly this same condition -- an active
+    native row with an unresolved anchor -- so "no controls shown" and "a
+    free-text answer would be refused anyway" agree. If that seam's
+    refusal is ever loosened, this tier's projection needs re-deciding
+    alongside it, not independently.
 
-    Consumers, and how much of this result they get: a later
-    adapter (not written here) projects this down to the legacy
-    ``(question, interactions)`` tuple for the four existing call sites,
-    dropping ``reason`` -- lossy by design, not an oversight. #1079's own
-    endpoint (not written here) is meant to consume this rich result
-    directly, keeping ``reason`` for its own outcome classification.
+    Both slots empty is a dead end for the user -- the task is plainly
+    waiting and the interface has nothing to answer -- and it is accepted
+    only because operations is told at the same moment and can go look.
+    Remove or silence that signal and this tier's projection has to be
+    decided again.
+
+    Consumers, and how much of this result they get:
+    ``task_interaction_read.get_pending_interaction_question`` projects
+    this down to the legacy ``(question, interactions)`` tuple for the
+    four existing call sites, dropping ``reason`` -- lossy by design, not
+    an oversight. Three of the four already hold a loaded ``Task`` row
+    when they need the answer; the fourth resolves and authorizes one
+    first, inside a worker-owned short session, before calling this view.
+    #1079's own endpoint (not written here) is meant to consume this rich
+    result directly, keeping ``reason`` for its own outcome classification.
     """
 
     if not interaction_requests_table_exists(db):
@@ -1420,29 +1445,77 @@ def materialize_compatibility_view(
     row = _active_native_row(db, task_id)
     if row is None:
         return _legacy_view(db, task_id)
+
     if row.protocol_version != INTERACTION_PROTOCOL_VERSION:
-        return _legacy_view(db, task_id)
+        # An active row holds this task's answer slot, so this cannot fold
+        # back into "there is no active row" and re-offer the legacy
+        # transcript: that would surface a question whose answer would land
+        # in a slot this row has already claimed. The row is unreadable
+        # rather than absent, so both slots come out empty and the caller
+        # shows nothing to answer -- which is only acceptable because of
+        # the signal raised right here.
+        #
+        # ``ck_task_interaction_requests_active_protocol`` pins every
+        # active row to protocol version 1, so on a schema carrying that
+        # constraint this branch cannot be reached at all: the database is
+        # the first line and this check is the second. It is kept, and
+        # kept observable, because a model-level constraint is not a
+        # licence for the reader to assume -- and because that constraint
+        # only converged on SQLite recently, so an older SQLite file may
+        # not carry it.
+        register_degradation(
+            INTERACTION_READ_PROTOCOL_UNRECOGNIZED,
+            f"task {task_id}: active interaction {row.id} carries protocol "
+            f"version {row.protocol_version}",
+        )
+        logger.warning(
+            "active native interaction row carries an unrecognized protocol "
+            "version; projecting an empty pending question",
+            extra={
+                "task_id": task_id,
+                "interaction_id": row.id,
+                "row_protocol_version": row.protocol_version,
+                "reason": "protocol_version_unrecognized",
+            },
+        )
+        return CompatibilityQuestionView(
+            tier="unanswerable",
+            question=None,
+            interactions=None,
+            reason="protocol_version_unrecognized",
+        )
 
     try:
         parsed = parse_v1_request_payload(row.request_payload)
     except _PydanticValidationError as exc:
-        # This is the unreadable-payload fallback: an active native row
-        # exists but its stored request_payload does not parse against the
-        # v1 shape this reader expects, so the caller silently gets the T1
-        # legacy transcript instead of the native projection. Logging here
-        # only guarantees the degradation is not silent; what the read
-        # surface does with it -- a dedicated ops_signals degradation
-        # constant, a counter, or something else -- is that surface's own
-        # call to make, not this module's.
+        # An active row holds the answer slot but its stored
+        # request_payload does not parse against the v1 shape, so its
+        # question text cannot be recovered at all -- ``parsed`` does not
+        # exist in this branch. Same rule as the unrecognized-version
+        # branch above: unreadable is not absent, so this does not fold
+        # back into the legacy transcript; both slots come out empty and
+        # the signal below is what makes that acceptable.
+        register_degradation(
+            INTERACTION_READ_PAYLOAD_UNREADABLE,
+            f"task {task_id}: active interaction {row.id} request_payload "
+            "does not parse against the v1 shape",
+        )
         logger.warning(
             "active native interaction row failed v1 payload validation; "
-            "falling back to the legacy transcript",
+            "projecting an empty pending question",
             extra={
                 "task_id": task_id,
+                "interaction_id": row.id,
+                "reason": "payload_unreadable",
                 "validation_errors": _validation_error_summary(exc),
             },
         )
-        return _legacy_view(db, task_id)
+        return CompatibilityQuestionView(
+            tier="unanswerable",
+            question=None,
+            interactions=None,
+            reason="payload_unreadable",
+        )
 
     unresolved = _resolve_read_direction_anchor(db, row)
     if unresolved is not None:

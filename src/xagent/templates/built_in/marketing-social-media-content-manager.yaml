@@ -35,6 +35,30 @@ sample_prompts:
     highlights:
     - 渠道
     - 粘贴简报
+persona:
+  name: Maya
+  role:
+    en: Social Media Content Manager
+    zh: 社媒内容经理
+  avatar: /marketplace/avatars/maya.png
+  intro:
+    en: |-
+      Hi there — I'm Maya, your Social Media Content Manager.
+
+      Give me a topic or a brief and I write LinkedIn, Instagram and Facebook posts with matching visuals.
+    zh: |-
+      你好，我是 Maya，你的社媒内容经理。
+
+      给我一个话题或简报，我就能写出 LinkedIn、Instagram 和 Facebook 的帖子文案，并配上对应的视觉内容。
+  kickoff_questions:
+    en:
+    - Which platforms are in scope — all three, or one to start?
+    - Do you have brand guidelines I should follow, or should I learn from your last few posts?
+    - How many posts a week are we aiming for, and who approves before anything goes out?
+    zh:
+    - 涉及哪些平台——三个都要，还是先从一个开始？
+    - 有品牌规范需要我遵循吗，还是让我从你最近发的帖子里学习？
+    - 每周计划发几条，发布前由谁审批？
 connections:
 - name: LinkedIn
   logo: https://www.google.com/s2/favicons?domain=linkedin.com&sz=64

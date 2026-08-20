@@ -43,10 +43,6 @@ def _assistant_question_filters(task_id: int) -> tuple[ColumnElement[bool], ...]
     and the writer (``supersede_legacy_question_rows``) so the two
     conditions cannot drift apart by hand-editing one copy and not the
     other.
-
-    Scoped to this one predicate. A second, ``allow_superseded`` pass
-    over already-superseded rows may be added to the reader later; that
-    pass is not this helper's concern.
     """
     return (
         TaskChatMessage.task_id == task_id,

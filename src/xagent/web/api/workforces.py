@@ -57,6 +57,7 @@ from ..services.workforce_lifecycle import (
     ensure_workforce_lifecycle_access,
 )
 from ..services.workforce_names import workforce_name_exists
+from ..services.workforce_prompt_runtime import MAX_WORKFORCE_PROMPT_LENGTH
 from ..services.workforce_runs import create_preview_workforce_run
 from ..services.workforce_runs import create_workforce_run as start_workforce_run
 from ..services.workforce_runtime import (
@@ -99,7 +100,11 @@ class WorkforceCreateRequest(BaseModel):
 
 
 class WorkforcePromptCreateRequest(BaseModel):
-    prompt: str = Field(..., min_length=1)
+    prompt: str = Field(
+        ...,
+        min_length=1,
+        max_length=MAX_WORKFORCE_PROMPT_LENGTH,
+    )
 
 
 class WorkforceUpdateRequest(BaseModel):

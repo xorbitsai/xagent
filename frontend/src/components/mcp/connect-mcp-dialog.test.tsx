@@ -298,6 +298,9 @@ function mcpOauthApp() {
     // /apps/{id}/oauth/connect rather than the per-server route.
     can_attach: false,
     can_authorize: false,
+    // The catalog branch's can_configure equals is_connected: its Configure
+    // equivalent (manage-my-key / re-run OAuth) only exists once connected.
+    can_configure: false,
   }
 }
 
@@ -322,6 +325,10 @@ function customMcpOauthApp() {
     // consent flow itself is available and is the recovery.
     can_attach: false,
     can_authorize: true,
+    // The owner holds the personal association the edit routes require, so
+    // this base shape is configurable -- independent of can_attach/
+    // can_authorize, which is the entire point of the field.
+    can_configure: true,
   }
 }
 
@@ -2021,6 +2028,39 @@ describe("ConnectMcpDialog Custom API detail loading", () => {
     is_connected: false,
   })
 
+  // A team-owned stdio connector the viewer holds no personal association
+  // for. The listing reports it connected -- the connected-state predicate
+  // returns True unconditionally for every non-mcp_oauth shape -- while the
+  // edit route answers 404 without a personal association row. That
+  // combination is the *narrowing* direction of the disagreement between the
+  // connected gate and can_configure; the widening direction (is_connected:
+  // false + can_configure: true) is the population this change exists for,
+  // covered by the hook-resolved fixtures above.
+  const teamOwnedStdio = () => ({
+    id: "team-files",
+    name: "Team Files",
+    description: "",
+    icon: "",
+    transport: "stdio",
+    is_custom: true,
+    is_local: true,
+    server_id: 11,
+    is_connected: true,
+    can_attach: true,
+    can_authorize: false,
+    can_configure: false,
+  })
+
+  // Same disagreement on the Custom API half, where the listing reports
+  // every entry connected unconditionally.
+  const teamOwnedCustomApi = () => ({
+    ...teamOwnedStdio(),
+    id: "team-billing",
+    name: "Team Billing",
+    transport: "custom_api",
+    server_id: 12,
+  })
+
   // Shared by renderSelectModeWith below and the non-select-mode card-click
   // test, which otherwise duplicated this exact mockImplementation block.
   function mockAppsList(apps: object[]) {
@@ -2055,6 +2095,10 @@ describe("ConnectMcpDialog Custom API detail loading", () => {
     // And no Authorize trigger: there is no consent flow behind it, so the
     // label would assert a step this connector does not have (#1347).
     expect(screen.queryByRole("button", { name: "tools.mcp.dialog.authorize" })).toBeNull()
+    // Configure does show: the owner's personal association makes the edit
+    // route resolve even though the connector is not "connected" by this
+    // field's usual meaning -- the bug this change exists to fix.
+    screen.getByRole("button", { name: "tools.mcp.dialog.configure" })
     // Becoming attachable must not change connected-state display: this
     // connector is still unconnected (is_connected: false), so it must stay
     // unchecked. Scoped through the card: connected-check is non-unique
@@ -2072,12 +2116,27 @@ describe("ConnectMcpDialog Custom API detail loading", () => {
     expect(onConnectSelected).toHaveBeenLastCalledWith([])
   })
 
+  it("opens the detail modal without toggling the selection when Configure is clicked in select mode", async () => {
+    // Configure's onClick carries the same stopPropagation() as Authorize's:
+    // without it, a click on the button would bubble to the card and toggle
+    // this attachable entry's selection as a side effect.
+    const onConnectSelected = vi.fn()
+    renderSelectModeWith([hookResolvedCustomMcp()], onConnectSelected)
+    await screen.findByText("Records MCP")
+
+    fireEvent.click(screen.getByRole("button", { name: "tools.mcp.dialog.configure" }))
+    expect(screen.getByTestId("connector-card-records")).toHaveAttribute("data-selected", "false")
+    expect(screen.getByTestId("settings-open-app").textContent).toBe("Records MCP")
+
+    fireEvent.click(screen.getByRole("button", { name: "tools.mcp.dialog.connect" }))
+    expect(onConnectSelected).toHaveBeenLastCalledWith([])
+  })
+
   it("shows Configure and the connected checkmark, not Authorize, for a connected custom mcp_oauth entry (#1332)", async () => {
-    // The isGloballyConnected branch of the footer ternary is checked first
-    // and must keep winning: a connected entry shows Configure plus the
-    // checkmark, never Authorize -- including now that can_authorize is true
-    // for it (re-consent is legitimate; the picker suppresses the trigger on
-    // connected state itself, which is why the backend does not).
+    // A connected entry shows Configure plus the checkmark, never Authorize --
+    // including when can_authorize is true for it (re-consent is legitimate;
+    // the Authorize block's own !isGloballyConnected term suppresses the
+    // trigger on connected state, which is why the backend does not).
     const onConnectSelected = vi.fn()
     renderSelectModeWith(
       [{ ...unauthorizedCustomMcp(), is_connected: true, can_attach: true }],
@@ -2116,6 +2175,20 @@ describe("ConnectMcpDialog Custom API detail loading", () => {
     )
     fireEvent.click(screen.getByRole("button", { name: "tools.mcp.dialog.connect" }))
     expect(onConnectSelected).toHaveBeenLastCalledWith([])
+  })
+
+  it("offers Authorize alongside Configure for a never-authorized connector its owner can still edit", async () => {
+    // The two fields answer different questions and neither implies the
+    // other: this connector needs consent (can_authorize) and its owner can
+    // also fix its configuration (can_configure) -- e.g. a wrong URL entered
+    // before consent was ever attempted. A ternary could only ever show one.
+    const onConnectSelected = vi.fn()
+    renderSelectModeWith([unauthorizedCustomMcp()], onConnectSelected)
+    await screen.findByText("Records MCP")
+
+    // getBy* throws when absent, so the bare calls are the assertions.
+    screen.getByRole("button", { name: "tools.mcp.dialog.authorize" })
+    screen.getByRole("button", { name: "tools.mcp.dialog.configure" })
   })
 
   // #1390: the create path into the selection, which ignored can_attach
@@ -2323,6 +2396,10 @@ describe("ConnectMcpDialog Custom API detail loading", () => {
       ...hookResolvedCustomMcp(),
       name: "Team Records",
       id: "team-records",
+      // The base factory is the owner's shape, which is configurable; a member
+      // reaching this connector through the team overlay holds no association
+      // of their own, so the listing reports false here.
+      can_configure: false,
     }
     delete teamOwned.auth_type
     renderSelectModeWith([teamOwned], onConnectSelected)
@@ -2333,6 +2410,56 @@ describe("ConnectMcpDialog Custom API detail loading", () => {
     expect(screen.getByTestId("settings-open-app").textContent).toBe("")
     fireEvent.click(screen.getByRole("button", { name: "tools.mcp.dialog.connect" }))
     expect(onConnectSelected).toHaveBeenLastCalledWith(["Team Records"])
+  })
+
+  it("offers no Configure for a team-owned connector the viewer holds no association for", async () => {
+    // The listing reports this connector connected (every non-mcp_oauth
+    // shape does), but the viewer has no row of their own, so the edit
+    // route would 404 -- the collapsing direction of the disagreement
+    // between the connected gate and can_configure.
+    const onConnectSelected = vi.fn()
+    renderSelectModeWith([teamOwnedStdio()], onConnectSelected)
+    await screen.findByText("Team Files")
+
+    expect(screen.queryByRole("button", { name: "tools.mcp.dialog.configure" })).toBeNull()
+    // The collapse must not have cost the team member their ability to
+    // select this connector -- can_attach is unaffected.
+    fireEvent.click(screen.getByText("Team Files"))
+    fireEvent.click(screen.getByRole("button", { name: "tools.mcp.dialog.connect" }))
+    expect(onConnectSelected).toHaveBeenLastCalledWith(["Team Files"])
+  })
+
+  it("offers no Configure for a team-owned custom API the viewer holds no association for", async () => {
+    const onConnectSelected = vi.fn()
+    renderSelectModeWith([teamOwnedCustomApi()], onConnectSelected)
+    await screen.findByText("Team Billing")
+
+    expect(screen.queryByRole("button", { name: "tools.mcp.dialog.configure" })).toBeNull()
+    fireEvent.click(screen.getByText("Team Billing"))
+    fireEvent.click(screen.getByRole("button", { name: "tools.mcp.dialog.connect" }))
+    expect(onConnectSelected).toHaveBeenLastCalledWith(["Team Billing"])
+  })
+
+  it("falls back to the connected gate for an entry that carries no can_configure field", async () => {
+    // teamOwnedStdio() is the shape where the connected gate and
+    // can_configure actively disagree (is_connected: true, can_configure:
+    // false) -- deleting the field here proves the fallback reads the
+    // connected gate rather than happening to agree with it by coincidence.
+    const connectedNoField: Record<string, unknown> = teamOwnedStdio()
+    delete connectedNoField.can_configure
+    const onConnectSelected = vi.fn()
+    renderSelectModeWith([connectedNoField], onConnectSelected)
+    await screen.findByText("Team Files")
+    screen.getByRole("button", { name: "tools.mcp.dialog.configure" })
+    cleanup()
+
+    const disconnectedNoField: Record<string, unknown> = {
+      ...connectedNoField,
+      is_connected: false,
+    }
+    renderSelectModeWith([disconnectedNoField], onConnectSelected)
+    await screen.findByText("Team Files")
+    expect(screen.queryByRole("button", { name: "tools.mcp.dialog.configure" })).toBeNull()
   })
 
   it("still gates selection on connected state for unconnected catalog apps", async () => {
@@ -2364,6 +2491,20 @@ describe("ConnectMcpDialog Custom API detail loading", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "tools.mcp.dialog.connect" }))
     expect(onConnectSelected).toHaveBeenLastCalledWith([])
+  })
+
+  it("offers no Configure for an unconnected catalog entry", async () => {
+    // Guards against the dead-button regression an unconditional True would
+    // reintroduce: Granola's Configure equivalent (manage-my-key / re-run
+    // OAuth) does not exist until it is connected, so nothing here must show.
+    const onConnectSelected = vi.fn()
+    renderSelectModeWith([mcpOauthApp()], onConnectSelected)
+    await screen.findByText("Granola")
+
+    expect(screen.queryByRole("button", { name: "tools.mcp.dialog.configure" })).toBeNull()
+    // Connect stays reachable through the card click.
+    fireEvent.click(screen.getByText("Granola"))
+    expect(screen.getByTestId("settings-open-app").textContent).toBe("Granola")
   })
 
   it("refuses a deactivated association even when it lists as connected", async () => {
@@ -2428,12 +2569,13 @@ describe("ConnectMcpDialog Custom API detail loading", () => {
     expect(onConnectSelected).toHaveBeenLastCalledWith([])
   })
 
-  it("routes a buttonless deactivated-before-consent entry to the modal", async () => {
-    // All four signals false and no auth_type: no checkmark, no Configure, no
-    // Authorize. The card click must still reach the detail modal — that route
-    // offers no recovery for this population (Connect has no auth_type to
-    // dispatch on), but it is the only thing the card has left, and the
-    // isAttachable comment records why.
+  it("routes a deactivated-before-consent entry to its edit form and the modal", async () => {
+    // No checkmark, no Authorize -- but its owner's personal association
+    // still exists (only its is_active flag is false, which the edit routes
+    // do not filter on), so Configure now opens. This does not re-enable the
+    // connector: the edit form's save payload carries no is_active key, so
+    // there is still no way to flip it back on from here. That gap is
+    // unrelated to this field and tracked on its own.
     const onConnectSelected = vi.fn()
     renderSelectModeWith([dormantBeforeConsent()], onConnectSelected)
     await screen.findByText("Records MCP")
@@ -2441,7 +2583,7 @@ describe("ConnectMcpDialog Custom API detail loading", () => {
     expect(
       within(screen.getByTestId("connector-card-records")).queryByTestId("connected-check"),
     ).toBeNull()
-    expect(screen.queryByRole("button", { name: "tools.mcp.dialog.configure" })).toBeNull()
+    screen.getByRole("button", { name: "tools.mcp.dialog.configure" })
     expect(screen.queryByRole("button", { name: "tools.mcp.dialog.authorize" })).toBeNull()
 
     fireEvent.click(screen.getByText("Records MCP"))
@@ -2450,11 +2592,12 @@ describe("ConnectMcpDialog Custom API detail loading", () => {
     expect(onConnectSelected).toHaveBeenLastCalledWith([])
   })
 
-  it("deselects a buttonless entry on the first click, then opens the modal on the second", async () => {
-    // The buttonless shape carries no affordance of its own, so the removal
-    // has to read from the card itself: the ring drops and the footer count
-    // decrements. The second click, with nothing left to remove, falls through
-    // to the modal like any other unattachable card.
+  it("deselects a deactivated-before-consent entry on the first click, then opens the modal on the second", async () => {
+    // This shape now carries a Configure button, but it renders on the card
+    // footer only, never on the card body the click below targets -- so the
+    // removal still has to read from the card itself: the ring drops and the
+    // footer count decrements. The second click, with nothing left to
+    // remove, falls through to the modal like any other unattachable card.
     const onConnectSelected = vi.fn()
     mockAppsList([dormantBeforeConsent()])
     render(
@@ -2488,6 +2631,9 @@ describe("ConnectMcpDialog Custom API detail loading", () => {
     await screen.findByText("Records MCP")
 
     expect(screen.queryByRole("button", { name: "tools.mcp.dialog.authorize" })).toBeNull()
+    // Configure is not scoped to select mode -- unlike Authorize, it does not
+    // exist to explain a diverted click, so it renders here too.
+    screen.getByRole("button", { name: "tools.mcp.dialog.configure" })
     fireEvent.click(screen.getByText("Records MCP"))
     expect(screen.getByTestId("settings-open-app").textContent).toBe("Records MCP")
   })

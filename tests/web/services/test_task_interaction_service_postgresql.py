@@ -68,7 +68,9 @@ from xagent.web.models.database import Base
 from xagent.web.models.task import Task, TaskStatus, TraceEvent
 from xagent.web.models.task_command import TaskExecutionCommand
 from xagent.web.models.task_interaction import TaskInteractionRequest
+from xagent.web.services import task_interaction_read as read_surface
 from xagent.web.services import task_interaction_service as svc
+from xagent.web.services.chat_history_service import persist_assistant_message
 from xagent.web.services.interaction_rollout import counters_snapshot
 from xagent.web.services.ops_signals import (
     CHECKPOINT_LOAD_UNAVAILABLE,
@@ -401,6 +403,121 @@ def test_the_session_survives_a_failed_anchor_fetch_with_no_rollback_postgresql(
     # ...and complete a whole second response construction.
     second_view = svc.materialize_compatibility_view(db, task_id)
     assert second_view.tier == "native"
+
+
+# ---------------------------------------------------------------------------
+# The read surface adapter's own double-backend cells (A6/A9/A13 from the
+# adapter's SQLite-backed test file): the table-existence gate a T1 cell
+# depends on, the four-field active-row predicate a T2 cell depends on, and
+# a malformed JSON payload a T3''' cell depends on. The remaining twelve
+# adapter cells are backend-independent and covered once, on SQLite, in
+# test_task_interaction_read.py.
+# ---------------------------------------------------------------------------
+
+
+def test_a6_marker_matches_no_active_row_reads_the_legacy_transcript_postgresql(
+    db_session,
+) -> None:
+    db = db_session
+    user_id = make_user(db)
+    task_id = make_task(db, user_id=user_id)
+    task = db.query(Task).filter(Task.id == task_id).first()
+    task.run_id = "run-a"
+    task.interaction_protocol_version = 1
+    db.commit()
+    db.refresh(task)
+    persist_assistant_message(
+        db,
+        task_id,
+        user_id,
+        "A live question",
+        message_type="question",
+        interactions=[{"type": "text_input", "label": "Live"}],
+    )
+
+    question, interactions = read_surface.get_pending_interaction_question(db, task)
+
+    assert question is not None
+    assert question.startswith("A live question")
+    assert interactions == [{"type": "text_input", "label": "Live"}]
+
+
+def test_a9_native_projection_postgresql(db_session) -> None:
+    db = db_session
+    user_id = make_user(db)
+    task_id = make_task(db, user_id=user_id)
+    task = db.query(Task).filter(Task.id == task_id).first()
+    task.run_id = "run-a"
+    task.interaction_protocol_version = 1
+    db.commit()
+    db.refresh(task)
+
+    trace_id = _make_trace_event(db, task_id=task_id, run_partition="run-a")
+    _make_active_row(
+        db,
+        task_id=task_id,
+        run_id="run-a",
+        resume_trace_event_id=trace_id,
+        resume_run_partition="run-a",
+    )
+
+    question, interactions = read_surface.get_pending_interaction_question(db, task)
+
+    assert question == "Which environment?"
+    assert interactions == [
+        {
+            "type": "text_input",
+            "field": "env",
+            "label": "Environment",
+            "options": None,
+            "placeholder": None,
+            "multiline": False,
+            "min": None,
+            "max": None,
+            "default_value": None,
+            "accept": None,
+            "multiple": False,
+        }
+    ]
+
+
+def test_a13_unparseable_payload_drops_both_slots_postgresql(db_session) -> None:
+    db = db_session
+    user_id = make_user(db)
+    task_id = make_task(db, user_id=user_id)
+    task = db.query(Task).filter(Task.id == task_id).first()
+    task.run_id = "run-a"
+    task.interaction_protocol_version = 1
+    db.commit()
+    db.refresh(task)
+
+    trace_id = _make_trace_event(db, task_id=task_id, run_partition="run-a")
+    now = _now()
+    row = TaskInteractionRequest(
+        task_id=task_id,
+        run_id="run-a",
+        kind="clarification",
+        protocol_version=1,
+        status="active",
+        active_slot=1,
+        origin="internal",
+        request_payload={"not": "a valid v1 payload"},
+        request_idempotency_key=f"pg-malformed-key-{next(_key_counter)}",
+        resume_trace_event_id=trace_id,
+        resume_event_id="resume-event-1",
+        resume_execution_id="exec-1",
+        resume_locator_format="trace_event_pk_v1",
+        resume_checkpoint_type="agent_execution_checkpoint",
+        resume_run_partition="run-a",
+        created_at=now,
+        expires_at=now + timedelta(minutes=15),
+    )
+    db.add(row)
+    db.commit()
+
+    question, interactions = read_surface.get_pending_interaction_question(db, task)
+
+    assert (question, interactions) == (None, None)
 
 
 # ---------------------------------------------------------------------------

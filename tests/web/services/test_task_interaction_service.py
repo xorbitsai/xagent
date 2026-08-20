@@ -141,21 +141,32 @@ from xagent.web.services import task_interaction_service as svc
 from xagent.web.services.ops_signals import (
     CHECKPOINT_LOAD_UNAVAILABLE,
     CHECKPOINT_PK_ANCHOR_DANGLING,
+    INTERACTION_READ_PAYLOAD_UNREADABLE,
+    INTERACTION_READ_PROTOCOL_UNRECOGNIZED,
+    active_degradations,
     clear_degradation,
 )
 from xagent.web.services.task_lease_service import TASK_RUN_ID_TRACE_FIELD
 
+_DEGRADATION_SIGNALS_UNDER_TEST = (
+    CHECKPOINT_PK_ANCHOR_DANGLING,
+    CHECKPOINT_LOAD_UNAVAILABLE,
+    INTERACTION_READ_PROTOCOL_UNRECOGNIZED,
+    INTERACTION_READ_PAYLOAD_UNREADABLE,
+)
+
 
 @pytest.fixture(autouse=True)
 def _clean_degradation_registry():
-    """The anchor resolver registers process-global degradation signals on
-    its failure paths; clear this module's two signals around every test so
-    they cannot leak into tests that read the shared registry (the /health
-    suite asserts exact payloads and fails on any leftover entry)."""
-    for signal in (CHECKPOINT_PK_ANCHOR_DANGLING, CHECKPOINT_LOAD_UNAVAILABLE):
+    """The anchor resolver and materialize_compatibility_view register
+    process-global degradation signals on their failure paths; clear this
+    module's four signals around every test so they cannot leak into tests
+    that read the shared registry (the /health suite asserts exact
+    payloads and fails on any leftover entry)."""
+    for signal in _DEGRADATION_SIGNALS_UNDER_TEST:
         clear_degradation(signal)
     yield
-    for signal in (CHECKPOINT_PK_ANCHOR_DANGLING, CHECKPOINT_LOAD_UNAVAILABLE):
+    for signal in _DEGRADATION_SIGNALS_UNDER_TEST:
         clear_degradation(signal)
 
 
@@ -932,15 +943,23 @@ def test_t1_falls_back_to_legacy_when_task_run_id_is_null(_db: Session) -> None:
     assert view.tier == "legacy"
 
 
-def test_t1_falls_back_to_legacy_when_protocol_version_is_unrecognized(
+def test_unreadable_protocol_version_is_unanswerable_not_legacy(
     _db: Session, _seeded_task: int, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """``ck_task_interaction_requests_active_protocol`` pins every active
     row's protocol_version to 1 today, so this branch cannot be reached
-    through any real write against this schema -- it defends against a
-    future protocol version whose active-row CHECK has not been written
-    yet. Monkeypatching the row lookup is how this delivery tests a branch
-    the schema itself does not yet allow to be constructed."""
+    through any real write against this schema -- it is a second line of
+    defense behind that database constraint, for a future protocol version
+    whose active-row CHECK has not been written yet, or an older SQLite
+    file that predates the constraint. Monkeypatching the row lookup is
+    how this delivery tests a branch the schema itself does not yet allow
+    to be constructed.
+
+    An active row holds this task's answer slot regardless of whether its
+    protocol_version is one this reader recognizes, so this can no longer
+    fold back into the legacy tier -- doing so would let the caller offer
+    a transcript question whose answer would land in a slot this row has
+    already claimed."""
 
     trace_event_id = _make_trace_event(_db, task_id=_seeded_task)
     row = _make_active_interaction_row(
@@ -953,10 +972,13 @@ def test_t1_falls_back_to_legacy_when_protocol_version_is_unrecognized(
 
     monkeypatch.setattr(svc, "_active_native_row", _fake_active_row)
     view = svc.materialize_compatibility_view(_db, _seeded_task)
-    assert view.tier == "legacy"
+    assert view.tier == "unanswerable"
+    assert view.question is None
+    assert view.interactions is None
+    assert view.reason == "protocol_version_unrecognized"
 
 
-def test_t1_falls_back_to_legacy_when_request_payload_does_not_parse(
+def test_unreadable_payload_is_unanswerable_not_legacy(
     _db: Session, _seeded_task: int
 ) -> None:
     """The active row's request_payload is a JSON column with no
@@ -964,7 +986,11 @@ def test_t1_falls_back_to_legacy_when_request_payload_does_not_parse(
     that satisfies NOT NULL, so this branch is reachable through a real
     write, unlike the protocol_version branch above. A missing "message"
     field is enough to fail parse_v1_request_payload's pydantic
-    validation."""
+    validation.
+
+    Same rule as the protocol-version branch: an active row holds the
+    answer slot even when its payload cannot be parsed, so this reports
+    unanswerable rather than folding back to the legacy transcript."""
 
     trace_event_id = _make_trace_event(_db, task_id=_seeded_task)
     _make_active_interaction_row(
@@ -974,7 +1000,109 @@ def test_t1_falls_back_to_legacy_when_request_payload_does_not_parse(
         request_payload={"not": "a valid v1 payload"},
     )
     view = svc.materialize_compatibility_view(_db, _seeded_task)
-    assert view.tier == "legacy"
+    assert view.tier == "unanswerable"
+    assert view.question is None
+    assert view.interactions is None
+    assert view.reason == "payload_unreadable"
+
+
+def test_unrecognized_protocol_version_raises_the_ops_signal_and_a_warning(
+    _db: Session, _seeded_task: int, monkeypatch: pytest.MonkeyPatch, caplog
+) -> None:
+    """The unrecognized-protocol-version branch must not be silent --
+    it registers a named degradation and logs a WARNING. Mutation: delete
+    the register_degradation() call in that branch and this test turns
+    red (INTERACTION_READ_PROTOCOL_UNRECOGNIZED never appears)."""
+
+    trace_event_id = _make_trace_event(_db, task_id=_seeded_task)
+    row = _make_active_interaction_row(
+        _db, task_id=_seeded_task, resume_trace_event_id=trace_event_id
+    )
+    row.protocol_version = 2
+
+    def _fake_active_row(db: Session, task_id: int) -> TaskInteractionRequest:
+        return row
+
+    monkeypatch.setattr(svc, "_active_native_row", _fake_active_row)
+    with caplog.at_level(
+        logging.WARNING, logger="xagent.web.services.task_interaction_service"
+    ):
+        svc.materialize_compatibility_view(_db, _seeded_task)
+
+    from xagent.web.services.ops_signals import INTERACTION_READ_PROTOCOL_UNRECOGNIZED
+
+    assert INTERACTION_READ_PROTOCOL_UNRECOGNIZED in active_degradations()
+    assert any(record.levelno == logging.WARNING for record in caplog.records)
+
+
+def test_unreadable_payload_raises_the_ops_signal_and_a_warning(
+    _db: Session, _seeded_task: int, caplog
+) -> None:
+    """Same requirement as the unrecognized-protocol-version test above,
+    for the payload-unreadable branch. Mutation: delete that branch's
+    register_degradation() call and this test turns red."""
+
+    trace_event_id = _make_trace_event(_db, task_id=_seeded_task)
+    _make_active_interaction_row(
+        _db,
+        task_id=_seeded_task,
+        resume_trace_event_id=trace_event_id,
+        request_payload={"not": "a valid v1 payload"},
+    )
+    with caplog.at_level(
+        logging.WARNING, logger="xagent.web.services.task_interaction_service"
+    ):
+        svc.materialize_compatibility_view(_db, _seeded_task)
+
+    from xagent.web.services.ops_signals import INTERACTION_READ_PAYLOAD_UNREADABLE
+
+    assert INTERACTION_READ_PAYLOAD_UNREADABLE in active_degradations()
+    assert any(record.levelno == logging.WARNING for record in caplog.records)
+
+
+def test_both_slots_empty_shape_on_unrecognized_protocol_version(
+    _db: Session, _seeded_task: int, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """One of two cells for the exact tuple shape both empty-slot
+    branches must produce."""
+
+    trace_event_id = _make_trace_event(_db, task_id=_seeded_task)
+    row = _make_active_interaction_row(
+        _db, task_id=_seeded_task, resume_trace_event_id=trace_event_id
+    )
+    row.protocol_version = 2
+
+    def _fake_active_row(db: Session, task_id: int) -> TaskInteractionRequest:
+        return row
+
+    monkeypatch.setattr(svc, "_active_native_row", _fake_active_row)
+    view = svc.materialize_compatibility_view(_db, _seeded_task)
+    assert (view.question, view.interactions, view.reason) == (
+        None,
+        None,
+        "protocol_version_unrecognized",
+    )
+
+
+def test_both_slots_empty_shape_on_unreadable_payload(
+    _db: Session, _seeded_task: int
+) -> None:
+    """The other cell: same shape assertion for the payload-unreadable
+    branch."""
+
+    trace_event_id = _make_trace_event(_db, task_id=_seeded_task)
+    _make_active_interaction_row(
+        _db,
+        task_id=_seeded_task,
+        resume_trace_event_id=trace_event_id,
+        request_payload={"not": "a valid v1 payload"},
+    )
+    view = svc.materialize_compatibility_view(_db, _seeded_task)
+    assert (view.question, view.interactions, view.reason) == (
+        None,
+        None,
+        "payload_unreadable",
+    )
 
 
 def test_unreadable_payload_warning_never_logs_the_rejected_question_text(
@@ -1198,6 +1326,51 @@ def test_t3_prime_anchor_dangling_for_each_remaining_validity_condition(
     view = svc.materialize_compatibility_view(_db, _seeded_task)
     assert view.tier == "unanswerable"
     assert view.reason == "anchor_dangling"
+
+
+def test_t3_row_validity_failure_raises_checkpoint_pk_anchor_dangling(
+    _db: Session, _seeded_task: int
+) -> None:
+    """The row-invalid branch of
+    _resolve_read_direction_anchor's six-condition guard must register
+    CHECKPOINT_PK_ANCHOR_DANGLING, same as the missing-row branch above.
+    Mutation: delete that register_degradation() call and this test turns
+    red."""
+
+    trace_event_id = _make_trace_event(
+        _db, task_id=_seeded_task, checkpoint_type="not_a_checkpoint_type"
+    )
+    _make_active_interaction_row(
+        _db, task_id=_seeded_task, resume_trace_event_id=trace_event_id
+    )
+
+    view = svc.materialize_compatibility_view(_db, _seeded_task)
+    assert view.tier == "unanswerable"
+    assert CHECKPOINT_PK_ANCHOR_DANGLING in active_degradations()
+
+
+def test_t2_empty_trace_side_execution_id_is_treated_as_a_match(
+    _db: Session, _seeded_task: int
+) -> None:
+    """A checkpoint row whose own execution_id is empty
+    short-circuits the execution-identity comparison to "matches"
+    regardless of the interaction row's resume_execution_id, so the
+    anchor still resolves and the view still reaches T2. Mutation: delete
+    the ``not row_execution_id or ...`` short-circuit (comparing execution
+    ids unconditionally instead) and this test turns red, because an
+    empty trace-side id would then never equal a non-empty
+    resume_execution_id."""
+
+    trace_event_id = _make_trace_event(_db, task_id=_seeded_task, execution_id="")
+    _make_active_interaction_row(
+        _db,
+        task_id=_seeded_task,
+        resume_trace_event_id=trace_event_id,
+        resume_execution_id="exec-1",
+    )
+
+    view = svc.materialize_compatibility_view(_db, _seeded_task)
+    assert view.tier == "native"
 
 
 def test_t3_does_not_fall_back_to_legacy(_db: Session, _seeded_task: int) -> None:

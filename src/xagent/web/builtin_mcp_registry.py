@@ -237,6 +237,29 @@ def get_builtin_oauth_provider_rows() -> list[dict[str, Any]]:
             # salesforce_get_current_user calls.
             "default_scopes": ["api", "refresh_token", "openid"],
         },
+        {
+            "provider_name": "jira",
+            "name": "Jira",
+            "client_id": os.environ.get("JIRA_CLIENT_ID", ""),
+            "client_secret": os.environ.get("JIRA_CLIENT_SECRET", ""),
+            "auth_url": "https://auth.atlassian.com/authorize",
+            "token_url": "https://auth.atlassian.com/oauth/token",
+            "redirect_uri": os.environ.get("JIRA_REDIRECT_URI", ""),
+            "userinfo_url": "https://api.atlassian.com/me",
+            "user_id_path": "account_id",
+            "email_path": "email",
+            # offline_access is required to get a refresh_token back at all
+            # (Atlassian omits it from the token response otherwise); read/
+            # write:jira-work cover issue and comment access, read:jira-user
+            # covers the user-search tool, and read:me backs jira_get_current_user.
+            "default_scopes": [
+                "offline_access",
+                "read:jira-work",
+                "write:jira-work",
+                "read:jira-user",
+                "read:me",
+            ],
+        },
     ]
 
 
@@ -821,6 +844,28 @@ def get_builtin_public_mcp_app_rows() -> list[dict[str, Any]]:
                     "SALESFORCE_ACCESS_TOKEN": "access_token",
                     "SALESFORCE_INSTANCE_URL": "instance_url",
                 },
+            },
+        },
+        {
+            "app_id": "jira",
+            "name": "Jira",
+            "description": "Connect to Jira to search issues with JQL, read and create issues and comments, transition issues through their workflow, and browse projects and users.",
+            "icon": "https://www.google.com/s2/favicons?domain=atlassian.com&sz=128",
+            "transport": "oauth",
+            "provider_name": "jira",
+            "category": "Productivity",
+            "oauth_scopes": [
+                "offline_access",
+                "read:jira-work",
+                "write:jira-work",
+                "read:jira-user",
+                "read:me",
+            ],
+            "is_visible_in_connector": True,
+            "launch_config": {
+                "command": "python",
+                "args": ["-m", "xagent.web.tools.mcp.jira"],
+                "env_mapping": {"JIRA_ACCESS_TOKEN": "access_token"},
             },
         },
     ]

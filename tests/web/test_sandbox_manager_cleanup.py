@@ -1,5 +1,7 @@
 """Test SandboxManager.cleanup — delete sandbox if config changed."""
 
+import asyncio
+import logging
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
@@ -16,6 +18,11 @@ from xagent.sandbox.base import (
     SandboxMountIntent,
     SandboxTemplate,
 )
+
+# WHY: importing app runs its module-level setup_logging(), which resets the
+# root handlers via dictConfig. Import it at collection so that reset happens
+# before caplog attaches per-test, not inside a caplog context.
+from xagent.web.app import _startup_phase
 from xagent.web.sandbox_manager import _SANDBOX_STOP_TIMEOUT_SECONDS, SandboxManager
 
 
@@ -467,3 +474,171 @@ class TestQuiesceReconcilingBackend:
         service.stop_existing.assert_awaited_once_with(
             "user::1", timeout=_SANDBOX_STOP_TIMEOUT_SECONDS
         )
+
+    @pytest.mark.asyncio
+    async def test_quiesce_logs_diagnostic_summary(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Quiesce emits one summary line with seen/running/stopped counts so a
+        slow startup is diagnosable from logs alone (issue #231)."""
+        service = FakeSandboxService(runtime_spec_supported=True)
+        spec = ResolvedSandboxRuntimeSpec.from_parts(
+            template_type="image", image="img:v1"
+        )
+        for name, state in (
+            ("user::1", "running"),
+            ("user::2", "running"),
+            ("user::3", "stopped"),
+        ):
+            service._containers[name] = _FakeReconcileContainer(
+                state=state,
+                spec=spec,
+                fingerprint_label=spec.fingerprint(),
+                version_label="1",
+            )
+        service.containers = {"user::1", "user::2", "user::3"}
+
+        manager = SandboxManager(service)
+
+        with caplog.at_level(logging.INFO, logger="xagent.web.sandbox_manager"):
+            await manager.cleanup()
+
+        summaries = [
+            r.getMessage()
+            for r in caplog.records
+            if "Sandbox quiesce completed" in r.getMessage()
+        ]
+        assert len(summaries) == 1, "expected exactly one quiesce summary line"
+        msg = summaries[0]
+        assert "seen=3" in msg
+        assert "running=2" in msg
+        assert "stopped=2" in msg
+        assert "failed=0" in msg
+        # Lock the full schema so a dropped/renamed duration field is caught.
+        assert "stop_time=" in msg
+        assert "total=" in msg
+        assert "status=ok" in msg
+
+    @pytest.mark.asyncio
+    async def test_quiesce_list_failure_marks_status(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A ``list_sandboxes`` failure must not read as clean empty work: the
+        summary reports ``status=list_failed`` rather than a zero-count success."""
+        service = FakeSandboxService(runtime_spec_supported=True)
+        service.list_sandboxes.side_effect = RuntimeError("boom")
+
+        manager = SandboxManager(service)
+
+        with caplog.at_level(logging.INFO, logger="xagent.web.sandbox_manager"):
+            await manager.cleanup()
+
+        summaries = [
+            r.getMessage()
+            for r in caplog.records
+            if "Sandbox quiesce completed" in r.getMessage()
+        ]
+        assert len(summaries) == 1
+        assert "seen=0" in summaries[0]
+        assert "status=list_failed" in summaries[0]
+
+
+class TestLegacyCleanupSummary:
+    """``_legacy_cleanup`` (Boxlite route) emits one structured summary on every
+    path — empty, stop, and error — with the same ``running``/``stop_time``
+    fields the quiesce route carries, so cleanup telemetry stays consistent
+    across supported backends (issue #231)."""
+
+    @pytest.mark.asyncio
+    async def test_empty_listing_still_emits_summary(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        service = FakeSandboxService()  # legacy route (no runtime spec)
+        service.list_sandboxes.return_value = []
+
+        manager = SandboxManager(service)
+
+        with caplog.at_level(logging.INFO, logger="xagent.web.sandbox_manager"):
+            await manager.cleanup()
+
+        summaries = [
+            r.getMessage()
+            for r in caplog.records
+            if "Sandbox cleanup completed" in r.getMessage()
+        ]
+        assert len(summaries) == 1
+        assert "seen=0" in summaries[0]
+        assert "status=ok" in summaries[0]
+
+    @pytest.mark.asyncio
+    async def test_running_sandbox_reports_running_and_stop_time(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        service = FakeSandboxService()
+        service.list_sandboxes.return_value = [
+            _make_sb_info("__warmup__", image="img:v1", state="running")
+        ]
+        service.get_or_create.return_value = AsyncMock()
+
+        manager = SandboxManager(service)
+
+        with (
+            patch.dict(
+                "os.environ",
+                {
+                    "SANDBOX_IMAGE": "img:v1",
+                    "SANDBOX_CPUS": "1",
+                    "SANDBOX_MEMORY": "512",
+                },
+                clear=True,
+            ),
+            caplog.at_level(logging.INFO, logger="xagent.web.sandbox_manager"),
+        ):
+            await manager.cleanup()
+
+        summaries = [
+            r.getMessage()
+            for r in caplog.records
+            if "Sandbox cleanup completed" in r.getMessage()
+        ]
+        assert len(summaries) == 1
+        assert "running=1" in summaries[0]
+        assert "stopped=1" in summaries[0]
+        assert "stop_time=" in summaries[0]
+        assert "status=ok" in summaries[0]
+
+
+class TestStartupPhaseLogging:
+    """``_startup_phase`` emits a terminal line on every exit — success, error,
+    and cancellation — so a stalled/aborted startup is never left showing only
+    its begin line (issue #231)."""
+
+    def test_success_logs_done(self, caplog: pytest.LogCaptureFixture) -> None:
+        with caplog.at_level(logging.INFO, logger="xagent.web.app"):
+            with _startup_phase("demo"):
+                pass
+
+        messages = [r.getMessage() for r in caplog.records]
+        assert any("startup phase done: demo" in m for m in messages)
+
+    def test_error_logs_failed_and_reraises(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        with caplog.at_level(logging.INFO, logger="xagent.web.app"):
+            with pytest.raises(ValueError):
+                with _startup_phase("demo"):
+                    raise ValueError("boom")
+
+        messages = [r.getMessage() for r in caplog.records]
+        assert any("startup phase failed: demo" in m for m in messages)
+
+    def test_cancellation_logs_terminal_and_reraises(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        with caplog.at_level(logging.INFO, logger="xagent.web.app"):
+            with pytest.raises(asyncio.CancelledError):
+                with _startup_phase("demo"):
+                    raise asyncio.CancelledError()
+
+        messages = [r.getMessage() for r in caplog.records]
+        assert any("startup phase cancelled: demo" in m for m in messages)

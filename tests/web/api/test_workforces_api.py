@@ -4,6 +4,7 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
+from fastapi import HTTPException
 from sqlalchemy import event
 
 from xagent.web.api import workforces as workforces_api
@@ -20,6 +21,7 @@ from xagent.web.models.workforce import (
     WorkforceBuilderMessage,
     WorkforceRun,
 )
+from xagent.web.services import workforce_creator
 from xagent.web.services.workforce_access import WorkforcePolicy, set_workforce_policy
 
 from .conftest import (
@@ -1749,9 +1751,91 @@ def test_discard_stays_successful_when_post_commit_cache_invalidation_fails(
         db.close()
 
 
-def test_from_prompt_creates_draft_workforce() -> None:
+def test_from_prompt_creates_all_staged_agents_atomically(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     headers = _admin_headers()
-    _create_published_agent(_user_id(), "Research Worker")
+    invalidated_agent_ids: list[int] = []
+
+    async def fake_generate_workforce_creation_plan(
+        _db: Any,
+        _user: User,
+        _prompt: str,
+    ) -> dict[str, Any]:
+        return {
+            "name": "Product Research Workforce",
+            "description": "Research and compare products.",
+            "manager": {
+                "agent_ref": "new:1",
+                "name": "Product Research Manager",
+                "description": "Coordinates product research.",
+                "instructions": "Delegate research and synthesize the evidence.",
+                "tool_categories": [],
+                "skills": [],
+                "execution_mode": "auto",
+            },
+            "created_agents": [
+                {
+                    "agent_ref": "new:1",
+                    "name": "Product Research Manager",
+                    "description": "Coordinates product research.",
+                    "instructions": "Delegate research and synthesize the evidence.",
+                    "tool_categories": [],
+                    "skills": [],
+                    "execution_mode": "auto",
+                },
+                {
+                    "agent_ref": "new:2",
+                    "name": "Market Researcher",
+                    "description": "Collects market evidence.",
+                    "instructions": "Collect and verify market evidence.",
+                    "tool_categories": ["web_search"],
+                    "skills": [],
+                    "execution_mode": "balanced",
+                },
+                {
+                    "agent_ref": "new:3",
+                    "name": "Product Analyst",
+                    "description": "Compares product capabilities.",
+                    "instructions": "Compare products and identify tradeoffs.",
+                    "tool_categories": [],
+                    "skills": [],
+                    "execution_mode": "balanced",
+                },
+            ],
+            "workers": [
+                {
+                    "agent_ref": "new:2",
+                    "alias": "Market Research",
+                    "assignment_instructions": "Collect and verify market evidence.",
+                    "enabled": True,
+                },
+                {
+                    "agent_ref": "new:3",
+                    "alias": "Product Analysis",
+                    "assignment_instructions": "Compare product capabilities.",
+                    "enabled": True,
+                },
+            ],
+            "warnings": [],
+            "builder_response": "The requested Workforce is ready.",
+        }
+
+    monkeypatch.setattr(
+        "xagent.web.services.workforce_creator.generate_workforce_creation_plan",
+        fake_generate_workforce_creation_plan,
+    )
+
+    def flaky_cache_invalidation(_user_id: int, agent_id: int) -> None:
+        invalidated_agent_ids.append(agent_id)
+        if len(invalidated_agent_ids) == 2:
+            raise RuntimeError("cache unavailable")
+
+    monkeypatch.setattr(
+        workforce_creator,
+        "invalidate_agent_cache",
+        flaky_cache_invalidation,
+    )
 
     response = client.post(
         "/api/workforces/from-prompt",
@@ -1764,12 +1848,221 @@ def test_from_prompt_creates_draft_workforce() -> None:
     assert payload["status"] == "draft"
     assert payload["manager"]["status"] == "published"
     assert "manager_instructions" not in payload
+    assert [worker["agent"]["name"] for worker in payload["workers"]] == [
+        "Market Researcher",
+        "Product Analyst",
+    ]
 
     db = _direct_db_session()
     try:
         manager_agent = db.get(Agent, payload["manager"]["id"])
         assert manager_agent is not None
         assert manager_agent.instructions
+        assert manager_agent.execution_mode == "auto"
+        assert manager_agent.origin == AgentOrigin.WORKFORCE_GENERATED_MANAGER.value
+        worker_agents = (
+            db.query(Agent)
+            .filter(Agent.name.in_(["Market Researcher", "Product Analyst"]))
+            .order_by(Agent.name)
+            .all()
+        )
+        assert len(worker_agents) == 2
+        assert all(agent.origin == AgentOrigin.USER.value for agent in worker_agents)
+        assert all(agent.status == AgentStatus.PUBLISHED for agent in worker_agents)
+        builder_messages = (
+            db.query(WorkforceBuilderMessage)
+            .filter(WorkforceBuilderMessage.workforce_id == payload["id"])
+            .order_by(WorkforceBuilderMessage.id)
+            .all()
+        )
+        assert [(message.role, message.content) for message in builder_messages] == [
+            ("user", "Create a research workforce for product analysis"),
+            ("assistant", "The requested Workforce is ready."),
+        ]
+        persisted_agent_ids = {
+            int(manager_agent.id),
+            *(int(agent.id) for agent in worker_agents),
+        }
+        assert set(invalidated_agent_ids) == persisted_agent_ids
+        assert len(invalidated_agent_ids) == 3
+    finally:
+        db.close()
+
+
+@pytest.mark.asyncio
+async def test_from_prompt_rechecks_create_permission_after_remote_builder(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _admin_headers()
+    db = _direct_db_session()
+    try:
+        user = db.query(User).filter(User.username == "admin").one()
+
+        async def fake_generate_workforce_creation_plan(
+            _db: Any,
+            _user: User,
+            _prompt: str,
+        ) -> dict[str, Any]:
+            return {"name": "Must Not Be Persisted"}
+
+        monkeypatch.setattr(
+            workforce_creator,
+            "generate_workforce_creation_plan",
+            fake_generate_workforce_creation_plan,
+        )
+        monkeypatch.setattr(
+            workforce_creator,
+            "resolve_create_scope",
+            lambda _db, _user: ("user", str(user.id)),
+        )
+        permission_checks = iter([True, False])
+        monkeypatch.setattr(
+            workforce_creator,
+            "can_create_workforce",
+            lambda *_args: next(permission_checks),
+        )
+
+        with pytest.raises(HTTPException) as exc_info:
+            await workforce_creator.create_workforce_from_prompt(
+                db,
+                user,
+                prompt="Create a Workforce.",
+            )
+
+        assert exc_info.value.status_code == 403
+        assert exc_info.value.detail == {
+            "code": workforce_creator.WORKFORCE_CREATE_ACCESS_DENIED_CODE,
+            "message": "Access denied",
+        }
+        assert (
+            db.query(Workforce)
+            .filter(Workforce.name == "Must Not Be Persisted")
+            .count()
+            == 0
+        )
+    finally:
+        db.close()
+
+
+def test_from_prompt_rejects_oversized_prompt_before_builder() -> None:
+    response = client.post(
+        "/api/workforces/from-prompt",
+        headers=_admin_headers(),
+        json={"prompt": "x" * 12_001},
+    )
+
+    assert response.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_from_prompt_rolls_back_all_staged_agents_when_worker_link_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _admin_headers()
+    plan = {
+        "name": "Rollback Workforce",
+        "description": "Must be atomic.",
+        "manager": {
+            "agent_ref": "new:1",
+            "name": "Rollback Manager",
+            "description": "Coordinates rollback test work.",
+            "instructions": "Delegate and synthesize.",
+            "execution_mode": "think",
+        },
+        "created_agents": [
+            {
+                "agent_ref": "new:1",
+                "name": "Rollback Manager",
+                "description": "Coordinates rollback test work.",
+                "instructions": "Delegate and synthesize.",
+                "execution_mode": "think",
+            },
+            {
+                "agent_ref": "new:2",
+                "name": "Rollback Worker One",
+                "description": "First worker.",
+                "instructions": "Do the first part.",
+                "execution_mode": "balanced",
+            },
+            {
+                "agent_ref": "new:3",
+                "name": "Rollback Worker Two",
+                "description": "Second worker.",
+                "instructions": "Do the second part.",
+                "execution_mode": "balanced",
+            },
+        ],
+        "workers": [
+            {
+                "agent_ref": "new:2",
+                "assignment_instructions": "Do the first part.",
+                "enabled": True,
+            },
+            {
+                "agent_ref": "new:3",
+                "assignment_instructions": "Do the second part.",
+                "enabled": True,
+            },
+        ],
+        "warnings": [],
+    }
+
+    async def fake_generate_workforce_creation_plan(
+        _db: Any,
+        _user: User,
+        _prompt: str,
+    ) -> dict[str, Any]:
+        return plan
+
+    real_create_worker = workforce_creator.create_workforce_worker
+    worker_calls = 0
+
+    def fail_second_worker(*args: Any, **kwargs: Any) -> Any:
+        nonlocal worker_calls
+        worker_calls += 1
+        if worker_calls == 2:
+            raise RuntimeError("second worker link failed")
+        return real_create_worker(*args, **kwargs)
+
+    monkeypatch.setattr(
+        workforce_creator,
+        "generate_workforce_creation_plan",
+        fake_generate_workforce_creation_plan,
+    )
+    monkeypatch.setattr(
+        workforce_creator,
+        "create_workforce_worker",
+        fail_second_worker,
+    )
+
+    db = _direct_db_session()
+    try:
+        user = db.query(User).filter(User.username == "admin").one()
+        with pytest.raises(RuntimeError, match="second worker link failed"):
+            await workforce_creator.create_workforce_from_prompt(
+                db,
+                user,
+                prompt="Create an atomic Workforce.",
+            )
+
+        assert (
+            db.query(Workforce).filter(Workforce.name == "Rollback Workforce").count()
+            == 0
+        )
+        assert (
+            db.query(Agent)
+            .filter(
+                Agent.name.in_(
+                    [
+                        "Rollback Manager",
+                        "Rollback Worker One",
+                        "Rollback Worker Two",
+                    ]
+                )
+            )
+            .count()
+            == 0
+        )
     finally:
         db.close()
 

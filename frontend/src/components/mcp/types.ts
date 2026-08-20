@@ -46,6 +46,16 @@ export interface AppIntegration {
   // a deployment whose tokens arrive through the resolver hook, where no
   // interactive consent exists at all.
   can_authorize?: boolean
+  // Whether this viewer's Configure route would resolve, decided by the
+  // backend (_local_mcp_can_configure in src/xagent/web/api/mcp.py for
+  // local entries; the connection state for a catalog entry, whose
+  // Configure equivalent is
+  // "manage my key" or "re-run OAuth" and only exists once connected) rather
+  // than re-derived here from is_connected. A connector whose tokens arrive
+  // through a deployment-installed resolver hook is never "connected" for
+  // its own creator -- no personal grant row is ever written -- so the
+  // connected gate hid the edit route from the one person entitled to it.
+  can_configure?: boolean
   // Team-sharing status (from POST /api/connectors/status), merged in after list load.
   shared?: boolean
   is_owner?: boolean

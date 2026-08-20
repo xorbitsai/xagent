@@ -5,7 +5,7 @@ Template Manager - Manages the scanning and retrieval of templates
 import asyncio
 import logging
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 import yaml
 
@@ -146,6 +146,15 @@ class TemplateManager:
             if field not in data:
                 raise ValueError(f"Missing required field: {field}")
 
+        # `name` must be a real string (not just present): it is backfilled
+        # into persona.role.en below, where a non-string would otherwise
+        # surface as a pydantic ValidationError - a 500 on the whole list
+        # endpoint - the first time a response is built from it.
+        name = data["name"]
+        if not isinstance(name, str) or not name.strip():
+            raise ValueError("'name' must be a non-empty string")
+        data["name"] = name.strip()
+
         # Validate descriptions contains English
         descriptions = data.get("descriptions", {})
         if not isinstance(descriptions, dict):
@@ -171,6 +180,14 @@ class TemplateManager:
         data.setdefault("featured", False)
         data.setdefault("sample_prompts", {})
         self._validate_sample_prompts(data["sample_prompts"])
+        data.setdefault("persona", None)
+        self._validate_persona(data["persona"])
+        if data["persona"] is not None:
+            # See _validate_persona's docstring: role.en is the one persona
+            # field allowed to be authored blank, precisely because this
+            # fallback exists - avoids 17+ templates each repeating their
+            # own top-level `name` verbatim under persona.role.en.
+            data["persona"]["role"].setdefault("en", data["name"])
 
         # agent_config default values
         agent_config = data["agent_config"]
@@ -190,6 +207,17 @@ class TemplateManager:
         data.setdefault("workforce_config", None)
         if data["type"] == "workforce":
             self._validate_workforce_config(data["workforce_config"])
+            # A workforce card renders from workforce_config, not a persona
+            # (see _validate_persona's docstring) - authoring one anyway
+            # would be validated, backfilled, and served, silently
+            # contradicting that contract, so reject it here where `type`
+            # is finally known.
+            if data["persona"] is not None:
+                raise ValueError(
+                    "'persona' is only supported on agent-type templates - "
+                    "a workforce template's card renders from "
+                    "workforce_config instead"
+                )
 
         return data
 
@@ -335,6 +363,174 @@ class TemplateManager:
                         f"'sample_prompts.{locale}[{index}].highlights' must be a list of strings"
                     )
 
+    # The only keys _validate_persona recognizes. Enforced explicitly (not
+    # just "known keys are well-formed") so a typo'd or misspelled key
+    # (`avator`, `kickoff_question`) is rejected at load time instead of
+    # silently parsing as an absent field - see the docstring below.
+    _PERSONA_KEYS = frozenset({"name", "role", "avatar", "intro", "kickoff_questions"})
+
+    def _validate_persona(self, persona: Any) -> None:
+        """Validate and normalize (strip values in place) the optional
+        `persona` block - the "AI Team Marketplace" card content (display
+        name, avatar, and the chat-opening intro/questions a Hire flow
+        seeds). `None` (the default) means the template shows up in the
+        marketplace with no persona treatment, e.g. a workforce-type
+        template's card is rendered from `workforce_config` instead.
+
+        `role`, `intro`, and `kickoff_questions` are locale-keyed the same
+        {'en': ..., 'zh': ...} shape as `descriptions` / `sample_prompts`
+        above, validated the same way so a malformed entry (including an
+        unrecognized key - a real risk given how similar this shape is to
+        its four siblings) fails that template's load - `reload()` logs
+        the error and skips the file - rather than surfacing as a 500 the
+        first time `TemplateInfo`/`PersonaInfo` tries to build a
+        response from it. `name` is deliberately a flat string, not
+        locale-keyed: it is a proper noun (the teammate's given name,
+        "Maya"), the same in every locale.
+
+        `role` and `intro`/`kickoff_questions` are deliberately NOT
+        symmetric, despite the shared shape: `role.en` may be omitted here
+        because `_parse_yaml_file` backfills it from the template's own
+        top-level `name` immediately after this returns, so there is
+        always a sensible non-blank value to localize. `intro` and
+        `kickoff_questions` have no such fallback - a blank opening
+        message is worse than refusing to load, so each requires an 'en'
+        entry the moment it is authored at all, rather than silently
+        resolving to "" for an English requester via
+        `get_localized_value`'s fallback-to-'en' behavior.
+        """
+        if persona is None:
+            return
+        if not isinstance(persona, dict):
+            raise ValueError("'persona' must be a mapping or omitted")
+
+        unknown_keys = set(persona) - self._PERSONA_KEYS
+        if unknown_keys:
+            raise ValueError(
+                f"'persona' has unknown key(s) {sorted(unknown_keys)} - "
+                f"expected only {sorted(self._PERSONA_KEYS)}"
+            )
+
+        self._require_string(persona, "name", path="persona")
+
+        self._validate_locale_map(
+            persona,
+            "role",
+            require_en=False,
+            flat_shape="a flat string",
+            value_requirement="a non-empty string",
+            coerce_value=self._coerce_stripped_string,
+        )
+
+        self._require_string(persona, "avatar", path="persona", required=False)
+        persona.setdefault("avatar", None)
+        avatar = persona["avatar"]
+        if avatar is not None and not avatar.startswith("/"):
+            # PersonaInfo.avatar's documented contract: an app-relative path
+            # served from the frontend's own static assets, never an
+            # external hotlink (which could rot, leak requests to a third
+            # party, or bypass the committed-file invariant test).
+            raise ValueError(
+                "'persona.avatar' must be an app-relative path starting "
+                "with '/' (e.g. '/marketplace/avatars/maya.png'), not an "
+                "external URL"
+            )
+
+        self._validate_locale_map(
+            persona,
+            "intro",
+            require_en=True,
+            flat_shape="a flat string",
+            value_requirement="a non-empty string",
+            coerce_value=self._coerce_stripped_string,
+        )
+
+        self._validate_locale_map(
+            persona,
+            "kickoff_questions",
+            require_en=True,
+            flat_shape="a flat list",
+            value_requirement="a non-empty list of non-empty strings",
+            coerce_value=self._coerce_stripped_string_list,
+        )
+
+    @staticmethod
+    def _coerce_stripped_string(value: Any) -> Optional[str]:
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+        return None
+
+    @staticmethod
+    def _coerce_stripped_string_list(value: Any) -> Optional[List[str]]:
+        # An empty list is rejected, not vacuously accepted: an authored
+        # `kickoff_questions.<locale>: []` is the same blank-content
+        # mistake the require_en check guards against - "no questions"
+        # is expressed by omitting the locale (or the field) entirely.
+        if (
+            isinstance(value, list)
+            and value
+            and all(isinstance(item, str) and item.strip() for item in value)
+        ):
+            return [item.strip() for item in value]
+        return None
+
+    @staticmethod
+    def _validate_locale_map(
+        container: Dict[str, Any],
+        key: str,
+        *,
+        require_en: bool,
+        flat_shape: str,
+        value_requirement: str,
+        coerce_value: Callable[[Any], Optional[Any]],
+    ) -> None:
+        """Validate and normalize one locale-keyed persona field in place.
+
+        The three call sites (`role`, `intro`, `kickoff_questions`) share
+        every rule except two: whether 'en' is required when the field is
+        authored (`role` is exempt - `_parse_yaml_file` backfills role.en
+        from the template's `name`), and what a locale's value looks like
+        (`coerce_value` returns the normalized value, or None to reject).
+
+        Only an explicit `null` (or an absent key) means "not provided" -
+        an `or {}` null-check would also swallow falsy junk like
+        `role: ""` or `kickoff_questions: []` that must fail the shape
+        check instead.
+        """
+        values = container.get(key)
+        if values is None:
+            values = {}
+        container[key] = values
+        if not isinstance(values, dict):
+            raise ValueError(
+                f"'persona.{key}' must be a dict keyed by locale (e.g. "
+                f"{{'en': ..., 'zh': ...}}), not {flat_shape}"
+            )
+        if require_en and values and "en" not in values:
+            # Without 'en', get_localized_value's fallback-to-'en' would
+            # resolve to blank for an English requester - silently seeding
+            # an empty opening message instead of failing loudly here.
+            raise ValueError(
+                f"'persona.{key}' must contain at least an 'en' key when "
+                "authored - unlike persona.role, there is no template "
+                "field to fall back to"
+            )
+        for locale, value in values.items():
+            if not isinstance(locale, str) or not locale.strip():
+                # YAML happily parses `true:` or `2026:` as non-string
+                # keys; get_localized_value would never match them, so
+                # they are dead content at best and confusing at worst.
+                raise ValueError(
+                    f"'persona.{key}' locale keys must be non-empty "
+                    f"strings, got {locale!r}"
+                )
+            coerced = coerce_value(value)
+            if coerced is None:
+                raise ValueError(
+                    f"'persona.{key}.{locale}' must be {value_requirement}"
+                )
+            values[locale] = coerced
+
     def _enrich_template(self, template: Dict[str, Any]) -> Dict[str, Any]:
         """Merge connections into agent_config.tool_categories.
 
@@ -389,6 +585,7 @@ class TemplateManager:
             "descriptions": template.get("descriptions", {}),
             "features": template.get("features", {}),
             "sample_prompts": template.get("sample_prompts", {}),
+            "persona": template.get("persona"),
             "connections": connections,
             "setup_time": template.get("setup_time", "5 min setup"),
             "tags": template.get("tags", {}),

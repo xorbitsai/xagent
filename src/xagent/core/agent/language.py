@@ -1,6 +1,13 @@
 """Prompt snippets for preserving user-facing response language."""
 
+import re
+from dataclasses import dataclass
+from typing import Literal
+
 OUTPUT_LANGUAGE_METADATA_KEY = "output_language"
+OUTPUT_LANGUAGE_SOURCE_METADATA_KEY = "output_language_source"
+OUTPUT_LANGUAGE_SOURCE_PLAN = "dag_plan"
+OUTPUT_LANGUAGE_SOURCE_ROUTER = "auto_router"
 
 _ALLOWED_RESPONSE_LANGUAGE_LABELS = frozenset(
     {
@@ -100,6 +107,217 @@ _LANGUAGE_LABEL_ALIASES = {
     "繁體中文": "Traditional Chinese",
 }
 
+_LATIN_SCRIPT_RESPONSE_LANGUAGES = frozenset(
+    {
+        "Afrikaans",
+        "Basque",
+        "Brazilian Portuguese",
+        "Catalan",
+        "Croatian",
+        "Czech",
+        "Danish",
+        "Dutch",
+        "English",
+        "Estonian",
+        "European Portuguese",
+        "Filipino",
+        "Finnish",
+        "French",
+        "Galician",
+        "German",
+        "Hungarian",
+        "Icelandic",
+        "Indonesian",
+        "Irish",
+        "Italian",
+        "Latvian",
+        "Lithuanian",
+        "Malay",
+        "Norwegian",
+        "Polish",
+        "Portuguese",
+        "Romanian",
+        "Slovak",
+        "Slovenian",
+        "Spanish",
+        "Swahili",
+        "Swedish",
+        "Tagalog",
+        "Turkish",
+        "Vietnamese",
+        "Welsh",
+    }
+)
+_HAN_SCRIPT_RESPONSE_LANGUAGES = frozenset(
+    {
+        "Cantonese",
+        "Chinese",
+        "Mandarin Chinese",
+        "Simplified Chinese",
+        "Traditional Chinese",
+    }
+)
+_MIN_HAN_CHARACTERS_FOR_MISMATCH = 8
+_MIN_LATIN_LETTERS_FOR_MISMATCH = 20
+_MIN_REFERENCE_HAN_CHARACTERS = 4
+_MIN_REFERENCE_LATIN_LETTERS = 12
+_SAFE_UNKNOWN_LANGUAGE_LABEL_PATTERN = re.compile(
+    r"^[^\W\d_]+(?:-[^\W\d_]+)*$",
+    flags=re.UNICODE,
+)
+_TECHNICAL_SPAN_PATTERN = re.compile(
+    r"```.*?```|`[^`\n]*`|(?:https?://|www\.)[^\s，。；、！？]+|"
+    r"(?:[A-Za-z]:\\|/)[^\s，。；、！？]+|"
+    r"\b[A-Za-z_][A-Za-z0-9_]*(?:[./:\\][A-Za-z0-9_]+)+\b|"
+    r"\b[A-Za-z][A-Za-z0-9]*(?:_[A-Za-z0-9]+)+\b|"
+    r"\b(?:[A-Z]{2,}(?=[A-Z][a-z])|[A-Z]?[a-z]+)"
+    r"(?:[A-Z][a-z0-9]+)+\b|"
+    r"\b[A-Z]{2,}\b",
+    flags=re.DOTALL,
+)
+_KANA_PATTERN = re.compile(r"[\u3040-\u30ff]")
+
+
+@dataclass(frozen=True)
+class ResponseLanguageScriptMismatch:
+    """A high-confidence contradiction between a language label and prose."""
+
+    response_language: str
+    expected_script: Literal["Han", "Latin"]
+    observed_script: Literal["Han", "Latin"]
+    han_count: int
+    latin_count: int
+
+
+def _script_counts(prose: str) -> tuple[int, int]:
+    prose_without_technical_spans = _TECHNICAL_SPAN_PATTERN.sub(" ", prose)
+    han_count = sum(
+        1
+        for character in prose_without_technical_spans
+        if "\u3400" <= character <= "\u4dbf"
+        or "\u4e00" <= character <= "\u9fff"
+        or "\uf900" <= character <= "\ufaff"
+    )
+    latin_count = sum(
+        1
+        for character in prose_without_technical_spans
+        if character.isascii() and character.isalpha()
+    )
+    return han_count, latin_count
+
+
+def _reference_language_for_script_validation(prose: str) -> str:
+    """Infer only script classes safe enough for validation, not a language."""
+    if not prose or _KANA_PATTERN.search(prose):
+        return ""
+    han_count, latin_count = _script_counts(prose)
+    if han_count >= _MIN_REFERENCE_HAN_CHARACTERS and han_count > latin_count:
+        return "Chinese"
+    if latin_count >= _MIN_REFERENCE_LATIN_LETTERS and latin_count > han_count * 2:
+        return "English"
+    return ""
+
+
+def _prose_mentions_language_from_group(
+    prose: str,
+    languages: frozenset[str],
+) -> bool:
+    """Return whether prose names a language from one script group.
+
+    A named target makes dominant-script inference ambiguous. The lightweight
+    validator must then defer to the language harness instead of rejecting a
+    potentially correct translation or explicit target-language request.
+    """
+    folded = prose.casefold()
+    labels = set(languages)
+    labels.update(
+        alias
+        for alias, canonical in _LANGUAGE_LABEL_ALIASES.items()
+        if canonical in languages
+    )
+    if languages is _HAN_SCRIPT_RESPONSE_LANGUAGES:
+        labels.update({"chinese", "中文", "简体中文", "繁體中文", "繁体中文"})
+    if languages is _LATIN_SCRIPT_RESPONSE_LANGUAGES:
+        labels.update({"english", "英文", "英语", "英語"})
+    for label in labels:
+        candidate = label.casefold()
+        if candidate.isascii():
+            if re.search(
+                rf"(?<![A-Za-z]){re.escape(candidate)}(?![A-Za-z])",
+                folded,
+            ):
+                return True
+        elif candidate in folded:
+            return True
+    return False
+
+
+def detect_response_language_script_mismatch(
+    response_language: str | None,
+    prose: str,
+) -> ResponseLanguageScriptMismatch | None:
+    """Detect an obvious Han/Latin script mismatch in user-facing prose.
+
+    The deliberately conservative thresholds allow short proper nouns and mixed
+    technical terms. Languages whose common script is ambiguous or unsupported
+    by this lightweight check are left to the model's language harness.
+    """
+    language = normalize_response_language_label(response_language)
+    if not language or not prose:
+        return None
+
+    han_count, latin_count = _script_counts(prose)
+
+    if (
+        language in _LATIN_SCRIPT_RESPONSE_LANGUAGES
+        and han_count >= _MIN_HAN_CHARACTERS_FOR_MISMATCH
+        and han_count > latin_count
+    ):
+        return ResponseLanguageScriptMismatch(
+            response_language=language,
+            expected_script="Latin",
+            observed_script="Han",
+            han_count=han_count,
+            latin_count=latin_count,
+        )
+    if (
+        language in _HAN_SCRIPT_RESPONSE_LANGUAGES
+        and latin_count >= _MIN_LATIN_LETTERS_FOR_MISMATCH
+        and latin_count > han_count * 2
+    ):
+        return ResponseLanguageScriptMismatch(
+            response_language=language,
+            expected_script="Han",
+            observed_script="Latin",
+            han_count=han_count,
+            latin_count=latin_count,
+        )
+    return None
+
+
+def detect_prose_script_mismatch(
+    reference_prose: str,
+    candidate_prose: str,
+) -> ResponseLanguageScriptMismatch | None:
+    """Compare prose using only a high-confidence Han/Latin reference signal."""
+    reference_language = _reference_language_for_script_validation(reference_prose)
+    if not reference_language:
+        return None
+    mismatch = detect_response_language_script_mismatch(
+        reference_language,
+        candidate_prose,
+    )
+    if mismatch is None:
+        return None
+    mentioned_languages = (
+        _HAN_SCRIPT_RESPONSE_LANGUAGES
+        if mismatch.observed_script == "Han"
+        else _LATIN_SCRIPT_RESPONSE_LANGUAGES
+    )
+    if _prose_mentions_language_from_group(reference_prose, mentioned_languages):
+        return None
+    return mismatch
+
 
 def output_language_policy(response_language: str | None = None) -> str:
     """Return a compact policy for downstream language preservation."""
@@ -139,7 +357,15 @@ def normalize_response_language_label(response_language: str | None) -> str:
     key = language.casefold()
     if key in _LANGUAGE_LABEL_ALIASES:
         return _LANGUAGE_LABEL_ALIASES[key]
-    return _LANGUAGE_LABEL_BY_KEY.get(key, "")
+    canonical = _LANGUAGE_LABEL_BY_KEY.get(key)
+    if canonical:
+        return canonical
+    # Permit bounded single-token language names such as Khmer or Amharic.
+    # Multi-word unknown values remain rejected so this metadata cannot become
+    # an arbitrary prompt-instruction channel.
+    if _SAFE_UNKNOWN_LANGUAGE_LABEL_PATTERN.fullmatch(language):
+        return language[:1].upper() + language[1:]
+    return ""
 
 
 def response_language_rules(*, subject: str = "current user request") -> str:

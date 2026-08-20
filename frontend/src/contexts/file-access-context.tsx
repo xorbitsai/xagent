@@ -17,6 +17,12 @@ export interface FileAccessPolicy {
   inlineDownloadUrl: (fileId: string) => string
   relativePreviewUrl: (fileId: string, relativePath: string) => string
   pdfPreviewUrl?: (fileId: string) => string
+  /**
+   * Execute under this policy's credential boundary. The built-in default
+   * attaches Bearer authorization. The public policy forces same-origin
+   * credentials, strips caller Authorization, and leaves its scoped query
+   * token on the URL. Custom policies must define an equivalent boundary.
+   */
   request: FileAccessRequest
   listFiles?: (query: string) => Promise<Response>
   /**
@@ -204,7 +210,11 @@ export function createPublicFileAccessPolicy(accessToken: string): FileAccessPol
     request: (url, options = {}) => {
       const headers = new Headers(options.headers)
       headers.delete("Authorization")
-      return fetch(url, { ...options, headers, credentials: "omit" })
+      // Same-origin requests carry ambient cookies, including the edge's
+      // selected_region routing cookie. Cookies are not an authorization input.
+      // Task-bound configured files validate the scoped query token; taskless
+      // and legacy paths use their file ID or path capability.
+      return fetch(url, { ...options, headers, credentials: "same-origin" })
     },
     // The guest token rides the query string, so media elements can load
     // previewUrl directly — no headers needed, and range requests work.

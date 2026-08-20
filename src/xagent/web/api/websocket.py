@@ -86,7 +86,6 @@ from ..services.chat_history_service import (
     DELIVERY_PENDING,
     UserMessageDeliveryClaim,
     claim_user_message_delivery_no_commit,
-    get_latest_waiting_question,
     inspect_user_message_delivery,
     mark_user_message_delivery_sync,
 )
@@ -154,6 +153,7 @@ from ..services.task_interaction_close import (
     clear_interaction_marker_if_unpaired,
     close_legacy_resume_interaction_sync,
 )
+from ..services.task_interaction_read import get_pending_interaction_question
 from ..services.task_lease_service import (
     TaskLease,
     TaskLeaseHeartbeatOutcome,
@@ -6798,8 +6798,8 @@ def _load_historical_stream_snapshot_sync(
             waiting_question = None
             waiting_interactions = None
             if task.status == TaskStatus.WAITING_FOR_USER:
-                waiting_question, waiting_interactions = get_latest_waiting_question(
-                    db, task_id
+                waiting_question, waiting_interactions = (
+                    get_pending_interaction_question(db, task)
                 )
 
             # Send task basic info
@@ -7171,8 +7171,13 @@ def _load_historical_stream_snapshot_sync(
                 question_message = None
                 question_interactions = None
                 if task.status == TaskStatus.WAITING_FOR_USER:
+                    # Same task, same db session, no await between this branch
+                    # and the task_info block above: reuse its already-fetched
+                    # result instead of querying get_pending_interaction_question
+                    # a second time for a value that cannot have changed.
                     question_message, question_interactions = (
-                        get_latest_waiting_question(db, task_id)
+                        waiting_question,
+                        waiting_interactions,
                     )
 
                 message = question_message or default_message

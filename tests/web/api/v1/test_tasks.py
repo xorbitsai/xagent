@@ -3342,13 +3342,15 @@ def test_get_task_non_waiting_never_queries_for_a_question(
 
     called = False
 
-    def spy_get_latest_waiting_question(*_args, **_kwargs):
+    def spy_get_pending_interaction_question(*_args, **_kwargs):
         nonlocal called
         called = True
         return None, None
 
     monkeypatch.setattr(
-        v1_tasks, "get_latest_waiting_question", spy_get_latest_waiting_question
+        v1_tasks,
+        "get_pending_interaction_question",
+        spy_get_pending_interaction_question,
     )
 
     resp = client.get(f"/v1/chat/tasks/{task_id}", headers=_bearer(full_key))

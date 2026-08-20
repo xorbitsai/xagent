@@ -1557,14 +1557,20 @@ async def startup_event() -> None:
         asyncio.create_task(run_uploaded_file_reconcile_background())
         logger.info("Started background uploaded files reconcile task")
 
-        # Clean up orphaned temporary files from interrupted atomic replacements
+        # Clean up orphaned temporary files from interrupted atomic replacements.
+        # Issue #231: this is an os.walk over the entire uploads tree, awaited
+        # inline in the lifespan. On a large tree (a prod region had ~640k
+        # directories) a cold-cache walk can dominate startup for minutes with
+        # no log output — the exact blind spot that hid the original stall.
+        # Wrap it so the next slow start names this phase and its duration.
         try:
             from .api.kb import cleanup_orphaned_temp_files
 
             def _run_temp_file_cleanup() -> int:
                 return cleanup_orphaned_temp_files()
 
-            cleaned_count = await asyncio.to_thread(_run_temp_file_cleanup)
+            with _startup_phase("orphaned temp-file cleanup"):
+                cleaned_count = await asyncio.to_thread(_run_temp_file_cleanup)
             if cleaned_count > 0:
                 logger.info(
                     "Startup cleanup: removed %d orphaned temporary file(s)",

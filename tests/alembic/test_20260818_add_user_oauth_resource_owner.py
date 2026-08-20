@@ -527,16 +527,33 @@ def test_create_owner_indexes_attempts_all_postgresql_indexes() -> None:
     ``test_postgresql_owner_index_collision_allows_retry_after_remediation``.
     """
     migration = _migration_module()
-    created: list[str] = []
+    created: list[tuple[str, tuple[str, ...], bool, str]] = []
+
+    def capture_index(name, _table, columns, *, unique, postgresql_where, **_kwargs):
+        created.append((name, tuple(columns), unique, str(postgresql_where).lower()))
+
     fake_op = SimpleNamespace(
         get_bind=lambda: SimpleNamespace(dialect=SimpleNamespace(name="postgresql")),
-        create_index=lambda name, *_args, **_kwargs: created.append(name),
+        create_index=capture_index,
     )
 
     with patch.object(migration, "op", fake_op):
         migration._create_owner_indexes()
 
-    assert created == [ORDINARY_INDEX, ACTOR_INDEX]
+    assert created == [
+        (
+            ORDINARY_INDEX,
+            ("user_id", "provider", "provider_user_id"),
+            True,
+            "resource_owner_key is null",
+        ),
+        (
+            ACTOR_INDEX,
+            ("user_id", "resource_owner_key", "provider", "provider_user_id"),
+            True,
+            "resource_owner_key is not null",
+        ),
+    ]
 
 
 def test_postgresql_index_creation_failure_keeps_old_constraint() -> None:

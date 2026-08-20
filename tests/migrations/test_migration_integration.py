@@ -21,7 +21,7 @@ from alembic import command
 from alembic.config import Config
 from alembic.script import ScriptDirectory
 from sqlalchemy import create_engine, inspect, text
-from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import sessionmaker
 
 # Project root directory
@@ -307,6 +307,51 @@ class TestMigrations:
         command.upgrade(postgresql_tester.alembic_cfg, "head")
 
         assert "resource_owner_key" in postgresql_tester.get_column_names("user_oauth")
+
+    @pytest.mark.postgresql
+    def test_postgresql_owner_indexes_enforce_namespace_boundaries(
+        self, postgresql_tester
+    ):
+        """The migrated PostgreSQL predicates separate ordinary and actor rows."""
+        parent = "20260818_seed_jira_mcp_app"
+        owner_revision = "20260818_user_oauth_resource_owner"
+        command.upgrade(postgresql_tester.alembic_cfg, parent)
+        with postgresql_tester.engine.begin() as conn:
+            conn.execute(text("CREATE TABLE users (id INTEGER PRIMARY KEY)"))
+            conn.execute(text("INSERT INTO users (id) VALUES (7101)"))
+
+        command.upgrade(postgresql_tester.alembic_cfg, owner_revision)
+        with postgresql_tester.engine.begin() as conn:
+            conn.execute(
+                text(
+                    "INSERT INTO user_oauth "
+                    "(user_id, provider, provider_user_id, access_token, "
+                    "resource_owner_key) VALUES "
+                    "(7101, 'gmail', 'shared', 'ordinary', NULL), "
+                    "(7101, 'gmail', 'shared', 'actor', 'actor:alice')"
+                )
+            )
+
+        with pytest.raises(IntegrityError):
+            with postgresql_tester.engine.begin() as conn:
+                conn.execute(
+                    text(
+                        "INSERT INTO user_oauth "
+                        "(user_id, provider, provider_user_id, access_token) "
+                        "VALUES (7101, 'gmail', 'shared', 'duplicate-ordinary')"
+                    )
+                )
+
+        with pytest.raises(IntegrityError):
+            with postgresql_tester.engine.begin() as conn:
+                conn.execute(
+                    text(
+                        "INSERT INTO user_oauth "
+                        "(user_id, provider, provider_user_id, access_token, "
+                        "resource_owner_key) VALUES "
+                        "(7101, 'gmail', 'shared', 'duplicate-actor', 'actor:alice')"
+                    )
+                )
 
     @pytest.mark.postgresql
     def test_postgresql_user_delete_cascades_actor_owned_oauth_rows(

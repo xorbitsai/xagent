@@ -25,13 +25,22 @@ def url_path_id(value: str, field_name: str) -> str:
     """Validate then percent-encode an id for safe interpolation into a URL
     path segment.
 
-    Percent-encoding - not a blocklist of "/", "?", "#", or ".." - is what
-    actually prevents a value like "x?limit=1&foo=/reports/metrics" from
-    escaping its intended path segment: any character that could do that
-    gets encoded regardless of which one it is, rather than relying on an
-    enumeration that could miss one.
+    Percent-encoding - not a blocklist of "/", "?", "#" - is what actually
+    prevents a value like "x?limit=1&foo=/reports/metrics" from escaping
+    its intended path segment: any character that could do that gets
+    encoded regardless of which one it is, rather than relying on an
+    enumeration that could miss one. "." and ".." are the one exception
+    that survives encoding unchanged (they're always-unreserved characters
+    per RFC 3986, so quote() never touches them), and requests/urllib3
+    normalize dot-segments out of the final URL before sending it --
+    verified directly: requests.Request("GET",
+    ".../sobjects/Account/..").prepare().url collapses to ".../sobjects/",
+    a completely different (still valid) endpoint. Rejected explicitly
+    since encoding can't close this one off.
     """
     require_clean_identifier(value, field_name)
+    if value in (".", ".."):
+        raise ValueError(f"{field_name} must not be '.' or '..'")
     return quote(value, safe="")
 
 

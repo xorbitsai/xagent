@@ -177,6 +177,30 @@ def test_downgrade_keeps_provider_when_custom_salesforce_app_exists(tmp_path):
         assert "salesforce" in _provider_names(connection)
 
 
+def test_downgrade_preserves_pre_existing_salesforce_app(tmp_path):
+    """A pre-existing "salesforce" app row (different shape than the seeded
+    one) must survive downgrade -- upgrade()'s own `app_id not in
+    existing_app_ids` check skipped inserting over it, so it was never
+    "this migration's row" to remove. Deleting it unconditionally would
+    also make the remaining-salesforce-apps count wrongly read as zero,
+    letting the oauth_providers row underneath it be deleted too."""
+    engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
+    migration = _load_migration_module()
+    with engine.begin() as connection:
+        _create_tables(connection)
+        connection.execute(
+            text(
+                "INSERT INTO public_mcp_apps (app_id, name, transport, provider_name)"
+                " VALUES ('salesforce', 'Custom Salesforce App', 'oauth', 'salesforce')"
+            )
+        )
+        with patch.object(migration, "op", _operations(connection)):
+            migration.upgrade()
+            migration.downgrade()
+        assert "salesforce" in _app_ids(connection)
+        assert "salesforce" in _provider_names(connection)
+
+
 def test_downgrade_preserves_admin_created_salesforce_provider(tmp_path):
     """A pre-existing admin-created "salesforce" provider (different shape
     than the seeded row) must survive downgrade even when no salesforce apps

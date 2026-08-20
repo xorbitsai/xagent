@@ -150,6 +150,41 @@ def test_callback_persists_instance_url_and_skips_userinfo_lookup(
     assert user_mcp.is_active is True
 
 
+def test_connected_salesforce_server_reports_no_account_label(db_session, monkeypatch):
+    """Documents the intentional "connected but unlabeled" contract at the
+    actual API surface a client reads (not just the UserOAuth row directly):
+    userinfo_url is deliberately left empty (see the registry comment), so
+    /api/mcp/apps-equivalent server listings must still show the server as
+    connected while leaving connected_account unset -- mirroring Meta's
+    test_facebook_server_list_does_not_show_bare_meta_email_as_connected."""
+    from xagent.web.api.mcp import get_mcp_servers
+
+    db, user = db_session
+    monkeypatch.setattr(
+        auth_api.requests,
+        "post",
+        Mock(
+            return_value=MockResponse(
+                {
+                    "access_token": "sf-token",
+                    "instance_url": "https://acme.my.salesforce.com",
+                }
+            )
+        ),
+    )
+    monkeypatch.setattr(auth_api.requests, "get", Mock())
+
+    response = generic_oauth_callback(
+        "salesforce", _callback_request(db, user), db, _salesforce_provider()
+    )
+    assert response.status_code == 200
+
+    responses = get_mcp_servers(current_user=user, db=db)
+
+    salesforce_response = next(r for r in responses if r.name == "Salesforce")
+    assert salesforce_response.connected_account is None
+
+
 def test_callback_sends_decrypted_code_verifier_in_token_exchange(
     db_session, monkeypatch
 ):

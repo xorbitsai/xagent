@@ -136,13 +136,26 @@ def downgrade() -> None:
     existing_tables = set(inspector.get_table_names())
 
     if "public_mcp_apps" in existing_tables:
-        # Only the catalog entry is removed. Any user OAuth connections created
-        # against this app are not owned by this migration and are cleaned up
-        # through the normal disconnect path.
+        # Only delete the catalog entry when it still matches the static
+        # shape this migration seeded, mirroring the oauth_providers guard
+        # below -- an unconditional delete-by-app_id would remove a
+        # pre-existing operator row that happened to already occupy app_id
+        # "salesforce" before this migration ever ran (upgrade()'s own
+        # `if APP_ID not in existing_app_ids` check would have skipped
+        # inserting over it, so upgrade and downgrade must agree on what
+        # "this migration's row" means). name/transport/provider_name are
+        # NOT NULL-or-always-set core columns present since the table's
+        # creation and none of them are env-dependent, so they can be
+        # matched unconditionally. Any user OAuth connections created
+        # against this app are not owned by this migration either way and
+        # are cleaned up through the normal disconnect path.
+        seeded_app = _salesforce_app_row()
         bind.execute(
-            sa.delete(PUBLIC_MCP_APPS_TABLE).where(
-                PUBLIC_MCP_APPS_TABLE.c.app_id == APP_ID
-            )
+            sa.delete(PUBLIC_MCP_APPS_TABLE)
+            .where(PUBLIC_MCP_APPS_TABLE.c.app_id == APP_ID)
+            .where(PUBLIC_MCP_APPS_TABLE.c.name == seeded_app["name"])
+            .where(PUBLIC_MCP_APPS_TABLE.c.transport == seeded_app["transport"])
+            .where(PUBLIC_MCP_APPS_TABLE.c.provider_name == seeded_app["provider_name"])
         )
 
     if "oauth_providers" not in existing_tables:

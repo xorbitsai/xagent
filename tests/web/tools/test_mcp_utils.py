@@ -1,4 +1,5 @@
 import pytest
+import requests
 
 from xagent.web.tools.mcp import utils
 
@@ -19,3 +20,29 @@ def test_url_path_id_percent_encodes_reserved_characters():
     assert utils.url_path_id("001x?fields=Id", "record_id") == ("001x%3Ffields%3DId")
     with pytest.raises(ValueError):
         utils.url_path_id("", "record_id")
+
+
+def test_url_path_id_rejects_exact_dot_segments():
+    # "." and ".." are always-unreserved characters -- quote() never
+    # touches them, and requests/urllib3 collapse dot-segments out of the
+    # final URL before sending it, so percent-encoding alone can't close
+    # this off the way it does for "/" and "?".
+    with pytest.raises(ValueError, match="record_id"):
+        utils.url_path_id("..", "record_id")
+    with pytest.raises(ValueError, match="record_id"):
+        utils.url_path_id(".", "record_id")
+
+
+def test_url_path_id_output_survives_requests_url_normalization():
+    """Confirms the actual exploit this guards against: a naively
+    interpolated ".." collapses the path via requests' own URL
+    normalization to a completely different (still valid) endpoint."""
+    prepared = requests.Request(
+        "GET", "https://acme.my.salesforce.com/services/data/v59.0/sobjects/Account/.."
+    ).prepare()
+    assert (
+        prepared.url == "https://acme.my.salesforce.com/services/data/v59.0/sobjects/"
+    )
+
+    with pytest.raises(ValueError):
+        utils.url_path_id("..", "record_id")

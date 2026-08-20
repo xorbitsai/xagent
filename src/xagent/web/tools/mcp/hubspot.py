@@ -4,13 +4,14 @@ import os
 from collections.abc import Callable
 from datetime import datetime, timezone
 from typing import Any
-from urllib.parse import quote
 
 import requests
 from mcp.server.fastmcp import FastMCP
 
 from ....config import get_tool_max_output_length
+from .utils import require_clean_identifier as _require_clean_identifier
 from .utils import setup_proxy_env
+from .utils import url_path_id as _url_path_id
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("hubspot-mcp")
@@ -241,37 +242,6 @@ def _success_with_capped_dict(field_name: str, data: Any) -> str:
         truncated = True
         response = _success(**{field_name: working, "truncated": truncated})
     return response
-
-
-def _require_clean_identifier(value: str, field_name: str) -> str:
-    """Reject an empty or whitespace-padded id rather than silently fixing it.
-
-    An id copy-pasted or concatenated by a caller with accidental whitespace
-    is more likely a bug worth surfacing than a value to repair - repairing
-    it would mask the bug and could send a query for a different object.
-    Use this for ids that go into a JSON request body; for ids interpolated
-    into a URL path, use _url_path_id instead - encoding (not just
-    rejecting whitespace) is what actually closes path/query injection.
-    """
-    if not value or value.strip() != value:
-        raise ValueError(
-            f"{field_name} must be a non-empty id with no surrounding whitespace"
-        )
-    return value
-
-
-def _url_path_id(value: str, field_name: str) -> str:
-    """Validate then percent-encode an id for safe interpolation into a URL
-    path segment.
-
-    Percent-encoding - not a blocklist of "/", "?", "#", or ".." - is what
-    actually prevents a value like "x?limit=1&foo=/reports/metrics" from
-    escaping its intended path segment: any character that could do that
-    gets encoded regardless of which one it is, rather than relying on an
-    enumeration that could miss one.
-    """
-    _require_clean_identifier(value, field_name)
-    return quote(value, safe="")
 
 
 def _require_date_format(

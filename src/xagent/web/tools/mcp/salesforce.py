@@ -7,6 +7,7 @@ from urllib.parse import urlparse
 import requests
 from mcp.server.fastmcp import FastMCP
 
+from ....config import get_tool_max_output_length
 from .utils import setup_proxy_env, url_path_id
 
 logging.basicConfig(level=logging.INFO)
@@ -36,6 +37,32 @@ MAX_ERROR_RESPONSE_TEXT_CHARS = 1000
 
 def _success(**payload: Any) -> str:
     return json.dumps({"status": "success", **payload}, ensure_ascii=False)
+
+
+def _success_with_capped_list(
+    list_field: str, items: list[Any], *, truncated: bool = False, **extra: Any
+) -> str:
+    """Build a success payload, halving ``items`` until the response fits
+    the platform's output limit.
+
+    A SOQL result page, search hit list, sobject list, or field/picklist
+    describe can each serialize past the output filter's fixed character
+    threshold and get hard-truncated into broken JSON -- the same failure
+    mode hubspot.py's _paged_list/_success_with_capped_dict exist to avoid.
+    Halving (rather than a fixed slice) adapts to whatever size a given
+    org's records/schema happen to have, and continues down to zero items:
+    a single oversized item must still be capped, not returned whole
+    because there's nothing left to halve away from it. ``truncated`` seeds
+    from any upstream-reported truncation (e.g. Salesforce's own SOQL
+    ``done`` flag) and is OR'd with whatever local capping adds.
+    """
+    max_output_length = get_tool_max_output_length()
+    response = _success(**{list_field: items, "truncated": truncated, **extra})
+    while len(response) > max_output_length and items:
+        items = items[: len(items) // 2]
+        truncated = True
+        response = _success(**{list_field: items, "truncated": truncated, **extra})
+    return response
 
 
 def _error(message: str) -> str:
@@ -128,8 +155,11 @@ def _request_absolute(
         detail = _extract_error_detail(response)
         if detail is None:
             detail = response.text.strip()
-            if len(detail) > MAX_ERROR_RESPONSE_TEXT_CHARS:
-                detail = detail[:MAX_ERROR_RESPONSE_TEXT_CHARS] + "... [truncated]"
+        # Applies to both branches -- a long or numerous structured error
+        # array (_extract_error_detail's case) is just as unbounded as raw
+        # response text, and was previously only capped in the latter.
+        if len(detail) > MAX_ERROR_RESPONSE_TEXT_CHARS:
+            detail = detail[:MAX_ERROR_RESPONSE_TEXT_CHARS] + "... [truncated]"
         raise RuntimeError(
             f"Salesforce API error (status {response.status_code}): {detail}"
         )
@@ -187,10 +217,11 @@ def salesforce_query(soql: str) -> str:
         result = _request(
             "GET", f"/services/data/{API_VERSION}/query", params={"q": soql}
         )
-        return _success(
-            records=result.get("records") or [],
-            total_size=result.get("totalSize"),
+        return _success_with_capped_list(
+            "records",
+            result.get("records") or [],
             truncated=not result.get("done", True),
+            total_size=result.get("totalSize"),
         )
     except Exception as e:
         logger.error(f"Error running Salesforce SOQL query: {e}")
@@ -210,7 +241,7 @@ def salesforce_search(sosl: str) -> str:
         result = _request(
             "GET", f"/services/data/{API_VERSION}/search", params={"q": sosl}
         )
-        return _success(results=result.get("searchRecords") or [])
+        return _success_with_capped_list("results", result.get("searchRecords") or [])
     except Exception as e:
         logger.error(f"Error running Salesforce SOSL search: {e}")
         return _error(str(e))
@@ -238,7 +269,7 @@ def salesforce_list_sobjects() -> str:
             }
             for s in result.get("sobjects") or []
         ]
-        return _success(sobjects=sobjects)
+        return _success_with_capped_list("sobjects", sobjects)
     except Exception as e:
         logger.error(f"Error listing Salesforce sobjects: {e}")
         return _error(str(e))
@@ -279,8 +310,8 @@ def salesforce_describe_sobject(sobject_type: str) -> str:
             }
             for f in result.get("fields") or []
         ]
-        return _success(
-            name=result.get("name"), label=result.get("label"), fields=fields
+        return _success_with_capped_list(
+            "fields", fields, name=result.get("name"), label=result.get("label")
         )
     except Exception as e:
         logger.error(f"Error describing Salesforce sobject {sobject_type}: {e}")

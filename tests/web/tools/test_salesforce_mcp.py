@@ -128,11 +128,41 @@ def test_get_record_rejects_empty_record_id(monkeypatch):
     mock_request.assert_not_called()
 
 
+def test_get_record_rejects_empty_sobject_type(monkeypatch):
+    mock_request = Mock()
+    monkeypatch.setattr(salesforce.requests, "request", mock_request)
+
+    result = json.loads(salesforce.salesforce_get_record("", "001xx"))
+
+    assert result["status"] == "error"
+    mock_request.assert_not_called()
+
+
+def test_get_record_rejects_dot_segment_record_id(monkeypatch):
+    mock_request = Mock()
+    monkeypatch.setattr(salesforce.requests, "request", mock_request)
+
+    result = json.loads(salesforce.salesforce_get_record("Account", ".."))
+
+    assert result["status"] == "error"
+    mock_request.assert_not_called()
+
+
 def test_delete_record_rejects_empty_record_id(monkeypatch):
     mock_request = Mock()
     monkeypatch.setattr(salesforce.requests, "request", mock_request)
 
     result = json.loads(salesforce.salesforce_delete_record("Account", ""))
+
+    assert result["status"] == "error"
+    mock_request.assert_not_called()
+
+
+def test_delete_record_rejects_empty_sobject_type(monkeypatch):
+    mock_request = Mock()
+    monkeypatch.setattr(salesforce.requests, "request", mock_request)
+
+    result = json.loads(salesforce.salesforce_delete_record("", "001xx"))
 
     assert result["status"] == "error"
     mock_request.assert_not_called()
@@ -205,6 +235,26 @@ def test_request_raises_with_joined_array_error_messages(monkeypatch):
 
     assert "Required fields are missing" in str(excinfo.value)
     assert "Session expired" in str(excinfo.value)
+
+
+def test_request_truncates_structured_error_body(monkeypatch):
+    long_message = "x" * 5000
+    monkeypatch.setattr(
+        salesforce.requests,
+        "request",
+        Mock(
+            return_value=MockResponse(
+                status_code=400,
+                json_data=[{"message": long_message, "errorCode": "FIELD_TOO_LONG"}],
+            )
+        ),
+    )
+
+    with pytest.raises(RuntimeError) as excinfo:
+        salesforce._request("GET", "/services/data/v59.0/sobjects/Account/1")
+
+    assert "[truncated]" in str(excinfo.value)
+    assert len(str(excinfo.value)) < len(long_message)
 
 
 def test_request_truncates_unstructured_error_body(monkeypatch):
@@ -355,6 +405,27 @@ def test_query_reports_truncated_when_not_done(monkeypatch):
     assert result["truncated"] is True
 
 
+def test_query_caps_output_size(monkeypatch):
+    big_records = [{"Id": str(i), "Name": "x" * 1000} for i in range(50)]
+    monkeypatch.setattr(
+        salesforce.requests,
+        "request",
+        Mock(
+            return_value=MockResponse(
+                json_data={"totalSize": 50, "done": True, "records": big_records}
+            )
+        ),
+    )
+    monkeypatch.setattr(salesforce, "get_tool_max_output_length", lambda: 2000)
+
+    result = json.loads(salesforce.salesforce_query("SELECT Id, Name FROM Account"))
+
+    assert result["status"] == "success"
+    assert result["truncated"] is True
+    assert len(result["records"]) < len(big_records)
+    assert len(json.dumps(result)) <= 2000 + 200
+
+
 def test_search_sends_sosl_as_query_param(monkeypatch):
     mock_request = Mock(
         return_value=MockResponse(
@@ -372,6 +443,25 @@ def test_search_sends_sosl_as_query_param(monkeypatch):
     assert mock_request.call_args.kwargs["params"] == {
         "q": "FIND {Acme} IN ALL FIELDS RETURNING Account(Id)"
     }
+
+
+def test_search_caps_output_size(monkeypatch):
+    big_results = [{"Id": str(i), "Name": "x" * 1000} for i in range(50)]
+    monkeypatch.setattr(
+        salesforce.requests,
+        "request",
+        Mock(return_value=MockResponse(json_data={"searchRecords": big_results})),
+    )
+    monkeypatch.setattr(salesforce, "get_tool_max_output_length", lambda: 2000)
+
+    result = json.loads(
+        salesforce.salesforce_search("FIND {Acme} IN ALL FIELDS RETURNING Account(Id)")
+    )
+
+    assert result["status"] == "success"
+    assert result["truncated"] is True
+    assert len(result["results"]) < len(big_results)
+    assert len(json.dumps(result)) <= 2000 + 200
 
 
 def test_list_sobjects_returns_summaries(monkeypatch):
@@ -401,6 +491,26 @@ def test_list_sobjects_returns_summaries(monkeypatch):
 
     assert result["status"] == "success"
     assert result["sobjects"][0]["name"] == "Account"
+
+
+def test_list_sobjects_caps_output_size(monkeypatch):
+    big_sobjects = [
+        {"name": f"Object{i}__c", "label": "x" * 1000, "queryable": True}
+        for i in range(50)
+    ]
+    monkeypatch.setattr(
+        salesforce.requests,
+        "request",
+        Mock(return_value=MockResponse(json_data={"sobjects": big_sobjects})),
+    )
+    monkeypatch.setattr(salesforce, "get_tool_max_output_length", lambda: 2000)
+
+    result = json.loads(salesforce.salesforce_list_sobjects())
+
+    assert result["status"] == "success"
+    assert result["truncated"] is True
+    assert len(result["sobjects"]) < len(big_sobjects)
+    assert len(json.dumps(result)) <= 2000 + 200
 
 
 def test_describe_sobject_extracts_picklist_values(monkeypatch):
@@ -446,6 +556,30 @@ def test_describe_sobject_extracts_picklist_values(monkeypatch):
     assert industry_field["picklist_values"] == ["Technology"]
     name_field = next(f for f in result["fields"] if f["name"] == "Name")
     assert name_field["picklist_values"] is None
+
+
+def test_describe_sobject_caps_output_size(monkeypatch):
+    big_fields = [
+        {"name": f"Field{i}__c", "label": "x" * 1000, "type": "string"}
+        for i in range(50)
+    ]
+    monkeypatch.setattr(
+        salesforce.requests,
+        "request",
+        Mock(
+            return_value=MockResponse(
+                json_data={"name": "Account", "label": "Account", "fields": big_fields}
+            )
+        ),
+    )
+    monkeypatch.setattr(salesforce, "get_tool_max_output_length", lambda: 2000)
+
+    result = json.loads(salesforce.salesforce_describe_sobject("Account"))
+
+    assert result["status"] == "success"
+    assert result["truncated"] is True
+    assert len(result["fields"]) < len(big_fields)
+    assert len(json.dumps(result)) <= 2000 + 200
 
 
 def test_get_record_sends_fields_param_when_provided(monkeypatch):
@@ -538,6 +672,32 @@ def test_create_record_propagates_errors_on_failure(monkeypatch):
     )
 
     assert result["errors"] == [{"statusCode": "REQUIRED_FIELD_MISSING"}]
+
+
+def test_create_record_reports_error_on_realistic_non_2xx_failure(monkeypatch):
+    """The documented, actually-reachable create failure contract: Salesforce
+    returns a non-2xx status with a top-level JSON array body, not a 200
+    carrying success=false (that shape is defended separately above, but
+    isn't what production traffic hits)."""
+    mock_request = Mock(
+        return_value=MockResponse(
+            status_code=400,
+            json_data=[
+                {
+                    "message": "Required fields are missing: [Name]",
+                    "errorCode": "REQUIRED_FIELD_MISSING",
+                }
+            ],
+        )
+    )
+    monkeypatch.setattr(salesforce.requests, "request", mock_request)
+
+    result = json.loads(
+        salesforce.salesforce_create_record("Account", {"Industry": "Technology"})
+    )
+
+    assert result["status"] == "error"
+    assert "Required fields are missing" in result["message"]
 
 
 def test_update_record_sends_fields_as_json_body(monkeypatch):

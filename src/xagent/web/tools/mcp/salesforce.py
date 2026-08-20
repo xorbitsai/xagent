@@ -2,6 +2,7 @@ import json
 import logging
 import os
 from typing import Any
+from urllib.parse import quote
 
 import requests
 from mcp.server.fastmcp import FastMCP
@@ -123,15 +124,39 @@ def _request(
     params: dict[str, Any] | None = None,
     json_data: dict[str, Any] | None = None,
 ) -> Any:
-    # sobject_type/record_id land here from LLM-controlled tool arguments
-    # (salesforce_get_record et al. interpolate them straight into the URL
-    # path) -- reject traversal sequences so a crafted value can't redirect
-    # the request to an unintended endpoint on this org's instance_url.
-    if ".." in path:
-        raise ValueError(f"Invalid path: {path!r}")
     return _request_absolute(
         method, f"{_instance_url()}{path}", params=params, json_data=json_data
     )
+
+
+def _require_clean_identifier(value: str, field_name: str) -> str:
+    """Reject an empty or whitespace-padded id rather than silently fixing it.
+
+    Matches hubspot.py's helper of the same name: an id copy-pasted or
+    concatenated by a caller with accidental whitespace is more likely a bug
+    worth surfacing than a value to repair.
+    """
+    if not value or value.strip() != value:
+        raise ValueError(
+            f"{field_name} must be a non-empty id with no surrounding whitespace"
+        )
+    return value
+
+
+def _url_path_id(value: str, field_name: str) -> str:
+    """Validate then percent-encode an id for safe interpolation into a URL
+    path segment.
+
+    sobject_type/record_id reach every call site below straight from
+    LLM-controlled tool arguments and get interpolated directly into the URL
+    path. A blocklist on literal ".." (this connector's first pass at this)
+    misses "/" and "?", which redirect the request to a different endpoint
+    or inject query params without ever containing "..". Percent-encoding -
+    not an enumeration of specific characters - is what actually closes
+    this off, matching hubspot.py's/jira.py's _url_path_id.
+    """
+    _require_clean_identifier(value, field_name)
+    return quote(value, safe="")
 
 
 @mcp.tool()
@@ -237,8 +262,10 @@ def salesforce_describe_sobject(sobject_type: str) -> str:
     sobject_type: an object's API name, e.g. "Account" or "My_Object__c".
     """
     try:
+        safe_sobject_type = _url_path_id(sobject_type, "sobject_type")
         result = _request(
-            "GET", f"/services/data/{API_VERSION}/sobjects/{sobject_type}/describe"
+            "GET",
+            f"/services/data/{API_VERSION}/sobjects/{safe_sobject_type}/describe",
         )
         fields = [
             {
@@ -277,10 +304,12 @@ def salesforce_get_record(sobject_type: str, record_id: str, fields: str = "") -
     "Name,Industry,AnnualRevenue"); omit to return every field.
     """
     try:
+        safe_sobject_type = _url_path_id(sobject_type, "sobject_type")
+        safe_record_id = _url_path_id(record_id, "record_id")
         params: dict[str, Any] = {"fields": fields} if fields else {}
         result = _request(
             "GET",
-            f"/services/data/{API_VERSION}/sobjects/{sobject_type}/{record_id}",
+            f"/services/data/{API_VERSION}/sobjects/{safe_sobject_type}/{safe_record_id}",
             params=params,
         )
         return _success(record=result)
@@ -302,12 +331,17 @@ def salesforce_create_record(sobject_type: str, fields: dict[str, Any]) -> str:
     which fields exist and are createable.
     """
     try:
+        safe_sobject_type = _url_path_id(sobject_type, "sobject_type")
         result = _request(
             "POST",
-            f"/services/data/{API_VERSION}/sobjects/{sobject_type}",
+            f"/services/data/{API_VERSION}/sobjects/{safe_sobject_type}",
             json_data=fields,
         )
-        return _success(id=result.get("id"), success=result.get("success"))
+        return _success(
+            id=result.get("id"),
+            success=result.get("success"),
+            errors=result.get("errors") or [],
+        )
     except Exception as e:
         logger.error(f"Error creating Salesforce {sobject_type} record: {e}")
         return _error(str(e))
@@ -326,9 +360,11 @@ def salesforce_update_record(
     try:
         if not fields:
             return _error("No fields provided to update")
+        safe_sobject_type = _url_path_id(sobject_type, "sobject_type")
+        safe_record_id = _url_path_id(record_id, "record_id")
         _request(
             "PATCH",
-            f"/services/data/{API_VERSION}/sobjects/{sobject_type}/{record_id}",
+            f"/services/data/{API_VERSION}/sobjects/{safe_sobject_type}/{safe_record_id}",
             json_data=fields,
         )
         return _success(id=record_id)
@@ -346,9 +382,11 @@ def salesforce_delete_record(sobject_type: str, record_id: str) -> str:
     sobject_type: an object's API name, e.g. "Account" or "My_Object__c".
     """
     try:
+        safe_sobject_type = _url_path_id(sobject_type, "sobject_type")
+        safe_record_id = _url_path_id(record_id, "record_id")
         _request(
             "DELETE",
-            f"/services/data/{API_VERSION}/sobjects/{sobject_type}/{record_id}",
+            f"/services/data/{API_VERSION}/sobjects/{safe_sobject_type}/{safe_record_id}",
         )
         return _success(id=record_id)
     except Exception as e:

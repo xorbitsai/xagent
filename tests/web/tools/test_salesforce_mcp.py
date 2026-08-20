@@ -66,15 +66,57 @@ def test_request_uses_instance_url_and_headers(monkeypatch):
     )
 
 
-def test_request_rejects_path_traversal(monkeypatch):
+def test_require_clean_identifier_rejects_empty_and_whitespace():
+    with pytest.raises(ValueError, match="record_id"):
+        salesforce._require_clean_identifier("", "record_id")
+    with pytest.raises(ValueError, match="record_id"):
+        salesforce._require_clean_identifier(" 001xx ", "record_id")
+    assert salesforce._require_clean_identifier("001xx", "record_id") == "001xx"
+
+
+def test_url_path_id_percent_encodes_reserved_characters():
+    # A literal ".." blocklist misses "/" and "?", which redirect the
+    # request to a different endpoint or inject query params without ever
+    # containing "..". Percent-encoding closes off all of them at once.
+    assert salesforce._url_path_id("Account/001abc", "sobject_type") == (
+        "Account%2F001abc"
+    )
+    assert salesforce._url_path_id("001x?fields=Id", "record_id") == (
+        "001x%3Ffields%3DId"
+    )
+    with pytest.raises(ValueError):
+        salesforce._url_path_id("", "record_id")
+
+
+def test_get_record_percent_encodes_ids_in_the_request_url(monkeypatch):
+    mock_request = Mock(return_value=MockResponse(json_data={"Id": "001xx"}))
+    monkeypatch.setattr(salesforce.requests, "request", mock_request)
+
+    salesforce.salesforce_get_record("Account/001abc", "001x?fields=Id")
+
+    url = mock_request.call_args.kwargs["url"]
+    assert url.endswith(
+        "/services/data/v59.0/sobjects/Account%2F001abc/001x%3Ffields%3DId"
+    )
+
+
+def test_get_record_rejects_empty_record_id(monkeypatch):
     mock_request = Mock()
     monkeypatch.setattr(salesforce.requests, "request", mock_request)
 
-    with pytest.raises(ValueError):
-        salesforce._request(
-            "GET", "/services/data/v59.0/sobjects/../../../services/oauth2/token"
-        )
+    result = json.loads(salesforce.salesforce_get_record("Account", ""))
 
+    assert result["status"] == "error"
+    mock_request.assert_not_called()
+
+
+def test_delete_record_rejects_empty_record_id(monkeypatch):
+    mock_request = Mock()
+    monkeypatch.setattr(salesforce.requests, "request", mock_request)
+
+    result = json.loads(salesforce.salesforce_delete_record("Account", ""))
+
+    assert result["status"] == "error"
     mock_request.assert_not_called()
 
 
@@ -180,6 +222,32 @@ def test_get_current_user_returns_error_payload_on_failure(monkeypatch):
 
     assert result["status"] == "error"
     assert "Session expired" in result["message"]
+
+
+def test_get_current_user_falls_back_to_raw_text_on_dict_shaped_error(monkeypatch):
+    # The OIDC userinfo endpoint (unlike every /services/data/* endpoint
+    # this connector otherwise calls) returns dict-shaped errors like
+    # {"error": ..., "error_description": ...}, not the top-level array
+    # _extract_error_detail otherwise expects -- it should return None for
+    # this shape and let the raw response text through instead of crashing.
+    monkeypatch.setattr(
+        salesforce.requests,
+        "request",
+        Mock(
+            return_value=MockResponse(
+                status_code=401,
+                json_data={
+                    "error": "invalid_grant",
+                    "error_description": "expired access/refresh token",
+                },
+            )
+        ),
+    )
+
+    result = json.loads(salesforce.salesforce_get_current_user())
+
+    assert result["status"] == "error"
+    assert "expired access/refresh token" in result["message"]
 
 
 def test_query_sends_soql_as_query_param(monkeypatch):

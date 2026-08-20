@@ -73,6 +73,54 @@ def test_strips_control_characters_but_keeps_newline_tab_and_cr() -> None:
     assert result["text"] == "keep\nthis\tand\rthisdrop-that"
 
 
+def test_serialize_trace_data_strips_control_chars_same_as_the_old_per_char_loop() -> (
+    None
+):
+    """``clean_string`` (``ws_trace_handlers.serialize_trace_data``'s
+    nested helper) moved from a per-character loop to ``str.translate``
+    against a module-level table purely for speed -- this pins that the
+    output is unchanged for every relevant class of input: every
+    control codepoint 0-31 except tab/newline/CR (all removed, same as
+    before), tab/newline/CR themselves (all kept), DEL and the C1
+    control range 128-159 (both kept, same as before -- the old loop's
+    ``ord(char) >= 32`` check let both through untouched), and ordinary
+    multi-byte content (CJK, an astral-plane emoji) untouched.
+    """
+
+    def old_clean_string(value: str) -> str:
+        # Reference implementation: the per-character loop this module
+        # used before the ``str.translate`` change, inlined here so this
+        # test pins behavior against the pre-change semantics rather
+        # than against the (also changed) production code. The old code
+        # also had a redundant NUL-stripping ``replace`` call right
+        # before this filter; omitted here since it is a no-op given the
+        # filter below already drops every codepoint < 32, NUL included.
+        return "".join(char for char in value if ord(char) >= 32 or char in "\n\r\t")
+
+    control_chars = "".join(chr(c) for c in range(32))
+    del_and_c1 = "".join(chr(c) for c in range(127, 160))
+    sample = (
+        control_chars
+        + "\t\n\r"
+        + del_and_c1
+        + "中文测试"
+        + "\U0001f600\U0001f680"  # astral-plane emoji
+        + "plain ascii text"
+    )
+
+    expected = old_clean_string(sample)
+    actual = serialize_trace_data({"value": sample})["value"]
+    assert actual == expected
+    # Pin the two concrete claims separately so a regression in either
+    # direction fails on its own assertion, not just the aggregate diff.
+    assert "\x00" not in actual
+    for c in "\t\n\r":
+        assert actual.count(c) == sample.count(c)
+    assert del_and_c1 in actual
+    assert "中文测试" in actual
+    assert "\U0001f600\U0001f680" in actual
+
+
 def test_falls_back_to_serialization_error_stub_instead_of_raising() -> None:
     """An object the serializer has no unwrap path for (no ``model_dump``,
     ``to_dict``, or ``dict``, and not JSON-native) survives the recursive

@@ -175,10 +175,12 @@ def _marker_clean(value: str) -> str:
     of it.
     """
 
-    # Both replaces below target the same code point, NUL (U+0000); the
-    # second is a no-op after the first and is kept only to mirror
-    # clean_string's two-line form character-for-character, per the
-    # cross-layer contract above.
+    # Both replaces below target the same code point, NUL (U+0000), so the
+    # second is a no-op after the first, and the filter on the return line
+    # would drop NUL regardless. What the cross-layer contract above binds
+    # is the set of characters that survive -- ``_MARKER_KEEP`` plus every
+    # codepoint >= 32 -- not the way any one copy is written; the copies
+    # may differ in form as long as they agree on that set.
     cleaned = value.replace("\x00", "")  # Remove NULL character
     cleaned = cleaned.replace("\u0000", "")  # Remove Unicode NULL
     return "".join(char for char in cleaned if ord(char) >= 32 or char in _MARKER_KEEP)

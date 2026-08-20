@@ -38,6 +38,7 @@ from ..models.user_oauth import UserOAuth
 from ..oauth_provider_quirks import requires_json_accept_header
 from ..services import gmail_provisioning
 from ..services.auth_email import send_password_reset_email
+from ..utils.graphql_errors import graphql_errors_message, truncate_error_text
 
 logger = logging.getLogger(__name__)
 
@@ -193,7 +194,10 @@ def _merge_oauth_scopes(
 
 
 def _oauth_scope_separator(provider: str) -> str:
-    if provider.lower() == "meta":
+    # Linear's authorize endpoint documents scope as "a comma separated list
+    # of scopes" -- unlike most providers here, which accept a space-joined
+    # list.
+    if provider.lower() in ("meta", "linear"):
         return ","
     return " "
 
@@ -374,6 +378,73 @@ def _bounded_oauth_error_message(
         description = None
     message = error if not description else f"{error}: {description}"
     return html.escape(message[:limit])
+
+
+def _fetch_linear_viewer_identity(
+    access_token: str,
+) -> tuple[Optional[str], Optional[str]]:
+    """Linear has no flat REST userinfo endpoint (GraphQL-only), so identity
+    comes from a `viewer` query against the same GraphQL endpoint the
+    connector's tools use, instead of the generic `userinfo_url` REST GET
+    path below (left empty for Linear's provider row).
+
+    This doubles as the post-exchange token verification every other
+    provider gets for free from its REST userinfo call: a token Linear
+    won't honour is caught here and reported, instead of being persisted
+    as healthy and failing opaquely later from inside a tool call.
+
+    Raises RuntimeError with a human-readable message on any failure, so
+    the callback can report it the same way the Slack-style `ok: false`
+    branch below does, rather than silently connecting.
+    """
+    response = requests.post(
+        "https://api.linear.app/graphql",
+        headers={
+            "Authorization": f"Bearer {access_token}",
+            "Content-Type": "application/json",
+        },
+        json={"query": "query { viewer { id email } }"},
+        timeout=10.0,
+    )
+
+    def _payload_errors_message(payload: Any) -> str | None:
+        if not isinstance(payload, dict):
+            return None
+        errors = payload.get("errors")
+        return graphql_errors_message(errors) if errors else None
+
+    if response.status_code != 200:
+        # Mirrors linear.py's _graphql(): prefer the structured GraphQL
+        # "errors" shape, but fall back to the raw (truncated) body for any
+        # other error shape (a differently-keyed JSON error, or an HTML
+        # gateway/WAF page on a 502/504) rather than discarding it.
+        detail = None
+        try:
+            detail = _payload_errors_message(response.json())
+        except ValueError:
+            pass
+        if detail is None:
+            detail = truncate_error_text(response.text.strip(), limit=500)
+        raise RuntimeError(
+            f"Linear API error (status {response.status_code})"
+            + (f": {detail}" if detail else "")
+        )
+    try:
+        payload = response.json()
+    except ValueError:
+        raise RuntimeError(
+            "Linear API returned a non-JSON response: "
+            f"{truncate_error_text(response.text.strip(), limit=500)}"
+        ) from None
+    if not isinstance(payload, dict):
+        raise RuntimeError("Linear API returned an unexpected response body")
+    data = payload.get("data")
+    viewer = data.get("viewer") if isinstance(data, dict) else None
+    if not isinstance(viewer, dict):
+        raise RuntimeError(
+            _payload_errors_message(payload) or "Linear did not return a viewer"
+        )
+    return viewer.get("id"), viewer.get("email")
 
 
 def create_access_token(
@@ -1434,6 +1505,14 @@ def generic_oauth_login(
         # previously granted a narrower scope set can be silently handed a
         # token still limited to that earlier grant.
         params["prompt"] = "consent"
+    if provider.lower() == "linear":
+        # Linear's OAuth docs confirm only that prompt=consent always shows
+        # the consent screen -- they don't document what happens by default
+        # on a scope-escalation request without it. Forcing consent
+        # sidesteps needing to know that default: a bare provider connect
+        # (read only) followed by an app-scoped connect (read+write) is
+        # guaranteed to end up with the broader grant either way.
+        params["prompt"] = "consent"
     meta_config_id = _meta_login_config_id() if provider.lower() == "meta" else ""
     if meta_config_id:
         params["config_id"] = meta_config_id
@@ -1829,7 +1908,44 @@ def generic_oauth_callback(
         provider_user_id = None
         email = None
 
-        if userinfo_url and access_token:
+        if provider.lower() == "linear":
+            # Checked before the generic userinfo_url branch below (not
+            # "elif" on it), not just as an ordering nicety: Linear's
+            # provider row leaves userinfo_url empty today (GraphQL-only, no
+            # flat REST endpoint fits that branch), but if userinfo_url were
+            # ever populated on Linear's row (e.g. an admin edit), the
+            # generic branch's REST GET would run instead, fail silently
+            # against Linear's GraphQL-only API, and persist the connection
+            # as "healthy" with no identity. Checking the provider name
+            # first means this path always wins for Linear regardless of
+            # what userinfo_url holds -- see _fetch_linear_viewer_identity's
+            # docstring for why this is not just a label workaround.
+            try:
+                provider_user_id, email = _fetch_linear_viewer_identity(access_token)
+            except RuntimeError as e:
+                # A deliberate failure raised by _fetch_linear_viewer_identity
+                # itself -- Linear's API responded, just not usably.
+                return HTMLResponse(
+                    content=(
+                        "<h1>Error verifying the connected account</h1>"
+                        f"<p>The provider reported: {html.escape(str(e))}</p>"
+                    ),
+                    status_code=400,
+                )
+            except Exception as e:
+                # A network-level failure (timeout, connection error) --
+                # distinct from the case above: Linear never actually
+                # responded, so attributing this to "the provider reported"
+                # would be misleading.
+                return HTMLResponse(
+                    content=(
+                        "<h1>Error verifying the connected account</h1>"
+                        f"<p>Could not reach Linear to verify the connection: "
+                        f"{html.escape(str(e))}</p>"
+                    ),
+                    status_code=400,
+                )
+        elif userinfo_url and access_token:
             info_headers = {"Authorization": f"Bearer {access_token}"}
             # Replace {{access_token}} placeholder if present
             actual_url = userinfo_url.replace("{{access_token}}", access_token)
@@ -1924,7 +2040,21 @@ def generic_oauth_callback(
 
             setattr(oauth_account, "access_token", access_token)
             setattr(oauth_account, "token_type", token_data.get("token_type", "Bearer"))
-            setattr(oauth_account, "scope", token_data.get("scope", ""))
+            # Most providers return "scope" as a single space/comma-joined
+            # string, but Linear OAuth applications created before December
+            # 1, 2023 return it as a list of strings -- UserOAuth.scope is a
+            # plain String column, so committing a list there would raise
+            # at flush time instead of saving a valid connection. Always
+            # join with a space regardless of provider: `_oauth_scope_separator`
+            # governs only the outbound authorize-request format (comma for
+            # Linear/Meta), and the two readers of this column already split
+            # on a space, so reusing that separator here would make the
+            # stored format provider-dependent and silently mis-parse every
+            # Linear row wherever this column is read.
+            token_scope = token_data.get("scope", "")
+            if isinstance(token_scope, list):
+                token_scope = " ".join(str(scope) for scope in token_scope)
+            setattr(oauth_account, "scope", token_scope)
             setattr(oauth_account, "email", email)
             if "refresh_token" in token_data:
                 setattr(oauth_account, "refresh_token", token_data.get("refresh_token"))

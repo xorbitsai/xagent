@@ -39,6 +39,30 @@ sample_prompts:
     prompt: 从 文档 / 会议纪要 中提取每一项行动项，按负责人和截止日期归类。
     highlights:
     - 文档 / 会议纪要
+persona:
+  name: Iris
+  role:
+    en: Doc Summarizer & Action Extractor
+    zh: 文档摘要与行动项提取
+  avatar: /marketplace/avatars/iris.png
+  intro:
+    en: |-
+      Hi there — I'm Iris, your Doc Summarizer & Action Extractor.
+
+      I read the documents you drop in and hand back a summary plus every action item, owner and deadline.
+    zh: |-
+      你好，我是 Iris，你的文档摘要与行动项提取助手。
+
+      把文档丢给我，我会返回一份摘要，外加其中的每一项行动项、负责人和截止日期。
+  kickoff_questions:
+    en:
+    - What am I reading first — contracts, board packs, meeting decks, something else?
+    - Do you want the summary first with actions underneath, or just the action table?
+    - Should I flag items with no stated owner or due date, or leave those blank?
+    zh:
+    - 我先看哪类文档——合同、董事会材料、会议演示，还是别的？
+    - 你希望先看摘要、下面再列行动项，还是只要行动项表格？
+    - 遇到没写明负责人或截止日期的条目，要标出来，还是留空就好？
 connections: []
 setup_time:
   en: 2 min setup

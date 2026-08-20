@@ -8,6 +8,8 @@ Covers two bugs the PR fixed:
 
 from __future__ import annotations
 
+import base64
+import hashlib
 from datetime import timedelta
 from types import SimpleNamespace
 from urllib.parse import parse_qs, urlparse
@@ -16,11 +18,12 @@ import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
-from xagent.core.utils.encryption import encrypt_value
+from xagent.core.utils.encryption import decrypt_value, encrypt_value
 from xagent.web.api.auth import (
     _resolve_oauth_secret,
     create_access_token,
     generic_oauth_login,
+    verify_token,
 )
 from xagent.web.models.database import Base
 from xagent.web.models.public_mcp import PublicMCPApp
@@ -162,6 +165,75 @@ def test_zoom_provider_sets_prompt_login(db_session):
     qs = parse_qs(urlparse(url).query)
 
     assert qs.get("prompt") == ["login"], f"zoom prompt missing: {url}"
+
+
+def test_salesforce_provider_includes_pkce_code_challenge(db_session):
+    """Newer Salesforce orgs enforce PKCE on this grant with no per-app
+    opt-out; the authorize redirect must carry a code_challenge derived from
+    a verifier that (a) round-trips through the signed state token via
+    decrypt_value (not left as plaintext in it) and (b) actually matches the
+    S256 challenge sent to Salesforce."""
+    db, user = db_session
+    token = _token_for(user)
+
+    provider = _provider(
+        auth_url="https://login.salesforce.com/services/oauth2/authorize",
+        default_scopes=["api", "refresh_token", "openid"],
+        redirect_uri="https://app.example.com/cb",
+    )
+
+    resp = generic_oauth_login(
+        provider="salesforce",
+        token=token,
+        app_id=None,
+        redirect=None,
+        db=db,
+        db_provider=provider,
+    )
+    qs = parse_qs(urlparse(_location(resp)).query)
+
+    assert qs.get("code_challenge_method") == ["S256"]
+    assert "code_challenge" in qs
+
+    state_payload = verify_token(qs["state"][0])
+    encrypted_verifier = state_payload["code_verifier"]
+    assert encrypted_verifier != qs["code_challenge"][0]
+    decrypted_verifier = decrypt_value(encrypted_verifier)
+
+    expected_challenge = (
+        base64.urlsafe_b64encode(
+            hashlib.sha256(decrypted_verifier.encode("ascii")).digest()
+        )
+        .decode("ascii")
+        .rstrip("=")
+    )
+    assert qs["code_challenge"][0] == expected_challenge
+
+
+def test_non_salesforce_provider_omits_pkce_code_challenge(db_session):
+    db, user = db_session
+    token = _token_for(user)
+
+    provider = _provider(
+        auth_url="https://example.com/oauth/authorize",
+        default_scopes=["openid"],
+        redirect_uri="https://app.example.com/cb",
+    )
+
+    resp = generic_oauth_login(
+        provider="custom",
+        token=token,
+        app_id=None,
+        redirect=None,
+        db=db,
+        db_provider=provider,
+    )
+    qs = parse_qs(urlparse(_location(resp)).query)
+
+    assert "code_challenge" not in qs
+    assert "code_challenge_method" not in qs
+    state_payload = verify_token(qs["state"][0])
+    assert "code_verifier" not in state_payload
 
 
 def test_non_zoom_provider_does_not_set_prompt_login(db_session):

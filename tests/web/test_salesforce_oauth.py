@@ -150,8 +150,8 @@ def test_callback_persists_instance_url_and_skips_userinfo_lookup(
 
 
 def test_non_salesforce_callback_does_not_persist_instance_url(db_session, monkeypatch):
-    """Guard the branch condition: a provider whose token response has no
-    instance_url key must leave that column unset, not crash or coerce it."""
+    """A provider whose token response has no instance_url key must leave
+    that column None, not crash or coerce it to something else."""
     db, user = db_session
 
     # No app_id: generic_oauth_callback persists UserOAuth.provider as

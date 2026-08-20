@@ -1231,14 +1231,22 @@ def generic_oauth_login(
     # the org level, with no per-app way to disable it (Setup > External
     # Client Apps > Security > "Require Proof Key for Code Exchange" is
     # locked once an org has it on). The verifier rides inside this signed,
-    # short-lived state token rather than a new DB row -- it never leaves
-    # the server unencrypted except as the one-way S256 challenge below, and
-    # the callback already decodes this same state to recover user_id/app_id.
+    # short-lived state token rather than a new DB row, to avoid a schema
+    # change for one provider -- but `state` itself goes out as a URL query
+    # param on the redirect to Salesforce and back, so it lands in browser
+    # history/Referer headers/proxy logs. HS256 signing alone doesn't hide
+    # the payload (it's base64, not encrypted), so the verifier is encrypted
+    # here before being embedded, and decrypted back out in the callback
+    # below. The token exchange still requires the server-held client_secret
+    # regardless, so this is defense-in-depth on top of that, not the only
+    # thing standing between an interceptor and a token.
     code_verifier = (
         secrets.token_urlsafe(64) if provider.lower() == "salesforce" else None
     )
     if code_verifier:
-        state_payload["code_verifier"] = code_verifier
+        from ...core.utils.encryption import encrypt_value
+
+        state_payload["code_verifier"] = encrypt_value(code_verifier)
     state = create_access_token(data=state_payload, expires_delta=timedelta(minutes=10))
 
     app_scopes: list[str] | None = None
@@ -1480,7 +1488,12 @@ def generic_oauth_callback(
 
     user_id = payload.get("user_id")
     app_id = payload.get("app_id")
-    code_verifier = payload.get("code_verifier")
+    encrypted_code_verifier = payload.get("code_verifier")
+    code_verifier = None
+    if encrypted_code_verifier:
+        from ...core.utils.encryption import decrypt_value
+
+        code_verifier = decrypt_value(encrypted_code_verifier)
 
     if app_id:
         # Reject a hidden app before spending the authorization code against
@@ -1657,11 +1670,14 @@ def generic_oauth_callback(
             setattr(oauth_account, "email", email)
             if "refresh_token" in token_data:
                 setattr(oauth_account, "refresh_token", token_data.get("refresh_token"))
-            if "instance_url" in token_data:
-                # Salesforce returns the per-org API host here instead of
-                # using a fixed domain -- no other provider sends this key,
-                # so persisting it generically is a no-op for everyone else.
-                setattr(oauth_account, "instance_url", token_data.get("instance_url"))
+            # Salesforce returns the per-org API host here instead of using a
+            # fixed domain -- no other provider sends this key, and
+            # oauth_account is freshly created above (never an update to an
+            # existing row), so token_data.get() returning None for every
+            # other provider is already the correct, final value: no `if
+            # "instance_url" in token_data` guard needed to avoid clobbering
+            # anything.
+            setattr(oauth_account, "instance_url", token_data.get("instance_url"))
             if "expires_in" in token_data:
                 setattr(
                     oauth_account,

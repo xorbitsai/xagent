@@ -123,6 +123,12 @@ def _request(
     params: dict[str, Any] | None = None,
     json_data: dict[str, Any] | None = None,
 ) -> Any:
+    # sobject_type/record_id land here from LLM-controlled tool arguments
+    # (salesforce_get_record et al. interpolate them straight into the URL
+    # path) -- reject traversal sequences so a crafted value can't redirect
+    # the request to an unintended endpoint on this org's instance_url.
+    if ".." in path:
+        raise ValueError(f"Invalid path: {path!r}")
     return _request_absolute(
         method, f"{_instance_url()}{path}", params=params, json_data=json_data
     )

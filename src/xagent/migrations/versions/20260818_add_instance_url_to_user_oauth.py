@@ -15,7 +15,6 @@ from typing import Sequence, Union
 
 import sqlalchemy as sa
 from alembic import op
-from sqlalchemy.engine.reflection import Inspector
 
 # revision identifiers, used by Alembic.
 revision: str = "20260818_add_instance_url_to_user_oauth"
@@ -29,7 +28,7 @@ COLUMN_NAME = "instance_url"
 
 def upgrade() -> None:
     bind = op.get_bind()
-    inspector = Inspector.from_engine(bind)
+    inspector = sa.inspect(bind)
 
     if TABLE_NAME not in inspector.get_table_names():
         return
@@ -41,7 +40,7 @@ def upgrade() -> None:
 
 def downgrade() -> None:
     bind = op.get_bind()
-    inspector = Inspector.from_engine(bind)
+    inspector = sa.inspect(bind)
 
     if TABLE_NAME not in inspector.get_table_names():
         return

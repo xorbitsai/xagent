@@ -66,6 +66,18 @@ def test_request_uses_instance_url_and_headers(monkeypatch):
     )
 
 
+def test_request_rejects_path_traversal(monkeypatch):
+    mock_request = Mock()
+    monkeypatch.setattr(salesforce.requests, "request", mock_request)
+
+    with pytest.raises(ValueError):
+        salesforce._request(
+            "GET", "/services/data/v59.0/sobjects/../../../services/oauth2/token"
+        )
+
+    mock_request.assert_not_called()
+
+
 def test_request_raises_with_joined_array_error_messages(monkeypatch):
     monkeypatch.setattr(
         salesforce.requests,

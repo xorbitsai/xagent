@@ -364,7 +364,6 @@ class OpenRouterLLM(OpenAILLM):
     ) -> Dict[str, Any]:
         _ = tools, output_config
         updated_extra_body = dict(extra_body)
-        should_disable = False
 
         if thinking is not None:
             should_enable = thinking.get("type") == "enabled" or thinking.get(
@@ -374,9 +373,20 @@ class OpenRouterLLM(OpenAILLM):
                 thinking.get("type") == "disabled" or not thinking.get("enable", False)
             )
         elif is_streaming and response_format:
-            should_disable = self.supports_thinking_mode
+            should_disable = (
+                self.supports_thinking_mode or self._uses_deepseek_tool_protocol
+            )
             should_enable = False
         else:
+            # DeepSeek-served endpoints can default to thinking mode, and once a
+            # response carries reasoning_content they require it to be replayed
+            # verbatim on the next request of a tool-call chain — which this
+            # client does not do (#1537). Keep thinking off unless the caller
+            # asks for it, matching DeepSeekLLM's default. This deliberately
+            # ignores supports_thinking_mode: the blocker is the missing
+            # replay, not model capability, so a declared thinking_mode
+            # ability must not re-enable the failing default before #1537.
+            should_disable = self._uses_deepseek_tool_protocol
             should_enable = False
 
         if should_disable:

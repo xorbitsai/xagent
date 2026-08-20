@@ -5485,6 +5485,12 @@ def test_coerce_arguments_drops_unusable_control_tool_payloads() -> None:
         "input": [1, 2]
     }
 
+    # Blank payloads have nothing to preserve, whether the raw string is blank
+    # or the JSON literal of a blank string.
+    assert pattern._coerce_arguments("", tool_name="calculator") == {}
+    assert pattern._coerce_arguments('""', tool_name="calculator") == {}
+    assert pattern._coerce_arguments('"   "', tool_name="calculator") == {}
+
     # Control tools must not smuggle a malformed payload through as ``input``,
     # which would silently strip ``answer`` and finalize with nothing to show.
     assert pattern._coerce_arguments("not json", tool_name="final_answer") == {}
@@ -5857,3 +5863,271 @@ async def test_run_flags_missing_image_editing_and_renders_the_correction(
     rendered = llm.calls[0]["messages"][0]["content"]
     assert ("image editing is unavailable here" in rendered) is unavailable
     assert ("attach a reference through images" in rendered) is unavailable
+
+
+class NoArgToolLLM:
+    """Calls a parameterless tool with `arguments: ""`, then finishes.
+
+    Reproduces the provider shape behind xorbitsai/xagent#1501 on the streaming
+    path: a blank argument string must reach the tool as an empty call, not kill
+    the run.
+    """
+
+    def __init__(self) -> None:
+        self.stream_calls: list[dict[str, Any]] = []
+
+    async def chat(self, **kwargs: Any) -> Any:
+        raise AssertionError("this path should stay streaming")
+
+    async def stream_chat(
+        self, messages: list[dict[str, Any]] | None = None, **kwargs: Any
+    ) -> Any:
+        if messages is not None:
+            kwargs["messages"] = messages
+        self.stream_calls.append(kwargs)
+        if len(self.stream_calls) == 1:
+            yield StreamChunk(
+                type=ChunkType.TOOL_CALL,
+                tool_calls=[
+                    {
+                        "id": "call_list_0",
+                        "function": {"name": "list_models", "arguments": ""},
+                    }
+                ],
+            )
+        else:
+            yield StreamChunk(
+                type=ChunkType.TOOL_CALL,
+                tool_calls=[
+                    {
+                        "id": "call_final_0",
+                        "function": {
+                            "name": "final_answer",
+                            "arguments": (
+                                '{"response_language":"English",'
+                                '"answer":"gpt-4o","outcome":"completed"}'
+                            ),
+                        },
+                    }
+                ],
+            )
+        yield StreamChunk(type=ChunkType.END)
+
+
+class NoArgTool:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, Any]] = []
+
+        class Metadata:
+            name = "list_models"
+            description = "List available models."
+
+        self.metadata = Metadata()
+
+    def args_type(self) -> type[BaseModel]:
+        return EmptyArgs
+
+    async def run_json_async(self, args: dict[str, Any]) -> Any:
+        self.calls.append(args)
+        return {"models": ["gpt-4o"]}
+
+
+@pytest.mark.asyncio
+async def test_react_runs_a_parameterless_tool_called_with_blank_arguments() -> None:
+    """#1501 (a): a no-arg tool sent `""` executes instead of failing the run."""
+
+    llm = NoArgToolLLM()
+    pattern, context, runtime, _outbound, _tracer = _react_empty_final_answer_fixture()
+    tool = NoArgTool()
+
+    result = await pattern.run(
+        context=context,
+        tools=[tool, FakeTool()],
+        llm=llm,
+        runtime=runtime,
+    )
+
+    assert result["success"] is True
+    assert result["response"] == "gpt-4o"
+    assert tool.calls == [{}]
+
+
+@pytest.mark.asyncio
+async def test_react_repairs_final_answer_called_with_blank_arguments() -> None:
+    """Guards the `_empty_final_answer_call` repair retry, not `_fallback_arguments`.
+
+    `final_answer` is a control tool, so blank arguments are dropped by the
+    control-tool branch and never reach the blank-string branch this PR adds.
+    What is pinned here is that the resulting empty args still spend the one
+    repair retry instead of finalizing the run.
+    """
+
+    llm = StreamingEmptyFinalAnswerLLM(broken_arguments="")
+    pattern, context, runtime, outbound, tracer = _react_empty_final_answer_fixture()
+
+    result = await pattern.run(
+        context=context,
+        tools=[FakeTool()],
+        llm=llm,
+        runtime=runtime,
+    )
+
+    assert result["success"] is True
+    assert result["response"] == "The result is 4."
+    assert len(llm.stream_calls) == 2
+
+    retry_starts = [
+        event
+        for event in tracer.events
+        if event["event_type"] == "action_start_llm"
+        and event["data"].get("phase") == "empty_final_answer_recovery"
+    ]
+    assert len(retry_starts) == 1
+    assert outbound.events[-1]["content"] == "The result is 4."
+
+
+class BlankThenRecoverLLM:
+    """Calls a required-argument work tool with `""`, then recovers.
+
+    First turn: `calculator` with blank arguments. Second turn: a valid
+    `final_answer`. Pins what actually happens to a required-argument tool
+    handed `{}` — the tool fails internally and the error feeds back as a tool
+    result, not a dead run.
+    """
+
+    def __init__(self) -> None:
+        self.stream_calls: list[dict[str, Any]] = []
+
+    async def chat(self, **kwargs: Any) -> Any:
+        raise AssertionError("this path should stay streaming")
+
+    async def stream_chat(
+        self, messages: list[dict[str, Any]] | None = None, **kwargs: Any
+    ) -> Any:
+        if messages is not None:
+            kwargs["messages"] = messages
+        self.stream_calls.append(kwargs)
+        if len(self.stream_calls) == 1:
+            yield StreamChunk(
+                type=ChunkType.TOOL_CALL,
+                tool_calls=[
+                    {
+                        "id": "call_calc_0",
+                        "function": {"name": "calculator", "arguments": ""},
+                    }
+                ],
+            )
+        else:
+            yield StreamChunk(
+                type=ChunkType.TOOL_CALL,
+                tool_calls=[
+                    {
+                        "id": "call_final_0",
+                        "function": {
+                            "name": "final_answer",
+                            "arguments": (
+                                '{"response_language":"English",'
+                                '"answer":"The result is 4.","outcome":"completed"}'
+                            ),
+                        },
+                    }
+                ],
+            )
+        yield StreamChunk(type=ChunkType.END)
+
+
+@pytest.mark.asyncio
+async def test_react_survives_required_argument_tool_called_with_blank_arguments() -> (
+    None
+):
+    """#1501 (b): a required-argument work tool sent `""` receives `{}`, fails
+    inside the tool, and the error feeds back to the model instead of killing
+    the run."""
+
+    llm = BlankThenRecoverLLM()
+    pattern, context, runtime, _outbound, _tracer = _react_empty_final_answer_fixture()
+    tool = FakeTool()
+
+    result = await pattern.run(
+        context=context,
+        tools=[tool],
+        llm=llm,
+        runtime=runtime,
+    )
+
+    assert result["success"] is True
+    assert result["response"] == "The result is 4."
+    assert len(llm.stream_calls) == 2
+
+    # Discriminating assertion for react.py's blank-string fallback branch: the
+    # old code delivered {"input": ""} here, which would fail this equality.
+    assert tool.calls == [{}]
+
+    tool_results = [m for m in context.messages if m.role == "tool"]
+    assert len(tool_results) >= 1
+    first = tool_results[0]
+    assert first.tool_call_id == "call_calc_0"
+    assert "'success': False" in first.content
+
+
+@pytest.mark.asyncio
+async def test_blank_streaming_arguments_flow_from_adapter_into_react(mocker) -> None:
+    """The seam: a real `OpenAICompatibleLLM` stream carrying `arguments: ""`
+    drives a real ReAct loop and the parameterless tool executes."""
+
+    def sdk_chunk(tool_calls=None, finish_reason=None):
+        return SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    delta=SimpleNamespace(content=None, tool_calls=tool_calls),
+                    finish_reason=finish_reason,
+                )
+            ]
+        )
+
+    def sdk_tool_call(name, arguments):
+        return SimpleNamespace(
+            index=0,
+            id=f"call_{name}",
+            type="function",
+            function=SimpleNamespace(name=name, arguments=arguments),
+        )
+
+    async def first_stream():
+        yield sdk_chunk([sdk_tool_call("list_models", "")])
+        yield sdk_chunk(finish_reason="tool_calls")
+
+    async def second_stream():
+        yield sdk_chunk(
+            [
+                sdk_tool_call(
+                    "final_answer",
+                    '{"response_language":"English",'
+                    '"answer":"gpt-4o","outcome":"completed"}',
+                )
+            ]
+        )
+        yield sdk_chunk(finish_reason="tool_calls")
+
+    mock_client = mocker.AsyncMock()
+    mock_client.chat.completions.create.side_effect = [first_stream(), second_stream()]
+    mocker.patch(
+        "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+        return_value=mock_client,
+    )
+    from xagent.core.model.chat.basic.openai import OpenAILLM
+
+    llm = OpenAILLM(model_name="gpt-4o-mini", base_url=None, api_key="test-key")
+    pattern, context, runtime, _outbound, _tracer = _react_empty_final_answer_fixture()
+    tool = NoArgTool()
+
+    result = await pattern.run(
+        context=context,
+        tools=[tool, FakeTool()],
+        llm=llm,
+        runtime=runtime,
+    )
+
+    assert result["success"] is True
+    assert result["response"] == "gpt-4o"
+    assert tool.calls == [{}]

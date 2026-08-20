@@ -242,6 +242,11 @@ def _tool_call_violation(
         )
 
     arguments = function.get("arguments", {})
+    if isinstance(arguments, str) and not arguments.strip():
+        # Rebind the local for validation only. `function["arguments"]` keeps the
+        # raw blank string: normalizing it to `"{}"` would defeat pass-through
+        # and crash the auto/DAG paths on a syntactically valid empty plan.
+        arguments = {}
     argument_details: dict[str, Any] | None = None
     if isinstance(arguments, str):
         original_arguments = arguments

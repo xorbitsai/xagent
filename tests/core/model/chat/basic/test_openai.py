@@ -19,6 +19,26 @@ from xagent.core.retry.strategy import FixedDelay
 from xagent.core.retry.wrapper import create_retry_wrapper
 
 
+def _stream_chunk(tool_calls=None, finish_reason=None):
+    return SimpleNamespace(
+        choices=[
+            SimpleNamespace(
+                delta=SimpleNamespace(content=None, tool_calls=tool_calls),
+                finish_reason=finish_reason,
+            )
+        ]
+    )
+
+
+def _tool_call_delta(index, call_id, name, arguments, call_type="function"):
+    return SimpleNamespace(
+        index=index,
+        id=call_id,
+        type=call_type,
+        function=SimpleNamespace(name=name, arguments=arguments),
+    )
+
+
 class TestOpenAILLM:
     """Test cases for OpenAI LLM implementation."""
 
@@ -203,30 +223,12 @@ class TestOpenAILLM:
     def test_parse_stream_chunk_ignores_empty_idless_tool_call_placeholder(self, llm):
         """Some OpenAI-compatible providers emit empty id-less tool-call slots."""
 
-        def chunk(tool_calls=None, finish_reason=None):
-            return SimpleNamespace(
-                choices=[
-                    SimpleNamespace(
-                        delta=SimpleNamespace(content=None, tool_calls=tool_calls),
-                        finish_reason=finish_reason,
-                    )
-                ]
-            )
-
-        def tool_call(index, call_id, name, arguments, call_type="function"):
-            return SimpleNamespace(
-                index=index,
-                id=call_id,
-                type=call_type,
-                function=SimpleNamespace(name=name, arguments=arguments),
-            )
-
         accumulated_tool_calls = {}
 
         llm._parse_stream_chunk(
-            chunk(
+            _stream_chunk(
                 [
-                    tool_call(
+                    _tool_call_delta(
                         0,
                         "call_sum",
                         "mcp_everything_mcp_get_sum",
@@ -237,9 +239,9 @@ class TestOpenAILLM:
             accumulated_tool_calls,
         )
         llm._parse_stream_chunk(
-            chunk(
+            _stream_chunk(
                 [
-                    tool_call(
+                    _tool_call_delta(
                         1,
                         "call_long",
                         "mcp_everything_mcp_trigger_long_running_operation",
@@ -250,12 +252,12 @@ class TestOpenAILLM:
             accumulated_tool_calls,
         )
         llm._parse_stream_chunk(
-            chunk([tool_call(2, None, "", "", None)]),
+            _stream_chunk([_tool_call_delta(2, None, "", "", None)]),
             accumulated_tool_calls,
         )
 
         final_chunk = llm._parse_stream_chunk(
-            chunk(finish_reason="tool_calls"),
+            _stream_chunk(finish_reason="tool_calls"),
             accumulated_tool_calls,
         )
 
@@ -1210,3 +1212,69 @@ class TestOpenAILLM:
         assert "response_format" in call_args.kwargs
         assert call_args.kwargs["response_format"]["type"] == "json_schema"
         assert "json_schema" in call_args.kwargs["response_format"]
+
+    @pytest.mark.parametrize(
+        ("empty_arguments", "expected"),
+        [("", ""), ("   ", "   "), (None, "")],
+    )
+    @pytest.mark.parametrize("method", ["chat", "vision_chat"])
+    @pytest.mark.asyncio
+    async def test_empty_tool_arguments_are_not_fatal(
+        self,
+        openai_llm_config,
+        mock_tool_call_completion,
+        mocker,
+        method,
+        empty_arguments,
+        expected,
+    ):
+        """Providers send `""` for parameterless calls; patterns repair the rest.
+
+        Passed through rather than normalized to `"{}"`: the blank string is
+        what auto's and the DAG plan generator's retry paths key on. `None`
+        coerces to `""`; whitespace-only passes through unchanged.
+        """
+        llm = OpenAILLM(**openai_llm_config, abilities=["chat", "vision"])
+        mock_tool_call_completion.choices[0].message.tool_calls[
+            0
+        ].function.arguments = empty_arguments
+
+        mock_client = mocker.AsyncMock()
+        mock_client.chat.completions.create.return_value = mock_tool_call_completion
+        mocker.patch(
+            "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+            return_value=mock_client,
+        )
+
+        response = await getattr(llm, method)([{"role": "user", "content": "hi"}])
+
+        assert response["type"] == "tool_call"
+        assert response["tool_calls"][0]["function"]["arguments"] == expected
+
+    @pytest.mark.parametrize(
+        ("empty_arguments", "expected"),
+        [("", ""), ("   ", "   "), (None, "")],
+    )
+    def test_parse_stream_chunk_passes_empty_tool_arguments_through(
+        self, llm, empty_arguments, expected
+    ):
+        """Same on the streaming finish-reason path; `None` accumulates as `""`."""
+        accumulated_tool_calls = {}
+        llm._parse_stream_chunk(
+            _stream_chunk(
+                [
+                    _tool_call_delta(
+                        0, "call_empty", "list_image_models", empty_arguments
+                    )
+                ]
+            ),
+            accumulated_tool_calls,
+        )
+
+        final_chunk = llm._parse_stream_chunk(
+            _stream_chunk(finish_reason="tool_calls"),
+            accumulated_tool_calls,
+        )
+
+        assert final_chunk is not None
+        assert final_chunk.tool_calls[0]["function"]["arguments"] == expected

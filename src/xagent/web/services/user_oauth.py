@@ -139,7 +139,9 @@ def delete_scoped_user_oauth_accounts(
     owner namespace, an empty sequence deletes nothing, and a non-empty
     sequence deletes only those providers. Requiring the argument prevents an
     omitted filter from silently becoming a delete-all operation. Transaction
-    ownership remains with the caller; this function never commits.
+    ownership remains with the caller; this function never commits. Callers
+    must not retain matching identity-mapped rows because the bulk delete does
+    not synchronize those in-memory objects.
     """
     query = scoped_user_oauth_query(
         db,

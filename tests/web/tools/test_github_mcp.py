@@ -1,4 +1,5 @@
 import base64
+import itertools
 import json
 from unittest.mock import Mock
 
@@ -368,6 +369,146 @@ def test_request_raw_does_not_retry_429_with_excessive_retry_after(monkeypatch):
     sleep_mock.assert_not_called()
 
 
+def test_request_raw_retries_get_once_on_403_with_retry_after(monkeypatch):
+    """GitHub's secondary/abuse-detection rate limit answers 403, not 429,
+    and commonly carries Retry-After -- this must retry the same as a 429
+    would, not fail fast as a permission error."""
+    mock_request = Mock(
+        side_effect=[
+            MockResponse(
+                json_data={"message": "secondary rate limit"},
+                status_code=403,
+                headers={"Retry-After": "1"},
+            ),
+            MockResponse(json_data={"ok": True}, status_code=200),
+        ]
+    )
+    monkeypatch.setattr(github.requests, "request", mock_request)
+    sleep_mock = Mock()
+    monkeypatch.setattr(github, "_sleep", sleep_mock)
+
+    response = github._request_raw("GET", "/repos/octocat/Hello-World")
+
+    assert response.status_code == 200
+    assert mock_request.call_count == 2
+    sleep_mock.assert_called_once_with(1)
+
+
+def test_request_raw_retries_get_once_on_403_with_exhausted_rate_limit(monkeypatch):
+    """GitHub's primary rate limit (quota exhausted) also answers 403, but
+    usually without Retry-After -- only X-RateLimit-Remaining: 0 and an
+    X-RateLimit-Reset epoch timestamp. The wait must be derived from that
+    reset time instead of being skipped for lack of Retry-After."""
+    mock_request = Mock(
+        side_effect=[
+            MockResponse(
+                json_data={"message": "rate limit exceeded"},
+                status_code=403,
+                headers={"X-RateLimit-Remaining": "0", "X-RateLimit-Reset": "1000"},
+            ),
+            MockResponse(json_data={"ok": True}, status_code=200),
+        ]
+    )
+    monkeypatch.setattr(github.requests, "request", mock_request)
+    sleep_mock = Mock()
+    monkeypatch.setattr(github, "_sleep", sleep_mock)
+    monkeypatch.setattr(github, "_wall_clock", lambda: 995.0)
+
+    response = github._request_raw("GET", "/repos/octocat/Hello-World")
+
+    assert response.status_code == 200
+    assert mock_request.call_count == 2
+    sleep_mock.assert_called_once_with(5)
+
+
+def test_request_raw_does_not_retry_403_with_reset_beyond_bound(monkeypatch):
+    """A primary rate limit whose reset is minutes/hours away (the common
+    case for a fully exhausted quota) must fail fast, not sleep for it --
+    same MAX_RETRY_AFTER_SECONDS bound as Retry-After already enforces."""
+    mock_request = Mock(
+        return_value=MockResponse(
+            json_data={"message": "rate limit exceeded"},
+            status_code=403,
+            headers={
+                "X-RateLimit-Remaining": "0",
+                "X-RateLimit-Reset": str(1000 + github.MAX_RETRY_AFTER_SECONDS + 1),
+            },
+        )
+    )
+    monkeypatch.setattr(github.requests, "request", mock_request)
+    sleep_mock = Mock()
+    monkeypatch.setattr(github, "_sleep", sleep_mock)
+    monkeypatch.setattr(github, "_wall_clock", lambda: 1000.0)
+
+    with pytest.raises(RuntimeError, match="rate limit exceeded"):
+        github._request_raw("GET", "/repos/octocat/Hello-World")
+
+    assert mock_request.call_count == 1
+    sleep_mock.assert_not_called()
+
+
+def test_request_raw_does_not_retry_a_genuine_permission_denied_403(monkeypatch):
+    """A real permission-denied 403 carries neither Retry-After nor
+    X-RateLimit-Remaining: 0 -- it must fail immediately, not be retried
+    into the same denial."""
+    mock_request = Mock(
+        return_value=MockResponse(
+            json_data={"message": "Must have admin rights to Repository."},
+            status_code=403,
+        )
+    )
+    monkeypatch.setattr(github.requests, "request", mock_request)
+    sleep_mock = Mock()
+    monkeypatch.setattr(github, "_sleep", sleep_mock)
+
+    with pytest.raises(RuntimeError, match="Must have admin rights"):
+        github._request_raw("GET", "/repos/octocat/Hello-World")
+
+    assert mock_request.call_count == 1
+    sleep_mock.assert_not_called()
+
+
+def test_request_raw_does_not_retry_403_on_write(monkeypatch):
+    mock_request = Mock(
+        return_value=MockResponse(
+            json_data={"message": "rate limited"},
+            status_code=403,
+            headers={"Retry-After": "1"},
+        )
+    )
+    monkeypatch.setattr(github.requests, "request", mock_request)
+    sleep_mock = Mock()
+    monkeypatch.setattr(github, "_sleep", sleep_mock)
+
+    with pytest.raises(RuntimeError, match="rate limited"):
+        github._request_raw("POST", "/repos/octocat/Hello-World/issues")
+
+    assert mock_request.call_count == 1
+    sleep_mock.assert_not_called()
+
+
+def test_request_raw_allow_retry_false_skips_403_retry(monkeypatch):
+    """Same reasoning as the 429 case just below: a caller running its own
+    wall-clock budget (github_list_issues) must not have this rate-limit
+    retry's sleep run invisibly inside a single call."""
+    mock_request = Mock(
+        return_value=MockResponse(
+            json_data={"message": "rate limited"},
+            status_code=403,
+            headers={"Retry-After": "1"},
+        )
+    )
+    monkeypatch.setattr(github.requests, "request", mock_request)
+    sleep_mock = Mock()
+    monkeypatch.setattr(github, "_sleep", sleep_mock)
+
+    with pytest.raises(RuntimeError, match="rate limited"):
+        github._request_raw("GET", "/repos/octocat/Hello-World", allow_retry=False)
+
+    assert mock_request.call_count == 1
+    sleep_mock.assert_not_called()
+
+
 def test_request_raw_allow_retry_false_skips_429_retry(monkeypatch):
     """github_list_issues opts out of the retry: its sleep + second attempt
     run inside _request_raw, invisible to the caller's aggregate deadline,
@@ -444,6 +585,15 @@ def test_clamp_limit_boundaries(limit, expected):
 
 def test_clamp_limit_uses_the_caller_supplied_default():
     assert github._clamp_limit("not-a-number", default=20) == 20
+
+
+def test_validate_positive_number_rejects_none_with_named_error():
+    """int(None) raises a bare, unnamed TypeError -- this must still surface
+    as the function's own named ValueError like every other rejection here,
+    not leak the raw builtin exception (only reachable via a direct Python
+    call, since FastMCP's schema would reject a missing/null argument first)."""
+    with pytest.raises(ValueError, match="issue_number must be a positive integer"):
+        github._validate_positive_number(None, field="issue_number")
 
 
 def test_search_repositories_falls_back_to_its_own_documented_default(monkeypatch):
@@ -1291,7 +1441,12 @@ def test_list_issues_stops_when_aggregate_time_budget_is_exceeded(monkeypatch):
     )
     # Call order: deadline baseline, page 1's request-timeout calc (still
     # within budget), page 2's pre-request budget check (already exhausted).
-    clock = iter([0.0, 0.0, github.MAX_ISSUE_LIST_SECONDS + 1])
+    # Repeats the last value forever rather than a fixed-length iter, so an
+    # unrelated code change adding one more clock read fails on its own
+    # assertion instead of a StopIteration from this test's plumbing.
+    clock = itertools.chain(
+        [0.0, 0.0], itertools.repeat(github.MAX_ISSUE_LIST_SECONDS + 1)
+    )
     monkeypatch.setattr(github, "_monotonic", lambda: next(clock))
 
     result = json.loads(github.github_list_issues("octocat/Hello-World", limit=5))
@@ -1324,8 +1479,11 @@ def test_list_issues_caps_request_timeout_to_remaining_budget(monkeypatch):
     monkeypatch.setattr(github.requests, "request", mock_request)
     # Call order: deadline baseline, page 1's request-timeout calc, page 2's
     # pre-request budget check, page 2's request-timeout calc (5s left).
-    clock = iter(
-        [0.0, 0.0, github.MAX_ISSUE_LIST_SECONDS - 5, github.MAX_ISSUE_LIST_SECONDS - 5]
+    # Repeats the last value forever rather than a fixed-length iter, so an
+    # unrelated code change adding one more clock read fails on its own
+    # assertion instead of a StopIteration from this test's plumbing.
+    clock = itertools.chain(
+        [0.0, 0.0], itertools.repeat(github.MAX_ISSUE_LIST_SECONDS - 5)
     )
     monkeypatch.setattr(github, "_monotonic", lambda: next(clock))
 
@@ -2695,6 +2853,8 @@ def test_tool_returns_error_payload_on_missing_token(monkeypatch):
         lambda: github.github_list_commits("octocat/Hello-World"),
         lambda: github.github_search_code("def parse"),
         lambda: github.github_search_repositories("stars:>1"),
+        lambda: github.github_get_file_contents("octocat/Hello-World", "README.md"),
+        lambda: github.github_list_issues("octocat/Hello-World"),
     ],
     ids=[
         "get_repository",
@@ -2705,10 +2865,12 @@ def test_tool_returns_error_payload_on_missing_token(monkeypatch):
         "list_commits",
         "search_code",
         "search_repositories",
+        "get_file_contents",
+        "list_issues",
     ],
 )
 def test_tool_wrapper_surfaces_error_response(monkeypatch, call):
-    """Each of these 8 tools previously had no test driving a GitHub error
+    """Each of these 10 tools previously had no test driving a GitHub error
     response through the tool wrapper itself (only through the shared
     _request/_request_raw helpers directly) -- pin that every one reports
     status: "error" with the upstream message, not an unhandled exception

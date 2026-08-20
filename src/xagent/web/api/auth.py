@@ -1657,9 +1657,41 @@ def generic_oauth_callback(
         token_response = requests.post(
             token_url, headers=headers, timeout=10.0, auth=auth, **post_kwargs
         )
-        token_data = token_response.json()
+        try:
+            token_data = token_response.json()
+        except ValueError:
+            # The Accept-header quirk above only pushes providers toward a
+            # JSON body -- it doesn't guarantee one (a proxy stripping the
+            # header, a misconfigured enterprise server). Without this, a
+            # non-JSON body reaches the outer handler as a bare
+            # JSONDecodeError instead of the same clear, actionable message
+            # every other failure branch in this callback gives.
+            logger.warning(
+                "OAuth token exchange for provider=%s returned a non-JSON "
+                "response (status %s)",
+                provider,
+                token_response.status_code,
+            )
+            return HTMLResponse(
+                content=(
+                    "<h1>Error exchanging token</h1>"
+                    f"<p>{html.escape(provider)} returned a response that "
+                    "could not be parsed.</p>"
+                ),
+                status_code=400,
+            )
 
         if "error" in token_data:
+            # The response to the browser is deliberately trimmed to the
+            # allowlisted error/error_description fields (see
+            # _bounded_oauth_error_message's docstring) -- log the full
+            # payload server-side so a provider's other diagnostic fields
+            # aren't lost entirely, just relocated out of the page.
+            logger.warning(
+                "OAuth token exchange failed for provider=%s: %s",
+                provider,
+                token_data,
+            )
             return HTMLResponse(
                 content=(
                     "<h1>Error exchanging token</h1>"
@@ -1682,6 +1714,11 @@ def generic_oauth_callback(
             # UserOAuth.access_token's NOT NULL constraint, and surface as a
             # raw SQLAlchemy IntegrityError message through the generic
             # exception handler instead of a clear, actionable error.
+            logger.warning(
+                "OAuth token exchange for provider=%s returned no access_token: %s",
+                provider,
+                token_data,
+            )
             message = f"{html.escape(provider)} did not return an access token."
             detail = _extract_provider_error_message(token_data)
             if detail:
@@ -1868,10 +1905,19 @@ def generic_oauth_callback(
         </html>
         """
         )
-    except Exception as e:
+    except Exception:
+        # str(e) is not rendered to the client: db.add(oauth_account)/db.commit()
+        # above persist the just-obtained access/refresh token as bound SQL
+        # parameters, and hide_parameters isn't configured anywhere in this
+        # codebase, so a SQLAlchemy StatementError's default __str__ includes
+        # those bound values -- a DB error here (constraint violation,
+        # connection drop, oversized field) would otherwise echo the plaintext
+        # token back to the browser in this 500 response. logger.exception
+        # still captures it server-side for debugging.
         logger.exception("Generic OAuth callback failed")
         return HTMLResponse(
-            content=f"<h1>Authentication Failed</h1><p>{html.escape(str(e))}</p>",
+            content="<h1>Authentication Failed</h1><p>An unexpected error occurred "
+            "while connecting this account. Please try again.</p>",
             status_code=500,
         )
 

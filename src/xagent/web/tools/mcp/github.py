@@ -37,23 +37,27 @@ MAX_ISSUE_PAGES = 10
 # PR-heavy repo could otherwise hold one tool call for up to
 # MAX_ISSUE_PAGES * DEFAULT_TIMEOUT_SECONDS (5 minutes) before returning.
 MAX_ISSUE_LIST_SECONDS = 60
-# Bounded 429 retry for idempotent reads -- same wait-and-retry shape as
-# jira.py/slack.py/intercom.py's own copies (a single wait on a small
+# Bounded rate-limit retry for idempotent reads -- same wait-and-retry shape
+# as jira.py/slack.py/intercom.py's own copies (a single wait on a small
 # Retry-After), but not an exact mirror: this one is GET-only, opt-out via
-# allow_retry, and folds rate-limit headers into the raised message, none
-# of which the siblings do. Never retries writes (POST could double-apply
-# a mutation if the original request actually reached the server before
-# being rate-limited).
+# allow_retry, also fires on GitHub's 403-shaped rate limits (not just 429),
+# and folds rate-limit headers into the raised message, none of which the
+# siblings do. Never retries writes (POST could double-apply a mutation if
+# the original request actually reached the server before being rate-limited).
 MAX_RETRY_AFTER_SECONDS = 30
 
-# Module-local bindings, rather than calling time.monotonic()/time.sleep()
-# directly at each call site, so tests can monkeypatch just this connector's
-# clock (monkeypatch.setattr(github, "_monotonic"/"_sleep", ...)) instead of
-# the singleton stdlib time module, which would otherwise leak the fake
-# clock/no-op sleep into unrelated code running in the same process for the
-# duration of the test.
+# Module-local bindings, rather than calling time.monotonic()/time.sleep()/
+# time.time() directly at each call site, so tests can monkeypatch just this
+# connector's clock (monkeypatch.setattr(github, "_monotonic"/"_sleep"/
+# "_wall_clock", ...)) instead of the singleton stdlib time module, which
+# would otherwise leak the fake clock/no-op sleep into unrelated code running
+# in the same process for the duration of the test. _wall_clock (epoch
+# seconds) is distinct from _monotonic (elapsed seconds, no fixed epoch): it
+# exists only to diff against GitHub's X-RateLimit-Reset, itself an epoch
+# timestamp.
 _monotonic = time.monotonic
 _sleep = time.sleep
+_wall_clock = time.time
 
 _FORBIDDEN_REPO_CHARS = re.compile(r"[/?#]")
 
@@ -228,9 +232,18 @@ def _validate_positive_number(value: int, *, field: str) -> int:
     validation entirely, so 0/negative values would otherwise reach
     `/issues/0` or `/pulls/-1` unchecked.
     """
-    if int(value) < 1:
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        # int(None) raises a bare, unnamed TypeError -- every other
+        # rejection in this function names the field, so this must too
+        # rather than leaking a raw builtin exception.
+        raise ValueError(
+            f"{field} must be a positive integer, got: {value!r}"
+        ) from None
+    if number < 1:
         raise ValueError(f"{field} must be a positive integer, got: {value!r}")
-    return int(value)
+    return number
 
 
 def _require_nonblank(value: str, *, field: str) -> str:
@@ -313,12 +326,13 @@ def _request_raw(
     raised message, along with any rate-limit/retry headers present, rather
     than surfaced as a bare HTTP status.
 
-    allow_retry=False opts out of the bounded 429 retry below. A caller
-    running under its own wall-clock budget (github_list_issues) must pass
-    False: the retry's sleep + second attempt happen inside this call, so
-    they are invisible to any deadline the caller computed its `timeout`
-    from -- a 429 near that deadline would otherwise hold the call up to
-    `timeout + MAX_RETRY_AFTER_SECONDS + timeout` and blow the budget the
+    allow_retry=False opts out of the bounded rate-limit retry below (429,
+    or a 403 carrying a rate-limit header -- see is_rate_limited_403). A
+    caller running under its own wall-clock budget (github_list_issues) must
+    pass False: the retry's sleep + second attempt happen inside this call,
+    so they are invisible to any deadline the caller computed its `timeout`
+    from -- a rate limit near that deadline would otherwise hold the call up
+    to `timeout + MAX_RETRY_AFTER_SECONDS + timeout` and blow the budget the
     caller's timeout-capping exists to enforce.
     """
     for attempt in (0, 1):
@@ -330,13 +344,24 @@ def _request_raw(
             json=json_data,
             timeout=timeout,
         )
-        # Retry once, only for reads: a POST/PATCH/DELETE rejected with 429
-        # never reached GitHub's mutation logic, but replaying it anyway
-        # risks a double-apply if that assumption is ever wrong for some
-        # endpoint -- reads have no such risk.
+        # GitHub answers both its primary rate limit (quota exhausted) and
+        # secondary/abuse-detection limit with 403, not 429 -- a plain
+        # `status_code == 429` check never catches the common real-world
+        # rate-limit case. Only treat a 403 as a rate limit, never a retry
+        # trigger, when it carries a rate-limit-specific header; a genuine
+        # permission-denied 403 carries neither and must keep failing fast
+        # rather than being retried into the same denial.
+        is_rate_limited_403 = response.status_code == 403 and (
+            response.headers.get("Retry-After") is not None
+            or response.headers.get("X-RateLimit-Remaining") == "0"
+        )
+        # Retry once, only for reads: a POST/PATCH/DELETE rejected with a
+        # rate limit never reached GitHub's mutation logic, but replaying it
+        # anyway risks a double-apply if that assumption is ever wrong for
+        # some endpoint -- reads have no such risk.
         if (
             allow_retry
-            and response.status_code == 429
+            and (response.status_code == 429 or is_rate_limited_403)
             and attempt == 0
             and method.upper() == "GET"
         ):
@@ -344,6 +369,22 @@ def _request_raw(
                 retry_after_seconds = int(response.headers.get("Retry-After", "0"))
             except ValueError:
                 retry_after_seconds = 0
+            if retry_after_seconds <= 0:
+                # No Retry-After (GitHub's primary-limit 403 usually omits
+                # it, using X-RateLimit-Reset -- an epoch timestamp --
+                # instead): derive a wait from that instead of skipping the
+                # retry outright. The MAX_RETRY_AFTER_SECONDS bound below
+                # still applies, so a reset that's minutes/hours away (the
+                # common case for a fully exhausted primary quota) falls
+                # through to the normal error rather than sleeping for it.
+                reset_header = response.headers.get("X-RateLimit-Reset")
+                if reset_header:
+                    try:
+                        retry_after_seconds = max(
+                            0, int(reset_header) - int(_wall_clock())
+                        )
+                    except ValueError:
+                        retry_after_seconds = 0
             if 0 < retry_after_seconds <= MAX_RETRY_AFTER_SECONDS:
                 _sleep(retry_after_seconds)
                 continue

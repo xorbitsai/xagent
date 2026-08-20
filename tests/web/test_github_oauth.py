@@ -489,6 +489,76 @@ def test_github_callback_bounds_token_exchange_error_response(db_session, monkey
     assert "<script>" not in body
 
 
+def test_github_callback_rejects_non_json_token_response(db_session, monkeypatch):
+    """The Accept-header quirk pushes GitHub toward a JSON body but doesn't
+    guarantee one -- a non-JSON response (e.g. a proxy stripping the header)
+    must surface the same clean, actionable error every other failure branch
+    here gives, not a bare JSONDecodeError from an unguarded .json() call."""
+    db, user = db_session
+    state = create_access_token(
+        data={
+            "type": "oauth_state",
+            "user_id": user.id,
+            "provider": "github",
+            "app_id": "github",
+        },
+        expires_delta=timedelta(minutes=10),
+    )
+    request = SimpleNamespace(query_params={"code": "bad-code", "state": state})
+    non_json_response = Mock(status_code=200)
+    non_json_response.json.side_effect = ValueError("Expecting value")
+    monkeypatch.setattr(auth_api.requests, "post", Mock(return_value=non_json_response))
+
+    response = generic_oauth_callback("github", request, db, _github_provider())
+
+    assert response.status_code == 400
+    body = response.body.decode()
+    assert "could not be parsed" in body
+    assert "Expecting value" not in body
+
+
+def test_github_callback_does_not_leak_token_on_db_commit_failure(
+    db_session, monkeypatch
+):
+    """A DB error while persisting the OAuth account must not echo the
+    just-obtained access_token back to the browser: SQLAlchemy's default
+    StatementError.__str__ includes bound parameters (hide_parameters isn't
+    configured anywhere in this codebase), and the outer exception handler
+    used to render str(e) -- and therefore the token -- directly into the
+    500 response."""
+    db, user = db_session
+    state = create_access_token(
+        data={
+            "type": "oauth_state",
+            "user_id": user.id,
+            "provider": "github",
+            "app_id": "github",
+        },
+        expires_delta=timedelta(minutes=10),
+    )
+    request = SimpleNamespace(query_params={"code": "good-code", "state": state})
+    monkeypatch.setattr(
+        auth_api.requests,
+        "post",
+        Mock(return_value=MockResponse({"access_token": "secret-token-xyz"})),
+    )
+
+    def failing_commit():
+        raise RuntimeError(
+            "(psycopg2.errors.UniqueViolation) duplicate key value "
+            "[parameters: {'access_token': 'secret-token-xyz'}]"
+        )
+
+    monkeypatch.setattr(db, "commit", failing_commit)
+
+    response = generic_oauth_callback("github", request, db, _github_provider())
+
+    assert response.status_code == 500
+    body = response.body.decode()
+    assert "secret-token-xyz" not in body
+    assert "Authentication Failed" in body
+
+
 def test_non_github_callback_omits_accept_json_header(db_session, monkeypatch):
     """Guard the branch condition: a non-github provider must be unaffected by
     the GitHub-specific Accept header."""
@@ -618,6 +688,73 @@ async def test_github_expired_token_refresh_sends_accept_json_header(
         "client_id": "github-client-id",
         "client_secret": "github-client-secret",
     }
+
+
+@pytest.mark.asyncio
+async def test_github_refresh_falls_back_to_env_credentials(db_session, monkeypatch):
+    """The connect path already falls back to GITHUB_CLIENT_ID/SECRET when
+    the DB row is blank (e.g. a migration that seeded the row before the
+    app's env was fully populated) -- the refresh path used to read only
+    the DB row, so connect would work but every refresh would fail this
+    credential check instead of using the same fallback."""
+    db, user = db_session
+    db.add(
+        OAuthProvider(
+            provider_name="github",
+            name="GitHub",
+            client_id="",
+            client_secret="",
+            auth_url="https://github.com/login/oauth/authorize",
+            token_url="https://github.com/login/oauth/access_token",
+            redirect_uri="https://app.example.com/api/auth/github/callback",
+            userinfo_url="https://api.github.com/user",
+            user_id_path="id",
+            email_path="login",
+            default_scopes=["read:user"],
+        )
+    )
+    oauth_account = UserOAuth(
+        user_id=user.id,
+        provider="github",
+        access_token="old-token",
+        refresh_token="old-refresh",
+        expires_at=datetime.now(timezone.utc) - timedelta(minutes=1),
+        provider_user_id="42",
+    )
+    db.add(oauth_account)
+    db.commit()
+
+    monkeypatch.setenv("GITHUB_CLIENT_ID", "env-client-id")
+    monkeypatch.setenv("GITHUB_CLIENT_SECRET", "env-client-secret")
+
+    captured_requests = []
+
+    class FakeAsyncClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return None
+
+        async def post(self, url, **kwargs):
+            captured_requests.append((url, kwargs))
+            return MockResponse(
+                {"access_token": "new-token", "token_type": "bearer"},
+                status_code=200,
+            )
+
+    monkeypatch.setattr(tool_config.httpx, "AsyncClient", FakeAsyncClient)
+
+    assert (
+        await tool_config.refresh_oauth_token_if_needed(db, oauth_account, "github")
+        is True
+    )
+
+    assert oauth_account.access_token == "new-token"
+    assert len(captured_requests) == 1
+    _, kwargs = captured_requests[0]
+    assert kwargs["data"]["client_id"] == "env-client-id"
+    assert kwargs["data"]["client_secret"] == "env-client-secret"
 
 
 @pytest.mark.asyncio

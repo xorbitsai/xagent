@@ -26,28 +26,12 @@ MAX_LIMIT = 100
 # rate-limited request returns HTTP 400 with a RATELIMITED code inside
 # errors[].extensions, and reset info in the X-RateLimit-Requests-Reset
 # header (UTC epoch milliseconds). On that signal we wait once and retry
-# rather than failing outright -- pagination here can fire up to
-# MAX_ISSUE_SEARCH_PAGES/MAX_USER_SEARCH_PAGES sequential requests per tool
-# call, making a transient rate limit far more likely to surface mid-fetch
-# than in a single-request tool.
+# rather than failing outright.
 MAX_RETRY_AFTER_SECONDS = 30
 # Matches zoom.py's convention: an error body that isn't the expected
 # {"errors": [...]} GraphQL shape (e.g. an HTML gateway error page) must not
 # be forwarded to the LLM/logs verbatim and unbounded.
 MAX_ERROR_RESPONSE_TEXT_CHARS = 1000
-# Bounded multi-page fetch for a client-side text filter (linear_search_issues'
-# title match, since Linear's API has no server-side title filter) --
-# mirrors slack.py's/aws.py's MAX_PAGES precedent: a single MAX_LIMIT-sized
-# page can undercount real matches that live further out.
-MAX_ISSUE_SEARCH_PAGES = 10
-# Workspaces typically have far fewer members than a repository has issues,
-# so linear_search_users gets a smaller cap for the same bounded-fetch reason.
-MAX_USER_SEARCH_PAGES = 5
-# Neither issues(...) nor users(...) below sets an explicit orderBy -- per
-# Linear's docs, that defaults to createdAt, which is immutable and
-# monotonically increasing, so paginating via after: endCursor across
-# multiple requests can't duplicate or skip rows even if new ones are
-# created mid-scan.
 
 _UUID_PATTERN = re.compile(
     r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
@@ -397,78 +381,43 @@ def linear_search_users(query: str = "", limit: int = 20) -> str:
     member.
     """
     try:
-        needle = query.strip().lower()
+        needle = query.strip()
         max_matches = _clamp_limit(limit)
-        matches: list[dict[str, Any]] = []
-        cursor: str | None = None
-        has_next_page = False
-        all_errors: list[Any] = []
-        pages_scanned = 0
-        # Linear's API has no server-side name/email filter, so a match
-        # beyond the first MAX_LIMIT-sized page would otherwise be silently
-        # missed -- keep paging (bounded) until enough matches are found or
-        # the server genuinely runs out of pages.
-        for _ in range(MAX_USER_SEARCH_PAGES):
-            try:
-                data, errors = _graphql(
-                    "query($first: Int!, $after: String) { users(first: $first,"
-                    " after: $after) { nodes { id name email active }"
-                    " pageInfo { hasNextPage endCursor } } }",
-                    {"first": MAX_LIMIT, "after": cursor},
-                )
-            except Exception as page_exc:
-                if not pages_scanned:
-                    raise
-                # A mid-pagination failure must not discard matches already
-                # collected -- return the partial list with a marker
-                # instead, mirroring slack_list_channels.
-                logger.warning(
-                    f"Linear user search pagination stopped early: {page_exc}"
-                )
-                return _success(
-                    users=matches[:max_matches],
-                    truncated=True,
-                    error=str(page_exc),
-                    _errors=all_errors,
-                )
-            pages_scanned += 1
-            all_errors.extend(errors)
-            users_data = data.get("users") or {}
-            raw_page = users_data.get("nodes") or []
-            page_info = users_data.get("pageInfo") or {}
-            has_next_page = bool(page_info.get("hasNextPage"))
-            cursor = page_info.get("endCursor")
-            if needle:
-                matches.extend(
-                    user
-                    for user in raw_page
-                    if needle in str(user.get("name") or "").lower()
-                    or needle in str(user.get("email") or "").lower()
-                )
-            else:
-                matches.extend(raw_page)
-            if len(matches) >= max_matches or not has_next_page:
-                break
-            if not cursor:
-                # hasNextPage is true but Linear gave no cursor to continue
-                # from -- refetching without one would just re-request page
-                # 1 and duplicate nodes, so stop instead of looping forever.
-                break
-        truncated = has_next_page or len(matches) > max_matches
-        return _success(
-            users=matches[:max_matches], truncated=truncated, _errors=all_errors
+        variables: dict[str, Any] = {"first": max_matches}
+        filter_clause = ""
+        if needle:
+            # UserFilter.name/email are StringComparators supporting
+            # containsIgnoreCase, and UserFilter.or combines sub-filters --
+            # confirmed against Linear's own GraphQL schema. Matching name
+            # OR email server-side means the result is complete up to
+            # max_matches, no client-side scanning or bounded page cap
+            # needed.
+            filter_clause = (
+                ", filter: { or: [{ name: { containsIgnoreCase: $query } },"
+                " { email: { containsIgnoreCase: $query } }] }"
+            )
+            variables["query"] = needle
+        data, errors = _graphql(
+            f"query($first: Int!{', $query: String!' if needle else ''}) {{"
+            f" users(first: $first{filter_clause}) {{ nodes {{ id name email"
+            " active } pageInfo { hasNextPage } } }",
+            variables,
         )
+        users_data = data.get("users") or {}
+        users = users_data.get("nodes") or []
+        truncated = bool((users_data.get("pageInfo") or {}).get("hasNextPage"))
+        return _success(users=users, truncated=truncated, _errors=errors)
     except Exception as e:
         logger.error(f"Error searching Linear users for '{query}': {e}")
         return _error(str(e))
 
 
 # Used for the list/search path -- excludes the (potentially large,
-# unbounded) description body, since up to MAX_ISSUE_SEARCH_PAGES *
-# MAX_LIMIT issues can be fetched server-side to answer one search.
-# Mirrors hubspot.py's trimmed _FORM_SUMMARY_FIELDS/_EMAIL_SUMMARY_FIELDS
-# and intercom.py's bounded conversation "preview" for the same reason:
-# don't forward an unbounded body per list row to the LLM.
+# unbounded) description body, since up to MAX_LIMIT issues can be
+# returned per call. Mirrors hubspot.py's trimmed
+# _FORM_SUMMARY_FIELDS/_EMAIL_SUMMARY_FIELDS and intercom.py's bounded
+# conversation "preview" for the same reason: don't forward an unbounded
+# body per list row to the LLM.
 _ISSUE_SUMMARY_FIELDS = (
     "id identifier title priority url createdAt updatedAt"
     " state { id name type } assignee { id name email }"
@@ -491,13 +440,12 @@ def linear_search_issues(
     limit: int = 20,
 ) -> str:
     """
-    Search/list issues, optionally filtered by team, assignee, or workflow
-    state type.
-    query: optional case-insensitive substring matched against title (Linear
-    has no full-text filter on this field via the API, so this is applied
-    client-side — up to MAX_ISSUE_SEARCH_PAGES pages are fetched past a
-    page with no matches yet, so a match outside the first page isn't
-    missed, though a very large result set can still exhaust that bound).
+    Search/list issues, optionally filtered by team, assignee, workflow
+    state type, or a title substring.
+    query: optional case-insensitive substring matched against title,
+    filtered server-side (Linear's IssueFilter.title is a StringComparator
+    supporting containsIgnoreCase) — a match is never missed regardless of
+    how many issues exist beyond `limit`.
     Returned issues omit the full description body (use linear_get_issue
     for that) to avoid fetching an unbounded amount of text per result.
     team_id: optional team id/key from linear_list_teams.
@@ -524,6 +472,13 @@ def linear_search_issues(
         if state_type:
             filter_parts.append("state: { type: { eq: $stateType } }")
             variables["stateType"] = state_type
+        needle = query.strip()
+        if needle:
+            # IssueFilter.title is a StringComparator supporting
+            # containsIgnoreCase -- confirmed against Linear's own GraphQL
+            # schema (github.com/linear/linear packages/sdk/src/schema.graphql).
+            filter_parts.append("title: { containsIgnoreCase: $query }")
+            variables["query"] = needle
 
         filter_clause = ""
         filter_signature = ""
@@ -533,86 +488,25 @@ def linear_search_issues(
                 "teamId": "$teamId: ID!",
                 "assigneeId": "$assigneeId: ID!",
                 "stateType": "$stateType: String!",
+                "query": "$query: String!",
             }
             filter_signature = ", " + ", ".join(
                 type_signature[key] for key in variables
             )
 
-        max_results = _clamp_limit(limit)
-        needle = query.strip().lower()
+        variables["first"] = _clamp_limit(limit)
 
         graphql_query = (
-            f"query($first: Int!, $after: String{filter_signature}) {{"
-            f" issues(first: $first, after: $after{filter_clause}) {{"
+            f"query($first: Int!{filter_signature}) {{"
+            f" issues(first: $first{filter_clause}) {{"
             f" nodes {{ {_ISSUE_SUMMARY_FIELDS} }}"
-            " pageInfo { hasNextPage endCursor } } }"
+            " pageInfo { hasNextPage } } }"
         )
-
-        if not needle:
-            variables["first"] = max_results
-            variables["after"] = None
-            data, errors = _graphql(graphql_query, variables)
-            issues_data = data.get("issues") or {}
-            issues = issues_data.get("nodes") or []
-            has_next_page = bool((issues_data.get("pageInfo") or {}).get("hasNextPage"))
-            return _success(
-                issues=issues[:max_results], truncated=has_next_page, _errors=errors
-            )
-
-        # Linear's API has no server-side title filter, so a single
-        # MAX_LIMIT-sized page can undercount real matches that live
-        # further out -- keep paging (bounded) until enough matches are
-        # found or the server genuinely runs out of pages.
-        matches: list[dict[str, Any]] = []
-        cursor: str | None = None
-        has_next_page = False
-        all_errors: list[Any] = []
-        pages_scanned = 0
-        for _ in range(MAX_ISSUE_SEARCH_PAGES):
-            # A fresh dict per page, not a mutate-in-place reuse of
-            # `variables` -- each request's payload must stay independent
-            # of later loop iterations' state.
-            page_variables = {**variables, "first": MAX_LIMIT, "after": cursor}
-            try:
-                data, errors = _graphql(graphql_query, page_variables)
-            except Exception as page_exc:
-                if not pages_scanned:
-                    raise
-                # A mid-pagination failure must not discard matches already
-                # collected -- return the partial list with a marker
-                # instead, mirroring slack_list_channels.
-                logger.warning(
-                    f"Linear issue search pagination stopped early: {page_exc}"
-                )
-                return _success(
-                    issues=matches[:max_results],
-                    truncated=True,
-                    error=str(page_exc),
-                    _errors=all_errors,
-                )
-            pages_scanned += 1
-            all_errors.extend(errors)
-            issues_data = data.get("issues") or {}
-            raw_page = issues_data.get("nodes") or []
-            page_info = issues_data.get("pageInfo") or {}
-            has_next_page = bool(page_info.get("hasNextPage"))
-            cursor = page_info.get("endCursor")
-            matches.extend(
-                issue
-                for issue in raw_page
-                if needle in str(issue.get("title") or "").lower()
-            )
-            if len(matches) >= max_results or not has_next_page:
-                break
-            if not cursor:
-                # hasNextPage is true but Linear gave no cursor to continue
-                # from -- refetching without one would just re-request page
-                # 1 and duplicate nodes, so stop instead of looping forever.
-                break
-        truncated = has_next_page or len(matches) > max_results
-        return _success(
-            issues=matches[:max_results], truncated=truncated, _errors=all_errors
-        )
+        data, errors = _graphql(graphql_query, variables)
+        issues_data = data.get("issues") or {}
+        issues = issues_data.get("nodes") or []
+        has_next_page = bool((issues_data.get("pageInfo") or {}).get("hasNextPage"))
+        return _success(issues=issues, truncated=has_next_page, _errors=errors)
     except Exception as e:
         logger.error(f"Error searching Linear issues: {e}")
         return _error(str(e))

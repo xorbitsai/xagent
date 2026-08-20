@@ -6,6 +6,7 @@ from unittest.mock import Mock
 from urllib.parse import parse_qs, urlparse
 
 import pytest
+import requests
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
@@ -147,21 +148,30 @@ def test_login_forces_consent_prompt(db_session):
     assert query["prompt"] == ["consent"]
 
 
-def test_callback_persists_token_without_userinfo_lookup(db_session, monkeypatch):
-    """With userinfo_url left empty, the callback must skip the identity
-    fetch entirely (no request attempted) and still persist the token."""
+_LINEAR_VIEWER_RESPONSE = MockResponse(
+    {"data": {"viewer": {"id": "linear-user-1", "email": "ada@example.com"}}}
+)
+
+
+def test_callback_fetches_identity_via_graphql_viewer_query(db_session, monkeypatch):
+    """With userinfo_url left empty, the callback must skip the flat-REST
+    lookup (no GET attempted) but still fetch identity via a `viewer`
+    GraphQL query against Linear's own endpoint, and persist it."""
     db, user = db_session
     mock_post = Mock(
-        return_value=MockResponse(
-            {
-                "access_token": "linear-token",
-                "refresh_token": "linear-refresh",
-                "token_type": "Bearer",
-                "scope": "read,write",
-                # Linear access tokens expire in 24 hours.
-                "expires_in": 86400,
-            }
-        )
+        side_effect=[
+            MockResponse(
+                {
+                    "access_token": "linear-token",
+                    "refresh_token": "linear-refresh",
+                    "token_type": "Bearer",
+                    "scope": "read,write",
+                    # Linear access tokens expire in 24 hours.
+                    "expires_in": 86400,
+                }
+            ),
+            _LINEAR_VIEWER_RESPONSE,
+        ]
     )
     mock_get = Mock()
     monkeypatch.setattr("xagent.web.api.auth.requests.post", mock_post)
@@ -173,6 +183,11 @@ def test_callback_persists_token_without_userinfo_lookup(db_session, monkeypatch
 
     assert response.status_code == 200
     mock_get.assert_not_called()
+    assert mock_post.call_count == 2
+    viewer_call = mock_post.call_args_list[1]
+    assert viewer_call.args[0] == "https://api.linear.app/graphql"
+    assert viewer_call.kwargs["headers"]["Authorization"] == "Bearer linear-token"
+    assert "viewer" in viewer_call.kwargs["json"]["query"]
 
     oauth_account = (
         db.query(UserOAuth)
@@ -183,8 +198,141 @@ def test_callback_persists_token_without_userinfo_lookup(db_session, monkeypatch
     assert oauth_account.access_token == "linear-token"
     assert oauth_account.refresh_token == "linear-refresh"
     assert oauth_account.expires_at is not None
-    assert oauth_account.email is None
-    assert oauth_account.provider_user_id is None
+    assert oauth_account.email == "ada@example.com"
+    assert oauth_account.provider_user_id == "linear-user-1"
+
+
+def test_callback_fails_when_viewer_query_is_rejected(db_session, monkeypatch):
+    """A token Linear won't honour must be caught here (this doubles as
+    post-exchange token verification) rather than persisted as a healthy
+    connection that then fails opaquely from inside a later tool call."""
+    db, user = db_session
+    mock_post = Mock(
+        side_effect=[
+            MockResponse(
+                {
+                    "access_token": "bad-token",
+                    "token_type": "Bearer",
+                    "scope": "read,write",
+                    "expires_in": 86400,
+                }
+            ),
+            MockResponse(
+                {"errors": [{"message": "Authentication required"}]}, status_code=200
+            ),
+        ]
+    )
+    monkeypatch.setattr("xagent.web.api.auth.requests.post", mock_post)
+
+    response = generic_oauth_callback(
+        "linear", _callback_request(db, user), db, _linear_provider()
+    )
+
+    assert response.status_code == 400
+    assert "Authentication required" in response.body.decode()
+    oauth_account = (
+        db.query(UserOAuth)
+        .filter(UserOAuth.user_id == user.id, UserOAuth.provider == "linear")
+        .first()
+    )
+    assert oauth_account is None
+
+
+def test_callback_surfaces_error_detail_on_non_200_viewer_response(
+    db_session, monkeypatch
+):
+    """A non-200 response with a structured error body must not collapse
+    to the opaque "status 401" -- the actual reason (e.g. an expired or
+    wrong-scope token) is what lets an operator self-serve the fix."""
+    db, user = db_session
+    mock_post = Mock(
+        side_effect=[
+            MockResponse(
+                {
+                    "access_token": "bad-token",
+                    "token_type": "Bearer",
+                    "scope": "read,write",
+                    "expires_in": 86400,
+                }
+            ),
+            MockResponse({"errors": [{"message": "Not authorized"}]}, status_code=401),
+        ]
+    )
+    monkeypatch.setattr("xagent.web.api.auth.requests.post", mock_post)
+
+    response = generic_oauth_callback(
+        "linear", _callback_request(db, user), db, _linear_provider()
+    )
+
+    assert response.status_code == 400
+    assert "Not authorized" in response.body.decode()
+
+
+def test_callback_surfaces_raw_body_when_non_200_error_is_not_graphql_shaped(
+    db_session, monkeypatch
+):
+    """A non-200 error body that isn't the {"errors": [...]} GraphQL shape
+    (e.g. a differently-keyed JSON error, or an HTML gateway/WAF page on a
+    502/504) must still surface something, not silently collapse to a bare
+    "status 502" with the actual body detail discarded."""
+    db, user = db_session
+    mock_post = Mock(
+        side_effect=[
+            MockResponse(
+                {
+                    "access_token": "linear-token",
+                    "token_type": "Bearer",
+                    "scope": "read,write",
+                    "expires_in": 86400,
+                }
+            ),
+            MockResponse(
+                {"message": "Bad Gateway"},
+                status_code=502,
+                text='{"message": "Bad Gateway"}',
+            ),
+        ]
+    )
+    monkeypatch.setattr("xagent.web.api.auth.requests.post", mock_post)
+
+    response = generic_oauth_callback(
+        "linear", _callback_request(db, user), db, _linear_provider()
+    )
+
+    assert response.status_code == 400
+    assert "Bad Gateway" in response.body.decode()
+
+
+def test_callback_distinguishes_network_failure_from_provider_rejection(
+    db_session, monkeypatch
+):
+    """A network-level failure (Linear never actually responded) must not
+    be worded as "the provider reported" -- that misattributes a
+    client-side/connectivity problem to Linear."""
+    db, user = db_session
+    mock_post = Mock(
+        side_effect=[
+            MockResponse(
+                {
+                    "access_token": "linear-token",
+                    "token_type": "Bearer",
+                    "scope": "read,write",
+                    "expires_in": 86400,
+                }
+            ),
+            requests.exceptions.ConnectionError("boom"),
+        ]
+    )
+    monkeypatch.setattr("xagent.web.api.auth.requests.post", mock_post)
+
+    response = generic_oauth_callback(
+        "linear", _callback_request(db, user), db, _linear_provider()
+    )
+
+    assert response.status_code == 400
+    body = response.body.decode()
+    assert "Could not reach Linear" in body
+    assert "The provider reported" not in body
 
 
 def test_callback_normalizes_legacy_array_scope_to_string(db_session, monkeypatch):
@@ -194,15 +342,18 @@ def test_callback_normalizes_legacy_array_scope_to_string(db_session, monkeypatc
     flush time instead of saving a valid connection."""
     db, user = db_session
     mock_post = Mock(
-        return_value=MockResponse(
-            {
-                "access_token": "legacy-linear-token",
-                "refresh_token": "legacy-linear-refresh",
-                "token_type": "Bearer",
-                "scope": ["read", "write"],
-                "expires_in": 86400,
-            }
-        )
+        side_effect=[
+            MockResponse(
+                {
+                    "access_token": "legacy-linear-token",
+                    "refresh_token": "legacy-linear-refresh",
+                    "token_type": "Bearer",
+                    "scope": ["read", "write"],
+                    "expires_in": 86400,
+                }
+            ),
+            _LINEAR_VIEWER_RESPONSE,
+        ]
     )
     monkeypatch.setattr("xagent.web.api.auth.requests.post", mock_post)
     monkeypatch.setattr("xagent.web.api.auth.requests.get", Mock())

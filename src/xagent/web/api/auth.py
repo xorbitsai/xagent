@@ -302,6 +302,79 @@ def _extract_provider_error_message(token_data: dict[str, Any]) -> str | None:
     return None
 
 
+def _fetch_linear_viewer_identity(
+    access_token: str,
+) -> tuple[Optional[str], Optional[str]]:
+    """Linear has no flat REST userinfo endpoint (GraphQL-only), so identity
+    comes from a `viewer` query against the same GraphQL endpoint the
+    connector's tools use, instead of the generic `userinfo_url` REST GET
+    path below (left empty for Linear's provider row).
+
+    This doubles as the post-exchange token verification every other
+    provider gets for free from its REST userinfo call: a token Linear
+    won't honour is caught here and reported, instead of being persisted
+    as healthy and failing opaquely later from inside a tool call.
+
+    Raises RuntimeError with a human-readable message on any failure, so
+    the callback can report it the same way the Slack-style `ok: false`
+    branch below does, rather than silently connecting.
+    """
+    response = requests.post(
+        "https://api.linear.app/graphql",
+        headers={
+            "Authorization": f"Bearer {access_token}",
+            "Content-Type": "application/json",
+        },
+        json={"query": "query { viewer { id email } }"},
+        timeout=10.0,
+    )
+
+    def _errors_message(payload: Any) -> str | None:
+        if not isinstance(payload, dict):
+            return None
+        errors = payload.get("errors")
+        if not errors:
+            return None
+        return "; ".join(
+            str(entry.get("message", entry)) if isinstance(entry, dict) else str(entry)
+            for entry in errors
+        )
+
+    def _truncate(text: str, limit: int = 500) -> str:
+        text = text.strip()
+        return text if len(text) <= limit else text[:limit] + "... [truncated]"
+
+    if response.status_code != 200:
+        # Mirrors linear.py's _graphql(): prefer the structured GraphQL
+        # "errors" shape, but fall back to the raw (truncated) body for any
+        # other error shape (a differently-keyed JSON error, or an HTML
+        # gateway/WAF page on a 502/504) rather than discarding it.
+        detail = None
+        try:
+            detail = _errors_message(response.json())
+        except ValueError:
+            pass
+        if detail is None:
+            detail = _truncate(response.text)
+        raise RuntimeError(
+            f"Linear API error (status {response.status_code})"
+            + (f": {detail}" if detail else "")
+        )
+    try:
+        payload = response.json()
+    except ValueError:
+        raise RuntimeError(
+            f"Linear API returned a non-JSON response: {_truncate(response.text)}"
+        ) from None
+    if not isinstance(payload, dict):
+        raise RuntimeError("Linear API returned an unexpected response body")
+    data = payload.get("data")
+    viewer = data.get("viewer") if isinstance(data, dict) else None
+    if not isinstance(viewer, dict):
+        raise RuntimeError(_errors_message(payload) or "Linear did not return a viewer")
+    return viewer.get("id"), viewer.get("email")
+
+
 def create_access_token(
     data: Dict[str, Any], expires_delta: Optional[timedelta] = None
 ) -> str:
@@ -1627,6 +1700,40 @@ def generic_oauth_callback(
                     )
                 provider_user_id = info_data.get(db_provider.user_id_path or "id")
                 email = info_data.get(db_provider.email_path or "email")
+        elif provider.lower() == "linear" and access_token:
+            # Linear's provider row leaves userinfo_url empty (GraphQL-only,
+            # no flat REST endpoint fits the block above) -- see
+            # _fetch_linear_viewer_identity's docstring for why this is not
+            # just a label workaround.
+            try:
+                provider_user_id, email = _fetch_linear_viewer_identity(access_token)
+            except RuntimeError as e:
+                # A deliberate failure raised by _fetch_linear_viewer_identity
+                # itself -- Linear's API responded, just not usably.
+                import html
+
+                return HTMLResponse(
+                    content=(
+                        "<h1>Error verifying the connected account</h1>"
+                        f"<p>The provider reported: {html.escape(str(e))}</p>"
+                    ),
+                    status_code=400,
+                )
+            except Exception as e:
+                # A network-level failure (timeout, connection error) --
+                # distinct from the case above: Linear never actually
+                # responded, so attributing this to "the provider reported"
+                # would be misleading.
+                import html
+
+                return HTMLResponse(
+                    content=(
+                        "<h1>Error verifying the connected account</h1>"
+                        f"<p>Could not reach Linear to verify the connection: "
+                        f"{html.escape(str(e))}</p>"
+                    ),
+                    status_code=400,
+                )
 
         if user_id:
             db.query(UserOAuth).filter(

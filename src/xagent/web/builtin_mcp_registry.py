@@ -218,9 +218,10 @@ def get_builtin_oauth_provider_rows() -> list[dict[str, Any]]:
             # -- there is no flat REST endpoint this callback's GET-plus-flat-
             # dict.get() userinfo lookup can use. Left empty so that lookup is
             # skipped entirely (generic_oauth_callback's `if userinfo_url and
-            # access_token:` guard); the connected account's identity is
-            # available on demand instead via this connector's own
-            # linear_get_current_user tool.
+            # access_token:` guard); identity comes instead from a dedicated
+            # `elif provider.lower() == "linear"` branch there that runs a
+            # `viewer` GraphQL query (_fetch_linear_viewer_identity), which
+            # also doubles as post-exchange token verification.
             "userinfo_url": "",
             "user_id_path": "id",
             "email_path": "email",

@@ -15,7 +15,7 @@ from sqlalchemy.exc import IntegrityError
 MIGRATION_NAME = "20260818_add_user_oauth_resource_owner.py"
 ORDINARY_INDEX = "uq_user_oauth_ordinary_account"
 ACTOR_INDEX = "uq_user_oauth_actor_account"
-LOOKUP_INDEX = "ix_user_oauth_owner_provider"
+REMOVED_LOOKUP_INDEX = "ix_user_oauth_owner_provider"
 OLD_CONSTRAINT = "uq_user_provider_account"
 OWNER_COLUMN = "resource_owner_key"
 
@@ -213,12 +213,7 @@ def test_upgrade_preserves_rows_and_installs_owner_aware_identity(tmp_path) -> N
         )
         assert indexes[ACTOR_INDEX]["unique"] == 1
         assert "resource_owner_key is not null" in _where(indexes[ACTOR_INDEX])
-        assert tuple(indexes[LOOKUP_INDEX]["column_names"]) == (
-            "user_id",
-            "resource_owner_key",
-            "provider",
-        )
-        assert indexes[LOOKUP_INDEX]["unique"] == 0
+        assert REMOVED_LOOKUP_INDEX not in indexes
 
         connection.execute(
             text(
@@ -303,7 +298,7 @@ def test_downgrade_restores_ordinary_schema_before_actor_rows_exist(tmp_path) ->
         indexes = _index_map(connection)
         assert ORDINARY_INDEX not in indexes
         assert ACTOR_INDEX not in indexes
-        assert LOOKUP_INDEX not in indexes
+        assert REMOVED_LOOKUP_INDEX not in indexes
         assert (
             connection.execute(
                 text("SELECT access_token FROM user_oauth WHERE id = 1")
@@ -398,9 +393,9 @@ def test_sqlite_upgrade_rejects_relation_name_collision_before_rebuild(
     with engine.begin() as connection:
         _create_old_table(connection)
         if relation_type == "TABLE":
-            connection.execute(text(f"CREATE TABLE {LOOKUP_INDEX} (id INTEGER)"))
+            connection.execute(text(f"CREATE TABLE {ORDINARY_INDEX} (id INTEGER)"))
         else:
-            connection.execute(text(f"CREATE VIEW {LOOKUP_INDEX} AS SELECT 1 AS id"))
+            connection.execute(text(f"CREATE VIEW {ORDINARY_INDEX} AS SELECT 1 AS id"))
 
         with patch.object(migration, "op", _operations(connection)):
             with pytest.raises(RuntimeError, match="already exist"):
@@ -493,12 +488,6 @@ def test_existing_owner_aware_schema_requires_semantic_index_definitions(
                 "WHERE resource_owner_key IS NOT NULL"
             )
         )
-        connection.execute(
-            text(
-                f"CREATE INDEX {LOOKUP_INDEX} ON user_oauth "
-                "(user_id, resource_owner_key, provider)"
-            )
-        )
 
         with patch.object(migration, "op", _operations(connection)):
             with pytest.raises(RuntimeError, match="incorrect indexes"):
@@ -547,7 +536,7 @@ def test_create_owner_indexes_attempts_all_postgresql_indexes() -> None:
     with patch.object(migration, "op", fake_op):
         migration._create_owner_indexes()
 
-    assert created == [ORDINARY_INDEX, ACTOR_INDEX, LOOKUP_INDEX]
+    assert created == [ORDINARY_INDEX, ACTOR_INDEX]
 
 
 def test_postgresql_index_creation_failure_keeps_old_constraint() -> None:

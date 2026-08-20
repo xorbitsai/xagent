@@ -38,12 +38,6 @@ class UserOAuth(Base):  # type: ignore[no-any-unimported]
             sqlite_where=_ACTOR_OWNER_CLAUSE,
             postgresql_where=_ACTOR_OWNER_CLAUSE,
         ),
-        Index(
-            "ix_user_oauth_owner_provider",
-            "user_id",
-            "resource_owner_key",
-            "provider",
-        ),
     )
 
     id = Column(Integer, primary_key=True, index=True)

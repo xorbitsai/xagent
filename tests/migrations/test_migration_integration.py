@@ -400,7 +400,6 @@ class TestMigrations:
         assert not {
             "uq_user_oauth_ordinary_account",
             "uq_user_oauth_actor_account",
-            "ix_user_oauth_owner_provider",
         } & {index["name"] for index in inspector.get_indexes("user_oauth")}
         with postgresql_tester.engine.begin() as conn:
             assert conn.execute(

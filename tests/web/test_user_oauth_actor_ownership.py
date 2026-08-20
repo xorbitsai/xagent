@@ -46,13 +46,7 @@ def test_model_declares_ordinary_and_actor_owned_partial_uniqueness() -> None:
     )
     assert "resource_owner_key is not null" in _where(actor)
 
-    lookup = indexes["ix_user_oauth_owner_provider"]
-    assert lookup.unique is False
-    assert tuple(column.name for column in lookup.columns) == (
-        "user_id",
-        "resource_owner_key",
-        "provider",
-    )
+    assert "ix_user_oauth_owner_provider" not in indexes
 
 
 def _oauth_relationship_db(tmp_path):

@@ -43,7 +43,6 @@ OWNER_LENGTH = 512
 OLD_CONSTRAINT = "uq_user_provider_account"
 ORDINARY_INDEX = "uq_user_oauth_ordinary_account"
 ACTOR_INDEX = "uq_user_oauth_actor_account"
-LOOKUP_INDEX = "ix_user_oauth_owner_provider"
 ORDINARY_WHERE = sa.text(f"{OWNER_COLUMN} IS NULL")
 ACTOR_WHERE = sa.text(f"{OWNER_COLUMN} IS NOT NULL")
 OWNER_INDEX_DEFINITIONS = (
@@ -59,7 +58,6 @@ OWNER_INDEX_DEFINITIONS = (
         True,
         ACTOR_WHERE,
     ),
-    (LOOKUP_INDEX, ("user_id", OWNER_COLUMN, "provider"), False, None),
 )
 
 
@@ -131,12 +129,11 @@ def _sqlite_global_owner_relation_names() -> set[str]:
         sa.text(
             "SELECT name FROM sqlite_master "
             "WHERE type IN ('table', 'index', 'view') "
-            "AND name IN (:ordinary, :actor, :lookup)"
+            "AND name IN (:ordinary, :actor)"
         ),
         {
             "ordinary": ORDINARY_INDEX,
             "actor": ACTOR_INDEX,
-            "lookup": LOOKUP_INDEX,
         },
     )
     return {str(name) for name in rows.scalars()}
@@ -224,7 +221,7 @@ def downgrade() -> None:
             )
 
     existing_indexes = _index_names()
-    for index_name in (LOOKUP_INDEX, ACTOR_INDEX, ORDINARY_INDEX):
+    for index_name in (ACTOR_INDEX, ORDINARY_INDEX):
         if index_name in existing_indexes:
             op.drop_index(index_name, table_name=TABLE)
 

@@ -89,7 +89,7 @@ On SQLite the migration rejects globally colliding owner-index names before rebu
 
 If the migration reports `UserOAuth schema is partially owner-aware`, do not start workers. The schema has either `resource_owner_key` and the old `uq_user_provider_account` constraint together, or neither one. Restore the last known complete schema from backup, or have a database operator finish one coherent legacy or owner-aware schema before retrying `alembic upgrade head`. Do not bypass this fail-closed check.
 
-If SQLite reports that an owner-index name already exists before migration, query `sqlite_master` for that exact name and identify its owning table and definition. After taking a backup, remove or rename only the unrelated colliding index, then retry `alembic upgrade head`. If either database reports `owner-aware UserOAuth schema has incorrect indexes`, keep workers stopped and compare all three index columns, uniqueness flags, and predicates with the verification definitions below. Repair or remove the incorrect owner indexes under database-operator supervision before retrying the migration.
+If SQLite reports that an owner-index name already exists before migration, query `sqlite_master` for that exact name and identify its owning table and definition. After taking a backup, remove or rename only the unrelated colliding index, then retry `alembic upgrade head`. If either database reports `owner-aware UserOAuth schema has incorrect indexes`, keep workers stopped and compare both index columns, uniqueness flags, and predicates with the verification definitions below. Repair or remove the incorrect owner indexes under database-operator supervision before retrying the migration.
 
 ### Prerequisites and configuration
 
@@ -131,7 +131,7 @@ WHERE resource_owner_key IS NOT NULL;
 
 The result must be zero.
 
-On PostgreSQL, verify that all three index names exist and are valid:
+On PostgreSQL, verify that both partial unique index names exist and are valid:
 
 ```sql
 SELECT c.relname, i.indisvalid
@@ -143,12 +143,11 @@ WHERE n.nspname = current_schema()
   AND t.relname = 'user_oauth'
   AND c.relname IN (
     'uq_user_oauth_ordinary_account',
-    'uq_user_oauth_actor_account',
-    'ix_user_oauth_owner_provider'
+    'uq_user_oauth_actor_account'
   );
 ```
 
-The query must return all three rows with `indisvalid = true`.
+The query must return both rows with `indisvalid = true`.
 
 For SQLite run `PRAGMA index_list('user_oauth');` and `PRAGMA index_info('<index-name>');`. Inspect `sqlite_master.sql` to confirm that the ordinary index uses `WHERE resource_owner_key IS NULL` and the actor index uses `WHERE resource_owner_key IS NOT NULL`.
 

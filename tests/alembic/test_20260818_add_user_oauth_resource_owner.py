@@ -387,6 +387,35 @@ def test_sqlite_upgrade_rejects_owner_index_name_collision_before_table_rebuild(
         }
 
 
+@pytest.mark.parametrize("relation_type", ["TABLE", "VIEW"])
+def test_sqlite_upgrade_rejects_relation_name_collision_before_rebuild(
+    tmp_path,
+    relation_type: str,
+) -> None:
+    engine = create_engine(f"sqlite:///{tmp_path / 'oauth-relation-collision.db'}")
+    migration = _migration_module()
+
+    with engine.begin() as connection:
+        _create_old_table(connection)
+        if relation_type == "TABLE":
+            connection.execute(text(f"CREATE TABLE {LOOKUP_INDEX} (id INTEGER)"))
+        else:
+            connection.execute(text(f"CREATE VIEW {LOOKUP_INDEX} AS SELECT 1 AS id"))
+
+        with patch.object(migration, "op", _operations(connection)):
+            with pytest.raises(RuntimeError, match="already exist"):
+                migration.upgrade()
+
+        constraints = {
+            constraint["name"]
+            for constraint in inspect(connection).get_unique_constraints("user_oauth")
+        }
+        assert OLD_CONSTRAINT in constraints
+        assert "resource_owner_key" not in {
+            column["name"] for column in inspect(connection).get_columns("user_oauth")
+        }
+
+
 def test_sqlite_upgrade_rejects_cross_table_index_name_collision_before_rebuild(
     tmp_path,
 ) -> None:

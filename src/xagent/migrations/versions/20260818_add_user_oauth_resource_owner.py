@@ -126,11 +126,11 @@ def _owner_indexes_are_current(dialect: str) -> bool:
     return True
 
 
-def _sqlite_global_owner_index_names() -> set[str]:
+def _sqlite_global_owner_relation_names() -> set[str]:
     rows = op.get_bind().execute(
         sa.text(
             "SELECT name FROM sqlite_master "
-            "WHERE type = 'index' "
+            "WHERE type IN ('table', 'index', 'view') "
             "AND name IN (:ordinary, :actor, :lookup)"
         ),
         {
@@ -171,11 +171,12 @@ def upgrade() -> None:
         raise RuntimeError("UserOAuth schema is partially owner-aware")
 
     if dialect == "sqlite":
-        collisions = _sqlite_global_owner_index_names()
+        collisions = _sqlite_global_owner_relation_names()
         if collisions:
             names = ", ".join(sorted(collisions))
             raise RuntimeError(
-                f"owner-aware SQLite index names already exist before migration: {names}"
+                "owner-aware SQLite schema names already exist before migration: "
+                f"{names}"
             )
         if needs_column or has_old_constraint:
             # SQLite cannot drop a named UNIQUE constraint directly. Batch mode

@@ -324,9 +324,27 @@ def _bounded_oauth_error_message(
     only the standard OAuth2 `error`/`error_description` fields are
     rendered now, with every other field dropped and the result capped in
     length.
+
+    `error` is a bare string for standard OAuth2 providers, but Meta's is
+    itself an object (`{"message": ..., "type": "OAuthException", ...}`)
+    -- str()-ing that directly would render a Python dict repr into the
+    page instead of the actual message. `error_description` is likewise
+    absent from Zoom's error shape, which instead carries the
+    human-readable detail in a `reason` key.
     """
-    error = str(token_data.get("error") or "unknown_error")
-    description = token_data.get("error_description")
+    raw_error = token_data.get("error")
+    if isinstance(raw_error, dict):
+        error = str(
+            raw_error.get("message") or raw_error.get("type") or "unknown_error"
+        )
+    else:
+        error = str(raw_error or "unknown_error")
+    description = token_data.get("error_description") or token_data.get("reason")
+    if not isinstance(description, str):
+        # Only a plain-string description is rendered -- an object-valued
+        # one would repr a Python dict into the page, the same defect the
+        # dict-`error` branch above exists to prevent.
+        description = None
     message = error if not description else f"{error}: {description}"
     return html.escape(message[:limit])
 

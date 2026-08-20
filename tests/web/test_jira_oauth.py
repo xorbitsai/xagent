@@ -173,6 +173,58 @@ def test_jira_callback_exchanges_code_with_json_body(db_session, monkeypatch):
     assert user_mcp.is_active is True
 
 
+def test_jira_json_body_quirk_preserves_an_accept_header_if_ever_combined(
+    db_session, monkeypatch
+):
+    """No current provider needs both the JSON-Accept-header quirk and the
+    JSON-body quirk at once (github needs the former, jira the latter), so
+    this specific interaction can't be exercised through a real provider
+    today. Force it synthetically: if requires_json_accept_header ever
+    returned True for jira, the jira branch's in-place
+    headers["Content-Type"] = ... must not silently drop the Accept header
+    set earlier in the same function -- a regression back to the old
+    `headers = {"Content-Type": ...}` full reassignment would."""
+    db, user = db_session
+    state = create_access_token(
+        data={
+            "type": "oauth_state",
+            "user_id": user.id,
+            "provider": "jira",
+            "app_id": "jira",
+        },
+        expires_delta=timedelta(minutes=10),
+    )
+    request = SimpleNamespace(query_params={"code": "jira-code", "state": state})
+
+    monkeypatch.setattr(auth_api, "requires_json_accept_header", lambda provider: True)
+    post = Mock(
+        return_value=MockResponse(
+            {
+                "access_token": "jira-token",
+                "token_type": "bearer",
+                "scope": "read:jira-work",
+            }
+        )
+    )
+    monkeypatch.setattr(auth_api.requests, "post", post)
+    monkeypatch.setattr(
+        auth_api.requests,
+        "get",
+        Mock(
+            return_value=MockResponse(
+                {"account_id": "jira-user-1", "email": "alice@example.com"}
+            )
+        ),
+    )
+
+    response = generic_oauth_callback("jira", request, db, _jira_provider())
+
+    assert response.status_code == 200
+    headers = post.call_args.kwargs["headers"]
+    assert headers["Content-Type"] == "application/json"
+    assert headers["Accept"] == "application/json"
+
+
 def test_non_jira_callback_still_sends_form_urlencoded_body(db_session, monkeypatch):
     """Guard the branch condition: a non-jira provider must be unaffected by
     the Atlassian-specific JSON-body carve-out."""

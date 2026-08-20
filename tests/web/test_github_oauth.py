@@ -374,6 +374,78 @@ def test_bare_github_callback_does_not_disturb_an_existing_scoped_connection(
     assert user_mcp.is_active is True
 
 
+def test_bounded_oauth_error_message_caps_at_500_chars():
+    """Direct unit coverage for _bounded_oauth_error_message's cap -- the
+    integration test above pins the end-to-end callback behavior, but
+    nothing previously asserted the 500-char limit itself, or that an
+    access_token field in the provider's error payload isn't echoed."""
+    long_description = "x" * 10_000
+    token_data = {
+        "error": "invalid_grant",
+        "error_description": long_description,
+        "access_token": "should-never-be-echoed",
+    }
+
+    message = auth_api._bounded_oauth_error_message(token_data)
+
+    assert len(message) <= 500
+    assert "should-never-be-echoed" not in message
+    assert message.startswith("invalid_grant: " + "x" * 10)
+
+
+def test_bounded_oauth_error_message_escapes_html():
+    token_data = {"error": "<script>alert(1)</script>"}
+
+    message = auth_api._bounded_oauth_error_message(token_data)
+
+    assert "<script>" not in message
+    assert "&lt;script&gt;" in message
+
+
+def test_bounded_oauth_error_message_extracts_metas_nested_error_object():
+    """Meta's OAuth error is itself an object, not a bare string -- str()
+    on it directly would render a Python dict repr into the page."""
+    token_data = {
+        "error": {
+            "message": "Error validating access token",
+            "type": "OAuthException",
+            "code": 190,
+        }
+    }
+
+    message = auth_api._bounded_oauth_error_message(token_data)
+
+    assert message == "Error validating access token"
+    assert "OAuthException" not in message
+    assert "{" not in message
+
+
+def test_bounded_oauth_error_message_uses_zooms_reason_field():
+    """Zoom's error shape carries the human-readable detail in a `reason`
+    key, not the standard OAuth2 `error_description`."""
+    token_data = {"error": "invalid_request", "reason": "Invalid Refresh Token"}
+
+    message = auth_api._bounded_oauth_error_message(token_data)
+
+    assert message == "invalid_request: Invalid Refresh Token"
+
+
+def test_bounded_oauth_error_message_drops_non_string_description():
+    """An object-valued error_description (or reason) must not be rendered
+    as a Python dict repr -- the same defect class the dict-`error` branch
+    prevents, one key over."""
+    token_data = {
+        "error": "invalid_request",
+        "error_description": {"code": 4700, "trace_id": "abc"},
+    }
+
+    message = auth_api._bounded_oauth_error_message(token_data)
+
+    assert message == "invalid_request"
+    assert "4700" not in message
+    assert "{" not in message
+
+
 def test_github_callback_bounds_token_exchange_error_response(db_session, monkeypatch):
     """GitHub's JSON Accept header makes its JSON error path reachable
     through the generic `"error" in token_data` branch -- that branch must

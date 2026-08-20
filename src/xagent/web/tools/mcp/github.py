@@ -23,6 +23,10 @@ mcp = FastMCP("github-mcp")
 GITHUB_BASE_URL = "https://api.github.com"
 DEFAULT_TIMEOUT_SECONDS = 30
 MAX_PER_PAGE = 100
+# Default result count for the two search tools -- one constant shared by
+# their signatures and their _clamp_limit fallbacks so the values can't
+# silently drift apart (the list tools use _clamp_limit's own default 30).
+SEARCH_DEFAULT_LIMIT = 20
 # Bounded multi-page fetch for github_list_issues, mirroring slack.py's
 # MAX_PAGES convention -- GitHub's issues endpoint mixes in pull requests,
 # so a single page of raw items can be mostly/entirely PRs and undercount
@@ -33,10 +37,13 @@ MAX_ISSUE_PAGES = 10
 # PR-heavy repo could otherwise hold one tool call for up to
 # MAX_ISSUE_PAGES * DEFAULT_TIMEOUT_SECONDS (5 minutes) before returning.
 MAX_ISSUE_LIST_SECONDS = 60
-# Bounded 429 retry for idempotent reads, mirroring the same policy already
-# used by jira.py/slack.py/intercom.py -- a single wait-and-retry on a small
-# Retry-After, never for writes (POST could double-apply a mutation if the
-# original request actually reached the server before being rate-limited).
+# Bounded 429 retry for idempotent reads -- same wait-and-retry shape as
+# jira.py/slack.py/intercom.py's own copies (a single wait on a small
+# Retry-After), but not an exact mirror: this one is GET-only, opt-out via
+# allow_retry, and folds rate-limit headers into the raised message, none
+# of which the siblings do. Never retries writes (POST could double-apply
+# a mutation if the original request actually reached the server before
+# being rate-limited).
 MAX_RETRY_AFTER_SECONDS = 30
 
 # Module-local bindings, rather than calling time.monotonic()/time.sleep()
@@ -133,6 +140,17 @@ def _success(**payload: Any) -> str:
 
 def _error(message: str) -> str:
     return json.dumps({"status": "error", "message": message}, ensure_ascii=False)
+
+
+def _partial(**payload: Any) -> str:
+    """A genuine fault interrupted pagination partway: the collected items
+    and resume cursor are preserved (same payload shape as `_success`,
+    plus `error`), but `status: "partial"` keeps a caller that branches
+    only on `status` from mistaking the result for a clean, complete page.
+    Clean stops (deadline/limit/page-cap) stay `_success` -- nothing went
+    wrong there.
+    """
+    return json.dumps({"status": "partial", **payload}, ensure_ascii=False)
 
 
 def _headers() -> dict[str, str]:
@@ -389,6 +407,17 @@ def _summarize_issue(issue: dict[str, Any]) -> dict[str, Any]:
 
 
 def _summarize_pull_request(pr: dict[str, Any]) -> dict[str, Any]:
+    # The list-PRs endpoint never includes a "merged" key at all (only the
+    # single-PR GET does) but does include "merged_at" -- without the
+    # fallback, github_list_pull_requests would always report merged: null
+    # for genuinely merged PRs instead of using the field it actually has.
+    # A payload carrying NEITHER key stays None ("unknown") rather than
+    # being reported as a confident false. "mergeable" has no substitute
+    # (GitHub only computes it for a single PR); None there means
+    # "unknown", which is honest for a list response.
+    merged = pr.get("merged")
+    if merged is None and "merged_at" in pr:
+        merged = pr["merged_at"] is not None
     return {
         "number": pr.get("number"),
         "title": pr.get("title"),
@@ -398,7 +427,7 @@ def _summarize_pull_request(pr: dict[str, Any]) -> dict[str, Any]:
         "head": (pr.get("head") or {}).get("ref"),
         "base": (pr.get("base") or {}).get("ref"),
         "draft": pr.get("draft"),
-        "merged": pr.get("merged"),
+        "merged": merged,
         "mergeable": pr.get("mergeable"),
         "html_url": pr.get("html_url"),
         "created_at": pr.get("created_at"),
@@ -435,7 +464,9 @@ def github_get_current_user() -> str:
 
 
 @mcp.tool()
-def github_search_repositories(query: str, limit: int = 20, page: int = 1) -> str:
+def github_search_repositories(
+    query: str, limit: int = SEARCH_DEFAULT_LIMIT, page: int = 1
+) -> str:
     """
     Search GitHub repositories (name, description, topics, etc.).
     query: a GitHub search-syntax query, e.g. "xagent language:python" or
@@ -453,7 +484,7 @@ def github_search_repositories(query: str, limit: int = 20, page: int = 1) -> st
             "/search/repositories",
             params={
                 "q": query,
-                "per_page": _clamp_limit(limit),
+                "per_page": _clamp_limit(limit, default=SEARCH_DEFAULT_LIMIT),
                 "page": start_page,
             },
         )
@@ -478,6 +509,7 @@ def github_search_repositories(query: str, limit: int = 20, page: int = 1) -> st
             # mistake a partial index result for an exhaustive one.
             incomplete_results=bool(result.get("incomplete_results")),
             truncated=has_next_page,
+            truncation_reason="more_pages" if has_next_page else None,
             next_page=start_page + 1 if has_next_page else None,
         )
     except Exception as e:
@@ -529,6 +561,11 @@ def github_list_issues(
     result set, not a stable cursor: an issue created or closed/reopened
     (changing its sort position) between calls can still shift the page's
     contents enough to duplicate or skip an item across the resume.
+
+    A response with status "partial" means a fault (see its `error` field)
+    interrupted pagination partway: the returned issues are valid and
+    next_page/next_skip resume from where it stopped -- do NOT discard
+    them or restart from page 1.
     """
     try:
         owner, name = _parse_repo(repo)
@@ -612,16 +649,19 @@ def github_list_issues(
                 if not pages_fetched:
                     raise
                 # A mid-pagination failure (e.g. a rate limit) must not
-                # discard the pages already fetched -- return the partial
-                # list with a marker instead, same as slack.py's channel
-                # listing. The failed page is a valid continuation point:
-                # reaching it at all means the previous page's Link header
-                # confirmed it exists, and nothing on it has been consumed
-                # yet, so next_skip stays 0 (retry the whole page).
+                # discard the pages already fetched -- return them as a
+                # resumable partial. (slack.py preserves partial results
+                # for the same fault but still labels them status:"success"
+                # with an error field; the "partial" status here is
+                # deliberately NOT the same -- see _partial.) The failed
+                # page is a valid continuation point: reaching it at all
+                # means the previous page's Link header confirmed it
+                # exists, and nothing on it has been consumed yet, so
+                # next_skip stays 0 (retry the whole page).
                 logger.warning(
                     f"GitHub issue pagination stopped early for {repo}: {page_exc}"
                 )
-                return _success(
+                return _partial(
                     issues=issues[:max_results],
                     truncated=True,
                     truncation_reason="request_failed",
@@ -702,7 +742,7 @@ def github_list_issues(
                     f"GitHub issue pagination stopped early for {repo}: "
                     f"{bad_item_error}"
                 )
-                return _success(
+                return _partial(
                     issues=issues[:max_results],
                     truncated=True,
                     truncation_reason="bad_item",
@@ -837,6 +877,7 @@ def github_list_pull_requests(
         return _success(
             pull_requests=[_summarize_pull_request(pr) for pr in result],
             truncated=has_next_page,
+            truncation_reason="more_pages" if has_next_page else None,
             next_page=start_page + 1 if has_next_page else None,
         )
     except Exception as e:
@@ -903,6 +944,14 @@ def github_get_file_contents(repo: str, path: str, ref: str = "") -> str:
     path: file or directory path relative to the repo root (e.g. "src/main.py",
     or "" for the repo root).
     ref: optional branch, tag, or commit SHA (defaults to the repo's default branch).
+
+    A file result's `encoding` is "utf-8" for text content, or "base64"
+    for binary/non-UTF-8 content (decode the returned `content` yourself
+    in that case). A file over the Contents API's ~1MB size limit, or a
+    submodule entry, is reported as an error/a distinct `type` rather than
+    empty content. A directory result's `entries` is capped at 1000 (the
+    Contents API's own limit, with `truncated=true` and no continuation --
+    use the Git Trees API for a larger directory).
     """
     try:
         owner, name = _parse_repo(repo)
@@ -952,9 +1001,29 @@ def github_get_file_contents(repo: str, path: str, ref: str = "") -> str:
             # GitHub's Contents API returns at most 1000 entries for a
             # directory with no continuation token in the response body --
             # flag it so a directory at exactly that cap isn't mistaken for
-            # a complete listing (use the Git Trees API for larger ones).
+            # a complete listing. Unlike the list tools' pagination, there
+            # is genuinely no page/cursor parameter to offer here (the
+            # Contents API itself doesn't support one for directories), so
+            # the remediation is surfaced as a message instead of a
+            # continuation field the caller could act on.
+            at_cap = len(entries) >= 1000
             return _success(
-                type="directory", entries=entries, truncated=len(entries) >= 1000
+                type="directory",
+                entries=entries,
+                truncated=at_cap,
+                truncation_reason="entry_cap" if at_cap else None,
+                **(
+                    {
+                        "message": (
+                            "This directory has 1000+ entries; the Contents "
+                            "API has no continuation for more -- use the Git "
+                            "Trees API (not available as a tool here) to list "
+                            "the rest"
+                        )
+                    }
+                    if at_cap
+                    else {}
+                ),
             )
         submodule_git_url = result.get("submodule_git_url")
         if submodule_git_url:
@@ -1057,6 +1126,7 @@ def github_list_commits(
         return _success(
             commits=commits,
             truncated=has_next_page,
+            truncation_reason="more_pages" if has_next_page else None,
             next_page=start_page + 1 if has_next_page else None,
         )
     except Exception as e:
@@ -1065,7 +1135,9 @@ def github_list_commits(
 
 
 @mcp.tool()
-def github_search_code(query: str, limit: int = 20, page: int = 1) -> str:
+def github_search_code(
+    query: str, limit: int = SEARCH_DEFAULT_LIMIT, page: int = 1
+) -> str:
     """
     Search code across GitHub (or, when scoped with "repo:owner/repo" or
     "org:name" in the query, within a specific repository or organization).
@@ -1083,7 +1155,7 @@ def github_search_code(query: str, limit: int = 20, page: int = 1) -> str:
             "/search/code",
             params={
                 "q": query,
-                "per_page": _clamp_limit(limit),
+                "per_page": _clamp_limit(limit, default=SEARCH_DEFAULT_LIMIT),
                 "page": start_page,
             },
         )
@@ -1112,6 +1184,7 @@ def github_search_code(query: str, limit: int = 20, page: int = 1) -> str:
             total_count=result.get("total_count", len(items)),
             incomplete_results=bool(result.get("incomplete_results")),
             truncated=has_next_page,
+            truncation_reason="more_pages" if has_next_page else None,
             next_page=start_page + 1 if has_next_page else None,
         )
     except Exception as e:

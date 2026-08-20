@@ -141,6 +141,43 @@ def test_request_raises_with_message_on_error(monkeypatch):
         github._request("GET", "/repos/octocat/missing")
 
 
+@pytest.mark.parametrize("status_code", [502, 503])
+def test_request_raises_fallback_message_on_5xx_without_message_field(
+    monkeypatch, status_code
+):
+    """GitHub's 5xx responses commonly carry no "message" field (or no
+    JSON body at all) -- the fallback f"GitHub API error (status {code})"
+    string must fire, not a raw KeyError/AttributeError or an empty
+    message. Zero test in this suite previously supplied a 5xx status."""
+    monkeypatch.setattr(
+        github.requests,
+        "request",
+        Mock(return_value=MockResponse(json_data={}, status_code=status_code)),
+    )
+
+    with pytest.raises(RuntimeError, match=f"status {status_code}"):
+        github._request("GET", "/repos/octocat/Hello-World")
+
+
+def test_request_raises_fallback_message_on_5xx_with_non_json_body(monkeypatch):
+    """A 5xx response with a non-JSON (e.g. HTML) body must not raise a
+    raw ValueError from response.json() -- it must fall back to the same
+    generic status message."""
+
+    class NonJsonResponse(MockResponse):
+        def json(self):
+            raise ValueError("Expecting value: line 1 column 1 (char 0)")
+
+    monkeypatch.setattr(
+        github.requests,
+        "request",
+        Mock(return_value=NonJsonResponse(status_code=503, content=b"<html>...")),
+    )
+
+    with pytest.raises(RuntimeError, match="status 503"):
+        github._request("GET", "/repos/octocat/Hello-World")
+
+
 def test_request_folds_validation_errors_into_message(monkeypatch):
     monkeypatch.setattr(
         github.requests,
@@ -235,6 +272,45 @@ def test_request_raw_retries_get_once_on_bounded_429(monkeypatch):
     assert response.status_code == 200
     assert mock_request.call_count == 2
     sleep_mock.assert_called_once_with(1)
+
+
+def test_request_raw_does_not_retry_429_with_missing_retry_after(monkeypatch):
+    mock_request = Mock(
+        return_value=MockResponse(
+            json_data={"message": "rate limited"}, status_code=429
+        )
+    )
+    monkeypatch.setattr(github.requests, "request", mock_request)
+    sleep_mock = Mock()
+    monkeypatch.setattr(github, "_sleep", sleep_mock)
+
+    with pytest.raises(RuntimeError, match="rate limited"):
+        github._request_raw("GET", "/repos/octocat/Hello-World")
+
+    assert mock_request.call_count == 1
+    sleep_mock.assert_not_called()
+
+
+def test_request_raw_does_not_retry_429_with_non_numeric_retry_after(monkeypatch):
+    """A non-numeric Retry-After (e.g. an RFC 7231 HTTP-date, which int()
+    rejects) must fail closed -- no retry -- rather than raising out of
+    _request_raw itself."""
+    mock_request = Mock(
+        return_value=MockResponse(
+            json_data={"message": "rate limited"},
+            status_code=429,
+            headers={"Retry-After": "Wed, 19 Aug 2026 07:00:05 GMT"},
+        )
+    )
+    monkeypatch.setattr(github.requests, "request", mock_request)
+    sleep_mock = Mock()
+    monkeypatch.setattr(github, "_sleep", sleep_mock)
+
+    with pytest.raises(RuntimeError, match="rate limited"):
+        github._request_raw("GET", "/repos/octocat/Hello-World")
+
+    assert mock_request.call_count == 1
+    sleep_mock.assert_not_called()
 
 
 def test_request_raw_does_not_retry_a_second_429(monkeypatch):
@@ -339,7 +415,10 @@ def test_list_issues_does_not_sleep_on_mid_pagination_429(monkeypatch):
 
     result = json.loads(github.github_list_issues("octocat/Hello-World", limit=100))
 
-    assert result["status"] == "success"
+    # "partial", not "success": a page request genuinely failed (a rate
+    # limit here) partway through -- a caller branching only on status
+    # must not mistake this for a clean, trustworthy result.
+    assert result["status"] == "partial"
     assert result["truncated"] is True
     assert result["truncation_reason"] == "request_failed"
     assert result["next_page"] == 2
@@ -361,6 +440,35 @@ def test_list_issues_does_not_sleep_on_mid_pagination_429(monkeypatch):
 )
 def test_clamp_limit_boundaries(limit, expected):
     assert github._clamp_limit(limit) == expected
+
+
+def test_clamp_limit_uses_the_caller_supplied_default():
+    assert github._clamp_limit("not-a-number", default=20) == 20
+
+
+def test_search_repositories_falls_back_to_its_own_documented_default(monkeypatch):
+    """A non-numeric limit reaching _clamp_limit (bypassing FastMCP's int
+    schema via a direct call) must fall back to this tool's own documented
+    default (20), not the generic 30 most other tools use."""
+    mock_request = Mock(
+        return_value=MockResponse(json_data={"total_count": 0, "items": []})
+    )
+    monkeypatch.setattr(github.requests, "request", mock_request)
+
+    github.github_search_repositories("stars:>1", limit="not-a-number")
+
+    assert mock_request.call_args.kwargs["params"]["per_page"] == 20
+
+
+def test_search_code_falls_back_to_its_own_documented_default(monkeypatch):
+    mock_request = Mock(
+        return_value=MockResponse(json_data={"total_count": 0, "items": []})
+    )
+    monkeypatch.setattr(github.requests, "request", mock_request)
+
+    github.github_search_code("def parse", limit="not-a-number")
+
+    assert mock_request.call_args.kwargs["params"]["per_page"] == 20
 
 
 def test_link_header_rels_returns_empty_set_for_missing_header():
@@ -603,6 +711,7 @@ def test_search_repositories_reports_truncated_when_more_pages_exist(monkeypatch
 
     assert result["status"] == "success"
     assert result["truncated"] is True
+    assert result["truncation_reason"] == "more_pages"
     assert result["next_page"] == 2
 
 
@@ -992,7 +1101,7 @@ def test_list_issues_preserves_partial_results_on_malformed_json_body(monkeypatc
 
     result = json.loads(github.github_list_issues("octocat/Hello-World", limit=100_000))
 
-    assert result["status"] == "success"
+    assert result["status"] == "partial"
     assert len(result["issues"]) == 2
     assert result["truncated"] is True
     assert result["truncation_reason"] == "request_failed"
@@ -1021,7 +1130,7 @@ def test_list_issues_preserves_partial_results_on_non_list_page(monkeypatch):
 
     result = json.loads(github.github_list_issues("octocat/Hello-World", limit=100_000))
 
-    assert result["status"] == "success"
+    assert result["status"] == "partial"
     assert len(result["issues"]) == 2
     assert result["truncated"] is True
     assert result["truncation_reason"] == "request_failed"
@@ -1045,7 +1154,7 @@ def test_list_issues_preserves_partial_results_on_non_object_item(monkeypatch):
 
     result = json.loads(github.github_list_issues("octocat/Hello-World", limit=100_000))
 
-    assert result["status"] == "success"
+    assert result["status"] == "partial"
     assert len(result["issues"]) == 1
     assert result["issues"][0]["number"] == 1
     assert result["truncated"] is True
@@ -1269,7 +1378,7 @@ def test_list_issues_preserves_partial_results_on_mid_pagination_failure(monkeyp
 
     result = json.loads(github.github_list_issues("octocat/Hello-World", limit=100_000))
 
-    assert result["status"] == "success"
+    assert result["status"] == "partial"
     assert len(result["issues"]) == github.MAX_PER_PAGE // 2
     assert result["truncated"] is True
     assert result["truncation_reason"] == "request_failed"
@@ -1484,6 +1593,76 @@ def test_list_pull_requests_returns_summaries(monkeypatch):
     assert result["next_page"] is None
 
 
+def test_list_pull_requests_derives_merged_from_merged_at(monkeypatch):
+    """The list-PRs endpoint never includes a "merged" key (only the
+    single-PR GET does), but it does include "merged_at" -- without
+    falling back to that, a genuinely merged PR would always report
+    merged: null from this tool."""
+    monkeypatch.setattr(
+        github.requests,
+        "request",
+        Mock(
+            return_value=MockResponse(
+                json_data=[
+                    {
+                        "number": 1,
+                        "title": "merged pr",
+                        "merged_at": "2026-01-01T00:00:00Z",
+                    },
+                    {
+                        "number": 2,
+                        "title": "open pr",
+                        "merged_at": None,
+                    },
+                ]
+            )
+        ),
+    )
+
+    result = json.loads(github.github_list_pull_requests("octocat/Hello-World"))
+
+    assert result["pull_requests"][0]["merged"] is True
+    assert result["pull_requests"][1]["merged"] is False
+
+
+def test_get_pull_request_prefers_actual_merged_field(monkeypatch):
+    """The single-PR GET endpoint returns "merged" directly -- it must be
+    used as-is rather than derived from merged_at. The fixture is
+    deliberately contradictory (merged=False but merged_at set): a
+    regression that always derived from merged_at would report True here."""
+    monkeypatch.setattr(
+        github.requests,
+        "request",
+        Mock(
+            return_value=MockResponse(
+                json_data={
+                    "number": 1,
+                    "merged": False,
+                    "merged_at": "2026-01-01T00:00:00Z",
+                }
+            )
+        ),
+    )
+
+    result = json.loads(github.github_get_pull_request("octocat/Hello-World", 1))
+
+    assert result["pull_request"]["merged"] is False
+
+
+def test_summarize_pull_request_reports_unknown_when_both_keys_absent(monkeypatch):
+    """A degraded payload carrying neither "merged" nor "merged_at" must
+    report null ("unknown"), not a confident false."""
+    monkeypatch.setattr(
+        github.requests,
+        "request",
+        Mock(return_value=MockResponse(json_data={"number": 1, "title": "pr"})),
+    )
+
+    result = json.loads(github.github_get_pull_request("octocat/Hello-World", 1))
+
+    assert result["pull_request"]["merged"] is None
+
+
 def test_list_pull_requests_reports_truncated_when_more_pages_exist(monkeypatch):
     monkeypatch.setattr(
         github.requests,
@@ -1500,6 +1679,7 @@ def test_list_pull_requests_reports_truncated_when_more_pages_exist(monkeypatch)
 
     assert result["status"] == "success"
     assert result["truncated"] is True
+    assert result["truncation_reason"] == "more_pages"
     assert result["next_page"] == 2
 
 
@@ -2121,6 +2301,11 @@ def test_get_file_contents_flags_directory_at_the_1000_entry_cap(monkeypatch):
 
     assert result["status"] == "success"
     assert result["truncated"] is True
+    assert result["truncation_reason"] == "entry_cap"
+    # Unlike the list tools, there's no page/cursor to offer here (the
+    # Contents API has none for directories) -- the remediation is a
+    # message instead of an actionable continuation field.
+    assert "Trees API" in result["message"]
 
 
 def test_get_file_contents_directory_under_cap_is_not_truncated(monkeypatch):
@@ -2138,6 +2323,8 @@ def test_get_file_contents_directory_under_cap_is_not_truncated(monkeypatch):
 
     assert result["status"] == "success"
     assert result["truncated"] is False
+    assert result["truncation_reason"] is None
+    assert "message" not in result
 
 
 def test_list_commits_returns_summaries(monkeypatch):
@@ -2185,6 +2372,7 @@ def test_list_commits_reports_truncated_when_more_pages_exist(monkeypatch):
 
     assert result["status"] == "success"
     assert result["truncated"] is True
+    assert result["truncation_reason"] == "more_pages"
     assert result["next_page"] == 2
 
 
@@ -2351,6 +2539,7 @@ def test_search_code_reports_truncated_when_more_pages_exist(monkeypatch):
 
     assert result["status"] == "success"
     assert result["truncated"] is True
+    assert result["truncation_reason"] == "more_pages"
     assert result["next_page"] == 2
 
 
@@ -2361,3 +2550,48 @@ def test_tool_returns_error_payload_on_missing_token(monkeypatch):
 
     assert result["status"] == "error"
     assert "GITHUB_ACCESS_TOKEN" in result["message"]
+
+
+@pytest.mark.parametrize(
+    "call",
+    [
+        lambda: github.github_get_repository("octocat/Hello-World"),
+        lambda: github.github_get_issue("octocat/Hello-World", 1),
+        lambda: github.github_comment_on_issue("octocat/Hello-World", 1, "hi"),
+        lambda: github.github_get_pull_request("octocat/Hello-World", 1),
+        lambda: github.github_list_pull_requests("octocat/Hello-World"),
+        lambda: github.github_list_commits("octocat/Hello-World"),
+        lambda: github.github_search_code("def parse"),
+        lambda: github.github_search_repositories("stars:>1"),
+    ],
+    ids=[
+        "get_repository",
+        "get_issue",
+        "comment_on_issue",
+        "get_pull_request",
+        "list_pull_requests",
+        "list_commits",
+        "search_code",
+        "search_repositories",
+    ],
+)
+def test_tool_wrapper_surfaces_error_response(monkeypatch, call):
+    """Each of these 8 tools previously had no test driving a GitHub error
+    response through the tool wrapper itself (only through the shared
+    _request/_request_raw helpers directly) -- pin that every one reports
+    status: "error" with the upstream message, not an unhandled exception
+    or a silently-swallowed failure."""
+    monkeypatch.setattr(
+        github.requests,
+        "request",
+        Mock(
+            return_value=MockResponse(
+                json_data={"message": "Service Unavailable"}, status_code=503
+            )
+        ),
+    )
+
+    result = json.loads(call())
+
+    assert result["status"] == "error"
+    assert "Service Unavailable" in result["message"]

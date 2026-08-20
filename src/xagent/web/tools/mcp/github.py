@@ -138,7 +138,8 @@ def _require_object(value: Any, *, context: str) -> None:
     """Raise if a single-object response isn't an object.
 
     The single-object GET/create tools (github_get_current_user,
-    github_get_repository, github_get_pull_request,
+    github_get_repository, github_get_issue, github_create_issue,
+    github_comment_on_issue, github_get_pull_request,
     github_create_pull_request) call `_request()` and immediately `.get()`
     or pass the result to a `_summarize_*` helper -- an unexpected `null`
     or list body (e.g. a malformed or proxy-mangled response) would

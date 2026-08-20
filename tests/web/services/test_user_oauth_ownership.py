@@ -120,6 +120,36 @@ def test_direct_id_lookup_requires_the_expected_owner(tmp_path) -> None:
         engine.dispose()
 
 
+def test_scoped_lookup_rejects_another_users_account_id(tmp_path) -> None:
+    engine, db, _owner, rows = _db(tmp_path)
+    other_user = User(username="other-owner", password_hash="hash")
+    db.add(other_user)
+    db.commit()
+    db.refresh(other_user)
+    alice_row = rows[1]
+    try:
+        assert (
+            get_scoped_user_oauth_account(
+                db,
+                user_id=int(other_user.id),
+                account_id=int(alice_row.id),
+                resource_owner_key=ALICE,
+            )
+            is None
+        )
+        assert (
+            list_scoped_user_oauth_accounts(
+                db,
+                user_id=int(other_user.id),
+                resource_owner_key=ALICE,
+            )
+            == []
+        )
+    finally:
+        db.close()
+        engine.dispose()
+
+
 def test_scoped_id_lookup_refreshes_an_identity_mapped_account(tmp_path) -> None:
     engine, db, user, rows = _db(tmp_path)
     alice_row = rows[1]

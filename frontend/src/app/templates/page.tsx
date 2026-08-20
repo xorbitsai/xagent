@@ -132,7 +132,7 @@ function TemplatesPageContent() {
       : t("templates.agentsCountOther", { count });
 
   const handleOpenTemplate = (templateId: string) => {
-    router.push(`/templates/${templateId}`);
+    router.push(`/templates/${encodeURIComponent(templateId)}`);
   };
 
   // Bundled into one object (rather than two independent props) so a
@@ -248,7 +248,7 @@ function TemplatesPageContent() {
     if (template?.type === "workforce") {
       setCreatingWorkforceId(templateId);
       try {
-        const response = await apiRequest(`${getApiUrl()}/api/templates/${templateId}/use-as-workforce?lang=${locale}`, {
+        const response = await apiRequest(`${getApiUrl()}/api/templates/${encodeURIComponent(templateId)}/use-as-workforce?lang=${locale}`, {
           method: "POST",
         });
         // The user may have navigated away while this request was in
@@ -284,16 +284,16 @@ function TemplatesPageContent() {
       return;
     }
     try {
-      await apiRequest(`${getApiUrl()}/api/templates/${templateId}/use`, { method: "POST" });
+      await apiRequest(`${getApiUrl()}/api/templates/${encodeURIComponent(templateId)}/use`, { method: "POST" });
     } catch { }
     if (!isMountedRef.current) return;
-    router.push(`/build/new?template=${templateId}`);
+    router.push(`/build/new?template=${encodeURIComponent(templateId)}`);
   };
 
   const handleLikeTemplate = async (templateId: string, e: React.MouseEvent) => {
     e.stopPropagation();
     try {
-      const response = await apiRequest(`${getApiUrl()}/api/templates/${templateId}/like`, { method: "POST" });
+      const response = await apiRequest(`${getApiUrl()}/api/templates/${encodeURIComponent(templateId)}/like`, { method: "POST" });
       if (response.ok) {
         const res = await apiRequest(`${getApiUrl()}/api/templates/?lang=${locale}`);
         if (res.ok) setTemplates(await res.json());

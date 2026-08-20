@@ -45,7 +45,7 @@ export default function TemplateDetailPage() {
     (async () => {
       try {
         const response = await apiRequest(
-          `${getApiUrl()}/api/templates/${id}?lang=${locale}`
+          `${getApiUrl()}/api/templates/${encodeURIComponent(id)}?lang=${locale}`
         );
         if (cancelled) return;
         if (!response.ok) {
@@ -289,7 +289,7 @@ export default function TemplateDetailPage() {
         {!template.hired && (
           <button
             type="button"
-            onClick={() => router.push(`/build/new?template=${template.id}`)}
+            onClick={() => router.push(`/build/new?template=${encodeURIComponent(template.id)}`)}
             className="mt-8 text-[13px] font-medium text-muted-foreground underline-offset-2 hover:text-foreground hover:underline"
           >
             {t("templates.marketplace.customizeBeforeHiring")}

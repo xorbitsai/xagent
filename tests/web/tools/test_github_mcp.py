@@ -614,7 +614,7 @@ def test_search_repositories_rejects_non_dict_body(monkeypatch):
     result = json.loads(github.github_search_repositories("stars:>1"))
 
     assert result["status"] == "error"
-    assert "non-object body" in result["message"]
+    assert "non-object value" in result["message"]
     assert "attribute" not in result["message"]
 
 
@@ -628,7 +628,7 @@ def test_search_code_rejects_non_dict_body(monkeypatch):
     result = json.loads(github.github_search_code("def parse"))
 
     assert result["status"] == "error"
-    assert "non-object body" in result["message"]
+    assert "non-object value" in result["message"]
 
 
 def test_list_tools_tolerate_next_page_none_feedback(monkeypatch):

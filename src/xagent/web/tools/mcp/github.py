@@ -146,7 +146,9 @@ def _require_object(value: Any, *, context: str) -> None:
     otherwise surface as an unhelpful `'NoneType'`/`'list' object has no
     attribute 'get'` instead of identifying what GitHub actually
     returned, the same class of gap `_require_object_items` closes for
-    the list-returning tools.
+    the list-returning tools. github_search_repositories/github_search_code
+    also call this, on the search envelope itself, ahead of the separate
+    `_require_object_items` check on its `items` field.
     """
     if not isinstance(value, dict):
         raise ValueError(
@@ -513,14 +515,7 @@ def github_search_repositories(
             },
         )
         result = response.json() if response.content else {}
-        if not isinstance(result, dict):
-            # A non-dict 200 body (e.g. a bare list) would otherwise raise
-            # an unhelpful AttributeError from .get() below -- the same
-            # error class _require_object_items exists to prevent.
-            raise ValueError(
-                "GitHub returned a non-object body for repository search "
-                f"({type(result).__name__})"
-            )
+        _require_object(result, context="repository search response")
         raw_items = result.get("items") or []
         _require_object_items(raw_items, context="repository search results")
         repos = [_summarize_repo(repo) for repo in raw_items]
@@ -1203,13 +1198,7 @@ def github_search_code(
             },
         )
         result = response.json() if response.content else {}
-        if not isinstance(result, dict):
-            # Same guard as github_search_repositories: a non-dict 200 body
-            # would raise an unhelpful AttributeError from .get() below.
-            raise ValueError(
-                "GitHub returned a non-object body for code search "
-                f"({type(result).__name__})"
-            )
+        _require_object(result, context="code search response")
         raw_items = result.get("items") or []
         _require_object_items(raw_items, context="code search results")
         items = [

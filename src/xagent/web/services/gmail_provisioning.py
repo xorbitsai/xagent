@@ -887,13 +887,14 @@ def ensure_gmail_mailbox_provisioned(
             "actor-owned OAuth credentials cannot provision Gmail watches"
         )
     oauth_account_id = int(oauth_account.id)
+    oauth_account_user_id = int(oauth_account.user_id)
     with _gmail_watch_transition_lock(db, oauth_account_id) as transition_db:
         transition_account = (
             oauth_account
             if transition_db is db
             else get_scoped_user_oauth_account(
                 transition_db,
-                user_id=int(oauth_account.user_id),
+                user_id=oauth_account_user_id,
                 account_id=oauth_account_id,
                 resource_owner_key=None,
             )

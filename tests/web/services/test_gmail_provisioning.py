@@ -96,6 +96,78 @@ def test_transition_lock_yields_the_database_session(
         assert transition_db is db_session
 
 
+def test_provisioning_captures_account_identity_before_transition_commit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The lock may commit and expire the caller's ORM identity map."""
+
+    class Account:
+        id = 7
+        resource_owner_key = None
+        expired = False
+
+        @property
+        def user_id(self) -> int:
+            if self.expired:
+                raise AssertionError("expired account identity was lazy-loaded")
+            return 11
+
+    class CallerSession:
+        expired_all = False
+
+        def expire_all(self) -> None:
+            self.expired_all = True
+
+    class TransitionLock:
+        def __enter__(self):
+            account.expired = True
+            return transition_db
+
+        def __exit__(self, *_args) -> None:
+            return None
+
+    account = Account()
+    caller_db = CallerSession()
+    transition_db = object()
+    transition_account = object()
+    state = object()
+    captured_user_ids: list[int] = []
+
+    monkeypatch.setattr(
+        gmail_provisioning,
+        "_gmail_watch_transition_lock",
+        lambda _db, _account_id: TransitionLock(),
+    )
+
+    def get_account(_db, *, user_id, account_id, resource_owner_key):
+        assert _db is transition_db
+        assert account_id == 7
+        assert resource_owner_key is None
+        captured_user_ids.append(user_id)
+        return transition_account
+
+    monkeypatch.setattr(
+        gmail_provisioning,
+        "get_scoped_user_oauth_account",
+        get_account,
+    )
+    monkeypatch.setattr(
+        gmail_provisioning,
+        "_ensure_gmail_mailbox_provisioned_locked",
+        lambda db, oauth_account, **_kwargs: (
+            state
+            if db is transition_db and oauth_account is transition_account
+            else pytest.fail("unexpected transition arguments")
+        ),
+    )
+
+    result = ensure_gmail_mailbox_provisioned(caller_db, account)
+
+    assert result is state
+    assert captured_user_ids == [11]
+    assert caller_db.expired_all is True
+
+
 def test_postgresql_transition_uses_only_the_lock_owning_connection(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

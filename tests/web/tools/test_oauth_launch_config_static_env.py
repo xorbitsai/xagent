@@ -4,9 +4,12 @@ the existing per-user OAuth access token forwarded via env_mapping."""
 
 from types import SimpleNamespace
 
+import pytest
+
 from xagent.web.tools.config import (
     WebToolConfig,
     _oauth_launch_config_static_env,
+    _OAuthInstanceUrlRequired,
 )
 
 
@@ -128,10 +131,14 @@ def test_transport_config_forwards_instance_url_when_mapped_and_provided():
     )
 
 
-def test_transport_config_omits_instance_url_env_when_not_provided():
-    """A provider that doesn't return instance_url (i.e. every provider
-    except Salesforce) must not get a stray env var for a mapping entry
-    that has nothing to forward."""
+def test_transport_config_raises_when_instance_url_mapped_but_not_provided():
+    """A launch_config that maps an env_mapping entry to "instance_url" but
+    gets no value for it (pre-migration UserOAuth row, hook path that hasn't
+    wired instance_url through, etc.) must not silently launch a connector
+    missing a value it declared as required -- that only turns into an
+    opaque failure on the connector's first real tool call. It should
+    surface as unavailable/reconnect-required instead, same as a missing
+    access_token."""
     cfg = WebToolConfig(db=None, request=None)
     app_info = {
         "launch_config": {
@@ -144,10 +151,9 @@ def test_transport_config_omits_instance_url_env_when_not_provided():
         }
     }
 
-    transport_config = cfg._build_oauth_mcp_stdio_transport_config(
-        server=SimpleNamespace(name="Salesforce"),
-        app_info=app_info,
-        access_token="user-access-token",
-    )
-
-    assert "SALESFORCE_INSTANCE_URL" not in transport_config["env"]
+    with pytest.raises(_OAuthInstanceUrlRequired):
+        cfg._build_oauth_mcp_stdio_transport_config(
+            server=SimpleNamespace(name="Salesforce"),
+            app_info=app_info,
+            access_token="user-access-token",
+        )

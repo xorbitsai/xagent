@@ -133,10 +133,13 @@ class ResolvedToken:
     comparison. Resolvers SHOULD set ``expires_at`` to enable MCP config
     caching; ``expires_at=None`` means the token is usable for this build only
     and this ``WebToolConfig`` instance will reload MCP configs on later calls.
+    ``instance_url`` carries the per-org API host a provider like Salesforce
+    returns alongside its access token; providers without one leave it None.
     """
 
     access_token: str = field(repr=False)
     expires_at: datetime | None = None
+    instance_url: str | None = None
     generation: str | None = field(default=None, repr=False)
 
 
@@ -259,6 +262,7 @@ class _ResolvedHookToken:
     access_token: str = field(repr=False)
     expires_at: datetime | None
     generation: str | None = field(repr=False)
+    instance_url: str | None = None
 
 
 class _OAuthTokenResolverFailed(Exception):
@@ -283,6 +287,17 @@ class _OAuthLaunchConfigInvalid(Exception):
     def __init__(self, *, field: str) -> None:
         super().__init__(field)
         self.field = field
+
+
+class _OAuthInstanceUrlRequired(Exception):
+    """The launch_config declares an instance_url env mapping, but the
+    resolved token (hook or legacy DB path) didn't supply one.
+
+    Raised instead of silently omitting the env var so the connector comes
+    back as unavailable/reconnect-required, matching how a missing
+    access_token is already surfaced, rather than launching a subprocess
+    that fails opaquely on its first real tool call.
+    """
 
 
 @dataclass(frozen=True)
@@ -2904,6 +2919,14 @@ class WebToolConfig(BaseToolConfig):
                 exception_type="InvalidGeneration",
                 resource=resource,
             )
+        if resolved.instance_url is not None and (
+            type(resolved.instance_url) is not str or not resolved.instance_url
+        ):
+            raise _OAuthTokenResolverFailed(
+                providers=providers,
+                exception_type="InvalidInstanceUrl",
+                resource=resource,
+            )
 
         expires_at = _normalize_oauth_expires_at(resolved.expires_at)
         if expires_at is not None and _oauth_token_is_expired(expires_at):
@@ -2918,6 +2941,7 @@ class WebToolConfig(BaseToolConfig):
             access_token=resolved.access_token,
             expires_at=expires_at,
             generation=resolved.generation,
+            instance_url=resolved.instance_url,
         )
 
     def _mark_hook_token_cache_metadata(self, resolved: _ResolvedHookToken) -> None:
@@ -3041,7 +3065,9 @@ class WebToolConfig(BaseToolConfig):
             ).items():
                 if token_type == "access_token":
                     env[env_key] = access_token
-                elif token_type == "instance_url" and instance_url:
+                elif token_type == "instance_url":
+                    if not instance_url:
+                        raise _OAuthInstanceUrlRequired()
                     env[env_key] = instance_url
 
             for env_key, host_env_var in _oauth_launch_config_static_env(
@@ -3268,6 +3294,7 @@ class WebToolConfig(BaseToolConfig):
                         server=server,
                         app_info=app_info,
                         access_token=hook_token.access_token,
+                        instance_url=hook_token.instance_url,
                     )
                 except _OAuthLaunchConfigInvalid as error:
                     logger.warning(
@@ -3278,6 +3305,17 @@ class WebToolConfig(BaseToolConfig):
                     return self._build_unavailable_mcp_config(
                         server=server,
                         reason="invalid_launch_config",
+                    )
+                except _OAuthInstanceUrlRequired:
+                    logger.info(
+                        "OAuth token resolver hook did not supply instance_url for MCP server '%s'",
+                        getattr(server, "name", "<unknown>"),
+                    )
+                    return self._build_unavailable_mcp_config(
+                        server=server,
+                        reason="oauth_token_required",
+                        message=UNAVAILABLE_MCP_CREDENTIAL_MESSAGE,
+                        failure_code="oauth_token_required",
                     )
                 config["transport"] = "stdio"
                 logger.info(
@@ -3324,6 +3362,17 @@ class WebToolConfig(BaseToolConfig):
                     return self._build_unavailable_mcp_config(
                         server=server,
                         reason="invalid_launch_config",
+                    )
+                except _OAuthInstanceUrlRequired:
+                    logger.info(
+                        "OAUTH CONFIG: No instance_url found for '%s'.",
+                        provider_name,
+                    )
+                    return self._build_unavailable_mcp_config(
+                        server=server,
+                        reason="oauth_token_required",
+                        message=UNAVAILABLE_MCP_CREDENTIAL_MESSAGE,
+                        failure_code="oauth_token_required",
                     )
                 config["transport"] = "stdio"
 

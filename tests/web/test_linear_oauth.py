@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import Mock
+from urllib.parse import parse_qs, urlparse
 
 import pytest
 from sqlalchemy import create_engine
@@ -123,6 +124,27 @@ def test_login_sends_comma_separated_scope_param(db_session):
 
     assert response.status_code == 307
     assert "scope=read%2Cwrite" in response.headers["location"]
+
+
+def test_login_forces_consent_prompt(db_session):
+    """Linear does not auto-reprompt when a later request asks for a
+    broader scope set than a previously granted token (confirmed against
+    Linear's own OAuth docs) -- without prompt=consent, a bare
+    read-only connect followed by an app-scoped read+write connect could
+    silently leave the user on the earlier, narrower grant."""
+    db, user = db_session
+    token = create_access_token(
+        data={"sub": user.username, "type": "access"},
+        expires_delta=timedelta(minutes=5),
+    )
+
+    response = generic_oauth_login(
+        "linear", token=token, app_id="linear", db=db, db_provider=_linear_provider()
+    )
+
+    assert response.status_code == 307
+    query = parse_qs(urlparse(response.headers["location"]).query)
+    assert query["prompt"] == ["consent"]
 
 
 def test_callback_persists_token_without_userinfo_lookup(db_session, monkeypatch):

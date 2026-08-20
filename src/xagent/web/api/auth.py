@@ -1309,6 +1309,14 @@ def generic_oauth_login(
         # previously granted a narrower scope set can be silently handed a
         # token still limited to that earlier grant.
         params["prompt"] = "consent"
+    if provider.lower() == "linear":
+        # Same reasoning as jira above, confirmed against Linear's own OAuth
+        # docs: Linear does not auto-reprompt when a later request asks for
+        # a broader scope set than a previously granted token -- a bare
+        # provider connect (read only) followed by an app-scoped connect
+        # (read+write) could otherwise silently leave the user with the
+        # earlier read-only token instead of the new grant.
+        params["prompt"] = "consent"
     meta_config_id = _meta_login_config_id() if provider.lower() == "meta" else ""
     if meta_config_id:
         params["config_id"] = meta_config_id

@@ -43,6 +43,11 @@ MAX_ISSUE_SEARCH_PAGES = 10
 # Workspaces typically have far fewer members than a repository has issues,
 # so linear_search_users gets a smaller cap for the same bounded-fetch reason.
 MAX_USER_SEARCH_PAGES = 5
+# Neither issues(...) nor users(...) below sets an explicit orderBy -- per
+# Linear's docs, that defaults to createdAt, which is immutable and
+# monotonically increasing, so paginating via after: endCursor across
+# multiple requests can't duplicate or skip rows even if new ones are
+# created mid-scan.
 
 _UUID_PATTERN = re.compile(
     r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
@@ -73,6 +78,14 @@ def _validate_title(title: str | None) -> str | None:
 
 
 def _success(*, _errors: list[Any] | None = None, **payload: Any) -> str:
+    """`_errors` becomes a `warnings` list entry, not to be confused with
+    the unrelated `error` string some pagination-loop callers pass directly
+    in `payload` (a page-fetch exception after earlier pages succeeded).
+    The two describe different things and can both be present at once: a
+    sub-field resolver failure on an already-fetched page (`warnings`) and
+    the reason a *later* page could not be fetched at all (`error`) --
+    neither takes precedence over the other, both are simply reported.
+    """
     body: dict[str, Any] = {"status": "success", **payload}
     if _errors:
         # A genuine partial GraphQL success (one sub-field failed, others
@@ -109,6 +122,12 @@ def _graphql_errors_message(errors: list[Any]) -> str:
         else:
             messages.append(str(entry))
     return "; ".join(messages) if messages else "Unknown Linear API error"
+
+
+def _truncate_error_text(text: str) -> str:
+    if len(text) > MAX_ERROR_RESPONSE_TEXT_CHARS:
+        return text[:MAX_ERROR_RESPONSE_TEXT_CHARS] + "... [truncated]"
+    return text
 
 
 def _is_rate_limited(response: requests.Response) -> bool:
@@ -196,9 +215,7 @@ def _graphql(
         except ValueError:
             pass
         if detail is None:
-            detail = response.text.strip()
-            if len(detail) > MAX_ERROR_RESPONSE_TEXT_CHARS:
-                detail = detail[:MAX_ERROR_RESPONSE_TEXT_CHARS] + "... [truncated]"
+            detail = _truncate_error_text(response.text.strip())
         raise RuntimeError(
             f"Linear API error (status {response.status_code}): {detail}"
         )
@@ -206,9 +223,7 @@ def _graphql(
     try:
         payload = response.json()
     except ValueError:
-        detail = response.text.strip()
-        if len(detail) > MAX_ERROR_RESPONSE_TEXT_CHARS:
-            detail = detail[:MAX_ERROR_RESPONSE_TEXT_CHARS] + "... [truncated]"
+        detail = _truncate_error_text(response.text.strip())
         raise RuntimeError(
             f"Linear API returned a non-JSON response: {detail}"
         ) from None
@@ -461,12 +476,10 @@ _ISSUE_SUMMARY_FIELDS = (
 )
 # Used for single-issue fetches and mutation results, where the caller
 # asked about (or just created/updated) exactly one issue and the full
-# body is the point.
-_ISSUE_DETAIL_FIELDS = (
-    "id identifier title description priority url createdAt updatedAt"
-    " state { id name type } assignee { id name email }"
-    " team { id key name } labels { nodes { id name } }"
-)
+# body is the point. Derived from _ISSUE_SUMMARY_FIELDS (rather than a
+# second hand-maintained literal) so the two field sets can't silently
+# drift apart on a future edit to the fields they share.
+_ISSUE_DETAIL_FIELDS = _ISSUE_SUMMARY_FIELDS.replace("title", "title description", 1)
 
 
 @mcp.tool()
@@ -659,7 +672,7 @@ def linear_create_issue(
             issue_input["assigneeId"] = assignee_id
         if priority is not None:
             issue_input["priority"] = priority
-        if label_ids:
+        if label_ids is not None:
             issue_input["labelIds"] = label_ids
 
         data, errors = _graphql(
@@ -796,6 +809,8 @@ def linear_add_comment(issue_id: str, body: str) -> str:
     body: the comment text (Markdown supported).
     """
     try:
+        if not body.strip():
+            return _error("body must not be empty")
         data, errors = _graphql(
             "mutation($input: CommentCreateInput!) { commentCreate(input: $input)"
             " { success comment { id body createdAt } } }",

@@ -492,6 +492,27 @@ def test_list_teams_clamps_over_limit(monkeypatch):
     assert mock_post.call_args.kwargs["json"]["variables"]["first"] == linear.MAX_LIMIT
 
 
+def test_list_teams_surfaces_partial_graphql_errors_as_warnings(monkeypatch):
+    monkeypatch.setattr(
+        linear.requests,
+        "post",
+        Mock(
+            return_value=MockResponse(
+                json_data={
+                    "data": {"teams": {"nodes": [{"id": "t1", "key": "ENG"}]}},
+                    "errors": [{"message": "some.other.field failed"}],
+                }
+            )
+        ),
+    )
+
+    result = json.loads(linear.linear_list_teams())
+
+    assert result["status"] == "success"
+    assert result["teams"] == [{"id": "t1", "key": "ENG"}]
+    assert "some.other.field failed" in result["warnings"][0]
+
+
 def test_list_teams_reports_truncated_when_more_pages_exist(monkeypatch):
     monkeypatch.setattr(
         linear.requests,
@@ -604,6 +625,27 @@ def test_list_workflow_states_clamps_over_limit(monkeypatch):
     assert mock_post.call_args.kwargs["json"]["variables"]["first"] == linear.MAX_LIMIT
 
 
+def test_list_workflow_states_surfaces_partial_graphql_errors_as_warnings(monkeypatch):
+    monkeypatch.setattr(
+        linear.requests,
+        "post",
+        Mock(
+            return_value=MockResponse(
+                json_data={
+                    "data": {"team": {"states": {"nodes": [{"id": "s1"}]}}},
+                    "errors": [{"message": "some.other.field failed"}],
+                }
+            )
+        ),
+    )
+
+    result = json.loads(linear.linear_list_workflow_states(_TEAM_UUID))
+
+    assert result["status"] == "success"
+    assert result["states"] == [{"id": "s1"}]
+    assert "some.other.field failed" in result["warnings"][0]
+
+
 def test_list_labels_resolves_team_key_to_uuid(monkeypatch):
     mock_post = Mock(
         side_effect=[
@@ -639,6 +681,40 @@ def test_list_labels_clamps_over_limit(monkeypatch):
     linear.linear_list_labels(_TEAM_UUID, limit=500)
 
     assert mock_post.call_args.kwargs["json"]["variables"]["first"] == linear.MAX_LIMIT
+
+
+def test_list_labels_reports_error_when_team_missing(monkeypatch):
+    monkeypatch.setattr(
+        linear.requests,
+        "post",
+        Mock(return_value=MockResponse(json_data={"data": {"team": None}})),
+    )
+
+    result = json.loads(linear.linear_list_labels(_TEAM_UUID))
+
+    assert result["status"] == "error"
+    assert "not found" in result["message"]
+
+
+def test_list_labels_surfaces_partial_graphql_errors_as_warnings(monkeypatch):
+    monkeypatch.setattr(
+        linear.requests,
+        "post",
+        Mock(
+            return_value=MockResponse(
+                json_data={
+                    "data": {"team": {"labels": {"nodes": [{"id": "l1"}]}}},
+                    "errors": [{"message": "some.other.field failed"}],
+                }
+            )
+        ),
+    )
+
+    result = json.loads(linear.linear_list_labels(_TEAM_UUID))
+
+    assert result["status"] == "success"
+    assert result["labels"] == [{"id": "l1"}]
+    assert "some.other.field failed" in result["warnings"][0]
 
 
 def test_list_labels_reports_truncated_when_more_pages_exist(monkeypatch):
@@ -795,6 +871,40 @@ def test_list_projects_without_team_id_skips_resolution(monkeypatch):
     # deprecated Project.state -> status migration reaches the output,
     # not just that the hardcoded query string happens to mention "status".
     assert result["projects"][0]["status"]["type"] == "started"
+
+
+def test_list_projects_reports_error_when_team_missing(monkeypatch):
+    monkeypatch.setattr(
+        linear.requests,
+        "post",
+        Mock(return_value=MockResponse(json_data={"data": {"team": None}})),
+    )
+
+    result = json.loads(linear.linear_list_projects(team_id=_TEAM_UUID))
+
+    assert result["status"] == "error"
+    assert "not found" in result["message"]
+
+
+def test_list_projects_surfaces_partial_graphql_errors_as_warnings(monkeypatch):
+    monkeypatch.setattr(
+        linear.requests,
+        "post",
+        Mock(
+            return_value=MockResponse(
+                json_data={
+                    "data": {"projects": {"nodes": [{"id": "p1"}]}},
+                    "errors": [{"message": "some.other.field failed"}],
+                }
+            )
+        ),
+    )
+
+    result = json.loads(linear.linear_list_projects())
+
+    assert result["status"] == "success"
+    assert result["projects"] == [{"id": "p1"}]
+    assert "some.other.field failed" in result["warnings"][0]
 
 
 def test_list_projects_without_team_id_reports_truncated_when_more_pages_exist(
@@ -1146,6 +1256,19 @@ def test_search_issues_title_query_returns_partial_matches_on_mid_pagination_fai
     assert "boom" in result["error"]
 
 
+def test_search_issues_title_query_reports_error_on_first_page_failure(monkeypatch):
+    """With no prior page to fall back on, a first-page failure must
+    surface as a hard error, not a `_success` with an empty partial list --
+    there is nothing to distinguish that from a genuine no-match result."""
+    mock_post = Mock(side_effect=[RuntimeError("Linear API error (status 500): boom")])
+    monkeypatch.setattr(linear.requests, "post", mock_post)
+
+    result = json.loads(linear.linear_search_issues(query="docs"))
+
+    assert result["status"] == "error"
+    assert "boom" in result["message"]
+
+
 def test_search_issues_preserves_earlier_page_warnings_on_later_page_failure(
     monkeypatch,
 ):
@@ -1305,6 +1428,27 @@ def test_get_issue_returns_issue_on_success(monkeypatch):
     assert result["issue"]["title"] == "Fix bug"
 
 
+def test_get_issue_surfaces_partial_graphql_errors_as_warnings(monkeypatch):
+    monkeypatch.setattr(
+        linear.requests,
+        "post",
+        Mock(
+            return_value=MockResponse(
+                json_data={
+                    "data": {"issue": {"id": "i1", "identifier": "ENG-1"}},
+                    "errors": [{"message": "some.other.field failed"}],
+                }
+            )
+        ),
+    )
+
+    result = json.loads(linear.linear_get_issue("ENG-1"))
+
+    assert result["status"] == "success"
+    assert result["issue"]["identifier"] == "ENG-1"
+    assert "some.other.field failed" in result["warnings"][0]
+
+
 def test_get_issue_returns_not_found_error_when_missing(monkeypatch):
     monkeypatch.setattr(
         linear.requests,
@@ -1400,6 +1544,43 @@ def test_create_issue_sends_expected_input(monkeypatch):
     }
 
 
+def test_create_issue_sends_label_ids(monkeypatch):
+    mock_post = Mock(
+        return_value=MockResponse(
+            json_data={
+                "data": {"issueCreate": {"success": True, "issue": {"id": "i1"}}}
+            }
+        )
+    )
+    monkeypatch.setattr(linear.requests, "post", mock_post)
+
+    linear.linear_create_issue(
+        team_id=_TEAM_UUID, title="New bug", label_ids=["l1", "l2"]
+    )
+
+    sent_input = mock_post.call_args.kwargs["json"]["variables"]["input"]
+    assert sent_input["labelIds"] == ["l1", "l2"]
+
+
+def test_create_issue_sends_explicit_empty_label_ids(monkeypatch):
+    """label_ids must use is-not-None (like linear_update_issue's label_ids),
+    not truthiness -- otherwise an explicitly empty list is silently dropped
+    instead of being sent through."""
+    mock_post = Mock(
+        return_value=MockResponse(
+            json_data={
+                "data": {"issueCreate": {"success": True, "issue": {"id": "i1"}}}
+            }
+        )
+    )
+    monkeypatch.setattr(linear.requests, "post", mock_post)
+
+    linear.linear_create_issue(team_id=_TEAM_UUID, title="New bug", label_ids=[])
+
+    sent_input = mock_post.call_args.kwargs["json"]["variables"]["input"]
+    assert sent_input["labelIds"] == []
+
+
 def test_create_issue_resolves_team_key_to_uuid(monkeypatch):
     """IssueCreateInput.teamId requires the team's real UUID, not its key
     (e.g. "ENG") — team_id must be resolved first."""
@@ -1477,6 +1658,27 @@ def test_create_issue_rejects_out_of_range_priority(monkeypatch):
     assert result["status"] == "error"
     assert "priority" in result["message"]
     mock_post.assert_not_called()
+
+
+def test_create_issue_surfaces_partial_graphql_errors_as_warnings(monkeypatch):
+    monkeypatch.setattr(
+        linear.requests,
+        "post",
+        Mock(
+            return_value=MockResponse(
+                json_data={
+                    "data": {"issueCreate": {"success": True, "issue": {"id": "i1"}}},
+                    "errors": [{"message": "some.other.field failed"}],
+                }
+            )
+        ),
+    )
+
+    result = json.loads(linear.linear_create_issue(team_id=_TEAM_UUID, title="New bug"))
+
+    assert result["status"] == "success"
+    assert result["issue"]["id"] == "i1"
+    assert "some.other.field failed" in result["warnings"][0]
 
 
 def test_create_issue_rejects_empty_title(monkeypatch):
@@ -1614,6 +1816,27 @@ _ISSUE_UPDATE_SUCCESS = MockResponse(
         }
     }
 )
+
+
+def test_update_issue_surfaces_partial_graphql_errors_as_warnings(monkeypatch):
+    monkeypatch.setattr(
+        linear.requests,
+        "post",
+        Mock(
+            return_value=MockResponse(
+                json_data={
+                    "data": {"issueUpdate": {"success": True, "issue": {"id": "i1"}}},
+                    "errors": [{"message": "some.other.field failed"}],
+                }
+            )
+        ),
+    )
+
+    result = json.loads(linear.linear_update_issue("ENG-1", title="Renamed"))
+
+    assert result["status"] == "success"
+    assert result["issue"]["id"] == "i1"
+    assert "some.other.field failed" in result["warnings"][0]
 
 
 def test_update_issue_leaves_labels_untouched_when_not_provided(monkeypatch):
@@ -1843,6 +2066,27 @@ def test_list_comments_returns_nodes(monkeypatch):
     }
 
 
+def test_list_comments_surfaces_partial_graphql_errors_as_warnings(monkeypatch):
+    monkeypatch.setattr(
+        linear.requests,
+        "post",
+        Mock(
+            return_value=MockResponse(
+                json_data={
+                    "data": {"issue": {"comments": {"nodes": [{"id": "c1"}]}}},
+                    "errors": [{"message": "some.other.field failed"}],
+                }
+            )
+        ),
+    )
+
+    result = json.loads(linear.linear_list_comments("ENG-1"))
+
+    assert result["status"] == "success"
+    assert result["comments"] == [{"id": "c1"}]
+    assert "some.other.field failed" in result["warnings"][0]
+
+
 def test_list_comments_clamps_over_limit(monkeypatch):
     mock_post = Mock(
         return_value=MockResponse(
@@ -1940,6 +2184,29 @@ def test_add_comment_passes_issue_id_through_without_a_lookup(monkeypatch):
     assert sent_input == {"issueId": "ENG-1", "body": "Looks good"}
 
 
+def test_add_comment_surfaces_partial_graphql_errors_as_warnings(monkeypatch):
+    monkeypatch.setattr(
+        linear.requests,
+        "post",
+        Mock(
+            return_value=MockResponse(
+                json_data={
+                    "data": {
+                        "commentCreate": {"success": True, "comment": {"id": "c1"}}
+                    },
+                    "errors": [{"message": "some.other.field failed"}],
+                }
+            )
+        ),
+    )
+
+    result = json.loads(linear.linear_add_comment("ENG-1", "Looks good"))
+
+    assert result["status"] == "success"
+    assert result["comment"]["id"] == "c1"
+    assert "some.other.field failed" in result["warnings"][0]
+
+
 def test_add_comment_reports_error_when_linear_reports_failure(monkeypatch):
     monkeypatch.setattr(
         linear.requests,
@@ -1957,6 +2224,17 @@ def test_add_comment_reports_error_when_linear_reports_failure(monkeypatch):
 
     assert result["status"] == "error"
     assert "not created" in result["message"]
+
+
+def test_add_comment_rejects_empty_body(monkeypatch):
+    mock_post = Mock()
+    monkeypatch.setattr(linear.requests, "post", mock_post)
+
+    result = json.loads(linear.linear_add_comment("ENG-1", "   "))
+
+    assert result["status"] == "error"
+    assert "body" in result["message"]
+    mock_post.assert_not_called()
 
 
 def test_search_users_filters_by_name_or_email(monkeypatch):
@@ -2092,6 +2370,19 @@ def test_search_users_returns_partial_matches_on_mid_pagination_failure(monkeypa
     assert [user["id"] for user in result["users"]] == ["u1"]
     assert result["truncated"] is True
     assert "boom" in result["error"]
+
+
+def test_search_users_reports_error_on_first_page_failure(monkeypatch):
+    """With no prior page to fall back on, a first-page failure must
+    surface as a hard error, not a `_success` with an empty partial list --
+    there is nothing to distinguish that from a genuine no-match result."""
+    mock_post = Mock(side_effect=[RuntimeError("Linear API error (status 500): boom")])
+    monkeypatch.setattr(linear.requests, "post", mock_post)
+
+    result = json.loads(linear.linear_search_users("ada"))
+
+    assert result["status"] == "error"
+    assert "boom" in result["message"]
 
 
 def test_search_users_preserves_earlier_page_warnings_on_later_page_failure(

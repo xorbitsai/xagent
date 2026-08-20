@@ -215,6 +215,44 @@ def test_salesforce_provider_includes_pkce_code_challenge(db_session):
     assert qs["code_challenge"][0] == expected_challenge
 
 
+def test_salesforce_login_returns_clear_error_when_encryption_key_missing(
+    db_session, monkeypatch
+):
+    """encrypt_value() raises a bare ValueError when ENCRYPTION_KEY is unset
+    outside development. Every other provider's login route never calls
+    encrypt_value at all, so this misconfiguration would otherwise be
+    invisible until the first Salesforce connect attempt -- and uncaught,
+    it would 500 with an opaque traceback instead of a clear cause."""
+    from xagent.core.utils.encryption import get_cipher
+
+    db, user = db_session
+    token = _token_for(user)
+
+    provider = _provider(
+        auth_url="https://login.salesforce.com/services/oauth2/authorize",
+        default_scopes=["api", "refresh_token", "openid"],
+        redirect_uri="https://app.example.com/cb",
+    )
+
+    monkeypatch.delenv("ENCRYPTION_KEY", raising=False)
+    monkeypatch.setenv("ENVIRONMENT", "production")
+    get_cipher.cache_clear()
+    try:
+        resp = generic_oauth_login(
+            provider="salesforce",
+            token=token,
+            app_id=None,
+            redirect=None,
+            db=db,
+            db_provider=provider,
+        )
+    finally:
+        get_cipher.cache_clear()
+
+    assert resp.status_code == 500
+    assert "ENCRYPTION_KEY" in resp.body.decode()
+
+
 def test_non_salesforce_provider_omits_pkce_code_challenge(db_session):
     db, user = db_session
     token = _token_for(user)

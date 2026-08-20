@@ -1258,10 +1258,22 @@ def generic_oauth_login(
             # get_cipher() raises this when ENCRYPTION_KEY is unset outside
             # development -- every other provider's login route never calls
             # encrypt_value at all, so this misconfiguration is otherwise
-            # invisible until the first Salesforce connect attempt. Fail
-            # with the same clear, actionable page used for a missing
-            # client_id/secret rather than an opaque 500 traceback.
-            return _oauth_provider_config_error(provider, ["ENCRYPTION_KEY"])
+            # invisible until the first Salesforce connect attempt. Not
+            # routed through _oauth_provider_config_error: that helper's
+            # "Missing X for provider Y" phrasing is written for a
+            # provider-prefixed env var (e.g. SALESFORCE_CLIENT_ID) and
+            # would misleadingly suggest a SALESFORCE_ENCRYPTION_KEY-style
+            # variable exists, when ENCRYPTION_KEY is a single global
+            # setting unrelated to any one provider.
+            return HTMLResponse(
+                content=(
+                    "<h1>Error: Server misconfigured</h1>"
+                    "<p>The ENCRYPTION_KEY environment variable is not set. "
+                    "This is required to connect Salesforce; set it and "
+                    "restart the backend.</p>"
+                ),
+                status_code=500,
+            )
     state = create_access_token(data=state_payload, expires_delta=timedelta(minutes=10))
 
     app_scopes: list[str] | None = None
@@ -1506,16 +1518,21 @@ def generic_oauth_callback(
     encrypted_code_verifier = payload.get("code_verifier")
     code_verifier = None
     if encrypted_code_verifier:
-        from ...core.utils.encryption import EncryptionDecodeError, decrypt_value_strict
+        from ...core.utils.encryption import decrypt_value_strict
 
         # Strict, not the lenient decrypt_value: a verifier this can't open
         # (e.g. ENCRYPTION_KEY rotated mid-flight, inside the state token's
         # 10-minute window) must not silently fall back to sending the raw
         # ciphertext to Salesforce as code_verifier -- that only surfaces as
         # an opaque invalid_grant from Salesforce instead of a clear cause.
+        # Catching ValueError, not just its EncryptionDecodeError subclass:
+        # decrypt_value_strict's own get_cipher() call raises a bare
+        # ValueError when ENCRYPTION_KEY is unset outside development,
+        # which is exactly the same "surface it clearly" case, not just a
+        # token that fails to decrypt under a present key.
         try:
             code_verifier = decrypt_value_strict(encrypted_code_verifier)
-        except EncryptionDecodeError:
+        except ValueError:
             return HTMLResponse(
                 content=(
                     "<h1>Error: Session expired</h1><p>Please try connecting again.</p>"

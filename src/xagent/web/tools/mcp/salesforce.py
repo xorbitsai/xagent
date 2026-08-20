@@ -62,7 +62,11 @@ def _instance_url() -> str:
         raise ValueError("SALESFORCE_INSTANCE_URL environment variable is missing")
     instance_url = instance_url.rstrip("/")
     parsed = urlparse(instance_url)
-    hostname = parsed.hostname or ""
+    # rstrip: a trailing-dot FQDN (e.g. "acme.my.salesforce.com.") is a
+    # valid, equivalent hostname that just wouldn't satisfy endswith below
+    # otherwise -- Salesforce's own token response never sends one, but
+    # there's no reason to reject it if it ever did.
+    hostname = (parsed.hostname or "").rstrip(".")
     if parsed.scheme != "https" or not any(
         hostname == suffix or hostname.endswith(f".{suffix}")
         for suffix in _INSTANCE_URL_HOST_SUFFIXES

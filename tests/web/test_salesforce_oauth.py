@@ -191,6 +191,43 @@ def test_callback_sends_decrypted_code_verifier_in_token_exchange(
     assert mock_post.call_args.kwargs["data"]["code_verifier"] == verifier
 
 
+def test_callback_returns_session_expired_when_encryption_key_missing(
+    db_session, monkeypatch
+):
+    """decrypt_value_strict's own get_cipher() call raises a bare ValueError
+    (not its EncryptionDecodeError subclass) when ENCRYPTION_KEY is unset --
+    the callback's except clause must catch ValueError broadly, or this
+    exact misconfiguration 500s with an opaque traceback instead of the
+    same clear "session expired" page a corrupted/foreign token gets."""
+    from xagent.core.utils.encryption import get_cipher
+
+    db, user = db_session
+    state = create_access_token(
+        data={
+            "type": "oauth_state",
+            "user_id": user.id,
+            "provider": "salesforce",
+            "app_id": "salesforce",
+            "code_verifier": encrypt_value("plain-text-verifier-value"),
+        },
+        expires_delta=timedelta(minutes=10),
+    )
+    request = SimpleNamespace(query_params={"code": "sf-code", "state": state})
+    monkeypatch.setattr(auth_api.requests, "post", Mock())
+    provider = _salesforce_provider()
+
+    monkeypatch.delenv("ENCRYPTION_KEY", raising=False)
+    monkeypatch.setenv("ENVIRONMENT", "production")
+    get_cipher.cache_clear()
+    try:
+        response = generic_oauth_callback("salesforce", request, db, provider)
+    finally:
+        get_cipher.cache_clear()
+
+    assert response.status_code == 400
+    assert "expired" in response.body.decode().lower()
+
+
 def test_non_salesforce_callback_does_not_persist_instance_url(db_session, monkeypatch):
     """A provider whose token response has no instance_url key must leave
     that column None, not crash or coerce it to something else."""

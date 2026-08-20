@@ -139,8 +139,8 @@ class ResolvedToken:
 
     access_token: str = field(repr=False)
     expires_at: datetime | None = None
-    instance_url: str | None = None
     generation: str | None = field(default=None, repr=False)
+    instance_url: str | None = None
 
 
 @dataclass(frozen=True)
@@ -296,8 +296,15 @@ class _OAuthInstanceUrlRequired(Exception):
     Raised instead of silently omitting the env var so the connector comes
     back as unavailable/reconnect-required, matching how a missing
     access_token is already surfaced, rather than launching a subprocess
-    that fails opaquely on its first real tool call.
+    that fails opaquely on its first real tool call. Carries the env_mapping
+    key that triggered it, mirroring _OAuthLaunchConfigInvalid.field, so a
+    second provider adding its own instance_url-mapped key someday doesn't
+    leave both call sites' log lines unable to say which one failed.
     """
+
+    def __init__(self, *, env_key: str) -> None:
+        super().__init__(env_key)
+        self.env_key = env_key
 
 
 @dataclass(frozen=True)
@@ -3067,7 +3074,7 @@ class WebToolConfig(BaseToolConfig):
                     env[env_key] = access_token
                 elif token_type == "instance_url":
                     if not instance_url:
-                        raise _OAuthInstanceUrlRequired()
+                        raise _OAuthInstanceUrlRequired(env_key=env_key)
                     env[env_key] = instance_url
 
             for env_key, host_env_var in _oauth_launch_config_static_env(
@@ -3306,9 +3313,10 @@ class WebToolConfig(BaseToolConfig):
                         server=server,
                         reason="invalid_launch_config",
                     )
-                except _OAuthInstanceUrlRequired:
+                except _OAuthInstanceUrlRequired as error:
                     logger.info(
-                        "OAuth token resolver hook did not supply instance_url for MCP server '%s'",
+                        "OAuth token resolver hook did not supply %s for MCP server '%s'",
+                        error.env_key,
                         getattr(server, "name", "<unknown>"),
                     )
                     return self._build_unavailable_mcp_config(
@@ -3363,9 +3371,10 @@ class WebToolConfig(BaseToolConfig):
                         server=server,
                         reason="invalid_launch_config",
                     )
-                except _OAuthInstanceUrlRequired:
+                except _OAuthInstanceUrlRequired as error:
                     logger.info(
-                        "OAUTH CONFIG: No instance_url found for '%s'.",
+                        "OAUTH CONFIG: No %s found for '%s'.",
+                        error.env_key,
                         provider_name,
                     )
                     return self._build_unavailable_mcp_config(

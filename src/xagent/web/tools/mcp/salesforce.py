@@ -153,7 +153,9 @@ def _url_path_id(value: str, field_name: str) -> str:
     misses "/" and "?", which redirect the request to a different endpoint
     or inject query params without ever containing "..". Percent-encoding -
     not an enumeration of specific characters - is what actually closes
-    this off, matching hubspot.py's/jira.py's _url_path_id.
+    this off, matching hubspot.py's _url_path_id and jira.py's
+    _path_segment (jira.py's version skips the empty-id check this one
+    does via _require_clean_identifier).
     """
     _require_clean_identifier(value, field_name)
     return quote(value, safe="")
@@ -337,11 +339,13 @@ def salesforce_create_record(sobject_type: str, fields: dict[str, Any]) -> str:
             f"/services/data/{API_VERSION}/sobjects/{safe_sobject_type}",
             json_data=fields,
         )
-        return _success(
-            id=result.get("id"),
-            success=result.get("success"),
-            errors=result.get("errors") or [],
-        )
+        # Only added when Salesforce actually returned something in it --
+        # an unconditional `errors: []` on every plain success would give a
+        # caller pattern-matching on "errors" key presence (a natural
+        # Salesforce-API idiom; its own bulk/collections endpoints always
+        # include one) a false partial-failure signal.
+        extra = {"errors": result["errors"]} if result.get("errors") else {}
+        return _success(id=result.get("id"), success=result.get("success"), **extra)
     except Exception as e:
         logger.error(f"Error creating Salesforce {sobject_type} record: {e}")
         return _error(str(e))

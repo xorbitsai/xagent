@@ -439,6 +439,38 @@ def test_create_record_sends_fields_as_json_body(monkeypatch):
     assert mock_request.call_args.kwargs["method"] == "POST"
 
 
+def test_create_record_omits_errors_key_on_plain_success(monkeypatch):
+    mock_request = Mock(
+        return_value=MockResponse(json_data={"id": "001xx", "success": True})
+    )
+    monkeypatch.setattr(salesforce.requests, "request", mock_request)
+
+    result = json.loads(
+        salesforce.salesforce_create_record("Account", {"Name": "Acme Corp"})
+    )
+
+    assert "errors" not in result
+
+
+def test_create_record_propagates_errors_on_failure(monkeypatch):
+    mock_request = Mock(
+        return_value=MockResponse(
+            json_data={
+                "id": None,
+                "success": False,
+                "errors": [{"statusCode": "REQUIRED_FIELD_MISSING"}],
+            }
+        )
+    )
+    monkeypatch.setattr(salesforce.requests, "request", mock_request)
+
+    result = json.loads(
+        salesforce.salesforce_create_record("Account", {"Name": "Acme Corp"})
+    )
+
+    assert result["errors"] == [{"statusCode": "REQUIRED_FIELD_MISSING"}]
+
+
 def test_update_record_sends_fields_as_json_body(monkeypatch):
     mock_request = Mock(return_value=MockResponse(status_code=204))
     monkeypatch.setattr(salesforce.requests, "request", mock_request)

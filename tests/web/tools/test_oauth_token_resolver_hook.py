@@ -1381,6 +1381,14 @@ async def test_hook_failure_drops_non_string_or_empty_actor_id(
             ResolvedToken(access_token="hook-token", expires_at="soon"),
             "InvalidExpiresAt",
         ),
+        (
+            ResolvedToken(access_token="hook-token", instance_url=123),
+            "InvalidInstanceUrl",
+        ),
+        (
+            ResolvedToken(access_token="hook-token", instance_url=""),
+            "InvalidInstanceUrl",
+        ),
     ],
 )
 async def test_hook_malformed_token_creates_unavailable_config(

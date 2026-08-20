@@ -477,7 +477,12 @@ def test_postgresql_upgrade_creates_indexes_transactionally_before_old_constrain
     assert events == ["add-column", "create-indexes", "drop-constraint"]
 
 
-def test_postgresql_owner_index_creation_does_not_accept_existing_names() -> None:
+def test_create_owner_indexes_attempts_all_postgresql_indexes() -> None:
+    """The database, not a mocked preflight, rejects relation-name collisions.
+
+    The PostgreSQL collision-and-retry safety net is covered by
+    ``test_postgresql_owner_index_collision_allows_retry_after_remediation``.
+    """
     migration = _migration_module()
     created: list[str] = []
     fake_op = SimpleNamespace(
@@ -485,14 +490,7 @@ def test_postgresql_owner_index_creation_does_not_accept_existing_names() -> Non
         create_index=lambda name, *_args, **_kwargs: created.append(name),
     )
 
-    with (
-        patch.object(migration, "op", fake_op),
-        patch.object(
-            migration,
-            "_index_names",
-            return_value={ORDINARY_INDEX, ACTOR_INDEX, LOOKUP_INDEX},
-        ),
-    ):
+    with patch.object(migration, "op", fake_op):
         migration._create_owner_indexes()
 
     assert created == [ORDINARY_INDEX, ACTOR_INDEX, LOOKUP_INDEX]

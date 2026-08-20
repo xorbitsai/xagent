@@ -95,6 +95,19 @@ def _oauth_relationship_db(tmp_path):
 def test_create_all_enforces_owner_aware_uniqueness(tmp_path) -> None:
     engine, db, user = _oauth_relationship_db(tmp_path)
     try:
+        # Partial uniqueness must separate the ordinary and actor namespaces,
+        # not impose one full-table identity constraint.
+        db.add(
+            UserOAuth(
+                user_id=int(user.id),
+                provider="gmail",
+                resource_owner_key="actor:bob",
+                provider_user_id="ordinary",
+                access_token="same-provider-identity-in-actor-namespace",
+            )
+        )
+        db.commit()
+
         db.add(
             UserOAuth(
                 user_id=int(user.id),

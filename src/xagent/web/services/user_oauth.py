@@ -97,6 +97,7 @@ def get_scoped_user_oauth_account(
             resource_owner_key=resource_owner_key,
         )
         .filter(UserOAuth.id == int(account_id))
+        .populate_existing()
         .first()
     )
 

@@ -120,6 +120,32 @@ def test_direct_id_lookup_requires_the_expected_owner(tmp_path) -> None:
         engine.dispose()
 
 
+def test_scoped_id_lookup_refreshes_an_identity_mapped_account(tmp_path) -> None:
+    engine, db, user, rows = _db(tmp_path)
+    alice_row = rows[1]
+    other_db = sessionmaker(bind=engine, autoflush=False, autocommit=False)()
+    try:
+        other_db.query(UserOAuth).filter(UserOAuth.id == int(alice_row.id)).update(
+            {UserOAuth.access_token: "alice-refreshed"},
+            synchronize_session=False,
+        )
+        other_db.commit()
+
+        account = get_scoped_user_oauth_account(
+            db,
+            user_id=int(user.id),
+            account_id=int(alice_row.id),
+            resource_owner_key=ALICE,
+        )
+
+        assert account is alice_row
+        assert account.access_token == "alice-refreshed"
+    finally:
+        other_db.close()
+        db.close()
+        engine.dispose()
+
+
 def test_owner_only_id_lookup_supports_internal_foreign_key_consumers(tmp_path) -> None:
     engine, db, _user, rows = _db(tmp_path)
     try:

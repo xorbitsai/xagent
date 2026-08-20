@@ -85,7 +85,9 @@ Two partial unique indexes replace `uq_user_provider_account`. One index protect
 
 On PostgreSQL the migration creates the replacement indexes transactionally before removing the old unique constraint. A failed statement rolls back the complete schema transition. If a same-name relation causes the failure, an operator must inspect and remove or rename that relation before retrying `alembic upgrade head`. Index creation is not concurrent and can block writes to `user_oauth`, so plan a short OAuth-write pause and monitor lock wait time.
 
-On SQLite the migration rejects globally colliding owner-index names before rebuilding the table in batch mode. Stop every worker before this rebuild and keep SQLite quiesced until the migration completes.
+On SQLite the migration rejects globally colliding owner-index names before rebuilding the table in batch mode. Stop every worker before this rebuild and keep SQLite quiesced until the migration completes. Take and verify a database backup before the rebuild: under the driver's legacy transaction mode, SQLite DDL can commit independently of Alembic's outer transaction.
+
+If the SQLite migration process exits after the rebuild starts, keep every worker stopped. Restore the verified pre-migration backup, confirm that `uq_user_provider_account` still exists and `resource_owner_key` does not, and then retry the migration. Do not resume from a table that has lost the old constraint but does not have both owner-aware indexes; that state has no uniqueness enforcement.
 
 If the migration reports `UserOAuth schema is partially owner-aware`, do not start workers. The schema has either `resource_owner_key` and the old `uq_user_provider_account` constraint together, or neither one. Restore the last known complete schema from backup, or have a database operator finish one coherent legacy or owner-aware schema before retrying `alembic upgrade head`. Do not bypass this fail-closed check.
 
@@ -103,11 +105,12 @@ Choose the procedure for the configured database.
 
 1. Stop new OAuth connections and task execution.
 2. Stop every API and task worker.
-3. Deploy the new application files without starting workers.
-4. Run `alembic upgrade head` one time.
-5. Start every API and task worker with the new version.
-6. Verify the schema and homogeneous worker version.
-7. Resume ordinary OAuth connections and task execution.
+3. Take and verify a restorable database backup.
+4. Deploy the new application files without starting workers.
+5. Run `alembic upgrade head` one time.
+6. Start every API and task worker with the new version.
+7. Verify the schema and homogeneous worker version.
+8. Resume ordinary OAuth connections and task execution.
 
 #### PostgreSQL
 

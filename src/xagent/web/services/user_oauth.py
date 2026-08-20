@@ -54,7 +54,7 @@ def scoped_user_oauth_query(
 ) -> Query[UserOAuth]:
     """Build a query restricted to one xagent user and one owner namespace."""
     return db.query(UserOAuth).filter(
-        UserOAuth.user_id == user_id,
+        UserOAuth.user_id == int(user_id),
         user_oauth_owner_clause(resource_owner_key),
     )
 

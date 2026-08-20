@@ -1,6 +1,8 @@
 """Storage identity tests for ordinary and actor-owned builtin OAuth rows."""
 
+import pytest
 from sqlalchemy import create_engine, event
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import sessionmaker
 
 from xagent.web.models.database import Base
@@ -88,6 +90,38 @@ def _oauth_relationship_db(tmp_path):
     db.commit()
     db.expire(user, ["oauth_accounts"])
     return engine, db, user
+
+
+def test_create_all_enforces_owner_aware_uniqueness(tmp_path) -> None:
+    engine, db, user = _oauth_relationship_db(tmp_path)
+    try:
+        db.add(
+            UserOAuth(
+                user_id=int(user.id),
+                provider="gmail",
+                provider_user_id="ordinary",
+                access_token="duplicate-ordinary",
+            )
+        )
+        with pytest.raises(IntegrityError):
+            db.commit()
+        db.rollback()
+
+        db.add(
+            UserOAuth(
+                user_id=int(user.id),
+                provider="gmail",
+                resource_owner_key="actor:alice",
+                provider_user_id="alice",
+                access_token="duplicate-actor",
+            )
+        )
+        with pytest.raises(IntegrityError):
+            db.commit()
+    finally:
+        db.rollback()
+        db.close()
+        engine.dispose()
 
 
 def test_user_oauth_accounts_relationship_contains_only_ordinary_rows(tmp_path) -> None:

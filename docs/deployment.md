@@ -87,6 +87,8 @@ On PostgreSQL the migration creates the replacement indexes transactionally befo
 
 On SQLite the migration rejects globally colliding owner-index names before rebuilding the table in batch mode. Stop every worker before this rebuild and keep SQLite quiesced until the migration completes.
 
+If the migration reports `UserOAuth schema is partially owner-aware`, do not start workers. The schema has either `resource_owner_key` and the old `uq_user_provider_account` constraint together, or neither one. Restore the last known complete schema from backup, or have a database operator finish one coherent legacy or owner-aware schema before retrying `alembic upgrade head`. Do not bypass this fail-closed check.
+
 ### Prerequisites and configuration
 
 This change has no new environment variable or dependency. Keep every future actor-OAuth caller disabled; this release does not expose a production path that creates actor-owned rows.

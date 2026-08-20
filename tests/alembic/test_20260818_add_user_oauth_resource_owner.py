@@ -17,6 +17,7 @@ ORDINARY_INDEX = "uq_user_oauth_ordinary_account"
 ACTOR_INDEX = "uq_user_oauth_actor_account"
 LOOKUP_INDEX = "ix_user_oauth_owner_provider"
 OLD_CONSTRAINT = "uq_user_provider_account"
+OWNER_COLUMN = "resource_owner_key"
 
 
 def _migration_module():
@@ -409,6 +410,31 @@ def test_sqlite_upgrade_rejects_cross_table_index_name_collision_before_rebuild(
         assert "resource_owner_key" not in {
             column["name"] for column in inspect(connection).get_columns("user_oauth")
         }
+
+
+@pytest.mark.parametrize(
+    ("columns", "constraints"),
+    [
+        ({OWNER_COLUMN}, {OLD_CONSTRAINT}),
+        (set(), set()),
+    ],
+)
+def test_upgrade_rejects_partially_owner_aware_schema(
+    columns: set[str], constraints: set[str]
+) -> None:
+    migration = _migration_module()
+    fake_op = SimpleNamespace(
+        get_bind=lambda: SimpleNamespace(dialect=SimpleNamespace(name="sqlite"))
+    )
+
+    with (
+        patch.object(migration, "op", fake_op),
+        patch.object(migration, "_table_exists", return_value=True),
+        patch.object(migration, "_column_names", return_value=columns),
+        patch.object(migration, "_constraint_names", return_value=constraints),
+    ):
+        with pytest.raises(RuntimeError, match="partially owner-aware"):
+            migration.upgrade()
 
 
 def test_existing_owner_aware_schema_requires_semantic_index_definitions(

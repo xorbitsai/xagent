@@ -445,9 +445,11 @@ class TestAuthAPI:
         """Same class of gap fixed in generic_oauth_callback: a DB error
         while persisting the freshly-issued refresh_token must not echo it
         back via str(e) -- SQLAlchemy's default StatementError.__str__
-        includes bound parameters (hide_parameters isn't configured
-        anywhere in this codebase), and this handler used to render str(e)
-        directly into the response detail."""
+        includes bound parameters, and this handler used to render str(e)
+        directly into the response detail. hide_parameters=True on the
+        engine (models/database.py) now hides it there too, but this test
+        forces a synthetic error message to pin the handler's own behavior
+        independently of that."""
         setup_first_admin()
         register_response = client.post("/api/auth/register", json=test_user_data)
         assert register_response.status_code == 200

@@ -174,6 +174,12 @@ def _get_or_init_model_hub() -> Any:
                         if "sqlite" in database_url
                         else {},
                         pool_pre_ping="sqlite" not in database_url,
+                        # Same database as the shared web engine
+                        # (web/models/database.py) -- the Model table this
+                        # hub reads/writes has an encrypted API key column,
+                        # so a bind/commit failure here must not surface it
+                        # as a bound SQL parameter either.
+                        hide_parameters=True,
                     )
                     Base = declarative_base()
                     Model = create_model_table(Base)

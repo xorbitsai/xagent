@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -402,6 +403,225 @@ def test_bounded_oauth_error_message_escapes_html():
     assert "&lt;script&gt;" in message
 
 
+def test_redact_oauth_log_payload_keeps_only_allowlisted_fields():
+    """The server-side log line for a failed token exchange must not put a
+    live secret in the log just because the browser-facing message was
+    already trimmed -- a malformed/partial response can carry an
+    access_token (or client_secret, refresh_token, etc.) alongside an
+    error field."""
+    token_data = {
+        "error": "invalid_grant",
+        "error_description": "the code has expired",
+        "access_token": "live-secret-token",
+        "refresh_token": "live-secret-refresh",
+        "client_secret": "live-secret-client",
+        "unexpected_provider_field": "also-should-not-appear",
+    }
+
+    redacted = auth_api._redact_oauth_log_payload(token_data)
+
+    assert redacted["error"] == "invalid_grant"
+    assert redacted["error_description"] == "the code has expired"
+    for secret in (
+        "live-secret-token",
+        "live-secret-refresh",
+        "live-secret-client",
+        "also-should-not-appear",
+    ):
+        assert secret not in str(redacted)
+
+
+def test_github_callback_does_not_log_token_alongside_error(
+    db_session, monkeypatch, caplog
+):
+    """End-to-end: a malformed response carrying an access_token alongside
+    an error field must not put that token into the server log via the
+    warning added for debuggability."""
+    db, user = db_session
+    state = create_access_token(
+        data={
+            "type": "oauth_state",
+            "user_id": user.id,
+            "provider": "github",
+            "app_id": "github",
+        },
+        expires_delta=timedelta(minutes=10),
+    )
+    request = SimpleNamespace(query_params={"code": "bad-code", "state": state})
+    monkeypatch.setattr(
+        auth_api.requests,
+        "post",
+        Mock(
+            return_value=MockResponse(
+                {
+                    "error": "invalid_grant",
+                    "access_token": "live-secret-token",
+                }
+            )
+        ),
+    )
+    caplog.set_level(logging.WARNING, logger=auth_api.__name__)
+
+    response = generic_oauth_callback("github", request, db, _github_provider())
+
+    assert response.status_code == 400
+    assert "live-secret-token" not in response.body.decode()
+    assert "live-secret-token" not in caplog.text
+
+
+def test_github_callback_rejects_non_200_userinfo_response(db_session, monkeypatch):
+    """A non-200 /user response (401/403/429/5xx) used to be silently
+    skipped, leaving provider_user_id/email at None and still persisting
+    a "connected" account -- it must fail the callback instead."""
+    db, user = db_session
+    state = create_access_token(
+        data={
+            "type": "oauth_state",
+            "user_id": user.id,
+            "provider": "github",
+            "app_id": "github",
+        },
+        expires_delta=timedelta(minutes=10),
+    )
+    request = SimpleNamespace(query_params={"code": "good-code", "state": state})
+    monkeypatch.setattr(
+        auth_api.requests,
+        "post",
+        Mock(return_value=MockResponse({"access_token": "some-token"})),
+    )
+    monkeypatch.setattr(
+        auth_api.requests,
+        "get",
+        Mock(return_value=MockResponse({}, status_code=401)),
+    )
+
+    response = generic_oauth_callback("github", request, db, _github_provider())
+
+    assert response.status_code == 400
+    assert "status 401" in response.body.decode()
+    assert (
+        db.query(UserOAuth)
+        .filter(UserOAuth.user_id == user.id, UserOAuth.provider == "github")
+        .count()
+        == 0
+    )
+
+
+def test_github_callback_userinfo_failure_does_not_replace_a_working_grant(
+    db_session, monkeypatch
+):
+    """The concrete risk a fail-open userinfo check creates: reconnecting
+    with a since-expired/insufficiently-scoped token whose /user call now
+    401s must not delete the still-working prior grant."""
+    db, user = db_session
+    state = create_access_token(
+        data={
+            "type": "oauth_state",
+            "user_id": user.id,
+            "provider": "github",
+            "app_id": "github",
+        },
+        expires_delta=timedelta(minutes=10),
+    )
+    db.add(
+        UserOAuth(
+            user_id=user.id,
+            provider="github",
+            access_token="working-token",
+            provider_user_id="42",
+        )
+    )
+    db.commit()
+
+    request = SimpleNamespace(query_params={"code": "good-code", "state": state})
+    monkeypatch.setattr(
+        auth_api.requests,
+        "post",
+        Mock(return_value=MockResponse({"access_token": "new-but-unverifiable"})),
+    )
+    monkeypatch.setattr(
+        auth_api.requests,
+        "get",
+        Mock(return_value=MockResponse({}, status_code=401)),
+    )
+
+    response = generic_oauth_callback("github", request, db, _github_provider())
+
+    assert response.status_code == 400
+    oauth_account = (
+        db.query(UserOAuth)
+        .filter(UserOAuth.user_id == user.id, UserOAuth.provider == "github")
+        .one()
+    )
+    assert oauth_account.access_token == "working-token"
+    assert oauth_account.provider_user_id == "42"
+
+
+def test_github_callback_rejects_non_json_userinfo_response(db_session, monkeypatch):
+    db, user = db_session
+    state = create_access_token(
+        data={
+            "type": "oauth_state",
+            "user_id": user.id,
+            "provider": "github",
+            "app_id": "github",
+        },
+        expires_delta=timedelta(minutes=10),
+    )
+    request = SimpleNamespace(query_params={"code": "good-code", "state": state})
+    monkeypatch.setattr(
+        auth_api.requests,
+        "post",
+        Mock(return_value=MockResponse({"access_token": "some-token"})),
+    )
+    non_json_response = Mock(status_code=200)
+    non_json_response.json.side_effect = ValueError("Expecting value")
+    monkeypatch.setattr(auth_api.requests, "get", Mock(return_value=non_json_response))
+
+    response = generic_oauth_callback("github", request, db, _github_provider())
+
+    assert response.status_code == 400
+    assert "could not be parsed" in response.body.decode()
+    assert (
+        db.query(UserOAuth)
+        .filter(UserOAuth.user_id == user.id, UserOAuth.provider == "github")
+        .count()
+        == 0
+    )
+
+
+def test_github_callback_rejects_non_object_userinfo_response(db_session, monkeypatch):
+    db, user = db_session
+    state = create_access_token(
+        data={
+            "type": "oauth_state",
+            "user_id": user.id,
+            "provider": "github",
+            "app_id": "github",
+        },
+        expires_delta=timedelta(minutes=10),
+    )
+    request = SimpleNamespace(query_params={"code": "good-code", "state": state})
+    monkeypatch.setattr(
+        auth_api.requests,
+        "post",
+        Mock(return_value=MockResponse({"access_token": "some-token"})),
+    )
+    list_response = Mock(status_code=200)
+    list_response.json.return_value = []
+    monkeypatch.setattr(auth_api.requests, "get", Mock(return_value=list_response))
+
+    response = generic_oauth_callback("github", request, db, _github_provider())
+
+    assert response.status_code == 400
+    assert (
+        db.query(UserOAuth)
+        .filter(UserOAuth.user_id == user.id, UserOAuth.provider == "github")
+        .count()
+        == 0
+    )
+
+
 def test_bounded_oauth_error_message_extracts_metas_nested_error_object():
     """Meta's OAuth error is itself an object, not a bare string -- str()
     on it directly would render a Python dict repr into the page."""
@@ -517,15 +737,93 @@ def test_github_callback_rejects_non_json_token_response(db_session, monkeypatch
     assert "Expecting value" not in body
 
 
+def test_github_callback_rejects_non_2xx_response_with_access_token_shaped_body(
+    db_session, monkeypatch
+):
+    """A non-2xx response body that happens to carry an access_token field
+    (a misbehaving proxy/gateway, a stale cached body) must not be trusted
+    as a successful exchange just because it has neither an "error" key
+    nor a missing access_token -- the HTTP status itself has to gate
+    success, or this would persist a connection off a response GitHub
+    never actually returned as successful."""
+    db, user = db_session
+    state = create_access_token(
+        data={
+            "type": "oauth_state",
+            "user_id": user.id,
+            "provider": "github",
+            "app_id": "github",
+        },
+        expires_delta=timedelta(minutes=10),
+    )
+    request = SimpleNamespace(query_params={"code": "some-code", "state": state})
+    monkeypatch.setattr(
+        auth_api.requests,
+        "post",
+        Mock(
+            return_value=MockResponse(
+                {"access_token": "should-not-be-persisted"}, status_code=502
+            )
+        ),
+    )
+
+    response = generic_oauth_callback("github", request, db, _github_provider())
+
+    assert response.status_code == 400
+    assert "status 502" in response.body.decode()
+    assert (
+        db.query(UserOAuth)
+        .filter(UserOAuth.user_id == user.id, UserOAuth.provider == "github")
+        .count()
+        == 0
+    )
+
+
+def test_github_callback_rejects_non_object_token_response(db_session, monkeypatch):
+    """A JSON-parseable but non-object token response (a bare list/string/
+    number) must not reach `"error" in token_data` -- which doesn't raise
+    for a list/string, it does a membership/substring check, not a key
+    check -- and then `token_data.get("access_token")`, which does raise
+    (AttributeError) on anything but a dict. Both would otherwise escape to
+    the outer handler as an opaque 500 instead of the same clear 400 every
+    other malformed-body case here gives."""
+    db, user = db_session
+    state = create_access_token(
+        data={
+            "type": "oauth_state",
+            "user_id": user.id,
+            "provider": "github",
+            "app_id": "github",
+        },
+        expires_delta=timedelta(minutes=10),
+    )
+    request = SimpleNamespace(query_params={"code": "some-code", "state": state})
+    list_response = Mock(status_code=200)
+    list_response.json.return_value = []
+    monkeypatch.setattr(auth_api.requests, "post", Mock(return_value=list_response))
+
+    response = generic_oauth_callback("github", request, db, _github_provider())
+
+    assert response.status_code == 400
+    assert (
+        db.query(UserOAuth)
+        .filter(UserOAuth.user_id == user.id, UserOAuth.provider == "github")
+        .count()
+        == 0
+    )
+
+
 def test_github_callback_does_not_leak_token_on_db_commit_failure(
     db_session, monkeypatch
 ):
     """A DB error while persisting the OAuth account must not echo the
     just-obtained access_token back to the browser: SQLAlchemy's default
-    StatementError.__str__ includes bound parameters (hide_parameters isn't
-    configured anywhere in this codebase), and the outer exception handler
-    used to render str(e) -- and therefore the token -- directly into the
-    500 response."""
+    StatementError.__str__ includes bound parameters, and the outer
+    exception handler used to render str(e) -- and therefore the token --
+    directly into the 500 response. hide_parameters=True on the engine
+    (models/database.py) now hides it there too, but this test forces a
+    synthetic error message to pin the handler's own behavior
+    independently of that."""
     db, user = db_session
     state = create_access_token(
         data={
@@ -541,6 +839,11 @@ def test_github_callback_does_not_leak_token_on_db_commit_failure(
         auth_api.requests,
         "post",
         Mock(return_value=MockResponse({"access_token": "secret-token-xyz"})),
+    )
+    monkeypatch.setattr(
+        auth_api.requests,
+        "get",
+        Mock(return_value=MockResponse({"login": "octocat", "id": 1})),
     )
 
     def failing_commit():

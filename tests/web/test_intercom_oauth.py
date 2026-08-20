@@ -500,14 +500,15 @@ def test_intercom_callback_rejects_non_json_token_response(db_session, monkeypat
     )
 
 
-def test_intercom_callback_hits_access_token_guard_on_non_200_json_response(
+def test_intercom_callback_rejects_non_2xx_json_response_with_no_error_field(
     db_session, monkeypatch
 ):
-    """A non-200 status with a JSON body carrying neither "error" nor a
-    token is untested territory: there is no explicit status check ahead of
-    the "error" in token_data guard, so this must still resolve cleanly via
-    the access_token guard rather than silently proceeding as if it were a
-    success."""
+    """A non-2xx status with a JSON body carrying neither "error" nor a
+    token must be rejected on the status code itself, not only inferred
+    from the body missing an access_token -- otherwise a non-2xx response
+    that happens to carry an access_token-shaped field (a misbehaving
+    proxy/gateway, a stale cached body) would be trusted as success purely
+    because the body shape looked fine."""
     db, user = db_session
     state = create_access_token(
         data={
@@ -530,5 +531,5 @@ def test_intercom_callback_hits_access_token_guard_on_non_200_json_response(
     response = generic_oauth_callback("intercom", request, db, _intercom_provider())
 
     assert response.status_code == 400
-    assert "did not return an access token" in response.body.decode()
+    assert "status 503" in response.body.decode()
     get_mock.assert_not_called()

@@ -1562,24 +1562,23 @@ async def startup_event() -> None:
         # minutes on a large tree with no log output in between. Wrap it in a
         # startup phase so its duration is visible and a slow start is easy to
         # diagnose from the logs alone.
-        try:
-            from .api.kb import cleanup_orphaned_temp_files
+        # WHY: try/except inside the phase keeps a tolerated failure at a single
+        # WARNING; propagating it would add a spurious ERROR from _startup_phase.
+        with _startup_phase("orphaned temp-file cleanup"):
+            try:
+                from .api.kb import cleanup_orphaned_temp_files
 
-            def _run_temp_file_cleanup() -> int:
-                return cleanup_orphaned_temp_files()
-
-            with _startup_phase("orphaned temp-file cleanup"):
-                cleaned_count = await asyncio.to_thread(_run_temp_file_cleanup)
-            if cleaned_count > 0:
-                logger.info(
-                    "Startup cleanup: removed %d orphaned temporary file(s)",
-                    cleaned_count,
+                cleaned_count = await asyncio.to_thread(cleanup_orphaned_temp_files)
+                if cleaned_count > 0:
+                    logger.info(
+                        "Startup cleanup: removed %d orphaned temporary file(s)",
+                        cleaned_count,
+                    )
+            except Exception as e:  # noqa: BLE001
+                logger.warning(
+                    "Temporary file cleanup skipped due to error: %s",
+                    e,
                 )
-        except Exception as e:  # noqa: BLE001
-            logger.warning(
-                "Temporary file cleanup skipped due to error: %s",
-                e,
-            )
 
     # Warmup sandbox manager
     from .sandbox_manager import check_sandbox_static_readiness, get_sandbox_manager

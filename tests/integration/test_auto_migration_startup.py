@@ -940,6 +940,18 @@ async def test_startup_event_triggers_background_auto_migration(
     monkeypatch.setattr(web_app_module.asyncio, "to_thread", _fake_to_thread)
     monkeypatch.setattr(web_app_module.asyncio, "create_task", _track_create_task)
 
+    # Record every phase name so a refactor that drops the temp-file cleanup's
+    # _startup_phase wrap is caught here; startup reconfigures logging, so spying
+    # on the phase is more reliable than capturing its log lines.
+    phase_names: list[str] = []
+    real_startup_phase = web_app_module._startup_phase
+
+    def _tracking_startup_phase(name: str):
+        phase_names.append(name)
+        return real_startup_phase(name)
+
+    monkeypatch.setattr(web_app_module, "_startup_phase", _tracking_startup_phase)
+
     await web_app_module.startup_event()
     if created_tasks:
         await asyncio.gather(*created_tasks)
@@ -947,6 +959,7 @@ async def test_startup_event_triggers_background_auto_migration(
     # We expect 2 tasks: backfill migration + uploaded files reconcile
     assert len(created_tasks) == 2
     assert migration_called["value"] is True
+    assert "orphaned temp-file cleanup" in phase_names
 
 
 @pytest.mark.asyncio

@@ -69,6 +69,7 @@ def _salesforce_provider_row() -> dict[str, object]:
         "client_secret": os.environ.get("SALESFORCE_CLIENT_SECRET", ""),
         "auth_url": "https://login.salesforce.com/services/oauth2/authorize",
         "token_url": "https://login.salesforce.com/services/oauth2/token",
+        "redirect_uri": os.environ.get("SALESFORCE_REDIRECT_URI", ""),
         # Salesforce's OIDC userinfo endpoint lives on the org's own
         # instance_url, not known until after the token exchange -- see the
         # matching comment on the registry row.

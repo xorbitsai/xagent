@@ -221,6 +221,7 @@ def get_builtin_oauth_provider_rows() -> list[dict[str, Any]]:
             # for any provider that returns this key).
             "auth_url": "https://login.salesforce.com/services/oauth2/authorize",
             "token_url": "https://login.salesforce.com/services/oauth2/token",
+            "redirect_uri": os.environ.get("SALESFORCE_REDIRECT_URI", ""),
             # Salesforce's OIDC userinfo endpoint lives on the org's own
             # instance_url (e.g. https://acme.my.salesforce.com/services/
             # oauth2/userinfo), which isn't known until after the token

@@ -42,6 +42,7 @@ sample_prompts:
 persona:
   name: Iris
   role:
+    en: Doc Summarizer & Action Extractor
     zh: 文档摘要与行动项提取
   avatar: /marketplace/avatars/iris.png
   intro:

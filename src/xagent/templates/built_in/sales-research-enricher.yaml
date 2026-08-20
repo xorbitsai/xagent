@@ -36,11 +36,12 @@ sample_prompts:
 persona:
   name: Vera
   role:
+    en: Research & Enrichment Specialist
     zh: 调研与信息增强专员
   avatar: /marketplace/avatars/vera.png
   intro:
     en: |-
-      Hi there — I'm Vera, your Research & Enricher.
+      Hi there — I'm Vera, your Research & Enrichment Specialist.
 
       I build account briefs from public sources and write the findings back to your CRM.
     zh: |-

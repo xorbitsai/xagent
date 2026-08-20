@@ -36,6 +36,7 @@ sample_prompts:
 persona:
   name: Sophie
   role:
+    en: AI Support Chatbot
     zh: AI 客服机器人
   avatar: /marketplace/avatars/sophie.png
   intro:

@@ -36,6 +36,7 @@ sample_prompts:
 persona:
   name: Milo
   role:
+    en: DevOps Specialist
     zh: DevOps 智能运维专员
   avatar: /marketplace/avatars/milo.png
   intro:

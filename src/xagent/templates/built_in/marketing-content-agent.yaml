@@ -38,6 +38,7 @@ sample_prompts:
 persona:
   name: Hugo
   role:
+    en: Content Creation Specialist
     zh: 内容创作专员
   avatar: /marketplace/avatars/hugo.png
   intro:

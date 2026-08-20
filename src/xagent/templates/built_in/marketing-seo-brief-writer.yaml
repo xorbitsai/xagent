@@ -36,6 +36,7 @@ sample_prompts:
 persona:
   name: Otto
   role:
+    en: SEO Brief Writer
     zh: SEO 内容简报撰写专员
   avatar: /marketplace/avatars/otto.png
   intro:

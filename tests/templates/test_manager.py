@@ -363,7 +363,7 @@ persona:
   role:
     en: Social Media Content Manager
     zh: 社媒内容经理
-  avatar: https://example.com/maya.png
+  avatar: /marketplace/avatars/maya.png
   intro:
     en: "Hi — I'm Maya, your Social Media Content Manager."
     zh: 你好，我是 Maya，你的社媒内容经理。
@@ -387,7 +387,7 @@ persona:
         assert persona["name"] == "Maya"
         assert persona["role"]["en"] == "Social Media Content Manager"
         assert persona["role"]["zh"] == "社媒内容经理"
-        assert persona["avatar"] == "https://example.com/maya.png"
+        assert persona["avatar"] == "/marketplace/avatars/maya.png"
         assert len(persona["kickoff_questions"]["en"]) == 2
 
     @pytest.mark.asyncio
@@ -727,6 +727,30 @@ workforce_config:
         assert len(avatars) == len(set(avatars)), (
             f"duplicate persona avatars: {avatars}"
         )
+
+    def test_builtin_personas_author_role_en_explicitly(self):
+        """Built-in personas must author role.en as a real job title
+        instead of leaning on the fallback-to-`name` backfill: the
+        template display name is a product name, and several leak badly
+        as persona copy ("Google Ads Recommendation", "Email Agent
+        (Sales)") - PR #1498 round-3 review. The fallback stays for
+        external/user-authored templates; this pins the content bar for
+        shipped ones. Reads the raw YAML because the parsed dict has the
+        backfill already applied and can't tell the two apart."""
+        built_in_dir = (
+            Path(__file__).resolve().parents[2] / "src/xagent/templates/built_in"
+        )
+        offenders = []
+        for template_file in built_in_dir.glob("*.yaml"):
+            raw = yaml.safe_load(template_file.read_text())
+            persona = raw.get("persona")
+            if not persona:
+                continue
+            role = persona.get("role") or {}
+            if not role.get("en"):
+                offenders.append(template_file.name)
+
+        assert not offenders, f"personas relying on the role.en fallback: {offenders}"
 
     def test_builtin_template_connections_resolve_to_a_registered_mcp_app(self):
         """A connections[].name that the build wizard can't resolve to a registered
@@ -1315,6 +1339,15 @@ class TestValidatePersona:
         manager._validate_persona(persona)
         assert persona["avatar"] == "/marketplace/avatars/nia.png"
 
+    def test_avatar_external_url_is_rejected(self, manager):
+        """persona.avatar's contract is an app-relative path served from
+        the frontend's own static assets - an external hotlink could rot,
+        leak requests to a third party, and bypasses the committed-file
+        invariant test (PR #1498 round-3 review)."""
+        persona = {"name": "Nia", "avatar": "https://example.com/nia.png"}
+        with pytest.raises(ValueError, match="persona.avatar.*app-relative"):
+            manager._validate_persona(persona)
+
     def test_intro_flat_string_is_rejected(self, manager):
         with pytest.raises(ValueError, match="persona.intro"):
             manager._validate_persona({"name": "Nia", "intro": "Hi there"})
@@ -1396,3 +1429,22 @@ class TestValidatePersona:
         }
         manager._validate_persona(persona)
         assert persona["kickoff_questions"]["en"] == ["What platforms?"]
+
+    def test_kickoff_questions_empty_locale_list_is_rejected(self, manager):
+        """An authored `kickoff_questions.<locale>: []` used to pass
+        vacuously (all() over an empty sequence is True) - the same blank
+        content the require_en check exists to prevent. "No questions" is
+        expressed by omitting the locale or the field entirely (PR #1498
+        round-3 review)."""
+        persona = {"name": "Nia", "kickoff_questions": {"en": []}}
+        with pytest.raises(ValueError, match="persona.kickoff_questions.en"):
+            manager._validate_persona(persona)
+
+    def test_non_string_locale_key_is_rejected(self, manager):
+        """YAML happily parses `true:` or `2026:` as non-string mapping
+        keys; get_localized_value would never match them, so they are
+        dead content that must fail loudly instead (PR #1498 round-3
+        review)."""
+        persona = {"name": "Nia", "role": {True: "Some Role"}}
+        with pytest.raises(ValueError, match="locale keys must be non-empty"):
+            manager._validate_persona(persona)

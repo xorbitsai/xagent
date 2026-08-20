@@ -381,8 +381,9 @@ class TemplateManager:
         {'en': ..., 'zh': ...} shape as `descriptions` / `sample_prompts`
         above, validated the same way so a malformed entry (including an
         unrecognized key - a real risk given how similar this shape is to
-        its four siblings) fails loudly at load time rather than as a 500
-        the first time `TemplateInfo`/`PersonaInfo` tries to build a
+        its four siblings) fails that template's load - `reload()` logs
+        the error and skips the file - rather than surfacing as a 500 the
+        first time `TemplateInfo`/`PersonaInfo` tries to build a
         response from it. `name` is deliberately a flat string, not
         locale-keyed: it is a proper noun (the teammate's given name,
         "Maya"), the same in every locale.
@@ -423,6 +424,17 @@ class TemplateManager:
 
         self._require_string(persona, "avatar", path="persona", required=False)
         persona.setdefault("avatar", None)
+        avatar = persona["avatar"]
+        if avatar is not None and not avatar.startswith("/"):
+            # PersonaInfo.avatar's documented contract: an app-relative path
+            # served from the frontend's own static assets, never an
+            # external hotlink (which could rot, leak requests to a third
+            # party, or bypass the committed-file invariant test).
+            raise ValueError(
+                "'persona.avatar' must be an app-relative path starting "
+                "with '/' (e.g. '/marketplace/avatars/maya.png'), not an "
+                "external URL"
+            )
 
         self._validate_locale_map(
             persona,
@@ -438,7 +450,7 @@ class TemplateManager:
             "kickoff_questions",
             require_en=True,
             flat_shape="a flat list",
-            value_requirement="a list of non-empty strings",
+            value_requirement="a non-empty list of non-empty strings",
             coerce_value=self._coerce_stripped_string_list,
         )
 
@@ -450,15 +462,21 @@ class TemplateManager:
 
     @staticmethod
     def _coerce_stripped_string_list(value: Any) -> Optional[List[str]]:
-        if isinstance(value, list) and all(
-            isinstance(item, str) and item.strip() for item in value
+        # An empty list is rejected, not vacuously accepted: an authored
+        # `kickoff_questions.<locale>: []` is the same blank-content
+        # mistake the require_en check guards against - "no questions"
+        # is expressed by omitting the locale (or the field) entirely.
+        if (
+            isinstance(value, list)
+            and value
+            and all(isinstance(item, str) and item.strip() for item in value)
         ):
             return [item.strip() for item in value]
         return None
 
     @staticmethod
     def _validate_locale_map(
-        persona: Dict[str, Any],
+        container: Dict[str, Any],
         key: str,
         *,
         require_en: bool,
@@ -479,10 +497,10 @@ class TemplateManager:
         `role: ""` or `kickoff_questions: []` that must fail the shape
         check instead.
         """
-        values = persona.get(key)
+        values = container.get(key)
         if values is None:
             values = {}
-        persona[key] = values
+        container[key] = values
         if not isinstance(values, dict):
             raise ValueError(
                 f"'persona.{key}' must be a dict keyed by locale (e.g. "
@@ -498,6 +516,14 @@ class TemplateManager:
                 "field to fall back to"
             )
         for locale, value in values.items():
+            if not isinstance(locale, str) or not locale.strip():
+                # YAML happily parses `true:` or `2026:` as non-string
+                # keys; get_localized_value would never match them, so
+                # they are dead content at best and confusing at worst.
+                raise ValueError(
+                    f"'persona.{key}' locale keys must be non-empty "
+                    f"strings, got {locale!r}"
+                )
             coerced = coerce_value(value)
             if coerced is None:
                 raise ValueError(

@@ -38,6 +38,7 @@ sample_prompts:
 persona:
   name: Freya
   role:
+    en: Marketing Collateral Specialist
     zh: 营销物料专员
   avatar: /marketplace/avatars/freya.png
   intro:

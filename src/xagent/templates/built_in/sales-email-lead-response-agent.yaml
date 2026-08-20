@@ -36,6 +36,7 @@ sample_prompts:
 persona:
   name: Leo
   role:
+    en: Email Lead Response Specialist
     zh: 邮件线索响应专员
   avatar: /marketplace/avatars/leo.png
   intro:

@@ -320,7 +320,7 @@ persona:
   role:
     en: Social Media Content Manager
     zh: 社媒内容经理
-  avatar: https://example.com/maya.png
+  avatar: /marketplace/avatars/maya.png
   intro:
     en: "Hi there — I'm Maya, your Social Media Content Manager."
     zh: 你好，我是 Maya，你的社媒内容经理。
@@ -896,7 +896,7 @@ class TestTemplatePersona:
             persona = response.json()["persona"]
             assert persona["name"] == "Maya"
             assert persona["role"] == "Social Media Content Manager"
-            assert persona["avatar"] == "https://example.com/maya.png"
+            assert persona["avatar"] == "/marketplace/avatars/maya.png"
             assert "Maya" in persona["intro"]
             assert len(persona["kickoff_questions"]) == 2
 
@@ -1008,6 +1008,36 @@ class TestTemplateHiredFlag:
             ).json()
             assert detail["hired"] is True
             assert detail["hired_agent_id"] == agent_id
+
+    def test_archived_quick_access_agent_still_counts_as_hired(
+        self, mock_app_state, admin_headers, admin_user
+    ):
+        """hired deliberately has no status filter (see
+        get_hired_agent_map's docstring): the resolve flow returns a found
+        quick-access agent as-is whatever its status - DRAFT and ARCHIVED
+        alike - so an archived one is still "what Hire returns" and must
+        report hired (PR #1498 round-3 review)."""
+        db = next(get_db())
+        agent = Agent(
+            user_id=admin_user["id"],
+            name="Customer Support Agent (archived)",
+            template_id="customer_support",
+            origin=AgentOrigin.TEMPLATE_QUICK_ACCESS.value,
+            status=AgentStatus.ARCHIVED,
+        )
+        db.add(agent)
+        db.commit()
+        db.refresh(agent)
+        agent_id = agent.id
+        db.close()
+
+        with patch.object(client.app, "state", mock_app_state):
+            listed = {
+                t["id"]: t
+                for t in client.get("/api/templates/", headers=admin_headers).json()
+            }
+            assert listed["customer_support"]["hired"] is True
+            assert listed["customer_support"]["hired_agent_id"] == agent_id
 
     def test_hired_resolves_to_the_quick_access_agent_not_a_user_origin_one(
         self, mock_app_state, admin_headers, admin_user

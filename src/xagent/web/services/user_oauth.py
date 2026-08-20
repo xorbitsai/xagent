@@ -52,9 +52,14 @@ def scoped_user_oauth_query(
     user_id: int,
     resource_owner_key: str | None,
 ) -> Query[UserOAuth]:
-    """Build a query restricted to one xagent user and one owner namespace."""
+    """Build a query restricted to one xagent user and one owner namespace.
+
+    Keep the caller's SQL value unchanged. The legacy OAuth callback persists
+    before it treats malformed state-claim coercion as a guarded side-effect
+    failure, so this query must not move that coercion before the commit.
+    """
     return db.query(UserOAuth).filter(
-        UserOAuth.user_id == int(user_id),
+        UserOAuth.user_id == user_id,
         user_oauth_owner_clause(resource_owner_key),
     )
 

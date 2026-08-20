@@ -134,6 +134,25 @@ def _require_object_items(items: Any, *, context: str) -> None:
         raise ValueError(f"GitHub returned a non-object item in {context}")
 
 
+def _require_object(value: Any, *, context: str) -> None:
+    """Raise if a single-object response isn't an object.
+
+    The single-object GET/create tools (github_get_current_user,
+    github_get_repository, github_get_pull_request,
+    github_create_pull_request) call `_request()` and immediately `.get()`
+    or pass the result to a `_summarize_*` helper -- an unexpected `null`
+    or list body (e.g. a malformed or proxy-mangled response) would
+    otherwise surface as an unhelpful `'NoneType'`/`'list' object has no
+    attribute 'get'` instead of identifying what GitHub actually
+    returned, the same class of gap `_require_object_items` closes for
+    the list-returning tools.
+    """
+    if not isinstance(value, dict):
+        raise ValueError(
+            f"GitHub returned a non-object value in {context} ({type(value).__name__})"
+        )
+
+
 def _success(**payload: Any) -> str:
     return json.dumps({"status": "success", **payload}, ensure_ascii=False)
 
@@ -447,6 +466,7 @@ def github_get_current_user() -> str:
     """
     try:
         result = _request("GET", "/user")
+        _require_object(result, context="authenticated user profile")
         return _success(
             user={
                 "login": result.get("login"),
@@ -531,6 +551,7 @@ def github_get_repository(repo: str) -> str:
     try:
         owner, name = _parse_repo(repo)
         result = _request("GET", f"/repos/{owner}/{name}")
+        _require_object(result, context=f"repository metadata for '{repo}'")
         return _success(repository=_summarize_repo(result))
     except Exception as e:
         logger.error(f"Error fetching GitHub repository {repo}: {e}", exc_info=True)
@@ -791,6 +812,7 @@ def github_get_issue(repo: str, issue_number: int) -> str:
         owner, name = _parse_repo(repo)
         issue_number = _validate_positive_number(issue_number, field="issue_number")
         result = _request("GET", f"/repos/{owner}/{name}/issues/{issue_number}")
+        _require_object(result, context=f"issue {repo}#{issue_number}")
         return _success(issue=_summarize_issue(result))
     except Exception as e:
         logger.error(
@@ -819,6 +841,7 @@ def github_create_issue(repo: str, title: str, body: str = "", labels: str = "")
                 label.strip() for label in labels.split(",") if label.strip()
             ]
         result = _request("POST", f"/repos/{owner}/{name}/issues", json_data=json_data)
+        _require_object(result, context=f"created issue in '{repo}'")
         return _success(issue=_summarize_issue(result))
     except Exception as e:
         logger.error(f"Error creating GitHub issue in {repo}: {e}", exc_info=True)
@@ -842,6 +865,7 @@ def github_comment_on_issue(repo: str, issue_number: int, body: str) -> str:
             f"/repos/{owner}/{name}/issues/{issue_number}/comments",
             json_data={"body": body},
         )
+        _require_object(result, context=f"comment on {repo}#{issue_number}")
         return _success(comment_id=result.get("id"), html_url=result.get("html_url"))
     except Exception as e:
         logger.error(
@@ -902,6 +926,7 @@ def github_get_pull_request(repo: str, pull_number: int) -> str:
         owner, name = _parse_repo(repo)
         pull_number = _validate_positive_number(pull_number, field="pull_number")
         result = _request("GET", f"/repos/{owner}/{name}/pulls/{pull_number}")
+        _require_object(result, context=f"pull request {repo}#{pull_number}")
         return _success(pull_request=_summarize_pull_request(result))
     except Exception as e:
         logger.error(
@@ -933,6 +958,7 @@ def github_create_pull_request(
         if body:
             json_data["body"] = body
         result = _request("POST", f"/repos/{owner}/{name}/pulls", json_data=json_data)
+        _require_object(result, context=f"created pull request in '{repo}'")
         return _success(pull_request=_summarize_pull_request(result))
     except Exception as e:
         logger.error(
@@ -1111,6 +1137,17 @@ def github_list_commits(
         start_page = max(1, int(page or 1))
         params: dict[str, Any] = {"per_page": _clamp_limit(limit), "page": start_page}
         if path:
+            # Sent as a query param, so (unlike github_get_file_contents'
+            # path) there's no injection risk to percent-encode away --
+            # but an empty segment (leading/trailing/double slash) or a
+            # bare "."/".." segment is still not a real path, and reached
+            # GitHub unvalidated here while the equivalent call to
+            # github_get_file_contents already rejected it up front.
+            # Validated per-segment only for that consistency; the
+            # original (unencoded) string is still what's sent, since
+            # requests percent-encodes query params on its own.
+            for segment in path.split("/"):
+                _encode_file_path_segment(segment, field="path")
             params["path"] = path
         response = _request_raw("GET", f"/repos/{owner}/{name}/commits", params=params)
         result = response.json() if response.content else []

@@ -770,6 +770,23 @@ def test_get_current_user_returns_error_payload_on_failure(monkeypatch):
     assert "Bad credentials" in result["message"]
 
 
+def test_get_current_user_rejects_non_object_response(monkeypatch):
+    """A malformed/proxy-mangled response (e.g. a bare list) must not
+    reach the unguarded .get() calls below, which would surface as an
+    unhelpful `'list' object has no attribute 'get'`."""
+    monkeypatch.setattr(
+        github.requests,
+        "request",
+        Mock(return_value=MockResponse(json_data=[])),
+    )
+
+    result = json.loads(github.github_get_current_user())
+
+    assert result["status"] == "error"
+    assert "non-object value" in result["message"]
+    assert "attribute" not in result["message"]
+
+
 def test_get_repository_returns_summary(monkeypatch):
     mock_request = Mock(
         return_value=MockResponse(json_data={"full_name": "octocat/Hello-World"})
@@ -781,6 +798,19 @@ def test_get_repository_returns_summary(monkeypatch):
     assert result["status"] == "success"
     assert result["repository"]["full_name"] == "octocat/Hello-World"
     assert mock_request.call_args.kwargs["url"].endswith("/repos/octocat/Hello-World")
+
+
+def test_get_repository_rejects_non_object_response(monkeypatch):
+    monkeypatch.setattr(
+        github.requests,
+        "request",
+        Mock(return_value=MockResponse(json_data=[])),
+    )
+
+    result = json.loads(github.github_get_repository("octocat/Hello-World"))
+
+    assert result["status"] == "error"
+    assert "non-object value" in result["message"]
 
 
 def test_get_repository_rejects_malformed_repo(monkeypatch):
@@ -1460,6 +1490,19 @@ def test_get_issue_rejects_non_positive_number(monkeypatch, issue_number):
     mock_request.assert_not_called()
 
 
+def test_get_issue_rejects_non_object_response(monkeypatch):
+    monkeypatch.setattr(
+        github.requests,
+        "request",
+        Mock(return_value=MockResponse(json_data=[])),
+    )
+
+    result = json.loads(github.github_get_issue("octocat/Hello-World", 1))
+
+    assert result["status"] == "error"
+    assert "non-object value" in result["message"]
+
+
 def test_create_issue_splits_comma_separated_labels(monkeypatch):
     mock_request = Mock(
         return_value=MockResponse(
@@ -1526,6 +1569,19 @@ def test_create_issue_surfaces_github_error_response(monkeypatch):
     assert "cannot be blank" in result["message"]
 
 
+def test_create_issue_rejects_non_object_response(monkeypatch):
+    monkeypatch.setattr(
+        github.requests,
+        "request",
+        Mock(return_value=MockResponse(json_data=[])),
+    )
+
+    result = json.loads(github.github_create_issue("octocat/Hello-World", "new issue"))
+
+    assert result["status"] == "error"
+    assert "non-object value" in result["message"]
+
+
 def test_comment_on_issue_posts_body(monkeypatch):
     mock_request = Mock(
         return_value=MockResponse(
@@ -1544,6 +1600,21 @@ def test_comment_on_issue_posts_body(monkeypatch):
     assert mock_request.call_args.kwargs["url"].endswith(
         "/repos/octocat/Hello-World/issues/1/comments"
     )
+
+
+def test_comment_on_issue_rejects_non_object_response(monkeypatch):
+    monkeypatch.setattr(
+        github.requests,
+        "request",
+        Mock(return_value=MockResponse(json_data=[])),
+    )
+
+    result = json.loads(
+        github.github_comment_on_issue("octocat/Hello-World", 1, "looks good")
+    )
+
+    assert result["status"] == "error"
+    assert "non-object value" in result["message"]
 
 
 @pytest.mark.parametrize("body", ["", "   "])
@@ -1793,6 +1864,19 @@ def test_get_pull_request_rejects_non_positive_number(monkeypatch, pull_number):
     mock_request.assert_not_called()
 
 
+def test_get_pull_request_rejects_non_object_response(monkeypatch):
+    monkeypatch.setattr(
+        github.requests,
+        "request",
+        Mock(return_value=MockResponse(json_data=[])),
+    )
+
+    result = json.loads(github.github_get_pull_request("octocat/Hello-World", 1))
+
+    assert result["status"] == "error"
+    assert "non-object value" in result["message"]
+
+
 def test_create_pull_request_sends_head_and_base(monkeypatch):
     mock_request = Mock(
         return_value=MockResponse(json_data={"number": 7, "title": "add feature"})
@@ -1856,6 +1940,23 @@ def test_create_pull_request_surfaces_github_error_response(monkeypatch):
 
     assert result["status"] == "error"
     assert "base branch not found" in result["message"]
+
+
+def test_create_pull_request_rejects_non_object_response(monkeypatch):
+    monkeypatch.setattr(
+        github.requests,
+        "request",
+        Mock(return_value=MockResponse(json_data=[])),
+    )
+
+    result = json.loads(
+        github.github_create_pull_request(
+            "octocat/Hello-World", "add feature", "feature-branch", "main"
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "non-object value" in result["message"]
 
 
 def test_get_file_contents_decodes_base64_file(monkeypatch):
@@ -2429,6 +2530,33 @@ def test_list_commits_omits_path_param_when_not_provided(monkeypatch):
     github.github_list_commits("octocat/Hello-World")
 
     assert "path" not in mock_request.call_args.kwargs["params"]
+
+
+@pytest.mark.parametrize("path", ["..", "src//main.py", "/src/main.py", "src/main.py/"])
+def test_list_commits_rejects_malformed_path(monkeypatch, path):
+    """path is sent as a query param, not path-interpolated, so this isn't
+    an injection risk -- but an empty segment or a bare dot-segment isn't
+    a real path, and github_get_file_contents already rejects the
+    identical shape of input up front instead of letting it reach GitHub
+    unvalidated."""
+    mock_request = Mock()
+    monkeypatch.setattr(github.requests, "request", mock_request)
+
+    result = json.loads(github.github_list_commits("octocat/Hello-World", path=path))
+
+    assert result["status"] == "error"
+    mock_request.assert_not_called()
+
+
+def test_list_commits_allows_question_mark_and_hash_in_path(monkeypatch):
+    """Unlike owner/repo, a real file path can legitimately contain '?'
+    or '#' -- must not be rejected the way a malformed path is."""
+    mock_request = Mock(return_value=MockResponse(json_data=[]))
+    monkeypatch.setattr(github.requests, "request", mock_request)
+
+    github.github_list_commits("octocat/Hello-World", path="docs/why?.md")
+
+    assert mock_request.call_args.kwargs["params"]["path"] == "docs/why?.md"
 
 
 def test_list_commits_sends_requested_page(monkeypatch):

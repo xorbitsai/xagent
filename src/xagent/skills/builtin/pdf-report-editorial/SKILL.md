@@ -1,19 +1,12 @@
 ---
 name: pdf-report-editorial
 description: |
-  Generate an editorial-styled PDF report (whitepaper, research brief,
-  executive memo, case study) by first emitting a self-contained HTML
-  document and then rendering it to PDF via the browser. Use when the
-  user asks for a "PDF report", "whitepaper", "executive brief",
-  "research report", "case study PDF", or similar document deliverable
-  where visual quality matters and the format must be portable / printable.
-  Use `pptx-editorial` or `html-deck-editorial` instead if the user
-  actually wants slides; this skill is for read-as-document, not as-slides.
+  An editorial-styled PDF report rendered from HTML via the browser:
+  "PDF report", "whitepaper", "executive brief", "research report",
+  "case study PDF". Read-as-document, not slides.
 when_to_use: |
-  When the user wants a polished read-as-document deliverable (whitepaper,
-  research brief, executive memo, case study) as a PDF where typography and
-  layout matter. Not for slides — use `pptx-editorial` or `html-deck-editorial`
-  for slide-style decks.
+  A polished portable, printable document where typography and layout matter.
+  Use pptx-editorial or html-deck-editorial instead when the user wants slides.
 tags:
   - pdf
   - report

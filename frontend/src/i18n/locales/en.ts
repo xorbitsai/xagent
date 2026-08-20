@@ -268,6 +268,13 @@ const en = {
       dagSectionOther: "DAG execution · {count} steps",
       view: "View plan",
     },
+    progressPanel: {
+      title: "Progress",
+      elapsed: "Elapsed",
+      planning: "Generating plan…",
+      toggleTooltip: "Show execution progress",
+      collapse: "Collapse",
+    },
     aiOutput: {
       title: "AI Output",
       subtitle: "Generated response",
@@ -2946,6 +2953,8 @@ Build when you need.`,
         completed: "Completed",
         failed: "Failed",
         skipped: "Skipped",
+        interrupted: "Interrupted",
+        clarification_invalidated: "Waiting on a new answer",
       },
       right: {
         titles: {

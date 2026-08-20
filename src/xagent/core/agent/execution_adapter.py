@@ -39,6 +39,7 @@ class AgentExecutionConfig:
     service_id: str | None = None
     registry: ExecutionRegistry | None = None
     dag_max_concurrency: int = 4
+    react_max_iterations: int = 200
     tool_parallel_enabled: bool = field(default_factory=get_tool_parallel_enabled)
     tool_max_concurrency: int = field(default_factory=get_tool_max_concurrency)
     outbound_message_handler: Any | None = None
@@ -297,6 +298,7 @@ class AgentExecutionAdapter:
             return (
                 AutoPattern(
                     react_pattern=ReActPattern(
+                        max_iterations=self.config.react_max_iterations,
                         tool_parallel_enabled=self.config.tool_parallel_enabled,
                         tool_max_concurrency=self.config.tool_max_concurrency,
                     ),
@@ -319,6 +321,7 @@ class AgentExecutionAdapter:
             )
         return (
             ReActPattern(
+                max_iterations=self.config.react_max_iterations,
                 tool_parallel_enabled=self.config.tool_parallel_enabled,
                 tool_max_concurrency=self.config.tool_max_concurrency,
             ),

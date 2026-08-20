@@ -223,6 +223,95 @@ def is_agent_checkpoint_data(data: Any) -> bool:
     )
 
 
+# Maps every control character (codepoint 0-31) to deletion, except tab
+# (9), newline (10), and carriage return (13), which are kept -- same
+# survivor set the old per-character loop in ``clean_string`` kept via
+# ``ord(char) >= 32 or char in "\n\r\t"``. DEL (127) and the C1 control
+# range (128-159) are untouched by this table (and were untouched by the
+# old loop too, since both are >= 32) -- this table only ever removes,
+# never rewrites, so leaving them out is the same as mapping them to
+# themselves. The table's contents never vary, and ``clean_string`` needs
+# it for every string value in every trace event this module serializes,
+# so it lives at module scope rather than inside the function.
+_CONTROL_CHAR_TRANSLATION_TABLE = str.maketrans(
+    {codepoint: None for codepoint in range(32) if codepoint not in (9, 10, 13)}
+)
+
+
+def serialize_trace_data(data: Dict[str, Any]) -> Dict[str, Any]:
+    """Recursively serialize trace event data to ensure JSON compatibility.
+
+    Module-level so the v1 SSE content-projection layer
+    (``v1/_events_stream.py``) can reuse the exact same pass on live
+    broadcast frames that the WebSocket handler applies before
+    broadcasting -- this function never reads ``self``, so lifting it
+    out of ``WebSocketTraceHandler`` changes nothing about its
+    behavior for the existing caller below.
+    """
+    import json
+    from datetime import datetime
+
+    def clean_string(value: str) -> str:
+        """Clean string data to remove problematic characters for JSON.
+
+        ``str.translate`` with the module-level
+        ``_CONTROL_CHAR_TRANSLATION_TABLE`` filters the whole string in
+        one C-level call. The previous form ran one Python-level
+        generator step per character and fed the survivors to
+        ``"".join`` -- the join was already a C builtin; the
+        per-character iteration was not. Same survivor set either way:
+        codepoints 0-31 are dropped except tab, newline, and carriage
+        return.
+        """
+        if not isinstance(value, str):
+            return value
+        return value.translate(_CONTROL_CHAR_TRANSLATION_TABLE)
+
+    def serialize_value(value: Any) -> Any:
+        # Handle Pydantic models (BaseModel)
+        if hasattr(value, "model_dump"):
+            return serialize_value(value.model_dump())
+        elif callable(getattr(value, "to_dict", None)):
+            return serialize_value(value.to_dict())
+        elif hasattr(value, "dict"):  # Fallback for older Pydantic
+            return serialize_value(value.dict())
+        elif isinstance(value, datetime):
+            if value.tzinfo is None:
+                value = value.replace(tzinfo=timezone.utc)
+            return value.timestamp()
+        elif isinstance(value, str):
+            return clean_string(value)
+        elif isinstance(value, dict):
+            return {k: serialize_value(v) for k, v in value.items()}
+        elif isinstance(value, (list, tuple)):
+            return [serialize_value(item) for item in value]
+        elif isinstance(value, bytes):
+            try:
+                return clean_string(value.decode("utf-8"))
+            except UnicodeDecodeError:
+                return f"<bytes: {len(value)}>"
+        else:
+            return value
+
+    try:
+        # First clean and serialize the data
+        cleaned_data = serialize_value(data)
+
+        # Test if cleaned data is JSON serializable
+        json.dumps(cleaned_data)
+        return cleaned_data  # type: ignore[no-any-return]
+    except (TypeError, ValueError) as e:
+        # If still not serializable, return a safe fallback
+        logger.warning(
+            f"Failed to serialize data for JSON: {e}, data type: {type(data)}"
+        )
+        return {
+            "_serialization_error": f"Failed to serialize {type(data).__name__}",
+            "_original_type": type(data).__name__,
+            "_error": str(e),
+        }
+
+
 def _convert_timestamp_to_utc_timestamp(timestamp: Any) -> float:
     """Convert timestamp to Unix timestamp for WebSocket compatibility."""
     if timestamp is None:
@@ -419,64 +508,11 @@ class WebSocketTraceHandler(TraceHandler):
             return False
 
     def _serialize_data(self, data: Dict[str, Any]) -> Dict[str, Any]:
-        """Recursively serialize data to ensure JSON compatibility."""
-        import json
-        from datetime import datetime
+        """Recursively serialize data to ensure JSON compatibility.
 
-        def clean_string(value: str) -> str:
-            """Clean string data to remove problematic characters for JSON."""
-            if not isinstance(value, str):
-                return value
-
-            # Remove NULL characters and other problematic control characters
-            cleaned = value.replace("\x00", "")  # Remove NULL character
-            cleaned = cleaned.replace("\u0000", "")  # Remove Unicode NULL
-            # Remove other control characters that might cause issues
-            cleaned = "".join(
-                char for char in cleaned if ord(char) >= 32 or char in "\n\r\t"
-            )
-            return cleaned
-
-        def serialize_value(value: Any) -> Any:
-            # Handle Pydantic models (BaseModel)
-            if hasattr(value, "model_dump"):
-                return serialize_value(value.model_dump())
-            elif callable(getattr(value, "to_dict", None)):
-                return serialize_value(value.to_dict())
-            elif hasattr(value, "dict"):  # Fallback for older Pydantic
-                return serialize_value(value.dict())
-            elif isinstance(value, datetime):
-                if value.tzinfo is None:
-                    value = value.replace(tzinfo=timezone.utc)
-                return value.timestamp()
-            elif isinstance(value, str):
-                return clean_string(value)
-            elif isinstance(value, dict):
-                return {k: serialize_value(v) for k, v in value.items()}
-            elif isinstance(value, (list, tuple)):
-                return [serialize_value(item) for item in value]
-            elif isinstance(value, bytes):
-                try:
-                    return clean_string(value.decode("utf-8"))
-                except UnicodeDecodeError:
-                    return f"<bytes: {len(value)}>"
-            else:
-                return value
-
-        try:
-            # First clean and serialize the data
-            cleaned_data = serialize_value(data)
-
-            # Test if cleaned data is JSON serializable
-            json.dumps(cleaned_data)
-            return cleaned_data  # type: ignore[no-any-return]
-        except (TypeError, ValueError) as e:
-            # If still not serializable, return a safe fallback
-            logger.warning(
-                f"Failed to serialize data for JSON: {e}, data type: {type(data)}"
-            )
-            return {
-                "_serialization_error": f"Failed to serialize {type(data).__name__}",
-                "_original_type": type(data).__name__,
-                "_error": str(e),
-            }
+        Thin instance wrapper -- the actual pass is ``serialize_trace_data``
+        (module level, doesn't read ``self``) so the v1 SSE content
+        projector can reuse the identical logic on live broadcast frames
+        without going through this class.
+        """
+        return serialize_trace_data(data)

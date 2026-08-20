@@ -696,7 +696,20 @@ export function TaskConversationPanel({
     })
   }
 
-  const isPlanning = dagNodes.length === 0 && state.dagExecution?.phase === "planning"
+  // "replanning" is a real, live phase the backend emits for a mid-run
+  // replan (dag.py's on_dag_execution) - it's planning-like in exactly the
+  // same way "planning" is (no NEW plan/graph to show yet), so it must show
+  // the same in-progress indicator rather than falling through unrecognized.
+  // Unlike "planning" (the very first plan, where dagNodes is naturally
+  // still empty), a mid-run replan keeps the SAME turn_id as the run it's
+  // revising, so app-context-chat's turn_id-based reset never clears the
+  // prior plan's dagNodes - gating on dagNodes.length === 0 the same way
+  // "planning" does would let the OLD, about-to-be-superseded graph keep
+  // rendering as if it were still current for the whole replan. Show the
+  // loading state unconditionally for "replanning" instead.
+  const isPlanning =
+    (dagNodes.length === 0 && state.dagExecution?.phase === "planning")
+    || state.dagExecution?.phase === "replanning"
   const hasError = dagNodes.length === 0 && (state.dagExecution?.phase === "failed" || state.currentTask?.status === "failed")
   const shouldShowHistoryLoading =
     timelineItems.length === 0 &&

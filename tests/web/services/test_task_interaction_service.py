@@ -124,7 +124,7 @@ import logging
 import sqlite3
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import pytest
 import sqlalchemy as sa
@@ -141,21 +141,32 @@ from xagent.web.services import task_interaction_service as svc
 from xagent.web.services.ops_signals import (
     CHECKPOINT_LOAD_UNAVAILABLE,
     CHECKPOINT_PK_ANCHOR_DANGLING,
+    INTERACTION_READ_PAYLOAD_UNREADABLE,
+    INTERACTION_READ_PROTOCOL_UNRECOGNIZED,
+    active_degradations,
     clear_degradation,
 )
 from xagent.web.services.task_lease_service import TASK_RUN_ID_TRACE_FIELD
 
+_DEGRADATION_SIGNALS_UNDER_TEST = (
+    CHECKPOINT_PK_ANCHOR_DANGLING,
+    CHECKPOINT_LOAD_UNAVAILABLE,
+    INTERACTION_READ_PROTOCOL_UNRECOGNIZED,
+    INTERACTION_READ_PAYLOAD_UNREADABLE,
+)
+
 
 @pytest.fixture(autouse=True)
 def _clean_degradation_registry():
-    """The anchor resolver registers process-global degradation signals on
-    its failure paths; clear this module's two signals around every test so
-    they cannot leak into tests that read the shared registry (the /health
-    suite asserts exact payloads and fails on any leftover entry)."""
-    for signal in (CHECKPOINT_PK_ANCHOR_DANGLING, CHECKPOINT_LOAD_UNAVAILABLE):
+    """The anchor resolver and materialize_compatibility_view register
+    process-global degradation signals on their failure paths; clear this
+    module's four signals around every test so they cannot leak into tests
+    that read the shared registry (the /health suite asserts exact
+    payloads and fails on any leftover entry)."""
+    for signal in _DEGRADATION_SIGNALS_UNDER_TEST:
         clear_degradation(signal)
     yield
-    for signal in (CHECKPOINT_PK_ANCHOR_DANGLING, CHECKPOINT_LOAD_UNAVAILABLE):
+    for signal in _DEGRADATION_SIGNALS_UNDER_TEST:
         clear_degradation(signal)
 
 
@@ -932,15 +943,23 @@ def test_t1_falls_back_to_legacy_when_task_run_id_is_null(_db: Session) -> None:
     assert view.tier == "legacy"
 
 
-def test_t1_falls_back_to_legacy_when_protocol_version_is_unrecognized(
+def test_unreadable_protocol_version_is_unanswerable_not_legacy(
     _db: Session, _seeded_task: int, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """``ck_task_interaction_requests_active_protocol`` pins every active
     row's protocol_version to 1 today, so this branch cannot be reached
-    through any real write against this schema -- it defends against a
-    future protocol version whose active-row CHECK has not been written
-    yet. Monkeypatching the row lookup is how this delivery tests a branch
-    the schema itself does not yet allow to be constructed."""
+    through any real write against this schema -- it is a second line of
+    defense behind that database constraint, for a future protocol version
+    whose active-row CHECK has not been written yet, or an older SQLite
+    file that predates the constraint. Monkeypatching the row lookup is
+    how this delivery tests a branch the schema itself does not yet allow
+    to be constructed.
+
+    An active row holds this task's answer slot regardless of whether its
+    protocol_version is one this reader recognizes, so this can no longer
+    fold back into the legacy tier -- doing so would let the caller offer
+    a transcript question whose answer would land in a slot this row has
+    already claimed."""
 
     trace_event_id = _make_trace_event(_db, task_id=_seeded_task)
     row = _make_active_interaction_row(
@@ -953,10 +972,13 @@ def test_t1_falls_back_to_legacy_when_protocol_version_is_unrecognized(
 
     monkeypatch.setattr(svc, "_active_native_row", _fake_active_row)
     view = svc.materialize_compatibility_view(_db, _seeded_task)
-    assert view.tier == "legacy"
+    assert view.tier == "unanswerable"
+    assert view.question is None
+    assert view.interactions is None
+    assert view.reason == "protocol_version_unrecognized"
 
 
-def test_t1_falls_back_to_legacy_when_request_payload_does_not_parse(
+def test_unreadable_payload_is_unanswerable_not_legacy(
     _db: Session, _seeded_task: int
 ) -> None:
     """The active row's request_payload is a JSON column with no
@@ -964,7 +986,11 @@ def test_t1_falls_back_to_legacy_when_request_payload_does_not_parse(
     that satisfies NOT NULL, so this branch is reachable through a real
     write, unlike the protocol_version branch above. A missing "message"
     field is enough to fail parse_v1_request_payload's pydantic
-    validation."""
+    validation.
+
+    Same rule as the protocol-version branch: an active row holds the
+    answer slot even when its payload cannot be parsed, so this reports
+    unanswerable rather than folding back to the legacy transcript."""
 
     trace_event_id = _make_trace_event(_db, task_id=_seeded_task)
     _make_active_interaction_row(
@@ -974,7 +1000,172 @@ def test_t1_falls_back_to_legacy_when_request_payload_does_not_parse(
         request_payload={"not": "a valid v1 payload"},
     )
     view = svc.materialize_compatibility_view(_db, _seeded_task)
-    assert view.tier == "legacy"
+    assert view.tier == "unanswerable"
+    assert view.question is None
+    assert view.interactions is None
+    assert view.reason == "payload_unreadable"
+
+
+def test_unrecognized_protocol_version_raises_the_ops_signal_and_a_warning(
+    _db: Session, _seeded_task: int, monkeypatch: pytest.MonkeyPatch, caplog
+) -> None:
+    """The unrecognized-protocol-version branch must not be silent --
+    it registers a named degradation and logs a WARNING. Mutation: delete
+    the register_degradation() call in that branch and this test turns
+    red (INTERACTION_READ_PROTOCOL_UNRECOGNIZED never appears)."""
+
+    trace_event_id = _make_trace_event(_db, task_id=_seeded_task)
+    row = _make_active_interaction_row(
+        _db, task_id=_seeded_task, resume_trace_event_id=trace_event_id
+    )
+    row.protocol_version = 2
+
+    def _fake_active_row(db: Session, task_id: int) -> TaskInteractionRequest:
+        return row
+
+    monkeypatch.setattr(svc, "_active_native_row", _fake_active_row)
+    with caplog.at_level(
+        logging.WARNING, logger="xagent.web.services.task_interaction_service"
+    ):
+        svc.materialize_compatibility_view(_db, _seeded_task)
+
+    from xagent.web.services.ops_signals import INTERACTION_READ_PROTOCOL_UNRECOGNIZED
+
+    assert INTERACTION_READ_PROTOCOL_UNRECOGNIZED in active_degradations()
+    assert any(record.levelno == logging.WARNING for record in caplog.records)
+
+
+def test_unreadable_payload_raises_the_ops_signal_and_a_warning(
+    _db: Session, _seeded_task: int, caplog
+) -> None:
+    """Same requirement as the unrecognized-protocol-version test above,
+    for the payload-unreadable branch. Mutation: delete that branch's
+    register_degradation() call and this test turns red."""
+
+    trace_event_id = _make_trace_event(_db, task_id=_seeded_task)
+    _make_active_interaction_row(
+        _db,
+        task_id=_seeded_task,
+        resume_trace_event_id=trace_event_id,
+        request_payload={"not": "a valid v1 payload"},
+    )
+    with caplog.at_level(
+        logging.WARNING, logger="xagent.web.services.task_interaction_service"
+    ):
+        svc.materialize_compatibility_view(_db, _seeded_task)
+
+    from xagent.web.services.ops_signals import INTERACTION_READ_PAYLOAD_UNREADABLE
+
+    assert INTERACTION_READ_PAYLOAD_UNREADABLE in active_degradations()
+    assert any(record.levelno == logging.WARNING for record in caplog.records)
+
+
+def test_both_slots_empty_shape_on_unrecognized_protocol_version(
+    _db: Session, _seeded_task: int, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """One of two cells for the exact tuple shape both empty-slot
+    branches must produce."""
+
+    trace_event_id = _make_trace_event(_db, task_id=_seeded_task)
+    row = _make_active_interaction_row(
+        _db, task_id=_seeded_task, resume_trace_event_id=trace_event_id
+    )
+    row.protocol_version = 2
+
+    def _fake_active_row(db: Session, task_id: int) -> TaskInteractionRequest:
+        return row
+
+    monkeypatch.setattr(svc, "_active_native_row", _fake_active_row)
+    view = svc.materialize_compatibility_view(_db, _seeded_task)
+    assert (view.question, view.interactions, view.reason) == (
+        None,
+        None,
+        "protocol_version_unrecognized",
+    )
+
+
+def test_both_slots_empty_shape_on_unreadable_payload(
+    _db: Session, _seeded_task: int
+) -> None:
+    """The other cell: same shape assertion for the payload-unreadable
+    branch."""
+
+    trace_event_id = _make_trace_event(_db, task_id=_seeded_task)
+    _make_active_interaction_row(
+        _db,
+        task_id=_seeded_task,
+        resume_trace_event_id=trace_event_id,
+        request_payload={"not": "a valid v1 payload"},
+    )
+    view = svc.materialize_compatibility_view(_db, _seeded_task)
+    assert (view.question, view.interactions, view.reason) == (
+        None,
+        None,
+        "payload_unreadable",
+    )
+
+
+def test_unreadable_payload_warning_never_logs_the_rejected_question_text(
+    _db: Session, _seeded_task: int, caplog
+) -> None:
+    """The privacy line: the validation-failure log line must
+    never carry the payload's own content. pydantic's str(ValidationError)
+    embeds ``input_value=``, and for this payload the input is the
+    question text an end user wrote -- logging it verbatim would leak
+    that text into the ops log. Mutation: swap
+    ``_validation_error_summary(exc)`` back for ``str(exc)[:500]`` in the
+    warning's ``extra`` and this test turns red, because the canary string
+    below would then appear in a log record's ``extra``.
+
+    Also asserts the warning was actually emitted, not just absent of the
+    canary: a caplog scan over zero records passes vacuously if the log
+    line is deleted or downgraded below WARNING, which would silently
+    defeat every assertion above. Filtering to this module's logger at
+    WARNING and requiring exactly one match, then pinning that record's
+    ``validation_errors`` to the real summary this payload produces,
+    closes that hole. Mutation: delete the ``logger.warning(...)`` call,
+    or downgrade it to ``logger.debug(...)``, and the record-count
+    assertion turns red because zero matching records survive the
+    filter."""
+
+    canary = "SENSITIVE-CANARY-9f2a"
+    trace_event_id = _make_trace_event(_db, task_id=_seeded_task)
+    _make_active_interaction_row(
+        _db,
+        task_id=_seeded_task,
+        resume_trace_event_id=trace_event_id,
+        # "message" must be a string per the v1 shape; an int forces a
+        # validation failure while carrying the canary text in the payload
+        # a real end-user question would occupy.
+        request_payload={"message": 12345, "marker_text": canary},
+    )
+    with caplog.at_level(
+        logging.WARNING, logger="xagent.web.services.task_interaction_service"
+    ):
+        svc.materialize_compatibility_view(_db, _seeded_task)
+
+    warning_records = [
+        record
+        for record in caplog.records
+        if record.name == "xagent.web.services.task_interaction_service"
+        and record.levelno == logging.WARNING
+    ]
+    assert len(warning_records) == 1
+    (warning_record,) = warning_records
+    assert warning_record.validation_errors == [
+        "message:string_type",
+        "interactions:missing",
+    ]
+
+    for record in caplog.records:
+        assert canary not in record.getMessage()
+        assert canary not in repr(record.args)
+        extra_values = {
+            key: value
+            for key, value in vars(record).items()
+            if key not in logging.LogRecord("", 0, "", 0, "", (), None).__dict__
+        }
+        assert canary not in repr(extra_values)
 
 
 def test_t2_native_projection_when_the_anchor_resolves(
@@ -1137,6 +1328,51 @@ def test_t3_prime_anchor_dangling_for_each_remaining_validity_condition(
     assert view.reason == "anchor_dangling"
 
 
+def test_t3_row_validity_failure_raises_checkpoint_pk_anchor_dangling(
+    _db: Session, _seeded_task: int
+) -> None:
+    """The row-invalid branch of
+    _resolve_read_direction_anchor's six-condition guard must register
+    CHECKPOINT_PK_ANCHOR_DANGLING, same as the missing-row branch above.
+    Mutation: delete that register_degradation() call and this test turns
+    red."""
+
+    trace_event_id = _make_trace_event(
+        _db, task_id=_seeded_task, checkpoint_type="not_a_checkpoint_type"
+    )
+    _make_active_interaction_row(
+        _db, task_id=_seeded_task, resume_trace_event_id=trace_event_id
+    )
+
+    view = svc.materialize_compatibility_view(_db, _seeded_task)
+    assert view.tier == "unanswerable"
+    assert CHECKPOINT_PK_ANCHOR_DANGLING in active_degradations()
+
+
+def test_t2_empty_trace_side_execution_id_is_treated_as_a_match(
+    _db: Session, _seeded_task: int
+) -> None:
+    """A checkpoint row whose own execution_id is empty
+    short-circuits the execution-identity comparison to "matches"
+    regardless of the interaction row's resume_execution_id, so the
+    anchor still resolves and the view still reaches T2. Mutation: delete
+    the ``not row_execution_id or ...`` short-circuit (comparing execution
+    ids unconditionally instead) and this test turns red, because an
+    empty trace-side id would then never equal a non-empty
+    resume_execution_id."""
+
+    trace_event_id = _make_trace_event(_db, task_id=_seeded_task, execution_id="")
+    _make_active_interaction_row(
+        _db,
+        task_id=_seeded_task,
+        resume_trace_event_id=trace_event_id,
+        resume_execution_id="exec-1",
+    )
+
+    view = svc.materialize_compatibility_view(_db, _seeded_task)
+    assert view.tier == "native"
+
+
 def test_t3_does_not_fall_back_to_legacy(_db: Session, _seeded_task: int) -> None:
     """A T3 result must never present
     as "no active row" -- it must always be the unanswerable tier, never
@@ -1158,7 +1394,16 @@ def test_t3_checkpoint_unavailable_when_the_anchor_fetch_raises(
     """T3's second reason: the anchor row fetch itself raises (a session
     or query-layer failure), distinct from anchor_dangling -- that reason
     covers the pointer naming a missing or invalid row, not the read
-    infrastructure failing before it can even answer that question."""
+    infrastructure failing before it can even answer that question.
+
+    Raises a SQLAlchemy error specifically, not a bare RuntimeError: the
+    fetch's except clause is scoped to a whitelist of transient
+    infrastructure failures, not ``sa.exc.SQLAlchemyError`` as a whole
+    (see the parametrized whitelist/blacklist tests below for the full
+    boundary, and test_anchor_fetch_non_sqlalchemy_error_propagates_uncaught
+    for the negative case that scoping exists to draw), so this cell has
+    to raise something the except tuple actually catches to keep testing
+    "a session or query-layer failure", not "any Python exception"."""
 
     trace_event_id = _make_trace_event(_db, task_id=_seeded_task)
     _make_active_interaction_row(
@@ -1169,13 +1414,250 @@ def test_t3_checkpoint_unavailable_when_the_anchor_fetch_raises(
 
     def _raising_get(model: Any, pk: Any, *args: Any, **kwargs: Any) -> Any:
         if model is TraceEvent:
-            raise RuntimeError("simulated session failure")
+            raise sa.exc.OperationalError(
+                "SELECT 1", {}, Exception("simulated session failure")
+            )
         return real_get(model, pk, *args, **kwargs)
 
     monkeypatch.setattr(_db, "get", _raising_get)
     view = svc.materialize_compatibility_view(_db, _seeded_task)
     assert view.tier == "unanswerable"
     assert view.reason == "checkpoint_unavailable"
+
+
+_TRANSIENT_ANCHOR_FETCH_ERRORS: list[Any] = [
+    pytest.param(
+        lambda: sa.exc.OperationalError(
+            "SELECT 1", {}, Exception("simulated connection loss")
+        ),
+        id="OperationalError",
+    ),
+    pytest.param(
+        lambda: sa.exc.InterfaceError(
+            "SELECT 1", {}, Exception("simulated DBAPI interface failure")
+        ),
+        id="InterfaceError",
+    ),
+    pytest.param(
+        lambda: sa.exc.DisconnectionError("simulated pool-detected disconnect"),
+        id="DisconnectionError",
+    ),
+    pytest.param(
+        lambda: sa.exc.TimeoutError("simulated pool checkout timeout"),
+        id="TimeoutError",
+    ),
+]
+
+
+@pytest.mark.parametrize("exc_factory", _TRANSIENT_ANCHOR_FETCH_ERRORS)
+def test_t3_checkpoint_unavailable_for_each_transient_infrastructure_error(
+    _db: Session,
+    _seeded_task: int,
+    monkeypatch: pytest.MonkeyPatch,
+    exc_factory: Callable[[], Exception],
+) -> None:
+    """The fallback whitelist, one cell per class: each of these four is a
+    transient, recoverable infrastructure failure (see the except
+    clause's own comment on ``_resolve_read_direction_anchor`` for the
+    classification), and each on its own degrades the read to
+    tier="unanswerable"/reason="checkpoint_unavailable" -- not only in
+    combination with the others. Mutation: delete any one of these four
+    from the except tuple and that case's cell turns red, because that
+    exception then propagates uncaught instead of degrading."""
+
+    trace_event_id = _make_trace_event(_db, task_id=_seeded_task)
+    _make_active_interaction_row(
+        _db, task_id=_seeded_task, resume_trace_event_id=trace_event_id
+    )
+
+    exc = exc_factory()
+    real_get = _db.get
+
+    def _raising_get(model: Any, pk: Any, *args: Any, **kwargs: Any) -> Any:
+        if model is TraceEvent:
+            raise exc
+        return real_get(model, pk, *args, **kwargs)
+
+    monkeypatch.setattr(_db, "get", _raising_get)
+    view = svc.materialize_compatibility_view(_db, _seeded_task)
+    assert view.tier == "unanswerable"
+    assert view.reason == "checkpoint_unavailable"
+
+
+_NON_TRANSIENT_ANCHOR_FETCH_ERRORS: list[Any] = [
+    pytest.param(
+        lambda: sa.exc.ProgrammingError(
+            "stmt", {}, Exception("simulated malformed statement")
+        ),
+        id="ProgrammingError",
+    ),
+    pytest.param(
+        lambda: sa.exc.ArgumentError("simulated bad argument"),
+        id="ArgumentError",
+    ),
+    pytest.param(
+        lambda: sa.exc.CompileError("simulated compile failure"),
+        id="CompileError",
+    ),
+    pytest.param(
+        lambda: sa.exc.InvalidRequestError("simulated invalid request"),
+        id="InvalidRequestError",
+    ),
+    pytest.param(
+        lambda: sa.exc.NoResultFound("simulated no-result-found"),
+        id="NoResultFound",
+    ),
+    pytest.param(
+        lambda: sa.exc.PendingRollbackError(
+            "simulated mid-transaction session failure"
+        ),
+        id="PendingRollbackError",
+    ),
+]
+
+
+@pytest.mark.parametrize("exc_factory", _NON_TRANSIENT_ANCHOR_FETCH_ERRORS)
+def test_anchor_fetch_non_transient_sqlalchemy_error_propagates_uncaught(
+    _db: Session,
+    _seeded_task: int,
+    monkeypatch: pytest.MonkeyPatch,
+    exc_factory: Callable[[], Exception],
+) -> None:
+    """The fallback blacklist, mirroring the whitelist test above one
+    class at a time: each of these six is a ``sa.exc.SQLAlchemyError``
+    subclass -- the old, wide ``except sa.exc.SQLAlchemyError`` used to
+    swallow every one of them -- but none names a transient
+    infrastructure failure the except tuple is meant to catch, so each
+    must propagate to the caller instead of being misclassified as
+    "checkpoint unavailable". ``PendingRollbackError`` sits here rather
+    than in the whitelist above because its source is mixed -- sometimes
+    a connection failure, sometimes a prior flush failure that left the
+    session itself unrecoverable -- and because it is unreachable at this
+    call site on either entry path: materialize_compatibility_view runs
+    ``interaction_requests_table_exists``'s own ``db.connection()`` call
+    first, and respond(), which reaches the resolver directly without
+    that check, has already run several statements on the session it
+    owns, so either way a session broken enough to raise it raises
+    earlier than this fetch. Mutation:
+    widen the except clause back to ``except sa.exc.SQLAlchemyError`` and
+    every case in this parametrization turns red, because all six would
+    then be swallowed and reported as tier="unanswerable" instead of
+    raising."""
+
+    trace_event_id = _make_trace_event(_db, task_id=_seeded_task)
+    _make_active_interaction_row(
+        _db, task_id=_seeded_task, resume_trace_event_id=trace_event_id
+    )
+
+    exc = exc_factory()
+
+    def _raising_get(model: Any, pk: Any, *args: Any, **kwargs: Any) -> Any:
+        if model is TraceEvent:
+            raise exc
+        raise AssertionError(f"unexpected db.get({model!r}, {pk!r})")
+
+    monkeypatch.setattr(_db, "get", _raising_get)
+    with pytest.raises(type(exc)):
+        svc.materialize_compatibility_view(_db, _seeded_task)
+
+
+def test_anchor_fetch_non_sqlalchemy_error_propagates_uncaught(
+    _db: Session, _seeded_task: int, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The anchor fetch's except clause only catches
+    ``sa.exc.SQLAlchemyError`` subclasses at all (and only a whitelisted
+    subset of those -- see the parametrized tests above) -- a programming
+    error that is not even a SQLAlchemy error (a TypeError, here) must
+    propagate to the caller rather than being misclassified as a
+    checkpoint that has become unavailable. Mutation: widen the except
+    clause back to ``except Exception`` and this test turns red, because
+    the TypeError would then be swallowed and reported as
+    tier="unanswerable" instead of raising."""
+
+    trace_event_id = _make_trace_event(_db, task_id=_seeded_task)
+    _make_active_interaction_row(
+        _db, task_id=_seeded_task, resume_trace_event_id=trace_event_id
+    )
+
+    def _raising_get(model: Any, pk: Any, *args: Any, **kwargs: Any) -> Any:
+        if model is TraceEvent:
+            raise TypeError("not a SQLAlchemy error")
+        raise AssertionError(f"unexpected db.get({model!r}, {pk!r})")
+
+    monkeypatch.setattr(_db, "get", _raising_get)
+    with pytest.raises(TypeError, match="not a SQLAlchemy error"):
+        svc.materialize_compatibility_view(_db, _seeded_task)
+
+
+def test_the_session_survives_a_failed_anchor_fetch_with_no_rollback(
+    _db: Session, _seeded_task: int, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The "no db.rollback()" definitive regression test: the anchor
+    fetch's except clause deliberately does
+    not roll back: the session it reads through belongs to the caller,
+    so disposing of a failed transaction is the session owner's call,
+    not this read helper's. (The same module's respond() owns a session
+    of its own and does commit and roll back on it; that ownership
+    boundary is exactly the point. See the except clause's comment.)
+
+    Proves this end to end in one real session: a write the caller had
+    already staged, uncommitted, before the failing read survives it and
+    can still be committed; the same session can still run a plain query
+    afterward; and the same session can still complete a whole second
+    materialize_compatibility_view() call -- a full response construction
+    -- once the transient failure clears.
+
+    Mutation: add ``db.rollback()`` to the except clause and the first
+    assertion below -- the caller's staged write surviving -- turns red,
+    because the rollback discards it along with anything else the caller
+    had pending."""
+
+    trace_event_id = _make_trace_event(_db, task_id=_seeded_task)
+    _make_active_interaction_row(
+        _db, task_id=_seeded_task, resume_trace_event_id=trace_event_id
+    )
+
+    # The caller's own staged, uncommitted write -- simulates a caller
+    # that has already modified something in this same session before
+    # asking the read surface for the pending question.
+    task = _db.query(Task).filter(Task.id == _seeded_task).first()
+    task.title = "staged-before-the-failing-read"
+
+    real_get = _db.get
+    raise_once = {"armed": True}
+
+    def _raising_get(model: Any, pk: Any, *args: Any, **kwargs: Any) -> Any:
+        if model is TraceEvent and raise_once["armed"]:
+            raise_once["armed"] = False
+            raise sa.exc.OperationalError(
+                "SELECT 1", {}, Exception("simulated session failure")
+            )
+        return real_get(model, pk, *args, **kwargs)
+
+    monkeypatch.setattr(_db, "get", _raising_get)
+    view = svc.materialize_compatibility_view(_db, _seeded_task)
+    assert view.tier == "unanswerable"
+    assert view.reason == "checkpoint_unavailable"
+
+    # (a) the caller's own pending write is still staged and committable --
+    # a db.rollback() in the except clause would have discarded it.
+    _db.commit()
+    reloaded = _db.query(Task).filter(Task.id == _seeded_task).first()
+    assert reloaded.title == "staged-before-the-failing-read"
+
+    # (b) the same session can still run a plain query...
+    still_readable = (
+        _db.query(TaskInteractionRequest)
+        .filter(TaskInteractionRequest.task_id == _seeded_task)
+        .first()
+    )
+    assert still_readable is not None
+
+    # ...and complete a whole second response construction: the transient
+    # failure was armed for exactly one call, so the real db.get resumes
+    # and the anchor now resolves normally.
+    second_view = svc.materialize_compatibility_view(_db, _seeded_task)
+    assert second_view.tier == "native"
 
 
 def test_stale_run_active_row_is_invisible(_db: Session, _session_factory) -> None:
@@ -2052,6 +2534,14 @@ def test_respond_reports_unavailable_when_the_interaction_row_does_not_exist(
 def test_respond_reports_unavailable_when_the_anchor_row_fetch_raises(
     _respond_db, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """_resolve_read_direction_anchor's fetch is caught on a whitelist of
+    transient infrastructure failures (``OperationalError``,
+    ``InterfaceError``, ``DisconnectionError``, ``TimeoutError``), not on
+    ``sa.exc.SQLAlchemyError`` as a whole, so this cell raises a
+    whitelisted class to keep testing "a session or query-layer failure",
+    not "any Python exception" -- see that resolver's own except clause
+    for why the whitelist exists and is scoped that narrowly."""
+
     user_id, task_id = _waiting_task(_respond_db)
     interaction_id = _active_row_ready_for_respond(_respond_db, task_id=task_id)
     with _asserts_no_side_effects(
@@ -2065,7 +2555,9 @@ def test_respond_reports_unavailable_when_the_anchor_row_fetch_raises(
             self: Any, model: Any, pk: Any, *args: Any, **kwargs: Any
         ) -> Any:
             if model is TraceEvent:
-                raise RuntimeError("simulated session failure")
+                raise sa.exc.OperationalError(
+                    "SELECT 1", {}, Exception("simulated session failure")
+                )
             return original_get(self, model, pk, *args, **kwargs)
 
         monkeypatch.setattr(OrmSession, "get", _raising_get)

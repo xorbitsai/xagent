@@ -19,26 +19,19 @@ def test_static_visual_design_skill_routes_only_commercial_creatives() -> None:
     assert skill["name"] == "static-visual-design"
     description = " ".join(skill["description"].split())
     when_to_use = " ".join(skill["when_to_use"].split())
-    assert "complete PNG or JPEG assets" in description
-    assert "commercial and brand-facing" in description
-    assert "campaign posters" in description
-    assert "advertising creatives" in description
-    assert "placement variants" in description
-    assert "marketing, campaign, event, or brand communication" in when_to_use
-    assert "educational infographics" in when_to_use
-    assert "technical diagrams" in when_to_use
-    assert "concept explainers" in when_to_use
+    assert "one PNG/JPEG" in description
+    assert "brand styling" in description
+    assert "finished ad, poster, banner, social post" in description
+    assert "another placement size or aspect ratio" in description
+    assert "marketing, promotion, campaign, event, or brand-facing image" in when_to_use
+    assert "explanatory diagrams" in when_to_use
+    assert "infographics" in when_to_use
+    assert "plain illustrations" in when_to_use
 
-    # Auto routing sees bounded one-line versions of these fields. Keep the
-    # positive commercial scope and the important exclusions inside that
-    # actual routing surface instead of only in the full skill body.
-    routing_description = _index_text(skill["description"])
-    routing_when_to_use = _index_text(skill["when_to_use"])
-    assert "commercial and brand-facing" in routing_description
-    assert "advertising creatives" in routing_description
-    assert "Use only for marketing" in routing_when_to_use
-    assert "educational infographics" in routing_when_to_use
-    assert "concept explainers" in routing_when_to_use
+    # Auto routing sees bounded one-line versions of these fields, so every
+    # assertion above has to hold on the routing surface, not only in the body.
+    assert _index_text(skill["description"]) == description
+    assert _index_text(skill["when_to_use"]) == when_to_use
 
     content = " ".join(skill["content"].split())
     assert "Stay within the commercial-creative scope" in content

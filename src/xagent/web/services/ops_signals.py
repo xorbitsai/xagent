@@ -116,6 +116,20 @@ CLARIFICATION_MULTIPLE_DRAFTS = "clarification_multiple_drafts"
 # migrated off the legacy resume path.
 INTERACTION_LEGACY_RESUME_SHIM = "interaction_legacy_resume_shim"
 
+# Set by materialize_compatibility_view (task_interaction_service.py) when a
+# task's active native interaction row carries a protocol_version this
+# reader does not recognize: the row holds the task's answer slot, so the
+# read surface cannot fall back to the legacy transcript, and reports the
+# unanswerable tier instead. Deliberately not paired with a clear site, the
+# same reasoning as INTERACTION_ROLLOUT_UNKNOWN_TASK_SOURCE above: this is a
+# property of a persisted row's protocol_version, and no in-process
+# registry can observe that row being fixed.
+INTERACTION_READ_PROTOCOL_UNRECOGNIZED = "interaction_read_protocol_unrecognized"
+# Set by the same function when an active native interaction row's
+# request_payload fails v1 validation. Same "unreadable is not absent"
+# reasoning as the sibling signal above, and the same no-clear-site rule.
+INTERACTION_READ_PAYLOAD_UNREADABLE = "interaction_read_payload_unreadable"
+
 _signals: dict[str, str] = {}
 _lock = threading.Lock()
 

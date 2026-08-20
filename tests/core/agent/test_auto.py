@@ -20,6 +20,10 @@ from xagent.core.agent import (
     PatternRuntime,
     ReActPattern,
 )
+from xagent.core.agent.language import (
+    OUTPUT_LANGUAGE_SOURCE_METADATA_KEY,
+    OUTPUT_LANGUAGE_SOURCE_ROUTER,
+)
 from xagent.core.agent.pattern.auto.auto import DECISION_TOOL_NAME, _AutoChildRuntime
 from xagent.core.model.chat.exceptions import LLMToolProtocolError
 from xagent.core.model.chat.tool_protocol import (
@@ -799,6 +803,10 @@ async def test_auto_pattern_final_answer_completes_without_child_pattern() -> No
     assert pattern.decision.action == AutoAction.FINAL_ANSWER
     assert pattern.decision.response_language == "English"
     assert context.metadata["output_language"] == "English"
+    assert (
+        context.metadata[OUTPUT_LANGUAGE_SOURCE_METADATA_KEY]
+        == OUTPUT_LANGUAGE_SOURCE_ROUTER
+    )
     assert context.messages[-1].role == "assistant"
     assert context.messages[-1].content == "hi"
     assert len(llm.calls) == 1

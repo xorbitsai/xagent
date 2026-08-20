@@ -1204,6 +1204,14 @@ class PatternRuntime:
         )
         return result
 
+    def _with_dag_turn_id(
+        self, context: Any, data: dict[str, Any] | None
+    ) -> dict[str, Any]:
+        turn_id = self._dag_turn_id(context)
+        if not turn_id:
+            return dict(data or {})
+        return {"turn_id": turn_id, **(data or {})}
+
     async def on_dag_step_start(
         self,
         *,
@@ -1215,7 +1223,7 @@ class PatternRuntime:
             TraceEventType(TraceScope.STEP, TraceAction.START, TraceCategory.DAG),
             task_id=self._task_id(context),
             step_id=step_id,
-            data=data or {},
+            data=self._with_dag_turn_id(context, data),
         )
 
     async def on_dag_step_end(
@@ -1229,7 +1237,7 @@ class PatternRuntime:
             TraceEventType(TraceScope.STEP, TraceAction.END, TraceCategory.DAG),
             task_id=self._task_id(context),
             step_id=step_id,
-            data=data or {},
+            data=self._with_dag_turn_id(context, data),
         )
 
     async def on_dag_execution(
@@ -1242,7 +1250,7 @@ class PatternRuntime:
         await self._emit_trace_event(
             TraceEventType(TraceScope.TASK, TraceAction.UPDATE, TraceCategory.DAG),
             task_id=self._task_id(context),
-            data={"phase": phase, **(data or {})},
+            data={"phase": phase, **self._with_dag_turn_id(context, data)},
         )
 
     def _build_checkpoint_payload(
@@ -1375,6 +1383,28 @@ class PatternRuntime:
 
     def _task_id(self, context: Any) -> str | None:
         return str(getattr(context, "execution_id", None) or self.execution_id or "")
+
+    def _dag_turn_id(self, context: Any) -> str | None:
+        # Identifies "which turn's DAG execution is this" to consumers (the
+        # frontend Progress panel distinguishes one run from the next by
+        # this) - reuses the existing turn_id already established on each
+        # user Message's own metadata (AgentRunner.inject_user_message's
+        # _ensure_user_message_turn_id), which is guaranteed fresh per turn.
+        # Deliberately NOT stashed in context.metadata instead: that dict is
+        # scoped to the whole execution/task, not one turn - it's the SAME
+        # object reused across every follow-up message in the task
+        # (inject_user_message calls context_manager.get_context, never
+        # rebuilding it), so a value stored there would persist unchanged
+        # into turn 2, 3, etc., never actually distinguishing runs.
+        messages = getattr(context, "messages", None) or []
+        for message in reversed(messages):
+            if getattr(message, "role", None) != "user":
+                continue
+            metadata = getattr(message, "metadata", None)
+            if isinstance(metadata, dict) and metadata.get("turn_id"):
+                return str(metadata["turn_id"])
+            return None
+        return None
 
     def _step_id(self, context: Any) -> str:
         metadata = getattr(context, "metadata", None)

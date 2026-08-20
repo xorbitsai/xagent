@@ -33,6 +33,30 @@ sample_prompts:
     prompt: 帮助客户逐步排查 产品领域 的问题，必要时上报人工处理。
     highlights:
     - 产品领域
+persona:
+  name: Sophie
+  role:
+    en: AI Support Chatbot
+    zh: AI 客服机器人
+  avatar: /marketplace/avatars/sophie.png
+  intro:
+    en: |-
+      Hi there — I'm Sophie, your AI Chatbot Agent.
+
+      I answer customer questions from your knowledge base and walk people through problems.
+    zh: |-
+      你好，我是 Sophie，你的 AI 客服机器人。
+
+      我会依据你的知识库回答客户问题，并引导他们解决问题。
+  kickoff_questions:
+    en:
+    - Which knowledge base should I answer from, and is it current?
+    - Where am I talking to customers — the help widget, a chat channel, somewhere else?
+    - When I can't answer something, who should I hand the conversation to?
+    zh:
+    - 我该依据哪个知识库来回答，内容是最新的吗？
+    - 我在哪里和客户对话——帮助中心组件、聊天渠道，还是别的地方？
+    - 遇到回答不了的问题，该转交给谁？
 connections:
 - name: Google Drive
   logo: https://www.google.com/s2/favicons?domain=drive.google.com&sz=64

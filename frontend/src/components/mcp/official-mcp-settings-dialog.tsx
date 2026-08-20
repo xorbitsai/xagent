@@ -19,6 +19,13 @@ interface OfficialMcpSettingsDialogProps {
   onSuccess?: () => void
   onDisconnect?: (app: AppIntegration) => void
   isGloballyConnected?: boolean
+  // Whether this viewer's Configure route would resolve — a backend fact
+  // (list_mcp_apps.can_configure), passed in like isGloballyConnected rather
+  // than read off `app`, because the two call sites answer it differently: the
+  // connector picker reads the listing field, while the Tools page hands this
+  // dialog a hand-built entry that carries no listing fields at all. Omitted
+  // means "use the connection state", which is exactly the gate this replaced.
+  canConfigure?: boolean
   onConnectStart?: (app: AppIntegration) => void
   onConfigure?: (app: AppIntegration) => void
   onManageKey?: (app: AppIntegration) => void
@@ -37,6 +44,7 @@ export function OfficialMcpSettingsDialog({
   onSuccess,
   onDisconnect,
   isGloballyConnected = false,
+  canConfigure,
   onConnectStart,
   onConfigure,
   onManageKey,
@@ -161,6 +169,21 @@ export function OfficialMcpSettingsDialog({
 
   if (!app) return null;
 
+  // configurable answers "would the edit route resolve for this viewer",
+  // independent of connection state: a connector whose tokens arrive through a
+  // deployment-installed resolver hook is never "connected" for its own
+  // creator, yet its owner holds the association the edit routes require.
+  // The `??` fallback exists only for the caller that omits the prop entirely
+  // (the Tools page's hand-built entry) and reproduces the pre-field gate.
+  const configurable = Boolean(canConfigure ?? isGloballyConnected)
+  const isKeyBased = app.auth_type === "api_key"
+  // Keyless apps have no key and no editable config — once connected,
+  // disconnect is the only sensible action.
+  const isKeyless = app.auth_type === "keyless"
+  // Team tool the viewer doesn't own: they can use it, but the backend
+  // rejects edit/delete/unshare (403), so don't render those buttons.
+  const isNonOwnedTeamTool = Boolean(app.shared) && app.is_owner === false
+
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent className="sm:max-w-md text-center p-0 overflow-hidden bg-white shadow-xl">
@@ -225,66 +248,61 @@ export function OfficialMcpSettingsDialog({
               </Button>
             )}
 
-            {isGloballyConnected && (
-              <>
-                {(() => {
-                  const isKeyBased = app.auth_type === "api_key"
-                  // Keyless apps have no key and no editable config — once
-                  // connected, disconnect is the only sensible action.
-                  const isKeyless = app.auth_type === "keyless"
-                  // Team tool the viewer doesn't own: they can use it, but the backend
-                  // rejects edit/delete/unshare (403), so don't render those buttons.
-                  const isNonOwnedTeamTool = Boolean(app.shared) && app.is_owner === false
-                  return (
-                    <>
-                      {!isNonOwnedTeamTool && !isKeyless && (
-                        <Button
-                          className="w-full max-w-[200px] rounded-full h-11 font-medium bg-slate-900 text-white hover:bg-slate-800"
-                          onClick={() => {
-                            // Key-based apps: users only manage their own key, never the
-                            // shared server config. Route to the key dialog, not the form.
-                            if (isKeyBased && onManageKey) {
-                              onManageKey(app);
-                            } else if (app.is_custom && onConfigure) {
-                              onConfigure(app);
-                            } else {
-                              handleConnectApp(app);
-                            }
-                          }}
-                        >
-                          <Settings className="h-4 w-4 mr-2" />
-                          {isKeyBased ? t('tools.mcp.dialog.manageKey') : t('tools.mcp.dialog.configure')}
-                        </Button>
-                      )}
-                      {/* "Make team" / "Make personal": only the owner (or a team admin,
-                          enforced server-side) can change ownership. Hidden on non-owned
-                          team tools. */}
-                      {inTeam && Number.isInteger(app.server_id) && !isNonOwnedTeamTool && (
-                        <Button
-                          variant="outline"
-                          className="w-full max-w-[200px] rounded-full h-11 font-medium"
-                          onClick={() => handleToggleShare(app, !app.shared)}
-                        >
-                          {app.shared ? (
-                            <><UserMinus className="h-4 w-4 mr-2" /> {t('tools.mcp.sharing.unshare')}</>
-                          ) : (
-                            <><Users className="h-4 w-4 mr-2" /> {t('tools.mcp.sharing.share')}</>
-                          )}
-                        </Button>
-                      )}
-                      {!isNonOwnedTeamTool && (
-                        <Button
-                          variant="outline"
-                          className="w-full max-w-[200px] rounded-full h-11 font-medium text-red-600 hover:text-red-700 hover:bg-red-50 border-red-200"
-                          onClick={() => handleDisconnectApp(app)}
-                        >
-                          <Unlink className="h-4 w-4 mr-2" /> {(app.is_custom && !isKeyBased) ? t('tools.mcp.dialog.deleteService') : t('tools.mcp.dialog.disconnect')}
-                        </Button>
-                      )}
-                    </>
-                  )
-                })()}
-              </>
+            {/* Configure / manage-my-key: gated on configurable, not on
+                isGloballyConnected. It is the one button here whose
+                availability answers a different question than the two below —
+                "does the edit route resolve for this viewer" rather than "is
+                this entry connected". */}
+            {configurable && !isNonOwnedTeamTool && !isKeyless && (
+              <Button
+                className="w-full max-w-[200px] rounded-full h-11 font-medium bg-slate-900 text-white hover:bg-slate-800"
+                onClick={() => {
+                  // Key-based apps: users only manage their own key, never the
+                  // shared server config. Route to the key dialog, not the form.
+                  if (isKeyBased && onManageKey) {
+                    onManageKey(app);
+                  } else if (app.is_custom && onConfigure) {
+                    onConfigure(app);
+                  } else {
+                    handleConnectApp(app);
+                  }
+                }}
+              >
+                <Settings className="h-4 w-4 mr-2" />
+                {isKeyBased ? t('tools.mcp.dialog.manageKey') : t('tools.mcp.dialog.configure')}
+              </Button>
+            )}
+            {/* "Make team" / "Make personal": only the owner (or a team admin,
+                enforced server-side) can change ownership. Hidden on non-owned
+                team tools. Unlike Configure, this route lives entirely in the
+                overlay layer, whose precondition upstream cannot answer, so it
+                keeps reading isGloballyConnected. */}
+            {isGloballyConnected && inTeam && Number.isInteger(app.server_id) && !isNonOwnedTeamTool && (
+              <Button
+                variant="outline"
+                className="w-full max-w-[200px] rounded-full h-11 font-medium"
+                onClick={() => handleToggleShare(app, !app.shared)}
+              >
+                {app.shared ? (
+                  <><UserMinus className="h-4 w-4 mr-2" /> {t('tools.mcp.sharing.unshare')}</>
+                ) : (
+                  <><Users className="h-4 w-4 mr-2" /> {t('tools.mcp.sharing.share')}</>
+                )}
+              </Button>
+            )}
+            {/* Disconnect deletes the row outright (DELETE .../servers/{id} or
+                .../custom-apis/{id}), so it is meaningful even with zero
+                grants — unlike Configure it keeps its own is_connected-based
+                door, which is a separate, pre-existing gate mismatch tracked
+                on its own and not addressed here. */}
+            {isGloballyConnected && !isNonOwnedTeamTool && (
+              <Button
+                variant="outline"
+                className="w-full max-w-[200px] rounded-full h-11 font-medium text-red-600 hover:text-red-700 hover:bg-red-50 border-red-200"
+                onClick={() => handleDisconnectApp(app)}
+              >
+                <Unlink className="h-4 w-4 mr-2" /> {(app.is_custom && !isKeyBased) ? t('tools.mcp.dialog.deleteService') : t('tools.mcp.dialog.disconnect')}
+              </Button>
             )}
           </div>
         </div>

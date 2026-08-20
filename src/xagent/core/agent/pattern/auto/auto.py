@@ -30,6 +30,8 @@ from ...frame import ExecutionFrame, ExecutionSnapshot, ExecutionStatus
 from ...grounding import grounding_rule
 from ...language import (
     OUTPUT_LANGUAGE_METADATA_KEY,
+    OUTPUT_LANGUAGE_SOURCE_METADATA_KEY,
+    OUTPUT_LANGUAGE_SOURCE_ROUTER,
     final_answer_language_rule,
     normalize_response_language_label,
     output_language_policy,
@@ -747,6 +749,9 @@ class AutoPattern(AgentPattern):
             # Auto is the current-turn language authority; replace any
             # request-scoped policy left by a previous turn.
             metadata[OUTPUT_LANGUAGE_METADATA_KEY] = response_language
+            metadata[OUTPUT_LANGUAGE_SOURCE_METADATA_KEY] = (
+                OUTPUT_LANGUAGE_SOURCE_ROUTER
+            )
 
     @staticmethod
     def _context_metadata(context: Any) -> dict[str, Any] | None:
@@ -762,6 +767,7 @@ class AutoPattern(AgentPattern):
         metadata = self._context_metadata(context)
         if metadata is not None:
             metadata.pop(OUTPUT_LANGUAGE_METADATA_KEY, None)
+            metadata.pop(OUTPUT_LANGUAGE_SOURCE_METADATA_KEY, None)
 
     def _attach_decision_metadata(self, result: dict[str, Any]) -> None:
         if self.decision is None:

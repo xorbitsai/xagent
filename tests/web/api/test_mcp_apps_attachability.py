@@ -1,19 +1,22 @@
-"""`/api/mcp/apps` must emit its attachability decisions, not their inputs
-(#1347).
+"""`/api/mcp/apps` must emit its attachability and configurability decisions,
+not their inputs (#1347).
 
-The connector picker used to reconstruct two decisions from
+The connector picker used to reconstruct these decisions from
 `is_connected` + `is_custom` + `auth_type`, which made three unstated backend
 emission rules load-bearing on the client: that `is_connected` for an
 mcp_oauth entry requires an active grant, that `auth_type` appears on a local
 entry only alongside an active personal association, and that `is_custom` is
-never set by the catalog branch. These tests pin `can_attach` and
-`can_authorize` directly, so changing any of those rules fails here instead of
-silently mis-gating the picker.
+never set by the catalog branch. These tests pin `can_attach`, `can_authorize`
+and `can_configure` directly, so changing any of those rules fails here
+instead of silently mis-gating the picker.
 
-The two fields answer different questions and diverge on real populations:
+The three fields answer different questions and diverge on real populations:
 a team-owned mcp_oauth connector is attachable but has no consent flow the
-member could start, and a hook-resolved connector is attachable with no
-consent flow existing at all.
+member could start; a hook-resolved connector is attachable with no consent
+flow existing at all; and `can_configure` answers whether the entry's edit
+route would resolve for the caller -- a personal association row for a local
+entry, or an existing connection for a catalog entry -- which is independent
+of both.
 """
 
 from __future__ import annotations
@@ -184,8 +187,10 @@ def _grant(db, server: MCPServer, user: User, *, status: str = "active") -> None
 
 
 def _add_custom_api(
-    db, owner: User, name: str = "billing", *, is_active: bool = True
+    db, owner: User | None, name: str = "billing", *, is_active: bool = True
 ) -> CustomApi:
+    """A custom API. ``owner=None`` writes no association at all, which is how
+    a team-owned custom API reaches a member."""
     api = CustomApi(
         name=name,
         description=f"{name} API",
@@ -195,15 +200,20 @@ def _add_custom_api(
     db.add(api)
     db.commit()
     db.refresh(api)
-    db.add(
-        UserCustomApi(
-            user_id=owner.id,
-            custom_api_id=api.id,
-            is_owner=True,
-            is_active=is_active,
+    if owner is not None:
+        db.add(
+            UserCustomApi(
+                user_id=owner.id,
+                custom_api_id=api.id,
+                is_owner=True,
+                # Matches the one production write point (custom_api.py:248);
+                # the column defaults to False, and PUT's second gate reads it,
+                # so a fixture without it is a shape production never creates.
+                can_edit=True,
+                is_active=is_active,
+            )
         )
-    )
-    db.commit()
+        db.commit()
     return api
 
 
@@ -662,12 +672,176 @@ def test_a_connected_catalog_app_is_attachable(db_session):
     assert entry["can_authorize"] is False
 
 
-# --- Every entry carries both fields ---------------------------------------
+# --- AC: can_configure, the picker's edit-route gate ------------------------
 
 
-def test_every_listed_entry_carries_both_decisions(db_session):
+def test_a_hook_resolved_connector_is_configurable_by_its_owner(db_session):
+    """#1332's population again: is_connected and can_authorize are both
+    false for a hook-resolved connector, yet its owner holds the personal
+    association the edit routes require, so the three fields must disagree."""
+    db, owner, _member = db_session
+    _add_oauth_server(db, owner)
+    _install_token_resolver()
+
+    entry = _entry(db, owner, "records")
+    assert entry["is_connected"] is False
+    assert entry["can_authorize"] is False
+    assert entry["can_configure"] is True
+
+
+def test_a_never_authorized_connector_is_both_configurable_and_authorizable(
+    db_session,
+):
+    """A connector whose owner has an active association but never completed
+    consent needs both: Configure to fix a misconfigured field, Authorize to
+    complete consent. Neither implies the other."""
+    db, owner, _member = db_session
+    _add_oauth_server(db, owner)
+
+    entry = _entry(db, owner, "records")
+    assert entry["can_configure"] is True and entry["can_authorize"] is True
+
+
+def test_a_deactivated_association_stays_configurable(db_session):
+    """Neither GET nor PUT /api/mcp/servers/{id} filters is_active, so a
+    deactivated connector's owner can still open and save its form -- unlike
+    can_attach, which the runtime's own query does filter on."""
+    db, owner, _member = db_session
+    _add_stdio_server(db, owner, is_active=False)
+
+    entry = _entry(db, owner, "files")
+    assert entry["can_attach"] is False and entry["can_configure"] is True
+
+
+def test_a_team_owned_connector_without_a_personal_association_is_not_configurable(
+    db_session,
+):
+    """The overlay makes this connector attachable for the member, but the
+    edit routes require a row of the member's own, which does not exist here
+    -- so GET/PUT /api/mcp/servers/{id} would 404."""
+    db, _owner, member = db_session
+    server = _add_oauth_server(db, None)
+    _install_visibility(
+        {int(member.id): {"mcp": {int(server.id)}, "custom_api": set()}}
+    )
+    _install_token_resolver()
+
+    entry = _entry(db, member, "records")
+    assert entry["can_attach"] is True and entry["can_configure"] is False
+
+
+def test_a_team_owned_custom_api_without_a_personal_association_is_not_configurable(
+    db_session,
+):
+    """The Custom API half of the same rule. `is_connected` is hardcoded True
+    for every Custom API entry, and must not be mistaken for configurability."""
+    db, _owner, member = db_session
+    api = _add_custom_api(db, None)
+    _install_visibility({int(member.id): {"mcp": set(), "custom_api": {int(api.id)}}})
+
+    entry = _entry(db, member, "billing")
+    assert entry["is_connected"] is True and entry["can_configure"] is False
+
+
+def test_an_own_custom_api_is_configurable(db_session):
+    db, owner, _member = db_session
+    _add_custom_api(db, owner)
+
+    entry = _entry(db, owner, "billing")
+    assert entry["can_configure"] is True
+
+
+def test_an_unconnected_catalog_app_is_not_configurable(db_session):
+    """The catalog branch's Configure equivalent is "manage my key" or
+    "re-run OAuth", both of which only exist once connected -- guarding
+    against the dead-button regression an unconditional True would reintroduce."""
+    db, owner, _member = db_session
+    _add_catalog_oauth_app(db)
+    _add_catalog_builtin_oauth_app(db)
+
+    granola = _entry(db, owner, "granola", location="remote")
+    acme = _entry(db, owner, "acme-crm", location="remote")
+    assert granola["can_configure"] is False
+    assert acme["can_configure"] is False
+
+
+def test_a_connected_catalog_app_is_configurable(db_session):
+    db, owner, _member = db_session
+    app = PublicMCPApp(
+        app_id="acme-docs",
+        name="Acme Docs",
+        description="A catalog app",
+        icon="",
+        category="Productivity",
+        transport="stdio",
+        launch_config={"command": "acme-docs-mcp"},
+        is_visible_in_connector=True,
+    )
+    db.add(app)
+    db.commit()
+    server = MCPServer.from_config(
+        {
+            "name": "acme-docs",
+            "managed": "external",
+            "transport": "stdio",
+            "command": "acme-docs-mcp",
+        }
+    )
+    db.add(server)
+    db.commit()
+    db.refresh(server)
+    db.add(
+        UserMCPServer(
+            user_id=owner.id,
+            mcpserver_id=server.id,
+            is_owner=True,
+            is_active=True,
+        )
+    )
+    db.commit()
+
+    entry = _entry(db, owner, "acme-docs", location="remote")
+    assert entry["can_configure"] is True
+
+
+def test_a_resolver_hook_does_not_make_a_catalog_app_configurable(db_session):
+    """The resolver hook only relaxes the credential gate on the local mcp_oauth
+    branch; the catalog branch's can_configure is the connection state, which
+    the hook does not touch."""
+    db, owner, _member = db_session
+    _add_catalog_oauth_app(db)
+    _install_token_resolver()
+
+    entry = _entry(db, owner, "granola", location="remote")
+    assert entry["can_configure"] is False
+
+
+def test_a_non_owner_with_a_personal_association_is_configurable(db_session):
+    """A non-owner's personal env override is still their own row to edit:
+    the edit routes' first gate is association existence, not is_owner."""
+    db, owner, member = db_session
+    server = _add_stdio_server(db, owner)
+    db.add(
+        UserMCPServer(
+            user_id=member.id,
+            mcpserver_id=server.id,
+            is_owner=False,
+            is_active=True,
+        )
+    )
+    db.commit()
+
+    entry = _entry(db, member, "files")
+    assert entry["can_configure"] is True
+
+
+# --- Every entry carries all three decisions ---------------------------------
+
+
+def test_every_listed_entry_carries_all_three_decisions(db_session):
     """A consumer reading `can_attach` must never see undefined and silently
-    treat an entry as unattachable, whichever branch emitted it."""
+    treat an entry as unattachable, whichever branch emitted it. Same for
+    `can_authorize` and `can_configure`."""
     db, owner, _member = db_session
     _add_stdio_server(db, owner)
     _add_oauth_server(db, owner)
@@ -682,3 +856,4 @@ def test_every_listed_entry_carries_both_decisions(db_session):
     for entry in entries:
         assert isinstance(entry.get("can_attach"), bool), entry["id"]
         assert isinstance(entry.get("can_authorize"), bool), entry["id"]
+        assert isinstance(entry.get("can_configure"), bool), entry["id"]

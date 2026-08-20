@@ -322,6 +322,13 @@ jobs:
       # added to this list -- the fast job deselects the marker and
       # provisions no database, so an unlisted file's postgres tests run
       # nowhere.
+      - name: Test owner-aware OAuth migrations (Postgres-only)
+        if: needs.detect-migration-changes.outputs.should-test == 'true'
+        run: |
+          pytest tests/migrations/test_migration_integration.py -m postgresql -q
+        env:
+          DATABASE_URL: postgresql://xagent:xagent@localhost:5432/xagent_test
+
       - name: Test Gmail provisioning Postgres-only behavior
         if: needs.detect-migration-changes.outputs.should-test == 'true'
         run: |

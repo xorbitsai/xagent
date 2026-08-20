@@ -503,7 +503,9 @@ class TestNamespaceIsolation:
             assert captured["labels"]["xagent.sandbox.namespace"] == "alpha"
             assert captured["labels"]["xagent.sandbox.name"] == "user::1"
             assert captured["name"].startswith("xagent_sandbox_")
-            # tini as PID 1 so the tail command handles SIGTERM (issue #231).
+            # tini as PID 1 so tail gets SIGTERM and exits in ~1s instead of a
+            # ~30s SIGKILL timeout (issue #231). Only the create kwarg is asserted;
+            # the stop-time drop was verified manually, not gated by a CI timer.
             assert captured["init"] is True
 
 

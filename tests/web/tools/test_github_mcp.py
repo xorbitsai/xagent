@@ -1266,7 +1266,11 @@ def test_list_issues_stops_when_aggregate_time_budget_is_exceeded(monkeypatch):
 
     result = json.loads(github.github_list_issues("octocat/Hello-World", limit=5))
 
-    assert result["status"] == "success"
+    # "partial", not "success": the budget ran out before the requested
+    # count was collected, same as a mid-pagination request fault -- a
+    # caller branching only on status must not mistake this for a clean,
+    # complete page (C1).
+    assert result["status"] == "partial"
     assert result["issues"] == []
     assert result["truncated"] is True
     assert result["truncation_reason"] == "deadline"

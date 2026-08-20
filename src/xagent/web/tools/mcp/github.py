@@ -143,12 +143,15 @@ def _error(message: str) -> str:
 
 
 def _partial(**payload: Any) -> str:
-    """A genuine fault interrupted pagination partway: the collected items
-    and resume cursor are preserved (same payload shape as `_success`,
-    plus `error`), but `status: "partial"` keeps a caller that branches
-    only on `status` from mistaking the result for a clean, complete page.
-    Clean stops (deadline/limit/page-cap) stay `_success` -- nothing went
-    wrong there.
+    """Pagination stopped before collecting everything the caller asked
+    for, for a reason beyond the tool's own item/page-count limit (a
+    request fault, a malformed item, or the aggregate deadline): the
+    collected items and resume cursor are preserved (same payload shape
+    as `_success`, plus `error` when there is one), but `status: "partial"`
+    keeps a caller that branches only on `status` from mistaking the
+    result for a clean, complete page. Only item_limit/more_pages/
+    max_pages -- hitting the requested count or GitHub's own page cap,
+    with nothing wrong -- stay `_success`.
     """
     return json.dumps({"status": "partial", **payload}, ensure_ascii=False)
 
@@ -562,8 +565,10 @@ def github_list_issues(
     (changing its sort position) between calls can still shift the page's
     contents enough to duplicate or skip an item across the resume.
 
-    A response with status "partial" means a fault (see its `error` field)
-    interrupted pagination partway: the returned issues are valid and
+    A response with status "partial" means pagination stopped before
+    collecting everything requested -- a request fault or malformed item
+    (see its `error` field, when present) or the aggregate time budget
+    running out. Either way the returned issues are valid and
     next_page/next_skip resume from where it stopped -- do NOT discard
     them or restart from page 1.
     """
@@ -595,7 +600,7 @@ def github_list_issues(
                     f"GitHub issue pagination hit its {MAX_ISSUE_LIST_SECONDS}s "
                     f"budget for {repo} after {pages_fetched} page(s)"
                 )
-                return _success(
+                return _partial(
                     issues=issues[:max_results],
                     truncated=True,
                     truncation_reason="deadline",

@@ -83,7 +83,7 @@ The `user_oauth` table gets a nullable `resource_owner_key` column. Existing row
 
 Two partial unique indexes replace `uq_user_provider_account`. One index protects ordinary rows. The other separates actor-owned namespaces when `provider_user_id` is non-null. Standard SQL null semantics still permit multiple rows with the same actor key, provider, and null `provider_user_id`. SQLite and PostgreSQL are the only supported database dialects for this schema; startup and migration fail before schema creation on other dialects.
 
-On PostgreSQL the migration creates the replacement indexes transactionally before removing the old unique constraint. A failed statement rolls back the complete schema transition. If a same-name relation causes the failure, an operator must inspect and remove or rename that relation before retrying `alembic upgrade head`. Index creation is not concurrent and can block writes to `user_oauth`, so plan a short OAuth-write pause and monitor lock wait time.
+On PostgreSQL the migration creates the replacement indexes transactionally before removing the old unique constraint. A failed statement rolls back the complete schema transition. If a same-name relation causes the failure, an operator must inspect and remove or rename that relation before retrying `alembic upgrade head`. `ADD COLUMN` and the non-concurrent index builds hold table locks until the transaction commits and can block both reads and writes to `user_oauth`. Pause every OAuth operation that accesses this table for the migration window, and monitor lock wait time instead of assuming the pause will be short.
 
 On SQLite the migration rejects globally colliding owner-index names before rebuilding the table in batch mode. Stop every worker before this rebuild and keep SQLite quiesced until the migration completes. Take and verify a database backup before the rebuild: under the driver's legacy transaction mode, SQLite DDL can commit independently of Alembic's outer transaction.
 
@@ -114,7 +114,7 @@ Choose the procedure for the configured database.
 
 #### PostgreSQL
 
-1. Pause new OAuth writes and make sure no long transaction holds a lock on `user_oauth`.
+1. Pause OAuth reads and writes that access `user_oauth`, and make sure no long transaction holds a lock on the table.
 2. Run `alembic upgrade head` one time. Already-running old workers can continue non-OAuth work while the transactional DDL runs, but an old worker that starts or restarts after the schema revision advances will fail startup because it does not recognize the new revision. Prevent old-version restarts and autoscaling during this window, or ensure every replacement starts from the owner-aware image.
 3. Resume ordinary OAuth writes after the migration commits.
 4. Roll every API and task worker to the owner-aware version.

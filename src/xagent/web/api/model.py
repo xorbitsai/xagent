@@ -980,6 +980,9 @@ async def transcribe_speech_input(
     """Transcribe a short UI voice input clip with an accessible ASR model."""
 
     from xagent.core.model.asr.adapter import get_asr_model_instance
+    from xagent.core.model.asr.usage import record_asr_usage
+
+    from ..tracking.standalone_usage import usage_scope
 
     try:
         audio_bytes = await _read_transcribe_upload_with_size_limit(file)
@@ -991,14 +994,36 @@ async def transcribe_speech_input(
     db_model = _resolve_asr_model_for_transcription(db, user, model_id)
     asr_model = get_asr_model_instance(db_model)
     try:
-        result = await asyncio.wait_for(
-            asr_model.transcribe(
-                audio_bytes,
-                language=language,
-                format=_format_from_upload(file),
-            ),
-            timeout=180.0,
-        )
+        # usage_scope binds a TokenUsage and reports it to the quota hook on
+        # exit. Recording alone is not enough here: this endpoint has no
+        # TaskTracker, so without a bound context the usage would land in a
+        # throwaway object and the transcription would bill nothing.
+        with usage_scope(int(user.id) if user and user.id is not None else None):
+            result = await asyncio.wait_for(
+                asr_model.transcribe(
+                    audio_bytes,
+                    language=language,
+                    format=_format_from_upload(file),
+                    # Without this the provider returns a bare string carrying
+                    # no timings, so the usage record below would be a
+                    # 0-second — unbillable — entry on every call. The extra
+                    # fields are discarded; only `text` is returned to the UI.
+                    verbose=True,
+                ),
+                timeout=180.0,
+            )
+            # model_id is deliberately left unset even though the real DB id is
+            # in scope here. The aggregator groups on `model_id or model`, and
+            # the other two ASR entry points (audio_tool, the Telegram channel)
+            # only ever see name-keyed model registries — model_service keys
+            # them by model_name — so no DB id is available there. Setting it
+            # on this path alone would split one physical model into two
+            # billing rows that can never be reconciled once written. Name is
+            # the one identity all three share.
+            record_asr_usage(
+                result,
+                model_name=str(db_model.model_name),
+            )
     except asyncio.TimeoutError as exc:
         raise HTTPException(status_code=504, detail="Transcription timed out") from exc
     except Exception as exc:

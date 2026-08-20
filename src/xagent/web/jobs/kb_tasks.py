@@ -34,6 +34,7 @@ from ..models.uploaded_file import UploadedFile
 from ..models.user import User
 from ..services.background_jobs import update_job_progress
 from ..services.kb_ingest_targets import is_latest_kb_ingest_generation
+from ..tracking.standalone_usage import usage_scope
 from .exceptions import BackgroundJobHandlerError
 from .progress import BackgroundJobProgressManager
 
@@ -208,9 +209,15 @@ def handle_kb_ingest_document(db: Session, job: BackgroundJob) -> dict[str, Any]
             raise StagedDocumentIngestSuperseded(_SUPERSEDED_STAGED_INGEST_MESSAGE)
 
     try:
-        with user_scope_context(
-            user_id=int(payload["user_id"]),
-            is_admin=bool(payload.get("is_admin", False)),
+        # This job runs in a Celery worker with no TaskTracker, so bind the
+        # usage sink here or the whole background ingestion bills nothing.
+        # Synchronous throughout, so contextvars are not at risk.
+        with (
+            usage_scope(int(payload["user_id"])),
+            user_scope_context(
+                user_id=int(payload["user_id"]),
+                is_admin=bool(payload.get("is_admin", False)),
+            ),
         ):
             api_result = _get_api_compatibility_facade().run_with_operation_outcome(
                 lambda: run_document_ingestion(

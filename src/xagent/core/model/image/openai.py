@@ -7,7 +7,9 @@ from urllib.parse import urlparse
 import aiohttp
 from openai import AsyncOpenAI
 
+from ..chat.token_context import MediaCallType
 from .base import BaseImageModel
+from .usage import record_image_usage
 
 
 class OpenAIImageModel(BaseImageModel):
@@ -127,11 +129,15 @@ class OpenAIImageModel(BaseImageModel):
         assert self._client is not None
 
         response_format = kwargs.pop("response_format", "url")
+        normalized_size = self._normalize_size(size)
+        # Captured for usage accounting: n reaches this provider only via
+        # kwargs, and billing must reflect how many images were requested.
+        image_count = kwargs.get("n", 1)
         images_client: Any = self._client.images
         response = await images_client.generate(
             prompt=prompt,
             model=self.model_name,
-            size=self._normalize_size(size),  # pyright: ignore[reportArgumentType]
+            size=normalized_size,  # pyright: ignore[reportArgumentType]
             response_format=response_format,
             **kwargs,
         )
@@ -144,11 +150,19 @@ class OpenAIImageModel(BaseImageModel):
             elif getattr(image_item, "b64_json", None):
                 image_url = f"data:image/png;base64,{image_item.b64_json}"
 
-        return {
+        result = {
             "image_url": image_url,
             "usage": getattr(response, "usage", {}) or {},
             "request_id": getattr(response, "id", None),
         }
+        record_image_usage(
+            result,
+            model_name=self.model_name,
+            call_type=MediaCallType.GENERATE_IMAGE,
+            image_count=image_count,
+            resolution=str(normalized_size or ""),
+        )
+        return result
 
     async def edit_image(
         self,
@@ -178,15 +192,20 @@ class OpenAIImageModel(BaseImageModel):
             image_paths.append(image_path)
 
         response_format = kwargs.pop("response_format", "url")
+        normalized_size = self._normalize_size(kwargs.pop("size", "1024*1024"))
+        # Mirrors generate_image: n reaches this provider only via kwargs, and
+        # the provider generates and bills the full count.
+        image_count = kwargs.get("n", 1)
         image_files = []
         try:
-            image_files = [open(path, "rb") for path in image_paths]
+            for path in image_paths:
+                image_files.append(open(path, "rb"))
             images_client: Any = self._client.images
             response = await images_client.edit(
                 image=image_files if len(image_files) > 1 else image_files[0],
                 prompt=prompt,
                 model=self.model_name,
-                size=self._normalize_size(kwargs.pop("size", "1024*1024")),  # pyright: ignore[reportArgumentType]
+                size=normalized_size,  # pyright: ignore[reportArgumentType]
                 response_format=response_format,
                 **kwargs,
             )
@@ -207,8 +226,16 @@ class OpenAIImageModel(BaseImageModel):
             elif getattr(image_item, "b64_json", None):
                 response_image_url = f"data:image/png;base64,{image_item.b64_json}"
 
-        return {
+        result = {
             "image_url": response_image_url,
             "usage": getattr(response, "usage", {}) or {},
             "request_id": getattr(response, "id", None),
         }
+        record_image_usage(
+            result,
+            model_name=self.model_name,
+            call_type=MediaCallType.EDIT_IMAGE,
+            image_count=image_count,
+            resolution=str(normalized_size or ""),
+        )
+        return result

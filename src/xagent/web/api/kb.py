@@ -85,9 +85,7 @@ from ...core.tools.core.RAG_tools.management.status import clear_ingestion_statu
 from ...core.tools.core.RAG_tools.pipelines.web_ingestion import FileHandlerResult
 from ...core.tools.core.RAG_tools.progress import get_progress_manager
 from ...core.tools.core.RAG_tools.storage.contracts import DocumentRecord
-from ...core.tools.core.RAG_tools.storage.factory import (
-    get_vector_index_store,
-)
+from ...core.tools.core.RAG_tools.storage.factory import get_vector_index_store
 from ...core.tools.core.RAG_tools.utils.string_utils import (
     generate_deterministic_doc_id,
 )
@@ -164,10 +162,7 @@ from ..services.knowledge_base_team_scope import (
     resolve_knowledge_base_access,
     visible_team_knowledge_bases,
 )
-from ..services.managed_file_ref import (
-    DurableObjectMissingError,
-    ManagedFileRef,
-)
+from ..services.managed_file_ref import DurableObjectMissingError, ManagedFileRef
 from ..services.uploaded_file_store import (
     UploadedFileStore,
     UploadedFileVersionConflict,
@@ -175,6 +170,7 @@ from ..services.uploaded_file_store import (
     cleanup_superseded_uploaded_file_objects,
     snapshot_uploaded_file_version,
 )
+from ..tracking.standalone_usage import bind_usage_to_thread, usage_scope
 from .cloud_storage import get_google_credentials
 
 T = TypeVar("T", bound=Callable[..., Any])
@@ -3916,9 +3912,7 @@ async def set_collection_rerank_model(
 
     try:
         from xagent.core.tools.core.RAG_tools.core.schemas import IngestionConfig
-        from xagent.core.tools.core.RAG_tools.storage.factory import (
-            get_metadata_store,
-        )
+        from xagent.core.tools.core.RAG_tools.storage.factory import get_metadata_store
 
         metadata_store = get_metadata_store()
 
@@ -4234,7 +4228,13 @@ async def ingest(
             )
 
         loop = asyncio.get_running_loop()
-        api_result = await loop.run_in_executor(None, _run_ingestion)
+        # usage_scope binds the sink (this endpoint has no TaskTracker);
+        # bind_usage_to_thread carries it across the executor hop, which —
+        # unlike asyncio.to_thread — does not propagate contextvars.
+        with usage_scope(int(_user.id) if _user.id is not None else None):
+            api_result = await loop.run_in_executor(
+                None, bind_usage_to_thread(_run_ingestion)
+            )
         result = api_result.result
         result = _with_user_actionable_ingestion_message(
             result,
@@ -5077,8 +5077,12 @@ async def ingest_cloud(
                 )
                 return rollback_execution.operation_result
 
-    # Run all file processings concurrently
-    api_results = await asyncio.gather(*[process_file(f) for f in request.files])
+    # Run all file processings concurrently, under one usage scope so every
+    # file's embedding usage reports together. asyncio.to_thread (used inside
+    # process_file) copies contextvars, and add_media_usage mutates the bound
+    # TokenUsage in place, so the worker's records reach this object.
+    with usage_scope(int(_user.id) if _user.id is not None else None):
+        api_results = await asyncio.gather(*[process_file(f) for f in request.files])
     results = [api_result.result for api_result in api_results]
 
     # `partial` and `error` files were rolled back inside `process_file` above,

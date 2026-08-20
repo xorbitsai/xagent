@@ -949,6 +949,71 @@ async def test_synthesize_speech_json_merges_default_and_segment_options() -> No
     ]
 
 
+async def test_synthesize_speech_json_records_media_usage_per_segment() -> None:
+    from xagent.core.model.chat.token_context import TokenContextManager
+
+    tts = FakeTTS()
+    tool = AudioToolCore(tts_models={"fake": tts})
+
+    with TokenContextManager() as manager:
+        result = await tool.synthesize_speech_json(
+            json_data={
+                "segments": [
+                    {"text": "First line"},
+                    {"text": "Second longer line"},
+                ],
+                "default_voice": "voice-1",
+            },
+            model_id="fake",
+        )
+        usage = manager.get_usage()
+
+    assert result["success"] is True
+    media_entries = [d for d in usage.details if d.get("type") == "media"]
+    # One TTS media entry per synthesized segment, metered by input characters.
+    assert usage.media_calls == 2
+    assert [(d["unit"], d["quantity"], d["call_type"]) for d in media_entries] == [
+        ("characters", len("First line"), "tts"),
+        ("characters", len("Second longer line"), "tts"),
+    ]
+
+
+async def test_tts_usage_records_real_model_not_default() -> None:
+    """Omitting model_id is the documented common case, so the usage entry must
+    still name the model — billing the literal string "default" would destroy
+    per-model cost attribution."""
+    from xagent.core.model.chat.token_context import TokenContextManager
+
+    tool = AudioToolCore(tts_models={"tts-a": FakeTTS()})
+
+    with TokenContextManager() as manager:
+        await tool.synthesize_speech(text="hello")
+        entries = [d for d in manager.get_usage().details if d.get("type") == "media"]
+
+    assert len(entries) == 1
+    assert entries[0]["model"] == "tts-a"
+    assert entries[0]["model"] != "default"
+
+
+async def test_asr_usage_meters_seconds_from_segments() -> None:
+    """ASR is duration-billed, so the unit is seconds and the quantity comes
+    from the transcribed audio's timing."""
+    from xagent.core.model.chat.token_context import TokenContextManager
+
+    tool = AudioToolCore(asr_models={"asr-a": FakeASR()})
+
+    with TokenContextManager() as manager:
+        result = await tool.transcribe_audio(audio_file_path="x.wav")
+        entries = [d for d in manager.get_usage().details if d.get("type") == "media"]
+
+    assert result["success"] is True
+    assert len(entries) == 1
+    assert entries[0]["unit"] == "seconds"
+    assert entries[0]["call_type"] == "asr"
+    assert entries[0]["quantity"] > 0
+    assert entries[0]["model"] == "asr-a"
+
+
 async def test_synthesize_speech_json_rejects_non_object_json() -> None:
     tool = AudioToolCore(tts_models={"fake": FakeTTS()})
 
@@ -963,3 +1028,59 @@ async def test_synthesize_speech_json_rejects_non_object_json() -> None:
         "failed": 0,
         "errors": ["JSON data must be an object"],
     }
+
+
+class _NamelessASR(FakeASR):
+    """The Xinference default-model shape: no ``model_name`` attribute.
+
+    Its default-getter builds a separate instance from the one in the registry
+    dict, so identity-by-``is`` never matches either.
+    """
+
+
+async def test_asr_default_model_is_not_billed_as_placeholder() -> None:
+    # Previously fell through to the literal string "default" — the exact
+    # placeholder the metering invariants forbid as a billing identity.
+    from xagent.core.model.chat.token_context import TokenContextManager
+
+    tool = AudioToolCore(
+        asr_models={"asr-a": _NamelessASR()},
+        default_asr_model=_NamelessASR(),
+    )
+
+    with TokenContextManager() as manager:
+        await tool.transcribe_audio(audio_file_path="x.wav")
+        entries = [d for d in manager.get_usage().details if d.get("type") == "media"]
+
+    assert len(entries) == 1
+    assert entries[0]["model"] not in {"default", "none", "null", ""}
+
+
+async def test_asr_usage_leaves_model_id_unset() -> None:
+    # The tool only ever sees name-keyed registries, so writing the name into
+    # model_id would persist a name under an id field and still not match the
+    # real DB model_id /speech/transcribe records. The aggregator groups on
+    # `model_id or model`, so all three ASR entry points must key on the name.
+    from xagent.core.model.chat.token_context import TokenContextManager
+
+    tool = AudioToolCore(asr_models={"asr-a": FakeASR()})
+
+    with TokenContextManager() as manager:
+        await tool.transcribe_audio(audio_file_path="x.wav")
+        entries = [d for d in manager.get_usage().details if d.get("type") == "media"]
+
+    assert entries[0]["model"] == "asr-a"
+    assert entries[0]["model_id"] == ""
+
+
+async def test_tts_usage_leaves_model_id_unset() -> None:
+    from xagent.core.model.chat.token_context import TokenContextManager
+
+    tool = AudioToolCore(tts_models={"tts-a": FakeTTS()})
+
+    with TokenContextManager() as manager:
+        await tool.synthesize_speech(text="hello")
+        entries = [d for d in manager.get_usage().details if d.get("type") == "media"]
+
+    assert entries[0]["model"] == "tts-a"
+    assert entries[0]["model_id"] == ""

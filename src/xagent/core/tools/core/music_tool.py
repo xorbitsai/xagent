@@ -8,8 +8,10 @@ from inspect import isawaitable
 from typing import Any, Optional
 
 from ...file_ref import build_workspace_file_ref
+from ...model.chat.token_context import MediaCallType
 from ...model.music import BaseMusicModel, MusicResult
 from ...workspace import TaskWorkspace
+from .media_usage import coerce_duration, record_media_seconds, resolve_billing_model
 
 logger = logging.getLogger(__name__)
 
@@ -137,6 +139,36 @@ file_id/file_ref.
                 force_instrumental=force_instrumental,
                 output_format=output_format,
             )
+            # Billing policy for the media tools: a provider call that has
+            # already happened is billable regardless of what fails afterwards,
+            # so usage is recorded before the response is validated. Metering
+            # after the checks below would silently drop every call that
+            # succeeded at the HTTP level but came back empty or malformed —
+            # which the provider still charges for.
+            #
+            # Music is duration-billed: always meter in seconds, even when the
+            # length was auto-selected and no duration came back. `result` is
+            # not yet known to be a MusicResult at this point, so read through
+            # getattr rather than attribute access.
+            raw_response = getattr(result, "raw_response", None)
+            reported_length = (
+                raw_response.get("music_length_seconds")
+                if isinstance(raw_response, dict)
+                else None
+            )
+            seconds = coerce_duration(reported_length) or coerce_duration(
+                music_length_seconds
+            )
+            record_media_seconds(
+                seconds,
+                # Never str(None): _configured_model_id returns Optional[str]
+                # and an inactive shared default resolves to None, which would
+                # bill against a phantom model literally named "None".
+                model=resolve_billing_model(configured_model_id, model),
+                model_id=configured_model_id or "",
+                call_type=MediaCallType.MUSIC,
+            )
+
             if not isinstance(result, MusicResult):
                 raise RuntimeError(f"Unexpected music response: {type(result)}")
             if not result.audio:

@@ -56,6 +56,12 @@ class EmbeddingModelConfig(ModelConfig):
     model_provider: str = "dashscope"  # openai, zhipu, dashscope, etc.
     dimension: Optional[int] = None
     instruct: Optional[str] = None
+    # Name to attribute usage to, when it differs from the model actually
+    # called. The memory store pins its embedding model for vector-space
+    # compatibility with already-stored memories while the DB row may name a
+    # different one; billing should follow the configured row, not the pin.
+    # None means "bill under model_name", which is the normal case.
+    billing_model_name: Optional[str] = None
 
 
 class RerankModelConfig(ModelConfig):

@@ -23,9 +23,30 @@ from typing import Any, Callable
 # callbacks may rely on that affinity and must remain non-blocking.
 _run_gate_hook: Callable[[Any, Any], str | Mapping[str, Any] | None] | None = None
 # (db, user_id, delta_details, delta_actions) -> None; best-effort post-run
-# metering. delta_details is this turn's per-model token breakdown (list of
-# {"type","tokens","model"}) for cost-based credits; delta_actions counts tool
-# calls (one billable action per tool invocation).
+# metering. delta_details is this turn's per-model usage breakdown for
+# cost-based credits; delta_actions counts tool calls (one billable action per
+# tool invocation). Entry shapes in delta_details:
+#   - LLM tokens: {"type":"input"|"output", "tokens", "model", "model_id",
+#       "call_type", ...cache fields}
+#   - Non-LLM media (image/video/tts/asr/embedding/rerank/...):
+#       {"type":"media", "unit":"images"|"seconds"|"characters"|"texts"|
+#       "requests", "quantity", "provider_tokens", "provider_input_tokens",
+#       "provider_output_tokens", "tokens_estimated", "model", "model_id",
+#       "call_type", "resolution"}
+# The app layer should price media entries by their "unit"/"quantity". The unit
+# is stable for a given (model, call_type) — a duration-billed modality always
+# reports "seconds", recording quantity=0 when the provider gave no duration,
+# rather than switching units. "requests" always carries quantity=1; a batch of
+# N embedded texts reports unit="texts" with quantity=N and calls=1.
+# For image models whose price varies by resolution, "resolution" ("1K"/"2K"/
+# "4K" or "1024x1024") keys a per-(model, resolution) price table. Providers
+# that report real image tokens (Gemini, OpenAI gpt-image) also fill
+# "provider_tokens" so a token-based price ($/1M tokens) can take precedence
+# over the resolution table — but only when "tokens_estimated" is False;
+# embedding/rerank counts are local heuristics and must not be priced as
+# measured tokens. Media token counts are deliberately NOT under the "tokens"
+# key, so a consumer summing "tokens" across entries cannot double-count them.
+# Unknown entry types must be ignored, not summed as tokens.
 #
 # TRANSACTION CONTRACT: the hook is invoked from TaskTracker.complete_tracking
 # only after the run/runner-fenced token-usage update commits. The hook owns
@@ -41,7 +62,8 @@ _usage_record_hook: Callable[[Any, Any, list, int], None] | None = None
 # in-flight run's live-so-far usage would push the team over a run-gated quota,
 # else None. Polled per step (each LLM reply / tool call) during a run so a
 # single long/expensive run is stopped mid-flight instead of only being metered
-# at completion.
+# at completion. delta_details carries the same entry shapes documented on the
+# metering hook above (LLM token entries plus type:"media" entries).
 #
 # CONTRACT: invoked SYNCHRONOUSLY on the event loop once per step. It MUST NOT
 # block (no synchronous network/DB round-trips per call) — blocking work stalls
@@ -88,6 +110,18 @@ def check_run_gate(db: Any, user_id: Any) -> str | Mapping[str, Any] | None:
     if _run_gate_hook is None or user_id is None:
         return None
     return _run_gate_hook(db, user_id)
+
+
+def has_usage_record_hook() -> bool:
+    """Whether a usage-record hook is installed.
+
+    Lets a caller skip the work of preparing a report — notably checking out a
+    DB session — when :func:`record_usage` would be a no-op anyway. In the
+    stock open-source configuration no hook is registered, so every ingest and
+    transcription would otherwise pay a pool checkout, transaction and close
+    for nothing.
+    """
+    return _usage_record_hook is not None
 
 
 def record_usage(

@@ -1,3 +1,4 @@
+import logging
 from typing import List, Optional, Union
 
 import requests
@@ -8,6 +9,8 @@ from .base import BaseEmbedding
 from .dashscope import DashScopeEmbedding
 from .openai import OpenAIEmbedding
 from .xinference import XinferenceEmbedding
+
+logger = logging.getLogger(__name__)
 
 
 def retry_on(e: Exception) -> bool:
@@ -80,7 +83,36 @@ class EmbeddingModelAdapter(BaseEmbedding):
         instruct: Optional[str] = None,
     ) -> Union[List[float], List[List[float]]]:
         """Encode text using the underlying embedding model."""
-        return self._embedding_model.encode(text, dimension, instruct)
+        result = self._embedding_model.encode(text, dimension, instruct)
+        try:
+            # Lazy import: this module is on the model package's init critical
+            # path, and importing ..chat at top level would circularly re-enter
+            # ..model before ChatModelConfig is defined.
+            from ..chat.token_context import (
+                MediaCallType,
+                MediaUnit,
+                add_media_usage,
+                estimate_media_tokens,
+            )
+
+            # unit=TEXTS, not REQUESTS: a batch of 32 texts is one provider call
+            # but 32 billable texts, and REQUESTS is defined as always 1 per
+            # call. Conflating them would over-bill embeddings by batch size.
+            count = 1 if isinstance(text, str) else len(text)
+            add_media_usage(
+                unit=MediaUnit.TEXTS,
+                quantity=count,
+                model=(
+                    self.model_config.billing_model_name or self.model_config.model_name
+                ),
+                model_id=self.model_config.id,
+                call_type=MediaCallType.EMBEDDING,
+                input_tokens=estimate_media_tokens(text),
+                tokens_estimated=True,
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.warning("Failed to record embedding usage: %s", e)
+        return result
 
     def get_dimension(self) -> Optional[int]:
         """Get the embedding dimension."""

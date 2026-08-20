@@ -1117,6 +1117,180 @@ class TestTaskTracker:
         assert sorted(d["tokens"] for d in captured["details"]) == [5, 10]
 
     @pytest.mark.asyncio
+    async def test_turn_delta_pairs_details_and_tool_calls_atomically(self, db_session):
+        """The details tail and the tool-call count must describe one instant.
+
+        ``interrupt_reason_for_quota`` polls ``_turn_delta`` at every safe point
+        — once per agent step and once per streamed LLM chunk — against the live
+        shared TokenUsage. Reading the two fields in separate lock acquisitions
+        lets a concurrent write land between them, yielding a pair from two
+        different logical points in time, which is then fed to quota gating.
+
+        The interleaving is forced from *inside* the locked read, by patching
+        ``copy_detail_rows`` — which ``detail_tail`` calls after taking the lock
+        and reading ``details``, but before reading ``tool_calls``. Two earlier
+        versions of this test wrapped ``detail_tail`` itself and released the
+        writer before the real accessor ran, so the write always completed
+        before the locked read began and the test passed against a deliberately
+        torn implementation. Mutation-verified: splitting ``detail_tail`` into
+        two lock acquisitions makes this fail with media=0, tool_calls=1.
+        """
+        import threading
+
+        from xagent.core.model.chat import token_context as tc_module
+        from xagent.core.model.chat.token_context import get_token_usage
+
+        task = db_session.query.return_value.filter.return_value.first.return_value
+        task.user_id = 42
+        task.input_tokens = 0
+        task.output_tokens = 0
+        task.llm_calls = 1
+        task.token_usage_details = []
+
+        tracker = TaskTracker(task_id=123, db_session=db_session)
+        await tracker.start_tracking()
+        usage = get_token_usage()
+
+        inside_locked_read = threading.Event()
+        writer_done = threading.Event()
+        real_copy = tc_module.copy_detail_rows
+
+        def copy_then_pause(raw_details):
+            rows = real_copy(raw_details)
+            # Inside detail_tail's lock: details已读, tool_calls 还没读.
+            inside_locked_read.set()
+            writer_done.wait(timeout=5)
+            return rows
+
+        results = {}
+
+        def read_delta() -> None:
+            # usage passed explicitly — a bare thread inherits no contextvars.
+            results["delta"] = tracker._turn_delta(usage)
+
+        def write_during_read() -> None:
+            assert inside_locked_read.wait(timeout=5), (
+                "reader never entered the locked read"
+            )
+            # These block until the reader releases the lock, when detail_tail is
+            # atomic. Against a torn implementation they land between its two
+            # acquisitions.
+            usage.record_media_call(
+                unit="images", quantity=1, call_type="generate_image"
+            )
+            usage.increment_tool_calls(1)
+            writer_done.set()
+
+        with patch.object(tc_module, "copy_detail_rows", copy_then_pause):
+            threads = [
+                threading.Thread(target=read_delta),
+                threading.Thread(target=write_during_read),
+            ]
+            for thread in threads:
+                thread.start()
+            # The writer must not be released by a silent timeout: give it a
+            # nudge so an atomic implementation (where the writer blocks on the
+            # lock) still completes instead of both sides waiting.
+            threads[0].join(timeout=10)
+            writer_done.set()
+            for thread in threads:
+                thread.join(timeout=10)
+
+        assert inside_locked_read.is_set(), "the interleaving never happened"
+        assert "delta" in results, "the reader never returned"
+
+        delta_details, delta_actions = results["delta"]
+        media_rows = sum(1 for d in delta_details if d.get("type") == "media")
+        # Whichever side of the write the locked read landed on, the pair agrees:
+        # either both saw it (1 row, 1 action) or neither did (0 and 0).
+        assert media_rows == delta_actions, (
+            f"torn pair: {media_rows} media rows vs {delta_actions} tool calls"
+        )
+
+    @pytest.mark.asyncio
+    async def test_media_rows_report_only_the_current_turn_delta(self, db_session):
+        """Media rows must behave like token rows across the TaskTracker seam.
+
+        The seed derives ``media_calls`` from persisted media rows rather than a
+        column, so a multi-turn task must not re-report a prior turn's media
+        calls; and both the mid-run gate and the completion hook must see only
+        this turn's rows.
+        """
+        from xagent.core.model.chat.token_context import (
+            MediaCallType,
+            MediaUnit,
+            add_media_usage,
+        )
+        from xagent.web.services import quota_hooks
+
+        task = db_session.query.return_value.filter.return_value.first.return_value
+        task.user_id = 42
+        task.input_tokens = 0
+        task.output_tokens = 0
+        task.llm_calls = 1
+        # A prior turn already recorded two media calls, persisted as rows.
+        task.token_usage_details = [
+            {
+                "type": "media",
+                "unit": "images",
+                "quantity": 2.0,
+                "model": "sd",
+                "call_type": "generate_image",
+            },
+            {
+                "type": "media",
+                "unit": "seconds",
+                "quantity": 9.0,
+                "model": "whisper",
+                "call_type": "asr",
+            },
+        ]
+
+        recorded = {}
+        gated = {}
+
+        def _usage_hook(db, user_id, delta_details, delta_actions):
+            recorded.update(details=delta_details, actions=delta_actions)
+
+        def _gate_hook(db, user_id, delta_details, delta_actions):
+            gated.update(details=delta_details)
+            return None
+
+        quota_hooks.set_usage_record_hook(_usage_hook)
+        quota_hooks.set_run_progress_gate_hook(_gate_hook)
+        try:
+            tracker = TaskTracker(task_id=123, db_session=db_session)
+            await tracker.start_tracking()
+
+            # The seed counted the prior rows, so the baseline is not zero.
+            seeded = get_token_usage()
+            assert seeded.media_calls == 2
+
+            # This turn records one more media call.
+            add_media_usage(
+                unit=MediaUnit.SECONDS,
+                quantity=4.5,
+                model="whisper",
+                call_type=MediaCallType.ASR,
+            )
+
+            # A periodic snapshot must carry the running total, not drop it.
+            snapshot = get_token_usage().snapshot()
+            assert snapshot.media_calls == 3
+
+            # The mid-run gate sees only this turn's row.
+            await tracker.interrupt_reason_for_quota()
+            await tracker.complete_tracking()
+        finally:
+            quota_hooks.set_usage_record_hook(None)
+            quota_hooks.set_run_progress_gate_hook(None)
+
+        for label, payload in (("gate", gated), ("completion", recorded)):
+            media = [d for d in payload["details"] if d.get("type") == "media"]
+            assert len(media) == 1, f"{label} hook saw {len(media)} media rows"
+            assert media[0]["quantity"] == 4.5, f"{label} hook saw a prior-turn row"
+
+    @pytest.mark.asyncio
     async def test_interrupt_reason_for_quota_passes_turn_delta(self, db_session):
         """The per-step quota gate must see the same this-turn delta the metering
         path computes, and surface the gate's reason (or None when open)."""

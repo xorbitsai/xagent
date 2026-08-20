@@ -1010,9 +1010,19 @@ class TestModelAPI:
                 self.calls = []
                 self.closed = False
 
-            async def transcribe(self, audio, language=None, format=None):
+            async def transcribe(
+                self, audio, language=None, format=None, verbose=False, **kwargs
+            ):
+                # Mirrors the real BaseASR signature, which takes verbose and
+                # **kwargs. A double narrower than the interface it stands in
+                # for is how the missing verbose=True went unnoticed.
                 self.calls.append(
-                    {"audio": audio, "language": language, "format": format}
+                    {
+                        "audio": audio,
+                        "language": language,
+                        "format": format,
+                        "verbose": verbose,
+                    }
                 )
                 return f"text from {self.model_name}"
 
@@ -1042,8 +1052,16 @@ class TestModelAPI:
         assert data["text"] == "text from asr-second"
         assert data["model_id"] == "test-asr-second"
         assert len(created_models) == 1
+        # verbose=True is required: without it the provider returns a bare
+        # string with no timings and the ASR usage record is an unbillable
+        # 0 seconds.
         assert created_models[0].calls == [
-            {"audio": b"audio-bytes", "language": "en", "format": "webm"}
+            {
+                "audio": b"audio-bytes",
+                "language": "en",
+                "format": "webm",
+                "verbose": True,
+            }
         ]
         assert created_models[0].closed is True
 

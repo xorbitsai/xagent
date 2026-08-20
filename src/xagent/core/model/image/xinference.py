@@ -5,7 +5,9 @@ from typing import Any, List, Optional
 
 from xinference_client import RESTfulClient as XinferenceClient
 
+from ..chat.token_context import MediaCallType
 from .base import BaseImageModel
+from .usage import record_image_usage
 
 logger = logging.getLogger(__name__)
 
@@ -175,11 +177,19 @@ class XinferenceImageModel(BaseImageModel):
                     if image_item.get("b64_json"):
                         image_url = f"data:image/png;base64,{image_url}"
 
-            return {
+            out = {
                 "image_url": image_url,
                 "usage": getattr(result, "usage", {}) or {},
                 "request_id": getattr(result, "id", None),
             }
+            record_image_usage(
+                out,
+                model_name=self.model_name,
+                call_type=MediaCallType.GENERATE_IMAGE,
+                image_count=n,
+                resolution=str(normalized_size or ""),
+            )
+            return out
 
         except Exception as e:
             logger.error(f"Xinference image generation failed: {e}")
@@ -241,11 +251,17 @@ class XinferenceImageModel(BaseImageModel):
                     **kwargs,
                 )
             elif hasattr(self._model_handle, "inpainting"):
-                # Use inpainting for edits
+                # Use inpainting for edits. n/size are forwarded so the billed
+                # image_count below matches what was actually requested —
+                # omitting them made the provider default to one image while
+                # usage was still recorded as n.
                 result = self._model_handle.inpainting(
                     image=image_inputs[0],
                     prompt=prompt,
+                    size=size,
                     negative_prompt=negative_prompt,
+                    n=n,
+                    response_format=response_format,
                     **kwargs,
                 )
             else:
@@ -271,11 +287,19 @@ class XinferenceImageModel(BaseImageModel):
                     if image_item.get("b64_json"):
                         result_image_url = f"data:image/png;base64,{result_image_url}"
 
-            return {
+            out = {
                 "image_url": result_image_url,
                 "usage": getattr(result, "usage", {}) or {},
                 "request_id": getattr(result, "id", None),
             }
+            record_image_usage(
+                out,
+                model_name=self.model_name,
+                call_type=MediaCallType.EDIT_IMAGE,
+                image_count=n,
+                resolution=str(size or ""),
+            )
+            return out
 
         except Exception as e:
             logger.error(f"Xinference image editing failed: {e}")

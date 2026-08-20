@@ -11,6 +11,7 @@ from typing import Any, Dict, Optional
 
 from ...core.model.chat.token_context import (
     TokenUsage,
+    copy_detail_rows,
     get_token_usage,
     set_token_usage,
 )
@@ -50,21 +51,14 @@ def _optional_int(value: Any) -> int | None:
     return None
 
 
-def _copy_details(raw_details: Any) -> list[dict[str, Any]]:
-    if not isinstance(raw_details, list):
-        return []
-    return [dict(item) for item in raw_details if isinstance(item, dict)]
-
-
 def _copy_usage(usage: TokenUsage) -> TokenUsage:
-    """Detach a stable snapshot before yielding to a database worker."""
-    return TokenUsage(
-        input_tokens=usage.input_tokens,
-        output_tokens=usage.output_tokens,
-        llm_calls=usage.llm_calls,
-        tool_calls=usage.tool_calls,
-        details=_copy_details(usage.details),
-    )
+    """Detach a stable snapshot before yielding to a database worker.
+
+    Delegates to ``TokenUsage.snapshot`` so the copy is taken under the usage
+    object's own lock. Reading the fields here field-by-field could interleave
+    with a concurrent media write and yield a counter without its detail row.
+    """
+    return usage.snapshot()
 
 
 def _task_for_run(
@@ -100,13 +94,22 @@ def _task_seed_from_session(
             f" for run {expected_run_id}" if expected_run_id is not None else ""
         )
         raise ValueError(f"Task {task_id}{run_suffix} not found")
+    seed_details = copy_detail_rows(getattr(task, "token_usage_details", None))
     return _TaskTrackingSeed(
         user_id=_optional_int(getattr(task, "user_id", None)),
         usage=TokenUsage(
             input_tokens=_safe_int(getattr(task, "input_tokens", 0)),
             output_tokens=_safe_int(getattr(task, "output_tokens", 0)),
             llm_calls=_safe_int(getattr(task, "llm_calls", 0)),
-            details=_copy_details(getattr(task, "token_usage_details", None)),
+            # Derived from the surviving detail rows rather than read from a
+            # column: Task has no media_calls column. This only keeps the
+            # in-memory running total consistent with the rows it summarises —
+            # the delta path reads `details` and `tool_calls`, never this
+            # counter, so seeding zero would not re-report prior-turn calls.
+            media_calls=sum(
+                1 for detail in seed_details if detail.get("type") == "media"
+            ),
+            details=seed_details,
         ),
     )
 
@@ -160,7 +163,7 @@ def _commit_task_usage_if_owned(
             Task.output_tokens: usage.output_tokens,
             Task.total_tokens: usage.total_tokens,
             Task.llm_calls: usage.llm_calls,
-            Task.token_usage_details: _copy_details(usage.details),
+            Task.token_usage_details: copy_detail_rows(usage.details),
         },
         synchronize_session=False,
     )
@@ -528,16 +531,44 @@ class TaskTracker:
         self._update_task = None
         logger.info(f"Stopped periodic token updates for task {self.task_id}")
 
-    def _turn_delta(self, usage: TokenUsage | None = None) -> tuple[list, int]:
+    def _turn_delta(
+        self, usage: TokenUsage | None = None
+    ) -> tuple[list[dict[str, Any]], int]:
         """This turn's (detail entries, tool-call count) over the baseline seeded
         in start_tracking. Single source for the completion meter and the mid-run
-        gate so they can't disagree on what 'this run's usage' means."""
+        gate so they can't disagree on what 'this run's usage' means.
+
+        Always snapshots first. The two reads below — the details slice and the
+        tool-call counter — must describe the same instant: a concurrent
+        ``record_media_call``/``increment_tool_calls`` landing between them
+        yields a pair from two different logical points in time (a row visible
+        with its counter bump missing, or the reverse), and that inconsistent
+        pair is what gets fed to quota gating. ``interrupt_reason_for_quota``
+        polls this at every safe point, so it is a hot concurrent path rather
+        than a one-shot teardown read.
+
+        Relies on an invariant worth stating: every row in ``details`` is a
+        dict. ``_initial_details_len`` indexes the same filtered list the live
+        usage object holds (``TokenUsage.__post_init__`` normalises on
+        construction and every mutation path appends a literal dict), so the
+        slice below stays aligned. A future non-dict append would be filtered
+        out of the tail and shift the boundary, re-metering prior-turn rows.
+
+        Reads through ``detail_tail``, which copies only the rows past the
+        baseline. ``snapshot()`` would deep-copy the entire cumulative list and
+        then discard everything before ``_initial_details_len`` — the list grows
+        monotonically across turns, so that costs O(total usage) per poll on a
+        path hit once per agent step and once per streamed LLM chunk, while
+        holding the lock every LLM adapter needs to write tokens.
+        """
         if usage is None:
             usage = get_token_usage()
-        return (
-            usage.details[self._initial_details_len :],
-            max(0, usage.tool_calls - self._initial_tool_calls),
-        )
+        # Rows come back already detached, so callers need no further copying
+        # before handing them to the quota hooks. tool_calls is the cumulative
+        # counter, so the baseline still has to be subtracted here — detail_tail
+        # slices details for us but cannot know this tracker's baseline.
+        tail, tool_calls = usage.detail_tail(self._initial_details_len)
+        return (tail, max(0, tool_calls - self._initial_tool_calls))
 
     async def interrupt_reason_for_quota(self) -> str | None:
         """Per-step interrupt-checker: return a reason when this run's live-so-far
@@ -558,9 +589,10 @@ class TaskTracker:
             return None
         try:
             delta_details, delta_actions = self._turn_delta()
+            # No extra copy: _turn_delta already returns detached rows.
             reason = _check_quota_on_event_loop(
                 self._user_id,
-                _copy_details(delta_details),
+                delta_details,
                 delta_actions,
             )
             if reason is not None:
@@ -613,9 +645,10 @@ class TaskTracker:
         # the task. The remaining blocking risk is tracked separately from the
         # database-lifecycle changes in this PR.
         try:
+            # No extra copy: _turn_delta already returns detached rows.
             _record_usage_on_event_loop(
                 self._user_id,
-                _copy_details(delta_details),
+                delta_details,
                 delta_actions,
             )
         except Exception as e:  # noqa: BLE001

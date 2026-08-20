@@ -7,7 +7,8 @@ from typing import Optional, Union
 
 from ..core.memory.in_memory import InMemoryMemoryStore
 from ..core.memory.lancedb import LanceDBMemoryStore
-from ..core.model.embedding import DashScopeEmbedding
+from ..core.model.embedding.adapter import create_embedding_adapter
+from ..core.model.model import EmbeddingModelConfig
 from ..core.storage.manager import get_storage_root
 from .models.database import get_db
 from .models.model import Model as DBModel
@@ -16,6 +17,11 @@ from .services.db_runtime import is_database_pool_timeout
 from .user_isolated_memory import UserIsolatedMemoryStore, current_user_id
 
 logger = logging.getLogger(__name__)
+
+# Matches DashScopeEmbedding's own default. Memory vectors written before the
+# store routed through the metered adapter used this model, so it stays the
+# fallback whenever the DB row does not name one.
+_DEFAULT_MEMORY_EMBEDDING_MODEL = "text-embedding-v4"
 
 # Type alias for our memory store types that includes user isolation
 MemoryStoreType = Union[
@@ -167,11 +173,51 @@ class DynamicMemoryStoreManager:
                 db_dir = str(new_dir)
 
             if embedding_model.model_provider == "dashscope":
+                # Keep the previous class default when the DB row carries no
+                # usable name. Memories already on disk were embedded with this
+                # model, and switching it would silently put old and new
+                # vectors in incompatible spaces — a recall-quality regression
+                # with no error at store-creation time (DashScopeEmbedding does
+                # not validate the name; a bad one only fails later at encode).
+                # The embedding model is PINNED, not read from the DB row.
+                # Memory vectors already stored were written with
+                # _DEFAULT_MEMORY_EMBEDDING_MODEL, and switching the model puts
+                # new vectors in a different space than the stored ones — a
+                # silent recall-quality regression, since
+                # schema_migration.py's mismatch check compares only vector
+                # presence and width, not model identity, so nothing triggers
+                # a rebuild. The configured name is still threaded through as
+                # the billing label so usage is attributed to the row the
+                # deployment actually configured.
+                configured_name = str(
+                    getattr(embedding_model, "model_name", "") or ""
+                ).strip()
+                if (
+                    configured_name
+                    and configured_name != _DEFAULT_MEMORY_EMBEDDING_MODEL
+                ):
+                    logger.info(
+                        "Memory store embeds with pinned %s for compatibility "
+                        "with existing vectors; billing usage as %s per the "
+                        "configured embedding row",
+                        _DEFAULT_MEMORY_EMBEDDING_MODEL,
+                        configured_name,
+                    )
+                # Built through the adapter rather than instantiating the
+                # provider directly: the adapter is where embedding usage is
+                # metered, so a direct DashScopeEmbedding() would make every
+                # memory-store embedding invisible to billing.
                 lancedb_store = LanceDBMemoryStore(
                     db_dir=db_dir,
-                    embedding_model=DashScopeEmbedding(
-                        api_key=str(embedding_model.api_key),
-                        dimension=int(embedding_model.dimension or 1024),
+                    embedding_model=create_embedding_adapter(
+                        EmbeddingModelConfig(
+                            id=str(getattr(embedding_model, "model_id", "") or ""),
+                            model_name=_DEFAULT_MEMORY_EMBEDDING_MODEL,
+                            billing_model_name=configured_name or None,
+                            model_provider="dashscope",
+                            api_key=str(embedding_model.api_key),
+                            dimension=int(embedding_model.dimension or 1024),
+                        )
                     ),
                     similarity_threshold=self._similarity_threshold or 1.5,
                 )

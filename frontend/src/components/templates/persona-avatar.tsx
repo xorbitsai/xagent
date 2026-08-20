@@ -1,9 +1,11 @@
 import React from "react";
-import type { PersonaInfo } from "@/types/template";
 import { cn } from "@/lib/utils";
 
 interface PersonaAvatarProps {
-  persona: PersonaInfo;
+  /** Only `name` and `avatar` are read - narrower than the full
+   * `PersonaInfo` type so callers with just an agent's name/logo (no real
+   * persona) can reuse this without fabricating unused fields. */
+  persona: { name: string; avatar?: string | null };
   /** Tailwind size classes, e.g. "h-11 w-11" or "h-16 w-16". */
   sizeClassName: string;
   /** Tailwind text-size class for the fallback initial, e.g. "text-sm" or "text-xl". */

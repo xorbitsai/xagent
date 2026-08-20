@@ -87,7 +87,7 @@ const PILL_KNOWN: Record<string, string> = {
   productivity: PILL_PALETTE[4],
 };
 
-function pillClasses(category?: string): string {
+export function pillClasses(category?: string): string {
   if (!category) return PILL_NEUTRAL;
   const key = category.toLowerCase();
   if (PILL_KNOWN[key]) return PILL_KNOWN[key];

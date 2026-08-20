@@ -48,6 +48,7 @@ const AGENT: Agent = {
   name: "Regional agent",
   description: "",
   logo_url: null,
+  template_id: null,
   status: "published",
   created_at: "2026-07-24T00:00:00Z",
   updated_at: "2026-07-24T00:00:00Z",

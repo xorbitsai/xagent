@@ -2361,21 +2361,30 @@ const zh = {
     },
     list: {
       header: {
-        title: "我的 Agent",
-        description: "管理你的自定义 Agent",
-        create: "创建 Agent",
+        title: "我的团队",
+        description: "谁在工作、有什么在等你确认、以及交付了什么。",
+        create: "添加队员",
       },
       search: {
-        placeholder: "搜索 Agent...",
+        placeholder: "查找队员...",
       },
       empty: {
         title: "暂无 Agent",
         description: "开始创建你的第一个 Agent",
         create: "创建 Agent",
       },
+      tabs: {
+        all: "全部",
+        enabled: "已启用",
+        drafts: "草稿",
+      },
+      sort: {
+        updated: "最近更新",
+        name: "名称（A–Z）",
+      },
       status: {
         draft: "草稿",
-        published: "已发布",
+        published: "已启用",
       },
       actions: {
         chat: "聊天",
@@ -2386,6 +2395,7 @@ const zh = {
         viewConfig: "查看配置",
         apiKey: "API Key",
         triggers: "Triggers",
+        deploy: "部署",
         deleteConfirm: "确定要删除这个 Agent 吗？",
       },
       deleteDialog: {

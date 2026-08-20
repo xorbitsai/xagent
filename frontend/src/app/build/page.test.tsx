@@ -13,7 +13,6 @@ const dispatchMock = vi.hoisted(() => vi.fn())
 const setTaskIdMock = vi.hoisted(() => vi.fn())
 const setPendingMessageMock = vi.hoisted(() => vi.fn())
 const resolveAgentLogoUrlMock = vi.hoisted(() => vi.fn())
-const formatDisplayDateMock = vi.hoisted(() => vi.fn())
 const localeMock = vi.hoisted(() => ({ value: "en" as "en" | "zh" }))
 
 vi.mock("@/lib/api-wrapper", async () => {
@@ -34,15 +33,6 @@ vi.mock("@/lib/utils", async () => {
     },
   }
 })
-
-vi.mock("@/lib/time-utils", () => ({
-  formatDisplayDate: (...args: [unknown, "en" | "zh", Intl.DateTimeFormatOptions]) => {
-    formatDisplayDateMock(...args)
-    return typeof args[0] === "string" && args[0].startsWith("valid-")
-      ? `formatted:${args[0]}`
-      : ""
-  },
-}))
 
 vi.mock("@/lib/models", () => ({
   resolveTaskLlmSelection: resolveTaskLlmSelectionMock,
@@ -139,21 +129,6 @@ const conflictPayload = {
   },
 }
 
-function cardDateRows(card: Element | null): Element[] {
-  const metadata = Array.from(card?.querySelectorAll("div") ?? []).find((element) =>
-    element.classList.contains("space-y-1.5"),
-  )
-  return metadata ? Array.from(metadata.children) : []
-}
-
-function cardAvatar(card: Element | null): Element | null {
-  return card?.querySelector('div[class*="h-10"][class*="w-10"]') ?? null
-}
-
-function cardTextOccurrences(card: Element | null, text: string): number {
-  return (card?.textContent ?? "").split(text).length - 1
-}
-
 function jsonResponse(data: unknown, init?: ResponseInit) {
   return new Response(JSON.stringify(data), {
     status: 200,
@@ -182,7 +157,6 @@ function resetMocks() {
   setTaskIdMock.mockReset()
   setPendingMessageMock.mockReset()
   resolveAgentLogoUrlMock.mockReset()
-  formatDisplayDateMock.mockReset()
   localeMock.value = "en"
   voiceInputState.hasAsrModel = false
 }
@@ -258,32 +232,25 @@ describe("BuildsPage rendering", () => {
     }
   })
 
-  it("uses the shared logo and date owners once per Build card with independent date rows", async () => {
-    localeMock.value = "zh"
+  it("uses the shared logo resolver once per card, falling back to a persona monogram", async () => {
     apiRequestMock.mockResolvedValue(jsonResponse([
       {
         ...agent,
         id: 91,
         name: "Absolute Agent",
         logo_url: "HTTPS://assets.example/agent.png",
-        created_at: "valid-created",
-        updated_at: "",
       },
       {
         ...agent,
         id: 92,
         name: "Relative Agent",
         logo_url: "/logos/relative.png",
-        created_at: "not-a-date",
-        updated_at: "valid-updated",
       },
       {
         ...agent,
         id: 93,
         name: "Invalid Agent",
         logo_url: "javascript:alert(1)",
-        created_at: "not-a-date",
-        updated_at: " ",
       },
     ]))
 
@@ -304,59 +271,18 @@ describe("BuildsPage rendering", () => {
       "src",
       "http://api.local/logos/relative.png",
     )
-    const invalidAvatar = cardAvatar(invalidCard)
-    expect(invalidAvatar).not.toBeNull()
-    expect(invalidAvatar?.querySelectorAll("img")).toHaveLength(0)
-    expect(invalidAvatar?.querySelectorAll("svg")).toHaveLength(1)
-    const invalidBot = invalidAvatar?.querySelector("svg")
-    expect(invalidBot).not.toHaveClass("lucide-chevron-right")
-    expect(invalidBot?.querySelector('rect[width="18"][height="10"]')).toBeInTheDocument()
-
-    expect(absoluteCard).toHaveTextContent("builds.card.createdAt: formatted:valid-created")
-    expect(cardTextOccurrences(absoluteCard, "builds.card.createdAt")).toBe(1)
-    expect(cardTextOccurrences(absoluteCard, "builds.card.updatedAt")).toBe(0)
-    expect(relativeCard).toHaveTextContent("builds.card.updatedAt: formatted:valid-updated")
-    expect(cardTextOccurrences(relativeCard, "builds.card.createdAt")).toBe(0)
-    expect(cardTextOccurrences(relativeCard, "builds.card.updatedAt")).toBe(1)
-    expect(cardTextOccurrences(invalidCard, "builds.card.createdAt")).toBe(0)
-    expect(cardTextOccurrences(invalidCard, "builds.card.updatedAt")).toBe(0)
-    const absoluteRows = cardDateRows(absoluteCard)
-    const relativeRows = cardDateRows(relativeCard)
-    const invalidRows = cardDateRows(invalidCard)
-    expect(absoluteRows).toHaveLength(1)
-    expect(absoluteRows[0].querySelectorAll("svg")).toHaveLength(1)
-    expect(relativeRows).toHaveLength(1)
-    expect(relativeRows[0].querySelectorAll("svg")).toHaveLength(1)
-    expect(invalidRows).toHaveLength(0)
+    expect(invalidCard?.querySelector("img")).toBeNull()
+    const monogram = Array.from(invalidCard?.querySelectorAll("div") ?? []).find(
+      (element) => element.textContent === "I",
+    )
+    expect(monogram).toBeTruthy()
 
     resolveAgentLogoUrlMock.mockClear()
-    formatDisplayDateMock.mockClear()
     view.rerender(<BuildsPage />)
     expect(resolveAgentLogoUrlMock).toHaveBeenCalledTimes(3)
     expect(resolveAgentLogoUrlMock).toHaveBeenNthCalledWith(1, "HTTPS://assets.example/agent.png", "http://api.local")
     expect(resolveAgentLogoUrlMock).toHaveBeenNthCalledWith(2, "/logos/relative.png", "http://api.local")
     expect(resolveAgentLogoUrlMock).toHaveBeenNthCalledWith(3, "javascript:alert(1)", "http://api.local")
-    expect(formatDisplayDateMock).toHaveBeenCalledTimes(6)
-    expect(formatDisplayDateMock).toHaveBeenCalledWith("valid-created", "zh", {
-      year: "numeric", month: "numeric", day: "numeric",
-    })
-    expect(formatDisplayDateMock).toHaveBeenCalledWith("valid-updated", "zh", {
-      year: "numeric", month: "numeric", day: "numeric",
-    })
-  })
-
-  it("keeps Build card display shaping in the shared owners", () => {
-    const source = readFileSync(`${process.cwd()}/src/app/build/page.tsx`, "utf8")
-    const cardRender = source.slice(source.indexOf("{filteredAgents.map((agent) => {"))
-    expect(cardRender).toContain("const resolvedLogoUrl = resolveAgentLogoUrl(agent.logo_url, getApiUrl())")
-    expect(cardRender.match(/resolveAgentLogoUrl\(/g)).toHaveLength(1)
-    expect(cardRender).toContain("const createdDate = formatDisplayDate(agent.created_at, locale, {")
-    expect(cardRender).toContain("const updatedDate = formatDisplayDate(agent.updated_at, locale, {")
-    expect(cardRender.match(/formatDisplayDate\(agent\.created_at/g)).toHaveLength(1)
-    expect(cardRender.match(/formatDisplayDate\(agent\.updated_at/g)).toHaveLength(1)
-    expect(cardRender.match(/\{createdDate && \(/g)).toHaveLength(1)
-    expect(cardRender.match(/\{updatedDate && \(/g)).toHaveLength(1)
-    expect(cardRender).not.toMatch(/const formatDate|\$\{getApiUrl\(\)\}\$\{agent\.logo_url\}|agent\.updated_at\s*\|\|\s*agent\.created_at/)
   })
 })
 

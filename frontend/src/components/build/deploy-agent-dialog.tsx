@@ -33,6 +33,7 @@ export interface Agent {
   name: string
   description: string
   logo_url: string | null
+  template_id: string | null
   status: string
   created_at: string
   updated_at: string

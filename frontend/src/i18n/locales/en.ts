@@ -2361,21 +2361,30 @@ Build when you need.`,
     },
     list: {
       header: {
-        title: "My Agents",
-        description: "Manage your custom agents",
-        create: "Create Agent",
+        title: "My Team",
+        description: "Who is working, what is waiting on you, and what they have delivered.",
+        create: "Add teammate",
       },
       search: {
-        placeholder: "Search agents...",
+        placeholder: "Find a teammate...",
       },
       empty: {
         title: "No agents found",
         description: "Get started by creating your first agent",
         create: "Create Agent",
       },
+      tabs: {
+        all: "All",
+        enabled: "Enabled",
+        drafts: "Drafts",
+      },
+      sort: {
+        updated: "Recently updated",
+        name: "Name (A–Z)",
+      },
       status: {
         draft: "Draft",
-        published: "Published",
+        published: "Enabled",
       },
       actions: {
         chat: "Chat",
@@ -2386,6 +2395,7 @@ Build when you need.`,
         viewConfig: "View config",
         apiKey: "API Key",
         triggers: "Triggers",
+        deploy: "Deploy",
         deleteConfirm: "Are you sure you want to delete this agent?",
       },
       deleteDialog: {

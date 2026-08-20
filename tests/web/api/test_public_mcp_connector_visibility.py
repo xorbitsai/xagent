@@ -448,6 +448,14 @@ def test_remote_connector_ignores_actor_owned_oauth_accounts(
 
         assert response.status_code == 200
         assert checked_providers == []
+        microsoft_apps = [
+            app for app in response.json() if app.get("provider") == "microsoft"
+        ]
+        assert microsoft_apps
+        for app in microsoft_apps:
+            assert app["is_connected"] is False
+            assert "connected_account" not in app
+            assert "server_id" not in app
     finally:
         Base.metadata.drop_all(bind=get_engine())
         try:

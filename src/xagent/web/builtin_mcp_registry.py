@@ -222,13 +222,17 @@ def get_builtin_oauth_provider_rows() -> list[dict[str, Any]]:
             "auth_url": "https://login.salesforce.com/services/oauth2/authorize",
             "token_url": "https://login.salesforce.com/services/oauth2/token",
             "redirect_uri": os.environ.get("SALESFORCE_REDIRECT_URI", ""),
-            # Salesforce's OIDC userinfo endpoint lives on the org's own
-            # instance_url (e.g. https://acme.my.salesforce.com/services/
-            # oauth2/userinfo), which isn't known until after the token
-            # exchange -- there is no fixed URL this callback's GET-plus-
-            # flat-dict.get() lookup could use. Left empty so that lookup is
-            # skipped entirely; identity is available on demand instead via
-            # this connector's own salesforce_get_current_user tool.
+            # Salesforce's OIDC userinfo endpoint IS a fixed host
+            # (login.salesforce.com, same as auth_url/token_url -- see
+            # salesforce.py's USERINFO_URL), not the per-org instance_url
+            # used by every other endpoint. Left empty anyway, on purpose:
+            # populating it here would add a network round-trip to every
+            # OAuth connect just to fill in email/provider_user_id, which
+            # this connector doesn't otherwise need -- identity is instead
+            # fetched lazily, on demand, via salesforce_get_current_user.
+            # UserOAuth.email/provider_user_id stay NULL for every Salesforce
+            # grant as a result; is_connected still works from access_token
+            # alone (see test_salesforce_oauth.py's dedicated coverage).
             "userinfo_url": "",
             "user_id_path": "user_id",
             "email_path": "email",

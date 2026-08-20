@@ -33,11 +33,6 @@ FULL_OAUTH_PROVIDERS_TABLE = sa.table(
     sa.column("default_scopes", sa.JSON),
 )
 
-OAUTH_PROVIDERS_TABLE = sa.table(
-    "oauth_providers",
-    sa.column("provider_name", sa.String),
-)
-
 PUBLIC_MCP_APPS_TABLE = sa.table(
     "public_mcp_apps",
     sa.column("app_id", sa.String),
@@ -70,9 +65,8 @@ def _salesforce_provider_row() -> dict[str, object]:
         "auth_url": "https://login.salesforce.com/services/oauth2/authorize",
         "token_url": "https://login.salesforce.com/services/oauth2/token",
         "redirect_uri": os.environ.get("SALESFORCE_REDIRECT_URI", ""),
-        # Salesforce's OIDC userinfo endpoint lives on the org's own
-        # instance_url, not known until after the token exchange -- see the
-        # matching comment on the registry row.
+        # Left empty on purpose, not because the URL is unknown -- see the
+        # matching comment on the registry row for why.
         "userinfo_url": "",
         "user_id_path": "user_id",
         "email_path": "email",
@@ -112,7 +106,9 @@ def upgrade() -> None:
             column["name"] for column in inspector.get_columns("oauth_providers")
         }
         existing_provider_names = set(
-            bind.execute(sa.select(OAUTH_PROVIDERS_TABLE.c.provider_name)).scalars()
+            bind.execute(
+                sa.select(FULL_OAUTH_PROVIDERS_TABLE.c.provider_name)
+            ).scalars()
         )
         if "salesforce" not in existing_provider_names:
             bind.execute(

@@ -586,40 +586,39 @@ function BuildsPageContent() {
                   return (
                   <div
                     key={agent.id}
-                    className="group relative flex flex-col justify-between space-y-4 rounded-xl border bg-card p-6 shadow-sm transition-all cursor-pointer hover:shadow-md hover:border-primary/50"
+                    className="group relative flex flex-col rounded-[20px] border bg-card p-5 shadow-sm transition-all cursor-pointer hover:-translate-y-0.5 hover:shadow-md hover:border-primary/50"
                     onClick={() => router.push(`/build/${agent.id}`)}
                   >
-                    <div className="flex-1 space-y-4">
-                      <div className="flex items-start gap-3">
-                        <PersonaAvatar
-                          persona={{ name: agent.name, avatar: resolvedLogoUrl || template?.persona?.avatar }}
-                          sizeClassName="h-14 w-14"
-                          textClassName="text-lg"
-                          className="rounded-2xl"
-                        />
-                        <div className="flex-1 min-w-0 pr-6">
-                          <h3 className="font-semibold text-base leading-tight truncate" title={agent.name}>
-                            {agent.name}
-                          </h3>
-                          {personaRole && (
-                            <p className="text-xs text-muted-foreground truncate mt-0.5">{personaRole}</p>
-                          )}
-                          <div className="mt-2 flex flex-wrap items-center gap-1.5">
-                            <span className={`inline-flex items-center gap-1 text-[11px] px-2 py-0.5 rounded-full font-medium ${agent.status === 'published'
-                              ? 'bg-green-100 text-green-700 dark:bg-green-900/20 dark:text-green-400'
-                              : 'bg-gray-100 text-gray-600 dark:bg-gray-800 dark:text-gray-400'
-                              }`}>
-                              <span className={`h-1.5 w-1.5 rounded-full ${agent.status === 'published' ? 'bg-green-500' : 'bg-gray-400'}`} />
-                              {agent.status === 'published' ? t('builds.list.status.published') : t('builds.list.status.draft')}
+                    <div className="flex flex-col items-start gap-3">
+                      <PersonaAvatar
+                        persona={{ name: agent.name, avatar: resolvedLogoUrl || template?.persona?.avatar }}
+                        sizeClassName="h-20 w-20"
+                        textClassName="text-2xl"
+                        className="rounded-[22px] shadow-[0_0_0_4px_var(--card),0_0_0_6px_hsl(var(--primary)/0.15)]"
+                      />
+                      <div className="w-full min-w-0 pr-6">
+                        <h3 className="font-bold text-xl leading-tight truncate" title={agent.name}>
+                          {agent.name}
+                        </h3>
+                        {personaRole && (
+                          <p className="text-[12.5px] text-muted-foreground truncate mt-0.5">{personaRole}</p>
+                        )}
+                        <div className="mt-2.5 flex flex-wrap items-center gap-1.5">
+                          <span className={`inline-flex items-center gap-1 text-[11px] px-2 py-0.5 rounded-full font-bold ${agent.status === 'published'
+                            ? 'bg-green-100 text-green-700 dark:bg-green-900/20 dark:text-green-400'
+                            : 'bg-gray-100 text-gray-600 dark:bg-gray-800 dark:text-gray-400'
+                            }`}>
+                            <span className={`h-1.5 w-1.5 rounded-full ${agent.status === 'published' ? 'bg-green-500' : 'bg-gray-400'}`} />
+                            {agent.status === 'published' ? t('builds.list.status.published') : t('builds.list.status.draft')}
+                          </span>
+                          {category && (
+                            <span className={`inline-flex text-[11px] px-2 py-0.5 rounded-full font-medium ${pillClasses(category)}`}>
+                              {categoryLabel(t, category)}
                             </span>
-                            {category && (
-                              <span className={`inline-flex text-[11px] px-2 py-0.5 rounded-full font-medium ${pillClasses(category)}`}>
-                                {categoryLabel(t, category)}
-                              </span>
-                            )}
-                          </div>
+                          )}
                         </div>
                       </div>
+                    </div>
                         {(canPublishAgent(agent) || canDeleteAgent(agent) || canEditAgent(agent)) && (
                           <div className="absolute right-4 top-4" onClick={(e) => e.stopPropagation()}>
                             <Popover>
@@ -630,19 +629,6 @@ function BuildsPageContent() {
                               </PopoverTrigger>
                               <PopoverContent align="end" className="w-40 p-1" onClick={(e) => e.stopPropagation()}>
                                 <div className="flex flex-col">
-                                  {agent.status === 'published' && canEditAgent(agent) && (
-                                    <Button
-                                      variant="ghost"
-                                      className="justify-start px-2 py-1.5 h-auto font-normal text-sm"
-                                      onClick={(e) => {
-                                        e.stopPropagation()
-                                        setDeployAgent(agent)
-                                      }}
-                                    >
-                                      <Rocket className="mr-2 h-4 w-4" />
-                                      {t('builds.list.actions.deploy')}
-                                    </Button>
-                                  )}
                                   {canEditAgent(agent) && (
                                     <Button
                                       variant="ghost"
@@ -711,38 +697,48 @@ function BuildsPageContent() {
                           </div>
                         )}
 
-                      <p className="text-sm text-muted-foreground line-clamp-2">
+                      <p className="mt-4 text-[13px] leading-relaxed text-muted-foreground line-clamp-3 min-h-[60px]">
                         {agent.description || t('builds.card.noDescription')}
                       </p>
-                    </div>
 
-                    <div className="pt-2" onClick={(e) => e.stopPropagation()}>
-                      <div className="space-y-4">
+                    <div className="mt-4 border-t pt-3.5" onClick={(e) => e.stopPropagation()}>
+                      <div className="space-y-3.5">
                         <BuildAgentCardExtension agentId={agent.id} />
-                        <div className="flex gap-2">
+                        <div className="flex items-center gap-1.5">
                           {agent.status === 'published' ? (
                             <>
                               <Button
                                 variant="default"
-                                className="flex-1 bg-blue-600 hover:bg-blue-700 text-white"
+                                className="flex-1 rounded-full h-[34px] bg-blue-600 hover:bg-blue-700 text-white"
                                 onClick={() => router.push(getAgentChatHref(agent))}
                               >
                                 <MessageSquare className="mr-1.5 h-4 w-4" />
                                 {t('builds.list.actions.chat')}
                               </Button>
                               {canEditAgent(agent) ? (
-                                <Button
-                                  variant="outline"
-                                  className="px-4"
-                                  onClick={() => router.push(`/build/${agent.id}`)}
-                                >
-                                  <Edit className="mr-1.5 h-4 w-4" />
-                                  {t('builds.list.actions.edit')}
-                                </Button>
+                                <>
+                                  <Button
+                                    variant="outline"
+                                    className="rounded-full h-[34px] px-4"
+                                    onClick={() => router.push(`/build/${agent.id}`)}
+                                  >
+                                    <Edit className="mr-1.5 h-4 w-4" />
+                                    {t('builds.list.actions.edit')}
+                                  </Button>
+                                  <Button
+                                    variant="outline"
+                                    size="icon"
+                                    className="rounded-full h-[34px] w-[34px] shrink-0"
+                                    title={t('builds.list.actions.deploy')}
+                                    onClick={() => setDeployAgent(agent)}
+                                  >
+                                    <Rocket className="h-4 w-4" />
+                                  </Button>
+                                </>
                               ) : (
                                 <Button
                                   variant="outline"
-                                  className={canRunAgent(agent) ? "px-4" : "flex-1 w-full"}
+                                  className={canRunAgent(agent) ? "rounded-full h-[34px] px-4" : "flex-1 w-full rounded-full h-[34px]"}
                                   onClick={() => router.push(`/build/${agent.id}`)}
                                 >
                                   <Settings2 className="mr-1.5 h-4 w-4" />
@@ -754,7 +750,7 @@ function BuildsPageContent() {
                             canEditAgent(agent) ? (
                               <Button
                                 variant="outline"
-                                className="flex-1 w-full"
+                                className="flex-1 w-full rounded-full h-[34px]"
                                 onClick={() => router.push(`/build/${agent.id}`)}
                               >
                                 <Edit className="mr-1.5 h-4 w-4" />
@@ -763,7 +759,7 @@ function BuildsPageContent() {
                             ) : (
                               <Button
                                 variant="outline"
-                                className="flex-1 w-full"
+                                className="flex-1 w-full rounded-full h-[34px]"
                                 onClick={() => router.push(`/build/${agent.id}`)}
                               >
                                 <Settings2 className="mr-1.5 h-4 w-4" />

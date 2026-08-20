@@ -2,10 +2,12 @@ import json
 import logging
 import os
 from typing import Any
+from urllib.parse import quote, urlsplit
 
 import requests
 from mcp.server.fastmcp import FastMCP
 
+from ....core.utils.security import PrivateNetworkHostError, reject_private_network_host
 from .utils import setup_proxy_env
 
 logging.basicConfig(level=logging.INFO)
@@ -49,17 +51,59 @@ def _base_url() -> str:
     Intercom's single auto-routing host) -- a key created on one region's
     host is not valid against the other, so which host to call is a
     connect-time configuration choice, not something this module can infer.
+
+    POSTHOG_HOST is user-supplied and gets an Authorization: Bearer header
+    attached to every request built from it, so it is validated as a bare
+    HTTPS origin (matching mcp_oauth.py's use of the same
+    reject_private_network_host guard for a user-configured MCP host):
+    no embedded credentials, no path/query/fragment that could redirect the
+    request elsewhere, and no localhost/private/link-local target.
     """
-    host = os.environ.get("POSTHOG_HOST", "").strip().rstrip("/")
+    host = os.environ.get("POSTHOG_HOST", "").strip()
     if not host:
         raise ValueError("POSTHOG_HOST environment variable is missing")
     if not host.startswith(("http://", "https://")):
         host = f"https://{host}"
-    return host
+
+    parsed = urlsplit(host)
+    if parsed.scheme != "https":
+        raise ValueError("POSTHOG_HOST must be an https:// URL")
+    if parsed.username is not None or parsed.password is not None:
+        raise ValueError("POSTHOG_HOST must not contain embedded credentials")
+    if parsed.path not in ("", "/") or parsed.query or parsed.fragment:
+        raise ValueError(
+            "POSTHOG_HOST must be a bare host, not a URL with a path, "
+            "query, or fragment"
+        )
+    if not parsed.hostname:
+        raise ValueError("POSTHOG_HOST environment variable is missing")
+    try:
+        reject_private_network_host(parsed.hostname)
+    except PrivateNetworkHostError as exc:
+        raise ValueError(f"POSTHOG_HOST is not allowed: {exc}") from exc
+
+    netloc = (
+        parsed.hostname if parsed.port is None else f"{parsed.hostname}:{parsed.port}"
+    )
+    return f"https://{netloc}"
 
 
 def _clamp_limit(limit: int) -> int:
     return max(1, min(int(limit), MAX_LIMIT))
+
+
+def _clamp_offset(offset: int) -> int:
+    return max(0, int(offset))
+
+
+def _path_segment(value: str) -> str:
+    """Percent-encode a value for safe interpolation into a URL path
+    segment (e.g. an organization/project/person/insight id), matching
+    jira.py's _path_segment / intercom.py's inline quote() calls.
+    Percent-encoding - not a blocklist of "/", "?", "#" - is what actually
+    prevents a value like "1/../2" from escaping its intended path segment.
+    """
+    return quote(str(value), safe="")
 
 
 def _extract_error_detail(response: requests.Response) -> str | None:
@@ -113,10 +157,23 @@ def _request(
     return response.json()
 
 
-def _paginated_results(payload: dict[str, Any], limit: int) -> tuple[list[Any], bool]:
+def _paginated_results(
+    payload: dict[str, Any], limit: int, offset: int
+) -> tuple[list[Any], bool, int | None]:
+    """Slice one page of results and compute the offset for the next page.
+
+    PostHog's own "next" field is a full URL; per PostHog's docs that URL is
+    a signal that more results exist, not something safe to fetch as-is (it
+    would let a compromised/malicious response redirect this connector to
+    an arbitrary host on the next call). Callers instead resurface
+    next_offset — reusable as this same tool's own bounded offset param —
+    so pagination never means following a server-supplied URL.
+    """
     results = payload.get("results") or []
+    page = results[:limit]
     truncated = bool(payload.get("next")) or len(results) > limit
-    return results[:limit], truncated
+    next_offset = offset + len(page) if truncated else None
+    return page, truncated, next_offset
 
 
 @mcp.tool()
@@ -142,38 +199,56 @@ def posthog_get_current_user() -> str:
 
 
 @mcp.tool()
-def posthog_list_organizations(limit: int = 50) -> str:
+def posthog_list_organizations(limit: int = 50, offset: int = 0) -> str:
     """
     List organizations this account can see — id, name.
     Use the returned id with posthog_list_projects.
+    offset: 0-based result offset for pagination; pass the previous call's
+    next_offset to fetch the next page (only present while truncated=True).
     """
     try:
         max_results = _clamp_limit(limit)
-        result = _request("GET", "/api/organizations/", params={"limit": max_results})
-        organizations, truncated = _paginated_results(result, max_results)
-        return _success(organizations=organizations, truncated=truncated)
+        page_offset = _clamp_offset(offset)
+        result = _request(
+            "GET",
+            "/api/organizations/",
+            params={"limit": max_results, "offset": page_offset},
+        )
+        organizations, truncated, next_offset = _paginated_results(
+            result, max_results, page_offset
+        )
+        return _success(
+            organizations=organizations, truncated=truncated, next_offset=next_offset
+        )
     except Exception as e:
         logger.error(f"Error listing PostHog organizations: {e}")
         return _error(str(e))
 
 
 @mcp.tool()
-def posthog_list_projects(organization_id: str = "@current", limit: int = 50) -> str:
+def posthog_list_projects(
+    organization_id: str = "@current", limit: int = 50, offset: int = 0
+) -> str:
     """
     List projects in an organization — id, name, and timezone.
     organization_id: an organization id from posthog_list_organizations;
     defaults to the API key owner's most recently active organization.
     Use the returned id (project_id) with every other tool here.
+    offset: 0-based result offset for pagination; pass the previous call's
+    next_offset to fetch the next page (only present while truncated=True).
     """
     try:
         max_results = _clamp_limit(limit)
+        page_offset = _clamp_offset(offset)
         result = _request(
             "GET",
-            f"/api/organizations/{organization_id}/projects/",
-            params={"limit": max_results},
+            f"/api/organizations/{_path_segment(organization_id)}/projects/",
+            params={"limit": max_results, "offset": page_offset},
         )
-        projects, truncated = _paginated_results(result, max_results)
-        return _success(projects=projects, truncated=truncated)
+        projects, truncated, next_offset = _paginated_results(
+            result, max_results, page_offset
+        )
+        return _success(projects=projects, truncated=truncated, next_offset=next_offset)
     except Exception as e:
         logger.error(f"Error listing PostHog projects for org {organization_id}: {e}")
         return _error(str(e))
@@ -200,7 +275,9 @@ def posthog_query(
         body: dict[str, Any] = {"query": {"kind": "HogQLQuery", "query": hogql_query}}
         if name:
             body["name"] = name
-        result = _request("POST", f"/api/projects/{project_id}/query/", json_data=body)
+        result = _request(
+            "POST", f"/api/projects/{_path_segment(project_id)}/query/", json_data=body
+        )
         return _success(
             columns=result.get("columns"),
             results=result.get("results"),
@@ -213,22 +290,29 @@ def posthog_query(
 
 @mcp.tool()
 def posthog_list_persons(
-    project_id: str = "@current", search: str = "", limit: int = 50
+    project_id: str = "@current", search: str = "", limit: int = 50, offset: int = 0
 ) -> str:
     """
     Search/list persons (users tracked by PostHog) in a project.
     search: optional substring matched against distinct_id/email/name by
     PostHog's own search — for aggregate or property-filtered lookups,
     prefer posthog_query against the `persons` table instead.
+    offset: 0-based result offset for pagination; pass the previous call's
+    next_offset to fetch the next page (only present while truncated=True).
     """
     try:
         max_results = _clamp_limit(limit)
-        params: dict[str, Any] = {"limit": max_results}
+        page_offset = _clamp_offset(offset)
+        params: dict[str, Any] = {"limit": max_results, "offset": page_offset}
         if search:
             params["search"] = search
-        result = _request("GET", f"/api/projects/{project_id}/persons/", params=params)
-        persons, truncated = _paginated_results(result, max_results)
-        return _success(persons=persons, truncated=truncated)
+        result = _request(
+            "GET", f"/api/projects/{_path_segment(project_id)}/persons/", params=params
+        )
+        persons, truncated, next_offset = _paginated_results(
+            result, max_results, page_offset
+        )
+        return _success(persons=persons, truncated=truncated, next_offset=next_offset)
     except Exception as e:
         logger.error(f"Error listing PostHog persons in project {project_id}: {e}")
         return _error(str(e))
@@ -242,7 +326,11 @@ def posthog_get_person(person_id: str, project_id: str = "@current") -> str:
     posthog_query.
     """
     try:
-        result = _request("GET", f"/api/projects/{project_id}/persons/{person_id}/")
+        result = _request(
+            "GET",
+            f"/api/projects/{_path_segment(project_id)}/persons/"
+            f"{_path_segment(person_id)}/",
+        )
         return _success(person=result)
     except Exception as e:
         logger.error(
@@ -253,21 +341,32 @@ def posthog_get_person(person_id: str, project_id: str = "@current") -> str:
 
 @mcp.tool()
 def posthog_list_insights(
-    project_id: str = "@current", search: str = "", limit: int = 50
+    project_id: str = "@current", search: str = "", limit: int = 50, offset: int = 0
 ) -> str:
     """
     List saved insights (trends, funnels, retention, etc.) in a project —
     id, short_id, name, and the insight type.
     search: optional substring matched against the insight's name.
+    offset: 0-based result offset for pagination; pass the previous call's
+    next_offset to fetch the next page (only present while truncated=True).
     """
     try:
         max_results = _clamp_limit(limit)
-        params: dict[str, Any] = {"limit": max_results, "basic": "true"}
+        page_offset = _clamp_offset(offset)
+        params: dict[str, Any] = {
+            "limit": max_results,
+            "offset": page_offset,
+            "basic": "true",
+        }
         if search:
             params["search"] = search
-        result = _request("GET", f"/api/projects/{project_id}/insights/", params=params)
-        insights, truncated = _paginated_results(result, max_results)
-        return _success(insights=insights, truncated=truncated)
+        result = _request(
+            "GET", f"/api/projects/{_path_segment(project_id)}/insights/", params=params
+        )
+        insights, truncated, next_offset = _paginated_results(
+            result, max_results, page_offset
+        )
+        return _success(insights=insights, truncated=truncated, next_offset=next_offset)
     except Exception as e:
         logger.error(f"Error listing PostHog insights in project {project_id}: {e}")
         return _error(str(e))
@@ -280,7 +379,11 @@ def posthog_get_insight(insight_id: str, project_id: str = "@current") -> str:
     insight_id: an insight's numeric id or short_id, from posthog_list_insights.
     """
     try:
-        result = _request("GET", f"/api/projects/{project_id}/insights/{insight_id}/")
+        result = _request(
+            "GET",
+            f"/api/projects/{_path_segment(project_id)}/insights/"
+            f"{_path_segment(insight_id)}/",
+        )
         return _success(insight=result)
     except Exception as e:
         logger.error(
@@ -290,19 +393,28 @@ def posthog_get_insight(insight_id: str, project_id: str = "@current") -> str:
 
 
 @mcp.tool()
-def posthog_list_feature_flags(project_id: str = "@current", limit: int = 50) -> str:
+def posthog_list_feature_flags(
+    project_id: str = "@current", limit: int = 50, offset: int = 0
+) -> str:
     """
     List feature flags in a project — id, key, name, and whether it's active.
+    offset: 0-based result offset for pagination; pass the previous call's
+    next_offset to fetch the next page (only present while truncated=True).
     """
     try:
         max_results = _clamp_limit(limit)
+        page_offset = _clamp_offset(offset)
         result = _request(
             "GET",
-            f"/api/projects/{project_id}/feature_flags/",
-            params={"limit": max_results},
+            f"/api/projects/{_path_segment(project_id)}/feature_flags/",
+            params={"limit": max_results, "offset": page_offset},
         )
-        flags, truncated = _paginated_results(result, max_results)
-        return _success(feature_flags=flags, truncated=truncated)
+        flags, truncated, next_offset = _paginated_results(
+            result, max_results, page_offset
+        )
+        return _success(
+            feature_flags=flags, truncated=truncated, next_offset=next_offset
+        )
     except Exception as e:
         logger.error(
             f"Error listing PostHog feature flags in project {project_id}: {e}"
@@ -311,19 +423,28 @@ def posthog_list_feature_flags(project_id: str = "@current", limit: int = 50) ->
 
 
 @mcp.tool()
-def posthog_list_dashboards(project_id: str = "@current", limit: int = 50) -> str:
+def posthog_list_dashboards(
+    project_id: str = "@current", limit: int = 50, offset: int = 0
+) -> str:
     """
     List dashboards in a project — id, name, and description.
+    offset: 0-based result offset for pagination; pass the previous call's
+    next_offset to fetch the next page (only present while truncated=True).
     """
     try:
         max_results = _clamp_limit(limit)
+        page_offset = _clamp_offset(offset)
         result = _request(
             "GET",
-            f"/api/projects/{project_id}/dashboards/",
-            params={"limit": max_results},
+            f"/api/projects/{_path_segment(project_id)}/dashboards/",
+            params={"limit": max_results, "offset": page_offset},
         )
-        dashboards, truncated = _paginated_results(result, max_results)
-        return _success(dashboards=dashboards, truncated=truncated)
+        dashboards, truncated, next_offset = _paginated_results(
+            result, max_results, page_offset
+        )
+        return _success(
+            dashboards=dashboards, truncated=truncated, next_offset=next_offset
+        )
     except Exception as e:
         logger.error(f"Error listing PostHog dashboards in project {project_id}: {e}")
         return _error(str(e))
@@ -331,23 +452,32 @@ def posthog_list_dashboards(project_id: str = "@current", limit: int = 50) -> st
 
 @mcp.tool()
 def posthog_list_annotations(
-    project_id: str = "@current", search: str = "", limit: int = 50
+    project_id: str = "@current", search: str = "", limit: int = 50, offset: int = 0
 ) -> str:
     """
     List annotations (notes marking a point in time, e.g. a deploy or
     incident) in a project.
     search: optional substring matched against the annotation's content.
+    offset: 0-based result offset for pagination; pass the previous call's
+    next_offset to fetch the next page (only present while truncated=True).
     """
     try:
         max_results = _clamp_limit(limit)
-        params: dict[str, Any] = {"limit": max_results}
+        page_offset = _clamp_offset(offset)
+        params: dict[str, Any] = {"limit": max_results, "offset": page_offset}
         if search:
             params["search"] = search
         result = _request(
-            "GET", f"/api/projects/{project_id}/annotations/", params=params
+            "GET",
+            f"/api/projects/{_path_segment(project_id)}/annotations/",
+            params=params,
         )
-        annotations, truncated = _paginated_results(result, max_results)
-        return _success(annotations=annotations, truncated=truncated)
+        annotations, truncated, next_offset = _paginated_results(
+            result, max_results, page_offset
+        )
+        return _success(
+            annotations=annotations, truncated=truncated, next_offset=next_offset
+        )
     except Exception as e:
         logger.error(f"Error listing PostHog annotations in project {project_id}: {e}")
         return _error(str(e))
@@ -355,12 +485,18 @@ def posthog_list_annotations(
 
 @mcp.tool()
 def posthog_create_annotation(
-    content: str, project_id: str = "@current", date_marker: str = ""
+    content: str, project_id: str, date_marker: str = ""
 ) -> str:
     """
     Create an annotation — a note marking a point in time on PostHog's
     graphs, e.g. "Deployed v2.3" or "Started incident".
     content: the annotation's text.
+    project_id: a project id from posthog_list_projects. Required — unlike
+    the read-only tools here, this has no "@current" default: creating an
+    annotation is a write with no delete/undo tool in this connector, and a
+    multi-project key's "current" project (PostHog resolves "@current" from
+    the account's mutable active-team setting) can silently differ from the
+    project the caller intended.
     date_marker: optional ISO 8601 timestamp the annotation should be
     anchored to; defaults to now if omitted.
     """
@@ -369,7 +505,9 @@ def posthog_create_annotation(
         if date_marker:
             body["date_marker"] = date_marker
         result = _request(
-            "POST", f"/api/projects/{project_id}/annotations/", json_data=body
+            "POST",
+            f"/api/projects/{_path_segment(project_id)}/annotations/",
+            json_data=body,
         )
         return _success(annotation=result)
     except Exception as e:

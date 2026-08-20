@@ -86,6 +86,84 @@ def test_base_url_strips_surrounding_whitespace(monkeypatch):
     assert posthog._base_url() == "https://eu.posthog.com"
 
 
+def test_base_url_preserves_explicit_port(monkeypatch):
+    monkeypatch.setenv("POSTHOG_HOST", "posthog.internal.example.com:8443")
+
+    assert posthog._base_url() == "https://posthog.internal.example.com:8443"
+
+
+def test_base_url_rejects_http_scheme(monkeypatch):
+    monkeypatch.setenv("POSTHOG_HOST", "http://us.posthog.com")
+
+    with pytest.raises(ValueError, match="https"):
+        posthog._base_url()
+
+
+def test_base_url_rejects_embedded_credentials(monkeypatch):
+    monkeypatch.setenv("POSTHOG_HOST", "user:pass@us.posthog.com")
+
+    with pytest.raises(ValueError, match="credentials"):
+        posthog._base_url()
+
+
+def test_base_url_rejects_path_in_host(monkeypatch):
+    monkeypatch.setenv("POSTHOG_HOST", "us.posthog.com/api")
+
+    with pytest.raises(ValueError, match="path"):
+        posthog._base_url()
+
+
+def test_base_url_rejects_query_in_host(monkeypatch):
+    monkeypatch.setenv("POSTHOG_HOST", "us.posthog.com?x=1")
+
+    with pytest.raises(ValueError, match="path"):
+        posthog._base_url()
+
+
+@pytest.mark.parametrize(
+    "host", ["127.0.0.1", "localhost", "169.254.169.254", "10.0.0.5"]
+)
+def test_base_url_rejects_private_network_host(monkeypatch, host):
+    monkeypatch.setenv("POSTHOG_HOST", host)
+
+    with pytest.raises(ValueError, match="POSTHOG_HOST"):
+        posthog._base_url()
+
+
+def test_path_segment_encodes_traversal_attempt():
+    assert posthog._path_segment("1/../2") == "1%2F..%2F2"
+
+
+def test_path_segment_encodes_at_current_sentinel():
+    # PostHog's server percent-decodes path segments before route matching,
+    # so the encoded form still resolves to the literal "@current" sentinel.
+    assert posthog._path_segment("@current") == "%40current"
+
+
+def test_paginated_results_returns_next_offset_when_truncated():
+    page, truncated, next_offset = posthog._paginated_results(
+        {
+            "results": [{"id": 1}, {"id": 2}],
+            "next": "https://us.posthog.com/x?offset=2",
+        },
+        limit=2,
+        offset=0,
+    )
+
+    assert page == [{"id": 1}, {"id": 2}]
+    assert truncated is True
+    assert next_offset == 2
+
+
+def test_paginated_results_no_next_offset_when_not_truncated():
+    page, truncated, next_offset = posthog._paginated_results(
+        {"results": [{"id": 1}], "next": None}, limit=50, offset=10
+    )
+
+    assert truncated is False
+    assert next_offset is None
+
+
 def test_request_uses_configured_host_and_headers(monkeypatch):
     mock_request = Mock(return_value=MockResponse(json_data={"ok": True}))
     monkeypatch.setattr(posthog.requests, "request", mock_request)
@@ -196,6 +274,7 @@ def test_list_organizations_returns_results_and_truncated_flag(monkeypatch):
     assert result["status"] == "success"
     assert result["organizations"] == [{"id": "org1", "name": "Acme"}]
     assert result["truncated"] is True
+    assert result["next_offset"] == 1
 
 
 def test_list_organizations_not_truncated_when_no_next_page(monkeypatch):
@@ -213,6 +292,33 @@ def test_list_organizations_not_truncated_when_no_next_page(monkeypatch):
 
     assert result["status"] == "success"
     assert result["truncated"] is False
+    assert result["next_offset"] is None
+
+
+def test_list_organizations_passes_offset_and_returns_next_offset(monkeypatch):
+    mock_request = Mock(
+        return_value=MockResponse(
+            json_data={
+                "results": [{"id": "org1"}],
+                "next": "https://us.posthog.com/api/organizations/?offset=51",
+            }
+        )
+    )
+    monkeypatch.setattr(posthog.requests, "request", mock_request)
+
+    result = json.loads(posthog.posthog_list_organizations(offset=50))
+
+    assert mock_request.call_args.kwargs["params"]["offset"] == 50
+    assert result["next_offset"] == 51
+
+
+def test_list_organizations_clamps_negative_offset(monkeypatch):
+    mock_request = Mock(return_value=MockResponse(json_data={"results": []}))
+    monkeypatch.setattr(posthog.requests, "request", mock_request)
+
+    posthog.posthog_list_organizations(offset=-5)
+
+    assert mock_request.call_args.kwargs["params"]["offset"] == 0
 
 
 def test_list_projects_uses_organization_id_in_path(monkeypatch):
@@ -238,9 +344,23 @@ def test_list_projects_defaults_organization_id_to_current(monkeypatch):
 
     posthog.posthog_list_projects()
 
+    # "@current" is percent-encoded like any other id (see
+    # test_list_projects_encodes_hostile_organization_id); PostHog's server
+    # decodes it back to the literal sentinel before route matching.
     assert mock_request.call_args.kwargs["url"].endswith(
-        "/api/organizations/@current/projects/"
+        "/api/organizations/%40current/projects/"
     )
+
+
+def test_list_projects_encodes_hostile_organization_id(monkeypatch):
+    mock_request = Mock(return_value=MockResponse(json_data={"results": []}))
+    monkeypatch.setattr(posthog.requests, "request", mock_request)
+
+    posthog.posthog_list_projects(organization_id="1/../2")
+
+    url = mock_request.call_args.kwargs["url"]
+    assert "/../" not in url
+    assert url.endswith("/api/organizations/1%2F..%2F2/projects/")
 
 
 def test_query_sends_hogql_query_body(monkeypatch):
@@ -269,7 +389,7 @@ def test_query_sends_hogql_query_body(monkeypatch):
         "name": "my query",
     }
     assert mock_request.call_args.kwargs["url"].endswith(
-        "/api/projects/@current/query/"
+        "/api/projects/%40current/query/"
     )
 
 
@@ -307,8 +427,19 @@ def test_get_person_returns_person(monkeypatch):
     assert result["status"] == "success"
     assert result["person"]["id"] == 1
     assert mock_request.call_args.kwargs["url"].endswith(
-        "/api/projects/@current/persons/1/"
+        "/api/projects/%40current/persons/1/"
     )
+
+
+def test_get_person_encodes_hostile_person_id(monkeypatch):
+    mock_request = Mock(return_value=MockResponse(json_data={"id": 1}))
+    monkeypatch.setattr(posthog.requests, "request", mock_request)
+
+    posthog.posthog_get_person("1/../2", project_id="proj1")
+
+    url = mock_request.call_args.kwargs["url"]
+    assert "/../" not in url
+    assert url.endswith("/api/projects/proj1/persons/1%2F..%2F2/")
 
 
 def test_list_insights_requests_basic_shape(monkeypatch):
@@ -393,24 +524,34 @@ def test_create_annotation_sends_content_and_scope(monkeypatch):
     )
     monkeypatch.setattr(posthog.requests, "request", mock_request)
 
-    result = json.loads(posthog.posthog_create_annotation("Deployed v2"))
+    result = json.loads(posthog.posthog_create_annotation("Deployed v2", "proj1"))
 
     assert result["status"] == "success"
     assert mock_request.call_args.kwargs["json"] == {
         "content": "Deployed v2",
         "scope": "project",
     }
+    assert mock_request.call_args.kwargs["url"].endswith(
+        "/api/projects/proj1/annotations/"
+    )
 
 
 def test_create_annotation_includes_date_marker_when_provided(monkeypatch):
     mock_request = Mock(return_value=MockResponse(json_data={"id": 1}))
     monkeypatch.setattr(posthog.requests, "request", mock_request)
 
-    posthog.posthog_create_annotation("Deployed v2", date_marker="2026-08-18T00:00:00Z")
+    posthog.posthog_create_annotation(
+        "Deployed v2", "proj1", date_marker="2026-08-18T00:00:00Z"
+    )
 
     assert (
         mock_request.call_args.kwargs["json"]["date_marker"] == "2026-08-18T00:00:00Z"
     )
+
+
+def test_create_annotation_requires_project_id():
+    with pytest.raises(TypeError):
+        posthog.posthog_create_annotation("Deployed v2")
 
 
 def test_posthog_app_registry_requires_api_key_and_host():

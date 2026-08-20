@@ -62,7 +62,9 @@ class User(Base):  # type: ignore
     )
     # This historical relationship represents the user's ordinary OAuth
     # accounts. Actor-owned credentials share the table for storage only and
-    # must be loaded through explicit owner-scoped service queries.
+    # must be loaded through explicit owner-scoped service queries. Their user
+    # deletion depends on the database ``ON DELETE CASCADE``; SQLite engine
+    # initialization enables and monitors the required foreign-key pragma.
     oauth_accounts = relationship(
         "UserOAuth",
         primaryjoin=(

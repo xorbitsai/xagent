@@ -114,6 +114,52 @@ def _create_tables_without_visibility_column(connection):
     )
 
 
+def _create_tables_without_optional_provider_column(connection):
+    """Same public_mcp_apps table as _create_tables, but oauth_providers is
+    missing redirect_uri -- simulates a database that predates that
+    (optional, nullable) column. Unlike is_visible_in_connector on
+    public_mcp_apps, no oauth_providers column is treated as required here,
+    so _filter_row is expected to silently drop it and seed the rest."""
+    connection.execute(
+        text(
+            """
+            CREATE TABLE oauth_providers (
+                id INTEGER PRIMARY KEY,
+                provider_name VARCHAR(50) NOT NULL UNIQUE,
+                name VARCHAR(100) NOT NULL,
+                client_id VARCHAR(500) NOT NULL,
+                client_secret VARCHAR(500) NOT NULL,
+                auth_url VARCHAR(500) NOT NULL,
+                token_url VARCHAR(500) NOT NULL,
+                userinfo_url VARCHAR(500),
+                user_id_path VARCHAR(100),
+                email_path VARCHAR(100),
+                default_scopes JSON
+            )
+            """
+        )
+    )
+    connection.execute(
+        text(
+            """
+            CREATE TABLE public_mcp_apps (
+                id INTEGER PRIMARY KEY,
+                app_id VARCHAR(100) NOT NULL UNIQUE,
+                name VARCHAR(200) NOT NULL,
+                description TEXT,
+                icon VARCHAR(1000),
+                transport VARCHAR(50) NOT NULL DEFAULT 'oauth',
+                provider_name VARCHAR(50),
+                category VARCHAR(100),
+                oauth_scopes JSON,
+                is_visible_in_connector BOOLEAN NOT NULL DEFAULT 1,
+                launch_config JSON
+            )
+            """
+        )
+    )
+
+
 def _app_ids(connection):
     return set(connection.execute(text("SELECT app_id FROM public_mcp_apps")).scalars())
 
@@ -158,6 +204,27 @@ def test_upgrade_raises_when_visibility_column_missing(tmp_path):
         with patch.object(migration, "op", _operations(connection)):
             with pytest.raises(RuntimeError, match="is_visible_in_connector"):
                 migration.upgrade()
+
+
+def test_upgrade_seeds_provider_when_optional_column_missing(tmp_path):
+    """Mirrors test_upgrade_raises_when_visibility_column_missing above, for
+    the opposite case: oauth_providers has no column this migration treats
+    as required, so a missing optional column (redirect_uri here) must be
+    silently dropped by _filter_row and the row still seeded, not raise."""
+    engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
+    migration = _load_migration_module()
+    with engine.begin() as connection:
+        _create_tables_without_optional_provider_column(connection)
+        with patch.object(migration, "op", _operations(connection)):
+            migration.upgrade()
+        assert "linear" in _provider_names(connection)
+        columns = {
+            row[1]
+            for row in connection.execute(
+                text("PRAGMA table_info(oauth_providers)")
+            ).fetchall()
+        }
+        assert "redirect_uri" not in columns
 
 
 def test_upgrade_is_idempotent(tmp_path):

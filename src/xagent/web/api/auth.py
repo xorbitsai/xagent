@@ -36,6 +36,7 @@ from ..models.user import User
 from ..models.user_oauth import UserOAuth
 from ..services import gmail_provisioning
 from ..services.auth_email import send_password_reset_email
+from ..utils.graphql_errors import graphql_errors_message, truncate_error_text
 
 logger = logging.getLogger(__name__)
 
@@ -329,20 +330,11 @@ def _fetch_linear_viewer_identity(
         timeout=10.0,
     )
 
-    def _errors_message(payload: Any) -> str | None:
+    def _payload_errors_message(payload: Any) -> str | None:
         if not isinstance(payload, dict):
             return None
         errors = payload.get("errors")
-        if not errors:
-            return None
-        return "; ".join(
-            str(entry.get("message", entry)) if isinstance(entry, dict) else str(entry)
-            for entry in errors
-        )
-
-    def _truncate(text: str, limit: int = 500) -> str:
-        text = text.strip()
-        return text if len(text) <= limit else text[:limit] + "... [truncated]"
+        return graphql_errors_message(errors) if errors else None
 
     if response.status_code != 200:
         # Mirrors linear.py's _graphql(): prefer the structured GraphQL
@@ -351,11 +343,11 @@ def _fetch_linear_viewer_identity(
         # gateway/WAF page on a 502/504) rather than discarding it.
         detail = None
         try:
-            detail = _errors_message(response.json())
+            detail = _payload_errors_message(response.json())
         except ValueError:
             pass
         if detail is None:
-            detail = _truncate(response.text)
+            detail = truncate_error_text(response.text.strip(), limit=500)
         raise RuntimeError(
             f"Linear API error (status {response.status_code})"
             + (f": {detail}" if detail else "")
@@ -364,14 +356,17 @@ def _fetch_linear_viewer_identity(
         payload = response.json()
     except ValueError:
         raise RuntimeError(
-            f"Linear API returned a non-JSON response: {_truncate(response.text)}"
+            "Linear API returned a non-JSON response: "
+            f"{truncate_error_text(response.text.strip(), limit=500)}"
         ) from None
     if not isinstance(payload, dict):
         raise RuntimeError("Linear API returned an unexpected response body")
     data = payload.get("data")
     viewer = data.get("viewer") if isinstance(data, dict) else None
     if not isinstance(viewer, dict):
-        raise RuntimeError(_errors_message(payload) or "Linear did not return a viewer")
+        raise RuntimeError(
+            _payload_errors_message(payload) or "Linear did not return a viewer"
+        )
     return viewer.get("id"), viewer.get("email")
 
 
@@ -1672,39 +1667,18 @@ def generic_oauth_callback(
         provider_user_id = None
         email = None
 
-        if userinfo_url and access_token:
-            info_headers = {"Authorization": f"Bearer {access_token}"}
-            # Replace {{access_token}} placeholder if present
-            actual_url = userinfo_url.replace("{{access_token}}", access_token)
-            info_response = requests.get(actual_url, headers=info_headers, timeout=10.0)
-            if info_response.status_code == 200:
-                info_data = info_response.json()
-                if isinstance(info_data, dict) and info_data.get("ok") is False:
-                    # Slack-style APIs answer HTTP 200 with {"ok": false,
-                    # "error": ...} on failure; a status check alone would
-                    # treat a bad/revoked token as success and persist a
-                    # "connected" account with no identity. Fail the
-                    # callback instead. Providers without Slack semantics
-                    # never carry an "ok" key, so they are unaffected.
-                    import html
-
-                    escaped_error = html.escape(
-                        str(info_data.get("error") or "unknown error")
-                    )
-                    return HTMLResponse(
-                        content=(
-                            "<h1>Error verifying the connected account</h1>"
-                            f"<p>The provider reported: {escaped_error}</p>"
-                        ),
-                        status_code=400,
-                    )
-                provider_user_id = info_data.get(db_provider.user_id_path or "id")
-                email = info_data.get(db_provider.email_path or "email")
-        elif provider.lower() == "linear" and access_token:
-            # Linear's provider row leaves userinfo_url empty (GraphQL-only,
-            # no flat REST endpoint fits the block above) -- see
-            # _fetch_linear_viewer_identity's docstring for why this is not
-            # just a label workaround.
+        if provider.lower() == "linear":
+            # Checked before the generic userinfo_url branch below (not
+            # "elif" on it), not just as an ordering nicety: Linear's
+            # provider row leaves userinfo_url empty today (GraphQL-only, no
+            # flat REST endpoint fits that branch), but if userinfo_url were
+            # ever populated on Linear's row (e.g. an admin edit), the
+            # generic branch's REST GET would run instead, fail silently
+            # against Linear's GraphQL-only API, and persist the connection
+            # as "healthy" with no identity. Checking the provider name
+            # first means this path always wins for Linear regardless of
+            # what userinfo_url holds -- see _fetch_linear_viewer_identity's
+            # docstring for why this is not just a label workaround.
             try:
                 provider_user_id, email = _fetch_linear_viewer_identity(access_token)
             except RuntimeError as e:
@@ -1734,6 +1708,34 @@ def generic_oauth_callback(
                     ),
                     status_code=400,
                 )
+        elif userinfo_url and access_token:
+            info_headers = {"Authorization": f"Bearer {access_token}"}
+            # Replace {{access_token}} placeholder if present
+            actual_url = userinfo_url.replace("{{access_token}}", access_token)
+            info_response = requests.get(actual_url, headers=info_headers, timeout=10.0)
+            if info_response.status_code == 200:
+                info_data = info_response.json()
+                if isinstance(info_data, dict) and info_data.get("ok") is False:
+                    # Slack-style APIs answer HTTP 200 with {"ok": false,
+                    # "error": ...} on failure; a status check alone would
+                    # treat a bad/revoked token as success and persist a
+                    # "connected" account with no identity. Fail the
+                    # callback instead. Providers without Slack semantics
+                    # never carry an "ok" key, so they are unaffected.
+                    import html
+
+                    escaped_error = html.escape(
+                        str(info_data.get("error") or "unknown error")
+                    )
+                    return HTMLResponse(
+                        content=(
+                            "<h1>Error verifying the connected account</h1>"
+                            f"<p>The provider reported: {escaped_error}</p>"
+                        ),
+                        status_code=400,
+                    )
+                provider_user_id = info_data.get(db_provider.user_id_path or "id")
+                email = info_data.get(db_provider.email_path or "email")
 
         if user_id:
             db.query(UserOAuth).filter(

@@ -8,6 +8,7 @@ from typing import Any
 import requests
 from mcp.server.fastmcp import FastMCP
 
+from ...utils.graphql_errors import graphql_errors_message, truncate_error_text
 from .utils import setup_proxy_env
 
 logging.basicConfig(level=logging.INFO)
@@ -28,10 +29,6 @@ MAX_LIMIT = 100
 # header (UTC epoch milliseconds). On that signal we wait once and retry
 # rather than failing outright.
 MAX_RETRY_AFTER_SECONDS = 30
-# Matches zoom.py's convention: an error body that isn't the expected
-# {"errors": [...]} GraphQL shape (e.g. an HTML gateway error page) must not
-# be forwarded to the LLM/logs verbatim and unbounded.
-MAX_ERROR_RESPONSE_TEXT_CHARS = 1000
 
 _UUID_PATTERN = re.compile(
     r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
@@ -77,7 +74,7 @@ def _success(*, _errors: list[Any] | None = None, **payload: Any) -> str:
         # resolved) -- surface it in the result instead of only the server
         # log, consistent with this module's own truncated=true contract
         # for "results are incomplete".
-        body["warnings"] = [_graphql_errors_message(_errors)]
+        body["warnings"] = [graphql_errors_message(_errors)]
     return json.dumps(body, ensure_ascii=False)
 
 
@@ -99,16 +96,6 @@ def _clamp_limit(limit: int) -> int:
     return max(1, min(int(limit), MAX_LIMIT))
 
 
-def _graphql_errors_message(errors: list[Any]) -> str:
-    messages = []
-    for entry in errors:
-        if isinstance(entry, dict) and entry.get("message"):
-            messages.append(str(entry["message"]))
-        else:
-            messages.append(str(entry))
-    return "; ".join(messages) if messages else "Unknown Linear API error"
-
-
 def _mutation_failure_message(base_message: str, errors: list[Any]) -> str:
     """`success: false` on its own gives the caller nothing to act on --
     bad team, missing permission, and invalid label id all look identical.
@@ -116,13 +103,7 @@ def _mutation_failure_message(base_message: str, errors: list[Any]) -> str:
     carries (already returned by `_graphql` alongside `data`), when any."""
     if not errors:
         return base_message
-    return f"{base_message}: {_graphql_errors_message(errors)}"
-
-
-def _truncate_error_text(text: str) -> str:
-    if len(text) > MAX_ERROR_RESPONSE_TEXT_CHARS:
-        return text[:MAX_ERROR_RESPONSE_TEXT_CHARS] + "... [truncated]"
-    return text
+    return f"{base_message}: {graphql_errors_message(errors)}"
 
 
 def _is_rate_limited(response: requests.Response) -> bool:
@@ -225,11 +206,11 @@ def _graphql(
         try:
             payload = response.json()
             if isinstance(payload, dict) and payload.get("errors"):
-                detail = _graphql_errors_message(payload["errors"])
+                detail = graphql_errors_message(payload["errors"])
         except ValueError:
             pass
         if detail is None:
-            detail = _truncate_error_text(response.text.strip())
+            detail = truncate_error_text(response.text.strip())
         raise RuntimeError(
             f"Linear API error (status {response.status_code}): {detail}"
         )
@@ -237,7 +218,7 @@ def _graphql(
     try:
         payload = response.json()
     except ValueError:
-        detail = _truncate_error_text(response.text.strip())
+        detail = truncate_error_text(response.text.strip())
         raise RuntimeError(
             f"Linear API returned a non-JSON response: {detail}"
         ) from None
@@ -261,7 +242,7 @@ def _graphql(
         )
     errors = payload.get("errors") or []
     if errors:
-        message = _graphql_errors_message(errors)
+        message = graphql_errors_message(errors)
         if all(value is None for value in data.values()):
             # Every top-level field is null (or data is empty) -- nothing
             # usable to return, e.g. a permission failure on the single

@@ -27,12 +27,21 @@ from xagent.web.tools import config as tool_config
 
 
 class MockResponse:
-    def __init__(self, json_data=None, status_code: int = 200, text: str = ""):
+    def __init__(
+        self,
+        json_data=None,
+        status_code: int = 200,
+        text: str = "",
+        raise_on_json: bool = False,
+    ):
         self._json_data = json_data or {}
         self.status_code = status_code
         self.text = text
+        self._raise_on_json = raise_on_json
 
     def json(self):
+        if self._raise_on_json:
+            raise ValueError("not JSON")
         return self._json_data
 
 
@@ -202,6 +211,51 @@ def test_callback_fetches_identity_via_graphql_viewer_query(db_session, monkeypa
     assert oauth_account.provider_user_id == "linear-user-1"
 
 
+def test_callback_uses_graphql_identity_even_if_userinfo_url_is_set(
+    db_session, monkeypatch
+):
+    """The Linear branch must win on provider name alone, not merely because
+    userinfo_url happens to be empty today -- if a provider row's
+    userinfo_url were ever populated for Linear (e.g. an admin edit via
+    update_provider), the generic REST-GET branch would otherwise run
+    instead, fail silently against Linear's GraphQL-only API, and persist
+    the connection as "healthy" with no identity."""
+    db, user = db_session
+    provider = _linear_provider()
+    provider.userinfo_url = "https://example.com/should-not-be-called"
+    mock_post = Mock(
+        side_effect=[
+            MockResponse(
+                {
+                    "access_token": "linear-token",
+                    "refresh_token": "linear-refresh",
+                    "token_type": "Bearer",
+                    "scope": "read,write",
+                    "expires_in": 86400,
+                }
+            ),
+            _LINEAR_VIEWER_RESPONSE,
+        ]
+    )
+    mock_get = Mock()
+    monkeypatch.setattr("xagent.web.api.auth.requests.post", mock_post)
+    monkeypatch.setattr("xagent.web.api.auth.requests.get", mock_get)
+
+    response = generic_oauth_callback(
+        "linear", _callback_request(db, user), db, provider
+    )
+
+    assert response.status_code == 200
+    mock_get.assert_not_called()
+    oauth_account = (
+        db.query(UserOAuth)
+        .filter(UserOAuth.user_id == user.id, UserOAuth.provider == "linear")
+        .first()
+    )
+    assert oauth_account.provider_user_id == "linear-user-1"
+    assert oauth_account.email == "ada@example.com"
+
+
 def test_callback_fails_when_viewer_query_is_rejected(db_session, monkeypatch):
     """A token Linear won't honour must be caught here (this doubles as
     post-exchange token verification) rather than persisted as a healthy
@@ -301,6 +355,129 @@ def test_callback_surfaces_raw_body_when_non_200_error_is_not_graphql_shaped(
 
     assert response.status_code == 400
     assert "Bad Gateway" in response.body.decode()
+
+
+def test_callback_surfaces_raw_body_when_non_200_response_is_not_json(
+    db_session, monkeypatch
+):
+    """A non-200 error body that isn't JSON at all (e.g. a plain-text or
+    HTML gateway page) must hit the `except ValueError` around parsing it as
+    GraphQL errors and fall through to the raw-text fallback, not raise
+    unhandled out of the callback."""
+    db, user = db_session
+    mock_post = Mock(
+        side_effect=[
+            MockResponse(
+                {
+                    "access_token": "linear-token",
+                    "token_type": "Bearer",
+                    "scope": "read,write",
+                    "expires_in": 86400,
+                }
+            ),
+            MockResponse(
+                status_code=503,
+                text="<html>Service Unavailable</html>",
+                raise_on_json=True,
+            ),
+        ]
+    )
+    monkeypatch.setattr("xagent.web.api.auth.requests.post", mock_post)
+
+    response = generic_oauth_callback(
+        "linear", _callback_request(db, user), db, _linear_provider()
+    )
+
+    assert response.status_code == 400
+    assert "Service Unavailable" in response.body.decode()
+
+
+def test_callback_fails_with_clear_message_when_200_viewer_response_is_not_json(
+    db_session, monkeypatch
+):
+    """A 200 response whose body isn't valid JSON must raise a clear,
+    truncated message rather than an unhandled exception escaping the
+    callback."""
+    db, user = db_session
+    mock_post = Mock(
+        side_effect=[
+            MockResponse(
+                {
+                    "access_token": "linear-token",
+                    "token_type": "Bearer",
+                    "scope": "read,write",
+                    "expires_in": 86400,
+                }
+            ),
+            MockResponse(status_code=200, text="not json", raise_on_json=True),
+        ]
+    )
+    monkeypatch.setattr("xagent.web.api.auth.requests.post", mock_post)
+
+    response = generic_oauth_callback(
+        "linear", _callback_request(db, user), db, _linear_provider()
+    )
+
+    assert response.status_code == 400
+    assert "non-JSON response" in response.body.decode()
+
+
+def test_callback_fails_when_200_response_body_is_not_a_dict(db_session, monkeypatch):
+    """A 200 response whose JSON body parses to something other than an
+    object (e.g. a bare list) must raise a clear message instead of an
+    unhandled AttributeError from treating it as a dict."""
+    db, user = db_session
+    mock_post = Mock(
+        side_effect=[
+            MockResponse(
+                {
+                    "access_token": "linear-token",
+                    "token_type": "Bearer",
+                    "scope": "read,write",
+                    "expires_in": 86400,
+                }
+            ),
+            MockResponse([1, 2, 3], status_code=200),
+        ]
+    )
+    monkeypatch.setattr("xagent.web.api.auth.requests.post", mock_post)
+
+    response = generic_oauth_callback(
+        "linear", _callback_request(db, user), db, _linear_provider()
+    )
+
+    assert response.status_code == 400
+    assert "unexpected response body" in response.body.decode()
+
+
+def test_callback_fails_with_generic_message_when_viewer_missing_and_no_errors(
+    db_session, monkeypatch
+):
+    """A 200 response with neither a usable `viewer` nor an `errors` array
+    (an empty-but-valid GraphQL response) must fall back to a generic
+    "did not return a viewer" message rather than a blank/None detail."""
+    db, user = db_session
+    mock_post = Mock(
+        side_effect=[
+            MockResponse(
+                {
+                    "access_token": "linear-token",
+                    "token_type": "Bearer",
+                    "scope": "read,write",
+                    "expires_in": 86400,
+                }
+            ),
+            MockResponse({"data": {}}, status_code=200),
+        ]
+    )
+    monkeypatch.setattr("xagent.web.api.auth.requests.post", mock_post)
+
+    response = generic_oauth_callback(
+        "linear", _callback_request(db, user), db, _linear_provider()
+    )
+
+    assert response.status_code == 400
+    assert "did not return a viewer" in response.body.decode()
 
 
 def test_callback_distinguishes_network_failure_from_provider_rejection(

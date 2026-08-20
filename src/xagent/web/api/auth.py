@@ -1410,7 +1410,7 @@ class AppNotOAuthError(ValueError):
 
 
 def _ensure_user_mcp_server(
-    db: Session, user_id: str, app_info: Dict[str, Any]
+    db: Session, user_id: int, app_info: Dict[str, Any]
 ) -> None:
     """Ensure MCPServer and UserMCPServer records exist for an OAuth app."""
     from sqlalchemy.exc import IntegrityError
@@ -1539,7 +1539,16 @@ def generic_oauth_callback(
             content="<h1>Error: Invalid or expired state</h1>", status_code=400
         )
 
-    user_id = payload.get("user_id")
+    user_id_claim = payload.get("user_id")
+    try:
+        user_id = int(user_id_claim) if user_id_claim is not None else None
+    except (TypeError, ValueError):
+        # Reject malformed state before exchanging the provider code or
+        # mutating OAuth rows. Scoped database helpers require an integer
+        # owner and must not become the first validation boundary.
+        return HTMLResponse(
+            content="<h1>Error: Invalid or expired state</h1>", status_code=400
+        )
     app_id = payload.get("app_id")
 
     if app_id:

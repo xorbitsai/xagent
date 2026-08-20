@@ -643,7 +643,7 @@ def test_oauth_connection_does_not_reuse_same_name_custom_stdio_mcp() -> None:
             ) as exc:
                 _ensure_user_mcp_server(
                     db,
-                    str(user.id),
+                    int(user.id),
                     {
                         "id": "teams",
                         "name": "Teams",

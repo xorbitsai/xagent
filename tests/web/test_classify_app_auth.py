@@ -174,7 +174,7 @@ def test_oauth_landing_rejects_non_oauth_app():
     with pytest.raises(AppNotOAuthError, match="not an OAuth app"):
         _ensure_user_mcp_server(
             None,
-            "1",
+            1,
             {"id": "google-maps", "name": "Google Maps", "auth_type": "api_key"},
         )
 

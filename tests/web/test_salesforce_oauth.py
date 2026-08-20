@@ -124,6 +124,7 @@ def test_callback_persists_instance_url_and_skips_userinfo_lookup(
     assert mock_post.call_args.kwargs["data"]["client_secret"] == (
         "salesforce-client-secret"
     )
+    assert "code_verifier" not in mock_post.call_args.kwargs["data"]
 
     oauth_account = (
         db.query(UserOAuth)
@@ -147,6 +148,47 @@ def test_callback_persists_instance_url_and_skips_userinfo_lookup(
         .one()
     )
     assert user_mcp.is_active is True
+
+
+def test_callback_sends_decrypted_code_verifier_in_token_exchange(
+    db_session, monkeypatch
+):
+    """The callback must decrypt the PKCE verifier carried in `state` and
+    send the original plaintext value as code_verifier in the token
+    exchange -- not the still-encrypted form, and not omit it entirely.
+    Removing the line that adds code_verifier to the token-exchange POST
+    body must fail this test; no other test in this file or
+    test_generic_oauth_login.py exercises the full authorize-to-token-
+    exchange round trip for the verifier."""
+    db, user = db_session
+    mock_post = Mock(
+        return_value=MockResponse(
+            {
+                "access_token": "sf-token",
+                "instance_url": "https://acme.my.salesforce.com",
+            }
+        )
+    )
+    monkeypatch.setattr(auth_api.requests, "post", mock_post)
+    monkeypatch.setattr(auth_api.requests, "get", Mock())
+
+    verifier = "plain-text-verifier-value"
+    state = create_access_token(
+        data={
+            "type": "oauth_state",
+            "user_id": user.id,
+            "provider": "salesforce",
+            "app_id": "salesforce",
+            "code_verifier": encrypt_value(verifier),
+        },
+        expires_delta=timedelta(minutes=10),
+    )
+    request = SimpleNamespace(query_params={"code": "sf-code", "state": state})
+
+    response = generic_oauth_callback("salesforce", request, db, _salesforce_provider())
+
+    assert response.status_code == 200
+    assert mock_post.call_args.kwargs["data"]["code_verifier"] == verifier
 
 
 def test_non_salesforce_callback_does_not_persist_instance_url(db_session, monkeypatch):

@@ -18,7 +18,7 @@ import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
-from xagent.core.utils.encryption import decrypt_value, encrypt_value
+from xagent.core.utils.encryption import _is_encrypted, decrypt_value, encrypt_value
 from xagent.web.api.auth import (
     _resolve_oauth_secret,
     create_access_token,
@@ -197,8 +197,13 @@ def test_salesforce_provider_includes_pkce_code_challenge(db_session):
 
     state_payload = verify_token(qs["state"][0])
     encrypted_verifier = state_payload["code_verifier"]
-    assert encrypted_verifier != qs["code_challenge"][0]
     decrypted_verifier = decrypt_value(encrypted_verifier)
+    # The real regression this guards: encryption actually changed the
+    # value. `encrypted_verifier != qs["code_challenge"][0]` alone proves
+    # nothing -- a verifier trivially differs from its own derived S256
+    # hash regardless of whether encryption ever ran.
+    assert encrypted_verifier != decrypted_verifier
+    assert _is_encrypted(encrypted_verifier)
 
     expected_challenge = (
         base64.urlsafe_b64encode(

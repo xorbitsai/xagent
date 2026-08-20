@@ -134,10 +134,14 @@ WHERE resource_owner_key IS NOT NULL;
 
 The result must be zero.
 
-On PostgreSQL, verify that both partial unique index names exist and are valid:
+On PostgreSQL, verify both partial unique index definitions:
 
 ```sql
-SELECT c.relname, i.indisvalid
+SELECT
+  c.relname,
+  i.indisunique,
+  pg_get_expr(i.indpred, i.indrelid) AS predicate,
+  pg_get_indexdef(i.indexrelid) AS definition
 FROM pg_index i
 JOIN pg_class c ON c.oid = i.indexrelid
 JOIN pg_class t ON t.oid = i.indrelid
@@ -150,7 +154,7 @@ WHERE n.nspname = current_schema()
   );
 ```
 
-The query must return both rows with `indisvalid = true`.
+The query must return both rows with `indisunique = true`. The ordinary row must index `(user_id, provider, provider_user_id)` with `resource_owner_key IS NULL`; the actor row must index `(user_id, resource_owner_key, provider, provider_user_id)` with `resource_owner_key IS NOT NULL`.
 
 For SQLite run `PRAGMA index_list('user_oauth');` and `PRAGMA index_info('<index-name>');`. Inspect `sqlite_master.sql` to confirm that the ordinary index uses `WHERE resource_owner_key IS NULL` and the actor index uses `WHERE resource_owner_key IS NOT NULL`.
 

@@ -1,5 +1,5 @@
 import React from "react";
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const apiRequestMock = vi.hoisted(() => vi.fn());
@@ -250,6 +250,16 @@ describe("TemplatesPage featured section", () => {
     },
   });
 
+  const FEATURED_WORKFORCE = makeTemplate({
+    id: "growth_workforce",
+    name: "Growth Workforce",
+    category: "Marketing",
+    type: "workforce",
+    featured: true,
+    used_count: 999,
+    persona: null,
+  });
+
   function installFeaturedApiMock(featured: Template[]) {
     apiRequestMock.mockImplementation(async (url: string) => {
       if (url.includes("/api/templates/?lang=")) {
@@ -290,6 +300,35 @@ describe("TemplatesPage featured section", () => {
     expect(
       screen.getByText("templates.categoryTitles.featured").parentElement
     ).toHaveTextContent("3");
+  });
+
+  it("excludes a featured workforce template (no persona) from the hero slot, even with the highest used_count", async () => {
+    // If a workforce template were ever left in the pool, FeaturedSection's
+    // [hero, ...rest] destructuring would hand it the hero slot outright -
+    // it has no persona, so it'd render as a plain compact card with no
+    // "Most used" ribbon in the hero's oversized grid column. Excluding it
+    // from the Featured pool entirely just falls it back to its normal
+    // category section instead, same as any other non-featured template.
+    installFeaturedApiMock([FEATURED_WORKFORCE, SOPHIE, MAYA, ELLIE]);
+    render(<TemplatesPage />);
+
+    await waitFor(() => {
+      expect(screen.getByText("Maya")).toBeInTheDocument();
+    });
+
+    expect(screen.getByText("static-visual-design")).toBeInTheDocument();
+
+    const featuredSection = screen
+      .getByText("templates.categoryTitles.featured")
+      .closest("section");
+    expect(featuredSection).not.toBeNull();
+    expect(featuredSection).toHaveTextContent("3");
+    expect(
+      within(featuredSection as HTMLElement).queryByText("Growth Workforce")
+    ).not.toBeInTheDocument();
+
+    // Still browsable via its own category section, just not featured.
+    expect(screen.getByText("Growth Workforce")).toBeInTheDocument();
   });
 });
 

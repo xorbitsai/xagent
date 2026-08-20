@@ -17,6 +17,7 @@ export const TOOL_CATEGORY_I18N_KEYS: Record<string, string> = {
   database: "builds.configForm.tools.categories.database",
   skill: "builds.configForm.tools.categories.skill",
   ssh: "builds.configForm.tools.categories.ssh",
+  mcp: "builds.configForm.tools.categories.mcp",
 };
 
 export function capitalize(value: string): string {

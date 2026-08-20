@@ -1,10 +1,19 @@
 import { describe, expect, it } from "vitest";
-import { capitalize, getCardCapabilityTags } from "./tool-category-labels";
+import { capitalize, getCardCapabilityTags, TOOL_CATEGORY_I18N_KEYS } from "./tool-category-labels";
 
 describe("capitalize", () => {
   it("uppercases only the first character", () => {
     expect(capitalize("ssh")).toBe("Ssh");
     expect(capitalize("")).toBe("");
+  });
+});
+
+describe("TOOL_CATEGORY_I18N_KEYS", () => {
+  it("has an entry for the plain 'mcp' category (all-MCP-tools selection), distinct from the mcp:ServerName-prefixed entries filtered elsewhere", () => {
+    // Without this, both consumers of this map (the card's capability tags
+    // and the detail page's Tools panel) fall through to the capitalize()
+    // fallback and render the raw string as "Mcp".
+    expect(TOOL_CATEGORY_I18N_KEYS.mcp).toBe("builds.configForm.tools.categories.mcp");
   });
 });
 

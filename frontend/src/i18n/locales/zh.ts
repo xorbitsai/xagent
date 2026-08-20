@@ -1632,6 +1632,8 @@ const zh = {
       hireNote: "雇佣会把 {name} 加入你的智能体列表并打开一个对话——上面的所有设置之后都可以修改。",
       hireFailed: "雇佣 {name} 失败，请重试。",
       notFound: "找不到这位 AI 员工。",
+      loadFailed: "加载这位 AI 员工失败，请检查网络连接后重试。",
+      retry: "重试",
       beforeWeStart: "开始之前，有几个问题：",
       hireClosingNote: "能回答的先回答，其余的我会用合理的默认值——之后随时可以修改，或者直接在这里告诉我。",
       customizeBeforeHiring: "想先自定义配置？",

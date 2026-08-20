@@ -493,6 +493,90 @@ async def test_runner_builds_context_and_invokes_pattern(tmp_path: Path) -> None
 
 
 @pytest.mark.asyncio
+async def test_runner_inserts_synthetic_user_turn_before_a_leading_assistant_initial_message(
+    tmp_path: Path,
+) -> None:
+    # The marketplace Hire flow seeds a persona greeting as a task's very
+    # first persisted message (see seed_assistant_message in
+    # src/xagent/web/api/chat.py) - initial_messages then starts with role
+    # "assistant" and no prior user turn. Anthropic's Messages API (and
+    # every claude_compatible provider routed through it) rejects a request
+    # whose first message isn't role "user", so the runner must correct
+    # this before it's ever replayed into context.
+    workspace_manager = FakeWorkspaceManager(tmp_path)
+    memory_manager = FakeMemoryManager()
+    pattern = FakePattern({"success": True, "output": "done"})
+    agent = Agent(name="writer", patterns=[pattern], tools=[], llm="fake-llm")
+    runner = AgentRunner(
+        agent=agent,
+        workspace_manager=workspace_manager,
+        memory_manager=memory_manager,
+        workspace_base_dir=str(tmp_path / "workspaces"),
+    )
+
+    result = await runner.run(
+        task="Let's get started",
+        execution_id="exec-seed",
+        user_id="user-1",
+        initial_messages=[
+            {
+                "role": "assistant",
+                "content": "Hi - I'm Maya, your Social Media Content Manager.",
+            }
+        ],
+    )
+
+    context = result["context"]
+    assert [message.role for message in context.messages] == [
+        "user",
+        "assistant",
+        "user",
+        "assistant",
+    ]
+    assert context.messages[0].content == "(conversation start)"
+    assert (
+        context.messages[1].content
+        == "Hi - I'm Maya, your Social Media Content Manager."
+    )
+    assert context.messages[2].content == "Let's get started"
+
+
+@pytest.mark.asyncio
+async def test_runner_does_not_insert_synthetic_turn_for_user_first_initial_messages(
+    tmp_path: Path,
+) -> None:
+    workspace_manager = FakeWorkspaceManager(tmp_path)
+    memory_manager = FakeMemoryManager()
+    pattern = FakePattern({"success": True, "output": "done"})
+    agent = Agent(name="writer", patterns=[pattern], tools=[], llm="fake-llm")
+    runner = AgentRunner(
+        agent=agent,
+        workspace_manager=workspace_manager,
+        memory_manager=memory_manager,
+        workspace_base_dir=str(tmp_path / "workspaces"),
+    )
+
+    result = await runner.run(
+        task="Follow up",
+        execution_id="exec-normal",
+        user_id="user-1",
+        initial_messages=[
+            {"role": "user", "content": "Hi"},
+            {"role": "assistant", "content": "Hello, how can I help?"},
+        ],
+    )
+
+    context = result["context"]
+    assert [message.role for message in context.messages] == [
+        "user",
+        "assistant",
+        "user",
+        "assistant",
+    ]
+    assert context.messages[0].content == "Hi"
+
+
+@pytest.mark.asyncio
 async def test_runner_passes_waiting_status_to_tool_teardown(tmp_path: Path) -> None:
     tool = StatusAwareTeardownTool()
     agent = Agent(

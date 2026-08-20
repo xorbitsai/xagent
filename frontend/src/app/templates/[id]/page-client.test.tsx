@@ -133,6 +133,35 @@ describe("TemplateDetailPage", () => {
     expect(routerPushMock).toHaveBeenCalledWith("/templates");
   });
 
+  it("shows a distinct retryable error (not the not-found message) for a transient load failure, and retries the fetch", async () => {
+    apiRequestMock.mockResolvedValueOnce(jsonResponse({ detail: "boom" }, 500));
+
+    render(<TemplateDetailPage />);
+
+    await waitFor(() => {
+      expect(screen.getByText("templates.marketplace.loadFailed")).toBeInTheDocument();
+    });
+    expect(screen.queryByText("templates.marketplace.notFound")).not.toBeInTheDocument();
+
+    apiRequestMock.mockResolvedValueOnce(jsonResponse(makeTemplate()));
+    fireEvent.click(screen.getByRole("button", { name: "templates.marketplace.retry" }));
+
+    await waitFor(() => {
+      expect(screen.getByText("Leo")).toBeInTheDocument();
+    });
+    expect(apiRequestMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("shows the same retryable error for a network failure (thrown fetch) as for a non-2xx response", async () => {
+    apiRequestMock.mockRejectedValueOnce(new Error("network down"));
+
+    render(<TemplateDetailPage />);
+
+    await waitFor(() => {
+      expect(screen.getByText("templates.marketplace.loadFailed")).toBeInTheDocument();
+    });
+  });
+
   it("hires the agent and navigates to the newly seeded task on success", async () => {
     apiRequestMock.mockResolvedValueOnce(jsonResponse(makeTemplate()));
     hireAgentFromTemplateMock.mockResolvedValueOnce({ taskId: 99, agentId: 5, created: true });

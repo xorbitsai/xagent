@@ -13,7 +13,7 @@ import { PersonaAvatar } from "@/components/templates/persona-avatar";
 import { TOOL_CATEGORY_I18N_KEYS, capitalize } from "@/lib/tool-category-labels";
 import type { TemplateDetail } from "@/types/template";
 
-type LoadStatus = "loading" | "error" | "ready";
+type LoadStatus = "loading" | "not_found" | "error" | "ready";
 
 export default function TemplateDetailPage() {
   const params = useParams();
@@ -23,6 +23,7 @@ export default function TemplateDetailPage() {
 
   const [template, setTemplate] = useState<TemplateDetail | null>(null);
   const [status, setStatus] = useState<LoadStatus>("loading");
+  const [retryToken, setRetryToken] = useState(0);
   const [hiring, setHiring] = useState(false);
   // Guards handlePrimaryAction against a second invocation (double-click,
   // a repeated Enter keypress) firing before React commits `hiring: true` -
@@ -31,7 +32,6 @@ export default function TemplateDetailPage() {
   const isMountedRef = useRef(true);
 
   useEffect(() => {
-    isMountedRef.current = true;
     return () => {
       isMountedRef.current = false;
     };
@@ -49,7 +49,13 @@ export default function TemplateDetailPage() {
         );
         if (cancelled) return;
         if (!response.ok) {
-          throw new Error(`Failed to load template (${response.status})`);
+          // A genuine 404 means the template doesn't exist - no retry would
+          // help. Any other failure mode (5xx, a transient network error,
+          // malformed JSON below) is presumed recoverable, so it gets its
+          // own state with a retry action rather than reusing "not found"
+          // and telling the user something untrue.
+          setStatus(response.status === 404 ? "not_found" : "error");
+          return;
         }
         const data = (await response.json()) as TemplateDetail;
         if (cancelled) return;
@@ -63,7 +69,7 @@ export default function TemplateDetailPage() {
     return () => {
       cancelled = true;
     };
-  }, [id, locale]);
+  }, [id, locale, retryToken]);
 
   // A workforce-type template (or any agent-type template with no
   // marketplace persona) has no meaningful detail view here - the
@@ -80,6 +86,7 @@ export default function TemplateDetailPage() {
   };
 
   const handleBack = () => router.push("/templates");
+  const handleRetry = () => setRetryToken((token) => token + 1);
 
   const handlePrimaryAction = async () => {
     if (!template || !persona || hiringRef.current) return;
@@ -110,6 +117,21 @@ export default function TemplateDetailPage() {
     return (
       <div className="flex h-full items-center justify-center">
         <Loader2 className="h-8 w-8 animate-spin text-muted-foreground" />
+      </div>
+    );
+  }
+
+  if (status === "error") {
+    return (
+      <div className="flex h-full flex-col items-center justify-center gap-4 text-center">
+        <p className="text-muted-foreground">{t("templates.marketplace.loadFailed")}</p>
+        <div className="flex gap-2">
+          <Button variant="outline" onClick={handleBack}>
+            <ArrowLeft className="mr-2 h-4 w-4" />
+            {t("templates.marketplace.back")}
+          </Button>
+          <Button onClick={handleRetry}>{t("templates.marketplace.retry")}</Button>
+        </div>
       </div>
     );
   }

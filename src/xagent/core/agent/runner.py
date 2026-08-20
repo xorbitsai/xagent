@@ -113,7 +113,24 @@ class AgentRunner:
                 base_dir=base_dir,
                 metadata=metadata,
             )
-            for message in initial_messages or []:
+            replay_messages = initial_messages or []
+            if (
+                replay_messages
+                and str(replay_messages[0].get("role") or "").strip() == "assistant"
+            ):
+                # A task's persisted history can begin with an
+                # assistant-role message today only via a marketplace Hire
+                # flow's seeded persona greeting - there is no other path
+                # that persists an assistant row before any user message.
+                # Anthropic's Messages API (and every claude_compatible
+                # provider routed through it) rejects a request whose first
+                # message isn't role "user", so correct it once here,
+                # before this history is ever replayed into context. This
+                # is deliberately not done in get_messages_for_llm(), which
+                # also serves truncated windows and tool-call/tool-result
+                # pairs that legitimately start mid-conversation.
+                context.add_user_message("(conversation start)")
+            for message in replay_messages:
                 role = str(message.get("role") or "").strip()
                 content = str(message.get("content") or "").strip()
                 context_refs = message.get(

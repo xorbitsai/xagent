@@ -17,13 +17,17 @@ interface LibraryTemplateCardProps {
   formatAgentsCount?: (count: number) => string;
   /** Opens the AI Team Marketplace detail page for a persona-bearing,
    * non-workforce template instead of instantiating anything directly -
-   * `onOpen` and `formatMeetLabel` are bundled into one prop so a caller
-   * can't wire one without the other (a "Meet {name}" button that silently
-   * calls `onUse` instead of navigating, or vice versa). Falls back to
-   * `onUse` when omitted entirely, so this component still works without it. */
+   * `onOpen`/`formatMeetLabel`/`chatLabel` are bundled into one prop so a
+   * caller can't wire one without the others (a "Meet {name}" button that
+   * silently calls `onUse` instead of navigating, or vice versa). Falls
+   * back to `onUse` when omitted entirely, so this component still works
+   * without it. `chatLabel` is shown instead of "Meet {name}" once
+   * `template.hired` is true - matches the same hired-aware distinction
+   * the detail page itself makes one navigation later. */
   onOpenPersona?: {
     onOpen: (templateId: string) => void;
     formatMeetLabel: (name: string) => string;
+    chatLabel: string;
   };
   /** Formats a raw tool_categories key into its display label, for the
    * "hero" variant's capability-tags row. Only meaningful when `variant`
@@ -202,7 +206,12 @@ export function LibraryTemplateCard({
 
   const bullets = template.features && template.features.length > 0 ? template.features.slice(0, 3) : [];
   const pill = pillClasses(template.category);
-  const meetLabel = persona && onOpenPersona ? onOpenPersona.formatMeetLabel(persona.name) : null;
+  const meetLabel =
+    persona && onOpenPersona
+      ? template.hired
+        ? onOpenPersona.chatLabel
+        : onOpenPersona.formatMeetLabel(persona.name)
+      : null;
 
   const containerClassName = cn(
     "group flex h-full cursor-pointer flex-col rounded-[18px] border border-border bg-card shadow-sm transition-all duration-300 ease-out hover:-translate-y-1 hover:border-transparent hover:shadow-[0_16px_40px_rgba(0,0,0,0.11)]",

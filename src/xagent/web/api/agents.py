@@ -61,6 +61,7 @@ from ..services.llm_utils import UserAwareModelStorage
 from ..services.workforce_access import get_visible_agent_ids
 from ..tools.config import WebToolConfig
 from ..user_isolated_memory import UserContext
+from .templates import get_or_create_template_stats, increment_template_used_count
 
 logger = logging.getLogger(__name__)
 
@@ -590,6 +591,28 @@ async def resolve_agent_from_template(
             template_id=data.template_id,
             name=data.name,
         )
+        if created:
+            # This is the marketplace Hire flow's entry point (the only
+            # caller that both mints a fresh agent here AND never touches
+            # /use or /use-as-workforce, the two endpoints that otherwise
+            # record usage) - without this, a hired template's used_count
+            # stays permanently stale, which matters because the featured
+            # section's hero ranking (templates/page.tsx) sorts by exactly
+            # that count. An analytics-counter failure must not fail an
+            # already-successful agent creation, so it's caught and logged
+            # the same way use_template_as_workforce's counter update is.
+            try:
+                get_or_create_template_stats(db, data.template_id)
+                increment_template_used_count(db, data.template_id)
+                db.commit()
+            except Exception:
+                db.rollback()
+                logger.exception(
+                    "Failed to record used_count for template_id=%s after "
+                    "successfully resolving a fresh agent for user_id=%s",
+                    data.template_id,
+                    user_id,
+                )
         return ResolvedTemplateAgentResponse(
             agent=AgentResponse.model_validate(snapshot.to_response_dict()),
             created=created,

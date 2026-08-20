@@ -124,7 +124,7 @@ describe("LibraryTemplateCard", () => {
         })}
         useLabel="Use Template"
         defaultSetupTime="5 min setup"
-        onOpenPersona={{ onOpen: vi.fn(), formatMeetLabel: (name) => `Meet ${name}` }}
+        onOpenPersona={{ onOpen: vi.fn(), formatMeetLabel: (name) => `Meet ${name}`, chatLabel: "Chat" }}
         onUse={vi.fn()}
       />
     );
@@ -155,7 +155,7 @@ describe("LibraryTemplateCard", () => {
         })}
         useLabel="Use Template"
         defaultSetupTime="5 min setup"
-        onOpenPersona={{ onOpen, formatMeetLabel: (name) => `Meet ${name}` }}
+        onOpenPersona={{ onOpen, formatMeetLabel: (name) => `Meet ${name}`, chatLabel: "Chat" }}
         onUse={onUse}
       />
     );
@@ -164,6 +164,35 @@ describe("LibraryTemplateCard", () => {
 
     expect(onOpen).toHaveBeenCalledWith("sales-email-lead-response-agent");
     expect(onUse).not.toHaveBeenCalled();
+  });
+
+  it("shows chatLabel instead of 'Meet {name}' once the template is hired", () => {
+    // page-client.tsx already makes this exact hired-aware distinction one
+    // navigation later (Chat vs. Hire {name}) - the card must match it,
+    // rather than always offering "Meet {name}" for an already-hired persona.
+    render(
+      <LibraryTemplateCard
+        template={makeTemplate({
+          id: "sales-email-lead-response-agent",
+          hired: true,
+          hired_agent_id: 5,
+          persona: {
+            name: "Leo",
+            role: "Email Lead Response Agent",
+            avatar: null,
+            intro: "Hi — I'm Leo.",
+            kickoff_questions: [],
+          },
+        })}
+        useLabel="Use Template"
+        defaultSetupTime="5 min setup"
+        onOpenPersona={{ onOpen: vi.fn(), formatMeetLabel: (name) => `Meet ${name}`, chatLabel: "Chat" }}
+        onUse={vi.fn()}
+      />
+    );
+
+    expect(screen.getByRole("button", { name: "Chat" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Meet Leo" })).not.toBeInTheDocument();
   });
 
   it("falls back entirely to onUse's label and behavior when onOpenPersona is omitted", () => {
@@ -218,7 +247,7 @@ describe("LibraryTemplateCard", () => {
         useLabel="Use Template"
         defaultSetupTime="5 min setup"
         workforceBadgeLabel="Workforce"
-        onOpenPersona={{ onOpen, formatMeetLabel: (name) => `Meet ${name}` }}
+        onOpenPersona={{ onOpen, formatMeetLabel: (name) => `Meet ${name}`, chatLabel: "Chat" }}
         onUse={onUse}
       />
     );
@@ -249,7 +278,7 @@ describe("LibraryTemplateCard", () => {
         })}
         useLabel="Use Template"
         defaultSetupTime="5 min setup"
-        onOpenPersona={{ onOpen, formatMeetLabel: (name) => `Meet ${name}` }}
+        onOpenPersona={{ onOpen, formatMeetLabel: (name) => `Meet ${name}`, chatLabel: "Chat" }}
         onUse={vi.fn()}
         disabled
       />
@@ -292,7 +321,7 @@ describe("LibraryTemplateCard", () => {
           variant="hero"
           heroBadgeLabel="Most used"
           formatToolLabel={(category) => `[${category}]`}
-          onOpenPersona={{ onOpen: vi.fn(), formatMeetLabel: (name) => `Meet ${name}` }}
+          onOpenPersona={{ onOpen: vi.fn(), formatMeetLabel: (name) => `Meet ${name}`, chatLabel: "Chat" }}
           onUse={vi.fn()}
         />
       );
@@ -333,7 +362,7 @@ describe("LibraryTemplateCard", () => {
           defaultSetupTime="5 min setup"
           variant="hero"
           formatToolLabel={() => "static-visual-design"}
-          onOpenPersona={{ onOpen: vi.fn(), formatMeetLabel: (name) => `Meet ${name}` }}
+          onOpenPersona={{ onOpen: vi.fn(), formatMeetLabel: (name) => `Meet ${name}`, chatLabel: "Chat" }}
           onUse={vi.fn()}
         />
       );
@@ -355,7 +384,7 @@ describe("LibraryTemplateCard", () => {
           defaultSetupTime="5 min setup"
           heroBadgeLabel="Most used"
           formatToolLabel={(category) => `[${category}]`}
-          onOpenPersona={{ onOpen: vi.fn(), formatMeetLabel: (name) => `Meet ${name}` }}
+          onOpenPersona={{ onOpen: vi.fn(), formatMeetLabel: (name) => `Meet ${name}`, chatLabel: "Chat" }}
           onUse={vi.fn()}
         />
       );

@@ -141,6 +141,7 @@ function TemplatesPageContent() {
   const onOpenPersona = {
     onOpen: handleOpenTemplate,
     formatMeetLabel: (name: string) => t("templates.marketplace.meet", { name }),
+    chatLabel: t("templates.marketplace.chat"),
   };
 
   const formatToolLabel = (category: string) => {
@@ -174,10 +175,14 @@ function TemplatesPageContent() {
   const featuredTemplates = useMemo(
     // Most-used first, so the hero slot (see FeaturedSection below) always
     // highlights the genuinely most-used featured template, not just
-    // whichever one happens to be first in the templates array.
+    // whichever one happens to be first in the templates array. Requires a
+    // persona (excludes workforce-type templates, which have none) since
+    // FeaturedSection always treats the first entry as the hero slot -
+    // a persona-less template there would render as a plain compact card
+    // with no "Most used" ribbon, oversized inside the hero's grid column.
     () =>
       templates
-        .filter((template) => template.featured)
+        .filter((template) => template.featured && Boolean(template.persona))
         .sort((a, b) => (b.used_count ?? 0) - (a.used_count ?? 0)),
     [templates]
   );
@@ -420,6 +425,7 @@ interface TemplateSectionProps {
   onOpenPersona: {
     onOpen: (templateId: string) => void;
     formatMeetLabel: (name: string) => string;
+    chatLabel: string;
   };
   creatingWorkforceId: string | null;
   busyLabel: string;
@@ -494,6 +500,7 @@ interface FeaturedSectionProps {
   onOpenPersona: {
     onOpen: (templateId: string) => void;
     formatMeetLabel: (name: string) => string;
+    chatLabel: string;
   };
   creatingWorkforceId: string | null;
   busyLabel: string;

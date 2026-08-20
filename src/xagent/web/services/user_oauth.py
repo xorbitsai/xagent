@@ -121,6 +121,7 @@ def get_user_oauth_account_by_id(
             UserOAuth.id == int(account_id),
             user_oauth_owner_clause(resource_owner_key),
         )
+        .populate_existing()
         .first()
     )
 

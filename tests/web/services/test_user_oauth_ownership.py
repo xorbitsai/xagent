@@ -170,6 +170,31 @@ def test_owner_only_id_lookup_supports_internal_foreign_key_consumers(tmp_path) 
         engine.dispose()
 
 
+def test_owner_only_id_lookup_refreshes_an_identity_mapped_account(tmp_path) -> None:
+    engine, db, _user, rows = _db(tmp_path)
+    ordinary_row = rows[0]
+    other_db = sessionmaker(bind=engine, autoflush=False, autocommit=False)()
+    try:
+        other_db.query(UserOAuth).filter(UserOAuth.id == int(ordinary_row.id)).update(
+            {UserOAuth.access_token: "ordinary-refreshed"},
+            synchronize_session=False,
+        )
+        other_db.commit()
+
+        account = get_user_oauth_account_by_id(
+            db,
+            account_id=int(ordinary_row.id),
+            resource_owner_key=None,
+        )
+
+        assert account is ordinary_row
+        assert account.access_token == "ordinary-refreshed"
+    finally:
+        other_db.close()
+        db.close()
+        engine.dispose()
+
+
 def test_destructive_provider_filter_must_be_explicit(tmp_path) -> None:
     engine, db, user, _rows = _db(tmp_path)
     try:

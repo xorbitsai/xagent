@@ -476,9 +476,8 @@ def test_existing_owner_aware_schema_requires_semantic_index_definitions(
                 migration.upgrade()
 
 
-def test_postgresql_upgrade_creates_indexes_transactionally_before_old_constraint_drop() -> (
-    None
-):
+def test_postgresql_upgrade_creates_indexes_before_old_constraint_drop() -> None:
+    """Verify call order; PostgreSQL integration tests cover transactional DDL."""
     migration = _migration_module()
     events: list[str] = []
     fake_op = SimpleNamespace(

@@ -365,18 +365,31 @@ def _request_raw(
             and attempt == 0
             and method.upper() == "GET"
         ):
-            try:
-                retry_after_seconds = int(response.headers.get("Retry-After", "0"))
-            except ValueError:
-                retry_after_seconds = 0
-            if retry_after_seconds <= 0:
-                # No Retry-After (GitHub's primary-limit 403 usually omits
-                # it, using X-RateLimit-Reset -- an epoch timestamp --
-                # instead): derive a wait from that instead of skipping the
-                # retry outright. The MAX_RETRY_AFTER_SECONDS bound below
-                # still applies, so a reset that's minutes/hours away (the
-                # common case for a fully exhausted primary quota) falls
-                # through to the normal error rather than sleeping for it.
+            # retry_after_seconds is None (rather than 0) whenever there is
+            # no usable wait signal at all -- Retry-After: "0" and an
+            # already-past X-RateLimit-Reset are both legitimate "retry
+            # right now" signals, not "no information," and must not be
+            # conflated with the missing-header case below them.
+            retry_after_header = response.headers.get("Retry-After")
+            retry_after_seconds = None
+            if retry_after_header is not None:
+                try:
+                    retry_after_seconds = int(retry_after_header)
+                except ValueError:
+                    retry_after_seconds = None
+            if retry_after_seconds is None and is_rate_limited_403:
+                # No (usable) Retry-After -- GitHub's primary-limit 403
+                # usually omits it, using X-RateLimit-Reset (an epoch
+                # timestamp) instead: derive a wait from that rather than
+                # skipping the retry outright. Gated on is_rate_limited_403
+                # (not just "status is 429 or 403") so this doesn't also
+                # silently extend a bare 429's existing, already-tested
+                # Retry-After-only behavior to a header 429 was never
+                # documented or tested to use here. The
+                # MAX_RETRY_AFTER_SECONDS bound below still applies, so a
+                # reset that's minutes/hours away (the common case for a
+                # fully exhausted primary quota) falls through to the normal
+                # error rather than sleeping for it.
                 reset_header = response.headers.get("X-RateLimit-Reset")
                 if reset_header:
                     try:
@@ -384,8 +397,11 @@ def _request_raw(
                             0, int(reset_header) - int(_wall_clock())
                         )
                     except ValueError:
-                        retry_after_seconds = 0
-            if 0 < retry_after_seconds <= MAX_RETRY_AFTER_SECONDS:
+                        retry_after_seconds = None
+            if (
+                retry_after_seconds is not None
+                and 0 <= retry_after_seconds <= MAX_RETRY_AFTER_SECONDS
+            ):
                 _sleep(retry_after_seconds)
                 continue
         break

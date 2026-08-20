@@ -861,10 +861,18 @@ async def login(request: LoginRequest, db: Session = Depends(get_db)) -> Dict[st
     except HTTPException:
         # Re-raise HTTP exceptions
         raise
-    except Exception as e:
+    except Exception:
+        # str(e) is not put in the response: _update_user_sync's db.commit()
+        # above persists the just-issued refresh_token as a bound SQL
+        # parameter, and hide_parameters isn't configured anywhere in this
+        # codebase, so a SQLAlchemy StatementError's default __str__ would
+        # otherwise echo that live session token back to the client -- the
+        # same class of leak fixed in generic_oauth_callback's callback
+        # handler. logger.exception still captures it server-side.
+        logger.exception("Login failed")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Error during login: {str(e)}",
+            detail="An unexpected error occurred during login.",
         )
 
 
@@ -935,10 +943,15 @@ async def register(
             },
         )
 
-    except Exception as e:
+    except Exception:
+        # Same reasoning as login's handler: create_user's db.commit() binds
+        # password_hash as a SQL parameter, which a SQLAlchemy
+        # StatementError's default __str__ would otherwise put into str(e)
+        # and, via this response, into the client-facing error.
+        logger.exception("Registration failed")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Error during registration: {str(e)}",
+            detail="An unexpected error occurred during registration.",
         )
 
 
@@ -1067,10 +1080,15 @@ async def change_password(
             success=True, message="Password updated successfully"
         )
 
-    except Exception as e:
+    except Exception:
+        # Same reasoning as login's handler: the db.commit() above binds the
+        # new password_hash as a SQL parameter, which a SQLAlchemy
+        # StatementError's default __str__ would otherwise put into str(e)
+        # and, via this response, into the client-facing error.
+        logger.exception("Password update failed")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Error during password update: {str(e)}",
+            detail="An unexpected error occurred while updating the password.",
         )
 
 

@@ -439,6 +439,34 @@ class TestAuthAPI:
         assert "detail" in data
         assert "Incorrect username or password" in data["detail"]
 
+    def test_login_does_not_leak_refresh_token_on_db_commit_failure(
+        self, test_db, test_user_data, monkeypatch
+    ):
+        """Same class of gap fixed in generic_oauth_callback: a DB error
+        while persisting the freshly-issued refresh_token must not echo it
+        back via str(e) -- SQLAlchemy's default StatementError.__str__
+        includes bound parameters (hide_parameters isn't configured
+        anywhere in this codebase), and this handler used to render str(e)
+        directly into the response detail."""
+        setup_first_admin()
+        register_response = client.post("/api/auth/register", json=test_user_data)
+        assert register_response.status_code == 200
+
+        from sqlalchemy.orm import Session as OrmSession
+
+        def failing_commit(self):
+            raise RuntimeError(
+                "(sqlite3.IntegrityError) UNIQUE constraint failed "
+                "[parameters: {'refresh_token': 'super-secret-refresh-token'}]"
+            )
+
+        monkeypatch.setattr(OrmSession, "commit", failing_commit)
+
+        response = client.post("/api/auth/login", json=test_user_data)
+
+        assert response.status_code == 500
+        assert "super-secret-refresh-token" not in response.text
+
     def test_register_success(self, test_db, test_user_data):
         """Test successful user registration"""
         from xagent.web.models.user import UserDefaultModel, UserModel

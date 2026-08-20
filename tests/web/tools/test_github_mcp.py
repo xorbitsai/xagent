@@ -292,6 +292,31 @@ def test_request_raw_does_not_retry_429_with_missing_retry_after(monkeypatch):
     sleep_mock.assert_not_called()
 
 
+def test_request_raw_does_not_retry_429_via_reset_header_fallback(monkeypatch):
+    """The X-RateLimit-Reset fallback added for 403 rate limits is gated on
+    is_rate_limited_403, not just "status is 429 or 403" -- a 429 with no
+    Retry-After must keep its existing, documented fail-fast behavior even
+    if X-RateLimit-Reset happens to be present, rather than silently
+    gaining a new, untested retry path."""
+    mock_request = Mock(
+        return_value=MockResponse(
+            json_data={"message": "rate limited"},
+            status_code=429,
+            headers={"X-RateLimit-Remaining": "0", "X-RateLimit-Reset": "1000"},
+        )
+    )
+    monkeypatch.setattr(github.requests, "request", mock_request)
+    sleep_mock = Mock()
+    monkeypatch.setattr(github, "_sleep", sleep_mock)
+    monkeypatch.setattr(github, "_wall_clock", lambda: 995.0)
+
+    with pytest.raises(RuntimeError, match="rate limited"):
+        github._request_raw("GET", "/repos/octocat/Hello-World")
+
+    assert mock_request.call_count == 1
+    sleep_mock.assert_not_called()
+
+
 def test_request_raw_does_not_retry_429_with_non_numeric_retry_after(monkeypatch):
     """A non-numeric Retry-After (e.g. an RFC 7231 HTTP-date, which int()
     rejects) must fail closed -- no retry -- rather than raising out of
@@ -419,6 +444,58 @@ def test_request_raw_retries_get_once_on_403_with_exhausted_rate_limit(monkeypat
     assert response.status_code == 200
     assert mock_request.call_count == 2
     sleep_mock.assert_called_once_with(5)
+
+
+def test_request_raw_retries_immediately_on_retry_after_zero(monkeypatch):
+    """Retry-After: "0" is a legitimate "retry right now" signal, not "no
+    information" -- treating a computed wait of exactly 0 the same as
+    "no Retry-After given" would skip a retry the response just said was
+    safe to make immediately."""
+    mock_request = Mock(
+        side_effect=[
+            MockResponse(
+                json_data={"message": "rate limited"},
+                status_code=429,
+                headers={"Retry-After": "0"},
+            ),
+            MockResponse(json_data={"ok": True}, status_code=200),
+        ]
+    )
+    monkeypatch.setattr(github.requests, "request", mock_request)
+    sleep_mock = Mock()
+    monkeypatch.setattr(github, "_sleep", sleep_mock)
+
+    response = github._request_raw("GET", "/repos/octocat/Hello-World")
+
+    assert response.status_code == 200
+    assert mock_request.call_count == 2
+    sleep_mock.assert_called_once_with(0)
+
+
+def test_request_raw_retries_immediately_on_reset_already_past(monkeypatch):
+    """An X-RateLimit-Reset that has already elapsed (clock skew, or the
+    quota replenishing between the original request and this check) must
+    retry immediately, not be treated as "no reset info" and fail fast."""
+    mock_request = Mock(
+        side_effect=[
+            MockResponse(
+                json_data={"message": "rate limit exceeded"},
+                status_code=403,
+                headers={"X-RateLimit-Remaining": "0", "X-RateLimit-Reset": "1000"},
+            ),
+            MockResponse(json_data={"ok": True}, status_code=200),
+        ]
+    )
+    monkeypatch.setattr(github.requests, "request", mock_request)
+    sleep_mock = Mock()
+    monkeypatch.setattr(github, "_sleep", sleep_mock)
+    monkeypatch.setattr(github, "_wall_clock", lambda: 1005.0)
+
+    response = github._request_raw("GET", "/repos/octocat/Hello-World")
+
+    assert response.status_code == 200
+    assert mock_request.call_count == 2
+    sleep_mock.assert_called_once_with(0)
 
 
 def test_request_raw_does_not_retry_403_with_reset_beyond_bound(monkeypatch):

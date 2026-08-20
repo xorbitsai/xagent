@@ -1,6 +1,38 @@
 import os
 import re
 import urllib.request
+from urllib.parse import quote
+
+
+def require_clean_identifier(value: str, field_name: str) -> str:
+    """Reject an empty or whitespace-padded id rather than silently fixing it.
+
+    An id copy-pasted or concatenated by a caller with accidental whitespace
+    is more likely a bug worth surfacing than a value to repair - repairing
+    it would mask the bug and could send a query for a different object.
+    Use this for ids that go into a JSON request body; for ids interpolated
+    into a URL path, use url_path_id instead - encoding (not just rejecting
+    whitespace) is what actually closes path/query injection.
+    """
+    if not value or value.strip() != value:
+        raise ValueError(
+            f"{field_name} must be a non-empty id with no surrounding whitespace"
+        )
+    return value
+
+
+def url_path_id(value: str, field_name: str) -> str:
+    """Validate then percent-encode an id for safe interpolation into a URL
+    path segment.
+
+    Percent-encoding - not a blocklist of "/", "?", "#", or ".." - is what
+    actually prevents a value like "x?limit=1&foo=/reports/metrics" from
+    escaping its intended path segment: any character that could do that
+    gets encoded regardless of which one it is, rather than relying on an
+    enumeration that could miss one.
+    """
+    require_clean_identifier(value, field_name)
+    return quote(value, safe="")
 
 
 def resolve_id_from_url(value: str, pattern: re.Pattern[str]) -> str:

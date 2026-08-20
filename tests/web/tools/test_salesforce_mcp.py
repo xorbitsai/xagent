@@ -50,15 +50,50 @@ def test_instance_url_strips_trailing_slash(monkeypatch):
     assert salesforce._instance_url() == "https://acme.my.salesforce.com"
 
 
+@pytest.mark.parametrize(
+    "value",
+    [
+        "http://acme.my.salesforce.com",  # not https
+        "https://attacker.example.com",  # wrong host entirely
+        "https://salesforce.com.attacker.com",  # suffix-match bypass attempt
+    ],
+)
+def test_instance_url_rejects_non_salesforce_hosts(monkeypatch, value):
+    monkeypatch.setenv("SALESFORCE_INSTANCE_URL", value)
+
+    with pytest.raises(ValueError, match="not a valid Salesforce host"):
+        salesforce._instance_url()
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "https://acme.my.salesforce.com",
+        "https://cs123.salesforce.com",
+        "https://acme.lightning.force.com",
+    ],
+)
+def test_instance_url_accepts_real_salesforce_hosts(monkeypatch, value):
+    monkeypatch.setenv("SALESFORCE_INSTANCE_URL", value)
+
+    assert salesforce._instance_url() == value
+
+
 def test_request_uses_instance_url_and_headers(monkeypatch):
+    # A generic sobjects path, not /services/oauth2/userinfo: in production
+    # that one is only ever fetched via _request_absolute against the fixed
+    # USERINFO_URL host, never through _request/_instance_url like every
+    # other tool's path.
     mock_request = Mock(return_value=MockResponse(json_data={"ok": True}))
     monkeypatch.setattr(salesforce.requests, "request", mock_request)
 
-    result = salesforce._request("GET", "/services/oauth2/userinfo")
+    result = salesforce._request(
+        "GET", f"/services/data/{salesforce.API_VERSION}/sobjects"
+    )
 
     assert result == {"ok": True}
     assert mock_request.call_args.kwargs["url"] == (
-        "https://acme.my.salesforce.com/services/oauth2/userinfo"
+        f"https://acme.my.salesforce.com/services/data/{salesforce.API_VERSION}/sobjects"
     )
     assert (
         mock_request.call_args.kwargs["headers"]["Authorization"]
@@ -66,26 +101,9 @@ def test_request_uses_instance_url_and_headers(monkeypatch):
     )
 
 
-def test_require_clean_identifier_rejects_empty_and_whitespace():
-    with pytest.raises(ValueError, match="record_id"):
-        salesforce._require_clean_identifier("", "record_id")
-    with pytest.raises(ValueError, match="record_id"):
-        salesforce._require_clean_identifier(" 001xx ", "record_id")
-    assert salesforce._require_clean_identifier("001xx", "record_id") == "001xx"
-
-
-def test_url_path_id_percent_encodes_reserved_characters():
-    # A literal ".." blocklist misses "/" and "?", which redirect the
-    # request to a different endpoint or inject query params without ever
-    # containing "..". Percent-encoding closes off all of them at once.
-    assert salesforce._url_path_id("Account/001abc", "sobject_type") == (
-        "Account%2F001abc"
-    )
-    assert salesforce._url_path_id("001x?fields=Id", "record_id") == (
-        "001x%3Ffields%3DId"
-    )
-    with pytest.raises(ValueError):
-        salesforce._url_path_id("", "record_id")
+# require_clean_identifier/url_path_id themselves are unit-tested in
+# test_mcp_utils.py, where they now live (src/xagent/web/tools/mcp/utils.py) --
+# this file keeps only the salesforce-specific call-site integration below.
 
 
 def test_get_record_percent_encodes_ids_in_the_request_url(monkeypatch):
@@ -115,6 +133,50 @@ def test_delete_record_rejects_empty_record_id(monkeypatch):
     monkeypatch.setattr(salesforce.requests, "request", mock_request)
 
     result = json.loads(salesforce.salesforce_delete_record("Account", ""))
+
+    assert result["status"] == "error"
+    mock_request.assert_not_called()
+
+
+def test_describe_sobject_rejects_empty_sobject_type(monkeypatch):
+    mock_request = Mock()
+    monkeypatch.setattr(salesforce.requests, "request", mock_request)
+
+    result = json.loads(salesforce.salesforce_describe_sobject(""))
+
+    assert result["status"] == "error"
+    mock_request.assert_not_called()
+
+
+def test_create_record_rejects_empty_sobject_type(monkeypatch):
+    mock_request = Mock()
+    monkeypatch.setattr(salesforce.requests, "request", mock_request)
+
+    result = json.loads(salesforce.salesforce_create_record("", {"Name": "Acme"}))
+
+    assert result["status"] == "error"
+    mock_request.assert_not_called()
+
+
+def test_update_record_rejects_empty_sobject_type(monkeypatch):
+    mock_request = Mock()
+    monkeypatch.setattr(salesforce.requests, "request", mock_request)
+
+    result = json.loads(
+        salesforce.salesforce_update_record("", "001xx", {"Industry": "Finance"})
+    )
+
+    assert result["status"] == "error"
+    mock_request.assert_not_called()
+
+
+def test_update_record_rejects_empty_record_id(monkeypatch):
+    mock_request = Mock()
+    monkeypatch.setattr(salesforce.requests, "request", mock_request)
+
+    result = json.loads(
+        salesforce.salesforce_update_record("Account", "", {"Industry": "Finance"})
+    )
 
     assert result["status"] == "error"
     mock_request.assert_not_called()
@@ -453,6 +515,13 @@ def test_create_record_omits_errors_key_on_plain_success(monkeypatch):
 
 
 def test_create_record_propagates_errors_on_failure(monkeypatch):
+    # Real Salesforce create failures surface via a non-2xx status (already
+    # exercised by test_request_raises_with_joined_array_error_messages, via
+    # the exception path in _request_absolute), not a 200 carrying
+    # success=false. This defends the {success:false, errors:[...]} shape
+    # anyway since Salesforce's own docs describe it as a possible response
+    # for this endpoint -- if that shape is ever hit, errors must not be
+    # silently dropped.
     mock_request = Mock(
         return_value=MockResponse(
             json_data={

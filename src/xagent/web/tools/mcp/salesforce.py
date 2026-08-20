@@ -2,12 +2,12 @@ import json
 import logging
 import os
 from typing import Any
-from urllib.parse import quote
+from urllib.parse import urlparse
 
 import requests
 from mcp.server.fastmcp import FastMCP
 
-from .utils import setup_proxy_env
+from .utils import setup_proxy_env, url_path_id
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("salesforce-mcp")
@@ -42,17 +42,35 @@ def _error(message: str) -> str:
     return json.dumps({"status": "error", "message": message}, ensure_ascii=False)
 
 
+_INSTANCE_URL_HOST_SUFFIXES = ("salesforce.com", "force.com")
+
+
 def _instance_url() -> str:
     """Return the per-org API host this connector's OAuth grant belongs to.
 
     Salesforce returns this in the token response instead of using a fixed
     API domain -- which org to call is a property of the connected account,
-    not something this module can infer.
+    not something this module can infer. Salesforce is the only connector
+    in this codebase where the entire outbound API origin, not just a path
+    segment, comes from provider-persisted data rather than a hardcoded
+    constant, so this validates scheme+host rather than only checking
+    non-empty: every request this module makes is built by interpolating
+    this value directly into a URL.
     """
     instance_url = os.environ.get("SALESFORCE_INSTANCE_URL")
     if not instance_url:
         raise ValueError("SALESFORCE_INSTANCE_URL environment variable is missing")
-    return instance_url.rstrip("/")
+    instance_url = instance_url.rstrip("/")
+    parsed = urlparse(instance_url)
+    hostname = parsed.hostname or ""
+    if parsed.scheme != "https" or not any(
+        hostname == suffix or hostname.endswith(f".{suffix}")
+        for suffix in _INSTANCE_URL_HOST_SUFFIXES
+    ):
+        raise ValueError(
+            f"SALESFORCE_INSTANCE_URL is not a valid Salesforce host: {instance_url!r}"
+        )
+    return instance_url
 
 
 def _headers() -> dict[str, str]:
@@ -127,38 +145,6 @@ def _request(
     return _request_absolute(
         method, f"{_instance_url()}{path}", params=params, json_data=json_data
     )
-
-
-def _require_clean_identifier(value: str, field_name: str) -> str:
-    """Reject an empty or whitespace-padded id rather than silently fixing it.
-
-    Matches hubspot.py's helper of the same name: an id copy-pasted or
-    concatenated by a caller with accidental whitespace is more likely a bug
-    worth surfacing than a value to repair.
-    """
-    if not value or value.strip() != value:
-        raise ValueError(
-            f"{field_name} must be a non-empty id with no surrounding whitespace"
-        )
-    return value
-
-
-def _url_path_id(value: str, field_name: str) -> str:
-    """Validate then percent-encode an id for safe interpolation into a URL
-    path segment.
-
-    sobject_type/record_id reach every call site below straight from
-    LLM-controlled tool arguments and get interpolated directly into the URL
-    path. A blocklist on literal ".." (this connector's first pass at this)
-    misses "/" and "?", which redirect the request to a different endpoint
-    or inject query params without ever containing "..". Percent-encoding -
-    not an enumeration of specific characters - is what actually closes
-    this off, matching hubspot.py's _url_path_id and jira.py's
-    _path_segment (jira.py's version skips the empty-id check this one
-    does via _require_clean_identifier).
-    """
-    _require_clean_identifier(value, field_name)
-    return quote(value, safe="")
 
 
 @mcp.tool()
@@ -264,7 +250,7 @@ def salesforce_describe_sobject(sobject_type: str) -> str:
     sobject_type: an object's API name, e.g. "Account" or "My_Object__c".
     """
     try:
-        safe_sobject_type = _url_path_id(sobject_type, "sobject_type")
+        safe_sobject_type = url_path_id(sobject_type, "sobject_type")
         result = _request(
             "GET",
             f"/services/data/{API_VERSION}/sobjects/{safe_sobject_type}/describe",
@@ -306,8 +292,8 @@ def salesforce_get_record(sobject_type: str, record_id: str, fields: str = "") -
     "Name,Industry,AnnualRevenue"); omit to return every field.
     """
     try:
-        safe_sobject_type = _url_path_id(sobject_type, "sobject_type")
-        safe_record_id = _url_path_id(record_id, "record_id")
+        safe_sobject_type = url_path_id(sobject_type, "sobject_type")
+        safe_record_id = url_path_id(record_id, "record_id")
         params: dict[str, Any] = {"fields": fields} if fields else {}
         result = _request(
             "GET",
@@ -333,7 +319,7 @@ def salesforce_create_record(sobject_type: str, fields: dict[str, Any]) -> str:
     which fields exist and are createable.
     """
     try:
-        safe_sobject_type = _url_path_id(sobject_type, "sobject_type")
+        safe_sobject_type = url_path_id(sobject_type, "sobject_type")
         result = _request(
             "POST",
             f"/services/data/{API_VERSION}/sobjects/{safe_sobject_type}",
@@ -364,8 +350,8 @@ def salesforce_update_record(
     try:
         if not fields:
             return _error("No fields provided to update")
-        safe_sobject_type = _url_path_id(sobject_type, "sobject_type")
-        safe_record_id = _url_path_id(record_id, "record_id")
+        safe_sobject_type = url_path_id(sobject_type, "sobject_type")
+        safe_record_id = url_path_id(record_id, "record_id")
         _request(
             "PATCH",
             f"/services/data/{API_VERSION}/sobjects/{safe_sobject_type}/{safe_record_id}",
@@ -386,8 +372,8 @@ def salesforce_delete_record(sobject_type: str, record_id: str) -> str:
     sobject_type: an object's API name, e.g. "Account" or "My_Object__c".
     """
     try:
-        safe_sobject_type = _url_path_id(sobject_type, "sobject_type")
-        safe_record_id = _url_path_id(record_id, "record_id")
+        safe_sobject_type = url_path_id(sobject_type, "sobject_type")
+        safe_record_id = url_path_id(record_id, "record_id")
         _request(
             "DELETE",
             f"/services/data/{API_VERSION}/sobjects/{safe_sobject_type}/{safe_record_id}",

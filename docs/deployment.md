@@ -115,7 +115,7 @@ Choose the procedure for the configured database.
 #### PostgreSQL
 
 1. Pause new OAuth writes and make sure no long transaction holds a lock on `user_oauth`.
-2. Run `alembic upgrade head` one time. Existing workers can continue non-OAuth work while the transactional DDL runs.
+2. Run `alembic upgrade head` one time. Already-running old workers can continue non-OAuth work while the transactional DDL runs, but an old worker that starts or restarts after the schema revision advances will fail startup because it does not recognize the new revision. Prevent old-version restarts and autoscaling during this window, or ensure every replacement starts from the owner-aware image.
 3. Resume ordinary OAuth writes after the migration commits.
 4. Roll every API and task worker to the owner-aware version.
 5. Verify the schema and make sure no old worker remains before a later release enables actor-owned rows.

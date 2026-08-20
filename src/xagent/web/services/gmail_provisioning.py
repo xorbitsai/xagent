@@ -1010,6 +1010,10 @@ def _provision_in_fresh_session(oauth_account_id: int) -> None:
             resource_owner_key=None,
         )
         if oauth_account is None:
+            logger.warning(
+                "Cannot provision Gmail watch without ordinary OAuth account %s",
+                oauth_account_id,
+            )
             return
         ensure_gmail_mailbox_provisioned(db, oauth_account)
     except Exception:

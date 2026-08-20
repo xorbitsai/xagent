@@ -96,6 +96,35 @@ def test_transition_lock_yields_the_database_session(
         assert transition_db is db_session
 
 
+def test_background_provisioning_warns_when_ordinary_account_is_missing(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    class FakeSession:
+        closed = False
+
+        def close(self) -> None:
+            self.closed = True
+
+    db = FakeSession()
+    monkeypatch.setattr(
+        "xagent.web.models.database.get_session_local",
+        lambda: lambda: db,
+    )
+    monkeypatch.setattr(
+        gmail_provisioning,
+        "get_user_oauth_account_by_id",
+        lambda *_args, **_kwargs: None,
+    )
+    caplog.set_level(logging.WARNING, logger=gmail_provisioning.__name__)
+
+    gmail_provisioning._provision_in_fresh_session(47)
+
+    assert "Cannot provision Gmail watch without ordinary OAuth account" in caplog.text
+    assert "47" in caplog.text
+    assert db.closed is True
+
+
 def test_provisioning_captures_account_identity_before_transition_commit(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -1,6 +1,7 @@
 """Authentication API endpoints"""
 
 import asyncio
+import base64
 import hashlib
 import logging
 import os
@@ -1226,6 +1227,18 @@ def generic_oauth_login(
         "app_id": app_id,
         "redirect": redirect,
     }
+    # Newer Salesforce orgs enforce PKCE on this authorization-code grant at
+    # the org level, with no per-app way to disable it (Setup > External
+    # Client Apps > Security > "Require Proof Key for Code Exchange" is
+    # locked once an org has it on). The verifier rides inside this signed,
+    # short-lived state token rather than a new DB row -- it never leaves
+    # the server unencrypted except as the one-way S256 challenge below, and
+    # the callback already decodes this same state to recover user_id/app_id.
+    code_verifier = (
+        secrets.token_urlsafe(64) if provider.lower() == "salesforce" else None
+    )
+    if code_verifier:
+        state_payload["code_verifier"] = code_verifier
     state = create_access_token(data=state_payload, expires_delta=timedelta(minutes=10))
 
     app_scopes: list[str] | None = None
@@ -1295,6 +1308,12 @@ def generic_oauth_login(
         params["prompt"] = "consent"
     if provider.lower() == "zoom":
         params["prompt"] = "login"
+    if code_verifier:
+        digest = hashlib.sha256(code_verifier.encode("ascii")).digest()
+        params["code_challenge"] = (
+            base64.urlsafe_b64encode(digest).decode("ascii").rstrip("=")
+        )
+        params["code_challenge_method"] = "S256"
     meta_config_id = _meta_login_config_id() if provider.lower() == "meta" else ""
     if meta_config_id:
         params["config_id"] = meta_config_id
@@ -1450,6 +1469,7 @@ def generic_oauth_callback(
 
     user_id = payload.get("user_id")
     app_id = payload.get("app_id")
+    code_verifier = payload.get("code_verifier")
 
     if app_id:
         # Reject a hidden app before spending the authorization code against
@@ -1518,6 +1538,8 @@ def generic_oauth_callback(
             "code": code,
             "redirect_uri": redirect_uri,
         }
+        if code_verifier:
+            data["code_verifier"] = code_verifier
         headers = {"Content-Type": "application/x-www-form-urlencoded"}
         auth: tuple[str, str] | None = None
         if provider.lower() == "zoom":

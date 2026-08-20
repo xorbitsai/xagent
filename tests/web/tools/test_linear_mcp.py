@@ -46,6 +46,19 @@ def test_headers_include_bearer_token_and_json_content_type():
     }
 
 
+def test_clamp_limit_caps_at_max():
+    assert linear._clamp_limit(500) == linear.MAX_LIMIT
+
+
+def test_clamp_limit_floors_zero_and_negative_to_one():
+    assert linear._clamp_limit(0) == 1
+    assert linear._clamp_limit(-5) == 1
+
+
+def test_clamp_limit_leaves_in_range_value_unchanged():
+    assert linear._clamp_limit(10) == 10
+
+
 def test_graphql_sends_query_and_variables_as_json_body(monkeypatch):
     mock_post = Mock(return_value=MockResponse(json_data={"data": {"ok": True}}))
     monkeypatch.setattr(linear.requests, "post", mock_post)
@@ -175,6 +188,31 @@ def test_graphql_does_not_retry_when_reset_wait_exceeds_max_retry_after(monkeypa
     assert mock_post.call_count == 1
 
 
+def test_graphql_retries_immediately_when_reset_has_already_elapsed(monkeypatch):
+    """A reset timestamp already in the past (clock skew, or the response
+    just arrived after the window rolled over) computes wait_seconds=0.0 --
+    that must still retry (immediately), not be treated the same as no
+    header/information at all."""
+    now = 1_700_000_000.0
+    reset_ms = str(int((now - 5) * 1000))
+    mock_post = Mock(
+        side_effect=[
+            _ratelimited_response(reset_ms),
+            MockResponse(json_data={"data": {"viewer": {"id": "u1"}}}),
+        ]
+    )
+    monkeypatch.setattr(linear.requests, "post", mock_post)
+    monkeypatch.setattr(linear.time, "time", lambda: now)
+    sleep_calls = []
+    monkeypatch.setattr(linear.time, "sleep", sleep_calls.append)
+
+    data, errors = linear._graphql("query { viewer { id } }")
+
+    assert data == {"viewer": {"id": "u1"}}
+    assert mock_post.call_count == 2
+    assert sleep_calls == [0.0]
+
+
 def test_graphql_does_not_retry_when_reset_header_missing(monkeypatch):
     mock_post = Mock(return_value=_ratelimited_response(None))
     monkeypatch.setattr(linear.requests, "post", mock_post)
@@ -183,6 +221,24 @@ def test_graphql_does_not_retry_when_reset_header_missing(monkeypatch):
         linear._graphql("query { viewer { id } }")
 
     assert mock_post.call_count == 1
+
+
+def test_rate_limit_wait_seconds_returns_none_for_missing_header():
+    """Pins the return-value contract directly, not just the resulting
+    no-retry behavior -- a future regression that reintroduces 0.0 as the
+    missing-header sentinel would still pass the no-retry behavioral test
+    (0.0 is also within retry range) without this."""
+    response = _ratelimited_response(None)
+
+    assert linear._rate_limit_wait_seconds(response) is None
+
+
+def test_rate_limit_wait_seconds_returns_float_for_present_header(monkeypatch):
+    now = 1_700_000_000.0
+    response = _ratelimited_response(str(int((now + 5) * 1000)))
+    monkeypatch.setattr(linear.time, "time", lambda: now)
+
+    assert linear._rate_limit_wait_seconds(response) == 5.0
 
 
 def test_graphql_returns_partial_data_and_errors_instead_of_raising(
@@ -425,6 +481,17 @@ def test_list_teams_returns_nodes(monkeypatch):
     assert result["truncated"] is False
 
 
+def test_list_teams_clamps_over_limit(monkeypatch):
+    mock_post = Mock(
+        return_value=MockResponse(json_data={"data": {"teams": {"nodes": []}}})
+    )
+    monkeypatch.setattr(linear.requests, "post", mock_post)
+
+    linear.linear_list_teams(limit=500)
+
+    assert mock_post.call_args.kwargs["json"]["variables"]["first"] == linear.MAX_LIMIT
+
+
 def test_list_teams_reports_truncated_when_more_pages_exist(monkeypatch):
     monkeypatch.setattr(
         linear.requests,
@@ -524,6 +591,19 @@ def test_list_workflow_states_reports_truncated_when_more_pages_exist(monkeypatc
     assert result["truncated"] is True
 
 
+def test_list_workflow_states_clamps_over_limit(monkeypatch):
+    mock_post = Mock(
+        return_value=MockResponse(
+            json_data={"data": {"team": {"states": {"nodes": []}}}}
+        )
+    )
+    monkeypatch.setattr(linear.requests, "post", mock_post)
+
+    linear.linear_list_workflow_states(_TEAM_UUID, limit=500)
+
+    assert mock_post.call_args.kwargs["json"]["variables"]["first"] == linear.MAX_LIMIT
+
+
 def test_list_labels_resolves_team_key_to_uuid(monkeypatch):
     mock_post = Mock(
         side_effect=[
@@ -546,6 +626,19 @@ def test_list_labels_resolves_team_key_to_uuid(monkeypatch):
     assert result["status"] == "success"
     assert result["labels"] == [{"id": "l1", "name": "bug"}]
     assert result["truncated"] is False
+
+
+def test_list_labels_clamps_over_limit(monkeypatch):
+    mock_post = Mock(
+        return_value=MockResponse(
+            json_data={"data": {"team": {"labels": {"nodes": []}}}}
+        )
+    )
+    monkeypatch.setattr(linear.requests, "post", mock_post)
+
+    linear.linear_list_labels(_TEAM_UUID, limit=500)
+
+    assert mock_post.call_args.kwargs["json"]["variables"]["first"] == linear.MAX_LIMIT
 
 
 def test_list_labels_reports_truncated_when_more_pages_exist(monkeypatch):
@@ -643,6 +736,30 @@ def test_list_projects_reports_truncated_when_team_scoped_has_more_pages(monkeyp
 
     assert result["status"] == "success"
     assert result["truncated"] is True
+
+
+def test_list_projects_clamps_over_limit_when_team_scoped(monkeypatch):
+    mock_post = Mock(
+        return_value=MockResponse(
+            json_data={"data": {"team": {"projects": {"nodes": []}}}}
+        )
+    )
+    monkeypatch.setattr(linear.requests, "post", mock_post)
+
+    linear.linear_list_projects(team_id=_TEAM_UUID, limit=500)
+
+    assert mock_post.call_args.kwargs["json"]["variables"]["first"] == linear.MAX_LIMIT
+
+
+def test_list_projects_clamps_over_limit_without_team_id(monkeypatch):
+    mock_post = Mock(
+        return_value=MockResponse(json_data={"data": {"projects": {"nodes": []}}})
+    )
+    monkeypatch.setattr(linear.requests, "post", mock_post)
+
+    linear.linear_list_projects(limit=500)
+
+    assert mock_post.call_args.kwargs["json"]["variables"]["first"] == linear.MAX_LIMIT
 
 
 def test_list_projects_without_team_id_skips_resolution(monkeypatch):
@@ -1362,6 +1479,17 @@ def test_create_issue_rejects_out_of_range_priority(monkeypatch):
     mock_post.assert_not_called()
 
 
+def test_create_issue_rejects_empty_title(monkeypatch):
+    mock_post = Mock()
+    monkeypatch.setattr(linear.requests, "post", mock_post)
+
+    result = json.loads(linear.linear_create_issue(team_id=_TEAM_UUID, title="   "))
+
+    assert result["status"] == "error"
+    assert "title" in result["message"]
+    mock_post.assert_not_called()
+
+
 def test_create_issue_reports_error_when_linear_reports_failure(monkeypatch):
     monkeypatch.setattr(
         linear.requests,
@@ -1650,6 +1778,28 @@ def test_update_issue_rejects_out_of_range_priority(monkeypatch):
     assert result["status"] == "error"
     assert "priority" in result["message"]
     mock_post.assert_not_called()
+
+
+def test_update_issue_rejects_explicitly_empty_title(monkeypatch):
+    mock_post = Mock()
+    monkeypatch.setattr(linear.requests, "post", mock_post)
+
+    result = json.loads(linear.linear_update_issue("ENG-1", title="   "))
+
+    assert result["status"] == "error"
+    assert "title" in result["message"]
+    mock_post.assert_not_called()
+
+
+def test_update_issue_allows_title_left_unset(monkeypatch):
+    """title=None (the default) means "leave untouched", not "empty" --
+    must not be rejected by the same guard that catches title=""."""
+    mock_post = Mock(return_value=_ISSUE_UPDATE_SUCCESS)
+    monkeypatch.setattr(linear.requests, "post", mock_post)
+
+    result = json.loads(linear.linear_update_issue("ENG-1", state_id="s1"))
+
+    assert result["status"] == "success"
 
 
 def test_list_comments_returns_nodes(monkeypatch):

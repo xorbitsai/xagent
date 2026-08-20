@@ -58,7 +58,21 @@ _VALID_STATE_TYPES = frozenset(
 _VALID_PRIORITIES = frozenset({0, 1, 2, 3, 4})
 
 
-def _success(_errors: list[Any] | None = None, **payload: Any) -> str:
+def _validate_priority(priority: int | None) -> str | None:
+    if priority is not None and priority not in _VALID_PRIORITIES:
+        return f"priority must be one of {sorted(_VALID_PRIORITIES)}, got: {priority!r}"
+    return None
+
+
+def _validate_title(title: str | None) -> str | None:
+    """None means "leave unset" (only meaningful for linear_update_issue)
+    and always passes; a provided title must be non-blank."""
+    if title is not None and not title.strip():
+        return "title must not be empty"
+    return None
+
+
+def _success(*, _errors: list[Any] | None = None, **payload: Any) -> str:
     body: dict[str, Any] = {"status": "success", **payload}
     if _errors:
         # A genuine partial GraphQL success (one sub-field failed, others
@@ -117,16 +131,23 @@ def _is_rate_limited(response: requests.Response) -> bool:
     return False
 
 
-def _rate_limit_wait_seconds(response: requests.Response) -> float:
+def _rate_limit_wait_seconds(response: requests.Response) -> float | None:
     """Linear reports the reset time via X-RateLimit-Requests-Reset, a UTC
-    epoch-milliseconds timestamp -- not a Retry-After header."""
+    epoch-milliseconds timestamp -- not a Retry-After header.
+
+    Returns None when the header is missing/unparsable (nothing to act
+    on -- distinct from a valid, already-elapsed reset time). A return of
+    0.0 means the reset window has already passed by the time this is
+    read, so an immediate retry (not a skipped one) is the likely-to-
+    succeed move.
+    """
     reset_header = response.headers.get("X-RateLimit-Requests-Reset")
     if not reset_header:
-        return 0.0
+        return None
     try:
         reset_ms = int(reset_header)
     except ValueError:
-        return 0.0
+        return None
     return max(0.0, (reset_ms / 1000.0) - time.time())
 
 
@@ -157,8 +178,12 @@ def _graphql(
         )
         if attempt == 0 and _is_rate_limited(response):
             wait_seconds = _rate_limit_wait_seconds(response)
-            if 0 < wait_seconds <= MAX_RETRY_AFTER_SECONDS:
-                time.sleep(wait_seconds)
+            if wait_seconds is not None and wait_seconds <= MAX_RETRY_AFTER_SECONDS:
+                # max(0.0, ...): _rate_limit_wait_seconds already clamps to
+                # non-negative, but time.sleep() raises ValueError on a
+                # negative argument -- this is belt-and-suspenders against
+                # that clamp ever being dropped in a future edit.
+                time.sleep(max(0.0, wait_seconds))
                 continue
         break
 
@@ -196,10 +221,12 @@ def _graphql(
     errors = payload.get("errors") or []
     if errors:
         message = _graphql_errors_message(errors)
-        if not any(data.values()):
+        if all(value is None for value in data.values()):
             # Every top-level field is null (or data is empty) -- nothing
             # usable to return, e.g. a permission failure on the single
-            # requested object.
+            # requested object. Checking for None specifically (not just
+            # falsy) matters because a resolved-but-empty field like {} or
+            # [] is a genuine partial success, not a hard failure.
             raise RuntimeError(message)
         # At least one top-level field resolved -- a genuine partial
         # success. Log for operators; the caller surfaces `errors` in its
@@ -255,8 +282,9 @@ def _resolve_team_uuid(team_id: str) -> str:
 def linear_get_current_user() -> str:
     """
     Get the profile of the Linear account this connector is authenticated as
-    (id, name, email, display name). Use this for "my account" / "who am I"
-    requests instead of asking the user for their Linear user id.
+    (id, name, email, display name, whether the account is a workspace
+    admin). Use this for "my account" / "who am I" requests instead of
+    asking the user for their Linear user id.
     """
     try:
         data, errors = _graphql("query { viewer { id name email displayName admin } }")
@@ -290,7 +318,7 @@ def linear_list_teams(limit: int = 50) -> str:
 
 
 @mcp.tool()
-def linear_list_workflow_states(team_id: str) -> str:
+def linear_list_workflow_states(team_id: str, limit: int = 100) -> str:
     """
     List a team's workflow states (e.g. "Todo", "In Progress", "Done") — id,
     name, and type. Resolve a state name to an id here before passing
@@ -300,9 +328,10 @@ def linear_list_workflow_states(team_id: str) -> str:
     try:
         resolved_team_id = _resolve_team_uuid(team_id)
         data, errors = _graphql(
-            "query($teamId: String!) { team(id: $teamId) { states(first: 100)"
-            " { nodes { id name type position } pageInfo { hasNextPage } } } }",
-            {"teamId": resolved_team_id},
+            "query($teamId: String!, $first: Int!) { team(id: $teamId) {"
+            " states(first: $first) { nodes { id name type position }"
+            " pageInfo { hasNextPage } } } }",
+            {"teamId": resolved_team_id, "first": _clamp_limit(limit)},
         )
         team = data.get("team")
         if not team or not isinstance(team, dict):
@@ -616,11 +645,10 @@ def linear_create_issue(
     label_ids: optional label ids from linear_list_labels.
     """
     try:
-        if priority is not None and priority not in _VALID_PRIORITIES:
-            return _error(
-                f"priority must be one of {sorted(_VALID_PRIORITIES)}, "
-                f"got: {priority!r}"
-            )
+        if err := _validate_title(title):
+            return _error(err)
+        if err := _validate_priority(priority):
+            return _error(err)
         issue_input: dict[str, Any] = {
             "teamId": _resolve_team_uuid(team_id),
             "title": title,
@@ -680,11 +708,10 @@ def linear_update_issue(
     affecting labels not listed here.
     """
     try:
-        if priority is not None and priority not in _VALID_PRIORITIES:
-            return _error(
-                f"priority must be one of {sorted(_VALID_PRIORITIES)}, "
-                f"got: {priority!r}"
-            )
+        if err := _validate_title(title):
+            return _error(err)
+        if err := _validate_priority(priority):
+            return _error(err)
         if label_ids is not None and (
             add_label_ids is not None or remove_label_ids is not None
         ):

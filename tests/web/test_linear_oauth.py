@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -17,9 +17,11 @@ from xagent.web.api.auth import (
     generic_oauth_login,
 )
 from xagent.web.models.database import Base
+from xagent.web.models.oauth_provider import OAuthProvider
 from xagent.web.models.public_mcp import PublicMCPApp
 from xagent.web.models.user import User
 from xagent.web.models.user_oauth import UserOAuth
+from xagent.web.tools import config as tool_config
 
 
 class MockResponse:
@@ -131,8 +133,11 @@ def test_callback_persists_token_without_userinfo_lookup(db_session, monkeypatch
         return_value=MockResponse(
             {
                 "access_token": "linear-token",
+                "refresh_token": "linear-refresh",
                 "token_type": "Bearer",
                 "scope": "read,write",
+                # Linear access tokens expire in 24 hours.
+                "expires_in": 86400,
             }
         )
     )
@@ -154,6 +159,8 @@ def test_callback_persists_token_without_userinfo_lookup(db_session, monkeypatch
     )
     assert oauth_account is not None
     assert oauth_account.access_token == "linear-token"
+    assert oauth_account.refresh_token == "linear-refresh"
+    assert oauth_account.expires_at is not None
     assert oauth_account.email is None
     assert oauth_account.provider_user_id is None
 
@@ -168,8 +175,10 @@ def test_callback_normalizes_legacy_array_scope_to_string(db_session, monkeypatc
         return_value=MockResponse(
             {
                 "access_token": "legacy-linear-token",
+                "refresh_token": "legacy-linear-refresh",
                 "token_type": "Bearer",
                 "scope": ["read", "write"],
+                "expires_in": 86400,
             }
         )
     )
@@ -187,3 +196,82 @@ def test_callback_normalizes_legacy_array_scope_to_string(db_session, monkeypatc
         .one()
     )
     assert oauth_account.scope == "read,write"
+
+
+async def test_linear_expired_token_refresh_uses_generic_form_body(
+    db_session, monkeypatch
+):
+    """Linear access tokens expire in 24 hours and have no provider-specific
+    branch in refresh_oauth_token_if_needed, so this exercises the fully
+    generic refresh path: form-encoded body, grant_type=refresh_token, and
+    client credentials sent in the body (not Basic Auth, not JSON)."""
+    db, user = db_session
+    db.add(
+        OAuthProvider(
+            provider_name="linear",
+            name="Linear",
+            client_id=encrypt_value("linear-client-id"),
+            client_secret=encrypt_value("linear-client-secret"),
+            auth_url="https://linear.app/oauth/authorize",
+            token_url="https://api.linear.app/oauth/token",
+            redirect_uri="https://app.example.com/api/auth/linear/callback",
+            userinfo_url="",
+            user_id_path="id",
+            email_path="email",
+            default_scopes=["read"],
+        )
+    )
+    oauth_account = UserOAuth(
+        user_id=user.id,
+        provider="linear",
+        access_token="old-token",
+        refresh_token="old-refresh",
+        expires_at=datetime.now(timezone.utc) - timedelta(minutes=1),
+        provider_user_id="linear-user-1",
+    )
+    db.add(oauth_account)
+    db.commit()
+
+    captured_requests = []
+
+    class FakeAsyncClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return None
+
+        async def post(self, url, **kwargs):
+            captured_requests.append((url, kwargs))
+            return MockResponse(
+                {
+                    "access_token": "new-token",
+                    "refresh_token": "new-refresh",
+                    "token_type": "Bearer",
+                    "expires_in": 86400,
+                },
+                status_code=200,
+            )
+
+    monkeypatch.setattr(tool_config.httpx, "AsyncClient", FakeAsyncClient)
+
+    assert (
+        await tool_config.refresh_oauth_token_if_needed(db, oauth_account, "linear")
+        is True
+    )
+
+    assert oauth_account.access_token == "new-token"
+    assert oauth_account.refresh_token == "new-refresh"
+    assert oauth_account.expires_at > datetime.now(timezone.utc) + timedelta(hours=1)
+    assert len(captured_requests) == 1
+    url, kwargs = captured_requests[0]
+    assert url == "https://api.linear.app/oauth/token"
+    assert kwargs["data"] == {
+        "grant_type": "refresh_token",
+        "refresh_token": "old-refresh",
+        "client_id": "linear-client-id",
+        "client_secret": "linear-client-secret",
+    }
+    assert "json" not in kwargs
+    assert "auth" not in kwargs
+    assert kwargs["headers"] == {}

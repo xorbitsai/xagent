@@ -36,6 +36,7 @@ from ..models.user import User
 from ..models.user_oauth import UserOAuth
 from ..services import gmail_provisioning
 from ..services.auth_email import send_password_reset_email
+from ..services.user_oauth import delete_scoped_user_oauth_accounts
 
 logger = logging.getLogger(__name__)
 
@@ -1618,13 +1619,17 @@ def generic_oauth_callback(
                 email = info_data.get(db_provider.email_path or "email")
 
         if user_id:
-            db.query(UserOAuth).filter(
-                UserOAuth.user_id == user_id, UserOAuth.provider == (app_id or provider)
-            ).delete()
+            delete_scoped_user_oauth_accounts(
+                db,
+                user_id=user_id,
+                resource_owner_key=None,
+                providers=[app_id or provider],
+            )
 
             oauth_account = UserOAuth(
                 user_id=user_id,
                 provider=(app_id or provider),
+                resource_owner_key=None,
                 provider_user_id=str(provider_user_id) if provider_user_id else None,
             )
             db.add(oauth_account)

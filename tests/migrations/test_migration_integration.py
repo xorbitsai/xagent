@@ -22,6 +22,7 @@ from alembic.config import Config
 from alembic.script import ScriptDirectory
 from sqlalchemy import create_engine, inspect, text
 from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.orm import sessionmaker
 
 # Project root directory
 project_root = Path(__file__).parent.parent.parent
@@ -271,6 +272,141 @@ class TestMigrations:
             "_api_key_encrypted column should exist"
         )
 
+    @pytest.mark.postgresql
+    def test_postgresql_owner_index_collision_allows_retry_after_remediation(
+        self, postgresql_tester
+    ):
+        """After operator remediation, retry starts from the intact old schema."""
+        down_revision = "20260818_seed_jira_mcp_app"
+        ordinary_index = "uq_user_oauth_ordinary_account"
+        actor_index = "uq_user_oauth_actor_account"
+        old_constraint = "uq_user_provider_account"
+
+        command.upgrade(postgresql_tester.alembic_cfg, down_revision)
+        with postgresql_tester.engine.begin() as conn:
+            conn.execute(text(f"CREATE INDEX {actor_index} ON user_oauth (user_id)"))
+
+        with pytest.raises(SQLAlchemyError):
+            command.upgrade(postgresql_tester.alembic_cfg, "head")
+
+        inspector = inspect(postgresql_tester.engine)
+        assert "resource_owner_key" not in {
+            column["name"] for column in inspector.get_columns("user_oauth")
+        }
+        assert old_constraint in {
+            constraint["name"]
+            for constraint in inspector.get_unique_constraints("user_oauth")
+        }
+        indexes = {index["name"] for index in inspector.get_indexes("user_oauth")}
+        assert actor_index in indexes
+        assert ordinary_index not in indexes
+        assert postgresql_tester.get_alembic_versions() == {down_revision}
+
+        with postgresql_tester.engine.begin() as conn:
+            conn.execute(text(f"DROP INDEX {actor_index}"))
+        command.upgrade(postgresql_tester.alembic_cfg, "head")
+
+        assert "resource_owner_key" in postgresql_tester.get_column_names("user_oauth")
+
+    @pytest.mark.postgresql
+    def test_postgresql_user_delete_cascades_actor_owned_oauth_rows(
+        self, postgresql_tester
+    ):
+        """Filtered ordinary relationship leaves actor cleanup to the FK."""
+        from xagent.web.models.database import Base
+        from xagent.web.models.user import User
+        from xagent.web.models.user_oauth import UserOAuth
+
+        Base.metadata.create_all(bind=postgresql_tester.engine)
+        db = sessionmaker(
+            bind=postgresql_tester.engine,
+            autoflush=False,
+            autocommit=False,
+        )()
+        try:
+            user = User(username="oauth-cascade-owner", password_hash="hash")
+            db.add(user)
+            db.commit()
+            db.refresh(user)
+            db.add_all(
+                [
+                    UserOAuth(
+                        user_id=int(user.id),
+                        provider="gmail",
+                        provider_user_id="ordinary",
+                        access_token="ordinary-token",
+                    ),
+                    UserOAuth(
+                        user_id=int(user.id),
+                        provider="gmail",
+                        resource_owner_key="actor:alice",
+                        provider_user_id="alice",
+                        access_token="actor-token",
+                    ),
+                ]
+            )
+            db.commit()
+            db.expire(user, ["oauth_accounts"])
+
+            assert [row.resource_owner_key for row in user.oauth_accounts] == [None]
+
+            db.delete(user)
+            db.commit()
+
+            assert db.query(UserOAuth).count() == 0
+        finally:
+            db.close()
+
+    @pytest.mark.postgresql
+    def test_postgresql_owner_migration_downgrade_restores_legacy_schema(
+        self, postgresql_tester
+    ):
+        """The supported PostgreSQL downgrade restores the old identity shape."""
+        parent = "20260818_seed_jira_mcp_app"
+        owner_revision = "20260818_user_oauth_resource_owner"
+        command.upgrade(postgresql_tester.alembic_cfg, parent)
+        with postgresql_tester.engine.begin() as conn:
+            # The historical migration chain creates user_oauth from scratch
+            # but assumes the core users table already exists. Complete that
+            # legacy shape explicitly before exercising the owner revision.
+            conn.execute(text("CREATE TABLE users (id INTEGER PRIMARY KEY)"))
+            conn.execute(
+                text(
+                    "ALTER TABLE user_oauth ADD CONSTRAINT "
+                    "fk_user_oauth_user_id_users FOREIGN KEY (user_id) "
+                    "REFERENCES users(id) ON DELETE CASCADE"
+                )
+            )
+            conn.execute(text("INSERT INTO users (id) VALUES (7001)"))
+            conn.execute(
+                text(
+                    "INSERT INTO user_oauth "
+                    "(id, user_id, provider, access_token, provider_user_id) "
+                    "VALUES (9001, 7001, 'gmail', 'token', 'provider-account')"
+                )
+            )
+
+        command.upgrade(postgresql_tester.alembic_cfg, owner_revision)
+        command.downgrade(postgresql_tester.alembic_cfg, parent)
+
+        inspector = inspect(postgresql_tester.engine)
+        assert "resource_owner_key" not in {
+            column["name"] for column in inspector.get_columns("user_oauth")
+        }
+        assert "uq_user_provider_account" in {
+            constraint["name"]
+            for constraint in inspector.get_unique_constraints("user_oauth")
+        }
+        assert not {
+            "uq_user_oauth_ordinary_account",
+            "uq_user_oauth_actor_account",
+            "ix_user_oauth_owner_provider",
+        } & {index["name"] for index in inspector.get_indexes("user_oauth")}
+        with postgresql_tester.engine.begin() as conn:
+            assert conn.execute(
+                text("SELECT provider, access_token FROM user_oauth WHERE id = 9001")
+            ).one() == ("gmail", "token")
+
     def test_sqlite_idempotence_with_sqlalchemy(self, sqlite_tester):
         """Test that migrations are idempotent when tables pre-created by SQLAlchemy.
 
@@ -311,19 +447,21 @@ class TestMigrations:
         assert "name" in agents_columns
 
     @pytest.mark.postgresql
-    def test_postgresql_idempotence_with_sqlalchemy(self, postgresql_tester):
-        """Test that migrations are idempotent when tables pre-created by SQLAlchemy.
-
-        This tests the production scenario where SQLAlchemy's Base.metadata.create_all()
-        creates tables first, then Alembic migrations run. Migrations should correctly
-        detect existing tables/columns and skip already-applied changes.
-        """
-        # First, create tables using SQLAlchemy (mimics production)
+    def test_postgresql_owner_migration_accepts_current_metadata(
+        self, postgresql_tester
+    ):
+        """The owner revision accepts its schema from current metadata."""
         from xagent.web.models.database import Base
 
         Base.metadata.create_all(bind=postgresql_tester.engine)
+        # Older migrations are not all compatible with current pre-created
+        # foreign keys. Stamp the immediate parent so this test isolates the
+        # owner migration's fresh-schema path.
+        command.stamp(
+            postgresql_tester.alembic_cfg,
+            "20260818_seed_jira_mcp_app",
+        )
 
-        # Then run migrations - should be idempotent and not fail
         command.upgrade(postgresql_tester.alembic_cfg, "head")
 
         # Get version after upgrade

@@ -219,7 +219,9 @@ def _connect_custom_stdio_mcp_for_user(username: str, server_name: str) -> None:
         db.close()
 
 
-def _connect_oauth_account_for_user(username: str, provider: str) -> None:
+def _connect_oauth_account_for_user(
+    username: str, provider: str, *, resource_owner_key: str | None = None
+) -> None:
     db = next(get_db())
     try:
         user = db.query(User).filter(User.username == username).first()
@@ -229,6 +231,7 @@ def _connect_oauth_account_for_user(username: str, provider: str) -> None:
             UserOAuth(
                 user_id=user.id,
                 provider=provider,
+                resource_owner_key=resource_owner_key,
                 access_token="access-token",
                 provider_user_id=f"{provider}-user",
                 email=f"{provider}@example.com",
@@ -399,6 +402,52 @@ def test_remote_connector_builds_oauth_connectability_once_per_account(
         assert response.status_code == 200
 
         assert checked_providers == ["microsoft"]
+    finally:
+        Base.metadata.drop_all(bind=get_engine())
+        try:
+            import shutil
+
+            shutil.rmtree(temp_dir)
+        except OSError:
+            pass
+
+
+def test_remote_connector_ignores_actor_owned_oauth_accounts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    temp_dir = _setup_test_db()
+    try:
+        _setup_admin()
+        register_response = client.post(
+            "/api/auth/register",
+            json={
+                "username": "regular",
+                "email": "regular@example.com",
+                "password": "password123",
+            },
+        )
+        assert register_response.status_code == 200
+        regular_headers = _login("regular", "password123")
+        _connect_oauth_account_for_user(
+            "regular",
+            "microsoft",
+            resource_owner_key="toby:slack:41:UALICE",
+        )
+
+        checked_providers: list[str] = []
+
+        def count_connectability_check(oauth_account: object) -> bool:
+            checked_providers.append(str(getattr(oauth_account, "provider")))
+            return True
+
+        monkeypatch.setattr(
+            mcp_api, "_oauth_account_can_connect", count_connectability_check
+        )
+
+        response = client.get("/api/mcp/apps?location=remote", headers=regular_headers)
+
+        assert response.status_code == 200
+        assert checked_providers == []
     finally:
         Base.metadata.drop_all(bind=get_engine())
         try:

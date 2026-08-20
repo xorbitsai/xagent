@@ -46,6 +46,11 @@ from ..models.trigger import (
 )
 from ..models.user_oauth import UserOAuth
 from .time_utils import coerce_utc as _coerce_utc
+from .user_oauth import (
+    get_scoped_user_oauth_account,
+    get_user_oauth_account_by_id,
+    scoped_user_oauth_query,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -871,20 +876,30 @@ def ensure_gmail_mailbox_provisioned(
     publisher_factory: PublisherFactory | None = None,
     subscriber_factory: SubscriberFactory | None = None,
 ) -> GmailWatchState:
-    """Idempotently provision Pub/Sub resources and a Gmail watch for a mailbox.
+    """Idempotently provision Pub/Sub resources for one ordinary mailbox.
 
-    Never raises for provisioning failures: the watch state converges to
-    failed with a clear last_error, and later reconcile attempts retry.
+    Actor-owned credentials are execution-only and cannot create machine-user
+    Gmail triggers. Other provisioning failures converge to a failed watch
+    state for later reconciliation.
     """
+    if oauth_account.resource_owner_key is not None:
+        raise GmailProvisioningError(
+            "actor-owned OAuth credentials cannot provision Gmail watches"
+        )
     oauth_account_id = int(oauth_account.id)
     with _gmail_watch_transition_lock(db, oauth_account_id) as transition_db:
         transition_account = (
             oauth_account
             if transition_db is db
-            else transition_db.query(UserOAuth)
-            .filter(UserOAuth.id == oauth_account_id)
-            .one()
+            else get_scoped_user_oauth_account(
+                transition_db,
+                user_id=int(oauth_account.user_id),
+                account_id=oauth_account_id,
+                resource_owner_key=None,
+            )
         )
+        if transition_account is None:
+            raise GmailProvisioningError("ordinary Gmail OAuth account not found")
         state = _ensure_gmail_mailbox_provisioned_locked(
             transition_db,
             transition_account,
@@ -988,8 +1003,10 @@ def _provision_in_fresh_session(oauth_account_id: int) -> None:
 
     db = get_session_local()()
     try:
-        oauth_account = (
-            db.query(UserOAuth).filter(UserOAuth.id == oauth_account_id).first()
+        oauth_account = get_user_oauth_account_by_id(
+            db,
+            account_id=oauth_account_id,
+            resource_owner_key=None,
         )
         if oauth_account is None:
             return
@@ -1273,8 +1290,11 @@ def release_gmail_mailbox_if_unused(
         db.commit()
         return False
 
-    oauth_account = (
-        db.query(UserOAuth).filter(UserOAuth.id == int(oauth_account_id)).first()
+    oauth_account = get_scoped_user_oauth_account(
+        db,
+        user_id=int(state.user_id),
+        account_id=int(oauth_account_id),
+        resource_owner_key=None,
     )
     if oauth_account is not None:
         try:
@@ -1357,10 +1377,11 @@ def sweep_gmail_provisioning(
     for state in candidates:
         if int(state.oauth_account_id) not in referenced_account_ids:
             continue
-        oauth_account = (
-            db.query(UserOAuth)
-            .filter(UserOAuth.id == int(state.oauth_account_id))
-            .first()
+        oauth_account = get_scoped_user_oauth_account(
+            db,
+            user_id=int(state.user_id),
+            account_id=int(state.oauth_account_id),
+            resource_owner_key=None,
         )
         if oauth_account is None:
             continue
@@ -1419,8 +1440,12 @@ def best_effort_provision_gmail_watches_for_user(
     # this function share the ``XAGENT_GMAIL_WATCH_ENABLED`` gate.
     try:
         accounts = (
-            db.query(UserOAuth)
-            .filter(UserOAuth.user_id == int(user_id), UserOAuth.provider == "gmail")
+            scoped_user_oauth_query(
+                db,
+                user_id=int(user_id),
+                resource_owner_key=None,
+            )
+            .filter(UserOAuth.provider == "gmail")
             .all()
         )
         referenced_account_ids = _referenced_gmail_oauth_account_ids(

@@ -72,6 +72,10 @@ from ..services.mcp_oauth import (
     validate_mcp_oauth_persisted_value,
 )
 from ..services.mcp_runtime import HTTP_MCP_TRANSPORTS
+from ..services.user_oauth import (
+    delete_scoped_user_oauth_accounts,
+    list_scoped_user_oauth_accounts,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -2059,11 +2063,11 @@ def list_mcp_apps(
         )
     ]
 
-    # Also fetch user oauth accounts to get the connected email
-    from ..models.user_oauth import UserOAuth
-
-    oauth_accounts = (
-        db.query(UserOAuth).filter(UserOAuth.user_id == current_user.id).all()
+    # Actor credentials are not personal catalog connections.
+    oauth_accounts = list_scoped_user_oauth_accounts(
+        db,
+        user_id=int(current_user.id),
+        resource_owner_key=None,
     )
 
     results = []
@@ -2450,11 +2454,11 @@ def get_mcp_servers(
             .all()
         )
 
-        # Fetch oauth emails
-        from ..models.user_oauth import UserOAuth
-
-        oauth_accounts = (
-            db.query(UserOAuth).filter(UserOAuth.user_id == effective_user_id).all()
+        # Actor credentials are not personal server connections.
+        oauth_accounts = list_scoped_user_oauth_accounts(
+            db,
+            user_id=effective_user_id,
+            resource_owner_key=None,
         )
         oauth_emails = {
             str(oauth.provider): str(oauth.email)
@@ -2566,10 +2570,12 @@ def get_mcp_server(
 
         user_mcp, server = result
 
-        # Fetch oauth emails for this user to enrich the server info
-        from ..models.user_oauth import UserOAuth
-
-        oauth_accounts = db.query(UserOAuth).filter(UserOAuth.user_id == user_id).all()
+        # Actor credentials are not personal server connections.
+        oauth_accounts = list_scoped_user_oauth_accounts(
+            db,
+            user_id=int(user_id),
+            resource_owner_key=None,
+        )
         oauth_emails = {
             oauth.provider: oauth.email
             for oauth in oauth_accounts
@@ -3426,7 +3432,6 @@ async def delete_mcp_server(
         # If it's an OAuth server, also delete the corresponding OAuth tokens
         if server.transport == "oauth":
             from ..mcp_apps import get_app_by_name
-            from ..models.user_oauth import UserOAuth
 
             # Find the corresponding app_id and provider
             app_info = get_app_by_name(db, str(server.name))
@@ -3444,10 +3449,12 @@ async def delete_mcp_server(
                     app_id, [provider, app_id]
                 )
                 if providers_to_delete:
-                    db.query(UserOAuth).filter(
-                        UserOAuth.user_id == user_id,
-                        UserOAuth.provider.in_(providers_to_delete),
-                    ).delete(synchronize_session=False)
+                    delete_scoped_user_oauth_accounts(
+                        db,
+                        user_id=int(user_id),
+                        resource_owner_key=None,
+                        providers=providers_to_delete,
+                    )
 
                 # The app-scoped restriction above deliberately excluded the
                 # bare provider row (e.g. "meta") so a sibling app under the
@@ -3478,10 +3485,12 @@ async def delete_mcp_server(
                         for other_server in other_servers
                     )
                     if not sibling_still_connected:
-                        db.query(UserOAuth).filter(
-                            UserOAuth.user_id == user_id,
-                            UserOAuth.provider == provider,
-                        ).delete(synchronize_session=False)
+                        delete_scoped_user_oauth_accounts(
+                            db,
+                            user_id=int(user_id),
+                            resource_owner_key=None,
+                            providers=[provider],
+                        )
 
         # Revoke and purge this user's MCP OAuth grants for the server. On a
         # shared (multi-user) row the server outlives this disconnect, so

@@ -12,6 +12,7 @@ from sqlalchemy import Engine, inspect, text
 from sqlalchemy.engine import Connection
 
 from .config import create_alembic_config
+from .migration_support import require_owner_aware_unique_index_dialect
 
 logger = logging.getLogger(__name__)
 
@@ -392,6 +393,9 @@ def try_upgrade_db(
 ) -> None:
     """Upgrade database to latest migration (or stamp head for brand-new databases)."""
     try:
+        # This precedes both Alembic revision work and the fresh-schema
+        # create_all path that follows try_upgrade_db during application start.
+        require_owner_aware_unique_index_dialect(engine.dialect.name)
         logger.info("Starting database upgrade process")
         if locked_connection is not None:
             _upgrade_db_locked(

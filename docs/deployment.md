@@ -74,3 +74,96 @@ If one task must recover before its policy inconsistency can be repaired, quiesc
 Gate new widget and shared-link task creation before rolling back any worker. Roll back all API and task-execution workers together. Do not re-enable public task creation while versions are mixed.
 
 Marked tasks do not remain isolated when executed by an older worker. Keep public execution gated during rollback, or complete the forward rollout before those tasks resume.
+
+## 2026-08-18 — Owner-aware builtin OAuth storage
+
+### Deployment impact
+
+The `user_oauth` table gets a nullable `resource_owner_key` column. Existing rows keep a null value, and every existing OAuth consumer explicitly selects that ordinary namespace.
+
+Two partial unique indexes replace `uq_user_provider_account`. One index protects ordinary rows. The other reserves distinct actor-owned namespaces for later callers. SQLite and PostgreSQL are the only supported database dialects for this schema; startup and migration fail before schema creation on other dialects.
+
+On PostgreSQL the migration creates the replacement indexes transactionally before removing the old unique constraint. A failed statement rolls back the complete schema transition. If a same-name relation causes the failure, an operator must inspect and remove or rename that relation before retrying `alembic upgrade head`. Index creation is not concurrent and can block writes to `user_oauth`, so plan a short OAuth-write pause and monitor lock wait time.
+
+On SQLite the migration rejects globally colliding owner-index names before rebuilding the table in batch mode. Stop every worker before this rebuild and keep SQLite quiesced until the migration completes.
+
+### Prerequisites and configuration
+
+This change has no new environment variable or dependency. Keep every future actor-OAuth caller disabled; this release does not expose a production path that creates actor-owned rows.
+
+### Deployment and migration steps
+
+Choose the procedure for the configured database.
+
+#### SQLite
+
+1. Stop new OAuth connections and task execution.
+2. Stop every API and task worker.
+3. Deploy the new application files without starting workers.
+4. Run `alembic upgrade head` one time.
+5. Start every API and task worker with the new version.
+6. Verify the schema and homogeneous worker version.
+7. Resume ordinary OAuth connections and task execution.
+
+#### PostgreSQL
+
+1. Pause new OAuth writes and make sure no long transaction holds a lock on `user_oauth`.
+2. Run `alembic upgrade head` one time. Existing workers can continue non-OAuth work while the transactional DDL runs.
+3. Resume ordinary OAuth writes after the migration commits.
+4. Roll every API and task worker to the owner-aware version.
+5. Verify the schema and make sure no old worker remains before a later release enables actor-owned rows.
+
+Do not backfill `resource_owner_key`. A null owner identifies an ordinary credential.
+
+### Verification and monitoring
+
+Run this query after the migration:
+
+```sql
+SELECT count(*)
+FROM user_oauth
+WHERE resource_owner_key IS NOT NULL;
+```
+
+The result must be zero.
+
+On PostgreSQL, verify that all three index names exist and are valid:
+
+```sql
+SELECT c.relname, i.indisvalid
+FROM pg_index i
+JOIN pg_class c ON c.oid = i.indexrelid
+JOIN pg_class t ON t.oid = i.indrelid
+JOIN pg_namespace n ON n.oid = t.relnamespace
+WHERE n.nspname = current_schema()
+  AND t.relname = 'user_oauth'
+  AND c.relname IN (
+    'uq_user_oauth_ordinary_account',
+    'uq_user_oauth_actor_account',
+    'ix_user_oauth_owner_provider'
+  );
+```
+
+The query must return all three rows with `indisvalid = true`.
+
+For SQLite run `PRAGMA index_list('user_oauth');` and `PRAGMA index_info('<index-name>');`. Inspect `sqlite_master.sql` to confirm that the ordinary index uses `WHERE resource_owner_key IS NULL` and the actor index uses `WHERE resource_owner_key IS NOT NULL`.
+
+Before restarting Gmail watch processing, run this query on either supported database:
+
+```sql
+SELECT count(*)
+FROM gmail_watch_states AS watch
+JOIN user_oauth AS account ON account.id = watch.oauth_account_id
+WHERE watch.user_id <> account.user_id
+   OR account.resource_owner_key IS NOT NULL;
+```
+
+The result must be zero. A nonzero result identifies a legacy watch whose account owner does not match its user or whose account is not ordinary; repair or remove that watch before rollout.
+
+Verify existing cloud-storage, Gmail, and builtin OAuth connections. Confirm that seeded non-null-owner test rows do not appear in ordinary catalog, token, or trigger paths.
+
+### Rollback
+
+Because this release cannot create actor-owned rows, the downgrade remains available after ordinary rollout. Stop workers, run `alembic downgrade 20260818_seed_jira_mcp_app`, and deploy the old version.
+
+The migration still refuses downgrade if a non-null owner row exists. If an external or future caller created such a row, disable that caller and use an approved credential-revocation and data-removal procedure before retrying the downgrade.

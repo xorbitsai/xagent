@@ -60,8 +60,16 @@ class User(Base):  # type: ignore
     user_default_models = relationship(
         "UserDefaultModel", back_populates="user", cascade="all, delete-orphan"
     )
+    # This historical relationship represents the user's ordinary OAuth
+    # accounts. Actor-owned credentials share the table for storage only and
+    # must be loaded through explicit owner-scoped service queries.
     oauth_accounts = relationship(
-        "UserOAuth", back_populates="user", cascade="all, delete-orphan"
+        "UserOAuth",
+        primaryjoin=(
+            "and_(User.id == UserOAuth.user_id, UserOAuth.resource_owner_key.is_(None))"
+        ),
+        back_populates="user",
+        cascade="all, delete-orphan",
     )
     identities = relationship(
         "UserIdentity", back_populates="user", cascade="all, delete-orphan"

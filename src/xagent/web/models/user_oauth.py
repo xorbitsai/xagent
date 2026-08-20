@@ -1,17 +1,48 @@
-from sqlalchemy import Column, DateTime, ForeignKey, Integer, String, UniqueConstraint
+from sqlalchemy import Column, DateTime, ForeignKey, Index, Integer, String, text
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
 
 from .database import Base
 
+USER_OAUTH_RESOURCE_OWNER_KEY_MAX_LENGTH = 512
+_ORDINARY_OWNER_CLAUSE = text("resource_owner_key IS NULL")
+_ACTOR_OWNER_CLAUSE = text("resource_owner_key IS NOT NULL")
+
 
 class UserOAuth(Base):  # type: ignore[no-any-unimported]
-    """User OAuth accounts (e.g. Google Drive, GitHub)"""
+    """OAuth credentials owned by either a user or one trusted actor.
+
+    A null ``resource_owner_key`` preserves the ordinary xagent credential
+    namespace. A non-null key selects an actor inside the same xagent account.
+    The key is server-owned identity metadata, never provider token material.
+    """
 
     __tablename__ = "user_oauth"
     __table_args__ = (
-        UniqueConstraint(
-            "user_id", "provider", "provider_user_id", name="uq_user_provider_account"
+        Index(
+            "uq_user_oauth_ordinary_account",
+            "user_id",
+            "provider",
+            "provider_user_id",
+            unique=True,
+            sqlite_where=_ORDINARY_OWNER_CLAUSE,
+            postgresql_where=_ORDINARY_OWNER_CLAUSE,
+        ),
+        Index(
+            "uq_user_oauth_actor_account",
+            "user_id",
+            "resource_owner_key",
+            "provider",
+            "provider_user_id",
+            unique=True,
+            sqlite_where=_ACTOR_OWNER_CLAUSE,
+            postgresql_where=_ACTOR_OWNER_CLAUSE,
+        ),
+        Index(
+            "ix_user_oauth_owner_provider",
+            "user_id",
+            "resource_owner_key",
+            "provider",
         ),
     )
 
@@ -20,6 +51,9 @@ class UserOAuth(Base):  # type: ignore[no-any-unimported]
         Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False
     )
     provider = Column(String(50), nullable=False)  # e.g. "google-drive"
+    resource_owner_key = Column(
+        String(USER_OAUTH_RESOURCE_OWNER_KEY_MAX_LENGTH), nullable=True
+    )
     access_token = Column(String, nullable=False)
     refresh_token = Column(String, nullable=True)
     expires_at = Column(DateTime(timezone=True), nullable=True)

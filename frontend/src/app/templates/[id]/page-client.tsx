@@ -32,6 +32,12 @@ export default function TemplateDetailPage() {
   const isMountedRef = useRef(true);
 
   useEffect(() => {
+    // Not redundant with useRef(true)'s initial value: React 18 StrictMode
+    // double-invokes this effect in dev (mount -> cleanup -> mount), and the
+    // cleanup below runs in between - without resetting to true on the
+    // second invocation, isMountedRef.current would stay false forever even
+    // though the component is genuinely still mounted.
+    isMountedRef.current = true;
     return () => {
       isMountedRef.current = false;
     };

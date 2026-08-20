@@ -29,6 +29,7 @@ from xagent.web.auth_config import JWT_ALGORITHM, JWT_SECRET_KEY
 from xagent.web.models.agent import Agent, AgentOrigin, AgentStatus
 from xagent.web.models.agent_api_key import AgentApiKey
 from xagent.web.models.task import Task, TaskStatus
+from xagent.web.models.template_stats import TemplateStats
 from xagent.web.models.uploaded_file import UploadedFile
 from xagent.web.models.user import User
 from xagent.web.models.workforce import Workforce, WorkforceAgent, WorkforceRun
@@ -341,6 +342,47 @@ def test_resolve_from_template_reuses_the_same_agent_on_repeat_calls(
     listed = client.get("/api/agents", headers=headers).json()
     matching = [a for a in listed if a.get("template_id") == "resolve-template"]
     assert len(matching) == 1
+
+
+def test_resolve_from_template_increments_used_count_only_on_the_fresh_mint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Hire is the primary adoption path for every currently-featured
+    template, and the Featured section's hero ranking sorts by used_count -
+    a resolve call that mints a fresh agent must record a use, exactly once,
+    not on every repeat/idempotent call."""
+    headers = _admin_headers()
+    _install_resolve_template_stub(monkeypatch)
+
+    def used_count() -> int:
+        db = _direct_db_session()
+        try:
+            stats = (
+                db.query(TemplateStats)
+                .filter(TemplateStats.template_id == "resolve-template")
+                .first()
+            )
+            return stats.used_count if stats else 0
+        finally:
+            db.close()
+
+    first = client.post(
+        "/api/agents/from-template/resolve",
+        headers=headers,
+        json={"template_id": "resolve-template"},
+    )
+    assert first.status_code == 200, first.text
+    assert first.json()["created"] is True
+    assert used_count() == 1
+
+    second = client.post(
+        "/api/agents/from-template/resolve",
+        headers=headers,
+        json={"template_id": "resolve-template"},
+    )
+    assert second.status_code == 200, second.text
+    assert second.json()["created"] is False
+    assert used_count() == 1
 
 
 def test_resolve_from_template_does_not_adopt_a_workforce_builder_draft(

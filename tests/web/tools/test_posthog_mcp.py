@@ -1,10 +1,18 @@
 import json
+import socket
 from unittest.mock import Mock
 
 import pytest
 import requests
 
 from xagent.web.tools.mcp import posthog
+
+
+def _fake_getaddrinfo(ip):
+    def _impl(host, port, *args, **kwargs):
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", (ip, port))]
+
+    return _impl
 
 
 class MockResponse:
@@ -31,6 +39,10 @@ class MockResponse:
 def _credentials(monkeypatch):
     monkeypatch.setenv("POSTHOG_API_KEY", "phx_test_key")
     monkeypatch.setenv("POSTHOG_HOST", "https://us.posthog.com")
+    # _base_url() resolves DNS to catch a hostname that rebinds to a private
+    # address; tests must not depend on real network/DNS, so every test gets
+    # a fake resolver returning an unambiguously public IP by default.
+    monkeypatch.setattr(posthog.socket, "getaddrinfo", _fake_getaddrinfo("1.1.1.1"))
 
 
 def test_headers_require_api_key(monkeypatch):
@@ -86,6 +98,41 @@ def test_base_url_strips_surrounding_whitespace(monkeypatch):
     assert posthog._base_url() == "https://eu.posthog.com"
 
 
+def test_base_url_accepts_uppercase_scheme(monkeypatch):
+    monkeypatch.setenv("POSTHOG_HOST", "HTTPS://us.posthog.com")
+
+    assert posthog._base_url() == "https://us.posthog.com"
+
+
+def test_base_url_strips_multiple_trailing_slashes(monkeypatch):
+    monkeypatch.setenv("POSTHOG_HOST", "https://eu.posthog.com///")
+
+    assert posthog._base_url() == "https://eu.posthog.com"
+
+
+def test_base_url_rejects_host_resolving_to_private_ip(monkeypatch):
+    # Not a literal private IP (that's covered by
+    # test_base_url_rejects_private_network_host) -- a hostname that only
+    # *resolves* to one, which the literal-string check alone can't catch.
+    monkeypatch.setenv("POSTHOG_HOST", "posthog-internal.example.com")
+    monkeypatch.setattr(posthog.socket, "getaddrinfo", _fake_getaddrinfo("10.0.0.5"))
+
+    with pytest.raises(ValueError, match="POSTHOG_HOST"):
+        posthog._base_url()
+
+
+def test_base_url_raises_when_dns_resolution_fails(monkeypatch):
+    monkeypatch.setenv("POSTHOG_HOST", "nonexistent.invalid")
+
+    def _raise(*args, **kwargs):
+        raise socket.gaierror("Name or service not known")
+
+    monkeypatch.setattr(posthog.socket, "getaddrinfo", _raise)
+
+    with pytest.raises(ValueError, match="POSTHOG_HOST"):
+        posthog._base_url()
+
+
 def test_base_url_preserves_explicit_port(monkeypatch):
     monkeypatch.setenv("POSTHOG_HOST", "posthog.internal.example.com:8443")
 
@@ -134,10 +181,11 @@ def test_path_segment_encodes_traversal_attempt():
     assert posthog._path_segment("1/../2") == "1%2F..%2F2"
 
 
-def test_path_segment_encodes_at_current_sentinel():
-    # PostHog's server percent-decodes path segments before route matching,
-    # so the encoded form still resolves to the literal "@current" sentinel.
-    assert posthog._path_segment("@current") == "%40current"
+def test_path_segment_leaves_at_current_sentinel_unescaped():
+    # "@" is explicitly kept literal (RFC 3986 permits it unescaped in a
+    # path segment) so the "@current"/"@me" sentinel every tool here
+    # defaults to stays readable, without relying on the server decoding it.
+    assert posthog._path_segment("@current") == "@current"
 
 
 def test_paginated_results_returns_next_offset_when_truncated():
@@ -164,6 +212,22 @@ def test_paginated_results_no_next_offset_when_not_truncated():
     assert next_offset is None
 
 
+def test_paginated_results_no_next_offset_when_truncated_but_page_empty():
+    # A server response that claims more pages exist (`next` is set) but
+    # returns zero results this call -- if this still handed back a
+    # next_offset, it would equal the offset just requested, and a caller
+    # that mechanically retries with it would loop forever on one request.
+    page, truncated, next_offset = posthog._paginated_results(
+        {"results": [], "next": "https://us.posthog.com/x?offset=999"},
+        limit=50,
+        offset=10,
+    )
+
+    assert page == []
+    assert truncated is True
+    assert next_offset is None
+
+
 def test_request_uses_configured_host_and_headers(monkeypatch):
     mock_request = Mock(return_value=MockResponse(json_data={"ok": True}))
     monkeypatch.setattr(posthog.requests, "request", mock_request)
@@ -178,6 +242,22 @@ def test_request_uses_configured_host_and_headers(monkeypatch):
         mock_request.call_args.kwargs["headers"]["Authorization"]
         == "Bearer phx_test_key"
     )
+    assert mock_request.call_args.kwargs["allow_redirects"] is False
+
+
+def test_request_rejects_redirect_response(monkeypatch):
+    monkeypatch.setattr(
+        posthog.requests,
+        "request",
+        Mock(
+            return_value=MockResponse(
+                status_code=302, url="https://us.posthog.com/api/users/@me/"
+            )
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="redirect"):
+        posthog._request("GET", "/api/users/@me/")
 
 
 def test_request_raises_with_structured_error_detail(monkeypatch):
@@ -344,11 +424,8 @@ def test_list_projects_defaults_organization_id_to_current(monkeypatch):
 
     posthog.posthog_list_projects()
 
-    # "@current" is percent-encoded like any other id (see
-    # test_list_projects_encodes_hostile_organization_id); PostHog's server
-    # decodes it back to the literal sentinel before route matching.
     assert mock_request.call_args.kwargs["url"].endswith(
-        "/api/organizations/%40current/projects/"
+        "/api/organizations/@current/projects/"
     )
 
 
@@ -389,7 +466,7 @@ def test_query_sends_hogql_query_body(monkeypatch):
         "name": "my query",
     }
     assert mock_request.call_args.kwargs["url"].endswith(
-        "/api/projects/%40current/query/"
+        "/api/projects/@current/query/"
     )
 
 
@@ -427,7 +504,7 @@ def test_get_person_returns_person(monkeypatch):
     assert result["status"] == "success"
     assert result["person"]["id"] == 1
     assert mock_request.call_args.kwargs["url"].endswith(
-        "/api/projects/%40current/persons/1/"
+        "/api/projects/@current/persons/1/"
     )
 
 

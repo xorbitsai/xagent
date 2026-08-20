@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+import socket
 from typing import Any
 from urllib.parse import quote, urlsplit
 
@@ -57,30 +58,45 @@ def _base_url() -> str:
     HTTPS origin (matching mcp_oauth.py's use of the same
     reject_private_network_host guard for a user-configured MCP host):
     no embedded credentials, no path/query/fragment that could redirect the
-    request elsewhere, and no localhost/private/link-local target.
+    request elsewhere, and no localhost/private/link-local target -- checked
+    both as a literal string and, since a hostname can resolve to a private
+    address it didn't spell out (DNS rebinding), against every address it
+    actually resolves to. This validates the address at call time; it does
+    not pin the later `requests` connection to the address checked here, so
+    a second, independent DNS answer at connect time is a narrower residual
+    gap than not checking DNS at all.
     """
     host = os.environ.get("POSTHOG_HOST", "").strip()
     if not host:
         raise ValueError("POSTHOG_HOST environment variable is missing")
-    if not host.startswith(("http://", "https://")):
+    if "://" not in host:
         host = f"https://{host}"
 
     parsed = urlsplit(host)
-    if parsed.scheme != "https":
+    if parsed.scheme.lower() != "https":
         raise ValueError("POSTHOG_HOST must be an https:// URL")
     if parsed.username is not None or parsed.password is not None:
         raise ValueError("POSTHOG_HOST must not contain embedded credentials")
-    if parsed.path not in ("", "/") or parsed.query or parsed.fragment:
+    if parsed.path.strip("/") or parsed.query or parsed.fragment:
         raise ValueError(
             "POSTHOG_HOST must be a bare host, not a URL with a path, "
             "query, or fragment"
         )
     if not parsed.hostname:
         raise ValueError("POSTHOG_HOST environment variable is missing")
+
+    port = parsed.port or 443
     try:
         reject_private_network_host(parsed.hostname)
+        resolved = socket.getaddrinfo(
+            parsed.hostname, port, socket.AF_UNSPEC, socket.SOCK_STREAM
+        )
+        for *_, sockaddr in resolved:
+            reject_private_network_host(str(sockaddr[0]))
     except PrivateNetworkHostError as exc:
         raise ValueError(f"POSTHOG_HOST is not allowed: {exc}") from exc
+    except OSError as exc:
+        raise ValueError(f"POSTHOG_HOST could not be resolved: {exc}") from exc
 
     netloc = (
         parsed.hostname if parsed.port is None else f"{parsed.hostname}:{parsed.port}"
@@ -102,8 +118,12 @@ def _path_segment(value: str) -> str:
     jira.py's _path_segment / intercom.py's inline quote() calls.
     Percent-encoding - not a blocklist of "/", "?", "#" - is what actually
     prevents a value like "1/../2" from escaping its intended path segment.
+    "@" is left unescaped (RFC 3986 already permits it literally in a path
+    segment) purely so the "@current"/"@me" sentinel values every tool here
+    defaults to stay readable in URLs and logs; it plays no role in the
+    escape this helper prevents.
     """
-    return quote(str(value), safe="")
+    return quote(str(value), safe="@")
 
 
 def _extract_error_detail(response: requests.Response) -> str | None:
@@ -138,7 +158,18 @@ def _request(
         params=params,
         json=json_data,
         timeout=DEFAULT_TIMEOUT_SECONDS,
+        # A redirect response is never followed with the Bearer header
+        # still attached: PostHog's documented API doesn't redirect, so a
+        # 3xx here is either a misconfiguration or exactly the "redirect to
+        # an internal host and carry the credential along" SSRF vector
+        # _base_url()'s host validation guards against on the way in.
+        allow_redirects=False,
     )
+    if 300 <= response.status_code < 400:
+        raise RuntimeError(
+            f"PostHog returned an unexpected redirect (HTTP {response.status_code}); "
+            "refusing to follow it with credentials attached"
+        )
     try:
         response.raise_for_status()
     except requests.HTTPError as exc:
@@ -172,7 +203,11 @@ def _paginated_results(
     results = payload.get("results") or []
     page = results[:limit]
     truncated = bool(payload.get("next")) or len(results) > limit
-    next_offset = offset + len(page) if truncated else None
+    # A truncated-but-empty page (a self-contradictory but not-impossible
+    # server response) would otherwise yield next_offset == offset, and a
+    # caller that mechanically retries with next_offset would loop forever
+    # on the exact same request.
+    next_offset = offset + len(page) if truncated and page else None
     return page, truncated, next_offset
 
 

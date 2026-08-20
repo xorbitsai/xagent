@@ -322,9 +322,9 @@ export function LibraryTemplateCard({
 
         {isHero && capabilityTags.length > 0 ? (
           <div className="mb-4 flex flex-wrap gap-1.5">
-            {capabilityTags.map((tag) => (
+            {capabilityTags.map((tag, index) => (
               <span
-                key={tag}
+                key={`${tag}-${index}`}
                 className="rounded-full border border-border px-2.5 py-1 text-[11.5px] font-medium text-foreground/80"
               >
                 {tag}

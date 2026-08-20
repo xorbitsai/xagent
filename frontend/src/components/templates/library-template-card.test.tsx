@@ -315,6 +315,38 @@ describe("LibraryTemplateCard", () => {
       expect(screen.queryByText("[browser]")).not.toBeInTheDocument();
     });
 
+    it("keys duplicate capability tags uniquely when a formatted category collides with a skill string", () => {
+      // formatToolLabel here deliberately produces "static-visual-design"
+      // for the "web_search" category, colliding with the literal skill of
+      // the same name - capabilityTags then has that string twice.
+      const consoleErrorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+      const collidingTemplate = makeTemplate({
+        ...MAYA_TEMPLATE,
+        tool_categories: ["web_search"],
+        skills: ["static-visual-design"],
+      });
+
+      render(
+        <LibraryTemplateCard
+          template={collidingTemplate}
+          useLabel="Use Template"
+          defaultSetupTime="5 min setup"
+          variant="hero"
+          formatToolLabel={() => "static-visual-design"}
+          onOpenPersona={{ onOpen: vi.fn(), formatMeetLabel: (name) => `Meet ${name}` }}
+          onUse={vi.fn()}
+        />
+      );
+
+      expect(screen.getAllByText("static-visual-design")).toHaveLength(2);
+      expect(
+        consoleErrorSpy.mock.calls.some((args) =>
+          String(args[0]).includes("same key")
+        )
+      ).toBe(false);
+      consoleErrorSpy.mockRestore();
+    });
+
     it("does not show the badge, bullets, or tags for the default variant, and truncates the description", () => {
       render(
         <LibraryTemplateCard

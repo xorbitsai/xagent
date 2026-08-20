@@ -412,7 +412,9 @@ def get_agent_capability_lists(template: dict[str, Any]) -> tuple[list[str], lis
     """
     if template.get("type") != "agent":
         return [], []
-    agent_config = template.get("agent_config") or {}
+    agent_config = template.get("agent_config")
+    if not isinstance(agent_config, dict):
+        return [], []
     tool_categories = agent_config.get("tool_categories", [])
     skills = agent_config.get("skills", [])
     return (

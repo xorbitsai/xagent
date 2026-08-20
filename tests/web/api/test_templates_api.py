@@ -12,6 +12,7 @@ from sqlalchemy.exc import IntegrityError
 
 from xagent.web.api.auth import auth_router, hash_password
 from xagent.web.api.templates import (
+    get_agent_capability_lists,
     get_or_create_template_stats,
     increment_template_likes,
     increment_template_used_count,
@@ -537,6 +538,14 @@ class TestTemplatesAPI:
             body = response.json()
             assert body["tool_categories"] == []
             assert body["skills"] == []
+
+    def test_get_agent_capability_lists_ignores_malformed_agent_config(self):
+        """A truthy but non-dict agent_config (corrupt data, not just a
+        missing/empty one) must fall back to empty lists rather than raise
+        - `.get()` on a str/list would blow up the whole endpoint."""
+        assert get_agent_capability_lists(
+            {"type": "agent", "agent_config": "not-a-dict"}
+        ) == ([], [])
 
     def test_sample_prompts_localization_and_default(
         self, mock_app_state, admin_headers

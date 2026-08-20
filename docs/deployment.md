@@ -93,7 +93,7 @@ The normal application-startup migration path disables SQLite foreign-key enforc
 
 If the migration reports `UserOAuth schema is partially owner-aware`, do not start workers. The schema has either `resource_owner_key` and the old `uq_user_provider_account` constraint together, or neither one. Restore the last known complete schema from backup, or have a database operator finish one coherent legacy or owner-aware schema before retrying `alembic upgrade head`. Do not bypass this fail-closed check.
 
-If SQLite reports that an owner-index name already exists before migration, query `sqlite_master` for that exact name and identify its owning table and definition. After taking a backup, remove or rename only the unrelated colliding index, then retry `alembic upgrade head`. If either database reports `owner-aware UserOAuth schema has incorrect indexes`, keep workers stopped and compare both index columns, uniqueness flags, and predicates with the verification definitions below. Repair or remove the incorrect owner indexes under database-operator supervision before retrying the migration.
+If SQLite reports that an owner-aware schema name already exists before migration, query `sqlite_master` for that exact name and identify its relation type, owning table, and definition. After taking a backup, remove or rename only the unrelated colliding table, index, or view, then retry `alembic upgrade head`. If either database reports `owner-aware UserOAuth schema has incorrect indexes`, keep workers stopped and compare both index columns, uniqueness flags, and predicates with the verification definitions below. Repair or remove the incorrect owner indexes under database-operator supervision before retrying the migration.
 
 ### Prerequisites and configuration
 

@@ -81,7 +81,7 @@ Marked tasks do not remain isolated when executed by an older worker. Keep publi
 
 The `user_oauth` table gets a nullable `resource_owner_key` column. Existing rows keep a null value, and every existing OAuth consumer explicitly selects that ordinary namespace.
 
-Two partial unique indexes replace `uq_user_provider_account`. One index protects ordinary rows. The other reserves distinct actor-owned namespaces for later callers. SQLite and PostgreSQL are the only supported database dialects for this schema; startup and migration fail before schema creation on other dialects.
+Two partial unique indexes replace `uq_user_provider_account`. One index protects ordinary rows. The other separates actor-owned namespaces when `provider_user_id` is non-null. Standard SQL null semantics still permit multiple rows with the same actor key, provider, and null `provider_user_id`. SQLite and PostgreSQL are the only supported database dialects for this schema; startup and migration fail before schema creation on other dialects.
 
 On PostgreSQL the migration creates the replacement indexes transactionally before removing the old unique constraint. A failed statement rolls back the complete schema transition. If a same-name relation causes the failure, an operator must inspect and remove or rename that relation before retrying `alembic upgrade head`. Index creation is not concurrent and can block writes to `user_oauth`, so plan a short OAuth-write pause and monitor lock wait time.
 

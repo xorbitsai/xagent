@@ -118,10 +118,10 @@ __all__ = ["app"]
 def _startup_phase(name: str) -> Iterator[None]:
     """Log a begin/end pair with duration around a startup phase.
 
-    Issue #231: the slow sandbox-quiesce phase was awaited inline with no
-    logs, so an ~8 min stall looked like a fast start. One line in, one line
-    out per phase (never per loop/tick) makes the next slow start obvious. A
-    failing phase still logs its end line before the error propagates.
+    A slow phase awaited inline with no logs makes a multi-minute stall look
+    like a fast start. One line in, one line out per phase (never per
+    loop/tick) makes the next slow start obvious. A failing phase still logs
+    its end line before the error propagates.
     """
     logger.info("startup phase begin: %s", name)
     started = time.monotonic()
@@ -1558,11 +1558,10 @@ async def startup_event() -> None:
         logger.info("Started background uploaded files reconcile task")
 
         # Clean up orphaned temporary files from interrupted atomic replacements.
-        # Issue #231: this is an os.walk over the entire uploads tree, awaited
-        # inline in the lifespan. On a large tree (a prod region had ~640k
-        # directories) a cold-cache walk can dominate startup for minutes with
-        # no log output — the exact blind spot that hid the original stall.
-        # Wrap it so the next slow start names this phase and its duration.
+        # This walks the entire uploads tree inline during startup and can take
+        # minutes on a large tree with no log output in between. Wrap it in a
+        # startup phase so its duration is visible and a slow start is easy to
+        # diagnose from the logs alone.
         try:
             from .api.kb import cleanup_orphaned_temp_files
 
@@ -1597,9 +1596,9 @@ async def startup_event() -> None:
         # This also resolves and caches the backend-capability probe as a
         # side effect, so cleanup() below reads the cached value instead of
         # resolving it again.
-        # The phases that hid issue #231: cleanup() quiesce was awaited
-        # inline for ~8 min with no logs. Time each so the next slow start
-        # names the exact sub-phase; the quiesce summary breaks it down more.
+        # cleanup() quiesce can be awaited inline for minutes with no logs.
+        # Time each sub-phase so the next slow start names the exact one; the
+        # quiesce summary breaks it down further.
         with _startup_phase("sandbox static readiness"):
             await check_sandbox_static_readiness(sandbox_mgr)
         with _startup_phase("sandbox cleanup"):

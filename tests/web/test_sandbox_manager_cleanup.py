@@ -611,7 +611,7 @@ class TestLegacyCleanupSummary:
 class TestStartupPhaseLogging:
     """``_startup_phase`` emits a terminal line on every exit — success, error,
     and cancellation — so a stalled/aborted startup is never left showing only
-    its begin line (issue #231)."""
+    its begin line."""
 
     def test_success_logs_done(self, caplog: pytest.LogCaptureFixture) -> None:
         with caplog.at_level(logging.INFO, logger="xagent.web.app"):

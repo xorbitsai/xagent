@@ -553,6 +553,13 @@ async def collect_gmail_pubsub_events(
         resource_owner_key=None,
     )
     if oauth_account is None:
+        logger.warning(
+            "Skipping Gmail callback for watch state %s: OAuth account %s is "
+            "missing or not ordinary for user %s",
+            state.id,
+            state.oauth_account_id,
+            state.user_id,
+        )
         return GmailPubsubEventCollection(events=[], skipped=1)
 
     state_id = int(state.id)

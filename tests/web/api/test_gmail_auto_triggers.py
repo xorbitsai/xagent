@@ -1403,6 +1403,46 @@ def test_best_effort_provisioning_targets_only_referenced_mailboxes(
         db.close()
 
 
+def test_collect_gmail_pubsub_events_warns_for_nonordinary_watch_account(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    db = _direct_db_session()
+    try:
+        user = _create_user(db, "gmail-owner-mismatch")
+        oauth = _create_gmail_oauth(db, user)
+        state = GmailWatchState(
+            user_id=int(user.id),
+            oauth_account_id=int(oauth.id),
+            email="codeacme17@gmail.com",
+            history_id="100",
+            topic_name="projects/demo/topics/xagent-gmail",
+        )
+        setattr(oauth, "resource_owner_key", "actor:alice")
+        db.add_all([oauth, state])
+        db.commit()
+
+        with caplog.at_level("WARNING"):
+            result = asyncio.run(
+                collect_gmail_pubsub_events(
+                    db,
+                    GmailPubsubNotification(
+                        email_address="codeacme17@gmail.com",
+                        history_id="222",
+                        pubsub_message_id="pubsub-owner-mismatch",
+                    ),
+                    state=state,
+                )
+            )
+
+        assert result.events == []
+        assert result.skipped == 1
+        assert "Skipping Gmail callback" in caplog.text
+        assert str(state.id) in caplog.text
+        assert str(oauth.id) in caplog.text
+    finally:
+        db.close()
+
+
 def test_collect_gmail_pubsub_events_collects_matching_trigger_events() -> None:
     db = _direct_db_session()
     try:

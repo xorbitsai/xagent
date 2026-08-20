@@ -1302,6 +1302,14 @@ def release_gmail_mailbox_if_unused(
             service.users().stop(userId="me").execute()
         except Exception as exc:
             logger.warning("Failed to stop Gmail watch for %s: %s", email, exc)
+    else:
+        logger.warning(
+            "Cannot stop Gmail watch for state %s: OAuth account %s is missing "
+            "or not ordinary for user %s",
+            state.id,
+            oauth_account_id,
+            state.user_id,
+        )
 
     project_id = get_gmail_pubsub_project_id()
     if project_id:
@@ -1384,6 +1392,13 @@ def sweep_gmail_provisioning(
             resource_owner_key=None,
         )
         if oauth_account is None:
+            logger.warning(
+                "Skipping Gmail provisioning sweep for watch state %s: OAuth "
+                "account %s is missing or not ordinary for user %s",
+                state.id,
+                state.oauth_account_id,
+                state.user_id,
+            )
             continue
         ensure_gmail_mailbox_provisioned(
             db,

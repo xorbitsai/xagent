@@ -460,6 +460,35 @@ def test_sweep_retries_stale_failed_referenced_mailbox(db_session: Session) -> N
     assert refreshed.last_error is None
 
 
+def test_sweep_warns_when_watch_account_is_not_ordinary(
+    db_session: Session, caplog: pytest.LogCaptureFixture
+) -> None:
+    user = _create_user(db_session)
+    agent = _create_agent(db_session, user)
+    account = _create_oauth(db_session, user)
+    _create_gmail_trigger(db_session, user, agent, account)
+    state = GmailWatchState(
+        user_id=int(user.id),
+        oauth_account_id=int(account.id),
+        email="owner@gmail.example",
+        history_id="",
+        topic_name="",
+        status=TriggerProvisioningStatus.FAILED.value,
+        updated_at=datetime.now(timezone.utc) - timedelta(minutes=10),
+    )
+    setattr(account, "resource_owner_key", "actor:alice")
+    db_session.add_all([account, state])
+    db_session.commit()
+
+    with caplog.at_level(logging.WARNING):
+        attempts = sweep_gmail_provisioning(db_session)
+
+    assert attempts == 0
+    assert "Skipping Gmail provisioning sweep" in caplog.text
+    assert str(state.id) in caplog.text
+    assert str(account.id) in caplog.text
+
+
 def test_sweep_matches_duplicate_mailboxes_by_oauth_account_id(
     db_session: Session,
 ) -> None:
@@ -1225,6 +1254,32 @@ def test_unbind_releases_old_mailbox_while_flag_is_off(
     )
     assert status == TriggerProvisioningStatus.FAILED.value
     assert "disabled" in str(trigger.provisioning_error)
+
+
+def test_release_warns_when_watch_account_is_not_ordinary(
+    db_session: Session, caplog: pytest.LogCaptureFixture
+) -> None:
+    user = _create_user(db_session)
+    account = _create_oauth(db_session, user)
+    state = GmailWatchState(
+        user_id=int(user.id),
+        oauth_account_id=int(account.id),
+        email="owner@gmail.example",
+        history_id="history",
+        topic_name="topic",
+        status=TriggerProvisioningStatus.ACTIVE.value,
+    )
+    setattr(account, "resource_owner_key", "actor:alice")
+    db_session.add_all([account, state])
+    db_session.commit()
+
+    with caplog.at_level(logging.WARNING):
+        released = release_gmail_mailbox_if_unused(db_session, int(account.id))
+
+    assert released is True
+    assert "Cannot stop Gmail watch" in caplog.text
+    assert str(state.id) in caplog.text
+    assert str(account.id) in caplog.text
 
 
 def test_provision_gmail_trigger_disabled_reports_failed_without_registering(

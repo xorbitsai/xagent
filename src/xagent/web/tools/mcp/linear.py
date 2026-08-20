@@ -62,13 +62,14 @@ def _validate_title(title: str | None) -> str | None:
 
 
 def _success(*, _errors: list[Any] | None = None, **payload: Any) -> str:
-    """`_errors` becomes a `warnings` list entry, not to be confused with
-    the unrelated `error` string some pagination-loop callers pass directly
-    in `payload` (a page-fetch exception after earlier pages succeeded).
-    The two describe different things and can both be present at once: a
-    sub-field resolver failure on an already-fetched page (`warnings`) and
-    the reason a *later* page could not be fetched at all (`error`) --
-    neither takes precedence over the other, both are simply reported.
+    """The result envelope has exactly one outcome field, `status`
+    ("success" here, "error" from `_error()`), plus two independent
+    incompleteness signals that a caller may need alongside a successful
+    result: `truncated` (more results exist past `limit`) and `warnings`
+    (this call's own top-level field resolved, but a nested sub-field on it
+    failed -- see `_graphql`'s docstring). Neither implies or excludes the
+    other; a single response can be truncated, carry warnings, both, or
+    neither, all while `status` stays "success".
     """
     body: dict[str, Any] = {"status": "success", **payload}
     if _errors:
@@ -108,6 +109,16 @@ def _graphql_errors_message(errors: list[Any]) -> str:
     return "; ".join(messages) if messages else "Unknown Linear API error"
 
 
+def _mutation_failure_message(base_message: str, errors: list[Any]) -> str:
+    """`success: false` on its own gives the caller nothing to act on --
+    bad team, missing permission, and invalid label id all look identical.
+    Fold in whatever detail the same GraphQL response's `errors` array
+    carries (already returned by `_graphql` alongside `data`), when any."""
+    if not errors:
+        return base_message
+    return f"{base_message}: {_graphql_errors_message(errors)}"
+
+
 def _truncate_error_text(text: str) -> str:
     if len(text) > MAX_ERROR_RESPONSE_TEXT_CHARS:
         return text[:MAX_ERROR_RESPONSE_TEXT_CHARS] + "... [truncated]"
@@ -134,24 +145,43 @@ def _is_rate_limited(response: requests.Response) -> bool:
     return False
 
 
-def _rate_limit_wait_seconds(response: requests.Response) -> float | None:
-    """Linear reports the reset time via X-RateLimit-Requests-Reset, a UTC
-    epoch-milliseconds timestamp -- not a Retry-After header.
+_RATE_LIMIT_RESET_HEADERS = (
+    "X-RateLimit-Requests-Reset",
+    "X-RateLimit-Endpoint-Requests-Reset",
+    "X-RateLimit-Complexity-Reset",
+)
 
-    Returns None when the header is missing/unparsable (nothing to act
-    on -- distinct from a valid, already-elapsed reset time). A return of
-    0.0 means the reset window has already passed by the time this is
-    read, so an immediate retry (not a skipped one) is the likely-to-
-    succeed move.
+
+def _rate_limit_wait_seconds(response: requests.Response) -> float | None:
+    """Linear enforces three independent rate-limit dimensions -- requests,
+    endpoint requests, and complexity -- each with its own UTC
+    epoch-milliseconds `X-RateLimit-*-Reset` header, and all three surface
+    the same RATELIMITED code. The list/search calls in this module are
+    exactly the shape most likely to trip the *complexity* limit (large
+    `first`, nested selections), so reading only one dimension's header
+    could wait on the wrong window; take the max reset across whichever of
+    the three headers are present on the response.
+
+    Returns None when none of the headers are present/parsable (nothing to
+    act on -- distinct from a valid, already-elapsed reset time). A return
+    of 0.0 means every present reset window has already passed by the time
+    this is read, so an immediate retry (not a skipped one) is the likely-
+    to-succeed move.
     """
-    reset_header = response.headers.get("X-RateLimit-Requests-Reset")
-    if not reset_header:
-        return None
-    try:
-        reset_ms = int(reset_header)
-    except ValueError:
-        return None
-    return max(0.0, (reset_ms / 1000.0) - time.time())
+    wait_seconds: float | None = None
+    for header_name in _RATE_LIMIT_RESET_HEADERS:
+        reset_header = response.headers.get(header_name)
+        if not reset_header:
+            continue
+        try:
+            reset_ms = int(reset_header)
+        except ValueError:
+            continue
+        header_wait = max(0.0, (reset_ms / 1000.0) - time.time())
+        wait_seconds = (
+            header_wait if wait_seconds is None else max(wait_seconds, header_wait)
+        )
+    return wait_seconds
 
 
 def _graphql(
@@ -217,6 +247,18 @@ def _graphql(
         )
 
     data = payload.get("data") or {}
+    if len(data) > 1:
+        # The hard-failure vs partial-success discriminator below is only
+        # correct when every query/mutation in this module selects exactly
+        # one top-level field (documented above) -- enforced here so a
+        # future multi-root-field query fails loudly instead of silently
+        # letting one null field alongside one resolved field be
+        # misclassified as a partial success.
+        raise RuntimeError(
+            f"Linear API response had {len(data)} top-level fields "
+            f"({sorted(data)}), but this module's error handling assumes "
+            "exactly one"
+        )
     errors = payload.get("errors") or []
     if errors:
         message = _graphql_errors_message(errors)
@@ -277,6 +319,32 @@ def _resolve_team_uuid(team_id: str) -> str:
     return str(teams[0]["id"])
 
 
+def _team_scoped_list(
+    team_id: str, field_name: str, first: int, selection: str
+) -> tuple[list[Any], bool, list[Any]]:
+    """Shared skeleton behind every `team(id: ...) { <field_name> { ... } }`
+    tool below (workflow states, labels, and the team-scoped half of
+    projects): resolve team → single-field query → validate the team
+    exists → extract nodes/truncated. Raises ValueError with the same
+    "Team '...' not found" message each call site returned directly before
+    this was extracted, so the caller's existing `except Exception` handling
+    needs no change."""
+    resolved_team_id = _resolve_team_uuid(team_id)
+    data, errors = _graphql(
+        f"query($teamId: String!, $first: Int!) {{ team(id: $teamId) {{"
+        f" {field_name}(first: $first) {{ nodes {{ {selection} }}"
+        " pageInfo { hasNextPage } } } }",
+        {"teamId": resolved_team_id, "first": first},
+    )
+    team = data.get("team")
+    if not team or not isinstance(team, dict):
+        raise ValueError(f"Team '{team_id}' not found")
+    field_data = team.get(field_name) or {}
+    nodes = field_data.get("nodes") or []
+    truncated = bool((field_data.get("pageInfo") or {}).get("hasNextPage"))
+    return nodes, truncated, errors
+
+
 @mcp.tool()
 def linear_get_current_user() -> str:
     """
@@ -325,19 +393,9 @@ def linear_list_workflow_states(team_id: str, limit: int = 100) -> str:
     team_id: a team id or key from linear_list_teams.
     """
     try:
-        resolved_team_id = _resolve_team_uuid(team_id)
-        data, errors = _graphql(
-            "query($teamId: String!, $first: Int!) { team(id: $teamId) {"
-            " states(first: $first) { nodes { id name type position }"
-            " pageInfo { hasNextPage } } } }",
-            {"teamId": resolved_team_id, "first": _clamp_limit(limit)},
+        states, truncated, errors = _team_scoped_list(
+            team_id, "states", _clamp_limit(limit), "id name type position"
         )
-        team = data.get("team")
-        if not team or not isinstance(team, dict):
-            return _error(f"Team '{team_id}' not found")
-        states_data = team.get("states") or {}
-        states = states_data.get("nodes") or []
-        truncated = bool((states_data.get("pageInfo") or {}).get("hasNextPage"))
         return _success(states=states, truncated=truncated, _errors=errors)
     except Exception as e:
         logger.error(f"Error listing Linear workflow states for team {team_id}: {e}")
@@ -353,19 +411,9 @@ def linear_list_labels(team_id: str, limit: int = 100) -> str:
     team_id: a team id or key from linear_list_teams.
     """
     try:
-        resolved_team_id = _resolve_team_uuid(team_id)
-        data, errors = _graphql(
-            "query($teamId: String!, $first: Int!) { team(id: $teamId) {"
-            " labels(first: $first) { nodes { id name color }"
-            " pageInfo { hasNextPage } } } }",
-            {"teamId": resolved_team_id, "first": _clamp_limit(limit)},
+        labels, truncated, errors = _team_scoped_list(
+            team_id, "labels", _clamp_limit(limit), "id name color"
         )
-        team = data.get("team")
-        if not team or not isinstance(team, dict):
-            return _error(f"Team '{team_id}' not found")
-        labels_data = team.get("labels") or {}
-        labels = labels_data.get("nodes") or []
-        truncated = bool((labels_data.get("pageInfo") or {}).get("hasNextPage"))
         return _success(labels=labels, truncated=truncated, _errors=errors)
     except Exception as e:
         logger.error(f"Error listing Linear labels for team {team_id}: {e}")
@@ -425,10 +473,10 @@ _ISSUE_SUMMARY_FIELDS = (
 )
 # Used for single-issue fetches and mutation results, where the caller
 # asked about (or just created/updated) exactly one issue and the full
-# body is the point. Derived from _ISSUE_SUMMARY_FIELDS (rather than a
+# body is the point. Appends to _ISSUE_SUMMARY_FIELDS (rather than a
 # second hand-maintained literal) so the two field sets can't silently
 # drift apart on a future edit to the fields they share.
-_ISSUE_DETAIL_FIELDS = _ISSUE_SUMMARY_FIELDS.replace("title", "title description", 1)
+_ISSUE_DETAIL_FIELDS = f"{_ISSUE_SUMMARY_FIELDS} description"
 
 
 @mcp.tool()
@@ -461,16 +509,27 @@ def linear_search_issues(
                 f"state_type must be one of {sorted(_VALID_STATE_TYPES)}, "
                 f"got: {state_type!r}"
             )
+        # filter_parts/filter_var_types/variables are built together, one
+        # entry per active filter, so filter_var_types's GraphQL variable
+        # declarations always match variables exactly -- no separate
+        # dict keyed by variable name, so there's nothing to fall out of
+        # sync with what's actually in `variables` (a prior version built
+        # this signature by iterating `variables` itself, which broke if
+        # any key was inserted before this block in a future edit).
         filter_parts = []
+        filter_var_types = []
         variables: dict[str, Any] = {}
         if team_id:
             filter_parts.append("team: { id: { eq: $teamId } }")
+            filter_var_types.append("$teamId: ID!")
             variables["teamId"] = _resolve_team_uuid(team_id)
         if assignee_id:
             filter_parts.append("assignee: { id: { eq: $assigneeId } }")
+            filter_var_types.append("$assigneeId: ID!")
             variables["assigneeId"] = assignee_id
         if state_type:
             filter_parts.append("state: { type: { eq: $stateType } }")
+            filter_var_types.append("$stateType: String!")
             variables["stateType"] = state_type
         needle = query.strip()
         if needle:
@@ -478,21 +537,14 @@ def linear_search_issues(
             # containsIgnoreCase -- confirmed against Linear's own GraphQL
             # schema (github.com/linear/linear packages/sdk/src/schema.graphql).
             filter_parts.append("title: { containsIgnoreCase: $query }")
+            filter_var_types.append("$query: String!")
             variables["query"] = needle
 
         filter_clause = ""
         filter_signature = ""
         if filter_parts:
             filter_clause = ", filter: { " + ", ".join(filter_parts) + " }"
-            type_signature = {
-                "teamId": "$teamId: ID!",
-                "assigneeId": "$assigneeId: ID!",
-                "stateType": "$stateType: String!",
-                "query": "$query: String!",
-            }
-            filter_signature = ", " + ", ".join(
-                type_signature[key] for key in variables
-            )
+            filter_signature = ", " + ", ".join(filter_var_types)
 
         variables["first"] = _clamp_limit(limit)
 
@@ -576,7 +628,11 @@ def linear_create_issue(
         )
         result = data.get("issueCreate") or {}
         if not result.get("success"):
-            return _error("Linear reported the issue was not created")
+            return _error(
+                _mutation_failure_message(
+                    "Linear reported the issue was not created", errors
+                )
+            )
         return _success(issue=result.get("issue"), _errors=errors)
     except Exception as e:
         logger.error(f"Error creating Linear issue in team {team_id}: {e}")
@@ -600,7 +656,8 @@ def linear_update_issue(
     changed; leave a parameter unset (None) to leave that field untouched.
     issue_id: an issue UUID or its human-readable identifier (e.g. "ENG-123").
     state_id: a workflow state id from linear_list_workflow_states, to move
-    the issue (e.g. to "Done").
+    the issue (e.g. to "Done") — an empty string is treated the same as
+    leaving it unset (a state can't be unassigned the way assignee_id can).
     assignee_id: a user id from linear_search_users, to reassign the issue —
     pass an empty string to unassign it.
     priority: 0 (no priority), 1 (urgent), 2 (high), 3 (normal), 4 (low).
@@ -641,7 +698,7 @@ def linear_update_issue(
             issue_input["title"] = title
         if description is not None:
             issue_input["description"] = description
-        if state_id is not None:
+        if state_id:
             issue_input["stateId"] = state_id
         if assignee_id is not None:
             issue_input["assigneeId"] = assignee_id or None
@@ -663,7 +720,11 @@ def linear_update_issue(
         )
         result = data.get("issueUpdate") or {}
         if not result.get("success"):
-            return _error("Linear reported the issue was not updated")
+            return _error(
+                _mutation_failure_message(
+                    "Linear reported the issue was not updated", errors
+                )
+            )
         return _success(issue=result.get("issue"), _errors=errors)
     except Exception as e:
         logger.error(f"Error updating Linear issue {issue_id}: {e}")
@@ -712,7 +773,11 @@ def linear_add_comment(issue_id: str, body: str) -> str:
         )
         result = data.get("commentCreate") or {}
         if not result.get("success"):
-            return _error("Linear reported the comment was not created")
+            return _error(
+                _mutation_failure_message(
+                    "Linear reported the comment was not created", errors
+                )
+            )
         return _success(comment=result.get("comment"), _errors=errors)
     except Exception as e:
         logger.error(f"Error adding comment to Linear issue {issue_id}: {e}")
@@ -729,29 +794,20 @@ def linear_list_projects(team_id: str = "", limit: int = 50) -> str:
     """
     try:
         max_results = _clamp_limit(limit)
+        project_selection = "id name status { id name type } progress url"
         if team_id:
-            resolved_team_id = _resolve_team_uuid(team_id)
-            data, errors = _graphql(
-                "query($teamId: String!, $first: Int!) { team(id: $teamId) {"
-                " projects(first: $first) { nodes { id name"
-                " status { id name type } progress url }"
-                " pageInfo { hasNextPage } } } }",
-                {"teamId": resolved_team_id, "first": max_results},
+            projects, truncated, errors = _team_scoped_list(
+                team_id, "projects", max_results, project_selection
             )
-            team = data.get("team")
-            if not team or not isinstance(team, dict):
-                return _error(f"Team '{team_id}' not found")
-            projects_data = team.get("projects") or {}
         else:
             data, errors = _graphql(
-                "query($first: Int!) { projects(first: $first) { nodes { id"
-                " name status { id name type } progress url }"
+                f"query($first: Int!) {{ projects(first: $first) {{ nodes {{ {project_selection} }}"
                 " pageInfo { hasNextPage } } }",
                 {"first": max_results},
             )
             projects_data = data.get("projects") or {}
-        projects = projects_data.get("nodes") or []
-        truncated = bool((projects_data.get("pageInfo") or {}).get("hasNextPage"))
+            projects = projects_data.get("nodes") or []
+            truncated = bool((projects_data.get("pageInfo") or {}).get("hasNextPage"))
         return _success(projects=projects, truncated=truncated, _errors=errors)
     except Exception as e:
         logger.error(f"Error listing Linear projects: {e}")

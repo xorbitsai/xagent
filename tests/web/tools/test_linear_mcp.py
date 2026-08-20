@@ -241,6 +241,42 @@ def test_rate_limit_wait_seconds_returns_float_for_present_header(monkeypatch):
     assert linear._rate_limit_wait_seconds(response) == 5.0
 
 
+def test_rate_limit_wait_seconds_takes_max_across_all_three_dimensions(monkeypatch):
+    """Linear enforces requests/endpoint-requests/complexity limits
+    independently, each with its own reset header -- a query that trips the
+    complexity limit specifically (the most likely dimension for this
+    module's list/search calls) must not have its wait time computed from a
+    different, already-elapsed dimension's header."""
+    now = 1_700_000_000.0
+    response = MockResponse(
+        status_code=400,
+        headers={
+            "X-RateLimit-Requests-Reset": str(int((now + 1) * 1000)),
+            "X-RateLimit-Endpoint-Requests-Reset": str(int((now + 20) * 1000)),
+            "X-RateLimit-Complexity-Reset": str(int((now + 9) * 1000)),
+        },
+    )
+    monkeypatch.setattr(linear.time, "time", lambda: now)
+
+    assert linear._rate_limit_wait_seconds(response) == 20.0
+
+
+def test_rate_limit_wait_seconds_ignores_unparsable_headers_and_uses_the_rest(
+    monkeypatch,
+):
+    now = 1_700_000_000.0
+    response = MockResponse(
+        status_code=400,
+        headers={
+            "X-RateLimit-Requests-Reset": "not-a-number",
+            "X-RateLimit-Complexity-Reset": str(int((now + 3) * 1000)),
+        },
+    )
+    monkeypatch.setattr(linear.time, "time", lambda: now)
+
+    assert linear._rate_limit_wait_seconds(response) == 3.0
+
+
 def test_graphql_returns_partial_data_and_errors_instead_of_raising(
     monkeypatch, caplog
 ):
@@ -268,6 +304,26 @@ def test_graphql_returns_partial_data_and_errors_instead_of_raising(
     assert data == {"viewer": {"id": "u1"}}
     assert errors == [{"message": "some.unrelated.field failed"}]
     assert "some.unrelated.field failed" in caplog.text
+
+
+def test_graphql_rejects_a_response_with_more_than_one_top_level_field(monkeypatch):
+    """The hard-failure vs partial-success discriminator above is only
+    correct when a response has exactly one top-level field -- this asserts
+    that invariant is enforced (raises loudly) rather than silently letting
+    a resolved field alongside a null one be misclassified as a partial
+    success."""
+    monkeypatch.setattr(
+        linear.requests,
+        "post",
+        Mock(
+            return_value=MockResponse(
+                json_data={"data": {"viewer": {"id": "u1"}, "teams": None}}
+            )
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="top-level fields"):
+        linear._graphql("query { viewer { id } teams { nodes { id } } }")
 
 
 def test_graphql_raises_when_the_requested_root_field_is_null_with_errors(monkeypatch):
@@ -1653,6 +1709,31 @@ def test_create_issue_reports_error_when_linear_reports_failure(monkeypatch):
     assert "not created" in result["message"]
 
 
+def test_create_issue_folds_graphql_error_detail_into_failure_message(monkeypatch):
+    """success: false on its own gives the caller nothing to act on (bad
+    team, missing permission, and invalid label id all look identical) --
+    the same response's top-level `errors` array must be folded into the
+    message when present."""
+    monkeypatch.setattr(
+        linear.requests,
+        "post",
+        Mock(
+            return_value=MockResponse(
+                json_data={
+                    "data": {"issueCreate": {"success": False, "issue": None}},
+                    "errors": [{"message": "You do not have access to this team"}],
+                }
+            )
+        ),
+    )
+
+    result = json.loads(linear.linear_create_issue(team_id=_TEAM_UUID, title="New bug"))
+
+    assert result["status"] == "error"
+    assert "not created" in result["message"]
+    assert "You do not have access to this team" in result["message"]
+
+
 def test_update_issue_requires_at_least_one_field(monkeypatch):
     mock_post = Mock()
     monkeypatch.setattr(linear.requests, "post", mock_post)
@@ -1679,6 +1760,55 @@ def test_update_issue_reports_error_when_linear_reports_failure(monkeypatch):
 
     assert result["status"] == "error"
     assert "not updated" in result["message"]
+
+
+def test_update_issue_folds_graphql_error_detail_into_failure_message(monkeypatch):
+    monkeypatch.setattr(
+        linear.requests,
+        "post",
+        Mock(
+            return_value=MockResponse(
+                json_data={
+                    "data": {"issueUpdate": {"success": False, "issue": None}},
+                    "errors": [{"message": "Invalid state for this team"}],
+                }
+            )
+        ),
+    )
+
+    result = json.loads(linear.linear_update_issue("ENG-1", title="Renamed"))
+
+    assert result["status"] == "error"
+    assert "not updated" in result["message"]
+    assert "Invalid state for this team" in result["message"]
+
+
+def test_update_issue_treats_empty_state_id_as_unset(monkeypatch):
+    """state_id="" must behave like leaving state_id unset (omitting
+    "stateId" from the input) rather than forwarding an empty string
+    literally -- unlike assignee_id, a state can't be meaningfully
+    "unassigned", so there is no null-clearing equivalent to send."""
+    mock_post = Mock(
+        return_value=MockResponse(
+            json_data={
+                "data": {
+                    "issueUpdate": {
+                        "success": True,
+                        "issue": {"id": "i1", "identifier": "ENG-1"},
+                    }
+                }
+            }
+        )
+    )
+    monkeypatch.setattr(linear.requests, "post", mock_post)
+
+    result = json.loads(
+        linear.linear_update_issue("ENG-1", title="Renamed", state_id="")
+    )
+
+    assert result["status"] == "success"
+    sent_input = mock_post.call_args.kwargs["json"]["variables"]["input"]
+    assert sent_input == {"title": "Renamed"}
 
 
 def test_update_issue_omits_priority_when_left_default(monkeypatch):
@@ -2168,6 +2298,27 @@ def test_add_comment_reports_error_when_linear_reports_failure(monkeypatch):
 
     assert result["status"] == "error"
     assert "not created" in result["message"]
+
+
+def test_add_comment_folds_graphql_error_detail_into_failure_message(monkeypatch):
+    monkeypatch.setattr(
+        linear.requests,
+        "post",
+        Mock(
+            return_value=MockResponse(
+                json_data={
+                    "data": {"commentCreate": {"success": False, "comment": None}},
+                    "errors": [{"message": "Issue is archived"}],
+                }
+            )
+        ),
+    )
+
+    result = json.loads(linear.linear_add_comment("ENG-1", "Looks good"))
+
+    assert result["status"] == "error"
+    assert "not created" in result["message"]
+    assert "Issue is archived" in result["message"]
 
 
 def test_add_comment_rejects_empty_body(monkeypatch):

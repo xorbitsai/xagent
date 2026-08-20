@@ -1383,12 +1383,12 @@ def generic_oauth_login(
         # token still limited to that earlier grant.
         params["prompt"] = "consent"
     if provider.lower() == "linear":
-        # Same reasoning as jira above, confirmed against Linear's own OAuth
-        # docs: Linear does not auto-reprompt when a later request asks for
-        # a broader scope set than a previously granted token -- a bare
-        # provider connect (read only) followed by an app-scoped connect
-        # (read+write) could otherwise silently leave the user with the
-        # earlier read-only token instead of the new grant.
+        # Linear's OAuth docs confirm only that prompt=consent always shows
+        # the consent screen -- they don't document what happens by default
+        # on a scope-escalation request without it. Forcing consent
+        # sidesteps needing to know that default: a bare provider connect
+        # (read only) followed by an app-scoped connect (read+write) is
+        # guaranteed to end up with the broader grant either way.
         params["prompt"] = "consent"
     meta_config_id = _meta_login_config_id() if provider.lower() == "meta" else ""
     if meta_config_id:
@@ -1753,12 +1753,16 @@ def generic_oauth_callback(
             # string, but Linear OAuth applications created before December
             # 1, 2023 return it as a list of strings -- UserOAuth.scope is a
             # plain String column, so committing a list there would raise
-            # at flush time instead of saving a valid connection.
+            # at flush time instead of saving a valid connection. Always
+            # join with a space regardless of provider: `_oauth_scope_separator`
+            # governs only the outbound authorize-request format (comma for
+            # Linear/Meta), and the two readers of this column already split
+            # on a space, so reusing that separator here would make the
+            # stored format provider-dependent and silently mis-parse every
+            # Linear row wherever this column is read.
             token_scope = token_data.get("scope", "")
             if isinstance(token_scope, list):
-                token_scope = _oauth_scope_separator(provider).join(
-                    str(scope) for scope in token_scope
-                )
+                token_scope = " ".join(str(scope) for scope in token_scope)
             setattr(oauth_account, "scope", token_scope)
             setattr(oauth_account, "email", email)
             if "refresh_token" in token_data:

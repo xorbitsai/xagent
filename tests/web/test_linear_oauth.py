@@ -339,7 +339,10 @@ def test_callback_normalizes_legacy_array_scope_to_string(db_session, monkeypatc
     """Linear OAuth applications created before December 1, 2023 return
     "scope" as a list of strings rather than a joined string. UserOAuth.scope
     is a plain String column, so persisting the list as-is would raise at
-    flush time instead of saving a valid connection."""
+    flush time instead of saving a valid connection. The joined string is
+    always space-separated regardless of provider (unlike the comma
+    separator Linear's authorize request itself uses), matching the format
+    every reader of this column already expects."""
     db, user = db_session
     mock_post = Mock(
         side_effect=[
@@ -368,7 +371,7 @@ def test_callback_normalizes_legacy_array_scope_to_string(db_session, monkeypatc
         .filter(UserOAuth.user_id == user.id, UserOAuth.provider == "linear")
         .one()
     )
-    assert oauth_account.scope == "read,write"
+    assert oauth_account.scope == "read write"
 
 
 async def test_linear_expired_token_refresh_uses_generic_form_body(

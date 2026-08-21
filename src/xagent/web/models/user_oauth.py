@@ -14,6 +14,8 @@ class UserOAuth(Base):  # type: ignore[no-any-unimported]
 
     A null ``resource_owner_key`` preserves the ordinary xagent credential
     namespace. A non-null key selects an actor inside the same xagent account.
+    This deliberately differs from ``MCPOAuthGrant``'s non-null synthetic
+    ``xagent:user:<id>`` owner key so existing UserOAuth rows need no backfill.
     The key is server-owned identity metadata, never provider token material.
     """
 

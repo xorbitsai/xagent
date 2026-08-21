@@ -40,7 +40,7 @@ export function openBuiltinOAuthPopup(options: {
     const authUrl = `${getApiUrl()}/api/auth/${provider}/login?token=${token || ""}&app_id=${appId}&redirect=${encodeURIComponent(window.location.href)}`;
     const popup = window.open(
       authUrl,
-      `${provider} OAuth`,
+      `${provider}OAuth`,
       `width=${POPUP_WIDTH},height=${POPUP_HEIGHT},left=${left},top=${top},scrollbars=yes`
     );
 

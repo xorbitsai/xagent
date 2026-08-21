@@ -175,10 +175,10 @@ Because this release cannot create actor-owned rows, the downgrade remains avail
 
 1. Stop all workers before the downgrade.
 2. If the database is SQLite, create a current database backup.
-3. If the database is SQLite, run `PRAGMA integrity_check;` against the backup. The result must be `ok`.
+3. If the database is SQLite, run `PRAGMA integrity_check;` against the backup and record `SELECT count(*) FROM gmail_watch_states;`. The integrity result must be `ok`.
 4. Run `alembic downgrade b1efe0dbe0af`.
 5. Run `alembic current`. The command must report only `b1efe0dbe0af`.
-6. If the database is SQLite, run `PRAGMA integrity_check;` and `PRAGMA foreign_key_check;`.
+6. If the database is SQLite, run `PRAGMA integrity_check;`, `PRAGMA foreign_key_check;`, and `SELECT count(*) FROM gmail_watch_states;`. Require `ok`, no foreign-key violations, and the same watch-state count recorded before downgrade.
 7. If the database is SQLite, inspect `PRAGMA table_info('user_oauth');`. The result must not contain `resource_owner_key`.
 8. If the database is SQLite, inspect `PRAGMA index_list('user_oauth');` and each `PRAGMA index_info('<index-name>');` result. One unique index must cover `(user_id, provider, provider_user_id)`.
 9. Deploy the old version.

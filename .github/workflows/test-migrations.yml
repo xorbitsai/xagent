@@ -45,6 +45,8 @@ on:
       - 'tests/web/services/test_task_interaction_close_postgresql.py'
       - 'src/xagent/web/models/chat_message.py'
       - 'src/xagent/web/models/user.py'
+      - 'src/xagent/web/models/user_oauth.py'
+      - 'tests/web/test_user_oauth_actor_ownership.py'
       - 'tests/shared/postgres_disposable.py'
       - 'tests/web/services/checkpoint_anchor_shared.py'
   pull_request:
@@ -128,6 +130,8 @@ jobs:
             tests/web/services/test_task_interaction_close_postgresql.py
             src/xagent/web/models/chat_message.py
             src/xagent/web/models/user.py
+            src/xagent/web/models/user_oauth.py
+            tests/web/test_user_oauth_actor_ownership.py
             tests/shared/postgres_disposable.py
             tests/web/services/checkpoint_anchor_shared.py
           )

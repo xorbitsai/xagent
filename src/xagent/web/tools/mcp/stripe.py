@@ -76,6 +76,24 @@ def _bool_str(value: bool) -> str:
     return "true" if value else "false"
 
 
+def _prefix_mismatch(value: str, prefix: str, field_name: str) -> str | None:
+    """Return a clear local error message if `value` doesn't look like the
+    right kind of Stripe id, else None.
+
+    An LLM passing e.g. a payment-intent id ("pi_...", exactly what
+    stripe_list_payment_intents returns) into a tool's charge_id parameter
+    is a plausible mistake -- Stripe would eventually reject it, but only
+    after a round trip and with a less specific error than this connector
+    can give locally.
+    """
+    if not value.startswith(prefix):
+        return (
+            f"{field_name} should start with {prefix!r} (got {value!r}); "
+            "double check you're passing the right kind of Stripe id"
+        )
+    return None
+
+
 def _path_segment(value: str) -> str:
     """Percent-encode a value for safe interpolation into a URL path segment
     (e.g. a customer/charge/invoice id), matching jira.py's _path_segment /
@@ -141,9 +159,11 @@ def _extract_error_detail(response: requests.Response) -> str | None:
     """Pull the human-readable message out of a Stripe error body.
 
     Stripe error responses are {"error": {"type", "code", "message",
-    "param"}} -- the "message" field alone is more useful to the LLM than
-    the raw envelope. Returns None if the body isn't in the expected shape,
-    so the caller can fall back to the raw response text.
+    "param"}} -- "message" plus "param" (when present) is more useful to an
+    LLM trying to self-correct than the raw envelope: "param" names exactly
+    which argument was wrong for a parameter_invalid_* class error. Returns
+    None if the body isn't in the expected shape, so the caller can fall
+    back to the raw response text.
     """
     try:
         payload = response.json()
@@ -155,7 +175,12 @@ def _extract_error_detail(response: requests.Response) -> str | None:
     if not isinstance(error, dict):
         return None
     message = error.get("message")
-    return message if isinstance(message, str) and message else None
+    if not isinstance(message, str) or not message:
+        return None
+    param = error.get("param")
+    if isinstance(param, str) and param:
+        return f"{message} (param: {param})"
+    return message
 
 
 def _request(
@@ -170,11 +195,13 @@ def _request(
     """`idempotency_key`, for a POST, is sent as Stripe's Idempotency-Key
     header; if omitted, a fresh one is generated per call (see
     `_generate_idempotency_key`'s docstring for why). `response_meta`, when
-    passed, is populated with `idempotent_replayed` so a caller that creates
-    a resource can tell a dedup replay apart from a fresh create -- for both
-    a successful response and a >=400 one, since Stripe replays a cached
-    *failed* response verbatim too, and a caller retrying that with the same
-    key would just get the same failure again.
+    passed, is populated with `idempotent_replayed` on a successful response,
+    so a caller that creates a resource can tell a dedup replay apart from a
+    fresh create. A >=400 response never reaches this assignment (the
+    RuntimeError below is raised first), but it isn't left unexplained: a
+    replayed *failed* response gets the same signal folded into the raised
+    message instead, since a caller retrying that with the same key would
+    just get the same failure again.
     """
     resolved_idempotency_key = (
         (idempotency_key or _generate_idempotency_key()) if method == "POST" else None
@@ -242,7 +269,9 @@ def _request(
         # context, matching posthog.py's identical treatment. Applied to
         # both sources uniformly, not just the raw-text fallback, since
         # either one is equally capable of embedding an echoed header.
-        detail = truncate_error_text(redact_sensitive_text(detail))
+        detail = truncate_error_text(redact_sensitive_text(detail)) or (
+            "<empty response body>"
+        )
         if idempotent_replayed:
             detail = (
                 f"{detail} (this is a replay of a previous failed attempt with "
@@ -260,11 +289,21 @@ def _request(
     if response.status_code == 204 or not response.content:
         return {}
     try:
-        return response.json()
+        parsed = response.json()
     except ValueError as exc:
         raise RuntimeError(
             f"Stripe returned a 2xx response with a non-JSON body: {exc}"
         ) from exc
+    # Checked once here, at the single choke point every caller goes
+    # through, rather than in each of the 7 _paginated_results callers:
+    # every caller assumes a dict (via .get(...)), so a bare JSON array or
+    # string body would otherwise surface as an unclear AttributeError deep
+    # in a specific tool instead of a clear error at the source.
+    if not isinstance(parsed, dict):
+        raise RuntimeError(
+            f"Stripe returned a non-dict 2xx body ({type(parsed).__name__})"
+        )
+    return parsed
 
 
 def _paginated_results(payload: dict[str, Any], limit: int) -> tuple[list[Any], bool]:
@@ -356,6 +395,9 @@ def stripe_get_customer(customer_id: str) -> str:
     try:
         if not customer_id:
             return _error("customer_id is required")
+        prefix_error = _prefix_mismatch(customer_id, "cus_", "customer_id")
+        if prefix_error:
+            return _error(prefix_error)
         result = _request("GET", f"/customers/{_path_segment(customer_id)}")
         return _success(customer=result)
     except Exception as e:
@@ -449,6 +491,9 @@ def stripe_get_charge(charge_id: str) -> str:
     try:
         if not charge_id:
             return _error("charge_id is required")
+        prefix_error = _prefix_mismatch(charge_id, "ch_", "charge_id")
+        if prefix_error:
+            return _error(prefix_error)
         result = _request("GET", f"/charges/{_path_segment(charge_id)}")
         return _success(charge=result)
     except Exception as e:
@@ -472,8 +517,8 @@ def stripe_create_refund(
     payment_intent_id: a Stripe payment intent id, e.g. "pi_ABC123", as an
     alternative way to identify the payment to refund. Provide this or
     charge_id, not both.
-    amount: optional amount to refund in the currency's smallest unit (e.g.
-    cents for USD); omit to refund the full remaining amount.
+    amount: optional positive amount to refund in the currency's smallest
+    unit (e.g. cents for USD); omit to refund the full remaining amount.
     reason: optional one of "duplicate", "fraudulent", or
     "requested_by_customer". "fraudulent" is not just a label: for
     applicable card payments it reports the charge to Stripe Radar as fraud
@@ -501,6 +546,18 @@ def stripe_create_refund(
             return _error(
                 "Provide only one of charge_id or payment_intent_id, not both"
             )
+        if charge_id:
+            prefix_error = _prefix_mismatch(charge_id, "ch_", "charge_id")
+            if prefix_error:
+                return _error(prefix_error)
+        if payment_intent_id:
+            prefix_error = _prefix_mismatch(
+                payment_intent_id, "pi_", "payment_intent_id"
+            )
+            if prefix_error:
+                return _error(prefix_error)
+        if amount is not None and amount <= 0:
+            return _error("amount must be a positive integer")
         form_data: dict[str, Any] = {}
         if charge_id:
             form_data["charge"] = charge_id
@@ -596,6 +653,9 @@ def stripe_get_invoice(invoice_id: str) -> str:
     try:
         if not invoice_id:
             return _error("invoice_id is required")
+        prefix_error = _prefix_mismatch(invoice_id, "in_", "invoice_id")
+        if prefix_error:
+            return _error(prefix_error)
         result = _request("GET", f"/invoices/{_path_segment(invoice_id)}")
         return _success(invoice=result)
     except Exception as e:

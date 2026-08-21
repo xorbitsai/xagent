@@ -324,6 +324,54 @@ def test_request_wraps_network_exception(monkeypatch):
         stripe._request("GET", "/account")
 
 
+def test_request_redacts_credentials_from_network_exception(monkeypatch):
+    monkeypatch.setattr(
+        stripe.requests,
+        "request",
+        Mock(
+            side_effect=stripe.requests.ConnectionError(
+                "ProxyError connecting via http://user:secret@proxyhost:8080"
+            )
+        ),
+    )
+
+    with pytest.raises(RuntimeError) as excinfo:
+        stripe._request("GET", "/account")
+
+    assert "secret" not in str(excinfo.value)
+
+
+def test_request_network_exception_suggests_idempotency_key_for_post(monkeypatch):
+    monkeypatch.setattr(
+        stripe.requests,
+        "request",
+        Mock(side_effect=stripe.requests.ConnectionError("timed out")),
+    )
+
+    with pytest.raises(RuntimeError) as excinfo:
+        stripe._request(
+            "POST",
+            "/refunds",
+            form_data={"charge": "ch_1"},
+            idempotency_key="retry-me",
+        )
+
+    assert 'idempotency_key="retry-me"' in str(excinfo.value)
+
+
+def test_request_network_exception_omits_idempotency_hint_for_get(monkeypatch):
+    monkeypatch.setattr(
+        stripe.requests,
+        "request",
+        Mock(side_effect=stripe.requests.ConnectionError("timed out")),
+    )
+
+    with pytest.raises(RuntimeError) as excinfo:
+        stripe._request("GET", "/account")
+
+    assert "idempotency_key" not in str(excinfo.value)
+
+
 def test_request_truncates_long_network_exception_text(monkeypatch):
     monkeypatch.setattr(
         stripe.requests,

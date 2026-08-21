@@ -9,6 +9,7 @@ from urllib.parse import quote
 import requests
 from mcp.server.fastmcp import FastMCP
 
+from ....core.utils.security import redact_sensitive_text
 from ...utils.graphql_errors import truncate_error_text
 from .utils import setup_proxy_env
 
@@ -168,13 +169,29 @@ def _request(
                 timeout=DEFAULT_TIMEOUT_SECONDS,
             )
         except requests.RequestException as exc:
-            # Bounded the same way an HTTP-level error body is below: a
-            # ConnectionError/Timeout's str(exc) is unstructured and can be
-            # arbitrarily long (e.g. embed a proxy's effective URL), so it
-            # must not reach the LLM/logs raw and unbounded either.
-            raise RuntimeError(
-                f"Stripe request failed: {truncate_error_text(str(exc))}"
-            ) from exc
+            # A connection/timeout/proxy failure's message can itself embed
+            # sensitive data -- e.g. a ProxyError echoing the ambient
+            # HTTPS_PROXY URL, which may carry embedded user:pass@
+            # credentials (setup_proxy_env() exports whatever the OS has
+            # configured) -- matches posthog.py's identical fix for the
+            # same shared proxy-env exposure surface. Also bounded in
+            # length the same way an HTTP-level error body is below, since
+            # the redacted text is still unstructured and can be long.
+            exc_detail = truncate_error_text(redact_sensitive_text(str(exc)))
+            # For a POST, this is the one failure mode where whether the
+            # operation actually reached Stripe is genuinely unknown (unlike
+            # a >=400 response, which means Stripe received and rejected
+            # it) -- so this is exactly the moment a caller deciding whether
+            # to retry needs the key that would make that retry safe.
+            hint = (
+                f" If you intend to retry this exact operation, pass "
+                f'idempotency_key="{resolved_idempotency_key}" so a retry is '
+                f"deduped by Stripe instead of creating a duplicate in case "
+                f"this request actually went through before failing."
+                if resolved_idempotency_key is not None
+                else ""
+            )
+            raise RuntimeError(f"Stripe request failed: {exc_detail}{hint}") from exc
         if response.status_code == 429 and attempt == 0:
             try:
                 retry_after = int(response.headers.get("Retry-After", "0"))
@@ -206,7 +223,7 @@ def _request(
             f"Stripe API error (status {response.status_code}): {detail}"
         )
 
-    if response_meta is not None and resolved_idempotency_key is not None:
+    if response_meta is not None:
         response_meta["idempotent_replayed"] = idempotent_replayed
 
     if response.status_code == 204 or not response.content:
@@ -320,7 +337,10 @@ def stripe_create_customer(
     that may have already succeeded (e.g. it errored or timed out and you
     don't know if it went through): Stripe will then return the original
     customer instead of creating a second one, and the response's
-    idempotent_replayed flag will be true.
+    idempotent_replayed flag will be true. If this tool errors with a
+    request-failed message rather than returning a result, that message
+    includes the idempotency_key that was used -- pass that same value back
+    in if you decide to retry, rather than retrying with no key at all.
     """
     try:
         form_data: dict[str, Any] = {}
@@ -422,7 +442,10 @@ def stripe_create_refund(
     that may have already succeeded (e.g. it errored or timed out and you
     don't know if it went through): Stripe will then return the original
     refund instead of issuing a second one, and the response's
-    idempotent_replayed flag will be true.
+    idempotent_replayed flag will be true. If this tool errors with a
+    request-failed message rather than returning a result, that message
+    includes the idempotency_key that was used -- pass that same value back
+    in if you decide to retry, rather than retrying with no key at all.
     """
     try:
         if not charge_id and not payment_intent_id:

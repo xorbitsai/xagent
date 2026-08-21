@@ -165,6 +165,7 @@ class AgentListItem(BaseModel):
     description: Optional[str]
     template_id: Optional[str] = None
     logo_url: Optional[str]
+    suggested_prompts: List[str] = []
     status: str
     visibility: str = "team"
     created_at: str

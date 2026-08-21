@@ -215,19 +215,13 @@ const zh = {
     },
     sections: {
       startingPrompts: "快捷指令",
-      chatWithAgents: "与智能体聊天",
+      assignToTeammate: "我的团队",
+      assignToTeammateLead: "将此任务分配给一位队员",
+      assignToTeammateHint: "——或者不选，让 {appName} 自行决定。",
+      leadReady: "{name} 已准备好接手这项任务，并调动合适的专家协助。",
     },
     templateQuickAccess: {
-      featuredLabel: "推荐",
-      categoryHeading: "{category} 智能体",
-      allTemplates: "全部模板 →",
       usingTemplateLabel: "智能体模板：",
-      agentCreatedToast: "已根据模板创建智能体 \"{name}\"",
-      viewInAgents: "在智能体中查看",
-      createAgentError: "无法根据该模板创建智能体，请重试。",
-      loading: "正在加载模板...",
-      loadError: "模板加载失败。",
-      retry: "重试",
     },
     input: {
       placeholder: "描述您的任务...",

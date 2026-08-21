@@ -1,0 +1,316 @@
+import React from "react"
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react"
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
+
+const apiRequestMock = vi.hoisted(() => vi.fn())
+const sendMessageMock = vi.hoisted(() => vi.fn())
+const dispatchMock = vi.hoisted(() => vi.fn())
+const closeFilePreviewMock = vi.hoisted(() => vi.fn())
+const toastErrorMock = vi.hoisted(() => vi.fn())
+const searchParamsMock = vi.hoisted(() => ({ value: new URLSearchParams() }))
+
+interface MockAgent {
+  id: number | string
+  name: string
+  suggested_prompts?: string[]
+}
+
+interface MockChatStartScreenProps {
+  inputValue?: string
+  agents?: MockAgent[]
+  selectedAgents?: MockAgent[]
+  onAgentClick?: (agent: MockAgent) => void
+  onRemoveSelectedAgent?: (id: number | string) => void
+  onInputChange?: (value: string) => void
+  onSend?: (message: string, files: unknown[], config?: unknown) => void
+}
+
+const chatStartScreenProps = vi.hoisted(() => ({
+  current: null as null | MockChatStartScreenProps,
+}))
+
+vi.mock("@/lib/api-wrapper", () => ({
+  apiRequest: apiRequestMock,
+}))
+
+vi.mock("@/lib/utils", () => ({
+  getApiUrl: () => "http://api.local",
+}))
+
+vi.mock("@/lib/branding", () => ({
+  getBrandingFromEnv: () => ({ appName: "Xagent" }),
+}))
+
+vi.mock("@/contexts/i18n-context", () => ({
+  useI18n: () => ({
+    t: (key: string, vars?: Record<string, string | number>) =>
+      vars ? `${key}:${JSON.stringify(vars)}` : key,
+  }),
+}))
+
+vi.mock("next/navigation", () => ({
+  useSearchParams: () => searchParamsMock.value,
+}))
+
+vi.mock("sonner", () => ({
+  toast: { error: toastErrorMock },
+}))
+
+vi.mock("@/components/file/file-preview-dialog", () => ({
+  FilePreviewDialog: () => null,
+}))
+
+vi.mock("@/contexts/app-context-chat", () => ({
+  useApp: () => ({
+    sendMessage: sendMessageMock,
+    state: { isProcessing: false, filePreview: { isOpen: false } },
+    dispatch: dispatchMock,
+    closeFilePreview: closeFilePreviewMock,
+  }),
+}))
+
+vi.mock("@/components/chat/ChatStartScreen", () => ({
+  ChatStartScreen: (props: MockChatStartScreenProps) => {
+    chatStartScreenProps.current = props
+    return (
+      <div>
+        <input data-testid="composer" readOnly value={props.inputValue ?? ""} />
+        {(props.agents ?? []).map((agent) => (
+          <button key={agent.id} onClick={() => props.onAgentClick?.(agent)}>
+            pick-{agent.name}
+          </button>
+        ))}
+        {(props.selectedAgents ?? []).map((agent) => (
+          <button key={agent.id} onClick={() => props.onRemoveSelectedAgent?.(agent.id)}>
+            remove-{agent.name}
+          </button>
+        ))}
+        <button onClick={() => props.onSend?.("hello", [], { mode: "balanced" })}>send</button>
+      </div>
+    )
+  },
+}))
+
+import TaskHomePage from "./page"
+
+function jsonResponse(data: unknown): Response {
+  return new Response(JSON.stringify(data), {
+    status: 200,
+    headers: { "Content-Type": "application/json" },
+  })
+}
+
+const VERA = { id: 1, name: "Vera", status: "published", suggested_prompts: ["Research a topic and report back"] }
+const KEVIN = { id: 2, name: "Kevin", status: "published", suggested_prompts: [] }
+const DRAFT_AGENT = { id: 3, name: "Draft Only", status: "draft", suggested_prompts: ["Should not appear"] }
+
+beforeEach(() => {
+  apiRequestMock.mockReset()
+  // Picking an agent triggers a second, best-effort GET /api/agents/{id}
+  // fetch for its execution config - default it to a benign 404 so tests
+  // that don't care about that fetch don't spam console.error.
+  apiRequestMock.mockResolvedValue(new Response(null, { status: 404 }))
+  sendMessageMock.mockReset()
+  dispatchMock.mockReset()
+  closeFilePreviewMock.mockReset()
+  toastErrorMock.mockReset()
+  chatStartScreenProps.current = null
+  searchParamsMock.value = new URLSearchParams()
+})
+
+afterEach(cleanup)
+
+describe("TaskHomePage agents", () => {
+  it("fetches agents once and forwards only the published ones", async () => {
+    apiRequestMock.mockResolvedValueOnce(jsonResponse([VERA, KEVIN, DRAFT_AGENT]))
+
+    render(<TaskHomePage />)
+
+    await waitFor(() => {
+      expect(chatStartScreenProps.current?.agents).toEqual([VERA, KEVIN])
+    })
+    expect(apiRequestMock).toHaveBeenCalledWith("http://api.local/api/agents")
+  })
+
+  it("picking a teammate with a suggested prompt fills the composer and selects them", async () => {
+    apiRequestMock.mockResolvedValueOnce(jsonResponse([VERA]))
+    render(<TaskHomePage />)
+    await screen.findByText("pick-Vera")
+
+    fireEvent.click(screen.getByText("pick-Vera"))
+
+    expect(screen.getByTestId("composer")).toHaveValue("Research a topic and report back")
+    expect(chatStartScreenProps.current?.selectedAgents).toEqual([VERA])
+  })
+
+  it("picking the already-selected teammate again deselects them and clears the auto-filled prompt", async () => {
+    apiRequestMock.mockResolvedValueOnce(jsonResponse([VERA]))
+    render(<TaskHomePage />)
+    await screen.findByText("pick-Vera")
+
+    fireEvent.click(screen.getByText("pick-Vera"))
+    expect(screen.getByTestId("composer")).toHaveValue("Research a topic and report back")
+
+    fireEvent.click(screen.getByText("pick-Vera"))
+
+    expect(screen.getByTestId("composer")).toHaveValue("")
+    expect(chatStartScreenProps.current?.selectedAgents).toEqual([])
+  })
+
+  it("does not clobber a prompt the user has since edited when deselecting", async () => {
+    apiRequestMock.mockResolvedValueOnce(jsonResponse([VERA]))
+    render(<TaskHomePage />)
+    await screen.findByText("pick-Vera")
+
+    fireEvent.click(screen.getByText("pick-Vera"))
+    // Simulate the user editing the composer after the auto-fill.
+    act(() => {
+      chatStartScreenProps.current?.onInputChange?.("Research a topic and report back on competitors")
+    })
+
+    fireEvent.click(screen.getByText("pick-Vera"))
+
+    expect(screen.getByTestId("composer")).toHaveValue(
+      "Research a topic and report back on competitors"
+    )
+  })
+
+  it("switching from one teammate to another replaces the selection and the filled prompt", async () => {
+    apiRequestMock.mockResolvedValueOnce(jsonResponse([VERA, { ...KEVIN, suggested_prompts: ["Turn my meetings into next steps"] }]))
+    render(<TaskHomePage />)
+    await screen.findByText("pick-Vera")
+
+    fireEvent.click(screen.getByText("pick-Vera"))
+    fireEvent.click(screen.getByText("pick-Kevin"))
+
+    expect(screen.getByTestId("composer")).toHaveValue("Turn my meetings into next steps")
+    expect(chatStartScreenProps.current?.selectedAgents).toEqual([
+      { ...KEVIN, suggested_prompts: ["Turn my meetings into next steps"] },
+    ])
+  })
+
+  it("selects a teammate with no suggested prompts without touching the composer", async () => {
+    apiRequestMock.mockResolvedValueOnce(jsonResponse([KEVIN]))
+    render(<TaskHomePage />)
+    await screen.findByText("pick-Kevin")
+
+    act(() => {
+      chatStartScreenProps.current?.onInputChange?.("Already typed something")
+    })
+    fireEvent.click(screen.getByText("pick-Kevin"))
+
+    expect(screen.getByTestId("composer")).toHaveValue("Already typed something")
+    expect(chatStartScreenProps.current?.selectedAgents).toEqual([KEVIN])
+  })
+
+  it("enriches a hired agent with its template's persona photo and category, leaving a custom agent untouched", async () => {
+    const HIRED = { ...VERA, template_id: "sales-research-enricher" }
+    const CUSTOM = { ...KEVIN, template_id: null }
+    apiRequestMock.mockImplementation((url: string) => {
+      if (url === "http://api.local/api/agents") return Promise.resolve(jsonResponse([HIRED, CUSTOM]))
+      if (url.startsWith("http://api.local/api/templates/")) {
+        return Promise.resolve(
+          jsonResponse([
+            {
+              id: "sales-research-enricher",
+              category: "Sales",
+              persona: { avatar: "/marketplace/avatars/vera.png" },
+            },
+          ])
+        )
+      }
+      return Promise.resolve(new Response(null, { status: 404 }))
+    })
+
+    render(<TaskHomePage />)
+
+    await waitFor(() => {
+      expect(chatStartScreenProps.current?.agents).toEqual([
+        {
+          ...HIRED,
+          persona_avatar: "/marketplace/avatars/vera.png",
+          specialty: "templates.categoryTitles.sales",
+        },
+        CUSTOM,
+      ])
+    })
+  })
+
+  it("prefers a hired agent's template sample prompt over its own (usually empty) suggested_prompts", async () => {
+    const HIRED = { id: 1, name: "Vera", status: "published", suggested_prompts: [], template_id: "sales-research-enricher" }
+    apiRequestMock.mockImplementation((url: string) => {
+      if (url === "http://api.local/api/agents") return Promise.resolve(jsonResponse([HIRED]))
+      if (url.startsWith("http://api.local/api/templates/")) {
+        return Promise.resolve(
+          jsonResponse([
+            {
+              id: "sales-research-enricher",
+              category: "Sales",
+              persona: { avatar: "/marketplace/avatars/vera.png" },
+              sample_prompts: [{ title: "Research", prompt: "Research a topic and give me an evidence-backed recommendation" }],
+            },
+          ])
+        )
+      }
+      return Promise.resolve(new Response(null, { status: 404 }))
+    })
+
+    render(<TaskHomePage />)
+    await screen.findByText("pick-Vera")
+
+    fireEvent.click(screen.getByText("pick-Vera"))
+
+    expect(screen.getByTestId("composer")).toHaveValue(
+      "Research a topic and give me an evidence-backed recommendation"
+    )
+  })
+
+  it("removing the selected-agent chip also clears an unedited auto-filled prompt", async () => {
+    apiRequestMock.mockResolvedValueOnce(jsonResponse([VERA]))
+    render(<TaskHomePage />)
+    await screen.findByText("pick-Vera")
+
+    fireEvent.click(screen.getByText("pick-Vera"))
+    fireEvent.click(screen.getByText("remove-Vera"))
+
+    expect(screen.getByTestId("composer")).toHaveValue("")
+    expect(chatStartScreenProps.current?.selectedAgents).toEqual([])
+  })
+})
+
+describe("TaskHomePage send", () => {
+  it("includes the selected agent's id and resets state on a successful send", async () => {
+    apiRequestMock.mockResolvedValueOnce(jsonResponse([VERA]))
+    sendMessageMock.mockResolvedValueOnce(undefined)
+    render(<TaskHomePage />)
+    await screen.findByText("pick-Vera")
+
+    fireEvent.click(screen.getByText("pick-Vera"))
+    fireEvent.click(screen.getByText("send"))
+
+    await waitFor(() => {
+      expect(sendMessageMock).toHaveBeenCalledWith(
+        "hello",
+        { mode: "balanced", agentId: 1 },
+        []
+      )
+    })
+    await waitFor(() => {
+      expect(screen.getByTestId("composer")).toHaveValue("")
+    })
+    expect(chatStartScreenProps.current?.selectedAgents).toEqual([])
+  })
+
+  it("toasts and keeps state when sendMessage rejects", async () => {
+    apiRequestMock.mockResolvedValueOnce(jsonResponse([]))
+    sendMessageMock.mockRejectedValueOnce(new Error("network down"))
+    render(<TaskHomePage />)
+    await waitFor(() => expect(chatStartScreenProps.current).not.toBeNull())
+
+    fireEvent.click(screen.getByText("send"))
+
+    await waitFor(() => {
+      expect(toastErrorMock).toHaveBeenCalledWith("network down")
+    })
+  })
+})

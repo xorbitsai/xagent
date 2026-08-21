@@ -101,6 +101,10 @@ interface ChatInputProps {
     name: string;
   }>;
   onRemoveSelectedAgent?: (agentId: number | string) => void;
+  // Suppresses the visual "Using @agent" chip (and the layout space it
+  // reserves) while `selectedAgents` still drives other behavior below,
+  // e.g. skipping the no-model-selected guard in handleSubmit.
+  hideSelectedAgentChip?: boolean;
   selectedTemplate?: { id: string; name: string } | null;
   onRemoveSelectedTemplate?: () => void;
   uploadFile?: (file: File, params: { taskType: string }) => Promise<{ file_id: string }>;
@@ -157,6 +161,7 @@ export function ChatInput({
   promptHighlightTerms = [],
   selectedAgents = [],
   onRemoveSelectedAgent,
+  hideSelectedAgentChip = false,
   selectedTemplate = null,
   onRemoveSelectedTemplate,
   uploadFile,
@@ -918,7 +923,7 @@ export function ChatInput({
     }
   }, [filesDisabled, message, promptHighlightTerms]);
 
-  const hasTopChip = selectedAgents.length > 0 || !!selectedTemplate;
+  const hasTopChip = (selectedAgents.length > 0 && !hideSelectedAgentChip) || !!selectedTemplate;
 
   return (
     <div className="space-y-3">
@@ -940,7 +945,7 @@ export function ChatInput({
         )}
         {hasTopChip && (
           <div className="absolute top-0 z-10 flex flex-wrap gap-2">
-            {selectedAgents.map((agent) => (
+            {!hideSelectedAgentChip && selectedAgents.map((agent) => (
               <SelectionChip
                 key={agent.id}
                 label={t("chatPage.input.usingAgentLabel")}

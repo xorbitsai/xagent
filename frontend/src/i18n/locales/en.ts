@@ -215,19 +215,13 @@ const en = {
     },
     sections: {
       startingPrompts: "STARTING PROMPTS",
-      chatWithAgents: "CHAT WITH AGENTS",
+      assignToTeammate: "MY TEAM",
+      assignToTeammateLead: "Assign this to a teammate",
+      assignToTeammateHint: "— or leave it and let {appName} choose.",
+      leadReady: "{name} is ready to lead this task and bring in the right specialists.",
     },
     templateQuickAccess: {
-      featuredLabel: "Featured",
-      categoryHeading: "{category} AI Agents",
-      allTemplates: "All templates →",
       usingTemplateLabel: "Agent template:",
-      agentCreatedToast: "Agent \"{name}\" created from template",
-      viewInAgents: "View in Agents",
-      createAgentError: "Couldn't create the agent from this template. Please try again.",
-      loading: "Loading templates...",
-      loadError: "Couldn't load templates.",
-      retry: "Retry",
     },
     input: {
       placeholder: "Describe your task...",

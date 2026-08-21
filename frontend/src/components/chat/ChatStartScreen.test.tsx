@@ -7,6 +7,8 @@ const chatInputProps = vi.hoisted(() => ({
     files?: File[]
     filesDisabled?: boolean
     hideFileUpload?: boolean
+    selectedAgents?: Array<{ id: number | string; name: string }>
+    hideSelectedAgentChip?: boolean
     onSend: (message: string, config?: unknown) => void
   },
 }))
@@ -17,8 +19,13 @@ vi.mock("@/contexts/i18n-context", () => ({
   }),
 }))
 
-vi.mock("@/lib/utils", () => ({
-  getApiUrl: () => "http://api.local",
+vi.mock("@/lib/utils", async () => {
+  const actual = await vi.importActual<typeof import("@/lib/utils")>("@/lib/utils")
+  return { ...actual, getApiUrl: () => "http://api.local" }
+})
+
+vi.mock("@/lib/branding", () => ({
+  getBrandingFromEnv: () => ({ appName: "Xagent" }),
 }))
 
 vi.mock("@/components/chat/ChatInput", () => ({
@@ -28,24 +35,16 @@ vi.mock("@/components/chat/ChatInput", () => ({
   },
 }))
 
-vi.mock("@/components/ui/tooltip", () => ({
-  Tooltip: ({ children }: { children: React.ReactNode }) => <>{children}</>,
-  TooltipContent: ({ children }: { children: React.ReactNode }) => <>{children}</>,
-  TooltipProvider: ({ children }: { children: React.ReactNode }) => <>{children}</>,
-  TooltipTrigger: ({ children }: { children: React.ReactNode }) => <>{children}</>,
-}))
-
 import { ChatStartScreen } from "@/components/chat/ChatStartScreen"
 
-const AGENTS_SECTION = "chatPage.sections.chatWithAgents"
+const AGENTS_SECTION = "chatPage.sections.assignToTeammate"
 
-// The agents block only renders inside the prompts branch, so every case needs
-// a non-empty prompts list to reach it at all.
+// The agents block renders independently of `prompts` - task/page.tsx (its
+// only real caller) never passes prompts at all.
 const renderScreen = (agents?: React.ComponentProps<typeof ChatStartScreen>["agents"]) =>
   render(
     <ChatStartScreen
       title="Support Agent"
-      prompts={["Summarize this page"]}
       agents={agents}
       onSend={vi.fn()}
     />
@@ -74,6 +73,75 @@ describe("ChatStartScreen agents section", () => {
 
     expect(screen.getByText(AGENTS_SECTION)).toBeTruthy()
     expect(screen.getByText("Billing Agent")).toBeTruthy()
+  })
+
+  it("shows a pill's specialty label and prefers its persona photo over logo_url", () => {
+    renderScreen([
+      {
+        id: 7,
+        name: "Maya",
+        logo_url: "/uploads/should-not-be-used.png",
+        persona_avatar: "/marketplace/avatars/maya.png",
+        specialty: "Marketing",
+      },
+    ])
+
+    expect(screen.getByText("Marketing")).toBeTruthy()
+    expect(screen.getByRole("img", { name: "Maya" })).toHaveAttribute(
+      "src",
+      "/marketplace/avatars/maya.png"
+    )
+  })
+
+  it("swaps the header for the selected teammate's portrait and a ready-to-lead subline", () => {
+    const maya = { id: 7, name: "Maya", persona_avatar: "/marketplace/avatars/maya.png" }
+    render(
+      <ChatStartScreen
+        title="Describe the goal"
+        description="Some description"
+        agents={[maya]}
+        selectedAgents={[maya]}
+        onSend={vi.fn()}
+      />
+    )
+
+    expect(screen.getByText("chatPage.sections.leadReady")).toBeTruthy()
+    // One portrait in the swapped header, one in her still-visible picker pill.
+    const portraits = screen.getAllByRole("img", { name: "Maya" })
+    expect(portraits).toHaveLength(2)
+    portraits.forEach((portrait) =>
+      expect(portrait).toHaveAttribute("src", "/marketplace/avatars/maya.png")
+    )
+    // The plain (no-lead) description only renders in the fallback header.
+    expect(screen.queryByText("Some description")).toBeNull()
+  })
+
+  it("keeps the plain header when nobody is selected", () => {
+    renderScreen([{ id: 7, name: "Maya" }])
+
+    expect(screen.queryByText("chatPage.sections.leadReady")).toBeNull()
+    expect(screen.queryByRole("img", { name: "Maya" })).toBeNull()
+  })
+
+  it("tells ChatInput to hide its own selected-agent chip, since the hero swap already shows the lead", () => {
+    const maya = { id: 7, name: "Maya" }
+    render(
+      <ChatStartScreen
+        title="Describe the goal"
+        agents={[maya]}
+        selectedAgents={[maya]}
+        onSend={vi.fn()}
+      />
+    )
+
+    expect(chatInputProps.current?.hideSelectedAgentChip).toBe(true)
+    expect(chatInputProps.current?.selectedAgents).toEqual([maya])
+  })
+
+  it("does not hide ChatInput's chip for callers that don't use the My Team picker", () => {
+    render(<ChatStartScreen title="Support Agent" onSend={vi.fn()} />)
+
+    expect(chatInputProps.current?.hideSelectedAgentChip).toBe(false)
   })
 })
 

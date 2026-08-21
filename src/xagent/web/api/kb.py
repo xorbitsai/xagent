@@ -1666,9 +1666,7 @@ def cleanup_orphaned_temp_files(
     # below so a file vanishing mid-scan skips instead of aborting the sweep.
     stack = [str(base_dir)]
     while stack:
-        # WHY: cooperative stop so a shutdown can interrupt a long walk; without
-        # it the executor thread keeps running and blocks process exit via
-        # asyncio.run()'s executor-thread join.
+        # Cooperative stop check; see the stop_event docstring above for why.
         if stop_event is not None and stop_event.is_set():
             break
         current = stack.pop()
@@ -1678,7 +1676,18 @@ def cleanup_orphaned_temp_files(
             logger.warning("Failed to scan directory %s: %s", current, e)
             continue
         with scandir_it:
-            for entry in scandir_it:
+            while True:
+                try:
+                    entry = next(scandir_it)
+                except StopIteration:
+                    break
+                except OSError as e:
+                    # A directory-level failure mid-iteration (e.g. NFS ESTALE,
+                    # or the directory removed mid-scan). Match os.walk's default
+                    # tolerance: skip this directory instead of aborting the
+                    # whole sweep.
+                    logger.warning("Failed while scanning directory %s: %s", current, e)
+                    break
                 try:
                     if entry.is_dir(follow_symlinks=False):
                         stack.append(entry.path)

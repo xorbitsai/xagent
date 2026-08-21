@@ -49,6 +49,9 @@ UPLOADED_FILE_RECOVERY_INTERVAL_SECONDS = (
 )
 UPLOADED_FILE_RECOVERY_STALE_SECONDS = "XAGENT_UPLOADED_FILE_RECOVERY_STALE_SECONDS"
 UPLOADED_FILE_RECOVERY_BATCH_SIZE = "XAGENT_UPLOADED_FILE_RECOVERY_BATCH_SIZE"
+TEMP_FILE_CLEANUP_SHUTDOWN_TIMEOUT_SECONDS = (
+    "XAGENT_TEMP_FILE_CLEANUP_SHUTDOWN_TIMEOUT_SECONDS"
+)
 STORAGE_ROOT = "XAGENT_STORAGE_ROOT"
 NATIVE_BROWSER_ENABLED = "XAGENT_NATIVE_BROWSER_ENABLED"
 NATIVE_BROWSER_APP_NAME = "XAGENT_NATIVE_BROWSER_APP_NAME"
@@ -413,6 +416,26 @@ def get_uploaded_file_recovery_batch_size() -> int:
     """Get the maximum file-compensation claims examined per polling tick."""
 
     return _get_positive_int_env(UPLOADED_FILE_RECOVERY_BATCH_SIZE, 100)
+
+
+def get_temp_file_cleanup_shutdown_timeout_seconds() -> int:
+    """Get how long shutdown waits for the orphaned temp-file sweep to unwind.
+
+    At shutdown the sweep's cooperative stop flag is set and the handler waits
+    up to this long for the walk to reach its next directory boundary and exit.
+    This bounds only the wait, not the walk: the executor thread is not
+    cancellable, so a long overrun is ultimately joined by asyncio.run()'s
+    teardown. Operators on very large uploads trees may want a larger value.
+
+    Priority:
+        1. XAGENT_TEMP_FILE_CLEANUP_SHUTDOWN_TIMEOUT_SECONDS environment variable
+        2. Default of 10 seconds
+
+    Returns:
+        Shutdown grace period in seconds
+    """
+
+    return _get_positive_int_env(TEMP_FILE_CLEANUP_SHUTDOWN_TIMEOUT_SECONDS, 10)
 
 
 def _get_positive_int_env(env_var: str, default: int, *, minimum: int = 1) -> int:

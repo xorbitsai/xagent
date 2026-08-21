@@ -102,6 +102,7 @@ from xagent.config import (
     TASK_LEASE_TTL_SECONDS,
     TASK_RUNTIME_HOOK_MAX_WORKERS,
     TASK_RUNTIME_HOOK_QUEUE_TIMEOUT_SECONDS,
+    TEMP_FILE_CLEANUP_SHUTDOWN_TIMEOUT_SECONDS,
     TRIGGER_DISPATCHER_BATCH_SIZE,
     TRIGGER_DISPATCHER_ENABLED,
     TRIGGER_DISPATCHER_INTERVAL_SECONDS,
@@ -206,6 +207,7 @@ from xagent.config import (
     get_task_lease_recovery_interval_seconds,
     get_task_runtime_hook_max_workers,
     get_task_runtime_hook_queue_timeout_seconds,
+    get_temp_file_cleanup_shutdown_timeout_seconds,
     get_trigger_dispatcher_batch_size,
     get_trigger_dispatcher_enabled,
     get_trigger_dispatcher_interval_seconds,
@@ -740,6 +742,22 @@ class TestCeleryBackgroundJobConfig:
         assert get_uploaded_file_recovery_interval_seconds() == 60
         assert get_uploaded_file_recovery_stale_seconds() == 300
         assert get_uploaded_file_recovery_batch_size() == 100
+
+    def test_temp_file_cleanup_shutdown_timeout_tuning(self, monkeypatch):
+        assert (
+            TEMP_FILE_CLEANUP_SHUTDOWN_TIMEOUT_SECONDS
+            == "XAGENT_TEMP_FILE_CLEANUP_SHUTDOWN_TIMEOUT_SECONDS"
+        )
+
+        monkeypatch.delenv(TEMP_FILE_CLEANUP_SHUTDOWN_TIMEOUT_SECONDS, raising=False)
+        assert get_temp_file_cleanup_shutdown_timeout_seconds() == 10
+
+        monkeypatch.setenv(TEMP_FILE_CLEANUP_SHUTDOWN_TIMEOUT_SECONDS, "45")
+        assert get_temp_file_cleanup_shutdown_timeout_seconds() == 45
+
+        # Invalid / non-positive values fall back to the default.
+        monkeypatch.setenv(TEMP_FILE_CLEANUP_SHUTDOWN_TIMEOUT_SECONDS, "0")
+        assert get_temp_file_cleanup_shutdown_timeout_seconds() == 10
 
 
 class TestGetWebSearchProvider:

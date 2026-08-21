@@ -945,15 +945,12 @@ async def test_startup_event_triggers_background_auto_migration(
     if created_tasks:
         await asyncio.gather(*created_tasks)
 
-    # We expect 3 tasks: backfill migration + uploaded files reconcile
-    # + orphaned temp-file cleanup
-    assert len(created_tasks) == 3
+    # We expect 2 tasks: backfill migration + uploaded files reconcile. The
+    # orphaned temp-file cleanup task is gated off under pytest (it walks the
+    # real uploads tree); its wiring/shutdown lifecycle is covered directly by
+    # test_shutdown_event_stops_temp_file_cleanup_without_cancel below.
+    assert len(created_tasks) == 2
     assert migration_called["value"] is True
-    # The count bump alone can't tell whether the temp-file cleanup task was
-    # wired: assert it is tracked on app.state alongside its cooperative stop
-    # flag, so removing either would fail here (see app.py shutdown handling).
-    assert web_app_module.app.state.temp_file_cleanup_task is not None
-    assert isinstance(web_app_module.app.state.temp_file_cleanup_stop, threading.Event)
 
 
 @pytest.mark.asyncio
@@ -1064,15 +1061,105 @@ async def test_startup_event_no_task_when_no_table_needs_migration(
     if created_tasks:
         await asyncio.gather(*created_tasks)
 
-    # We expect 2 tasks: uploaded files reconcile + orphaned temp-file cleanup
-    # (both run under auto_migrate even without migration needs)
-    assert len(created_tasks) == 2
+    # We expect 1 task: uploaded files reconcile (runs under auto_migrate even
+    # without migration needs). The orphaned temp-file cleanup task is gated off
+    # under pytest; its lifecycle is covered by the dedicated shutdown test.
+    assert len(created_tasks) == 1
     assert migration_called["value"] is False
-    # The count bump alone can't tell whether the temp-file cleanup task was
-    # wired: assert it is tracked on app.state alongside its cooperative stop
-    # flag, so removing either would fail here (see app.py shutdown handling).
-    assert web_app_module.app.state.temp_file_cleanup_task is not None
-    assert isinstance(web_app_module.app.state.temp_file_cleanup_stop, threading.Event)
+
+
+@pytest.mark.asyncio
+async def test_shutdown_event_stops_temp_file_cleanup_without_cancel(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Shutdown must signal the cleanup stop flag first and NOT cancel the task.
+
+    Covers the two round-2 majors on the shutdown path: the stop flag is set
+    before any other teardown (so an earlier hang cannot strand the executor
+    thread), and the task is awaited via asyncio.wait rather than cancelled.
+    """
+    import importlib
+
+    _patch_channel_modules_disabled(monkeypatch)
+    web_app_module = importlib.import_module("xagent.web.app")
+    app = web_app_module.app
+
+    async def _anoop(*args, **kwargs):
+        return None
+
+    def _noop(*args, **kwargs):
+        return None
+
+    # Neutralize the unrelated teardown steps so only the temp-cleanup stop/await
+    # path is exercised.
+    for name in (
+        "stop_orphan_upload_gc_task",
+        "stop_uploaded_file_recovery_task",
+        "stop_task_lease_recovery_task",
+    ):
+        monkeypatch.setattr(web_app_module, name, _anoop)
+    monkeypatch.setattr(web_app_module, "unregister_local_browser_runtime", _noop)
+    for name in (
+        "_task_command_dispatcher_task",
+        "_sandbox_idle_sweep_task",
+        "_file_storage_startup_sync_task",
+        "_trigger_dispatcher_task",
+        "_migration_task",
+    ):
+        monkeypatch.setattr(web_app_module, name, None)
+
+    class _FakeBackgroundTaskManager:
+        async def shutdown(self) -> None:
+            return None
+
+    monkeypatch.setattr(
+        "xagent.web.api.websocket.background_task_manager",
+        _FakeBackgroundTaskManager(),
+    )
+    monkeypatch.setattr(
+        "xagent.web.services.task_lease_service.wait_for_heartbeat_manager_idle",
+        _anoop,
+    )
+    monkeypatch.setattr(
+        "xagent.web.services.task_runtime.shutdown_task_runtime_hook_executor",
+        _noop,
+    )
+    monkeypatch.setattr(
+        "xagent.web.sandbox_manager.get_sandbox_manager",
+        lambda: None,
+    )
+
+    stop = threading.Event()
+    flush_saw_stop = {}
+
+    def _spy_flush() -> None:
+        # N2: the stop flag must already be set by the time the first teardown
+        # step (flush_langfuse) runs.
+        flush_saw_stop["set"] = stop.is_set()
+
+    monkeypatch.setattr(web_app_module, "flush_langfuse", _spy_flush)
+
+    started = asyncio.Event()
+
+    async def _cooperative_walk() -> None:
+        started.set()
+        while not stop.is_set():
+            await asyncio.sleep(0.01)
+
+    task = asyncio.create_task(_cooperative_walk())
+    await started.wait()
+
+    app.state.temp_file_cleanup_stop = stop
+    app.state.temp_file_cleanup_task = task
+
+    await web_app_module.shutdown_event()
+
+    assert flush_saw_stop["set"] is True
+    assert stop.is_set()
+    assert task.done()
+    assert not task.cancelled()
+    assert app.state.temp_file_cleanup_task is None
+    assert app.state.temp_file_cleanup_stop is None
 
 
 @pytest.mark.asyncio

@@ -41,7 +41,18 @@ class GmailWatchState(Base):  # type: ignore
     )
 
     user = relationship("User")
-    oauth_account = relationship("UserOAuth")
+    oauth_account = relationship(
+        "UserOAuth",
+        primaryjoin=(
+            "and_(GmailWatchState.oauth_account_id == UserOAuth.id, "
+            "foreign(GmailWatchState.user_id) == UserOAuth.user_id, "
+            "UserOAuth.resource_owner_key.is_(None))"
+        ),
+        foreign_keys="[GmailWatchState.oauth_account_id, GmailWatchState.user_id]",
+        # Gmail consumers mutate accounts through owner-scoped services. Keep
+        # this convenience relationship read-only so it cannot widen writes.
+        viewonly=True,
+    )
 
     def __repr__(self) -> str:
         return (

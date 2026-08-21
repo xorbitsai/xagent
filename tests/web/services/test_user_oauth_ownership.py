@@ -5,6 +5,7 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 from xagent.web.models.database import Base
+from xagent.web.models.gmail_watch import GmailWatchState
 from xagent.web.models.user import User
 from xagent.web.models.user_oauth import UserOAuth
 from xagent.web.services.user_oauth import (
@@ -65,6 +66,56 @@ def _db(tmp_path):
     for row in rows:
         db.refresh(row)
     return engine, db, user, rows
+
+
+def test_gmail_watch_relationship_requires_matching_ordinary_owner(tmp_path) -> None:
+    engine, db, user, rows = _db(tmp_path)
+    other_user = User(username="other-watch-owner", password_hash="hash")
+    db.add(other_user)
+    db.commit()
+    db.refresh(other_user)
+    foreign_account = UserOAuth(
+        user_id=int(other_user.id),
+        provider="gmail",
+        provider_user_id="foreign",
+        access_token="foreign",
+    )
+    db.add(foreign_account)
+    db.commit()
+    db.refresh(foreign_account)
+
+    states = [
+        GmailWatchState(
+            user_id=int(user.id),
+            oauth_account_id=int(rows[0].id),
+            email="ordinary@example.com",
+            history_id="1",
+            topic_name="ordinary",
+        ),
+        GmailWatchState(
+            user_id=int(user.id),
+            oauth_account_id=int(rows[1].id),
+            email="actor@example.com",
+            history_id="2",
+            topic_name="actor",
+        ),
+        GmailWatchState(
+            user_id=int(user.id),
+            oauth_account_id=int(foreign_account.id),
+            email="foreign@example.com",
+            history_id="3",
+            topic_name="foreign",
+        ),
+    ]
+    db.add_all(states)
+    db.commit()
+    try:
+        assert states[0].oauth_account is rows[0]
+        assert states[1].oauth_account is None
+        assert states[2].oauth_account is None
+    finally:
+        db.close()
+        engine.dispose()
 
 
 def test_scoped_query_normalizes_int_like_user_ids(tmp_path) -> None:

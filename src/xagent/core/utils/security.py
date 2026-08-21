@@ -255,7 +255,10 @@ def _mask_secret(value: str) -> str:
 
 
 def redact_url_credentials_for_logging(url: str) -> str:
-    """Redact sensitive query credentials from a URL."""
+    """Redact sensitive query credentials and any embedded userinfo from a
+    URL (e.g. a proxy URL's "user:pass@host", the single most common place
+    a URL carries a credential -- a query-string-only check would silently
+    pass it through unchanged)."""
     if not url:
         return url
 
@@ -264,8 +267,9 @@ def redact_url_credentials_for_logging(url: str) -> str:
     except ValueError:
         return url
 
+    has_userinfo = parsed.username is not None or parsed.password is not None
     query_items = parse_qsl(parsed.query, keep_blank_values=True)
-    if not query_items:
+    if not query_items and not has_userinfo:
         return url
 
     redacted_items: list[tuple[str, str]] = []
@@ -274,10 +278,23 @@ def redact_url_credentials_for_logging(url: str) -> str:
             redacted_items.append((key, _mask_secret(value)))
         else:
             redacted_items.append((key, value))
-
     redacted_query = urlencode(redacted_items, doseq=True)
+
+    netloc = parsed.netloc
+    if has_userinfo:
+        try:
+            host = parsed.hostname or ""
+            port = parsed.port
+        except ValueError:
+            # An unparsable port means netloc isn't a clean "host[:port]"
+            # tail after the "@" either; fall back to dropping everything
+            # before the last "@" rather than guessing at its shape.
+            host = parsed.netloc.rsplit("@", 1)[-1]
+            port = None
+        netloc = f"***@{host}" if port is None else f"***@{host}:{port}"
+
     return urlunsplit(
-        (parsed.scheme, parsed.netloc, parsed.path, redacted_query, parsed.fragment)
+        (parsed.scheme, netloc, parsed.path, redacted_query, parsed.fragment)
     )
 
 

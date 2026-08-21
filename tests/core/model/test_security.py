@@ -214,6 +214,25 @@ def test_redact_url_credentials_for_logging_masks_sensitive_query_values() -> No
     assert "v=1" in redacted
 
 
+def test_redact_url_credentials_for_logging_masks_embedded_userinfo() -> None:
+    # The query string isn't the only -- or even the most common -- place a
+    # URL carries a credential; a proxy URL's "user:pass@host" needs the
+    # same treatment, or it passes through this function unchanged.
+    url = "https://alice:s3cret-pass@proxy.internal:8080/"
+    redacted = redact_url_credentials_for_logging(url)
+
+    assert "alice" not in redacted
+    assert "s3cret-pass" not in redacted
+    assert redacted == "https://***@proxy.internal:8080/"
+
+
+def test_redact_sensitive_text_masks_embedded_proxy_userinfo() -> None:
+    text = "Unable to connect to proxy https://alice:s3cret-pass@proxy.internal:8080/"
+    redacted = redact_sensitive_text(text)
+
+    assert "s3cret-pass" not in redacted
+
+
 def test_redact_sensitive_text_masks_bearer_and_header_keys() -> None:
     text = (
         "Authorization: Bearer sk-secret-value "

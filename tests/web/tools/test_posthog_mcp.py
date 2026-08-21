@@ -83,56 +83,75 @@ def test_base_url_requires_host(monkeypatch):
         posthog._base_url()
 
 
-def test_base_url_strips_trailing_slash(monkeypatch):
-    monkeypatch.setenv("POSTHOG_HOST", "https://eu.posthog.com/")
+@pytest.mark.parametrize(
+    "host, expected",
+    [
+        ("https://eu.posthog.com/", "https://eu.posthog.com"),
+        ("us.posthog.com", "https://us.posthog.com"),
+        ("  https://eu.posthog.com  ", "https://eu.posthog.com"),
+        ("HTTPS://us.posthog.com", "https://us.posthog.com"),
+        ("https://eu.posthog.com///", "https://eu.posthog.com"),
+        ("https://us.posthog.com.", "https://us.posthog.com"),
+    ],
+)
+def test_base_url_normalizes_valid_host(monkeypatch, host, expected):
+    monkeypatch.setenv("POSTHOG_HOST", host)
 
-    assert posthog._base_url() == "https://eu.posthog.com"
+    assert posthog._base_url() == expected
 
 
-def test_base_url_rejects_whitespace_only_host(monkeypatch):
-    monkeypatch.setenv("POSTHOG_HOST", "   ")
+@pytest.mark.parametrize(
+    "host, match",
+    [
+        ("   ", "POSTHOG_HOST"),  # whitespace-only
+        ("/", "posthog.com"),  # slash-only -> empty hostname -> allowlist
+        ("https://", "posthog.com"),  # scheme-only -> empty hostname
+        ("http://us.posthog.com", "https"),  # wrong scheme
+        ("user:pass@us.posthog.com", "credentials"),  # embedded userinfo
+        ("us.posthog.com/api", "path"),  # path component
+        ("us.posthog.com?x=1", "path"),  # query component
+        ("https://evil.example.com", "posthog.com"),  # unrelated domain
+        # a naive host.endswith("posthog.com") (missing the leading dot)
+        # would wrongly accept this:
+        ("https://evilposthog.com", "posthog.com"),
+        # the bare apex domain isn't one of the two allowed hosts either:
+        ("https://posthog.com", "posthog.com"),
+        ("us.posthog.com:8443", "port"),  # only PostHog Cloud is supported,
+        # which never uses a non-default port
+        ("us.posthog.com:notaport", "port"),  # unparsable port
+        # an empty DNS label that a suffix-based allowlist would have let
+        # through as ".posthog.com", crashing socket.getaddrinfo with a
+        # UnicodeEncodeError instead of failing cleanly here:
+        ("https://.posthog.com", "posthog.com"),
+        # literal private/loopback/link-local hosts, plus decimal- and
+        # hex-encoded IP obfuscation attempts -- none of these are one of
+        # the two allowed hosts, so all are rejected by the allowlist
+        # without ever reaching DNS resolution:
+        ("127.0.0.1", "posthog.com"),
+        ("localhost", "posthog.com"),
+        ("169.254.169.254", "posthog.com"),
+        ("10.0.0.5", "posthog.com"),
+        # a bracket-less IPv6 literal: urlsplit can't tell the trailing
+        # ":1" from a port separator, so this is rejected as an invalid
+        # port before ever reaching the allowlist check -- still rejected,
+        # just via a different diagnostic than the other rows here.
+        ("::1", "port"),
+        ("2130706433", "posthog.com"),
+        ("0x7f000001", "posthog.com"),
+    ],
+)
+def test_base_url_rejects_invalid_host(monkeypatch, host, match):
+    monkeypatch.setenv("POSTHOG_HOST", host)
 
-    with pytest.raises(ValueError, match="POSTHOG_HOST"):
+    with pytest.raises(ValueError, match=match):
         posthog._base_url()
-
-
-def test_base_url_rejects_slash_only_host(monkeypatch):
-    monkeypatch.setenv("POSTHOG_HOST", "/")
-
-    with pytest.raises(ValueError, match="hostname"):
-        posthog._base_url()
-
-
-def test_base_url_prepends_https_when_scheme_missing(monkeypatch):
-    monkeypatch.setenv("POSTHOG_HOST", "us.posthog.com")
-
-    assert posthog._base_url() == "https://us.posthog.com"
-
-
-def test_base_url_strips_surrounding_whitespace(monkeypatch):
-    monkeypatch.setenv("POSTHOG_HOST", "  https://eu.posthog.com  ")
-
-    assert posthog._base_url() == "https://eu.posthog.com"
-
-
-def test_base_url_accepts_uppercase_scheme(monkeypatch):
-    monkeypatch.setenv("POSTHOG_HOST", "HTTPS://us.posthog.com")
-
-    assert posthog._base_url() == "https://us.posthog.com"
-
-
-def test_base_url_strips_multiple_trailing_slashes(monkeypatch):
-    monkeypatch.setenv("POSTHOG_HOST", "https://eu.posthog.com///")
-
-    assert posthog._base_url() == "https://eu.posthog.com"
 
 
 def test_base_url_rejects_host_resolving_to_private_ip(monkeypatch):
-    # A posthog.com host (so it clears the domain allowlist below) that
-    # only *resolves* to a private address -- the DNS-rebinding case the
-    # literal-string check in test_base_url_rejects_private_network_host
-    # can't catch on its own.
-    monkeypatch.setenv("POSTHOG_HOST", "fake.posthog.com")
+    # An allowed host (so it clears the domain allowlist) that only
+    # *resolves* to a private address -- the DNS-rebinding case a literal
+    # host/IP check alone can't catch.
+    monkeypatch.setenv("POSTHOG_HOST", "us.posthog.com")
     monkeypatch.setattr(posthog.socket, "getaddrinfo", _fake_getaddrinfo("10.0.0.5"))
 
     with pytest.raises(ValueError, match="not allowed"):
@@ -143,7 +162,7 @@ def test_base_url_rejects_when_any_resolved_address_is_private(monkeypatch):
     # A hostname resolving to more than one address (common for a load
     # balanced service) must be rejected if ANY resolved address is
     # private, not just the first one checked.
-    monkeypatch.setenv("POSTHOG_HOST", "fake.posthog.com")
+    monkeypatch.setenv("POSTHOG_HOST", "us.posthog.com")
     monkeypatch.setattr(
         posthog.socket, "getaddrinfo", _fake_getaddrinfo("1.1.1.1", "10.0.0.5")
     )
@@ -153,7 +172,7 @@ def test_base_url_rejects_when_any_resolved_address_is_private(monkeypatch):
 
 
 def test_base_url_rejects_ipv6_private_resolved_address(monkeypatch):
-    monkeypatch.setenv("POSTHOG_HOST", "fake.posthog.com")
+    monkeypatch.setenv("POSTHOG_HOST", "us.posthog.com")
     monkeypatch.setattr(posthog.socket, "getaddrinfo", _fake_getaddrinfo("fe80::1"))
 
     with pytest.raises(ValueError, match="not allowed"):
@@ -161,7 +180,7 @@ def test_base_url_rejects_ipv6_private_resolved_address(monkeypatch):
 
 
 def test_base_url_raises_when_dns_resolution_fails(monkeypatch):
-    monkeypatch.setenv("POSTHOG_HOST", "fake.posthog.com")
+    monkeypatch.setenv("POSTHOG_HOST", "us.posthog.com")
 
     def _raise(*args, **kwargs):
         raise socket.gaierror("Name or service not known")
@@ -172,105 +191,31 @@ def test_base_url_raises_when_dns_resolution_fails(monkeypatch):
         posthog._base_url()
 
 
-def test_base_url_preserves_explicit_port(monkeypatch):
-    monkeypatch.setenv("POSTHOG_HOST", "us.posthog.com:8443")
+def test_base_url_revalidates_host_on_every_call(monkeypatch):
+    # _base_url() is called fresh on every _request() -- it doesn't cache
+    # a validated host across calls -- so a POSTHOG_HOST change between
+    # two calls in the same process must be caught on the very next one.
+    assert posthog._base_url() == "https://us.posthog.com"
 
-    assert posthog._base_url() == "https://us.posthog.com:8443"
-
-
-def test_base_url_rejects_invalid_port(monkeypatch):
-    monkeypatch.setenv("POSTHOG_HOST", "us.posthog.com:notaport")
-
-    with pytest.raises(ValueError, match="port"):
-        posthog._base_url()
-
-
-def test_base_url_rejects_scheme_only_host(monkeypatch):
-    monkeypatch.setenv("POSTHOG_HOST", "https://")
-
-    with pytest.raises(ValueError, match="hostname"):
-        posthog._base_url()
-
-
-def test_base_url_rejects_non_posthog_domain(monkeypatch):
     monkeypatch.setenv("POSTHOG_HOST", "https://evil.example.com")
 
     with pytest.raises(ValueError, match="posthog.com"):
         posthog._base_url()
 
 
-def test_base_url_rejects_domain_that_merely_ends_with_posthog_com(monkeypatch):
-    # A naive `host.endswith("posthog.com")` (missing the leading dot)
-    # would wrongly accept this -- the real check requires a "." boundary.
-    monkeypatch.setenv("POSTHOG_HOST", "https://evilposthog.com")
-
-    with pytest.raises(ValueError, match="posthog.com"):
-        posthog._base_url()
-
-
-def test_base_url_accepts_posthog_com_apex_domain(monkeypatch):
-    monkeypatch.setenv("POSTHOG_HOST", "https://posthog.com")
-
-    assert posthog._base_url() == "https://posthog.com"
-
-
-def test_base_url_accepts_trailing_dns_root_dot(monkeypatch):
-    monkeypatch.setenv("POSTHOG_HOST", "https://us.posthog.com.")
-
-    assert posthog._base_url() == "https://us.posthog.com"
-
-
-def test_base_url_rejects_http_scheme(monkeypatch):
-    monkeypatch.setenv("POSTHOG_HOST", "http://us.posthog.com")
-
-    with pytest.raises(ValueError, match="https"):
-        posthog._base_url()
-
-
-def test_base_url_rejects_embedded_credentials(monkeypatch):
-    monkeypatch.setenv("POSTHOG_HOST", "user:pass@us.posthog.com")
-
-    with pytest.raises(ValueError, match="credentials"):
-        posthog._base_url()
-
-
-def test_base_url_rejects_path_in_host(monkeypatch):
-    monkeypatch.setenv("POSTHOG_HOST", "us.posthog.com/api")
-
-    with pytest.raises(ValueError, match="path"):
-        posthog._base_url()
-
-
-def test_base_url_rejects_query_in_host(monkeypatch):
-    monkeypatch.setenv("POSTHOG_HOST", "us.posthog.com?x=1")
-
-    with pytest.raises(ValueError, match="path"):
-        posthog._base_url()
-
-
 @pytest.mark.parametrize(
-    "host",
+    "limit, expected",
     [
-        "127.0.0.1",
-        "localhost",
-        "169.254.169.254",
-        "10.0.0.5",
-        "::1",
-        "2130706433",  # decimal-encoded 127.0.0.1
-        "0x7f000001",  # hex-encoded 127.0.0.1
+        (0, 1),  # clamped up to the minimum of 1, not 0 (an empty page)
+        (-5, 1),
+        (1, 1),
+        (posthog.MAX_LIMIT, posthog.MAX_LIMIT),
+        (posthog.MAX_LIMIT + 1, posthog.MAX_LIMIT),
+        (10_000, posthog.MAX_LIMIT),
     ],
 )
-def test_base_url_rejects_private_network_host(monkeypatch, host):
-    # None of these are a posthog.com host, so most are rejected by the
-    # domain allowlist without even reaching DNS resolution -- still
-    # correct, just via a more fundamental gate than the literal-IP check
-    # alone. "::1" is the exception: urlsplit can't parse a bracket-less
-    # IPv6 literal, so parsed.hostname comes back empty and it's rejected
-    # by the earlier "must include a hostname" check instead.
-    monkeypatch.setenv("POSTHOG_HOST", host)
-
-    with pytest.raises(ValueError, match="POSTHOG_HOST"):
-        posthog._base_url()
+def test_clamp_limit_boundaries(limit, expected):
+    assert posthog._clamp_limit(limit) == expected
 
 
 def test_path_segment_encodes_traversal_attempt():
@@ -394,19 +339,87 @@ def test_request_uses_configured_host_and_headers(monkeypatch):
     assert mock_request.call_args.kwargs["allow_redirects"] is False
 
 
-def test_request_rejects_redirect_response(monkeypatch):
+@pytest.mark.parametrize("status_code", [301, 302, 303, 307, 308])
+def test_request_rejects_redirect_response(monkeypatch, status_code):
     monkeypatch.setattr(
         posthog.requests,
         "request",
         Mock(
             return_value=MockResponse(
-                status_code=302, url="https://us.posthog.com/api/users/@me/"
+                status_code=status_code, url="https://us.posthog.com/api/users/@me/"
             )
         ),
     )
 
     with pytest.raises(RuntimeError, match="redirect"):
         posthog._request("GET", "/api/users/@me/")
+
+
+def test_request_passes_configured_timeout(monkeypatch):
+    mock_request = Mock(return_value=MockResponse(json_data={"ok": True}))
+    monkeypatch.setattr(posthog.requests, "request", mock_request)
+
+    posthog._request("GET", "/api/users/@me/")
+
+    assert mock_request.call_args.kwargs["timeout"] == posthog.DEFAULT_TIMEOUT_SECONDS
+
+
+def test_request_returns_empty_dict_for_204(monkeypatch):
+    monkeypatch.setattr(
+        posthog.requests,
+        "request",
+        Mock(return_value=MockResponse(status_code=204, text="")),
+    )
+
+    assert posthog._request("GET", "/api/users/@me/") == {}
+
+
+def test_request_retries_once_on_429_with_retry_after(monkeypatch):
+    responses = [
+        MockResponse(status_code=429, text="", url="x"),
+        MockResponse(json_data={"ok": True}),
+    ]
+    responses[0].headers = {"Retry-After": "1"}
+    mock_request = Mock(side_effect=responses)
+    monkeypatch.setattr(posthog.requests, "request", mock_request)
+    monkeypatch.setattr(posthog.time, "sleep", Mock())
+
+    result = posthog._request("GET", "/api/users/@me/")
+
+    assert result == {"ok": True}
+    assert mock_request.call_count == 2
+    posthog.time.sleep.assert_called_once_with(1)
+
+
+def test_request_does_not_retry_a_second_429(monkeypatch):
+    response = MockResponse(status_code=429, text="", url="x")
+    response.headers = {"Retry-After": "1"}
+    mock_request = Mock(return_value=response)
+    monkeypatch.setattr(posthog.requests, "request", mock_request)
+    monkeypatch.setattr(posthog.time, "sleep", Mock())
+
+    with pytest.raises(RuntimeError):
+        posthog._request("GET", "/api/users/@me/")
+
+    assert mock_request.call_count == 2
+
+
+def test_request_redacts_connection_error_message(monkeypatch):
+    # setup_proxy_env() exports whatever ambient HTTPS_PROXY the OS has
+    # configured, which requests honors; a ProxyError connecting through
+    # it can echo the full proxy URL, credentials included.
+    def _raise(*args, **kwargs):
+        raise requests.exceptions.ProxyError(
+            "Unable to connect to proxy: "
+            "https://user:sp-secret-proxy-pass@proxy.internal:8080/"
+        )
+
+    monkeypatch.setattr(posthog.requests, "request", _raise)
+
+    with pytest.raises(RuntimeError) as excinfo:
+        posthog._request("GET", "/api/users/@me/")
+
+    assert "sp-secret-proxy-pass" not in str(excinfo.value)
 
 
 def test_request_raises_with_structured_error_detail(monkeypatch):

@@ -2,6 +2,7 @@ import json
 import logging
 import os
 import socket
+import time
 from typing import Any
 from urllib.parse import quote, urlsplit
 
@@ -29,6 +30,11 @@ MAX_LIMIT = 100
 # expected {"detail": ...} shape (e.g. an HTML gateway error page) must not
 # be forwarded to the LLM/logs verbatim and unbounded.
 MAX_ERROR_RESPONSE_TEXT_CHARS = 1000
+# PostHog rate-limits aggressively, especially the query endpoint; on a 429
+# with a small Retry-After we wait once and retry rather than failing
+# outright, mirroring the same bounded-retry policy already used by the
+# Jira/Slack/Intercom sibling modules.
+MAX_RETRY_AFTER_SECONDS = 30
 
 
 def _success(**payload: Any) -> str:
@@ -49,7 +55,15 @@ def _headers() -> dict[str, str]:
     }
 
 
-POSTHOG_HOST_SUFFIX = "posthog.com"
+# PostHog Cloud has exactly two regional hosts; both always serve over
+# https on the default port. An exact-match allowlist -- rather than a
+# ".posthog.com" suffix check -- is both simpler and strictly safer: it
+# can't be fooled by a malformed hostname (e.g. an empty label like
+# ".posthog.com", which a suffix check would accept but which crashes
+# socket.getaddrinfo with a UnicodeEncodeError) or by a hypothetical
+# posthog.com subdomain that isn't actually one of PostHog's own API
+# hosts, and it makes "what port should this connect to" unambiguous.
+ALLOWED_POSTHOG_HOSTS = frozenset({"us.posthog.com", "eu.posthog.com"})
 
 
 def _base_url() -> str:
@@ -63,17 +77,18 @@ def _base_url() -> str:
     POSTHOG_HOST is user-supplied and gets an Authorization: Bearer header
     attached to every request built from it, so it is validated in layers:
     a bare HTTPS origin (no embedded credentials, no path/query/fragment
-    that could redirect the request elsewhere), restricted to a
-    posthog.com host -- self-hosted PostHog instances are not a documented
-    target of this connector, so there is no reason to send this key
-    anywhere else -- and, as defense in depth against that host's DNS
-    being rebound to a private/internal address, checked against every
-    address it actually resolves to (matching mcp_oauth.py's use of the
-    same reject_private_network_host guard for a user-configured MCP
-    host). This validates the address at call time; it does not pin the
-    later `requests` connection to the address checked here, so a second,
-    independent DNS answer at connect time is a narrower residual gap
-    than not checking DNS at all.
+    that could redirect the request elsewhere), restricted to exactly the
+    two supported PostHog Cloud hosts -- self-hosted PostHog instances are
+    not a documented target of this connector, so there is no reason to
+    send this key anywhere else -- and, as defense in depth against DNS
+    for one of those two hosts being rebound to a private/internal
+    address, checked against every address it actually resolves to
+    (reusing the same reject_private_network_host guard
+    src/xagent/web/services/mcp_oauth.py uses for a user-configured MCP
+    host, though that module goes further and pins its actual connection
+    to the validated address -- this one only validates at call time and
+    lets `requests` re-resolve independently, a narrower residual gap
+    than not checking DNS at all, not full parity with that module).
     """
     host = os.environ.get("POSTHOG_HOST", "").strip()
     if not host:
@@ -91,29 +106,26 @@ def _base_url() -> str:
             "POSTHOG_HOST must be a bare host, not a URL with a path, "
             "query, or fragment"
         )
+    try:
+        has_port = parsed.port is not None
+    except ValueError as exc:
+        raise ValueError(f"POSTHOG_HOST has an invalid port: {exc}") from exc
+    if has_port:
+        raise ValueError("POSTHOG_HOST must not include a port")
     # A trailing "." denotes the DNS root and is semantically equivalent to
-    # the same name without it (e.g. "posthog.com." == "posthog.com"); drop
-    # it before both the allowlist comparison and the address it's rebuilt
-    # into below, or a syntactically valid FQDN gets wrongly rejected.
+    # the same name without it (e.g. "us.posthog.com." == "us.posthog.com");
+    # drop it before the allowlist comparison, or a syntactically valid
+    # FQDN gets wrongly rejected.
     hostname = (parsed.hostname or "").rstrip(".")
-    if not hostname:
-        raise ValueError("POSTHOG_HOST must include a hostname")
-    if hostname != POSTHOG_HOST_SUFFIX and not hostname.endswith(
-        f".{POSTHOG_HOST_SUFFIX}"
-    ):
+    if hostname not in ALLOWED_POSTHOG_HOSTS:
         raise ValueError(
-            "POSTHOG_HOST must be a posthog.com host (e.g. us.posthog.com or "
-            "eu.posthog.com); self-hosted PostHog instances are not supported"
+            "POSTHOG_HOST must be us.posthog.com or eu.posthog.com; "
+            "self-hosted PostHog instances are not supported"
         )
 
     try:
-        port = parsed.port or 443
-    except ValueError as exc:
-        raise ValueError(f"POSTHOG_HOST has an invalid port: {exc}") from exc
-
-    try:
         resolved = socket.getaddrinfo(
-            hostname, port, socket.AF_UNSPEC, socket.SOCK_STREAM
+            hostname, 443, socket.AF_UNSPEC, socket.SOCK_STREAM
         )
         for *_, sockaddr in resolved:
             reject_private_network_host(str(sockaddr[0]))
@@ -122,8 +134,7 @@ def _base_url() -> str:
     except OSError as exc:
         raise ValueError(f"POSTHOG_HOST could not be resolved: {exc}") from exc
 
-    netloc = hostname if parsed.port is None else f"{hostname}:{parsed.port}"
-    return f"https://{netloc}"
+    return f"https://{hostname}"
 
 
 def _clamp_limit(limit: int) -> int:
@@ -183,20 +194,42 @@ def _request(
     params: dict[str, Any] | None = None,
     json_data: dict[str, Any] | None = None,
 ) -> Any:
-    response = requests.request(
-        method=method,
-        url=f"{_base_url()}{path}",
-        headers=_headers(),
-        params=params,
-        json=json_data,
-        timeout=DEFAULT_TIMEOUT_SECONDS,
-        # A redirect response is never followed with the Bearer header
-        # still attached: PostHog's documented API doesn't redirect, so a
-        # 3xx here is either a misconfiguration or exactly the "redirect to
-        # an internal host and carry the credential along" SSRF vector
-        # _base_url()'s host validation guards against on the way in.
-        allow_redirects=False,
-    )
+    url = f"{_base_url()}{path}"
+    try:
+        for attempt in (0, 1):
+            response = requests.request(
+                method=method,
+                url=url,
+                headers=_headers(),
+                params=params,
+                json=json_data,
+                timeout=DEFAULT_TIMEOUT_SECONDS,
+                # A redirect response is never followed with the Bearer
+                # header still attached: PostHog's documented API doesn't
+                # redirect, so a 3xx here is either a misconfiguration or
+                # exactly the "redirect to an internal host and carry the
+                # credential along" SSRF vector _base_url()'s host
+                # validation guards against on the way in.
+                allow_redirects=False,
+            )
+            if response.status_code == 429 and attempt == 0:
+                try:
+                    retry_after = int(response.headers.get("Retry-After", "0"))
+                except ValueError:
+                    retry_after = 0
+                if 0 < retry_after <= MAX_RETRY_AFTER_SECONDS:
+                    time.sleep(retry_after)
+                    continue
+            break
+    except requests.RequestException as exc:
+        # A connection/timeout/proxy failure's message can itself embed
+        # sensitive data -- e.g. a ProxyError echoing the ambient
+        # HTTPS_PROXY URL, which may carry embedded user:pass@ credentials
+        # (setup_proxy_env() exports whatever the OS has configured) -- so
+        # this gets the same redaction the HTTPError response-body path
+        # below already has, not just that one case.
+        raise RuntimeError(redact_sensitive_text(str(exc))) from exc
+
     if 300 <= response.status_code < 400:
         raise RuntimeError(
             f"PostHog returned an unexpected redirect (HTTP {response.status_code}); "
@@ -356,11 +389,16 @@ def posthog_query(
     API key owner's most recently active project.
     name: optional descriptive label for the query (shown in PostHog's own
     query log; purely for the user's/PostHog's bookkeeping).
-    limit: caps rows returned here, independent of any LIMIT already in
-    hogql_query -- HogQL is arbitrary caller-supplied text, so unlike the
-    tools above this one has no query-side limit to lean on, and a query
-    result table can be large enough to get truncated mid-JSON by this
-    server's own tool-output size cap.
+    limit: caps rows returned here (default 50, hard cap 100 -- see
+    MAX_LIMIT), independent of any LIMIT already in hogql_query -- HogQL
+    is arbitrary caller-supplied text, so unlike the tools above this one
+    has no query-side limit to lean on, and a query result table can be
+    large enough to get truncated mid-JSON by this server's own
+    tool-output size cap. This is a client-side cap on the response
+    already returned, not a row count passed to PostHog, and there is no
+    offset param to page past it -- a caller that needs more than 100
+    rows, or a specific slice of a larger result, should add its own
+    LIMIT/OFFSET to hogql_query instead.
     """
     try:
         body: dict[str, Any] = {"query": {"kind": "HogQLQuery", "query": hogql_query}}

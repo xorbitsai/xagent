@@ -163,19 +163,7 @@ The query must return both rows with `indisunique = true`. The ordinary row must
 
 For SQLite run `PRAGMA index_list('user_oauth');` and `PRAGMA index_info('<index-name>');`. Inspect `sqlite_master.sql` to confirm that the ordinary index uses `WHERE resource_owner_key IS NULL` and the actor index uses `WHERE resource_owner_key IS NOT NULL`.
 
-Before restarting Gmail watch processing, run this query on either supported database:
-
-```sql
-SELECT count(*)
-FROM gmail_watch_states AS watch
-JOIN user_oauth AS account ON account.id = watch.oauth_account_id
-WHERE watch.user_id <> account.user_id
-   OR account.resource_owner_key IS NOT NULL;
-```
-
-The result must be zero. A nonzero result identifies a legacy watch whose account owner does not match its user or whose account is not ordinary; repair or remove that watch before rollout.
-
-Verify existing cloud-storage, Gmail, and builtin OAuth connections. Confirm that seeded non-null-owner test rows do not appear in ordinary catalog, token, or trigger paths.
+Verify existing cloud-storage and builtin OAuth connections. Confirm that seeded non-null-owner test rows do not appear in ordinary catalog or token paths.
 
 ### Rollback
 

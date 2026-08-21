@@ -27,7 +27,6 @@ from ..models.oauth_provider import OAuthProvider
 from ..models.trigger import AgentTrigger, TriggerProvisioningStatus, TriggerType
 from ..models.user_oauth import UserOAuth
 from .time_utils import coerce_utc as _coerce_utc
-from .user_oauth import get_scoped_user_oauth_account, user_oauth_owner_clause
 
 logger = logging.getLogger(__name__)
 
@@ -191,11 +190,7 @@ def _credentials_expiry(value: datetime | None) -> datetime | None:
 
 
 def build_gmail_service(db: Session, oauth_account: UserOAuth) -> Any:
-    """Build Gmail trigger access for one ordinary connected account."""
-    if oauth_account.resource_owner_key is not None:
-        raise GmailWatchConfigurationError(
-            "actor-owned OAuth credentials cannot back Gmail triggers"
-        )
+    """Build an authenticated Gmail API client for a connected Gmail account."""
     client_id, client_secret = _get_google_oauth_config(db)
     if not client_id or not client_secret:
         raise GmailWatchConfigurationError("Google OAuth configuration missing")
@@ -342,10 +337,7 @@ def scan_due_gmail_watch_renewals(
             GmailWatchState,
             GmailWatchState.oauth_account_id == UserOAuth.id,
         )
-        .filter(
-            UserOAuth.provider == "gmail",
-            user_oauth_owner_clause(None),
-        )
+        .filter(UserOAuth.provider == "gmail")
         .filter(
             or_(
                 GmailWatchState.id.is_(None),
@@ -546,11 +538,8 @@ async def collect_gmail_pubsub_events(
     if not email_address or not notification.history_id:
         return GmailPubsubEventCollection(events=[], skipped=1)
 
-    oauth_account = get_scoped_user_oauth_account(
-        db,
-        user_id=int(state.user_id),
-        account_id=int(state.oauth_account_id),
-        resource_owner_key=None,
+    oauth_account = (
+        db.query(UserOAuth).filter(UserOAuth.id == int(state.oauth_account_id)).first()
     )
     if oauth_account is None:
         return GmailPubsubEventCollection(events=[], skipped=1)

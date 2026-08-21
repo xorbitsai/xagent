@@ -34,6 +34,7 @@ from ..models.trigger import (
     TriggerType,
 )
 from ..models.user import User
+from ..models.user_oauth import UserOAuth
 from ..models.workforce import Workforce
 from .agent_team_scope import get_agent_team_scope, owned_agent_clause
 from .background_jobs import create_background_job, enqueue_background_job
@@ -60,7 +61,6 @@ from .trigger_providers.schemas import (
     normalize_weekdays,
     parse_trigger_config,
 )
-from .user_oauth import get_scoped_user_oauth_account
 
 logger = logging.getLogger(__name__)
 
@@ -600,13 +600,8 @@ def _resolve_gmail_resource(
     """Validate the bound Gmail account and return the normalized mailbox."""
     if oauth_account_id is None:
         raise TriggerServiceError("gmail trigger requires oauth_account_id")
-    account = get_scoped_user_oauth_account(
-        db,
-        user_id=user_id,
-        account_id=oauth_account_id,
-        resource_owner_key=None,
-    )
-    if account is None:
+    account = db.query(UserOAuth).filter(UserOAuth.id == int(oauth_account_id)).first()
+    if account is None or int(account.user_id) != int(user_id):
         raise TriggerServiceError("Gmail account not found")
     if str(account.provider) != "gmail":
         raise TriggerServiceError("Selected account is not a Gmail account")

@@ -264,7 +264,7 @@ export function ChatStartScreen({
                         persona={{ name: agent.name, avatar: avatarUrl }}
                         sizeClassName="h-[27px] w-[27px]"
                         textClassName="text-[11px]"
-                        className={isSelected ? "shadow-[0_0_0_2px_var(--background),0_0_0_3px_hsl(var(--primary))]" : ""}
+                        className={isSelected ? "shadow-[0_0_0_2px_hsl(var(--background)),0_0_0_3px_hsl(var(--primary))]" : ""}
                       />
                       <b className={`text-[12.5px] font-semibold ${isSelected ? "text-primary" : "text-foreground"}`}>
                         {agent.name}

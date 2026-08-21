@@ -261,6 +261,13 @@ function TaskHomePageContent() {
       return;
     }
 
+    // Switching straight to a teammate with no suggested prompt of their
+    // own must still clear whatever the previous teammate auto-filled -
+    // otherwise their (unedited) prompt is stranded in the composer with
+    // nothing tracking it, since `loadedPromptRef` is about to be
+    // overwritten below regardless of which branch runs next.
+    clearAutoFilledPromptIfUnchanged();
+
     setSelectedAgents([agent]);
     const prompt = agent.suggested_prompts?.[0];
     if (prompt) {

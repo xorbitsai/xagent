@@ -189,6 +189,20 @@ describe("TaskHomePage agents", () => {
     ])
   })
 
+  it("switching to a teammate with no suggested prompts clears the previous teammate's unedited auto-fill", async () => {
+    apiRequestMock.mockResolvedValueOnce(jsonResponse([VERA, KEVIN]))
+    render(<TaskHomePage />)
+    await screen.findByText("pick-Vera")
+
+    fireEvent.click(screen.getByText("pick-Vera"))
+    expect(screen.getByTestId("composer")).toHaveValue("Research a topic and report back")
+
+    fireEvent.click(screen.getByText("pick-Kevin"))
+
+    expect(screen.getByTestId("composer")).toHaveValue("")
+    expect(chatStartScreenProps.current?.selectedAgents).toEqual([KEVIN])
+  })
+
   it("selects a teammate with no suggested prompts without touching the composer", async () => {
     apiRequestMock.mockResolvedValueOnce(jsonResponse([KEVIN]))
     render(<TaskHomePage />)

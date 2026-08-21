@@ -73,6 +73,25 @@ def _column_names() -> set[str]:
     return {column["name"] for column in sa.inspect(op.get_bind()).get_columns(TABLE)}
 
 
+def _owner_column_is_current() -> bool:
+    owner_column = next(
+        (
+            column
+            for column in sa.inspect(op.get_bind()).get_columns(TABLE)
+            if column["name"] == OWNER_COLUMN
+        ),
+        None,
+    )
+    if (
+        owner_column is None
+        or owner_column.get("nullable") is not True
+        or owner_column.get("default") is not None
+    ):
+        return False
+    owner_type = owner_column.get("type")
+    return isinstance(owner_type, sa.String) and owner_type.length == OWNER_LENGTH
+
+
 def _constraint_names() -> set[str]:
     return {
         constraint["name"]
@@ -161,6 +180,10 @@ def upgrade() -> None:
     has_old_constraint = OLD_CONSTRAINT in constraints
 
     if not needs_column and not has_old_constraint:
+        if not _owner_column_is_current():
+            raise RuntimeError(
+                "owner-aware UserOAuth schema has incorrect owner column"
+            )
         if _owner_indexes_are_current(dialect):
             return
         raise RuntimeError("owner-aware UserOAuth schema has incorrect indexes")

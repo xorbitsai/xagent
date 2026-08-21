@@ -494,6 +494,59 @@ def test_existing_owner_aware_schema_requires_semantic_index_definitions(
                 migration.upgrade()
 
 
+@pytest.mark.parametrize(
+    ("owner_type", "nullable", "server_default"),
+    [
+        (sa.String(255), True, None),
+        (sa.String(512), False, None),
+        (sa.String(512), True, sa.text("'actor:unexpected'")),
+    ],
+)
+def test_existing_owner_aware_schema_requires_owner_column_semantics(
+    tmp_path,
+    owner_type: sa.String,
+    nullable: bool,
+    server_default: object | None,
+) -> None:
+    engine = create_engine(f"sqlite:///{tmp_path / 'oauth-owner-column-drift.db'}")
+    migration = _migration_module()
+
+    with engine.begin() as connection:
+        _operations(connection).create_table(
+            "user_oauth",
+            sa.Column("id", sa.Integer(), nullable=False),
+            sa.Column("user_id", sa.Integer(), nullable=False),
+            sa.Column("provider", sa.String(50), nullable=False),
+            sa.Column("access_token", sa.String(), nullable=False),
+            sa.Column("provider_user_id", sa.String(), nullable=True),
+            sa.Column(
+                "resource_owner_key",
+                owner_type,
+                nullable=nullable,
+                server_default=server_default,
+            ),
+            sa.PrimaryKeyConstraint("id"),
+        )
+        connection.execute(
+            text(
+                f"CREATE UNIQUE INDEX {ORDINARY_INDEX} ON user_oauth "
+                "(user_id, provider, provider_user_id) "
+                "WHERE resource_owner_key IS NULL"
+            )
+        )
+        connection.execute(
+            text(
+                f"CREATE UNIQUE INDEX {ACTOR_INDEX} ON user_oauth "
+                "(user_id, resource_owner_key, provider, provider_user_id) "
+                "WHERE resource_owner_key IS NOT NULL"
+            )
+        )
+
+        with patch.object(migration, "op", _operations(connection)):
+            with pytest.raises(RuntimeError, match="incorrect owner column"):
+                migration.upgrade()
+
+
 def test_postgresql_upgrade_creates_indexes_before_old_constraint_drop() -> None:
     """Verify call order; PostgreSQL integration tests cover transactional DDL."""
     migration = _migration_module()

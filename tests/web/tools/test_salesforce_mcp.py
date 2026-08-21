@@ -56,6 +56,10 @@ def test_instance_url_strips_trailing_slash(monkeypatch):
         "http://acme.my.salesforce.com",  # not https
         "https://attacker.example.com",  # wrong host entirely
         "https://salesforce.com.attacker.com",  # suffix-match bypass attempt
+        # force.com hosts Salesforce Sites/Experience Cloud pages, which can
+        # serve customer-authored content -- broader than the OAuth token
+        # endpoint's actual instance_url pattern, so deliberately not allowed.
+        "https://acme.lightning.force.com",
     ],
 )
 def test_instance_url_rejects_non_salesforce_hosts(monkeypatch, value):
@@ -70,13 +74,31 @@ def test_instance_url_rejects_non_salesforce_hosts(monkeypatch, value):
     [
         "https://acme.my.salesforce.com",
         "https://cs123.salesforce.com",
-        "https://acme.lightning.force.com",
     ],
 )
 def test_instance_url_accepts_real_salesforce_hosts(monkeypatch, value):
     monkeypatch.setenv("SALESFORCE_INSTANCE_URL", value)
 
     assert salesforce._instance_url() == value
+
+
+def test_instance_url_strips_path_query_and_userinfo(monkeypatch):
+    """_instance_url() is used as a raw prefix for every outbound request
+    URL, so a scheme+host check alone isn't enough -- an extra path/query/
+    userinfo component that passed that check would otherwise silently
+    ride along into every request this connector makes."""
+    monkeypatch.setenv(
+        "SALESFORCE_INSTANCE_URL",
+        "https://user:pw@acme.my.salesforce.com/evil/path?x=1",
+    )
+
+    assert salesforce._instance_url() == "https://acme.my.salesforce.com"
+
+
+def test_instance_url_preserves_non_default_port(monkeypatch):
+    monkeypatch.setenv("SALESFORCE_INSTANCE_URL", "https://acme.my.salesforce.com:8443")
+
+    assert salesforce._instance_url() == "https://acme.my.salesforce.com:8443"
 
 
 def test_request_uses_instance_url_and_headers(monkeypatch):
@@ -143,26 +165,6 @@ def test_get_record_rejects_dot_segment_record_id(monkeypatch):
     monkeypatch.setattr(salesforce.requests, "request", mock_request)
 
     result = json.loads(salesforce.salesforce_get_record("Account", ".."))
-
-    assert result["status"] == "error"
-    mock_request.assert_not_called()
-
-
-def test_delete_record_rejects_empty_record_id(monkeypatch):
-    mock_request = Mock()
-    monkeypatch.setattr(salesforce.requests, "request", mock_request)
-
-    result = json.loads(salesforce.salesforce_delete_record("Account", ""))
-
-    assert result["status"] == "error"
-    mock_request.assert_not_called()
-
-
-def test_delete_record_rejects_empty_sobject_type(monkeypatch):
-    mock_request = Mock()
-    monkeypatch.setattr(salesforce.requests, "request", mock_request)
-
-    result = json.loads(salesforce.salesforce_delete_record("", "001xx"))
 
     assert result["status"] == "error"
     mock_request.assert_not_called()
@@ -235,6 +237,25 @@ def test_request_raises_with_joined_array_error_messages(monkeypatch):
 
     assert "Required fields are missing" in str(excinfo.value)
     assert "Session expired" in str(excinfo.value)
+
+
+def test_request_falls_back_to_error_code_for_empty_message(monkeypatch):
+    monkeypatch.setattr(
+        salesforce.requests,
+        "request",
+        Mock(
+            return_value=MockResponse(
+                status_code=400,
+                json_data=[{"message": "", "errorCode": "MALFORMED_ID"}],
+            )
+        ),
+    )
+
+    with pytest.raises(RuntimeError) as excinfo:
+        salesforce._request("GET", "/services/data/v59.0/sobjects/Account/1")
+
+    assert "MALFORMED_ID" in str(excinfo.value)
+    assert "{'message'" not in str(excinfo.value)
 
 
 def test_request_truncates_structured_error_body(monkeypatch):
@@ -725,19 +746,6 @@ def test_update_record_requires_at_least_one_field(monkeypatch):
     assert result["status"] == "error"
     assert "No fields" in result["message"]
     mock_request.assert_not_called()
-
-
-def test_delete_record_sends_delete_method(monkeypatch):
-    mock_request = Mock(return_value=MockResponse(status_code=204))
-    monkeypatch.setattr(salesforce.requests, "request", mock_request)
-
-    result = json.loads(salesforce.salesforce_delete_record("Account", "001xx"))
-
-    assert result["status"] == "success"
-    assert mock_request.call_args.kwargs["method"] == "DELETE"
-    assert mock_request.call_args.kwargs["url"].endswith(
-        f"/services/data/{salesforce.API_VERSION}/sobjects/Account/001xx"
-    )
 
 
 def test_salesforce_app_registry_requires_refresh_token_and_openid_scopes():

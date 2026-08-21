@@ -157,3 +157,31 @@ def test_transport_config_raises_when_instance_url_mapped_but_not_provided():
             app_info=app_info,
             access_token="user-access-token",
         )
+
+
+def test_transport_config_warns_and_omits_env_var_for_unrecognized_token_type(
+    caplog,
+):
+    """launch_config is not developer-only: POST /admin/mcp/apps accepts it
+    as an unvalidated free-form dict (PublicMCPAppCreate's validator only
+    checks command/required_env/url/auth.type), so a hand-typed custom
+    OAuth app's env_mapping (e.g. "acess_token", a typo) can reach this
+    branch too, not just a typo in this codebase's own registry."""
+    cfg = WebToolConfig(db=None, request=None)
+    app_info = {
+        "launch_config": {
+            "command": "python",
+            "args": ["-m", "xagent.web.tools.mcp.custom_app"],
+            "env_mapping": {"CUSTOM_ACCESS_TOKEN": "acess_token"},
+        }
+    }
+
+    with caplog.at_level("WARNING"):
+        transport_config = cfg._build_oauth_mcp_stdio_transport_config(
+            server=SimpleNamespace(name="Custom App"),
+            app_info=app_info,
+            access_token="user-access-token",
+        )
+
+    assert "CUSTOM_ACCESS_TOKEN" not in transport_config["env"]
+    assert "acess_token" in caplog.text

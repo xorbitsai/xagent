@@ -263,6 +263,38 @@ def test_callback_returns_session_expired_when_encryption_key_missing(
     assert "expired" in response.body.decode().lower()
 
 
+def test_callback_returns_session_expired_when_code_verifier_is_foreign_ciphertext(
+    db_session, monkeypatch
+):
+    """A distinct branch from the missing-key case above: ENCRYPTION_KEY is
+    present and valid, but the verifier is Fernet-shaped ciphertext produced
+    under a *different* key (e.g. a stale token from before a key rotation).
+    decrypt_value_strict raises EncryptionDecodeError (an InvalidToken, not
+    a missing-key ValueError) here -- must hit the same "session expired"
+    page, not a raw exception."""
+    from cryptography.fernet import Fernet
+
+    db, user = db_session
+    foreign_ciphertext = Fernet(Fernet.generate_key()).encrypt(b"verifier").decode()
+    state = create_access_token(
+        data={
+            "type": "oauth_state",
+            "user_id": user.id,
+            "provider": "salesforce",
+            "app_id": "salesforce",
+            "code_verifier": foreign_ciphertext,
+        },
+        expires_delta=timedelta(minutes=10),
+    )
+    request = SimpleNamespace(query_params={"code": "sf-code", "state": state})
+    monkeypatch.setattr(auth_api.requests, "post", Mock())
+
+    response = generic_oauth_callback("salesforce", request, db, _salesforce_provider())
+
+    assert response.status_code == 400
+    assert "expired" in response.body.decode().lower()
+
+
 def test_non_salesforce_callback_does_not_persist_instance_url(db_session, monkeypatch):
     """A provider whose token response has no instance_url key must leave
     that column None, not crash or coerce it to something else."""

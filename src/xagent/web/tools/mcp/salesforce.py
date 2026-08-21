@@ -24,9 +24,9 @@ mcp = FastMCP("salesforce-mcp")
 USERINFO_URL = "https://login.salesforce.com/services/oauth2/userinfo"
 
 # Pinned to a long-supported version rather than the latest release --
-# Salesforce keeps every past API version working indefinitely, and the
-# SOQL/sobject CRUD surface this connector uses has been stable across
-# versions for years.
+# Salesforce supports past API versions for many years (not indefinitely;
+# old versions are eventually retired), and the SOQL/sobject CRUD surface
+# this connector uses has been stable across versions for years.
 API_VERSION = "v59.0"
 DEFAULT_TIMEOUT_SECONDS = 30
 # Matches zoom.py's/linear.py's convention: an error body that isn't the
@@ -69,7 +69,7 @@ def _error(message: str) -> str:
     return json.dumps({"status": "error", "message": message}, ensure_ascii=False)
 
 
-_INSTANCE_URL_HOST_SUFFIXES = ("salesforce.com", "force.com")
+_INSTANCE_URL_HOST_SUFFIXES = ("salesforce.com",)
 
 
 def _instance_url() -> str:
@@ -83,12 +83,23 @@ def _instance_url() -> str:
     constant, so this validates scheme+host rather than only checking
     non-empty: every request this module makes is built by interpolating
     this value directly into a URL.
+
+    Canonicalizes to exactly ``scheme://host[:port]`` rather than returning
+    the input string as-is: the value is used as a raw prefix
+    (``f"{_instance_url()}{path}"``), so a value like
+    "https://acme.my.salesforce.com/evil/path" or
+    "https://user:pw@acme.my.salesforce.com" would otherwise pass the
+    scheme+host check and then silently carry its extra path/userinfo
+    component into every outbound request URL. force.com (Salesforce Sites
+    / Experience Cloud, which can serve customer-authored content) is
+    deliberately not in the allowed suffixes -- the OAuth token endpoint's
+    instance_url is always a *.salesforce.com host in practice, and
+    force.com would only widen this beyond what Salesforce actually sends.
     """
     instance_url = os.environ.get("SALESFORCE_INSTANCE_URL")
     if not instance_url:
         raise ValueError("SALESFORCE_INSTANCE_URL environment variable is missing")
-    instance_url = instance_url.rstrip("/")
-    parsed = urlparse(instance_url)
+    parsed = urlparse(instance_url.rstrip("/"))
     # rstrip: a trailing-dot FQDN (e.g. "acme.my.salesforce.com.") is a
     # valid, equivalent hostname that just wouldn't satisfy endswith below
     # otherwise -- Salesforce's own token response never sends one, but
@@ -101,7 +112,8 @@ def _instance_url() -> str:
         raise ValueError(
             f"SALESFORCE_INSTANCE_URL is not a valid Salesforce host: {instance_url!r}"
         )
-    return instance_url
+    port = f":{parsed.port}" if parsed.port else ""
+    return f"{parsed.scheme}://{hostname}{port}"
 
 
 def _headers() -> dict[str, str]:
@@ -129,10 +141,17 @@ def _extract_error_detail(response: requests.Response) -> str | None:
         return None
     if not isinstance(payload, list) or not payload:
         return None
-    messages = [
-        str(item.get("message") or item) if isinstance(item, dict) else str(item)
-        for item in payload
-    ]
+
+    def _describe(item: Any) -> str:
+        if not isinstance(item, dict):
+            return str(item)
+        # A falsy (missing or empty-string) message falls back to
+        # errorCode -- still readable text, unlike str(item)'s Python
+        # dict-repr, which is only used as a last resort when neither key
+        # has anything useful.
+        return str(item.get("message") or item.get("errorCode") or item)
+
+    messages = [_describe(item) for item in payload]
     return "; ".join(messages) if messages else None
 
 
@@ -396,27 +415,6 @@ def salesforce_update_record(
     except Exception as e:
         logger.error(
             f"Error updating Salesforce {sobject_type} record {record_id}: {e}"
-        )
-        return _error(str(e))
-
-
-@mcp.tool()
-def salesforce_delete_record(sobject_type: str, record_id: str) -> str:
-    """
-    Delete a record by id.
-    sobject_type: an object's API name, e.g. "Account" or "My_Object__c".
-    """
-    try:
-        safe_sobject_type = url_path_id(sobject_type, "sobject_type")
-        safe_record_id = url_path_id(record_id, "record_id")
-        _request(
-            "DELETE",
-            f"/services/data/{API_VERSION}/sobjects/{safe_sobject_type}/{safe_record_id}",
-        )
-        return _success(id=record_id)
-    except Exception as e:
-        logger.error(
-            f"Error deleting Salesforce {sobject_type} record {record_id}: {e}"
         )
         return _error(str(e))
 

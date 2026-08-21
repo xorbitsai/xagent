@@ -3081,9 +3081,13 @@ class WebToolConfig(BaseToolConfig):
                     # otherwise silently emit neither an env var nor an
                     # error -- the exact opaque failure mode
                     # _OAuthInstanceUrlRequired exists to prevent for the
-                    # one token_type above it. launch_config is
-                    # developer-authored, not user input, so this can only
-                    # come from a typo in this codebase's own registry.
+                    # one token_type above it. Not developer-only: an admin
+                    # can reach this through POST /admin/mcp/apps, whose
+                    # launch_config is an unvalidated free-form dict (see
+                    # PublicMCPAppCreate in admin_mcp.py -- its validator
+                    # checks command/required_env/url/auth.type, not
+                    # env_mapping's values), so a hand-typed custom OAuth
+                    # app's env_mapping can carry this too.
                     logger.warning(
                         "Unrecognized launch_config.env_mapping token_type "
                         "'%s' for env var '%s'; no value forwarded",

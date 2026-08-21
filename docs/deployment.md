@@ -177,6 +177,18 @@ Verify existing cloud-storage, Gmail, and builtin OAuth connections. Confirm tha
 
 ### Rollback
 
-Because this release cannot create actor-owned rows, the downgrade remains available after ordinary rollout. Stop workers, run `alembic downgrade 20260819_merge_jira_and_linear_heads`, verify that `alembic current` reports that single revision, and then deploy the old version.
+Because this release cannot create actor-owned rows, the downgrade remains available after ordinary rollout.
 
-The migration still refuses downgrade if a non-null owner row exists. If an external or future caller created such a row, disable that caller and use an approved credential-revocation and data-removal procedure before retrying the downgrade.
+1. Stop all workers before the downgrade.
+2. If the database is SQLite, create a current database backup.
+3. If the database is SQLite, run `PRAGMA integrity_check;` against the backup. The result must be `ok`.
+4. Run `alembic downgrade 20260819_merge_jira_and_linear_heads`.
+5. Run `alembic current`. The command must report only `20260819_merge_jira_and_linear_heads`.
+6. If the database is SQLite, run `PRAGMA integrity_check;` and `PRAGMA foreign_key_check;`.
+7. If the database is SQLite, inspect `PRAGMA table_info('user_oauth');`. The result must not contain `resource_owner_key`.
+8. If the database is SQLite, inspect `PRAGMA index_list('user_oauth');` and each `PRAGMA index_info('<index-name>');` result. One unique index must cover `(user_id, provider, provider_user_id)`.
+9. Deploy the old version.
+
+SQLite can commit each schema operation separately during a batch-table rebuild. If the downgrade fails or stops, do not retry against the changed database. Restore the verified backup, make sure that `alembic current` reports the owner-aware revision, and retry the downgrade.
+
+The migration refuses the downgrade if a non-null owner row exists. If a caller created such a row, disable that caller. Revoke and remove the credential with an approved procedure. Then retry the downgrade.

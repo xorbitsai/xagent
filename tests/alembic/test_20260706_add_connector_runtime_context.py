@@ -157,13 +157,18 @@ def test_downgrade_removes_connector_runtime_schema(tmp_path) -> None:
             assert "allow_delegated_authorization" not in columns
 
 
-def test_empty_database_alembic_upgrade_to_head_completes(
+def test_database_with_core_users_table_alembic_upgrade_to_head_completes(
     tmp_path,
 ) -> None:
+    from xagent.web.models.user import User
+
     engine = create_engine(f"sqlite:///{tmp_path / 'empty.db'}")
     cfg = create_alembic_config(engine)
 
     with engine.begin() as connection:
+        # Application startup creates metadata-owned core tables before
+        # Alembic upgrades the migration-owned schema.
+        User.__table__.create(bind=connection)
         cfg.attributes["connection"] = connection
         command.upgrade(cfg, "head")
 

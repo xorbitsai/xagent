@@ -63,6 +63,8 @@ def _flatten_form_params(value: Any, prefix: str = "") -> list[tuple[str, Any]]:
     elif isinstance(value, list):
         for index, sub_value in enumerate(value):
             items.extend(_flatten_form_params(sub_value, f"{prefix}[{index}]"))
+    elif isinstance(value, bool):
+        items.append((prefix, "true" if value else "false"))
     elif value is not None:
         items.append((prefix, value))
     return items

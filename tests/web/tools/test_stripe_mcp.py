@@ -54,6 +54,17 @@ def test_flatten_form_params_omits_none_values():
     assert result == [("name", "Acme")]
 
 
+def test_flatten_form_params_serializes_booleans_lowercase():
+    result = stripe._flatten_form_params(
+        {"metadata": {"is_active": True, "is_pending": False}}
+    )
+
+    assert result == [
+        ("metadata[is_active]", "true"),
+        ("metadata[is_pending]", "false"),
+    ]
+
+
 def test_request_uses_base_url_and_headers(monkeypatch):
     mock_request = Mock(return_value=MockResponse(json_data={"id": "acct_123"}))
     monkeypatch.setattr(stripe.requests, "request", mock_request)

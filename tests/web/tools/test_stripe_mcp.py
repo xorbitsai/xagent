@@ -55,16 +55,9 @@ def test_path_segment_percent_encodes_path_traversal_characters():
     assert stripe._path_segment("cus_1/../account") == "cus_1%2F..%2Faccount"
 
 
-def test_idempotency_key_is_stable_for_identical_arguments():
-    first = stripe._idempotency_key("POST", "/refunds", {"charge": "ch_1"})
-    second = stripe._idempotency_key("POST", "/refunds", {"charge": "ch_1"})
-
-    assert first == second
-
-
-def test_idempotency_key_differs_for_different_arguments():
-    first = stripe._idempotency_key("POST", "/refunds", {"charge": "ch_1"})
-    second = stripe._idempotency_key("POST", "/refunds", {"charge": "ch_2"})
+def test_generate_idempotency_key_is_not_stable_across_calls():
+    first = stripe._generate_idempotency_key()
+    second = stripe._generate_idempotency_key()
 
     assert first != second
 
@@ -170,7 +163,10 @@ def test_request_omits_idempotency_key_for_get(monkeypatch):
     assert "Idempotency-Key" not in mock_request.call_args.kwargs["headers"]
 
 
-def test_request_reuses_idempotency_key_for_identical_retry_arguments(monkeypatch):
+def test_request_generates_different_key_for_identical_default_calls(monkeypatch):
+    """Two independent calls with the same arguments and no explicit
+    idempotency_key must NOT collide -- see _generate_idempotency_key's
+    docstring for why a content-derived key was wrong."""
     mock_request = Mock(return_value=MockResponse(json_data={"id": "re_1"}))
     monkeypatch.setattr(stripe.requests, "request", mock_request)
 
@@ -179,7 +175,23 @@ def test_request_reuses_idempotency_key_for_identical_retry_arguments(monkeypatc
 
     first_key = mock_request.call_args_list[0].kwargs["headers"]["Idempotency-Key"]
     second_key = mock_request.call_args_list[1].kwargs["headers"]["Idempotency-Key"]
-    assert first_key == second_key
+    assert first_key != second_key
+
+
+def test_request_reuses_caller_supplied_idempotency_key(monkeypatch):
+    mock_request = Mock(return_value=MockResponse(json_data={"id": "re_1"}))
+    monkeypatch.setattr(stripe.requests, "request", mock_request)
+
+    stripe._request(
+        "POST", "/refunds", form_data={"charge": "ch_1"}, idempotency_key="retry-1"
+    )
+    stripe._request(
+        "POST", "/refunds", form_data={"charge": "ch_2"}, idempotency_key="retry-1"
+    )
+
+    first_key = mock_request.call_args_list[0].kwargs["headers"]["Idempotency-Key"]
+    second_key = mock_request.call_args_list[1].kwargs["headers"]["Idempotency-Key"]
+    assert first_key == second_key == "retry-1"
 
 
 def test_request_retries_once_on_429_with_retry_after(monkeypatch):
@@ -264,6 +276,66 @@ def test_request_truncates_unstructured_error_body(monkeypatch):
 
     assert "[truncated]" in str(excinfo.value)
     assert len(str(excinfo.value)) < len(long_body)
+
+
+def test_request_flags_replay_on_error_response(monkeypatch):
+    monkeypatch.setattr(
+        stripe.requests,
+        "request",
+        Mock(
+            return_value=MockResponse(
+                status_code=402,
+                json_data={"error": {"message": "Your card was declined."}},
+                headers={"Idempotent-Replayed": "true"},
+            )
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="replay of a previous failed attempt"):
+        stripe._request("POST", "/refunds", form_data={"charge": "ch_1"})
+
+
+def test_request_does_not_mention_replay_on_fresh_error(monkeypatch):
+    monkeypatch.setattr(
+        stripe.requests,
+        "request",
+        Mock(
+            return_value=MockResponse(
+                status_code=402,
+                json_data={"error": {"message": "Your card was declined."}},
+            )
+        ),
+    )
+
+    with pytest.raises(RuntimeError) as excinfo:
+        stripe._request("POST", "/refunds", form_data={"charge": "ch_1"})
+
+    assert "replay" not in str(excinfo.value).lower()
+
+
+def test_request_wraps_network_exception(monkeypatch):
+    monkeypatch.setattr(
+        stripe.requests,
+        "request",
+        Mock(side_effect=stripe.requests.ConnectionError("boom at http://x:y@host")),
+    )
+
+    with pytest.raises(RuntimeError, match="Stripe request failed"):
+        stripe._request("GET", "/account")
+
+
+def test_request_truncates_long_network_exception_text(monkeypatch):
+    monkeypatch.setattr(
+        stripe.requests,
+        "request",
+        Mock(side_effect=stripe.requests.ConnectionError("x" * 5000)),
+    )
+
+    with pytest.raises(RuntimeError) as excinfo:
+        stripe._request("GET", "/account")
+
+    assert "[truncated]" in str(excinfo.value)
+    assert len(str(excinfo.value)) < 5000
 
 
 def test_get_account_info_returns_profile(monkeypatch):
@@ -439,6 +511,15 @@ def test_create_customer_reports_idempotent_replayed_false_on_fresh_create(
     assert result["idempotent_replayed"] is False
 
 
+def test_create_customer_passes_through_caller_supplied_idempotency_key(monkeypatch):
+    mock_request = Mock(return_value=MockResponse(json_data={"id": "cus_1"}))
+    monkeypatch.setattr(stripe.requests, "request", mock_request)
+
+    stripe.stripe_create_customer(name="Acme", idempotency_key="my-retry-key")
+
+    assert mock_request.call_args.kwargs["headers"]["Idempotency-Key"] == "my-retry-key"
+
+
 def test_get_customer_requires_non_empty_id():
     result = json.loads(stripe.stripe_get_customer(""))
 
@@ -547,6 +628,15 @@ def test_create_refund_reports_idempotent_replayed_false_on_fresh_create(monkeyp
     result = json.loads(stripe.stripe_create_refund(charge_id="ch_1"))
 
     assert result["idempotent_replayed"] is False
+
+
+def test_create_refund_passes_through_caller_supplied_idempotency_key(monkeypatch):
+    mock_request = Mock(return_value=MockResponse(json_data={"id": "re_1"}))
+    monkeypatch.setattr(stripe.requests, "request", mock_request)
+
+    stripe.stripe_create_refund(charge_id="ch_1", idempotency_key="my-retry-key")
+
+    assert mock_request.call_args.kwargs["headers"]["Idempotency-Key"] == "my-retry-key"
 
 
 def test_list_payment_intents_returns_results(monkeypatch):
@@ -699,3 +789,50 @@ def test_stripe_app_registry_requires_api_key():
     )
     assert stripe_app["provider_name"] is None
     assert stripe_app["launch_config"]["required_env"] == ["STRIPE_API_KEY"]
+
+
+async def test_mcp_registers_all_fourteen_tools():
+    """Direct-call unit tests above exercise each tool's Python body, but
+    none of them go through FastMCP's own registration/schema layer -- a
+    tool whose @mcp.tool() decorator was dropped, or whose name was typo'd,
+    would still pass every test above while being unreachable to an agent."""
+    tools = await stripe.mcp.list_tools()
+
+    assert {tool.name for tool in tools} == {
+        "stripe_get_account_info",
+        "stripe_get_balance",
+        "stripe_list_customers",
+        "stripe_get_customer",
+        "stripe_create_customer",
+        "stripe_list_charges",
+        "stripe_get_charge",
+        "stripe_create_refund",
+        "stripe_list_payment_intents",
+        "stripe_list_invoices",
+        "stripe_get_invoice",
+        "stripe_list_subscriptions",
+        "stripe_list_products",
+        "stripe_list_prices",
+    }
+
+
+async def test_create_customer_via_mcp_layer_parses_json_string_metadata(monkeypatch):
+    """MCP tool arguments arrive as JSON over the wire; some callers send a
+    dict-typed argument as a JSON-encoded string rather than a native JSON
+    object (a real, observed LLM tool-calling behavior). FastMCP's schema
+    validation pre-parses this before the tool body runs -- a direct Python
+    call bypasses that layer entirely, so metadata's dict[str, str] contract
+    is only actually exercised through mcp.call_tool, not stripe_create_
+    customer(...) called directly."""
+    mock_request = Mock(return_value=MockResponse(json_data={"id": "cus_1"}))
+    monkeypatch.setattr(stripe.requests, "request", mock_request)
+
+    await stripe.mcp.call_tool(
+        "stripe_create_customer",
+        {"name": "Acme", "metadata": '{"internal_id": "6735"}'},
+    )
+
+    assert mock_request.call_args.kwargs["data"] == [
+        ("name", "Acme"),
+        ("metadata[internal_id]", "6735"),
+    ]

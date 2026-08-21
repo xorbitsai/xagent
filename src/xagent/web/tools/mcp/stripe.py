@@ -1,8 +1,8 @@
-import hashlib
 import json
 import logging
 import os
 import time
+import uuid
 from typing import Any
 from urllib.parse import quote
 
@@ -69,26 +69,22 @@ def _path_segment(value: str) -> str:
     return quote(str(value), safe="")
 
 
-def _idempotency_key(method: str, path: str, form_data: dict[str, Any] | None) -> str:
-    """Derive a stable Idempotency-Key for a mutating request from its exact
-    arguments, so an agent retry of the identical tool call (e.g. after a
-    timeout or dropped connection) is deduped by Stripe instead of creating a
-    second real refund/customer.
+def _generate_idempotency_key() -> str:
+    """A fresh, content-independent Idempotency-Key for a POST call that
+    didn't get an explicit one from its caller.
 
-    Tradeoff: two genuinely distinct calls that happen to share identical
-    arguments (e.g. two separate real customers both created with just
-    name="Acme") are content-indistinguishable from a retry and will also be
-    deduped -- Stripe caches a key's result for ~24h and replays it verbatim.
-    Callers MUST pass `response_meta` to `_request` and surface its
-    `idempotent_replayed` flag in the tool's response so this is visible
-    rather than a silent duplicate customer/refund object.
+    A key derived from the request's own arguments (an earlier version of
+    this function) seemed appealing for deduping an agent's accidental retry
+    without any extra plumbing, but it silently merges two *genuinely
+    distinct* calls that happen to share identical arguments (e.g. two real
+    customers both created with just name="Acme") into one -- Stripe caches
+    a key's result for ~24h and replays it verbatim, indistinguishable from
+    a fresh success. A random key makes every call independent by default;
+    real retry-safety is opt-in via the tool's own `idempotency_key`
+    parameter, which a caller passes explicitly (and reuses verbatim) only
+    when it is deliberately retrying a specific prior call.
     """
-    canonical = json.dumps(
-        {"method": method, "path": path, "form_data": form_data or {}},
-        sort_keys=True,
-        default=str,
-    )
-    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    return uuid.uuid4().hex
 
 
 def _flatten_form_params(value: Any, prefix: str = "") -> list[tuple[str, Any]]:
@@ -144,27 +140,41 @@ def _request(
     *,
     params: dict[str, Any] | None = None,
     form_data: dict[str, Any] | None = None,
+    idempotency_key: str | None = None,
     response_meta: dict[str, Any] | None = None,
 ) -> Any:
-    """`response_meta`, when passed, is populated with `idempotent_replayed`
-    for POST requests -- see `_idempotency_key`'s docstring for why a caller
-    that creates a resource needs to know when a call was a dedup replay
-    rather than a fresh create.
+    """`idempotency_key`, for a POST, is sent as Stripe's Idempotency-Key
+    header; if omitted, a fresh one is generated per call (see
+    `_generate_idempotency_key`'s docstring for why). `response_meta`, when
+    passed, is populated with `idempotent_replayed` so a caller that creates
+    a resource can tell a dedup replay apart from a fresh create -- for both
+    a successful response and a >=400 one, since Stripe replays a cached
+    *failed* response verbatim too, and a caller retrying that with the same
+    key would just get the same failure again.
     """
-    idempotency_key = (
-        _idempotency_key(method, path, form_data) if method == "POST" else None
+    resolved_idempotency_key = (
+        (idempotency_key or _generate_idempotency_key()) if method == "POST" else None
     )
-    headers = _headers(idempotency_key)
+    headers = _headers(resolved_idempotency_key)
     data = _flatten_form_params(form_data) if form_data else None
     for attempt in (0, 1):
-        response = requests.request(
-            method=method,
-            url=f"{BASE_URL}{path}",
-            headers=headers,
-            params=params,
-            data=data,
-            timeout=DEFAULT_TIMEOUT_SECONDS,
-        )
+        try:
+            response = requests.request(
+                method=method,
+                url=f"{BASE_URL}{path}",
+                headers=headers,
+                params=params,
+                data=data,
+                timeout=DEFAULT_TIMEOUT_SECONDS,
+            )
+        except requests.RequestException as exc:
+            # Bounded the same way an HTTP-level error body is below: a
+            # ConnectionError/Timeout's str(exc) is unstructured and can be
+            # arbitrarily long (e.g. embed a proxy's effective URL), so it
+            # must not reach the LLM/logs raw and unbounded either.
+            raise RuntimeError(
+                f"Stripe request failed: {truncate_error_text(str(exc))}"
+            ) from exc
         if response.status_code == 429 and attempt == 0:
             try:
                 retry_after = int(response.headers.get("Retry-After", "0"))
@@ -175,20 +185,29 @@ def _request(
                 continue
         break
 
+    idempotent_replayed = False
+    if resolved_idempotency_key is not None:
+        idempotent_replayed = response.headers.get("Idempotent-Replayed") == "true"
+        if idempotent_replayed:
+            logger.warning(f"Stripe idempotent replay detected for POST {path}")
+
     if response.status_code >= 400:
         detail = _extract_error_detail(response)
         if detail is None:
             detail = truncate_error_text(response.text.strip())
+        if idempotent_replayed:
+            detail = (
+                f"{detail} (this is a replay of a previous failed attempt with "
+                "the same idempotency_key -- retrying with that same key will "
+                "reproduce the same failure; use a different idempotency_key "
+                "for a genuinely new attempt)"
+            )
         raise RuntimeError(
             f"Stripe API error (status {response.status_code}): {detail}"
         )
 
-    if idempotency_key is not None:
-        idempotent_replayed = response.headers.get("Idempotent-Replayed") == "true"
-        if idempotent_replayed:
-            logger.warning(f"Stripe idempotent replay detected for POST {path}")
-        if response_meta is not None:
-            response_meta["idempotent_replayed"] = idempotent_replayed
+    if response_meta is not None and resolved_idempotency_key is not None:
+        response_meta["idempotent_replayed"] = idempotent_replayed
 
     if response.status_code == 204 or not response.content:
         return {}
@@ -287,18 +306,21 @@ def stripe_create_customer(
     email: str = "",
     description: str = "",
     metadata: dict[str, str] | None = None,
+    idempotency_key: str = "",
 ) -> str:
     """
     Create a new customer.
     name/email/description: optional customer profile fields.
     metadata: optional string key/value pairs to attach for your own
     bookkeeping, e.g. {"internal_id": "6735"}.
-
-    A retry of this exact call (same arguments) is deduped by Stripe and
-    returns the original customer instead of creating a second one; the
-    response's idempotent_replayed flag is true when that happened. Vary at
-    least one argument (e.g. add a distinguishing metadata value) to
-    intentionally create another customer with otherwise-identical details.
+    idempotency_key: optional. Omit it for a normal call -- each call then
+    gets its own fresh key, so two distinct customers created with identical
+    arguments are never silently merged into one. Only pass the SAME value
+    here when you are deliberately retrying a previous call to this tool
+    that may have already succeeded (e.g. it errored or timed out and you
+    don't know if it went through): Stripe will then return the original
+    customer instead of creating a second one, and the response's
+    idempotent_replayed flag will be true.
     """
     try:
         form_data: dict[str, Any] = {}
@@ -312,7 +334,11 @@ def stripe_create_customer(
             form_data["metadata"] = metadata
         response_meta: dict[str, Any] = {}
         result = _request(
-            "POST", "/customers", form_data=form_data, response_meta=response_meta
+            "POST",
+            "/customers",
+            form_data=form_data,
+            idempotency_key=idempotency_key or None,
+            response_meta=response_meta,
         )
         return _success(
             customer=result,
@@ -371,6 +397,7 @@ def stripe_create_refund(
     amount: int | None = None,
     reason: str = "",
     metadata: dict[str, str] | None = None,
+    idempotency_key: str = "",
 ) -> str:
     """
     Refund a charge, in full or in part.
@@ -381,15 +408,21 @@ def stripe_create_refund(
     amount: optional amount to refund in the currency's smallest unit (e.g.
     cents for USD); omit to refund the full remaining amount.
     reason: optional one of "duplicate", "fraudulent", or
-    "requested_by_customer".
+    "requested_by_customer". "fraudulent" is not just a label: for
+    applicable card payments it reports the charge to Stripe Radar as fraud
+    and can add the card's fingerprint and the customer's email(s) to the
+    account's default block lists -- only use it when that fraud-reporting
+    side effect is actually intended.
     metadata: optional string key/value pairs to attach for your own
     bookkeeping, e.g. {"internal_id": "6735"}.
-
-    A retry of this exact call (same arguments) is deduped by Stripe and
-    returns the original refund instead of creating a second one; the
-    response's idempotent_replayed flag is true when that happened. Vary at
-    least one argument (e.g. add a distinguishing metadata value) to
-    intentionally issue another refund with otherwise-identical details.
+    idempotency_key: optional. Omit it for a normal call -- each call then
+    gets its own fresh key, so two distinct refunds issued with identical
+    arguments are never silently merged into one. Only pass the SAME value
+    here when you are deliberately retrying a previous call to this tool
+    that may have already succeeded (e.g. it errored or timed out and you
+    don't know if it went through): Stripe will then return the original
+    refund instead of issuing a second one, and the response's
+    idempotent_replayed flag will be true.
     """
     try:
         if not charge_id and not payment_intent_id:
@@ -407,7 +440,11 @@ def stripe_create_refund(
             form_data["metadata"] = metadata
         response_meta: dict[str, Any] = {}
         result = _request(
-            "POST", "/refunds", form_data=form_data, response_meta=response_meta
+            "POST",
+            "/refunds",
+            form_data=form_data,
+            idempotency_key=idempotency_key or None,
+            response_meta=response_meta,
         )
         return _success(
             refund=result,

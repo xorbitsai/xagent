@@ -1,11 +1,15 @@
+import hashlib
 import json
 import logging
 import os
+import time
 from typing import Any
+from urllib.parse import quote
 
 import requests
 from mcp.server.fastmcp import FastMCP
 
+from ...utils.graphql_errors import truncate_error_text
 from .utils import setup_proxy_env
 
 logging.basicConfig(level=logging.INFO)
@@ -19,10 +23,10 @@ mcp = FastMCP("stripe-mcp")
 BASE_URL = "https://api.stripe.com/v1"
 DEFAULT_TIMEOUT_SECONDS = 30
 MAX_LIMIT = 100
-# Matches zoom.py's/linear.py's convention: an error body that isn't the
-# expected {"error": {...}} shape (e.g. an HTML gateway error page) must not
-# be forwarded to the LLM/logs verbatim and unbounded.
-MAX_ERROR_RESPONSE_TEXT_CHARS = 1000
+# Stripe is rate-limited; on a 429 with a small Retry-After we wait once and
+# retry rather than failing outright, mirroring jira.py's/intercom.py's/
+# slack.py's bounded-retry policy for the same REST-shaped 429 signal.
+MAX_RETRY_AFTER_SECONDS = 30
 
 
 def _success(**payload: Any) -> str:
@@ -33,15 +37,43 @@ def _error(message: str) -> str:
     return json.dumps({"status": "error", "message": message}, ensure_ascii=False)
 
 
-def _headers() -> dict[str, str]:
+def _headers(idempotency_key: str | None = None) -> dict[str, str]:
     api_key = os.environ.get("STRIPE_API_KEY")
     if not api_key:
         raise ValueError("STRIPE_API_KEY environment variable is missing")
-    return {"Authorization": f"Bearer {api_key}"}
+    headers = {"Authorization": f"Bearer {api_key}"}
+    if idempotency_key:
+        headers["Idempotency-Key"] = idempotency_key
+    return headers
 
 
 def _clamp_limit(limit: int) -> int:
     return max(1, min(int(limit), MAX_LIMIT))
+
+
+def _path_segment(value: str) -> str:
+    """Percent-encode a value for safe interpolation into a URL path segment
+    (e.g. a customer/charge/invoice id), matching jira.py's _path_segment /
+    zoom.py's _encode_meeting_id. Percent-encoding - not a blocklist of "/",
+    "?", "#" - is what actually prevents a value like "cus_1/../account"
+    from escaping its intended path segment.
+    """
+    return quote(str(value), safe="")
+
+
+def _idempotency_key(method: str, path: str, form_data: dict[str, Any] | None) -> str:
+    """Derive a stable Idempotency-Key for a mutating request from its exact
+    arguments, so an agent retry of the identical tool call (e.g. after a
+    timeout or dropped connection) is deduped by Stripe instead of creating a
+    second real refund/customer, while a call with genuinely different
+    arguments still gets a different key.
+    """
+    canonical = json.dumps(
+        {"method": method, "path": path, "form_data": form_data or {}},
+        sort_keys=True,
+        default=str,
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
 def _flatten_form_params(value: Any, prefix: str = "") -> list[tuple[str, Any]]:
@@ -98,20 +130,32 @@ def _request(
     params: dict[str, Any] | None = None,
     form_data: dict[str, Any] | None = None,
 ) -> Any:
-    response = requests.request(
-        method=method,
-        url=f"{BASE_URL}{path}",
-        headers=_headers(),
-        params=params,
-        data=_flatten_form_params(form_data) if form_data else None,
-        timeout=DEFAULT_TIMEOUT_SECONDS,
+    idempotency_key = (
+        _idempotency_key(method, path, form_data) if method == "POST" else None
     )
+    for attempt in (0, 1):
+        response = requests.request(
+            method=method,
+            url=f"{BASE_URL}{path}",
+            headers=_headers(idempotency_key),
+            params=params,
+            data=_flatten_form_params(form_data) if form_data else None,
+            timeout=DEFAULT_TIMEOUT_SECONDS,
+        )
+        if response.status_code == 429 and attempt == 0:
+            try:
+                retry_after = int(response.headers.get("Retry-After", "0"))
+            except ValueError:
+                retry_after = 0
+            if 0 < retry_after <= MAX_RETRY_AFTER_SECONDS:
+                time.sleep(retry_after)
+                continue
+        break
+
     if response.status_code >= 400:
         detail = _extract_error_detail(response)
         if detail is None:
-            detail = response.text.strip()
-            if len(detail) > MAX_ERROR_RESPONSE_TEXT_CHARS:
-                detail = detail[:MAX_ERROR_RESPONSE_TEXT_CHARS] + "... [truncated]"
+            detail = truncate_error_text(response.text.strip())
         raise RuntimeError(
             f"Stripe API error (status {response.status_code}): {detail}"
         )
@@ -198,7 +242,7 @@ def stripe_get_customer(customer_id: str) -> str:
     customer_id: a Stripe customer id, e.g. "cus_ABC123".
     """
     try:
-        result = _request("GET", f"/customers/{customer_id}")
+        result = _request("GET", f"/customers/{_path_segment(customer_id)}")
         return _success(customer=result)
     except Exception as e:
         logger.error(f"Error fetching Stripe customer {customer_id}: {e}")
@@ -267,7 +311,7 @@ def stripe_get_charge(charge_id: str) -> str:
     charge_id: a Stripe charge id, e.g. "ch_ABC123".
     """
     try:
-        result = _request("GET", f"/charges/{charge_id}")
+        result = _request("GET", f"/charges/{_path_segment(charge_id)}")
         return _success(charge=result)
     except Exception as e:
         logger.error(f"Error fetching Stripe charge {charge_id}: {e}")
@@ -376,7 +420,7 @@ def stripe_get_invoice(invoice_id: str) -> str:
     invoice_id: a Stripe invoice id, e.g. "in_ABC123".
     """
     try:
-        result = _request("GET", f"/invoices/{invoice_id}")
+        result = _request("GET", f"/invoices/{_path_segment(invoice_id)}")
         return _success(invoice=result)
     except Exception as e:
         logger.error(f"Error fetching Stripe invoice {invoice_id}: {e}")
@@ -396,7 +440,8 @@ def stripe_list_subscriptions(
     subscriptions.
     status: optional one of "active", "past_due", "unpaid", "canceled",
     "incomplete", "incomplete_expired", "trialing", "paused", or "all"
-    (Stripe defaults to "active" only if omitted).
+    (if omitted, Stripe returns every non-canceled status, not just
+    "active" -- pass "active" explicitly to filter to active-only).
     starting_after: a subscription id from a previous page, to page forward.
     """
     try:

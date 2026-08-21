@@ -961,7 +961,7 @@ def get_builtin_public_mcp_app_rows() -> list[dict[str, Any]]:
             "icon": "https://www.google.com/s2/favicons?domain=stripe.com&sz=128",
             "transport": "stdio",
             "provider_name": None,
-            "category": "Finance",
+            "category": "Payments",
             "oauth_scopes": None,
             "is_visible_in_connector": True,
             # Key-based (non-oauth), like aws/google-maps/posthog: Stripe's

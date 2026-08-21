@@ -40,7 +40,7 @@ ROW = {
     "icon": "https://www.google.com/s2/favicons?domain=stripe.com&sz=128",
     "transport": "stdio",
     "provider_name": None,
-    "category": "Finance",
+    "category": "Payments",
     "oauth_scopes": None,
     "is_visible_in_connector": True,
     "launch_config": {

@@ -36,6 +36,33 @@ def test_headers_include_bearer_token_only():
     assert stripe._headers() == {"Authorization": "Bearer rk_test_123"}
 
 
+def test_headers_include_idempotency_key_when_given():
+    headers = stripe._headers(idempotency_key="abc123")
+
+    assert headers == {
+        "Authorization": "Bearer rk_test_123",
+        "Idempotency-Key": "abc123",
+    }
+
+
+def test_path_segment_percent_encodes_path_traversal_characters():
+    assert stripe._path_segment("cus_1/../account") == "cus_1%2F..%2Faccount"
+
+
+def test_idempotency_key_is_stable_for_identical_arguments():
+    first = stripe._idempotency_key("POST", "/refunds", {"charge": "ch_1"})
+    second = stripe._idempotency_key("POST", "/refunds", {"charge": "ch_1"})
+
+    assert first == second
+
+
+def test_idempotency_key_differs_for_different_arguments():
+    first = stripe._idempotency_key("POST", "/refunds", {"charge": "ch_1"})
+    second = stripe._idempotency_key("POST", "/refunds", {"charge": "ch_2"})
+
+    assert first != second
+
+
 def test_flatten_form_params_flattens_nested_dict():
     result = stripe._flatten_form_params({"metadata": {"order_id": "6735"}})
 
@@ -93,6 +120,66 @@ def test_request_form_encodes_nested_form_data(monkeypatch):
         ("name", "Acme"),
         ("metadata[order_id]", "6735"),
     ]
+
+
+def test_request_sends_idempotency_key_only_for_post(monkeypatch):
+    mock_request = Mock(return_value=MockResponse(json_data={"id": "cus_123"}))
+    monkeypatch.setattr(stripe.requests, "request", mock_request)
+
+    stripe._request("POST", "/customers", form_data={"name": "Acme"})
+
+    assert "Idempotency-Key" in mock_request.call_args.kwargs["headers"]
+
+
+def test_request_omits_idempotency_key_for_get(monkeypatch):
+    mock_request = Mock(return_value=MockResponse(json_data={"id": "acct_123"}))
+    monkeypatch.setattr(stripe.requests, "request", mock_request)
+
+    stripe._request("GET", "/account")
+
+    assert "Idempotency-Key" not in mock_request.call_args.kwargs["headers"]
+
+
+def test_request_reuses_idempotency_key_for_identical_retry_arguments(monkeypatch):
+    mock_request = Mock(return_value=MockResponse(json_data={"id": "re_1"}))
+    monkeypatch.setattr(stripe.requests, "request", mock_request)
+
+    stripe._request("POST", "/refunds", form_data={"charge": "ch_1"})
+    stripe._request("POST", "/refunds", form_data={"charge": "ch_1"})
+
+    first_key = mock_request.call_args_list[0].kwargs["headers"]["Idempotency-Key"]
+    second_key = mock_request.call_args_list[1].kwargs["headers"]["Idempotency-Key"]
+    assert first_key == second_key
+
+
+def test_request_retries_once_on_429_with_retry_after(monkeypatch):
+    responses = [
+        MockResponse(status_code=429, text="rate limited"),
+        MockResponse(json_data={"id": "acct_123"}),
+    ]
+    responses[0].headers = {"Retry-After": "1"}
+    mock_request = Mock(side_effect=responses)
+    monkeypatch.setattr(stripe.requests, "request", mock_request)
+    mock_sleep = Mock()
+    monkeypatch.setattr(stripe.time, "sleep", mock_sleep)
+
+    result = stripe._request("GET", "/account")
+
+    assert result == {"id": "acct_123"}
+    assert mock_request.call_count == 2
+    mock_sleep.assert_called_once_with(1)
+
+
+def test_request_does_not_retry_past_max_retry_after(monkeypatch):
+    response = MockResponse(status_code=429, text="rate limited")
+    response.headers = {"Retry-After": str(stripe.MAX_RETRY_AFTER_SECONDS + 1)}
+    mock_request = Mock(return_value=response)
+    monkeypatch.setattr(stripe.requests, "request", mock_request)
+
+    with pytest.raises(RuntimeError, match="429"):
+        stripe._request("GET", "/account")
+
+    assert mock_request.call_count == 1
 
 
 def test_request_raises_with_structured_error_detail(monkeypatch):
@@ -241,6 +328,17 @@ def test_get_customer_returns_customer(monkeypatch):
     assert result["status"] == "success"
     assert result["customer"]["id"] == "cus_1"
     assert mock_request.call_args.kwargs["url"].endswith("/customers/cus_1")
+
+
+def test_get_customer_percent_encodes_customer_id(monkeypatch):
+    mock_request = Mock(return_value=MockResponse(json_data={"id": "cus_1"}))
+    monkeypatch.setattr(stripe.requests, "request", mock_request)
+
+    stripe.stripe_get_customer("cus_1/../account")
+
+    assert mock_request.call_args.kwargs["url"].endswith(
+        "/customers/cus_1%2F..%2Faccount"
+    )
 
 
 def test_create_customer_sends_form_data_with_metadata(monkeypatch):

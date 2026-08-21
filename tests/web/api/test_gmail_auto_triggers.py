@@ -2142,6 +2142,51 @@ def test_collect_gmail_pubsub_events_retains_reregistration_failure_detail(
         db.close()
 
 
+def test_gmail_unified_callback_preserves_cursor_for_nonordinary_watch_account() -> (
+    None
+):
+    """Acknowledged ownership mismatches must not consume Gmail history."""
+    signal_name = "gmail_oauth_ownership_mismatch"
+    ops_signals.clear_degradation(signal_name)
+    db = _direct_db_session()
+    try:
+        user = _create_user(db, "gmail-owner-mismatch-route-user")
+        oauth = _create_gmail_oauth(db, user)
+        _mark_unified_gmail_trigger(db, _create_gmail_trigger(db, user))
+        state = _create_gmail_watch_state(
+            db, user, oauth, callback_id="cb-owner-mismatch-route"
+        )
+        setattr(oauth, "resource_owner_key", "actor:alice")
+        db.add(oauth)
+        db.commit()
+
+        def fake_verify(_token: str, audience: str) -> dict[str, object]:
+            return {"iss": "https://accounts.google.com", "aud": audience}
+
+        register_trigger_provider(
+            GmailProvider(oidc_verifier=fake_verify),
+            replace=True,
+        )
+
+        response = client.post(
+            "/api/triggers/callback/gmail/cb-owner-mismatch-route",
+            headers={"Authorization": "Bearer oidc-token"},
+            content=_gmail_pubsub_push_body(
+                claimed_email="codeacme17@gmail.com",
+                message_id="pubsub-owner-mismatch-route",
+            ),
+        )
+
+        assert response.status_code == 200, response.text
+        db.refresh(state)
+        assert state.history_id == "100"
+        assert signal_name in ops_signals.active_degradations()
+    finally:
+        register_trigger_provider(GmailProvider(), replace=True)
+        ops_signals.clear_degradation(signal_name)
+        db.close()
+
+
 def test_gmail_unified_callback_acks_and_stays_disabled_when_watch_disabled(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

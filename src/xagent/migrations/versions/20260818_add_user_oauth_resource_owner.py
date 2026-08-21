@@ -108,10 +108,6 @@ def _index_names() -> set[str]:
     }
 
 
-def _owner_index_names() -> set[str]:
-    return {name for name, _columns, _unique, _predicate in OWNER_INDEX_DEFINITIONS}
-
-
 def _normalize_index_predicate(predicate: object | None) -> str | None:
     if predicate is None:
         return None
@@ -121,16 +117,22 @@ def _normalize_index_predicate(predicate: object | None) -> str | None:
     return normalized
 
 
-def _owner_indexes_are_current(dialect: str) -> bool:
+def _missing_owner_index_definitions(
+    dialect: str,
+) -> tuple[tuple[str, tuple[str, ...], bool, object], ...]:
+    """Return missing indexes after rejecting every malformed definition."""
     indexes = {
         str(index["name"]): index
         for index in sa.inspect(op.get_bind()).get_indexes(TABLE)
         if index.get("name")
     }
-    for name, columns, unique, predicate in OWNER_INDEX_DEFINITIONS:
+    missing: list[tuple[str, tuple[str, ...], bool, object]] = []
+    for definition in OWNER_INDEX_DEFINITIONS:
+        name, columns, unique, predicate = definition
         index = indexes.get(name)
         if index is None:
-            return False
+            missing.append(definition)
+            continue
         options = index.get("dialect_options") or {}
         actual_predicate = options.get(f"{dialect}_where")
         if (
@@ -139,8 +141,12 @@ def _owner_indexes_are_current(dialect: str) -> bool:
             or _normalize_index_predicate(actual_predicate)
             != _normalize_index_predicate(predicate)
         ):
-            return False
-    return True
+            raise RuntimeError("owner-aware UserOAuth schema has incorrect indexes")
+    return tuple(missing)
+
+
+def _owner_indexes_are_current(dialect: str) -> bool:
+    return not _missing_owner_index_definitions(dialect)
 
 
 def _sqlite_global_owner_relation_names() -> set[str]:
@@ -158,9 +164,13 @@ def _sqlite_global_owner_relation_names() -> set[str]:
     return {str(name) for name in rows.scalars()}
 
 
-def _create_owner_indexes() -> None:
-    """Create the owner indexes inside the current migration transaction."""
-    for name, columns, unique, predicate in OWNER_INDEX_DEFINITIONS:
+def _create_owner_indexes(
+    definitions: tuple[tuple[str, tuple[str, ...], bool, object], ...] = (
+        OWNER_INDEX_DEFINITIONS
+    ),
+) -> None:
+    """Create selected owner indexes inside the current migration transaction."""
+    for name, columns, unique, predicate in definitions:
         kwargs = (
             {"sqlite_where": predicate, "postgresql_where": predicate}
             if predicate is not None
@@ -184,9 +194,20 @@ def upgrade() -> None:
             raise RuntimeError(
                 "owner-aware UserOAuth schema has incorrect owner column"
             )
-        if _owner_indexes_are_current(dialect):
+        missing_indexes = _missing_owner_index_definitions(dialect)
+        if not missing_indexes:
             return
-        raise RuntimeError("owner-aware UserOAuth schema has incorrect indexes")
+        if dialect != "sqlite":
+            raise RuntimeError("owner-aware UserOAuth schema has incorrect indexes")
+        # SQLite batch DDL is not reliably transactional under pysqlite. A
+        # process can exit after the old constraint is removed or after only
+        # the first replacement index is created. Existing indexes were
+        # validated above, so creating only the missing definitions safely
+        # completes that exact interrupted state without accepting drift.
+        _create_owner_indexes(missing_indexes)
+        if not _owner_indexes_are_current(dialect):  # pragma: no cover - invariant
+            raise RuntimeError("owner-aware UserOAuth schema has incorrect indexes")
+        return
     if not needs_column or not has_old_constraint:
         raise RuntimeError("UserOAuth schema is partially owner-aware")
 

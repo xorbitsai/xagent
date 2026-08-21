@@ -114,6 +114,46 @@ def _create_old_table(connection) -> None:
     )
 
 
+def _create_interrupted_owner_table(
+    connection, *, existing_indexes: tuple[str, ...] = ()
+) -> None:
+    """Create the exact SQLite shape left by interrupted index installation."""
+    operations = _operations(connection)
+    operations.create_table(
+        "user_oauth",
+        sa.Column("id", sa.Integer(), nullable=False),
+        sa.Column("user_id", sa.Integer(), nullable=False),
+        sa.Column("provider", sa.String(50), nullable=False),
+        sa.Column("access_token", sa.String(), nullable=False),
+        sa.Column("provider_user_id", sa.String(), nullable=True),
+        sa.Column("resource_owner_key", sa.String(512), nullable=True),
+        sa.PrimaryKeyConstraint("id"),
+    )
+    connection.execute(
+        text(
+            "INSERT INTO user_oauth "
+            "(id, user_id, provider, access_token, provider_user_id) "
+            "VALUES (1, 7, 'gmail', 'ordinary', 'provider-account')"
+        )
+    )
+    if ORDINARY_INDEX in existing_indexes:
+        connection.execute(
+            text(
+                f"CREATE UNIQUE INDEX {ORDINARY_INDEX} ON user_oauth "
+                "(user_id, provider, provider_user_id) "
+                "WHERE resource_owner_key IS NULL"
+            )
+        )
+    if ACTOR_INDEX in existing_indexes:
+        connection.execute(
+            text(
+                f"CREATE UNIQUE INDEX {ACTOR_INDEX} ON user_oauth "
+                "(user_id, resource_owner_key, provider, provider_user_id) "
+                "WHERE resource_owner_key IS NOT NULL"
+            )
+        )
+
+
 def _index_map(connection) -> dict[str, dict]:
     return {
         index["name"]: index for index in inspect(connection).get_indexes("user_oauth")
@@ -126,6 +166,76 @@ def _where(index: dict) -> str:
     if clause is None:
         clause = options.get("postgresql_where")
     return str(clause if clause is not None else "").lower()
+
+
+@pytest.mark.parametrize(
+    "existing_indexes",
+    [
+        (),
+        (ORDINARY_INDEX,),
+        (ACTOR_INDEX,),
+    ],
+)
+def test_upgrade_repairs_interrupted_owner_index_installation(
+    tmp_path, existing_indexes: tuple[str, ...]
+) -> None:
+    engine = create_engine(f"sqlite:///{tmp_path / 'oauth-interrupted.db'}")
+    migration = _migration_module()
+
+    with engine.begin() as connection:
+        _create_interrupted_owner_table(
+            connection,
+            existing_indexes=existing_indexes,
+        )
+
+        with patch.object(migration, "op", _operations(connection)):
+            migration.upgrade()
+
+        indexes = _index_map(connection)
+        assert tuple(indexes[ORDINARY_INDEX]["column_names"]) == (
+            "user_id",
+            "provider",
+            "provider_user_id",
+        )
+        assert "resource_owner_key is null" in _where(indexes[ORDINARY_INDEX])
+        assert tuple(indexes[ACTOR_INDEX]["column_names"]) == (
+            "user_id",
+            "resource_owner_key",
+            "provider",
+            "provider_user_id",
+        )
+        assert "resource_owner_key is not null" in _where(indexes[ACTOR_INDEX])
+        assert (
+            connection.execute(
+                text("SELECT access_token FROM user_oauth WHERE id = 1")
+            ).scalar_one()
+            == "ordinary"
+        )
+
+
+def test_interrupted_owner_index_repair_rejects_duplicate_identity(tmp_path) -> None:
+    engine = create_engine(f"sqlite:///{tmp_path / 'oauth-interrupted-duplicate.db'}")
+    migration = _migration_module()
+
+    with engine.begin() as connection:
+        _create_interrupted_owner_table(connection)
+        connection.execute(
+            text(
+                "INSERT INTO user_oauth "
+                "(id, user_id, provider, access_token, provider_user_id) "
+                "VALUES (2, 7, 'gmail', 'duplicate', 'provider-account')"
+            )
+        )
+
+        with patch.object(migration, "op", _operations(connection)):
+            with pytest.raises(IntegrityError):
+                migration.upgrade()
+
+        assert ORDINARY_INDEX not in _index_map(connection)
+        assert (
+            connection.execute(text("SELECT count(*) FROM user_oauth")).scalar_one()
+            == 2
+        )
 
 
 def test_upgrade_preserves_rows_and_installs_owner_aware_identity(tmp_path) -> None:

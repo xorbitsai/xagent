@@ -21,7 +21,7 @@ namespaces into the old identity can violate uniqueness and would destroy the
 security boundary, so downgrade refuses rather than deleting or merging rows.
 
 Revision ID: 20260818_user_oauth_resource_owner
-Revises: 20260818_seed_jira_mcp_app
+Revises: 20260819_merge_jira_and_linear_heads
 Create Date: 2026-08-18
 """
 
@@ -33,7 +33,7 @@ from alembic import op
 from xagent.db.migration_support import require_owner_aware_unique_index_dialect
 
 revision: str = "20260818_user_oauth_resource_owner"
-down_revision: Union[str, None] = "20260818_seed_jira_mcp_app"
+down_revision: Union[str, None] = "20260819_merge_jira_and_linear_heads"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 

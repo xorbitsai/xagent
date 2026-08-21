@@ -177,6 +177,6 @@ Verify existing cloud-storage, Gmail, and builtin OAuth connections. Confirm tha
 
 ### Rollback
 
-Because this release cannot create actor-owned rows, the downgrade remains available after ordinary rollout. Stop workers, run `alembic downgrade 20260818_seed_jira_mcp_app`, and deploy the old version.
+Because this release cannot create actor-owned rows, the downgrade remains available after ordinary rollout. Stop workers, run `alembic downgrade 20260819_merge_jira_and_linear_heads`, verify that `alembic current` reports that single revision, and then deploy the old version.
 
 The migration still refuses downgrade if a non-null owner row exists. If an external or future caller created such a row, disable that caller and use an approved credential-revocation and data-removal procedure before retrying the downgrade.

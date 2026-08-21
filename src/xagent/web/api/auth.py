@@ -3,6 +3,8 @@
 import asyncio
 import base64
 import hashlib
+import html
+import json
 import logging
 import os
 import re
@@ -35,6 +37,7 @@ from ..models.database import get_db
 from ..models.system_setting import SystemSetting
 from ..models.user import User
 from ..models.user_oauth import UserOAuth
+from ..oauth_provider_quirks import requires_json_accept_header
 from ..services import gmail_provisioning
 from ..services.auth_email import send_password_reset_email
 from ..utils.graphql_errors import graphql_errors_message, truncate_error_text
@@ -159,8 +162,6 @@ def _resolve_oauth_redirect_uri(provider: str, db_provider: Any) -> str:
 def _oauth_provider_config_error(
     provider: str, missing_env_names: list[str]
 ) -> HTMLResponse:
-    import html
-
     escaped_provider = html.escape(provider)
     escaped_missing = html.escape(", ".join(missing_env_names))
     return HTMLResponse(
@@ -286,7 +287,84 @@ def _normalize_intercom_token_response(
     return {**token_data, "access_token": token}
 
 
-def _extract_provider_error_message(token_data: dict[str, Any]) -> str | None:
+# One shared cap for every provider-supplied error detail echoed to the
+# browser -- both renderers below default to it so the two error shapes
+# (standard error/error_description, Intercom's error.list) can't silently
+# diverge by someone tuning one magic default and not the other.
+_OAUTH_ERROR_MESSAGE_LIMIT = 500
+
+# Diagnostic fields safe to log verbatim from a token-endpoint response --
+# everything else (access_token, refresh_token, client_secret, and any
+# provider-specific field that might carry a token) is reduced to presence
+# only. Server-side logging isn't a safe place for the raw payload either:
+# hide_parameters isn't a substitute here since these are dict values being
+# logged directly, not SQL bound parameters. Applied recursively (see
+# _redact_oauth_log_value), so "message"/"type" also cover an allowlisted
+# key's own nested object shape (Meta's "error" is itself
+# {"message": ..., "type": ...}, the same shape _bounded_oauth_error_message
+# already extracts from for the browser-facing message).
+_OAUTH_LOG_SAFE_KEYS = frozenset(
+    {"error", "error_description", "error_uri", "reason", "type", "message"}
+)
+
+
+def _redact_oauth_log_value(value: Any) -> Any:
+    """Recursively apply _OAUTH_LOG_SAFE_KEYS to a value found under an
+    already-allowlisted key.
+
+    A first version of this redaction serialized an allowlisted key's
+    whole value verbatim (e.g. via json.dumps) once it wasn't a plain str.
+    That reopened the exact leak this function exists to close: a
+    malformed/adversarial response can nest a live secret *inside* an
+    allowlisted key's object (`{"error": {"access_token": "..."}}`), and a
+    verbatim dump would still put it in the log even though the top-level
+    `access_token` field is correctly redacted. Recursing with the same
+    allowlist at every level closes that regardless of nesting depth.
+    """
+    if isinstance(value, dict):
+        return {
+            key: (
+                _redact_oauth_log_value(nested)
+                if key in _OAUTH_LOG_SAFE_KEYS
+                else "<redacted>"
+            )
+            for key, nested in value.items()
+        }
+    if isinstance(value, list):
+        return [_redact_oauth_log_value(item) for item in value]
+    if isinstance(value, str):
+        return value[:_OAUTH_ERROR_MESSAGE_LIMIT]
+    return value
+
+
+def _redact_oauth_log_payload(token_data: Dict[str, Any]) -> Dict[str, Any]:
+    """Project a provider token/error response down to a safe-to-log shape.
+
+    Only the allowlisted diagnostic fields keep their (recursively
+    redacted, length-capped) value; every other key is replaced with a
+    presence marker so a malformed or partial response can't put a live
+    access/refresh token into the server log the way logging the raw dict
+    would.
+
+    An allowlisted key's value can still be non-str -- Meta's "error" is
+    itself an object (`{"message": ..., "type": ...}`), the same shape
+    `_bounded_oauth_error_message` already handles for the browser-facing
+    message -- so this keeps that diagnostic content instead of blanking
+    it, but via the same recursive allowlist rather than a verbatim dump.
+    """
+    return {
+        key: (
+            _redact_oauth_log_value(value)
+            if key in _OAUTH_LOG_SAFE_KEYS
+            else "<redacted>"
+        )
+        for key, value in token_data.items()
+    }
+
+
+def _extract_provider_error_message(
+    token_data: dict[str, Any], *, limit: int = _OAUTH_ERROR_MESSAGE_LIMIT
+) -> str | None:
     """Best-effort human-readable detail for a token exchange that yielded no
     access_token.
 
@@ -294,14 +372,55 @@ def _extract_provider_error_message(token_data: dict[str, Any]) -> str | None:
     handled by the `"error" in token_data` check earlier in the callback.
     This covers Intercom's differently-shaped `error.list` envelope instead
     (`{"type": "error.list", "errors": [{"message": "..."}]}`), which does
-    not use an `error` key and so slips past that earlier check.
+    not use an `error` key and so slips past that earlier check. Capped the
+    same way as `_bounded_oauth_error_message`'s standard-shape sibling --
+    this value is echoed to the browser too, and an unbounded provider
+    message is exactly the risk that helper was added to close.
     """
     errors = token_data.get("errors")
     if isinstance(errors, list) and errors:
         first_error = errors[0]
         if isinstance(first_error, dict) and first_error.get("message"):
-            return str(first_error["message"])
+            return str(first_error["message"])[:limit]
     return None
+
+
+def _bounded_oauth_error_message(
+    token_data: Dict[str, Any], *, limit: int = _OAUTH_ERROR_MESSAGE_LIMIT
+) -> str:
+    """Bounded, allowlisted, HTML-escaped rendering of a token-endpoint
+    error response for a `token_data["error"]` payload.
+
+    Echoing `str(token_data)` in full (as this used to) was safe only by
+    accident: it relied on no provider's error payload ever containing a
+    token. Making GitHub's JSON error path reachable here (via the
+    provider-quirk Accept header) removed that accidental guarantee, so
+    only the standard OAuth2 `error`/`error_description` fields are
+    rendered now, with every other field dropped and the result capped in
+    length.
+
+    `error` is a bare string for standard OAuth2 providers, but Meta's is
+    itself an object (`{"message": ..., "type": "OAuthException", ...}`)
+    -- str()-ing that directly would render a Python dict repr into the
+    page instead of the actual message. `error_description` is likewise
+    absent from Zoom's error shape, which instead carries the
+    human-readable detail in a `reason` key.
+    """
+    raw_error = token_data.get("error")
+    if isinstance(raw_error, dict):
+        error = str(
+            raw_error.get("message") or raw_error.get("type") or "unknown_error"
+        )
+    else:
+        error = str(raw_error or "unknown_error")
+    description = token_data.get("error_description") or token_data.get("reason")
+    if not isinstance(description, str):
+        # Only a plain-string description is rendered -- an object-valued
+        # one would repr a Python dict into the page, the same defect the
+        # dict-`error` branch above exists to prevent.
+        description = None
+    message = error if not description else f"{error}: {description}"
+    return html.escape(message[:limit])
 
 
 def _fetch_linear_viewer_identity(
@@ -883,10 +1002,20 @@ async def login(request: LoginRequest, db: Session = Depends(get_db)) -> Dict[st
     except HTTPException:
         # Re-raise HTTP exceptions
         raise
-    except Exception as e:
+    except Exception:
+        # str(e) is not put in the response: _update_user_sync's db.commit()
+        # above persists the just-issued refresh_token as a bound SQL
+        # parameter, and a SQLAlchemy StatementError's default __str__
+        # would otherwise echo that live session token back to the client
+        # -- the same class of leak fixed in generic_oauth_callback's
+        # callback handler. hide_parameters=True on the engine
+        # (models/database.py) now hides it there too, but this handler
+        # doesn't rely on that alone. logger.exception still captures it
+        # server-side.
+        logger.exception("Login failed")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Error during login: {str(e)}",
+            detail="An unexpected error occurred during login.",
         )
 
 
@@ -957,10 +1086,15 @@ async def register(
             },
         )
 
-    except Exception as e:
+    except Exception:
+        # Same reasoning as login's handler: create_user's db.commit() binds
+        # password_hash as a SQL parameter, which a SQLAlchemy
+        # StatementError's default __str__ would otherwise put into str(e)
+        # and, via this response, into the client-facing error.
+        logger.exception("Registration failed")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Error during registration: {str(e)}",
+            detail="An unexpected error occurred during registration.",
         )
 
 
@@ -1089,10 +1223,15 @@ async def change_password(
             success=True, message="Password updated successfully"
         )
 
-    except Exception as e:
+    except Exception:
+        # Same reasoning as login's handler: the db.commit() above binds the
+        # new password_hash as a SQL parameter, which a SQLAlchemy
+        # StatementError's default __str__ would otherwise put into str(e)
+        # and, via this response, into the client-facing error.
+        logger.exception("Password update failed")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Error during password update: {str(e)}",
+            detail="An unexpected error occurred while updating the password.",
         )
 
 
@@ -1290,6 +1429,37 @@ def generic_oauth_login(
             content="<h1>Error: Not authenticated</h1><p>Please provide a valid token.</p>",
             status_code=401,
         )
+
+    if not app_id:
+        from ..mcp_apps import requires_app_scoped_oauth_grant
+
+        # A bare (app_id-less) login persists to UserOAuth.provider==provider
+        # -- for a provider in APPS_REQUIRING_APP_SCOPED_OAUTH_GRANT whose
+        # sole app's app_id is that same provider string (e.g. github), that
+        # is the EXACT SAME key an app-scoped login uses. Without this
+        # guard, re-running the bare route would silently delete-and-replace
+        # a fully-scoped connection's grant with an identity-only one via
+        # generic_oauth_callback's delete-then-recreate step below, while
+        # the existing MCPServer/UserMCPServer row is left active and now
+        # backed by an under-scoped token. Facebook/Instagram are unaffected
+        # (their bare provider string "meta" is never itself a member of the
+        # set, only their app_ids "facebook"/"instagram" are).
+        #
+        # Checked after the config/auth checks above (not before) so an
+        # unauthenticated or misconfigured caller still gets the more
+        # specific 401/config-error response instead of a 404 that implies
+        # the connector itself doesn't support this route -- this still
+        # runs before any state token is minted below, which is the actual
+        # security property this guard needs to hold.
+        if requires_app_scoped_oauth_grant(provider):
+            return HTMLResponse(
+                content=(
+                    "<h1>Cannot Connect</h1>"
+                    "<p>This connector must be started from its catalog "
+                    "entry.</p>"
+                ),
+                status_code=404,
+            )
 
     state_payload = {
         "type": "oauth_state",
@@ -1571,8 +1741,6 @@ def generic_oauth_callback(
     error = request.query_params.get("error")
 
     if error:
-        import html
-
         return HTMLResponse(
             content=f"<h1>Error: {html.escape(str(error))}</h1>", status_code=400
         )
@@ -1617,6 +1785,27 @@ def generic_oauth_callback(
                     "<h1>Error: Session expired</h1><p>Please try connecting again.</p>"
                 ),
                 status_code=400,
+            )
+
+    if not app_id:
+        from ..mcp_apps import requires_app_scoped_oauth_grant
+
+        # Symmetric to generic_oauth_login's own guard: that guard only
+        # stops a NEW bare state from being minted, so it can't protect a
+        # bare state that was already signed (and is still within its
+        # 10-minute TTL) before this guard was deployed, or a future
+        # internal caller that reaches this callback with an app_id-less
+        # state directly. Checked here, before any token exchange or the
+        # delete-then-recreate UserOAuth write below, so a bare grant can
+        # never replace an existing app-scoped one for these providers.
+        if requires_app_scoped_oauth_grant(provider):
+            return HTMLResponse(
+                content=(
+                    "<h1>Cannot Connect</h1>"
+                    "<p>This connector must be started from its catalog "
+                    "entry.</p>"
+                ),
+                status_code=404,
             )
 
     if app_id:
@@ -1689,6 +1878,8 @@ def generic_oauth_callback(
         if code_verifier:
             data["code_verifier"] = code_verifier
         headers = {"Content-Type": "application/x-www-form-urlencoded"}
+        if requires_json_accept_header(provider):
+            headers["Accept"] = "application/json"
         auth: tuple[str, str] | None = None
         if provider.lower() == "zoom":
             # Zoom's token endpoint requires HTTP Basic Auth for client
@@ -1703,19 +1894,108 @@ def generic_oauth_callback(
         # answers a form-encoded POST with a 400.
         post_kwargs: dict[str, Any] = {"data": data}
         if provider.lower() == "jira":
-            headers = {"Content-Type": "application/json"}
+            # In-place, not a full `headers = {...}` reassignment -- that
+            # would silently drop an Accept header set above by
+            # requires_json_accept_header(), matching the refresh-path
+            # branch in tools/config.py. Currently a latent distinction
+            # only (no provider needs both quirks at once yet).
+            headers["Content-Type"] = "application/json"
             post_kwargs = {"json": data}
 
         token_response = requests.post(
             token_url, headers=headers, timeout=10.0, auth=auth, **post_kwargs
         )
-        token_data = token_response.json()
+        try:
+            token_data = token_response.json()
+        except ValueError:
+            # The Accept-header quirk above only pushes providers toward a
+            # JSON body -- it doesn't guarantee one (a proxy stripping the
+            # header, a misconfigured enterprise server). Without this, a
+            # non-JSON body reaches the outer handler as a bare
+            # JSONDecodeError instead of the same clear, actionable message
+            # every other failure branch in this callback gives.
+            logger.warning(
+                "OAuth token exchange for provider=%s returned a non-JSON "
+                "response (status %s)",
+                provider,
+                token_response.status_code,
+            )
+            return HTMLResponse(
+                content=(
+                    "<h1>Error exchanging token</h1>"
+                    f"<p>{html.escape(provider)} returned a response that "
+                    "could not be parsed.</p>"
+                ),
+                status_code=400,
+            )
+
+        if not isinstance(token_data, dict):
+            # A JSON-parseable but non-object body (a bare list/string/
+            # number) would otherwise reach `"error" in token_data` --
+            # which doesn't raise for a list/string (it does a membership/
+            # substring check, not a key check) -- and then
+            # `token_data.get("access_token")` below, which does raise
+            # (AttributeError) on anything but a dict. That would escape
+            # to the outer handler as an opaque 500 instead of the same
+            # clear, actionable 400 every other malformed-body case here
+            # gives -- the same class of gap the userinfo guards below
+            # close for that response.
+            logger.warning(
+                "OAuth token exchange for provider=%s returned a non-object body (%s)",
+                provider,
+                type(token_data).__name__,
+            )
+            return HTMLResponse(
+                content=(
+                    "<h1>Error exchanging token</h1>"
+                    f"<p>{html.escape(provider)} returned an unexpected "
+                    "response.</p>"
+                ),
+                status_code=400,
+            )
 
         if "error" in token_data:
-            import html
-
+            # The response to the browser is deliberately trimmed to the
+            # allowlisted error/error_description fields (see
+            # _bounded_oauth_error_message's docstring) -- log the same
+            # allowlisted projection server-side rather than the raw dict,
+            # since a malformed/partial response can carry a live
+            # access_token alongside an error field, and logging the raw
+            # dict would put it in the server log instead of the browser.
+            logger.warning(
+                "OAuth token exchange failed for provider=%s: %s",
+                provider,
+                _redact_oauth_log_payload(token_data),
+            )
             return HTMLResponse(
-                content=f"<h1>Error exchanging token</h1><p>{html.escape(str(token_data))}</p>",
+                content=(
+                    "<h1>Error exchanging token</h1>"
+                    f"<p>{_bounded_oauth_error_message(token_data)}</p>"
+                ),
+                status_code=400,
+            )
+
+        if not 200 <= token_response.status_code < 300:
+            # A non-2xx response with no "error" key still isn't a
+            # successful exchange -- without this, a body that happens to
+            # be JSON-parseable and (coincidentally, or via a
+            # misbehaving proxy/gateway) carries an access_token-shaped
+            # field would be trusted as success purely because
+            # `"error" in token_data` was false, regardless of the HTTP
+            # status actually returned.
+            logger.warning(
+                "OAuth token exchange for provider=%s returned status %s "
+                "with no explicit error field: %s",
+                provider,
+                token_response.status_code,
+                _redact_oauth_log_payload(token_data),
+            )
+            return HTMLResponse(
+                content=(
+                    "<h1>Error exchanging token</h1>"
+                    f"<p>{html.escape(provider)} returned an unexpected "
+                    f"response (status {token_response.status_code}).</p>"
+                ),
                 status_code=400,
             )
 
@@ -1733,8 +2013,11 @@ def generic_oauth_callback(
             # UserOAuth.access_token's NOT NULL constraint, and surface as a
             # raw SQLAlchemy IntegrityError message through the generic
             # exception handler instead of a clear, actionable error.
-            import html
-
+            logger.warning(
+                "OAuth token exchange for provider=%s returned no access_token: %s",
+                provider,
+                _redact_oauth_log_payload(token_data),
+            )
             message = f"{html.escape(provider)} did not return an access token."
             detail = _extract_provider_error_message(token_data)
             if detail:
@@ -1791,8 +2074,6 @@ def generic_oauth_callback(
             except RuntimeError as e:
                 # A deliberate failure raised by _fetch_linear_viewer_identity
                 # itself -- Linear's API responded, just not usably.
-                import html
-
                 return HTMLResponse(
                     content=(
                         "<h1>Error verifying the connected account</h1>"
@@ -1805,8 +2086,6 @@ def generic_oauth_callback(
                 # distinct from the case above: Linear never actually
                 # responded, so attributing this to "the provider reported"
                 # would be misleading.
-                import html
-
                 return HTMLResponse(
                     content=(
                         "<h1>Error verifying the connected account</h1>"
@@ -1835,29 +2114,81 @@ def generic_oauth_callback(
             # Replace {{access_token}} placeholder if present
             actual_url = userinfo_url.replace("{{access_token}}", access_token)
             info_response = requests.get(actual_url, headers=info_headers, timeout=10.0)
-            if info_response.status_code == 200:
+            if info_response.status_code != 200:
+                # A non-200 userinfo response (401/403/429/5xx -- an
+                # expired/insufficiently-scoped token, or the provider's
+                # own outage) used to be silently skipped here, leaving
+                # provider_user_id/email at None and falling through to
+                # persist a "connected" account with no identity. On a
+                # reconnect, that replaces a previously working grant with
+                # a broken one while still reporting success to the user.
+                logger.warning(
+                    "OAuth userinfo fetch for provider=%s returned status %s",
+                    provider,
+                    info_response.status_code,
+                )
+                return HTMLResponse(
+                    content=(
+                        "<h1>Error verifying the connected account</h1>"
+                        f"<p>{html.escape(provider)} could not be verified "
+                        f"(status {info_response.status_code}). Please try "
+                        "again.</p>"
+                    ),
+                    status_code=400,
+                )
+            try:
                 info_data = info_response.json()
-                if isinstance(info_data, dict) and info_data.get("ok") is False:
-                    # Slack-style APIs answer HTTP 200 with {"ok": false,
-                    # "error": ...} on failure; a status check alone would
-                    # treat a bad/revoked token as success and persist a
-                    # "connected" account with no identity. Fail the
-                    # callback instead. Providers without Slack semantics
-                    # never carry an "ok" key, so they are unaffected.
-                    import html
-
-                    escaped_error = html.escape(
-                        str(info_data.get("error") or "unknown error")
-                    )
-                    return HTMLResponse(
-                        content=(
-                            "<h1>Error verifying the connected account</h1>"
-                            f"<p>The provider reported: {escaped_error}</p>"
-                        ),
-                        status_code=400,
-                    )
-                provider_user_id = info_data.get(db_provider.user_id_path or "id")
-                email = info_data.get(db_provider.email_path or "email")
+            except ValueError:
+                # Same reasoning as the token-exchange guard above: a
+                # non-JSON 200 body must not reach the unguarded .get()
+                # calls below as an unhelpful raw exception, and must not
+                # be silently treated as "no identity, proceed anyway."
+                logger.warning(
+                    "OAuth userinfo fetch for provider=%s returned a non-JSON response",
+                    provider,
+                )
+                return HTMLResponse(
+                    content=(
+                        "<h1>Error verifying the connected account</h1>"
+                        f"<p>{html.escape(provider)} returned a response "
+                        "that could not be parsed. Please try again.</p>"
+                    ),
+                    status_code=400,
+                )
+            if not isinstance(info_data, dict):
+                logger.warning(
+                    "OAuth userinfo fetch for provider=%s returned a "
+                    "non-object body (%s)",
+                    provider,
+                    type(info_data).__name__,
+                )
+                return HTMLResponse(
+                    content=(
+                        "<h1>Error verifying the connected account</h1>"
+                        f"<p>{html.escape(provider)} returned an "
+                        "unexpected response. Please try again.</p>"
+                    ),
+                    status_code=400,
+                )
+            if info_data.get("ok") is False:
+                # Slack-style APIs answer HTTP 200 with {"ok": false,
+                # "error": ...} on failure; a status check alone would
+                # treat a bad/revoked token as success and persist a
+                # "connected" account with no identity. Fail the
+                # callback instead. Providers without Slack semantics
+                # never carry an "ok" key, so they are unaffected.
+                escaped_error = html.escape(
+                    str(info_data.get("error") or "unknown error")
+                )
+                return HTMLResponse(
+                    content=(
+                        "<h1>Error verifying the connected account</h1>"
+                        f"<p>The provider reported: {escaped_error}</p>"
+                    ),
+                    status_code=400,
+                )
+            provider_user_id = info_data.get(db_provider.user_id_path or "id")
+            email = info_data.get(db_provider.email_path or "email")
 
         if user_id:
             db.query(UserOAuth).filter(
@@ -1994,7 +2325,6 @@ def generic_oauth_callback(
                 db, user_id=user_id, connector_key=(app_id or provider)
             )
 
-        import json
         from urllib.parse import urlparse
 
         redirect_url = payload.get("redirect")
@@ -2028,12 +2358,20 @@ def generic_oauth_callback(
         </html>
         """
         )
-    except Exception as e:
-        import html
-
+    except Exception:
+        # str(e) is not rendered to the client: db.add(oauth_account)/db.commit()
+        # above persist the just-obtained access/refresh token as bound SQL
+        # parameters, and a SQLAlchemy StatementError's default __str__
+        # includes those bound values -- a DB error here (constraint
+        # violation, connection drop, oversized field) would otherwise echo
+        # the plaintext token back to the browser in this 500 response.
+        # hide_parameters=True on the engine (models/database.py) now hides
+        # it there too, but this handler doesn't rely on that alone.
+        # logger.exception still captures it server-side for debugging.
         logger.exception("Generic OAuth callback failed")
         return HTMLResponse(
-            content=f"<h1>Authentication Failed</h1><p>{html.escape(str(e))}</p>",
+            content="<h1>Authentication Failed</h1><p>An unexpected error occurred "
+            "while connecting this account. Please try again.</p>",
             status_code=500,
         )
 

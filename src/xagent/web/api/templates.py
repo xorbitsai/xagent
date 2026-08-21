@@ -138,6 +138,17 @@ class TemplateInfo(BaseModel):
     connections: list[ConnectionInfo] = Field(
         default_factory=list, description="App connections"
     )
+    tool_categories: list[str] = Field(
+        default_factory=list,
+        description="Tool categories this template's agent_config grants "
+        "(e.g. for rendering capability tags on a marketplace card without "
+        "a second detail fetch). Empty for a 'workforce'-type template.",
+    )
+    skills: list[str] = Field(
+        default_factory=list,
+        description="Skill names this template's agent_config grants. "
+        "Empty for a 'workforce'-type template.",
+    )
     setup_time: str = Field(default="5 min setup", description="Setup time")
     tags: list[str] = Field(default_factory=list, description="Template tags")
     author: str = Field(..., description="Template author")
@@ -390,6 +401,39 @@ def increment_template_used_count(db: Session, template_id: str) -> None:
     )
 
 
+def get_agent_capability_lists(template: dict[str, Any]) -> tuple[list[str], list[str]]:
+    """(tool_categories, skills) an 'agent'-type template's agent_config
+    grants, or ([], []) for a 'workforce'-type template (whose real
+    configuration lives in workforce_config instead - see
+    TemplateManager._enrich_template). Exposed on both the list and detail
+    responses so a marketplace card can render capability tags without a
+    second per-card detail fetch, using the exact same source `agent_config`
+    already merges mcp: entries into (see `_enrich_template`).
+    """
+    if template.get("type") != "agent":
+        return [], []
+    agent_config = template.get("agent_config")
+    if not isinstance(agent_config, dict):
+        return [], []
+    tool_categories = agent_config.get("tool_categories", [])
+    skills = agent_config.get("skills", [])
+    return (
+        _string_list_elements(tool_categories),
+        _string_list_elements(skills),
+    )
+
+
+def _string_list_elements(value: Any) -> list[str]:
+    """Filters a possibly-malformed list down to its string elements -
+    used by get_agent_capability_lists above. A single non-string entry
+    (e.g. an authoring typo like `[123, "web_search"]`) must not 500 the
+    whole /api/templates/ list at request time via an unhandled Pydantic
+    ValidationError when TemplateInfo/TemplateDetail get constructed."""
+    if not isinstance(value, list):
+        return []
+    return [item for item in value if isinstance(item, str)]
+
+
 def get_workforce_agent_count(template: dict[str, Any]) -> int:
     """Total agents (1 manager + N workers) a workforce-type template
     creates - the card badge's only need, computed server-side rather than
@@ -449,7 +493,9 @@ async def list_templates(
 
         # Get localized values
         description = get_localized_value(template.get("descriptions", {}), lang, "")
-        features = get_localized_value(template.get("features", {}), lang, [])
+        features = _string_list_elements(
+            get_localized_value(template.get("features", {}), lang, [])
+        )
         sample_prompts = get_localized_value(
             template.get("sample_prompts", {}), lang, []
         )
@@ -457,8 +503,11 @@ async def list_templates(
             template.get("setup_time", {}), lang, "5 min setup"
         )
         connections = template.get("connections", [])
-        tags = get_localized_value(template.get("tags", {}), lang, [])
+        tags = _string_list_elements(
+            get_localized_value(template.get("tags", {}), lang, [])
+        )
         hired_agent_id = hired_agent_id_by_template_id.get(template_id)
+        tool_categories, skills = get_agent_capability_lists(template)
 
         result.append(
             TemplateInfo(
@@ -473,6 +522,8 @@ async def list_templates(
                 connections=connections,
                 setup_time=setup_time,
                 tags=tags,
+                tool_categories=tool_categories,
+                skills=skills,
                 author=template.get("author", ""),
                 version=template.get("version", ""),
                 views=stats.views,
@@ -525,17 +576,22 @@ async def get_template(
 
     # Get localized values
     description = get_localized_value(template.get("descriptions", {}), lang, "")
-    features = get_localized_value(template.get("features", {}), lang, [])
+    features = _string_list_elements(
+        get_localized_value(template.get("features", {}), lang, [])
+    )
     sample_prompts = get_localized_value(template.get("sample_prompts", {}), lang, [])
     setup_time = get_localized_value(
         template.get("setup_time", {}), lang, "5 min setup"
     )
     connections = template.get("connections", [])
-    tags = get_localized_value(template.get("tags", {}), lang, [])
+    tags = _string_list_elements(
+        get_localized_value(template.get("tags", {}), lang, [])
+    )
     current_user_id = int(current_user.id)
     hired_agent_id = get_hired_agent_map(db, current_user_id, [template_id]).get(
         template_id
     )
+    tool_categories, skills = get_agent_capability_lists(template)
 
     return TemplateDetail(
         id=template["id"],
@@ -549,6 +605,8 @@ async def get_template(
         connections=connections,
         setup_time=setup_time,
         tags=tags,
+        tool_categories=tool_categories,
+        skills=skills,
         author=template.get("author", ""),
         version=template.get("version", ""),
         views=stats.views,
@@ -562,8 +620,12 @@ async def get_template(
         agent_config=(
             {
                 "instructions": template["agent_config"].get("instructions", ""),
-                "skills": template["agent_config"].get("skills", []),
-                "tool_categories": template["agent_config"].get("tool_categories", []),
+                "skills": _string_list_elements(
+                    template["agent_config"].get("skills", [])
+                ),
+                "tool_categories": _string_list_elements(
+                    template["agent_config"].get("tool_categories", [])
+                ),
                 "execution_mode": template["agent_config"].get(
                     "execution_mode", "balanced"
                 ),

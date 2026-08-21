@@ -297,6 +297,31 @@ const zh = {
       model: "模型",
       unknownModel: "未知模型",
       unattributed: "未归属",
+      tokensShort: "tokens",
+      unmeasured: "暂未计量",
+      mediaByModel: "媒体用量",
+      mediaCall: "{count} 次媒体调用",
+      mediaCalls: "{count} 次媒体调用",
+      quantity: "用量",
+      callType: "类型",
+      unit: {
+        images: { one: "张", other: "张" },
+        seconds: { one: "秒", other: "秒" },
+        characters: { one: "字符", other: "字符" },
+        requests: { one: "次", other: "次" },
+        texts: { one: "条文本", other: "条文本" },
+      },
+      mediaType: {
+        generate_image: "生图",
+        edit_image: "图片编辑",
+        video: "视频",
+        tts: "语音合成",
+        asr: "语音识别",
+        music: "音乐",
+        sound_effect: "音效",
+        embedding: "向量",
+        rerank: "重排",
+      },
     },
     contextUsage: {
       tooltip: "上下文窗口 {pct}%（{used}/{total} tokens）",
@@ -1611,6 +1636,33 @@ const zh = {
       useWorkforceAccessDenied: "你没有权限创建工作组。",
       useWorkforceRetry: "该模版当前并发请求过多，请重试。",
       useWorkforceUnpublishedAgent: "该工作组需要的智能体「{agentName}」当前未发布，请在你的智能体列表中重新发布它，然后再试一次。"
+    },
+    marketplace: {
+      pageTitle: "添加队友",
+      pageSubtitle: "选择你想要完成的工作，队友会自动配置好。每一位都会先起草再行动。",
+      meet: "认识 {name}",
+      hire: "雇佣 {name}",
+      hiring: "雇佣中…",
+      chat: "聊天",
+      back: "返回 AI 团队市场",
+      whatItDoes: "能做什么",
+      whatsIncluded: "包含内容",
+      tryAsking: "试着这样问",
+      thinking: "思考模式",
+      tools: "工具",
+      connectedApps: "已连接应用",
+      skills: "技能",
+      runsCountOne: "{count} 次运行",
+      runsCountOther: "{count} 次运行",
+      hireNote: "雇佣会把 {name} 加入你的智能体列表并打开一个对话——上面的所有设置之后都可以修改。",
+      hireFailed: "雇佣 {name} 失败，请重试。",
+      notFound: "找不到这位 AI 员工。",
+      loadFailed: "加载这位 AI 员工失败，请检查网络连接后重试。",
+      retry: "重试",
+      beforeWeStart: "开始之前，有几个问题：",
+      hireClosingNote: "能回答的先回答，其余的我会用合理的默认值——之后随时可以修改，或者直接在这里告诉我。",
+      customizeBeforeHiring: "想先自定义配置？",
+      mostUsed: "最常使用"
     }
   },
   sidebar: {
@@ -2334,21 +2386,30 @@ const zh = {
     },
     list: {
       header: {
-        title: "我的 Agent",
-        description: "管理你的自定义 Agent",
-        create: "创建 Agent",
+        title: "我的团队",
+        description: "查看和管理 Agent、状态及配置。",
+        create: "添加队员",
       },
       search: {
-        placeholder: "搜索 Agent...",
+        placeholder: "查找队员...",
       },
       empty: {
         title: "暂无 Agent",
         description: "开始创建你的第一个 Agent",
         create: "创建 Agent",
       },
+      tabs: {
+        all: "全部",
+        enabled: "已启用",
+        drafts: "草稿",
+      },
+      sort: {
+        updated: "最近更新",
+        name: "名称（A–Z）",
+      },
       status: {
         draft: "草稿",
-        published: "已发布",
+        published: "已启用",
       },
       actions: {
         chat: "聊天",
@@ -2359,6 +2420,7 @@ const zh = {
         viewConfig: "查看配置",
         apiKey: "API Key",
         triggers: "Triggers",
+        deploy: "部署",
         deleteConfirm: "确定要删除这个 Agent 吗？",
       },
       deleteDialog: {
@@ -2610,6 +2672,7 @@ const zh = {
           specialImage: "图像工具",
           database: "数据库",
           skill: "技能工具",
+          ssh: "SSH",
         },
         categoryDescriptions: {
           basic: "系统基础能力，包括数学计算、日期时间获取等核心功能。",

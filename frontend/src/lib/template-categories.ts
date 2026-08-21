@@ -1,6 +1,41 @@
 import type { Template } from "@/types/template";
+import type { Translate } from "@/contexts/i18n-context";
+import type { TranslationKey } from "@/i18n/translations";
 
 export const FEATURED_CATEGORY_ID = "Featured";
+
+const CATEGORY_LABEL_KEYS: Record<string, TranslationKey> = {
+  general: "templates.categoryTitles.general",
+  sales: "templates.categoryTitles.sales",
+  marketing: "templates.categoryTitles.marketing",
+  support: "templates.categoryTitles.support",
+  research: "templates.sections.knowledge",
+  productivity: "templates.categoryTitles.general_productivity",
+  healthcare_fitness: "templates.categoryTitles.healthcare_fitness",
+  general_productivity: "templates.categoryTitles.general_productivity",
+  customer_service: "templates.categoryTitles.customer_service",
+  finance_lms_ops: "templates.categoryTitles.finance_lms_ops",
+  security: "templates.categoryTitles.security",
+  operations: "templates.categoryTitles.operations",
+};
+
+const formatFallbackLabel = (category: string) =>
+  category
+    .replace(/_/g, " ")
+    .replace(/\b\w/g, (char) => char.toUpperCase());
+
+/**
+ * A template category's display label: the known i18n key for it when one
+ * exists, else its raw slug title-cased - shared so a category badge reads
+ * the same everywhere it's shown (the /templates library page and any
+ * agent card that traces back to a template) instead of some places
+ * showing a translated label and others an untranslated raw slug.
+ */
+export function categoryLabel(t: Translate, category: string | undefined): string {
+  const c = category || "Others";
+  const key = CATEGORY_LABEL_KEYS[normalizeCategoryKey(c)];
+  return key ? t(key) : formatFallbackLabel(c);
+}
 
 const PREFERRED_ORDER = ["Marketing", "Sales", "Support", "Research", "Productivity"];
 

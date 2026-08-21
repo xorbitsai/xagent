@@ -13,7 +13,6 @@ const dispatchMock = vi.hoisted(() => vi.fn())
 const setTaskIdMock = vi.hoisted(() => vi.fn())
 const setPendingMessageMock = vi.hoisted(() => vi.fn())
 const resolveAgentLogoUrlMock = vi.hoisted(() => vi.fn())
-const formatDisplayDateMock = vi.hoisted(() => vi.fn())
 const localeMock = vi.hoisted(() => ({ value: "en" as "en" | "zh" }))
 
 vi.mock("@/lib/api-wrapper", async () => {
@@ -34,15 +33,6 @@ vi.mock("@/lib/utils", async () => {
     },
   }
 })
-
-vi.mock("@/lib/time-utils", () => ({
-  formatDisplayDate: (...args: [unknown, "en" | "zh", Intl.DateTimeFormatOptions]) => {
-    formatDisplayDateMock(...args)
-    return typeof args[0] === "string" && args[0].startsWith("valid-")
-      ? `formatted:${args[0]}`
-      : ""
-  },
-}))
 
 vi.mock("@/lib/models", () => ({
   resolveTaskLlmSelection: resolveTaskLlmSelectionMock,
@@ -139,21 +129,6 @@ const conflictPayload = {
   },
 }
 
-function cardDateRows(card: Element | null): Element[] {
-  const metadata = Array.from(card?.querySelectorAll("div") ?? []).find((element) =>
-    element.classList.contains("space-y-1.5"),
-  )
-  return metadata ? Array.from(metadata.children) : []
-}
-
-function cardAvatar(card: Element | null): Element | null {
-  return card?.querySelector('div[class*="h-10"][class*="w-10"]') ?? null
-}
-
-function cardTextOccurrences(card: Element | null, text: string): number {
-  return (card?.textContent ?? "").split(text).length - 1
-}
-
 function jsonResponse(data: unknown, init?: ResponseInit) {
   return new Response(JSON.stringify(data), {
     status: 200,
@@ -182,7 +157,6 @@ function resetMocks() {
   setTaskIdMock.mockReset()
   setPendingMessageMock.mockReset()
   resolveAgentLogoUrlMock.mockReset()
-  formatDisplayDateMock.mockReset()
   localeMock.value = "en"
   voiceInputState.hasAsrModel = false
 }
@@ -258,32 +232,25 @@ describe("BuildsPage rendering", () => {
     }
   })
 
-  it("uses the shared logo and date owners once per Build card with independent date rows", async () => {
-    localeMock.value = "zh"
+  it("uses the shared logo resolver once per card, falling back to a persona monogram", async () => {
     apiRequestMock.mockResolvedValue(jsonResponse([
       {
         ...agent,
         id: 91,
         name: "Absolute Agent",
         logo_url: "HTTPS://assets.example/agent.png",
-        created_at: "valid-created",
-        updated_at: "",
       },
       {
         ...agent,
         id: 92,
         name: "Relative Agent",
         logo_url: "/logos/relative.png",
-        created_at: "not-a-date",
-        updated_at: "valid-updated",
       },
       {
         ...agent,
         id: 93,
         name: "Invalid Agent",
         logo_url: "javascript:alert(1)",
-        created_at: "not-a-date",
-        updated_at: " ",
       },
     ]))
 
@@ -304,59 +271,169 @@ describe("BuildsPage rendering", () => {
       "src",
       "http://api.local/logos/relative.png",
     )
-    const invalidAvatar = cardAvatar(invalidCard)
-    expect(invalidAvatar).not.toBeNull()
-    expect(invalidAvatar?.querySelectorAll("img")).toHaveLength(0)
-    expect(invalidAvatar?.querySelectorAll("svg")).toHaveLength(1)
-    const invalidBot = invalidAvatar?.querySelector("svg")
-    expect(invalidBot).not.toHaveClass("lucide-chevron-right")
-    expect(invalidBot?.querySelector('rect[width="18"][height="10"]')).toBeInTheDocument()
-
-    expect(absoluteCard).toHaveTextContent("builds.card.createdAt: formatted:valid-created")
-    expect(cardTextOccurrences(absoluteCard, "builds.card.createdAt")).toBe(1)
-    expect(cardTextOccurrences(absoluteCard, "builds.card.updatedAt")).toBe(0)
-    expect(relativeCard).toHaveTextContent("builds.card.updatedAt: formatted:valid-updated")
-    expect(cardTextOccurrences(relativeCard, "builds.card.createdAt")).toBe(0)
-    expect(cardTextOccurrences(relativeCard, "builds.card.updatedAt")).toBe(1)
-    expect(cardTextOccurrences(invalidCard, "builds.card.createdAt")).toBe(0)
-    expect(cardTextOccurrences(invalidCard, "builds.card.updatedAt")).toBe(0)
-    const absoluteRows = cardDateRows(absoluteCard)
-    const relativeRows = cardDateRows(relativeCard)
-    const invalidRows = cardDateRows(invalidCard)
-    expect(absoluteRows).toHaveLength(1)
-    expect(absoluteRows[0].querySelectorAll("svg")).toHaveLength(1)
-    expect(relativeRows).toHaveLength(1)
-    expect(relativeRows[0].querySelectorAll("svg")).toHaveLength(1)
-    expect(invalidRows).toHaveLength(0)
+    expect(invalidCard?.querySelector("img")).toBeNull()
+    const monogram = Array.from(invalidCard?.querySelectorAll("div") ?? []).find(
+      (element) => element.textContent === "I",
+    )
+    expect(monogram).toBeTruthy()
 
     resolveAgentLogoUrlMock.mockClear()
-    formatDisplayDateMock.mockClear()
     view.rerender(<BuildsPage />)
     expect(resolveAgentLogoUrlMock).toHaveBeenCalledTimes(3)
     expect(resolveAgentLogoUrlMock).toHaveBeenNthCalledWith(1, "HTTPS://assets.example/agent.png", "http://api.local")
     expect(resolveAgentLogoUrlMock).toHaveBeenNthCalledWith(2, "/logos/relative.png", "http://api.local")
     expect(resolveAgentLogoUrlMock).toHaveBeenNthCalledWith(3, "javascript:alert(1)", "http://api.local")
-    expect(formatDisplayDateMock).toHaveBeenCalledTimes(6)
-    expect(formatDisplayDateMock).toHaveBeenCalledWith("valid-created", "zh", {
-      year: "numeric", month: "numeric", day: "numeric",
+  })
+
+  it("narrows the All/Enabled/Drafts tab counts by the search term", async () => {
+    apiRequestMock.mockImplementation((url: string) => {
+      if (url.startsWith("http://api.local/api/agents")) {
+        return Promise.resolve(jsonResponse([
+          { ...agent, id: 1, name: "Weather Watcher", status: "published" },
+          { ...agent, id: 2, name: "Weather Digest", status: "draft" },
+          { ...agent, id: 3, name: "Inbox Triage", status: "published" },
+        ]))
+      }
+      return Promise.resolve(jsonResponse([]))
     })
-    expect(formatDisplayDateMock).toHaveBeenCalledWith("valid-updated", "zh", {
-      year: "numeric", month: "numeric", day: "numeric",
+
+    render(<BuildsPage />)
+    await screen.findByText("Weather Watcher")
+
+    expect(screen.getByRole("button", { name: "builds.list.tabs.all 3" })).toBeInTheDocument()
+    expect(screen.getByRole("button", { name: "builds.list.tabs.enabled 2" })).toBeInTheDocument()
+    expect(screen.getByRole("button", { name: "builds.list.tabs.drafts 1" })).toBeInTheDocument()
+
+    fireEvent.change(screen.getByPlaceholderText("builds.list.search.placeholder"), {
+      target: { value: "weather" },
+    })
+
+    await waitFor(() => {
+      expect(screen.getByRole("button", { name: "builds.list.tabs.all 2" })).toBeInTheDocument()
+    })
+    expect(screen.getByRole("button", { name: "builds.list.tabs.enabled 1" })).toBeInTheDocument()
+    expect(screen.getByRole("button", { name: "builds.list.tabs.drafts 1" })).toBeInTheDocument()
+  })
+
+  it("sorts by name A-Z when the sort toggle is switched, and by recently-updated by default", async () => {
+    apiRequestMock.mockImplementation((url: string) => {
+      if (url.startsWith("http://api.local/api/agents")) {
+        return Promise.resolve(jsonResponse([
+          { ...agent, id: 1, name: "Zebra", updated_at: "2026-07-05T00:00:00Z" },
+          { ...agent, id: 2, name: "Amber", updated_at: "2026-07-03T00:00:00Z" },
+        ]))
+      }
+      return Promise.resolve(jsonResponse([]))
+    })
+
+    render(<BuildsPage />)
+    await screen.findByText("Zebra")
+
+    const namesInOrder = () => screen.getAllByRole("heading", { level: 3 }).map((h) => h.textContent)
+    expect(namesInOrder()).toEqual(["Zebra", "Amber"])
+
+    fireEvent.click(screen.getByRole("button", { name: /builds\.list\.sort\.updated/ }))
+
+    await waitFor(() => {
+      expect(namesInOrder()).toEqual(["Amber", "Zebra"])
     })
   })
 
-  it("keeps Build card display shaping in the shared owners", () => {
-    const source = readFileSync(`${process.cwd()}/src/app/build/page.tsx`, "utf8")
-    const cardRender = source.slice(source.indexOf("{filteredAgents.map((agent) => {"))
-    expect(cardRender).toContain("const resolvedLogoUrl = resolveAgentLogoUrl(agent.logo_url, getApiUrl())")
-    expect(cardRender.match(/resolveAgentLogoUrl\(/g)).toHaveLength(1)
-    expect(cardRender).toContain("const createdDate = formatDisplayDate(agent.created_at, locale, {")
-    expect(cardRender).toContain("const updatedDate = formatDisplayDate(agent.updated_at, locale, {")
-    expect(cardRender.match(/formatDisplayDate\(agent\.created_at/g)).toHaveLength(1)
-    expect(cardRender.match(/formatDisplayDate\(agent\.updated_at/g)).toHaveLength(1)
-    expect(cardRender.match(/\{createdDate && \(/g)).toHaveLength(1)
-    expect(cardRender.match(/\{updatedDate && \(/g)).toHaveLength(1)
-    expect(cardRender).not.toMatch(/const formatDate|\$\{getApiUrl\(\)\}\$\{agent\.logo_url\}|agent\.updated_at\s*\|\|\s*agent\.created_at/)
+  it("shows the persona role and a localized category badge only for a template-linked Agent", async () => {
+    apiRequestMock.mockImplementation((url: string) => {
+      if (url.startsWith("http://api.local/api/agents")) {
+        return Promise.resolve(jsonResponse([
+          { ...agent, id: 1, name: "Hired Agent", template_id: "sample-template" },
+          { ...agent, id: 2, name: "Custom Agent", template_id: null },
+        ]))
+      }
+      if (url.startsWith("http://api.local/api/templates/")) {
+        return Promise.resolve(jsonResponse([
+          {
+            id: "sample-template",
+            name: "Sample Template",
+            category: "operations_research",
+            description: "",
+            features: [],
+            connections: [],
+            setup_time: "",
+            tags: [],
+            author: "",
+            version: "1.0",
+            views: 0,
+            likes: 0,
+            used_count: 0,
+            persona: { name: "Hired Agent", role: "Research Specialist", avatar: null, intro: "", kickoff_questions: [] },
+          },
+        ]))
+      }
+      return Promise.resolve(jsonResponse([]))
+    })
+
+    render(<BuildsPage />)
+    await screen.findByText("Hired Agent")
+    await screen.findByText("Custom Agent")
+
+    // Known key -> t() returns the untranslated key itself under this
+    // mock, but an unrecognized category slug falls back to a title-cased
+    // rendering of the raw value rather than leaking the raw slug as-is.
+    await waitFor(() => {
+      expect(screen.getByText("Research Specialist")).toBeInTheDocument()
+    })
+    expect(screen.getByText("Operations Research")).toBeInTheDocument()
+
+    const customCard = screen.getByText("Custom Agent").closest("[class*='cursor-pointer']")
+    expect(customCard).not.toHaveTextContent("Research Specialist")
+    expect(customCard).not.toHaveTextContent("Operations Research")
+  })
+
+  it("clears stale template enrichment (rather than keeping the previous locale's) after a failed refetch", async () => {
+    let templatesCall = 0
+    apiRequestMock.mockImplementation((url: string) => {
+      if (url.startsWith("http://api.local/api/agents")) {
+        return Promise.resolve(jsonResponse([
+          { ...agent, id: 1, name: "Hired Agent", template_id: "sample-template" },
+        ]))
+      }
+      if (url.startsWith("http://api.local/api/templates/")) {
+        templatesCall += 1
+        if (templatesCall === 1) {
+          return Promise.resolve(jsonResponse([
+            {
+              id: "sample-template",
+              name: "Sample Template",
+              category: "operations_research",
+              description: "",
+              features: [],
+              connections: [],
+              setup_time: "",
+              tags: [],
+              author: "",
+              version: "1.0",
+              views: 0,
+              likes: 0,
+              used_count: 0,
+              persona: { name: "Hired Agent", role: "Research Specialist", avatar: null, intro: "", kickoff_questions: [] },
+            },
+          ]))
+        }
+        return Promise.resolve(new Response(null, { status: 500 }))
+      }
+      return Promise.resolve(jsonResponse([]))
+    })
+
+    const view = render(<BuildsPage />)
+    await waitFor(() => {
+      expect(screen.getByText("Research Specialist")).toBeInTheDocument()
+    })
+
+    localeMock.value = "zh"
+    view.rerender(<BuildsPage />)
+
+    await waitFor(() => {
+      expect(screen.queryByText("Research Specialist")).not.toBeInTheDocument()
+    })
+    expect(screen.queryByText("Operations Research")).not.toBeInTheDocument()
   })
 })
 

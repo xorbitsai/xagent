@@ -244,6 +244,14 @@ def test_numeric_task_id_parses_workspace_prefixed_id() -> None:
     assert _numeric_task_id(None) is None
 
 
+def test_numeric_task_id_rejects_ids_that_merely_end_in_digits() -> None:
+    # A trailing-digit search would read the uuid suffix as somebody else's
+    # task id, and the caller derives the owner scope from whatever row it hits.
+    assert _numeric_task_id("agent_7_a1b2cd34") is None
+    assert _numeric_task_id("preview_ab12cd34") is None
+    assert _numeric_task_id("web_task_30x") is None
+
+
 @pytest.fixture
 def task_db(tmp_path):
     engine = create_engine(f"sqlite:///{tmp_path / 'ssh-tools.db'}")
@@ -299,7 +307,7 @@ def test_agent_id_for_task_authorizes_owned_direct_agent(task_db, status) -> Non
     finally:
         db.close()
 
-    assert _agent_id_for_task(task_db, int(task.id)) == int(agent.id)
+    assert _agent_id_for_task(task_db, int(task.id), int(owner.id)) == int(agent.id)
 
 
 @pytest.mark.parametrize("status", [AgentStatus.DRAFT, AgentStatus.PUBLISHED])
@@ -316,7 +324,7 @@ def test_agent_id_for_task_authorizes_owned_preview_agent(task_db, status) -> No
     finally:
         db.close()
 
-    assert _agent_id_for_task(task_db, int(task.id)) == int(agent.id)
+    assert _agent_id_for_task(task_db, int(task.id), int(owner.id)) == int(agent.id)
 
 
 def test_agent_id_for_task_rejects_cross_owner_published_direct_agent(task_db) -> None:
@@ -329,7 +337,7 @@ def test_agent_id_for_task_rejects_cross_owner_published_direct_agent(task_db) -
     finally:
         db.close()
 
-    assert _agent_id_for_task(task_db, int(task.id)) is None
+    assert _agent_id_for_task(task_db, int(task.id), int(owner.id)) is None
 
 
 @pytest.mark.parametrize("candidate", ["01", "abc", True, 2**31, str(2**31)])
@@ -347,7 +355,7 @@ def test_agent_id_for_task_rejects_malformed_preview_candidate(
     finally:
         db.close()
 
-    assert _agent_id_for_task(task_db, int(task.id)) is None
+    assert _agent_id_for_task(task_db, int(task.id), int(owner.id)) is None
 
 
 def test_agent_id_for_task_rejects_cross_scope_preview_agent(task_db) -> None:
@@ -364,7 +372,7 @@ def test_agent_id_for_task_rejects_cross_scope_preview_agent(task_db) -> None:
     finally:
         db.close()
 
-    assert _agent_id_for_task(task_db, int(task.id)) is None
+    assert _agent_id_for_task(task_db, int(task.id), int(owner.id)) is None
 
 
 def test_agent_id_for_task_rejects_archived_agent(task_db) -> None:
@@ -380,7 +388,7 @@ def test_agent_id_for_task_rejects_archived_agent(task_db) -> None:
     finally:
         db.close()
 
-    assert _agent_id_for_task(task_db, int(task.id)) is None
+    assert _agent_id_for_task(task_db, int(task.id), int(owner.id)) is None
 
 
 def test_agent_id_for_task_does_not_fallback_after_denied_primary_agent(
@@ -401,7 +409,7 @@ def test_agent_id_for_task_does_not_fallback_after_denied_primary_agent(
     finally:
         db.close()
 
-    assert _agent_id_for_task(task_db, int(task.id)) is None
+    assert _agent_id_for_task(task_db, int(task.id), int(owner.id)) is None
 
 
 def test_agent_id_for_task_allows_team_admin_private_and_member_team_visible(
@@ -436,11 +444,100 @@ def test_agent_id_for_task_allows_team_admin_private_and_member_team_visible(
         )
     )
     try:
-        assert _agent_id_for_task(task_db, int(admin_task.id)) == int(private.id)
-        assert _agent_id_for_task(task_db, int(member_task.id)) == int(shared.id)
-        assert _agent_id_for_task(task_db, int(legacy_task.id)) == int(legacy.id)
+        assert _agent_id_for_task(task_db, int(admin_task.id), int(admin.id)) == int(
+            private.id
+        )
+        assert _agent_id_for_task(task_db, int(member_task.id), int(member.id)) == int(
+            shared.id
+        )
+        assert _agent_id_for_task(task_db, int(legacy_task.id), int(member.id)) == int(
+            legacy.id
+        )
     finally:
         set_agent_team_scope_hook(None)
+
+
+def test_agent_id_for_task_rejects_a_task_owned_by_another_user(task_db) -> None:
+    """The owner scope must come from the executing user, not from whatever row
+    the task id happens to hit."""
+    db = task_db()
+    try:
+        owner = _new_user(db, "owner")
+        intruder = _new_user(db, "intruder")
+        agent = _new_agent(db, int(owner.id))
+        task = _new_task(db, int(owner.id), agent_id=int(agent.id))
+    finally:
+        db.close()
+
+    assert _agent_id_for_task(task_db, int(task.id), int(intruder.id)) is None
+
+
+async def test_binding_authorized_creator_emits_nothing_without_a_binding(
+    task_db,
+) -> None:
+    """The contract behind ``BINDING_AUTHORIZED_CATEGORIES``: admission is
+    unconditional at the selection gates, so the creator itself must refuse to
+    emit anything for an agent with no bound target."""
+    from xagent.core.tools.adapters.vibe import ssh_tools
+    from xagent.core.tools.adapters.vibe.base import BINDING_AUTHORIZED_CATEGORIES
+    from xagent.web.services.ssh_runtime import set_ssh_target_provider_hook
+
+    assert BINDING_AUTHORIZED_CATEGORIES == frozenset({"ssh"}), (
+        "a new member needs the same no-authorization-no-tools proof"
+    )
+
+    db = task_db()
+    try:
+        owner = _new_user(db, "owner")
+        agent = _new_agent(db, int(owner.id))
+        task = _new_task(db, int(owner.id), agent_id=int(agent.id))
+    finally:
+        db.close()
+
+    provider = _RecordingTargetProvider()  # no bound targets
+    set_ssh_target_provider_hook(lambda _sf: provider)
+    config = SimpleNamespace(
+        get_session_factory=lambda: task_db,
+        get_user_id=lambda: int(owner.id),
+        get_task_id=lambda: f"web_task_{int(task.id)}",
+        get_workspace_config=lambda: None,
+    )
+    try:
+        assert await ssh_tools.create_ssh_tools(config) == []
+        assert provider.list_calls == 1
+    finally:
+        set_ssh_target_provider_hook(None)
+
+
+async def test_create_ssh_tools_emits_nothing_for_a_delegated_sub_agent(
+    task_db,
+) -> None:
+    """A delegated sub-agent's task id (``agent_{id}_{uuid8}``) carries no
+    resolvable task, so it must not reach the provider at all."""
+    from xagent.core.tools.adapters.vibe import ssh_tools
+    from xagent.web.services.ssh_runtime import set_ssh_target_provider_hook
+
+    db = task_db()
+    try:
+        owner = _new_user(db, "owner")
+        agent = _new_agent(db, int(owner.id))
+        _new_task(db, int(owner.id), agent_id=int(agent.id))
+    finally:
+        db.close()
+
+    provider = _RecordingTargetProvider()
+    set_ssh_target_provider_hook(lambda _sf: provider)
+    config = SimpleNamespace(
+        get_session_factory=lambda: task_db,
+        get_user_id=lambda: int(owner.id),
+        get_task_id=lambda: f"agent_{int(agent.id)}_a1b2cd34",
+        get_workspace_config=lambda: None,
+    )
+    try:
+        assert await ssh_tools.create_ssh_tools(config) == []
+        assert provider.list_calls == 0
+    finally:
+        set_ssh_target_provider_hook(None)
 
 
 class _RecordingTargetProvider(_Provider):
@@ -833,7 +930,7 @@ async def test_create_ssh_tools_skips_on_boxlite_backend(monkeypatch) -> None:
 
     provider = _Provider(targets=[SimpleNamespace()])  # one bound target
     set_ssh_target_provider_hook(lambda _sf: provider)
-    monkeypatch.setattr(ssh_tools, "_agent_id_for_task", lambda _sf, _tid: 1)
+    monkeypatch.setattr(ssh_tools, "_agent_id_for_task", lambda _sf, _tid, _uid: 1)
     monkeypatch.setattr(sm, "get_sandbox_manager", lambda: _FakeManager(object()))
     monkeypatch.setenv("SANDBOX_IMPLEMENTATION", "boxlite")
     config = SimpleNamespace(

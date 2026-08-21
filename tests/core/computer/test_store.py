@@ -4,9 +4,11 @@ import asyncio
 import os
 import threading
 import time
+from io import BytesIO
 from pathlib import Path
 
 import pytest
+from PIL import Image
 
 from xagent.core.computer.schema import (
     COMPUTER_FRAME_ID_METADATA_KEY,
@@ -81,6 +83,12 @@ class MissingInternalTempWorkspace(FakeWorkspace):
         del self.internal_temp_dir
 
 
+def _png_bytes() -> bytes:
+    output = BytesIO()
+    Image.new("RGB", (2, 2), color="red").save(output, format="PNG")
+    return output.getvalue()
+
+
 @pytest.mark.asyncio
 async def test_observation_store_persists_and_resolves_file_ref(
     tmp_path: Path,
@@ -88,11 +96,12 @@ async def test_observation_store_persists_and_resolves_file_ref(
     workspace = FakeWorkspace(tmp_path / "workspace")
     store = ObservationStore(workspace)
     event_loop_thread = threading.get_ident()
+    image_bytes = _png_bytes()
 
     reference = await store.save_screenshot(
         session_id="session/unsafe",
         frame_id="frame-1",
-        image_bytes=b"fake-png-bytes",
+        image_bytes=image_bytes,
         mime_type="image/png",
         viewport=Viewport(width=1280, height=720),
         text_fallback="browser screenshot",
@@ -120,7 +129,6 @@ async def test_observation_store_persists_and_resolves_file_ref(
         reference
     )
     assert materialized.startswith("data:image/png;base64,")
-    assert "fake-png-bytes" not in materialized
 
 
 @pytest.mark.asyncio

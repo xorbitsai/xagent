@@ -129,6 +129,12 @@ INTERACTION_READ_PROTOCOL_UNRECOGNIZED = "interaction_read_protocol_unrecognized
 # request_payload fails v1 validation. Same "unreadable is not absent"
 # reasoning as the sibling signal above, and the same no-clear-site rule.
 INTERACTION_READ_PAYLOAD_UNREADABLE = "interaction_read_payload_unreadable"
+# Set by the read surface adapter (task_interaction_read.py) when a task's
+# own interaction_protocol_version marker holds a value it does not
+# recognize -- a separate name from the two signals above, which report an
+# active row's stored protocol version, because /health exposes names and
+# not details. No clear site, for the same reason as those two signals.
+INTERACTION_READ_TASK_MARKER_UNRECOGNIZED = "interaction_read_task_marker_unrecognized"
 
 _signals: dict[str, str] = {}
 _lock = threading.Lock()

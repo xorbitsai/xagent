@@ -88,6 +88,18 @@ class TaskCreateRequest(BaseModel):
     examples: Optional[List[ExampleItem]] = (
         None  # Process mode: input/output examples (deprecated)
     )
+    seed_assistant_message: Optional[str] = Field(
+        default=None,
+        max_length=8000,
+        description=(
+            "Plain-text assistant message to seed as the task's first chat "
+            "history entry, in the same transaction as task creation - lets "
+            "an agent 'speak first' (e.g. a marketplace persona's opening "
+            "intro) without running the LLM. Never triggers execution or "
+            "sets task status to waiting_for_user; it is purely a transcript "
+            "row a client reading the task's history will see immediately."
+        ),
+    )
 
     @model_validator(mode="before")
     @classmethod

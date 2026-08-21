@@ -121,10 +121,38 @@ def make_trace_event(db: Session, *, task_id: int) -> int:
     return int(event.id)
 
 
+def anchor_event_id(db: Session, resume_trace_event_id: int) -> str:
+    """The ``event_id`` carried by the trace row an anchor points at.
+
+    The write direction stores exactly this string in the interaction row's
+    ``resume_event_id``, and the read-direction resolver compares the two,
+    so an anchor resolves only when the fixture takes the value from the
+    row it names. A fixture that wants an anchor to stay unresolvable
+    breaks one of the resolver's other conditions on purpose -- the run
+    partition, the execution id, the checkpoint type -- rather than leaving
+    this one mismatched, because a deliberate mismatch here is
+    indistinguishable from a fixture that simply forgot.
+
+    Raises ``LookupError`` when no trace row carries that primary key.
+    There is no sentinel return value: ``resume_event_id`` is NOT NULL, so
+    a caller has nowhere legal to put an "unknown", and every caller passes
+    an id the same fixture just created, so a miss is a broken fixture and
+    not a test condition.
+    """
+    trace_row = db.get(TraceEvent, resume_trace_event_id)
+    if trace_row is None:
+        raise LookupError(
+            f"no trace_events row with id {resume_trace_event_id}: an anchor "
+            "fixture must name a row that exists"
+        )
+    return str(trace_row.event_id)
+
+
 def make_row(
     *,
     task_id: int,
     resume_trace_event_id: int | None,
+    db: Session | None = None,
     status: str = "active",
     **overrides: object,
 ) -> dict[str, object]:
@@ -144,6 +172,17 @@ def make_row(
     request_idempotency_key gets a fresh value on every call so identity
     tests (T-uq-4/T-uq-5) only collide when a test deliberately repeats one
     via ``overrides``.
+
+    ``db`` is what makes ``resume_event_id`` agree with the trace row
+    ``resume_trace_event_id`` names: pass it and the value is read off that
+    row through ``anchor_event_id``, which is the only way a row built here
+    can resolve its read-direction anchor. Omit it -- as the
+    constraint-behaviour suites do, since no CHECK looks at the anchor's
+    identity -- and the field holds the literal
+    ``"unresolvable-anchor-event-id"``, named that way so a test which does
+    read such a row back sees at once why the anchor came out dangling,
+    instead of chasing a plausible-looking value that was never going to
+    match anything.
     """
     now = datetime.now(timezone.utc)
     row: dict[str, object] = {
@@ -158,7 +197,11 @@ def make_row(
         "response_payload": None,
         "request_idempotency_key": f"req-{next(_key_counter)}",
         "resume_trace_event_id": resume_trace_event_id,
-        "resume_event_id": "resume-event-1",
+        "resume_event_id": (
+            anchor_event_id(db, resume_trace_event_id)
+            if db is not None and resume_trace_event_id is not None
+            else "unresolvable-anchor-event-id"
+        ),
         "resume_execution_id": "resume-execution-1",
         "resume_locator_format": "trace_event_pk_v1",
         "resume_checkpoint_type": "agent_execution_checkpoint",

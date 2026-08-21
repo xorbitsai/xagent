@@ -166,6 +166,30 @@ def get_builtin_oauth_provider_rows() -> list[dict[str, Any]]:
             "default_scopes": ["user:read:user"],
         },
         {
+            "provider_name": "github",
+            "name": "GitHub",
+            "client_id": os.environ.get("GITHUB_CLIENT_ID", ""),
+            "client_secret": os.environ.get("GITHUB_CLIENT_SECRET", ""),
+            "auth_url": "https://github.com/login/oauth/authorize",
+            "token_url": "https://github.com/login/oauth/access_token",
+            "redirect_uri": os.environ.get("GITHUB_REDIRECT_URI", ""),
+            "userinfo_url": "https://api.github.com/user",
+            "user_id_path": "id",
+            # GitHub's /user "email" field is null unless the account has a
+            # public email set or the connecting token carries user:email
+            # (only requested via this app's own oauth_scopes below, not the
+            # provider's bare default_scopes) -- "login" (the username) is
+            # always present on any valid token and is what the connector UI
+            # actually needs for a display label, same rationale as slack's
+            # team-name-in-email-slot above.
+            "email_path": "login",
+            # Identity-only for this provider row, same pattern as zoom
+            # above: the functional scopes (repo access, email) live on
+            # the app row's oauth_scopes and are merged in at authorize
+            # time by _merge_oauth_scopes.
+            "default_scopes": ["read:user"],
+        },
+        {
             "provider_name": "intercom",
             "name": "Intercom",
             "client_id": os.environ.get("INTERCOM_CLIENT_ID", ""),
@@ -746,6 +770,45 @@ def get_builtin_public_mcp_app_rows() -> list[dict[str, Any]]:
             },
         },
         {
+            "app_id": "posthog",
+            "name": "PostHog",
+            "description": "Connect to PostHog Cloud (US or EU) to query events and persons via HogQL, and read insights, feature flags, dashboards, and annotations. Self-hosted PostHog is not supported.",
+            "icon": "https://www.google.com/s2/favicons?domain=posthog.com&sz=128",
+            "transport": "stdio",
+            "provider_name": None,
+            # "Analytics" is already one of the connect dialog's fixed
+            # sidebar category filters (connect-mcp-dialog.tsx) with no
+            # connector using it before this one -- an always-empty filter
+            # button. google-analytics uses "Marketing" instead, but that's
+            # its own pre-existing mismatch, not a reason to leave this
+            # button empty too.
+            "category": "Analytics",
+            "oauth_scopes": None,
+            "is_visible_in_connector": True,
+            # Key-based (non-oauth), like aws/google-maps: PostHog's only
+            # documented OAuth path is Client ID Metadata Document (CIMD),
+            # where the client_id is a URL hosting a metadata document *we*
+            # would have to serve publicly -- infrastructure this connector
+            # doesn't have, and a materially different model (no client
+            # secret at all) than every oauth_providers row in this file.
+            # Personal API keys sidestep that entirely: each user generates
+            # their own (posthog.com/docs/api/personal-api-keys), same
+            # no-review self-serve bar as an OAuth App, without needing
+            # xagent to host anything. POSTHOG_HOST is required alongside
+            # the key because US/EU Cloud are separate deployments -- a key
+            # from one host is not valid against the other (unlike, say,
+            # Intercom's single auto-routing API host). posthog.py's
+            # _base_url() restricts this to exactly those two hosts (not a
+            # broader "*.posthog.com" allowlist): self-hosted PostHog is
+            # not a documented target of this connector, so there's no
+            # reason to let this key be sent anywhere else.
+            "launch_config": {
+                "command": "python",
+                "args": ["-m", "xagent.web.tools.mcp.posthog"],
+                "required_env": ["POSTHOG_API_KEY", "POSTHOG_HOST"],
+            },
+        },
+        {
             # "chrome-devtools", not the generic "chrome", matching the
             # upstream package name and the vendor-scoped ids every other
             # seeded app uses. Known, accepted caveat: api/mcp.py couples
@@ -824,6 +887,39 @@ def get_builtin_public_mcp_app_rows() -> list[dict[str, Any]]:
                     "--no-usage-statistics",
                     "--no-performance-crux",
                 ],
+            },
+        },
+        {
+            "app_id": "github",
+            "name": "GitHub",
+            # Explicitly discloses the "repo" scope's blast radius (all
+            # repositories -- public and private -- the connecting account
+            # can access, not just ones the user picks) rather than leaving
+            # it implicit, since this is an OAuth App with no per-repository
+            # allowlist (unlike a GitHub App's repository-selection step).
+            "description": "Connect to GitHub to search repositories and code, read and create issues and pull requests, comment, and browse file contents and commit history. Grants access to every repository (public and private) the connected account can access -- there is no per-repository selection.",
+            "icon": "https://www.google.com/s2/favicons?domain=github.com&sz=128",
+            "transport": "oauth",
+            "provider_name": "github",
+            "category": "Development",
+            # read:org dropped: no tool here calls any organization endpoint
+            # (no org listing/membership lookup), so it was requested
+            # without a corresponding capability -- principle of least
+            # privilege. user:email is kept: unlike a separate unused
+            # endpoint, it changes what /user's own "email" field returns
+            # (populates it for accounts without a public email), which
+            # github_get_current_user's output relies on directly -- see
+            # test_get_current_user_returns_profile in test_github_mcp.py,
+            # which asserts the email field is surfaced, and
+            # test_github_login_requests_exact_canonical_scope in
+            # test_generic_oauth_login.py, which asserts this exact scope
+            # is what gets requested at authorize time.
+            "oauth_scopes": ["repo", "user:email"],
+            "is_visible_in_connector": True,
+            "launch_config": {
+                "command": "python",
+                "args": ["-m", "xagent.web.tools.mcp.github"],
+                "env_mapping": {"GITHUB_ACCESS_TOKEN": "access_token"},
             },
         },
         {

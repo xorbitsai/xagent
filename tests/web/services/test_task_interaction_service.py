@@ -131,7 +131,11 @@ import sqlalchemy as sa
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
 
-from tests.web.services.task_interaction_schema_shared import make_task, make_user
+from tests.web.services.task_interaction_schema_shared import (
+    anchor_event_id,
+    make_task,
+    make_user,
+)
 from xagent.core.agent.checkpoint import CHECKPOINT_EVENT_TYPE
 from xagent.db.sqlite import apply_sqlite_concurrency_pragmas
 from xagent.web.models.database import Base
@@ -833,9 +837,10 @@ def _make_active_interaction_row(
     *,
     task_id: int,
     run_id: str = "run-a",
-    resume_trace_event_id: int | None,
+    resume_trace_event_id: int,
     resume_run_partition: str = "run-a",
     resume_execution_id: str = "exec-1",
+    resume_event_id: str | None = None,
     protocol_version: int = 1,
     request_payload: dict[str, Any] | None = None,
 ) -> TaskInteractionRequest:
@@ -858,7 +863,9 @@ def _make_active_interaction_row(
         },
         request_idempotency_key=f"key-{task_id}",
         resume_trace_event_id=resume_trace_event_id,
-        resume_event_id="resume-event-1",
+        resume_event_id=resume_event_id
+        if resume_event_id is not None
+        else anchor_event_id(db, resume_trace_event_id),
         resume_execution_id=resume_execution_id,
         resume_locator_format="trace_event_pk_v1",
         resume_checkpoint_type="agent_execution_checkpoint",
@@ -1271,14 +1278,14 @@ def test_t3_prime_anchor_dangling_when_the_row_fails_validation(
 
 
 # ---------------------------------------------------------------------------
-# T3', the other five conditions: _resolve_read_direction_anchor's row-
-# validity judgment is six self-consistency conditions ANDed together (task
-# id, event type, build id, checkpoint type, run partition, execution
-# identity -- see that function's own docstring). The run-partition cell is
-# covered above; each of these five breaks exactly one of the remaining
-# conditions, following the same one-condition-per-cell shape
-# test_task_interaction_anchor.py's own _CONDITION_BREAKS table uses for the
-# sibling resolver it covers.
+# T3', the other six conditions: _resolve_read_direction_anchor's row-
+# validity judgment is seven self-consistency conditions ANDed together
+# (task id, event type, build id, checkpoint type, run partition, execution
+# identity, anchor event id -- see that function's own docstring). The
+# run-partition cell is covered above; each of these six breaks exactly one
+# of the remaining conditions, following the same one-condition-per-cell
+# shape test_task_interaction_anchor.py's own _CONDITION_BREAKS table uses
+# for the sibling resolver it covers.
 # ---------------------------------------------------------------------------
 
 _T3_ANCHOR_VALIDATION_BREAKS: dict[str, dict[str, Any]] = {
@@ -1287,6 +1294,7 @@ _T3_ANCHOR_VALIDATION_BREAKS: dict[str, dict[str, Any]] = {
     "build_id": {"build_id": "build-x"},
     "checkpoint_type": {"checkpoint_type": "not_a_checkpoint_type"},
     "execution_id": {"mismatched_resume_execution_id": "exec-mismatch"},
+    "resume_event_id": {"mismatched_resume_event_id": "resume-event-mismatch"},
 }
 
 
@@ -1294,11 +1302,11 @@ _T3_ANCHOR_VALIDATION_BREAKS: dict[str, dict[str, Any]] = {
 def test_t3_prime_anchor_dangling_for_each_remaining_validity_condition(
     _db: Session, _seeded_task: int, condition: str
 ) -> None:
-    """Every other cell in this file leaves all six conditions passing (or,
-    for the run-partition cell above, breaks exactly one). Deleting any one
-    of the five conditions exercised here from
+    """Every other cell in this file leaves all seven conditions passing
+    (or, for the run-partition cell above, breaks exactly one). Deleting any
+    one of the six conditions exercised here from
     _resolve_read_direction_anchor's boolean guard must turn exactly this
-    cell red and leave every other cell -- including the four remaining
+    cell red and leave every other cell -- including the five remaining
     parametrizations of this same test -- green."""
 
     overrides = dict(_T3_ANCHOR_VALIDATION_BREAKS[condition])
@@ -1314,6 +1322,10 @@ def test_t3_prime_anchor_dangling_for_each_remaining_validity_condition(
     # the other four cells is what keeps this condition passing everywhere
     # else.
     resume_execution_id = overrides.pop("mismatched_resume_execution_id", "exec-1")
+    # None leaves the row builder to take the anchor's event id from the
+    # trace row it points at, which is what makes every other cell here
+    # break exactly one condition.
+    resume_event_id = overrides.pop("mismatched_resume_event_id", None)
 
     trace_event_id = _make_trace_event(_db, task_id=trace_task_id, **overrides)
     _make_active_interaction_row(
@@ -1321,18 +1333,20 @@ def test_t3_prime_anchor_dangling_for_each_remaining_validity_condition(
         task_id=_seeded_task,
         resume_trace_event_id=trace_event_id,
         resume_execution_id=resume_execution_id,
+        resume_event_id=resume_event_id,
     )
 
     view = svc.materialize_compatibility_view(_db, _seeded_task)
     assert view.tier == "unanswerable"
     assert view.reason == "anchor_dangling"
+    assert CHECKPOINT_PK_ANCHOR_DANGLING in active_degradations()
 
 
 def test_t3_row_validity_failure_raises_checkpoint_pk_anchor_dangling(
     _db: Session, _seeded_task: int
 ) -> None:
     """The row-invalid branch of
-    _resolve_read_direction_anchor's six-condition guard must register
+    _resolve_read_direction_anchor's seven-condition guard must register
     CHECKPOINT_PK_ANCHOR_DANGLING, same as the missing-row branch above.
     Mutation: delete that register_degradation() call and this test turns
     red."""

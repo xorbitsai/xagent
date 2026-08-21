@@ -691,3 +691,28 @@ class TestResolveLLMAdapter:
         from langchain_core.runnables import Runnable
 
         assert isinstance(adapter, Runnable)
+
+
+class TestModelHubEngineHideParameters:
+    """The model hub engine points at the same database as the shared web
+    engine (web/models/database.py) -- the Model table it reads/writes has
+    an encrypted API key column, so a bind/commit failure here must not
+    surface it as a bound SQL parameter either."""
+
+    def teardown_method(self) -> None:
+        model_resolver._reset_model_hub_cache()
+
+    def test_sqlite_model_hub_engine_hides_bound_parameters(
+        self, tmp_path, monkeypatch
+    ):
+        model_resolver._reset_model_hub_cache()
+        monkeypatch.setattr(
+            model_resolver,
+            "get_default_db_url",
+            lambda: f"sqlite:///{tmp_path / 'model_hub.db'}",
+        )
+
+        hub = model_resolver._get_or_init_model_hub()
+
+        assert hub is not None
+        assert model_resolver._MODEL_HUB_ENGINE.hide_parameters is True

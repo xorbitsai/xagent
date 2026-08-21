@@ -108,4 +108,318 @@ describe("LibraryTemplateCard", () => {
 
     expect(onUse).not.toHaveBeenCalled();
   });
+
+  it("renders the persona's name/role instead of the template name when present", () => {
+    render(
+      <LibraryTemplateCard
+        template={makeTemplate({
+          name: "Email Lead Response Agent",
+          persona: {
+            name: "Leo",
+            role: "Email Lead Response Agent",
+            avatar: "/marketplace/avatars/leo.png",
+            intro: "Hi — I'm Leo.",
+            kickoff_questions: [],
+          },
+        })}
+        useLabel="Use Template"
+        defaultSetupTime="5 min setup"
+        onOpenPersona={{ onOpen: vi.fn(), formatMeetLabel: (name) => `Meet ${name}`, chatLabel: "Chat" }}
+        onUse={vi.fn()}
+      />
+    );
+
+    expect(screen.getByText("Leo")).toBeInTheDocument();
+    expect(screen.getByText("Email Lead Response Agent")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Meet Leo" })).toBeInTheDocument();
+    expect(screen.getByRole("img", { name: "Leo" })).toHaveAttribute(
+      "src",
+      "/marketplace/avatars/leo.png"
+    );
+  });
+
+  it("calls onOpen (not onUse) with the whole template when a persona-bearing card is activated", () => {
+    // onOpen receives the whole template (not just its id) so the caller
+    // can route an already-hired template straight to its agent's chat
+    // instead of through the detail page - see the hired-routing test below.
+    const onUse = vi.fn();
+    const onOpen = vi.fn();
+    const template = makeTemplate({
+      id: "sales-email-lead-response-agent",
+      persona: {
+        name: "Leo",
+        role: "Email Lead Response Agent",
+        avatar: null,
+        intro: "Hi — I'm Leo.",
+        kickoff_questions: [],
+      },
+    });
+    render(
+      <LibraryTemplateCard
+        template={template}
+        useLabel="Use Template"
+        defaultSetupTime="5 min setup"
+        onOpenPersona={{ onOpen, formatMeetLabel: (name) => `Meet ${name}`, chatLabel: "Chat" }}
+        onUse={onUse}
+      />
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Meet Leo" }));
+
+    expect(onOpen).toHaveBeenCalledWith(template);
+    expect(onUse).not.toHaveBeenCalled();
+  });
+
+  it("shows chatLabel instead of 'Meet {name}' once the template is hired", () => {
+    // page-client.tsx already makes this exact hired-aware distinction one
+    // navigation later (Chat vs. Hire {name}) - the card must match it,
+    // rather than always offering "Meet {name}" for an already-hired persona.
+    render(
+      <LibraryTemplateCard
+        template={makeTemplate({
+          id: "sales-email-lead-response-agent",
+          hired: true,
+          hired_agent_id: 5,
+          persona: {
+            name: "Leo",
+            role: "Email Lead Response Agent",
+            avatar: null,
+            intro: "Hi — I'm Leo.",
+            kickoff_questions: [],
+          },
+        })}
+        useLabel="Use Template"
+        defaultSetupTime="5 min setup"
+        onOpenPersona={{ onOpen: vi.fn(), formatMeetLabel: (name) => `Meet ${name}`, chatLabel: "Chat" }}
+        onUse={vi.fn()}
+      />
+    );
+
+    expect(screen.getByRole("button", { name: "Chat" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Meet Leo" })).not.toBeInTheDocument();
+  });
+
+  it("falls back entirely to onUse's label and behavior when onOpenPersona is omitted", () => {
+    // Regression test: onOpen and formatMeetLabel used to be independent
+    // optional props, so a caller could wire one without the other and get
+    // a "Meet {name}" button that silently called onUse. Bundling them into
+    // one onOpenPersona prop means omitting it falls back to useLabel too,
+    // not just onUse - there is no way to render "Meet Leo" without also
+    // getting onOpen behavior.
+    const onUse = vi.fn();
+    render(
+      <LibraryTemplateCard
+        template={makeTemplate({
+          id: "sales-email-lead-response-agent",
+          persona: {
+            name: "Leo",
+            role: "Email Lead Response Agent",
+            avatar: null,
+            intro: "Hi — I'm Leo.",
+            kickoff_questions: [],
+          },
+        })}
+        useLabel="Use Template"
+        defaultSetupTime="5 min setup"
+        onUse={onUse}
+      />
+    );
+
+    expect(screen.queryByRole("button", { name: "Meet Leo" })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Use Template" }));
+
+    expect(onUse).toHaveBeenCalledWith("sales-email-lead-response-agent");
+  });
+
+  it("ignores persona and keeps the workforce click behavior for a workforce-type template", () => {
+    const onUse = vi.fn();
+    const onOpen = vi.fn();
+    render(
+      <LibraryTemplateCard
+        template={makeTemplate({
+          id: "growth-workforce",
+          type: "workforce",
+          agent_count: 3,
+          persona: {
+            name: "Leo",
+            role: "Email Lead Response Agent",
+            avatar: null,
+            intro: "Hi — I'm Leo.",
+            kickoff_questions: [],
+          },
+        })}
+        useLabel="Use Template"
+        defaultSetupTime="5 min setup"
+        workforceBadgeLabel="Workforce"
+        onOpenPersona={{ onOpen, formatMeetLabel: (name) => `Meet ${name}`, chatLabel: "Chat" }}
+        onUse={onUse}
+      />
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Use Template" }));
+
+    expect(onUse).toHaveBeenCalledWith("growth-workforce");
+    expect(onOpen).not.toHaveBeenCalled();
+  });
+
+  it("does not lock a persona card's onOpenPersona navigation while a sibling workforce is being created", () => {
+    // Regression test: the cross-card `disabled` lock exists to stop a
+    // slow workforce-creation request from racing a click elsewhere, but
+    // onOpenPersona is pure client-side navigation with nothing to race -
+    // it must stay active even while `disabled` is true for that reason.
+    const onOpen = vi.fn();
+    const template = makeTemplate({
+      id: "sales-email-lead-response-agent",
+      persona: {
+        name: "Leo",
+        role: "Email Lead Response Agent",
+        avatar: null,
+        intro: "Hi — I'm Leo.",
+        kickoff_questions: [],
+      },
+    });
+    render(
+      <LibraryTemplateCard
+        template={template}
+        useLabel="Use Template"
+        defaultSetupTime="5 min setup"
+        onOpenPersona={{ onOpen, formatMeetLabel: (name) => `Meet ${name}`, chatLabel: "Chat" }}
+        onUse={vi.fn()}
+        disabled
+      />
+    );
+
+    const button = screen.getByRole("button", { name: "Meet Leo" });
+    expect(button).not.toBeDisabled();
+
+    fireEvent.click(button);
+
+    expect(onOpen).toHaveBeenCalledWith(template);
+  });
+
+  describe("hero variant", () => {
+    const MAYA_TEMPLATE = makeTemplate({
+      id: "marketing-social-media-content-manager",
+      description: "Turn one brief into ready-to-publish posts and visuals.",
+      features: [
+        "Transforms topics or briefs into platform-native copy",
+        "Creates matching visuals at correct dimensions",
+        "Applies brand tone, voice, and visual guidelines",
+      ],
+      tool_categories: ["basic", "web_search", "browser", "file", "image", "knowledge", "mcp:LinkedIn"],
+      skills: ["static-visual-design"],
+      persona: {
+        name: "Maya",
+        role: "Social Media Content Manager",
+        avatar: null,
+        intro: "Hi — I'm Maya.",
+        kickoff_questions: [],
+      },
+    });
+
+    it("shows the full description, feature bullets, capability tags, and a 'most used' badge", () => {
+      render(
+        <LibraryTemplateCard
+          template={MAYA_TEMPLATE}
+          useLabel="Use Template"
+          defaultSetupTime="5 min setup"
+          variant="hero"
+          heroBadgeLabel="Most used"
+          formatToolLabel={(category) => `[${category}]`}
+          onOpenPersona={{ onOpen: vi.fn(), formatMeetLabel: (name) => `Meet ${name}`, chatLabel: "Chat" }}
+          onUse={vi.fn()}
+        />
+      );
+
+      expect(screen.getByText("Most used")).toBeInTheDocument();
+      expect(
+        screen.getByText("Turn one brief into ready-to-publish posts and visuals.")
+      ).toBeInTheDocument();
+      expect(
+        screen.getByText("Transforms topics or briefs into platform-native copy")
+      ).toBeInTheDocument();
+      // basic/browser/knowledge/mcp: are excluded from the tag row; skills
+      // are appended verbatim - see tool-category-labels.test.ts for the
+      // filtering behavior itself.
+      expect(screen.getByText("[web_search]")).toBeInTheDocument();
+      expect(screen.getByText("[file]")).toBeInTheDocument();
+      expect(screen.getByText("[image]")).toBeInTheDocument();
+      expect(screen.getByText("static-visual-design")).toBeInTheDocument();
+      expect(screen.queryByText("[basic]")).not.toBeInTheDocument();
+      expect(screen.queryByText("[browser]")).not.toBeInTheDocument();
+    });
+
+    it("keys duplicate capability tags uniquely when a formatted category collides with a skill string", () => {
+      // formatToolLabel here deliberately produces "static-visual-design"
+      // for the "web_search" category, colliding with the literal skill of
+      // the same name - capabilityTags then has that string twice.
+      const consoleErrorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+      const collidingTemplate = makeTemplate({
+        ...MAYA_TEMPLATE,
+        tool_categories: ["web_search"],
+        skills: ["static-visual-design"],
+      });
+
+      render(
+        <LibraryTemplateCard
+          template={collidingTemplate}
+          useLabel="Use Template"
+          defaultSetupTime="5 min setup"
+          variant="hero"
+          formatToolLabel={() => "static-visual-design"}
+          onOpenPersona={{ onOpen: vi.fn(), formatMeetLabel: (name) => `Meet ${name}`, chatLabel: "Chat" }}
+          onUse={vi.fn()}
+        />
+      );
+
+      expect(screen.getAllByText("static-visual-design")).toHaveLength(2);
+      expect(
+        consoleErrorSpy.mock.calls.some((args) =>
+          String(args[0]).includes("same key")
+        )
+      ).toBe(false);
+      consoleErrorSpy.mockRestore();
+    });
+
+    it("does not show the badge, bullets, or tags for the default variant, and truncates the description", () => {
+      render(
+        <LibraryTemplateCard
+          template={MAYA_TEMPLATE}
+          useLabel="Use Template"
+          defaultSetupTime="5 min setup"
+          heroBadgeLabel="Most used"
+          formatToolLabel={(category) => `[${category}]`}
+          onOpenPersona={{ onOpen: vi.fn(), formatMeetLabel: (name) => `Meet ${name}`, chatLabel: "Chat" }}
+          onUse={vi.fn()}
+        />
+      );
+
+      expect(screen.queryByText("Most used")).not.toBeInTheDocument();
+      expect(
+        screen.queryByText("Transforms topics or briefs into platform-native copy")
+      ).not.toBeInTheDocument();
+      expect(screen.queryByText("[web_search]")).not.toBeInTheDocument();
+      // The description still renders (truncated via CSS line-clamp, not
+      // removed from the DOM).
+      expect(
+        screen.getByText("Turn one brief into ready-to-publish posts and visuals.")
+      ).toBeInTheDocument();
+    });
+
+    it("ignores the hero variant for a template with no persona", () => {
+      render(
+        <LibraryTemplateCard
+          template={makeTemplate({ id: "growth-workforce", type: "workforce", agent_count: 2 })}
+          useLabel="Use Template"
+          defaultSetupTime="5 min setup"
+          workforceBadgeLabel="Workforce"
+          variant="hero"
+          heroBadgeLabel="Most used"
+          onUse={vi.fn()}
+        />
+      );
+
+      expect(screen.queryByText("Most used")).not.toBeInTheDocument();
+    });
+  });
 });

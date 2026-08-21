@@ -134,7 +134,7 @@ class AgentService:
         self._outbound_message_handler: Callable[[dict[str, Any]], Any] | None = None
         self._interrupt_checker: Callable[[], Any] | None = None
         self._conversation_history: list[dict[str, Any]] = []
-        self._execution_context_messages: list[dict[str, str]] = []
+        self._execution_context_messages: list[dict[str, Any]] = []
         self._recovered_skill_context: str | None = None
         self.allowed_skills = self._get_allowed_skills_from_config(tool_config)
         self.skill_scope_context = self._get_skill_scope_context_from_config(

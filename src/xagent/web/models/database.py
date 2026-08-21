@@ -183,6 +183,13 @@ def configure_db(
             database_url,
             connect_args={"check_same_thread": False},
             poolclass=NullPool,
+            # A StatementError's default __str__ includes bound parameter
+            # values -- without this, any `except Exception: logger.x(e)`
+            # or `str(e)` anywhere in the app that touches a commit/execute
+            # failure can put a live secret (an OAuth token, a password
+            # hash) bound as a query parameter into a log or, worse, a
+            # client-facing response.
+            hide_parameters=True,
         )
         if not read_only:
             # WAL + busy_timeout let concurrent writes wait for the lock instead
@@ -192,6 +199,9 @@ def configure_db(
         engine_kwargs: dict[str, Any] = {
             "poolclass": QueuePool,
             **get_db_pool_kwargs(),
+            # After the spread, not before: get_db_pool_kwargs() must never
+            # be able to silently win this key and turn the guard off.
+            "hide_parameters": True,
         }
         if read_only:
             # SQLAlchemy applies PostgreSQL's READ ONLY transaction mode when

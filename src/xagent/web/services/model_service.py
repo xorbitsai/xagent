@@ -1476,6 +1476,11 @@ def get_default_sound_effect_model(
                     .filter(
                         UserDefaultModel.config_type == "sound_effect",
                         DBModel.category == "sound_effect",
+                        # Mirrors the user-default branch above: without this an
+                        # inactive shared default still resolves to a model
+                        # instance that is absent from the tool's own registry,
+                        # so usage records fall back to a phantom model name.
+                        DBModel.is_active,
                         sa_cast(DBModel.abilities, String).contains('"generate"'),
                         UserModel.is_shared.is_(True),
                         UserDefaultModel.user_id.in_(
@@ -1539,6 +1544,10 @@ def get_default_music_model(
                     .filter(
                         UserDefaultModel.config_type == "music",
                         DBModel.category == "music",
+                        # Mirrors the user-default branch above; see the
+                        # sound-effect getter for why an inactive shared
+                        # default corrupts usage attribution.
+                        DBModel.is_active,
                         sa_cast(DBModel.abilities, String).contains('"generate"'),
                         UserModel.is_shared.is_(True),
                         UserDefaultModel.user_id.in_(

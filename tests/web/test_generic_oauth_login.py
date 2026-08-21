@@ -346,6 +346,164 @@ def test_meta_login_uses_comma_separated_canonical_scopes_for_builtin_app(
     ]
 
 
+def test_github_login_requests_exact_canonical_scope(db_session):
+    """The requested scope must be exactly the provider's default_scopes
+    ("read:user") merged with the github app row's canonical oauth_scopes
+    ("repo", "user:email", sorted) -- read:org must NOT reappear even if a
+    stale/incorrect DB row still lists it, since get_app_by_id overlays the
+    canonical registry's oauth_scopes for a builtin app_id regardless of
+    what is persisted."""
+    db, user = db_session
+    token = _token_for(user)
+    db.add(
+        PublicMCPApp(
+            app_id="github",
+            name="GitHub",
+            description="GitHub connector",
+            transport="oauth",
+            provider_name="github",
+            category="Development",
+            # Deliberately stale/wrong to prove the registry, not this
+            # row's oauth_scopes, is what actually gets requested.
+            oauth_scopes=["repo", "read:org", "user:email"],
+            is_visible_in_connector=True,
+            launch_config={},
+        )
+    )
+    db.commit()
+
+    provider = _provider(
+        auth_url="https://github.com/login/oauth/authorize",
+        default_scopes=["read:user"],
+        redirect_uri="https://app.example.com/api/auth/github/callback",
+    )
+
+    resp = generic_oauth_login(
+        provider="github",
+        token=token,
+        app_id="github",
+        redirect=None,
+        db=db,
+        db_provider=provider,
+    )
+    qs = parse_qs(urlparse(_location(resp)).query)
+
+    assert qs["scope"] == ["read:user repo user:email"]
+
+
+def test_bare_github_login_config_error_takes_precedence_over_bare_route_guard(
+    db_session,
+):
+    """A bare (app_id-less) login persists to the exact same
+    UserOAuth.provider="github" key an app-scoped login uses, since
+    github's app_id and provider name are the same string. Left unblocked,
+    re-running this route would silently replace a fully-scoped
+    connection's grant with an identity-only one on the next callback --
+    that guard exists and still runs before any state token is minted.
+
+    But the guard is checked AFTER config/auth resolution, not before: a
+    misconfigured provider (missing client_id) must still get the
+    actionable CLIENT_ID config error, not a 404 that would incorrectly
+    read as "this route doesn't support a normal connect attempt" to an
+    operator debugging their setup."""
+    db, user = db_session
+    token = _token_for(user)
+
+    provider = _provider(
+        auth_url="https://github.com/login/oauth/authorize",
+        default_scopes=["read:user"],
+        redirect_uri="https://app.example.com/api/auth/github/callback",
+        client_id="",  # deliberately unconfigured
+    )
+
+    resp = generic_oauth_login(
+        provider="github",
+        token=token,
+        app_id=None,
+        redirect=None,
+        db=db,
+        db_provider=provider,
+    )
+
+    assert resp.status_code == 500
+    assert "GITHUB_CLIENT_ID" in resp.body.decode()
+
+
+def test_bare_github_login_unauthenticated_gets_401_not_404(db_session):
+    """Same ordering point as the config-error case above: an
+    unauthenticated bare-route request must get the generic 401, not a 404
+    that implies the route itself is unsupported."""
+    db, _user = db_session
+
+    provider = _provider(
+        auth_url="https://github.com/login/oauth/authorize",
+        default_scopes=["read:user"],
+        redirect_uri="https://app.example.com/api/auth/github/callback",
+    )
+
+    resp = generic_oauth_login(
+        provider="github",
+        token=None,
+        app_id=None,
+        redirect=None,
+        db=db,
+        db_provider=provider,
+    )
+
+    assert resp.status_code == 401
+
+
+def test_bare_github_login_is_rejected_once_authenticated_and_configured(db_session):
+    """Once config and auth both resolve cleanly, the bare-route guard for
+    providers requiring an app-scoped grant still fires -- before any
+    state token is minted, which is the property it actually needs to
+    hold."""
+    db, user = db_session
+    token = _token_for(user)
+
+    provider = _provider(
+        auth_url="https://github.com/login/oauth/authorize",
+        default_scopes=["read:user"],
+        redirect_uri="https://app.example.com/api/auth/github/callback",
+    )
+
+    resp = generic_oauth_login(
+        provider="github",
+        token=token,
+        app_id=None,
+        redirect=None,
+        db=db,
+        db_provider=provider,
+    )
+
+    assert resp.status_code == 404
+
+
+def test_bare_login_for_unrestricted_provider_still_proceeds(db_session):
+    """Sanity: the bare-route guard is scoped to
+    APPS_REQUIRING_APP_SCOPED_OAUTH_GRANT members only -- an ordinary
+    provider's bare login (no collision risk) must be unaffected."""
+    db, user = db_session
+    token = _token_for(user)
+
+    provider = _provider(
+        auth_url="https://login.microsoftonline.com/common/oauth2/v2.0/authorize",
+        default_scopes=["User.Read"],
+        redirect_uri="https://app.example.com/cb",
+    )
+
+    resp = generic_oauth_login(
+        provider="microsoft",
+        token=token,
+        app_id=None,
+        redirect=None,
+        db=db,
+        db_provider=provider,
+    )
+
+    assert resp.status_code == 307
+
+
 def test_hubspot_login_sends_tier_gated_scopes_as_optional(db_session):
     """business-intelligence, marketing-email, and marketing.campaigns.read
     are all gated on a Marketing Hub tier above Free/CRM-only - requesting

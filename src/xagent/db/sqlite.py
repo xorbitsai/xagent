@@ -76,13 +76,12 @@ def apply_sqlite_concurrency_pragmas(
 
 
 def _apply_concurrency_pragmas(cursor, timeout_ms: int) -> None:  # type: ignore[no-untyped-def]
-    """Set the SQLite runtime pragmas, best-effort.
+    """Set optional concurrency pragmas and required relational integrity.
 
-    A connect hook that raises breaks every connection, so a pragma failure must
-    never propagate. On a read-only database (or a directory where the -wal/-shm
-    sidecars cannot be created) ``PRAGMA journal_mode=WAL`` raises; we log and
-    continue. ``busy_timeout`` is connection-local (no disk write) and is set
-    independently so it still applies when WAL is unavailable.
+    WAL and ``busy_timeout`` failures degrade concurrency but do not invalidate
+    stored relationships, so they remain best-effort. Foreign-key enforcement
+    is a required connection invariant: ORM relationships intentionally depend
+    on database cascades for rows hidden from filtered collections.
     """
     try:
         cursor.execute("PRAGMA journal_mode=WAL")
@@ -96,7 +95,8 @@ def _apply_concurrency_pragmas(cursor, timeout_ms: int) -> None:  # type: ignore
         cursor.execute(f"PRAGMA busy_timeout={timeout_ms}")
     except Exception as exc:  # noqa: BLE001
         logger.warning("Could not set SQLite busy_timeout: %s", exc)
-    try:
-        cursor.execute("PRAGMA foreign_keys=ON")
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("Could not enable SQLite foreign keys: %s", exc)
+    cursor.execute("PRAGMA foreign_keys=ON")
+    cursor.execute("PRAGMA foreign_keys")
+    enabled = cursor.fetchone()
+    if enabled is None or int(enabled[0]) != 1:
+        raise RuntimeError("SQLite foreign-key enforcement could not be enabled")

@@ -2,6 +2,7 @@ import asyncio
 import json
 import logging
 import os
+import threading
 import time
 from collections.abc import Iterator
 from contextlib import contextmanager, suppress
@@ -1558,30 +1559,42 @@ async def startup_event() -> None:
         logger.info("Started background uploaded files reconcile task")
 
         # Clean up orphaned temporary files from interrupted atomic replacements.
-        # This walks the entire uploads tree inline during startup and can take
-        # minutes on a large tree with no log output in between. Wrap it in a
-        # startup phase so its duration is visible and a slow start is easy to
-        # diagnose from the logs alone.
-        # WHY: try/except inside the phase keeps a tolerated failure at a single
-        # WARNING; propagating it would add a spurious ERROR from _startup_phase.
-        # exc_info keeps the traceback so an unexpected bug (not just a transient
-        # FS error) is still diagnosable despite the WARNING-level downgrade.
-        with _startup_phase("orphaned temp-file cleanup"):
-            try:
-                from .api.kb import cleanup_orphaned_temp_files
+        # This walks the entire uploads tree and can take minutes on a large
+        # tree, so it runs in the background (fire-and-forget scheduling like the
+        # reconcile step above) instead of awaiting it inline, letting the
+        # lifespan finish and /health open immediately regardless of tree size.
+        # Unlike that reconcile task, this one is tracked on app.state and stopped
+        # at shutdown: the threading.Event lets the walk unwind cooperatively so a
+        # mid-sweep restart does not block process exit on the executor thread.
+        temp_file_cleanup_stop = threading.Event()
+        app.state.temp_file_cleanup_stop = temp_file_cleanup_stop
 
-                cleaned_count = await asyncio.to_thread(cleanup_orphaned_temp_files)
-                if cleaned_count > 0:
-                    logger.info(
-                        "Startup cleanup: removed %d orphaned temporary file(s)",
-                        cleaned_count,
-                    )
+        async def run_temp_file_cleanup_background() -> None:
+            from .api.kb import cleanup_orphaned_temp_files
+
+            started = time.monotonic()
+            logger.info("Background orphaned temp-file cleanup started")
+            try:
+                cleaned_count = await asyncio.to_thread(
+                    cleanup_orphaned_temp_files, stop_event=temp_file_cleanup_stop
+                )
             except Exception as e:  # noqa: BLE001
                 logger.warning(
-                    "Temporary file cleanup skipped due to error: %s",
+                    "Background orphaned temp-file cleanup failed after %.2fs: %s",
+                    time.monotonic() - started,
                     e,
-                    exc_info=True,
                 )
+                return
+            logger.info(
+                "Background orphaned temp-file cleanup completed in %.2fs "
+                "(removed %d file(s))",
+                time.monotonic() - started,
+                cleaned_count,
+            )
+
+        app.state.temp_file_cleanup_task = asyncio.create_task(
+            run_temp_file_cleanup_background()
+        )
 
     # Warmup sandbox manager
     from .sandbox_manager import check_sandbox_static_readiness, get_sandbox_manager
@@ -1715,6 +1728,27 @@ async def shutdown_event() -> None:
             task.cancel()
             with suppress(asyncio.CancelledError):
                 await task
+
+    # Stop the background orphaned temp-file cleanup task. The walk runs in an
+    # executor thread, so cancelling the task would only stop the await while the
+    # thread keeps running and blocks process exit via asyncio.run()'s executor
+    # join. Set the cooperative stop flag instead, then wait briefly for the walk
+    # to unwind at its next directory boundary.
+    if hasattr(app.state, "temp_file_cleanup_task"):
+        task = app.state.temp_file_cleanup_task
+        if task and not task.done():
+            stop = getattr(app.state, "temp_file_cleanup_stop", None)
+            if stop is not None:
+                stop.set()
+            try:
+                await asyncio.wait_for(task, timeout=10.0)
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "Orphaned temp-file cleanup still running 10s after stop "
+                    "signal; leaving it to finish in the background"
+                )
+            except asyncio.CancelledError:
+                pass
 
     # Shutdown chat channels before draining task finalizers.
     try:

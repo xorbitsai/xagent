@@ -1618,7 +1618,10 @@ async def _rollback_failed_cloud_ingestion(
         raise RollbackFailureError(message) from exc
 
 
-def cleanup_orphaned_temp_files(upload_dir: Optional[Path] = None) -> int:
+def cleanup_orphaned_temp_files(
+    upload_dir: Optional[Path] = None,
+    stop_event: Optional[threading.Event] = None,
+) -> int:
     """Clean up orphaned temporary files from interrupted atomic replacements.
 
     Removes files matching patterns like:
@@ -1627,6 +1630,10 @@ def cleanup_orphaned_temp_files(upload_dir: Optional[Path] = None) -> int:
 
     Args:
         upload_dir: Base uploads directory to clean. If None, uses default uploads dir.
+        stop_event: Optional cooperative stop flag, checked once per directory. When
+            set, the walk unwinds early so a shutdown can interrupt a long sweep
+            instead of the worker thread blocking process exit via asyncio.run()'s
+            executor-thread join.
 
     Returns:
         Number of files cleaned up.
@@ -1640,43 +1647,62 @@ def cleanup_orphaned_temp_files(upload_dir: Optional[Path] = None) -> int:
     cleaned_count = 0
     now = time.time()
 
-    # Walk through uploads directory and clean up temp files older than 1 hour
-    # to avoid deleting files that might still be in use
-    for root, dirs, files in os.walk(base_dir):
-        for filename in files:
-            file_path = Path(root) / filename
+    def _is_orphaned_temp_name(filename: str) -> bool:
+        # Old atomic-replace pattern (*.tmp-replace).
+        if filename.endswith(".tmp-replace"):
+            return True
+        # New NamedTemporaryFile pattern: filename.XXXXXX.tmp (has multiple
+        # extensions, so at least three dot-separated parts ending in ``tmp``).
+        if filename.endswith(".tmp") and "." in filename[:-4]:
+            parts = filename.split(".")
+            if len(parts) >= 3 and parts[-1] == "tmp":
+                return True
+        return False
 
-            # Check for old temp file pattern (*.tmp-replace)
-            if filename.endswith(".tmp-replace"):
-                file_age = now - file_path.stat().st_mtime
-                if file_age > 3600:  # 1 hour
-                    try:
-                        file_path.unlink()
-                        cleaned_count += 1
-                        logger.debug("Cleaned up orphaned temp file: %s", file_path)
-                    except OSError as e:
-                        logger.warning(
-                            "Failed to clean up orphaned temp file %s: %s", file_path, e
-                        )
+    # Walk the uploads tree with os.scandir, seeding the stack with a str path
+    # and appending entry.path directly so no Path object is allocated per
+    # entry on a large tree. Clean temp files older than 1 hour to avoid
+    # deleting files that might still be in use; per-entry OSError is tolerated
+    # below so a file vanishing mid-scan skips instead of aborting the sweep.
+    stack = [str(base_dir)]
+    while stack:
+        # WHY: cooperative stop so a shutdown can interrupt a long walk; without
+        # it the executor thread keeps running and blocks process exit via
+        # asyncio.run()'s executor-thread join.
+        if stop_event is not None and stop_event.is_set():
+            break
+        current = stack.pop()
+        try:
+            scandir_it = os.scandir(current)
+        except OSError as e:
+            logger.warning("Failed to scan directory %s: %s", current, e)
+            continue
+        with scandir_it:
+            for entry in scandir_it:
+                try:
+                    if entry.is_dir(follow_symlinks=False):
+                        stack.append(entry.path)
+                        continue
+                    if not entry.is_file(follow_symlinks=False):
+                        continue
+                    if not _is_orphaned_temp_name(entry.name):
+                        continue
+                    if now - entry.stat().st_mtime <= 3600:  # 1 hour
+                        continue
+                except OSError as e:
+                    # The entry vanished mid-scan (e.g. a concurrent replace);
+                    # skip it rather than aborting the whole sweep.
+                    logger.debug("Skipping temp-file candidate %s: %s", entry.path, e)
+                    continue
 
-            # Check for new temp file pattern (.*.tmp from NamedTemporaryFile)
-            # Pattern: filename.XXXXXX.tmp where X is random hex
-            if filename.endswith(".tmp") and "." in filename[:-4]:
-                # Verify it looks like our temp pattern (has multiple extensions)
-                parts = filename.split(".")
-                if len(parts) >= 3 and parts[-1] == "tmp":
-                    file_age = now - file_path.stat().st_mtime
-                    if file_age > 3600:  # 1 hour
-                        try:
-                            file_path.unlink()
-                            cleaned_count += 1
-                            logger.debug("Cleaned up orphaned temp file: %s", file_path)
-                        except OSError as e:
-                            logger.warning(
-                                "Failed to clean up orphaned temp file %s: %s",
-                                file_path,
-                                e,
-                            )
+                try:
+                    os.unlink(entry.path)
+                    cleaned_count += 1
+                    logger.debug("Cleaned up orphaned temp file: %s", entry.path)
+                except OSError as e:
+                    logger.warning(
+                        "Failed to clean up orphaned temp file %s: %s", entry.path, e
+                    )
 
     if cleaned_count > 0:
         logger.info("Cleaned up %d orphaned temporary file(s)", cleaned_count)

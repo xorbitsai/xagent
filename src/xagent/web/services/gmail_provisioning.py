@@ -1324,6 +1324,11 @@ def release_gmail_mailbox_if_unused(
             f"Gmail watch state {state.id} cannot resolve ordinary OAuth "
             f"account {oauth_account_id} for user {state.user_id}",
         )
+        # Preserve every cleanup handle until an operator repairs the owner
+        # mismatch. Deleting Pub/Sub resources or this row while Gmail stop()
+        # was impossible would orphan the remote watch permanently.
+        db.commit()
+        return False
 
     project_id = get_gmail_pubsub_project_id()
     if project_id:

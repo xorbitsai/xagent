@@ -1387,10 +1387,19 @@ def test_release_warns_when_watch_account_is_not_ordinary(
     db_session.add_all([account, state])
     db_session.commit()
 
-    with caplog.at_level(logging.WARNING):
-        released = release_gmail_mailbox_if_unused(db_session, int(account.id))
+    def forbidden_cleanup_client() -> NoReturn:
+        raise AssertionError("cloud cleanup must wait for ownership remediation")
 
-    assert released is True
+    with caplog.at_level(logging.WARNING):
+        released = release_gmail_mailbox_if_unused(
+            db_session,
+            int(account.id),
+            publisher_factory=forbidden_cleanup_client,
+            subscriber_factory=forbidden_cleanup_client,
+        )
+
+    assert released is False
+    assert db_session.get(GmailWatchState, int(state.id)) is state
     assert "Cannot stop Gmail watch" in caplog.text
     assert str(state.id) in caplog.text
     assert str(account.id) in caplog.text

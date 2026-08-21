@@ -37,7 +37,6 @@ from ..ops_signals import (
     clear_degradation,
     register_degradation,
 )
-from ..user_oauth import get_scoped_user_oauth_account
 from .base import (
     CallbackRequestContext,
     TriggerConfigError,
@@ -516,19 +515,6 @@ class GmailProvider:
         _ = (trigger, events)
         state = _watch_state_for_callback(db, context.callback_id)
         if state is None:
-            return
-        if (
-            get_scoped_user_oauth_account(
-                db,
-                user_id=int(state.user_id),
-                account_id=int(state.oauth_account_id),
-                resource_owner_key=None,
-            )
-            is None
-        ):
-            # parse_events acknowledges ownership mismatches without fetching
-            # Gmail history. Preserve the previous cursor so a repaired
-            # ordinary account can consume the missed range on a later push.
             return
         if (
             str(state.status) == TriggerProvisioningStatus.FAILED.value

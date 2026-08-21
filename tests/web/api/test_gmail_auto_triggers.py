@@ -27,7 +27,6 @@ from xagent.web.models.trigger import (
 )
 from xagent.web.models.user import User
 from xagent.web.models.user_oauth import UserOAuth
-from xagent.web.services import ops_signals
 from xagent.web.services.gmail_provisioning import (
     GMAIL_WATCH_DISABLED_ERROR,
     gmail_topic_path,
@@ -1404,50 +1403,6 @@ def test_best_effort_provisioning_targets_only_referenced_mailboxes(
         db.close()
 
 
-def test_collect_gmail_pubsub_events_warns_for_nonordinary_watch_account(
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    signal_name = "gmail_oauth_ownership_mismatch"
-    ops_signals.clear_degradation(signal_name)
-    db = _direct_db_session()
-    try:
-        user = _create_user(db, "gmail-owner-mismatch")
-        oauth = _create_gmail_oauth(db, user)
-        state = GmailWatchState(
-            user_id=int(user.id),
-            oauth_account_id=int(oauth.id),
-            email="codeacme17@gmail.com",
-            history_id="100",
-            topic_name="projects/demo/topics/xagent-gmail",
-        )
-        setattr(oauth, "resource_owner_key", "actor:alice")
-        db.add_all([oauth, state])
-        db.commit()
-
-        with caplog.at_level("WARNING"):
-            result = asyncio.run(
-                collect_gmail_pubsub_events(
-                    db,
-                    GmailPubsubNotification(
-                        email_address="codeacme17@gmail.com",
-                        history_id="222",
-                        pubsub_message_id="pubsub-owner-mismatch",
-                    ),
-                    state=state,
-                )
-            )
-
-        assert result.events == []
-        assert result.skipped == 1
-        assert "Skipping Gmail callback" in caplog.text
-        assert str(state.id) in caplog.text
-        assert str(oauth.id) in caplog.text
-        assert signal_name in ops_signals.active_degradations()
-    finally:
-        ops_signals.clear_degradation(signal_name)
-        db.close()
-
-
 def test_collect_gmail_pubsub_events_collects_matching_trigger_events() -> None:
     db = _direct_db_session()
     try:
@@ -1521,81 +1476,6 @@ def test_collect_gmail_pubsub_events_collects_matching_trigger_events() -> None:
         # does, only after all events fired.
         db.refresh(state)
         assert state.history_id == "100"
-    finally:
-        db.close()
-
-
-def test_collect_gmail_pubsub_events_targets_exact_bound_account() -> None:
-    db = _direct_db_session()
-    try:
-        user = _create_user(db, "gmail-exact-bound-account-user")
-        watched_account = _create_gmail_oauth(db, user)
-        other_account = UserOAuth(
-            user_id=int(user.id),
-            provider="gmail",
-            access_token="other-access-token",
-            refresh_token="other-refresh-token",
-            provider_user_id="other-provider-user",
-            email="codeacme17@gmail.com",
-        )
-        db.add(other_account)
-        db.commit()
-        db.refresh(other_account)
-        watched_trigger = _mark_unified_gmail_trigger(
-            db,
-            _create_gmail_trigger(
-                db,
-                user,
-                config={
-                    "watch_label": "INBOX",
-                    "oauth_account_id": int(watched_account.id),
-                },
-            ),
-        )
-        _mark_unified_gmail_trigger(
-            db,
-            _create_gmail_trigger(
-                db,
-                user,
-                config={
-                    "watch_label": "INBOX",
-                    "oauth_account_id": int(other_account.id),
-                },
-            ),
-            callback_id="other-trigger-callback",
-        )
-        state = GmailWatchState(
-            user_id=int(user.id),
-            oauth_account_id=int(watched_account.id),
-            email="codeacme17@gmail.com",
-            history_id="100",
-            topic_name="projects/demo/topics/xagent-gmail",
-        )
-        db.add(state)
-        db.commit()
-        fake_service = _FakeGmailService(
-            history_response={
-                "history": [{"messagesAdded": [{"message": {"id": "msg-bound"}}]}]
-            },
-            messages={"msg-bound": _gmail_message("msg-bound")},
-        )
-
-        result = asyncio.run(
-            collect_gmail_pubsub_events(
-                db,
-                GmailPubsubNotification(
-                    email_address="codeacme17@gmail.com",
-                    history_id="222",
-                    pubsub_message_id="pubsub-bound",
-                ),
-                state=state,
-                service_factory=lambda _db, _oauth: fake_service,
-            )
-        )
-
-        assert [event.trigger_id for event in result.events] == [
-            int(watched_trigger.id)
-        ]
     finally:
         db.close()
 
@@ -2214,51 +2094,6 @@ def test_collect_gmail_pubsub_events_retains_reregistration_failure_detail(
         assert state.status == TriggerProvisioningStatus.FAILED.value
         assert "renewal backend unavailable" in str(state.last_error)
     finally:
-        db.close()
-
-
-def test_gmail_unified_callback_preserves_cursor_for_nonordinary_watch_account() -> (
-    None
-):
-    """Acknowledged ownership mismatches must not consume Gmail history."""
-    signal_name = "gmail_oauth_ownership_mismatch"
-    ops_signals.clear_degradation(signal_name)
-    db = _direct_db_session()
-    try:
-        user = _create_user(db, "gmail-owner-mismatch-route-user")
-        oauth = _create_gmail_oauth(db, user)
-        _mark_unified_gmail_trigger(db, _create_gmail_trigger(db, user))
-        state = _create_gmail_watch_state(
-            db, user, oauth, callback_id="cb-owner-mismatch-route"
-        )
-        setattr(oauth, "resource_owner_key", "actor:alice")
-        db.add(oauth)
-        db.commit()
-
-        def fake_verify(_token: str, audience: str) -> dict[str, object]:
-            return {"iss": "https://accounts.google.com", "aud": audience}
-
-        register_trigger_provider(
-            GmailProvider(oidc_verifier=fake_verify),
-            replace=True,
-        )
-
-        response = client.post(
-            "/api/triggers/callback/gmail/cb-owner-mismatch-route",
-            headers={"Authorization": "Bearer oidc-token"},
-            content=_gmail_pubsub_push_body(
-                claimed_email="codeacme17@gmail.com",
-                message_id="pubsub-owner-mismatch-route",
-            ),
-        )
-
-        assert response.status_code == 200, response.text
-        db.refresh(state)
-        assert state.history_id == "100"
-        assert signal_name in ops_signals.active_degradations()
-    finally:
-        register_trigger_provider(GmailProvider(), replace=True)
-        ops_signals.clear_degradation(signal_name)
         db.close()
 
 

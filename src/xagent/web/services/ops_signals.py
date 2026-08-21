@@ -24,9 +24,6 @@ GMAIL_OIDC_SERVICE_ACCOUNT_UNVERIFIED = "gmail_oidc_service_account_unverified"
 # are disabled, so Gmail triggers report failed provisioning and existing
 # watches expire unrenewed.
 GMAIL_WATCH_REGISTRATION_DISABLED = "gmail_watch_registration_disabled"
-# Set when persisted Gmail watch ownership no longer matches an ordinary OAuth
-# account. The mismatch requires data repair, so no request path clears it.
-GMAIL_OAUTH_OWNERSHIP_MISMATCH = "gmail_oauth_ownership_mismatch"
 CHECKPOINT_DECODE_FALLBACK = "checkpoint_decode_fallback"
 CHECKPOINT_LEGACY_POINTER_AMBIGUOUS = "checkpoint_legacy_pointer_ambiguous"
 CHECKPOINT_LOAD_UNAVAILABLE = "checkpoint_load_unavailable"

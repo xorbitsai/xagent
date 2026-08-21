@@ -524,7 +524,7 @@ function BuildsPageContent() {
       />
 
       {/* Main Content */}
-      <div className="flex-1 px-4 md:px-6 pb-6 space-y-6 overflow-auto">
+      <div className="flex-1 px-4 md:px-6 py-6 space-y-6 overflow-auto">
         {/* Loading State */}
         {loading ? (
           <div className="flex items-center justify-center h-[400px]">
@@ -563,7 +563,7 @@ function BuildsPageContent() {
           />
         ) : (
           <>
-            <div className="flex flex-wrap items-center justify-between gap-3 border-b pb-3">
+            <div className="flex flex-wrap items-center justify-between gap-3">
               <SegmentedTabs items={statusTabs} value={statusTab} onValueChange={(value) => setStatusTab(value as typeof statusTab)} />
               <button
                 type="button"
@@ -577,7 +577,7 @@ function BuildsPageContent() {
 
             {/* List */}
             {filteredAgents.length > 0 ? (
-              <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4">
+              <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 2xl:grid-cols-4 gap-4">
                 {filteredAgents.map((agent) => {
                   const resolvedLogoUrl = resolveAgentLogoUrl(agent.logo_url, getApiUrl())
                   const template = agent.template_id ? templatesById[agent.template_id] : undefined
@@ -697,7 +697,7 @@ function BuildsPageContent() {
                           </div>
                         )}
 
-                      <p className="mt-4 text-[13px] leading-relaxed text-muted-foreground line-clamp-3 min-h-[60px]">
+                      <p className="mt-4 flex-1 text-[13px] leading-relaxed text-muted-foreground line-clamp-3 min-h-[60px]">
                         {agent.description || t('builds.card.noDescription')}
                       </p>
 

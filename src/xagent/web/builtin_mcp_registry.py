@@ -739,9 +739,10 @@ def get_builtin_public_mcp_app_rows() -> list[dict[str, Any]]:
             # the key because US/EU Cloud are separate deployments -- a key
             # from one host is not valid against the other (unlike, say,
             # Intercom's single auto-routing API host). posthog.py's
-            # _base_url() restricts this to a posthog.com host: self-hosted
-            # PostHog is not a documented target of this connector, so
-            # there's no reason to let this key be sent anywhere else.
+            # _base_url() restricts this to exactly those two hosts (not a
+            # broader "*.posthog.com" allowlist): self-hosted PostHog is
+            # not a documented target of this connector, so there's no
+            # reason to let this key be sent anywhere else.
             "launch_config": {
                 "command": "python",
                 "args": ["-m", "xagent.web.tools.mcp.posthog"],

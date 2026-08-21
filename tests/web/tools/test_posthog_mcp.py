@@ -32,6 +32,7 @@ class MockResponse:
         text: str = "",
         url: str = "",
         json_raises: bool = False,
+        headers: dict | None = None,
     ):
         self._json_data = json_data if json_data is not None else {}
         self._json_raises = json_raises
@@ -39,6 +40,7 @@ class MockResponse:
         self.text = text or (json.dumps(self._json_data) if json_data else "")
         self.content = self.text.encode()
         self.url = url
+        self.headers = headers or {}
 
     def json(self):
         if self._json_raises:
@@ -92,6 +94,11 @@ def test_base_url_requires_host(monkeypatch):
         ("HTTPS://us.posthog.com", "https://us.posthog.com"),
         ("https://eu.posthog.com///", "https://eu.posthog.com"),
         ("https://us.posthog.com.", "https://us.posthog.com"),
+        # the default port spelled out explicitly is a no-op, not a real
+        # customization -- it's exactly the port every request already
+        # goes to, so rejecting it would break a previously-valid,
+        # harmless config value for no functional reason.
+        ("us.posthog.com:443", "https://us.posthog.com"),
     ],
 )
 def test_base_url_normalizes_valid_host(monkeypatch, host, expected):
@@ -376,10 +383,9 @@ def test_request_returns_empty_dict_for_204(monkeypatch):
 
 def test_request_retries_once_on_429_with_retry_after(monkeypatch):
     responses = [
-        MockResponse(status_code=429, text="", url="x"),
+        MockResponse(status_code=429, url="x", headers={"Retry-After": "1"}),
         MockResponse(json_data={"ok": True}),
     ]
-    responses[0].headers = {"Retry-After": "1"}
     mock_request = Mock(side_effect=responses)
     monkeypatch.setattr(posthog.requests, "request", mock_request)
     monkeypatch.setattr(posthog.time, "sleep", Mock())
@@ -392,8 +398,7 @@ def test_request_retries_once_on_429_with_retry_after(monkeypatch):
 
 
 def test_request_does_not_retry_a_second_429(monkeypatch):
-    response = MockResponse(status_code=429, text="", url="x")
-    response.headers = {"Retry-After": "1"}
+    response = MockResponse(status_code=429, url="x", headers={"Retry-After": "1"})
     mock_request = Mock(return_value=response)
     monkeypatch.setattr(posthog.requests, "request", mock_request)
     monkeypatch.setattr(posthog.time, "sleep", Mock())

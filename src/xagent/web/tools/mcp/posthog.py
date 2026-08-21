@@ -107,11 +107,16 @@ def _base_url() -> str:
             "query, or fragment"
         )
     try:
-        has_port = parsed.port is not None
+        port = parsed.port
     except ValueError as exc:
         raise ValueError(f"POSTHOG_HOST has an invalid port: {exc}") from exc
-    if has_port:
-        raise ValueError("POSTHOG_HOST must not include a port")
+    # 443 is the port every request already goes to below, so spelling it
+    # out is a harmless no-op, not a real customization -- only reject a
+    # port that would actually change where this connects.
+    if port is not None and port != 443:
+        raise ValueError(
+            "POSTHOG_HOST must not include a port other than the default 443"
+        )
     # A trailing "." denotes the DNS root and is semantically equivalent to
     # the same name without it (e.g. "us.posthog.com." == "us.posthog.com");
     # drop it before the allowlist comparison, or a syntactically valid

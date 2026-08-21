@@ -268,8 +268,14 @@ def _request(
 
 
 def _paginated_results(payload: dict[str, Any], limit: int) -> tuple[list[Any], bool]:
-    data = payload.get("data") or []
-    if not isinstance(data, list):
+    data = payload.get("data")
+    if data is None:
+        data = []
+    elif not isinstance(data, list):
+        # Checked before any `or []`-style fallback: that would silently
+        # coerce a falsy-but-invalid value (0, "", False) to an empty list
+        # instead of catching it here, defeating the point of this check
+        # for exactly the malformed-response shapes it's meant to catch.
         raise RuntimeError(
             f"Stripe returned a non-list 'data' field ({type(data).__name__})"
         )

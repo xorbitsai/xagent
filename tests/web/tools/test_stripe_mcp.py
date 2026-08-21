@@ -981,6 +981,21 @@ def test_paginated_results_rejects_non_list_data():
         stripe._paginated_results({"data": "not-a-list"}, limit=3)
 
 
+@pytest.mark.parametrize("falsy_invalid_data", [0, "", False])
+def test_paginated_results_rejects_falsy_non_list_data(falsy_invalid_data):
+    """A falsy-but-wrong-type value (0/""/False) must still be rejected, not
+    silently coerced to an empty list by an `or []`-style fallback."""
+    with pytest.raises(RuntimeError, match="non-list"):
+        stripe._paginated_results({"data": falsy_invalid_data}, limit=3)
+
+
+def test_paginated_results_defaults_missing_data_to_empty_list():
+    data, truncated = stripe._paginated_results({}, limit=3)
+
+    assert data == []
+    assert truncated is False
+
+
 def test_request_raises_on_non_json_success_body(monkeypatch):
     response = Mock()
     response.status_code = 200

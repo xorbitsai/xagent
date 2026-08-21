@@ -1,6 +1,6 @@
 "use client"
 
-import React, { useState, useEffect, useRef } from "react"
+import React, { useState, useEffect, useMemo, useRef } from "react"
 import { SearchInput } from "@/components/ui/search-input"
 import { Button } from "@/components/ui/button"
 import { PageHeader } from "@/components/ui/page-header"
@@ -51,6 +51,15 @@ import {
   BuildPageExtensionProvider,
 } from "@/lib/build-page-extension"
 
+type StatusTab = "all" | "enabled" | "drafts"
+
+const matchesStatusTab = (agent: Agent, tab: StatusTab): boolean =>
+  tab === "all" ? true : tab === "enabled" ? agent.status === "published" : agent.status === "draft"
+
+const matchesSearch = (agent: Agent, searchTerm: string): boolean =>
+  agent.name.toLowerCase().includes(searchTerm.toLowerCase()) ||
+  Boolean(agent.description && agent.description.toLowerCase().includes(searchTerm.toLowerCase()))
+
 function BuildsPageContent() {
   const { t, locale } = useI18n()
   const { dispatch, setTaskId, setPendingMessage } = useApp()
@@ -67,7 +76,7 @@ function BuildsPageContent() {
   const [searchTerm, setSearchTerm] = useState("")
   const [agents, setAgents] = useState<Agent[]>([])
   const [loading, setLoading] = useState(true)
-  const [statusTab, setStatusTab] = useState<"all" | "enabled" | "drafts">("all")
+  const [statusTab, setStatusTab] = useState<StatusTab>("all")
   const [sortMode, setSortMode] = useState<"updated" | "name">("updated")
   // Best-effort enrichment only: an agent traces back to the template it was
   // hired from via `template_id`, and this lookup supplies that template's
@@ -346,31 +355,36 @@ function BuildsPageContent() {
     })
   }
 
-  const matchesSearch = (agent: Agent) =>
-    agent.name.toLowerCase().includes(searchTerm.toLowerCase()) ||
-    (agent.description && agent.description.toLowerCase().includes(searchTerm.toLowerCase()))
+  const statusTabs: SegmentedTabItem[] = useMemo(
+    () =>
+      (["all", "enabled", "drafts"] as const).map((tab) => ({
+        id: tab,
+        label: (
+          <>
+            {t(`builds.list.tabs.${tab}`)}
+            <span className="ml-1.5 text-[10px] text-muted-foreground/70">
+              {
+                agents
+                  .filter((agent) => matchesStatusTab(agent, tab))
+                  .filter((agent) => matchesSearch(agent, searchTerm)).length
+              }
+            </span>
+          </>
+        ),
+      })),
+    [agents, searchTerm, t]
+  )
 
-  const matchesStatusTab = (agent: Agent, tab: typeof statusTab) =>
-    tab === "all" ? true : tab === "enabled" ? agent.status === "published" : agent.status === "draft"
-
-  const statusTabs: SegmentedTabItem[] = (["all", "enabled", "drafts"] as const).map((tab) => ({
-    id: tab,
-    label: (
-      <>
-        {t(`builds.list.tabs.${tab}`)}
-        <span className="ml-1.5 text-[10px] text-muted-foreground/70">
-          {agents.filter((agent) => matchesStatusTab(agent, tab)).filter(matchesSearch).length}
-        </span>
-      </>
-    ),
-  }))
-
-  const filteredAgents = agents
-    .filter((agent) => matchesStatusTab(agent, statusTab))
-    .filter(matchesSearch)
-    .sort((a, b) =>
-      sortMode === "name" ? a.name.localeCompare(b.name) : b.updated_at.localeCompare(a.updated_at)
-    )
+  const filteredAgents = useMemo(
+    () =>
+      agents
+        .filter((agent) => matchesStatusTab(agent, statusTab))
+        .filter((agent) => matchesSearch(agent, searchTerm))
+        .sort((a, b) =>
+          sortMode === "name" ? a.name.localeCompare(b.name) : b.updated_at.localeCompare(a.updated_at)
+        ),
+    [agents, statusTab, searchTerm, sortMode]
+  )
 
   const [isCreateModalOpen, setIsCreateModalOpen] = useState(false)
   const [createPrompt, setCreatePrompt] = useState("")
@@ -564,7 +578,7 @@ function BuildsPageContent() {
         ) : (
           <>
             <div className="flex flex-wrap items-center justify-between gap-3">
-              <SegmentedTabs items={statusTabs} value={statusTab} onValueChange={(value) => setStatusTab(value as typeof statusTab)} />
+              <SegmentedTabs items={statusTabs} value={statusTab} onValueChange={(value) => setStatusTab(value as StatusTab)} />
               <button
                 type="button"
                 onClick={() => setSortMode((mode) => (mode === "updated" ? "name" : "updated"))}

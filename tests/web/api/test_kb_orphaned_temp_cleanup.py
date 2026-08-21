@@ -59,36 +59,40 @@ def test_cleanup_stops_early_when_stop_event_is_set(tmp_path: Path):
     assert (tmp_path / "old.tmp-replace").exists()
 
 
-class _StopAfter:
-    """Stop flag that reports 'set' only from its Nth is_set() poll onward.
+class _StopAfterFirstPoll:
+    """Stop flag that is unset on its first poll and set on every poll after.
 
-    Proves the walk checks the flag once per directory rather than only once
-    before the loop: with a nested tree, tripping after the root + one subdir
-    have been visited leaves the remaining subdir untouched.
+    The seed (root) directory is always popped on the first poll, so the walk
+    processes root and then breaks before descending into any subdirectory.
+    This pins the per-directory granularity without depending on the exact poll
+    count or on scandir ordering: if the flag were checked only once before the
+    loop it would be unset (first poll), so the subdir file would be swept too.
     """
 
-    def __init__(self, trip_on_call: int) -> None:
-        self._calls = 0
-        self._trip = trip_on_call
+    def __init__(self) -> None:
+        self._polled = False
 
     def is_set(self) -> bool:
-        self._calls += 1
-        return self._calls >= self._trip
+        if not self._polled:
+            self._polled = True
+            return False
+        return True
 
 
 def test_cleanup_stops_midwalk_at_directory_boundary(tmp_path: Path):
     old = ORPHAN_AGE_SECONDS + 600
-    _write_aged(tmp_path / "a" / "x.tmp-replace", age=old)
-    _write_aged(tmp_path / "b" / "y.tmp-replace", age=old)
+    # One orphan in the root, one nested a level down. The stop trips after the
+    # root directory is processed, so the subdir is never descended into.
+    _write_aged(tmp_path / "root_orphan.tmp-replace", age=old)
+    _write_aged(tmp_path / "sub" / "nested.tmp-replace", age=old)
 
-    # Poll 1: pop root, push a + b. Poll 2: pop one subdir, sweep its file.
-    # Poll 3: reports set -> break before the second subdir is swept.
-    stop = _StopAfter(trip_on_call=3)
+    stop = _StopAfterFirstPoll()
 
     removed = cleanup_orphaned_temp_files(upload_dir=tmp_path, stop_event=stop)
 
     assert removed == 1
-    assert len(list(tmp_path.rglob("*.tmp-replace"))) == 1
+    assert not (tmp_path / "root_orphan.tmp-replace").exists()
+    assert (tmp_path / "sub" / "nested.tmp-replace").exists()
 
 
 def test_cleanup_excludes_symlinks_named_like_temp_files(tmp_path: Path):

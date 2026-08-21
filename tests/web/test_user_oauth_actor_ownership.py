@@ -5,6 +5,7 @@ from sqlalchemy import create_engine, event
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import sessionmaker
 
+from xagent.web.models import database
 from xagent.web.models.database import Base
 from xagent.web.models.user import User
 from xagent.web.models.user_oauth import UserOAuth
@@ -152,6 +153,41 @@ def test_user_oauth_accounts_relationship_contains_only_ordinary_rows(tmp_path) 
     finally:
         db.close()
         engine.dispose()
+
+
+def test_production_sqlite_engine_cascades_hidden_actor_oauth_rows(tmp_path) -> None:
+    previous_engine = database._engine
+    previous_session_local = database._SessionLocal
+    database.configure_db(db_url=f"sqlite:///{tmp_path / 'production-cascade.db'}")
+    engine = database.get_engine()
+    Base.metadata.create_all(engine)
+    db = database.get_session_local()()
+    try:
+        assert db.connection().exec_driver_sql("PRAGMA foreign_keys").scalar_one() == 1
+        user = User(username="production-cascade-owner", password_hash="hash")
+        db.add(user)
+        db.commit()
+        db.refresh(user)
+        db.add(
+            UserOAuth(
+                user_id=int(user.id),
+                provider="gmail",
+                resource_owner_key="actor:alice",
+                provider_user_id="alice",
+                access_token="actor-token",
+            )
+        )
+        db.commit()
+
+        db.delete(user)
+        db.commit()
+
+        assert db.query(UserOAuth).count() == 0
+    finally:
+        db.close()
+        engine.dispose()
+        database._engine = previous_engine
+        database._SessionLocal = previous_session_local
 
 
 def test_sqlite_user_delete_cascades_hidden_actor_oauth_rows(tmp_path) -> None:

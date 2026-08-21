@@ -38,6 +38,7 @@ branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
 TABLE = "user_oauth"
+SQLITE_BATCH_TEMP_TABLE = "_alembic_tmp_user_oauth"
 USERS_TABLE = "users"
 USER_CASCADE_FK = "fk_user_oauth_user_id_users"
 OWNER_COLUMN = "resource_owner_key"
@@ -166,6 +167,21 @@ def _owner_indexes_are_current(dialect: str) -> bool:
     return not _missing_owner_index_definitions(dialect)
 
 
+def _sqlite_batch_temp_table_exists() -> bool:
+    return (
+        op.get_bind()
+        .execute(
+            sa.text(
+                "SELECT 1 FROM sqlite_master "
+                "WHERE type = 'table' AND name = :name LIMIT 1"
+            ),
+            {"name": SQLITE_BATCH_TEMP_TABLE},
+        )
+        .first()
+        is not None
+    )
+
+
 def _sqlite_global_owner_relation_names() -> set[str]:
     rows = op.get_bind().execute(
         sa.text(
@@ -198,6 +214,12 @@ def _create_owner_indexes(
 
 def upgrade() -> None:
     dialect = _require_partial_unique_index_support()
+    if dialect == "sqlite" and _sqlite_batch_temp_table_exists():
+        raise RuntimeError(
+            "interrupted SQLite UserOAuth rebuild left temporary table "
+            f"{SQLITE_BATCH_TEMP_TABLE}; restore the verified backup or have a "
+            "database operator inspect both tables before retrying"
+        )
     if not _table_exists():
         return
 

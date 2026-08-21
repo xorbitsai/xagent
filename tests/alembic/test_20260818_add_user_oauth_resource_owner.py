@@ -193,6 +193,68 @@ def _where(index: dict) -> str:
     return str(clause if clause is not None else "").lower()
 
 
+def test_upgrade_rejects_leftover_sqlite_batch_table_before_rebuild(tmp_path) -> None:
+    engine = create_engine(f"sqlite:///{tmp_path / 'oauth-batch-temp.db'}")
+    migration = _migration_module()
+
+    with engine.begin() as connection:
+        _create_old_table(connection)
+        connection.execute(text("INSERT INTO users (id) VALUES (7)"))
+        connection.execute(
+            text(
+                "INSERT INTO user_oauth "
+                "(id, user_id, provider, access_token, provider_user_id) "
+                "VALUES (1, 7, 'gmail', 'ordinary', 'provider-account')"
+            )
+        )
+        connection.execute(
+            text("CREATE TABLE _alembic_tmp_user_oauth (id INTEGER PRIMARY KEY)")
+        )
+
+        with patch.object(migration, "op", _operations(connection)):
+            with pytest.raises(RuntimeError, match="temporary table"):
+                migration.upgrade()
+
+        assert (
+            connection.execute(
+                text("SELECT access_token FROM user_oauth WHERE id = 1")
+            ).scalar_one()
+            == "ordinary"
+        )
+
+
+def test_upgrade_rejects_orphan_sqlite_batch_table_before_missing_table_return(
+    tmp_path,
+) -> None:
+    engine = create_engine(f"sqlite:///{tmp_path / 'oauth-orphan-temp.db'}")
+    migration = _migration_module()
+
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "CREATE TABLE _alembic_tmp_user_oauth "
+                "(id INTEGER PRIMARY KEY, access_token TEXT)"
+            )
+        )
+        connection.execute(
+            text(
+                "INSERT INTO _alembic_tmp_user_oauth (id, access_token) "
+                "VALUES (1, 'stranded')"
+            )
+        )
+
+        with patch.object(migration, "op", _operations(connection)):
+            with pytest.raises(RuntimeError, match="temporary table"):
+                migration.upgrade()
+
+        assert (
+            connection.execute(
+                text("SELECT access_token FROM _alembic_tmp_user_oauth WHERE id = 1")
+            ).scalar_one()
+            == "stranded"
+        )
+
+
 @pytest.mark.parametrize(
     "existing_indexes",
     [
@@ -639,6 +701,7 @@ def test_upgrade_rejects_partially_owner_aware_schema(
 
     with (
         patch.object(migration, "op", fake_op),
+        patch.object(migration, "_sqlite_batch_temp_table_exists", return_value=False),
         patch.object(migration, "_table_exists", return_value=True),
         patch.object(migration, "_users_table_exists", return_value=True),
         patch.object(migration, "_column_names", return_value=columns),

@@ -1,7 +1,7 @@
 """seed built-in Stripe (key-based) MCP connector
 
 Revision ID: 20260818_seed_stripe_mcp_app
-Revises: 20260820_merge_jira_posthog_heads
+Revises: b1efe0dbe0af
 Create Date: 2026-08-18 00:00:00.000000
 
 """
@@ -13,7 +13,7 @@ from alembic import op
 
 # revision identifiers, used by Alembic.
 revision: str = "20260818_seed_stripe_mcp_app"
-down_revision: Union[str, None] = "20260820_merge_jira_posthog_heads"
+down_revision: Union[str, None] = "b1efe0dbe0af"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 

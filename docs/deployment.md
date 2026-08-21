@@ -184,8 +184,8 @@ Because this release cannot create actor-owned rows, the downgrade remains avail
 1. Stop all workers before the downgrade.
 2. If the database is SQLite, create a current database backup.
 3. If the database is SQLite, run `PRAGMA integrity_check;` against the backup. The result must be `ok`.
-4. Run `alembic downgrade 20260820_merge_jira_posthog_heads`.
-5. Run `alembic current`. The command must report only `20260820_merge_jira_posthog_heads`.
+4. Run `alembic downgrade b1efe0dbe0af`.
+5. Run `alembic current`. The command must report only `b1efe0dbe0af`.
 6. If the database is SQLite, run `PRAGMA integrity_check;` and `PRAGMA foreign_key_check;`.
 7. If the database is SQLite, inspect `PRAGMA table_info('user_oauth');`. The result must not contain `resource_owner_key`.
 8. If the database is SQLite, inspect `PRAGMA index_list('user_oauth');` and each `PRAGMA index_info('<index-name>');` result. One unique index must cover `(user_id, provider, provider_user_id)`.

@@ -274,7 +274,7 @@ class TestMigrations:
         self, postgresql_tester
     ):
         """After operator remediation, retry starts from the intact old schema."""
-        down_revision = "20260820_merge_jira_posthog_heads"
+        down_revision = "b1efe0dbe0af"
         ordinary_index = "uq_user_oauth_ordinary_account"
         actor_index = "uq_user_oauth_actor_account"
         old_constraint = "uq_user_provider_account"
@@ -317,7 +317,7 @@ class TestMigrations:
         self, postgresql_tester
     ):
         """The migrated PostgreSQL predicates separate ordinary and actor rows."""
-        parent = "20260820_merge_jira_posthog_heads"
+        parent = "b1efe0dbe0af"
         owner_revision = "20260818_user_oauth_resource_owner"
         command.upgrade(postgresql_tester.alembic_cfg, parent)
         with postgresql_tester.engine.begin() as conn:
@@ -411,7 +411,7 @@ class TestMigrations:
         self, postgresql_tester
     ):
         """The supported PostgreSQL downgrade restores the old identity shape."""
-        parent = "20260820_merge_jira_posthog_heads"
+        parent = "b1efe0dbe0af"
         owner_revision = "20260818_user_oauth_resource_owner"
         command.upgrade(postgresql_tester.alembic_cfg, parent)
         with postgresql_tester.engine.begin() as conn:
@@ -457,7 +457,7 @@ class TestMigrations:
 
     def test_sqlite_owner_downgrade_restores_one_known_head(self, sqlite_tester):
         """Rollback removes owner storage and retains the existing merge head."""
-        parent = "20260820_merge_jira_posthog_heads"
+        parent = "b1efe0dbe0af"
 
         command.upgrade(sqlite_tester.alembic_cfg, "head")
         command.downgrade(sqlite_tester.alembic_cfg, parent)
@@ -517,7 +517,7 @@ class TestMigrations:
         # owner migration's fresh-schema path.
         command.stamp(
             postgresql_tester.alembic_cfg,
-            "20260820_merge_jira_posthog_heads",
+            "b1efe0dbe0af",
         )
 
         command.upgrade(postgresql_tester.alembic_cfg, "head")

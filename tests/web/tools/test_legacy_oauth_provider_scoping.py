@@ -59,6 +59,16 @@ def test_restrict_to_app_scoped_oauth_grant_normalizes_admin_created_app_id():
     assert requires_app_scoped_oauth_grant("FACEBOOK") is True
 
 
+def test_requires_app_scoped_oauth_grant_github_addition_leaves_meta_unaffected():
+    """github was added to APPS_REQUIRING_APP_SCOPED_OAUTH_GRANT alongside
+    facebook -- pin that this didn't also flip instagram or the bare
+    "meta" provider string, which must stay unaffected."""
+    assert requires_app_scoped_oauth_grant("github") is True
+    assert requires_app_scoped_oauth_grant("GitHub") is True
+    assert requires_app_scoped_oauth_grant("instagram") is False
+    assert requires_app_scoped_oauth_grant("meta") is False
+
+
 def test_restrict_to_app_scoped_oauth_grant_dedupes_and_preserves_order():
     assert restrict_to_app_scoped_oauth_grant(
         "instagram", ["meta", "meta", "instagram", None, ""]

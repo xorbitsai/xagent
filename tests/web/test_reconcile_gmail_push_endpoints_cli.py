@@ -180,5 +180,6 @@ def test_configure_db_enforces_read_only_postgresql_transactions(
     assert created["kwargs"] == {
         "poolclass": database.QueuePool,
         **database.get_db_pool_kwargs(),
+        "hide_parameters": True,
         "execution_options": {"postgresql_readonly": True},
     }

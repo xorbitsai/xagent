@@ -254,6 +254,43 @@ def test_intercom_callback_fails_cleanly_when_token_exchange_yields_no_token(
     )
 
 
+def test_intercom_error_list_message_is_length_capped(db_session, monkeypatch):
+    """The error.list envelope's detail is echoed to the browser the same
+    way the standard error/error_description branch is -- it must be
+    capped the same way (500 chars), not echoed unbounded."""
+    db, user = db_session
+    state = create_access_token(
+        data={
+            "type": "oauth_state",
+            "user_id": user.id,
+            "provider": "intercom",
+            "app_id": "intercom",
+        },
+        expires_delta=timedelta(minutes=10),
+    )
+    request = SimpleNamespace(query_params={"code": "bad-code", "state": state})
+
+    long_message = "x" * 10_000
+    monkeypatch.setattr(
+        auth_api.requests,
+        "post",
+        Mock(
+            return_value=MockResponse(
+                {"type": "error.list", "errors": [{"message": long_message}]}
+            )
+        ),
+    )
+    monkeypatch.setattr(auth_api.requests, "get", Mock())
+
+    response = generic_oauth_callback("intercom", request, db, _intercom_provider())
+
+    assert response.status_code == 400
+    body = response.body.decode()
+    assert long_message not in body
+    assert "x" * 500 in body
+    assert "x" * 501 not in body
+
+
 def test_hidden_intercom_app_rejects_single_app_oauth_connect(
     hidden_db_session, monkeypatch
 ):
@@ -428,12 +465,12 @@ def test_access_token_guard_applies_to_a_non_intercom_provider_too(monkeypatch):
     engine.dispose()
 
 
-def test_intercom_callback_surfaces_500_for_non_json_token_response(
-    db_session, monkeypatch
-):
-    """Pre-existing behavior, not a new fix: a non-JSON token response has no
-    status check ahead of token_response.json(), so it falls through to the
-    generic exception handler as a 500 rather than the clean 400 guard."""
+def test_intercom_callback_rejects_non_json_token_response(db_session, monkeypatch):
+    """token_response.json() is now guarded the same way for every provider
+    (generic_oauth_callback, api/auth.py), not just GitHub: a non-JSON body
+    gets the clean 400 error page instead of falling through to the generic
+    exception handler as an unhandled-feeling 500. Previously pinned as a
+    known 500 here; this is the fix, not a regression."""
     db, user = db_session
     state = create_access_token(
         data={
@@ -453,7 +490,8 @@ def test_intercom_callback_surfaces_500_for_non_json_token_response(
 
     response = generic_oauth_callback("intercom", request, db, _intercom_provider())
 
-    assert response.status_code == 500
+    assert response.status_code == 400
+    assert "could not be parsed" in response.body.decode()
     assert (
         db.query(UserOAuth)
         .filter(UserOAuth.user_id == user.id, UserOAuth.provider == "intercom")
@@ -462,14 +500,15 @@ def test_intercom_callback_surfaces_500_for_non_json_token_response(
     )
 
 
-def test_intercom_callback_hits_access_token_guard_on_non_200_json_response(
+def test_intercom_callback_rejects_non_2xx_json_response_with_no_error_field(
     db_session, monkeypatch
 ):
-    """A non-200 status with a JSON body carrying neither "error" nor a
-    token is untested territory: there is no explicit status check ahead of
-    the "error" in token_data guard, so this must still resolve cleanly via
-    the access_token guard rather than silently proceeding as if it were a
-    success."""
+    """A non-2xx status with a JSON body carrying neither "error" nor a
+    token must be rejected on the status code itself, not only inferred
+    from the body missing an access_token -- otherwise a non-2xx response
+    that happens to carry an access_token-shaped field (a misbehaving
+    proxy/gateway, a stale cached body) would be trusted as success purely
+    because the body shape looked fine."""
     db, user = db_session
     state = create_access_token(
         data={
@@ -492,5 +531,5 @@ def test_intercom_callback_hits_access_token_guard_on_non_200_json_response(
     response = generic_oauth_callback("intercom", request, db, _intercom_provider())
 
     assert response.status_code == 400
-    assert "did not return an access token" in response.body.decode()
+    assert "status 503" in response.body.decode()
     get_mock.assert_not_called()

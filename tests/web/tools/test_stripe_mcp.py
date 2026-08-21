@@ -8,13 +8,19 @@ from xagent.web.tools.mcp import stripe
 
 class MockResponse:
     def __init__(
-        self, json_data=None, status_code: int = 200, text: str = "", url: str = ""
+        self,
+        json_data=None,
+        status_code: int = 200,
+        text: str = "",
+        url: str = "",
+        headers=None,
     ):
         self._json_data = json_data if json_data is not None else {}
         self.status_code = status_code
         self.text = text or (json.dumps(self._json_data) if json_data else "")
         self.content = self.text.encode()
         self.url = url
+        self.headers = headers or {}
 
     def json(self):
         return self._json_data
@@ -368,6 +374,37 @@ def test_create_customer_omits_optional_fields_when_not_provided(monkeypatch):
     assert mock_request.call_args.kwargs["data"] is None
 
 
+def test_create_customer_reports_idempotent_replayed_true_on_dedup(monkeypatch):
+    mock_request = Mock(
+        return_value=MockResponse(
+            json_data={"id": "cus_1"}, headers={"Idempotent-Replayed": "true"}
+        )
+    )
+    monkeypatch.setattr(stripe.requests, "request", mock_request)
+
+    result = json.loads(stripe.stripe_create_customer(name="Acme"))
+
+    assert result["idempotent_replayed"] is True
+
+
+def test_create_customer_reports_idempotent_replayed_false_on_fresh_create(
+    monkeypatch,
+):
+    mock_request = Mock(return_value=MockResponse(json_data={"id": "cus_1"}))
+    monkeypatch.setattr(stripe.requests, "request", mock_request)
+
+    result = json.loads(stripe.stripe_create_customer(name="Acme"))
+
+    assert result["idempotent_replayed"] is False
+
+
+def test_get_customer_requires_non_empty_id():
+    result = json.loads(stripe.stripe_get_customer(""))
+
+    assert result["status"] == "error"
+    assert "customer_id is required" in result["message"]
+
+
 def test_list_charges_uses_customer_filter(monkeypatch):
     mock_request = Mock(
         return_value=MockResponse(
@@ -394,6 +431,13 @@ def test_get_charge_returns_charge(monkeypatch):
 
     assert result["status"] == "success"
     assert result["charge"]["amount"] == 500
+
+
+def test_get_charge_requires_non_empty_id():
+    result = json.loads(stripe.stripe_get_charge(""))
+
+    assert result["status"] == "error"
+    assert "charge_id is required" in result["message"]
 
 
 def test_create_refund_requires_charge_or_payment_intent():
@@ -428,6 +472,28 @@ def test_create_refund_sends_payment_intent(monkeypatch):
         ("payment_intent", "pi_1"),
         ("reason", "requested_by_customer"),
     ]
+
+
+def test_create_refund_reports_idempotent_replayed_true_on_dedup(monkeypatch):
+    mock_request = Mock(
+        return_value=MockResponse(
+            json_data={"id": "re_1"}, headers={"Idempotent-Replayed": "true"}
+        )
+    )
+    monkeypatch.setattr(stripe.requests, "request", mock_request)
+
+    result = json.loads(stripe.stripe_create_refund(charge_id="ch_1"))
+
+    assert result["idempotent_replayed"] is True
+
+
+def test_create_refund_reports_idempotent_replayed_false_on_fresh_create(monkeypatch):
+    mock_request = Mock(return_value=MockResponse(json_data={"id": "re_1"}))
+    monkeypatch.setattr(stripe.requests, "request", mock_request)
+
+    result = json.loads(stripe.stripe_create_refund(charge_id="ch_1"))
+
+    assert result["idempotent_replayed"] is False
 
 
 def test_list_payment_intents_returns_results(monkeypatch):
@@ -472,6 +538,13 @@ def test_get_invoice_returns_invoice(monkeypatch):
 
     assert result["status"] == "success"
     assert result["invoice"]["total"] == 1000
+
+
+def test_get_invoice_requires_non_empty_id():
+    result = json.loads(stripe.stripe_get_invoice(""))
+
+    assert result["status"] == "error"
+    assert "invoice_id is required" in result["message"]
 
 
 def test_list_subscriptions_uses_status_filter(monkeypatch):
@@ -527,6 +600,42 @@ def test_list_prices_uses_product_filter(monkeypatch):
 
     assert result["status"] == "success"
     assert mock_request.call_args.kwargs["params"]["product"] == "prod_1"
+
+
+def test_list_prices_uses_active_filter(monkeypatch):
+    mock_request = Mock(
+        return_value=MockResponse(
+            json_data={"data": [{"id": "price_1"}], "has_more": False}
+        )
+    )
+    monkeypatch.setattr(stripe.requests, "request", mock_request)
+
+    result = json.loads(stripe.stripe_list_prices(active=True))
+
+    assert result["status"] == "success"
+    assert mock_request.call_args.kwargs["params"]["active"] == "true"
+
+
+def test_list_prices_serializes_active_false_as_lowercase_string(monkeypatch):
+    """requests would otherwise serialize a bare Python bool as "True"/"False"
+    in the query string, which Stripe's API does not accept."""
+    mock_request = Mock(
+        return_value=MockResponse(json_data={"data": [], "has_more": False})
+    )
+    monkeypatch.setattr(stripe.requests, "request", mock_request)
+
+    stripe.stripe_list_prices(active=False)
+
+    assert mock_request.call_args.kwargs["params"]["active"] == "false"
+
+
+def test_paginated_results_truncates_when_data_exceeds_limit():
+    data, truncated = stripe._paginated_results(
+        {"data": [{"id": f"cus_{i}"} for i in range(5)], "has_more": False}, limit=3
+    )
+
+    assert data == [{"id": "cus_0"}, {"id": "cus_1"}, {"id": "cus_2"}]
+    assert truncated is True
 
 
 def test_stripe_app_registry_requires_api_key():

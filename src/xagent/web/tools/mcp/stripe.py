@@ -51,6 +51,14 @@ def _clamp_limit(limit: int) -> int:
     return max(1, min(int(limit), MAX_LIMIT))
 
 
+def _bool_str(value: bool) -> str:
+    """`requests` serializes a bare Python bool as "True"/"False" in both
+    query strings and (via _flatten_form_params) form bodies, but Stripe's
+    API only accepts lowercase "true"/"false" for boolean filters/fields.
+    """
+    return "true" if value else "false"
+
+
 def _path_segment(value: str) -> str:
     """Percent-encode a value for safe interpolation into a URL path segment
     (e.g. a customer/charge/invoice id), matching jira.py's _path_segment /
@@ -65,8 +73,15 @@ def _idempotency_key(method: str, path: str, form_data: dict[str, Any] | None) -
     """Derive a stable Idempotency-Key for a mutating request from its exact
     arguments, so an agent retry of the identical tool call (e.g. after a
     timeout or dropped connection) is deduped by Stripe instead of creating a
-    second real refund/customer, while a call with genuinely different
-    arguments still gets a different key.
+    second real refund/customer.
+
+    Tradeoff: two genuinely distinct calls that happen to share identical
+    arguments (e.g. two separate real customers both created with just
+    name="Acme") are content-indistinguishable from a retry and will also be
+    deduped -- Stripe caches a key's result for ~24h and replays it verbatim.
+    Callers MUST pass `response_meta` to `_request` and surface its
+    `idempotent_replayed` flag in the tool's response so this is visible
+    rather than a silent duplicate customer/refund object.
     """
     canonical = json.dumps(
         {"method": method, "path": path, "form_data": form_data or {}},
@@ -96,7 +111,7 @@ def _flatten_form_params(value: Any, prefix: str = "") -> list[tuple[str, Any]]:
         for index, sub_value in enumerate(value):
             items.extend(_flatten_form_params(sub_value, f"{prefix}[{index}]"))
     elif isinstance(value, bool):
-        items.append((prefix, "true" if value else "false"))
+        items.append((prefix, _bool_str(value)))
     elif value is not None:
         items.append((prefix, value))
     return items
@@ -129,7 +144,13 @@ def _request(
     *,
     params: dict[str, Any] | None = None,
     form_data: dict[str, Any] | None = None,
+    response_meta: dict[str, Any] | None = None,
 ) -> Any:
+    """`response_meta`, when passed, is populated with `idempotent_replayed`
+    for POST requests -- see `_idempotency_key`'s docstring for why a caller
+    that creates a resource needs to know when a call was a dedup replay
+    rather than a fresh create.
+    """
     idempotency_key = (
         _idempotency_key(method, path, form_data) if method == "POST" else None
     )
@@ -158,6 +179,11 @@ def _request(
             detail = truncate_error_text(response.text.strip())
         raise RuntimeError(
             f"Stripe API error (status {response.status_code}): {detail}"
+        )
+
+    if response_meta is not None and idempotency_key is not None:
+        response_meta["idempotent_replayed"] = (
+            response.headers.get("Idempotent-Replayed") == "true"
         )
 
     if response.status_code == 204 or not response.content:
@@ -242,6 +268,8 @@ def stripe_get_customer(customer_id: str) -> str:
     customer_id: a Stripe customer id, e.g. "cus_ABC123".
     """
     try:
+        if not customer_id:
+            return _error("customer_id is required")
         result = _request("GET", f"/customers/{_path_segment(customer_id)}")
         return _success(customer=result)
     except Exception as e:
@@ -261,6 +289,12 @@ def stripe_create_customer(
     name/email/description: optional customer profile fields.
     metadata: optional string key/value pairs to attach for your own
     bookkeeping, e.g. {"internal_id": "6735"}.
+
+    A retry of this exact call (same arguments) is deduped by Stripe and
+    returns the original customer instead of creating a second one; the
+    response's idempotent_replayed flag is true when that happened. Vary at
+    least one argument (e.g. add a distinguishing metadata value) to
+    intentionally create another customer with otherwise-identical details.
     """
     try:
         form_data: dict[str, Any] = {}
@@ -272,8 +306,14 @@ def stripe_create_customer(
             form_data["description"] = description
         if metadata:
             form_data["metadata"] = metadata
-        result = _request("POST", "/customers", form_data=form_data)
-        return _success(customer=result)
+        response_meta: dict[str, Any] = {}
+        result = _request(
+            "POST", "/customers", form_data=form_data, response_meta=response_meta
+        )
+        return _success(
+            customer=result,
+            idempotent_replayed=response_meta.get("idempotent_replayed", False),
+        )
     except Exception as e:
         logger.error(f"Error creating Stripe customer: {e}")
         return _error(str(e))
@@ -311,6 +351,8 @@ def stripe_get_charge(charge_id: str) -> str:
     charge_id: a Stripe charge id, e.g. "ch_ABC123".
     """
     try:
+        if not charge_id:
+            return _error("charge_id is required")
         result = _request("GET", f"/charges/{_path_segment(charge_id)}")
         return _success(charge=result)
     except Exception as e:
@@ -335,6 +377,10 @@ def stripe_create_refund(
     cents for USD); omit to refund the full remaining amount.
     reason: optional one of "duplicate", "fraudulent", or
     "requested_by_customer".
+
+    A retry of this exact call (same arguments) is deduped by Stripe and
+    returns the original refund instead of creating a second one; the
+    response's idempotent_replayed flag is true when that happened.
     """
     try:
         if not charge_id and not payment_intent_id:
@@ -348,8 +394,14 @@ def stripe_create_refund(
             form_data["amount"] = amount
         if reason:
             form_data["reason"] = reason
-        result = _request("POST", "/refunds", form_data=form_data)
-        return _success(refund=result)
+        response_meta: dict[str, Any] = {}
+        result = _request(
+            "POST", "/refunds", form_data=form_data, response_meta=response_meta
+        )
+        return _success(
+            refund=result,
+            idempotent_replayed=response_meta.get("idempotent_replayed", False),
+        )
     except Exception as e:
         logger.error(f"Error creating Stripe refund: {e}")
         return _error(str(e))
@@ -420,6 +472,8 @@ def stripe_get_invoice(invoice_id: str) -> str:
     invoice_id: a Stripe invoice id, e.g. "in_ABC123".
     """
     try:
+        if not invoice_id:
+            return _error("invoice_id is required")
         result = _request("GET", f"/invoices/{_path_segment(invoice_id)}")
         return _success(invoice=result)
     except Exception as e:
@@ -475,9 +529,7 @@ def stripe_list_products(
         max_results = _clamp_limit(limit)
         params: dict[str, Any] = {"limit": max_results}
         if active is not None:
-            # `requests` serializes a bare bool as "True"/"False" in query
-            # strings, but Stripe's API only accepts lowercase "true"/"false".
-            params["active"] = "true" if active else "false"
+            params["active"] = _bool_str(active)
         if starting_after:
             params["starting_after"] = starting_after
         result = _request("GET", "/products", params=params)
@@ -509,9 +561,7 @@ def stripe_list_prices(
         if product_id:
             params["product"] = product_id
         if active is not None:
-            # `requests` serializes a bare bool as "True"/"False" in query
-            # strings, but Stripe's API only accepts lowercase "true"/"false".
-            params["active"] = "true" if active else "false"
+            params["active"] = _bool_str(active)
         if starting_after:
             params["starting_after"] = starting_after
         result = _request("GET", "/prices", params=params)

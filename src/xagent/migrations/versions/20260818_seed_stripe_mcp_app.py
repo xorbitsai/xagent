@@ -36,7 +36,7 @@ APP_ID = "stripe"
 ROW = {
     "app_id": APP_ID,
     "name": "Stripe",
-    "description": "Connect to Stripe to look up customers, charges, invoices, and subscriptions, and issue refunds.",
+    "description": "Connect to Stripe with a Restricted API Key (not your full secret key) to look up customers, charges, invoices, and subscriptions, and issue refunds.",
     "icon": "https://www.google.com/s2/favicons?domain=stripe.com&sz=128",
     "transport": "stdio",
     "provider_name": None,

@@ -957,7 +957,7 @@ def get_builtin_public_mcp_app_rows() -> list[dict[str, Any]]:
         {
             "app_id": "stripe",
             "name": "Stripe",
-            "description": "Connect to Stripe to look up customers, charges, invoices, and subscriptions, and issue refunds.",
+            "description": "Connect to Stripe with a Restricted API Key (not your full secret key) to look up customers, charges, invoices, and subscriptions, and issue refunds.",
             "icon": "https://www.google.com/s2/favicons?domain=stripe.com&sz=128",
             "transport": "stdio",
             "provider_name": None,

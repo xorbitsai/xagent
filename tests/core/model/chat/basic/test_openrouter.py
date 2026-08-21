@@ -494,7 +494,8 @@ async def test_openrouter_official_provider_pinning_disabled_by_default(
     await llm.chat([{"role": "user", "content": "Hello"}])
 
     call_kwargs = mock_client.chat.completions.create.call_args.kwargs
-    assert "extra_body" not in call_kwargs
+    assert "provider" not in call_kwargs["extra_body"]
+    assert call_kwargs["extra_body"]["thinking"] == {"type": "disabled"}
 
 
 @pytest.mark.asyncio
@@ -582,6 +583,8 @@ async def test_openrouter_provider_override_is_preserved(
     assert call_kwargs["extra_body"] == {
         "provider": {"only": ["deepinfra"]},
         "trace_id": "manual",
+        "reasoning": {"enabled": False},
+        "thinking": {"type": "disabled"},
     }
 
 
@@ -979,6 +982,116 @@ def test_openrouter_reasoning_hook_enables_reasoning_payload(monkeypatch):
         "reasoning": {"enabled": True},
         "thinking": {"type": "enabled"},
     }
+
+
+@pytest.mark.parametrize(
+    "model_name",
+    [
+        "deepseek/deepseek-v4-flash",
+        "openrouter/deepseek/deepseek-v4-flash",
+    ],
+)
+@pytest.mark.parametrize("is_streaming", [True, False])
+@pytest.mark.parametrize("response_format", [None, {"type": "json_object"}])
+def test_openrouter_deepseek_defaults_to_disabled_thinking(
+    monkeypatch, model_name, is_streaming, response_format
+):
+    monkeypatch.setenv("XAGENT_OPENROUTER_OFFICIAL_PROVIDERS_ONLY", "false")
+    llm = OpenRouterLLM(
+        model_name=model_name,
+        api_key="test-key",
+        abilities=["chat", "tool_calling"],
+    )
+
+    extra_body = llm._prepare_provider_reasoning_extra_body(
+        extra_body={"trace_id": "abc"},
+        thinking=None,
+        tools=None,
+        response_format=response_format,
+        output_config=None,
+        is_streaming=is_streaming,
+    )
+
+    assert extra_body == {
+        "trace_id": "abc",
+        "reasoning": {"enabled": False},
+        "thinking": {"type": "disabled"},
+    }
+
+
+def test_openrouter_deepseek_structured_streaming_disables_thinking(monkeypatch):
+    monkeypatch.setenv("XAGENT_OPENROUTER_OFFICIAL_PROVIDERS_ONLY", "false")
+    llm = OpenRouterLLM(
+        model_name="deepseek/deepseek-v4-flash",
+        api_key="test-key",
+        abilities=["chat", "tool_calling"],
+    )
+
+    extra_body = llm._prepare_provider_reasoning_extra_body(
+        extra_body={},
+        thinking=None,
+        tools=None,
+        response_format={"type": "json_object"},
+        output_config=None,
+        is_streaming=True,
+    )
+
+    assert extra_body == {
+        "reasoning": {"enabled": False},
+        "thinking": {"type": "disabled"},
+    }
+
+
+@pytest.mark.parametrize("response_format", [None, {"type": "json_object"}])
+def test_openrouter_non_deepseek_defaults_leave_thinking_unset(
+    monkeypatch, response_format
+):
+    monkeypatch.setenv("XAGENT_OPENROUTER_OFFICIAL_PROVIDERS_ONLY", "false")
+    llm = OpenRouterLLM(
+        model_name="openai/gpt-5",
+        api_key="test-key",
+        abilities=["chat", "tool_calling"],
+    )
+
+    extra_body = llm._prepare_provider_reasoning_extra_body(
+        extra_body={"trace_id": "abc"},
+        thinking=None,
+        tools=None,
+        response_format=response_format,
+        output_config=None,
+        is_streaming=True,
+    )
+
+    assert extra_body == {"trace_id": "abc"}
+
+
+@pytest.mark.parametrize(
+    ("is_streaming", "expected_extra_body"),
+    [
+        (True, {"reasoning": {"enabled": False}, "thinking": {"type": "disabled"}}),
+        (False, {}),
+    ],
+)
+def test_openrouter_non_deepseek_thinking_structured_output_fork(
+    monkeypatch, is_streaming, expected_extra_body
+):
+    monkeypatch.setenv("XAGENT_OPENROUTER_OFFICIAL_PROVIDERS_ONLY", "false")
+    llm = OpenRouterLLM(
+        model_name="openai/gpt-5",
+        api_key="test-key",
+        abilities=["chat", "tool_calling", "thinking_mode"],
+    )
+
+    extra_body = llm._prepare_provider_reasoning_extra_body(
+        extra_body={},
+        thinking=None,
+        tools=None,
+        response_format={"type": "json_object"},
+        output_config=None,
+        is_streaming=is_streaming,
+    )
+
+    assert extra_body == expected_extra_body
 
 
 @pytest.mark.asyncio

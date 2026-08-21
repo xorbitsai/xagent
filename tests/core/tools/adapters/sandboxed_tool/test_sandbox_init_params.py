@@ -239,6 +239,20 @@ class TestBuildExecutionEnv:
         env = wrapper._build_execution_env()
         assert env["PYTHONPATH"] == SANDBOX_SRC_ROOT
 
+    def test_tool_env_vars_cannot_override_the_sandbox_seeds(self, monkeypatch):
+        """A host PYTHONPATH would point the runner outside the sandbox."""
+        from xagent.config import SANDBOX_TOOL_RUNNER
+
+        monkeypatch.setenv("PYTHONPATH", "/host/src")
+        monkeypatch.setenv(SANDBOX_TOOL_RUNNER, "0")
+        wrapper = _create_test_wrapper(_FakeToolNoParams())
+        wrapper._env_vars = ["PYTHONPATH", SANDBOX_TOOL_RUNNER]
+
+        env = wrapper._build_execution_env()
+
+        assert env["PYTHONPATH"] == SANDBOX_SRC_ROOT
+        assert env[SANDBOX_TOOL_RUNNER] == "1"
+
     def test_picks_up_host_env(self, monkeypatch):
         monkeypatch.setenv("MY_API_KEY", "secret")
         wrapper = _create_test_wrapper(_FakeToolNoParams())

@@ -14,6 +14,7 @@ from xagent.core.agent import (
     PatternRuntime,
     TraceEventCallback,
 )
+from xagent.core.agent.attachments import build_image_context_references
 from xagent.core.agent.checkpoint import (
     CheckpointCorruptError,
     CheckpointUnavailableError,
@@ -1275,6 +1276,58 @@ async def test_runner_initial_user_message_preserves_display_metadata(
     )
     assert user_event["data"]["message"] == "Read file"
     assert user_event["data"]["turn_id"] == turn_id
+
+
+@pytest.mark.asyncio
+async def test_runner_attaches_uploaded_image_refs_to_initial_user_message(
+    tmp_path: Path,
+) -> None:
+    agent = Agent(
+        name="vision",
+        patterns=[FakePattern({"success": True, "response": "Done"})],
+    )
+    runner = AgentRunner(
+        agent=agent,
+        workspace_manager=FakeWorkspaceManager(tmp_path),
+    )
+    references = build_image_context_references(
+        [{"file_id": "image-123", "name": "diagram.png", "type": "image/png"}]
+    )
+
+    result = await runner.run(
+        task="What is shown?",
+        execution_id="exec-initial-image",
+        task_context_refs=references,
+    )
+
+    first_user = next(
+        message for message in result["context"].messages if message.role == "user"
+    )
+    assert first_user.context_refs == references
+
+
+@pytest.mark.asyncio
+async def test_runner_attaches_uploaded_image_refs_to_injected_user_message(
+    tmp_path: Path,
+) -> None:
+    tracer = TracerCheckpointStore()
+    agent = Agent(name="vision", patterns=[FakePattern({"success": True})])
+    runner = AgentRunner(
+        agent=agent,
+        tracer=tracer,
+        workspace_manager=FakeWorkspaceManager(tmp_path),
+    )
+    await runner.run(task="Start", execution_id="exec-injected-image")
+
+    context = await runner.inject_user_message(
+        "exec-injected-image",
+        "Inspect the new image",
+        files=[{"file_id": "image-456", "name": "screen.jpg", "type": "image/jpeg"}],
+        request_interrupt=False,
+    )
+
+    assert context is not None
+    assert context.messages[-1].context_refs[0].file_id == "image-456"
 
 
 @pytest.mark.asyncio

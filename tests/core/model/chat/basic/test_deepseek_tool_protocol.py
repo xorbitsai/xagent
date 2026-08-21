@@ -48,6 +48,11 @@ WRITE_FILE_TOOL = _tool_schema(
         "content": {"type": "string"},
     },
 )
+LIST_IMAGE_MODELS_TOOL = _tool_schema(
+    "list_image_models",
+    {},
+    additional_properties=False,
+)
 
 
 def test_deepseek_codec_rejects_serialized_tool_call_content() -> None:
@@ -205,6 +210,61 @@ def test_deepseek_codec_keeps_valid_tool_call() -> None:
     }
 
     assert normalize_deepseek_response(response, tools=[WRITE_FILE_TOOL]) is response
+
+
+@pytest.mark.parametrize("blank", ["", "   ", "\n"])
+@pytest.mark.parametrize(
+    ("tool_name", "tool"),
+    [
+        ("list_image_models", LIST_IMAGE_MODELS_TOOL),
+        # A tool with declared properties skips the `additionalProperties`
+        # guard entirely rather than passing trivially against an empty set.
+        ("write_file", WRITE_FILE_TOOL),
+    ],
+)
+def test_deepseek_codec_keeps_blank_arguments_for_declared_tool(
+    blank: str,
+    tool_name: str,
+    tool: dict[str, object],
+) -> None:
+    response = {
+        "type": "tool_call",
+        "tool_calls": [
+            {
+                "id": "call_blank",
+                "type": "function",
+                "function": {"name": tool_name, "arguments": blank},
+            }
+        ],
+    }
+
+    assert normalize_deepseek_response(response, tools=[tool]) is response
+    assert response["tool_calls"][0]["function"]["arguments"] == blank
+
+
+@pytest.mark.parametrize("blank", ["", "   "])
+def test_deepseek_codec_still_rejects_unavailable_tool_with_blank_arguments(
+    blank: str,
+) -> None:
+    """Blank arguments must not become a bypass for the unavailable-tool guard."""
+
+    normalized = normalize_deepseek_response(
+        {
+            "type": "tool_call",
+            "tool_calls": [
+                {
+                    "id": "call_ghost",
+                    "type": "function",
+                    "function": {"name": "fetch_web_content", "arguments": blank},
+                }
+            ],
+        },
+        tools=[WRITE_FILE_TOOL],
+    )
+
+    error = get_tool_protocol_error(normalized)
+    assert error is not None
+    assert error["code"] == "unavailable_tool_call"
 
 
 def test_deepseek_codec_repairs_complete_malformed_tool_arguments() -> None:
@@ -536,6 +596,50 @@ async def test_deepseek_stream_forwards_accumulated_valid_tool_calls() -> None:
     assert tool_chunks[-1].tool_calls[0]["function"]["arguments"] == (
         '{"file_path":"podcast.md","content":"script"}'
     )
+
+
+@pytest.mark.parametrize("blank", ["", "   ", "\n"])
+@pytest.mark.asyncio
+async def test_deepseek_stream_keeps_blank_arguments_for_parameterless_tool(
+    blank: str,
+) -> None:
+    """Blank arguments must survive both of the stream adapter's gates.
+
+    The mid-stream gate skips them (`_arguments_are_ready_for_validation` is
+    False for a non-`{...}` string), so the end-of-stream check is the one that
+    reaches `_tool_call_violation` -- the production path behind #1501.
+    """
+
+    async def source() -> AsyncIterator[StreamChunk]:
+        yield StreamChunk(
+            type=ChunkType.TOOL_CALL,
+            tool_calls=[
+                {
+                    "index": 0,
+                    "id": "call_list",
+                    "type": "function",
+                    "function": {
+                        "name": "list_image_models",
+                        "arguments": blank,
+                    },
+                }
+            ],
+            finish_reason="tool_calls",
+        )
+        yield StreamChunk(type=ChunkType.END, finish_reason="tool_calls")
+
+    chunks = [
+        chunk
+        async for chunk in adapt_deepseek_stream(
+            source(),
+            tools=[LIST_IMAGE_MODELS_TOOL],
+        )
+    ]
+
+    assert not any(chunk.is_protocol_error() for chunk in chunks)
+    tool_chunks = [chunk for chunk in chunks if chunk.is_tool_call()]
+    assert tool_chunks
+    assert tool_chunks[-1].tool_calls[0]["function"]["arguments"] == blank
 
 
 @pytest.mark.asyncio

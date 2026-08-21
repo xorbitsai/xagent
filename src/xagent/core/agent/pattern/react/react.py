@@ -1584,13 +1584,22 @@ class ReActPattern(AgentPattern):
             try:
                 parsed = json.loads(arguments)
             except json.JSONDecodeError:
-                logger.warning(
-                    "ReAct tool call %s returned malformed JSON arguments "
-                    "(%d chars); dropping them for control tools and passing "
-                    "them through as `input` otherwise.",
-                    tool_name or "<unknown>",
-                    len(arguments),
-                )
+                if not arguments.strip():
+                    # The happy path for a parameterless tool on providers that
+                    # send `""` instead of `"{}"` (#1501) - not a malformation.
+                    logger.debug(
+                        "ReAct tool call %s returned blank arguments; "
+                        "treating as no arguments.",
+                        tool_name or "<unknown>",
+                    )
+                else:
+                    logger.warning(
+                        "ReAct tool call %s returned malformed JSON arguments "
+                        "(%d chars); dropping them for control tools, passing "
+                        "anything else through as `input`.",
+                        tool_name or "<unknown>",
+                        len(arguments),
+                    )
                 return self._fallback_arguments(tool_name, arguments)
             if isinstance(parsed, dict):
                 return parsed
@@ -1607,10 +1616,10 @@ class ReActPattern(AgentPattern):
     ) -> dict[str, Any]:
         """Wrap unusable tool arguments, or drop them for control tools.
 
-        Work tools tolerate an opaque ``input`` passthrough, so they keep the
-        payload. Control tools drop it, because ``input`` is never a field any of
-        them declares: carrying it forward only disguises the loss as a populated
-        arguments object.
+        Work tools tolerate an opaque ``input`` passthrough, so they keep a
+        non-blank payload. Control tools drop it, because ``input`` is never a
+        field any of them declares: carrying it forward only disguises the loss
+        as a populated arguments object.
 
         For ``final_answer`` dropping it is also load-bearing. That tool owns the
         run's only user-visible exit, so a payload smuggled through as ``input``
@@ -1623,6 +1632,10 @@ class ReActPattern(AgentPattern):
         """
 
         if tool_name in self._control_tool_names():
+            return {}
+        if isinstance(payload, str) and not payload.strip():
+            # A blank payload carries nothing to preserve, so there is no
+            # opaque value for the `input` passthrough to forward.
             return {}
         return {"input": payload}
 

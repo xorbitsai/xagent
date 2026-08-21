@@ -6,12 +6,14 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import sessionmaker
 
 from xagent.core.agent.transcript import build_assistant_transcript_content
+from xagent.core.context_ref import CONTEXT_REFS_KEY
 from xagent.web.models.chat_message import TaskChatMessage
 from xagent.web.models.database import Base
 from xagent.web.models.task import Task, TaskStatus
 from xagent.web.models.uploaded_file import UploadedFile
 from xagent.web.models.user import User
 from xagent.web.services.chat_history_service import (
+    _MAX_HISTORICAL_IMAGE_CONTEXT_REFS,
     DELIVERY_COMPLETED,
     DELIVERY_DISPATCHED,
     DELIVERY_FAILED,
@@ -95,6 +97,78 @@ def test_load_task_transcript_returns_prior_turns_only():
                 "content": "The main risks are architecture drift and persistence gaps.",
             },
         ]
+    finally:
+        db_session.close()
+
+
+def test_load_task_transcript_preserves_uploaded_images_as_context_refs():
+    db_session = _create_db_session()
+    try:
+        task = _create_task(db_session)
+        image_message = persist_user_message(
+            db_session,
+            int(task.id),
+            int(task.user_id),
+            "What is shown?",
+            attachments=[
+                {
+                    "file_id": "image-id",
+                    "name": "diagram.png",
+                    "size": 321,
+                    "type": "image/png",
+                },
+                {
+                    "file_id": "pdf-id",
+                    "name": "notes.pdf",
+                    "size": 654,
+                    "type": "application/pdf",
+                },
+            ],
+        )
+        assert image_message is not None
+
+        transcript = load_task_transcript(db_session, int(task.id))
+
+        assert transcript[0]["content"] == "What is shown?"
+        references = transcript[0][CONTEXT_REFS_KEY]
+        assert len(references) == 1
+        assert references[0]["file_ref"]["file_id"] == "image-id"
+        assert references[0]["metadata"] == {"source": "user_upload"}
+    finally:
+        db_session.close()
+
+
+def test_load_task_transcript_bounds_historical_images_to_recent_window():
+    db_session = _create_db_session()
+    try:
+        task = _create_task(db_session)
+        total_images = _MAX_HISTORICAL_IMAGE_CONTEXT_REFS + 2
+        for index in range(total_images):
+            persist_user_message(
+                db_session,
+                int(task.id),
+                int(task.user_id),
+                f"Image {index}",
+                attachments=[
+                    {
+                        "file_id": f"image-{index}",
+                        "name": f"image-{index}.png",
+                        "type": "image/png",
+                    }
+                ],
+            )
+
+        transcript = load_task_transcript(db_session, int(task.id))
+
+        assert len(transcript) == total_images
+        assert CONTEXT_REFS_KEY not in transcript[0]
+        assert CONTEXT_REFS_KEY not in transcript[1]
+        retained_ids = [
+            message[CONTEXT_REFS_KEY][0]["file_ref"]["file_id"]
+            for message in transcript
+            if CONTEXT_REFS_KEY in message
+        ]
+        assert retained_ids == [f"image-{index}" for index in range(2, total_images)]
     finally:
         db_session.close()
 

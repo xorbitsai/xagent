@@ -1765,6 +1765,7 @@ def _schedule_bg(
                         context=_execution_context_with_turn_id(
                             context,
                             payload.turn_id,
+                            files=payload.attachments,
                         ),
                         agent_manager=_get_agent_manager(),
                         task_owner_user_id=task_owner_user_id,
@@ -1968,9 +1969,15 @@ def _schedule_bg(
 
 
 def _execution_context_with_turn_id(
-    context: Optional[Dict[str, Any]], turn_id: str
+    context: Optional[Dict[str, Any]],
+    turn_id: str,
+    *,
+    files: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     execution_context = dict(context or {})
     if turn_id:
         execution_context["turn_id"] = turn_id
+    # A resumed/retried turn may already carry its authoritative file batch.
+    if files and not execution_context.get("files"):
+        execution_context["files"] = [dict(file_info) for file_info in files]
     return execution_context

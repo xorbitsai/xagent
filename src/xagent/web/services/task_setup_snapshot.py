@@ -118,7 +118,7 @@ class TaskSetupSnapshot:
     agent: Optional[AgentRuntimeFields]
     agent_config: Optional[dict]
     excluded_agent_id: Optional[int]
-    conversation_history: tuple[dict[str, str], ...] = ()
+    conversation_history: tuple[dict[str, Any], ...] = ()
     execution_recovery: TaskExecutionRecoverySnapshot = TaskExecutionRecoverySnapshot()
     reconstruction: TaskReconstructionSnapshot = TaskReconstructionSnapshot()
     # Resolved by ``resolve_task_runtime_config_core`` using this same Session.

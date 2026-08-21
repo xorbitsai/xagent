@@ -207,6 +207,34 @@ def get_builtin_oauth_provider_rows() -> list[dict[str, Any]]:
             "default_scopes": [],
         },
         {
+            "provider_name": "linear",
+            "name": "Linear",
+            "client_id": os.environ.get("LINEAR_CLIENT_ID", ""),
+            "client_secret": os.environ.get("LINEAR_CLIENT_SECRET", ""),
+            "auth_url": "https://linear.app/oauth/authorize",
+            "token_url": "https://api.linear.app/oauth/token",
+            "redirect_uri": os.environ.get("LINEAR_REDIRECT_URI", ""),
+            # Linear's API is GraphQL-only (POST-only, nested response shape)
+            # -- there is no flat REST endpoint this callback's GET-plus-flat-
+            # dict.get() userinfo lookup can use. Left empty so that lookup is
+            # skipped entirely (generic_oauth_callback's `if userinfo_url and
+            # access_token:` guard); identity comes instead from a dedicated
+            # `elif provider.lower() == "linear"` branch there that runs a
+            # `viewer` GraphQL query (_fetch_linear_viewer_identity), which
+            # also doubles as post-exchange token verification.
+            "userinfo_url": "",
+            "user_id_path": "id",
+            "email_path": "email",
+            # Identity-only convention (see zoom's comment above) — the
+            # functional "write" scope this connector actually calls for
+            # lives on the app row's oauth_scopes below and is merged in at
+            # authorize time by _merge_oauth_scopes, so listing it here too
+            # would just be a second place scope changes have to be kept in
+            # sync, and would survive a narrowing of the app row's scopes
+            # since _merge_oauth_scopes is a pure union.
+            "default_scopes": ["read"],
+        },
+        {
             "provider_name": "jira",
             "name": "Jira",
             "client_id": os.environ.get("JIRA_CLIENT_ID", ""),
@@ -828,6 +856,22 @@ def get_builtin_public_mcp_app_rows() -> list[dict[str, Any]]:
                 "command": "python",
                 "args": ["-m", "xagent.web.tools.mcp.intercom"],
                 "env_mapping": {"INTERCOM_ACCESS_TOKEN": "access_token"},
+            },
+        },
+        {
+            "app_id": "linear",
+            "name": "Linear",
+            "description": "Connect to Linear to search and manage issues, comments, teams, and projects.",
+            "icon": "https://www.google.com/s2/favicons?domain=linear.app&sz=128",
+            "transport": "oauth",
+            "provider_name": "linear",
+            "category": "Productivity",
+            "oauth_scopes": ["read", "write"],
+            "is_visible_in_connector": True,
+            "launch_config": {
+                "command": "python",
+                "args": ["-m", "xagent.web.tools.mcp.linear"],
+                "env_mapping": {"LINEAR_ACCESS_TOKEN": "access_token"},
             },
         },
         {

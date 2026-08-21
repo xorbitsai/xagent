@@ -276,6 +276,37 @@ def test_payload_uses_execution_when_provided() -> None:
     assert p.for_agent == "summarize this\n\n[file context]"
 
 
+def test_execution_context_carries_path_stripped_turn_attachments() -> None:
+    files = [{"file_id": "image-id", "name": "screen.png", "type": "image/png"}]
+
+    context = task_orchestrator_module._execution_context_with_turn_id(
+        {"existing": True},
+        "turn-1",
+        files=files,
+    )
+
+    assert context == {
+        "existing": True,
+        "turn_id": "turn-1",
+        "files": files,
+    }
+    assert context["files"] is not files
+
+
+def test_execution_context_preserves_existing_turn_attachments() -> None:
+    existing_files = [
+        {"file_id": "existing", "name": "existing.png", "type": "image/png"}
+    ]
+
+    context = task_orchestrator_module._execution_context_with_turn_id(
+        {"files": existing_files},
+        "turn-2",
+        files=[{"file_id": "new", "name": "new.png", "type": "image/png"}],
+    )
+
+    assert context["files"] is existing_files
+
+
 # ---------------------------------------------------------------------------
 # begin_turn — happy paths
 # ---------------------------------------------------------------------------

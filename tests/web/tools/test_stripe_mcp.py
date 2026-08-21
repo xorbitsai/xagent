@@ -42,6 +42,26 @@ def test_headers_include_bearer_token_only():
     assert stripe._headers() == {"Authorization": "Bearer rk_test_123"}
 
 
+def test_headers_accept_live_restricted_key(monkeypatch):
+    monkeypatch.setenv("STRIPE_API_KEY", "rk_live_abc")
+
+    assert stripe._headers() == {"Authorization": "Bearer rk_live_abc"}
+
+
+def test_headers_reject_full_secret_key(monkeypatch):
+    monkeypatch.setenv("STRIPE_API_KEY", "sk_live_abc")
+
+    with pytest.raises(ValueError, match="Restricted API Key"):
+        stripe._headers()
+
+
+def test_headers_reject_test_mode_full_secret_key(monkeypatch):
+    monkeypatch.setenv("STRIPE_API_KEY", "sk_test_abc")
+
+    with pytest.raises(ValueError, match="Restricted API Key"):
+        stripe._headers()
+
+
 def test_headers_include_idempotency_key_when_given():
     headers = stripe._headers(idempotency_key="abc123")
 
@@ -89,6 +109,16 @@ def test_flatten_form_params_serializes_booleans_lowercase():
         ("metadata[is_active]", "true"),
         ("metadata[is_pending]", "false"),
     ]
+
+
+def test_flatten_form_params_rejects_bracket_in_key():
+    with pytest.raises(ValueError, match="Invalid form field name"):
+        stripe._flatten_form_params({"metadata": {"foo]bar": "1"}})
+
+
+def test_flatten_form_params_rejects_empty_key():
+    with pytest.raises(ValueError, match="must be non-empty"):
+        stripe._flatten_form_params({"": "1"})
 
 
 def test_request_uses_base_url_and_headers(monkeypatch):
@@ -261,6 +291,46 @@ def test_request_raises_with_structured_error_detail(monkeypatch):
 
     with pytest.raises(RuntimeError, match="Your card was declined"):
         stripe._request("GET", "/charges/ch_123")
+
+
+def test_request_redacts_structured_error_message(monkeypatch):
+    monkeypatch.setattr(
+        stripe.requests,
+        "request",
+        Mock(
+            return_value=MockResponse(
+                status_code=402,
+                json_data={
+                    "error": {
+                        "message": "Gateway error, Authorization: Bearer sk_live_leaked"
+                    }
+                },
+            )
+        ),
+    )
+
+    with pytest.raises(RuntimeError) as excinfo:
+        stripe._request("GET", "/charges/ch_123")
+
+    assert "sk_live_leaked" not in str(excinfo.value)
+
+
+def test_request_redacts_raw_error_body(monkeypatch):
+    monkeypatch.setattr(
+        stripe.requests,
+        "request",
+        Mock(
+            return_value=MockResponse(
+                status_code=500,
+                text="<html>Authorization: Bearer sk_live_leaked</html>",
+            )
+        ),
+    )
+
+    with pytest.raises(RuntimeError) as excinfo:
+        stripe._request("GET", "/charges/ch_123")
+
+    assert "sk_live_leaked" not in str(excinfo.value)
 
 
 def test_request_truncates_unstructured_error_body(monkeypatch):
@@ -590,6 +660,70 @@ def test_list_charges_uses_customer_filter(monkeypatch):
     assert mock_request.call_args.kwargs["params"]["customer"] == "cus_1"
 
 
+def test_list_charges_clamps_limit(monkeypatch):
+    mock_request = Mock(
+        return_value=MockResponse(json_data={"data": [], "has_more": False})
+    )
+    monkeypatch.setattr(stripe.requests, "request", mock_request)
+
+    stripe.stripe_list_charges(limit=500)
+
+    assert mock_request.call_args.kwargs["params"]["limit"] == stripe.MAX_LIMIT
+
+
+def test_list_charges_forwards_starting_after(monkeypatch):
+    mock_request = Mock(
+        return_value=MockResponse(json_data={"data": [], "has_more": False})
+    )
+    monkeypatch.setattr(stripe.requests, "request", mock_request)
+
+    stripe.stripe_list_charges(starting_after="ch_1")
+
+    assert mock_request.call_args.kwargs["params"]["starting_after"] == "ch_1"
+
+
+def test_list_charges_reports_truncated_flag(monkeypatch):
+    mock_request = Mock(
+        return_value=MockResponse(
+            json_data={"data": [{"id": "ch_1"}], "has_more": True}
+        )
+    )
+    monkeypatch.setattr(stripe.requests, "request", mock_request)
+
+    result = json.loads(stripe.stripe_list_charges())
+
+    assert result["truncated"] is True
+
+
+def test_list_charges_returns_error_payload_on_failure(monkeypatch):
+    monkeypatch.setattr(
+        stripe.requests,
+        "request",
+        Mock(return_value=MockResponse(status_code=500, text="boom")),
+    )
+
+    result = json.loads(stripe.stripe_list_charges())
+
+    assert result["status"] == "error"
+
+
+def test_create_refund_returns_error_payload_on_failure(monkeypatch):
+    monkeypatch.setattr(
+        stripe.requests,
+        "request",
+        Mock(
+            return_value=MockResponse(
+                status_code=402, json_data={"error": {"message": "card declined"}}
+            )
+        ),
+    )
+
+    result = json.loads(stripe.stripe_create_refund(charge_id="ch_1"))
+
+    assert result["status"] == "error"
+    assert "card declined" in result["message"]
+
+
 def test_get_charge_returns_charge(monkeypatch):
     monkeypatch.setattr(
         stripe.requests,
@@ -615,6 +749,19 @@ def test_create_refund_requires_charge_or_payment_intent():
 
     assert result["status"] == "error"
     assert "charge_id or payment_intent_id" in result["message"]
+
+
+def test_create_refund_rejects_both_charge_and_payment_intent(monkeypatch):
+    mock_request = Mock(return_value=MockResponse(json_data={"id": "re_1"}))
+    monkeypatch.setattr(stripe.requests, "request", mock_request)
+
+    result = json.loads(
+        stripe.stripe_create_refund(charge_id="ch_1", payment_intent_id="pi_1")
+    )
+
+    assert result["status"] == "error"
+    assert "not both" in result["message"]
+    mock_request.assert_not_called()
 
 
 def test_create_refund_sends_charge_and_amount(monkeypatch):
@@ -827,6 +974,23 @@ def test_paginated_results_truncates_when_data_exceeds_limit():
 
     assert data == [{"id": "cus_0"}, {"id": "cus_1"}, {"id": "cus_2"}]
     assert truncated is True
+
+
+def test_paginated_results_rejects_non_list_data():
+    with pytest.raises(RuntimeError, match="non-list"):
+        stripe._paginated_results({"data": "not-a-list"}, limit=3)
+
+
+def test_request_raises_on_non_json_success_body(monkeypatch):
+    response = Mock()
+    response.status_code = 200
+    response.content = b"not json"
+    response.headers = {}
+    response.json.side_effect = ValueError("Expecting value")
+    monkeypatch.setattr(stripe.requests, "request", Mock(return_value=response))
+
+    with pytest.raises(RuntimeError, match="non-JSON body"):
+        stripe._request("GET", "/account")
 
 
 def test_stripe_app_registry_requires_api_key():

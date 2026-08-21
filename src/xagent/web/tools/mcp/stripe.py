@@ -42,6 +42,22 @@ def _headers(idempotency_key: str | None = None) -> dict[str, str]:
     api_key = os.environ.get("STRIPE_API_KEY")
     if not api_key:
         raise ValueError("STRIPE_API_KEY environment variable is missing")
+    # Enforced here, not just recommended in the connector's description:
+    # a full sk_live_/sk_test_ secret key works against Stripe's API just
+    # as well as a Restricted Key, so nothing else in this connector (or
+    # the generic MCP connect flow, which has no per-connector validation
+    # hook) stops one from being pasted in and silently granted full
+    # account access instead of the curated, minimal permissions a
+    # Restricted Key guarantees. Matches aws.py's precedent of enforcing
+    # its own security claim server-side rather than relying on user
+    # diligence.
+    if not api_key.startswith(("rk_live_", "rk_test_")):
+        raise ValueError(
+            "STRIPE_API_KEY must be a Restricted API Key (rk_live_... or "
+            "rk_test_...), not a full secret key. Create one in the Stripe "
+            "Dashboard under Developers > API keys > Create restricted key, "
+            "scoped to only the permissions this connector needs."
+        )
     headers = {"Authorization": f"Bearer {api_key}"}
     if idempotency_key:
         headers["Idempotency-Key"] = idempotency_key
@@ -102,7 +118,14 @@ def _flatten_form_params(value: Any, prefix: str = "") -> list[tuple[str, Any]]:
     items: list[tuple[str, Any]] = []
     if isinstance(value, dict):
         for key, sub_value in value.items():
-            new_prefix = f"{prefix}[{key}]" if prefix else str(key)
+            key_str = str(key)
+            if not key_str or "[" in key_str or "]" in key_str:
+                raise ValueError(
+                    f"Invalid form field name {key_str!r}: must be non-empty "
+                    "and must not contain '[' or ']', which are reserved for "
+                    "Stripe's own bracket-notation nesting"
+                )
+            new_prefix = f"{prefix}[{key_str}]" if prefix else key_str
             items.extend(_flatten_form_params(sub_value, new_prefix))
     elif isinstance(value, list):
         for index, sub_value in enumerate(value):
@@ -211,7 +234,15 @@ def _request(
     if response.status_code >= 400:
         detail = _extract_error_detail(response)
         if detail is None:
-            detail = truncate_error_text(response.text.strip())
+            detail = response.text.strip()
+        # The response body is attacker/host-controlled content, not
+        # something this module wrote -- if it happens to echo request
+        # headers (e.g. a misconfigured proxy/WAF/gateway's error page),
+        # redact the Bearer token before it reaches logs or the LLM's
+        # context, matching posthog.py's identical treatment. Applied to
+        # both sources uniformly, not just the raw-text fallback, since
+        # either one is equally capable of embedding an echoed header.
+        detail = truncate_error_text(redact_sensitive_text(detail))
         if idempotent_replayed:
             detail = (
                 f"{detail} (this is a replay of a previous failed attempt with "
@@ -228,11 +259,20 @@ def _request(
 
     if response.status_code == 204 or not response.content:
         return {}
-    return response.json()
+    try:
+        return response.json()
+    except ValueError as exc:
+        raise RuntimeError(
+            f"Stripe returned a 2xx response with a non-JSON body: {exc}"
+        ) from exc
 
 
 def _paginated_results(payload: dict[str, Any], limit: int) -> tuple[list[Any], bool]:
     data = payload.get("data") or []
+    if not isinstance(data, list):
+        raise RuntimeError(
+            f"Stripe returned a non-list 'data' field ({type(data).__name__})"
+        )
     truncated = bool(payload.get("has_more")) or len(data) > limit
     return data[:limit], truncated
 
@@ -422,9 +462,10 @@ def stripe_create_refund(
     """
     Refund a charge, in full or in part.
     charge_id: a Stripe charge id, e.g. "ch_ABC123". Provide this or
-    payment_intent_id (at least one is required).
+    payment_intent_id, not both.
     payment_intent_id: a Stripe payment intent id, e.g. "pi_ABC123", as an
-    alternative way to identify the payment to refund.
+    alternative way to identify the payment to refund. Provide this or
+    charge_id, not both.
     amount: optional amount to refund in the currency's smallest unit (e.g.
     cents for USD); omit to refund the full remaining amount.
     reason: optional one of "duplicate", "fraudulent", or
@@ -450,6 +491,10 @@ def stripe_create_refund(
     try:
         if not charge_id and not payment_intent_id:
             return _error("Either charge_id or payment_intent_id is required")
+        if charge_id and payment_intent_id:
+            return _error(
+                "Provide only one of charge_id or payment_intent_id, not both"
+            )
         form_data: dict[str, Any] = {}
         if charge_id:
             form_data["charge"] = charge_id

@@ -105,14 +105,26 @@ def _instance_url() -> str:
     # otherwise -- Salesforce's own token response never sends one, but
     # there's no reason to reject it if it ever did.
     hostname = (parsed.hostname or "").rstrip(".")
-    if parsed.scheme != "https" or not any(
-        hostname == suffix or hostname.endswith(f".{suffix}")
-        for suffix in _INSTANCE_URL_HOST_SUFFIXES
+    try:
+        # .port is a lazy property that raises ValueError for a
+        # non-numeric port (e.g. "...salesforce.com:abc") -- accessed here,
+        # before the scheme/host check below, so that case raises this
+        # function's own clear message instead of urlparse's cryptic
+        # "Port could not be cast to integer value" escaping uncaught.
+        port = f":{parsed.port}" if parsed.port else ""
+    except ValueError:
+        port = None
+    if (
+        port is None
+        or parsed.scheme != "https"
+        or not any(
+            hostname == suffix or hostname.endswith(f".{suffix}")
+            for suffix in _INSTANCE_URL_HOST_SUFFIXES
+        )
     ):
         raise ValueError(
             f"SALESFORCE_INSTANCE_URL is not a valid Salesforce host: {instance_url!r}"
         )
-    port = f":{parsed.port}" if parsed.port else ""
     return f"{parsed.scheme}://{hostname}{port}"
 
 
@@ -142,16 +154,15 @@ def _extract_error_detail(response: requests.Response) -> str | None:
     if not isinstance(payload, list) or not payload:
         return None
 
-    def _describe(item: Any) -> str:
-        if not isinstance(item, dict):
-            return str(item)
-        # A falsy (missing or empty-string) message falls back to
-        # errorCode -- still readable text, unlike str(item)'s Python
-        # dict-repr, which is only used as a last resort when neither key
-        # has anything useful.
-        return str(item.get("message") or item.get("errorCode") or item)
-
-    messages = [_describe(item) for item in payload]
+    # A falsy (missing or empty-string) message falls back to errorCode --
+    # still readable text, unlike str(item)'s Python dict-repr, which is
+    # only used as a last resort when neither key has anything useful.
+    messages = [
+        str(item.get("message") or item.get("errorCode") or item)
+        if isinstance(item, dict)
+        else str(item)
+        for item in payload
+    ]
     return "; ".join(messages) if messages else None
 
 

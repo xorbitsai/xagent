@@ -101,6 +101,27 @@ def test_instance_url_preserves_non_default_port(monkeypatch):
     assert salesforce._instance_url() == "https://acme.my.salesforce.com:8443"
 
 
+def test_instance_url_rejects_non_numeric_port_with_clear_message(monkeypatch):
+    """urlparse().port is a lazy property that raises a bare ValueError
+    ("Port could not be cast to integer value...") on access for a
+    non-numeric port -- this must still surface as _instance_url's own
+    clear message, not that cryptic one escaping uncaught."""
+    monkeypatch.setenv("SALESFORCE_INSTANCE_URL", "https://acme.my.salesforce.com:abc")
+
+    with pytest.raises(ValueError, match="not a valid Salesforce host"):
+        salesforce._instance_url()
+
+
+def test_instance_url_strips_trailing_dot_from_hostname(monkeypatch):
+    """A trailing-dot FQDN is a valid, equivalent hostname that just
+    wouldn't satisfy the endswith host-suffix check otherwise -- accepted,
+    and the dot is canonicalized away in the returned value along with
+    everything else _instance_url() strips."""
+    monkeypatch.setenv("SALESFORCE_INSTANCE_URL", "https://acme.my.salesforce.com.")
+
+    assert salesforce._instance_url() == "https://acme.my.salesforce.com"
+
+
 def test_request_uses_instance_url_and_headers(monkeypatch):
     # A generic sobjects path, not /services/oauth2/userinfo: in production
     # that one is only ever fetched via _request_absolute against the fixed

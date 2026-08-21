@@ -80,10 +80,18 @@ function TaskHomePageContent() {
       try {
         const response = await apiRequest(`${getApiUrl()}/api/templates/?lang=${locale}`);
         if (!response.ok || cancelled) return;
-        const data: Template[] = await response.json();
+        const data: unknown = await response.json();
         if (cancelled) return;
         const map: Record<string, Template> = {};
-        for (const template of data) map[template.id] = template;
+        // A single malformed entry (missing/non-string `id`) must not drop
+        // every other otherwise-valid template out of the map - skip just
+        // that entry instead of letting the `for` loop throw and lose the
+        // whole batch to the catch below.
+        for (const template of Array.isArray(data) ? data : []) {
+          if (template && typeof template === "object" && typeof template.id === "string") {
+            map[template.id] = template;
+          }
+        }
         setTemplatesById(map);
       } catch {
         // Picker just renders without persona photos/specialty labels.

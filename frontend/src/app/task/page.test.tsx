@@ -250,6 +250,39 @@ describe("TaskHomePage agents", () => {
     })
   })
 
+  it("skips malformed template entries instead of losing the whole batch's enrichment", async () => {
+    const HIRED = { ...VERA, template_id: "sales-research-enricher" }
+    apiRequestMock.mockImplementation((url: string) => {
+      if (url === "http://api.local/api/agents") return Promise.resolve(jsonResponse([HIRED]))
+      if (url.startsWith("http://api.local/api/templates/")) {
+        return Promise.resolve(
+          jsonResponse([
+            null,
+            { category: "Sales" }, // missing id - must not break the valid entry below
+            {
+              id: "sales-research-enricher",
+              category: "Sales",
+              persona: { avatar: "/marketplace/avatars/vera.png" },
+            },
+          ])
+        )
+      }
+      return Promise.resolve(new Response(null, { status: 404 }))
+    })
+
+    render(<TaskHomePage />)
+
+    await waitFor(() => {
+      expect(chatStartScreenProps.current?.agents).toEqual([
+        {
+          ...HIRED,
+          persona_avatar: "/marketplace/avatars/vera.png",
+          specialty: "templates.categoryTitles.sales",
+        },
+      ])
+    })
+  })
+
   it("prefers a hired agent's template sample prompt over its own (usually empty) suggested_prompts", async () => {
     const HIRED = { id: 1, name: "Vera", status: "published", suggested_prompts: [], template_id: "sales-research-enricher" }
     apiRequestMock.mockImplementation((url: string) => {

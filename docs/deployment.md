@@ -79,7 +79,7 @@ Marked tasks do not remain isolated when executed by an older worker. Keep publi
 
 ### Deployment impact
 
-The `user_oauth` table gets a nullable `resource_owner_key` column. Existing rows keep a null value, and every existing OAuth consumer explicitly selects that ordinary namespace.
+The `user_oauth` table gets a nullable `resource_owner_key` column, and existing rows keep a null value. This foundation explicitly scopes non-Gmail OAuth consumers to that ordinary namespace. Gmail behavior remains unchanged here; the immediately following Gmail lifecycle release installs its complete owner boundary before any release can create actor-owned credentials.
 
 Two partial unique indexes replace `uq_user_provider_account`. One index protects ordinary rows. The other separates actor-owned namespaces when `provider_user_id` is non-null. Standard SQL null semantics still permit multiple rows with the same actor key, provider, and null `provider_user_id`. SQLite and PostgreSQL are the only supported database dialects for this schema; startup and migration fail before schema creation on other dialects.
 

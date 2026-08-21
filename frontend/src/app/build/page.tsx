@@ -53,8 +53,13 @@ import {
 
 type StatusTab = "all" | "enabled" | "drafts"
 
+// "drafts" means "not enabled" rather than a strict `=== "draft"` check, so
+// every agent lands in exactly one of Enabled/Drafts (matching the "All"
+// count) even for a status other than the two the UI otherwise names
+// (e.g. `archived`, defined on the backend but not currently reachable
+// through any create/update path).
 const matchesStatusTab = (agent: Agent, tab: StatusTab): boolean =>
-  tab === "all" ? true : tab === "enabled" ? agent.status === "published" : agent.status === "draft"
+  tab === "all" ? true : tab === "enabled" ? agent.status === "published" : agent.status !== "published"
 
 const matchesSearch = (agent: Agent, searchTerm: string): boolean =>
   agent.name.toLowerCase().includes(searchTerm.toLowerCase()) ||
@@ -162,14 +167,21 @@ function BuildsPageContent() {
     ;(async () => {
       try {
         const response = await apiRequest(`${getApiUrl()}/api/templates/?lang=${locale}`)
-        if (!response.ok || cancelled) return
+        if (cancelled) return
+        if (!response.ok) {
+          // Clear rather than leave stale data in place - otherwise a failed
+          // refetch after a locale switch would keep rendering the previous
+          // locale's persona role/category text beside the new-locale UI.
+          setTemplatesById({})
+          return
+        }
         const data: Template[] = await response.json()
         if (cancelled) return
         const map: Record<string, Template> = {}
         for (const template of data) map[template.id] = template
         setTemplatesById(map)
       } catch {
-        // Card badges/avatars just render without template enrichment.
+        if (!cancelled) setTemplatesById({})
       }
     })()
     return () => {

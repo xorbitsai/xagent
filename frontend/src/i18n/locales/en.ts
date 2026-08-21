@@ -2362,7 +2362,7 @@ Build when you need.`,
     list: {
       header: {
         title: "My Team",
-        description: "Who is working, what is waiting on you, and what they have delivered.",
+        description: "View and manage your agents, their status, and configuration.",
         create: "Add teammate",
       },
       search: {

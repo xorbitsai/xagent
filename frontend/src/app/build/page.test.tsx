@@ -284,6 +284,157 @@ describe("BuildsPage rendering", () => {
     expect(resolveAgentLogoUrlMock).toHaveBeenNthCalledWith(2, "/logos/relative.png", "http://api.local")
     expect(resolveAgentLogoUrlMock).toHaveBeenNthCalledWith(3, "javascript:alert(1)", "http://api.local")
   })
+
+  it("narrows the All/Enabled/Drafts tab counts by the search term", async () => {
+    apiRequestMock.mockImplementation((url: string) => {
+      if (url.startsWith("http://api.local/api/agents")) {
+        return Promise.resolve(jsonResponse([
+          { ...agent, id: 1, name: "Weather Watcher", status: "published" },
+          { ...agent, id: 2, name: "Weather Digest", status: "draft" },
+          { ...agent, id: 3, name: "Inbox Triage", status: "published" },
+        ]))
+      }
+      return Promise.resolve(jsonResponse([]))
+    })
+
+    render(<BuildsPage />)
+    await screen.findByText("Weather Watcher")
+
+    expect(screen.getByRole("button", { name: "builds.list.tabs.all 3" })).toBeInTheDocument()
+    expect(screen.getByRole("button", { name: "builds.list.tabs.enabled 2" })).toBeInTheDocument()
+    expect(screen.getByRole("button", { name: "builds.list.tabs.drafts 1" })).toBeInTheDocument()
+
+    fireEvent.change(screen.getByPlaceholderText("builds.list.search.placeholder"), {
+      target: { value: "weather" },
+    })
+
+    await waitFor(() => {
+      expect(screen.getByRole("button", { name: "builds.list.tabs.all 2" })).toBeInTheDocument()
+    })
+    expect(screen.getByRole("button", { name: "builds.list.tabs.enabled 1" })).toBeInTheDocument()
+    expect(screen.getByRole("button", { name: "builds.list.tabs.drafts 1" })).toBeInTheDocument()
+  })
+
+  it("sorts by name A-Z when the sort toggle is switched, and by recently-updated by default", async () => {
+    apiRequestMock.mockImplementation((url: string) => {
+      if (url.startsWith("http://api.local/api/agents")) {
+        return Promise.resolve(jsonResponse([
+          { ...agent, id: 1, name: "Zebra", updated_at: "2026-07-05T00:00:00Z" },
+          { ...agent, id: 2, name: "Amber", updated_at: "2026-07-03T00:00:00Z" },
+        ]))
+      }
+      return Promise.resolve(jsonResponse([]))
+    })
+
+    render(<BuildsPage />)
+    await screen.findByText("Zebra")
+
+    const namesInOrder = () => screen.getAllByRole("heading", { level: 3 }).map((h) => h.textContent)
+    expect(namesInOrder()).toEqual(["Zebra", "Amber"])
+
+    fireEvent.click(screen.getByRole("button", { name: /builds\.list\.sort\.updated/ }))
+
+    await waitFor(() => {
+      expect(namesInOrder()).toEqual(["Amber", "Zebra"])
+    })
+  })
+
+  it("shows the persona role and a localized category badge only for a template-linked Agent", async () => {
+    apiRequestMock.mockImplementation((url: string) => {
+      if (url.startsWith("http://api.local/api/agents")) {
+        return Promise.resolve(jsonResponse([
+          { ...agent, id: 1, name: "Hired Agent", template_id: "sample-template" },
+          { ...agent, id: 2, name: "Custom Agent", template_id: null },
+        ]))
+      }
+      if (url.startsWith("http://api.local/api/templates/")) {
+        return Promise.resolve(jsonResponse([
+          {
+            id: "sample-template",
+            name: "Sample Template",
+            category: "operations_research",
+            description: "",
+            features: [],
+            connections: [],
+            setup_time: "",
+            tags: [],
+            author: "",
+            version: "1.0",
+            views: 0,
+            likes: 0,
+            used_count: 0,
+            persona: { name: "Hired Agent", role: "Research Specialist", avatar: null, intro: "", kickoff_questions: [] },
+          },
+        ]))
+      }
+      return Promise.resolve(jsonResponse([]))
+    })
+
+    render(<BuildsPage />)
+    await screen.findByText("Hired Agent")
+    await screen.findByText("Custom Agent")
+
+    // Known key -> t() returns the untranslated key itself under this
+    // mock, but an unrecognized category slug falls back to a title-cased
+    // rendering of the raw value rather than leaking the raw slug as-is.
+    await waitFor(() => {
+      expect(screen.getByText("Research Specialist")).toBeInTheDocument()
+    })
+    expect(screen.getByText("Operations Research")).toBeInTheDocument()
+
+    const customCard = screen.getByText("Custom Agent").closest("[class*='cursor-pointer']")
+    expect(customCard).not.toHaveTextContent("Research Specialist")
+    expect(customCard).not.toHaveTextContent("Operations Research")
+  })
+
+  it("clears stale template enrichment (rather than keeping the previous locale's) after a failed refetch", async () => {
+    let templatesCall = 0
+    apiRequestMock.mockImplementation((url: string) => {
+      if (url.startsWith("http://api.local/api/agents")) {
+        return Promise.resolve(jsonResponse([
+          { ...agent, id: 1, name: "Hired Agent", template_id: "sample-template" },
+        ]))
+      }
+      if (url.startsWith("http://api.local/api/templates/")) {
+        templatesCall += 1
+        if (templatesCall === 1) {
+          return Promise.resolve(jsonResponse([
+            {
+              id: "sample-template",
+              name: "Sample Template",
+              category: "operations_research",
+              description: "",
+              features: [],
+              connections: [],
+              setup_time: "",
+              tags: [],
+              author: "",
+              version: "1.0",
+              views: 0,
+              likes: 0,
+              used_count: 0,
+              persona: { name: "Hired Agent", role: "Research Specialist", avatar: null, intro: "", kickoff_questions: [] },
+            },
+          ]))
+        }
+        return Promise.resolve(new Response(null, { status: 500 }))
+      }
+      return Promise.resolve(jsonResponse([]))
+    })
+
+    const view = render(<BuildsPage />)
+    await waitFor(() => {
+      expect(screen.getByText("Research Specialist")).toBeInTheDocument()
+    })
+
+    localeMock.value = "zh"
+    view.rerender(<BuildsPage />)
+
+    await waitFor(() => {
+      expect(screen.queryByText("Research Specialist")).not.toBeInTheDocument()
+    })
+    expect(screen.queryByText("Operations Research")).not.toBeInTheDocument()
+  })
 })
 
 describe("BuildsPage Agent deletion", () => {

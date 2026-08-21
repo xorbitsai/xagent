@@ -2362,7 +2362,7 @@ const zh = {
     list: {
       header: {
         title: "我的团队",
-        description: "谁在工作、有什么在等你确认、以及交付了什么。",
+        description: "查看和管理 Agent、状态及配置。",
         create: "添加队员",
       },
       search: {

@@ -2044,8 +2044,6 @@ def generic_oauth_callback(
             # UserOAuth row for this user+provider first, so letting a bad
             # response through here would destroy a prior *working* grant
             # while still telling the user "Connected Successfully".
-            import html
-
             return HTMLResponse(
                 content=(
                     "<h1>Error exchanging token</h1>"

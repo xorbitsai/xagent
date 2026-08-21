@@ -131,6 +131,20 @@ def test_create_all_enforces_owner_aware_uniqueness(tmp_path) -> None:
         engine.dispose()
 
 
+def test_actor_assignment_does_not_enter_ordinary_oauth_collection() -> None:
+    user = User(username="actor-assignment", password_hash="hash")
+    actor_account = UserOAuth(
+        provider="gmail",
+        resource_owner_key="actor:alice",
+        provider_user_id="alice",
+        access_token="actor-token",
+    )
+
+    actor_account.user = user
+
+    assert actor_account not in user.oauth_accounts
+
+
 def test_user_oauth_accounts_relationship_contains_only_ordinary_rows(tmp_path) -> None:
     engine, db, user = _oauth_relationship_db(tmp_path)
     try:

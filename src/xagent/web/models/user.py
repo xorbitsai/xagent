@@ -72,6 +72,10 @@ class User(Base):  # type: ignore
         ),
         back_populates="user",
         cascade="all, delete-orphan",
+        # SQL predicates do not filter Python-side back-reference updates.
+        # Disable synchronization so assigning an actor row's ``user`` cannot
+        # inject it into this ordinary-only delete-orphan collection.
+        sync_backref=False,
     )
     identities = relationship(
         "UserIdentity", back_populates="user", cascade="all, delete-orphan"

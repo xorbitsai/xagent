@@ -62,7 +62,13 @@ class UserOAuth(Base):  # type: ignore[no-any-unimported]
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
 
     # Relationships
-    user = relationship("User", back_populates="oauth_accounts")
+    user = relationship(
+        "User",
+        back_populates="oauth_accounts",
+        # Keep actor assignment from synchronizing into User.oauth_accounts,
+        # whose SQL join intentionally represents ordinary credentials only.
+        sync_backref=False,
+    )
 
     def __repr__(self) -> str:
         return f"<UserOAuth(user_id={self.user_id}, provider='{self.provider}', email='{self.email}')>"

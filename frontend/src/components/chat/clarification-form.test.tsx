@@ -289,9 +289,11 @@ describe("ClarificationForm connect_apps interaction", () => {
       />,
     )
 
-    expect(screen.getByText("Google")).toBeInTheDocument()
+    expect(screen.getByText("Gmail")).toBeInTheDocument()
     expect(
-      screen.getByRole("button", { name: "chatPage.clarification.connectApps.connect" }),
+      screen.getByRole("button", {
+        name: 'chatPage.clarification.connectApps.continueWith:{"provider":"Gmail"}',
+      }),
     ).toBeInTheDocument()
   })
 

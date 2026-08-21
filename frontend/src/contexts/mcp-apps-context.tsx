@@ -18,6 +18,18 @@ export interface McpApp {
   is_connected?: boolean
   server_id?: number
   connected_account?: string
+  // Canonical connect classification derived by the backend
+  // (mcp_apps.classify_app_auth) - see components/mcp/types.ts's
+  // AppIntegration for the same field. The API already returns this; it
+  // was just never declared here before.
+  auth_type?: "builtin_oauth" | "api_key" | "keyless" | "mcp_oauth" | "unconnectable"
+  // Same gap as auth_type above: already in the API response, just not
+  // declared here. required_env lists the env var names an "api_key" app
+  // needs (e.g. AWS_ACCESS_KEY_ID) - see components/mcp/types.ts's
+  // AppIntegration.launch_config for the fuller shape.
+  launch_config?: {
+    required_env?: string[]
+  }
 }
 
 interface McpAppsContextType {

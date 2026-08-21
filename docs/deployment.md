@@ -89,7 +89,7 @@ On SQLite the migration rejects globally colliding owner-index names before rebu
 
 If the SQLite migration process exits after the rebuild starts, keep every worker stopped. Restore the verified pre-migration backup, confirm that `uq_user_provider_account` still exists and `resource_owner_key` does not, and then retry the migration. Do not resume from a table that has lost the old constraint but does not have both owner-aware indexes; that state has no uniqueness enforcement.
 
-The normal application-startup migration path disables SQLite foreign-key enforcement around batch rebuilds and rejects any new foreign-key violations before commit. The standalone `alembic upgrade head` path does not provide that guard. If operators must use the standalone command, record the complete `PRAGMA foreign_key_check;` result before and after migration and do not start workers if the result gains any row.
+The normal application-startup migration path disables SQLite foreign-key enforcement around batch rebuilds and rejects any new foreign-key violations before commit. The standalone `alembic upgrade head` path does not provide that guard. If operators must use the standalone command, record the complete `PRAGMA foreign_key_check;` result and `SELECT count(*) FROM gmail_watch_states;` before and after migration. Do not start workers if the foreign-key result gains a row or the watch-state count changes. The row count is required because a valid `ON DELETE CASCADE` can remove child rows without leaving a foreign-key violation.
 
 If the migration reports `UserOAuth schema is partially owner-aware`, do not start workers. The schema has either `resource_owner_key` and the old `uq_user_provider_account` constraint together, or neither one. Restore the last known complete schema from backup, or have a database operator finish one coherent legacy or owner-aware schema before retrying `alembic upgrade head`. Do not bypass this fail-closed check.
 
@@ -109,8 +109,8 @@ Choose the procedure for the configured database.
 2. Stop every API and task worker.
 3. Take and verify a restorable database backup.
 4. Deploy the new application files without starting workers.
-5. Record `PRAGMA foreign_key_check;`, then run `alembic upgrade head` one time.
-6. Run `PRAGMA foreign_key_check;` again and require that it contains no new row.
+5. Record `PRAGMA foreign_key_check;` and `SELECT count(*) FROM gmail_watch_states;`, then run `alembic upgrade head` one time.
+6. Run both queries again. Require that the foreign-key result contains no new row and that the watch-state count is unchanged.
 7. Start every API and task worker with the new version.
 8. Verify the schema and homogeneous worker version.
 9. Resume ordinary OAuth connections and task execution.

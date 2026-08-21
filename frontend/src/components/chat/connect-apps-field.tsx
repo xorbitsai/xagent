@@ -138,6 +138,7 @@ function RowIcon({
           alt=""
           className="h-full w-full object-contain p-1"
           onError={(event) => {
+            event.currentTarget.onerror = null;
             event.currentTarget.src = iconFallbackUrl(fallbackName);
           }}
         />

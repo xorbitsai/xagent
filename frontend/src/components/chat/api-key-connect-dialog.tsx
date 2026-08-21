@@ -97,6 +97,7 @@ export function ApiKeyConnectDialog({
                 alt=""
                 className="h-5 w-5"
                 onError={(event) => {
+                  event.currentTarget.onerror = null;
                   event.currentTarget.src = iconFallbackUrl(app.name);
                 }}
               />

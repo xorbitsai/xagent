@@ -296,6 +296,22 @@ def test_none_provider_filter_cannot_delete_an_owner_namespace(tmp_path) -> None
         engine.dispose()
 
 
+def test_string_provider_filter_is_rejected(tmp_path) -> None:
+    engine, db, user, _rows = _db(tmp_path)
+    try:
+        with pytest.raises(TypeError, match="sequence, not a string"):
+            delete_scoped_user_oauth_accounts(
+                db,
+                user_id=int(user.id),
+                resource_owner_key=ALICE,
+                providers="gmail",
+            )
+        assert db.query(UserOAuth).count() == 3
+    finally:
+        db.close()
+        engine.dispose()
+
+
 def test_actor_revocation_leaves_ordinary_and_other_actor_rows(tmp_path) -> None:
     engine, db, user, _rows = _db(tmp_path)
     try:

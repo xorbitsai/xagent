@@ -136,6 +136,8 @@ def delete_scoped_user_oauth_accounts(
     commits. Callers must not retain matching identity-mapped rows because the
     bulk delete does not synchronize those in-memory objects.
     """
+    if isinstance(providers, str):
+        raise TypeError("providers must be a sequence, not a string")
     provider_keys = tuple(dict.fromkeys(str(provider) for provider in providers))
     if not provider_keys:
         return 0

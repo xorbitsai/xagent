@@ -122,6 +122,21 @@ function TaskHomePageContent() {
     [agents, templatesById, t]
   );
 
+  // `selectedAgents` can be set from a pre-enrichment `teammates` snapshot
+  // (the user clicks a hired agent's pill before its template lookup has
+  // resolved, so the object captured at click time has no persona photo or
+  // sample prompt yet). Re-resolving by id against the latest `teammates`
+  // on every render means the hero portrait and the picker's `isSelected`
+  // pill stay in sync once enrichment lands, instead of being stuck on the
+  // stale pre-enrichment object until the user deselects and reselects.
+  const resolvedSelectedAgents = useMemo(
+    () =>
+      selectedAgents.map(
+        (agent) => teammates.find((teammate) => teammate.id === agent.id) ?? agent
+      ),
+    [selectedAgents, teammates]
+  );
+
   useEffect(() => {
     if (!agentFromQuery || appliedAgentFromQueryRef.current === agentFromQuery || teammates.length === 0) {
       return;
@@ -138,6 +153,12 @@ function TaskHomePageContent() {
 
   useEffect(() => {
     let cancelled = false;
+    // Clear the previous agent's config synchronously the moment the
+    // selection changes - otherwise, switching from agent A to agent B and
+    // sending before B's fetch below resolves would submit A's stale
+    // model/executionMode under B's id (ChatInput reads `taskConfig`
+    // directly at submit time, not a value snapshotted per-agent).
+    setSelectedAgentConfig(undefined);
 
     const fetchSelectedAgentConfig = async () => {
       const selectedAgent = selectedAgents[0];
@@ -207,6 +228,22 @@ function TaskHomePageContent() {
     setInputValue(queryInputValue);
     setPromptHighlightTerms(queryPromptHighlightTerms);
   }, [queryInputValue, queryPromptHighlightTerms]);
+
+  // Companion fix for the same pre-enrichment race `resolvedSelectedAgents`
+  // addresses above: if the agent had no prompt to offer at click time
+  // (its template hadn't loaded yet) but one arrives once enrichment
+  // lands, fill it in - but only while the composer is still exactly as
+  // `handleAgentClick` left it, so a task the user has since typed
+  // themselves is never overwritten.
+  useEffect(() => {
+    const lead = resolvedSelectedAgents[0];
+    const prompt = lead?.suggested_prompts?.[0];
+    if (prompt && loadedPromptRef.current === null && inputValue === "") {
+      setInputValue(prompt);
+      setPromptHighlightTerms([]);
+      loadedPromptRef.current = prompt;
+    }
+  }, [resolvedSelectedAgents, inputValue]);
 
   const handleSend = async (message: string, filesToSend: File[], config?: any) => {
     if (state.isProcessing) return;
@@ -297,7 +334,7 @@ function TaskHomePageContent() {
             icon={<Bot className="w-10 h-10 text-[hsl(var(--gradient-from))]" />}
             agents={teammates}
             onAgentClick={handleAgentClick}
-            selectedAgents={selectedAgents}
+            selectedAgents={resolvedSelectedAgents}
             onRemoveSelectedAgent={handleRemoveSelectedAgent}
             onSend={handleSend}
             isSending={state.isProcessing}

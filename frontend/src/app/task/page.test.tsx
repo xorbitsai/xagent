@@ -23,6 +23,7 @@ interface MockChatStartScreenProps {
   onRemoveSelectedAgent?: (id: number | string) => void
   onInputChange?: (value: string) => void
   onSend?: (message: string, files: unknown[], config?: unknown) => void
+  taskConfig?: unknown
 }
 
 const chatStartScreenProps = vi.hoisted(() => ({
@@ -281,6 +282,123 @@ describe("TaskHomePage agents", () => {
         },
       ])
     })
+  })
+
+  it("re-syncs the selection and retroactively fills the prompt once a click-time-unenriched agent's template loads", async () => {
+    const HIRED_RAW = { id: 1, name: "Vera", status: "published", suggested_prompts: [], template_id: "sales-research-enricher" }
+    let resolveTemplates: (value: Response) => void = () => {}
+    const templatesPromise = new Promise<Response>((resolve) => {
+      resolveTemplates = resolve
+    })
+    apiRequestMock.mockImplementation((url: string) => {
+      if (url === "http://api.local/api/agents") return Promise.resolve(jsonResponse([HIRED_RAW]))
+      if (url.startsWith("http://api.local/api/templates/")) return templatesPromise
+      return Promise.resolve(new Response(null, { status: 404 }))
+    })
+
+    render(<TaskHomePage />)
+    await screen.findByText("pick-Vera")
+
+    // Clicked before the template lookup resolves - nothing to enrich with
+    // yet, so the raw (unenriched) agent is selected and the composer stays
+    // empty, same as any agent with no prompt of its own.
+    fireEvent.click(screen.getByText("pick-Vera"))
+    expect(chatStartScreenProps.current?.selectedAgents).toEqual([HIRED_RAW])
+    expect(screen.getByTestId("composer")).toHaveValue("")
+
+    await act(async () => {
+      resolveTemplates(
+        jsonResponse([
+          {
+            id: "sales-research-enricher",
+            category: "Sales",
+            persona: { avatar: "/marketplace/avatars/vera.png" },
+            sample_prompts: [{ title: "Research", prompt: "Research a topic and give me an evidence-backed recommendation" }],
+          },
+        ])
+      )
+    })
+
+    await waitFor(() => {
+      expect(chatStartScreenProps.current?.selectedAgents).toEqual([
+        {
+          ...HIRED_RAW,
+          persona_avatar: "/marketplace/avatars/vera.png",
+          specialty: "templates.categoryTitles.sales",
+          suggested_prompts: ["Research a topic and give me an evidence-backed recommendation"],
+        },
+      ])
+    })
+    expect(screen.getByTestId("composer")).toHaveValue(
+      "Research a topic and give me an evidence-backed recommendation"
+    )
+  })
+
+  it("does not retroactively fill the prompt once the user has started typing their own", async () => {
+    const HIRED_RAW = { id: 1, name: "Vera", status: "published", suggested_prompts: [], template_id: "sales-research-enricher" }
+    let resolveTemplates: (value: Response) => void = () => {}
+    const templatesPromise = new Promise<Response>((resolve) => {
+      resolveTemplates = resolve
+    })
+    apiRequestMock.mockImplementation((url: string) => {
+      if (url === "http://api.local/api/agents") return Promise.resolve(jsonResponse([HIRED_RAW]))
+      if (url.startsWith("http://api.local/api/templates/")) return templatesPromise
+      return Promise.resolve(new Response(null, { status: 404 }))
+    })
+
+    render(<TaskHomePage />)
+    await screen.findByText("pick-Vera")
+
+    fireEvent.click(screen.getByText("pick-Vera"))
+    act(() => {
+      chatStartScreenProps.current?.onInputChange?.("My own task description")
+    })
+
+    await act(async () => {
+      resolveTemplates(
+        jsonResponse([
+          {
+            id: "sales-research-enricher",
+            category: "Sales",
+            sample_prompts: [{ title: "Research", prompt: "Research a topic and give me an evidence-backed recommendation" }],
+          },
+        ])
+      )
+    })
+
+    expect(screen.getByTestId("composer")).toHaveValue("My own task description")
+  })
+
+  it("clears the previous agent's execution config synchronously on switch, so it can't leak into the new agent's send", async () => {
+    const AGENT_A = { id: 1, name: "Vera", status: "published", suggested_prompts: [] }
+    const AGENT_B = { id: 2, name: "Kevin", status: "published", suggested_prompts: [] }
+    let resolveAConfig: (value: Response) => void = () => {}
+    const aConfigPromise = new Promise<Response>((resolve) => {
+      resolveAConfig = resolve
+    })
+    apiRequestMock.mockImplementation((url: string) => {
+      if (url === "http://api.local/api/agents") return Promise.resolve(jsonResponse([AGENT_A, AGENT_B]))
+      if (url === "http://api.local/api/agents/1") return aConfigPromise
+      return Promise.resolve(new Response(null, { status: 404 }))
+    })
+
+    render(<TaskHomePage />)
+    await screen.findByText("pick-Vera")
+
+    fireEvent.click(screen.getByText("pick-Vera"))
+    await act(async () => {
+      resolveAConfig(jsonResponse({ models: { general: "gpt-x" }, execution_mode: "think" }))
+    })
+    await waitFor(() => {
+      expect(chatStartScreenProps.current?.taskConfig).toEqual({ model: "gpt-x", executionMode: "think" })
+    })
+
+    fireEvent.click(screen.getByText("pick-Kevin"))
+
+    // Kevin's own config fetch (a 404 in this test) is still in flight -
+    // Vera's stale config must already be gone, not still sitting there
+    // ready to be sent under Kevin's id.
+    expect(chatStartScreenProps.current?.taskConfig).toBeUndefined()
   })
 
   it("prefers a hired agent's template sample prompt over its own (usually empty) suggested_prompts", async () => {

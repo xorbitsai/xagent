@@ -1,5 +1,5 @@
 import React from "react"
-import { cleanup, render, screen } from "@testing-library/react"
+import { cleanup, fireEvent, render, screen } from "@testing-library/react"
 import { afterEach, describe, expect, it, vi } from "vitest"
 
 const chatInputProps = vi.hoisted(() => ({
@@ -121,6 +121,24 @@ describe("ChatStartScreen agents section", () => {
 
     expect(screen.queryByText("chatPage.sections.leadReady")).toBeNull()
     expect(screen.queryByRole("img", { name: "Maya" })).toBeNull()
+  })
+
+  it("does not show a right-edge fade when the pill row does not overflow", () => {
+    renderScreen([{ id: 7, name: "Maya" }])
+
+    expect(screen.queryByTestId("team-strip")?.nextSibling).toBeNull()
+  })
+
+  it("shows the right-edge fade once the pill row actually has scrollable overflow", () => {
+    renderScreen([{ id: 7, name: "Maya" }])
+
+    const strip = screen.getByTestId("team-strip")
+    Object.defineProperty(strip, "scrollWidth", { configurable: true, value: 800 })
+    Object.defineProperty(strip, "clientWidth", { configurable: true, value: 400 })
+    Object.defineProperty(strip, "scrollLeft", { configurable: true, value: 0 })
+    fireEvent.scroll(strip)
+
+    expect(strip.nextSibling).not.toBeNull()
   })
 
   it("tells ChatInput to hide its own selected-agent chip, since the hero swap already shows the lead", () => {

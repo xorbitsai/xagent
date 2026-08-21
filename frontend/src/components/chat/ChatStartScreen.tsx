@@ -1,4 +1,4 @@
-import React from "react";
+import React, { useEffect, useRef, useState } from "react";
 import { Sparkles } from "lucide-react";
 import { ChatInput } from "@/components/chat/ChatInput";
 import { useI18n } from "@/contexts/i18n-context";
@@ -119,6 +119,29 @@ export function ChatStartScreen({
   // and the header falls back to the plain title/description below.
   const leadAgent = agents && agents.length > 0 ? selectedAgents[0] : undefined;
 
+  // The right-edge fade only earns its place when there's actually
+  // something past the edge to scroll to - otherwise it's a gradient
+  // fading into nothing over the last, fully-visible pill.
+  const teamStripRef = useRef<HTMLDivElement>(null);
+  const [teamStripHasMore, setTeamStripHasMore] = useState(false);
+  useEffect(() => {
+    const strip = teamStripRef.current;
+    if (!strip) {
+      setTeamStripHasMore(false);
+      return;
+    }
+    const sync = () => {
+      setTeamStripHasMore(strip.scrollWidth - strip.scrollLeft - strip.clientWidth > 8);
+    };
+    sync();
+    strip.addEventListener("scroll", sync);
+    window.addEventListener("resize", sync);
+    return () => {
+      strip.removeEventListener("scroll", sync);
+      window.removeEventListener("resize", sync);
+    };
+  }, [agents]);
+
   return (
     <div className="flex flex-col items-center justify-start min-h-[80vh] pt-10 pb-16 px-6 text-center">
       {leadAgent ? (
@@ -132,9 +155,9 @@ export function ChatStartScreen({
             textClassName="text-xl"
             className="rounded-[22px] shrink-0"
           />
-          <div>
-            <h2 className="text-2xl font-bold leading-tight">{title}</h2>
-            <p className="text-sm text-muted-foreground mt-1">
+          <div className="min-w-0">
+            <h2 className="text-2xl font-bold leading-tight break-words">{title}</h2>
+            <p className="text-sm text-muted-foreground mt-1 break-words">
               {t("chatPage.sections.leadReady", { name: leadAgent.name })}
             </p>
           </div>
@@ -236,6 +259,8 @@ export function ChatStartScreen({
             </p>
             <div className="relative">
               <div
+                ref={teamStripRef}
+                data-testid="team-strip"
                 className="flex items-center gap-2 overflow-x-auto p-1 pr-8 [scrollbar-width:none] [-ms-overflow-style:none] [&::-webkit-scrollbar]:hidden"
               >
                 <span className="shrink-0 text-[11px] font-bold uppercase tracking-[0.07em] text-muted-foreground/80 whitespace-nowrap">
@@ -277,8 +302,12 @@ export function ChatStartScreen({
                 })}
               </div>
               {/* Fades the right edge so a horizontally-clipped pill reads as
-                  "more to scroll" rather than an abruptly truncated name. */}
-              <div className="pointer-events-none absolute inset-y-0 right-0 w-8 bg-gradient-to-l from-background to-transparent" />
+                  "more to scroll" rather than an abruptly truncated name -
+                  only when there's actually more past the edge, or it's a
+                  gradient fading into nothing over a fully-visible pill. */}
+              {teamStripHasMore && (
+                <div className="pointer-events-none absolute inset-y-0 right-0 w-8 bg-gradient-to-l from-background to-transparent" />
+              )}
             </div>
           </div>
         )}

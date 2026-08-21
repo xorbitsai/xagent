@@ -42,6 +42,36 @@ def test_serializers_include_visibility(db):
     assert store.agent_to_list_item_dict(agent)["team_id"] is None
 
 
+def test_list_item_dict_includes_suggested_prompts(db):
+    # The /task "My Team" picker auto-fills its composer from this field on
+    # the agent-list response - it must actually be present there, not just
+    # on the per-agent detail response.
+    from xagent.web.models.user import User
+    from xagent.web.services.agent_store import AgentStore
+
+    u = User(username="prompts", password_hash="h", is_admin=False)
+    db.add(u)
+    db.flush()
+    store = AgentStore(db)
+    agent = store.create_agent(
+        user_id=int(u.id),
+        name="Prompter",
+        description=None,
+        instructions=None,
+        suggested_prompts=["Draft a status update"],
+    )
+    assert store.agent_to_list_item_dict(agent)["suggested_prompts"] == [
+        "Draft a status update"
+    ]
+
+    agent_without_prompts = store.create_agent(
+        user_id=int(u.id), name="Plain", description=None, instructions=None
+    )
+    assert (
+        store.agent_to_list_item_dict(agent_without_prompts)["suggested_prompts"] == []
+    )
+
+
 def test_team_id_of():
     from xagent.web.services.agent_team_scope import AgentTeamScope, team_id_of
 

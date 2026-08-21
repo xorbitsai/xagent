@@ -135,10 +135,15 @@ export function ChatStartScreen({
     };
     sync();
     strip.addEventListener("scroll", sync);
-    window.addEventListener("resize", sync);
+    // A ResizeObserver on the strip itself catches every way its available
+    // width can change (window resize, but also a sidebar toggling or any
+    // other local layout shift) - a window `resize` listener alone would
+    // miss the ones that aren't the window itself resizing.
+    const observer = new ResizeObserver(sync);
+    observer.observe(strip);
     return () => {
       strip.removeEventListener("scroll", sync);
-      window.removeEventListener("resize", sync);
+      observer.disconnect();
     };
   }, [agents]);
 

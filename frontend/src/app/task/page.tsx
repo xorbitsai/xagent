@@ -306,20 +306,31 @@ function TaskHomePageContent() {
       return;
     }
 
-    // Switching straight to a teammate with no suggested prompt of their
-    // own must still clear whatever the previous teammate auto-filled -
-    // otherwise their (unedited) prompt is stranded in the composer with
-    // nothing tracking it, since `loadedPromptRef` is about to be
-    // overwritten below regardless of which branch runs next.
-    clearAutoFilledPromptIfUnchanged();
+    // Only ever touch the composer when it's still exactly what the last
+    // auto-fill left behind (or empty) - a task the user has genuinely
+    // typed themselves must never be overwritten just because a different
+    // teammate is now leading. Read `inputValue` once, up front: setState
+    // is batched, so calling clearAutoFilledPromptIfUnchanged() first (as
+    // this used to) and then re-checking `inputValue` afterwards would
+    // still see the pre-clear value within this same handler run.
+    const composerIsUntouched = inputValue === "" || inputValue === loadedPromptRef.current;
 
     setSelectedAgents([agent]);
     const prompt = agent.suggested_prompts?.[0];
+    if (!composerIsUntouched) {
+      // The user's own text stays exactly as they left it; there's no
+      // longer an auto-fill of ours to track against it.
+      loadedPromptRef.current = null;
+      return;
+    }
+
     if (prompt) {
       setInputValue(prompt);
       setPromptHighlightTerms([]);
       loadedPromptRef.current = prompt;
     } else {
+      setInputValue("");
+      setPromptHighlightTerms([]);
       loadedPromptRef.current = null;
     }
   };

@@ -176,6 +176,20 @@ describe("TaskHomePage agents", () => {
     )
   })
 
+  it("does not overwrite a task the user already typed by picking a first teammate with a suggested prompt", async () => {
+    apiRequestMock.mockResolvedValueOnce(jsonResponse([VERA]))
+    render(<TaskHomePage />)
+    await screen.findByText("pick-Vera")
+
+    act(() => {
+      chatStartScreenProps.current?.onInputChange?.("Build me a report on our top customers")
+    })
+    fireEvent.click(screen.getByText("pick-Vera"))
+
+    expect(screen.getByTestId("composer")).toHaveValue("Build me a report on our top customers")
+    expect(chatStartScreenProps.current?.selectedAgents).toEqual([VERA])
+  })
+
   it("switching from one teammate to another replaces the selection and the filled prompt", async () => {
     apiRequestMock.mockResolvedValueOnce(jsonResponse([VERA, { ...KEVIN, suggested_prompts: ["Turn my meetings into next steps"] }]))
     render(<TaskHomePage />)

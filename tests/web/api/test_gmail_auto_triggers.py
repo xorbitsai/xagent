@@ -1525,6 +1525,81 @@ def test_collect_gmail_pubsub_events_collects_matching_trigger_events() -> None:
         db.close()
 
 
+def test_collect_gmail_pubsub_events_targets_exact_bound_account() -> None:
+    db = _direct_db_session()
+    try:
+        user = _create_user(db, "gmail-exact-bound-account-user")
+        watched_account = _create_gmail_oauth(db, user)
+        other_account = UserOAuth(
+            user_id=int(user.id),
+            provider="gmail",
+            access_token="other-access-token",
+            refresh_token="other-refresh-token",
+            provider_user_id="other-provider-user",
+            email="codeacme17@gmail.com",
+        )
+        db.add(other_account)
+        db.commit()
+        db.refresh(other_account)
+        watched_trigger = _mark_unified_gmail_trigger(
+            db,
+            _create_gmail_trigger(
+                db,
+                user,
+                config={
+                    "watch_label": "INBOX",
+                    "oauth_account_id": int(watched_account.id),
+                },
+            ),
+        )
+        _mark_unified_gmail_trigger(
+            db,
+            _create_gmail_trigger(
+                db,
+                user,
+                config={
+                    "watch_label": "INBOX",
+                    "oauth_account_id": int(other_account.id),
+                },
+            ),
+            callback_id="other-trigger-callback",
+        )
+        state = GmailWatchState(
+            user_id=int(user.id),
+            oauth_account_id=int(watched_account.id),
+            email="codeacme17@gmail.com",
+            history_id="100",
+            topic_name="projects/demo/topics/xagent-gmail",
+        )
+        db.add(state)
+        db.commit()
+        fake_service = _FakeGmailService(
+            history_response={
+                "history": [{"messagesAdded": [{"message": {"id": "msg-bound"}}]}]
+            },
+            messages={"msg-bound": _gmail_message("msg-bound")},
+        )
+
+        result = asyncio.run(
+            collect_gmail_pubsub_events(
+                db,
+                GmailPubsubNotification(
+                    email_address="codeacme17@gmail.com",
+                    history_id="222",
+                    pubsub_message_id="pubsub-bound",
+                ),
+                state=state,
+                service_factory=lambda _db, _oauth: fake_service,
+            )
+        )
+
+        assert [event.trigger_id for event in result.events] == [
+            int(watched_trigger.id)
+        ]
+    finally:
+        db.close()
+
+
 def test_collect_gmail_pubsub_events_skips_label_mismatch() -> None:
     db = _direct_db_session()
     try:

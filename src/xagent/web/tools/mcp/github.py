@@ -23,6 +23,11 @@ mcp = FastMCP("github-mcp")
 GITHUB_BASE_URL = "https://api.github.com"
 DEFAULT_TIMEOUT_SECONDS = 30
 MAX_PER_PAGE = 100
+# Same bound/convention as jira.py's and intercom.py's own copies -- a large
+# 422 validation-error list (or an unusually verbose "message") would
+# otherwise be joined in full into the raised exception and land verbatim in
+# the model's context.
+MAX_ERROR_RESPONSE_TEXT_CHARS = 1000
 # Default result count for the two search tools -- one constant shared by
 # their signatures and their _clamp_limit fallbacks so the values can't
 # silently drift apart (the list tools use _clamp_limit's own default 30).
@@ -75,7 +80,22 @@ def _encode_path_component(value: str, *, field: str) -> str:
     than left to percent-encoding) because a legitimate owner or repo name
     never contains them -- unlike file paths, see _encode_file_path_segment.
     """
-    if not value or _FORBIDDEN_REPO_CHARS.search(value) or value in (".", ".."):
+    stripped = value.strip() if value else value
+    if (
+        not value
+        or not stripped
+        or _FORBIDDEN_REPO_CHARS.search(value)
+        or stripped in (".", "..")
+    ):
+        # A whitespace-only value (e.g. " ") is truthy and would otherwise
+        # pass through to be percent-encoded ("%20") and reach GitHub as a
+        # literal owner/repo name -- _require_nonblank already rejects this
+        # shape for other string fields (title/body/head/base); this module
+        # is a "reject rather than repair" module too, so owner/repo
+        # shouldn't be the exception. Checked against the stripped value,
+        # not the raw one, so a padded dot-segment (" . ", " .. ") can't
+        # slip past by being neither purely whitespace nor an exact "."/".."
+        # match.
         raise ValueError(f"{field} contains characters that are not allowed: {value!r}")
     return quote(value, safe="")
 
@@ -225,12 +245,15 @@ def _clamp_limit(limit: int, *, default: int = 30) -> int:
     return max(1, min(value, MAX_PER_PAGE))
 
 
-def _validate_positive_number(value: int, *, field: str) -> int:
+def _validate_positive_number(value: Any, *, field: str) -> int:
     """Reject a non-positive issue/pull-request number before it reaches an
     authenticated route -- FastMCP's plain `int` schema doesn't enforce a
     lower bound, and a direct Python call (as in tests) bypasses FastMCP
-    validation entirely, so 0/negative values would otherwise reach
-    `/issues/0` or `/pulls/-1` unchecked.
+    validation entirely, so 0/negative values (or a non-integral float,
+    e.g. 2.9) would otherwise reach `/issues/0`/`/pulls/-1`, or silently
+    truncate to the wrong number, unchecked. `value` is typed `Any`, not
+    `int`, precisely because callers reaching this function directly are
+    not guaranteed to have already satisfied that type.
     """
     try:
         number = int(value)
@@ -241,6 +264,11 @@ def _validate_positive_number(value: int, *, field: str) -> int:
         raise ValueError(
             f"{field} must be a positive integer, got: {value!r}"
         ) from None
+    if isinstance(value, float) and not value.is_integer():
+        # int() truncates rather than rejecting -- without this, 2.9
+        # silently becomes 2 and fetches that issue/PR instead of being
+        # rejected as the non-integer input it actually is.
+        raise ValueError(f"{field} must be a positive integer, got: {value!r}")
     if number < 1:
         raise ValueError(f"{field} must be a positive integer, got: {value!r}")
     return number
@@ -435,6 +463,8 @@ def _request_raw(
             rate_limit_bits.append(f"rate_limit_reset={rate_limit_reset}")
         if rate_limit_bits:
             message = f"{message} ({', '.join(rate_limit_bits)})"
+        if len(message) > MAX_ERROR_RESPONSE_TEXT_CHARS:
+            message = message[:MAX_ERROR_RESPONSE_TEXT_CHARS] + "... [truncated]"
         raise RuntimeError(message)
     return response
 
@@ -579,7 +609,17 @@ def github_search_repositories(
         has_next_page = "next" in _link_header_rels(response.headers.get("Link"))
         return _success(
             repositories=repos,
-            total_count=result.get("total_count", len(repos)),
+            # `.get(..., default)`'s default only fires when the key is
+            # absent -- an explicit `"total_count": null` would otherwise
+            # surface as None instead of falling back to the item count.
+            # An `or` fallback would be wrong the other way (a genuine
+            # total_count=0 shouldn't be replaced by len(repos)), so this
+            # checks for None specifically.
+            total_count=(
+                result.get("total_count")
+                if result.get("total_count") is not None
+                else len(repos)
+            ),
             # GitHub can answer a 200 with incomplete_results=true when its
             # search index times out -- dropping this would let a caller
             # mistake a partial index result for an exhaustive one.
@@ -1136,7 +1176,21 @@ def github_get_file_contents(repo: str, path: str, ref: str = "") -> str:
                 "returned) -- clone the repository to read it; this connector "
                 "has no raw-blob or Trees API tool for large files"
             )
-        raw_content = result.get("content") or ""
+        raw_content = result.get("content")
+        if raw_content is None:
+            # content omitted is the one falsy-but-legitimate case, treated
+            # as empty.
+            raw_content = ""
+        elif not isinstance(raw_content, str):
+            # Anything else non-string (an int, a list) would otherwise
+            # either reach _decode_base64_content() and raise an uncaught
+            # TypeError (it only expects `except ValueError`), or for a
+            # non-base64 encoding, be silently accepted as "content" and
+            # returned as if it were a real file body.
+            return _error(
+                f"File '{path}' has a non-string content field "
+                f"({type(raw_content).__name__})"
+            )
         if encoding == "base64":
             try:
                 decoded_bytes = _decode_base64_content(raw_content)
@@ -1270,7 +1324,14 @@ def github_search_code(
         has_next_page = "next" in _link_header_rels(response.headers.get("Link"))
         return _success(
             items=items,
-            total_count=result.get("total_count", len(items)),
+            # Same reasoning as github_search_repositories: `.get`'s default
+            # only fires when the key is absent, and an `or` fallback would
+            # be wrong for a genuine total_count=0.
+            total_count=(
+                result.get("total_count")
+                if result.get("total_count") is not None
+                else len(items)
+            ),
             incomplete_results=bool(result.get("incomplete_results")),
             truncated=has_next_page,
             truncation_reason="more_pages" if has_next_page else None,

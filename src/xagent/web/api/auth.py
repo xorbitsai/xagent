@@ -3,6 +3,7 @@
 import asyncio
 import hashlib
 import html
+import json
 import logging
 import os
 import re
@@ -296,27 +297,68 @@ _OAUTH_ERROR_MESSAGE_LIMIT = 500
 # provider-specific field that might carry a token) is reduced to presence
 # only. Server-side logging isn't a safe place for the raw payload either:
 # hide_parameters isn't a substitute here since these are dict values being
-# logged directly, not SQL bound parameters.
+# logged directly, not SQL bound parameters. Applied recursively (see
+# _redact_oauth_log_value), so "message"/"type" also cover an allowlisted
+# key's own nested object shape (Meta's "error" is itself
+# {"message": ..., "type": ...}, the same shape _bounded_oauth_error_message
+# already extracts from for the browser-facing message).
 _OAUTH_LOG_SAFE_KEYS = frozenset(
-    {"error", "error_description", "error_uri", "reason", "type"}
+    {"error", "error_description", "error_uri", "reason", "type", "message"}
 )
+
+
+def _redact_oauth_log_value(value: Any) -> Any:
+    """Recursively apply _OAUTH_LOG_SAFE_KEYS to a value found under an
+    already-allowlisted key.
+
+    A first version of this redaction serialized an allowlisted key's
+    whole value verbatim (e.g. via json.dumps) once it wasn't a plain str.
+    That reopened the exact leak this function exists to close: a
+    malformed/adversarial response can nest a live secret *inside* an
+    allowlisted key's object (`{"error": {"access_token": "..."}}`), and a
+    verbatim dump would still put it in the log even though the top-level
+    `access_token` field is correctly redacted. Recursing with the same
+    allowlist at every level closes that regardless of nesting depth.
+    """
+    if isinstance(value, dict):
+        return {
+            key: (
+                _redact_oauth_log_value(nested)
+                if key in _OAUTH_LOG_SAFE_KEYS
+                else "<redacted>"
+            )
+            for key, nested in value.items()
+        }
+    if isinstance(value, list):
+        return [_redact_oauth_log_value(item) for item in value]
+    if isinstance(value, str):
+        return value[:_OAUTH_ERROR_MESSAGE_LIMIT]
+    return value
 
 
 def _redact_oauth_log_payload(token_data: Dict[str, Any]) -> Dict[str, Any]:
     """Project a provider token/error response down to a safe-to-log shape.
 
-    Only the allowlisted diagnostic fields keep their (length-capped)
-    value; every other key is replaced with a presence marker so a
-    malformed or partial response can't put a live access/refresh token
-    into the server log the way logging the raw dict would.
+    Only the allowlisted diagnostic fields keep their (recursively
+    redacted, length-capped) value; every other key is replaced with a
+    presence marker so a malformed or partial response can't put a live
+    access/refresh token into the server log the way logging the raw dict
+    would.
+
+    An allowlisted key's value can still be non-str -- Meta's "error" is
+    itself an object (`{"message": ..., "type": ...}`), the same shape
+    `_bounded_oauth_error_message` already handles for the browser-facing
+    message -- so this keeps that diagnostic content instead of blanking
+    it, but via the same recursive allowlist rather than a verbatim dump.
     """
-    redacted: Dict[str, Any] = {}
-    for key, value in token_data.items():
-        if key in _OAUTH_LOG_SAFE_KEYS and isinstance(value, str):
-            redacted[key] = value[:200]
-        else:
-            redacted[key] = "<redacted>"
-    return redacted
+    return {
+        key: (
+            _redact_oauth_log_value(value)
+            if key in _OAUTH_LOG_SAFE_KEYS
+            else "<redacted>"
+        )
+        for key, value in token_data.items()
+    }
 
 
 def _extract_provider_error_message(
@@ -2153,7 +2195,6 @@ def generic_oauth_callback(
                 db, user_id=user_id, connector_key=(app_id or provider)
             )
 
-        import json
         from urllib.parse import urlparse
 
         redirect_url = payload.get("redirect")

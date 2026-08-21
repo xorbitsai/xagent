@@ -6,11 +6,14 @@ Create Date: 2026-08-17 00:00:00.000000
 
 """
 
+import logging
 import os
 from typing import Sequence, Union
 
 import sqlalchemy as sa
 from alembic import op
+
+logger = logging.getLogger(__name__)
 
 # revision identifiers, used by Alembic.
 revision: str = "20260817_seed_github_mcp_app"
@@ -59,6 +62,17 @@ GITHUB_PROVIDER_DEFAULT_SCOPES = ["read:user"]
 
 
 def _filter_row(row: dict[str, object], allowed_columns: set[str]) -> dict[str, object]:
+    dropped = row.keys() - allowed_columns
+    if dropped:
+        # An older DB missing a column this seed data includes (e.g.
+        # launch_config/oauth_scopes) would otherwise be silently dropped
+        # with no signal, producing a catalog entry that renders but can't
+        # actually launch or authorize correctly.
+        logger.warning(
+            "Dropping columns not present in the live schema while seeding "
+            "the GitHub connector: %s",
+            sorted(dropped),
+        )
     return {key: value for key, value in row.items() if key in allowed_columns}
 
 

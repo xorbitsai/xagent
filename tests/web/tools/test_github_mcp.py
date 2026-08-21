@@ -96,6 +96,28 @@ def test_encode_path_component_rejects_forbidden_values(value):
         github._encode_path_component(value, field="test")
 
 
+@pytest.mark.parametrize("value", [" ", "   ", "\t"])
+def test_encode_path_component_rejects_whitespace_only_values(value):
+    """A whitespace-only value is truthy and would otherwise pass through
+    to be percent-encoded ("%20") and reach GitHub as a literal owner/repo
+    name -- _require_nonblank already rejects this shape for other string
+    fields; owner/repo shouldn't be the exception."""
+    with pytest.raises(ValueError, match="not allowed"):
+        github._encode_path_component(value, field="test")
+
+
+@pytest.mark.parametrize("value", [" . ", " .. ", "\t.\t", "\n..\n"])
+def test_encode_path_component_rejects_whitespace_padded_dot_segments(value):
+    """A dot-segment check against the raw value only catches an exact "."
+    or ".." -- a whitespace-padded one (" . ", " .. ") is neither purely
+    whitespace (so the whitespace-only check doesn't catch it) nor an
+    exact match (so the dot-segment check doesn't either), and would
+    otherwise reach GitHub as a percent-encoded but still nonsense
+    owner/repo segment."""
+    with pytest.raises(ValueError, match="not allowed"):
+        github._encode_path_component(value, field="test")
+
+
 def test_encode_path_component_percent_encodes_space_in_owner_or_repo_name():
     """_encode_path_component (owner/repo names) only rejects '/', '?', '#',
     and dot-segments -- a space is not forbidden, so it must be
@@ -196,6 +218,30 @@ def test_request_folds_validation_errors_into_message(monkeypatch):
 
     with pytest.raises(RuntimeError, match="cannot be blank"):
         github._request("POST", "/repos/octocat/Hello-World/issues")
+
+
+def test_request_caps_a_large_validation_errors_list(monkeypatch):
+    """A large 422 validation-error list must be capped the same way
+    jira.py/intercom.py cap their own error text, not joined in full into
+    the raised exception and landed verbatim in the model's context."""
+    long_errors = [{"field": f"field_{i}", "message": "x" * 50} for i in range(50)]
+    monkeypatch.setattr(
+        github.requests,
+        "request",
+        Mock(
+            return_value=MockResponse(
+                json_data={"message": "Validation Failed", "errors": long_errors},
+                status_code=422,
+            )
+        ),
+    )
+
+    with pytest.raises(RuntimeError) as exc_info:
+        github._request("POST", "/repos/octocat/Hello-World/issues")
+
+    message = str(exc_info.value)
+    assert len(message) <= github.MAX_ERROR_RESPONSE_TEXT_CHARS + len("... [truncated]")
+    assert message.endswith("... [truncated]")
 
 
 def test_request_returns_empty_dict_on_no_content(monkeypatch):
@@ -673,6 +719,18 @@ def test_validate_positive_number_rejects_none_with_named_error():
         github._validate_positive_number(None, field="issue_number")
 
 
+def test_validate_positive_number_rejects_non_integral_float():
+    """int(2.9) truncates to 2 rather than raising -- without an explicit
+    check, github_get_issue(repo, 2.9) would silently fetch issue 2
+    instead of rejecting the non-integer input."""
+    with pytest.raises(ValueError, match="issue_number must be a positive integer"):
+        github._validate_positive_number(2.9, field="issue_number")
+
+
+def test_validate_positive_number_accepts_whole_number_float():
+    assert github._validate_positive_number(3.0, field="issue_number") == 3
+
+
 def test_search_repositories_falls_back_to_its_own_documented_default(monkeypatch):
     """A non-numeric limit reaching _clamp_limit (bypassing FastMCP's int
     schema via a direct call) must fall back to this tool's own documented
@@ -940,6 +998,58 @@ def test_search_repositories_reports_truncated_when_more_pages_exist(monkeypatch
     assert result["truncated"] is True
     assert result["truncation_reason"] == "more_pages"
     assert result["next_page"] == 2
+
+
+def test_search_repositories_falls_back_to_item_count_on_null_total_count(
+    monkeypatch,
+):
+    """.get("total_count", default)'s default only fires when the key is
+    absent -- an explicit "total_count": null must still fall back to the
+    item count, not surface as None."""
+    monkeypatch.setattr(
+        github.requests,
+        "request",
+        Mock(
+            return_value=MockResponse(
+                json_data={"total_count": None, "items": [{"full_name": "a/b"}]}
+            )
+        ),
+    )
+
+    result = json.loads(github.github_search_repositories("stars:>1"))
+
+    assert result["total_count"] == 1
+
+
+def test_search_repositories_not_truncated_when_link_header_has_no_next_rel(
+    monkeypatch,
+):
+    """Every existing truncated-case fixture sets rel="next"; every
+    non-truncated case omits the Link header entirely -- neither
+    distinguishes "no next rel" from "any Link header at all". A Link
+    header with only rel="last"/"prev" (the last page of a paginated
+    result) must not be mistaken for a continuation."""
+    monkeypatch.setattr(
+        github.requests,
+        "request",
+        Mock(
+            return_value=MockResponse(
+                json_data={"total_count": 2, "items": []},
+                headers={
+                    "Link": (
+                        '<https://api.github.com/x?page=1>; rel="prev", '
+                        '<https://api.github.com/x?page=1>; rel="first"'
+                    )
+                },
+            )
+        ),
+    )
+
+    result = json.loads(github.github_search_repositories("stars:>1"))
+
+    assert result["status"] == "success"
+    assert result["truncated"] is False
+    assert result.get("next_page") is None
 
 
 def test_search_repositories_sends_requested_page(monkeypatch):
@@ -1218,6 +1328,46 @@ def test_list_issues_skip_resumes_exactly_where_a_mid_page_cut_left_off(monkeypa
     assert [issue["number"] for issue in second["issues"]] == [4, 5, 6]
     assert second["next_page"] == 1
     assert second["next_skip"] == 6
+
+
+def test_list_issues_nonzero_skip_does_not_carry_over_to_a_later_real_page(
+    monkeypatch,
+):
+    """`page_skip` must reset to 0 once execution moves past the resumed
+    page -- all existing nonzero-skip tests mock only a single page, and
+    all existing multi-page tests (via a real Link header) start at
+    skip=0, so nothing exercises "resume with skip>0" together with "a
+    real second page fetched via the Link header". A regression that kept
+    applying start_skip to every page would silently drop start_skip
+    items from page 2 as well."""
+    first_page = [
+        {"number": i, "title": f"issue {i}", "labels": []} for i in range(1, 6)
+    ]
+    second_page = [
+        {"number": i, "title": f"issue {i}", "labels": []} for i in range(6, 9)
+    ]
+    monkeypatch.setattr(
+        github.requests,
+        "request",
+        Mock(
+            side_effect=[
+                MockResponse(
+                    json_data=first_page,
+                    headers={"Link": '<https://api.github.com/x?page=2>; rel="next"'},
+                ),
+                MockResponse(json_data=second_page),
+            ]
+        ),
+    )
+
+    result = json.loads(
+        github.github_list_issues("octocat/Hello-World", page=1, skip=2, limit=100)
+    )
+
+    assert result["status"] == "success"
+    # First 2 of page 1 (numbers 1-2) skipped per the resume cursor; all of
+    # page 2 (numbers 6-8) must be present, not skipped a second time.
+    assert [issue["number"] for issue in result["issues"]] == [3, 4, 5, 6, 7, 8]
 
 
 def test_list_issues_trailing_prs_after_limit_do_not_count_as_truncation(monkeypatch):
@@ -2312,6 +2462,61 @@ def test_get_file_contents_rejects_malformed_base64(monkeypatch):
     assert "invalid base64" in result["message"]
 
 
+def test_get_file_contents_rejects_non_string_content_field(monkeypatch):
+    """A non-string, non-null `content` (e.g. an int from a malformed
+    response) must not reach _decode_base64_content(), which only expects
+    a string and would otherwise raise an uncaught TypeError instead of a
+    clean error message."""
+    monkeypatch.setattr(
+        github.requests,
+        "request",
+        Mock(
+            return_value=MockResponse(
+                json_data={
+                    "type": "file",
+                    "path": "main.py",
+                    "encoding": "base64",
+                    "content": 12345,
+                }
+            )
+        ),
+    )
+
+    result = json.loads(
+        github.github_get_file_contents("octocat/Hello-World", "main.py")
+    )
+
+    assert result["status"] == "error"
+    assert "non-string content" in result["message"]
+
+
+def test_get_file_contents_treats_null_content_as_empty(monkeypatch):
+    """content: null (explicit JSON null, distinct from the key being
+    absent) must still fall back to an empty read, not be rejected as a
+    malformed non-string type."""
+    monkeypatch.setattr(
+        github.requests,
+        "request",
+        Mock(
+            return_value=MockResponse(
+                json_data={
+                    "type": "file",
+                    "path": "empty.txt",
+                    "encoding": "utf-8",
+                    "content": None,
+                }
+            )
+        ),
+    )
+
+    result = json.loads(
+        github.github_get_file_contents("octocat/Hello-World", "empty.txt")
+    )
+
+    assert result["status"] == "success"
+    assert result["content"] == ""
+
+
 def test_get_file_contents_flags_legacy_submodule_shape(monkeypatch):
     """A submodule can be returned with the legacy type="file" plus
     submodule_git_url and no real content -- it must not be reported as a
@@ -2801,6 +3006,25 @@ def test_list_commits_sends_requested_page(monkeypatch):
     github.github_list_commits("octocat/Hello-World", page=4)
 
     assert mock_request.call_args.kwargs["params"]["page"] == 4
+
+
+def test_search_code_falls_back_to_item_count_on_null_total_count(monkeypatch):
+    monkeypatch.setattr(
+        github.requests,
+        "request",
+        Mock(
+            return_value=MockResponse(
+                json_data={
+                    "total_count": None,
+                    "items": [{"name": "main.py", "path": "src/main.py"}],
+                }
+            )
+        ),
+    )
+
+    result = json.loads(github.github_search_code("def parse"))
+
+    assert result["total_count"] == 1
 
 
 def test_search_code_returns_items(monkeypatch):

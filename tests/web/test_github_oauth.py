@@ -431,6 +431,47 @@ def test_redact_oauth_log_payload_keeps_only_allowlisted_fields():
         assert secret not in str(redacted)
 
 
+def test_redact_oauth_log_payload_recurses_into_a_dict_shaped_allowlisted_field():
+    """Meta's "error" is itself an object ({"message": ..., "type": ...}),
+    the same shape _bounded_oauth_error_message already handles for the
+    browser-facing message -- an allowlisted key with a non-str value must
+    still keep its diagnostic content, not be blanked to "<redacted>" just
+    because it isn't a plain string."""
+    token_data = {
+        "error": {"message": "Invalid OAuth access token.", "type": "OAuthException"},
+    }
+
+    redacted = auth_api._redact_oauth_log_payload(token_data)
+
+    assert redacted["error"] != "<redacted>"
+    assert redacted["error"]["message"] == "Invalid OAuth access token."
+    assert redacted["error"]["type"] == "OAuthException"
+
+
+def test_redact_oauth_log_payload_redacts_a_secret_nested_inside_an_allowlisted_field():
+    """A first version of this function serialized an allowlisted key's
+    whole value verbatim (e.g. via json.dumps) once it wasn't a plain str
+    -- that reopens the exact leak this function exists to close if a
+    malformed/adversarial response nests a live secret *inside* an
+    allowlisted key's object, e.g. {"error": {"access_token": "..."}}.
+    The nested secret must be redacted the same as a top-level one."""
+    token_data = {
+        "access_token": "top-level-secret",
+        "error": {
+            "message": "safe to log",
+            "access_token": "nested-secret",
+        },
+    }
+
+    redacted = auth_api._redact_oauth_log_payload(token_data)
+
+    assert redacted["access_token"] == "<redacted>"
+    assert redacted["error"]["message"] == "safe to log"
+    assert redacted["error"]["access_token"] == "<redacted>"
+    for secret in ("top-level-secret", "nested-secret"):
+        assert secret not in str(redacted)
+
+
 def test_github_callback_does_not_log_token_alongside_error(
     db_session, monkeypatch, caplog
 ):

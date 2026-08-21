@@ -113,6 +113,35 @@ def test_upgrade_inserts_provider_and_app(tmp_path):
         assert launch_config["env_mapping"] == {"GITHUB_ACCESS_TOKEN": "access_token"}
 
 
+def test_filter_row_warns_when_dropping_columns(caplog):
+    """The full current schema (this file's own _create_tables) is a strict
+    superset of the seeded columns, so this branch is never exercised by
+    the upgrade tests -- a direct unit test on the helper covers the actual
+    missing-column/drop path instead."""
+    migration = _load_migration_module()
+
+    with caplog.at_level("WARNING"):
+        filtered = migration._filter_row(
+            {"provider_name": "github", "launch_config": {"command": "python"}},
+            allowed_columns={"provider_name"},
+        )
+
+    assert filtered == {"provider_name": "github"}
+    assert "launch_config" in caplog.text
+
+
+def test_filter_row_does_not_warn_when_nothing_is_dropped(caplog):
+    migration = _load_migration_module()
+
+    with caplog.at_level("WARNING"):
+        filtered = migration._filter_row(
+            {"provider_name": "github"}, allowed_columns={"provider_name", "name"}
+        )
+
+    assert filtered == {"provider_name": "github"}
+    assert caplog.text == ""
+
+
 def test_upgrade_is_idempotent(tmp_path):
     engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
     migration = _load_migration_module()

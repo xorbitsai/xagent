@@ -245,7 +245,7 @@ class TestTryUpgradeDb:
         engine = create_engine(f"sqlite:///{tmp_path / 'owner-inbound.db'}")
         apply_sqlite_concurrency_pragmas(engine)
         config = create_alembic_config(engine)
-        parent = "20260819_merge_jira_and_linear_heads"
+        parent = "20260820_merge_jira_posthog_heads"
 
         try:
             with engine.begin() as conn:

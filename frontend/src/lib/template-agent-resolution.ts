@@ -31,12 +31,13 @@ export const toAgentId = (
  * correctness boundary; there is no client-side shortcut that preserves it.
  */
 export async function resolveAgentForTemplate(
-  templateId: string
+  templateId: string,
+  name?: string
 ): Promise<{ agent: AgentCard; created: boolean }> {
   const response = await apiRequest(`${getApiUrl()}/api/agents/from-template/resolve`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ template_id: templateId }),
+    body: JSON.stringify(name ? { template_id: templateId, name } : { template_id: templateId }),
   });
   if (!response.ok) {
     throw new Error(`Failed to resolve agent from template (${response.status})`);

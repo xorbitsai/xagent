@@ -1196,6 +1196,11 @@ def test_projector_equivalent_to_batch(events):
     direct-call tests above, which now exercise the projector itself.
     What this test guards instead is that the batch driver never grows
     a second, independent folding implementation.
+
+    It is also the pin on the retention default: this path goes through
+    ``from_history(events).materialized_steps()`` with no override, so a
+    projector that stopped retaining finished steps by default would
+    raise rather than return the task's whole timeline here.
     """
     expected = map_trace_events_to_public_steps(events)
     projected = PublicStepProjector.from_history(events).materialized_steps()
@@ -1224,6 +1229,39 @@ def test_projector_incremental_feed_matches_materialized_steps(events):
     reconstructed = sorted(by_id.values(), key=lambda s: s["id"])
     materialized = sorted(projector.materialized_steps(), key=lambda s: s["id"])
     assert reconstructed == materialized
+
+
+@pytest.mark.parametrize(
+    "events",
+    _PROJECTOR_EQUIVALENCE_CASES.values(),
+    ids=list(_PROJECTOR_EQUIVALENCE_CASES.keys()),
+)
+def test_projector_without_retention_returns_the_same_steps_and_keeps_none(events):
+    """``retain_finished=False`` changes only what the projector keeps
+    after ``feed()`` returns, never what ``feed()`` itself returns.
+
+    Feeds the same event sequence into a retaining and a non-retaining
+    projector in lockstep, deep-copying each ``feed()`` result
+    immediately (the same reason ``test_feed_return_value_reflects_step_
+    state_at_call_time`` does -- a returned dict is mutated in place
+    when its end event later arrives, and a non-retaining projector
+    still hands back that same live object, it just doesn't also keep
+    it in ``_finished``). The two sequences must be equal event-for-
+    event. Afterwards, the non-retaining projector's ``_finished`` is
+    ``None`` and ``materialized_steps()`` raises rather than returning a
+    silently partial timeline.
+    """
+    retaining = PublicStepProjector()
+    non_retaining = PublicStepProjector(retain_finished=False)
+    retaining_results = []
+    non_retaining_results = []
+    for event in events:
+        retaining_results.append(copy.deepcopy(retaining.feed(event)))
+        non_retaining_results.append(copy.deepcopy(non_retaining.feed(event)))
+    assert retaining_results == non_retaining_results
+    assert non_retaining._finished is None
+    with pytest.raises(RuntimeError):
+        non_retaining.materialized_steps()
 
 
 def test_feed_return_value_reflects_step_state_at_call_time():

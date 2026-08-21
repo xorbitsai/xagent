@@ -53,6 +53,7 @@ from sqlalchemy.orm import Session
 
 import xagent.web.api.websocket as websocket_module
 import xagent.web.services.task_interaction_service as interaction_service_module
+from tests.web.services.task_interaction_schema_shared import anchor_event_id
 from xagent.core.agent.checkpoint import CHECKPOINT_EVENT_TYPE
 from xagent.core.agent.transcript import build_assistant_transcript_content
 from xagent.web.api.agents import router as agents_router
@@ -288,7 +289,7 @@ def _make_active_row(
     *,
     task_id: int,
     run_id: str,
-    resume_trace_event_id: int | None,
+    resume_trace_event_id: int,
     resume_run_partition: str,
     request_payload: dict[str, Any] | None = None,
 ) -> None:
@@ -311,7 +312,7 @@ def _make_active_row(
         },
         request_idempotency_key=f"shape-contract-key-{uuid.uuid4()}",
         resume_trace_event_id=resume_trace_event_id,
-        resume_event_id="resume-event-1",
+        resume_event_id=anchor_event_id(db, resume_trace_event_id),
         resume_execution_id="exec-1",
         resume_locator_format="trace_event_pk_v1",
         resume_checkpoint_type="agent_execution_checkpoint",
@@ -734,6 +735,50 @@ def test_old_writer_new_reader_legacy_question_is_still_readable_without_a_marke
         assert interactions is None
     finally:
         db.close()
+
+
+def test_a_relabelled_question_reaches_the_wire_instead_of_the_default_message(
+    _environment: _Environment, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The superseded fallback's outcome on the one wire shape that has
+    something to fall back to: the websocket status reassertion event. A
+    task whose only question row carries ``question_superseded`` still
+    reaches this event with the question itself, not with the generic
+    waiting message the event falls back to when both slots are empty."""
+
+    db = _environment.session_factory()
+    try:
+        run_id = f"relabelled-{uuid.uuid4()}"
+        task = _make_task(db, env=_environment, marker=None, run_id=run_id)
+        task_id = int(task.id)
+        raw_content = "Relabelled question"
+        persist_assistant_message(
+            db,
+            task_id,
+            _environment.user_id,
+            raw_content,
+            message_type="question_superseded",
+            interactions=_LEGACY_INTERACTIONS,
+        )
+    finally:
+        db.close()
+    expected_question = build_assistant_transcript_content(
+        raw_content, _LEGACY_INTERACTIONS
+    )
+
+    _disable_websocket_cache(monkeypatch)
+    snapshot = websocket_module._load_historical_stream_snapshot_sync(
+        task_id,
+        actor_user_id=_environment.user_id,
+        actor_is_admin=False,
+    )
+    assert snapshot is not None
+
+    event = _status_reassertion_event(snapshot)
+    assert event["message"] != _DEFAULT_WAITING_MESSAGE
+    assert event["message"] == expected_question
+    assert event["question"] == expected_question
+    assert event["interactions"] == _LEGACY_INTERACTIONS
 
 
 def test_old_writer_new_reader_legacy_question_is_still_readable_with_no_active_row(

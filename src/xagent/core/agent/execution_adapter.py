@@ -5,11 +5,13 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from ...config import get_tool_max_concurrency, get_tool_parallel_enabled
+from ..context_ref import ContextReference
 from ..task_runtime import (
     PREFERRED_INPUT_MODALITIES_METADATA_KEY,
     normalize_input_modalities,
 )
 from .agent import Agent
+from .attachments import build_image_context_references
 from .pattern import AutoPattern, DAGPattern, LLMPlanGenerator, ReActPattern
 from .registry import ExecutionRegistry
 from .result import NO_OUTPUT_PLACEHOLDER
@@ -103,6 +105,7 @@ class AgentExecutionAdapter:
             workspace_id=self._workspace_id(execution_id),
             allowed_external_dirs=self.config.allowed_external_dirs,
             initial_messages=self._initial_messages(),
+            task_context_refs=self._request_context_refs(context),
             interrupt_checker=self.config.interrupt_checker,
         )
         if handle.task is None:
@@ -141,6 +144,7 @@ class AgentExecutionAdapter:
             workspace_id=self._workspace_id(execution_id),
             allowed_external_dirs=self.config.allowed_external_dirs,
             initial_messages=self._initial_messages(),
+            task_context_refs=self._request_context_refs(context),
             interrupt_checker=self.config.interrupt_checker,
         )
         return handle.to_dict()
@@ -333,6 +337,22 @@ class AgentExecutionAdapter:
             *self.config.execution_context_messages,
             *self.config.conversation_history,
         ]
+
+    @staticmethod
+    def _request_context_refs(
+        context: dict[str, Any] | None,
+    ) -> tuple[ContextReference, ...]:
+        if not isinstance(context, dict):
+            return ()
+        references: list[ContextReference] = []
+        seen: set[str] = set()
+        for key in ("file_info", "files", "attachments"):
+            for reference in build_image_context_references(context.get(key)):
+                if reference.file_id in seen:
+                    continue
+                seen.add(reference.file_id)
+                references.append(reference)
+        return tuple(references)
 
     def _execution_type(self) -> str:
         if self.config.pattern == "dag_plan_execute":

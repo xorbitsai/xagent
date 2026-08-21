@@ -11,10 +11,12 @@ from sqlalchemy.exc import DBAPIError, IntegrityError
 from sqlalchemy.orm import Session
 from sqlalchemy.sql.elements import ColumnElement
 
+from ...core.agent.attachments import build_image_context_references
 from ...core.agent.transcript import (
     build_assistant_transcript_content,
     normalize_transcript_messages,
 )
+from ...core.context_ref import CONTEXT_REFS_KEY, ContextReference
 from ..models.chat_message import TaskChatMessage
 from .file_reference_output_service import reconcile_assistant_file_references
 from .ops_signals import (
@@ -33,21 +35,37 @@ DELIVERY_FAILED = "failed"
 QUESTION_MESSAGE_TYPE = "question"
 SUPERSEDED_MESSAGE_TYPE = "question_superseded"
 
+# Historical attachments are replayed context rather than the current upload
+# batch. Keep a bounded recent window as a secondary replay limit; the shared
+# materializer applies the active model's token and encoded-byte budgets while
+# preserving current-turn priority.
+_MAX_HISTORICAL_IMAGE_CONTEXT_REFS = 16
 
-def _assistant_question_filters(task_id: int) -> tuple[ColumnElement[bool], ...]:
-    """The three-leg WHERE predicate for a task's assistant question
-    rows: ``task_id``, ``role == "assistant"``,
-    ``message_type == QUESTION_MESSAGE_TYPE``. It matches every such
-    row, whether it is still waiting for an answer or was already
-    answered. Shared by the reader (``get_latest_waiting_question``)
-    and the writer (``supersede_legacy_question_rows``) so the two
-    conditions cannot drift apart by hand-editing one copy and not the
-    other.
+
+def _assistant_question_filters(
+    task_id: int, *, message_type: str = QUESTION_MESSAGE_TYPE
+) -> tuple[ColumnElement[bool], ...]:
+    """The three-leg WHERE predicate for a task's assistant question rows:
+    ``task_id``, ``role == "assistant"``, and one ``message_type``. It
+    matches every such row, whether it is still waiting for an answer or
+    was already answered. Shared by the reader
+    (``get_latest_waiting_question``) and the writer
+    (``supersede_legacy_question_rows``) so the two conditions cannot drift
+    apart by hand-editing one copy and not the other.
+
+    ``message_type`` defaults to ``QUESTION_MESSAGE_TYPE``: the value the
+    writer wants and the value the reader's first pass wants, so both keep
+    calling this with one argument and the drift-guard test keeps comparing
+    the same two rendered clauses. The reader's second pass passes
+    ``SUPERSEDED_MESSAGE_TYPE`` instead, because it looks for what the
+    writer *produces* rather than what the writer consumes. That one leg is
+    the only thing that legitimately differs between the two passes; the
+    other two legs stay shared, which is the whole point of this helper.
     """
     return (
         TaskChatMessage.task_id == task_id,
         TaskChatMessage.role == "assistant",
-        TaskChatMessage.message_type == QUESTION_MESSAGE_TYPE,
+        TaskChatMessage.message_type == message_type,
     )
 
 
@@ -704,7 +722,7 @@ def load_task_transcript(
     task_id: int,
     *,
     before_message_id: Optional[int] = None,
-) -> List[Dict[str, str]]:
+) -> List[Dict[str, Any]]:
     if before_message_id is not None:
         # Check if the reference message actually exists
         exists = (
@@ -725,17 +743,66 @@ def load_task_transcript(
     if before_message_id is not None:
         query = query.filter(TaskChatMessage.id < before_message_id)
 
-    messages = [
-        {"role": str(message.role), "content": str(message.content)}
-        for message in query.order_by(TaskChatMessage.id.asc()).all()
+    stored_messages = query.order_by(TaskChatMessage.id.asc()).all()
+    retained_references: list[tuple[ContextReference, ...]] = [
+        () for _ in stored_messages
     ]
+    remaining_references = _MAX_HISTORICAL_IMAGE_CONTEXT_REFS
+    for index in range(len(stored_messages) - 1, -1, -1):
+        if remaining_references <= 0:
+            break
+        references = build_image_context_references(stored_messages[index].attachments)
+        retained_references[index] = references[:remaining_references]
+        remaining_references -= len(retained_references[index])
+
+    messages: List[Dict[str, Any]] = []
+    for message, references in zip(stored_messages, retained_references):
+        item: Dict[str, Any] = {
+            "role": str(message.role),
+            "content": str(message.content),
+        }
+        if references:
+            item[CONTEXT_REFS_KEY] = [
+                reference.durable_dict() for reference in references
+            ]
+        messages.append(item)
     return normalize_transcript_messages(messages)
 
 
 def get_latest_waiting_question(
-    db: Session, task_id: int
+    db: Session, task_id: int, *, allow_superseded: bool = False
 ) -> tuple[Optional[str], Optional[list[dict[str, Any]]]]:
-    """Return the latest persisted ask-user question for a waiting task."""
+    """Return the latest persisted ask-user question for a waiting task.
+
+    Two sequential passes rather than one ``message_type.in_(...)``
+    predicate. Today's writer cannot produce the inversion that shape
+    avoids: it relabels a task's question rows in one unpartitioned
+    statement, so any row still labelled ``QUESTION_MESSAGE_TYPE``
+    postdates every ``SUPERSEDED_MESSAGE_TYPE`` row on the task. The
+    passes are kept for the writer shapes that come next -- a relabel
+    narrowed to one run or turn, or one committed alongside a fresh
+    question insert -- where the two labels' ids interleave and a single
+    id-ordered predicate would rank a superseded row over a live one,
+    inverting the priority this reader owes its callers. Narrowing a
+    task-wide write to the row it actually means is already a stated
+    obligation next door, on ``close_legacy_resume_interaction``'s close
+    statement. The first pass is unconditional and always runs first.
+
+    ``allow_superseded`` opens a second pass over
+    ``SUPERSEDED_MESSAGE_TYPE`` rows, and only when the first pass came
+    back empty. It is off by default, and the read surface adapter
+    (``task_interaction_read.get_pending_interaction_question``) is the
+    only caller that turns it on; every other caller reads exactly what it
+    reads with the parameter absent.
+
+    What the second pass hands back is the newest question row on this
+    task that ``supersede_legacy_question_rows`` has relabelled. That
+    writer's WHERE is ``_assistant_question_filters`` -- task, assistant
+    role, message type -- with no run partition, so one call relabels
+    every round's question row on the task at once; taking the highest id
+    back is therefore this task's most recent question even on a task that
+    has asked several times.
+    """
 
     latest_question = (
         db.query(TaskChatMessage)
@@ -743,6 +810,17 @@ def get_latest_waiting_question(
         .order_by(TaskChatMessage.id.desc())
         .first()
     )
+    if not latest_question and allow_superseded:
+        latest_question = (
+            db.query(TaskChatMessage)
+            .filter(
+                *_assistant_question_filters(
+                    task_id, message_type=SUPERSEDED_MESSAGE_TYPE
+                )
+            )
+            .order_by(TaskChatMessage.id.desc())
+            .first()
+        )
     if not latest_question:
         return None, None
 

@@ -480,7 +480,7 @@ class TestQuiesceReconcilingBackend:
         self, caplog: pytest.LogCaptureFixture
     ) -> None:
         """Quiesce emits one summary line with seen/running/stopped counts so a
-        slow startup is diagnosable from logs alone (issue #231)."""
+        slow startup is diagnosable from logs alone."""
         service = FakeSandboxService(runtime_spec_supported=True)
         spec = ResolvedSandboxRuntimeSpec.from_parts(
             template_type="image", image="img:v1"
@@ -547,7 +547,7 @@ class TestLegacyCleanupSummary:
     """``_legacy_cleanup`` (Boxlite route) emits one structured summary on every
     path — empty, stop, and error — with the same ``running``/``stop_time``
     fields the quiesce route carries, so cleanup telemetry stays consistent
-    across supported backends (issue #231)."""
+    across supported backends."""
 
     @pytest.mark.asyncio
     async def test_empty_listing_still_emits_summary(
@@ -611,7 +611,7 @@ class TestLegacyCleanupSummary:
 class TestStartupPhaseLogging:
     """``_startup_phase`` emits a terminal line on every exit — success, error,
     and cancellation — so a stalled/aborted startup is never left showing only
-    its begin line (issue #231)."""
+    its begin line."""
 
     def test_success_logs_done(self, caplog: pytest.LogCaptureFixture) -> None:
         with caplog.at_level(logging.INFO, logger="xagent.web.app"):

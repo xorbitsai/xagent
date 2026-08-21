@@ -2102,9 +2102,9 @@ class SandboxManager:
         self._lease_providers.clear()
         self._activity.clear()
         self._reconcile_budget.clear()
-        # One summary line per quiesce (issue #231): stops are serial and each
-        # rides the full stop timeout, so stop_time grows with the running
-        # count and dominates startup.
+        # One summary line per quiesce: stops are serial and each rides the full
+        # stop timeout, so stop_time grows with the running count and dominates
+        # startup.
         logger.info(
             "Sandbox quiesce completed: seen=%d running=%d stopped=%d failed=%d "
             "stop_time=%.2fs total=%.2fs status=%s",
@@ -2267,10 +2267,9 @@ class SandboxManager:
             status = "error"
             logger.error(f"Failed to cleanup sandboxes: {e}")
         finally:
-            # One summary per cleanup (issue #231): serial stops each ride the
-            # full stop timeout, so stop_time grows with the running count.
-            # Always emitted (empty/error paths too) so no outcome reads as
-            # clean empty work.
+            # One summary per cleanup: serial stops each ride the full stop
+            # timeout, so stop_time grows with the running count. Always emitted
+            # (empty/error paths too) so no outcome reads as clean empty work.
             logger.info(
                 "Sandbox cleanup completed: seen=%d running=%d stopped=%d "
                 "deleted=%d failed=%d stop_time=%.2fs total=%.2fs status=%s",

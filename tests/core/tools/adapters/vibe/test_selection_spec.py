@@ -2354,3 +2354,118 @@ def test_spec_wants_mcp_only_for_explicit_mcp_selection():
     for spec, expected in specs:
         assert should_load_mcp_server_configs(spec) is expected
         assert _spec_wants_mcp(spec) is expected
+
+
+def test_ssh_tools_survive_a_selection_that_never_names_ssh() -> None:
+    """``ssh`` is never selectable in the builder's category picker (the
+    tool-list endpoint cannot enumerate SSH tools), so filtering on it would
+    leave every configured agent without the tools its binding grants."""
+    result = ToolSelectionSpec.from_raw(
+        tool_categories=["basic"]
+    ).compute_allowed_names(
+        [
+            _mock_tool("calculator", "basic"),
+            _mock_tool("ssh_execute", "ssh"),
+            _mock_tool("file_read", "file"),
+        ],
+    )
+    assert sorted(result or []) == ["calculator", "ssh_execute"]
+
+
+def test_connector_only_selection_still_gets_its_ssh_tools() -> None:
+    """A ``mcp:<server>``-only selection lands in ``mcp_servers`` with empty
+    ``categories`` -- still a user opt-in, so the binding rides along."""
+    spec = ToolSelectionSpec.from_raw(tool_categories=["mcp:gmail"])
+    assert spec.categories == frozenset() and spec.mcp_servers == frozenset({"gmail"})
+
+    result = spec.compute_allowed_names(
+        [
+            _mock_tool("mcp_gmail_send", "mcp", source_server="gmail"),
+            _mock_tool("ssh_execute", "ssh"),
+        ],
+    )
+    assert result == frozenset({"mcp_gmail_send", "ssh_execute"})
+    assert ToolRegistry._should_run_creator(frozenset({"ssh"}), spec, None) is True
+
+
+def test_unconfigured_workforce_manager_stays_worker_tools_only() -> None:
+    """The binding rides along a real category selection only.
+
+    An unconfigured workforce manager is BY_CATEGORIES with EMPTY categories
+    plus a worker-tool ``name_allowlist`` -- an internal injection, not a user
+    opt-in -- so it must keep the worker-tools-only invariant even when the
+    manager agent itself carries an SSH binding.
+    """
+    spec = ToolSelectionSpec.from_raw(
+        tool_categories=None,
+        published_agent_ids=[7],
+        name_allowlist={"ask_agent_worker1"},
+        extras_only_when_unconfigured=True,
+    )
+    assert spec.is_by_categories() and spec.categories == frozenset()
+
+    result = spec.compute_allowed_names(
+        [_mock_tool("ask_agent_worker1", "agent"), _mock_tool("ssh_execute", "ssh")],
+    )
+    assert result == frozenset({"ask_agent_worker1"})
+    assert ToolRegistry._should_run_creator(frozenset({"ssh"}), spec, None) is False, (
+        "an injection-only spec must not dispatch the SSH creator either"
+    )
+
+
+def test_should_run_creator_runs_ssh_for_any_configured_selection() -> None:
+    """The SSH creator gates on the target binding itself, so a selection that
+    never names ``ssh`` must still dispatch it -- zero-tools must not."""
+    declared = frozenset({"ssh"})
+    basic_only = ToolSelectionSpec.from_raw(tool_categories=["basic"])
+    assert ToolRegistry._should_run_creator(declared, basic_only, None) is True
+    zero_tools = ToolSelectionSpec.from_raw(tool_categories=[])
+    assert ToolRegistry._should_run_creator(declared, zero_tools, None) is False
+
+    # A creator declaring ssh alongside an unselected category still runs, and
+    # the name filter -- not this gate -- drops its non-ssh tools.
+    mixed = frozenset({"ssh", "browser"})
+    assert ToolRegistry._should_run_creator(mixed, basic_only, None) is True
+    assert basic_only.compute_allowed_names(
+        [_mock_tool("ssh_execute", "ssh"), _mock_tool("browser_open", "browser")],
+    ) == frozenset({"ssh_execute"})
+
+
+def test_selecting_ssh_explicitly_matches_omitting_it() -> None:
+    """``ssh`` is not selectable in the picker, so the binding -- not the
+    category list -- is the authority: an agent with a binding gets the same
+    tools whether the saved list names ``ssh`` or not. Removing it from an
+    already-saved list is therefore a no-op today; a real opt-out means
+    dropping the binding (or its own switch, out of scope here).
+    """
+    tools = [_mock_tool("calculator", "basic"), _mock_tool("ssh_execute", "ssh")]
+    with_ssh = ToolSelectionSpec.from_raw(tool_categories=["basic", "ssh"])
+    without_ssh = ToolSelectionSpec.from_raw(tool_categories=["basic"])
+
+    assert with_ssh.compute_allowed_names(tools) == without_ssh.compute_allowed_names(
+        tools
+    )
+    declared = frozenset({"ssh"})
+    assert ToolRegistry._should_run_creator(
+        declared, with_ssh, None
+    ) is ToolRegistry._should_run_creator(declared, without_ssh, None)
+
+
+def test_published_agent_scope_alone_is_not_an_injection() -> None:
+    """Only the injection-only shape (worker tool names, nothing selectable)
+    is denied -- a spec scoped by ``published_agent_ids`` alone is not it."""
+    spec = ToolSelectionSpec.from_raw(
+        tool_categories=None,
+        published_agent_ids=[7],
+        extras_only_when_unconfigured=True,
+    )
+    assert spec.is_by_categories() and spec.includes_binding_authorized()
+
+
+def test_includes_category_agrees_with_the_other_two_gates_on_ssh() -> None:
+    """Third gate parity: a future caller asking ``includes_category("ssh")``
+    must get the same answer the dispatch and name filters give."""
+    assert ToolSelectionSpec.from_raw(tool_categories=["basic"]).includes_category(
+        "ssh"
+    )
+    assert not ToolSelectionSpec.from_raw(tool_categories=[]).includes_category("ssh")

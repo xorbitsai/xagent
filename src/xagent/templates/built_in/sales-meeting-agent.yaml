@@ -1,7 +1,7 @@
 id: sales-meeting-agent
 name: Meeting Agent
 category: Sales
-featured: false
+featured: true
 descriptions:
   en: Turns a meeting — from Zoom, your Granola notes, or a transcript you paste or upload — into a summary, decisions, action items and a follow-up email draft, grounded in the transcript, nothing invented.
   zh: 将会议——来自 Zoom、您的 Granola 笔记，或您粘贴/上传的会议记录——转化为摘要、决策、行动项和跟进邮件草稿，完全基于记录内容，不臆造。

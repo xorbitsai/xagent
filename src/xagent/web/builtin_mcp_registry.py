@@ -711,6 +711,45 @@ def get_builtin_public_mcp_app_rows() -> list[dict[str, Any]]:
             },
         },
         {
+            "app_id": "posthog",
+            "name": "PostHog",
+            "description": "Connect to PostHog Cloud (US or EU) to query events and persons via HogQL, and read insights, feature flags, dashboards, and annotations. Self-hosted PostHog is not supported.",
+            "icon": "https://www.google.com/s2/favicons?domain=posthog.com&sz=128",
+            "transport": "stdio",
+            "provider_name": None,
+            # "Analytics" is already one of the connect dialog's fixed
+            # sidebar category filters (connect-mcp-dialog.tsx) with no
+            # connector using it before this one -- an always-empty filter
+            # button. google-analytics uses "Marketing" instead, but that's
+            # its own pre-existing mismatch, not a reason to leave this
+            # button empty too.
+            "category": "Analytics",
+            "oauth_scopes": None,
+            "is_visible_in_connector": True,
+            # Key-based (non-oauth), like aws/google-maps: PostHog's only
+            # documented OAuth path is Client ID Metadata Document (CIMD),
+            # where the client_id is a URL hosting a metadata document *we*
+            # would have to serve publicly -- infrastructure this connector
+            # doesn't have, and a materially different model (no client
+            # secret at all) than every oauth_providers row in this file.
+            # Personal API keys sidestep that entirely: each user generates
+            # their own (posthog.com/docs/api/personal-api-keys), same
+            # no-review self-serve bar as an OAuth App, without needing
+            # xagent to host anything. POSTHOG_HOST is required alongside
+            # the key because US/EU Cloud are separate deployments -- a key
+            # from one host is not valid against the other (unlike, say,
+            # Intercom's single auto-routing API host). posthog.py's
+            # _base_url() restricts this to exactly those two hosts (not a
+            # broader "*.posthog.com" allowlist): self-hosted PostHog is
+            # not a documented target of this connector, so there's no
+            # reason to let this key be sent anywhere else.
+            "launch_config": {
+                "command": "python",
+                "args": ["-m", "xagent.web.tools.mcp.posthog"],
+                "required_env": ["POSTHOG_API_KEY", "POSTHOG_HOST"],
+            },
+        },
+        {
             # "chrome-devtools", not the generic "chrome", matching the
             # upstream package name and the vendor-scoped ids every other
             # seeded app uses. Known, accepted caveat: api/mcp.py couples

@@ -92,6 +92,25 @@ describe("resolveAgentForTemplate", () => {
     expect(result.agent).toMatchObject({ id: 11 });
   });
 
+  it("includes an optional name override in the resolve request body", async () => {
+    apiRequestMock.mockResolvedValueOnce(
+      jsonResponse({
+        agent: { id: 12, name: "Leo", template_id: "sales-email-lead-response-agent", status: "published" },
+        created: true,
+      })
+    );
+
+    await resolveAgentForTemplate("sales-email-lead-response-agent", "Leo");
+
+    expect(apiRequestMock).toHaveBeenCalledWith(
+      "http://api.local/api/agents/from-template/resolve",
+      expect.objectContaining({
+        method: "POST",
+        body: JSON.stringify({ template_id: "sales-email-lead-response-agent", name: "Leo" }),
+      })
+    );
+  });
+
   it("throws on a non-ok resolve response", async () => {
     apiRequestMock.mockResolvedValueOnce(
       jsonResponse({ detail: "boom" }, { status: 500 })

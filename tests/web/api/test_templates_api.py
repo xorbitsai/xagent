@@ -12,6 +12,7 @@ from sqlalchemy.exc import IntegrityError
 
 from xagent.web.api.auth import auth_router, hash_password
 from xagent.web.api.templates import (
+    get_agent_capability_lists,
     get_or_create_template_stats,
     increment_template_likes,
     increment_template_used_count,
@@ -502,6 +503,110 @@ class TestTemplatesAPI:
             assert "customer support assistant" in agent_config["instructions"].lower()
             assert agent_config["skills"] == ["product_knowledge"]
             assert agent_config["tool_categories"] == ["web_search"]
+
+            # The top-level tool_categories/skills mirror agent_config's,
+            # so a marketplace card can render capability tags without a
+            # second detail fetch (see test_list_templates_exposes_capabilities).
+            assert template["skills"] == ["product_knowledge"]
+            assert template["tool_categories"] == ["web_search"]
+
+    def test_get_template_detail_survives_non_string_elements_in_authored_lists(
+        self, mock_app_state, admin_headers, monkeypatch
+    ):
+        """A template-authoring typo like `tool_categories: [123, "web_search"]`
+        must not 500 the detail endpoint via an unhandled Pydantic
+        ValidationError. Covers every field this round's fix touched
+        (tool_categories, skills, features, tags) at the actual HTTP
+        response, not just the get_agent_capability_lists unit-level path -
+        including the detail endpoint's own inline agent_config
+        construction, a second, independent call site 170 lines away from
+        get_agent_capability_lists that has the identical gap."""
+        original_get_template = mock_app_state.template_manager.get_template
+
+        async def malformed_get_template(template_id):
+            template = await original_get_template(template_id)
+            if template is not None and template_id == "customer_support":
+                template = dict(template)
+                template["agent_config"] = dict(template["agent_config"])
+                template["agent_config"]["tool_categories"] = [123, "web_search", None]
+                template["agent_config"]["skills"] = [
+                    "product_knowledge",
+                    {"bad": "shape"},
+                ]
+                template["features"] = {"en": [123, "Real feature"]}
+                template["tags"] = ["support", 456, "customer"]
+            return template
+
+        monkeypatch.setattr(
+            mock_app_state.template_manager, "get_template", malformed_get_template
+        )
+
+        with patch.object(client.app, "state", mock_app_state):
+            response = client.get(
+                "/api/templates/customer_support?lang=en", headers=admin_headers
+            )
+
+        assert response.status_code == 200, response.text
+        body = response.json()
+        assert body["agent_config"]["tool_categories"] == ["web_search"]
+        assert body["agent_config"]["skills"] == ["product_knowledge"]
+        assert body["tool_categories"] == ["web_search"]
+        assert body["skills"] == ["product_knowledge"]
+        assert body["features"] == ["Real feature"]
+        assert body["tags"] == ["support", "customer"]
+
+    def test_list_templates_exposes_capabilities(self, mock_app_state, admin_headers):
+        """The list endpoint's TemplateInfo carries the same tool_categories/
+        skills as the detail endpoint, since PersonaCard rendering needs
+        them at list-render time, not just on a per-template detail fetch."""
+        with patch.object(client.app, "state", mock_app_state):
+            response = client.get("/api/templates/", headers=admin_headers)
+            assert response.status_code == 200
+            listed = {t["id"]: t for t in response.json()}
+
+            assert listed["customer_support"]["tool_categories"] == ["web_search"]
+            assert listed["customer_support"]["skills"] == ["product_knowledge"]
+            assert listed["sales_assistant"]["tool_categories"] == ["file_operations"]
+            assert listed["sales_assistant"]["skills"] == ["sales_techniques"]
+
+    def test_workforce_template_exposes_no_capabilities(
+        self, workforce_mock_app_state, admin_headers
+    ):
+        """A workforce-type template's real configuration lives in
+        workforce_config, not agent_config - tool_categories/skills must
+        report empty rather than leaking a stray/unused agent_config."""
+        with patch.object(client.app, "state", workforce_mock_app_state):
+            response = client.get(
+                "/api/templates/growth_workforce", headers=admin_headers
+            )
+            assert response.status_code == 200
+            body = response.json()
+            assert body["tool_categories"] == []
+            assert body["skills"] == []
+
+    def test_get_agent_capability_lists_ignores_malformed_agent_config(self):
+        """A truthy but non-dict agent_config (corrupt data, not just a
+        missing/empty one) must fall back to empty lists rather than raise
+        - `.get()` on a str/list would blow up the whole endpoint."""
+        assert get_agent_capability_lists(
+            {"type": "agent", "agent_config": "not-a-dict"}
+        ) == ([], [])
+
+    def test_get_agent_capability_lists_drops_non_string_elements(self):
+        """A non-string element (an authoring typo like `[123, "web_search"]`)
+        must be dropped rather than passed through - it would otherwise 500
+        as an unhandled Pydantic ValidationError once TemplateInfo/
+        TemplateDetail try to construct their `tool_categories: list[str]` /
+        `skills: list[str]` fields."""
+        assert get_agent_capability_lists(
+            {
+                "type": "agent",
+                "agent_config": {
+                    "tool_categories": [123, "web_search", None],
+                    "skills": ["real_skill", {"bad": "shape"}],
+                },
+            }
+        ) == (["web_search"], ["real_skill"])
 
     def test_sample_prompts_localization_and_default(
         self, mock_app_state, admin_headers

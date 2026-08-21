@@ -6,7 +6,11 @@ import logging
 from pathlib import Path
 from typing import Any, Iterable
 
-from ..file_ref import build_workspace_file_ref, guess_mime_type
+from ..file_ref import (
+    build_workspace_file_ref,
+    guess_mime_type,
+    is_sandbox_local_file_id,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -109,7 +113,7 @@ def build_inline_artifact(file_ref: dict[str, Any]) -> dict[str, str]:
 
 def markdown_reference_for_artifact(artifact: dict[str, Any]) -> str | None:
     file_id = artifact.get("file_id")
-    if not file_id:
+    if not file_id or is_sandbox_local_file_id(file_id):
         return None
 
     filename = str(artifact.get("filename") or "artifact")
@@ -170,6 +174,17 @@ def _format_artifact_lines(artifacts: list[Any]) -> list[str]:
         filename = artifact.get("filename") or "generated image"
         markdown_ref = markdown_reference_for_artifact(artifact)
         if not markdown_ref:
+            lines.append(
+                "\n".join(
+                    [
+                        f"- {filename}",
+                        "  file_id: unavailable, registration did not complete",
+                        "  The file itself is written and intact. No file_id "
+                        "can be obtained for it in this task; say so plainly "
+                        "and never rewrite the file to try to mint one.",
+                    ]
+                )
+            )
             continue
         artifact_type = str(artifact.get("type") or "").lower()
         markdown_label = (
@@ -215,9 +230,23 @@ def _sanitize_tool_result_value(value: Any, known_paths: dict[str, str]) -> Any:
     }
 
 
+# A sandbox id resolves nowhere outside the runner that minted it, so every key
+# asserting a fetchable file would hand the model a link that 404s.
+_UNRESOLVABLE_FILE_REF_KEYS = {
+    "download_url",
+    "file_id",
+    "markdown_link",
+    "markdown_ref",
+    "preview_url",
+}
+
+
 def _safe_tool_result_items(value: dict[str, Any]) -> Iterable[tuple[str, Any]]:
     if _is_file_ref_like(value):
-        return ((key, value[key]) for key in SAFE_FILE_REF_KEYS if key in value)
+        keys = SAFE_FILE_REF_KEYS
+        if is_sandbox_local_file_id(value.get("file_id")):
+            keys = keys - _UNRESOLVABLE_FILE_REF_KEYS
+        return ((key, value[key]) for key in keys if key in value)
     return ((key, item) for key, item in value.items() if key not in LOCAL_PATH_KEYS)
 
 

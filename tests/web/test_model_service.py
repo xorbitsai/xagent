@@ -8,7 +8,7 @@ from sqlalchemy.orm import sessionmaker
 
 from xagent.web.models.database import Base
 from xagent.web.models.model import Model
-from xagent.web.models.user import User
+from xagent.web.models.user import User, UserDefaultModel, UserModel
 from xagent.web.services.model_service import (
     _is_model_visible_to_user,
     get_asr_models,
@@ -697,6 +697,115 @@ class TestModelService:
         )
         session_factory.assert_called_once_with()
         mock_db.close.assert_called_once_with()
+
+    @pytest.mark.parametrize(
+        "get_default",
+        [get_default_sound_effect_model, get_default_music_model],
+    )
+    def test_audio_generation_shared_default_requires_active_model(self, get_default):
+        """The shared-default branch must filter on is_active.
+
+        Without it an inactive shared default still resolves to a model
+        instance that is absent from the audio tool's own registry, so its
+        usage records fall back to a phantom model name instead of the real
+        one. This mirrors the user-default branch, which already filtered.
+        """
+        mock_db = MagicMock()
+        filter_query = (
+            mock_db.query.return_value.join.return_value.join.return_value.filter
+        )
+        filter_query.return_value.limit.return_value.all.return_value = []
+        session_factory = MagicMock(return_value=mock_db)
+
+        with patch(
+            "xagent.web.models.database.get_session_local",
+            return_value=session_factory,
+        ):
+            get_default(user_id=None)
+
+        # The is_active column itself is passed as a filter condition, so look
+        # for a condition naming that column rather than a comparison value.
+        assert filter_query.call_args is not None, (
+            "the shared-default query never reached its filter() call"
+        )
+        assert any(
+            getattr(condition, "key", None) == "is_active"
+            or getattr(getattr(condition, "left", None), "key", None) == "is_active"
+            for condition in filter_query.call_args.args
+        ), "shared audio-generation default must filter on DBModel.is_active"
+
+    @pytest.mark.parametrize(
+        ("get_default", "category", "config_type", "factory_module"),
+        [
+            (
+                get_default_sound_effect_model,
+                "sound_effect",
+                "sound_effect",
+                "xagent.core.model.sound_effect.get_sound_effect_model_instance",
+            ),
+            (
+                get_default_music_model,
+                "music",
+                "music",
+                "xagent.core.model.music.get_music_model_instance",
+            ),
+        ],
+    )
+    def test_audio_generation_shared_default_skips_inactive_model(
+        self,
+        db_session,
+        admin_user,
+        get_default,
+        category,
+        config_type,
+        factory_module,
+    ):
+        """An inactive shared default must not be selected or instantiated.
+
+        The expression-shape assertion above only proves that *some* condition
+        naming ``is_active`` is present; an inverted predicate such as
+        ``DBModel.is_active.is_(False)`` would satisfy it while still handing
+        back a deactivated model. This exercises the real query against SQLite
+        so polarity is observable: the inactive row must be skipped, and an
+        active one must still be returned.
+        """
+        inactive = Model(
+            model_id=f"inactive-{category}",
+            category=category,
+            model_provider="test",
+            model_name=f"inactive-{category}",
+            api_key="test-api-key",
+            abilities=["generate"],
+            is_active=False,
+        )
+        db_session.add(inactive)
+        db_session.commit()
+        db_session.refresh(inactive)
+        db_session.add(
+            UserModel(user_id=admin_user.id, model_id=inactive.id, is_shared=True)
+        )
+        db_session.add(
+            UserDefaultModel(
+                user_id=admin_user.id,
+                model_id=inactive.id,
+                config_type=config_type,
+            )
+        )
+        db_session.commit()
+
+        with patch(factory_module) as factory:
+            assert get_default(user_id=None, db=db_session) is None
+        factory.assert_not_called()
+
+        # Same wiring, but active: proves the query is not simply matching
+        # nothing for an unrelated reason.
+        inactive.is_active = True
+        db_session.commit()
+
+        with patch(factory_module) as factory:
+            result = get_default(user_id=None, db=db_session)
+        factory.assert_called_once()
+        assert result is factory.return_value
 
     @pytest.mark.parametrize(
         "get_default",

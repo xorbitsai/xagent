@@ -254,18 +254,30 @@ def _mask_secret(value: str) -> str:
     return "***" + value[-tail_len:]
 
 
+_USERINFO_PREFIX_PATTERN = re.compile(r"://[^/\s@]*@")
+
+
 def redact_url_credentials_for_logging(url: str) -> str:
-    """Redact sensitive query credentials from a URL."""
+    """Redact sensitive query credentials and any embedded userinfo from a
+    URL (e.g. a proxy URL's "user:pass@host", the single most common place
+    a URL carries a credential -- a query-string-only check would silently
+    pass it through unchanged)."""
     if not url:
         return url
 
     try:
         parsed = urlsplit(url)
     except ValueError:
-        return url
+        # Malformed enough that urlsplit itself can't parse it (e.g. an
+        # unclosed IPv6 bracket) -- fall back to a structure-agnostic scan
+        # for a "user:pass@" prefix. Returning the input unchanged here
+        # would be worse than not redacting at all: it would silently
+        # leak a credential through the one code path meant to catch it.
+        return _USERINFO_PREFIX_PATTERN.sub("://***@", url)
 
+    has_userinfo = parsed.username is not None or parsed.password is not None
     query_items = parse_qsl(parsed.query, keep_blank_values=True)
-    if not query_items:
+    if not query_items and not has_userinfo:
         return url
 
     redacted_items: list[tuple[str, str]] = []
@@ -274,10 +286,21 @@ def redact_url_credentials_for_logging(url: str) -> str:
             redacted_items.append((key, _mask_secret(value)))
         else:
             redacted_items.append((key, value))
-
     redacted_query = urlencode(redacted_items, doseq=True)
+
+    netloc = parsed.netloc
+    if has_userinfo:
+        # Split the raw netloc on its last "@" rather than rebuilding
+        # "host[:port]" from parsed.hostname/.port: those properties
+        # lowercase the host and strip IPv6 brackets, which would make
+        # this the only place in the URL that silently changes casing or
+        # produces an ambiguous bracket-less "host:port"-looking string
+        # for an IPv6 literal -- and .port can raise for a malformed tail
+        # after "@" anyway, which this sidesteps entirely.
+        netloc = "***@" + parsed.netloc.rsplit("@", 1)[-1]
+
     return urlunsplit(
-        (parsed.scheme, parsed.netloc, parsed.path, redacted_query, parsed.fragment)
+        (parsed.scheme, netloc, parsed.path, redacted_query, parsed.fragment)
     )
 
 

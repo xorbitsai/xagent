@@ -1780,3 +1780,130 @@ def test_delete_task_runtime_cleanup_failure_preserves_task_for_retry(
             db.close()
     finally:
         unregister_task_extension("failing_runtime")
+
+
+def test_task_create_seeds_assistant_message(test_db, user1_headers):
+    """`seed_assistant_message` should land as the task's first (and only)
+    chat history row, committed in the same request as task creation - the
+    AI Team Marketplace's "Hire" flow relies on this to let a persona speak
+    first without ever running the LLM."""
+    from xagent.web.models.chat_message import TaskChatMessage
+
+    resp = client.post(
+        "/api/chat/task/create",
+        json={
+            "title": "Hire Leo",
+            "seed_assistant_message": "Hi — I'm Leo, your Email Lead Response Agent.",
+        },
+        headers=user1_headers,
+    )
+    assert resp.status_code == 200
+    task_id = resp.json()["task_id"]
+
+    db = next(get_db())
+    try:
+        messages = (
+            db.query(TaskChatMessage)
+            .filter_by(task_id=task_id)
+            .order_by(TaskChatMessage.id)
+            .all()
+        )
+        assert len(messages) == 1
+        assert messages[0].role == "assistant"
+        assert messages[0].content == "Hi — I'm Leo, your Email Lead Response Agent."
+    finally:
+        db.close()
+
+
+def test_task_create_without_seed_message_creates_no_chat_messages(
+    test_db, user1_headers
+):
+    """Omitting `seed_assistant_message` (the existing behavior for every
+    other task-creation caller) must not start writing empty history rows."""
+    from xagent.web.models.chat_message import TaskChatMessage
+
+    resp = client.post(
+        "/api/chat/task/create",
+        json={"title": "No seed"},
+        headers=user1_headers,
+    )
+    assert resp.status_code == 200
+    task_id = resp.json()["task_id"]
+
+    db = next(get_db())
+    try:
+        assert db.query(TaskChatMessage).filter_by(task_id=task_id).count() == 0
+    finally:
+        db.close()
+
+
+def test_task_create_rejects_overlong_seed_assistant_message(test_db, user1_headers):
+    """`seed_assistant_message` is bounded (max_length=8000) since it is a
+    public request field, not just internal marketplace-authored content."""
+    resp = client.post(
+        "/api/chat/task/create",
+        json={"title": "Too long", "seed_assistant_message": "x" * 8001},
+        headers=user1_headers,
+    )
+    assert resp.status_code == 422
+
+
+def test_task_create_warns_when_seed_assistant_message_normalizes_to_empty(
+    test_db, user1_headers, caplog
+):
+    """A non-empty `seed_assistant_message` that `persist_assistant_message_no_commit`
+    drops (normalizes to whitespace-only) must leave a log trail - otherwise a
+    'speak first' flow silently produces zero chat history with no way to
+    tell why."""
+    from xagent.web.models.chat_message import TaskChatMessage
+
+    with caplog.at_level(logging.WARNING):
+        resp = client.post(
+            "/api/chat/task/create",
+            json={"title": "Blank seed", "seed_assistant_message": "   "},
+            headers=user1_headers,
+        )
+    assert resp.status_code == 200
+    task_id = resp.json()["task_id"]
+
+    db = next(get_db())
+    try:
+        assert db.query(TaskChatMessage).filter_by(task_id=task_id).count() == 0
+    finally:
+        db.close()
+
+    assert any(
+        "normalized to" in record.message and str(task_id) in record.message
+        for record in caplog.records
+    )
+
+
+def test_task_create_warns_for_a_plain_empty_seed_assistant_message_too(
+    test_db, user1_headers, caplog
+):
+    """A truthy check (`if request.seed_assistant_message:`) would drop a
+    literal "" with zero log output - only the whitespace-only case above
+    would reach the warning. Checking `is not None` instead covers both,
+    since both are the same "seeder passed a value that normalizes to
+    nothing" situation worth a log trail."""
+    from xagent.web.models.chat_message import TaskChatMessage
+
+    with caplog.at_level(logging.WARNING):
+        resp = client.post(
+            "/api/chat/task/create",
+            json={"title": "Empty seed", "seed_assistant_message": ""},
+            headers=user1_headers,
+        )
+    assert resp.status_code == 200
+    task_id = resp.json()["task_id"]
+
+    db = next(get_db())
+    try:
+        assert db.query(TaskChatMessage).filter_by(task_id=task_id).count() == 0
+    finally:
+        db.close()
+
+    assert any(
+        "normalized to" in record.message and str(task_id) in record.message
+        for record in caplog.records
+    )

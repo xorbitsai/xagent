@@ -283,6 +283,12 @@ Use this tool to:
 - Comparing multiple images or videos
 - Answering specific questions about visual content
 
+Do not call this tool merely to inspect a standard uploaded image that is
+already attached to the current conversation as visual context; answer from the
+attached image directly. Use this tool as the fallback when that image is only
+available by file_id, or for video and SVG source inspection. Structured object
+localization and marked-image generation belong to detect_objects instead.
+
 Parameters:
 - media (required): One image/video path or file_id, or a list of them. Always use
   the exact file_id or filename from uploaded/generated file metadata.

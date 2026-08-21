@@ -13,6 +13,7 @@ from sqlalchemy.exc import TimeoutError as SQLAlchemyTimeoutError
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import QueuePool
 
+from tests.web.pool_contention_shared import CONTENTION_POOL_TIMEOUT
 from xagent.web.models.database import Base
 from xagent.web.models.uploaded_file import UploadedFile
 from xagent.web.models.user import User
@@ -33,12 +34,15 @@ from xagent.web.services.uploaded_file_store import (
 
 
 def _database(tmp_path):
+    # WHY: the CAS test's loser must wait its turn for the winner's commit, not
+    # give up. 0.1s was too tight under `pytest -n 4` (spurious QueuePool
+    # TimeoutError); the CONTENTION budget is never expected to fire.
     engine = create_engine(
         f"sqlite:///{tmp_path / 'uploaded-file-recovery.db'}",
         poolclass=QueuePool,
         pool_size=1,
         max_overflow=0,
-        pool_timeout=0.1,
+        pool_timeout=CONTENTION_POOL_TIMEOUT,
         connect_args={"check_same_thread": False},
     )
     Base.metadata.create_all(engine)

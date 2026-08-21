@@ -45,6 +45,10 @@ AGENT_CONFIG_UNASSIGNABLE_CATEGORIES: frozenset[str] = frozenset(
     {ToolCategory.OTHER.value, ToolCategory.AGENT.value}
 )
 
+# Categories granted by a per-agent binding the creator enforces itself. Not
+# selectable in the builder's picker, so never gate them on a selection.
+BINDING_AUTHORIZED_CATEGORIES: frozenset[str] = frozenset({ToolCategory.SSH.value})
+
 
 class ToolMetadata(BaseModel):
     name: str

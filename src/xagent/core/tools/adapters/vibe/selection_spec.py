@@ -26,6 +26,9 @@ Background:
 Mode completeness:
     Each abstract method (``is_*`` / ``includes_*`` /
     ``compute_allowed_names``) must be implemented by every subclass.
+    ``includes_binding_authorized`` is one of them: it decides whether
+    ``BINDING_AUTHORIZED_CATEGORIES`` (granted by a per-agent binding
+    rather than by selection) ride along this spec.
     Missing an implementation is both a mypy error and a runtime
     ``TypeError`` at instantiation time. Adding a new ``includes_*``
     creator-dispatch method on the base forces every subclass to
@@ -53,7 +56,10 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any, List, Optional, Set
 
-from .base import AGENT_CONFIG_UNASSIGNABLE_CATEGORIES
+from .base import (
+    AGENT_CONFIG_UNASSIGNABLE_CATEGORIES,
+    BINDING_AUTHORIZED_CATEGORIES,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -164,6 +170,16 @@ class ToolSelectionSpec(ABC):
     @abstractmethod
     def includes_published_agent(self) -> bool:
         """Whether the Published Agent delegation creators should run."""
+
+    @abstractmethod
+    def includes_binding_authorized(self) -> bool:
+        """Whether ``BINDING_AUTHORIZED_CATEGORIES`` ride along this spec.
+
+        Such a category is never selectable, so its per-agent binding is the
+        opt-in. False for an explicit zero-tools spec and for one whose only
+        selection is an internal injection (the unconfigured workforce
+        manager's worker tools), which stays scoped to that injection.
+        """
 
     @abstractmethod
     def scoped_mcp_servers(self) -> Optional[frozenset[str]]:
@@ -374,7 +390,9 @@ class ToolSelectionSpec(ABC):
         """Whether the given category passes the spec.
 
         ``ALL`` admits every category; ``NONE`` admits none; and
-        ``BY_CATEGORIES`` admits only members of :attr:`categories`.
+        ``BY_CATEGORIES`` admits members of :attr:`categories`, plus any
+        ``BINDING_AUTHORIZED_CATEGORIES`` member per
+        :meth:`includes_binding_authorized`.
         Existing callers in ``factory.py`` registry-skip and
         creator-internal short-circuits keep using this.
         """
@@ -386,6 +404,8 @@ class ToolSelectionSpec(ABC):
         # through ``is_by_categories()`` narrowing in modern setups,
         # but the duck-typed attribute access is also safe here.
         categories: frozenset[str] = getattr(self, "categories", frozenset())
+        if cat in BINDING_AUTHORIZED_CATEGORIES:
+            return self.includes_binding_authorized()
         return cat in categories
 
 
@@ -463,6 +483,9 @@ class _SpecAll(ToolSelectionSpec):
             return False
         return True
 
+    def includes_binding_authorized(self) -> bool:
+        return True
+
     def scoped_mcp_servers(self) -> Optional[frozenset[str]]:
         # ALL mode: MCP selected without restriction -> initialize every
         # server. (``includes_mcp()`` already honors the legacy
@@ -512,6 +535,9 @@ class _SpecNone(ToolSelectionSpec):
         return False
 
     def includes_published_agent(self) -> bool:
+        return False
+
+    def includes_binding_authorized(self) -> bool:
         return False
 
     def scoped_mcp_servers(self) -> Optional[frozenset[str]]:
@@ -623,6 +649,15 @@ class _SpecByCategories(ToolSelectionSpec):
             return False
         return "agent" in self.categories or bool(self.published_agent_ids)
 
+    def includes_binding_authorized(self) -> bool:
+        # Denied only for the injection-only shape: worker tool names with no
+        # dimension a user could have selected. A connector-only selection
+        # (``mcp:<server>`` -> mcp_servers, empty categories) is an opt-in.
+        injection_only = bool(self.name_allowlist) and not (
+            self.categories or self.mcp_servers
+        )
+        return not injection_only
+
     def scoped_mcp_servers(self) -> Optional[frozenset[str]]:
         # Parent/child rule, identical to what compute_allowed_names applies
         # post-build: the plain "mcp" parent admits every server, so it means
@@ -647,6 +682,9 @@ class _SpecByCategories(ToolSelectionSpec):
           - a tool whose category ∈ ``categories`` is admitted (plain
             ``"mcp"`` admits all MCP tools, etc.; DB-backed Custom API
             tools are loaded only for scoped ``mcp:<server>`` connectors);
+          - a tool in a ``BINDING_AUTHORIZED_CATEGORIES`` category is
+            admitted per :meth:`includes_binding_authorized` -- its per-agent
+            binding is the opt-in, since the category is never selectable;
           - otherwise a tool whose ``metadata.source_server`` matches a
             scoped server in ``mcp_servers`` is admitted. ``source_server``
             is the normalized originating-server identity set once at
@@ -695,7 +733,10 @@ class _SpecByCategories(ToolSelectionSpec):
             category = str(tool.metadata.category.value)
 
             # Plain category admit (categories holds only plain names).
-            if category in self.categories:
+            if category in self.categories or (
+                category in BINDING_AUTHORIZED_CATEGORIES
+                and self.includes_binding_authorized()
+            ):
                 names.add(tool_name)
                 continue
 

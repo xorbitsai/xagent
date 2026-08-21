@@ -38,6 +38,8 @@ branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
 TABLE = "user_oauth"
+USERS_TABLE = "users"
+USER_CASCADE_FK = "fk_user_oauth_user_id_users"
 OWNER_COLUMN = "resource_owner_key"
 OWNER_LENGTH = 512
 OLD_CONSTRAINT = "uq_user_provider_account"
@@ -69,6 +71,10 @@ def _table_exists() -> bool:
     return sa.inspect(op.get_bind()).has_table(TABLE)
 
 
+def _users_table_exists() -> bool:
+    return sa.inspect(op.get_bind()).has_table(USERS_TABLE)
+
+
 def _column_names() -> set[str]:
     return {column["name"] for column in sa.inspect(op.get_bind()).get_columns(TABLE)}
 
@@ -98,6 +104,17 @@ def _constraint_names() -> set[str]:
         for constraint in sa.inspect(op.get_bind()).get_unique_constraints(TABLE)
         if constraint.get("name")
     }
+
+
+def _user_cascade_fk_is_current() -> bool:
+    """Return whether user deletion is guaranteed to remove every OAuth row."""
+    return any(
+        tuple(foreign_key.get("constrained_columns") or ()) == ("user_id",)
+        and foreign_key.get("referred_table") == USERS_TABLE
+        and tuple(foreign_key.get("referred_columns") or ()) == ("id",)
+        and str((foreign_key.get("options") or {}).get("ondelete")).upper() == "CASCADE"
+        for foreign_key in sa.inspect(op.get_bind()).get_foreign_keys(TABLE)
+    )
 
 
 def _index_names() -> set[str]:
@@ -184,15 +201,26 @@ def upgrade() -> None:
     if not _table_exists():
         return
 
+    if not _users_table_exists():
+        raise RuntimeError(
+            "owner-aware UserOAuth migration requires the users table; "
+            "initialize metadata-owned core tables before running Alembic"
+        )
+
     columns = _column_names()
     constraints = _constraint_names()
     needs_column = OWNER_COLUMN not in columns
     has_old_constraint = OLD_CONSTRAINT in constraints
+    needs_user_cascade_fk = not _user_cascade_fk_is_current()
 
     if not needs_column and not has_old_constraint:
         if not _owner_column_is_current():
             raise RuntimeError(
                 "owner-aware UserOAuth schema has incorrect owner column"
+            )
+        if needs_user_cascade_fk:
+            raise RuntimeError(
+                "owner-aware UserOAuth schema is missing its user cascade foreign key"
             )
         missing_indexes = _missing_owner_index_definitions(dialect)
         if not missing_indexes:
@@ -227,11 +255,28 @@ def upgrade() -> None:
                     batch_op.add_column(
                         sa.Column(OWNER_COLUMN, sa.String(OWNER_LENGTH))
                     )
+                if needs_user_cascade_fk:
+                    batch_op.create_foreign_key(
+                        USER_CASCADE_FK,
+                        USERS_TABLE,
+                        ["user_id"],
+                        ["id"],
+                        ondelete="CASCADE",
+                    )
                 if has_old_constraint:
                     batch_op.drop_constraint(OLD_CONSTRAINT, type_="unique")
     elif dialect == "postgresql":
         if needs_column:
             op.add_column(TABLE, sa.Column(OWNER_COLUMN, sa.String(OWNER_LENGTH)))
+        if needs_user_cascade_fk:
+            op.create_foreign_key(
+                USER_CASCADE_FK,
+                TABLE,
+                USERS_TABLE,
+                ["user_id"],
+                ["id"],
+                ondelete="CASCADE",
+            )
     else:  # pragma: no cover - rejected before schema inspection above
         raise AssertionError(f"unsupported dialect: {dialect}")
 

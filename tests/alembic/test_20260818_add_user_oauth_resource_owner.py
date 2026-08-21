@@ -39,12 +39,27 @@ def _operations(connection):
     return Operations(MigrationContext.configure(connection))
 
 
-def _create_old_table(connection) -> None:
-    operations = _operations(connection)
-    operations.create_table(
+def _create_users_table(connection) -> None:
+    _operations(connection).create_table(
         "users",
         sa.Column("id", sa.Integer(), nullable=False),
         sa.PrimaryKeyConstraint("id"),
+    )
+
+
+def _create_old_table(
+    connection,
+    *,
+    create_users: bool = True,
+    include_user_fk: bool = True,
+) -> None:
+    operations = _operations(connection)
+    if create_users:
+        _create_users_table(connection)
+    foreign_keys = (
+        (sa.ForeignKeyConstraint(["user_id"], ["users.id"], ondelete="CASCADE"),)
+        if include_user_fk
+        else ()
     )
     operations.create_table(
         "user_oauth",
@@ -65,7 +80,7 @@ def _create_old_table(connection) -> None:
             nullable=True,
         ),
         sa.Column("updated_at", sa.DateTime(timezone=True), nullable=True),
-        sa.ForeignKeyConstraint(["user_id"], ["users.id"], ondelete="CASCADE"),
+        *foreign_keys,
         sa.PrimaryKeyConstraint("id"),
         sa.UniqueConstraint(
             "user_id",
@@ -115,10 +130,14 @@ def _create_old_table(connection) -> None:
 
 
 def _create_interrupted_owner_table(
-    connection, *, existing_indexes: tuple[str, ...] = ()
+    connection,
+    *,
+    existing_indexes: tuple[str, ...] = (),
+    include_user_fk: bool = True,
 ) -> None:
     """Create the exact SQLite shape left by interrupted index installation."""
     operations = _operations(connection)
+    _create_users_table(connection)
     operations.create_table(
         "user_oauth",
         sa.Column("id", sa.Integer(), nullable=False),
@@ -127,8 +146,14 @@ def _create_interrupted_owner_table(
         sa.Column("access_token", sa.String(), nullable=False),
         sa.Column("provider_user_id", sa.String(), nullable=True),
         sa.Column("resource_owner_key", sa.String(512), nullable=True),
+        *(
+            (sa.ForeignKeyConstraint(["user_id"], ["users.id"], ondelete="CASCADE"),)
+            if include_user_fk
+            else ()
+        ),
         sa.PrimaryKeyConstraint("id"),
     )
+    connection.execute(text("INSERT INTO users (id) VALUES (7)"))
     connection.execute(
         text(
             "INSERT INTO user_oauth "
@@ -213,6 +238,20 @@ def test_upgrade_repairs_interrupted_owner_index_installation(
         )
 
 
+def test_interrupted_owner_schema_rejects_missing_user_cascade_foreign_key(
+    tmp_path,
+) -> None:
+    engine = create_engine(f"sqlite:///{tmp_path / 'oauth-interrupted-no-fk.db'}")
+    migration = _migration_module()
+
+    with engine.begin() as connection:
+        _create_interrupted_owner_table(connection, include_user_fk=False)
+
+        with patch.object(migration, "op", _operations(connection)):
+            with pytest.raises(RuntimeError, match="missing its user cascade"):
+                migration.upgrade()
+
+
 def test_interrupted_owner_index_repair_rejects_duplicate_identity(tmp_path) -> None:
     engine = create_engine(f"sqlite:///{tmp_path / 'oauth-interrupted-duplicate.db'}")
     migration = _migration_module()
@@ -235,6 +274,43 @@ def test_interrupted_owner_index_repair_rejects_duplicate_identity(tmp_path) -> 
         assert (
             connection.execute(text("SELECT count(*) FROM user_oauth")).scalar_one()
             == 2
+        )
+
+
+def test_upgrade_requires_users_table_for_the_cascade_contract(tmp_path) -> None:
+    engine = create_engine(f"sqlite:///{tmp_path / 'oauth-missing-users.db'}")
+    migration = _migration_module()
+
+    with engine.begin() as connection:
+        _create_old_table(
+            connection,
+            create_users=False,
+            include_user_fk=False,
+        )
+
+        with patch.object(migration, "op", _operations(connection)):
+            with pytest.raises(RuntimeError, match="requires the users table"):
+                migration.upgrade()
+
+
+def test_upgrade_installs_missing_user_cascade_foreign_key(tmp_path) -> None:
+    engine = create_engine(f"sqlite:///{tmp_path / 'oauth-missing-user-fk.db'}")
+    migration = _migration_module()
+
+    with engine.begin() as connection:
+        _create_old_table(connection, include_user_fk=False)
+
+        with patch.object(migration, "op", _operations(connection)):
+            migration.upgrade()
+
+        foreign_keys = inspect(connection).get_foreign_keys("user_oauth")
+        assert any(
+            tuple(foreign_key.get("constrained_columns") or ()) == ("user_id",)
+            and foreign_key.get("referred_table") == "users"
+            and tuple(foreign_key.get("referred_columns") or ()) == ("id",)
+            and str((foreign_key.get("options") or {}).get("ondelete")).upper()
+            == "CASCADE"
+            for foreign_key in foreign_keys
         )
 
 
@@ -564,8 +640,10 @@ def test_upgrade_rejects_partially_owner_aware_schema(
     with (
         patch.object(migration, "op", fake_op),
         patch.object(migration, "_table_exists", return_value=True),
+        patch.object(migration, "_users_table_exists", return_value=True),
         patch.object(migration, "_column_names", return_value=columns),
         patch.object(migration, "_constraint_names", return_value=constraints),
+        patch.object(migration, "_user_cascade_fk_is_current", return_value=True),
     ):
         with pytest.raises(RuntimeError, match="partially owner-aware"):
             migration.upgrade()
@@ -578,6 +656,7 @@ def test_existing_owner_aware_schema_requires_semantic_index_definitions(
     migration = _migration_module()
 
     with engine.begin() as connection:
+        _create_users_table(connection)
         _operations(connection).create_table(
             "user_oauth",
             sa.Column("id", sa.Integer(), nullable=False),
@@ -586,6 +665,7 @@ def test_existing_owner_aware_schema_requires_semantic_index_definitions(
             sa.Column("access_token", sa.String(), nullable=False),
             sa.Column("provider_user_id", sa.String(), nullable=True),
             sa.Column("resource_owner_key", sa.String(512), nullable=True),
+            sa.ForeignKeyConstraint(["user_id"], ["users.id"], ondelete="CASCADE"),
             sa.PrimaryKeyConstraint("id"),
         )
         connection.execute(
@@ -622,6 +702,7 @@ def test_existing_owner_aware_schema_requires_owner_column_semantics(
     migration = _migration_module()
 
     with engine.begin() as connection:
+        _create_users_table(connection)
         _operations(connection).create_table(
             "user_oauth",
             sa.Column("id", sa.Integer(), nullable=False),
@@ -635,6 +716,7 @@ def test_existing_owner_aware_schema_requires_owner_column_semantics(
                 nullable=nullable,
                 server_default=server_default,
             ),
+            sa.ForeignKeyConstraint(["user_id"], ["users.id"], ondelete="CASCADE"),
             sa.PrimaryKeyConstraint("id"),
         )
         connection.execute(
@@ -664,14 +746,17 @@ def test_postgresql_upgrade_creates_indexes_before_old_constraint_drop() -> None
     fake_op = SimpleNamespace(
         get_bind=lambda: SimpleNamespace(dialect=SimpleNamespace(name="postgresql")),
         add_column=lambda *_args, **_kwargs: events.append("add-column"),
+        create_foreign_key=lambda *_args, **_kwargs: events.append("create-user-fk"),
         drop_constraint=lambda *_args, **_kwargs: events.append("drop-constraint"),
     )
 
     with (
         patch.object(migration, "op", fake_op),
         patch.object(migration, "_table_exists", return_value=True),
+        patch.object(migration, "_users_table_exists", return_value=True),
         patch.object(migration, "_column_names", return_value=set()),
         patch.object(migration, "_constraint_names", return_value={OLD_CONSTRAINT}),
+        patch.object(migration, "_user_cascade_fk_is_current", return_value=False),
         patch.object(
             migration,
             "_create_owner_indexes",
@@ -680,7 +765,12 @@ def test_postgresql_upgrade_creates_indexes_before_old_constraint_drop() -> None
     ):
         migration.upgrade()
 
-    assert events == ["add-column", "create-indexes", "drop-constraint"]
+    assert events == [
+        "add-column",
+        "create-user-fk",
+        "create-indexes",
+        "drop-constraint",
+    ]
 
 
 def test_create_owner_indexes_attempts_all_postgresql_indexes() -> None:
@@ -731,8 +821,10 @@ def test_postgresql_index_creation_failure_keeps_old_constraint() -> None:
     with (
         patch.object(migration, "op", fake_op),
         patch.object(migration, "_table_exists", return_value=True),
+        patch.object(migration, "_users_table_exists", return_value=True),
         patch.object(migration, "_column_names", return_value=set()),
         patch.object(migration, "_constraint_names", return_value={OLD_CONSTRAINT}),
+        patch.object(migration, "_user_cascade_fk_is_current", return_value=True),
         patch.object(
             migration,
             "_create_owner_indexes",

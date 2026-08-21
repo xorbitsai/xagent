@@ -293,6 +293,20 @@ def _install_resolve_template_stub(
     )
 
 
+class _MalformedCapabilitiesTemplateManagerStub(_ResolveTemplateManagerStub):
+    """A template whose authored tool_categories/skills contain a
+    non-string element (e.g. an authoring typo) - agent_management.py's
+    _spec_from_template must filter these out rather than let them reach
+    AgentResponse's strict list[str] fields as an unhandled Pydantic
+    ValidationError."""
+
+    async def get_template(self, template_id: str) -> dict[str, Any]:
+        template = await super().get_template(template_id)
+        template["agent_config"]["tool_categories"] = [123, "web_search", None]
+        template["agent_config"]["skills"] = ["real_skill", {"bad": "shape"}]
+        return template
+
+
 def test_resolve_from_template_creates_and_publishes_on_first_use(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -342,6 +356,33 @@ def test_resolve_from_template_reuses_the_same_agent_on_repeat_calls(
     listed = client.get("/api/agents", headers=headers).json()
     matching = [a for a in listed if a.get("template_id") == "resolve-template"]
     assert len(matching) == 1
+
+
+def test_resolve_from_template_drops_non_string_capability_elements(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A malformed tool_categories/skills entry in the template's authored
+    agent_config must not 500 the resolve endpoint - it must be filtered
+    out, the same way get_agent_capability_lists filters it for the
+    marketplace list/detail endpoints."""
+    headers = _admin_headers()
+    monkeypatch.setattr(
+        client.app.state,
+        "template_manager",
+        _MalformedCapabilitiesTemplateManagerStub(),
+        raising=False,
+    )
+
+    response = client.post(
+        "/api/agents/from-template/resolve",
+        headers=headers,
+        json={"template_id": "malformed-capabilities-template"},
+    )
+
+    assert response.status_code == 200, response.text
+    body = response.json()["agent"]
+    assert body["tool_categories"] == ["web_search"]
+    assert body["skills"] == ["real_skill"]
 
 
 def test_resolve_from_template_increments_used_count_only_on_the_fresh_mint(

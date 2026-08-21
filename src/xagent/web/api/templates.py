@@ -493,7 +493,9 @@ async def list_templates(
 
         # Get localized values
         description = get_localized_value(template.get("descriptions", {}), lang, "")
-        features = get_localized_value(template.get("features", {}), lang, [])
+        features = _string_list_elements(
+            get_localized_value(template.get("features", {}), lang, [])
+        )
         sample_prompts = get_localized_value(
             template.get("sample_prompts", {}), lang, []
         )
@@ -501,7 +503,9 @@ async def list_templates(
             template.get("setup_time", {}), lang, "5 min setup"
         )
         connections = template.get("connections", [])
-        tags = get_localized_value(template.get("tags", {}), lang, [])
+        tags = _string_list_elements(
+            get_localized_value(template.get("tags", {}), lang, [])
+        )
         hired_agent_id = hired_agent_id_by_template_id.get(template_id)
         tool_categories, skills = get_agent_capability_lists(template)
 
@@ -572,13 +576,17 @@ async def get_template(
 
     # Get localized values
     description = get_localized_value(template.get("descriptions", {}), lang, "")
-    features = get_localized_value(template.get("features", {}), lang, [])
+    features = _string_list_elements(
+        get_localized_value(template.get("features", {}), lang, [])
+    )
     sample_prompts = get_localized_value(template.get("sample_prompts", {}), lang, [])
     setup_time = get_localized_value(
         template.get("setup_time", {}), lang, "5 min setup"
     )
     connections = template.get("connections", [])
-    tags = get_localized_value(template.get("tags", {}), lang, [])
+    tags = _string_list_elements(
+        get_localized_value(template.get("tags", {}), lang, [])
+    )
     current_user_id = int(current_user.id)
     hired_agent_id = get_hired_agent_map(db, current_user_id, [template_id]).get(
         template_id

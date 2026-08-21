@@ -867,6 +867,28 @@ class TestFileStorageConfig:
         with pytest.raises(ValueError, match="XAGENT_FILE_STORAGE_OPTIONS"):
             get_file_storage_options()
 
+    def test_file_upload_admission_defaults(self, monkeypatch):
+        monkeypatch.delenv("XAGENT_FILE_UPLOAD_MAX_CONCURRENCY", raising=False)
+        monkeypatch.delenv("XAGENT_FILE_UPLOAD_QUEUE_TIMEOUT_SECONDS", raising=False)
+
+        assert config.get_file_upload_max_concurrency() == 4
+        assert config.get_file_upload_queue_timeout_seconds() == 30
+
+    def test_file_upload_admission_uses_positive_overrides(self, monkeypatch):
+        monkeypatch.setenv("XAGENT_FILE_UPLOAD_MAX_CONCURRENCY", "7")
+        monkeypatch.setenv("XAGENT_FILE_UPLOAD_QUEUE_TIMEOUT_SECONDS", "45")
+
+        assert config.get_file_upload_max_concurrency() == 7
+        assert config.get_file_upload_queue_timeout_seconds() == 45
+
+    @pytest.mark.parametrize("value", ["0", "-1", "invalid"])
+    def test_file_upload_admission_rejects_invalid_overrides(self, monkeypatch, value):
+        monkeypatch.setenv("XAGENT_FILE_UPLOAD_MAX_CONCURRENCY", value)
+        monkeypatch.setenv("XAGENT_FILE_UPLOAD_QUEUE_TIMEOUT_SECONDS", value)
+
+        assert config.get_file_upload_max_concurrency() == 4
+        assert config.get_file_upload_queue_timeout_seconds() == 30
+
     def test_file_materialize_dir_default(self, monkeypatch):
         monkeypatch.delenv(FILE_MATERIALIZE_DIR, raising=False)
 

@@ -224,6 +224,75 @@ describe("api-wrapper auth refresh", () => {
     mockNavigatorLocks()
   })
 
+  it("does not replay an upload after an ambiguous transport failure", async () => {
+    writeAuthCache(user, "access-token", "refresh-token", 120, 240)
+    const fetchMock = vi.spyOn(globalThis, "fetch")
+      .mockRejectedValue(new TypeError("network connection lost"))
+
+    await expect(apiRequest(
+      "http://api.local/api/files/upload",
+      { method: "POST", body: new FormData() },
+      { retryTransport: false },
+    )).rejects.toThrow("network connection lost")
+
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+  })
+
+  it("does not generically retry a failed upload replay after refreshing auth", async () => {
+    writeAuthCache(user, "old-access", "old-refresh", 120, 240)
+    const uploadUrl = "http://api.local/api/files/upload"
+    const replayError = new TypeError("replay connection lost")
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(
+      async (input, options) => {
+        const url = String(input)
+        const authorization = new Headers(options?.headers).get("Authorization")
+
+        if (url.endsWith("/api/auth/refresh")) {
+          return new Response(JSON.stringify({
+            success: true,
+            access_token: "new-access",
+            refresh_token: "new-refresh",
+            expires_in: 120,
+            refresh_expires_in: 240,
+          }), {
+            status: 200,
+            headers: { "Content-Type": "application/json" },
+          })
+        }
+        if (url === uploadUrl && authorization === "Bearer old-access") {
+          return new Response(null, {
+            status: 401,
+            headers: { "Error-Type": "TokenExpired" },
+          })
+        }
+        if (url === uploadUrl && authorization === "Bearer new-access") {
+          throw replayError
+        }
+        throw new Error(`Unexpected request: ${url}`)
+      },
+    )
+
+    await expect(apiRequest(
+      uploadUrl,
+      { method: "POST", body: new FormData() },
+      { retryTransport: false },
+    )).rejects.toBe(replayError)
+
+    expect(readAuthCache()).toMatchObject({
+      token: "new-access",
+      refreshToken: "new-refresh",
+    })
+    expect(fetchMock.mock.calls.map(([input, options]) => ({
+      url: String(input),
+      authorization: new Headers(options?.headers).get("Authorization"),
+    }))).toEqual([
+      { url: uploadUrl, authorization: "Bearer old-access" },
+      { url: expect.stringMatching(/\/api\/auth\/refresh$/), authorization: null },
+      { url: uploadUrl, authorization: "Bearer new-access" },
+    ])
+    expect(fetchMock).toHaveBeenCalledTimes(3)
+  })
+
   it("replays once when the profile advances after the refreshed credential is committed", async () => {
     writeAuthCache(user, "old-access", "old-refresh", 120, 240)
     const updateProfileAfterRefresh = () => {

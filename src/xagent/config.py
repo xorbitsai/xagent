@@ -74,6 +74,8 @@ _NATIVE_BROWSER_APP_NAMES_BY_CASEFOLD = {
 MAX_UPLOAD_SIZE = "XAGENT_MAX_UPLOAD_SIZE"
 FILE_STORAGE_URI = "XAGENT_FILE_STORAGE_URI"
 FILE_STORAGE_OPTIONS = "XAGENT_FILE_STORAGE_OPTIONS"
+FILE_UPLOAD_MAX_CONCURRENCY = "XAGENT_FILE_UPLOAD_MAX_CONCURRENCY"
+FILE_UPLOAD_QUEUE_TIMEOUT_SECONDS = "XAGENT_FILE_UPLOAD_QUEUE_TIMEOUT_SECONDS"
 FILE_MATERIALIZE_DIR = "XAGENT_FILE_MATERIALIZE_DIR"
 PREVIEW_TMP_DIR = "XAGENT_PREVIEW_TMP_DIR"
 FILE_STORAGE_STARTUP_SYNC_ENABLED = "XAGENT_FILE_STORAGE_STARTUP_SYNC_ENABLED"
@@ -1821,6 +1823,24 @@ def get_file_storage_options() -> dict[str, Any]:
         raise ValueError(f"Invalid {FILE_STORAGE_OPTIONS} value: must be a JSON object")
 
     return parsed
+
+
+def get_file_upload_max_concurrency() -> int:
+    """Return the maximum active durable upload registrations per process.
+
+    The admission gate applies at the asynchronous HTTP boundary immediately
+    before durable registration. Keeping the value process-local protects each
+    backend worker's object-storage connection pool without implying a
+    deployment-wide distributed limit.
+    """
+
+    return _get_positive_int_env(FILE_UPLOAD_MAX_CONCURRENCY, 4)
+
+
+def get_file_upload_queue_timeout_seconds() -> int:
+    """Return how long an upload may wait for durable-registration capacity."""
+
+    return _get_positive_int_env(FILE_UPLOAD_QUEUE_TIMEOUT_SECONDS, 30)
 
 
 def get_file_materialize_dir() -> Path:

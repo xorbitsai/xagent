@@ -1357,6 +1357,197 @@ describe("ChatInput", () => {
     expect(container.querySelector('button[type="submit"]')).toBeDisabled()
   })
 
+  it("caps attachment uploads across repeated selections", async () => {
+    const controlledUploads: Array<{
+      file: File
+      resolve: (value: { file_id: string }) => void
+    }> = []
+    let activeUploads = 0
+    let maxActiveUploads = 0
+    const uploadFile = vi.fn((file: File) => {
+      activeUploads += 1
+      maxActiveUploads = Math.max(maxActiveUploads, activeUploads)
+      return new Promise<{ file_id: string }>((resolve) => {
+        controlledUploads.push({ file, resolve })
+      }).finally(() => {
+        activeUploads -= 1
+      })
+    })
+
+    function Harness() {
+      const [files, setFiles] = React.useState<File[]>([])
+      return (
+        <ChatInput
+          hideConfig
+          files={files}
+          onFilesChange={setFiles}
+          onSend={vi.fn()}
+          uploadFile={uploadFile}
+        />
+      )
+    }
+
+    const { container } = render(<Harness />)
+    const fileInput = container.querySelector('input[type="file"]') as HTMLInputElement
+    const firstBatch = Array.from({ length: 5 }, (_, index) => (
+      new File([String(index)], `first-${index}.txt`, { type: "text/plain" })
+    ))
+    const secondBatch = Array.from({ length: 2 }, (_, index) => (
+      new File([String(index)], `second-${index}.txt`, { type: "text/plain" })
+    ))
+    const expectedUploadOrder = [...firstBatch, ...secondBatch].map(file => file.name)
+
+    fireEvent.change(fileInput, { target: { files: firstBatch } })
+    await waitFor(() => expect(uploadFile).toHaveBeenCalledTimes(3))
+    expect(activeUploads).toBe(3)
+    expect(maxActiveUploads).toBe(3)
+
+    fireEvent.change(fileInput, { target: { files: secondBatch } })
+    await act(async () => Promise.resolve())
+    expect(uploadFile).toHaveBeenCalledTimes(3)
+
+    let resolvedUploads = 0
+    while (uploadFile.mock.calls.length < expectedUploadOrder.length) {
+      const uploadsStarted = uploadFile.mock.calls.length
+      const controlledUpload = controlledUploads[resolvedUploads]
+      expect(controlledUpload).toBeDefined()
+
+      await act(async () => {
+        controlledUpload.resolve({ file_id: `id-${controlledUpload.file.name}` })
+      })
+      resolvedUploads += 1
+
+      await waitFor(() => expect(uploadFile).toHaveBeenCalledTimes(uploadsStarted + 1))
+      expect(activeUploads).toBe(3)
+      expect(maxActiveUploads).toBeLessThanOrEqual(3)
+    }
+
+    expect(uploadFile.mock.calls.map(([file]) => file.name)).toEqual(
+      expectedUploadOrder
+    )
+
+    while (resolvedUploads < controlledUploads.length) {
+      const controlledUpload = controlledUploads[resolvedUploads]
+      await act(async () => {
+        controlledUpload.resolve({ file_id: `id-${controlledUpload.file.name}` })
+      })
+      resolvedUploads += 1
+
+      await waitFor(() => {
+        expect(activeUploads).toBe(expectedUploadOrder.length - resolvedUploads)
+      })
+      expect(uploadFile).toHaveBeenCalledTimes(expectedUploadOrder.length)
+      expect(maxActiveUploads).toBeLessThanOrEqual(3)
+    }
+
+    expect(activeUploads).toBe(0)
+    expect(maxActiveUploads).toBe(3)
+    await waitFor(() => {
+      expect(container.querySelector('button[type="submit"]')).not.toBeDisabled()
+    })
+  })
+
+  it("cancels duplicate-metadata files by object identity", async () => {
+    const signals: AbortSignal[] = []
+    apiRequestMock.mockImplementation((url: string, init?: RequestInit) => {
+      if (url === "http://upload.local/api/files/upload") {
+        signals.push(init?.signal as AbortSignal)
+        return new Promise<Response>(() => {})
+      }
+      return Promise.resolve(emptyJsonResponse())
+    })
+
+    function Harness() {
+      const [files, setFiles] = React.useState<File[]>([])
+      return (
+        <ChatInput
+          hideConfig
+          files={files}
+          onFilesChange={setFiles}
+          onSend={vi.fn()}
+        />
+      )
+    }
+
+    const { container } = render(<Harness />)
+    const fileInput = container.querySelector('input[type="file"]') as HTMLInputElement
+    const lastModified = Date.now()
+    const first = new File(["first"], "duplicate.txt", { lastModified })
+    const second = new File(["second"], "duplicate.txt", { lastModified })
+
+    fireEvent.change(fileInput, { target: { files: [first, second] } })
+    await waitFor(() => expect(signals).toHaveLength(2))
+
+    fireEvent.click(screen.getAllByTitle("common.cancel")[0])
+
+    expect(signals[0].aborted).toBe(true)
+    expect(signals[1].aborted).toBe(false)
+  })
+
+  it("keeps successful attachments when other uploads fail", async () => {
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => {})
+    const controlledUploads = new Map<string, {
+      resolve: (value: { file_id: string }) => void
+      reject: (reason: unknown) => void
+    }>()
+    const uploadFile = vi.fn((file: File) => new Promise<{ file_id: string }>(
+      (resolve, reject) => {
+        controlledUploads.set(file.name, { resolve, reject })
+      }
+    ))
+
+    function Harness() {
+      const [files, setFiles] = React.useState<File[]>([])
+      return (
+        <ChatInput
+          hideConfig
+          files={files}
+          onFilesChange={setFiles}
+          onSend={vi.fn()}
+          uploadFile={uploadFile}
+        />
+      )
+    }
+
+    const { container } = render(<Harness />)
+    const fileInput = container.querySelector('input[type="file"]') as HTMLInputElement
+    const successful = new File(["ok"], "successful.txt")
+    const firstFailure = new File(["bad-1"], "failed-one.txt")
+    const secondFailure = new File(["bad-2"], "failed-two.txt")
+
+    fireEvent.change(fileInput, {
+      target: { files: [successful, firstFailure, secondFailure] },
+    })
+    await waitFor(() => expect(controlledUploads.size).toBe(3))
+
+    await act(async () => {
+      controlledUploads.get(successful.name)?.resolve({
+        file_id: `id-${successful.name}`,
+      })
+      controlledUploads.get(firstFailure.name)?.reject(
+        new Error("storage unavailable")
+      )
+      controlledUploads.get(secondFailure.name)?.reject(
+        new Error("storage unavailable")
+      )
+    })
+
+    await waitFor(() => {
+      expect(screen.getByText(successful.name)).toBeInTheDocument()
+      expect(screen.queryByText(firstFailure.name)).not.toBeInTheDocument()
+      expect(screen.queryByText(secondFailure.name)).not.toBeInTheDocument()
+    })
+    expect((successful as File & { file_id?: string }).file_id).toBe(
+      "id-successful.txt"
+    )
+    expect(toastErrorMock).toHaveBeenCalledTimes(1)
+    expect(toastErrorMock).toHaveBeenCalledWith(
+      "storage unavailable (2): failed-one.txt, failed-two.txt",
+      expect.anything(),
+    )
+    consoleError.mockRestore()
+  })
+
   it("keeps pause hidden while running draft files are still uploading", async () => {
     const onPause = vi.fn()
     const uploadFile = vi.fn(() => new Promise<{ file_id: string }>(() => {}))

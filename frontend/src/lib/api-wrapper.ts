@@ -142,11 +142,19 @@ export function refreshStoredAccessToken(expectedSession: AuthSessionSnapshot): 
 function withBearer(options: RequestInit, token: string): RequestInit {
   return { ...options, headers: { ...options.headers, Authorization: `Bearer ${token}` } }
 }
+export interface ApiRequestPolicy { retryTransport?: boolean }
 /** A request has at most one post-401 replay, bound to an exact immutable credential snapshot. */
-export async function apiRequest(url: string, options: RequestInit = {}): Promise<Response> {
+export async function apiRequest(
+  url: string,
+  options: RequestInit = {},
+  policy: ApiRequestPolicy = {},
+): Promise<Response> {
   const session = readAuthSessionSnapshot()
   if (!session.accessToken) return fetch(url, options)
-  const response = await fetchWithRetry(url, withBearer(options, session.accessToken))
+  const authenticatedOptions = withBearer(options, session.accessToken)
+  const response = await (policy.retryTransport === false
+    ? fetch(url, authenticatedOptions)
+    : fetchWithRetry(url, authenticatedOptions))
   if (response.status !== 401 || shouldSkipRefresh(url)) return response
   const afterResponse = compareAuthSession(session)
   if (afterResponse.status === "credentials_advanced" || afterResponse.status === "credentials_and_profile_advanced") {

@@ -2499,6 +2499,9 @@ describe("useWebSocket normalized connections", () => {
       await Promise.resolve()
     })
     const oldSettledBeforeUploadCompleted = oldSettled
+    expect(uploadFiles.mock.calls[0][1].signal).toBeInstanceOf(AbortSignal)
+    expect(uploadFiles.mock.calls[0][1].signal.aborted).toBe(true)
+    expect(uploadFiles.mock.calls[1][1].signal.aborted).toBe(false)
 
     await act(async () => {
       oldUpload.resolve([{ file_id: "stale-file" }])

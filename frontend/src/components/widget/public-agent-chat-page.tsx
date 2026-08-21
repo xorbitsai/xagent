@@ -1,13 +1,13 @@
 "use client"
 
-import React, { useCallback, useEffect, useMemo, useState } from "react"
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import { Loader2, MessageSquarePlus } from "lucide-react"
 import { ChatStartScreen } from "@/components/chat/ChatStartScreen"
 import { TaskConversationPanel } from "@/components/task/task-conversation-panel"
 import { AppProvider, useApp, type AppProviderTransportConfig } from "@/contexts/app-context-chat"
 import { usePublicFileAccessPolicy } from "@/contexts/file-access-context"
 import { useI18n } from "@/contexts/i18n-context"
-import { uploadPublicChatFile } from "@/lib/public-chat-file-upload"
+import { uploadDeferredPublicChatFiles } from "@/lib/public-chat-file-upload"
 import { normalizeTaskStatus } from "@/lib/task-status"
 import {
   getApiUrl,
@@ -127,6 +127,15 @@ const shareGuestIdFromToken = (token: string): string => {
 
 type PublicMessageConfig = Record<string, unknown>
 
+// Consume generation inputs only to trigger a new opaque identity. The cache
+// receives the returned object and never retains those inputs (including tokens).
+const createPublicUploadContext = (...generationInputs: unknown[]): object => {
+  // Reading the count prevents the generation inputs from becoming retained
+  // properties while still making their deliberate consumption explicit.
+  void generationInputs.length
+  return {}
+}
+
 function PublicConversationContent({
   authMode,
   routeToken,
@@ -154,6 +163,19 @@ function PublicConversationContent({
   const [draftFiles, setDraftFiles] = useState<File[]>([])
   const [isBootstrappingTask, setIsBootstrappingTask] = useState(false)
   const [hasResolvedStoredTask, setHasResolvedStoredTask] = useState(false)
+  const [workforceUploadGeneration, setWorkforceUploadGeneration] = useState(0)
+  const bootstrapControllerRef = useRef<AbortController | null>(null)
+  // Object identity retains taskless upload successes across retries for one
+  // pending conversation, then rotates when that conversation is acknowledged.
+  const workforceUploadContext = useMemo(
+    () => createPublicUploadContext(
+      accessToken,
+      authMode,
+      routeToken,
+      workforceUploadGeneration,
+    ),
+    [accessToken, authMode, routeToken, workforceUploadGeneration],
+  )
   const storageKey = authMode === "share"
     // Scope the persisted task-id by guest_id (decoded from the guest JWT) so a
     // task minted under one guest is never read back under another's token — a
@@ -224,6 +246,11 @@ function PublicConversationContent({
   // active taskId, and the visitor is back on the start screen; the next
   // message creates a fresh task through handleSend. #1039
   const handleNewConversation = useCallback(() => {
+    // Task creation and the agent opening send form one bootstrap operation.
+    // Do not let a reset cancel it after the server may have created the task.
+    if (bootstrapControllerRef.current) return
+
+    setWorkforceUploadGeneration((generation) => generation + 1)
     safeRemoveItem(storageKey)
     setTaskId(null, { navigate: false })
     // Nulling taskId closes the socket, so no terminal WS event will ever
@@ -239,11 +266,20 @@ function PublicConversationContent({
     setCreateTaskError(null)
   }, [dispatch, storageKey, setTaskId])
 
+  useEffect(() => () => {
+    bootstrapControllerRef.current?.abort()
+    bootstrapControllerRef.current = null
+  }, [])
+
   const handleSend = useCallback(async (
     message: string,
     config?: PublicMessageConfig,
     files?: File[],
   ) => {
+    // This ref is set before any React state update or await. Reentrant sends
+    // are ignored without replacing or duplicating the active bootstrap.
+    if (bootstrapControllerRef.current) return
+
     if (state.taskId) {
       await sendMessage(message, config, files)
       return
@@ -257,6 +293,17 @@ function PublicConversationContent({
       return
     }
 
+    const bootstrapController = new AbortController()
+    bootstrapControllerRef.current = bootstrapController
+    const ensureActiveBootstrap = () => {
+      if (
+        bootstrapControllerRef.current !== bootstrapController
+        || bootstrapController.signal.aborted
+      ) {
+        throw bootstrapController.signal.reason
+          ?? new DOMException("Task bootstrap was cancelled", "AbortError")
+      }
+    }
     setIsBootstrappingTask(true)
     try {
       const taskPayload: Record<string, string | number | string[]> = {
@@ -274,26 +321,35 @@ function PublicConversationContent({
       // exists yet) and threaded in as file ids BEFORE the run begins;
       // otherwise the first turn never sees them.
       if (workforceId && files?.length) {
-        const uploaded = await Promise.all(files.map((file) => uploadPublicChatFile({
+        const uploaded = await uploadDeferredPublicChatFiles(files, {
           url: `${getApiUrl()}${publicApiPrefix}/files/upload`,
           accessToken,
-          file,
           taskType: "task",
           fallbackError: t("files.uploadFailed"),
-        })))
+          signal: bootstrapController.signal,
+          uploadContext: workforceUploadContext,
+        })
+        ensureActiveBootstrap()
         taskPayload.files = uploaded.map((item) => item.file_id)
       }
 
       const response = await fetch(`${getApiUrl()}${publicApiPrefix}/chat/task/create`, {
         method: "POST",
+        signal: bootstrapController.signal,
         headers: {
           "Content-Type": "application/json",
           "Authorization": `Bearer ${accessToken}`,
         },
         body: JSON.stringify(taskPayload),
       })
+      // Owner cancellation can race with an already-resolved response or
+      // delayed body parsing. Fence every boundary so an unmounted bootstrap
+      // cannot publish stale results.
+      ensureActiveBootstrap()
 
       if (!response.ok) {
+        const errorData = await response.json().catch(() => null)
+        ensureActiveBootstrap()
         // A share task-create carries no task id, so 401/403 here means the
         // guest token itself is no longer valid (rotated/disabled link, or a
         // legacy token rejected post-#973). Drop the persisted token and force
@@ -302,18 +358,23 @@ function PublicConversationContent({
           safeRemoveItem(storageKey)
           onAuthInvalidated?.()
         }
-        const errorData = await response.json().catch(() => null)
         const errorMessage = errorData?.detail || t("widgetChat.messages.error_init")
         setCreateTaskError(errorMessage)
         throw new Error(errorMessage)
       }
 
       const taskData = await response.json()
+      ensureActiveBootstrap()
       const newTaskId = taskData.task_id
       if (typeof newTaskId !== "number") {
         throw new Error("Task creation failed")
       }
 
+      // A valid task id acknowledges the taskless upload generation. Future
+      // conversations must POST even when the visitor selects the same File.
+      if (workforceId) {
+        setWorkforceUploadGeneration((generation) => generation + 1)
+      }
       setTaskId(newTaskId, { navigate: false })
       dispatch({
         type: "SET_CURRENT_TASK",
@@ -335,6 +396,7 @@ function PublicConversationContent({
 
       if (!workforceId) {
         await sendMessage(message, { ...config, targetTaskId: newTaskId }, files)
+        ensureActiveBootstrap()
       }
       // Workforce share sessions already started their first turn (with the
       // files threaded in above) inside task creation — the connection
@@ -342,17 +404,13 @@ function PublicConversationContent({
       // duplicate the turn.
       setDraftMessage("")
       setDraftFiles([])
-    } catch (error) {
-      setIsBootstrappingTask(false)
-      throw error
+    } finally {
+      if (bootstrapControllerRef.current === bootstrapController) {
+        bootstrapControllerRef.current = null
+        setIsBootstrappingTask(false)
+      }
     }
-  }, [accessToken, agentId, agentLogo, agentName, authMode, dispatch, onAuthInvalidated, publicApiPrefix, sendMessage, setTaskId, state.taskId, storageKey, t, workforceId])
-
-  useEffect(() => {
-    if (state.taskId || createTaskError) {
-      setIsBootstrappingTask(false)
-    }
-  }, [createTaskError, state.taskId])
+  }, [accessToken, agentId, agentLogo, agentName, authMode, dispatch, onAuthInvalidated, publicApiPrefix, sendMessage, setTaskId, state.taskId, storageKey, t, workforceId, workforceUploadContext])
 
   const resolvedAgentName = state.currentTask?.agentName || agentName || t("widgetChat.title")
   const resolvedAgentLogo = state.currentTask?.agentLogoUrl || agentLogo || null
@@ -391,9 +449,10 @@ function PublicConversationContent({
             <button
               type="button"
               onClick={handleNewConversation}
+              disabled={isBootstrappingTask}
               title={t("widgetChat.newConversation")}
               aria-label={t("widgetChat.newConversation")}
-              className="ml-auto p-2 rounded-md text-muted-foreground hover:text-foreground hover:bg-muted/50 transition-colors"
+              className="ml-auto p-2 rounded-md text-muted-foreground hover:text-foreground hover:bg-muted/50 transition-colors disabled:cursor-not-allowed disabled:opacity-50"
             >
               <MessageSquarePlus className="w-4 h-4" />
             </button>
@@ -587,6 +646,12 @@ export function PublicAgentChatPage({
   const publicAccessToken = authResult?.access_token ?? ""
   const fileAccess = usePublicFileAccessPolicy(publicAccessToken)
 
+  // A new auth result creates a new cache owner without storing its token.
+  const transportUploadContext = useMemo(
+    () => createPublicUploadContext(authMode, publicAccessToken),
+    [authMode, publicAccessToken],
+  )
+
   const transport = useMemo<AppProviderTransportConfig>(() => ({
     capabilities: {
       agentCards: "disabled",
@@ -601,17 +666,16 @@ export function PublicAgentChatPage({
       `${baseUrl}/${authMode === "share" ? "api/share" : "api/widget"}/chat/ws/${taskId}${token ? `?token=${token}` : ""}`,
     fileAccess,
     uploadFiles: (files, params) =>
-      Promise.all(files.map((file) =>
-        uploadPublicChatFile({
-          url: `${getApiUrl()}/${authMode === "share" ? "api/share" : "api/widget"}/files/upload`,
-          accessToken: publicAccessToken,
-          file,
-          taskType: params.taskType,
-          taskId: params.taskId,
-          fallbackError: t("files.uploadFailed"),
-        }),
-      )),
-  }), [authMode, fileAccess, publicAccessToken, t])
+      uploadDeferredPublicChatFiles(files, {
+        url: `${getApiUrl()}/${authMode === "share" ? "api/share" : "api/widget"}/files/upload`,
+        accessToken: publicAccessToken,
+        taskType: params.taskType,
+        taskId: params.taskId,
+        fallbackError: t("files.uploadFailed"),
+        signal: params.signal,
+        uploadContext: transportUploadContext,
+      }),
+  }), [authMode, fileAccess, publicAccessToken, t, transportUploadContext])
 
   if (isInitializing) {
     return (

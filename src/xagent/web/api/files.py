@@ -37,7 +37,7 @@ from ...config import (
     get_uploads_dir,
 )
 from ...core.execution_scope import resolve_execution_scope
-from ...core.file_storage import get_user_file_storage
+from ...core.file_storage import get_file_storage_backend, get_user_file_storage
 from ...core.tools.adapters.vibe.file_tool import read_file
 from ...core.tools.core.file_analysis import collect_pptx_slide_blocks
 from ...core.utils.svg import rasterize_svg_bytes
@@ -75,6 +75,10 @@ from ..services.managed_file_ref import (
     DurableStorageOperationError,
     ManagedFileRef,
     guess_media_type,
+)
+from ..services.upload_storage_gate import (
+    UploadStorageCapacityError,
+    get_upload_storage_gate,
 )
 from ..services.uploaded_file_store import (
     LocalUploadRegistration,
@@ -573,9 +577,20 @@ async def store_uploaded_files(
                 )
             )
 
-        registered = await run_db_io_cancellation_safe(
-            lambda: register_local_uploads_sync(registrations)
-        )
+        try:
+            async with get_upload_storage_gate().lease():
+                registered = await run_db_io_cancellation_safe(
+                    lambda: register_local_uploads_sync(registrations)
+                )
+        except UploadStorageCapacityError as exc:
+            logger.warning(
+                "Timed out waiting for durable upload capacity: "
+                "user_id=%s task_id=%s file_count=%s",
+                user_id,
+                parsed_task_id,
+                len(upload_items),
+            )
+            raise _durable_storage_unavailable() from exc
         for file_record in registered:
             uploaded_files.append(
                 {
@@ -588,7 +603,15 @@ async def store_uploaded_files(
             )
         completed = True
     except DurableStorageOperationError as exc:
-        logger.warning("Durable storage unavailable during upload: %s", exc)
+        logger.exception(
+            "Durable storage unavailable during upload: "
+            "operation=register_local_uploads backend=%s user_id=%s task_id=%s "
+            "file_count=%s",
+            get_file_storage_backend(),
+            user_id,
+            parsed_task_id,
+            len(upload_items),
+        )
         raise _durable_storage_unavailable() from exc
     finally:
         if not completed:

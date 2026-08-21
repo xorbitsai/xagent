@@ -175,7 +175,7 @@ export function FilesPage() {
       const response = await apiRequest(`${getUploadApiUrl()}/api/files/upload`, {
         method: 'POST',
         body: formData
-      })
+      }, { retryTransport: false })
 
       const parsed = await parseApiResponse(response)
 

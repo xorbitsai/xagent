@@ -192,7 +192,7 @@ export function AgentBuilderChat({ agentConfig, onUpdateConfig, availableOptions
           const uploadResponse = await apiRequest(`${getUploadApiUrl()}/api/files/upload`, {
             method: 'POST',
             body: formData,
-          });
+          }, { retryTransport: false });
           const parsed = await parseApiResponse(uploadResponse);
           if (!uploadResponse.ok) {
             throw new Error(getUploadErrorMessage(uploadResponse, parsed, {

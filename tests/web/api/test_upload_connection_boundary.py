@@ -31,6 +31,10 @@ from xagent.web.services.managed_file_ref import (
     DurableStorageOperationError,
     ManagedFileRef,
 )
+from xagent.web.services.upload_storage_gate import (
+    UploadStorageCapacityError,
+    UploadStorageGate,
+)
 
 from .conftest import (
     _admin_headers,
@@ -592,6 +596,58 @@ async def test_cancelled_store_cleans_its_exact_late_result_once(
 
     assert unlink_calls.count(target) == 1
     assert not target.exists()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_registration_holds_capacity_until_worker_settles(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Cancellation cannot admit a replacement while durable I/O still runs."""
+
+    user_id = 7
+    gate = UploadStorageGate(max_concurrency=1, queue_timeout_seconds=0.01)
+    registration_started = threading.Event()
+    release_registration = threading.Event()
+    monkeypatch.setattr(files_api, "get_upload_path", _stage_path_in(tmp_path, user_id))
+    monkeypatch.setattr(files_api, "get_upload_storage_gate", lambda: gate)
+
+    def blocked_registration(_registrations):  # type: ignore[no-untyped-def]
+        registration_started.set()
+        assert release_registration.wait(2)
+        return ()
+
+    monkeypatch.setattr(
+        files_api,
+        "register_local_uploads_sync",
+        blocked_registration,
+    )
+    task = asyncio.create_task(
+        files_api.store_uploaded_files(
+            upload_items=[
+                UploadFile(
+                    filename="cancelled-registration.txt",
+                    file=io.BytesIO(b"payload"),
+                )
+            ],
+            task_type="general",
+            task_id=None,
+            folder=None,
+            user_id=user_id,
+            single_file_mode=True,
+        )
+    )
+    assert await asyncio.to_thread(registration_started.wait, 2)
+
+    task.cancel()
+    with pytest.raises(UploadStorageCapacityError):
+        async with gate.lease():
+            raise AssertionError("replacement must not overlap the draining worker")
+
+    release_registration.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert gate.active == 0
 
 
 @pytest.mark.asyncio

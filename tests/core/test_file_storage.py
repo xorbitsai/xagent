@@ -230,6 +230,48 @@ def test_s3_file_storage_keeps_explicit_client_timeout_overrides(monkeypatch, tm
     }
 
 
+def test_s3_file_storage_keeps_explicit_retry_mode_override(monkeypatch, tmp_path):
+    captured: dict[str, object] = {}
+
+    class DummyStorage:
+        pass
+
+    def fake_url_to_fs(uri: str, **options: object):
+        captured["options"] = options
+        return DummyStorage(), "bucket/root"
+
+    monkeypatch.setenv("XAGENT_FILE_STORAGE_URI", "s3://bucket/root")
+    monkeypatch.setenv("XAGENT_FILE_MATERIALIZE_DIR", str(tmp_path))
+    monkeypatch.setenv(
+        "XAGENT_FILE_STORAGE_OPTIONS",
+        json.dumps(
+            {
+                "config_kwargs": {
+                    "retries": {
+                        "mode": "adaptive",
+                        "total_max_attempts": 5,
+                    }
+                }
+            }
+        ),
+    )
+    monkeypatch.setattr(file_storage_factory.fsspec.core, "url_to_fs", fake_url_to_fs)
+    get_unscoped_file_storage.cache_clear()
+
+    get_unscoped_file_storage()
+
+    assert captured["options"] == {
+        "config_kwargs": {
+            "connect_timeout": 3,
+            "read_timeout": 10,
+            "retries": {
+                "mode": "adaptive",
+                "total_max_attempts": 5,
+            },
+        }
+    }
+
+
 def test_put_file_hashes_while_copying(monkeypatch, tmp_path):
     monkeypatch.setenv("XAGENT_FILE_STORAGE_URI", (tmp_path / "objects").as_uri())
     get_unscoped_file_storage.cache_clear()

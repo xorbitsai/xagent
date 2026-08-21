@@ -3065,6 +3065,28 @@ describe("AppProvider websocket message routing", () => {
     })
   })
 
+  it("passes caller-owned upload cancellation through the provider transport seam", async () => {
+    const uploadFiles = vi.fn().mockResolvedValue([])
+    render(
+      <AppProvider token="token" transport={{ uploadFiles }}>
+        <StateProbe />
+      </AppProvider>,
+    )
+    const signal = new AbortController().signal
+    const wiredUpload = webSocketOptions.current?.uploadFiles as (
+      files: File[],
+      params: { taskType: string; taskId?: number | null; signal: AbortSignal },
+    ) => Promise<unknown>
+
+    await wiredUpload([], { taskType: "task", taskId: 7, signal })
+
+    expect(uploadFiles).toHaveBeenCalledWith([], {
+      taskType: "task",
+      taskId: 7,
+      signal,
+    })
+  })
+
   it("passes the persistent Session transport contract and sends the first taskless turn only through the socket", async () => {
     const transport = makeSessionTransport()
     const acknowledgement = deferred<{

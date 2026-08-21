@@ -20,11 +20,19 @@ const app = vi.hoisted(() => ({
     transport?: AppProviderTransportConfig
   },
   startScreenProps: null as null | {
+    onSend: (
+      message: string,
+      files: File[],
+      config?: Record<string, string>,
+    ) => Promise<void>
+    inputValue: string
+    onInputChange: (value: string) => void
     voiceInputEnabled?: boolean
   },
 }))
 
 const i18n = vi.hoisted(() => ({ t: (key: string) => key }))
+const uploads = vi.hoisted(() => ({ deferred: vi.fn() }))
 
 vi.mock("@/contexts/app-context-chat", () => ({
   AppProvider: ({
@@ -58,16 +66,23 @@ vi.mock("@/contexts/i18n-context", () => ({
   useI18n: () => i18n,
 }))
 
+vi.mock("@/lib/public-chat-file-upload", () => ({
+  uploadDeferredPublicChatFiles: uploads.deferred,
+}))
+
 vi.mock("@/components/chat/ChatStartScreen", () => ({
   ChatStartScreen: (props: {
     onSend: (message: string, files: File[], config?: Record<string, string>) => Promise<void>
     title: string
+    inputValue: string
+    onInputChange: (value: string) => void
     voiceInputEnabled?: boolean
   }) => {
     app.startScreenProps = props
     return (
       <button
         type="button"
+        data-input-value={props.inputValue}
         onClick={() => {
           void props.onSend("first message", [], { mode: "balanced" }).catch(() => undefined)
         }}
@@ -121,6 +136,14 @@ function jsonResponse(payload: unknown, status = 200) {
     status,
     headers: { "Content-Type": "application/json" },
   })
+}
+
+function deferred<T>() {
+  let resolve!: (value: T) => void
+  const promise = new Promise<T>((resolvePromise) => {
+    resolve = resolvePromise
+  })
+  return { promise, resolve }
 }
 
 function renderWidgetPage(overrides: Partial<React.ComponentProps<typeof PublicAgentChatPage>> = {}) {
@@ -236,6 +259,14 @@ describe("PublicAgentChatPage", () => {
     app.startScreenProps = null
     sessionStorage.clear()
     fetchMock.mockReset()
+    uploads.deferred.mockReset()
+    uploads.deferred.mockImplementation(async (files: File[]) =>
+      files.map((file, index) => ({
+        file_id: `uploaded-${index}`,
+        name: file.name,
+        size: file.size,
+        type: file.type,
+      })))
     vi.stubGlobal("fetch", fetchMock)
   })
 
@@ -289,6 +320,30 @@ describe("PublicAgentChatPage", () => {
       },
     )
     expectPublicProviderToken()
+  })
+
+  it("uses the shared deferred uploader for existing-task transport uploads", async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse(successfulAgentAuth))
+    const file = new File(["existing"], "existing.txt", { type: "text/plain" })
+
+    renderWidgetPage({ widgetKey: "widget-secret" })
+    await screen.findByRole("button", { name: "start:Support Agent" })
+    const signal = new AbortController().signal
+    await app.provider?.transport?.uploadFiles?.([file], {
+      taskId: 71,
+      taskType: "task",
+      signal,
+    })
+
+    expect(uploads.deferred).toHaveBeenCalledWith([file], expect.objectContaining({
+      url: "https://api.example/api/widget/files/upload",
+      accessToken: "public-access-token",
+      taskType: "task",
+      taskId: 71,
+      fallbackError: "files.uploadFailed",
+      signal,
+      uploadContext: expect.any(Object),
+    }))
   })
 
   it("fails closed for an invalid direct widget key", async () => {
@@ -471,6 +526,7 @@ describe("PublicAgentChatPage", () => {
       "https://api.example/api/widget/chat/task/create",
       {
         method: "POST",
+        signal: expect.any(AbortSignal),
         headers: {
           "Content-Type": "application/json",
           Authorization: "Bearer public-access-token",
@@ -504,18 +560,90 @@ describe("PublicAgentChatPage", () => {
     expect(app.setTaskId).toHaveBeenCalledWith(42, { navigate: false })
   })
 
-  it("lets workforce task creation start the opening turn without sending it again", async () => {
+  it("serializes reentrant opening sends into one task creation", async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse(successfulAgentAuth))
+    const taskCreation = deferred<Response>()
+    fetchMock.mockReturnValueOnce(taskCreation.promise)
+    app.sendMessage.mockResolvedValue(undefined)
+    renderWidgetPage({ widgetKey: "widget-secret" })
+
+    await screen.findByRole("button", { name: "start:Support Agent" })
+    const firstSend = app.startScreenProps!.onSend("first message", [])
+    const secondSend = app.startScreenProps!.onSend("second message", [])
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2))
+    expect(fetchMock.mock.calls.filter(([url]) =>
+      url === "https://api.example/api/widget/chat/task/create")).toHaveLength(1)
+    const taskCreateSignal = (fetchMock.mock.calls[1][1] as RequestInit).signal
+    expect(taskCreateSignal?.aborted).toBe(false)
+
+    taskCreation.resolve(jsonResponse(widgetTaskResponse(42, "pending")))
+    await Promise.all([firstSend, secondSend])
+
+    expect(app.sendMessage).toHaveBeenCalledOnce()
+    expect(app.sendMessage).toHaveBeenCalledWith(
+      "first message",
+      { targetTaskId: 42 },
+      [],
+    )
+  })
+
+  it("gates New Conversation until the opening send has a definite outcome", async () => {
+    fetchMock
+      .mockResolvedValueOnce(jsonResponse(successfulAgentAuth))
+      .mockResolvedValueOnce(jsonResponse(widgetTaskResponse(42, "pending")))
+      .mockResolvedValueOnce(jsonResponse(widgetTaskResponse(43, "pending")))
+    const openingSend = deferred<void>()
+    app.sendMessage.mockReturnValueOnce(openingSend.promise)
+    renderWidgetPage({ widgetKey: "widget-secret" })
+
+    await screen.findByRole("button", { name: "start:Support Agent" })
+    app.setTaskId.mockClear()
+    const send = app.startScreenProps!.onSend("first message", [])
+
+    const newConversation = await screen.findByRole("button", {
+      name: "widgetChat.newConversation",
+    })
+    expect(newConversation).toBeDisabled()
+    fireEvent.click(newConversation)
+    expect(app.setTaskId).not.toHaveBeenCalledWith(null, { navigate: false })
+
+    openingSend.resolve()
+    await send
+    await waitFor(() => expect(newConversation).toBeEnabled())
+    fireEvent.click(newConversation)
+
+    expect(app.setTaskId).toHaveBeenCalledWith(null, { navigate: false })
+    expect(await screen.findByRole("button", { name: "start:Support Agent" })).toBeInTheDocument()
+
+    await app.startScreenProps!.onSend("next conversation", [])
+    expect(fetchMock.mock.calls.filter(([url]) =>
+      url === "https://api.example/api/widget/chat/task/create")).toHaveLength(2)
+    expect(app.setTaskId).toHaveBeenCalledWith(43, { navigate: false })
+  })
+
+  it("uses the shared deferred uploader when workforce task creation starts the opening turn", async () => {
     fetchMock
       .mockResolvedValueOnce(jsonResponse(successfulWorkforceAuth))
       .mockResolvedValueOnce(jsonResponse(widgetTaskResponse(43, "running")))
+    const file = new File(["opening"], "opening.txt", { type: "text/plain" })
 
     renderWidgetPage({ searchAgentId: null, widgetKey: "widget-secret" })
 
-    fireEvent.click(await screen.findByRole("button", { name: "start:Support Workforce" }))
+    await screen.findByRole("button", { name: "start:Support Workforce" })
+    await app.startScreenProps?.onSend("first message", [file], { mode: "balanced" })
 
     await waitFor(() => {
       expect(app.setTaskId).toHaveBeenCalledWith(43, { navigate: false })
     })
+    expect(uploads.deferred).toHaveBeenCalledWith([file], expect.objectContaining({
+      url: "https://api.example/api/widget/files/upload",
+      accessToken: "public-access-token",
+      taskType: "task",
+      fallbackError: "files.uploadFailed",
+      signal: expect.any(AbortSignal),
+      uploadContext: expect.any(Object),
+    }))
     expect(app.sendMessage).not.toHaveBeenCalled()
     expect(fetchMock).toHaveBeenCalledTimes(2)
     expect(fetchMock).toHaveBeenNthCalledWith(
@@ -536,6 +664,7 @@ describe("PublicAgentChatPage", () => {
       "https://api.example/api/widget/chat/task/create",
       {
         method: "POST",
+        signal: expect.any(AbortSignal),
         headers: {
           "Content-Type": "application/json",
           Authorization: "Bearer public-access-token",
@@ -543,12 +672,98 @@ describe("PublicAgentChatPage", () => {
         body: JSON.stringify({
           title: "first message",
           description: "first message",
+          files: ["uploaded-0"],
         }),
       },
     )
     await waitFor(() => {
       expect(localStorage.getItem("widget_task_wf8_guest-1")).toBe("43")
     })
+  })
+
+  it("keeps the workforce taskless upload context across a partial retry", async () => {
+    fetchMock
+      .mockResolvedValueOnce(jsonResponse(successfulWorkforceAuth))
+      .mockResolvedValueOnce(jsonResponse(widgetTaskResponse(43, "running")))
+    uploads.deferred
+      .mockRejectedValueOnce(new Error("retry upload"))
+      .mockResolvedValueOnce([{ file_id: "uploaded-retry" }])
+    const file = new File(["opening"], "opening.txt", { type: "text/plain" })
+
+    renderWidgetPage({ searchAgentId: null, widgetKey: "widget-secret" })
+    await screen.findByRole("button", { name: "start:Support Workforce" })
+
+    await expect(app.startScreenProps!.onSend("first message", [file]))
+      .rejects.toThrow("retry upload")
+    await expect(app.startScreenProps!.onSend("first message", [file]))
+      .resolves.toBeUndefined()
+
+    const firstContext = uploads.deferred.mock.calls[0][1].uploadContext
+    const retryContext = uploads.deferred.mock.calls[1][1].uploadContext
+    expect(retryContext).toBe(firstContext)
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+  })
+
+  it("rotates the workforce taskless upload context for a new conversation", async () => {
+    fetchMock
+      .mockResolvedValueOnce(jsonResponse(successfulWorkforceAuth))
+      .mockResolvedValueOnce(jsonResponse(widgetTaskResponse(43, "running")))
+      .mockResolvedValueOnce(jsonResponse(widgetTaskResponse(44, "running")))
+    uploads.deferred
+      .mockResolvedValueOnce([{ file_id: "conversation-a-file" }])
+      .mockResolvedValueOnce([{ file_id: "conversation-b-file" }])
+    const file = new File(["same"], "same.txt", { type: "text/plain" })
+
+    renderWidgetPage({ searchAgentId: null, widgetKey: "widget-secret" })
+    await screen.findByRole("button", { name: "start:Support Workforce" })
+    await app.startScreenProps!.onSend("conversation A", [file])
+
+    fireEvent.click(await screen.findByRole("button", {
+      name: "widgetChat.newConversation",
+    }))
+    await screen.findByRole("button", { name: "start:Support Workforce" })
+    await app.startScreenProps!.onSend("conversation B", [file])
+
+    expect(uploads.deferred).toHaveBeenCalledTimes(2)
+    expect(uploads.deferred.mock.calls[1][0][0]).toBe(file)
+    expect(uploads.deferred.mock.calls[1][1].uploadContext).not.toBe(
+      uploads.deferred.mock.calls[0][1].uploadContext,
+    )
+    expect(JSON.parse((fetchMock.mock.calls[1][1] as RequestInit).body as string))
+      .toMatchObject({ files: ["conversation-a-file"] })
+    expect(JSON.parse((fetchMock.mock.calls[2][1] as RequestInit).body as string))
+      .toMatchObject({ files: ["conversation-b-file"] })
+  })
+
+  it("aborts workforce opening uploads on unmount before task creation", async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse(successfulWorkforceAuth))
+    uploads.deferred.mockImplementation((_files: File[], options: { signal: AbortSignal }) => (
+      new Promise((_resolve, reject) => {
+        options.signal.addEventListener(
+          "abort",
+          () => reject(options.signal.reason),
+          { once: true },
+        )
+      })
+    ))
+    const file = new File(["opening"], "opening.txt", { type: "text/plain" })
+    const { unmount } = renderWidgetPage({
+      searchAgentId: null,
+      widgetKey: "widget-secret",
+    })
+    await screen.findByRole("button", { name: "start:Support Workforce" })
+    const sendOutcome = app.startScreenProps!.onSend("first message", [file])
+      .then(() => "resolved", error => `rejected:${(error as Error).name}`)
+
+    await waitFor(() => expect(uploads.deferred).toHaveBeenCalledOnce())
+    unmount()
+
+    await expect(sendOutcome).resolves.toBe("rejected:AbortError")
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+    expect(fetchMock).not.toHaveBeenCalledWith(
+      expect.stringContaining("/chat/task/create"),
+      expect.anything(),
+    )
   })
 
   it("authenticates a share link and persists the guest token for reuse", async () => {

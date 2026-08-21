@@ -124,6 +124,7 @@ interface MessagePreparationClaim {
   cancellation: Promise<never>
   cancel: (error: Error) => void
   cancelled: boolean
+  uploadController: AbortController
   connectionIdentity: string
   descriptorKey: ConnectionDescriptorIdentity
   lifecycleEpoch: number
@@ -208,7 +209,11 @@ export interface UseWebSocketOptions {
   taskId?: number
   token?: string
   buildWebSocketUrl?: (params: { baseUrl: string; taskId: number; token?: string }) => string
-  uploadFiles?: (files: File[], params: { taskId?: number | null; taskType: string }) => Promise<Array<{ file_id: string; name?: string; size?: number; type?: string }>>
+  uploadFiles?: (files: File[], params: {
+    taskId?: number | null
+    taskType: string
+    signal: AbortSignal
+  }) => Promise<Array<{ file_id: string; name?: string; size?: number; type?: string }>>
   connection?: WebSocketConnection | null
   deliveryGeneration?: number
   onConnectionClose?: (event: CloseEvent) => "handled" | "default"
@@ -1146,14 +1151,17 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
     const cancellation = new Promise<never>((_resolve, reject) => {
       rejectCancellation = reject
     })
+    const uploadController = new AbortController()
     const claim: MessagePreparationClaim = {
       cancellation,
       cancel: (error) => {
         if (claim.cancelled) return
         claim.cancelled = true
+        uploadController.abort(error)
         rejectCancellation(error)
       },
       cancelled: false,
+      uploadController,
       connectionIdentity: connection.identity,
       descriptorKey: currentDescriptorKey,
       lifecycleEpoch: currentLifecycleEpoch,
@@ -1193,6 +1201,7 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
             uploadFiles(filesToUpload, {
               taskId: currentTaskId,
               taskType: 'task',
+              signal: claim.uploadController.signal,
             }),
             claim.cancellation,
           ])
@@ -1204,11 +1213,12 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
             formData.append('task_id', currentTaskId.toString())
             const response = await apiRequest(`${getUploadApiUrl()}/api/files/upload`, {
               method: 'POST',
+              signal: claim.uploadController.signal,
               headers: {
                 'Authorization': `Bearer ${tokenRef.current ?? localStorage.getItem('token') ?? ''}`,
               },
               body: formData,
-            })
+            }, { retryTransport: false })
             const parsed = await parseApiResponse(response)
             if (!response.ok || !isJsonRecord(parsed.data)) {
               throw deliveryError(getUploadErrorMessage(response, parsed, {

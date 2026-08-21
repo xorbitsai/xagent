@@ -166,12 +166,14 @@ Before restarting Gmail watch processing, run this query on either supported dat
 ```sql
 SELECT count(*)
 FROM gmail_watch_states AS watch
-JOIN user_oauth AS account ON account.id = watch.oauth_account_id
-WHERE watch.user_id <> account.user_id
+LEFT JOIN user_oauth AS account ON account.id = watch.oauth_account_id
+WHERE account.id IS NULL
+   OR watch.user_id <> account.user_id
+   OR account.provider <> 'gmail'
    OR account.resource_owner_key IS NOT NULL;
 ```
 
-The result must be zero. A nonzero result identifies a legacy watch whose account owner does not match its user or whose account is not ordinary; repair or remove that watch before rollout.
+The result must be zero. A nonzero result identifies an orphan watch, a user mismatch, a non-Gmail account, or a non-ordinary account. Repair or remove the watch before rollout.
 
 Verify existing cloud-storage, Gmail, and builtin OAuth connections. Confirm that seeded non-null-owner test rows do not appear in ordinary catalog, token, or trigger paths.
 

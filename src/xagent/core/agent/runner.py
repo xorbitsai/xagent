@@ -129,7 +129,10 @@ class AgentRunner:
                 # is deliberately not done in get_messages_for_llm(), which
                 # also serves truncated windows and tool-call/tool-result
                 # pairs that legitimately start mid-conversation.
-                context.add_user_message("(conversation start)")
+                context.add_user_message(
+                    "(conversation start)",
+                    metadata={"_xagent_synthetic": "leading_user_turn"},
+                )
             for message in replay_messages:
                 role = str(message.get("role") or "").strip()
                 content = str(message.get("content") or "").strip()

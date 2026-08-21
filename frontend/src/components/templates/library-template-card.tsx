@@ -16,16 +16,19 @@ interface LibraryTemplateCardProps {
   workforceBadgeLabel?: string;
   formatAgentsCount?: (count: number) => string;
   /** Opens the AI Team Marketplace detail page for a persona-bearing,
-   * non-workforce template instead of instantiating anything directly -
-   * `onOpen`/`formatMeetLabel`/`chatLabel` are bundled into one prop so a
-   * caller can't wire one without the others (a "Meet {name}" button that
-   * silently calls `onUse` instead of navigating, or vice versa). Falls
-   * back to `onUse` when omitted entirely, so this component still works
-   * without it. `chatLabel` is shown instead of "Meet {name}" once
-   * `template.hired` is true - matches the same hired-aware distinction
-   * the detail page itself makes one navigation later. */
+   * non-workforce, not-yet-hired template instead of instantiating
+   * anything directly - `onOpen`/`formatMeetLabel`/`chatLabel` are bundled
+   * into one prop so a caller can't wire one without the others (a "Meet
+   * {name}" button that silently calls `onUse` instead of navigating, or
+   * vice versa). Falls back to `onUse` when omitted entirely, so this
+   * component still works without it. `chatLabel` is shown instead of
+   * "Meet {name}" once `template.hired` is true, and `onOpen` receives the
+   * whole template (not just its id) so the caller can route an
+   * already-hired template straight to its agent's chat instead of one
+   * more hop through the detail page - matching the same hired-aware
+   * distinction the detail page itself makes for its own primary button. */
   onOpenPersona?: {
-    onOpen: (templateId: string) => void;
+    onOpen: (template: Template) => void;
     formatMeetLabel: (name: string) => string;
     chatLabel: string;
   };
@@ -184,7 +187,7 @@ export function LibraryTemplateCard({
   const handleActivate = () => {
     if (isBlocked) return;
     if (persona && onOpenPersona) {
-      onOpenPersona.onOpen(template.id);
+      onOpenPersona.onOpen(template);
       return;
     }
     onUse(template.id);

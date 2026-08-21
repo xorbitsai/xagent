@@ -592,11 +592,15 @@ async def resolve_agent_from_template(
             name=data.name,
         )
         if created:
-            # This is the marketplace Hire flow's entry point (the only
-            # caller that both mints a fresh agent here AND never touches
-            # /use or /use-as-workforce, the two endpoints that otherwise
-            # record usage) - without this, a hired template's used_count
-            # stays permanently stale, which matters because the featured
+            # This endpoint is the entry point for two frontend flows that
+            # never touch /use or /use-as-workforce, the two endpoints that
+            # otherwise record usage: the marketplace Hire flow AND the
+            # task page's quick-access template picker
+            # (frontend/src/app/task/page.tsx, resolveAgentForTemplate).
+            # Both genuinely put the template into use, so counting either
+            # here is correct - without this, used_count would stay
+            # permanently stale for any template only ever adopted through
+            # one of these paths, which matters because the featured
             # section's hero ranking (templates/page.tsx) sorts by exactly
             # that count. An analytics-counter failure must not fail an
             # already-successful agent creation, so it's caught and logged

@@ -138,21 +138,25 @@ describe("LibraryTemplateCard", () => {
     );
   });
 
-  it("calls onOpen (not onUse) when a persona-bearing card is activated", () => {
+  it("calls onOpen (not onUse) with the whole template when a persona-bearing card is activated", () => {
+    // onOpen receives the whole template (not just its id) so the caller
+    // can route an already-hired template straight to its agent's chat
+    // instead of through the detail page - see the hired-routing test below.
     const onUse = vi.fn();
     const onOpen = vi.fn();
+    const template = makeTemplate({
+      id: "sales-email-lead-response-agent",
+      persona: {
+        name: "Leo",
+        role: "Email Lead Response Agent",
+        avatar: null,
+        intro: "Hi — I'm Leo.",
+        kickoff_questions: [],
+      },
+    });
     render(
       <LibraryTemplateCard
-        template={makeTemplate({
-          id: "sales-email-lead-response-agent",
-          persona: {
-            name: "Leo",
-            role: "Email Lead Response Agent",
-            avatar: null,
-            intro: "Hi — I'm Leo.",
-            kickoff_questions: [],
-          },
-        })}
+        template={template}
         useLabel="Use Template"
         defaultSetupTime="5 min setup"
         onOpenPersona={{ onOpen, formatMeetLabel: (name) => `Meet ${name}`, chatLabel: "Chat" }}
@@ -162,7 +166,7 @@ describe("LibraryTemplateCard", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "Meet Leo" }));
 
-    expect(onOpen).toHaveBeenCalledWith("sales-email-lead-response-agent");
+    expect(onOpen).toHaveBeenCalledWith(template);
     expect(onUse).not.toHaveBeenCalled();
   });
 
@@ -264,18 +268,19 @@ describe("LibraryTemplateCard", () => {
     // onOpenPersona is pure client-side navigation with nothing to race -
     // it must stay active even while `disabled` is true for that reason.
     const onOpen = vi.fn();
+    const template = makeTemplate({
+      id: "sales-email-lead-response-agent",
+      persona: {
+        name: "Leo",
+        role: "Email Lead Response Agent",
+        avatar: null,
+        intro: "Hi — I'm Leo.",
+        kickoff_questions: [],
+      },
+    });
     render(
       <LibraryTemplateCard
-        template={makeTemplate({
-          id: "sales-email-lead-response-agent",
-          persona: {
-            name: "Leo",
-            role: "Email Lead Response Agent",
-            avatar: null,
-            intro: "Hi — I'm Leo.",
-            kickoff_questions: [],
-          },
-        })}
+        template={template}
         useLabel="Use Template"
         defaultSetupTime="5 min setup"
         onOpenPersona={{ onOpen, formatMeetLabel: (name) => `Meet ${name}`, chatLabel: "Chat" }}
@@ -289,7 +294,7 @@ describe("LibraryTemplateCard", () => {
 
     fireEvent.click(button);
 
-    expect(onOpen).toHaveBeenCalledWith("sales-email-lead-response-agent");
+    expect(onOpen).toHaveBeenCalledWith(template);
   });
 
   describe("hero variant", () => {

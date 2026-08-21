@@ -131,8 +131,16 @@ function TemplatesPageContent() {
       ? t("templates.agentsCountOne", { count })
       : t("templates.agentsCountOther", { count });
 
-  const handleOpenTemplate = (templateId: string) => {
-    router.push(`/templates/${encodeURIComponent(templateId)}`);
+  const handleOpenTemplate = (template: Template) => {
+    // Mirrors page-client.tsx's own handlePrimaryAction: an already-hired
+    // template's card shows "Chat" (see chatLabel below), so activating it
+    // must go straight to that chat, not one more hop through the detail
+    // page's own hired-aware redirect.
+    if (template.hired && template.hired_agent_id) {
+      router.push(`/agent/${template.hired_agent_id}`);
+      return;
+    }
+    router.push(`/templates/${encodeURIComponent(template.id)}`);
   };
 
   // Bundled into one object (rather than two independent props) so a
@@ -423,7 +431,7 @@ interface TemplateSectionProps {
   workforceBadgeLabel: string;
   formatAgentsCount: (count: number) => string;
   onOpenPersona: {
-    onOpen: (templateId: string) => void;
+    onOpen: (template: Template) => void;
     formatMeetLabel: (name: string) => string;
     chatLabel: string;
   };
@@ -498,7 +506,7 @@ interface FeaturedSectionProps {
   formatToolLabel: (category: string) => string;
   heroBadgeLabel: string;
   onOpenPersona: {
-    onOpen: (templateId: string) => void;
+    onOpen: (template: Template) => void;
     formatMeetLabel: (name: string) => string;
     chatLabel: string;
   };

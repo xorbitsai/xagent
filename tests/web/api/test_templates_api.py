@@ -547,6 +547,22 @@ class TestTemplatesAPI:
             {"type": "agent", "agent_config": "not-a-dict"}
         ) == ([], [])
 
+    def test_get_agent_capability_lists_drops_non_string_elements(self):
+        """A non-string element (an authoring typo like `[123, "web_search"]`)
+        must be dropped rather than passed through - it would otherwise 500
+        as an unhandled Pydantic ValidationError once TemplateInfo/
+        TemplateDetail try to construct their `tool_categories: list[str]` /
+        `skills: list[str]` fields."""
+        assert get_agent_capability_lists(
+            {
+                "type": "agent",
+                "agent_config": {
+                    "tool_categories": [123, "web_search", None],
+                    "skills": ["real_skill", {"bad": "shape"}],
+                },
+            }
+        ) == (["web_search"], ["real_skill"])
+
     def test_sample_prompts_localization_and_default(
         self, mock_app_state, admin_headers
     ):

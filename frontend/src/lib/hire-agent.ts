@@ -25,13 +25,16 @@ export function buildSeedAssistantMessage(
   strings: HireMessageStrings
 ): string {
   const parts = [persona.intro.trim()].filter(Boolean);
+  const hasKickoffQuestions = persona.kickoff_questions.length > 0;
 
-  if (persona.kickoff_questions.length > 0) {
+  if (hasKickoffQuestions) {
     const bulletList = persona.kickoff_questions.map((question) => `- ${question}`).join("\n");
     parts.push(`${strings.beforeWeStart}\n\n${bulletList}`);
   }
 
-  if (strings.closingNote) {
+  // closingNote's copy ("Answer what you can...") refers back to the
+  // kickoff questions above it - dangling and contextless without them.
+  if (hasKickoffQuestions && strings.closingNote) {
     parts.push(strings.closingNote);
   }
 

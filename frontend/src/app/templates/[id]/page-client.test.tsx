@@ -188,7 +188,54 @@ describe("TemplateDetailPage", () => {
     );
   });
 
+  it("routes straight to the agent's chat, without hiring, if a fresh recheck reveals the template was hired elsewhere in the meantime", async () => {
+    // Simulates the two-tab race: this tab mounted with hired: false, but
+    // by the time the user clicks Hire, another tab/request already
+    // completed the hire. hireAgentFromTemplate's resolve step would reuse
+    // the same agent either way, but task/create always mints a new task -
+    // the recheck must catch this before that happens.
+    apiRequestMock.mockResolvedValueOnce(jsonResponse(makeTemplate({ hired: false })));
+    apiRequestMock.mockResolvedValueOnce(
+      jsonResponse(makeTemplate({ hired: true, hired_agent_id: 77 }))
+    );
+
+    render(<TemplateDetailPage />);
+    await waitFor(() => {
+      expect(screen.getByText("Leo")).toBeInTheDocument();
+    });
+
+    fireEvent.click(
+      screen.getByRole("button", { name: 'templates.marketplace.hire:{"name":"Leo"}' })
+    );
+
+    await waitFor(() => {
+      expect(routerPushMock).toHaveBeenCalledWith("/agent/77");
+    });
+    expect(hireAgentFromTemplateMock).not.toHaveBeenCalled();
+  });
+
+  it("proceeds with hiring when the pre-hire freshness recheck itself fails, rather than blocking the action", async () => {
+    apiRequestMock.mockResolvedValueOnce(jsonResponse(makeTemplate()));
+    apiRequestMock.mockRejectedValueOnce(new Error("network down"));
+    hireAgentFromTemplateMock.mockResolvedValueOnce({ taskId: 99, agentId: 5, created: true });
+
+    render(<TemplateDetailPage />);
+    await waitFor(() => {
+      expect(screen.getByText("Leo")).toBeInTheDocument();
+    });
+
+    fireEvent.click(
+      screen.getByRole("button", { name: 'templates.marketplace.hire:{"name":"Leo"}' })
+    );
+
+    await waitFor(() => {
+      expect(routerPushMock).toHaveBeenCalledWith("/task/99");
+    });
+  });
+
   it("ignores a second click while a hire is already in flight", async () => {
+    apiRequestMock.mockResolvedValueOnce(jsonResponse(makeTemplate()));
+    // The pre-hire freshness recheck (fired inside handlePrimaryAction).
     apiRequestMock.mockResolvedValueOnce(jsonResponse(makeTemplate()));
     let resolveHire: (result: { taskId: number; agentId: number; created: boolean }) => void =
       () => {};
@@ -210,7 +257,12 @@ describe("TemplateDetailPage", () => {
     fireEvent.click(button);
     fireEvent.click(button);
 
-    expect(hireAgentFromTemplateMock).toHaveBeenCalledTimes(1);
+    // hiringRef guards synchronously on the first click, but the actual
+    // hireAgentFromTemplate call now happens after an awaited freshness
+    // recheck - wait for it rather than asserting synchronously.
+    await waitFor(() => {
+      expect(hireAgentFromTemplateMock).toHaveBeenCalledTimes(1);
+    });
 
     resolveHire({ taskId: 99, agentId: 5, created: true });
     await waitFor(() => {

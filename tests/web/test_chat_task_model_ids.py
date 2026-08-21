@@ -1876,3 +1876,34 @@ def test_task_create_warns_when_seed_assistant_message_normalizes_to_empty(
         "normalized to" in record.message and str(task_id) in record.message
         for record in caplog.records
     )
+
+
+def test_task_create_warns_for_a_plain_empty_seed_assistant_message_too(
+    test_db, user1_headers, caplog
+):
+    """A truthy check (`if request.seed_assistant_message:`) would drop a
+    literal "" with zero log output - only the whitespace-only case above
+    would reach the warning. Checking `is not None` instead covers both,
+    since both are the same "seeder passed a value that normalizes to
+    nothing" situation worth a log trail."""
+    from xagent.web.models.chat_message import TaskChatMessage
+
+    with caplog.at_level(logging.WARNING):
+        resp = client.post(
+            "/api/chat/task/create",
+            json={"title": "Empty seed", "seed_assistant_message": ""},
+            headers=user1_headers,
+        )
+    assert resp.status_code == 200
+    task_id = resp.json()["task_id"]
+
+    db = next(get_db())
+    try:
+        assert db.query(TaskChatMessage).filter_by(task_id=task_id).count() == 0
+    finally:
+        db.close()
+
+    assert any(
+        "normalized to" in record.message and str(task_id) in record.message
+        for record in caplog.records
+    )

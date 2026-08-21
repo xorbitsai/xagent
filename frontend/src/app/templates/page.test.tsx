@@ -189,6 +189,32 @@ describe("TemplatesPage persona routing", () => {
     );
   });
 
+  it("routes an already-hired persona card straight to its agent's chat, not through the detail page", async () => {
+    // The card shows "Chat" (not "Meet {name}") once hired - activating it
+    // must actually deliver that, matching page-client.tsx's own
+    // hired-aware primary-button behavior one navigation earlier.
+    apiRequestMock.mockImplementation(async (url: string) => {
+      if (url.includes("/api/templates/?lang=")) {
+        return jsonResponse([
+          AGENT_TEMPLATE,
+          { ...PERSONA_TEMPLATE, hired: true, hired_agent_id: 42 },
+        ]);
+      }
+      return jsonResponse({});
+    });
+    render(<TemplatesPage />);
+    await waitFor(() => {
+      expect(screen.getByText("Leo")).toBeInTheDocument();
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "templates.marketplace.chat" }));
+
+    expect(routerPushMock).toHaveBeenCalledWith("/agent/42");
+    expect(routerPushMock).not.toHaveBeenCalledWith(
+      expect.stringContaining("/templates/sales-email-lead-response-agent")
+    );
+  });
+
   it("falls back to the old builder-prefill flow for an agent template with no persona", async () => {
     installPersonaApiMock();
     render(<TemplatesPage />);

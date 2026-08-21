@@ -71,15 +71,17 @@ describe("buildSeedAssistantMessage", () => {
     );
   });
 
-  it("omits the kickoff-questions section entirely when there are none", () => {
+  it("omits the kickoff-questions section, and the closing note that refers back to it, when there are none", () => {
+    // closingNote's copy ("Answer what you can...") only makes sense as a
+    // reply to the kickoff questions above it - a persona with none must
+    // not get a dangling, contextless closing sentence.
     const persona: PersonaInfo = { ...LEO_PERSONA, kickoff_questions: [] };
 
     const message = buildSeedAssistantMessage(persona, STRINGS);
 
     expect(message).not.toContain("A few things before I start");
-    expect(message).toBe(
-      ["Hi — I'm Leo, your Email Lead Response Agent.", STRINGS.closingNote].join("\n\n")
-    );
+    expect(message).not.toContain(STRINGS.closingNote);
+    expect(message).toBe("Hi — I'm Leo, your Email Lead Response Agent.");
   });
 });
 

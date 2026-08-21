@@ -534,6 +534,7 @@ async def test_runner_inserts_synthetic_user_turn_before_a_leading_assistant_ini
         "assistant",
     ]
     assert context.messages[0].content == "(conversation start)"
+    assert context.messages[0].metadata.get("_xagent_synthetic") == "leading_user_turn"
     assert (
         context.messages[1].content
         == "Hi - I'm Maya, your Social Media Content Manager."

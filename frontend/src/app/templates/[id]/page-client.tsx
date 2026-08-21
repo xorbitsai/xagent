@@ -105,6 +105,31 @@ export default function TemplateDetailPage() {
     hiringRef.current = true;
     setHiring(true);
     try {
+      // `template.hired` was fetched once on mount and never revalidated,
+      // so a second tab (or a bookmarked/back-navigated stale page) that
+      // hired this template in the meantime would still see hired: false
+      // here. hireAgentFromTemplate's own resolve step is idempotent
+      // (reuses the agent), but task/create always mints a new task, so
+      // without this recheck a race would seed a second opening message
+      // onto an agent the user already has a real conversation with. Best
+      // effort only: if the recheck itself fails, fall through to the
+      // normal hire flow rather than blocking the action on it.
+      try {
+        const freshCheck = await apiRequest(
+          `${getApiUrl()}/api/templates/${encodeURIComponent(template.id)}?lang=${locale}`
+        );
+        if (freshCheck.ok) {
+          const freshTemplate = (await freshCheck.json()) as TemplateDetail;
+          if (freshTemplate.hired && freshTemplate.hired_agent_id) {
+            if (isMountedRef.current) router.push(`/agent/${freshTemplate.hired_agent_id}`);
+            return;
+          }
+        }
+      } catch {
+        // Fall through - see the best-effort note above.
+      }
+      if (!isMountedRef.current) return;
+
       const result = await hireAgentFromTemplate(template.id, persona, {
         beforeWeStart: t("templates.marketplace.beforeWeStart"),
         closingNote: t("templates.marketplace.hireClosingNote"),
@@ -250,7 +275,10 @@ export default function TemplateDetailPage() {
                   {t("templates.marketplace.thinking")}
                 </div>
                 <div className="text-[13.5px] font-medium text-foreground">
-                  {capitalize(template.agent_config.execution_mode)}
+                  {tDynamic(
+                    `builds.configForm.executionMode.${template.agent_config.execution_mode}.title`,
+                    capitalize(template.agent_config.execution_mode)
+                  )}
                 </div>
               </div>
             )}

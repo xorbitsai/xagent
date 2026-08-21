@@ -418,9 +418,20 @@ def get_agent_capability_lists(template: dict[str, Any]) -> tuple[list[str], lis
     tool_categories = agent_config.get("tool_categories", [])
     skills = agent_config.get("skills", [])
     return (
-        list(tool_categories) if isinstance(tool_categories, list) else [],
-        list(skills) if isinstance(skills, list) else [],
+        _string_list_elements(tool_categories),
+        _string_list_elements(skills),
     )
+
+
+def _string_list_elements(value: Any) -> list[str]:
+    """Filters a possibly-malformed list down to its string elements -
+    used by get_agent_capability_lists above. A single non-string entry
+    (e.g. an authoring typo like `[123, "web_search"]`) must not 500 the
+    whole /api/templates/ list at request time via an unhandled Pydantic
+    ValidationError when TemplateInfo/TemplateDetail get constructed."""
+    if not isinstance(value, list):
+        return []
+    return [item for item in value if isinstance(item, str)]
 
 
 def get_workforce_agent_count(template: dict[str, Any]) -> int:
@@ -601,8 +612,12 @@ async def get_template(
         agent_config=(
             {
                 "instructions": template["agent_config"].get("instructions", ""),
-                "skills": template["agent_config"].get("skills", []),
-                "tool_categories": template["agent_config"].get("tool_categories", []),
+                "skills": _string_list_elements(
+                    template["agent_config"].get("skills", [])
+                ),
+                "tool_categories": _string_list_elements(
+                    template["agent_config"].get("tool_categories", [])
+                ),
                 "execution_mode": template["agent_config"].get(
                     "execution_mode", "balanced"
                 ),

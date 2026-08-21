@@ -4121,7 +4121,7 @@ async def create_task(
                 ),
             )
 
-        if request.seed_assistant_message:
+        if request.seed_assistant_message is not None:
             # Staged (not committed) here so the seed message lands in the
             # same transaction as task creation - a client that opens this
             # task never observes it existing with zero history. Plain text

@@ -91,7 +91,11 @@ def _base_url() -> str:
             "POSTHOG_HOST must be a bare host, not a URL with a path, "
             "query, or fragment"
         )
-    hostname = parsed.hostname
+    # A trailing "." denotes the DNS root and is semantically equivalent to
+    # the same name without it (e.g. "posthog.com." == "posthog.com"); drop
+    # it before both the allowlist comparison and the address it's rebuilt
+    # into below, or a syntactically valid FQDN gets wrongly rejected.
+    hostname = (parsed.hostname or "").rstrip(".")
     if not hostname:
         raise ValueError("POSTHOG_HOST must include a hostname")
     if hostname != POSTHOG_HOST_SUFFIX and not hostname.endswith(
@@ -149,7 +153,7 @@ def _path_segment(value: str, field_name: str = "id") -> str:
     here defaults to stay readable in URLs and logs; it plays no role in
     the escape this helper prevents.
     """
-    if not str(value):
+    if value is None or not str(value):
         raise ValueError(f"{field_name} must not be empty")
     return quote(str(value), safe="@")
 
@@ -368,11 +372,15 @@ def posthog_query(
             json_data=body,
         )
         max_results = _clamp_limit(limit)
-        raw_results = result.get("results") or []
-        truncated = len(raw_results) > max_results
+        # Reuses _paginated_results' payload-shape guards and slicing
+        # rather than a second, divergent hand-rolled version: PostHog's
+        # query endpoint has no "next"/offset concept, so the discarded
+        # next_offset is always None here, but truncated is still exactly
+        # "there were more rows than max_results".
+        rows, truncated, _next_offset = _paginated_results(result, max_results, 0)
         return _success(
             columns=result.get("columns"),
-            results=raw_results[:max_results],
+            results=rows,
             hogql=result.get("hogql"),
             truncated=truncated,
         )

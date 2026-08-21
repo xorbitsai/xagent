@@ -99,7 +99,7 @@ def test_base_url_rejects_whitespace_only_host(monkeypatch):
 def test_base_url_rejects_slash_only_host(monkeypatch):
     monkeypatch.setenv("POSTHOG_HOST", "/")
 
-    with pytest.raises(ValueError, match="POSTHOG_HOST"):
+    with pytest.raises(ValueError, match="hostname"):
         posthog._base_url()
 
 
@@ -135,7 +135,7 @@ def test_base_url_rejects_host_resolving_to_private_ip(monkeypatch):
     monkeypatch.setenv("POSTHOG_HOST", "fake.posthog.com")
     monkeypatch.setattr(posthog.socket, "getaddrinfo", _fake_getaddrinfo("10.0.0.5"))
 
-    with pytest.raises(ValueError, match="POSTHOG_HOST"):
+    with pytest.raises(ValueError, match="not allowed"):
         posthog._base_url()
 
 
@@ -148,7 +148,7 @@ def test_base_url_rejects_when_any_resolved_address_is_private(monkeypatch):
         posthog.socket, "getaddrinfo", _fake_getaddrinfo("1.1.1.1", "10.0.0.5")
     )
 
-    with pytest.raises(ValueError, match="POSTHOG_HOST"):
+    with pytest.raises(ValueError, match="not allowed"):
         posthog._base_url()
 
 
@@ -156,7 +156,7 @@ def test_base_url_rejects_ipv6_private_resolved_address(monkeypatch):
     monkeypatch.setenv("POSTHOG_HOST", "fake.posthog.com")
     monkeypatch.setattr(posthog.socket, "getaddrinfo", _fake_getaddrinfo("fe80::1"))
 
-    with pytest.raises(ValueError, match="POSTHOG_HOST"):
+    with pytest.raises(ValueError, match="not allowed"):
         posthog._base_url()
 
 
@@ -168,7 +168,7 @@ def test_base_url_raises_when_dns_resolution_fails(monkeypatch):
 
     monkeypatch.setattr(posthog.socket, "getaddrinfo", _raise)
 
-    with pytest.raises(ValueError, match="POSTHOG_HOST"):
+    with pytest.raises(ValueError, match="could not be resolved"):
         posthog._base_url()
 
 
@@ -214,6 +214,12 @@ def test_base_url_accepts_posthog_com_apex_domain(monkeypatch):
     assert posthog._base_url() == "https://posthog.com"
 
 
+def test_base_url_accepts_trailing_dns_root_dot(monkeypatch):
+    monkeypatch.setenv("POSTHOG_HOST", "https://us.posthog.com.")
+
+    assert posthog._base_url() == "https://us.posthog.com"
+
+
 def test_base_url_rejects_http_scheme(monkeypatch):
     monkeypatch.setenv("POSTHOG_HOST", "http://us.posthog.com")
 
@@ -255,9 +261,12 @@ def test_base_url_rejects_query_in_host(monkeypatch):
     ],
 )
 def test_base_url_rejects_private_network_host(monkeypatch, host):
-    # None of these are a posthog.com host, so the domain allowlist rejects
-    # them outright without even reaching DNS resolution -- still correct,
-    # just via a more fundamental gate than the literal-IP check alone.
+    # None of these are a posthog.com host, so most are rejected by the
+    # domain allowlist without even reaching DNS resolution -- still
+    # correct, just via a more fundamental gate than the literal-IP check
+    # alone. "::1" is the exception: urlsplit can't parse a bracket-less
+    # IPv6 literal, so parsed.hostname comes back empty and it's rejected
+    # by the earlier "must include a hostname" check instead.
     monkeypatch.setenv("POSTHOG_HOST", host)
 
     with pytest.raises(ValueError, match="POSTHOG_HOST"):
@@ -328,6 +337,13 @@ def test_paginated_results_rejects_non_list_results():
 def test_path_segment_rejects_empty_value():
     with pytest.raises(ValueError, match="project_id"):
         posthog._path_segment("", "project_id")
+
+
+def test_path_segment_rejects_none_value():
+    # str(None) == "None", a non-empty string -- a naive `not str(value)`
+    # check would miss this and build a literal ".../None/" path.
+    with pytest.raises(ValueError, match="person_id"):
+        posthog._path_segment(None, "person_id")
 
 
 def test_get_person_rejects_empty_person_id():
@@ -680,6 +696,22 @@ def test_query_not_truncated_when_results_within_limit(monkeypatch):
     result = json.loads(posthog.posthog_query("select 1", limit=50))
 
     assert result["truncated"] is False
+
+
+def test_query_reports_clear_error_for_malformed_results_shape(monkeypatch):
+    # Exercises the same _paginated_results shape guard the list tools get,
+    # rather than a silent bad slice (e.g. slicing a dict, or slicing a
+    # string into a garbled row) or an opaque AttributeError/TypeError.
+    monkeypatch.setattr(
+        posthog.requests,
+        "request",
+        Mock(return_value=MockResponse(json_data={"results": {"not": "a-list"}})),
+    )
+
+    result = json.loads(posthog.posthog_query("select 1"))
+
+    assert result["status"] == "error"
+    assert "results" in result["message"]
 
 
 def test_list_persons_includes_search_param(monkeypatch):

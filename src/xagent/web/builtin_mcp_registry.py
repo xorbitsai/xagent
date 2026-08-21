@@ -685,13 +685,17 @@ def get_builtin_public_mcp_app_rows() -> list[dict[str, Any]]:
         {
             "app_id": "posthog",
             "name": "PostHog",
-            "description": "Connect to PostHog to query events and persons via HogQL, and read insights, feature flags, dashboards, and annotations.",
+            "description": "Connect to PostHog Cloud (US or EU) to query events and persons via HogQL, and read insights, feature flags, dashboards, and annotations. Self-hosted PostHog is not supported.",
             "icon": "https://www.google.com/s2/favicons?domain=posthog.com&sz=128",
             "transport": "stdio",
             "provider_name": None,
-            # Matches google-analytics's category rather than introducing a
-            # new "Analytics" bucket for a single connector.
-            "category": "Marketing",
+            # "Analytics" is already one of the connect dialog's fixed
+            # sidebar category filters (connect-mcp-dialog.tsx) with no
+            # connector using it before this one -- an always-empty filter
+            # button. google-analytics uses "Marketing" instead, but that's
+            # its own pre-existing mismatch, not a reason to leave this
+            # button empty too.
+            "category": "Analytics",
             "oauth_scopes": None,
             "is_visible_in_connector": True,
             # Key-based (non-oauth), like aws/google-maps: PostHog's only

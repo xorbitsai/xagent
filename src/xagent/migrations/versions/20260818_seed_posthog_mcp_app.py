@@ -36,11 +36,11 @@ APP_ID = "posthog"
 ROW = {
     "app_id": APP_ID,
     "name": "PostHog",
-    "description": "Connect to PostHog to query events and persons via HogQL, and read insights, feature flags, dashboards, and annotations.",
+    "description": "Connect to PostHog Cloud (US or EU) to query events and persons via HogQL, and read insights, feature flags, dashboards, and annotations. Self-hosted PostHog is not supported.",
     "icon": "https://www.google.com/s2/favicons?domain=posthog.com&sz=128",
     "transport": "stdio",
     "provider_name": None,
-    "category": "Marketing",
+    "category": "Analytics",
     "oauth_scopes": None,
     "is_visible_in_connector": True,
     "launch_config": {

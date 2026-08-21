@@ -73,6 +73,44 @@ def test_upgrade_inserts_stripe(tmp_path):
         assert "STRIPE_API_KEY" in str(row[2])
 
 
+def test_upgrade_warns_and_still_inserts_when_column_missing(tmp_path, caplog):
+    """If a table predates one of ROW's keys (shouldn't happen here, but the
+    column-filter exists defensively), the row must still be inserted, and
+    the drop must be logged rather than silent -- app_id then already
+    exists, so a later run can never self-heal the missing column."""
+    engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
+    migration = _load_migration_module()
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                """
+                CREATE TABLE public_mcp_apps (
+                    id INTEGER PRIMARY KEY,
+                    app_id VARCHAR(100) NOT NULL UNIQUE,
+                    name VARCHAR(200) NOT NULL,
+                    icon VARCHAR(1000),
+                    transport VARCHAR(50) NOT NULL DEFAULT 'oauth',
+                    provider_name VARCHAR(50),
+                    category VARCHAR(100),
+                    oauth_scopes JSON,
+                    is_visible_in_connector BOOLEAN NOT NULL DEFAULT 1,
+                    launch_config JSON
+                )
+                """
+            )
+        )
+        with patch.object(migration, "op", _operations(connection)):
+            with caplog.at_level("WARNING"):
+                migration.upgrade()
+        assert "stripe" in _app_ids(connection)
+
+    messages = [record.getMessage() for record in caplog.records]
+    assert any(
+        "description" in message and "missing columns" in message
+        for message in messages
+    )
+
+
 def test_upgrade_is_idempotent(tmp_path):
     engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
     migration = _load_migration_module()

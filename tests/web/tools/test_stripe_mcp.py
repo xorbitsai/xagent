@@ -692,6 +692,19 @@ def test_list_charges_uses_customer_filter(monkeypatch):
     assert mock_request.call_args.kwargs["params"]["customer"] == "cus_1"
 
 
+def test_list_charges_rejects_wrong_customer_prefix(monkeypatch):
+    mock_request = Mock(
+        return_value=MockResponse(json_data={"data": [], "has_more": False})
+    )
+    monkeypatch.setattr(stripe.requests, "request", mock_request)
+
+    result = json.loads(stripe.stripe_list_charges(customer_id="pi_1"))
+
+    assert result["status"] == "error"
+    assert "cus_" in result["message"]
+    mock_request.assert_not_called()
+
+
 def test_list_charges_clamps_limit(monkeypatch):
     mock_request = Mock(
         return_value=MockResponse(json_data={"data": [], "has_more": False})
@@ -938,6 +951,19 @@ def test_list_payment_intents_returns_results(monkeypatch):
     assert result["payment_intents"] == [{"id": "pi_1"}]
 
 
+def test_list_payment_intents_rejects_wrong_customer_prefix(monkeypatch):
+    mock_request = Mock(
+        return_value=MockResponse(json_data={"data": [], "has_more": False})
+    )
+    monkeypatch.setattr(stripe.requests, "request", mock_request)
+
+    result = json.loads(stripe.stripe_list_payment_intents(customer_id="ch_1"))
+
+    assert result["status"] == "error"
+    assert "cus_" in result["message"]
+    mock_request.assert_not_called()
+
+
 def test_list_invoices_uses_status_filter(monkeypatch):
     mock_request = Mock(
         return_value=MockResponse(
@@ -983,6 +1009,19 @@ def test_get_invoice_rejects_wrong_prefix(monkeypatch):
     mock_request.assert_not_called()
 
 
+def test_list_invoices_rejects_wrong_customer_prefix(monkeypatch):
+    mock_request = Mock(
+        return_value=MockResponse(json_data={"data": [], "has_more": False})
+    )
+    monkeypatch.setattr(stripe.requests, "request", mock_request)
+
+    result = json.loads(stripe.stripe_list_invoices(customer_id="ch_1"))
+
+    assert result["status"] == "error"
+    assert "cus_" in result["message"]
+    mock_request.assert_not_called()
+
+
 def test_list_subscriptions_uses_status_filter(monkeypatch):
     mock_request = Mock(
         return_value=MockResponse(
@@ -995,6 +1034,19 @@ def test_list_subscriptions_uses_status_filter(monkeypatch):
 
     assert result["status"] == "success"
     assert mock_request.call_args.kwargs["params"]["status"] == "past_due"
+
+
+def test_list_subscriptions_rejects_wrong_customer_prefix(monkeypatch):
+    mock_request = Mock(
+        return_value=MockResponse(json_data={"data": [], "has_more": False})
+    )
+    monkeypatch.setattr(stripe.requests, "request", mock_request)
+
+    result = json.loads(stripe.stripe_list_subscriptions(customer_id="ch_1"))
+
+    assert result["status"] == "error"
+    assert "cus_" in result["message"]
+    mock_request.assert_not_called()
 
 
 def test_list_products_uses_active_filter(monkeypatch):
@@ -1036,6 +1088,19 @@ def test_list_prices_uses_product_filter(monkeypatch):
 
     assert result["status"] == "success"
     assert mock_request.call_args.kwargs["params"]["product"] == "prod_1"
+
+
+def test_list_prices_rejects_wrong_product_prefix(monkeypatch):
+    mock_request = Mock(
+        return_value=MockResponse(json_data={"data": [], "has_more": False})
+    )
+    monkeypatch.setattr(stripe.requests, "request", mock_request)
+
+    result = json.loads(stripe.stripe_list_prices(product_id="cus_1"))
+
+    assert result["status"] == "error"
+    assert "prod_" in result["message"]
+    mock_request.assert_not_called()
 
 
 def test_list_prices_uses_active_filter(monkeypatch):

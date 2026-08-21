@@ -468,6 +468,10 @@ def stripe_list_charges(
     starting_after: a charge id from a previous page, to page forward.
     """
     try:
+        if customer_id:
+            prefix_error = _prefix_mismatch(customer_id, "cus_", "customer_id")
+            if prefix_error:
+                return _error(prefix_error)
         max_results = _clamp_limit(limit)
         params: dict[str, Any] = {"limit": max_results}
         if customer_id:
@@ -598,6 +602,10 @@ def stripe_list_payment_intents(
     forward.
     """
     try:
+        if customer_id:
+            prefix_error = _prefix_mismatch(customer_id, "cus_", "customer_id")
+            if prefix_error:
+                return _error(prefix_error)
         max_results = _clamp_limit(limit)
         params: dict[str, Any] = {"limit": max_results}
         if customer_id:
@@ -628,6 +636,10 @@ def stripe_list_invoices(
     starting_after: an invoice id from a previous page, to page forward.
     """
     try:
+        if customer_id:
+            prefix_error = _prefix_mismatch(customer_id, "cus_", "customer_id")
+            if prefix_error:
+                return _error(prefix_error)
         max_results = _clamp_limit(limit)
         params: dict[str, Any] = {"limit": max_results}
         if customer_id:
@@ -681,6 +693,10 @@ def stripe_list_subscriptions(
     starting_after: a subscription id from a previous page, to page forward.
     """
     try:
+        if customer_id:
+            prefix_error = _prefix_mismatch(customer_id, "cus_", "customer_id")
+            if prefix_error:
+                return _error(prefix_error)
         max_results = _clamp_limit(limit)
         params: dict[str, Any] = {"limit": max_results}
         if customer_id:
@@ -738,6 +754,10 @@ def stripe_list_prices(
     starting_after: a price id from a previous page, to page forward.
     """
     try:
+        if product_id:
+            prefix_error = _prefix_mismatch(product_id, "prod_", "product_id")
+            if prefix_error:
+                return _error(prefix_error)
         max_results = _clamp_limit(limit)
         params: dict[str, Any] = {"limit": max_results}
         if product_id:

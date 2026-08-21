@@ -126,26 +126,22 @@ def delete_scoped_user_oauth_accounts(
     *,
     user_id: int,
     resource_owner_key: str | None,
-    providers: Sequence[str] | None,
+    providers: Sequence[str],
 ) -> int:
-    """Delete matching local credentials without committing the session.
+    """Delete selected local credentials without committing the session.
 
-    ``providers=None`` explicitly deletes every credential in the selected
-    owner namespace, an empty sequence deletes nothing, and a non-empty
-    sequence deletes only those providers. Requiring the argument prevents an
-    omitted filter from silently becoming a delete-all operation. Transaction
-    ownership remains with the caller; this function never commits. Callers
-    must not retain matching identity-mapped rows because the bulk delete does
-    not synchronize those in-memory objects.
+    An empty sequence deletes nothing. Requiring explicit provider names keeps
+    a missing or falsy filter from becoming a namespace-wide deletion.
+    Transaction ownership remains with the caller; this function never
+    commits. Callers must not retain matching identity-mapped rows because the
+    bulk delete does not synchronize those in-memory objects.
     """
+    provider_keys = tuple(dict.fromkeys(str(provider) for provider in providers))
+    if not provider_keys:
+        return 0
     query = scoped_user_oauth_query(
         db,
         user_id=user_id,
         resource_owner_key=resource_owner_key,
-    )
-    if providers is not None:
-        provider_keys = tuple(dict.fromkeys(str(provider) for provider in providers))
-        if not provider_keys:
-            return 0
-        query = query.filter(UserOAuth.provider.in_(provider_keys))
+    ).filter(UserOAuth.provider.in_(provider_keys))
     return int(query.delete(synchronize_session=False))

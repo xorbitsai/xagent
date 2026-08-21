@@ -328,34 +328,21 @@ def test_empty_provider_filter_deletes_nothing(tmp_path) -> None:
         engine.dispose()
 
 
-def test_none_provider_filter_deletes_all_for_owner_without_committing(
-    tmp_path,
-) -> None:
+def test_none_provider_filter_cannot_delete_an_owner_namespace(tmp_path) -> None:
     engine, db, user, _rows = _db(tmp_path)
-    other_db = sessionmaker(bind=engine, autoflush=False, autocommit=False)()
     try:
-        assert (
+        with pytest.raises(TypeError):
             delete_scoped_user_oauth_accounts(
                 db,
                 user_id=int(user.id),
                 resource_owner_key=ALICE,
-                providers=None,
+                providers=None,  # type: ignore[arg-type]
             )
-            == 1
-        )
         assert (
             db.query(UserOAuth).filter(UserOAuth.resource_owner_key == ALICE).count()
-            == 0
-        )
-        assert (
-            other_db.query(UserOAuth)
-            .filter(UserOAuth.resource_owner_key == ALICE)
-            .count()
             == 1
         )
     finally:
-        other_db.close()
-        db.rollback()
         db.close()
         engine.dispose()
 

@@ -1564,6 +1564,8 @@ async def startup_event() -> None:
         # diagnose from the logs alone.
         # WHY: try/except inside the phase keeps a tolerated failure at a single
         # WARNING; propagating it would add a spurious ERROR from _startup_phase.
+        # exc_info keeps the traceback so an unexpected bug (not just a transient
+        # FS error) is still diagnosable despite the WARNING-level downgrade.
         with _startup_phase("orphaned temp-file cleanup"):
             try:
                 from .api.kb import cleanup_orphaned_temp_files
@@ -1578,6 +1580,7 @@ async def startup_event() -> None:
                 logger.warning(
                     "Temporary file cleanup skipped due to error: %s",
                     e,
+                    exc_info=True,
                 )
 
     # Warmup sandbox manager

@@ -130,6 +130,23 @@ def upgrade() -> None:
             )
 
 
+def _row_matches_seeded_shape(
+    row: sa.engine.Row, seeded: dict[str, object], compare_columns: set[str]
+) -> bool:
+    """Compare a fetched row against the seeded row dict in Python.
+
+    Deliberately not pushed into the SQL WHERE clause: PostgreSQL's plain
+    ``json`` column type (what oauth_scopes/launch_config/default_scopes
+    actually are -- see the models, no ``.with_variant(JSONB(), ...)``
+    escape hatch here) has no ``=`` operator at all, so
+    ``.where(json_column == python_value)`` compiles fine but raises
+    ``UndefinedFunction: operator does not exist: json = json`` at
+    execute time on Postgres. Comparing in Python after a plain SELECT
+    sidesteps that entirely and works identically on every backend.
+    """
+    return all(row._mapping[column] == seeded[column] for column in compare_columns)
+
+
 def downgrade() -> None:
     bind = op.get_bind()
     inspector = sa.inspect(bind)
@@ -137,35 +154,48 @@ def downgrade() -> None:
 
     if "public_mcp_apps" in existing_tables:
         # Only delete the catalog entry when it still matches the FULL
-        # static shape this migration seeded, mirroring the oauth_providers
-        # guard below -- an unconditional delete-by-app_id would remove a
-        # pre-existing operator row that happened to already occupy app_id
-        # "salesforce" before this migration ever ran (upgrade()'s own
-        # `if APP_ID not in existing_app_ids` check would have skipped
-        # inserting over it, so upgrade and downgrade must agree on what
-        # "this migration's row" means). Matching only a handful of
-        # structural columns (name/transport/provider_name) isn't enough:
-        # an admin who PATCHed the seeded row's oauth_scopes/description/
-        # launch_config/visibility without touching those few fields would
-        # still match and get silently deleted. None of this row's columns
-        # are env-dependent, so every one of them can be matched.
-        seeded_app = _salesforce_app_row()
-        bind.execute(
-            sa.delete(PUBLIC_MCP_APPS_TABLE)
-            .where(PUBLIC_MCP_APPS_TABLE.c.app_id == APP_ID)
-            .where(PUBLIC_MCP_APPS_TABLE.c.name == seeded_app["name"])
-            .where(PUBLIC_MCP_APPS_TABLE.c.description == seeded_app["description"])
-            .where(PUBLIC_MCP_APPS_TABLE.c.icon == seeded_app["icon"])
-            .where(PUBLIC_MCP_APPS_TABLE.c.transport == seeded_app["transport"])
-            .where(PUBLIC_MCP_APPS_TABLE.c.provider_name == seeded_app["provider_name"])
-            .where(PUBLIC_MCP_APPS_TABLE.c.category == seeded_app["category"])
-            .where(PUBLIC_MCP_APPS_TABLE.c.oauth_scopes == seeded_app["oauth_scopes"])
-            .where(
-                PUBLIC_MCP_APPS_TABLE.c.is_visible_in_connector
-                == seeded_app["is_visible_in_connector"]
+        # static shape this migration seeded -- an unconditional
+        # delete-by-app_id would remove a pre-existing operator row that
+        # happened to already occupy app_id "salesforce" before this
+        # migration ever ran (upgrade()'s own `if APP_ID not in
+        # existing_app_ids` check would have skipped inserting over it, so
+        # upgrade and downgrade must agree on what "this migration's row"
+        # means). Matching only a handful of structural columns
+        # (name/transport/provider_name) isn't enough: admin_mcp.py's
+        # _BUILTIN_PROTECTED_FIELDS blocks a PATCH from changing
+        # oauth_scopes/launch_config away from the built-in registry's
+        # values while this app_id stays registered as built-in, but
+        # description/is_visible_in_connector are freely PATCHable today,
+        # and a raw DB edit (or the app_id later being dropped from the
+        # built-in registry while this row persists) could diverge any of
+        # them -- so every one of this row's non-env-dependent columns is
+        # compared, not just the always-PATCHable few. In Python, see
+        # _row_matches_seeded_shape's docstring for why not in SQL.
+        app_row = bind.execute(
+            sa.select(PUBLIC_MCP_APPS_TABLE).where(
+                PUBLIC_MCP_APPS_TABLE.c.app_id == APP_ID
             )
-            .where(PUBLIC_MCP_APPS_TABLE.c.launch_config == seeded_app["launch_config"])
-        )
+        ).first()
+        if app_row is not None and _row_matches_seeded_shape(
+            app_row,
+            _salesforce_app_row(),
+            {
+                "name",
+                "description",
+                "icon",
+                "transport",
+                "provider_name",
+                "category",
+                "oauth_scopes",
+                "is_visible_in_connector",
+                "launch_config",
+            },
+        ):
+            bind.execute(
+                sa.delete(PUBLIC_MCP_APPS_TABLE).where(
+                    PUBLIC_MCP_APPS_TABLE.c.app_id == APP_ID
+                )
+            )
 
     if "oauth_providers" not in existing_tables:
         return
@@ -188,22 +218,26 @@ def downgrade() -> None:
     # an admin who edited userinfo_url/user_id_path/email_path/
     # default_scopes without touching those few fields would otherwise
     # still match and get silently deleted.
-    seeded_provider = _salesforce_provider_row()
-    bind.execute(
-        sa.delete(FULL_OAUTH_PROVIDERS_TABLE)
-        .where(FULL_OAUTH_PROVIDERS_TABLE.c.provider_name == "salesforce")
-        .where(FULL_OAUTH_PROVIDERS_TABLE.c.name == seeded_provider["name"])
-        .where(FULL_OAUTH_PROVIDERS_TABLE.c.auth_url == seeded_provider["auth_url"])
-        .where(FULL_OAUTH_PROVIDERS_TABLE.c.token_url == seeded_provider["token_url"])
-        .where(
-            FULL_OAUTH_PROVIDERS_TABLE.c.userinfo_url == seeded_provider["userinfo_url"]
+    provider_row = bind.execute(
+        sa.select(FULL_OAUTH_PROVIDERS_TABLE).where(
+            FULL_OAUTH_PROVIDERS_TABLE.c.provider_name == "salesforce"
         )
-        .where(
-            FULL_OAUTH_PROVIDERS_TABLE.c.user_id_path == seeded_provider["user_id_path"]
+    ).first()
+    if provider_row is not None and _row_matches_seeded_shape(
+        provider_row,
+        _salesforce_provider_row(),
+        {
+            "name",
+            "auth_url",
+            "token_url",
+            "userinfo_url",
+            "user_id_path",
+            "email_path",
+            "default_scopes",
+        },
+    ):
+        bind.execute(
+            sa.delete(FULL_OAUTH_PROVIDERS_TABLE).where(
+                FULL_OAUTH_PROVIDERS_TABLE.c.provider_name == "salesforce"
+            )
         )
-        .where(FULL_OAUTH_PROVIDERS_TABLE.c.email_path == seeded_provider["email_path"])
-        .where(
-            FULL_OAUTH_PROVIDERS_TABLE.c.default_scopes
-            == seeded_provider["default_scopes"]
-        )
-    )

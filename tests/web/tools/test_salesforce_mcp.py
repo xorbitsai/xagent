@@ -474,6 +474,19 @@ def test_query_caps_output_size(monkeypatch):
     assert "cannot be recovered" in result["message"]
 
 
+def test_capped_list_drops_message_when_it_alone_exceeds_the_limit(monkeypatch):
+    monkeypatch.setattr(salesforce, "get_tool_max_output_length", lambda: 40)
+
+    raw = salesforce._success_with_capped_list(
+        "records", [{"Id": str(i)} for i in range(50)]
+    )
+    result = json.loads(raw)
+
+    assert result["records"] == []
+    assert result["truncated"] is True
+    assert "message" not in result
+
+
 def test_search_sends_sosl_as_query_param(monkeypatch):
     mock_request = Mock(
         return_value=MockResponse(

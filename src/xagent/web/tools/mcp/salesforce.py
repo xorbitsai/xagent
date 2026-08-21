@@ -65,37 +65,40 @@ def _success_with_capped_list(
     help.
     """
 
-    def _build(items: list[Any], truncated: bool, with_message: bool) -> str:
+    def _build(items: list[Any], truncated: bool, halved: bool) -> str:
         payload = {list_field: items, "truncated": truncated, **extra}
-        if with_message:
+        if halved:
             payload["message"] = (
-                f"{len(items)} of the original result set is returned here; "
+                f"Returned {len(items)} {list_field} out of the full result; "
                 "the rest did not fit the output size limit and cannot be "
                 "recovered via this tool call."
             )
         return _success(**payload)
 
     max_output_length = get_tool_max_output_length()
-    response = _build(items, truncated, with_message=False)
     halved = False
+    response = _build(items, truncated, halved)
     while len(response) > max_output_length and items:
         items = items[: len(items) // 2]
         truncated = True
         halved = True
-        response = _build(items, truncated, with_message=False)
-    if not halved:
-        return response
-    # The message itself takes space, so it must be checked against the
-    # limit like everything else -- appending it unconditionally after the
-    # loop above already confirmed a fit would silently blow that fit back
-    # open for a response that halved down to a still-sizeable (not empty)
-    # list, re-creating the exact invalid-JSON risk this function exists to
-    # prevent.
-    with_message = _build(items, truncated, with_message=True)
-    while len(with_message) > max_output_length and items:
-        items = items[: len(items) // 2]
-        with_message = _build(items, truncated, with_message=True)
-    return with_message
+        # Rebuilding with halved=True (message included) from the first
+        # halving iteration onward, not just once at the end, means the
+        # size check on the *next* loop condition already accounts for the
+        # message's own weight -- appending it only after the loop
+        # converged would let it silently push an already-fitted response
+        # back over the limit, re-creating the exact invalid-JSON risk this
+        # function exists to prevent.
+        response = _build(items, truncated, halved)
+    if halved and len(response) > max_output_length:
+        # Halving already emptied ``items`` and the message text itself is
+        # what's still pushing the response over the limit (an operator can
+        # configure XAGENT_TOOL_MAX_OUTPUT_LENGTH arbitrarily small) --
+        # there's nothing left to halve away, so drop the message rather
+        # than return a payload that violates the caller's own size
+        # contract.
+        response = _build(items, truncated, False)
+    return response
 
 
 def _error(message: str) -> str:

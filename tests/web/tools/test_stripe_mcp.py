@@ -128,6 +128,30 @@ def test_request_form_encodes_nested_form_data(monkeypatch):
     ]
 
 
+def test_request_logs_warning_on_idempotent_replay(monkeypatch, caplog):
+    mock_request = Mock(
+        return_value=MockResponse(
+            json_data={"id": "cus_1"}, headers={"Idempotent-Replayed": "true"}
+        )
+    )
+    monkeypatch.setattr(stripe.requests, "request", mock_request)
+
+    with caplog.at_level("WARNING", logger=stripe.logger.name):
+        stripe._request("POST", "/customers", form_data={"name": "Acme"})
+
+    assert "idempotent replay" in caplog.text.lower()
+
+
+def test_request_does_not_log_warning_on_fresh_create(monkeypatch, caplog):
+    mock_request = Mock(return_value=MockResponse(json_data={"id": "cus_1"}))
+    monkeypatch.setattr(stripe.requests, "request", mock_request)
+
+    with caplog.at_level("WARNING", logger=stripe.logger.name):
+        stripe._request("POST", "/customers", form_data={"name": "Acme"})
+
+    assert "idempotent replay" not in caplog.text.lower()
+
+
 def test_request_sends_idempotency_key_only_for_post(monkeypatch):
     mock_request = Mock(return_value=MockResponse(json_data={"id": "cus_123"}))
     monkeypatch.setattr(stripe.requests, "request", mock_request)
@@ -174,6 +198,23 @@ def test_request_retries_once_on_429_with_retry_after(monkeypatch):
     assert result == {"id": "acct_123"}
     assert mock_request.call_count == 2
     mock_sleep.assert_called_once_with(1)
+
+
+def test_request_reuses_same_headers_and_data_across_429_retry(monkeypatch):
+    responses = [
+        MockResponse(status_code=429, text="rate limited"),
+        MockResponse(json_data={"id": "cus_1"}),
+    ]
+    responses[0].headers = {"Retry-After": "1"}
+    mock_request = Mock(side_effect=responses)
+    monkeypatch.setattr(stripe.requests, "request", mock_request)
+    monkeypatch.setattr(stripe.time, "sleep", Mock())
+
+    stripe._request("POST", "/customers", form_data={"name": "Acme"})
+
+    first_call, second_call = mock_request.call_args_list
+    assert first_call.kwargs["headers"] == second_call.kwargs["headers"]
+    assert first_call.kwargs["data"] == second_call.kwargs["data"]
 
 
 def test_request_does_not_retry_past_max_retry_after(monkeypatch):
@@ -471,6 +512,18 @@ def test_create_refund_sends_payment_intent(monkeypatch):
     assert mock_request.call_args.kwargs["data"] == [
         ("payment_intent", "pi_1"),
         ("reason", "requested_by_customer"),
+    ]
+
+
+def test_create_refund_sends_metadata(monkeypatch):
+    mock_request = Mock(return_value=MockResponse(json_data={"id": "re_1"}))
+    monkeypatch.setattr(stripe.requests, "request", mock_request)
+
+    stripe.stripe_create_refund(charge_id="ch_1", metadata={"internal_id": "6735"})
+
+    assert mock_request.call_args.kwargs["data"] == [
+        ("charge", "ch_1"),
+        ("metadata[internal_id]", "6735"),
     ]
 
 

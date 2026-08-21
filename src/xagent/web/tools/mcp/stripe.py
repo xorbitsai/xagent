@@ -154,13 +154,15 @@ def _request(
     idempotency_key = (
         _idempotency_key(method, path, form_data) if method == "POST" else None
     )
+    headers = _headers(idempotency_key)
+    data = _flatten_form_params(form_data) if form_data else None
     for attempt in (0, 1):
         response = requests.request(
             method=method,
             url=f"{BASE_URL}{path}",
-            headers=_headers(idempotency_key),
+            headers=headers,
             params=params,
-            data=_flatten_form_params(form_data) if form_data else None,
+            data=data,
             timeout=DEFAULT_TIMEOUT_SECONDS,
         )
         if response.status_code == 429 and attempt == 0:
@@ -181,10 +183,12 @@ def _request(
             f"Stripe API error (status {response.status_code}): {detail}"
         )
 
-    if response_meta is not None and idempotency_key is not None:
-        response_meta["idempotent_replayed"] = (
-            response.headers.get("Idempotent-Replayed") == "true"
-        )
+    if idempotency_key is not None:
+        idempotent_replayed = response.headers.get("Idempotent-Replayed") == "true"
+        if idempotent_replayed:
+            logger.warning(f"Stripe idempotent replay detected for POST {path}")
+        if response_meta is not None:
+            response_meta["idempotent_replayed"] = idempotent_replayed
 
     if response.status_code == 204 or not response.content:
         return {}
@@ -366,6 +370,7 @@ def stripe_create_refund(
     payment_intent_id: str = "",
     amount: int | None = None,
     reason: str = "",
+    metadata: dict[str, str] | None = None,
 ) -> str:
     """
     Refund a charge, in full or in part.
@@ -377,10 +382,14 @@ def stripe_create_refund(
     cents for USD); omit to refund the full remaining amount.
     reason: optional one of "duplicate", "fraudulent", or
     "requested_by_customer".
+    metadata: optional string key/value pairs to attach for your own
+    bookkeeping, e.g. {"internal_id": "6735"}.
 
     A retry of this exact call (same arguments) is deduped by Stripe and
     returns the original refund instead of creating a second one; the
-    response's idempotent_replayed flag is true when that happened.
+    response's idempotent_replayed flag is true when that happened. Vary at
+    least one argument (e.g. add a distinguishing metadata value) to
+    intentionally issue another refund with otherwise-identical details.
     """
     try:
         if not charge_id and not payment_intent_id:
@@ -394,6 +403,8 @@ def stripe_create_refund(
             form_data["amount"] = amount
         if reason:
             form_data["reason"] = reason
+        if metadata:
+            form_data["metadata"] = metadata
         response_meta: dict[str, Any] = {}
         result = _request(
             "POST", "/refunds", form_data=form_data, response_meta=response_meta

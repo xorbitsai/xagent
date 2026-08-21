@@ -8,24 +8,41 @@ import requests
 from xagent.web.tools.mcp import posthog
 
 
-def _fake_getaddrinfo(ip):
+def _fake_getaddrinfo(*ips):
     def _impl(host, port, *args, **kwargs):
-        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", (ip, port))]
+        return [
+            (
+                socket.AF_INET6 if ":" in ip else socket.AF_INET,
+                socket.SOCK_STREAM,
+                6,
+                "",
+                (ip, port),
+            )
+            for ip in ips
+        ]
 
     return _impl
 
 
 class MockResponse:
     def __init__(
-        self, json_data=None, status_code: int = 200, text: str = "", url: str = ""
+        self,
+        json_data=None,
+        status_code: int = 200,
+        text: str = "",
+        url: str = "",
+        json_raises: bool = False,
     ):
         self._json_data = json_data if json_data is not None else {}
+        self._json_raises = json_raises
         self.status_code = status_code
         self.text = text or (json.dumps(self._json_data) if json_data else "")
         self.content = self.text.encode()
         self.url = url
 
     def json(self):
+        if self._json_raises:
+            raise json.JSONDecodeError("Expecting value", self.text, 0)
         return self._json_data
 
     def raise_for_status(self):
@@ -111,18 +128,40 @@ def test_base_url_strips_multiple_trailing_slashes(monkeypatch):
 
 
 def test_base_url_rejects_host_resolving_to_private_ip(monkeypatch):
-    # Not a literal private IP (that's covered by
-    # test_base_url_rejects_private_network_host) -- a hostname that only
-    # *resolves* to one, which the literal-string check alone can't catch.
-    monkeypatch.setenv("POSTHOG_HOST", "posthog-internal.example.com")
+    # A posthog.com host (so it clears the domain allowlist below) that
+    # only *resolves* to a private address -- the DNS-rebinding case the
+    # literal-string check in test_base_url_rejects_private_network_host
+    # can't catch on its own.
+    monkeypatch.setenv("POSTHOG_HOST", "fake.posthog.com")
     monkeypatch.setattr(posthog.socket, "getaddrinfo", _fake_getaddrinfo("10.0.0.5"))
 
     with pytest.raises(ValueError, match="POSTHOG_HOST"):
         posthog._base_url()
 
 
+def test_base_url_rejects_when_any_resolved_address_is_private(monkeypatch):
+    # A hostname resolving to more than one address (common for a load
+    # balanced service) must be rejected if ANY resolved address is
+    # private, not just the first one checked.
+    monkeypatch.setenv("POSTHOG_HOST", "fake.posthog.com")
+    monkeypatch.setattr(
+        posthog.socket, "getaddrinfo", _fake_getaddrinfo("1.1.1.1", "10.0.0.5")
+    )
+
+    with pytest.raises(ValueError, match="POSTHOG_HOST"):
+        posthog._base_url()
+
+
+def test_base_url_rejects_ipv6_private_resolved_address(monkeypatch):
+    monkeypatch.setenv("POSTHOG_HOST", "fake.posthog.com")
+    monkeypatch.setattr(posthog.socket, "getaddrinfo", _fake_getaddrinfo("fe80::1"))
+
+    with pytest.raises(ValueError, match="POSTHOG_HOST"):
+        posthog._base_url()
+
+
 def test_base_url_raises_when_dns_resolution_fails(monkeypatch):
-    monkeypatch.setenv("POSTHOG_HOST", "nonexistent.invalid")
+    monkeypatch.setenv("POSTHOG_HOST", "fake.posthog.com")
 
     def _raise(*args, **kwargs):
         raise socket.gaierror("Name or service not known")
@@ -134,9 +173,45 @@ def test_base_url_raises_when_dns_resolution_fails(monkeypatch):
 
 
 def test_base_url_preserves_explicit_port(monkeypatch):
-    monkeypatch.setenv("POSTHOG_HOST", "posthog.internal.example.com:8443")
+    monkeypatch.setenv("POSTHOG_HOST", "us.posthog.com:8443")
 
-    assert posthog._base_url() == "https://posthog.internal.example.com:8443"
+    assert posthog._base_url() == "https://us.posthog.com:8443"
+
+
+def test_base_url_rejects_invalid_port(monkeypatch):
+    monkeypatch.setenv("POSTHOG_HOST", "us.posthog.com:notaport")
+
+    with pytest.raises(ValueError, match="port"):
+        posthog._base_url()
+
+
+def test_base_url_rejects_scheme_only_host(monkeypatch):
+    monkeypatch.setenv("POSTHOG_HOST", "https://")
+
+    with pytest.raises(ValueError, match="hostname"):
+        posthog._base_url()
+
+
+def test_base_url_rejects_non_posthog_domain(monkeypatch):
+    monkeypatch.setenv("POSTHOG_HOST", "https://evil.example.com")
+
+    with pytest.raises(ValueError, match="posthog.com"):
+        posthog._base_url()
+
+
+def test_base_url_rejects_domain_that_merely_ends_with_posthog_com(monkeypatch):
+    # A naive `host.endswith("posthog.com")` (missing the leading dot)
+    # would wrongly accept this -- the real check requires a "." boundary.
+    monkeypatch.setenv("POSTHOG_HOST", "https://evilposthog.com")
+
+    with pytest.raises(ValueError, match="posthog.com"):
+        posthog._base_url()
+
+
+def test_base_url_accepts_posthog_com_apex_domain(monkeypatch):
+    monkeypatch.setenv("POSTHOG_HOST", "https://posthog.com")
+
+    assert posthog._base_url() == "https://posthog.com"
 
 
 def test_base_url_rejects_http_scheme(monkeypatch):
@@ -168,9 +243,21 @@ def test_base_url_rejects_query_in_host(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    "host", ["127.0.0.1", "localhost", "169.254.169.254", "10.0.0.5"]
+    "host",
+    [
+        "127.0.0.1",
+        "localhost",
+        "169.254.169.254",
+        "10.0.0.5",
+        "::1",
+        "2130706433",  # decimal-encoded 127.0.0.1
+        "0x7f000001",  # hex-encoded 127.0.0.1
+    ],
 )
 def test_base_url_rejects_private_network_host(monkeypatch, host):
+    # None of these are a posthog.com host, so the domain allowlist rejects
+    # them outright without even reaching DNS resolution -- still correct,
+    # just via a more fundamental gate than the literal-IP check alone.
     monkeypatch.setenv("POSTHOG_HOST", host)
 
     with pytest.raises(ValueError, match="POSTHOG_HOST"):
@@ -228,6 +315,52 @@ def test_paginated_results_no_next_offset_when_truncated_but_page_empty():
     assert next_offset is None
 
 
+def test_paginated_results_rejects_non_dict_payload():
+    with pytest.raises(ValueError, match="JSON object"):
+        posthog._paginated_results(["not", "a", "dict"], limit=50, offset=0)
+
+
+def test_paginated_results_rejects_non_list_results():
+    with pytest.raises(ValueError, match="results"):
+        posthog._paginated_results({"results": "not-a-list"}, limit=50, offset=0)
+
+
+def test_path_segment_rejects_empty_value():
+    with pytest.raises(ValueError, match="project_id"):
+        posthog._path_segment("", "project_id")
+
+
+def test_get_person_rejects_empty_person_id():
+    result = json.loads(posthog.posthog_get_person("", project_id="proj1"))
+
+    assert result["status"] == "error"
+    assert "person_id" in result["message"]
+
+
+def test_create_annotation_rejects_empty_project_id():
+    result = json.loads(posthog.posthog_create_annotation("Deployed v2", ""))
+
+    assert result["status"] == "error"
+    assert "project_id" in result["message"]
+
+
+def test_create_annotation_raises_on_http_error(monkeypatch):
+    monkeypatch.setattr(
+        posthog.requests,
+        "request",
+        Mock(
+            return_value=MockResponse(
+                status_code=403, json_data={"detail": "Permission denied."}
+            )
+        ),
+    )
+
+    result = json.loads(posthog.posthog_create_annotation("Deployed v2", "proj1"))
+
+    assert result["status"] == "error"
+    assert "Permission denied" in result["message"]
+
+
 def test_request_uses_configured_host_and_headers(monkeypatch):
     mock_request = Mock(return_value=MockResponse(json_data={"ok": True}))
     monkeypatch.setattr(posthog.requests, "request", mock_request)
@@ -278,6 +411,51 @@ def test_request_raises_with_structured_error_detail(monkeypatch):
 
     with pytest.raises(RuntimeError, match="Invalid Personal API key"):
         posthog._request("GET", "/api/users/@me/")
+
+
+def test_request_redacts_bearer_token_in_error_detail(monkeypatch):
+    monkeypatch.setattr(
+        posthog.requests,
+        "request",
+        Mock(
+            return_value=MockResponse(
+                status_code=502,
+                json_data={
+                    "detail": (
+                        "Upstream error, request had Authorization: "
+                        "Bearer sk-super-secret-token-12345 rejected"
+                    )
+                },
+            )
+        ),
+    )
+
+    with pytest.raises(RuntimeError) as excinfo:
+        posthog._request("GET", "/api/users/@me/")
+
+    assert "sk-super-secret-token-12345" not in str(excinfo.value)
+    assert "Bearer ***" in str(excinfo.value)
+
+
+def test_request_raises_clear_error_for_non_json_2xx_body(monkeypatch):
+    monkeypatch.setattr(
+        posthog.requests,
+        "request",
+        Mock(
+            return_value=MockResponse(
+                status_code=200, text="<html>not json</html>", json_raises=True
+            )
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="non-JSON"):
+        posthog._request("GET", "/api/users/@me/")
+
+
+def test_extract_error_detail_returns_none_for_non_json_body():
+    response = MockResponse(status_code=500, text="not json", json_raises=True)
+
+    assert posthog._extract_error_detail(response) is None
 
 
 def test_request_truncates_unstructured_error_body(monkeypatch):
@@ -477,6 +655,31 @@ def test_query_omits_name_when_not_provided(monkeypatch):
     posthog.posthog_query("select 1")
 
     assert "name" not in mock_request.call_args.kwargs["json"]
+
+
+def test_query_clamps_results_to_limit_and_reports_truncated(monkeypatch):
+    mock_request = Mock(
+        return_value=MockResponse(
+            json_data={"results": [[1], [2], [3]], "columns": ["n"]}
+        )
+    )
+    monkeypatch.setattr(posthog.requests, "request", mock_request)
+
+    result = json.loads(posthog.posthog_query("select n from numbers", limit=2))
+
+    assert result["results"] == [[1], [2]]
+    assert result["truncated"] is True
+
+
+def test_query_not_truncated_when_results_within_limit(monkeypatch):
+    mock_request = Mock(
+        return_value=MockResponse(json_data={"results": [[1]], "columns": ["n"]})
+    )
+    monkeypatch.setattr(posthog.requests, "request", mock_request)
+
+    result = json.loads(posthog.posthog_query("select 1", limit=50))
+
+    assert result["truncated"] is False
 
 
 def test_list_persons_includes_search_param(monkeypatch):

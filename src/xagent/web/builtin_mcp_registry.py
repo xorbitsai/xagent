@@ -689,7 +689,9 @@ def get_builtin_public_mcp_app_rows() -> list[dict[str, Any]]:
             "icon": "https://www.google.com/s2/favicons?domain=posthog.com&sz=128",
             "transport": "stdio",
             "provider_name": None,
-            "category": "Analytics",
+            # Matches google-analytics's category rather than introducing a
+            # new "Analytics" bucket for a single connector.
+            "category": "Marketing",
             "oauth_scopes": None,
             "is_visible_in_connector": True,
             # Key-based (non-oauth), like aws/google-maps: PostHog's only
@@ -704,7 +706,10 @@ def get_builtin_public_mcp_app_rows() -> list[dict[str, Any]]:
             # xagent to host anything. POSTHOG_HOST is required alongside
             # the key because US/EU Cloud are separate deployments -- a key
             # from one host is not valid against the other (unlike, say,
-            # Intercom's single auto-routing API host).
+            # Intercom's single auto-routing API host). posthog.py's
+            # _base_url() restricts this to a posthog.com host: self-hosted
+            # PostHog is not a documented target of this connector, so
+            # there's no reason to let this key be sent anywhere else.
             "launch_config": {
                 "command": "python",
                 "args": ["-m", "xagent.web.tools.mcp.posthog"],

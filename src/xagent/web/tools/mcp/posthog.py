@@ -8,7 +8,11 @@ from urllib.parse import quote, urlsplit
 import requests
 from mcp.server.fastmcp import FastMCP
 
-from ....core.utils.security import PrivateNetworkHostError, reject_private_network_host
+from ....core.utils.security import (
+    PrivateNetworkHostError,
+    redact_sensitive_text,
+    reject_private_network_host,
+)
 from .utils import setup_proxy_env
 
 logging.basicConfig(level=logging.INFO)
@@ -45,6 +49,9 @@ def _headers() -> dict[str, str]:
     }
 
 
+POSTHOG_HOST_SUFFIX = "posthog.com"
+
+
 def _base_url() -> str:
     """Return the region host this connector's Personal API key belongs to.
 
@@ -54,17 +61,19 @@ def _base_url() -> str:
     connect-time configuration choice, not something this module can infer.
 
     POSTHOG_HOST is user-supplied and gets an Authorization: Bearer header
-    attached to every request built from it, so it is validated as a bare
-    HTTPS origin (matching mcp_oauth.py's use of the same
-    reject_private_network_host guard for a user-configured MCP host):
-    no embedded credentials, no path/query/fragment that could redirect the
-    request elsewhere, and no localhost/private/link-local target -- checked
-    both as a literal string and, since a hostname can resolve to a private
-    address it didn't spell out (DNS rebinding), against every address it
-    actually resolves to. This validates the address at call time; it does
-    not pin the later `requests` connection to the address checked here, so
-    a second, independent DNS answer at connect time is a narrower residual
-    gap than not checking DNS at all.
+    attached to every request built from it, so it is validated in layers:
+    a bare HTTPS origin (no embedded credentials, no path/query/fragment
+    that could redirect the request elsewhere), restricted to a
+    posthog.com host -- self-hosted PostHog instances are not a documented
+    target of this connector, so there is no reason to send this key
+    anywhere else -- and, as defense in depth against that host's DNS
+    being rebound to a private/internal address, checked against every
+    address it actually resolves to (matching mcp_oauth.py's use of the
+    same reject_private_network_host guard for a user-configured MCP
+    host). This validates the address at call time; it does not pin the
+    later `requests` connection to the address checked here, so a second,
+    independent DNS answer at connect time is a narrower residual gap
+    than not checking DNS at all.
     """
     host = os.environ.get("POSTHOG_HOST", "").strip()
     if not host:
@@ -82,14 +91,25 @@ def _base_url() -> str:
             "POSTHOG_HOST must be a bare host, not a URL with a path, "
             "query, or fragment"
         )
-    if not parsed.hostname:
-        raise ValueError("POSTHOG_HOST environment variable is missing")
+    hostname = parsed.hostname
+    if not hostname:
+        raise ValueError("POSTHOG_HOST must include a hostname")
+    if hostname != POSTHOG_HOST_SUFFIX and not hostname.endswith(
+        f".{POSTHOG_HOST_SUFFIX}"
+    ):
+        raise ValueError(
+            "POSTHOG_HOST must be a posthog.com host (e.g. us.posthog.com or "
+            "eu.posthog.com); self-hosted PostHog instances are not supported"
+        )
 
-    port = parsed.port or 443
     try:
-        reject_private_network_host(parsed.hostname)
+        port = parsed.port or 443
+    except ValueError as exc:
+        raise ValueError(f"POSTHOG_HOST has an invalid port: {exc}") from exc
+
+    try:
         resolved = socket.getaddrinfo(
-            parsed.hostname, port, socket.AF_UNSPEC, socket.SOCK_STREAM
+            hostname, port, socket.AF_UNSPEC, socket.SOCK_STREAM
         )
         for *_, sockaddr in resolved:
             reject_private_network_host(str(sockaddr[0]))
@@ -98,9 +118,7 @@ def _base_url() -> str:
     except OSError as exc:
         raise ValueError(f"POSTHOG_HOST could not be resolved: {exc}") from exc
 
-    netloc = (
-        parsed.hostname if parsed.port is None else f"{parsed.hostname}:{parsed.port}"
-    )
+    netloc = hostname if parsed.port is None else f"{hostname}:{parsed.port}"
     return f"https://{netloc}"
 
 
@@ -112,17 +130,27 @@ def _clamp_offset(offset: int) -> int:
     return max(0, int(offset))
 
 
-def _path_segment(value: str) -> str:
-    """Percent-encode a value for safe interpolation into a URL path
-    segment (e.g. an organization/project/person/insight id), matching
-    jira.py's _path_segment / intercom.py's inline quote() calls.
+def _path_segment(value: str, field_name: str = "id") -> str:
+    """Validate then percent-encode a value for safe interpolation into a
+    URL path segment (e.g. an organization/project/person/insight id),
+    matching jira.py's _path_segment / hubspot.py's _url_path_id.
+
+    An empty value is rejected outright rather than silently building a
+    malformed path like ".../persons//" -- every id parameter in this file
+    (including project_id, now required rather than defaulting to
+    "@current" for the one write tool) goes through this single choke
+    point, so a caller passing an empty id gets one clear error here
+    instead of a confusing 404 from PostHog.
+
     Percent-encoding - not a blocklist of "/", "?", "#" - is what actually
     prevents a value like "1/../2" from escaping its intended path segment.
     "@" is left unescaped (RFC 3986 already permits it literally in a path
-    segment) purely so the "@current"/"@me" sentinel values every tool here
-    defaults to stay readable in URLs and logs; it plays no role in the
-    escape this helper prevents.
+    segment) purely so the "@current"/"@me" sentinel values every read tool
+    here defaults to stay readable in URLs and logs; it plays no role in
+    the escape this helper prevents.
     """
+    if not str(value):
+        raise ValueError(f"{field_name} must not be empty")
     return quote(str(value), safe="@")
 
 
@@ -180,12 +208,21 @@ def _request(
             if len(detail) > MAX_ERROR_RESPONSE_TEXT_CHARS:
                 detail = detail[:MAX_ERROR_RESPONSE_TEXT_CHARS] + "... [truncated]"
         if detail:
-            message = f"{message} - {detail}"
+            # The response body is attacker/host-controlled content, not
+            # something this module wrote; if it happens to echo request
+            # headers (e.g. a misconfigured gateway's error page), redact
+            # the Bearer token before it reaches logs or the LLM's context.
+            message = f"{message} - {redact_sensitive_text(detail)}"
         raise RuntimeError(message) from exc
 
     if response.status_code == 204 or not response.content:
         return {}
-    return response.json()
+    try:
+        return response.json()
+    except ValueError as exc:
+        raise RuntimeError(
+            f"PostHog returned a 2xx response with a non-JSON body: {exc}"
+        ) from exc
 
 
 def _paginated_results(
@@ -200,7 +237,15 @@ def _paginated_results(
     next_offset — reusable as this same tool's own bounded offset param —
     so pagination never means following a server-supplied URL.
     """
+    if not isinstance(payload, dict):
+        raise ValueError(
+            f"Expected a JSON object from PostHog, got {type(payload).__name__}"
+        )
     results = payload.get("results") or []
+    if not isinstance(results, list):
+        raise ValueError(
+            f'Expected PostHog\'s "results" field to be a list, got {type(results).__name__}'
+        )
     page = results[:limit]
     truncated = bool(payload.get("next")) or len(results) > limit
     # A truncated-but-empty page (a self-contradictory but not-impossible
@@ -215,8 +260,9 @@ def _paginated_results(
 def posthog_get_current_user() -> str:
     """
     Get the profile of the PostHog account this connector's Personal API key
-    belongs to (id, email, name). Use this for "my account" / "who am I"
-    requests instead of asking the user for their PostHog user id.
+    belongs to (uuid, email, first_name, last_name). Use this for "my
+    account" / "who am I" requests instead of asking the user for their
+    PostHog user id.
     """
     try:
         result = _request("GET", "/api/users/@me/")
@@ -239,7 +285,7 @@ def posthog_list_organizations(limit: int = 50, offset: int = 0) -> str:
     List organizations this account can see — id, name.
     Use the returned id with posthog_list_projects.
     offset: 0-based result offset for pagination; pass the previous call's
-    next_offset to fetch the next page (only present while truncated=True).
+    next_offset to fetch the next page (null when truncated is False).
     """
     try:
         max_results = _clamp_limit(limit)
@@ -270,14 +316,15 @@ def posthog_list_projects(
     defaults to the API key owner's most recently active organization.
     Use the returned id (project_id) with every other tool here.
     offset: 0-based result offset for pagination; pass the previous call's
-    next_offset to fetch the next page (only present while truncated=True).
+    next_offset to fetch the next page (null when truncated is False).
     """
     try:
         max_results = _clamp_limit(limit)
         page_offset = _clamp_offset(offset)
         result = _request(
             "GET",
-            f"/api/organizations/{_path_segment(organization_id)}/projects/",
+            f"/api/organizations/{_path_segment(organization_id, 'organization_id')}"
+            "/projects/",
             params={"limit": max_results, "offset": page_offset},
         )
         projects, truncated, next_offset = _paginated_results(
@@ -291,7 +338,7 @@ def posthog_list_projects(
 
 @mcp.tool()
 def posthog_query(
-    hogql_query: str, project_id: str = "@current", name: str = ""
+    hogql_query: str, project_id: str = "@current", name: str = "", limit: int = 50
 ) -> str:
     """
     Run a read-only HogQL (PostHog's SQL dialect) query against a project's
@@ -305,18 +352,29 @@ def posthog_query(
     API key owner's most recently active project.
     name: optional descriptive label for the query (shown in PostHog's own
     query log; purely for the user's/PostHog's bookkeeping).
+    limit: caps rows returned here, independent of any LIMIT already in
+    hogql_query -- HogQL is arbitrary caller-supplied text, so unlike the
+    tools above this one has no query-side limit to lean on, and a query
+    result table can be large enough to get truncated mid-JSON by this
+    server's own tool-output size cap.
     """
     try:
         body: dict[str, Any] = {"query": {"kind": "HogQLQuery", "query": hogql_query}}
         if name:
             body["name"] = name
         result = _request(
-            "POST", f"/api/projects/{_path_segment(project_id)}/query/", json_data=body
+            "POST",
+            f"/api/projects/{_path_segment(project_id, 'project_id')}/query/",
+            json_data=body,
         )
+        max_results = _clamp_limit(limit)
+        raw_results = result.get("results") or []
+        truncated = len(raw_results) > max_results
         return _success(
             columns=result.get("columns"),
-            results=result.get("results"),
+            results=raw_results[:max_results],
             hogql=result.get("hogql"),
+            truncated=truncated,
         )
     except Exception as e:
         logger.error(f"Error running PostHog HogQL query in project {project_id}: {e}")
@@ -333,7 +391,7 @@ def posthog_list_persons(
     PostHog's own search — for aggregate or property-filtered lookups,
     prefer posthog_query against the `persons` table instead.
     offset: 0-based result offset for pagination; pass the previous call's
-    next_offset to fetch the next page (only present while truncated=True).
+    next_offset to fetch the next page (null when truncated is False).
     """
     try:
         max_results = _clamp_limit(limit)
@@ -342,7 +400,9 @@ def posthog_list_persons(
         if search:
             params["search"] = search
         result = _request(
-            "GET", f"/api/projects/{_path_segment(project_id)}/persons/", params=params
+            "GET",
+            f"/api/projects/{_path_segment(project_id, 'project_id')}/persons/",
+            params=params,
         )
         persons, truncated, next_offset = _paginated_results(
             result, max_results, page_offset
@@ -363,8 +423,8 @@ def posthog_get_person(person_id: str, project_id: str = "@current") -> str:
     try:
         result = _request(
             "GET",
-            f"/api/projects/{_path_segment(project_id)}/persons/"
-            f"{_path_segment(person_id)}/",
+            f"/api/projects/{_path_segment(project_id, 'project_id')}/persons/"
+            f"{_path_segment(person_id, 'person_id')}/",
         )
         return _success(person=result)
     except Exception as e:
@@ -383,7 +443,7 @@ def posthog_list_insights(
     id, short_id, name, and the insight type.
     search: optional substring matched against the insight's name.
     offset: 0-based result offset for pagination; pass the previous call's
-    next_offset to fetch the next page (only present while truncated=True).
+    next_offset to fetch the next page (null when truncated is False).
     """
     try:
         max_results = _clamp_limit(limit)
@@ -396,7 +456,9 @@ def posthog_list_insights(
         if search:
             params["search"] = search
         result = _request(
-            "GET", f"/api/projects/{_path_segment(project_id)}/insights/", params=params
+            "GET",
+            f"/api/projects/{_path_segment(project_id, 'project_id')}/insights/",
+            params=params,
         )
         insights, truncated, next_offset = _paginated_results(
             result, max_results, page_offset
@@ -416,8 +478,8 @@ def posthog_get_insight(insight_id: str, project_id: str = "@current") -> str:
     try:
         result = _request(
             "GET",
-            f"/api/projects/{_path_segment(project_id)}/insights/"
-            f"{_path_segment(insight_id)}/",
+            f"/api/projects/{_path_segment(project_id, 'project_id')}/insights/"
+            f"{_path_segment(insight_id, 'insight_id')}/",
         )
         return _success(insight=result)
     except Exception as e:
@@ -434,14 +496,14 @@ def posthog_list_feature_flags(
     """
     List feature flags in a project — id, key, name, and whether it's active.
     offset: 0-based result offset for pagination; pass the previous call's
-    next_offset to fetch the next page (only present while truncated=True).
+    next_offset to fetch the next page (null when truncated is False).
     """
     try:
         max_results = _clamp_limit(limit)
         page_offset = _clamp_offset(offset)
         result = _request(
             "GET",
-            f"/api/projects/{_path_segment(project_id)}/feature_flags/",
+            f"/api/projects/{_path_segment(project_id, 'project_id')}/feature_flags/",
             params={"limit": max_results, "offset": page_offset},
         )
         flags, truncated, next_offset = _paginated_results(
@@ -464,14 +526,14 @@ def posthog_list_dashboards(
     """
     List dashboards in a project — id, name, and description.
     offset: 0-based result offset for pagination; pass the previous call's
-    next_offset to fetch the next page (only present while truncated=True).
+    next_offset to fetch the next page (null when truncated is False).
     """
     try:
         max_results = _clamp_limit(limit)
         page_offset = _clamp_offset(offset)
         result = _request(
             "GET",
-            f"/api/projects/{_path_segment(project_id)}/dashboards/",
+            f"/api/projects/{_path_segment(project_id, 'project_id')}/dashboards/",
             params={"limit": max_results, "offset": page_offset},
         )
         dashboards, truncated, next_offset = _paginated_results(
@@ -494,7 +556,7 @@ def posthog_list_annotations(
     incident) in a project.
     search: optional substring matched against the annotation's content.
     offset: 0-based result offset for pagination; pass the previous call's
-    next_offset to fetch the next page (only present while truncated=True).
+    next_offset to fetch the next page (null when truncated is False).
     """
     try:
         max_results = _clamp_limit(limit)
@@ -504,7 +566,7 @@ def posthog_list_annotations(
             params["search"] = search
         result = _request(
             "GET",
-            f"/api/projects/{_path_segment(project_id)}/annotations/",
+            f"/api/projects/{_path_segment(project_id, 'project_id')}/annotations/",
             params=params,
         )
         annotations, truncated, next_offset = _paginated_results(
@@ -541,7 +603,7 @@ def posthog_create_annotation(
             body["date_marker"] = date_marker
         result = _request(
             "POST",
-            f"/api/projects/{_path_segment(project_id)}/annotations/",
+            f"/api/projects/{_path_segment(project_id, 'project_id')}/annotations/",
             json_data=body,
         )
         return _success(annotation=result)

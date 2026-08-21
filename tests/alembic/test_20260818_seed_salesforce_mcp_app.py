@@ -201,6 +201,29 @@ def test_downgrade_preserves_pre_existing_salesforce_app(tmp_path):
         assert "salesforce" in _provider_names(connection)
 
 
+def test_downgrade_preserves_app_row_admin_edited_beyond_structural_fields(tmp_path):
+    """An admin who PATCHed the seeded app row's oauth_scopes without
+    touching app_id/name/transport/provider_name must not have that edit
+    silently discarded by downgrade -- matching only those four structural
+    columns isn't enough to prove this is still "this migration's row"
+    once anything else about it has been customized."""
+    engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
+    migration = _load_migration_module()
+    with engine.begin() as connection:
+        _create_tables(connection)
+        with patch.object(migration, "op", _operations(connection)):
+            migration.upgrade()
+        connection.execute(
+            text(
+                "UPDATE public_mcp_apps SET oauth_scopes = '[\"api\"]'"
+                " WHERE app_id = 'salesforce'"
+            )
+        )
+        with patch.object(migration, "op", _operations(connection)):
+            migration.downgrade()
+        assert "salesforce" in _app_ids(connection)
+
+
 def test_downgrade_preserves_admin_created_salesforce_provider(tmp_path):
     """A pre-existing admin-created "salesforce" provider (different shape
     than the seeded row) must survive downgrade even when no salesforce apps
@@ -220,6 +243,32 @@ def test_downgrade_preserves_admin_created_salesforce_provider(tmp_path):
         )
         with patch.object(migration, "op", _operations(connection)):
             migration.upgrade()
+            migration.downgrade()
+        assert "salesforce" not in _app_ids(connection)
+        assert "salesforce" in _provider_names(connection)
+
+
+def test_downgrade_preserves_provider_row_admin_edited_beyond_structural_fields(
+    tmp_path,
+):
+    """An admin who edited the seeded provider row's default_scopes without
+    touching provider_name/name/auth_url/token_url must not have that edit
+    silently discarded by downgrade -- the app row is removed as usual (it
+    still matches the seeded shape exactly), but the provider row it
+    depends on must survive since its own shape no longer matches."""
+    engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
+    migration = _load_migration_module()
+    with engine.begin() as connection:
+        _create_tables(connection)
+        with patch.object(migration, "op", _operations(connection)):
+            migration.upgrade()
+        connection.execute(
+            text(
+                "UPDATE oauth_providers SET default_scopes = '[\"api\"]'"
+                " WHERE provider_name = 'salesforce'"
+            )
+        )
+        with patch.object(migration, "op", _operations(connection)):
             migration.downgrade()
         assert "salesforce" not in _app_ids(connection)
         assert "salesforce" in _provider_names(connection)

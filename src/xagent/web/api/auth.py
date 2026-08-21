@@ -1744,6 +1744,33 @@ def generic_oauth_callback(
                 status_code=400,
             )
 
+        salesforce_instance_url = token_data.get("instance_url")
+        if provider.lower() == "salesforce" and (
+            not isinstance(salesforce_instance_url, str) or not salesforce_instance_url
+        ):
+            # Every real Salesforce token exchange includes a non-empty
+            # string instance_url; anything else here (missing, empty, or a
+            # non-string value) means the response is unusable for this
+            # connector (launch_config.env_mapping requires it, so the
+            # server would come back unavailable/reconnect-required on the
+            # very next load) -- full host/scheme validation still only
+            # happens at use-time in salesforce.py's _instance_url(), this
+            # is just "is this even a plausible value to store" before
+            # committing it. Checked before the delete-then-recreate below,
+            # not after: that block unconditionally drops any existing
+            # UserOAuth row for this user+provider first, so letting a bad
+            # response through here would destroy a prior *working* grant
+            # while still telling the user "Connected Successfully".
+            import html
+
+            return HTMLResponse(
+                content=(
+                    "<h1>Error exchanging token</h1>"
+                    f"<p>{html.escape(provider)} did not return an instance_url.</p>"
+                ),
+                status_code=400,
+            )
+
         provider_user_id = None
         email = None
 
@@ -1788,6 +1815,21 @@ def generic_oauth_callback(
                     ),
                     status_code=400,
                 )
+        elif provider.lower() == "salesforce":
+            # Salesforce's userinfo_url is deliberately left empty (see the
+            # registry row's comment: an extra round-trip just for a label
+            # this connector doesn't otherwise need), which also means
+            # provider_user_id stays NULL here -- and UserOAuth's unique
+            # constraint is (user_id, provider, provider_user_id), which
+            # SQL treats as non-conflicting across multiple NULLs. Every
+            # other provider gets real protection from that constraint
+            # because their provider_user_id is a real value; Salesforce
+            # would get none at all, letting concurrent callbacks for the
+            # same user leave more than one row with no error. The token
+            # response's own "id" field (Salesforce's identity URL, unique
+            # per org+user) closes that gap for free -- no extra network
+            # call, unlike a real userinfo lookup.
+            provider_user_id = token_data.get("id")
         elif userinfo_url and access_token:
             info_headers = {"Authorization": f"Bearer {access_token}"}
             # Replace {{access_token}} placeholder if present

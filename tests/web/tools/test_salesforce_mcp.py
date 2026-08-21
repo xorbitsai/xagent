@@ -460,12 +460,18 @@ def test_query_caps_output_size(monkeypatch):
     )
     monkeypatch.setattr(salesforce, "get_tool_max_output_length", lambda: 2000)
 
-    result = json.loads(salesforce.salesforce_query("SELECT Id, Name FROM Account"))
+    # The raw returned string, not a reparsed-and-reserialized approximation
+    # of it (json.loads then json.dumps can differ in length from the
+    # original due to formatting/escaping) -- this is the exact string the
+    # production output filter would apply its own hard-truncation to.
+    raw = salesforce.salesforce_query("SELECT Id, Name FROM Account")
+    result = json.loads(raw)
 
+    assert len(raw) <= 2000
     assert result["status"] == "success"
     assert result["truncated"] is True
     assert len(result["records"]) < len(big_records)
-    assert len(json.dumps(result)) <= 2000 + 200
+    assert "cannot be recovered" in result["message"]
 
 
 def test_search_sends_sosl_as_query_param(monkeypatch):
@@ -496,14 +502,16 @@ def test_search_caps_output_size(monkeypatch):
     )
     monkeypatch.setattr(salesforce, "get_tool_max_output_length", lambda: 2000)
 
-    result = json.loads(
-        salesforce.salesforce_search("FIND {Acme} IN ALL FIELDS RETURNING Account(Id)")
+    raw = salesforce.salesforce_search(
+        "FIND {Acme} IN ALL FIELDS RETURNING Account(Id)"
     )
+    result = json.loads(raw)
 
+    assert len(raw) <= 2000
     assert result["status"] == "success"
     assert result["truncated"] is True
     assert len(result["results"]) < len(big_results)
-    assert len(json.dumps(result)) <= 2000 + 200
+    assert "cannot be recovered" in result["message"]
 
 
 def test_list_sobjects_returns_summaries(monkeypatch):
@@ -547,12 +555,14 @@ def test_list_sobjects_caps_output_size(monkeypatch):
     )
     monkeypatch.setattr(salesforce, "get_tool_max_output_length", lambda: 2000)
 
-    result = json.loads(salesforce.salesforce_list_sobjects())
+    raw = salesforce.salesforce_list_sobjects()
+    result = json.loads(raw)
 
+    assert len(raw) <= 2000
     assert result["status"] == "success"
     assert result["truncated"] is True
     assert len(result["sobjects"]) < len(big_sobjects)
-    assert len(json.dumps(result)) <= 2000 + 200
+    assert "cannot be recovered" in result["message"]
 
 
 def test_describe_sobject_extracts_picklist_values(monkeypatch):
@@ -616,12 +626,14 @@ def test_describe_sobject_caps_output_size(monkeypatch):
     )
     monkeypatch.setattr(salesforce, "get_tool_max_output_length", lambda: 2000)
 
-    result = json.loads(salesforce.salesforce_describe_sobject("Account"))
+    raw = salesforce.salesforce_describe_sobject("Account")
+    result = json.loads(raw)
 
+    assert len(raw) <= 2000
     assert result["status"] == "success"
     assert result["truncated"] is True
     assert len(result["fields"]) < len(big_fields)
-    assert len(json.dumps(result)) <= 2000 + 200
+    assert "cannot be recovered" in result["message"]
 
 
 def test_get_record_sends_fields_param_when_provided(monkeypatch):

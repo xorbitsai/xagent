@@ -10,7 +10,7 @@ from typing import Sequence, Union
 
 # revision identifiers, used by Alembic.
 revision: str = "c97b6332a895"
-down_revision: Union[str, None] = (
+down_revision: Union[str, Sequence[str], None] = (
     "0b38b8d46e1c",
     "20260819_merge_jira_and_linear_heads",
 )

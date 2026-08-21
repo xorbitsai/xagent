@@ -10,7 +10,7 @@ from typing import Sequence, Union
 
 # revision identifiers, used by Alembic.
 revision: str = "0b38b8d46e1c"
-down_revision: Union[str, None] = (
+down_revision: Union[str, Sequence[str], None] = (
     "20260818_seed_jira_mcp_app",
     "20260818_seed_salesforce_mcp_app",
 )

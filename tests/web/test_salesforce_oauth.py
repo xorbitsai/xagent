@@ -86,12 +86,97 @@ def _callback_request(db, user) -> SimpleNamespace:
     return SimpleNamespace(query_params={"code": "sf-code", "state": state})
 
 
+def test_callback_rejects_missing_instance_url_without_touching_prior_grant(
+    db_session, monkeypatch
+):
+    """A token response missing instance_url must be rejected before the
+    delete-then-recreate persistence step runs -- letting it through would
+    destroy any prior *working* grant for this user while still reporting
+    success, since instance_url is required for the connector to launch at
+    all (launch_config.env_mapping)."""
+    db, user = db_session
+    existing = UserOAuth(
+        user_id=user.id,
+        provider="salesforce",
+        access_token="old-working-token",
+        instance_url="https://old.my.salesforce.com",
+    )
+    db.add(existing)
+    db.commit()
+
+    mock_post = Mock(
+        return_value=MockResponse({"access_token": "sf-token", "token_type": "Bearer"})
+    )
+    monkeypatch.setattr(auth_api.requests, "post", mock_post)
+    monkeypatch.setattr(auth_api.requests, "get", Mock())
+
+    response = generic_oauth_callback(
+        "salesforce", _callback_request(db, user), db, _salesforce_provider()
+    )
+
+    assert response.status_code == 400
+    oauth_account = (
+        db.query(UserOAuth)
+        .filter(UserOAuth.user_id == user.id, UserOAuth.provider == "salesforce")
+        .one()
+    )
+    assert oauth_account.access_token == "old-working-token"
+    assert oauth_account.instance_url == "https://old.my.salesforce.com"
+
+
+def test_callback_rejects_non_string_instance_url_without_touching_prior_grant(
+    db_session, monkeypatch
+):
+    """Same guard, the malformed-rather-than-missing case: a non-string
+    instance_url (e.g. a provider bug or a proxy mangling the response)
+    must be rejected the same way, not committed as-is only to fail later
+    at salesforce.py's own type-agnostic _instance_url() use-time check."""
+    db, user = db_session
+    existing = UserOAuth(
+        user_id=user.id,
+        provider="salesforce",
+        access_token="old-working-token",
+        instance_url="https://old.my.salesforce.com",
+    )
+    db.add(existing)
+    db.commit()
+
+    mock_post = Mock(
+        return_value=MockResponse(
+            {
+                "access_token": "sf-token",
+                "token_type": "Bearer",
+                "instance_url": 12345,
+            }
+        )
+    )
+    monkeypatch.setattr(auth_api.requests, "post", mock_post)
+    monkeypatch.setattr(auth_api.requests, "get", Mock())
+
+    response = generic_oauth_callback(
+        "salesforce", _callback_request(db, user), db, _salesforce_provider()
+    )
+
+    assert response.status_code == 400
+    oauth_account = (
+        db.query(UserOAuth)
+        .filter(UserOAuth.user_id == user.id, UserOAuth.provider == "salesforce")
+        .one()
+    )
+    assert oauth_account.access_token == "old-working-token"
+    assert oauth_account.instance_url == "https://old.my.salesforce.com"
+
+
 def test_callback_persists_instance_url_and_skips_userinfo_lookup(
     db_session, monkeypatch
 ):
     """With userinfo_url left empty, the callback must skip the identity
     fetch entirely (no request attempted) while still persisting
-    instance_url -- the per-org host every subsequent API call needs."""
+    instance_url -- the per-org host every subsequent API call needs -- and
+    provider_user_id from the token response's own "id" field, so the
+    (user_id, provider, provider_user_id) unique constraint still protects
+    against concurrent duplicate grants the way it does for every other
+    provider (whose provider_user_id comes from a real userinfo lookup)."""
     db, user = db_session
     mock_post = Mock(
         return_value=MockResponse(
@@ -136,6 +221,10 @@ def test_callback_persists_instance_url_and_skips_userinfo_lookup(
     assert oauth_account.refresh_token == "sf-refresh"
     assert oauth_account.instance_url == "https://acme.my.salesforce.com"
     assert oauth_account.email is None
+    assert (
+        oauth_account.provider_user_id
+        == "https://login.salesforce.com/id/00D.../005..."
+    )
 
     server = db.query(MCPServer).filter(MCPServer.name == "Salesforce").one()
     assert server.transport == "oauth"
@@ -421,3 +510,68 @@ async def test_salesforce_refresh_updates_instance_url(db_session, monkeypatch):
         "client_id": "salesforce-client-id",
         "client_secret": "salesforce-client-secret",
     }
+
+
+@pytest.mark.asyncio
+async def test_salesforce_refresh_keeps_prior_instance_url_when_response_is_malformed(
+    db_session, monkeypatch
+):
+    """A malformed refresh-response instance_url (non-string, or an empty
+    string) must not overwrite the previously stored, working value --
+    otherwise a refresh that succeeds at the token level (new access_token)
+    silently breaks the connector by replacing a valid instance_url with
+    garbage, with no signal at refresh time that anything went wrong."""
+    db, user = db_session
+    db.add(
+        OAuthProvider(
+            provider_name="salesforce",
+            name="Salesforce",
+            client_id=encrypt_value("salesforce-client-id"),
+            client_secret=encrypt_value("salesforce-client-secret"),
+            auth_url="https://login.salesforce.com/services/oauth2/authorize",
+            token_url="https://login.salesforce.com/services/oauth2/token",
+            redirect_uri="https://app.example.com/api/auth/salesforce/callback",
+            userinfo_url="",
+            user_id_path="user_id",
+            email_path="email",
+            default_scopes=["api", "refresh_token", "openid"],
+        )
+    )
+    oauth_account = UserOAuth(
+        user_id=user.id,
+        provider="salesforce",
+        access_token="old-token",
+        refresh_token="old-refresh",
+        instance_url="https://acme.my.salesforce.com",
+        expires_at=datetime.now(timezone.utc) - timedelta(minutes=1),
+        provider_user_id="005...",
+    )
+    db.add(oauth_account)
+    db.commit()
+
+    class FakeAsyncClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return None
+
+        async def post(self, url, **kwargs):
+            return MockResponse(
+                {
+                    "access_token": "new-token",
+                    "instance_url": 12345,
+                    "token_type": "Bearer",
+                },
+                status_code=200,
+            )
+
+    monkeypatch.setattr(tool_config.httpx, "AsyncClient", FakeAsyncClient)
+
+    assert (
+        await tool_config.refresh_oauth_token_if_needed(db, oauth_account, "salesforce")
+        is True
+    )
+
+    assert oauth_account.access_token == "new-token"
+    assert oauth_account.instance_url == "https://acme.my.salesforce.com"

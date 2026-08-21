@@ -55,14 +55,47 @@ def _success_with_capped_list(
     because there's nothing left to halve away from it. ``truncated`` seeds
     from any upstream-reported truncation (e.g. Salesforce's own SOQL
     ``done`` flag) and is OR'd with whatever local capping adds.
+
+    None of the four tools calling this expose a cursor/offset the caller
+    could retry with to recover items this halving drops (unlike Salesforce
+    query's own separate, still-unimplemented nextRecordsUrl pagination,
+    tracked in #1541) -- items dropped here are gone for this call, not
+    just this page. When halving actually ran, the message says so plainly
+    instead of leaving a bare ``truncated: true`` to imply a retry would
+    help.
     """
+
+    def _build(items: list[Any], truncated: bool, with_message: bool) -> str:
+        payload = {list_field: items, "truncated": truncated, **extra}
+        if with_message:
+            payload["message"] = (
+                f"{len(items)} of the original result set is returned here; "
+                "the rest did not fit the output size limit and cannot be "
+                "recovered via this tool call."
+            )
+        return _success(**payload)
+
     max_output_length = get_tool_max_output_length()
-    response = _success(**{list_field: items, "truncated": truncated, **extra})
+    response = _build(items, truncated, with_message=False)
+    halved = False
     while len(response) > max_output_length and items:
         items = items[: len(items) // 2]
         truncated = True
-        response = _success(**{list_field: items, "truncated": truncated, **extra})
-    return response
+        halved = True
+        response = _build(items, truncated, with_message=False)
+    if not halved:
+        return response
+    # The message itself takes space, so it must be checked against the
+    # limit like everything else -- appending it unconditionally after the
+    # loop above already confirmed a fit would silently blow that fit back
+    # open for a response that halved down to a still-sizeable (not empty)
+    # list, re-creating the exact invalid-JSON risk this function exists to
+    # prevent.
+    with_message = _build(items, truncated, with_message=True)
+    while len(with_message) > max_output_length and items:
+        items = items[: len(items) // 2]
+        with_message = _build(items, truncated, with_message=True)
+    return with_message
 
 
 def _error(message: str) -> str:

@@ -136,26 +136,35 @@ def downgrade() -> None:
     existing_tables = set(inspector.get_table_names())
 
     if "public_mcp_apps" in existing_tables:
-        # Only delete the catalog entry when it still matches the static
-        # shape this migration seeded, mirroring the oauth_providers guard
-        # below -- an unconditional delete-by-app_id would remove a
+        # Only delete the catalog entry when it still matches the FULL
+        # static shape this migration seeded, mirroring the oauth_providers
+        # guard below -- an unconditional delete-by-app_id would remove a
         # pre-existing operator row that happened to already occupy app_id
         # "salesforce" before this migration ever ran (upgrade()'s own
         # `if APP_ID not in existing_app_ids` check would have skipped
         # inserting over it, so upgrade and downgrade must agree on what
-        # "this migration's row" means). name/transport/provider_name are
-        # NOT NULL-or-always-set core columns present since the table's
-        # creation and none of them are env-dependent, so they can be
-        # matched unconditionally. Any user OAuth connections created
-        # against this app are not owned by this migration either way and
-        # are cleaned up through the normal disconnect path.
+        # "this migration's row" means). Matching only a handful of
+        # structural columns (name/transport/provider_name) isn't enough:
+        # an admin who PATCHed the seeded row's oauth_scopes/description/
+        # launch_config/visibility without touching those few fields would
+        # still match and get silently deleted. None of this row's columns
+        # are env-dependent, so every one of them can be matched.
         seeded_app = _salesforce_app_row()
         bind.execute(
             sa.delete(PUBLIC_MCP_APPS_TABLE)
             .where(PUBLIC_MCP_APPS_TABLE.c.app_id == APP_ID)
             .where(PUBLIC_MCP_APPS_TABLE.c.name == seeded_app["name"])
+            .where(PUBLIC_MCP_APPS_TABLE.c.description == seeded_app["description"])
+            .where(PUBLIC_MCP_APPS_TABLE.c.icon == seeded_app["icon"])
             .where(PUBLIC_MCP_APPS_TABLE.c.transport == seeded_app["transport"])
             .where(PUBLIC_MCP_APPS_TABLE.c.provider_name == seeded_app["provider_name"])
+            .where(PUBLIC_MCP_APPS_TABLE.c.category == seeded_app["category"])
+            .where(PUBLIC_MCP_APPS_TABLE.c.oauth_scopes == seeded_app["oauth_scopes"])
+            .where(
+                PUBLIC_MCP_APPS_TABLE.c.is_visible_in_connector
+                == seeded_app["is_visible_in_connector"]
+            )
+            .where(PUBLIC_MCP_APPS_TABLE.c.launch_config == seeded_app["launch_config"])
         )
 
     if "oauth_providers" not in existing_tables:
@@ -170,12 +179,15 @@ def downgrade() -> None:
         if remaining_salesforce_apps:
             return
 
-    # Only delete the provider row when it still matches the static shape this
-    # migration seeded, so an admin-created "salesforce" provider (via
-    # POST /admin/mcp/providers) is preserved. client_id/client_secret are
-    # env-dependent and intentionally not part of the guard. name/auth_url/
-    # token_url are NOT NULL core columns present since the table's creation,
-    # so they can be matched unconditionally.
+    # Only delete the provider row when it still matches the FULL static
+    # shape this migration seeded, so an admin-created or admin-edited
+    # "salesforce" provider (via POST/PUT /admin/mcp/providers) is
+    # preserved. client_id/client_secret/redirect_uri are env-dependent and
+    # intentionally excluded from the guard; every other column is static
+    # and matched, not just the structural few (name/auth_url/token_url) --
+    # an admin who edited userinfo_url/user_id_path/email_path/
+    # default_scopes without touching those few fields would otherwise
+    # still match and get silently deleted.
     seeded_provider = _salesforce_provider_row()
     bind.execute(
         sa.delete(FULL_OAUTH_PROVIDERS_TABLE)
@@ -183,4 +195,15 @@ def downgrade() -> None:
         .where(FULL_OAUTH_PROVIDERS_TABLE.c.name == seeded_provider["name"])
         .where(FULL_OAUTH_PROVIDERS_TABLE.c.auth_url == seeded_provider["auth_url"])
         .where(FULL_OAUTH_PROVIDERS_TABLE.c.token_url == seeded_provider["token_url"])
+        .where(
+            FULL_OAUTH_PROVIDERS_TABLE.c.userinfo_url == seeded_provider["userinfo_url"]
+        )
+        .where(
+            FULL_OAUTH_PROVIDERS_TABLE.c.user_id_path == seeded_provider["user_id_path"]
+        )
+        .where(FULL_OAUTH_PROVIDERS_TABLE.c.email_path == seeded_provider["email_path"])
+        .where(
+            FULL_OAUTH_PROVIDERS_TABLE.c.default_scopes
+            == seeded_provider["default_scopes"]
+        )
     )

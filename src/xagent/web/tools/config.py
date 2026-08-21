@@ -711,7 +711,25 @@ async def refresh_oauth_token_if_needed(
                     # Salesforce can return a different instance_url on
                     # refresh (e.g. after an org migration), so this is
                     # re-persisted here too, not just at initial connect.
-                    oauth_account.instance_url = data["instance_url"]
+                    # Type/non-empty checked (not full host/scheme
+                    # validation -- that stays salesforce.py's own
+                    # use-time job) before overwriting: this row's
+                    # existing instance_url is a previously-valid value,
+                    # and a malformed refresh response replacing it would
+                    # break the connector on its next use with no signal
+                    # at refresh time that anything went wrong.
+                    refreshed_instance_url = data["instance_url"]
+                    if (
+                        isinstance(refreshed_instance_url, str)
+                        and refreshed_instance_url
+                    ):
+                        oauth_account.instance_url = refreshed_instance_url
+                    else:
+                        logger.warning(
+                            f"Refresh response for {provider_name} (user "
+                            f"{oauth_account.user_id}) had a malformed "
+                            "instance_url; keeping the previously stored value"
+                        )
                 if "expires_in" in data:
                     oauth_account.expires_at = datetime.now(timezone.utc) + timedelta(
                         seconds=data["expires_in"]

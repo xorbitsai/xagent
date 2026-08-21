@@ -27,6 +27,7 @@ from xagent.web.models.trigger import (
 )
 from xagent.web.models.user import User
 from xagent.web.models.user_oauth import UserOAuth
+from xagent.web.services import ops_signals
 from xagent.web.services.gmail_provisioning import (
     GMAIL_WATCH_DISABLED_ERROR,
     gmail_topic_path,
@@ -1406,6 +1407,8 @@ def test_best_effort_provisioning_targets_only_referenced_mailboxes(
 def test_collect_gmail_pubsub_events_warns_for_nonordinary_watch_account(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
+    signal_name = "gmail_oauth_ownership_mismatch"
+    ops_signals.clear_degradation(signal_name)
     db = _direct_db_session()
     try:
         user = _create_user(db, "gmail-owner-mismatch")
@@ -1439,7 +1442,9 @@ def test_collect_gmail_pubsub_events_warns_for_nonordinary_watch_account(
         assert "Skipping Gmail callback" in caplog.text
         assert str(state.id) in caplog.text
         assert str(oauth.id) in caplog.text
+        assert signal_name in ops_signals.active_degradations()
     finally:
+        ops_signals.clear_degradation(signal_name)
         db.close()
 
 

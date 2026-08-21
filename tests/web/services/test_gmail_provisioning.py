@@ -29,7 +29,7 @@ from xagent.web.models.trigger import (
 )
 from xagent.web.models.user import User
 from xagent.web.models.user_oauth import UserOAuth
-from xagent.web.services import gmail_provisioning
+from xagent.web.services import gmail_provisioning, ops_signals
 from xagent.web.services.gmail_provisioning import (
     GMAIL_PUSH_PUBLISHER,
     GMAIL_WATCH_DISABLED_ERROR,
@@ -561,8 +561,18 @@ def test_sweep_retries_stale_failed_referenced_mailbox(db_session: Session) -> N
     assert refreshed.last_error is None
 
 
+@pytest.fixture
+def gmail_ownership_mismatch_signal() -> str:
+    name = "gmail_oauth_ownership_mismatch"
+    ops_signals.clear_degradation(name)
+    yield name
+    ops_signals.clear_degradation(name)
+
+
 def test_sweep_warns_when_watch_account_is_not_ordinary(
-    db_session: Session, caplog: pytest.LogCaptureFixture
+    db_session: Session,
+    caplog: pytest.LogCaptureFixture,
+    gmail_ownership_mismatch_signal: str,
 ) -> None:
     user = _create_user(db_session)
     agent = _create_agent(db_session, user)
@@ -588,6 +598,7 @@ def test_sweep_warns_when_watch_account_is_not_ordinary(
     assert "Skipping Gmail provisioning sweep" in caplog.text
     assert str(state.id) in caplog.text
     assert str(account.id) in caplog.text
+    assert gmail_ownership_mismatch_signal in ops_signals.active_degradations()
 
 
 def test_sweep_matches_duplicate_mailboxes_by_oauth_account_id(
@@ -1358,7 +1369,9 @@ def test_unbind_releases_old_mailbox_while_flag_is_off(
 
 
 def test_release_warns_when_watch_account_is_not_ordinary(
-    db_session: Session, caplog: pytest.LogCaptureFixture
+    db_session: Session,
+    caplog: pytest.LogCaptureFixture,
+    gmail_ownership_mismatch_signal: str,
 ) -> None:
     user = _create_user(db_session)
     account = _create_oauth(db_session, user)
@@ -1381,6 +1394,7 @@ def test_release_warns_when_watch_account_is_not_ordinary(
     assert "Cannot stop Gmail watch" in caplog.text
     assert str(state.id) in caplog.text
     assert str(account.id) in caplog.text
+    assert gmail_ownership_mismatch_signal in ops_signals.active_degradations()
 
 
 def test_provision_gmail_trigger_disabled_reports_failed_without_registering(

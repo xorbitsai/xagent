@@ -45,6 +45,10 @@ from ..models.trigger import (
     TriggerType,
 )
 from ..models.user_oauth import UserOAuth
+from .ops_signals import (
+    GMAIL_OAUTH_OWNERSHIP_MISMATCH,
+    register_degradation,
+)
 from .time_utils import coerce_utc as _coerce_utc
 from .user_oauth import (
     get_scoped_user_oauth_account,
@@ -1315,6 +1319,11 @@ def release_gmail_mailbox_if_unused(
             oauth_account_id,
             state.user_id,
         )
+        register_degradation(
+            GMAIL_OAUTH_OWNERSHIP_MISMATCH,
+            f"Gmail watch state {state.id} cannot resolve ordinary OAuth "
+            f"account {oauth_account_id} for user {state.user_id}",
+        )
 
     project_id = get_gmail_pubsub_project_id()
     if project_id:
@@ -1403,6 +1412,11 @@ def sweep_gmail_provisioning(
                 state.id,
                 state.oauth_account_id,
                 state.user_id,
+            )
+            register_degradation(
+                GMAIL_OAUTH_OWNERSHIP_MISMATCH,
+                f"Gmail watch state {state.id} cannot resolve ordinary OAuth "
+                f"account {state.oauth_account_id} for user {state.user_id}",
             )
             continue
         ensure_gmail_mailbox_provisioned(

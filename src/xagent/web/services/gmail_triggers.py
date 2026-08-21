@@ -26,6 +26,10 @@ from ..models.gmail_watch import GmailWatchState
 from ..models.oauth_provider import OAuthProvider
 from ..models.trigger import AgentTrigger, TriggerProvisioningStatus, TriggerType
 from ..models.user_oauth import UserOAuth
+from .ops_signals import (
+    GMAIL_OAUTH_OWNERSHIP_MISMATCH,
+    register_degradation,
+)
 from .time_utils import coerce_utc as _coerce_utc
 from .user_oauth import get_scoped_user_oauth_account, user_oauth_owner_clause
 
@@ -559,6 +563,11 @@ async def collect_gmail_pubsub_events(
             state.id,
             state.oauth_account_id,
             state.user_id,
+        )
+        register_degradation(
+            GMAIL_OAUTH_OWNERSHIP_MISMATCH,
+            f"Gmail watch state {state.id} cannot resolve ordinary OAuth "
+            f"account {state.oauth_account_id} for user {state.user_id}",
         )
         return GmailPubsubEventCollection(events=[], skipped=1)
 

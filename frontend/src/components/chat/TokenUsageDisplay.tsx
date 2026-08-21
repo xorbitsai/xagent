@@ -19,6 +19,7 @@ interface TokenUsage {
   llm_calls: number;
   cached_input_tokens: number;
   model_usage: ModelTokenUsage[];
+  media_usage: MediaUsage[];
 }
 
 interface ModelTokenUsage {
@@ -29,10 +30,58 @@ interface ModelTokenUsage {
   cached_input_tokens?: number;
 }
 
+interface MediaUsage {
+  model_id: string;
+  model_name: string;
+  unit: string;
+  call_type: string;
+  resolution?: string;
+  quantity: number;
+  calls: number;
+  provider_tokens?: number;
+  tokens_estimated?: boolean;
+}
+
+/**
+ * Coerce one raw media row into a fully-typed MediaUsage, or drop it.
+ *
+ * `token_usage_details` is free-form legacy JSON, so a row can be null, a
+ * non-object, or carry a numeric field as a string. Both matter here: reducing
+ * over a null row throws on property access, and a string `quantity` like "4"
+ * passes a `> 0` check while failing `Number.isFinite` in the formatter, so it
+ * silently renders "0 sec" instead of the real value. Normalising once at the
+ * fetch boundary keeps every consumer below dealing in real numbers.
+ */
+function normalizeMediaUsage(raw: unknown): MediaUsage | null {
+  // Arrays are typeof 'object' too, and would otherwise normalise into a bogus
+  // all-zero row rather than being dropped.
+  if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) return null;
+  const row = raw as Record<string, unknown>;
+
+  const num = (value: unknown): number => {
+    const parsed = typeof value === 'string' ? Number(value) : value;
+    return typeof parsed === 'number' && Number.isFinite(parsed) ? Math.max(0, parsed) : 0;
+  };
+  const str = (value: unknown): string => (typeof value === 'string' ? value : '');
+
+  return {
+    model_id: str(row.model_id),
+    model_name: str(row.model_name),
+    unit: str(row.unit),
+    call_type: str(row.call_type),
+    resolution: str(row.resolution),
+    quantity: num(row.quantity),
+    calls: num(row.calls),
+    provider_tokens: num(row.provider_tokens),
+    tokens_estimated: row.tokens_estimated === true,
+  };
+}
+
 // Build formatters lazily per locale so this file stays valid regardless of the
 // locale set (the SaaS overlay adds more locales than the standalone build).
 const compactTokenFormatters = new Map<Locale, Intl.NumberFormat>();
 const exactTokenFormatters = new Map<Locale, Intl.NumberFormat>();
+const mediaQuantityFormatters = new Map<Locale, Intl.NumberFormat>();
 
 function getFormatter(
   cache: Map<Locale, Intl.NumberFormat>,
@@ -65,9 +114,30 @@ export function formatExactTokenCount(value: number, locale: Locale = 'en'): str
   return getFormatter(exactTokenFormatters, locale).format(normalizeTokenCount(value));
 }
 
+function formatMediaQuantity(value: number, locale: Locale = 'en'): string {
+  const safe = Number.isFinite(value) ? Math.max(0, value) : 0;
+  // Media quantities can be fractional (e.g. audio seconds); keep up to one
+  // decimal but drop trailing ".0" for whole counts like image counts.
+  //
+  // A positive quantity below the rounding threshold must not render as "0":
+  // the caller already decided this row is measured (quantity > 0), so a bare
+  // "0" contradicts that and reads as "this cost nothing". Show "<0.1" instead
+  // — the exact value is not meaningful at that scale, but "some, but less
+  // than a tenth" is. Exact zero never reaches here; it takes the unmeasured
+  // branch at the call site.
+  if (safe > 0 && safe < 0.05) {
+    return `<${getFormatter(mediaQuantityFormatters, locale, {
+      maximumFractionDigits: 1,
+    }).format(0.1)}`;
+  }
+  return getFormatter(mediaQuantityFormatters, locale, {
+    maximumFractionDigits: 1,
+  }).format(safe);
+}
+
 export function TokenUsageDisplay({ taskId, isRunning, className }: TokenUsageDisplayProps) {
   const [usage, setUsage] = useState<TokenUsage | null>(null);
-  const { locale, t } = useI18n();
+  const { locale, t, tDynamic } = useI18n();
 
   useEffect(() => {
     if (!taskId) return;
@@ -87,6 +157,14 @@ export function TokenUsageDisplay({ taskId, isRunning, className }: TokenUsageDi
             llm_calls: data.llm_calls || 0,
             cached_input_tokens: data.cached_input_tokens || 0,
             model_usage: Array.isArray(data.model_usage) ? data.model_usage : [],
+            // `data` is `any` from response.json(), so annotate explicitly:
+            // without it the filter callback's parameter is implicitly `any`
+            // and the build fails under noImplicitAny.
+            media_usage: ((Array.isArray(data.media_usage)
+              ? data.media_usage
+              : []) as unknown[])
+              .map(normalizeMediaUsage)
+              .filter((row: MediaUsage | null): row is MediaUsage => row !== null),
           });
         }
       } catch (error) {
@@ -127,6 +205,33 @@ export function TokenUsageDisplay({ taskId, isRunning, className }: TokenUsageDi
             : 'chatPage.tokenUsage.models',
           { count: attributedModelCount },
         );
+
+  // Rows are normalised at the fetch boundary, so calls is always a finite
+  // non-negative number here.
+  const totalMediaCalls = usage.media_usage.reduce((sum, media) => sum + media.calls, 0);
+  const mediaUsageLabel = t(
+    totalMediaCalls === 1
+      ? 'chatPage.tokenUsage.mediaCall'
+      : 'chatPage.tokenUsage.mediaCalls',
+    { count: totalMediaCalls },
+  );
+  const formatMediaType = (callType: string) =>
+    callType
+      ? tDynamic(
+          `chatPage.tokenUsage.mediaType.${callType}`,
+          callType,
+        )
+      : '-';
+  // Plural form is chosen by the raw quantity, not the formatted string: a
+  // sub-threshold value renders as "<0.1" yet is grammatically plural, and
+  // locales without plural distinction just carry the same text in both keys.
+  const formatMediaUnit = (unit: string, quantity: number) =>
+    unit
+      ? tDynamic(
+          `chatPage.tokenUsage.unit.${unit}.${quantity === 1 ? 'one' : 'other'}`,
+          unit,
+        )
+      : '';
 
   return (
     <div className={`inline-flex flex-wrap items-center gap-x-3 gap-y-1 rounded-xl border bg-card/80 px-3 py-2 text-xs sm:text-sm ${className || ""}`}>
@@ -226,6 +331,93 @@ export function TokenUsageDisplay({ taskId, isRunning, className }: TokenUsageDi
                   </span>
                   <span className="text-right tabular-nums" title={formatExactTokenCount(model.output_tokens, locale)}>
                     {formatTokenCount(model.output_tokens, locale)}
+                  </span>
+                </React.Fragment>
+              ))}
+            </div>
+          </PopoverContent>
+        </Popover>
+      )}
+      {usage.media_usage.length > 0 && (
+        <Popover>
+          <PopoverTrigger asChild>
+            <button
+              type="button"
+              className="flex items-center gap-1 whitespace-nowrap rounded-md px-1.5 py-0.5 text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
+            >
+              <span>{mediaUsageLabel}</span>
+              <ChevronDown className="h-3.5 w-3.5" />
+            </button>
+          </PopoverTrigger>
+          <PopoverContent
+            align="end"
+            className="w-[32rem] max-w-[calc(100vw-2rem)] p-0"
+          >
+            <div className="border-b px-3 py-2.5 text-sm font-medium">
+              {t('chatPage.tokenUsage.mediaByModel')}
+            </div>
+            <div className="grid grid-cols-[minmax(0,1fr)_7rem_6rem] gap-x-4 gap-y-2 p-3 text-xs">
+              <span className="text-muted-foreground">{t('chatPage.tokenUsage.model')}</span>
+              <span className="text-muted-foreground">{t('chatPage.tokenUsage.callType')}</span>
+              <span className="text-right text-muted-foreground">
+                {t('chatPage.tokenUsage.quantity')}
+              </span>
+              {usage.media_usage.map((media) => (
+                <React.Fragment
+                  key={JSON.stringify([
+                    media.model_id,
+                    media.model_name,
+                    media.unit,
+                    media.call_type,
+                    media.resolution ?? "",
+                  ])}
+                >
+                  <span className="min-w-0" title={media.model_name || media.model_id}>
+                    <span className="block truncate font-medium">
+                      {media.model_name || media.model_id || t('chatPage.tokenUsage.unknownModel')}
+                    </span>
+                    {/* Same secondary-identity rule as the LLM rows above: the
+                        backend groups media by `model_id or model_name`, so two
+                        distinct configured IDs sharing one provider-facing name
+                        are separate billable rows. Without the id they render
+                        identically and look like a duplicate. */}
+                    {media.model_id && media.model_name && media.model_id !== media.model_name && (
+                      <span className="block truncate text-[10px] text-muted-foreground">
+                        {media.model_id}
+                      </span>
+                    )}
+                    {media.resolution && (
+                      <span className="block truncate text-[10px] text-muted-foreground">
+                        {media.resolution}
+                      </span>
+                    )}
+                  </span>
+                  <span className="min-w-0 truncate" title={formatMediaType(media.call_type)}>
+                    {formatMediaType(media.call_type)}
+                  </span>
+                  <span className="text-right tabular-nums">
+                    {/* quantity 0 means the call happened but the provider
+                        reported no measurable size (e.g. an async video with
+                        no duration yet) — say so rather than showing "0 sec",
+                        which reads as "this cost nothing". */}
+                    {media.quantity > 0
+                      ? /* Joined via filter so an unrecognised (or empty) unit
+                           renders as "4" rather than "4 " with a trailing space. */
+                        [
+                          formatMediaQuantity(media.quantity, locale),
+                          formatMediaUnit(media.unit, media.quantity),
+                        ]
+                          .filter(Boolean)
+                          .join(' ')
+                      : t('chatPage.tokenUsage.unmeasured')}
+                    {media.provider_tokens ? (
+                      <span className="block text-[10px] text-muted-foreground">
+                        {formatTokenCount(media.provider_tokens, locale)}
+                        {media.tokens_estimated ? '~' : ''}
+                        {' '}
+                        {t('chatPage.tokenUsage.tokensShort')}
+                      </span>
+                    ) : null}
                   </span>
                 </React.Fragment>
               ))}

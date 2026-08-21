@@ -34,7 +34,10 @@ from ...core.model.chat.basic.base import BaseLLM
 from ...core.model.chat.basic.deepseek import DeepSeekLLM
 from ...core.model.chat.basic.openai import OpenAILLM
 from ...core.model.chat.basic.zhipu import ZhipuLLM
-from ...core.model.chat.token_context import aggregate_token_usage_by_model
+from ...core.model.chat.token_context import (
+    aggregate_media_usage_by_model,
+    aggregate_token_usage_by_model,
+)
 from ...core.model.providers import is_placeholder_api_key
 from ...core.task_runtime import (
     EMPTY_TASK_RUNTIME_CONTRIBUTION,
@@ -4559,6 +4562,7 @@ async def get_task(
             agent_logo_url = task.agent.logo_url if task.agent else None
 
             model_usage = aggregate_token_usage_by_model(task.token_usage_details)
+            media_usage = aggregate_media_usage_by_model(task.token_usage_details)
             response = {
                 "task_id": task.id,
                 "title": task.title,
@@ -4589,6 +4593,12 @@ async def get_task(
                     entry["cache_write_input_tokens"] for entry in model_usage
                 ),
                 "model_usage": model_usage,
+                # No media_calls companion: the client derives its own count
+                # from these rows, and a second server-side reduction would be
+                # a duplicate that can drift. Deliberately no cross-unit
+                # quantity total either — summing images + seconds + characters
+                # produces a number with no meaning.
+                "media_usage": media_usage,
                 "agent_id": task.agent_id,
                 "agent_name": agent_name,
                 "agent_logo_url": agent_logo_url,

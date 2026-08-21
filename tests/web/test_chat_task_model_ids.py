@@ -638,6 +638,170 @@ def test_get_task_returns_token_usage_grouped_by_actual_model(test_db, user1_hea
     assert payload["cache_write_input_tokens"] == 15
 
 
+def test_get_task_returns_media_usage_grouped_by_model_and_unit(test_db, user1_headers):
+    """Pin ``media_usage`` at the real route, not just at the aggregator.
+
+    The aggregator has its own unit tests and the frontend tests mock this
+    response, so both sides can stay green while the handler omits, renames or
+    fails to serialise the field. This asserts the exact payload the client
+    actually receives.
+    """
+    from xagent.web.models.task import Task
+
+    create_resp = client.post(
+        "/api/chat/task/create",
+        json={"title": "media-usage-test", "description": "desc"},
+        headers=user1_headers,
+    )
+    assert create_resp.status_code == 200
+    task_id = create_resp.json()["task_id"]
+
+    db = next(get_db())
+    try:
+        task = db.query(Task).filter(Task.id == task_id).one()
+        task.token_usage_details = [
+            # Two calls on the same (model, unit, call_type, resolution) key
+            # must collapse into one row with summed quantity and calls.
+            {
+                "type": "media",
+                "model": "stable-diffusion-xl",
+                "model_id": "sd",
+                "unit": "images",
+                "call_type": "generate_image",
+                "resolution": "1K",
+                "quantity": 2,
+                "provider_tokens": 30,
+            },
+            {
+                "type": "media",
+                "model": "stable-diffusion-xl",
+                "model_id": "sd",
+                "unit": "images",
+                "call_type": "generate_image",
+                "resolution": "1K",
+                "quantity": 1,
+                "provider_tokens": 12,
+                "tokens_estimated": True,
+            },
+            # Zero quantity is meaningful and must survive: the call happened,
+            # its size is not known yet.
+            {
+                "type": "media",
+                "model": "veo-3",
+                "model_id": "veo",
+                "unit": "seconds",
+                "call_type": "video",
+                "quantity": 0,
+            },
+            # An LLM entry must not leak into media_usage.
+            {
+                "type": "input",
+                "tokens": 100,
+                "model": "gpt-4.1",
+                "model_id": "main",
+            },
+        ]
+        db.commit()
+    finally:
+        db.close()
+
+    response = client.get(f"/api/chat/task/{task_id}", headers=user1_headers)
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["media_usage"] == [
+        {
+            "model_id": "sd",
+            "model_name": "stable-diffusion-xl",
+            "unit": "images",
+            "call_type": "generate_image",
+            "resolution": "1K",
+            "quantity": 3.0,
+            "calls": 2,
+            "provider_tokens": 42,
+            # True because one of the two merged entries was estimated: a mixed
+            # group must never be priced as if it were fully measured.
+            "tokens_estimated": True,
+        },
+        {
+            "model_id": "veo",
+            "model_name": "veo-3",
+            "unit": "seconds",
+            "call_type": "video",
+            "resolution": "",
+            "quantity": 0.0,
+            "calls": 1,
+            "provider_tokens": 0,
+            "tokens_estimated": False,
+        },
+    ]
+    # The LLM entry stayed on its own side of the split.
+    assert [row["model_id"] for row in payload["model_usage"]] == ["main"]
+
+
+def test_web_task_detail_cache_serves_media_usage_on_cache_hit(test_db, user1_headers):
+    """A cache hit must carry ``media_usage``, not drop it on the second read.
+
+    The detail response is cached wholesale, so a field added to the miss path
+    only is invisible on every subsequent poll -- which is the path the usage
+    popover actually hits while a task runs.
+    """
+    from xagent.web.models.task import Task
+    from xagent.web.services.hot_path_cache import (
+        InMemoryTTLCache,
+        set_cache_backend_for_testing,
+    )
+
+    set_cache_backend_for_testing(InMemoryTTLCache())
+    try:
+        create_resp = client.post(
+            "/api/chat/task/create",
+            json={"title": "media-cache-test", "description": "desc"},
+            headers=user1_headers,
+        )
+        assert create_resp.status_code == 200
+        task_id = create_resp.json()["task_id"]
+
+        db = next(get_db())
+        try:
+            task = db.query(Task).filter(Task.id == task_id).one()
+            task.token_usage_details = [
+                {
+                    "type": "media",
+                    "model": "elevenlabs-tts",
+                    "model_id": "tts-1",
+                    "unit": "characters",
+                    "call_type": "tts",
+                    "quantity": 480,
+                }
+            ]
+            db.commit()
+        finally:
+            db.close()
+
+        first = client.get(f"/api/chat/task/{task_id}", headers=user1_headers)
+        assert first.status_code == 200
+        expected = [
+            {
+                "model_id": "tts-1",
+                "model_name": "elevenlabs-tts",
+                "unit": "characters",
+                "call_type": "tts",
+                "resolution": "",
+                "quantity": 480.0,
+                "calls": 1,
+                "provider_tokens": 0,
+                "tokens_estimated": False,
+            }
+        ]
+        assert first.json()["media_usage"] == expected
+
+        cached = client.get(f"/api/chat/task/{task_id}", headers=user1_headers)
+        assert cached.status_code == 200
+        assert cached.json()["media_usage"] == expected
+    finally:
+        set_cache_backend_for_testing(None)
+
+
 def test_get_task_llm_ids_preserves_stored_id_when_model_missing(test_db):
     ensure_system_initialized()
     from xagent.web.models.task import Task, TaskStatus

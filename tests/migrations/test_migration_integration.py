@@ -304,6 +304,7 @@ class TestMigrations:
         actor_index = "uq_user_oauth_actor_account"
         old_constraint = "uq_user_provider_account"
 
+        postgresql_tester.create_metadata_owned_users_table()
         command.upgrade(postgresql_tester.alembic_cfg, down_revision)
         with postgresql_tester.engine.begin() as conn:
             conn.execute(text(f"CREATE INDEX {actor_index} ON user_oauth (user_id)"))

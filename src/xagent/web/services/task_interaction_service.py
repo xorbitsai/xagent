@@ -106,7 +106,11 @@ from ..models.task_interaction import (
     TaskInteractionRequest,
 )
 from .chat_history_service import get_latest_waiting_question
-from .interaction_rollout import COUNTER_LIFECYCLE_RESPONSE_CONFLICT, increment_counter
+from .interaction_rollout import (
+    COUNTER_COMPAT_READ_FALLBACK,
+    COUNTER_LIFECYCLE_RESPONSE_CONFLICT,
+    increment_counter,
+)
 from .ops_signals import (
     CHECKPOINT_LOAD_UNAVAILABLE,
     CHECKPOINT_PK_ANCHOR_DANGLING,
@@ -1155,9 +1159,10 @@ def _resolve_read_direction_anchor(
     """Resolve an active interaction row's resume anchor for the read
     direction: does ``row.resume_trace_event_id`` still point at a
     structurally valid checkpoint row -- the right task, event type,
-    checkpoint type, run partition, and (when present) execution identity?
-    Returns ``None`` on success, or an ``_AnchorUnresolved`` naming which of
-    the two outcomes applies otherwise.
+    checkpoint type, run partition, (when present) execution identity, and
+    the event id the anchor itself names? Returns ``None`` on success, or
+    an ``_AnchorUnresolved`` naming which of the two outcomes applies
+    otherwise.
 
     This validates the row's *identity*, not its *payload*: unlike
     ``trace_handlers``, which also calls ``decode_trace_event_data`` and
@@ -1185,6 +1190,15 @@ def _resolve_read_direction_anchor(
       predicate the two resolvers could both import is a real
       simplification, left as a follow-up, not done here -- see the
       module docstring's delivered-here accounting.)
+    - One condition in that judgment is this resolver's alone and is not
+      expected to appear in trace_handlers': ``trace_row.event_id`` must
+      equal ``row.resume_event_id``. It is the identity the write-direction
+      resolver stored on the interaction row for exactly this comparison,
+      and it is checkable only from here -- trace_handlers reaches a
+      checkpoint by primary key with no interaction row in hand, so it has
+      no second identity to compare against. The "must agree with
+      trace_handlers' own" rule above does not reach it, and matching the
+      two sides is not a reason to remove it.
     - ``CHECKPOINT_LOAD_UNAVAILABLE`` is registered exactly the way
       trace_handlers registers it: a read failure is a read failure on
       either side.
@@ -1316,6 +1330,7 @@ def _resolve_read_direction_anchor(
     execution_matches = (
         not row_execution_id or row_execution_id == row.resume_execution_id
     )
+    event_id_matches = trace_row.event_id == row.resume_event_id
     if (
         trace_row.task_id != row.task_id
         or trace_row.event_type != str(CHECKPOINT_EVENT_TYPE)
@@ -1323,6 +1338,7 @@ def _resolve_read_direction_anchor(
         or row_data.get("checkpoint_type") not in READABLE_CHECKPOINT_TYPES
         or not partition_matches
         or not execution_matches
+        or not event_id_matches
     ):
         register_degradation(
             CHECKPOINT_PK_ANCHOR_DANGLING,
@@ -1352,8 +1368,12 @@ class CompatibilityQuestionView:
     reason: str | None = None
 
 
-def _legacy_view(db: "Session", task_id: int) -> CompatibilityQuestionView:
-    question, interactions = get_latest_waiting_question(db, task_id)
+def _legacy_view(
+    db: "Session", task_id: int, *, allow_superseded: bool = False
+) -> CompatibilityQuestionView:
+    question, interactions = get_latest_waiting_question(
+        db, task_id, allow_superseded=allow_superseded
+    )
     return CompatibilityQuestionView(
         tier="legacy", question=question, interactions=interactions
     )
@@ -1377,7 +1397,7 @@ def _validation_error_summary(exc: _PydanticValidationError) -> list[str]:
 
 
 def materialize_compatibility_view(
-    db: "Session", task_id: int
+    db: "Session", task_id: int, *, allow_superseded: bool = False
 ) -> CompatibilityQuestionView:
     """The single rich implementation of "what is this waiting task's
     question", three-tiered:
@@ -1385,7 +1405,9 @@ def materialize_compatibility_view(
     T1 (tier ``"legacy"``) -- the ``task_interaction_requests`` table does
     not exist yet, or there is no active native row for this task: falls
     back, internally, to ``get_latest_waiting_question`` and returns
-    exactly what that function would have, unconditionally. This tier's
+    exactly what that function hands back, with no filtering of its own
+    and no reason code (the caller's ``allow_superseded`` is passed
+    through to it -- see below). This tier's
     table-existence gate is not defensive decoration for a table that
     might never exist -- ``interaction_rollout.py``'s own ``/ready`` gate
     treats "the service deploys before its own migration has run" as a
@@ -1437,14 +1459,84 @@ def materialize_compatibility_view(
     first, inside a worker-owned short session, before calling this view.
     #1079's own endpoint (not written here) is meant to consume this rich
     result directly, keeping ``reason`` for its own outcome classification.
+
+    ``allow_superseded`` is passed straight to
+    ``get_latest_waiting_question`` on both T1 branches and nowhere else.
+    It lets the transcript reader reach a question row a structured
+    publication has already relabelled. Both T1 branches mean "no active
+    native row", which is not on its own enough to make that honest: the
+    window where ``respond()`` has retired the row to ``answered`` while
+    the task stays ``WAITING_FOR_USER`` until its staged resume command is
+    consumed means it too, and a read landing there would re-offer the
+    relabelled row for a question already answered. That window is
+    unreachable here -- ``respond()`` is its only writer and has no
+    production caller, kept true by its own zero-caller gate -- and what
+    the read surface owes it belongs to the change that publishes an
+    interaction atomically with the task's status transition. The three T3
+    branches never call ``_legacy_view`` at all, so the parameter has no
+    place to appear in them -- not an omission.
+
+    Deciding "no active row" and reading the transcript are two separate
+    statements, and on PostgreSQL's default READ COMMITTED each statement
+    takes a fresh snapshot, so another session can commit an active row
+    between them. The no-active-row branch therefore looks once more, after
+    the transcript read and before returning, and answers from the row if
+    one has appeared. **This narrows the window, it does not close it**:
+    another session can still commit an active row between that recheck and
+    this function's return, and the caller gets the legacy tier anyway. The
+    consequence of landing in that remaining window is bounded and worth
+    naming: the user answers through the legacy channel, the native row
+    retires as ``answered_via_legacy_resume``, and the answer is neither
+    lost nor the task left stuck -- what that one turn does not get is a
+    structured record of the answer. The table-absent branch does not
+    recheck: with no table there is nothing an active row could have been
+    written into.
+
+    The recheck's inverse is not narrowed by any of this and does not need
+    to be: a row it finds can retire between the find and whatever the
+    caller does next. Nothing is corrupted when that happens, because the
+    answer path never trusts this read -- ``respond()`` re-selects the row
+    inside ``_answer_fence_stmt``'s compare-and-swap and classifies the
+    zero rowcount, rather than writing into a slot that has since moved on.
+
+    ``compat.read_fallback`` counts one per legacy tier returned from here,
+    and only from here. It is a raw count and not a rate: nothing in this
+    registry records how often this function ran or how often it answered
+    from a native row, so there is no denominator to read it against, and
+    a reader who wants one has to bring their own request-volume figure.
+    Two different states increment it and they are worth keeping apart --
+    the table-absent branch counts a deployment whose interaction-table
+    migration has not landed yet, and the no-active-row branch counts a
+    read that genuinely had to fall back to the transcript. Only the second
+    says anything about the rollout; past the migration the first cannot
+    fire at all, so a non-zero count on a migrated deployment is entirely
+    the second. A run the recheck rescues is not a fallback and is not
+    counted. Like every counter in ``interaction_rollout``, this one lives
+    in process memory: it starts at zero on each start, a redeploy resets
+    it, and a reader behind a load balancer sees one process's share.
     """
 
     if not interaction_requests_table_exists(db):
-        return _legacy_view(db, task_id)
+        # No recheck on this branch: with no table there is nowhere for an
+        # active row to have been written. The count goes up after
+        # ``_legacy_view`` returns, not before it is called, so a raise on
+        # the way through cannot leave a fallback counted that no caller
+        # ever received -- same ordering as the no-active-row branch below.
+        fallback = _legacy_view(db, task_id, allow_superseded=allow_superseded)
+        increment_counter(COUNTER_COMPAT_READ_FALLBACK)
+        return fallback
 
     row = _active_native_row(db, task_id)
     if row is None:
-        return _legacy_view(db, task_id)
+        fallback = _legacy_view(db, task_id, allow_superseded=allow_superseded)
+        row = _active_native_row(db, task_id)
+        if row is None:
+            increment_counter(COUNTER_COMPAT_READ_FALLBACK)
+            return fallback
+        # An active row appeared between the two looks, so this task's tier
+        # is decided from it below instead of from the transcript. Once:
+        # there is no second recheck, and a row found here is answered
+        # from rather than looked at again.
 
     if row.protocol_version != INTERACTION_PROTOCOL_VERSION:
         # An active row holds this task's answer slot, so this cannot fold

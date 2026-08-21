@@ -214,6 +214,61 @@ def test_redact_url_credentials_for_logging_masks_sensitive_query_values() -> No
     assert "v=1" in redacted
 
 
+def test_redact_url_credentials_for_logging_masks_embedded_userinfo() -> None:
+    # The query string isn't the only -- or even the most common -- place a
+    # URL carries a credential; a proxy URL's "user:pass@host" needs the
+    # same treatment, or it passes through this function unchanged.
+    url = "https://alice:s3cret-pass@proxy.internal:8080/"
+    redacted = redact_url_credentials_for_logging(url)
+
+    assert "alice" not in redacted
+    assert "s3cret-pass" not in redacted
+    assert redacted == "https://***@proxy.internal:8080/"
+
+
+def test_redact_url_credentials_for_logging_preserves_host_casing() -> None:
+    # A URL with no userinfo keeps its original host casing (urlunsplit
+    # just passes netloc through); the userinfo-redaction branch must not
+    # be the only place that silently lowercases it.
+    url = "https://Alice:s3cret-pass@Proxy-Host.Internal:8080/"
+    redacted = redact_url_credentials_for_logging(url)
+
+    assert redacted == "https://***@Proxy-Host.Internal:8080/"
+
+
+def test_redact_url_credentials_for_logging_preserves_ipv6_brackets() -> None:
+    url = "https://alice:s3cret-pass@[2001:db8::1]:443/v1"
+    redacted = redact_url_credentials_for_logging(url)
+
+    assert "s3cret-pass" not in redacted
+    assert redacted == "https://***@[2001:db8::1]:443/v1"
+
+
+def test_redact_url_credentials_for_logging_does_not_leak_on_parse_failure() -> None:
+    # A malformed URL (unclosed IPv6 bracket) that urlsplit can't parse
+    # must not fall back to returning the credential-bearing input
+    # unchanged -- that would be worse than not attempting redaction at
+    # all, since it looks sanitized but isn't.
+    url = "https://alice:s3cret-pass@[::1/"
+    redacted = redact_url_credentials_for_logging(url)
+
+    assert "s3cret-pass" not in redacted
+
+
+def test_redact_sensitive_text_does_not_leak_malformed_proxy_url() -> None:
+    text = "Unable to connect to proxy https://alice:s3cret-pass@[::1/"
+    redacted = redact_sensitive_text(text)
+
+    assert "s3cret-pass" not in redacted
+
+
+def test_redact_sensitive_text_masks_embedded_proxy_userinfo() -> None:
+    text = "Unable to connect to proxy https://alice:s3cret-pass@proxy.internal:8080/"
+    redacted = redact_sensitive_text(text)
+
+    assert "s3cret-pass" not in redacted
+
+
 def test_redact_sensitive_text_masks_bearer_and_header_keys() -> None:
     text = (
         "Authorization: Bearer sk-secret-value "

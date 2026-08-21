@@ -18,6 +18,20 @@ Two steps, in this order, and nothing else:
    implementation of "what is this waiting task's question" -- decides
    the tier, and this function projects its result down to the tuple.
 
+The marker also decides one thing beyond routing: whether the transcript
+reader may reach a question row a structured publication has already
+relabelled to ``question_superseded``. This function is the only caller
+anywhere that opens ``get_latest_waiting_question``'s ``allow_superseded``
+gate, and it opens it on exactly the outcomes where nothing holds this
+task's answer slot -- a NULL marker in step 1, and the two fallback
+branches of the rich view in step 2. A marker value this reader does not
+recognize leaves the slot's state unknown, and unknown keeps the gate
+shut. Step 1 still costs one attribute access and no query: the gate value
+comes from the marker, which is already in memory. Once a writer for those
+relabelled rows exists, this gate is a client-visible change at all four
+consumers: a waiting task that renders an empty or generic waiting state
+today starts rendering the recovered question instead.
+
 This function performs **no authorization**. It takes a ``Task`` object,
 not an id, precisely so that a caller has to have resolved and
 authorized that row through its own layer first. All four callers do
@@ -84,9 +98,14 @@ answer, written here because this adapter's projection depends on them:
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
+from ..models.task_interaction import INTERACTION_PROTOCOL_VERSION
 from .chat_history_service import get_latest_waiting_question
+from .ops_signals import (
+    INTERACTION_READ_TASK_MARKER_UNRECOGNIZED,
+    register_degradation,
+)
 from .task_interaction_service import materialize_compatibility_view
 
 if TYPE_CHECKING:
@@ -107,13 +126,36 @@ def get_pending_interaction_question(
     that authorized it (see the module docstring).
     """
 
-    marker = task.interaction_protocol_version
+    # Cast, not annotated: mypy sees the class-level Column, so without it
+    # the comparison below types as a SQL expression instead of the plain
+    # bool it is at runtime. ``object`` rather than ``int | None`` keeps a
+    # malformed persisted value dynamic, so it still fails closed below.
+    marker = cast("object | None", task.interaction_protocol_version)
     if marker is None:
         # No native row can belong to this task under a NULL marker, so
-        # the interaction table is not queried.
-        return get_latest_waiting_question(db, int(task.id))
+        # the interaction table is not queried -- and nothing holds this
+        # task's answer slot, so a question row a structured publication
+        # already relabelled is still the honest answer.
+        return get_latest_waiting_question(db, int(task.id), allow_superseded=True)
 
-    view = materialize_compatibility_view(db, int(task.id))
+    # Only the one recognized marker lets the view's own two fallback
+    # branches decide that nothing holds the answer slot. Every other value
+    # -- including one that is not an integer at all -- leaves the gate
+    # shut: an unrecognized marker means the slot's state is unknown. Such
+    # a value is also corruption the tasks-row CHECK constraint forbids, so
+    # it registers a keyed degradation once per process, routing unchanged.
+    recognized = marker == INTERACTION_PROTOCOL_VERSION
+    if not recognized:
+        register_degradation(
+            INTERACTION_READ_TASK_MARKER_UNRECOGNIZED,
+            f"task {task.id}: interaction_protocol_version holds an "
+            f"unrecognized {type(marker).__name__} value",
+        )
+    view = materialize_compatibility_view(
+        db,
+        int(task.id),
+        allow_superseded=recognized,
+    )
     if view.tier == "unanswerable":
         # The question text, when the tier could still read one, and no
         # controls: this question cannot be answered right now, so

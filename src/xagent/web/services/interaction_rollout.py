@@ -173,9 +173,12 @@ COUNTER_ANCHOR_ABSENT_NO_RUN = "anchor.absent_no_run"
 COUNTER_ANCHOR_UNAVAILABLE_DANGLING_POINTER = "anchor.unavailable_dangling_pointer"
 COUNTER_ANCHOR_ABSENT_LEGACY_CHECKPOINT_TYPE = "anchor.absent_legacy_checkpoint_type"
 
-# Not incremented by this PR -- placeholders for later owners sharing this
-# registry.
-COUNTER_COMPAT_READ_FALLBACK = "compat.read_fallback"  # owner: read-path wiring
+# Two constants below are actively incremented, both from
+# task_interaction_service.py: COUNTER_COMPAT_READ_FALLBACK by the
+# compatibility view, COUNTER_LIFECYCLE_RESPONSE_CONFLICT by respond().
+# The materialize.*, repair.* and command.* constants are placeholders for
+# later owners sharing this registry and are incremented by nothing yet.
+COUNTER_COMPAT_READ_FALLBACK = "compat.read_fallback"  # owner: read path
 COUNTER_LIFECYCLE_RESPONSE_CONFLICT = "lifecycle.response_conflict"  # owner: #1075
 COUNTER_MATERIALIZE_SUCCESS = "materialize.success"  # owner: #1078
 COUNTER_MATERIALIZE_TRANSIENT = "materialize.transient"  # owner: #1078

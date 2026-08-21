@@ -236,6 +236,50 @@ def test_execution_adapter_uses_service_id_as_runner_workspace_id() -> None:
     assert registry.start_kwargs["workspace_id"] == "web_task_458"
 
 
+def test_execution_adapter_projects_request_images_to_task_context_refs() -> None:
+    registry = RecordingRegistry()
+    adapter = AgentExecutionAdapter(
+        AgentExecutionConfig(
+            name="vision-task",
+            pattern="react",
+            llm=FakeLLM(["unused"]),
+            service_id="vision-service",
+            registry=cast(Any, registry),
+            skill_manager=NoSkillManager(),
+        )
+    )
+
+    adapter.start(
+        task="Inspect the upload",
+        task_id="vision-exec",
+        context={
+            "file_info": [
+                {
+                    "file_id": "image-id",
+                    "name": "screen.png",
+                    "type": "image/png",
+                    "path": "/private/runtime/screen.png",
+                }
+            ],
+            # The display-safe projection can be present at the same time and
+            # must not duplicate the provider image.
+            "files": [
+                {
+                    "file_id": "image-id",
+                    "name": "display-screen.png",
+                    "type": "image/png",
+                }
+            ],
+        },
+    )
+
+    assert registry.start_kwargs is not None
+    references = registry.start_kwargs["task_context_refs"]
+    assert len(references) == 1
+    assert references[0].file_id == "image-id"
+    assert "path" not in references[0].durable_dict()["file_ref"]
+
+
 @pytest.mark.asyncio
 async def test_execution_adapter_routes_single_call_to_one_tool_then_final_answer() -> (
     None

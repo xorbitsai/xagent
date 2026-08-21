@@ -145,7 +145,8 @@ agent_config:
 
     - The copy in the final content package must exactly match the saved draft file.'
   execution_mode: balanced
-  skills: []
+  skills:
+  - static-visual-design
   tool_categories:
   - basic
   - web_search

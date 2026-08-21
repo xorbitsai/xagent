@@ -118,10 +118,10 @@ __all__ = ["app"]
 def _startup_phase(name: str) -> Iterator[None]:
     """Log a begin/end pair with duration around a startup phase.
 
-    Issue #231: the slow sandbox-quiesce phase was awaited inline with no
-    logs, so an ~8 min stall looked like a fast start. One line in, one line
-    out per phase (never per loop/tick) makes the next slow start obvious. A
-    failing phase still logs its end line before the error propagates.
+    A slow phase awaited inline with no logs makes a multi-minute stall look
+    like a fast start. One line in, one line out per phase (never per
+    loop/tick) makes the next slow start obvious. A failing phase still logs
+    its end line before the error propagates.
     """
     logger.info("startup phase begin: %s", name)
     started = time.monotonic()
@@ -1557,24 +1557,31 @@ async def startup_event() -> None:
         asyncio.create_task(run_uploaded_file_reconcile_background())
         logger.info("Started background uploaded files reconcile task")
 
-        # Clean up orphaned temporary files from interrupted atomic replacements
-        try:
-            from .api.kb import cleanup_orphaned_temp_files
+        # Clean up orphaned temporary files from interrupted atomic replacements.
+        # This walks the entire uploads tree inline during startup and can take
+        # minutes on a large tree with no log output in between. Wrap it in a
+        # startup phase so its duration is visible and a slow start is easy to
+        # diagnose from the logs alone.
+        # WHY: try/except inside the phase keeps a tolerated failure at a single
+        # WARNING; propagating it would add a spurious ERROR from _startup_phase.
+        # exc_info keeps the traceback so an unexpected bug (not just a transient
+        # FS error) is still diagnosable despite the WARNING-level downgrade.
+        with _startup_phase("orphaned temp-file cleanup"):
+            try:
+                from .api.kb import cleanup_orphaned_temp_files
 
-            def _run_temp_file_cleanup() -> int:
-                return cleanup_orphaned_temp_files()
-
-            cleaned_count = await asyncio.to_thread(_run_temp_file_cleanup)
-            if cleaned_count > 0:
-                logger.info(
-                    "Startup cleanup: removed %d orphaned temporary file(s)",
-                    cleaned_count,
+                cleaned_count = await asyncio.to_thread(cleanup_orphaned_temp_files)
+                if cleaned_count > 0:
+                    logger.info(
+                        "Startup cleanup: removed %d orphaned temporary file(s)",
+                        cleaned_count,
+                    )
+            except Exception as e:  # noqa: BLE001
+                logger.warning(
+                    "Temporary file cleanup skipped due to error: %s",
+                    e,
+                    exc_info=True,
                 )
-        except Exception as e:  # noqa: BLE001
-            logger.warning(
-                "Temporary file cleanup skipped due to error: %s",
-                e,
-            )
 
     # Warmup sandbox manager
     from .sandbox_manager import check_sandbox_static_readiness, get_sandbox_manager
@@ -1591,9 +1598,9 @@ async def startup_event() -> None:
         # This also resolves and caches the backend-capability probe as a
         # side effect, so cleanup() below reads the cached value instead of
         # resolving it again.
-        # The phases that hid issue #231: cleanup() quiesce was awaited
-        # inline for ~8 min with no logs. Time each so the next slow start
-        # names the exact sub-phase; the quiesce summary breaks it down more.
+        # cleanup() quiesce can be awaited inline for minutes with no logs.
+        # Time each sub-phase so the next slow start names the exact one; the
+        # quiesce summary breaks it down further.
         with _startup_phase("sandbox static readiness"):
             await check_sandbox_static_readiness(sandbox_mgr)
         with _startup_phase("sandbox cleanup"):

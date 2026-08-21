@@ -182,6 +182,29 @@ class PublicStepProjector:
         late-attaching consumer pre-warms pairing state instead of seeing
         orphan ends for steps that started before it attached.
 
+    Two retention modes, chosen at construction:
+
+      - ``retain_finished=True`` (the default): every finalized step is
+        kept so :meth:`materialized_steps` can return the task's whole
+        projected timeline at the end. A one-shot request needs this,
+        and ``map_trace_events_to_public_steps`` -- and therefore
+        ``GET /v1/chat/tasks/{task_id}/steps`` -- reads its result
+        *only* through :meth:`materialized_steps`, so that driver must
+        never be built with the other mode.
+      - ``retain_finished=False``: a finalized step is returned by
+        :meth:`feed` and then forgotten. For a consumer that acts on
+        each ``feed`` result immediately and never calls
+        :meth:`materialized_steps` -- the v1 SSE sink serializes each
+        changed step to a frame as it comes and holds one projector for
+        as long as its connection lives, so retaining would accumulate
+        every step's untruncated ``data`` for that whole time in a list
+        nothing reads. :meth:`materialized_steps` raises in this mode
+        rather than returning a silently partial timeline.
+
+    ``feed``'s return value is identical in both modes; the mode only
+    decides whether the projector also keeps the step afterwards. The
+    pending table is kept either way -- the pairing rules need it.
+
     :meth:`materialized_steps` never sorts by ``started_at``. That global
     resort is a batch-only concern (see ``map_trace_events_to_public_steps``):
     a live consumer wants steps in the order they actually resolved, not
@@ -195,7 +218,7 @@ class PublicStepProjector:
     throwaway instance per call.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, *, retain_finished: bool = True) -> None:
         # In-progress (start seen, end not yet seen) steps keyed by
         # (public_type, pairing_key). Order of insertion is preserved by
         # Python 3.7+ dict semantics, which is what we use to emit final
@@ -203,8 +226,10 @@ class PublicStepProjector:
         self._pending: Dict[Tuple[str, str], Dict[str, Any]] = {}
         # Completed-or-emitted-immediately steps. Filled in either by an
         # end event matching a pending start, or by a one-shot event like
-        # ``user_message`` / ``ai_message`` which has no separate end.
-        self._finished: List[Dict[str, Any]] = []
+        # ``user_message`` / ``ai_message``. ``None`` when the caller
+        # opted out of retention (see the class docstring): those steps
+        # are still returned by ``feed``, they are just not kept after.
+        self._finished: Optional[List[Dict[str, Any]]] = [] if retain_finished else None
         # ``dag_plan_*`` has no per-plan identifier in the event data, so
         # we synthesize one by counting starts and remembering the
         # currently-open key. Replan in a single task (rare but legal)
@@ -228,7 +253,7 @@ class PublicStepProjector:
         """Build a projector pre-warmed by replaying a full event history.
 
         Feeds every event into a fresh instance, in order. The resulting
-        pairing state (open plan key/counter, any still-``pending``
+        state (the accumulated timeline plus any still-unpaired
         starts) is identical to what a live consumer would have
         accumulated by that point -- there is no separate "batch" code
         path for the folding logic itself, only this replay.
@@ -252,7 +277,16 @@ class PublicStepProjector:
         is mutated in place when its end event arrives (see
         :meth:`feed`). Treat them as read-only views -- a caller that
         needs a stable picture must copy before storing.
+
+        Raises ``RuntimeError`` on a projector built with
+        ``retain_finished=False``: the finished steps it would need were
+        never kept, so there is no partial answer worth returning.
         """
+        if self._finished is None:
+            raise RuntimeError(
+                "materialized_steps() needs the finished-step history; this "
+                "projector was built with retain_finished=False"
+            )
         steps = list(self._finished)
         steps.extend(self._pending.values())
         return steps
@@ -271,7 +305,8 @@ class PublicStepProjector:
         :meth:`materialized_steps`'s backing storage (mutated in place
         when a pending start is later finalized), so a caller folding
         successive ``feed`` results by step id always ends up with the
-        current state of each step.
+        current state of each step (when this projector retains them;
+        see the class docstring).
         """
         event_type = _safe_get(event, "event_type")
         if not event_type:
@@ -280,11 +315,13 @@ class PublicStepProjector:
         # ===== messages: one event per message, no pairing =====
         if event_type == "user_message":
             step = _build_message_step(event, role="user")
-            self._finished.append(step)
+            if self._finished is not None:
+                self._finished.append(step)
             return [step]
         if event_type == "ai_message":
             step = _build_message_step(event, role="assistant")
-            self._finished.append(step)
+            if self._finished is not None:
+                self._finished.append(step)
             return [step]
 
         # ===== thinking: paired start/end =====
@@ -766,20 +803,24 @@ def _terminal_status_from_event(event: Any) -> str:
 
 def _finalize_pending(
     pending: Dict[Tuple[str, str], Dict[str, Any]],
-    finished: List[Dict[str, Any]],
+    finished: Optional[List[Dict[str, Any]]],
     key: Tuple[str, str],
     *,
     end_event: Any,
     status: str,
     extra_data_fn: Optional[Any] = None,
 ) -> Optional[Dict[str, Any]]:
-    """Move ``pending[key]`` to ``finished`` and patch with end metadata.
+    """Move ``pending[key]`` out of the pending table and patch it with
+    end metadata, appending it to ``finished`` when the caller keeps one
+    (``None`` for a projector built with ``retain_finished=False`` -- see
+    :class:`PublicStepProjector`).
 
     Orphan end (no matching start in ``pending``) is dropped on
     purpose -- see module docstring. Returns the finalized step dict
-    (the same object moved into ``finished``), or ``None`` for a
-    dropped orphan end, so callers that need to report "what changed"
-    (:meth:`PublicStepProjector.feed`) don't have to re-derive it.
+    (the same object appended to ``finished`` when one is kept), or
+    ``None`` for a dropped orphan end, so callers that need to report
+    "what changed" (:meth:`PublicStepProjector.feed`) don't have to
+    re-derive it.
     """
     step = pending.pop(key, None)
     if step is None:
@@ -793,7 +834,8 @@ def _finalize_pending(
             step["data"].update(redact_runtime_sensitive_payload(extra))
         except Exception as exc:  # defensive; data shape is external
             logger.debug("step extra_data_fn failed: %s", exc)
-    finished.append(step)
+    if finished is not None:
+        finished.append(step)
     return step
 
 

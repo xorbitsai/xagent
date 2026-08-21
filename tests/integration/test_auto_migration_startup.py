@@ -7,9 +7,11 @@ startup to add user_id fields to existing LanceDB tables.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import os
 import sys
 import tempfile
+from collections.abc import Iterator
 from types import ModuleType
 
 import pyarrow as pa
@@ -940,6 +942,37 @@ async def test_startup_event_triggers_background_auto_migration(
     monkeypatch.setattr(web_app_module.asyncio, "to_thread", _fake_to_thread)
     monkeypatch.setattr(web_app_module.asyncio, "create_task", _track_create_task)
 
+    # Prove the temp-file cleanup runs *inside* its _startup_phase wrap and the
+    # phase completes: a refactor that drops the wrap -- or keeps it but stops
+    # calling the cleanup inside it -- is caught here. Startup reconfigures
+    # logging, so spying is more reliable than capturing the phase's log lines.
+    import xagent.web.api.kb as kb_module
+
+    completed_phases: list[str] = []
+    active_phase: dict[str, str | None] = {"name": None}
+    cleanup_ran_in_phase = {"value": False}
+    real_startup_phase = web_app_module._startup_phase
+    real_cleanup = kb_module.cleanup_orphaned_temp_files
+
+    @contextlib.contextmanager
+    def _tracking_startup_phase(name: str) -> Iterator[None]:
+        previous = active_phase["name"]
+        active_phase["name"] = name
+        try:
+            with real_startup_phase(name):
+                yield
+        finally:
+            active_phase["name"] = previous
+        completed_phases.append(name)
+
+    def _spy_cleanup() -> int:
+        if active_phase["name"] == "orphaned temp-file cleanup":
+            cleanup_ran_in_phase["value"] = True
+        return real_cleanup()
+
+    monkeypatch.setattr(web_app_module, "_startup_phase", _tracking_startup_phase)
+    monkeypatch.setattr(kb_module, "cleanup_orphaned_temp_files", _spy_cleanup)
+
     await web_app_module.startup_event()
     if created_tasks:
         await asyncio.gather(*created_tasks)
@@ -947,6 +980,8 @@ async def test_startup_event_triggers_background_auto_migration(
     # We expect 2 tasks: backfill migration + uploaded files reconcile
     assert len(created_tasks) == 2
     assert migration_called["value"] is True
+    assert "orphaned temp-file cleanup" in completed_phases
+    assert cleanup_ran_in_phase["value"] is True
 
 
 @pytest.mark.asyncio

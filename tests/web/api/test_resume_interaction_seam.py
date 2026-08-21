@@ -127,6 +127,7 @@ def _make_active_row(session_factory, *, task_id: int, run_id: str = RUN_ID) -> 
             **make_row(
                 task_id=task_id,
                 resume_trace_event_id=event.id,
+                db=db,
                 run_id=run_id,
                 request_payload={"message": "Which environment?", "interactions": []},
                 resume_run_partition=run_id,

@@ -58,6 +58,7 @@ from sqlalchemy.orm import sessionmaker
 
 import xagent.web.models.database as database_module
 from tests.web.services.task_interaction_schema_shared import (
+    anchor_event_id,
     assert_rejected,
     make_row,
     make_task,
@@ -70,7 +71,10 @@ from xagent.web.models.task_command import TaskExecutionCommand
 from xagent.web.models.task_interaction import TaskInteractionRequest
 from xagent.web.services import task_interaction_read as read_surface
 from xagent.web.services import task_interaction_service as svc
-from xagent.web.services.chat_history_service import persist_assistant_message
+from xagent.web.services.chat_history_service import (
+    persist_assistant_message,
+    supersede_legacy_question_rows,
+)
 from xagent.web.services.interaction_rollout import counters_snapshot
 from xagent.web.services.ops_signals import (
     CHECKPOINT_LOAD_UNAVAILABLE,
@@ -185,7 +189,7 @@ def _make_active_row(
         },
         request_idempotency_key=f"pg-key-{next(_key_counter)}",
         resume_trace_event_id=resume_trace_event_id,
-        resume_event_id="resume-event-1",
+        resume_event_id=anchor_event_id(db, resume_trace_event_id),
         resume_execution_id="exec-1",
         resume_locator_format="trace_event_pk_v1",
         resume_checkpoint_type="agent_execution_checkpoint",
@@ -1444,3 +1448,149 @@ def test_respond_races_a_committed_duplicate_command_and_conflicts_on_mismatched
         assert task.control_state == "waiting_for_user"
     finally:
         verify_db.close()
+
+
+# ---------------------------------------------------------------------------
+# The legacy fallback's ownership recheck, and the stale marker it makes
+# benign. Both need two real sessions committing independently, which is
+# what puts them on this backend rather than in the SQLite-backed file.
+# ---------------------------------------------------------------------------
+
+
+def test_legacy_fallback_rechecks_active_ownership_across_sessions(
+    engine, session_factory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Deciding "no active row" and reading the transcript are separate
+    statements, so another session can publish an active row in between.
+    Rechecking the active row after the transcript read and before
+    returning is what stops this reader handing back a legacy question
+    whose answer a native row has already claimed."""
+
+    db = session_factory()
+    try:
+        user_id = make_user(db)
+        task_id = make_task(db, user_id=user_id)
+        task = db.query(Task).filter(Task.id == task_id).first()
+        task.run_id = "run-a"
+        task.interaction_protocol_version = 1
+        db.commit()
+        persist_assistant_message(
+            db,
+            task_id,
+            user_id,
+            "A live legacy question",
+            message_type="question",
+            interactions=[{"type": "text_input", "label": "Legacy"}],
+        )
+        db.commit()
+
+        active_row_calls = 0
+        real_active_row = svc._active_native_row
+
+        def _counted_active_row(session, active_task_id: int):
+            nonlocal active_row_calls
+            active_row_calls += 1
+            return real_active_row(session, active_task_id)
+
+        monkeypatch.setattr(svc, "_active_native_row", _counted_active_row)
+
+        real_reader = svc.get_latest_waiting_question
+        published = False
+
+        def _publish_then_read(session, read_task_id: int, **kwargs):
+            # The window itself: session A has already decided there is no
+            # active row and has not read the transcript yet.
+            nonlocal published
+            if not published:
+                published = True
+                writer = session_factory()
+                try:
+                    trace_id = _make_trace_event(
+                        writer, task_id=task_id, run_partition="run-a"
+                    )
+                    _make_active_row(
+                        writer,
+                        task_id=task_id,
+                        run_id="run-a",
+                        resume_trace_event_id=trace_id,
+                        resume_run_partition="run-a",
+                    )
+                finally:
+                    writer.close()
+            return real_reader(session, read_task_id, **kwargs)
+
+        monkeypatch.setattr(svc, "get_latest_waiting_question", _publish_then_read)
+
+        view = svc.materialize_compatibility_view(db, task_id)
+
+        assert view.tier == "native"
+        assert view.question == "Which environment?"
+        # Two calls: the first decision and the one recheck. The recheck
+        # never loops -- an active row found on the second look is answered
+        # from, not rechecked again.
+        assert active_row_calls == 2
+    finally:
+        db.close()
+
+
+def test_stale_null_marker_reader_still_sees_the_question_text(
+    engine, session_factory
+) -> None:
+    """The reader holds a Task row loaded before a publication committed,
+    so its ``interaction_protocol_version`` is still NULL while the
+    database says 1. Step 0 believes the stale value and answers from the
+    transcript -- and because the publication relabelled the transcript row
+    on its way past, what it finds is the question itself rather than an
+    empty pair."""
+
+    reader = session_factory()
+    try:
+        writer = session_factory()
+        try:
+            user_id = make_user(writer)
+            task_id = make_task(writer, user_id=user_id)
+            task = writer.query(Task).filter(Task.id == task_id).first()
+            task.run_id = "run-a"
+            writer.commit()
+            persist_assistant_message(
+                writer,
+                task_id,
+                user_id,
+                "Which environment?",
+                message_type="question",
+                interactions=[{"type": "text_input", "label": "Environment"}],
+            )
+            writer.commit()
+        finally:
+            writer.close()
+
+        # The reader loads the task while the marker is still NULL.
+        stale_task = reader.query(Task).filter(Task.id == task_id).first()
+        assert stale_task.interaction_protocol_version is None
+
+        writer = session_factory()
+        try:
+            trace_id = _make_trace_event(writer, task_id=task_id, run_partition="run-a")
+            _make_active_row(
+                writer,
+                task_id=task_id,
+                run_id="run-a",
+                resume_trace_event_id=trace_id,
+                resume_run_partition="run-a",
+            )
+            published_task = writer.query(Task).filter(Task.id == task_id).first()
+            published_task.interaction_protocol_version = 1
+            supersede_legacy_question_rows(writer, task_id=task_id)
+            writer.commit()
+        finally:
+            writer.close()
+
+        question, interactions = read_surface.get_pending_interaction_question(
+            reader, stale_task
+        )
+
+        assert question is not None
+        assert question.startswith("Which environment?")
+        assert interactions == [{"type": "text_input", "label": "Environment"}]
+    finally:
+        reader.close()

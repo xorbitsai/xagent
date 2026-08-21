@@ -1,5 +1,8 @@
 """Unit tests for core/config.py configuration functions."""
 
+import os
+import subprocess
+import sys
 import tempfile
 from pathlib import Path
 from tempfile import gettempdir
@@ -79,6 +82,7 @@ from xagent.config import (
     SANDBOX_MEMORY,
     SANDBOX_NAMESPACE,
     SANDBOX_SWEEP_INTERVAL,
+    SANDBOX_TOOL_RUNNER,
     SANDBOX_VOLUMES,
     SLACK_APP_TOKEN,
     SLACK_CLIENT_ID,
@@ -213,6 +217,7 @@ from xagent.config import (
     get_web_crawl_tls_impersonate,
     get_web_dir,
     get_web_search_provider,
+    in_sandbox_tool_runner,
     validate_sandbox_namespace,
 )
 
@@ -265,6 +270,45 @@ class TestEnvironmentVariableConstants:
 
     def test_sandbox_host_storage_root_constant(self):
         assert SANDBOX_HOST_STORAGE_ROOT == "XAGENT_SANDBOX_HOST_STORAGE_ROOT"
+
+    def test_sandbox_tool_runner_constant(self):
+        assert SANDBOX_TOOL_RUNNER == "XAGENT_SANDBOX_TOOL_RUNNER"
+
+    def test_in_sandbox_tool_runner_defaults_to_false(self):
+        assert in_sandbox_tool_runner() is False
+
+    def test_in_sandbox_tool_runner_reads_the_env_at_process_start(self, monkeypatch):
+        for value, expected in (
+            ("1", True),
+            ("true", True),
+            ("yes", True),
+            ("on", True),
+            ("0", False),
+            ("false", False),
+            ("no", False),
+            ("off", False),
+            ("", False),
+        ):
+            monkeypatch.setenv(SANDBOX_TOOL_RUNNER, value)
+            assert config._get_bool_env(SANDBOX_TOOL_RUNNER, False) is expected
+
+    def test_in_sandbox_tool_runner_ignores_later_env_mutation(self, monkeypatch):
+        """Agent-authored code runs late; it must not flip the whole process."""
+        monkeypatch.setenv(SANDBOX_TOOL_RUNNER, "1")
+        assert in_sandbox_tool_runner() is False
+
+    def test_in_sandbox_tool_runner_does_read_the_env_at_import(self):
+        """The other tests patch the snapshot, so pin that it is populated."""
+        probe = "import xagent.config as c; print(c.in_sandbox_tool_runner())"
+        env = {**os.environ, SANDBOX_TOOL_RUNNER: "1"}
+        proc = subprocess.run(
+            [sys.executable, "-c", probe],
+            capture_output=True,
+            text=True,
+            env=env,
+            check=True,
+        )
+        assert proc.stdout.strip() == "True"
 
     def test_lancedb_path_constant(self):
         assert LANCEDB_PATH == "LANCEDB_PATH"

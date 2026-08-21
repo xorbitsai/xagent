@@ -98,6 +98,21 @@ class InvalidKnowledgeBaseError(ValueError):
     """Raised when KB selection fails the knowledge-tool or visibility rule."""
 
 
+def _string_list_elements(value: Any) -> list[str]:
+    """Filters a possibly-malformed list down to its string elements. A
+    template's agent_config.skills/tool_categories is author-provided YAML
+    data with no element-type validation upstream (see
+    TemplateManager._enrich_template) - a single non-string entry (e.g. an
+    authoring typo like `[123, "web_search"]`) would otherwise reach
+    AgentCreateSpec untouched (a plain dataclass, no runtime type
+    enforcement) and only fail later as an unhandled Pydantic
+    ValidationError when AgentResponse serializes the created agent back
+    out, 500ing an otherwise-successful creation."""
+    if not isinstance(value, list):
+        return []
+    return [item for item in value if isinstance(item, str)]
+
+
 @dataclass(frozen=True)
 class AgentCreateSpec:
     """Detached input for one agent-management create transaction."""
@@ -802,11 +817,15 @@ class AgentManagementService:
                 if knowledge_bases is not None
                 else agent_config.get("knowledge_bases") or []
             ),
-            skills=skills if skills is not None else agent_config.get("skills") or [],
+            skills=(
+                skills
+                if skills is not None
+                else _string_list_elements(agent_config.get("skills"))
+            ),
             tool_categories=(
                 tool_categories
                 if tool_categories is not None
-                else agent_config.get("tool_categories") or []
+                else _string_list_elements(agent_config.get("tool_categories"))
             ),
             suggested_prompts=(
                 suggested_prompts
@@ -1276,11 +1295,15 @@ class AgentManagementRuntime:
                 if knowledge_bases is not None
                 else agent_config.get("knowledge_bases") or []
             ),
-            skills=skills if skills is not None else agent_config.get("skills") or [],
+            skills=(
+                skills
+                if skills is not None
+                else _string_list_elements(agent_config.get("skills"))
+            ),
             tool_categories=(
                 tool_categories
                 if tool_categories is not None
-                else agent_config.get("tool_categories") or []
+                else _string_list_elements(agent_config.get("tool_categories"))
             ),
             suggested_prompts=(
                 suggested_prompts

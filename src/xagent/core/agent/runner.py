@@ -9,13 +9,14 @@ from uuid import uuid4
 
 from ...config import get_compact_threshold_default, get_compact_threshold_ratio
 from ..context_materializer import WorkspaceContextReferenceResolver
-from ..context_ref import CONTEXT_REFS_KEY
+from ..context_ref import CONTEXT_REFS_KEY, ContextReference
 from ..model.intent import enter_goal, exit_goal
 from ..task_runtime import (
     PREFERRED_INPUT_MODALITIES_METADATA_KEY,
     normalize_input_modalities,
 )
 from ..workspace import WorkspaceManager
+from .attachments import build_image_context_references
 from .checkpoint import CheckpointCorruptError, read_latest_checkpoint_payload
 from .context import ContextManager, ExecutionContext
 from .result import extract_assistant_message
@@ -77,6 +78,7 @@ class AgentRunner:
         extra_tools: list[Any] | None = None,
         metadata: dict[str, Any] | None = None,
         initial_messages: list[dict[str, Any]] | None = None,
+        task_context_refs: tuple[ContextReference, ...] = (),
     ) -> dict[str, Any]:
         execution_id = execution_id or str(uuid4())
         checkpoint = checkpoint or (
@@ -113,7 +115,27 @@ class AgentRunner:
                 base_dir=base_dir,
                 metadata=metadata,
             )
-            for message in initial_messages or []:
+            replay_messages = initial_messages or []
+            if (
+                replay_messages
+                and str(replay_messages[0].get("role") or "").strip() == "assistant"
+            ):
+                # A task's persisted history can begin with an
+                # assistant-role message today only via a marketplace Hire
+                # flow's seeded persona greeting - there is no other path
+                # that persists an assistant row before any user message.
+                # Anthropic's Messages API (and every claude_compatible
+                # provider routed through it) rejects a request whose first
+                # message isn't role "user", so correct it once here,
+                # before this history is ever replayed into context. This
+                # is deliberately not done in get_messages_for_llm(), which
+                # also serves truncated windows and tool-call/tool-result
+                # pairs that legitimately start mid-conversation.
+                context.add_user_message(
+                    "(conversation start)",
+                    metadata={"_xagent_synthetic": "leading_user_turn"},
+                )
+            for message in replay_messages:
                 role = str(message.get("role") or "").strip()
                 content = str(message.get("content") or "").strip()
                 context_refs = message.get(
@@ -131,6 +153,7 @@ class AgentRunner:
                 context.add_user_message(
                     task,
                     metadata=self._initial_user_message_metadata(context),
+                    context_refs=task_context_refs,
                 )
 
         runtime = runtime or PatternRuntime(
@@ -471,7 +494,11 @@ class AgentRunner:
             metadata["turn_id"] = requested_turn_id
         self._ensure_user_message_turn_id(metadata)
 
-        added = context.add_user_message(resolved_execution_message, metadata=metadata)
+        added = context.add_user_message(
+            resolved_execution_message,
+            metadata=metadata,
+            context_refs=build_image_context_references(files),
+        )
         # Set a "this turn is waiting to be traced" pending marker before
         # we persist. The resume catch-up logic uses this to disambiguate
         # an old checkpoint that pre-dates this PR (no watermark, no

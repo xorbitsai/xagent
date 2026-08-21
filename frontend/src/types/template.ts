@@ -45,6 +45,14 @@ export interface Template {
   connections: ConnectionInfo[];
   setup_time: string;
   tags: string[];
+  /** Tool categories this template's agent_config grants - mirrors
+   * agent_config.tool_categories, exposed at list level so a marketplace
+   * card can render capability tags without a second detail fetch. Empty
+   * for a "workforce"-type template. */
+  tool_categories?: string[];
+  /** Skill names this template's agent_config grants. Empty for a
+   * "workforce"-type template. */
+  skills?: string[];
   author: string;
   version: string;
   views: number;

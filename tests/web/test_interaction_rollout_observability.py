@@ -316,7 +316,11 @@ async def test_to6b_active_row_present_yields_positive_count_and_age(
     anchor_id = make_trace_event(sqlite_session_with_table, task_id=task_id)
     assert_accepted(
         sqlite_session_with_table,
-        make_row(task_id=task_id, resume_trace_event_id=anchor_id),
+        make_row(
+            task_id=task_id,
+            resume_trace_event_id=anchor_id,
+            db=sqlite_session_with_table,
+        ),
     )
 
     response = await get_interaction_rollout_diagnostics(

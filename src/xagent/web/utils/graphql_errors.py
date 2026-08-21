@@ -1,10 +1,15 @@
 """Turn a Linear GraphQL API error response into a human-readable message.
 
-Shared by `tools/mcp/linear.py`'s `_graphql()` (used by every Linear MCP tool
-call) and `api/auth.py`'s `_fetch_linear_viewer_identity()` (used once, at
-OAuth-connect time) -- both parse the same GraphQL endpoint's error shape,
-and had drifted into two independently-maintained copies (the `auth.py` copy
-lost the "message is present but empty" fallback) before this module existed.
+`graphql_errors_message` is shared by `tools/mcp/linear.py`'s `_graphql()`
+(used by every Linear MCP tool call) and `api/auth.py`'s
+`_fetch_linear_viewer_identity()` (used once, at OAuth-connect time) -- both
+parse the same GraphQL endpoint's error shape, and had drifted into two
+independently-maintained copies (the `auth.py` copy lost the "message is
+present but empty" fallback) before this module existed.
+
+`truncate_error_text`, despite living in this GraphQL-named module, is
+generic (any text, any source) and is reused by non-GraphQL REST connectors
+too, e.g. `tools/mcp/stripe.py`.
 """
 
 from __future__ import annotations

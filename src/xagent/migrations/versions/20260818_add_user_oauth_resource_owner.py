@@ -182,6 +182,17 @@ def _sqlite_batch_temp_table_exists() -> bool:
     )
 
 
+def _reject_sqlite_batch_temp_table(dialect: str) -> None:
+    """Reject an interrupted batch rebuild before any upgrade or downgrade work."""
+    if dialect != "sqlite" or not _sqlite_batch_temp_table_exists():
+        return
+    raise RuntimeError(
+        "interrupted SQLite UserOAuth rebuild left temporary table "
+        f"{SQLITE_BATCH_TEMP_TABLE}; restore the verified backup or have a "
+        "database operator inspect both tables before retrying"
+    )
+
+
 def _sqlite_global_owner_relation_names(
     expected_names: Sequence[str] = (ORDINARY_INDEX, ACTOR_INDEX),
 ) -> set[str]:
@@ -216,12 +227,7 @@ def _create_owner_indexes(
 
 def upgrade() -> None:
     dialect = _require_partial_unique_index_support()
-    if dialect == "sqlite" and _sqlite_batch_temp_table_exists():
-        raise RuntimeError(
-            "interrupted SQLite UserOAuth rebuild left temporary table "
-            f"{SQLITE_BATCH_TEMP_TABLE}; restore the verified backup or have a "
-            "database operator inspect both tables before retrying"
-        )
+    _reject_sqlite_batch_temp_table(dialect)
     if not _table_exists():
         return
 
@@ -322,7 +328,8 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
-    _require_partial_unique_index_support()
+    dialect = _require_partial_unique_index_support()
+    _reject_sqlite_batch_temp_table(dialect)
     if not _table_exists():
         return
 
@@ -348,7 +355,6 @@ def downgrade() -> None:
             op.drop_index(index_name, table_name=TABLE)
 
     has_old_constraint = OLD_CONSTRAINT in _constraint_names()
-    dialect = op.get_bind().dialect.name
     if dialect == "sqlite" and (OWNER_COLUMN in columns or not has_old_constraint):
         with op.batch_alter_table(TABLE) as batch_op:
             if not has_old_constraint:

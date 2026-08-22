@@ -255,6 +255,38 @@ def test_upgrade_rejects_orphan_sqlite_batch_table_before_missing_table_return(
         )
 
 
+def test_downgrade_rejects_orphan_sqlite_batch_table_before_missing_table_return(
+    tmp_path,
+) -> None:
+    engine = create_engine(f"sqlite:///{tmp_path / 'oauth-down-orphan-temp.db'}")
+    migration = _migration_module()
+
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "CREATE TABLE _alembic_tmp_user_oauth "
+                "(id INTEGER PRIMARY KEY, access_token TEXT)"
+            )
+        )
+        connection.execute(
+            text(
+                "INSERT INTO _alembic_tmp_user_oauth (id, access_token) "
+                "VALUES (1, 'stranded')"
+            )
+        )
+
+        with patch.object(migration, "op", _operations(connection)):
+            with pytest.raises(RuntimeError, match="temporary table"):
+                migration.downgrade()
+
+        assert (
+            connection.execute(
+                text("SELECT access_token FROM _alembic_tmp_user_oauth WHERE id = 1")
+            ).scalar_one()
+            == "stranded"
+        )
+
+
 @pytest.mark.parametrize(
     "existing_indexes",
     [

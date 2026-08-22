@@ -291,6 +291,7 @@ def test_downgrade_rejects_orphan_sqlite_batch_table_before_missing_table_return
         (),
         (ORDINARY_INDEX,),
         (ACTOR_INDEX,),
+        (ORDINARY_INDEX, ACTOR_INDEX),
     ],
 )
 def test_upgrade_repairs_interrupted_owner_index_installation(

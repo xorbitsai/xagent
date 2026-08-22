@@ -91,7 +91,11 @@ On PostgreSQL the migration creates the replacement indexes transactionally befo
 
 On SQLite the migration rejects globally colliding owner-index names before rebuilding the table in batch mode. Stop every worker before this rebuild and keep SQLite quiesced until the migration completes. Take and verify a database backup before the rebuild: under the driver's legacy transaction mode, SQLite DDL can commit independently of Alembic's outer transaction.
 
-If the SQLite migration process exits after the rebuild starts, keep every worker stopped and retry `alembic upgrade head` once with the same release. The migration automatically completes only an unambiguous interrupted index-installation state: `resource_owner_key` has its expected nullable `VARCHAR(512)` definition, `uq_user_provider_account` is absent, and zero or one existing owner-aware index has the exact expected definition. It validates every existing owner index and creates only the missing definitions. Do not start workers until both owner-aware indexes pass the verification below.
+If the SQLite migration process exits after the rebuild starts, keep every worker stopped. Retry `alembic upgrade head` once with the same release.
+
+The migration completes only an unambiguous interrupted index-installation state. The `resource_owner_key` column must have its expected nullable `VARCHAR(512)` definition. The `uq_user_provider_account` constraint must be absent. Zero, one, or both owner-aware indexes can exist. Each existing owner-aware index must have the expected definition.
+
+The migration creates only the missing owner-aware indexes. If both valid indexes exist, the migration makes no schema change before Alembic records the revision. Do not start workers until both indexes pass the verification below.
 
 If that retry reports a partially owner-aware schema, an incorrect owner column, a missing user cascade, an incorrect index, a relation-name collision, or duplicate data that prevents unique-index creation, do not continue automatically. Restore the verified pre-migration backup, confirm that `users` and `uq_user_provider_account` exist and `resource_owner_key` does not, and then retry from the legacy schema; alternatively, have a database operator repair one coherent schema under the same quiescent window. Never resume from a table that has lost the old constraint but does not have the required user cascade and both verified owner-aware indexes because that state has incomplete deletion or uniqueness enforcement.
 

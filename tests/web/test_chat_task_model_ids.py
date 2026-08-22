@@ -1986,6 +1986,7 @@ def test_task_create_seeds_interactions_alongside_the_assistant_message(
     row - the AI Team Marketplace's "connect your apps" card is delivered
     this way, attached to the same seeded intro message."""
     from xagent.web.models.chat_message import TaskChatMessage
+    from xagent.web.models.user import User
 
     connect_apps_interaction = {
         "type": "connect_apps",
@@ -2009,8 +2010,32 @@ def test_task_create_seeds_interactions_alongside_the_assistant_message(
     try:
         message = db.query(TaskChatMessage).filter_by(task_id=task_id).one()
         assert message.interactions == [connect_apps_interaction]
+        user1_id = db.query(User).filter_by(username="user1").one().id
     finally:
         db.close()
+
+    # The DB row alone doesn't prove a client ever actually sees the card
+    # again - assert what historical websocket replay (websocket.py) emits
+    # for it too, so a regression there (e.g. dropping metadata.interactions,
+    # or flipping expect_response back to True and re-opening a stale
+    # question) can't silently remove the card on reload without any test
+    # noticing.
+    from xagent.web.api import websocket as websocket_api
+
+    snapshot = websocket_api._load_historical_stream_snapshot_sync(
+        task_id, actor_user_id=user1_id, actor_is_admin=False
+    )
+    assert snapshot is not None
+    agent_events = [
+        event["data"]
+        for event in snapshot.events
+        if event.get("event_type") == "agent_message"
+    ]
+    assert len(agent_events) == 1
+    replayed = agent_events[0]
+    assert replayed["source"] == "chat_history"
+    assert replayed["expect_response"] is False
+    assert replayed["metadata"] == {"interactions": [connect_apps_interaction]}
 
 
 def test_task_create_ignores_seed_interactions_without_a_seed_message(

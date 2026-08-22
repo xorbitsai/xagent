@@ -4,6 +4,7 @@ import importlib.util
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
 from alembic import command
 from alembic.migration import MigrationContext
 from alembic.operations import Operations
@@ -155,6 +156,37 @@ def test_downgrade_removes_connector_runtime_schema(tmp_path) -> None:
             assert "runtime_input_schema" not in columns
             assert "runtime_bindings" not in columns
             assert "allow_delegated_authorization" not in columns
+
+
+def test_empty_database_alembic_upgrade_fails_closed_at_owner_revision(
+    tmp_path,
+) -> None:
+    engine = create_engine(f"sqlite:///{tmp_path / 'unsupported-empty.db'}")
+    cfg = create_alembic_config(engine)
+
+    with engine.begin() as connection:
+        cfg.attributes["connection"] = connection
+
+        with pytest.raises(RuntimeError, match="requires the users table"):
+            command.upgrade(cfg, "head")
+
+        inspector = inspect(connection)
+        assert "users" not in inspector.get_table_names()
+        assert "resource_owner_key" not in {
+            column["name"] for column in inspector.get_columns("user_oauth")
+        }
+        assert (
+            connection.execute(
+                text("SELECT version_num FROM alembic_version")
+            ).scalar_one()
+            == "20260818_seed_stripe_mcp_app"
+        )
+        assert (
+            connection.execute(
+                text("SELECT count(*) FROM public_mcp_apps WHERE app_id = 'stripe'")
+            ).scalar_one()
+            == 1
+        )
 
 
 def test_database_with_core_users_table_alembic_upgrade_to_head_completes(

@@ -81,7 +81,7 @@ def _best_effort_ensure_gmail_watches_for_user(db: Session, *, user_id: int) -> 
 
 
 def _run_post_commit_oauth_side_effects(
-    db: Session, *, user_id: Any, connector_key: str
+    db: Session, *, user_id: int, connector_key: str
 ) -> None:
     """Run the OAuth callback's post-commit work; never raise.
 
@@ -89,11 +89,8 @@ def _run_post_commit_oauth_side_effects(
     id when the connect is app-scoped (``"gmail"``), otherwise the provider
     name (``"google"``).
 
-    ``user_id`` is the raw ``oauth_state`` claim rather than an ``int`` so that
-    its coercion happens inside the guard below. Coercing it into the argument
-    would put that conversion post-commit but outside the guard, which is the
-    one thing this helper exists to prevent, and would lose the offending value
-    to a 500 instead of logging it.
+    ``user_id`` is a validated ``oauth_state`` claim. The callback validates
+    this claim before the provider exchange and database changes.
 
     Everything here runs once ``db.commit()`` has persisted the OAuth token, so
     the connect has already succeeded as far as the user is concerned. The
@@ -124,7 +121,7 @@ def _run_post_commit_oauth_side_effects(
     """
     try:
         if connector_key == "gmail":
-            _best_effort_ensure_gmail_watches_for_user(db, user_id=int(user_id))
+            _best_effort_ensure_gmail_watches_for_user(db, user_id=user_id)
     except Exception:
         logger.warning(
             "Post-commit OAuth side effects failed for user %s on connector %s; "

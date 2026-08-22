@@ -1866,21 +1866,19 @@ def _app_configured_env_keys(
     return [key for key in required if str(decrypted.get(key) or "").strip()]
 
 
-def _app_user_env_configured(
-    app: dict,
-    server: Optional[MCPServer],
-    user_mcp_by_server_id: dict[int, UserMCPServer],
-) -> bool:
+def _app_user_env_configured(configured_keys: list[str], required: list[str]) -> bool:
     """Whether this user has their own per-user key covering the app's required
     env (vs falling back to the admin's global key). Non-oauth apps only.
-    `server` is the app's already-resolved shared row (see _shared_server_for_app).
+
+    Takes the already-computed per-key breakdown (_app_configured_env_keys)
+    rather than re-deriving it from (app, server, user_mcp_by_server_id) -
+    the original shape of this function - so a caller that needs both the
+    boolean and the per-key list (list_mcp_apps below) only decrypts the
+    association's env once instead of twice.
     """
-    required = (app.get("launch_config") or {}).get("required_env") or []
     if not required:
         return False
-    return set(_app_configured_env_keys(app, server, user_mcp_by_server_id)) == set(
-        required
-    )
+    return set(configured_keys) == set(required)
 
 
 def _connected_non_oauth_server_for_app(
@@ -2181,19 +2179,21 @@ def list_mcp_apps(
                     app, shared_server, shared_env_by_id
                 )
                 app_platform_env = _app_platform_env_available(app, shared_server)
-                # Compute once and derive the all-or-nothing flag from it,
-                # rather than calling _app_user_env_configured too - that
-                # would decrypt this same association's env a second time
-                # (it calls _app_configured_env_keys internally).
+                # Decrypt this association's env once via
+                # _app_configured_env_keys and derive the all-or-nothing flag
+                # from that result, rather than also calling
+                # _app_user_env_configured's old (app, server,
+                # user_mcp_by_server_id) form, which decrypted the same env
+                # a second time internally.
                 app_configured_keys = _app_configured_env_keys(
                     app, shared_server, user_mcp_by_server_id
                 )
                 app_required_env = (app.get("launch_config") or {}).get(
                     "required_env"
                 ) or []
-                app_user_env = bool(app_required_env) and set(
-                    app_configured_keys
-                ) == set(app_required_env)
+                app_user_env = _app_user_env_configured(
+                    app_configured_keys, app_required_env
+                )
                 _assoc = (
                     user_mcp_by_server_id.get(cast(int, shared_server.id))
                     if shared_server

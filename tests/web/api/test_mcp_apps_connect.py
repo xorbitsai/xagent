@@ -303,8 +303,9 @@ def test_configured_env_keys_reflects_per_key_state_for_a_partially_configured_a
         for um in test_db.query(UserMCPServer).filter(UserMCPServer.user_id == 1).all()
     }
 
-    assert _app_user_env_configured(app, server, um_by_id) is False
-    assert _app_configured_env_keys(app, server, um_by_id) == ["KEY_A"]
+    configured_keys = _app_configured_env_keys(app, server, um_by_id)
+    assert configured_keys == ["KEY_A"]
+    assert _app_user_env_configured(configured_keys, ["KEY_A", "KEY_B"]) is False
 
 
 def test_list_mcp_apps_serializes_configured_env_keys_for_a_partially_configured_app(
@@ -350,6 +351,7 @@ def test_user_env_configured_reflects_own_key(test_db):
     (vs relying on the admin's global key), so the manage dialog can show it."""
     from xagent.web.api.mcp import (
         MCPAppConnectRequest,
+        _app_configured_env_keys,
         _app_user_env_configured,
         connect_mcp_app,
     )
@@ -360,6 +362,7 @@ def test_user_env_configured_reflects_own_key(test_db):
         "transport": "stdio",
         "launch_config": {"required_env": ["GOOGLE_MAPS_API_KEY"]},
     }
+    required = ["GOOGLE_MAPS_API_KEY"]
 
     def _server():
         return test_db.query(MCPServer).filter(MCPServer.name == "google-maps").first()
@@ -379,7 +382,12 @@ def test_user_env_configured_reflects_own_key(test_db):
         current_user=_user(test_db, 1),
         db=test_db,
     )
-    assert _app_user_env_configured(app, _server(), _um_by_id(1)) is False
+    assert (
+        _app_user_env_configured(
+            _app_configured_env_keys(app, _server(), _um_by_id(1)), required
+        )
+        is False
+    )
 
     # Connected with own key -> configured.
     connect_mcp_app(
@@ -388,7 +396,12 @@ def test_user_env_configured_reflects_own_key(test_db):
         current_user=_user(test_db, 2),
         db=test_db,
     )
-    assert _app_user_env_configured(app, _server(), _um_by_id(2)) is True
+    assert (
+        _app_user_env_configured(
+            _app_configured_env_keys(app, _server(), _um_by_id(2)), required
+        )
+        is True
+    )
 
 
 def test_connect_only_stores_required_env_keys(test_db):

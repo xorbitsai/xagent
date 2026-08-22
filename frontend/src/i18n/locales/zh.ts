@@ -218,15 +218,11 @@ const zh = {
       assignToTeammate: "我的团队",
       assignToTeammateLead: "将此任务分配给一位队员",
       assignToTeammateHint: "——或者不选，让 {appName} 自行决定。",
-      leadReady: "{name} 已准备好接手这项任务，并调动合适的专家协助。",
-    },
-    templateQuickAccess: {
-      usingTemplateLabel: "智能体模板：",
+      leadReady: "{name} 已准备好接手这项任务。",
     },
     input: {
       placeholder: "描述您的任务...",
       processing: "处理中",
-      usingAgentLabel: "使用",
       actions: {
         add: "添加",
         config: "配置模型",

@@ -42,6 +42,13 @@ export interface AgentCard {
   specialty?: string;
 }
 
+// A hired agent's persona photo, falling back to a resolved `logo_url` -
+// shared by the hero swap and the picker pill so both always agree on
+// which photo an agent shows.
+function resolveTeammateAvatar(agent: Pick<AgentCard, "persona_avatar" | "logo_url">): string | null {
+  return agent.persona_avatar || resolveAgentLogoUrl(agent.logo_url ?? null, getApiUrl());
+}
+
 type ChatStartScreenProps = {
   title: string;
   description?: string;
@@ -50,7 +57,6 @@ type ChatStartScreenProps = {
   agents?: AgentCard[];
   onAgentClick?: (agent: AgentCard) => void;
   selectedAgents?: AgentCard[];
-  onRemoveSelectedAgent?: (agentId: number | string) => void;
   onSend: (message: string, files: File[], config?: any) => void | Promise<void>;
   isSending?: boolean;
   inputValue?: string;
@@ -79,7 +85,6 @@ export function ChatStartScreen({
   agents,
   onAgentClick,
   selectedAgents = [],
-  onRemoveSelectedAgent,
   onSend,
   isSending = false,
   inputValue,
@@ -154,7 +159,7 @@ export function ChatStartScreen({
           <PersonaAvatar
             persona={{
               name: leadAgent.name,
-              avatar: leadAgent.persona_avatar || resolveAgentLogoUrl(leadAgent.logo_url ?? null, getApiUrl()),
+              avatar: resolveTeammateAvatar(leadAgent),
             }}
             sizeClassName="h-16 w-16"
             textClassName="text-xl"
@@ -202,13 +207,6 @@ export function ChatStartScreen({
             autoFocus={autoFocus}
             minHeightClass={inputMinHeightClass}
             selectedAgents={selectedAgents}
-            onRemoveSelectedAgent={onRemoveSelectedAgent}
-            // The "My Team" picker already shows who's leading via the hero
-            // portrait/subline swap above - repeating it as a chip on the
-            // composer itself is redundant, so this context alone suppresses
-            // that chip while keeping `selectedAgents` wired through (it
-            // still matters for ChatInput's own model-selection guard).
-            hideSelectedAgentChip={Boolean(agents && agents.length > 0)}
           />
         </div>
 
@@ -259,13 +257,14 @@ export function ChatStartScreen({
               <b className="font-semibold text-foreground/85">
                 {t("chatPage.sections.assignToTeammateLead")}
               </b>
-              {" "}
               {t("chatPage.sections.assignToTeammateHint", { appName: branding.appName })}
             </p>
             <div className="relative">
               <div
                 ref={teamStripRef}
                 data-testid="team-strip"
+                role="group"
+                aria-label={t("chatPage.sections.assignToTeammate")}
                 className="flex items-center gap-2 overflow-x-auto p-1 pr-8 [scrollbar-width:none] [-ms-overflow-style:none] [&::-webkit-scrollbar]:hidden"
               >
                 <span className="shrink-0 text-[11px] font-bold uppercase tracking-[0.07em] text-muted-foreground/80 whitespace-nowrap">
@@ -275,7 +274,7 @@ export function ChatStartScreen({
                   const isSelected = selectedAgents.some(
                     (selectedAgent) => selectedAgent.id === agent.id
                   );
-                  const avatarUrl = agent.persona_avatar || resolveAgentLogoUrl(agent.logo_url ?? null, getApiUrl());
+                  const avatarUrl = resolveTeammateAvatar(agent);
 
                   return (
                     <button
@@ -286,7 +285,7 @@ export function ChatStartScreen({
                       onClick={() => onAgentClick?.(agent)}
                       className={`shrink-0 flex items-center gap-[7px] rounded-full border pl-[3px] pr-3 py-[3px] transition-all whitespace-nowrap ${
                         isSelected
-                          ? "border-primary/40 bg-primary/[0.06] shadow-[0_4px_14px_rgba(37,54,224,0.11)]"
+                          ? "border-primary/40 bg-primary/[0.06] shadow-[0_4px_14px_hsl(var(--primary)/0.11)]"
                           : "border-border bg-background hover:border-primary/30 hover:bg-primary/[0.04] hover:-translate-y-px"
                       }`}
                     >

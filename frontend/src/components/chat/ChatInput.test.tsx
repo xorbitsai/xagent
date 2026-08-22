@@ -1205,7 +1205,7 @@ describe("ChatInput", () => {
     expect(onSend.mock.calls[0][1].executionMode).toBeUndefined()
   })
 
-  it("hides the execution mode picker for a template-resolved task", async () => {
+  it("hides the execution mode picker for a read-only (agent-resolved) task", async () => {
     mockDefaultModel()
     render(
       <ChatInput
@@ -1213,7 +1213,7 @@ describe("ChatInput", () => {
         inputValue="summarize this doc"
         onInputChange={vi.fn()}
         onSend={vi.fn()}
-        selectedTemplate={{ id: "doc-summarizer", name: "Doc Summarizer" }}
+        readOnlyConfig
       />
     )
 
@@ -1235,9 +1235,7 @@ describe("ChatInput", () => {
     fireEvent.click(screen.getByText(executionModeLabel("think")))
     expect(screen.getByText(executionModeLabel("think"))).toBeInTheDocument()
 
-    rerender(
-      <ChatInput {...props} selectedTemplate={{ id: "doc-summarizer", name: "Doc Summarizer" }} />
-    )
+    rerender(<ChatInput {...props} readOnlyConfig />)
     rerender(<ChatInput {...props} />)
 
     expect(screen.getByText(UNSET_MODE_LABEL)).toBeInTheDocument()

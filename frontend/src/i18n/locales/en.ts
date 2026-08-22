@@ -217,16 +217,12 @@ const en = {
       startingPrompts: "STARTING PROMPTS",
       assignToTeammate: "MY TEAM",
       assignToTeammateLead: "Assign this to a teammate",
-      assignToTeammateHint: "— or leave it and let {appName} choose.",
-      leadReady: "{name} is ready to lead this task and bring in the right specialists.",
-    },
-    templateQuickAccess: {
-      usingTemplateLabel: "Agent template:",
+      assignToTeammateHint: " — or leave it and let {appName} choose.",
+      leadReady: "{name} is ready to lead this task.",
     },
     input: {
       placeholder: "Describe your task...",
       processing: "Processing",
-      usingAgentLabel: "Using",
       actions: {
         add: "Add",
         config: "Configure Model",

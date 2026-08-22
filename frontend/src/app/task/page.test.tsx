@@ -20,7 +20,6 @@ interface MockChatStartScreenProps {
   agents?: MockAgent[]
   selectedAgents?: MockAgent[]
   onAgentClick?: (agent: MockAgent) => void
-  onRemoveSelectedAgent?: (id: number | string) => void
   onInputChange?: (value: string) => void
   onSend?: (message: string, files: unknown[], config?: unknown) => void
   taskConfig?: unknown
@@ -81,11 +80,6 @@ vi.mock("@/components/chat/ChatStartScreen", () => ({
             pick-{agent.name}
           </button>
         ))}
-        {(props.selectedAgents ?? []).map((agent) => (
-          <button key={agent.id} onClick={() => props.onRemoveSelectedAgent?.(agent.id)}>
-            remove-{agent.name}
-          </button>
-        ))}
         <button onClick={() => props.onSend?.("hello", [], { mode: "balanced" })}>send</button>
       </div>
     )
@@ -131,6 +125,28 @@ describe("TaskHomePage agents", () => {
       expect(chatStartScreenProps.current?.agents).toEqual([VERA, KEVIN])
     })
     expect(apiRequestMock).toHaveBeenCalledWith("http://api.local/api/agents")
+  })
+
+  it("selects the agent named in a ?agent= deep link once it's loaded, and also auto-fills its prompt", async () => {
+    searchParamsMock.value = new URLSearchParams({ agent: String(VERA.id) })
+    apiRequestMock.mockResolvedValueOnce(jsonResponse([VERA, KEVIN]))
+
+    render(<TaskHomePage />)
+
+    await waitFor(() => {
+      expect(chatStartScreenProps.current?.selectedAgents).toEqual([VERA])
+    })
+    expect(screen.getByTestId("composer")).toHaveValue("Research a topic and report back")
+  })
+
+  it("ignores a ?agent= deep link that doesn't match any published agent", async () => {
+    searchParamsMock.value = new URLSearchParams({ agent: "does-not-exist" })
+    apiRequestMock.mockResolvedValueOnce(jsonResponse([VERA]))
+
+    render(<TaskHomePage />)
+    await screen.findByText("pick-Vera")
+
+    expect(chatStartScreenProps.current?.selectedAgents).toEqual([])
   })
 
   it("picking a teammate with a suggested prompt fills the composer and selects them", async () => {
@@ -188,6 +204,30 @@ describe("TaskHomePage agents", () => {
 
     expect(screen.getByTestId("composer")).toHaveValue("Build me a report on our top customers")
     expect(chatStartScreenProps.current?.selectedAgents).toEqual([VERA])
+  })
+
+  it("does not resurrect a teammate's prompt after the user manually clears the composer back to empty", async () => {
+    apiRequestMock.mockResolvedValueOnce(jsonResponse([VERA]))
+    render(<TaskHomePage />)
+    await screen.findByText("pick-Vera")
+
+    // Typed custom text (never auto-filled), then picked a teammate - the
+    // composer is correctly left untouched, same as the test above.
+    act(() => {
+      chatStartScreenProps.current?.onInputChange?.("my own task")
+    })
+    fireEvent.click(screen.getByText("pick-Vera"))
+    expect(screen.getByTestId("composer")).toHaveValue("my own task")
+
+    // The user then deliberately clears it themselves.
+    act(() => {
+      chatStartScreenProps.current?.onInputChange?.("")
+    })
+
+    // A composer that's merely empty must not read as "never touched" and
+    // trigger the retroactive-fill effect to silently reinsert Vera's
+    // prompt - the user asked for it to be empty.
+    expect(screen.getByTestId("composer")).toHaveValue("")
   })
 
   it("switching from one teammate to another replaces the selection and the filled prompt", async () => {
@@ -444,16 +484,39 @@ describe("TaskHomePage agents", () => {
     )
   })
 
-  it("removing the selected-agent chip also clears an unedited auto-filled prompt", async () => {
-    apiRequestMock.mockResolvedValueOnce(jsonResponse([VERA]))
+  it("keeps a hired agent's own customized suggested_prompts over its template's generic sample prompt", async () => {
+    // /build's Suggested Prompts editor lets a user customize a hired
+    // agent's prompts after the fact - that edit must win here, not get
+    // silently replaced by the template's original marketplace sample.
+    const HIRED = {
+      id: 1,
+      name: "Vera",
+      status: "published",
+      suggested_prompts: ["My customized starting prompt"],
+      template_id: "sales-research-enricher",
+    }
+    apiRequestMock.mockImplementation((url: string) => {
+      if (url === "http://api.local/api/agents") return Promise.resolve(jsonResponse([HIRED]))
+      if (url.startsWith("http://api.local/api/templates/")) {
+        return Promise.resolve(
+          jsonResponse([
+            {
+              id: "sales-research-enricher",
+              category: "Sales",
+              sample_prompts: [{ title: "Research", prompt: "The template's generic sample prompt" }],
+            },
+          ])
+        )
+      }
+      return Promise.resolve(new Response(null, { status: 404 }))
+    })
+
     render(<TaskHomePage />)
     await screen.findByText("pick-Vera")
 
     fireEvent.click(screen.getByText("pick-Vera"))
-    fireEvent.click(screen.getByText("remove-Vera"))
 
-    expect(screen.getByTestId("composer")).toHaveValue("")
-    expect(chatStartScreenProps.current?.selectedAgents).toEqual([])
+    expect(screen.getByTestId("composer")).toHaveValue("My customized starting prompt")
   })
 })
 

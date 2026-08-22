@@ -32,47 +32,6 @@ import {
   AlertDialogTitle,
 } from "@/components/ui/alert-dialog";
 
-// Shared accent styling for the "Using @agent" / "Agent template: X" chips
-// rendered above the input.
-const CHIP_ACCENT_STYLE = { borderColor: "#3040cf", color: "#3040cf", backgroundColor: "#eef1ff" };
-
-// The "Using @agent" and "Agent template: X" chips are the same shape (an
-// italic label, a pill with the value, an optional remove button) - one
-// component instead of two near-identical blocks.
-function SelectionChip({
-  label,
-  value,
-  onRemove,
-  removeLabel,
-}: {
-  label: string;
-  value: string;
-  onRemove?: () => void;
-  removeLabel: string;
-}) {
-  return (
-    <div
-      className="inline-flex h-9 items-center gap-1 rounded-t-xl rounded-b-none border border-b-0 px-3 text-xs font-medium shadow-[0_-1px_0_rgba(53,88,255,0.08)]"
-      style={CHIP_ACCENT_STYLE}
-    >
-      <span className="italic">{label}</span>
-      <span className="rounded-md border px-2 py-0.5 not-italic" style={CHIP_ACCENT_STYLE}>
-        {value}
-      </span>
-      {onRemove && (
-        <button
-          type="button"
-          onClick={onRemove}
-          className="rounded-sm p-0.5 hover:bg-[#dfe6ff]"
-          title={removeLabel}
-        >
-          <X className="h-3 w-3" />
-        </button>
-      )}
-    </div>
-  );
-}
-
 interface ChatInputProps {
   onSend: (message: string, config?: AgentConfig) => void | Promise<void>;
   isLoading?: boolean;
@@ -96,17 +55,13 @@ interface ChatInputProps {
   autoFocus?: boolean;
   minHeightClass?: string;
   promptHighlightTerms?: string[];
+  // Drives `hasSelectedAgent` below (skips the no-model-selected guard) -
+  // never rendered as a visible chip; callers that assign a task lead show
+  // that in their own header instead (see ChatStartScreen's hero swap).
   selectedAgents?: Array<{
     id: number | string;
     name: string;
   }>;
-  onRemoveSelectedAgent?: (agentId: number | string) => void;
-  // Suppresses the visual "Using @agent" chip (and the layout space it
-  // reserves) while `selectedAgents` still drives other behavior below,
-  // e.g. skipping the no-model-selected guard in handleSubmit.
-  hideSelectedAgentChip?: boolean;
-  selectedTemplate?: { id: string; name: string } | null;
-  onRemoveSelectedTemplate?: () => void;
   uploadFile?: (file: File, params: { taskType: string }) => Promise<{ file_id: string }>;
   deferFileUpload?: boolean;
 }
@@ -160,10 +115,6 @@ export function ChatInput({
   minHeightClass = "min-h-[130px]",
   promptHighlightTerms = [],
   selectedAgents = [],
-  onRemoveSelectedAgent,
-  hideSelectedAgentChip = false,
-  selectedTemplate = null,
-  onRemoveSelectedTemplate,
   uploadFile,
   deferFileUpload = false,
 }: ChatInputProps) {
@@ -600,7 +551,7 @@ export function ChatInput({
   // Only a new standalone task: the backend takes execution_mode at creation
   // only, and an agent (a template resolves into one) overrides it anyway.
   const showExecutionModePicker =
-    !hideConfig && !readOnlyConfig && !taskConfig && !selectedTemplate;
+    !hideConfig && !readOnlyConfig && !taskConfig;
   // Unset reads as "Default", not "Auto": the server default is auto only when
   // XAGENT_AGENT_RUNTIME is unset (config.get_default_task_execution_mode).
   const executionModeTriggerLabel = pickedExecutionMode
@@ -923,13 +874,11 @@ export function ChatInput({
     }
   }, [filesDisabled, message, promptHighlightTerms]);
 
-  const hasTopChip = (selectedAgents.length > 0 && !hideSelectedAgentChip) || !!selectedTemplate;
-
   return (
     <div className="space-y-3">
       {/* Input area */}
       <div
-        className={cn("relative", hasTopChip && "pt-9")}
+        className="relative"
         ref={containerRef}
       >
         {fileMention.fileMentionsEnabled && (
@@ -943,34 +892,10 @@ export function ChatInput({
             position={fileMention.dropdownPosition}
           />
         )}
-        {hasTopChip && (
-          <div className="absolute top-0 z-10 flex flex-wrap gap-2">
-            {!hideSelectedAgentChip && selectedAgents.map((agent) => (
-              <SelectionChip
-                key={agent.id}
-                label={t("chatPage.input.usingAgentLabel")}
-                value={`@${agent.name}`}
-                onRemove={onRemoveSelectedAgent ? () => onRemoveSelectedAgent(agent.id) : undefined}
-                removeLabel={t("common.remove")}
-              />
-            ))}
-            {selectedTemplate && (
-              <SelectionChip
-                label={t("chatPage.templateQuickAccess.usingTemplateLabel")}
-                value={selectedTemplate.name}
-                onRemove={onRemoveSelectedTemplate}
-                removeLabel={t("common.remove")}
-              />
-            )}
-          </div>
-        )}
         <form
           onSubmit={handleSubmit}
           className={cn(
-            "relative flex flex-col overflow-hidden border-2 bg-card shadow-sm",
-            hasTopChip
-              ? "rounded-tr-2xl rounded-br-2xl rounded-bl-2xl rounded-tl-none"
-              : "rounded-2xl",
+            "relative flex flex-col overflow-hidden border-2 bg-card shadow-sm rounded-2xl",
             isFocused
               ? "shadow-[0_0_0_3px_rgba(48,64,207,0.16)]"
               : ""
@@ -980,7 +905,7 @@ export function ChatInput({
           onDragLeave={handleDragLeave}
           onDrop={handleDrop}
           style={{
-            borderColor: hasTopChip ? "#3040cf" : isDraggingFiles || isFocused ? "#3040cf" : "#d7deec"
+            borderColor: isDraggingFiles || isFocused ? "#3040cf" : "#d7deec"
           }}
         >
           {isDraggingFiles && (

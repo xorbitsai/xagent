@@ -8,7 +8,6 @@ const chatInputProps = vi.hoisted(() => ({
     filesDisabled?: boolean
     hideFileUpload?: boolean
     selectedAgents?: Array<{ id: number | string; name: string }>
-    hideSelectedAgentChip?: boolean
     onSend: (message: string, config?: unknown) => void
   },
 }))
@@ -141,7 +140,7 @@ describe("ChatStartScreen agents section", () => {
     expect(strip.nextSibling).not.toBeNull()
   })
 
-  it("tells ChatInput to hide its own selected-agent chip, since the hero swap already shows the lead", () => {
+  it("still forwards selectedAgents to ChatInput (it drives ChatInput's own no-model-selected guard)", () => {
     const maya = { id: 7, name: "Maya" }
     render(
       <ChatStartScreen
@@ -152,14 +151,7 @@ describe("ChatStartScreen agents section", () => {
       />
     )
 
-    expect(chatInputProps.current?.hideSelectedAgentChip).toBe(true)
     expect(chatInputProps.current?.selectedAgents).toEqual([maya])
-  })
-
-  it("does not hide ChatInput's chip for callers that don't use the My Team picker", () => {
-    render(<ChatStartScreen title="Support Agent" onSend={vi.fn()} />)
-
-    expect(chatInputProps.current?.hideSelectedAgentChip).toBe(false)
   })
 })
 

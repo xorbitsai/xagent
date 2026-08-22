@@ -24,10 +24,16 @@ function TaskHomePageContent() {
   const promptFromQuery = searchParams.get("prompt");
   const agentFromQuery = searchParams.get("agent");
   const appliedAgentFromQueryRef = useRef<string | null>(null);
-  // The exact prompt text auto-filled by the last "My Team" pick, so
-  // deselecting only clears the composer when the user hasn't since typed
-  // over it - never clobber a real edit.
-  const loadedPromptRef = useRef<string | null>(null);
+  // True once the composer holds something we did not put there ourselves
+  // - the user typed/edited/cleared it, or it was seeded from a
+  // `?prompt=`/`?starter=` deep link. Once true, no auto-fill or
+  // auto-clear logic may touch the composer again until the task is sent.
+  // This is deliberately a flag, not "does the current text match the
+  // text we last filled": that comparison breaks the moment the user
+  // clears the box back to empty - the exact state auto-fill considers
+  // "untouched" - which would then silently reinsert the very prompt they
+  // just deleted.
+  const composerDirtyRef = useRef(false);
 
   const [files, setFiles] = useState<File[]>([]);
   const [agents, setAgents] = useState<AgentCard[]>([]);
@@ -45,11 +51,13 @@ function TaskHomePageContent() {
 
   // Fetch agents on mount
   useEffect(() => {
+    let cancelled = false;
     const fetchAgents = async () => {
       try {
         const response = await apiRequest(`${getApiUrl()}/api/agents`);
-        if (response.ok) {
+        if (response.ok && !cancelled) {
           const data = await response.json();
+          if (cancelled) return;
           setAgents(
             Array.isArray(data)
               ? data.filter(
@@ -62,10 +70,15 @@ function TaskHomePageContent() {
           );
         }
       } catch (error) {
-        console.error("Failed to fetch agents:", error);
+        if (!cancelled) {
+          console.error("Failed to fetch agents:", error);
+        }
       }
     };
     fetchAgents();
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
   // Best-effort enrichment only: a hired agent traces back to the template
@@ -108,15 +121,18 @@ function TaskHomePageContent() {
         const template = agent.template_id ? templatesById[agent.template_id] : undefined;
         if (!template) return agent;
         // A hired agent's own `suggested_prompts` (from `agent_config`) is
-        // almost never populated by our built-in templates - the marketplace
-        // prompt shown for it lives on the template's `sample_prompts`
-        // instead, so prefer that for the "My Team" auto-fill.
+        // almost never populated by our built-in templates, so fall back to
+        // the template's marketplace `sample_prompts` for the "My Team"
+        // auto-fill in that case - but never override an agent's own
+        // prompts once set, since /build's Suggested Prompts editor lets a
+        // user customize them after hiring, and that edit must win here.
+        const ownPrompts = agent.suggested_prompts;
         const samplePrompt = template.sample_prompts?.[0]?.prompt;
         return {
           ...agent,
           persona_avatar: template.persona?.avatar,
           specialty: categoryLabel(t, template.category),
-          suggested_prompts: samplePrompt ? [samplePrompt] : agent.suggested_prompts,
+          suggested_prompts: ownPrompts?.length ? ownPrompts : (samplePrompt ? [samplePrompt] : ownPrompts),
         };
       }),
     [agents, templatesById, t]
@@ -227,21 +243,24 @@ function TaskHomePageContent() {
   useEffect(() => {
     setInputValue(queryInputValue);
     setPromptHighlightTerms(queryPromptHighlightTerms);
+    // A non-empty `?prompt=`/`?starter=` deep link is already an explicit
+    // choice (a pasted link, or a Welcome-modal card the user clicked) -
+    // treat it the same as the user's own text so a teammate pick can't
+    // silently blow it away.
+    composerDirtyRef.current = Boolean(queryInputValue);
   }, [queryInputValue, queryPromptHighlightTerms]);
 
   // Companion fix for the same pre-enrichment race `resolvedSelectedAgents`
   // addresses above: if the agent had no prompt to offer at click time
   // (its template hadn't loaded yet) but one arrives once enrichment
-  // lands, fill it in - but only while the composer is still exactly as
-  // `handleAgentClick` left it, so a task the user has since typed
-  // themselves is never overwritten.
+  // lands, fill it in - but only while the composer is still untouched.
   useEffect(() => {
+    if (composerDirtyRef.current) return;
     const lead = resolvedSelectedAgents[0];
     const prompt = lead?.suggested_prompts?.[0];
-    if (prompt && loadedPromptRef.current === null && inputValue === "") {
+    if (prompt && inputValue !== prompt) {
       setInputValue(prompt);
       setPromptHighlightTerms([]);
-      loadedPromptRef.current = prompt;
     }
   }, [resolvedSelectedAgents, inputValue]);
 
@@ -262,7 +281,7 @@ function TaskHomePageContent() {
       setInputValue("");
       setPromptHighlightTerms([]);
       setSelectedAgents([]);
-      loadedPromptRef.current = null;
+      composerDirtyRef.current = false;
     } catch (error) {
       console.error("Failed to send message:", error);
       toast.error(error instanceof Error ? error.message : t("builds.list.chat.sendFailed"));
@@ -275,64 +294,42 @@ function TaskHomePageContent() {
   };
 
   const handleInputChange = (value: string) => {
+    composerDirtyRef.current = true;
     setInputValue(value);
   };
 
-  // Clears the composer only if it still holds exactly the prompt a "My
-  // Team" pick auto-filled - never clobber whatever the user has since
-  // typed, matching the reference behavior this pill row is modeled on.
-  const clearAutoFilledPromptIfUnchanged = () => {
-    if (loadedPromptRef.current !== null && inputValue === loadedPromptRef.current) {
+  // Clears the composer only if we're the ones who last wrote to it -
+  // never clobber whatever the user has since typed.
+  const clearComposerIfOurs = () => {
+    if (!composerDirtyRef.current) {
       setInputValue("");
       setPromptHighlightTerms([]);
     }
-    loadedPromptRef.current = null;
   };
 
-  const handleRemoveSelectedAgent = (agentId: number | string) => {
-    setSelectedAgents((prev) => prev.filter((agent) => agent.id !== agentId));
-    clearAutoFilledPromptIfUnchanged();
-  };
-
-  // Picking a teammate assigns them as the task's lead and, when they carry
-  // a suggested prompt, fills the composer with it - clicking the already-
-  // selected pill again clears both (see clearAutoFilledPromptIfUnchanged).
-  // Only one teammate can lead a task, so this always replaces rather than
-  // appending to `selectedAgents`.
+  // Picking a teammate assigns them as the task's lead and, when the
+  // composer is still untouched, fills it with their suggested prompt (or
+  // clears it, if they don't have one) - clicking the already-selected
+  // pill again clears both. Only one teammate can lead a task, so this
+  // always replaces rather than appending to `selectedAgents`. Re-clicking
+  // the same pill is the only supported way to deselect - there's no
+  // visible "remove" affordance in the composer, since the hero swap
+  // above already shows who's leading.
   const handleAgentClick = (agent: AgentCard) => {
     if (selectedAgents[0]?.id === agent.id) {
       setSelectedAgents([]);
-      clearAutoFilledPromptIfUnchanged();
+      clearComposerIfOurs();
       return;
     }
-
-    // Only ever touch the composer when it's still exactly what the last
-    // auto-fill left behind (or empty) - a task the user has genuinely
-    // typed themselves must never be overwritten just because a different
-    // teammate is now leading. Read `inputValue` once, up front: setState
-    // is batched, so calling clearAutoFilledPromptIfUnchanged() first (as
-    // this used to) and then re-checking `inputValue` afterwards would
-    // still see the pre-clear value within this same handler run.
-    const composerIsUntouched = inputValue === "" || inputValue === loadedPromptRef.current;
 
     setSelectedAgents([agent]);
-    const prompt = agent.suggested_prompts?.[0];
-    if (!composerIsUntouched) {
-      // The user's own text stays exactly as they left it; there's no
-      // longer an auto-fill of ours to track against it.
-      loadedPromptRef.current = null;
+    if (composerDirtyRef.current) {
+      // The user's own text stays exactly as they left it.
       return;
     }
 
-    if (prompt) {
-      setInputValue(prompt);
-      setPromptHighlightTerms([]);
-      loadedPromptRef.current = prompt;
-    } else {
-      setInputValue("");
-      setPromptHighlightTerms([]);
-      loadedPromptRef.current = null;
-    }
+    setInputValue(agent.suggested_prompts?.[0] || "");
+    setPromptHighlightTerms([]);
   };
 
   return (
@@ -346,7 +343,6 @@ function TaskHomePageContent() {
             agents={teammates}
             onAgentClick={handleAgentClick}
             selectedAgents={resolvedSelectedAgents}
-            onRemoveSelectedAgent={handleRemoveSelectedAgent}
             onSend={handleSend}
             isSending={state.isProcessing}
             files={files}

@@ -188,8 +188,6 @@ def _index_map(connection) -> dict[str, dict]:
 def _where(index: dict) -> str:
     options = index.get("dialect_options") or {}
     clause = options.get("sqlite_where")
-    if clause is None:
-        clause = options.get("postgresql_where")
     return str(clause if clause is not None else "").lower()
 
 

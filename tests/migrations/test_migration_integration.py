@@ -481,16 +481,27 @@ class TestMigrations:
                 text("SELECT provider, access_token FROM user_oauth WHERE id = 9001")
             ).one() == ("gmail", "token")
 
-    def test_sqlite_owner_downgrade_restores_one_known_head(self, sqlite_tester):
-        """Rollback removes owner storage and retains the existing merge head."""
-        parent = "b1efe0dbe0af"
+    def test_sqlite_owner_downgrade_preserves_stripe_head(self, sqlite_tester):
+        """Rollback removes owner storage without removing the Stripe seed."""
+        owner_revision = "20260818_user_oauth_resource_owner"
+        stripe_revision = "20260818_seed_stripe_mcp_app"
+        script_dir = ScriptDirectory.from_config(sqlite_tester.alembic_cfg)
+
+        assert script_dir.get_heads() == [owner_revision]
 
         sqlite_tester.create_metadata_owned_users_table()
         command.upgrade(sqlite_tester.alembic_cfg, "head")
-        command.downgrade(sqlite_tester.alembic_cfg, parent)
+        command.downgrade(sqlite_tester.alembic_cfg, stripe_revision)
 
-        assert sqlite_tester.get_alembic_versions() == {parent}
+        assert sqlite_tester.get_alembic_versions() == {stripe_revision}
         assert "resource_owner_key" not in sqlite_tester.get_column_names("user_oauth")
+        with sqlite_tester.engine.begin() as conn:
+            assert (
+                conn.execute(
+                    text("SELECT count(*) FROM public_mcp_apps WHERE app_id = 'stripe'")
+                ).scalar_one()
+                == 1
+            )
 
     def test_sqlite_idempotence_with_sqlalchemy(self, sqlite_tester):
         """Test that migrations are idempotent when tables pre-created by SQLAlchemy.

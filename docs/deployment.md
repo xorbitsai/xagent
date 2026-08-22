@@ -81,7 +81,7 @@ Marked tasks do not remain isolated when executed by an older worker. Keep publi
 
 The `user_oauth` table gets a nullable `resource_owner_key` column, and existing rows keep a null value. This foundation explicitly scopes non-Gmail OAuth consumers to that ordinary namespace. Gmail behavior remains unchanged here; the immediately following Gmail lifecycle release installs its complete owner boundary before any release can create actor-owned credentials.
 
-Two partial unique indexes replace `uq_user_provider_account`. One index protects ordinary rows. The other separates actor-owned namespaces when `provider_user_id` is non-null. Standard SQL null semantics still permit multiple rows with the same actor key, provider, and null `provider_user_id`. SQLite and PostgreSQL are the only supported database dialects for this schema; startup and migration fail before schema creation on other dialects.
+Two partial unique indexes replace `uq_user_provider_account`. One index protects ordinary rows. The other separates actor-owned namespaces when `provider_user_id` is non-null. Standard SQL null semantics still permit multiple rows with the same actor key, provider, and null `provider_user_id`. PostgreSQL is the only supported production database, including self-hosted production installations. SQLite is supported only for local development and CI. Startup and migration fail before schema creation on other dialects.
 
 The `users` table is an application-metadata table and must exist before this revision runs. Do not use bare Alembic to initialize a genuinely empty application database; normal application startup stamps the empty database before creating metadata-owned tables. On an existing legacy schema, this revision installs the missing `user_oauth.user_id -> users.id ON DELETE CASCADE` foreign key during the owner-aware transition. It fails closed when `users` is absent or when an already owner-aware schema is missing that cascade.
 
@@ -89,23 +89,23 @@ If bare Alembic was run against a genuinely empty database, the command can stop
 
 On PostgreSQL the migration creates the replacement indexes transactionally before removing the old unique constraint. A failed statement rolls back the complete schema transition. If a same-name relation causes the failure, an operator must inspect and remove or rename that relation before retrying `alembic upgrade head`. `ADD COLUMN` and the non-concurrent index builds hold table locks until the transaction commits and can block both reads and writes to `user_oauth`. Pause every OAuth operation that accesses this table for the migration window, and monitor lock wait time instead of assuming the pause will be short.
 
-On SQLite the migration rejects globally colliding owner-index names before rebuilding the table in batch mode. Stop every worker before this rebuild and keep SQLite quiesced until the migration completes. Take and verify a database backup before the rebuild: under the driver's legacy transaction mode, SQLite DDL can commit independently of Alembic's outer transaction.
+On local SQLite, the migration rejects globally colliding owner-index names before it rebuilds the table. Stop local processes that use the database before this rebuild. If the local data must be preserved, create a verified backup. SQLite DDL can commit independently of Alembic's outer transaction.
 
-If the SQLite migration process exits after the rebuild starts, keep every worker stopped. Retry `alembic upgrade head` once with the same release.
+If the SQLite migration process exits after the rebuild starts, keep local processes stopped. Retry `alembic upgrade head` once with the same release.
 
 The migration completes only an unambiguous interrupted index-installation state. The `resource_owner_key` column must have its expected nullable `VARCHAR(512)` definition. The `uq_user_provider_account` constraint must be absent. Zero, one, or both owner-aware indexes can exist. Each existing owner-aware index must have the expected definition.
 
-The migration creates only the missing owner-aware indexes. If both valid indexes exist, the migration makes no schema change before Alembic records the revision. Do not start workers until both indexes pass the verification below.
+The migration creates only the missing owner-aware indexes. If both valid indexes exist, the migration makes no schema change before Alembic records the revision. Do not resume local processes until both indexes pass the verification below.
 
-If that retry reports a partially owner-aware schema, an incorrect owner column, a missing user cascade, an incorrect index, a relation-name collision, or duplicate data that prevents unique-index creation, do not continue automatically. Restore the verified pre-migration backup, confirm that `users` and `uq_user_provider_account` exist and `resource_owner_key` does not, and then retry from the legacy schema; alternatively, have a database operator repair one coherent schema under the same quiescent window. Never resume from a table that has lost the old constraint but does not have the required user cascade and both verified owner-aware indexes because that state has incomplete deletion or uniqueness enforcement.
+If that retry reports an invalid schema, do not continue automatically. For a disposable local database, delete and recreate it through normal application startup. For a non-disposable local database, restore the verified backup or repair one coherent schema manually. Never use a table that lacks the old constraint and the two verified owner-aware indexes.
 
-If the retry reports a leftover `_alembic_tmp_user_oauth` temporary table, do not remove or rename either table automatically. Keep workers stopped. Restore the verified pre-migration backup, or have a database operator compare both table definitions and contents and restore one coherent `user_oauth` table before retrying.
+If the retry reports a leftover `_alembic_tmp_user_oauth` table, do not remove or rename either table automatically. For a disposable local database, delete and recreate it. Otherwise, compare both tables and restore one coherent `user_oauth` table before retrying.
 
-The normal application-startup migration path disables SQLite foreign-key enforcement around batch rebuilds and rejects any new foreign-key violations before commit. The standalone `alembic upgrade head` path does not provide that guard. If operators must use the standalone command, record the complete `PRAGMA foreign_key_check;` result and `SELECT count(*) FROM gmail_watch_states;` before and after migration. Do not start workers if the foreign-key result gains a row or the watch-state count changes. The row count is required because a valid `ON DELETE CASCADE` can remove child rows without leaving a foreign-key violation.
+The normal application-startup migration path disables SQLite foreign-key enforcement around batch rebuilds. It rejects new foreign-key violations before commit. The standalone `alembic upgrade head` path does not provide that guard. If you use the standalone command, record `PRAGMA foreign_key_check;` and `SELECT count(*) FROM gmail_watch_states;` before and after migration. Do not resume local processes if the foreign-key result gains a row or the watch-state count changes. A valid `ON DELETE CASCADE` can remove child rows without leaving a foreign-key violation.
 
-If the migration reports `UserOAuth schema is partially owner-aware`, do not start workers. The schema has either `resource_owner_key` and the old `uq_user_provider_account` constraint together, or neither one. Restore the last known complete schema from backup, or have a database operator finish one coherent legacy or owner-aware schema before retrying `alembic upgrade head`. Do not bypass this fail-closed check.
+If the migration reports `UserOAuth schema is partially owner-aware`, do not resume local processes. For a disposable local database, delete and recreate it. Otherwise, restore the last complete backup or repair one coherent schema before retrying `alembic upgrade head`.
 
-If SQLite reports that an owner-aware schema name already exists before migration, query `sqlite_master` for that exact name and identify its relation type, owning table, and definition. After taking a backup, remove or rename only the unrelated colliding table, index, or view, then retry `alembic upgrade head`. If either database reports `owner-aware UserOAuth schema has incorrect indexes`, keep workers stopped and compare both index columns, uniqueness flags, and predicates with the verification definitions below. Repair or remove the incorrect owner indexes under database-operator supervision before retrying the migration.
+If SQLite reports that an owner-aware schema name exists before migration, query `sqlite_master` for that name. Identify its relation type, owning table, and definition. After you create a backup, remove or rename only the unrelated colliding table, index, or view. Then retry `alembic upgrade head`. If either database reports `owner-aware UserOAuth schema has incorrect indexes`, do not use the database. Compare the index columns, uniqueness flags, and predicates with the definitions below. Repair or remove incorrect indexes before you retry the migration.
 
 ### Prerequisites and configuration
 
@@ -113,21 +113,20 @@ This change has no new environment variable or dependency. Keep every future act
 
 ### Deployment and migration steps
 
-Choose the procedure for the configured database.
+Use the PostgreSQL procedure for production. Use the SQLite procedure only for local development. CI uses automated migration coverage.
 
-#### SQLite
+#### SQLite local development
 
-1. Stop new OAuth connections and task execution.
-2. Stop every API and task worker.
-3. Take and verify a restorable database backup.
-4. Deploy the new application files without starting workers.
-5. Record `PRAGMA foreign_key_check;` and `SELECT count(*) FROM gmail_watch_states;`, then run `alembic upgrade head` one time.
-6. Run both queries again. Require that the foreign-key result contains no new row and that the watch-state count is unchanged.
-7. Start every API and task worker with the new version.
-8. Verify the schema and homogeneous worker version.
-9. Resume ordinary OAuth connections and task execution.
+1. Stop local processes that use the database.
+2. If the local data must be preserved, create a verified backup.
+3. Update the local application files.
+4. Record `PRAGMA foreign_key_check;` and `SELECT count(*) FROM gmail_watch_states;`.
+5. Run `alembic upgrade head` one time.
+6. Run both queries again. Make sure that the foreign-key result has no new row. Make sure that the watch-state count is unchanged.
+7. Verify the schema.
+8. Resume the local processes.
 
-#### PostgreSQL
+#### PostgreSQL production
 
 1. Pause OAuth reads and writes that access `user_oauth`, and make sure no long transaction holds a lock on the table.
 2. Run `alembic upgrade head` one time. Already-running old workers can continue non-OAuth work while the transactional DDL runs, but an old worker that starts or restarts after the schema revision advances will fail startup because it does not recognize the new revision. Prevent old-version restarts and autoscaling during this window, or ensure every replacement starts from the owner-aware image.
@@ -171,7 +170,7 @@ WHERE n.nspname = current_schema()
 
 The query must return both rows with `indisunique = true`. The ordinary row must index `(user_id, provider, provider_user_id)` with `resource_owner_key IS NULL`; the actor row must index `(user_id, resource_owner_key, provider, provider_user_id)` with `resource_owner_key IS NOT NULL`.
 
-For SQLite run `PRAGMA index_list('user_oauth');` and `PRAGMA index_info('<index-name>');`. Inspect `sqlite_master.sql` to confirm that the ordinary index uses `WHERE resource_owner_key IS NULL` and the actor index uses `WHERE resource_owner_key IS NOT NULL`. Run `PRAGMA foreign_key_list('user_oauth');` and require a `user_id -> users.id` row whose delete action is `CASCADE`. On PostgreSQL, inspect `user_oauth` constraints and require the equivalent cascade before enabling actor-owned rows.
+For local SQLite, run `PRAGMA index_list('user_oauth');` and `PRAGMA index_info('<index-name>');`. Inspect `sqlite_master.sql`. The ordinary index must use `WHERE resource_owner_key IS NULL`. The actor index must use `WHERE resource_owner_key IS NOT NULL`. Run `PRAGMA foreign_key_list('user_oauth');`. Require a `user_id -> users.id` row with a `CASCADE` delete action. On PostgreSQL, inspect `user_oauth` constraints. Require the equivalent cascade before you enable actor-owned rows.
 
 Verify existing cloud-storage and builtin OAuth connections. Confirm that seeded non-null-owner test rows do not appear in ordinary catalog or token paths.
 
@@ -179,16 +178,17 @@ Verify existing cloud-storage and builtin OAuth connections. Confirm that seeded
 
 Because this release cannot create actor-owned rows, the downgrade remains available after ordinary rollout.
 
-1. Stop all workers before the downgrade.
-2. If the database is SQLite, create a current database backup.
-3. If the database is SQLite, run `PRAGMA integrity_check;` against the backup and record `SELECT count(*) FROM gmail_watch_states;`. The integrity result must be `ok`.
+1. For PostgreSQL, stop all production workers. For SQLite, stop local processes that use the database.
+2. If local SQLite data must be preserved, create a current database backup.
+3. For a non-disposable SQLite database, run `PRAGMA integrity_check;` against the backup. Record `SELECT count(*) FROM gmail_watch_states;`. The integrity result must be `ok`.
 4. Run `alembic downgrade 20260818_seed_stripe_mcp_app`.
 5. Run `alembic current`. The command must report only `20260818_seed_stripe_mcp_app`. The Stripe catalog seed remains installed.
-6. If the database is SQLite, run `PRAGMA integrity_check;`, `PRAGMA foreign_key_check;`, and `SELECT count(*) FROM gmail_watch_states;`. Require `ok`, no foreign-key violations, and the same watch-state count recorded before downgrade.
-7. If the database is SQLite, inspect `PRAGMA table_info('user_oauth');`. The result must not contain `resource_owner_key`.
-8. If the database is SQLite, inspect `PRAGMA index_list('user_oauth');` and each `PRAGMA index_info('<index-name>');` result. One unique index must cover `(user_id, provider, provider_user_id)`.
-9. Deploy the old version.
+6. For SQLite, run `PRAGMA integrity_check;` and `PRAGMA foreign_key_check;`. Require `ok` and no foreign-key violations.
+7. For a non-disposable SQLite database, run `SELECT count(*) FROM gmail_watch_states;`. Require the count that step 3 recorded.
+8. For SQLite, inspect `PRAGMA table_info('user_oauth');`. The result must not contain `resource_owner_key`.
+9. For SQLite, inspect `PRAGMA index_list('user_oauth');` and each `PRAGMA index_info('<index-name>');` result. One unique index must cover `(user_id, provider, provider_user_id)`.
+10. For PostgreSQL, deploy the old version. For SQLite, return to the previous local application version.
 
-SQLite can commit each schema operation separately during a batch-table rebuild. If the downgrade fails or stops, do not retry against the changed database. Restore the verified backup, make sure that `alembic current` reports the owner-aware revision, and retry the downgrade.
+SQLite can commit each schema operation separately during a batch-table rebuild. If a downgrade fails, do not retry against the changed database. For a disposable local database, delete and recreate it through normal application startup. Otherwise, restore the verified backup. Make sure that `alembic current` reports the owner-aware revision before you retry the downgrade.
 
 The migration refuses the downgrade if a non-null owner row exists. If a caller created such a row, disable that caller. Revoke and remove the credential with an approved procedure. Then retry the downgrade.

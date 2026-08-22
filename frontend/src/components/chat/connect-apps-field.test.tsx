@@ -432,6 +432,46 @@ describe("ConnectAppsField", () => {
     expect(toastErrorMock).not.toHaveBeenCalled();
   });
 
+  it("ignores a same-tick double click, so a fast double-click on Granola can't register two OAuth clients at the provider (DCR)", async () => {
+    // openMcpOAuthPopup mints a new OAuth client via Dynamic Client
+    // Registration on every call (see its own doc comment) - a second
+    // concurrent call for the same app is a real, unrecoverable side effect
+    // at the provider, not just a wasted request. setConnectingKeys alone
+    // can't prevent this: React batches the state update, so the button's
+    // disabled={isConnecting} still reads false for a click landing before
+    // the first commit - this is why withConnectingKey also keeps a
+    // synchronous ref guard (connectingKeysRef), mirroring connect-mcp-
+    // dialog.tsx's loadingAppsRef/beginAppConnect for the identical race.
+    mcpAppsMock.apps = [
+      makeApp({
+        id: "granola",
+        name: "Granola",
+        provider: undefined,
+        auth_type: "mcp_oauth",
+        is_connected: false,
+      }),
+    ];
+    let resolveConnect: (result: { connected: boolean }) => void = () => {};
+    openMcpOAuthPopupMock.mockImplementation(
+      () => new Promise((resolve) => { resolveConnect = resolve; })
+    );
+
+    render(
+      <ConnectAppsField interaction={{ ...LEO_INTERACTION, apps: ["Granola"] }} onSkip={vi.fn()} />
+    );
+
+    const button = continueButton("Granola");
+    fireEvent.click(button);
+    fireEvent.click(button);
+
+    expect(openMcpOAuthPopupMock).toHaveBeenCalledTimes(1);
+
+    resolveConnect({ connected: true });
+    await waitFor(() => {
+      expect(mcpAppsMock.refresh).toHaveBeenCalled();
+    });
+  });
+
   it("toasts an error when the mcp_oauth popup does not end up connected", async () => {
     mcpAppsMock.apps = [
       makeApp({ id: "granola", name: "Granola", provider: undefined, auth_type: "mcp_oauth" }),

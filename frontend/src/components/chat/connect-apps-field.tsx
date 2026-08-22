@@ -1,7 +1,7 @@
 "use client";
 
 import React, { useEffect, useMemo, useRef, useState } from "react";
-import { Check } from "lucide-react";
+import { CheckCircle2 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { useAuth } from "@/contexts/auth-context";
 import { useI18n } from "@/contexts/i18n-context";
@@ -14,7 +14,7 @@ import { cn, getApiUrl } from "@/lib/utils";
 import type { Interaction } from "@/contexts/app-context-chat";
 import { capitalize } from "@/lib/tool-category-labels";
 import { findMatchingMcpApp } from "@/lib/mcp-lookup";
-import { ApiKeyConnectDialog } from "./api-key-connect-dialog";
+import { ApiKeyConnectDialog, CONNECT_TIMEOUT_MS, iconFallbackUrl } from "./api-key-connect-dialog";
 
 // The 11 builtin-OAuth providers (see src/xagent/web/builtin_mcp_registry.py's
 // get_builtin_oauth_provider_rows) - brand names, left untranslated in both
@@ -35,16 +35,6 @@ const PROVIDER_DISPLAY_NAMES: Record<string, string> = {
   linear: "Linear",
   jira: "Jira",
 };
-
-// Same load-failure fallback as connect-mcp-dialog.tsx/official-mcp-settings-
-// dialog.tsx: a real icon can still 404 (catalog data drifts, a favicon
-// service hiccups), so swap to a generated avatar rather than leave a
-// broken-image glyph in a card whose whole point is inspiring OAuth trust.
-function iconFallbackUrl(name: string): string {
-  return `https://ui-avatars.com/api/?name=${encodeURIComponent(name)}&background=random&color=fff&size=128`;
-}
-
-const CONNECT_TIMEOUT_MS = 30_000;
 
 interface OAuthProviderGroup {
   provider: string;
@@ -166,7 +156,10 @@ function RowIcon({
 function ConnectedBadge({ label }: { label: string }) {
   return (
     <span className="flex flex-shrink-0 items-center gap-1.5 text-xs font-semibold text-green-700 dark:text-green-400">
-      <Check className="h-3.5 w-3.5" />
+      {/* Same glyph connect-mcp-dialog.tsx uses for "connected/verified/
+          selected" everywhere in Settings -> Tools, so a connected state
+          reads the same whether the user sees it there or in this card. */}
+      <CheckCircle2 className="h-3.5 w-3.5" />
       {label}
     </span>
   );
@@ -192,6 +185,15 @@ export function ConnectAppsField({
   const [skipped, setSkipped] = useState(false);
   const [keyConnectApp, setKeyConnectApp] = useState<McpApp | null>(null);
   const isMountedRef = useRef(true);
+  // Synchronous shadow of connectingKeys, same reason connect-mcp-dialog.tsx
+  // keeps loadingAppsRef alongside loadingApps (#1330 there): setState-based
+  // `disabled={isConnecting}` lags a commit cycle behind two clicks landing
+  // in the same tick, and for the mcp_oauth (DCR) path a double-click
+  // reaching openMcpOAuthPopup twice really does register two OAuth clients
+  // at the third-party authorization server - a side effect nothing here can
+  // withdraw, unlike the bare-OAuth-popup or keyless paths that merely open a
+  // redundant popup or hit an idempotent backend.
+  const connectingKeysRef = useRef<Set<string>>(new Set());
 
   useEffect(() => {
     isMountedRef.current = true;
@@ -223,10 +225,13 @@ export function ConnectAppsField({
   }
 
   const withConnectingKey = async (key: string, run: () => Promise<void>) => {
+    if (connectingKeysRef.current.has(key)) return;
+    connectingKeysRef.current.add(key);
     setConnectingKeys((prev) => new Set(prev).add(key));
     try {
       await run();
     } finally {
+      connectingKeysRef.current.delete(key);
       if (isMountedRef.current) {
         setConnectingKeys((prev) => {
           const next = new Set(prev);

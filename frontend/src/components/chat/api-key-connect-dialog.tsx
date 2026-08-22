@@ -11,18 +11,22 @@ import { getApiUrl } from "@/lib/utils";
 import { toast } from "@/components/ui/sonner";
 import type { McpApp } from "@/contexts/mcp-apps-context";
 
-const CONNECT_TIMEOUT_MS = 30_000;
+// Shared with connect-apps-field.tsx, which renders this dialog - both files
+// live in this same PR, unlike the big connect-mcp-dialog.tsx this file
+// otherwise deliberately avoids importing from, so there's no reason to
+// keep two copies in sync by hand.
+export const CONNECT_TIMEOUT_MS = 30_000;
 // A same-key retention token: submitting it back unchanged tells the backend
 // (_merge_masked_env, src/xagent/web/api/mcp.py) to keep the stored secret
 // rather than overwrite it. Matches connect-mcp-dialog.tsx's own constant of
-// the same name/value - duplicated per this file's established narrow-slice
-// pattern rather than imported, since neither file exports it.
+// the same name/value - duplicated from *that* file per this file's
+// established narrow-slice pattern, since that file doesn't export it.
 const MASKED_SECRET_VALUE = "********";
 
-// Same load-failure fallback as connect-apps-field.tsx's RowIcon: a real
-// icon URL can still 404, and this dialog reuses the exact same app.icon
-// value that row already has to guard for the same reason.
-function iconFallbackUrl(name: string): string {
+// A real icon URL can still 404 (catalog data drifts, a favicon service
+// hiccups) - shared with connect-apps-field.tsx's RowIcon, which guards the
+// same app.icon value for the same reason.
+export function iconFallbackUrl(name: string): string {
   return `https://ui-avatars.com/api/?name=${encodeURIComponent(name)}&background=random&color=fff&size=128`;
 }
 

@@ -1,6 +1,6 @@
 /// <reference types="@testing-library/jest-dom/vitest" />
 import React from "react";
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { McpApp } from "@/contexts/mcp-apps-context";
 
@@ -84,6 +84,28 @@ describe("ApiKeyConnectDialog", () => {
     expect(img.src).toBe(
       "https://ui-avatars.com/api/?name=AWS&background=random&color=fff&size=128"
     );
+
+    // If the fallback avatar itself also fails (ui-avatars.com down, an
+    // ad-blocker), onError fires again - the handler must bail out instead
+    // of writing src again forever. jsdom never actually loads images, so
+    // re-writing the identical URL is otherwise invisible from the outside;
+    // spy on the src setter itself to prove the second error is a no-op.
+    // (Nulling .onerror would NOT catch this - React attaches this handler
+    // via addEventListener, not the element's .onerror DOM property, so an
+    // implementation that only did that would still write src again here.)
+    const srcDescriptor = Object.getOwnPropertyDescriptor(HTMLImageElement.prototype, "src")!;
+    const setSrcSpy = vi.fn();
+    Object.defineProperty(img, "src", {
+      configurable: true,
+      get: () => srcDescriptor.get!.call(img),
+      set: (value: string) => {
+        setSrcSpy(value);
+        srcDescriptor.set!.call(img, value);
+      },
+    });
+
+    fireEvent.error(img);
+    expect(setSrcSpy).not.toHaveBeenCalled();
   });
 
   it("renders one password input per required env var, labeled by its name", () => {
@@ -93,6 +115,31 @@ describe("ApiKeyConnectDialog", () => {
     const secretKeyInput = screen.getByLabelText("AWS_SECRET_ACCESS_KEY");
     expect(accessKeyInput).toHaveAttribute("type", "password");
     expect(secretKeyInput).toHaveAttribute("type", "password");
+  });
+
+  it("encodes the app id in the connect route, since it is interpolated into a URL path segment", async () => {
+    apiRequestMock.mockResolvedValueOnce(jsonResponse({ ok: true }));
+
+    render(
+      <ApiKeyConnectDialog
+        app={makeApp({ id: "weird/app?id" })}
+        onOpenChange={vi.fn()}
+        onConnected={vi.fn()}
+      />
+    );
+
+    fireEvent.change(screen.getByLabelText("AWS_ACCESS_KEY_ID"), { target: { value: "key-123" } });
+    fireEvent.change(screen.getByLabelText("AWS_SECRET_ACCESS_KEY"), {
+      target: { value: "secret-456" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "tools.mcp.dialog.connect" }));
+
+    await waitFor(() => {
+      expect(apiRequestMock).toHaveBeenCalledWith(
+        "http://api.local/api/mcp/apps/weird%2Fapp%3Fid/connect",
+        expect.anything()
+      );
+    });
   });
 
   it("posts the entered values with env_source 'own' and reports success", async () => {
@@ -134,27 +181,71 @@ describe("ApiKeyConnectDialog", () => {
     });
   });
 
-  it("sends every required key explicitly, defaulting an untouched one to an empty string", async () => {
-    apiRequestMock.mockResolvedValueOnce(jsonResponse({ ok: true }));
-
+  it("disables Connect until every required field has a value, so a partial setup can't be submitted at all", () => {
+    // connect_mcp_app accepts (and activates) a partial env - a blank field
+    // is dropped, not rejected, and is_connected only checks association
+    // membership, not env completeness (src/xagent/web/api/mcp.py). Unlike
+    // connect-mcp-dialog.tsx's key form, this dialog offers no shared/
+    // platform fallback, so a blank field has no honest reading other than
+    // "not done yet" - the button must not be clickable until every field
+    // has something in it, or this flow can create a "Connected" row a real
+    // tool call would still fail against.
     render(<ApiKeyConnectDialog app={makeApp()} onOpenChange={vi.fn()} onConnected={vi.fn()} />);
+
+    const connectButton = screen.getByRole("button", { name: "tools.mcp.dialog.connect" });
+    expect(connectButton).toBeDisabled();
 
     // Only fill the first field; leave AWS_SECRET_ACCESS_KEY untouched.
     fireEvent.change(screen.getByLabelText("AWS_ACCESS_KEY_ID"), {
       target: { value: "key-123" },
     });
-    fireEvent.click(screen.getByRole("button", { name: "tools.mcp.dialog.connect" }));
+    expect(connectButton).toBeDisabled();
 
+    fireEvent.change(screen.getByLabelText("AWS_SECRET_ACCESS_KEY"), {
+      target: { value: "   " },
+    });
+    expect(connectButton).toBeDisabled();
+
+    fireEvent.change(screen.getByLabelText("AWS_SECRET_ACCESS_KEY"), {
+      target: { value: "secret-456" },
+    });
+    expect(connectButton).not.toBeDisabled();
+    expect(apiRequestMock).not.toHaveBeenCalled();
+  });
+
+  it("ignores a same-tick double click on Connect, so a fast double-click can't issue two POSTs", async () => {
+    // disabled={isSubmitting} alone isn't enough: React batches the
+    // setIsSubmitting(true) update, so a second click landing before that
+    // commit still reads disabled=false - the same race connect-apps-
+    // field.tsx's connectingKeysRef guards against for its own handlers.
+    // Both dispatches below go through one outer act() rather than two
+    // separate fireEvent.click calls, which would each flush React's state
+    // synchronously before returning - the DOM would already show
+    // disabled=true before a second, separate fireEvent.click, which would
+    // pass even without the ref guard for the wrong reason.
+    let resolveConnect: (value: Response) => void = () => {};
+    apiRequestMock.mockImplementation(
+      () => new Promise((resolve) => { resolveConnect = resolve; })
+    );
+
+    render(<ApiKeyConnectDialog app={makeApp()} onOpenChange={vi.fn()} onConnected={vi.fn()} />);
+
+    fireEvent.change(screen.getByLabelText("AWS_ACCESS_KEY_ID"), { target: { value: "key-123" } });
+    fireEvent.change(screen.getByLabelText("AWS_SECRET_ACCESS_KEY"), {
+      target: { value: "secret-456" },
+    });
+
+    const connectButton = screen.getByRole("button", { name: "tools.mcp.dialog.connect" });
+    act(() => {
+      fireEvent.click(connectButton);
+      fireEvent.click(connectButton);
+    });
+
+    expect(apiRequestMock).toHaveBeenCalledTimes(1);
+
+    resolveConnect(jsonResponse({ ok: true }));
     await waitFor(() => {
-      expect(apiRequestMock).toHaveBeenCalledWith(
-        "http://api.local/api/mcp/apps/aws/connect",
-        expect.objectContaining({
-          body: JSON.stringify({
-            env: { AWS_ACCESS_KEY_ID: "key-123", AWS_SECRET_ACCESS_KEY: "" },
-            env_source: "own",
-          }),
-        })
-      );
+      expect(toastSuccessMock).toHaveBeenCalled();
     });
   });
 
@@ -166,6 +257,10 @@ describe("ApiKeyConnectDialog", () => {
       <ApiKeyConnectDialog app={makeApp()} onOpenChange={onOpenChange} onConnected={vi.fn()} />
     );
 
+    fireEvent.change(screen.getByLabelText("AWS_ACCESS_KEY_ID"), { target: { value: "key-123" } });
+    fireEvent.change(screen.getByLabelText("AWS_SECRET_ACCESS_KEY"), {
+      target: { value: "secret-456" },
+    });
     fireEvent.click(screen.getByRole("button", { name: "tools.mcp.dialog.connect" }));
 
     await waitFor(() => {
@@ -184,6 +279,10 @@ describe("ApiKeyConnectDialog", () => {
 
     render(<ApiKeyConnectDialog app={makeApp()} onOpenChange={vi.fn()} onConnected={vi.fn()} />);
 
+    fireEvent.change(screen.getByLabelText("AWS_ACCESS_KEY_ID"), { target: { value: "key-123" } });
+    fireEvent.change(screen.getByLabelText("AWS_SECRET_ACCESS_KEY"), {
+      target: { value: "secret-456" },
+    });
     fireEvent.click(screen.getByRole("button", { name: "tools.mcp.dialog.connect" }));
 
     await waitFor(() => {
@@ -291,6 +390,10 @@ describe("ApiKeyConnectDialog", () => {
 
     render(<ApiKeyConnectDialog app={makeApp()} onOpenChange={vi.fn()} onConnected={vi.fn()} />);
 
+    fireEvent.change(screen.getByLabelText("AWS_ACCESS_KEY_ID"), { target: { value: "key-123" } });
+    fireEvent.change(screen.getByLabelText("AWS_SECRET_ACCESS_KEY"), {
+      target: { value: "secret-456" },
+    });
     fireEvent.click(screen.getByRole("button", { name: "tools.mcp.dialog.connect" }));
 
     await waitFor(() => {

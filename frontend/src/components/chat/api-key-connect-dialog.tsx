@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useEffect, useState } from "react";
+import React, { useEffect, useRef, useState } from "react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -66,6 +66,25 @@ export function ApiKeyConnectDialog({
   const { t } = useI18n();
   const [values, setValues] = useState<Record<string, string>>({});
   const [isSubmitting, setIsSubmitting] = useState(false);
+  // Synchronous shadow of isSubmitting - same reason connect-apps-field.tsx
+  // keeps connectingKeysRef alongside connectingKeys (mirroring connect-mcp-
+  // dialog.tsx's loadingAppsRef, #1330): a setState-based disabled flag lags
+  // a commit cycle behind two clicks landing in the same tick, so relying on
+  // `disabled={isSubmitting}` alone lets a fast double-click issue two POSTs.
+  const isSubmittingRef = useRef(false);
+  // The connect endpoint accepts (and activates) a partial env - any key
+  // left blank is dropped rather than rejected (see connect_mcp_app's
+  // `provided` filter and _merge_masked_env in src/xagent/web/api/mcp.py),
+  // and is_connected only checks association membership, not env
+  // completeness. Unlike connect-mcp-dialog.tsx's key form - which offers a
+  // shared/platform fallback and says as much via its own optional-key hint
+  // - this narrower dialog has no such fallback story, so a blank field here
+  // has no honest interpretation other than "not done yet": require every
+  // key to have some value before Connect is even clickable, so this flow
+  // can't create a "Connected" row a real tool call would still fail against.
+  const canSubmit = (app?.launch_config?.required_env || []).every(
+    (key) => (values[key] ?? "").trim().length > 0
+  );
 
   const requiredEnv = app?.launch_config?.required_env || [];
 
@@ -101,7 +120,8 @@ export function ApiKeyConnectDialog({
   };
 
   const handleSubmit = async () => {
-    if (!app) return;
+    if (!app || !canSubmit || isSubmittingRef.current) return;
+    isSubmittingRef.current = true;
     setIsSubmitting(true);
     try {
       // Send every required key explicitly, even ones left untouched, rather
@@ -111,7 +131,7 @@ export function ApiKeyConnectDialog({
       // sentinel seeded above, the user's edit, or "" for a key that was
       // never configured and is still untouched).
       const env = Object.fromEntries(requiredEnv.map((key) => [key, values[key] ?? ""]));
-      const response = await apiRequest(`${getApiUrl()}/api/mcp/apps/${app.id}/connect`, {
+      const response = await apiRequest(`${getApiUrl()}/api/mcp/apps/${encodeURIComponent(app.id)}/connect`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ env, env_source: "own" }),
@@ -132,6 +152,7 @@ export function ApiKeyConnectDialog({
         timedOut ? t("tools.mcp.alerts.connectTimedOut") : t("tools.mcp.alerts.saveFailed")
       );
     } finally {
+      isSubmittingRef.current = false;
       setIsSubmitting(false);
     }
   };
@@ -148,8 +169,15 @@ export function ApiKeyConnectDialog({
                 alt=""
                 className="h-5 w-5"
                 onError={(event) => {
-                  event.currentTarget.onerror = null;
-                  event.currentTarget.src = iconFallbackUrl(app.name);
+                  // Comparing src, not nulling .onerror: React attaches this
+                  // handler via addEventListener, not the element's .onerror
+                  // IDL property, so clearing that property doesn't detach
+                  // React's own listener - if the fallback URL is already
+                  // what's showing and it still errored, stop instead of
+                  // looping.
+                  const fallback = iconFallbackUrl(app.name);
+                  if (event.currentTarget.src === fallback) return;
+                  event.currentTarget.src = fallback;
                 }}
               />
             )}
@@ -176,7 +204,7 @@ export function ApiKeyConnectDialog({
           <Button variant="outline" onClick={() => handleOpenChange(false)} disabled={isSubmitting}>
             {t("common.cancel")}
           </Button>
-          <Button onClick={handleSubmit} disabled={isSubmitting}>
+          <Button onClick={handleSubmit} disabled={isSubmitting || !canSubmit}>
             {isSubmitting ? t("tools.mcp.dialog.connecting") : t("tools.mcp.dialog.connect")}
           </Button>
         </div>

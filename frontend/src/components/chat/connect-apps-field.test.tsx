@@ -1,6 +1,6 @@
 /// <reference types="@testing-library/jest-dom/vitest" />
 import React from "react";
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { McpApp } from "@/contexts/mcp-apps-context";
 
@@ -137,6 +137,28 @@ describe("ConnectAppsField", () => {
     expect(img.src).toBe(
       "https://ui-avatars.com/api/?name=Gmail&background=random&color=fff&size=128"
     );
+
+    // If the fallback avatar itself also fails (ui-avatars.com down, an
+    // ad-blocker), onError fires again - the handler must bail out instead
+    // of writing src again forever. jsdom never actually loads images, so
+    // re-writing the identical URL is otherwise invisible from the outside;
+    // spy on the src setter itself to prove the second error is a no-op.
+    // (Nulling .onerror would NOT catch this - React attaches this handler
+    // via addEventListener, not the element's .onerror DOM property, so an
+    // implementation that only did that would still write src again here.)
+    const srcDescriptor = Object.getOwnPropertyDescriptor(HTMLImageElement.prototype, "src")!;
+    const setSrcSpy = vi.fn();
+    Object.defineProperty(img, "src", {
+      configurable: true,
+      get: () => srcDescriptor.get!.call(img),
+      set: (value: string) => {
+        setSrcSpy(value);
+        srcDescriptor.set!.call(img, value);
+      },
+    });
+
+    fireEvent.error(img);
+    expect(setSrcSpy).not.toHaveBeenCalled();
   });
 
   it("falls back to an app-initial monogram when the app has no icon at all", () => {
@@ -206,7 +228,7 @@ describe("ConnectAppsField", () => {
     ).toBeInTheDocument();
   });
 
-  it("shows the catalog fetch error instead of an empty panel when useMcpApps() fails", () => {
+  it("shows the catalog fetch error and a Retry button instead of an empty panel when useMcpApps() fails", async () => {
     mcpAppsMock.apps = [];
     mcpAppsMock.error = "tools.mcp.dialog.fetchFailed";
 
@@ -215,6 +237,29 @@ describe("ConnectAppsField", () => {
     );
 
     expect(screen.getByText("tools.mcp.dialog.fetchFailed")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "chatPage.clarification.connectApps.retry" }));
+    await waitFor(() => {
+      expect(mcpAppsMock.refresh).toHaveBeenCalled();
+    });
+  });
+
+  it("still shows the row list alongside a refresh-error banner, instead of silently hiding a later refresh failure", () => {
+    // Once rows.length > 0, a *later* refresh() failure (e.g. after
+    // connecting a sibling app) never reaches the empty-panel branch, which
+    // only fires when rows.length is still 0 - it needs its own surface.
+    mcpAppsMock.apps = [makeApp({ provider: "google", is_connected: false })];
+    mcpAppsMock.error = "tools.mcp.dialog.fetchFailed";
+
+    render(
+      <ConnectAppsField interaction={{ ...LEO_INTERACTION, apps: ["Gmail"] }} onSkip={vi.fn()} />
+    );
+
+    expect(screen.getByText("Gmail")).toBeInTheDocument();
+    expect(screen.getByText("tools.mcp.dialog.fetchFailed")).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "chatPage.clarification.connectApps.retry" })
+    ).toBeInTheDocument();
   });
 
   it("shows a Connected badge instead of a button once an app is connected", () => {
@@ -461,8 +506,19 @@ describe("ConnectAppsField", () => {
     );
 
     const button = continueButton("Granola");
-    fireEvent.click(button);
-    fireEvent.click(button);
+    // Both dispatches inside one act() call, not two separate fireEvent.click
+    // calls: fireEvent already wraps each call in its own act(), which
+    // flushes React's state synchronously before returning, so two
+    // sequential fireEvent.click calls never actually race - the DOM already
+    // shows disabled=true before the second dispatch fires, and that alone
+    // (not the ref) would explain a single call. Wrapping both dispatches in
+    // one outer act() defers React's flush until after both handlers'
+    // synchronous prefix has already run, reproducing what a genuine
+    // same-tick double click looks like.
+    act(() => {
+      fireEvent.click(button);
+      fireEvent.click(button);
+    });
 
     expect(openMcpOAuthPopupMock).toHaveBeenCalledTimes(1);
 
@@ -560,6 +616,34 @@ describe("ConnectAppsField", () => {
     expect(
       screen.queryByRole("button", { name: "tools.mcp.dialog.connect" })
     ).not.toBeInTheDocument();
+  });
+
+  it("encodes the app id in the keyless connect route, since it is interpolated into a URL path segment", async () => {
+    mcpAppsMock.apps = [
+      makeApp({
+        id: "weird/app?id",
+        name: "Weird App",
+        provider: undefined,
+        auth_type: "keyless",
+        launch_config: undefined,
+        icon: "",
+        is_connected: false,
+      }),
+    ];
+    apiRequestMock.mockResolvedValue(jsonResponse({ ok: true }));
+
+    render(
+      <ConnectAppsField interaction={{ ...LEO_INTERACTION, apps: ["Weird App"] }} onSkip={vi.fn()} />
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "tools.mcp.dialog.connect" }));
+
+    await waitFor(() => {
+      expect(apiRequestMock).toHaveBeenCalledWith(
+        "http://api.local/api/mcp/apps/weird%2Fapp%3Fid/connect",
+        expect.anything()
+      );
+    });
   });
 
   it("connects a keyless manual app with one click straight to the connect endpoint, no dialog", async () => {
@@ -700,6 +784,51 @@ describe("ConnectAppsField", () => {
     expect(screen.queryByText("chatPage.clarification.connectApps.skip")).not.toBeInTheDocument();
     expect(
       screen.getByText("chatPage.clarification.connectApps.skippedNote")
+    ).toBeInTheDocument();
+  });
+
+  it("hides the Skip link and shows a completion note once every row is already Connected", () => {
+    mcpAppsMock.apps = [makeApp({ provider: "google", is_connected: true })];
+
+    render(
+      <ConnectAppsField interaction={{ ...LEO_INTERACTION, apps: ["Gmail"] }} onSkip={vi.fn()} />
+    );
+
+    expect(screen.queryByText("chatPage.clarification.connectApps.skip")).not.toBeInTheDocument();
+    expect(
+      screen.getByText("chatPage.clarification.connectApps.allConnectedNote")
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByText('chatPage.clarification.connectApps.privacyNote:{"appName":"Xagent"}')
+    ).not.toBeInTheDocument();
+  });
+
+  it("hides the Skip link once a refresh brings every row to Connected, even though it started out actionable", async () => {
+    mcpAppsMock.apps = [
+      makeApp({ id: "hubspot", name: "HubSpot", provider: "hubspot", is_connected: false }),
+    ];
+    openBuiltinOAuthPopupMock.mockResolvedValue({ success: true });
+
+    render(
+      <ConnectAppsField interaction={{ ...LEO_INTERACTION, apps: ["HubSpot"] }} onSkip={vi.fn()} />
+    );
+
+    expect(screen.getByText("chatPage.clarification.connectApps.skip")).toBeInTheDocument();
+
+    mcpAppsMock.refresh.mockImplementation(async () => {
+      mcpAppsMock.apps = [
+        makeApp({ id: "hubspot", name: "HubSpot", provider: "hubspot", is_connected: true }),
+      ];
+    });
+    fireEvent.click(continueButton("HubSpot"));
+
+    await waitFor(() => {
+      expect(
+        screen.queryByText("chatPage.clarification.connectApps.skip"),
+      ).not.toBeInTheDocument();
+    });
+    expect(
+      screen.getByText("chatPage.clarification.connectApps.allConnectedNote")
     ).toBeInTheDocument();
   });
 });

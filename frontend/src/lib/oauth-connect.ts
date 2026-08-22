@@ -145,10 +145,16 @@ export async function openMcpOAuthPopup(options: {
   popup.opener = null;
 
   try {
-    const response = await apiRequest(`${getApiUrl()}/api/mcp/apps/${appId}/oauth/connect`, {
+    const response = await apiRequest(`${getApiUrl()}/api/mcp/apps/${encodeURIComponent(appId)}/oauth/connect`, {
       method: "POST",
       credentials: "include",
-      headers: { "Content-Type": "application/json" },
+      // Without this, the endpoint's Accept-based content negotiation
+      // (connect_mcp_oauth in src/xagent/web/api/mcp.py) falls through to
+      // its no-Accept-header branch and returns a redirect instead of the
+      // {authorization_url} JSON body this code parses next - fetch follows
+      // the redirect, response.json() then fails on whatever's at the other
+      // end, and every mcp_oauth connect looks like an immediate failure.
+      headers: { "Content-Type": "application/json", "Accept": "application/json" },
       body: JSON.stringify({ redirect_after: "/tools?tab=mcp" }),
     });
     if (!response.ok) {

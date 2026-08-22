@@ -364,4 +364,27 @@ describe("ClarificationForm connect_apps interaction", () => {
       screen.queryByText('chatPage.clarification.unsupportedType:{"type":"connect_apps"}'),
     ).not.toBeInTheDocument()
   })
+
+  it("resolves the connect_apps field label live in the mixed-list branch too, not the persisted hire-time label", () => {
+    // The singleton isConnectAppsOnly header was fixed to call t() live, but
+    // that branch is skipped entirely for a mixed list (isConnectAppsOnly is
+    // false) - the per-field label above renderField's switch is a second,
+    // separate render path that has to make the same fix independently.
+    render(
+      <ClarificationForm
+        interactions={[
+          CONNECT_APPS_INTERACTION,
+          { type: "text_input", field: "note", label: "Note" },
+        ]}
+        onSend={vi.fn()}
+      />,
+    )
+
+    expect(
+      screen.getByText("chatPage.clarification.connectApps.title"),
+    ).toBeInTheDocument()
+    expect(screen.queryByText(CONNECT_APPS_INTERACTION.label)).not.toBeInTheDocument()
+    // An ordinary field's own persisted label is untouched by this.
+    expect(screen.getByText("Note:")).toBeInTheDocument()
+  })
 })

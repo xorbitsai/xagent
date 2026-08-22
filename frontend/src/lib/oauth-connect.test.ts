@@ -46,28 +46,40 @@ describe("openBuiltinOAuthPopup", () => {
     vi.useRealTimers();
   });
 
-  it("opens the provider login URL with the app id and current page as redirect", () => {
-    const windowOpenSpy = vi.spyOn(window, "open").mockReturnValue(fakePopup());
+  it("opens the provider login URL with the app id and current page as redirect", async () => {
+    const popup = fakePopup();
+    const windowOpenSpy = vi.spyOn(window, "open").mockReturnValue(popup);
 
-    void openBuiltinOAuthPopup({ provider: "google", appId: "gmail", token: "tok123" });
+    const pending = openBuiltinOAuthPopup({ provider: "google", appId: "gmail", token: "tok123" });
 
     expect(windowOpenSpy).toHaveBeenCalledTimes(1);
     const [url] = windowOpenSpy.mock.calls[0];
     expect(url).toBe(
       `http://api.local/api/auth/google/login?token=tok123&app_id=gmail&redirect=${encodeURIComponent(window.location.href)}`
     );
+
+    // Settle via close, not leaving the poll timer/message listener dangling
+    // for the rest of the file to (silently) inherit.
+    (popup as { closed: boolean }).closed = true;
+    await vi.advanceTimersByTimeAsync(500);
+    await pending;
   });
 
-  it("omits app_id from the login URL when no appId is given, for the bare batch-connect login", () => {
-    const windowOpenSpy = vi.spyOn(window, "open").mockReturnValue(fakePopup());
+  it("omits app_id from the login URL when no appId is given, for the bare batch-connect login", async () => {
+    const popup = fakePopup();
+    const windowOpenSpy = vi.spyOn(window, "open").mockReturnValue(popup);
 
-    void openBuiltinOAuthPopup({ provider: "google", token: "tok123" });
+    const pending = openBuiltinOAuthPopup({ provider: "google", token: "tok123" });
 
     const [url] = windowOpenSpy.mock.calls[0];
     expect(url).toBe(
       `http://api.local/api/auth/google/login?token=tok123&redirect=${encodeURIComponent(window.location.href)}`
     );
     expect(url).not.toContain("app_id");
+
+    (popup as { closed: boolean }).closed = true;
+    await vi.advanceTimersByTimeAsync(500);
+    await pending;
   });
 
   it("resolves success:false immediately when the popup is blocked", async () => {
@@ -104,14 +116,19 @@ describe("openBuiltinOAuthPopup", () => {
     expect(popup.close).toHaveBeenCalledTimes(1);
   });
 
-  it("encodes provider, app id, and token in the login URL", () => {
-    const windowOpenSpy = vi.spyOn(window, "open").mockReturnValue(fakePopup());
+  it("encodes provider, app id, and token in the login URL", async () => {
+    const popup = fakePopup();
+    const windowOpenSpy = vi.spyOn(window, "open").mockReturnValue(popup);
 
-    void openBuiltinOAuthPopup({ provider: "google", appId: "app id/weird", token: "tok en" });
+    const pending = openBuiltinOAuthPopup({ provider: "google", appId: "app id/weird", token: "tok en" });
 
     const [url] = windowOpenSpy.mock.calls[0];
     expect(url).toContain(`token=${encodeURIComponent("tok en")}`);
     expect(url).toContain(`app_id=${encodeURIComponent("app id/weird")}`);
+
+    (popup as { closed: boolean }).closed = true;
+    await vi.advanceTimersByTimeAsync(500);
+    await pending;
   });
 
   it("does not resolve a call for one provider when a concurrent call's popup for a different provider/app finishes first", async () => {
@@ -218,6 +235,10 @@ describe("openMcpOAuthPopup", () => {
       "http://api.local/api/mcp/apps/granola/oauth/connect",
       expect.objectContaining({
         method: "POST",
+        // Without this, connect_mcp_oauth's Accept-based content negotiation
+        // (src/xagent/web/api/mcp.py) returns a redirect instead of
+        // {authorization_url} JSON, and every mcp_oauth connect fails.
+        headers: expect.objectContaining({ Accept: "application/json" }),
         body: JSON.stringify({ redirect_after: "/tools?tab=mcp" }),
       })
     );
@@ -249,6 +270,19 @@ describe("openMcpOAuthPopup", () => {
     const result = await openMcpOAuthPopup({ appId: "granola" });
 
     expect(result).toEqual({ connected: false });
+  });
+
+  it("encodes the app id in the connect route, since it is interpolated into a URL path segment", async () => {
+    const popup = fakeMcpPopup();
+    vi.spyOn(window, "open").mockReturnValue(popup);
+    apiRequestMock.mockResolvedValueOnce(jsonResponse({}, { status: 500 }));
+
+    await openMcpOAuthPopup({ appId: "weird/app?id" });
+
+    expect(apiRequestMock).toHaveBeenCalledWith(
+      "http://api.local/api/mcp/apps/weird%2Fapp%3Fid/oauth/connect",
+      expect.anything()
+    );
   });
 
   it("closes the popup on timeout when the user never closes it themselves", async () => {

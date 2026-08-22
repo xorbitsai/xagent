@@ -85,6 +85,20 @@ export function ClarificationForm({
     interactions.length > 0 && interactions.every((interaction) => LIVE_WIDGET_TYPES.has(interaction.type))
 
   const { t } = useI18n()
+
+  // Ignore the persisted interaction.label for a live-widget type (it's only
+  // ever a t()'d string frozen into the DB row at hire time - see
+  // hire-agent.ts's buildConnectAppsInteraction/HireMessageStrings) and
+  // re-resolve live instead, so a locale switch after hiring doesn't leave
+  // it stuck in whatever language was active when the task was created.
+  // Shared by both the isConnectAppsOnly header below and the per-field
+  // label in the mixed-interaction-list branch further down - the singleton
+  // header fix alone missed that second render path entirely.
+  const fieldLabel = (interaction: Interaction): string =>
+    LIVE_WIDGET_TYPES.has(interaction.type)
+      ? t("chatPage.clarification.connectApps.title")
+      : interaction.label || interaction.field
+
   const [formState, setFormState] = useState<Record<string, any>>({})
   const [isSubmitting, setIsSubmitting] = useState(false)
   const [isSubmitted, setIsSubmitted] = useState(!active && !isConnectAppsOnly)
@@ -558,8 +572,8 @@ export function ClarificationForm({
                 filesDisabled && interaction.type === "file_upload" ? null : (
                 <div key={`${interaction.field}-${index}`} className="space-y-2">
                   <Label className="text-sm font-medium">
-                    {interaction.label || interaction.field}
-                    {interaction.type === "confirm" ? "" : ":"}
+                    {fieldLabel(interaction)}
+                    {interaction.type === "confirm" || LIVE_WIDGET_TYPES.has(interaction.type) ? "" : ":"}
                   </Label>
 
                   {renderField(interaction)}

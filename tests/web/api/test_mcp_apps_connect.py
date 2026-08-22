@@ -307,6 +307,44 @@ def test_configured_env_keys_reflects_per_key_state_for_a_partially_configured_a
     assert _app_configured_env_keys(app, server, um_by_id) == ["KEY_A"]
 
 
+def test_list_mcp_apps_serializes_configured_env_keys_for_a_partially_configured_app(
+    test_db,
+):
+    """Asserting only the private helpers (test above) would still pass if
+    the serialization step in list_mcp_apps that copies configured_env_keys
+    onto the response dict were ever deleted or renamed - assert the actual
+    GET /api/mcp/apps response shape too."""
+    from xagent.web.api.mcp import MCPAppConnectRequest, connect_mcp_app, list_mcp_apps
+
+    test_db.add(
+        PublicMCPApp(
+            app_id="multi-key-app",
+            name="multi-key-app",
+            description="Multi-key test app",
+            transport="stdio",
+            launch_config={
+                "command": "npx",
+                "args": ["multi-key-app"],
+                "required_env": ["KEY_A", "KEY_B"],
+            },
+        )
+    )
+    test_db.commit()
+
+    connect_mcp_app(
+        "multi-key-app",
+        MCPAppConnectRequest(env={"KEY_A": "value-a"}),
+        current_user=_user(test_db, 1),
+        db=test_db,
+    )
+
+    apps = list_mcp_apps(current_user=_user(test_db, 1), db=test_db)
+    multi_key_app = next(app for app in apps if app["id"] == "multi-key-app")
+
+    assert multi_key_app["configured_env_keys"] == ["KEY_A"]
+    assert multi_key_app["user_env_configured"] is False
+
+
 def test_user_env_configured_reflects_own_key(test_db):
     """The catalog exposes whether the current user has their own per-user key
     (vs relying on the admin's global key), so the manage dialog can show it."""

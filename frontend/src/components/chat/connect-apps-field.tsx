@@ -140,8 +140,14 @@ function RowIcon({
           alt=""
           className="h-full w-full object-contain p-1"
           onError={(event) => {
-            event.currentTarget.onerror = null;
-            event.currentTarget.src = iconFallbackUrl(fallbackName);
+            // Comparing src, not nulling .onerror: React attaches this
+            // handler via addEventListener, not the element's .onerror IDL
+            // property, so clearing that property doesn't detach React's own
+            // listener - if the fallback URL is already what's showing and
+            // it still errored, stop instead of looping.
+            const fallback = iconFallbackUrl(fallbackName);
+            if (event.currentTarget.src === fallback) return;
+            event.currentTarget.src = fallback;
           }}
         />
       ) : (
@@ -203,6 +209,11 @@ export function ConnectAppsField({
   }, []);
 
   const rows = useMemo(() => resolveRows(interaction.apps, apps), [interaction.apps, apps]);
+  // Recomputed on every render (not memoized against rows, which doesn't
+  // change when just an app's is_connected flips) - the footer's "not
+  // connected yet" copy plus a Skip button, alongside a card whose every row
+  // already shows Connected, would read as an outright contradiction.
+  const allConnected = rows.length > 0 && rows.every((row) => !!row.app.is_connected);
 
   if (rows.length === 0) {
     // ClarificationForm's Collapsible card (title bar + chevron) is already
@@ -219,7 +230,18 @@ export function ConnectAppsField({
       );
     }
     if (error) {
-      return <p className="text-xs text-destructive">{error}</p>;
+      return (
+        <div className="flex items-center gap-3">
+          <p className="flex-1 text-xs text-destructive">{error}</p>
+          <button
+            type="button"
+            className="flex-shrink-0 rounded-md border border-border px-2 py-1 text-xs font-medium text-foreground hover:bg-muted"
+            onClick={() => void refresh()}
+          >
+            {t("chatPage.clarification.connectApps.retry")}
+          </button>
+        </div>
+      );
     }
     return null;
   }
@@ -298,7 +320,7 @@ export function ConnectAppsField({
   const handleConnectKeyless = (app: McpApp) =>
     withConnectingKey(app.id, async () => {
       try {
-        const response = await apiRequest(`${getApiUrl()}/api/mcp/apps/${app.id}/connect`, {
+        const response = await apiRequest(`${getApiUrl()}/api/mcp/apps/${encodeURIComponent(app.id)}/connect`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ is_active: true }),
@@ -320,6 +342,24 @@ export function ConnectAppsField({
       <p className="text-xs text-muted-foreground">
         {t("chatPage.clarification.connectApps.subtitle")}
       </p>
+
+      {/* Rows already resolved from a still-good, if now stale, catalog
+          fetch, so this only ever hides the row list on a *fresh* failure -
+          a later refresh (e.g. after connecting something) failing doesn't
+          reach the early return above (rows.length is already non-zero) and
+          would otherwise fail completely silently. */}
+      {error && (
+        <div className="mt-3 flex items-center gap-3 rounded-lg border border-destructive/30 bg-destructive/5 px-3 py-2">
+          <p className="flex-1 text-xs text-destructive">{error}</p>
+          <button
+            type="button"
+            className="flex-shrink-0 rounded-md border border-border px-2 py-1 text-xs font-medium text-foreground hover:bg-muted"
+            onClick={() => void refresh()}
+          >
+            {t("chatPage.clarification.connectApps.retry")}
+          </button>
+        </div>
+      )}
 
       {/* One row per app, not per provider - a "Google" row that also
           covers Calendar used to fold both into one merged row; that read
@@ -412,11 +452,17 @@ export function ConnectAppsField({
 
         <div className="flex items-center gap-3 border-t bg-muted/40 px-3 py-2.5">
           <span className="flex-1 text-[11.5px] text-muted-foreground">
-            {skipped
-              ? t("chatPage.clarification.connectApps.skippedNote")
-              : t("chatPage.clarification.connectApps.privacyNote", { appName: branding.appName })}
+            {allConnected
+              ? t("chatPage.clarification.connectApps.allConnectedNote")
+              : skipped
+                ? t("chatPage.clarification.connectApps.skippedNote")
+                : t("chatPage.clarification.connectApps.privacyNote", { appName: branding.appName })}
           </span>
-          {!skipped && (
+          {/* Hidden once every row is Connected (whether that was already
+              true on first render or only became true after a later
+              refresh) - a Skip button next to an "I'll do this later" -
+              flavored note would contradict a card with nothing left to do. */}
+          {!skipped && !allConnected && (
             <button
               type="button"
               className="flex-shrink-0 rounded-md px-2 py-1 text-xs font-medium text-muted-foreground hover:bg-muted hover:text-foreground"

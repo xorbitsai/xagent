@@ -2181,12 +2181,19 @@ def list_mcp_apps(
                     app, shared_server, shared_env_by_id
                 )
                 app_platform_env = _app_platform_env_available(app, shared_server)
-                app_user_env = _app_user_env_configured(
-                    app, shared_server, user_mcp_by_server_id
-                )
+                # Compute once and derive the all-or-nothing flag from it,
+                # rather than calling _app_user_env_configured too - that
+                # would decrypt this same association's env a second time
+                # (it calls _app_configured_env_keys internally).
                 app_configured_keys = _app_configured_env_keys(
                     app, shared_server, user_mcp_by_server_id
                 )
+                app_required_env = (app.get("launch_config") or {}).get(
+                    "required_env"
+                ) or []
+                app_user_env = bool(app_required_env) and set(
+                    app_configured_keys
+                ) == set(app_required_env)
                 _assoc = (
                     user_mcp_by_server_id.get(cast(int, shared_server.id))
                     if shared_server

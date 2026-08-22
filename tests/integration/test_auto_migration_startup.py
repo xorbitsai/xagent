@@ -941,6 +941,23 @@ async def test_startup_event_triggers_background_auto_migration(
     monkeypatch.setattr(web_app_module.asyncio, "to_thread", _fake_to_thread)
     monkeypatch.setattr(web_app_module.asyncio, "create_task", _track_create_task)
 
+    # The cleanup task itself is gated off under pytest (it walks the real
+    # uploads tree), so it contributes no entry to created_tasks and the count
+    # assertion below cannot see it. Spy on the call site so deleting it from
+    # startup_event fails a test instead of silently disabling the sweep in
+    # production.
+    cleanup_scheduled: list[object] = []
+
+    def _spy_start_temp_file_cleanup_task(app_instance):
+        cleanup_scheduled.append(app_instance)
+        return None
+
+    monkeypatch.setattr(
+        web_app_module,
+        "start_temp_file_cleanup_task",
+        _spy_start_temp_file_cleanup_task,
+    )
+
     await web_app_module.startup_event()
     if created_tasks:
         await asyncio.gather(*created_tasks)
@@ -951,6 +968,7 @@ async def test_startup_event_triggers_background_auto_migration(
     # test_shutdown_event_stops_temp_file_cleanup_without_cancel below.
     assert len(created_tasks) == 2
     assert migration_called["value"] is True
+    assert cleanup_scheduled == [web_app_module.app]
 
 
 @pytest.mark.asyncio
@@ -1171,18 +1189,36 @@ async def test_shutdown_event_stops_temp_file_cleanup_without_cancel(
 
     await web_app_module.shutdown_event()
 
-    assert flush_saw_stop["set"] is True
-    assert stop.is_set()
-    # The timeout above genuinely elapsed while the walk was still blocked on
-    # `resume`. asyncio.wait_for would have cancelled the task by now;
-    # asyncio.wait leaves it running, untouched.
-    assert not task.done()
-    assert not task.cancelled()
-    assert app.state.temp_file_cleanup_task is None
-    assert app.state.temp_file_cleanup_stop is None
+    try:
+        assert flush_saw_stop["set"] is True
+        assert stop.is_set()
+        # The timeout above genuinely elapsed while the walk was still blocked on
+        # `resume`. asyncio.wait_for would have cancelled the task by now;
+        # asyncio.wait leaves it running, untouched.
+        assert not task.done()
+        assert not task.cancelled()
+        # The walk outlived the bounded wait, so its handles must be RETAINED.
+        # Clearing them here would discard the only stop handle and let a
+        # re-entrant startup schedule a second concurrent sweep over the same
+        # tree -- the exact case start_temp_file_cleanup_task's guard exists for.
+        assert app.state.temp_file_cleanup_task is task
+        assert app.state.temp_file_cleanup_stop is stop
 
-    resume.set()
-    await task
+        resume.set()
+        await task
+
+        # Once the walk has actually finished, a later shutdown releases them.
+        await web_app_module.shutdown_event()
+        assert app.state.temp_file_cleanup_task is None
+        assert app.state.temp_file_cleanup_stop is None
+    finally:
+        # Never leave a pending task or populated app.state behind for the rest
+        # of the session, even if an assertion above fails.
+        resume.set()
+        if not task.done():
+            await task
+        app.state.temp_file_cleanup_task = None
+        app.state.temp_file_cleanup_stop = None
 
 
 @pytest.mark.asyncio

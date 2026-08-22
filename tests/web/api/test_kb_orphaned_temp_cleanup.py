@@ -274,3 +274,122 @@ def test_cleanup_tolerates_unlink_failure_and_keeps_sweeping(tmp_path, monkeypat
     assert removed == 1
     assert (tmp_path / "boom.tmp-replace").exists()
     assert not (tmp_path / "ok.tmp-replace").exists()
+
+
+class _TrackedScandir:
+    """Pass-through os.scandir wrapper that reports whether it is still open."""
+
+    def __init__(self, it, open_dirs: set, path: str) -> None:
+        self._it = it
+        self._open_dirs = open_dirs
+        self._path = path
+        open_dirs.add(path)
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        return next(self._it)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_exc) -> bool:
+        self.close()
+        return False
+
+    def close(self) -> None:
+        self._open_dirs.discard(self._path)
+        self._it.close()
+
+
+def test_cleanup_never_unlinks_while_its_directory_scan_is_open(
+    tmp_path: Path, monkeypatch
+):
+    """Unlink must happen only after the directory's scandir stream is closed.
+
+    Whether readdir() still returns the remaining entries of a directory that
+    was modified mid-iteration is unspecified by POSIX, so unlinking inside the
+    scan can silently skip siblings -- and this sweep runs once per process with
+    no resumption, so a skipped orphan is never reclaimed. os.walk (exhausts and
+    closes before yielding) and shutil.rmtree (materializes list(scandir_it))
+    both avoid this; pin that the sweep does too.
+
+    Bookkeeping is scoped to paths under tmp_path so the pass-through wrappers
+    stay inert for any other os.scandir/os.unlink caller in the process.
+    """
+    import xagent.web.api.kb as kb_module
+
+    old = ORPHAN_AGE_SECONDS + 600
+    # Several matches in one directory: the case where a mid-scan unlink could
+    # perturb the iteration and drop siblings.
+    for i in range(20):
+        _write_aged(tmp_path / f"o{i:02d}.ab12cd.tmp", age=old)
+    _write_aged(tmp_path / "sub" / "nested.xy.tmp", age=old)
+
+    open_dirs: set = set()
+    real_scandir = os.scandir
+    real_unlink = os.unlink
+    unlinks_with_open_scan: list = []
+
+    def _tracked_scandir(path, *args, **kwargs):
+        it = real_scandir(path, *args, **kwargs)
+        if str(path).startswith(str(tmp_path)):
+            return _TrackedScandir(it, open_dirs, str(path))
+        return it
+
+    def _tracked_unlink(path, *args, **kwargs):
+        if open_dirs and str(path).startswith(str(tmp_path)):
+            unlinks_with_open_scan.append(str(path))
+        return real_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(kb_module.os, "scandir", _tracked_scandir)
+    monkeypatch.setattr(kb_module.os, "unlink", _tracked_unlink)
+
+    removed = cleanup_orphaned_temp_files(upload_dir=tmp_path)
+
+    assert removed == 21
+    assert unlinks_with_open_scan == []
+    assert open_dirs == set()
+
+
+def test_completed_sweep_is_not_reported_as_truncated(tmp_path, monkeypatch, caplog):
+    """A sweep that finished the tree must not log itself as cut short.
+
+    Shutdown sets the stop flag as its very first statement, so it can land
+    while the final directory is being scanned -- the tree still gets fully
+    walked. Re-reading the flag after the loop would report that completed
+    sweep as truncated and tell operators to expect leftover orphans that do
+    not exist, so the walk must track "stopped early" as it goes instead.
+    """
+    import logging
+
+    import xagent.web.api.kb as kb_module
+
+    # A dedicated single-directory root: the walk must have nothing left on its
+    # stack when the flag is set, so that "flag set but tree fully walked" is
+    # the only state under test. (A shared conftest fixture seeds tmp_path
+    # itself with a lancedb/ subdirectory, which would legitimately still be
+    # pending and make an early stop the correct outcome.)
+    root = tmp_path / "uploads"
+    root.mkdir()
+    _write_aged(root / "only.ab12cd.tmp", age=ORPHAN_AGE_SECONDS + 600)
+
+    stop = threading.Event()
+    real_unlink = os.unlink
+
+    def _unlink_then_signal_shutdown(path, *args, **kwargs):
+        # Shutdown fires exactly while the last victims are being removed.
+        result = real_unlink(path, *args, **kwargs)
+        stop.set()
+        return result
+
+    monkeypatch.setattr(kb_module.os, "unlink", _unlink_then_signal_shutdown)
+
+    with caplog.at_level(logging.INFO, logger="xagent.web.api.kb"):
+        removed = cleanup_orphaned_temp_files(upload_dir=root, stop_event=stop)
+
+    assert removed == 1
+    assert stop.is_set()
+    assert "was not fully walked" not in caplog.text
+    assert "Cleaned up 1 orphaned temporary file(s)" in caplog.text

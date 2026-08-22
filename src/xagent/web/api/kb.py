@@ -1684,9 +1684,16 @@ def cleanup_orphaned_temp_files(
     # deleting files that might still be in use; per-entry OSError is tolerated
     # below so a file vanishing mid-scan skips instead of aborting the sweep.
     stack = [str(base_dir)]
+    # WHY: track "did we stop early" as we go instead of re-reading stop_event
+    # after the loop. The flag can be set by shutdown *while* the final
+    # directory is being scanned, in which case the tree still gets fully
+    # walked -- re-polling afterwards would report a completed sweep as
+    # truncated and tell operators to expect leftover orphans that aren't there.
+    stopped_early = False
     while stack:
         # Cooperative stop check; see the stop_event docstring above for why.
         if stop_event is not None and stop_event.is_set():
+            stopped_early = True
             break
         current = stack.pop()
         try:
@@ -1694,6 +1701,15 @@ def cleanup_orphaned_temp_files(
         except OSError as e:
             logger.warning("Failed to scan directory %s: %s", current, e)
             continue
+        # WHY: matches are collected here and unlinked only after the directory
+        # stream is closed below. Whether readdir() still returns the remaining
+        # entries of a directory that was modified mid-iteration is unspecified
+        # by POSIX, so unlinking inside the scan can silently skip siblings --
+        # and this sweep runs once per process with no resumption, so a skipped
+        # orphan is never reclaimed. Both stdlib walkers avoid this: os.walk
+        # exhausts and closes the iterator before yielding, and shutil.rmtree
+        # materializes list(scandir_it) before unlinking.
+        victims: list[str] = []
         with scandir_it:
             entries_seen = 0
             while True:
@@ -1714,14 +1730,17 @@ def cleanup_orphaned_temp_files(
                     and entries_seen % _TEMP_CLEANUP_STOP_CHECK_ENTRIES == 0
                     and stop_event.is_set()
                 ):
+                    stopped_early = True
                     break
                 try:
                     if entry.is_dir(follow_symlinks=False):
                         stack.append(entry.path)
                         continue
-                    if not entry.is_file(follow_symlinks=False):
-                        continue
+                    # Name test first: it touches no filesystem, so the vast
+                    # majority of entries are rejected before is_file()/stat().
                     if not _is_orphaned_temp_name(entry.name):
+                        continue
+                    if not entry.is_file(follow_symlinks=False):
                         continue
                     if now - entry.stat().st_mtime <= 3600:  # 1 hour
                         continue
@@ -1730,19 +1749,23 @@ def cleanup_orphaned_temp_files(
                     # skip it rather than aborting the whole sweep.
                     logger.debug("Skipping temp-file candidate %s: %s", entry.path, e)
                     continue
+                victims.append(entry.path)
 
-                try:
-                    os.unlink(entry.path)
-                    cleaned_count += 1
-                    logger.debug("Cleaned up orphaned temp file: %s", entry.path)
-                except OSError as e:
-                    logger.warning(
-                        "Failed to clean up orphaned temp file %s: %s", entry.path, e
-                    )
+        for victim in victims:
+            try:
+                os.unlink(victim)
+                cleaned_count += 1
+                logger.debug("Cleaned up orphaned temp file: %s", victim)
+            except OSError as e:
+                logger.warning(
+                    "Failed to clean up orphaned temp file %s: %s", victim, e
+                )
 
-    if stop_event is not None and stop_event.is_set():
+    if stopped_early:
         # WHY: an interrupted sweep must not look identical to a completed one
         # in the logs -- operators need to know the tree was not fully walked.
+        # This is the authoritative signal; the background wrapper in app.py
+        # deliberately does not re-derive it from the stop flag.
         logger.info(
             "Orphaned temp-file sweep stopped early by shutdown signal after "
             "removing %d file(s); the uploads tree was not fully walked",

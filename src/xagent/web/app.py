@@ -692,20 +692,19 @@ def start_temp_file_cleanup_task(
                 exc_info=True,
             )
             return
-        if temp_file_cleanup_stop.is_set():
-            logger.info(
-                "Background orphaned temp-file cleanup interrupted by shutdown "
-                "after %.2fs (removed %d file(s))",
-                time.monotonic() - started,
-                cleaned_count,
-            )
-        else:
-            logger.info(
-                "Background orphaned temp-file cleanup completed in %.2fs "
-                "(removed %d file(s))",
-                time.monotonic() - started,
-                cleaned_count,
-            )
+        # WHY: this reports duration/count only, and deliberately does NOT
+        # re-read temp_file_cleanup_stop to label the run interrupted. Shutdown
+        # sets that flag as its first statement, so it can flip between the
+        # walk finishing and this coroutine being resumed -- and the walk can
+        # also complete its last directory after the flag is set. Either way a
+        # completed sweep would be logged as truncated. cleanup_orphaned_temp_files
+        # tracks that state internally and logs it authoritatively.
+        logger.info(
+            "Background orphaned temp-file cleanup finished in %.2fs "
+            "(removed %d file(s))",
+            time.monotonic() - started,
+            cleaned_count,
+        )
 
     task = asyncio.create_task(run_temp_file_cleanup_background())
     app_instance.state.temp_file_cleanup_task = task
@@ -1784,30 +1783,6 @@ async def shutdown_event() -> None:
             with suppress(asyncio.CancelledError):
                 await task
 
-    # Wait briefly for the background orphaned temp-file cleanup to unwind (its
-    # stop flag was already set at the top of this handler). The walk runs in an
-    # executor thread that a cancel cannot stop, so use asyncio.wait rather than
-    # asyncio.wait_for: wait_for's cancellation only kills the awaiting coroutine,
-    # not the executor thread doing the real work, so cancelling early has no
-    # benefit -- only the risk of losing the completion/failure log to an
-    # uncaught CancelledError. If the walk is still running once this bounded
-    # wait elapses, the process's own asyncio.run() teardown will join (or
-    # cancel) the outstanding task regardless.
-    if hasattr(app.state, "temp_file_cleanup_task"):
-        task = app.state.temp_file_cleanup_task
-        if task and not task.done():
-            timeout = get_temp_file_cleanup_shutdown_timeout_seconds()
-            done, _pending = await asyncio.wait({task}, timeout=timeout)
-            if not done:
-                logger.warning(
-                    "Orphaned temp-file cleanup still running %ss after stop "
-                    "signal; the executor thread will unwind at its next "
-                    "directory boundary",
-                    timeout,
-                )
-        app.state.temp_file_cleanup_task = None
-        app.state.temp_file_cleanup_stop = None
-
     # Shutdown chat channels before draining task finalizers.
     try:
         if hasattr(app.state, "telegram_task"):
@@ -1853,6 +1828,42 @@ async def shutdown_event() -> None:
     sandbox_mgr = get_sandbox_manager()
     if sandbox_mgr:
         await sandbox_mgr.cleanup()
+
+    # Wait briefly for the background orphaned temp-file cleanup to unwind (its
+    # stop flag was already set at the top of this handler). This runs LAST on
+    # purpose: the wait has no ordering dependency on anything above -- the stop
+    # signal is already delivered and this only collects the task -- so putting
+    # it here donates every preceding teardown step's duration to the walk as
+    # free grace time, and keeps its timeout off the critical path of lease
+    # draining and sandbox cleanup, which must finish inside the orchestrator's
+    # termination grace period.
+    #
+    # Use asyncio.wait rather than asyncio.wait_for: wait_for's cancellation only
+    # kills the awaiting coroutine, not the executor thread doing the real work,
+    # so cancelling early has no benefit -- only the risk of losing the
+    # completion/failure log to an uncaught CancelledError. If the walk is still
+    # running once this bounded wait elapses, the process's own asyncio.run()
+    # teardown will join (or cancel) the outstanding task regardless.
+    if hasattr(app.state, "temp_file_cleanup_task"):
+        task = app.state.temp_file_cleanup_task
+        if task and not task.done():
+            timeout = get_temp_file_cleanup_shutdown_timeout_seconds()
+            done, _pending = await asyncio.wait({task}, timeout=timeout)
+            if not done:
+                logger.warning(
+                    "Orphaned temp-file cleanup still running %ss after stop "
+                    "signal; the executor thread will unwind at its next "
+                    "directory boundary",
+                    timeout,
+                )
+        # WHY: only release the handles once the task is actually finished.
+        # Clearing them while the walk is still running would discard its only
+        # stop handle and let a re-entrant startup schedule a second concurrent
+        # sweep over the same tree -- exactly what the guard in
+        # start_temp_file_cleanup_task exists to prevent.
+        if task is None or task.done():
+            app.state.temp_file_cleanup_task = None
+            app.state.temp_file_cleanup_stop = None
 
 
 from ..config import get_frontend_dist_dir  # noqa: E402

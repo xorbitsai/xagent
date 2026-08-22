@@ -285,6 +285,25 @@ def test_downgrade_rejects_orphan_sqlite_batch_table_before_missing_table_return
         )
 
 
+@pytest.mark.parametrize("operation_name", ["upgrade", "downgrade"])
+def test_case_variant_sqlite_batch_table_is_rejected_before_missing_table_return(
+    tmp_path,
+    operation_name: str,
+) -> None:
+    engine = create_engine(f"sqlite:///{tmp_path / 'oauth-case-temp.db'}")
+    migration = _migration_module()
+    collision_name = migration.SQLITE_BATCH_TEMP_TABLE.upper()
+
+    with engine.begin() as connection:
+        connection.execute(
+            text(f"CREATE TABLE {collision_name} (id INTEGER PRIMARY KEY)")
+        )
+
+        with patch.object(migration, "op", _operations(connection)):
+            with pytest.raises(RuntimeError, match=collision_name):
+                getattr(migration, operation_name)()
+
+
 @pytest.mark.parametrize(
     "existing_indexes",
     [
@@ -361,6 +380,39 @@ def test_interrupted_owner_index_repair_rejects_missing_name_collision(
         indexes = _index_map(connection)
         assert existing_index in indexes
         assert missing_index not in indexes
+        assert (
+            connection.execute(text("SELECT count(*) FROM user_oauth")).scalar_one()
+            == 1
+        )
+
+
+@pytest.mark.parametrize("relation_type", ["TABLE", "INDEX", "VIEW"])
+def test_interrupted_owner_index_repair_rejects_case_variant_name_collision(
+    tmp_path,
+    relation_type: str,
+) -> None:
+    engine = create_engine(f"sqlite:///{tmp_path / 'oauth-case-collision.db'}")
+    migration = _migration_module()
+    collision_name = ACTOR_INDEX.upper()
+
+    with engine.begin() as connection:
+        _create_interrupted_owner_table(
+            connection,
+            existing_indexes=(ORDINARY_INDEX,),
+        )
+        if relation_type == "TABLE":
+            connection.execute(text(f"CREATE TABLE {collision_name} (id INTEGER)"))
+        elif relation_type == "VIEW":
+            connection.execute(text(f"CREATE VIEW {collision_name} AS SELECT 1 AS id"))
+        else:
+            connection.execute(text("CREATE TABLE unrelated (id INTEGER PRIMARY KEY)"))
+            connection.execute(text(f"CREATE INDEX {collision_name} ON unrelated (id)"))
+
+        with patch.object(migration, "op", _operations(connection)):
+            with pytest.raises(RuntimeError, match=collision_name):
+                migration.upgrade()
+
+        assert ORDINARY_INDEX in _index_map(connection)
         assert (
             connection.execute(text("SELECT count(*) FROM user_oauth")).scalar_one()
             == 1
@@ -768,7 +820,7 @@ def test_upgrade_rejects_partially_owner_aware_schema(
 
     with (
         patch.object(migration, "op", fake_op),
-        patch.object(migration, "_sqlite_batch_temp_table_exists", return_value=False),
+        patch.object(migration, "_sqlite_batch_temp_table_name", return_value=None),
         patch.object(migration, "_table_exists", return_value=True),
         patch.object(migration, "_users_table_exists", return_value=True),
         patch.object(migration, "_column_names", return_value=columns),

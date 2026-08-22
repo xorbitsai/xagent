@@ -165,47 +165,59 @@ def _owner_indexes_are_current(dialect: str) -> bool:
     return not _missing_owner_index_definitions(dialect)
 
 
-def _sqlite_batch_temp_table_exists() -> bool:
-    return (
+def _sqlite_batch_temp_table_name() -> str | None:
+    """Return the stored temp-table name with case-insensitive matching.
+
+    SQLite resolves schema identifiers case-insensitively, but ``sqlite_master``
+    compares names with binary collation unless the query specifies otherwise.
+    """
+    name = (
         op.get_bind()
         .execute(
             sa.text(
-                "SELECT 1 FROM sqlite_master "
-                "WHERE type = 'table' AND name = :name LIMIT 1"
+                "SELECT name FROM sqlite_master "
+                "WHERE type = 'table' "
+                "AND name COLLATE NOCASE = :name LIMIT 1"
             ),
             {"name": SQLITE_BATCH_TEMP_TABLE},
         )
-        .first()
-        is not None
+        .scalar_one_or_none()
     )
+    return str(name) if name is not None else None
 
 
 def _reject_sqlite_batch_temp_table(dialect: str) -> None:
     """Reject an interrupted batch rebuild before any upgrade or downgrade work."""
-    if dialect != "sqlite" or not _sqlite_batch_temp_table_exists():
+    if dialect != "sqlite":
+        return
+    table_name = _sqlite_batch_temp_table_name()
+    if table_name is None:
         return
     raise RuntimeError(
         "interrupted SQLite UserOAuth rebuild left temporary table "
-        f"{SQLITE_BATCH_TEMP_TABLE}; restore the verified backup or have a "
-        "database operator inspect both tables before retrying"
+        f"{table_name}; restore the verified backup or have a database operator "
+        "inspect both tables before retrying"
     )
 
 
 def _sqlite_global_owner_relation_names(
     expected_names: Sequence[str] = (ORDINARY_INDEX, ACTOR_INDEX),
 ) -> set[str]:
+    """Return stored names that collide in SQLite's case-insensitive namespace."""
     rows = op.get_bind().execute(
         sa.text(
             "SELECT name FROM sqlite_master "
             "WHERE type IN ('table', 'index', 'view') "
-            "AND name IN (:ordinary, :actor)"
+            "AND name COLLATE NOCASE IN (:ordinary, :actor)"
         ),
         {
             "ordinary": ORDINARY_INDEX,
             "actor": ACTOR_INDEX,
         },
     )
-    return {str(name) for name in rows.scalars()} & set(expected_names)
+    expected = {name.casefold() for name in expected_names}
+    actual_names = {str(name) for name in rows.scalars()}
+    return {name for name in actual_names if name.casefold() in expected}
 
 
 def _create_owner_indexes(

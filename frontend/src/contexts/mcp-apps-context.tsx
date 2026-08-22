@@ -7,13 +7,13 @@ import type { AppIntegration } from "@/components/mcp/types"
 import { useAuth } from "./auth-context"
 import { useI18n } from "./i18n-context"
 
-// auth_type/launch_config/user_env_configured are picked from AppIntegration
+// auth_type/launch_config/configured_env_keys are picked from AppIntegration
 // (components/mcp/types.ts), not redeclared, so this catalog-entry shape
 // can't drift from the one the connector dialog and settings dialog share -
 // the exact drift that file's own header comment exists to prevent. All
-// three were already in the API response before being declared here.
+// three are already in the API response.
 export interface McpApp
-  extends Pick<AppIntegration, "auth_type" | "launch_config" | "user_env_configured"> {
+  extends Pick<AppIntegration, "auth_type" | "launch_config" | "configured_env_keys"> {
   id: string
   name: string
   description: string

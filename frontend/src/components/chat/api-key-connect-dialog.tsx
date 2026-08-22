@@ -72,14 +72,20 @@ export function ApiKeyConnectDialog({
   useEffect(() => {
     if (!app) return;
     const required = app.launch_config?.required_env || [];
+    const configured = new Set(app.configured_env_keys || []);
     const initial: Record<string, string> = {};
-    // Pre-fill masked when the user already has a key, so submitting without
-    // retyping preserves it instead of silently wiping it - _merge_masked_env
-    // only restores a key whose incoming value is exactly this sentinel; any
-    // other value (including "") is written as the new secret. Matches
-    // connect-mcp-dialog.tsx's openKeyConnect prefill for the same reason.
+    // Pre-fill masked per key that's already configured, so submitting
+    // without retyping it preserves it instead of silently wiping it -
+    // _merge_masked_env only restores a key whose incoming value is exactly
+    // this sentinel; any other value (including "") is written as the new
+    // secret, dropping whatever was stored. This has to be per key, not
+    // app.user_env_configured's single all-required-keys-set flag: an app
+    // with more than one required key (e.g. AWS's 3) can be configured
+    // key-by-key over time, and treating "not fully configured yet" as
+    // "blank every field" would wipe the ones that *are* already set the
+    // moment the user only means to add the missing one.
     required.forEach((key) => {
-      initial[key] = app.user_env_configured ? MASKED_SECRET_VALUE : "";
+      initial[key] = configured.has(key) ? MASKED_SECRET_VALUE : "";
     });
     setValues(initial);
   }, [app]);

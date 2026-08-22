@@ -196,7 +196,7 @@ describe("ApiKeyConnectDialog", () => {
 
     render(
       <ApiKeyConnectDialog
-        app={makeApp({ user_env_configured: true })}
+        app={makeApp({ configured_env_keys: ["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"] })}
         onOpenChange={vi.fn()}
         onConnected={vi.fn()}
       />
@@ -222,10 +222,59 @@ describe("ApiKeyConnectDialog", () => {
     });
   });
 
+  it("prefills only the keys that are actually configured, leaving a missing one blank, for a partially-configured multi-key app", async () => {
+    // The exact gap a single app-level "is this app configured" boolean
+    // can't cover: AWS_REGION was never set, so app.user_env_configured
+    // would be false even though the other two keys are - configured_env_keys
+    // is per key precisely so this case doesn't blank (and on submit, wipe)
+    // the two that are already there.
+    apiRequestMock.mockResolvedValueOnce(jsonResponse({ ok: true }));
+
+    render(
+      <ApiKeyConnectDialog
+        app={makeApp({
+          launch_config: {
+            required_env: ["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_REGION"],
+          },
+          configured_env_keys: ["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"],
+        })}
+        onOpenChange={vi.fn()}
+        onConnected={vi.fn()}
+      />
+    );
+
+    expect((screen.getByLabelText("AWS_ACCESS_KEY_ID") as HTMLInputElement).value).toBe(
+      "********"
+    );
+    expect((screen.getByLabelText("AWS_SECRET_ACCESS_KEY") as HTMLInputElement).value).toBe(
+      "********"
+    );
+    expect((screen.getByLabelText("AWS_REGION") as HTMLInputElement).value).toBe("");
+
+    fireEvent.change(screen.getByLabelText("AWS_REGION"), { target: { value: "us-east-1" } });
+    fireEvent.click(screen.getByRole("button", { name: "tools.mcp.dialog.connect" }));
+
+    await waitFor(() => {
+      expect(apiRequestMock).toHaveBeenCalledWith(
+        "http://api.local/api/mcp/apps/aws/connect",
+        expect.objectContaining({
+          body: JSON.stringify({
+            env: {
+              AWS_ACCESS_KEY_ID: "********",
+              AWS_SECRET_ACCESS_KEY: "********",
+              AWS_REGION: "us-east-1",
+            },
+            env_source: "own",
+          }),
+        })
+      );
+    });
+  });
+
   it("does not prefill the masked sentinel for an app with no stored key yet", () => {
     render(
       <ApiKeyConnectDialog
-        app={makeApp({ user_env_configured: false })}
+        app={makeApp({ configured_env_keys: [] })}
         onOpenChange={vi.fn()}
         onConnected={vi.fn()}
       />

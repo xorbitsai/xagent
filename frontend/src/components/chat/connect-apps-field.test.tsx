@@ -163,7 +163,7 @@ describe("ConnectAppsField", () => {
     expect(container).toBeEmptyDOMElement();
   });
 
-  it("resolves a requested name against an app's id (with a hyphen-for-space variant), not just its display name", () => {
+  it("resolves a requested name against an app's id, not just its display name", () => {
     // Mirrors tests/templates/test_manager.py's
     // test_builtin_template_connections_resolve_to_a_registered_mcp_app,
     // which assumes this exact lenient name/app_id/hyphen matching.
@@ -173,6 +173,21 @@ describe("ConnectAppsField", () => {
 
     render(
       <ConnectAppsField interaction={{ ...LEO_INTERACTION, apps: ["facebook"] }} onSkip={vi.fn()} />
+    );
+
+    expect(screen.getByText("Facebook Pages")).toBeInTheDocument();
+  });
+
+  it("resolves a requested name against an app's id with a hyphen-for-space variant in either direction", () => {
+    mcpAppsMock.apps = [
+      makeApp({ id: "facebook-pages", name: "Facebook Pages", provider: "meta" }),
+    ];
+
+    render(
+      <ConnectAppsField
+        interaction={{ ...LEO_INTERACTION, apps: ["facebook pages"] }}
+        onSkip={vi.fn()}
+      />
     );
 
     expect(screen.getByText("Facebook Pages")).toBeInTheDocument();

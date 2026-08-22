@@ -251,6 +251,62 @@ def test_platform_and_shared_env_available_flags(test_db):
     assert _app_shared_env_available(app, server, {server.id: {"X": "y"}}) is False
 
 
+def test_configured_env_keys_reflects_per_key_state_for_a_partially_configured_app(
+    test_db,
+):
+    """_app_user_env_configured is all-or-nothing over required_env, which a
+    multi-key app (e.g. AWS's 3 keys) can't use to tell a reconnect dialog
+    which keys already have a stored value - the dialog would have to blank
+    every field the moment even one is missing, and submitting a blank value
+    clears whatever was already there (see connect_mcp_app's provided/
+    _merge_masked_env handling). _app_configured_env_keys exists to answer
+    that per key instead."""
+    from xagent.web.api.mcp import (
+        MCPAppConnectRequest,
+        _app_configured_env_keys,
+        _app_user_env_configured,
+        connect_mcp_app,
+    )
+
+    test_db.add(
+        PublicMCPApp(
+            app_id="multi-key-app",
+            name="multi-key-app",
+            description="Multi-key test app",
+            transport="stdio",
+            launch_config={
+                "command": "npx",
+                "args": ["multi-key-app"],
+                "required_env": ["KEY_A", "KEY_B"],
+            },
+        )
+    )
+    test_db.commit()
+
+    app = {
+        "id": "multi-key-app",
+        "name": "multi-key-app",
+        "transport": "stdio",
+        "launch_config": {"required_env": ["KEY_A", "KEY_B"]},
+    }
+
+    # Only KEY_A is set - not fully configured, but KEY_A specifically is.
+    connect_mcp_app(
+        "multi-key-app",
+        MCPAppConnectRequest(env={"KEY_A": "value-a"}),
+        current_user=_user(test_db, 1),
+        db=test_db,
+    )
+    server = test_db.query(MCPServer).filter(MCPServer.name == "multi-key-app").first()
+    um_by_id = {
+        um.mcpserver_id: um
+        for um in test_db.query(UserMCPServer).filter(UserMCPServer.user_id == 1).all()
+    }
+
+    assert _app_user_env_configured(app, server, um_by_id) is False
+    assert _app_configured_env_keys(app, server, um_by_id) == ["KEY_A"]
+
+
 def test_user_env_configured_reflects_own_key(test_db):
     """The catalog exposes whether the current user has their own per-user key
     (vs relying on the admin's global key), so the manage dialog can show it."""

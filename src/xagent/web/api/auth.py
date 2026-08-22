@@ -49,6 +49,7 @@ auth_router = APIRouter(prefix="/api/auth", tags=["Authentication"])
 REGISTRATION_ENABLED_SETTING_KEY = "registration_enabled"
 SETUP_COMPLETED_SETTING_KEY = "setup_completed"
 EMAIL_PATTERN = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+_MAX_USER_ID = 2_147_483_647
 
 
 def _best_effort_ensure_gmail_watches_for_user(db: Session, *, user_id: int) -> None:
@@ -1708,15 +1709,16 @@ def generic_oauth_callback(
         )
 
     user_id_claim = payload.get("user_id")
-    try:
-        user_id = int(user_id_claim) if user_id_claim is not None else None
-    except (TypeError, ValueError):
+    if user_id_claim is not None and (
+        type(user_id_claim) is not int or not 0 < user_id_claim <= _MAX_USER_ID
+    ):
         # Reject malformed state before exchanging the provider code or
-        # mutating OAuth rows. Scoped database helpers require an integer
-        # owner and must not become the first validation boundary.
+        # mutating OAuth rows. ``User.id`` uses a signed database integer, so
+        # values accepted only by SQLite must also fail at this boundary.
         return HTMLResponse(
             content="<h1>Error: Invalid or expired state</h1>", status_code=400
         )
+    user_id = user_id_claim
     app_id = payload.get("app_id")
 
     if not app_id:

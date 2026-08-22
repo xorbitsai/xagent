@@ -450,15 +450,28 @@ def test_oauth_callback_still_fails_when_the_success_page_cannot_be_rendered(
     assert "Authentication Failed" in response.body.decode()
 
 
-def test_oauth_callback_rejects_a_non_integer_user_id_claim_before_exchange(
-    db_session, monkeypatch
+@pytest.mark.parametrize(
+    "user_id_claim",
+    [
+        pytest.param("7abc", id="non-integer-string"),
+        pytest.param(True, id="boolean"),
+        pytest.param(7.9, id="fractional-float"),
+        pytest.param(7.0, id="integral-float"),
+        pytest.param(float("inf"), id="infinite-float"),
+        pytest.param(0, id="zero"),
+        pytest.param(-1, id="negative"),
+        pytest.param(2**31, id="larger-than-database-integer"),
+    ],
+)
+def test_oauth_callback_rejects_an_invalid_user_id_claim_before_exchange(
+    db_session, monkeypatch, user_id_claim: object
 ):
     """An invalid state owner must fail before provider and database effects."""
     db, _user = db_session
     state = create_access_token(
         data={
             "type": "oauth_state",
-            "user_id": "7abc",
+            "user_id": user_id_claim,
             "provider": "google",
             "app_id": "gmail",
         },
@@ -484,7 +497,10 @@ def test_oauth_callback_rejects_a_non_integer_user_id_claim_before_exchange(
         provision,
     )
 
-    response = generic_oauth_callback("google", request, db, _google_provider())
+    try:
+        response = generic_oauth_callback("google", request, db, _google_provider())
+    except Exception as exc:
+        pytest.fail(f"invalid user ID claim escaped the callback: {exc!r}")
 
     assert response.status_code == 400
     assert "Invalid or expired state" in response.body.decode()

@@ -108,10 +108,12 @@ class TaskCreateRequest(BaseModel):
             "ask_user_question agent tool produces) attached to the "
             "seed_assistant_message's chat history row. Not validated "
             "against a fixed schema here - same permissive contract as "
-            "every other interactions list in this codebase - the frontend "
-            "renders unrecognized types as a plain 'unsupported' notice "
-            "rather than erroring. Ignored if seed_assistant_message is not "
-            "also set, since there is no row to attach interactions to."
+            "every other interactions list in this codebase - the frontend's "
+            "normalizeInteractions drops any entry with an unrecognized type "
+            "before it ever renders; the 'unsupported' notice is reachable "
+            "only for a recognized type ClarificationForm has no render case "
+            "for. Ignored if seed_assistant_message is not also set, since "
+            "there is no row to attach interactions to."
         ),
     )
 

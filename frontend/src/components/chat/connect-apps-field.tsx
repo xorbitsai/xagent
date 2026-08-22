@@ -13,11 +13,15 @@ import { apiRequest } from "@/lib/api-wrapper";
 import { cn, getApiUrl } from "@/lib/utils";
 import type { Interaction } from "@/contexts/app-context-chat";
 import { capitalize } from "@/lib/tool-category-labels";
+import { findMatchingMcpApp } from "@/lib/mcp-lookup";
 import { ApiKeyConnectDialog } from "./api-key-connect-dialog";
 
-// The 8 builtin-OAuth providers (see src/xagent/web/builtin_mcp_registry.py's
+// The 11 builtin-OAuth providers (see src/xagent/web/builtin_mcp_registry.py's
 // get_builtin_oauth_provider_rows) - brand names, left untranslated in both
-// locales like every other connector name in the app.
+// locales like every other connector name in the app. Falling back to
+// capitalize() below still runs for any provider missing here, but gets the
+// casing wrong for a multi-cap brand name (e.g. "Github" instead of
+// "GitHub"), so every provider in the registry should have an entry here.
 const PROVIDER_DISPLAY_NAMES: Record<string, string> = {
   google: "Google",
   linkedin: "LinkedIn",
@@ -27,6 +31,9 @@ const PROVIDER_DISPLAY_NAMES: Record<string, string> = {
   slack: "Slack",
   zoom: "Zoom",
   intercom: "Intercom",
+  github: "GitHub",
+  linear: "Linear",
+  jira: "Jira",
 };
 
 // Same load-failure fallback as connect-mcp-dialog.tsx/official-mcp-settings-
@@ -72,14 +79,19 @@ type ConnectAppsRow =
  * about it either way.
  */
 function resolveRows(appNames: string[] | undefined, allApps: McpApp[]): ConnectAppsRow[] {
-  const wanted = (appNames || []).map((name) => name.toLowerCase().trim());
+  const wanted = appNames || [];
   if (wanted.length === 0) return [];
 
-  const byName = new Map(allApps.map((app) => [app.name.toLowerCase().trim(), app]));
+  // findMatchingMcpApp (lib/mcp-lookup.ts) matches by name OR id, tolerating
+  // a hyphen-for-space variant either way - the same lenient matching
+  // tests/templates/test_manager.py's test_builtin_template_connections_
+  // resolve_to_a_registered_mcp_app already assumes this card does. A plain
+  // lowercase/trim name-only lookup silently drops any template that names
+  // its connection by app_id (e.g. "facebook-pages") instead of display name.
   const seen = new Set<string>();
   const resolved: McpApp[] = [];
   for (const name of wanted) {
-    const app = byName.get(name);
+    const app = findMatchingMcpApp(allApps, name);
     if (!app || seen.has(app.id)) continue;
     seen.add(app.id);
     resolved.push(app);
@@ -167,7 +179,7 @@ export function ConnectAppsField({
   interaction: Interaction;
   onSkip: () => void;
 }) {
-  const { apps, refresh } = useMcpApps();
+  const { apps, refresh, isLoading, error } = useMcpApps();
   const { token } = useAuth();
   const { t } = useI18n();
   const branding = getBrandingFromEnv();
@@ -190,7 +202,25 @@ export function ConnectAppsField({
 
   const rows = useMemo(() => resolveRows(interaction.apps, apps), [interaction.apps, apps]);
 
-  if (rows.length === 0) return null;
+  if (rows.length === 0) {
+    // ClarificationForm's Collapsible card (title bar + chevron) is already
+    // showing above this by the time useMcpApps() is still fetching or has
+    // failed - returning null unconditionally here left it sitting over a
+    // blank void with nothing telling the user why. Once apps has loaded and
+    // still resolves to zero rows, null is correct again: there's genuinely
+    // nothing this card can show.
+    if (isLoading) {
+      return (
+        <p className="text-xs text-muted-foreground">
+          {t("chatPage.clarification.connectApps.loading")}
+        </p>
+      );
+    }
+    if (error) {
+      return <p className="text-xs text-destructive">{error}</p>;
+    }
+    return null;
+  }
 
   const withConnectingKey = async (key: string, run: () => Promise<void>) => {
     setConnectingKeys((prev) => new Set(prev).add(key));

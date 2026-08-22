@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useState } from "react";
+import React, { useEffect, useState } from "react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -12,12 +12,32 @@ import { toast } from "@/components/ui/sonner";
 import type { McpApp } from "@/contexts/mcp-apps-context";
 
 const CONNECT_TIMEOUT_MS = 30_000;
+// A same-key retention token: submitting it back unchanged tells the backend
+// (_merge_masked_env, src/xagent/web/api/mcp.py) to keep the stored secret
+// rather than overwrite it. Matches connect-mcp-dialog.tsx's own constant of
+// the same name/value - duplicated per this file's established narrow-slice
+// pattern rather than imported, since neither file exports it.
+const MASKED_SECRET_VALUE = "********";
 
 // Same load-failure fallback as connect-apps-field.tsx's RowIcon: a real
 // icon URL can still 404, and this dialog reuses the exact same app.icon
 // value that row already has to guard for the same reason.
 function iconFallbackUrl(name: string): string {
   return `https://ui-avatars.com/api/?name=${encodeURIComponent(name)}&background=random&color=fff&size=128`;
+}
+
+// FastAPI's RequestValidationError handler (src/xagent/web/app.py) returns
+// `detail` as an array of {msg, loc, ...} objects for a 422 on this endpoint,
+// not the plain string every other failure mode here returns it as - render
+// that shape's first message instead of stringifying the whole array.
+function readableErrorDetail(detail: unknown): string | undefined {
+  if (typeof detail === "string") return detail;
+  if (Array.isArray(detail) && detail.length > 0) {
+    const first = detail[0];
+    if (typeof first === "string") return first;
+    if (first && typeof first === "object" && typeof first.msg === "string") return first.msg;
+  }
+  return undefined;
 }
 
 /**
@@ -45,6 +65,25 @@ export function ApiKeyConnectDialog({
 
   const requiredEnv = app?.launch_config?.required_env || [];
 
+  // Re-seed on every app change (including re-opening for the same app after
+  // a prior close), not just once on mount - a bare `useState({})` initial
+  // value only ever runs for this component instance's first render, so a
+  // later app would inherit the previous app's stale values otherwise.
+  useEffect(() => {
+    if (!app) return;
+    const required = app.launch_config?.required_env || [];
+    const initial: Record<string, string> = {};
+    // Pre-fill masked when the user already has a key, so submitting without
+    // retyping preserves it instead of silently wiping it - _merge_masked_env
+    // only restores a key whose incoming value is exactly this sentinel; any
+    // other value (including "") is written as the new secret. Matches
+    // connect-mcp-dialog.tsx's openKeyConnect prefill for the same reason.
+    required.forEach((key) => {
+      initial[key] = app.user_env_configured ? MASKED_SECRET_VALUE : "";
+    });
+    setValues(initial);
+  }, [app]);
+
   const handleOpenChange = (open: boolean) => {
     if (open || isSubmitting) return;
     setValues({});
@@ -55,11 +94,13 @@ export function ApiKeyConnectDialog({
     if (!app) return;
     setIsSubmitting(true);
     try {
-      // Send every required key explicitly, even ones left untouched (as
-      // ""), rather than only the ones the user actually typed into -
-      // matching connect-mcp-dialog.tsx's openKeyConnect, whose POST body
-      // always carries the full required_env set.
-      const env = Object.fromEntries(requiredEnv.map((key) => [key, values[key] || ""]));
+      // Send every required key explicitly, even ones left untouched, rather
+      // than only the ones the user actually typed into - matching
+      // connect-mcp-dialog.tsx's openKeyConnect, whose POST body always
+      // carries the full required_env set (each entry either the masked
+      // sentinel seeded above, the user's edit, or "" for a key that was
+      // never configured and is still untouched).
+      const env = Object.fromEntries(requiredEnv.map((key) => [key, values[key] ?? ""]));
       const response = await apiRequest(`${getApiUrl()}/api/mcp/apps/${app.id}/connect`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -73,7 +114,7 @@ export function ApiKeyConnectDialog({
         onOpenChange(false);
       } else {
         const error = await response.json().catch(() => ({}));
-        toast.error(error.detail || t("tools.mcp.alerts.saveFailed"));
+        toast.error(readableErrorDetail(error.detail) || t("tools.mcp.alerts.saveFailed"));
       }
     } catch (error) {
       const timedOut = error instanceof DOMException && error.name === "TimeoutError";

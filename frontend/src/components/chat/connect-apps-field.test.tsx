@@ -7,6 +7,8 @@ import type { McpApp } from "@/contexts/mcp-apps-context";
 const mcpAppsMock = vi.hoisted(() => ({
   apps: [] as McpApp[],
   refresh: vi.fn(),
+  isLoading: false,
+  error: null as string | null,
 }));
 const toastErrorMock = vi.hoisted(() => vi.fn());
 const openBuiltinOAuthPopupMock = vi.hoisted(() => vi.fn());
@@ -88,6 +90,8 @@ function jsonResponse(data: unknown, init?: ResponseInit) {
 beforeEach(() => {
   mcpAppsMock.apps = [];
   mcpAppsMock.refresh.mockReset().mockResolvedValue(undefined);
+  mcpAppsMock.isLoading = false;
+  mcpAppsMock.error = null;
   toastErrorMock.mockReset();
   openBuiltinOAuthPopupMock.mockReset();
   openMcpOAuthPopupMock.mockReset();
@@ -157,6 +161,45 @@ describe("ConnectAppsField", () => {
     );
 
     expect(container).toBeEmptyDOMElement();
+  });
+
+  it("resolves a requested name against an app's id (with a hyphen-for-space variant), not just its display name", () => {
+    // Mirrors tests/templates/test_manager.py's
+    // test_builtin_template_connections_resolve_to_a_registered_mcp_app,
+    // which assumes this exact lenient name/app_id/hyphen matching.
+    mcpAppsMock.apps = [
+      makeApp({ id: "facebook", name: "Facebook Pages", provider: "meta" }),
+    ];
+
+    render(
+      <ConnectAppsField interaction={{ ...LEO_INTERACTION, apps: ["facebook"] }} onSkip={vi.fn()} />
+    );
+
+    expect(screen.getByText("Facebook Pages")).toBeInTheDocument();
+  });
+
+  it("shows a loading message instead of an empty panel while the catalog is still fetching", () => {
+    mcpAppsMock.apps = [];
+    mcpAppsMock.isLoading = true;
+
+    render(
+      <ConnectAppsField interaction={{ ...LEO_INTERACTION, apps: ["Gmail"] }} onSkip={vi.fn()} />
+    );
+
+    expect(
+      screen.getByText("chatPage.clarification.connectApps.loading")
+    ).toBeInTheDocument();
+  });
+
+  it("shows the catalog fetch error instead of an empty panel when useMcpApps() fails", () => {
+    mcpAppsMock.apps = [];
+    mcpAppsMock.error = "tools.mcp.dialog.fetchFailed";
+
+    render(
+      <ConnectAppsField interaction={{ ...LEO_INTERACTION, apps: ["Gmail"] }} onSkip={vi.fn()} />
+    );
+
+    expect(screen.getByText("tools.mcp.dialog.fetchFailed")).toBeInTheDocument();
   });
 
   it("shows a Connected badge instead of a button once an app is connected", () => {
@@ -274,6 +317,25 @@ describe("ConnectAppsField", () => {
     await waitFor(() => {
       expect(toastErrorMock).toHaveBeenCalledWith(
         'chatPage.clarification.connectApps.connectFailed:{"provider":"Google"}'
+      );
+    });
+  });
+
+  it("capitalizes github's failure toast as 'GitHub', not the generic capitalize() fallback's 'Github'", async () => {
+    mcpAppsMock.apps = [
+      makeApp({ id: "github", name: "GitHub", provider: "github", is_connected: false }),
+    ];
+    openBuiltinOAuthPopupMock.mockResolvedValue({ success: false });
+
+    render(
+      <ConnectAppsField interaction={{ ...LEO_INTERACTION, apps: ["GitHub"] }} onSkip={vi.fn()} />
+    );
+
+    fireEvent.click(continueButton("GitHub"));
+
+    await waitFor(() => {
+      expect(toastErrorMock).toHaveBeenCalledWith(
+        'chatPage.clarification.connectApps.connectFailed:{"provider":"GitHub"}'
       );
     });
   });

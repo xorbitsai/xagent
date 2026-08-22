@@ -297,13 +297,18 @@ describe("ClarificationForm connect_apps interaction", () => {
     ).toBeInTheDocument()
   })
 
-  it("shows the interaction's own label in the header instead of the generic 'Ask User' title", () => {
+  it("shows the live-translated connectApps title in the header instead of the generic 'Ask User' title, ignoring the persisted label", () => {
+    // CONNECT_APPS_INTERACTION.label ("Connect your apps") stands in for the
+    // DB-persisted, hire-time-translated string (see hire-agent.ts's
+    // buildConnectAppsInteraction) - the header must not use it, or a locale
+    // switch after hiring would leave it frozen in the original language.
     render(
       <ClarificationForm interactions={[CONNECT_APPS_INTERACTION]} onSend={vi.fn()} />,
     )
 
-    expect(screen.getByText("Connect your apps")).toBeInTheDocument()
+    expect(screen.getByText("chatPage.clarification.connectApps.title")).toBeInTheDocument()
     expect(screen.queryByText("chatPage.clarification.title")).not.toBeInTheDocument()
+    expect(screen.queryByText(CONNECT_APPS_INTERACTION.label)).not.toBeInTheDocument()
   })
 
   it("does not render the generic Submit button - connecting happens per-provider, not via a form submit", () => {
@@ -331,5 +336,32 @@ describe("ClarificationForm connect_apps interaction", () => {
         {},
       )
     })
+  })
+
+  it("renders the real connect_apps widget instead of an 'unsupported type' error when mixed into a list with another interaction type", () => {
+    // Not producible by any seeder today (see LIVE_WIDGET_TYPES's comment in
+    // clarification-form.tsx), but nothing rules it out - isConnectAppsOnly
+    // is false here since the list isn't every() connect_apps, so this must
+    // go through renderField's normal per-field switch instead of the
+    // dedicated isConnectAppsOnly branch.
+    render(
+      <ClarificationForm
+        interactions={[
+          CONNECT_APPS_INTERACTION,
+          { type: "text_input", field: "note", label: "Note" },
+        ]}
+        onSend={vi.fn()}
+      />,
+    )
+
+    expect(screen.getByText("Gmail")).toBeInTheDocument()
+    expect(
+      screen.getByRole("button", {
+        name: 'chatPage.clarification.connectApps.continueWith:{"provider":"Gmail"}',
+      }),
+    ).toBeInTheDocument()
+    expect(
+      screen.queryByText('chatPage.clarification.unsupportedType:{"type":"connect_apps"}'),
+    ).not.toBeInTheDocument()
   })
 })

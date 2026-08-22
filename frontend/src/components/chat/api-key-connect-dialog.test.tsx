@@ -174,6 +174,67 @@ describe("ApiKeyConnectDialog", () => {
     expect(onOpenChange).not.toHaveBeenCalledWith(false);
   });
 
+  it("shows the first message of a FastAPI validation-error array instead of stringifying the whole array", async () => {
+    apiRequestMock.mockResolvedValueOnce(
+      jsonResponse(
+        { detail: [{ loc: ["body", "env"], msg: "field required", type: "missing" }] },
+        { status: 422 }
+      )
+    );
+
+    render(<ApiKeyConnectDialog app={makeApp()} onOpenChange={vi.fn()} onConnected={vi.fn()} />);
+
+    fireEvent.click(screen.getByRole("button", { name: "tools.mcp.dialog.connect" }));
+
+    await waitFor(() => {
+      expect(toastErrorMock).toHaveBeenCalledWith("field required");
+    });
+  });
+
+  it("prefills already-configured keys with the masked sentinel instead of blank, so submitting untouched preserves the stored secret", async () => {
+    apiRequestMock.mockResolvedValueOnce(jsonResponse({ ok: true }));
+
+    render(
+      <ApiKeyConnectDialog
+        app={makeApp({ user_env_configured: true })}
+        onOpenChange={vi.fn()}
+        onConnected={vi.fn()}
+      />
+    );
+
+    const accessKeyInput = screen.getByLabelText("AWS_ACCESS_KEY_ID") as HTMLInputElement;
+    const secretKeyInput = screen.getByLabelText("AWS_SECRET_ACCESS_KEY") as HTMLInputElement;
+    expect(accessKeyInput.value).toBe("********");
+    expect(secretKeyInput.value).toBe("********");
+
+    fireEvent.click(screen.getByRole("button", { name: "tools.mcp.dialog.connect" }));
+
+    await waitFor(() => {
+      expect(apiRequestMock).toHaveBeenCalledWith(
+        "http://api.local/api/mcp/apps/aws/connect",
+        expect.objectContaining({
+          body: JSON.stringify({
+            env: { AWS_ACCESS_KEY_ID: "********", AWS_SECRET_ACCESS_KEY: "********" },
+            env_source: "own",
+          }),
+        })
+      );
+    });
+  });
+
+  it("does not prefill the masked sentinel for an app with no stored key yet", () => {
+    render(
+      <ApiKeyConnectDialog
+        app={makeApp({ user_env_configured: false })}
+        onOpenChange={vi.fn()}
+        onConnected={vi.fn()}
+      />
+    );
+
+    const accessKeyInput = screen.getByLabelText("AWS_ACCESS_KEY_ID") as HTMLInputElement;
+    expect(accessKeyInput.value).toBe("");
+  });
+
   it("shows a timeout-specific error when the request aborts", async () => {
     apiRequestMock.mockImplementation(() =>
       Promise.reject(new DOMException("timed out", "TimeoutError"))

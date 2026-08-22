@@ -3,10 +3,17 @@
 import React, { createContext, useContext, useState, useEffect } from "react"
 import { apiRequest } from "@/lib/api-wrapper"
 import { getApiUrl } from "@/lib/utils"
+import type { AppIntegration } from "@/components/mcp/types"
 import { useAuth } from "./auth-context"
 import { useI18n } from "./i18n-context"
 
-export interface McpApp {
+// auth_type/launch_config/user_env_configured are picked from AppIntegration
+// (components/mcp/types.ts), not redeclared, so this catalog-entry shape
+// can't drift from the one the connector dialog and settings dialog share -
+// the exact drift that file's own header comment exists to prevent. All
+// three were already in the API response before being declared here.
+export interface McpApp
+  extends Pick<AppIntegration, "auth_type" | "launch_config" | "user_env_configured"> {
   id: string
   name: string
   description: string
@@ -18,18 +25,6 @@ export interface McpApp {
   is_connected?: boolean
   server_id?: number
   connected_account?: string
-  // Canonical connect classification derived by the backend
-  // (mcp_apps.classify_app_auth) - see components/mcp/types.ts's
-  // AppIntegration for the same field. The API already returns this; it
-  // was just never declared here before.
-  auth_type?: "builtin_oauth" | "api_key" | "keyless" | "mcp_oauth" | "unconnectable"
-  // Same gap as auth_type above: already in the API response, just not
-  // declared here. required_env lists the env var names an "api_key" app
-  // needs (e.g. AWS_ACCESS_KEY_ID) - see components/mcp/types.ts's
-  // AppIntegration.launch_config for the fuller shape.
-  launch_config?: {
-    required_env?: string[]
-  }
 }
 
 interface McpAppsContextType {

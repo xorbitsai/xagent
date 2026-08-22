@@ -41,12 +41,17 @@ export function openBuiltinOAuthPopup(options: {
   token: string | null | undefined;
 }): Promise<OpenBuiltinOAuthPopupResult> {
   const { provider, appId, token } = options;
+  // The backend echoes this same value back as the postMessage's `provider`
+  // field (auth.py: `provider: app_id or provider`) - matching against it
+  // below is what lets a concurrent second connect's success message not
+  // resolve this one (see handleMessage's comment).
+  const expectedProvider = appId || provider;
 
   return new Promise((resolve) => {
     const left = window.screenX + (window.outerWidth - POPUP_WIDTH) / 2;
     const top = window.screenY + (window.outerHeight - POPUP_HEIGHT) / 2;
-    const appIdParam = appId ? `&app_id=${appId}` : "";
-    const authUrl = `${getApiUrl()}/api/auth/${provider}/login?token=${token || ""}${appIdParam}&redirect=${encodeURIComponent(window.location.href)}`;
+    const appIdParam = appId ? `&app_id=${encodeURIComponent(appId)}` : "";
+    const authUrl = `${getApiUrl()}/api/auth/${encodeURIComponent(provider)}/login?token=${encodeURIComponent(token || "")}${appIdParam}&redirect=${encodeURIComponent(window.location.href)}`;
     const popup = window.open(
       authUrl,
       `${provider}OAuth`,
@@ -64,11 +69,20 @@ export function openBuiltinOAuthPopup(options: {
       settled = true;
       window.clearInterval(pollTimer);
       window.removeEventListener("message", handleMessage);
+      // Closing here (not just on the caller's own popup.closed check) means
+      // a stale popup from an already-resolved call can't sit open and swallow
+      // its own late completion into a listener nothing is waiting on anymore.
+      if (!popup.closed) popup.close();
       resolve({ success });
     };
 
+    // `connectingKeys` in connect-apps-field.tsx allows more than one of
+    // these popups open at once, each with its own listener on the shared
+    // `window` object - a message posted by any one of them reaches every
+    // listener, so without this provider/app_id check, one popup finishing
+    // first would resolve every other pending call's promise as success too.
     const handleMessage = (event: MessageEvent) => {
-      if (event.data?.type === "oauth-success") {
+      if (event.data?.type === "oauth-success" && event.data?.provider === expectedProvider) {
         finish(true);
       }
     };
@@ -159,6 +173,10 @@ export async function openMcpOAuthPopup(options: {
       const expired = Date.now() - startedAt >= MAX_WAIT_MS;
       if (!popup.closed && !expired) return;
       window.clearInterval(pollTimer);
+      // On a timeout the popup may still be open (the recheck below then
+      // treats it as not-connected) - close it so a completion the user
+      // finishes late in it doesn't land somewhere nothing is watching.
+      if (!popup.closed) popup.close();
       resolve();
     }, POLL_INTERVAL_MS);
   });

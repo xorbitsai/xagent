@@ -45,6 +45,15 @@ const isFileActionSelection = (
   ? isFileActionOption(option)
   : isFileActionValue(value)
 
+// Interaction types that are "live widgets" reflecting external state (e.g.
+// useMcpApps()'s connection state), not a question with an answer to submit
+// - see the comment on isConnectAppsOnly below for why that distinction
+// matters. Named so a list mixing one of these with an ordinary field (not
+// currently produced by any seeder, but nothing in the type system or
+// backend schema rules it out) still renders correctly via renderField's
+// switch below instead of falling through to its "unsupported type" case.
+const LIVE_WIDGET_TYPES = new Set(["connect_apps"])
+
 export function ClarificationForm({
   interactions,
   messageId,
@@ -73,7 +82,7 @@ export function ClarificationForm({
   // waiting_for_user at all, so gating this on `active` the normal way
   // would leave it permanently collapsed and inert.
   const isConnectAppsOnly =
-    interactions.length > 0 && interactions.every((interaction) => interaction.type === "connect_apps")
+    interactions.length > 0 && interactions.every((interaction) => LIVE_WIDGET_TYPES.has(interaction.type))
 
   const { t } = useI18n()
   const [formState, setFormState] = useState<Record<string, any>>({})
@@ -490,6 +499,14 @@ export function ClarificationForm({
           </div>
         )
 
+      // Normally rendered via the isConnectAppsOnly branch below, which skips
+      // renderField entirely - this case only matters if connect_apps is
+      // ever mixed into a list with another interaction type (not producible
+      // today, see LIVE_WIDGET_TYPES's comment), so that path still gets the
+      // real widget instead of falling to the "unsupported type" case below.
+      case "connect_apps":
+        return <ConnectAppsField interaction={interaction} onSkip={handleSkipConnectApps} />
+
       default:
         return <div className="text-destructive text-sm">{t("chatPage.clarification.unsupportedType", { type: interaction.type })}</div>
     }
@@ -507,7 +524,13 @@ export function ClarificationForm({
             <MessageSquare className="h-4 w-4" />
             <span className="text-sm">
               {isConnectAppsOnly
-                ? normalizedInteractions[0]?.label || t("chatPage.clarification.connectApps.title")
+                ? // Ignore the persisted interaction.label here (it's only ever a
+                  // t()'d string frozen into the DB row at hire time - see
+                  // hire-agent.ts's buildConnectAppsInteraction/HireMessageStrings)
+                  // and re-resolve live instead, so a locale switch after hiring
+                  // doesn't leave this header stuck in whatever language was
+                  // active when the task was created.
+                  t("chatPage.clarification.connectApps.title")
                 : t("chatPage.clarification.title")}
             </span>
           </div>

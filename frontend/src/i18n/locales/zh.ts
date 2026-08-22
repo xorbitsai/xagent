@@ -352,6 +352,7 @@ const zh = {
       connectApps: {
         title: "连接你的应用",
         subtitle: "逐个连接下面的应用——同一服务商下登录一次仍会一并连接。",
+        loading: "正在加载你的应用…",
         continueWith: "继续使用 {provider} 登录",
         connected: "已连接",
         connecting: "连接中…",

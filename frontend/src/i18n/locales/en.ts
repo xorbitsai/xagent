@@ -352,6 +352,7 @@ const en = {
       connectApps: {
         title: "Connect your apps",
         subtitle: "Connect each app below — one sign-in still covers every app under the same provider.",
+        loading: "Loading your apps…",
         continueWith: "Continue with {provider}",
         connected: "Connected",
         connecting: "Connecting…",

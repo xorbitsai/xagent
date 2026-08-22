@@ -15,11 +15,17 @@ import { openBuiltinOAuthPopup, openMcpOAuthPopup } from "./oauth-connect";
 import { MCP_OAUTH_POPUP_WINDOW_NAME } from "@/lib/mcp-utils";
 
 function fakePopup(overrides: Partial<Window> = {}): Window {
-  return { closed: false, ...overrides } as Window;
+  return { closed: false, close: vi.fn(), ...overrides } as unknown as Window;
 }
 
 function fakeMcpPopup(overrides: Partial<Window> = {}): Window {
-  return { closed: false, opener: null, location: { href: "" }, ...overrides } as unknown as Window;
+  return {
+    closed: false,
+    close: vi.fn(),
+    opener: null,
+    location: { href: "" },
+    ...overrides,
+  } as unknown as Window;
 }
 
 function jsonResponse(data: unknown, init?: ResponseInit) {
@@ -72,15 +78,61 @@ describe("openBuiltinOAuthPopup", () => {
     expect(result).toEqual({ success: false, popupBlocked: true });
   });
 
-  it("resolves success:true on an oauth-success postMessage, and ignores unrelated messages", async () => {
+  it("resolves success:true on an oauth-success postMessage for this call's own provider/app_id, and ignores unrelated messages", async () => {
     vi.spyOn(window, "open").mockReturnValue(fakePopup());
 
     const pending = openBuiltinOAuthPopup({ provider: "google", appId: "gmail", token: "t" });
 
     window.dispatchEvent(new MessageEvent("message", { data: { type: "something-else" } }));
-    window.dispatchEvent(new MessageEvent("message", { data: { type: "oauth-success" } }));
+    window.dispatchEvent(
+      new MessageEvent("message", { data: { type: "oauth-success", provider: "gmail" } })
+    );
 
     await expect(pending).resolves.toEqual({ success: true });
+  });
+
+  it("closes its own popup once it resolves, so a stale window can't swallow a later completion", async () => {
+    const popup = fakePopup();
+    vi.spyOn(window, "open").mockReturnValue(popup);
+
+    const pending = openBuiltinOAuthPopup({ provider: "google", appId: "gmail", token: "t" });
+    window.dispatchEvent(
+      new MessageEvent("message", { data: { type: "oauth-success", provider: "gmail" } })
+    );
+    await pending;
+
+    expect(popup.close).toHaveBeenCalledTimes(1);
+  });
+
+  it("encodes provider, app id, and token in the login URL", () => {
+    const windowOpenSpy = vi.spyOn(window, "open").mockReturnValue(fakePopup());
+
+    void openBuiltinOAuthPopup({ provider: "google", appId: "app id/weird", token: "tok en" });
+
+    const [url] = windowOpenSpy.mock.calls[0];
+    expect(url).toContain(`token=${encodeURIComponent("tok en")}`);
+    expect(url).toContain(`app_id=${encodeURIComponent("app id/weird")}`);
+  });
+
+  it("does not resolve a call for one provider when a concurrent call's popup for a different provider/app finishes first", async () => {
+    // connect-apps-field.tsx's connectingKeys allows more than one of these
+    // open at once (e.g. HubSpot and Gmail both in flight); each call's own
+    // window "message" listener must ignore a sibling's success postMessage.
+    vi.spyOn(window, "open")
+      .mockReturnValueOnce(fakePopup())
+      .mockReturnValueOnce(fakePopup());
+
+    const hubspotPending = openBuiltinOAuthPopup({ provider: "hubspot", token: "t" });
+    const gmailPending = openBuiltinOAuthPopup({ provider: "google", appId: "gmail", token: "t" });
+
+    // Gmail's popup finishes first - must resolve only the gmail call.
+    window.dispatchEvent(
+      new MessageEvent("message", { data: { type: "oauth-success", provider: "gmail" } })
+    );
+    await expect(gmailPending).resolves.toEqual({ success: true });
+
+    await vi.advanceTimersByTimeAsync(5 * 60 * 1000);
+    await expect(hubspotPending).resolves.toEqual({ success: false });
   });
 
   it("resolves success:false once the popup is closed without a success message", async () => {
@@ -111,7 +163,9 @@ describe("openBuiltinOAuthPopup", () => {
     const removeEventListenerSpy = vi.spyOn(window, "removeEventListener");
 
     const pending = openBuiltinOAuthPopup({ provider: "google", appId: "gmail", token: "t" });
-    window.dispatchEvent(new MessageEvent("message", { data: { type: "oauth-success" } }));
+    window.dispatchEvent(
+      new MessageEvent("message", { data: { type: "oauth-success", provider: "gmail" } })
+    );
     await pending;
 
     expect(removeEventListenerSpy).toHaveBeenCalledWith("message", expect.any(Function));
@@ -195,6 +249,23 @@ describe("openMcpOAuthPopup", () => {
     const result = await openMcpOAuthPopup({ appId: "granola" });
 
     expect(result).toEqual({ connected: false });
+  });
+
+  it("closes the popup on timeout when the user never closes it themselves", async () => {
+    const popup = fakeMcpPopup();
+    vi.spyOn(window, "open").mockReturnValue(popup);
+    apiRequestMock.mockResolvedValueOnce(
+      jsonResponse({ authorization_url: "https://mcp.granola.ai/authorize" })
+    );
+    apiRequestMock.mockResolvedValueOnce(jsonResponse([{ id: "granola", is_connected: false }]));
+
+    const pending = openMcpOAuthPopup({ appId: "granola" });
+    await vi.waitFor(() => expect(apiRequestMock).toHaveBeenCalledTimes(1));
+
+    await vi.advanceTimersByTimeAsync(5 * 60 * 1000);
+    await pending;
+
+    expect(popup.close).toHaveBeenCalledTimes(1);
   });
 
   it("resolves connected:false when the popup closes but the app is still not connected on recheck", async () => {

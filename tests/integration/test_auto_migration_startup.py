@@ -1077,6 +1077,13 @@ async def test_shutdown_event_stops_temp_file_cleanup_without_cancel(
     Covers the two round-2 majors on the shutdown path: the stop flag is set
     before any other teardown (so an earlier hang cannot strand the executor
     thread), and the task is awaited via asyncio.wait rather than cancelled.
+
+    On the happy path (the walk finishes almost immediately) asyncio.wait and
+    asyncio.wait_for behave identically, so that alone can't tell them apart --
+    a prior version of this test made exactly that mistake. The walk task
+    below deliberately blocks past a (monkeypatched, tiny) shutdown timeout
+    without checking `stop`, forcing a genuine timeout: asyncio.wait leaves
+    the task pending past it, while asyncio.wait_for would cancel it.
     """
     import importlib
 
@@ -1129,6 +1136,13 @@ async def test_shutdown_event_stops_temp_file_cleanup_without_cancel(
         lambda: None,
     )
 
+    # Real but tiny, so the wait genuinely times out without slowing the suite.
+    monkeypatch.setattr(
+        web_app_module,
+        "get_temp_file_cleanup_shutdown_timeout_seconds",
+        lambda: 0.05,
+    )
+
     stop = threading.Event()
     flush_saw_stop = {}
 
@@ -1140,11 +1154,14 @@ async def test_shutdown_event_stops_temp_file_cleanup_without_cancel(
     monkeypatch.setattr(web_app_module, "flush_langfuse", _spy_flush)
 
     started = asyncio.Event()
+    resume = asyncio.Event()
 
     async def _cooperative_walk() -> None:
         started.set()
-        while not stop.is_set():
-            await asyncio.sleep(0.01)
+        # Simulate being mid-scan, past the point where `stop` would next be
+        # polled, until the test releases `resume` below -- this is what
+        # forces the shutdown wait to genuinely time out.
+        await resume.wait()
 
     task = asyncio.create_task(_cooperative_walk())
     await started.wait()
@@ -1156,10 +1173,70 @@ async def test_shutdown_event_stops_temp_file_cleanup_without_cancel(
 
     assert flush_saw_stop["set"] is True
     assert stop.is_set()
-    assert task.done()
+    # The timeout above genuinely elapsed while the walk was still blocked on
+    # `resume`. asyncio.wait_for would have cancelled the task by now;
+    # asyncio.wait leaves it running, untouched.
+    assert not task.done()
     assert not task.cancelled()
     assert app.state.temp_file_cleanup_task is None
     assert app.state.temp_file_cleanup_stop is None
+
+    resume.set()
+    await task
+
+
+@pytest.mark.asyncio
+async def test_start_temp_file_cleanup_task_wires_stop_event(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """The pytest-gated wiring block itself must actually wire things up.
+
+    Regression guard: an earlier commit on this PR asserted
+    app.state.temp_file_cleanup_task is not None and
+    isinstance(app.state.temp_file_cleanup_stop, threading.Event) directly
+    against startup_event(), but those assertions were dropped rather than
+    reworked when the PYTEST_CURRENT_TEST gate was introduced, leaving this
+    block untested. Calling start_temp_file_cleanup_task directly (rather
+    than the full startup_event) exercises its own pytest gate without also
+    un-gating the unrelated trigger/lease-recovery/orphan-GC loops that share
+    the same env-var check elsewhere in startup_event.
+    """
+    import importlib
+
+    web_app_module = importlib.import_module("xagent.web.app")
+    app = web_app_module.app
+
+    monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
+    app.state.temp_file_cleanup_task = None
+    app.state.temp_file_cleanup_stop = None
+
+    seen_stop_events: list[threading.Event] = []
+
+    def _fake_cleanup_orphaned_temp_files(*, stop_event=None) -> int:
+        seen_stop_events.append(stop_event)
+        return 0
+
+    monkeypatch.setattr(
+        "xagent.web.api.kb.cleanup_orphaned_temp_files",
+        _fake_cleanup_orphaned_temp_files,
+    )
+
+    task = web_app_module.start_temp_file_cleanup_task(app)
+    stop_event = app.state.temp_file_cleanup_stop
+
+    assert task is not None
+    assert task is app.state.temp_file_cleanup_task
+    assert isinstance(stop_event, threading.Event)
+
+    await task
+
+    # Pins that the exact stop-event object stored on app.state is the one
+    # actually threaded into the walk -- a wiring bug here would silently
+    # make shutdown's stop signal a no-op.
+    assert seen_stop_events == [stop_event]
+
+    app.state.temp_file_cleanup_task = None
+    app.state.temp_file_cleanup_stop = None
 
 
 @pytest.mark.asyncio

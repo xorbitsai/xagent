@@ -635,6 +635,84 @@ async def stop_orphan_upload_gc_task(app_instance: FastAPI) -> None:
             )
 
 
+def start_temp_file_cleanup_task(
+    app_instance: FastAPI,
+) -> asyncio.Task[Any] | None:
+    """Start the background orphaned temp-file cleanup sweep for this process.
+
+    This walks the entire uploads tree and can take minutes on a large tree,
+    so it runs in the background (fire-and-forget scheduling like the
+    uploaded-files reconcile step) instead of being awaited inline, letting
+    the lifespan finish and /health open immediately regardless of tree size.
+
+    Unlike that reconcile task, this one is tracked on app_instance.state and
+    stopped at shutdown: the threading.Event lets the walk unwind
+    cooperatively so a mid-sweep restart does not block process exit on the
+    executor thread. Extracted into its own function (matching
+    start_orphan_upload_gc_task above) so the pytest gate below can be
+    exercised directly in a test without also spinning up the other
+    startup_event background loops.
+    """
+
+    existing_cleanup_task = cast(
+        asyncio.Task[Any] | None,
+        getattr(app_instance.state, "temp_file_cleanup_task", None),
+    )
+    if existing_cleanup_task is not None and not existing_cleanup_task.done():
+        # WHY: keeps a re-entrant startup from orphaning an in-flight walk and
+        # discarding its only stop handle.
+        logger.debug(
+            "Orphaned temp-file cleanup already running; not scheduling another"
+        )
+        return existing_cleanup_task
+
+    if os.getenv("PYTEST_CURRENT_TEST"):
+        # The sweep walks the real uploads tree, which tests must not trigger.
+        logger.info("Skipping orphaned temp-file cleanup (test environment)")
+        return None
+
+    temp_file_cleanup_stop = threading.Event()
+    app_instance.state.temp_file_cleanup_stop = temp_file_cleanup_stop
+
+    async def run_temp_file_cleanup_background() -> None:
+        from .api.kb import cleanup_orphaned_temp_files
+
+        started = time.monotonic()
+        logger.info("Background orphaned temp-file cleanup started")
+        try:
+            cleaned_count = await asyncio.to_thread(
+                cleanup_orphaned_temp_files, stop_event=temp_file_cleanup_stop
+            )
+        except Exception:  # noqa: BLE001
+            # WHY: keep the traceback (exc_info) even at WARNING -- the sweep
+            # runs unattended, so a failure has no other surface.
+            logger.warning(
+                "Background orphaned temp-file cleanup failed after %.2fs",
+                time.monotonic() - started,
+                exc_info=True,
+            )
+            return
+        if temp_file_cleanup_stop.is_set():
+            logger.info(
+                "Background orphaned temp-file cleanup interrupted by shutdown "
+                "after %.2fs (removed %d file(s))",
+                time.monotonic() - started,
+                cleaned_count,
+            )
+        else:
+            logger.info(
+                "Background orphaned temp-file cleanup completed in %.2fs "
+                "(removed %d file(s))",
+                time.monotonic() - started,
+                cleaned_count,
+            )
+
+    task = asyncio.create_task(run_temp_file_cleanup_background())
+    app_instance.state.temp_file_cleanup_task = task
+    logger.info("Started background orphaned temp-file cleanup task")
+    return task
+
+
 async def wait_for_file_storage_startup_sync(app_instance: FastAPI) -> None:
     """Wait until durable file storage startup sync has completed successfully."""
     while True:
@@ -1560,56 +1638,8 @@ async def startup_event() -> None:
         logger.info("Started background uploaded files reconcile task")
 
         # Clean up orphaned temporary files from interrupted atomic replacements.
-        # This walks the entire uploads tree and can take minutes on a large
-        # tree, so it runs in the background (fire-and-forget scheduling like the
-        # reconcile step above) instead of awaiting it inline, letting the
-        # lifespan finish and /health open immediately regardless of tree size.
-        # Unlike that reconcile task, this one is tracked on app.state and stopped
-        # at shutdown: the threading.Event lets the walk unwind cooperatively so a
-        # mid-sweep restart does not block process exit on the executor thread.
-        # Gate under pytest (like the metadata rebuild task above): the sweep
-        # walks the real uploads tree, which tests must not trigger. The
-        # idempotency guard then keeps a re-entrant startup from orphaning an
-        # in-flight walk and discarding its only stop handle.
-        existing_cleanup_task = getattr(app.state, "temp_file_cleanup_task", None)
-        if os.getenv("PYTEST_CURRENT_TEST"):
-            pass
-        elif existing_cleanup_task is not None and not existing_cleanup_task.done():
-            logger.debug(
-                "Orphaned temp-file cleanup already running; not scheduling another"
-            )
-        else:
-            temp_file_cleanup_stop = threading.Event()
-            app.state.temp_file_cleanup_stop = temp_file_cleanup_stop
-
-            async def run_temp_file_cleanup_background() -> None:
-                from .api.kb import cleanup_orphaned_temp_files
-
-                started = time.monotonic()
-                logger.info("Background orphaned temp-file cleanup started")
-                try:
-                    cleaned_count = await asyncio.to_thread(
-                        cleanup_orphaned_temp_files, stop_event=temp_file_cleanup_stop
-                    )
-                except Exception:  # noqa: BLE001
-                    # WHY: keep the traceback (exc_info) even at WARNING — the
-                    # sweep runs unattended, so a failure has no other surface.
-                    logger.warning(
-                        "Background orphaned temp-file cleanup failed after %.2fs",
-                        time.monotonic() - started,
-                        exc_info=True,
-                    )
-                    return
-                logger.info(
-                    "Background orphaned temp-file cleanup completed in %.2fs "
-                    "(removed %d file(s))",
-                    time.monotonic() - started,
-                    cleaned_count,
-                )
-
-            app.state.temp_file_cleanup_task = asyncio.create_task(
-                run_temp_file_cleanup_background()
-            )
+        # See start_temp_file_cleanup_task for the backgrounding/shutdown rationale.
+        start_temp_file_cleanup_task(app)
 
     # Warmup sandbox manager
     from .sandbox_manager import check_sandbox_static_readiness, get_sandbox_manager
@@ -1757,11 +1787,12 @@ async def shutdown_event() -> None:
     # Wait briefly for the background orphaned temp-file cleanup to unwind (its
     # stop flag was already set at the top of this handler). The walk runs in an
     # executor thread that a cancel cannot stop, so use asyncio.wait rather than
-    # asyncio.wait_for: wait_for CANCELS the task on timeout, which here would
-    # only kill the awaiting coroutine (losing its completion/failure log via an
-    # uncaught CancelledError) while the thread keeps running. asyncio.wait bounds
-    # the wait WITHOUT cancelling, letting the task log its own outcome once the
-    # walk reaches its next directory boundary.
+    # asyncio.wait_for: wait_for's cancellation only kills the awaiting coroutine,
+    # not the executor thread doing the real work, so cancelling early has no
+    # benefit -- only the risk of losing the completion/failure log to an
+    # uncaught CancelledError. If the walk is still running once this bounded
+    # wait elapses, the process's own asyncio.run() teardown will join (or
+    # cancel) the outstanding task regardless.
     if hasattr(app.state, "temp_file_cleanup_task"):
         task = app.state.temp_file_cleanup_task
         if task and not task.done():

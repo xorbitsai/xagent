@@ -427,6 +427,12 @@ def get_temp_file_cleanup_shutdown_timeout_seconds() -> int:
     cancellable, so a long overrun is ultimately joined by asyncio.run()'s
     teardown. Operators on very large uploads trees may want a larger value.
 
+    Unlike XAGENT_MCP_TOOL_INIT_TIMEOUT_SECONDS and similar getters in this
+    module, "0" is not treated as "disable the timeout" here: it already has
+    a distinct, meaningful value for a wait bound -- "don't wait at all" --
+    which is the opposite of disabling it (waiting forever). So "0" falls
+    back to the default like any other invalid value instead.
+
     Priority:
         1. XAGENT_TEMP_FILE_CLEANUP_SHUTDOWN_TIMEOUT_SECONDS environment variable
         2. Default of 10 seconds

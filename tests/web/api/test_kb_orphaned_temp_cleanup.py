@@ -3,7 +3,10 @@ import threading
 import time
 from pathlib import Path
 
-from xagent.web.api.kb import cleanup_orphaned_temp_files
+from xagent.web.api.kb import (
+    _TEMP_CLEANUP_STOP_CHECK_ENTRIES,
+    cleanup_orphaned_temp_files,
+)
 
 # Any file whose mtime is older than this is treated as orphaned by the sweep.
 ORPHAN_AGE_SECONDS = 3600
@@ -95,6 +98,40 @@ def test_cleanup_stops_midwalk_at_directory_boundary(tmp_path: Path):
     assert (tmp_path / "sub" / "nested.tmp-replace").exists()
 
 
+class _StopAfterEntryCheck:
+    """Stop flag unset for the per-directory boundary check, set thereafter.
+
+    The walk's outer per-directory check runs once before a directory is
+    opened; returning False there lets the walk actually enter the single
+    large flat directory under test. Every later poll -- all of which come
+    from the per-entry check inside that directory's scan -- returns True, so
+    only that per-entry check (not the per-directory one) can catch this stop.
+    """
+
+    def __init__(self) -> None:
+        self._calls = 0
+
+    def is_set(self) -> bool:
+        self._calls += 1
+        return self._calls > 1
+
+
+def test_cleanup_stops_mid_directory_scan_on_large_flat_directory(tmp_path: Path):
+    old = ORPHAN_AGE_SECONDS + 600
+    total = _TEMP_CLEANUP_STOP_CHECK_ENTRIES * 2
+    for i in range(total):
+        _write_aged(tmp_path / f"orphan_{i:04d}.tmp-replace", age=old)
+
+    stop = _StopAfterEntryCheck()
+
+    removed = cleanup_orphaned_temp_files(upload_dir=tmp_path, stop_event=stop)
+
+    # A per-directory-only stop check could never interrupt a single huge
+    # flat directory. The per-entry check must have caught this stop partway
+    # through the scan, so some but not all orphans were swept.
+    assert 0 < removed < total
+
+
 def test_cleanup_excludes_symlinks_named_like_temp_files(tmp_path: Path):
     # Agent file registration creates real symlinks named like temp files under
     # the uploads tree (websocket.py _register_uploaded_files_for_agent). Those
@@ -110,6 +147,43 @@ def test_cleanup_excludes_symlinks_named_like_temp_files(tmp_path: Path):
     assert removed == 0
     assert link.is_symlink()
     assert target.exists()
+
+
+def test_cleanup_skips_symlinked_directory_named_like_temp_file(tmp_path: Path):
+    # A symlink to a directory, named like a temp file, must be neither
+    # descended into nor deleted: is_dir(follow_symlinks=False) and
+    # is_file(follow_symlinks=False) both report False for it, so it is
+    # simply skipped. The target lives outside the walked upload_dir, so the
+    # only way its contents could be reached is by following the symlink.
+    upload_dir = tmp_path / "uploads"
+    external_target = tmp_path / "external_target_not_walked"
+    _write_aged(external_target / "nested.tmp-replace", age=ORPHAN_AGE_SECONDS + 600)
+
+    upload_dir.mkdir()
+    link = upload_dir / "linked.abc123.tmp"
+    link.symlink_to(external_target, target_is_directory=True)
+
+    removed = cleanup_orphaned_temp_files(upload_dir=upload_dir)
+
+    assert removed == 0
+    assert link.is_symlink()
+    assert (external_target / "nested.tmp-replace").exists()
+
+
+def test_cleanup_recurses_into_real_directory_named_like_temp_file(tmp_path: Path):
+    # A real (non-symlink) directory is always descended into via
+    # is_dir(follow_symlinks=False), regardless of whether its own name
+    # happens to match the temp-file pattern -- only file entries are tested
+    # against _is_orphaned_temp_name.
+    old = ORPHAN_AGE_SECONDS + 600
+    dir_named_like_temp = tmp_path / "batch.abc123.tmp"
+    _write_aged(dir_named_like_temp / "nested.tmp-replace", age=old)
+
+    removed = cleanup_orphaned_temp_files(upload_dir=tmp_path)
+
+    assert removed == 1
+    assert dir_named_like_temp.is_dir()
+    assert not (dir_named_like_temp / "nested.tmp-replace").exists()
 
 
 def test_cleanup_skips_directory_that_fails_to_open(tmp_path, monkeypatch):

@@ -759,6 +759,12 @@ class TestCeleryBackgroundJobConfig:
         monkeypatch.setenv(TEMP_FILE_CLEANUP_SHUTDOWN_TIMEOUT_SECONDS, "0")
         assert get_temp_file_cleanup_shutdown_timeout_seconds() == 10
 
+        monkeypatch.setenv(TEMP_FILE_CLEANUP_SHUTDOWN_TIMEOUT_SECONDS, "abc")
+        assert get_temp_file_cleanup_shutdown_timeout_seconds() == 10
+
+        monkeypatch.setenv(TEMP_FILE_CLEANUP_SHUTDOWN_TIMEOUT_SECONDS, "-5")
+        assert get_temp_file_cleanup_shutdown_timeout_seconds() == 10
+
 
 class TestGetWebSearchProvider:
     """Test get_web_search_provider() function."""

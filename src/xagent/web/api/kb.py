@@ -25,6 +25,7 @@ from typing import (
     Literal,
     Mapping,
     Optional,
+    Protocol,
     TypedDict,
     TypeVar,
     Union,
@@ -1618,9 +1619,26 @@ async def _rollback_failed_cloud_ingestion(
         raise RollbackFailureError(message) from exc
 
 
+# WHY: a single very large flat directory must still be interruptible within
+# the shutdown grace period, not only at directory boundaries -- checking
+# every entry would add per-entry overhead for no benefit at typical sizes.
+_TEMP_CLEANUP_STOP_CHECK_ENTRIES = 500
+
+
+class _StopSignal(Protocol):
+    """The only threading.Event behavior this walk actually needs.
+
+    A Protocol (rather than threading.Event itself) so a lightweight test
+    double satisfies the type without implementing set()/clear()/wait().
+    """
+
+    def is_set(self) -> bool: ...
+
+
 def cleanup_orphaned_temp_files(
     upload_dir: Optional[Path] = None,
-    stop_event: Optional[threading.Event] = None,
+    *,
+    stop_event: Optional[_StopSignal] = None,
 ) -> int:
     """Clean up orphaned temporary files from interrupted atomic replacements.
 
@@ -1630,9 +1648,10 @@ def cleanup_orphaned_temp_files(
 
     Args:
         upload_dir: Base uploads directory to clean. If None, uses default uploads dir.
-        stop_event: Optional cooperative stop flag, checked once per directory. When
-            set, the walk unwinds early so a shutdown can interrupt a long sweep
-            instead of the worker thread blocking process exit via asyncio.run()'s
+        stop_event: Optional cooperative stop flag, checked once per directory and
+            periodically within a large directory's scan. When set, the walk
+            unwinds early so a shutdown can interrupt a long sweep instead of
+            the worker thread blocking process exit via asyncio.run()'s
             executor-thread join.
 
     Returns:
@@ -1676,6 +1695,7 @@ def cleanup_orphaned_temp_files(
             logger.warning("Failed to scan directory %s: %s", current, e)
             continue
         with scandir_it:
+            entries_seen = 0
             while True:
                 try:
                     entry = next(scandir_it)
@@ -1687,6 +1707,13 @@ def cleanup_orphaned_temp_files(
                     # tolerance: skip this directory instead of aborting the
                     # whole sweep.
                     logger.warning("Failed while scanning directory %s: %s", current, e)
+                    break
+                entries_seen += 1
+                if (
+                    stop_event is not None
+                    and entries_seen % _TEMP_CLEANUP_STOP_CHECK_ENTRIES == 0
+                    and stop_event.is_set()
+                ):
                     break
                 try:
                     if entry.is_dir(follow_symlinks=False):
@@ -1713,7 +1740,15 @@ def cleanup_orphaned_temp_files(
                         "Failed to clean up orphaned temp file %s: %s", entry.path, e
                     )
 
-    if cleaned_count > 0:
+    if stop_event is not None and stop_event.is_set():
+        # WHY: an interrupted sweep must not look identical to a completed one
+        # in the logs -- operators need to know the tree was not fully walked.
+        logger.info(
+            "Orphaned temp-file sweep stopped early by shutdown signal after "
+            "removing %d file(s); the uploads tree was not fully walked",
+            cleaned_count,
+        )
+    elif cleaned_count > 0:
         logger.info("Cleaned up %d orphaned temporary file(s)", cleaned_count)
 
     return cleaned_count

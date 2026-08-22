@@ -182,7 +182,9 @@ def _sqlite_batch_temp_table_exists() -> bool:
     )
 
 
-def _sqlite_global_owner_relation_names() -> set[str]:
+def _sqlite_global_owner_relation_names(
+    expected_names: Sequence[str] = (ORDINARY_INDEX, ACTOR_INDEX),
+) -> set[str]:
     rows = op.get_bind().execute(
         sa.text(
             "SELECT name FROM sqlite_master "
@@ -194,7 +196,7 @@ def _sqlite_global_owner_relation_names() -> set[str]:
             "actor": ACTOR_INDEX,
         },
     )
-    return {str(name) for name in rows.scalars()}
+    return {str(name) for name in rows.scalars()} & set(expected_names)
 
 
 def _create_owner_indexes(
@@ -249,6 +251,15 @@ def upgrade() -> None:
             return
         if dialect != "sqlite":
             raise RuntimeError("owner-aware UserOAuth schema has incorrect indexes")
+        collisions = _sqlite_global_owner_relation_names(
+            tuple(name for name, *_rest in missing_indexes)
+        )
+        if collisions:
+            names = ", ".join(sorted(collisions))
+            raise RuntimeError(
+                "owner-aware SQLite schema names already exist before migration: "
+                f"{names}"
+            )
         # SQLite batch DDL is not reliably transactional under pysqlite. A
         # process can exit after the old constraint is removed or after only
         # the first replacement index is created. Existing indexes were

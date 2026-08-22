@@ -300,6 +300,42 @@ def test_upgrade_repairs_interrupted_owner_index_installation(
         )
 
 
+@pytest.mark.parametrize(
+    ("existing_index", "missing_index"),
+    [
+        (ORDINARY_INDEX, ACTOR_INDEX),
+        (ACTOR_INDEX, ORDINARY_INDEX),
+    ],
+)
+def test_interrupted_owner_index_repair_rejects_missing_name_collision(
+    tmp_path,
+    existing_index: str,
+    missing_index: str,
+) -> None:
+    engine = create_engine(f"sqlite:///{tmp_path / 'oauth-repair-collision.db'}")
+    migration = _migration_module()
+
+    with engine.begin() as connection:
+        _create_interrupted_owner_table(
+            connection,
+            existing_indexes=(existing_index,),
+        )
+        connection.execute(text("CREATE TABLE unrelated (id INTEGER PRIMARY KEY)"))
+        connection.execute(text(f"CREATE INDEX {missing_index} ON unrelated (id)"))
+
+        with patch.object(migration, "op", _operations(connection)):
+            with pytest.raises(RuntimeError, match="already exist"):
+                migration.upgrade()
+
+        indexes = _index_map(connection)
+        assert existing_index in indexes
+        assert missing_index not in indexes
+        assert (
+            connection.execute(text("SELECT count(*) FROM user_oauth")).scalar_one()
+            == 1
+        )
+
+
 def test_interrupted_owner_schema_rejects_missing_user_cascade_foreign_key(
     tmp_path,
 ) -> None:

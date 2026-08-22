@@ -52,13 +52,11 @@ OWNER_INDEX_DEFINITIONS = (
     (
         ORDINARY_INDEX,
         ("user_id", "provider", "provider_user_id"),
-        True,
         ORDINARY_WHERE,
     ),
     (
         ACTOR_INDEX,
         ("user_id", OWNER_COLUMN, "provider", "provider_user_id"),
-        True,
         ACTOR_WHERE,
     ),
 )
@@ -137,16 +135,16 @@ def _normalize_index_predicate(predicate: object | None) -> str | None:
 
 def _missing_owner_index_definitions(
     dialect: str,
-) -> tuple[tuple[str, tuple[str, ...], bool, object], ...]:
+) -> tuple[tuple[str, tuple[str, ...], object], ...]:
     """Return missing indexes after rejecting every malformed definition."""
     indexes = {
         str(index["name"]): index
         for index in sa.inspect(op.get_bind()).get_indexes(TABLE)
         if index.get("name")
     }
-    missing: list[tuple[str, tuple[str, ...], bool, object]] = []
+    missing: list[tuple[str, tuple[str, ...], object]] = []
     for definition in OWNER_INDEX_DEFINITIONS:
-        name, columns, unique, predicate = definition
+        name, columns, predicate = definition
         index = indexes.get(name)
         if index is None:
             missing.append(definition)
@@ -155,7 +153,7 @@ def _missing_owner_index_definitions(
         actual_predicate = options.get(f"{dialect}_where")
         if (
             tuple(index.get("column_names") or ()) != columns
-            or bool(index.get("unique")) is not unique
+            or not bool(index.get("unique"))
             or _normalize_index_predicate(actual_predicate)
             != _normalize_index_predicate(predicate)
         ):
@@ -211,18 +209,18 @@ def _sqlite_global_owner_relation_names(
 
 
 def _create_owner_indexes(
-    definitions: tuple[tuple[str, tuple[str, ...], bool, object], ...] = (
+    definitions: tuple[tuple[str, tuple[str, ...], object], ...] = (
         OWNER_INDEX_DEFINITIONS
     ),
 ) -> None:
     """Create selected owner indexes inside the current migration transaction."""
-    for name, columns, unique, predicate in definitions:
+    for name, columns, predicate in definitions:
         kwargs = (
             {"sqlite_where": predicate, "postgresql_where": predicate}
             if predicate is not None
             else {}
         )
-        op.create_index(name, TABLE, columns, unique=unique, **kwargs)
+        op.create_index(name, TABLE, columns, unique=True, **kwargs)
 
 
 def upgrade() -> None:

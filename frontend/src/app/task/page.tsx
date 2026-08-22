@@ -288,7 +288,13 @@ function TaskHomePageContent() {
     }
   };
 
+  // Not currently reachable on this page (it never passes `prompts` to
+  // ChatStartScreen), but marks the pick as dirty for consistency with
+  // every other explicit "put this specific text in the composer" action -
+  // if a starting-prompt grid is ever added here, a teammate pick must not
+  // silently overwrite a prompt the user just chose.
   const handlePromptSelect = (prompt: string, highlights?: string[]) => {
+    composerDirtyRef.current = true;
     setInputValue(prompt);
     setPromptHighlightTerms(highlights || []);
   };

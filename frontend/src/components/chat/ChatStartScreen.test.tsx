@@ -116,10 +116,16 @@ describe("ChatStartScreen agents section", () => {
   })
 
   it("keeps the plain header when nobody is selected", () => {
-    renderScreen([{ id: 7, name: "Maya" }])
+    // Give Maya a real avatar so the assertion below is actually load-bearing -
+    // with no avatar at all, "no portrait in the header" would pass trivially
+    // even if the hero-swap logic were broken, since PersonaAvatar always
+    // falls back to text initials regardless of selection state.
+    renderScreen([{ id: 7, name: "Maya", persona_avatar: "/marketplace/avatars/maya.png" }])
 
     expect(screen.queryByText("chatPage.sections.leadReady")).toBeNull()
-    expect(screen.queryByRole("img", { name: "Maya" })).toBeNull()
+    // Her picker pill still renders its own portrait either way - only a
+    // second (hero) portrait would indicate the header wrongly swapped.
+    expect(screen.getAllByRole("img", { name: "Maya" })).toHaveLength(1)
   })
 
   it("does not show a right-edge fade when the pill row does not overflow", () => {

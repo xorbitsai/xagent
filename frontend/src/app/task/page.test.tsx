@@ -613,15 +613,46 @@ describe("TaskHomePage send", () => {
   })
 
   it("toasts and keeps state when sendMessage rejects", async () => {
-    apiRequestMock.mockResolvedValueOnce(jsonResponse([]))
+    apiRequestMock.mockResolvedValueOnce(jsonResponse([VERA]))
     sendMessageMock.mockRejectedValueOnce(new Error("network down"))
     render(<TaskHomePage />)
-    await waitFor(() => expect(chatStartScreenProps.current).not.toBeNull())
+    await screen.findByText("pick-Vera")
+
+    fireEvent.click(screen.getByText("pick-Vera"))
+    expect(screen.getByTestId("composer")).toHaveValue("Research a topic and report back")
 
     fireEvent.click(screen.getByText("send"))
 
     await waitFor(() => {
       expect(toastErrorMock).toHaveBeenCalledWith("network down")
     })
+    // handleSend's catch branch never touches inputValue/selectedAgents on
+    // failure - and ChatInput's own post-submit onInputChange("") echo
+    // (simulated by the mock's send button, same as a real send) must not
+    // be mistaken for the user clearing the box themselves.
+    expect(screen.getByTestId("composer")).toHaveValue("Research a topic and report back")
+    expect(chatStartScreenProps.current?.selectedAgents).toEqual([VERA])
+  })
+
+  it("does not poison auto-fill for the next pick after a failed send", async () => {
+    const KEVIN_WITH_PROMPT = { ...KEVIN, suggested_prompts: ["Turn my meetings into next steps"] }
+    apiRequestMock.mockResolvedValueOnce(jsonResponse([VERA, KEVIN_WITH_PROMPT]))
+    sendMessageMock.mockRejectedValueOnce(new Error("network down"))
+    render(<TaskHomePage />)
+    await screen.findByText("pick-Vera")
+
+    fireEvent.click(screen.getByText("pick-Vera"))
+    fireEvent.click(screen.getByText("send"))
+    await waitFor(() => {
+      expect(toastErrorMock).toHaveBeenCalledWith("network down")
+    })
+
+    // ChatInput's post-submit onInputChange("") echo fires even after a
+    // failed send (handleSend never rejects to ChatInput) - it must not
+    // have been mistaken for a real edit and left the composer "dirty"
+    // for the rest of the session.
+    fireEvent.click(screen.getByText("pick-Kevin"))
+
+    expect(screen.getByTestId("composer")).toHaveValue("Turn my meetings into next steps")
   })
 })

@@ -304,10 +304,17 @@ function TaskHomePageContent() {
       setPromptHighlightTerms([]);
       setSelectedAgents([]);
       composerDirtyRef.current = false;
-      suppressNextInputChangeRef.current = true;
     } catch (error) {
       console.error("Failed to send message:", error);
       toast.error(error instanceof Error ? error.message : t("builds.list.chat.sendFailed"));
+    } finally {
+      // ChatInput calls its own post-submit onInputChange("") reset right
+      // after this function resolves, regardless of whether the send
+      // above succeeded or failed (this function only ever resolves,
+      // never rejects, to ChatInput) - suppress that echo either way, or
+      // a failed send would silently wipe the message it just failed to
+      // send.
+      suppressNextInputChangeRef.current = true;
     }
   };
 
@@ -324,11 +331,14 @@ function TaskHomePageContent() {
 
   const handleInputChange = (value: string) => {
     if (suppressNextInputChangeRef.current) {
-      // ChatInput's own post-submit reset, not a real edit - let it clear
-      // the composer without disturbing the fresh (untouched) state
-      // handleSend just established.
+      // ChatInput's own post-submit reset, not a real edit - handleSend
+      // has already decided what the composer should hold after a send
+      // attempt (cleared on success, left exactly as the user had it on
+      // failure), so this echo carries no information of its own and
+      // must be ignored outright - applying its value would clear the
+      // composer even on a failed send, where handleSend's catch branch
+      // never touches it.
       suppressNextInputChangeRef.current = false;
-      setInputValue(value);
       return;
     }
     composerDirtyRef.current = true;

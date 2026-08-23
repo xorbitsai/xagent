@@ -3687,7 +3687,7 @@ def test_policy_shared_non_admin_reads_agent_detail_read_only():
 def _set_preferences(user_id: int, preferences: dict[str, Any]) -> None:
     db = _direct_db_session()
     try:
-        user = db.query(User).filter(User.id == user_id).first()
+        user = db.get(User, user_id)
         assert user is not None
         user.preferences = preferences
         db.commit()
@@ -3747,7 +3747,7 @@ class TestVoiceFromRuntimeUser:
 
         db = _direct_db_session()
         try:
-            user = db.query(User).filter(User.id == user_id).first()
+            user = db.get(User, user_id)
             assert agents_api.voice_from_runtime_user(user) == "playful"
         finally:
             db.close()
@@ -3759,7 +3759,7 @@ class TestVoiceFromRuntimeUser:
 
         db = _direct_db_session()
         try:
-            user = db.query(User).filter(User.id == user_id).first()
+            user = db.get(User, user_id)
             assert agents_api.voice_from_runtime_user(user) is None
         finally:
             db.close()

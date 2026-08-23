@@ -342,11 +342,14 @@ _VOICE_INSTRUCTIONS: Dict[str, str] = {
         'have an answer by Thursday."'
     ),
 }
-assert set(_VOICE_INSTRUCTIONS) == VALID_USER_VOICES, (
-    "_VOICE_INSTRUCTIONS must define exactly the voices UpdatePreferencesRequest "
-    "accepts (api/auth.py's VALID_USER_VOICES) - otherwise a valid, storable "
-    "voice preference could silently have no prompt effect."
-)
+if set(_VOICE_INSTRUCTIONS) != VALID_USER_VOICES:
+    # A plain assert would be stripped under `python -O`, silently losing
+    # this consistency guarantee in production rather than failing loudly.
+    raise ValueError(
+        "_VOICE_INSTRUCTIONS must define exactly the voices UpdatePreferencesRequest "
+        "accepts (api/auth.py's VALID_USER_VOICES) - otherwise a valid, storable "
+        "voice preference could silently have no prompt effect."
+    )
 
 
 def apply_user_voice(

@@ -483,11 +483,14 @@ class TestMigrations:
 
     def test_sqlite_owner_downgrade_preserves_stripe_head(self, sqlite_tester):
         """Rollback removes owner storage without removing the Stripe seed."""
-        owner_revision = "20260818_user_oauth_resource_owner"
+        # Bump this whenever a new migration lands on top - it just pins
+        # down that the chain is still a single, unbranched head before we
+        # exercise the upgrade/downgrade below.
+        current_head_revision = "20260823_add_preferences_to_users"
         stripe_revision = "20260818_seed_stripe_mcp_app"
         script_dir = ScriptDirectory.from_config(sqlite_tester.alembic_cfg)
 
-        assert script_dir.get_heads() == [owner_revision]
+        assert script_dir.get_heads() == [current_head_revision]
 
         sqlite_tester.create_metadata_owned_users_table()
         command.upgrade(sqlite_tester.alembic_cfg, "head")

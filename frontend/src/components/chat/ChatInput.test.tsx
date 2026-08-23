@@ -561,10 +561,11 @@ describe("ChatInput", () => {
     // The internal `agentConfig` mirror inherits the previous model when a
     // new taskConfig doesn't specify one (`taskConfig.model || prev.model`
     // in the syncing effect) - correct for genuine partial updates to the
-    // SAME lead, but submission must still prefer the live prop over that
-    // mirror once a config is meant to be authoritative (readOnlyConfig),
-    // so a real timing gap between a lead switch and its own effect
-    // catching up can't submit an unrelated previous lead's model.
+    // SAME lead, but submission (and the read-only model badge, which reads
+    // the same live-`taskConfig` value) must still prefer the live prop over
+    // that mirror once a config is meant to be authoritative (readOnlyConfig),
+    // so a real timing gap between a lead switch and its own effect catching
+    // up can't submit - or display - an unrelated previous lead's model.
     const onSend = vi.fn()
     const commonProps = {
       hideFileUpload: true,
@@ -579,10 +580,12 @@ describe("ChatInput", () => {
     expect(screen.getByText("agent-a-model")).toBeInTheDocument()
 
     // New lead's taskConfig arrives without its own model yet (e.g. only
-    // executionMode resolved so far) - the internal mirror inherits the
-    // previous lead's model rather than clearing it.
+    // executionMode resolved so far) - the internal mirror would inherit the
+    // previous lead's model rather than clearing it, but the live-read badge
+    // must not show that stale value either.
     rerender(<ChatInput {...commonProps} taskConfig={{ executionMode: "flash" }} />)
-    expect(screen.getByText("agent-a-model")).toBeInTheDocument()
+    expect(screen.queryByText("agent-a-model")).not.toBeInTheDocument()
+    expect(screen.getByText("chatPage.input.noModel")).toBeInTheDocument()
 
     fireEvent.submit(container.querySelector("form") as HTMLFormElement)
 

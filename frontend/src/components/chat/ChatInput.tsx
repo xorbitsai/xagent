@@ -586,6 +586,23 @@ export function ChatInput({
   const activeTaskRuntimeSelection = showTaskRuntimeExtension
     ? taskRuntimeSelection
     : null;
+  // `agentConfig` mirrors `taskConfig` via a separate effect (below) that
+  // runs asynchronously after a prop change, not synchronously with it - a
+  // read landing in that gap (e.g. right after switching to a different
+  // read-only lead, before its own config has finished loading) would
+  // otherwise still show/send the PREVIOUS lead's model, even though
+  // `taskConfig` itself already correctly reflects the new one (or the
+  // absence of one yet). Read model fields straight from the live prop
+  // instead of the mirror, whenever one is meant to be authoritative -
+  // shared by both the read-only model badge below and handleSubmit, so a
+  // future caller of either one doesn't have to remember this separately.
+  // `hideConfig` alone (no taskConfig, not read-only) legitimately means
+  // "use my own configured default", not "mirror of taskConfig", so it's
+  // excluded here even though no current caller combines them.
+  const configIsDrivenByTaskConfig = readOnlyConfig || Boolean(taskConfig);
+  const displayModel = configIsDrivenByTaskConfig
+    ? taskConfig?.model || ""
+    : agentConfig.model;
   useEffect(() => {
     if (!showExecutionModePicker) {
       setPickedExecutionMode(undefined);
@@ -699,21 +716,6 @@ export function ChatInput({
       const executionMode = showExecutionModePicker
         ? pickedExecutionMode
         : taskConfig?.executionMode;
-      // `agentConfig` mirrors `taskConfig` via a separate effect (below)
-      // that runs asynchronously after a prop change, not synchronously
-      // with it - a submit landing in that gap (e.g. right after
-      // switching to a different read-only lead, before its own config
-      // has finished loading) would otherwise still carry the PREVIOUS
-      // lead's model, even though `taskConfig` itself already correctly
-      // reflects the new one (or the absence of one yet). Read model
-      // fields straight from the live prop instead of the mirror,
-      // whenever one is meant to be authoritative - same reasoning
-      // `executionMode` above already applies, just narrower: `hideConfig`
-      // alone (no taskConfig, not read-only) legitimately means "use my
-      // own configured default", not "mirror of taskConfig", so it's
-      // excluded here even though it also sets showExecutionModePicker
-      // to false.
-      const configIsDrivenByTaskConfig = readOnlyConfig || Boolean(taskConfig);
       const extraRuntimeExtensions = activeLocalBrowserTarget
         ? { local_browser: { ...activeLocalBrowserTarget } }
         : activeTaskRuntimeSelection?.runtimeExtensions;
@@ -736,11 +738,7 @@ export function ChatInput({
         ...agentConfig,
         ...(configIsDrivenByTaskConfig
           ? {
-              // Same fallback values the mirroring effect below uses for
-              // this exact "taskConfig hasn't arrived yet" state - `""`
-              // for `model` specifically (not `undefined`), matching what
-              // callers of this shape already expect.
-              model: taskConfig?.model || "",
+              model: displayModel,
               smallFastModel: taskConfig?.smallFastModel,
               visualModel: taskConfig?.visualModel,
               compactModel: taskConfig?.compactModel,
@@ -1116,11 +1114,11 @@ export function ChatInput({
                         size="sm"
                         className="h-9 px-3 text-muted-foreground rounded-xl gap-2 cursor-default hover:bg-transparent"
                         disabled={true}
-                        title={models.find(m => String(m.id) === String(agentConfig.model) || String(m.model_id) === String(agentConfig.model))?.model_name || agentConfig.model || t("chatPage.input.noModel")}
+                        title={models.find(m => String(m.id) === String(displayModel) || String(m.model_id) === String(displayModel))?.model_name || displayModel || t("chatPage.input.noModel")}
                       >
                         <Globe className="h-4 w-4" />
                         <span className="text-xs font-normal max-w-[150px] truncate hidden sm:inline-block">
-                          {models.find(m => String(m.id) === String(agentConfig.model) || String(m.model_id) === String(agentConfig.model))?.model_name || agentConfig.model || t("chatPage.input.noModel")}
+                          {models.find(m => String(m.id) === String(displayModel) || String(m.model_id) === String(displayModel))?.model_name || displayModel || t("chatPage.input.noModel")}
                         </span>
                       </Button>
                     ) : (

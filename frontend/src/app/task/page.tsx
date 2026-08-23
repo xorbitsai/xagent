@@ -50,6 +50,17 @@ function TaskHomePageContent() {
   // `onSend` promise hands control back to ChatInput, so there is no
   // window for a real keystroke to be mistaken for the echo.
   const suppressNextInputChangeRef = useRef(false);
+  // ChatInput intentionally skips syncing its visible contentEditable from
+  // a programmatic `inputValue` change while the editor has focus (so it
+  // doesn't clobber a user mid-edit) - but that means a value set from
+  // here while the user's cursor happens to be in the box can end up
+  // "sent" without ever having been visible. The retroactive-fill effect
+  // below checks this before writing, so it never fills in a prompt the
+  // user wouldn't actually see land in the composer.
+  const composerFocusedRef = useRef(false);
+  const handleComposerFocusChange = (focused: boolean) => {
+    composerFocusedRef.current = focused;
+  };
 
   const [files, setFiles] = useState<File[]>([]);
   const [agents, setAgents] = useState<AgentCard[]>([]);
@@ -294,9 +305,16 @@ function TaskHomePageContent() {
   // Companion fix for the same pre-enrichment race `resolvedSelectedAgents`
   // addresses above: if the agent had no prompt to offer at click time
   // (its template hadn't loaded yet) but one arrives once enrichment
-  // lands, fill it in - but only while the composer is still untouched.
+  // lands, fill it in - but only while the composer is still untouched,
+  // and only while it isn't focused. Filling it in while the user's
+  // cursor is in the box would still update this state, but ChatInput
+  // would never reflect it in the visible editor (it skips syncing a
+  // focused editor from a programmatic value change) - so the user could
+  // send a prompt they never saw land in the composer. There's no retry
+  // once focus moves on; the alternative (silently sending unseen text)
+  // is worse than this one race case just not auto-filling.
   useEffect(() => {
-    if (composerDirtyRef.current) return;
+    if (composerDirtyRef.current || composerFocusedRef.current) return;
     const lead = resolvedSelectedAgents[0];
     const prompt = firstNonBlankPrompt(lead?.suggested_prompts);
     if (prompt && inputValue !== prompt) {
@@ -434,6 +452,7 @@ function TaskHomePageContent() {
             onFilesChange={setFiles}
             inputValue={inputValue}
             onInputChange={handleInputChange}
+            onFocusChange={handleComposerFocusChange}
             onPromptSelect={handlePromptSelect}
             promptHighlightTerms={promptHighlightTerms}
             readOnlyConfig={selectedAgents.length > 0}

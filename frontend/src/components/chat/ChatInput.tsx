@@ -42,6 +42,12 @@ interface ChatInputProps {
   onModeChange?: (mode: "task" | "process") => void;
   inputValue?: string;
   onInputChange?: (value: string) => void;
+  // Fires on the editor's own focus/blur, independent of `isLoading`/task
+  // status - lets a controlled caller know it's currently unsafe to rely
+  // on a programmatic `inputValue` change being reflected in the visible
+  // editor (see the DOM-sync effect below, which intentionally skips
+  // updating a focused editor from an external value change).
+  onFocusChange?: (focused: boolean) => void;
   taskStatus?: TaskStatus | string;
   onPause?: () => void;
   onResume?: () => void;
@@ -101,6 +107,7 @@ export function ChatInput({
   mode,
   inputValue,
   onInputChange,
+  onFocusChange,
   taskStatus,
   onPause,
   onResume,
@@ -692,6 +699,21 @@ export function ChatInput({
       const executionMode = showExecutionModePicker
         ? pickedExecutionMode
         : taskConfig?.executionMode;
+      // `agentConfig` mirrors `taskConfig` via a separate effect (below)
+      // that runs asynchronously after a prop change, not synchronously
+      // with it - a submit landing in that gap (e.g. right after
+      // switching to a different read-only lead, before its own config
+      // has finished loading) would otherwise still carry the PREVIOUS
+      // lead's model, even though `taskConfig` itself already correctly
+      // reflects the new one (or the absence of one yet). Read model
+      // fields straight from the live prop instead of the mirror,
+      // whenever one is meant to be authoritative - same reasoning
+      // `executionMode` above already applies, just narrower: `hideConfig`
+      // alone (no taskConfig, not read-only) legitimately means "use my
+      // own configured default", not "mirror of taskConfig", so it's
+      // excluded here even though it also sets showExecutionModePicker
+      // to false.
+      const configIsDrivenByTaskConfig = readOnlyConfig || Boolean(taskConfig);
       const extraRuntimeExtensions = activeLocalBrowserTarget
         ? { local_browser: { ...activeLocalBrowserTarget } }
         : activeTaskRuntimeSelection?.runtimeExtensions;
@@ -712,6 +734,18 @@ export function ChatInput({
 
       const configToSend = {
         ...agentConfig,
+        ...(configIsDrivenByTaskConfig
+          ? {
+              // Same fallback values the mirroring effect below uses for
+              // this exact "taskConfig hasn't arrived yet" state - `""`
+              // for `model` specifically (not `undefined`), matching what
+              // callers of this shape already expect.
+              model: taskConfig?.model || "",
+              smallFastModel: taskConfig?.smallFastModel,
+              visualModel: taskConfig?.visualModel,
+              compactModel: taskConfig?.compactModel,
+            }
+          : {}),
         clientMessageId,
         ...(extraRuntimeExtensions
           ? {
@@ -982,8 +1016,14 @@ export function ChatInput({
               onInput={handleInput}
               onKeyDown={handleKeyDown}
               onPaste={handlePaste}
-              onFocus={() => setIsFocused(true)}
-              onBlur={() => setIsFocused(false)}
+              onFocus={() => {
+                setIsFocused(true);
+                onFocusChange?.(true);
+              }}
+              onBlur={() => {
+                setIsFocused(false);
+                onFocusChange?.(false);
+              }}
               role="textbox"
               aria-multiline="true"
             />

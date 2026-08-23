@@ -23,6 +23,7 @@ interface MockChatStartScreenProps {
   selectedAgents?: MockAgent[]
   onAgentClick?: (agent: MockAgent) => void
   onInputChange?: (value: string) => void
+  onFocusChange?: (focused: boolean) => void
   onSend?: (message: string, files: unknown[], config?: unknown) => void
   taskConfig?: unknown
 }
@@ -492,6 +493,46 @@ describe("TaskHomePage agents", () => {
     expect(screen.getByTestId("composer")).toHaveValue(
       "Research a topic and give me an evidence-backed recommendation"
     )
+  })
+
+  it("does not retroactively fill the prompt while the composer is focused, since ChatInput would never show it", async () => {
+    // ChatInput intentionally skips syncing its visible editor from a
+    // programmatic inputValue change while the editor has focus (so it
+    // doesn't clobber the user mid-edit) - filling in here regardless
+    // would leave a prompt "sent" that the user never actually saw land
+    // in the box.
+    const HIRED_RAW = { id: 1, name: "Vera", status: "published", suggested_prompts: [], template_id: "sales-research-enricher" }
+    let resolveTemplates: (value: Response) => void = () => {}
+    const templatesPromise = new Promise<Response>((resolve) => {
+      resolveTemplates = resolve
+    })
+    apiRequestMock.mockImplementation((url: string) => {
+      if (url === "http://api.local/api/agents") return Promise.resolve(jsonResponse([HIRED_RAW]))
+      if (url.startsWith("http://api.local/api/templates/")) return templatesPromise
+      return Promise.resolve(new Response(null, { status: 404 }))
+    })
+
+    render(<TaskHomePage />)
+    await screen.findByText("pick-Vera")
+
+    fireEvent.click(screen.getByText("pick-Vera"))
+    act(() => {
+      chatStartScreenProps.current?.onFocusChange?.(true)
+    })
+
+    await act(async () => {
+      resolveTemplates(
+        jsonResponse([
+          {
+            id: "sales-research-enricher",
+            category: "Sales",
+            sample_prompts: [{ title: "Research", prompt: "Research a topic and give me an evidence-backed recommendation" }],
+          },
+        ])
+      )
+    })
+
+    expect(screen.getByTestId("composer")).toHaveValue("")
   })
 
   it("does not retroactively fill the prompt once the user has started typing their own", async () => {

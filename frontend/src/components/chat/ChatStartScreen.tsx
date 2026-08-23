@@ -67,6 +67,7 @@ type ChatStartScreenProps = {
   isSending?: boolean;
   inputValue?: string;
   onInputChange?: (value: string) => void;
+  onFocusChange?: (focused: boolean) => void;
   onPromptSelect?: (prompt: string, promptHighlights?: string[]) => void;
   promptHighlightTerms?: string[];
   files?: File[];
@@ -97,6 +98,7 @@ export function ChatStartScreen({
   isSending = false,
   inputValue,
   onInputChange,
+  onFocusChange,
   onPromptSelect,
   promptHighlightTerms = [],
   files = [],
@@ -203,6 +205,7 @@ export function ChatStartScreen({
             showModeToggle={showModeToggle}
             inputValue={inputValue}
             onInputChange={onInputChange}
+            onFocusChange={onFocusChange}
             promptHighlightTerms={promptHighlightTerms}
             readOnlyConfig={readOnlyConfig}
             hideConfig={hideConfig}

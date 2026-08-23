@@ -529,6 +529,11 @@ describe("ChatInput", () => {
     })
     expect(resetMentionMock).toHaveBeenCalledTimes(1)
     expect(screen.queryByText("chatPage.input.noModelAlert")).not.toBeInTheDocument()
+    // selectedAgents no longer renders a "Using @name" chip (that
+    // mechanism was removed as unreachable dead code) - only drives the
+    // no-model guard above. A regression reintroducing it would leave
+    // this test green without an explicit check.
+    expect(screen.queryByText("@Shared Agent")).not.toBeInTheDocument()
   })
 
   it("clears the read-only model display instead of showing a stale lead's model while a new one's config is still loading", () => {
@@ -550,6 +555,43 @@ describe("ChatInput", () => {
 
     expect(screen.queryByText("agent-a-model")).not.toBeInTheDocument()
     expect(screen.getByText("chatPage.input.noModel")).toBeInTheDocument()
+  })
+
+  it("submits the live taskConfig model, not a stale value inherited by the internal mirror", async () => {
+    // The internal `agentConfig` mirror inherits the previous model when a
+    // new taskConfig doesn't specify one (`taskConfig.model || prev.model`
+    // in the syncing effect) - correct for genuine partial updates to the
+    // SAME lead, but submission must still prefer the live prop over that
+    // mirror once a config is meant to be authoritative (readOnlyConfig),
+    // so a real timing gap between a lead switch and its own effect
+    // catching up can't submit an unrelated previous lead's model.
+    const onSend = vi.fn()
+    const commonProps = {
+      hideFileUpload: true,
+      inputValue: "hello",
+      onInputChange: vi.fn(),
+      onSend,
+      readOnlyConfig: true,
+    }
+    const { container, rerender } = render(
+      <ChatInput {...commonProps} taskConfig={{ model: "agent-a-model", executionMode: "think" }} />
+    )
+    expect(screen.getByText("agent-a-model")).toBeInTheDocument()
+
+    // New lead's taskConfig arrives without its own model yet (e.g. only
+    // executionMode resolved so far) - the internal mirror inherits the
+    // previous lead's model rather than clearing it.
+    rerender(<ChatInput {...commonProps} taskConfig={{ executionMode: "flash" }} />)
+    expect(screen.getByText("agent-a-model")).toBeInTheDocument()
+
+    fireEvent.submit(container.querySelector("form") as HTMLFormElement)
+
+    await waitFor(() => {
+      expect(onSend).toHaveBeenCalledWith(
+        "hello",
+        expect.objectContaining({ model: "" })
+      )
+    })
   })
 
   it("does not show pause for uppercase terminal task status", () => {

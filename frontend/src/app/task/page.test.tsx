@@ -6,7 +6,6 @@ const apiRequestMock = vi.hoisted(() => vi.fn())
 const sendMessageMock = vi.hoisted(() => vi.fn())
 const dispatchMock = vi.hoisted(() => vi.fn())
 const closeFilePreviewMock = vi.hoisted(() => vi.fn())
-const toastErrorMock = vi.hoisted(() => vi.fn())
 const searchParamsMock = vi.hoisted(() => ({ value: new URLSearchParams() }))
 
 interface MockAgent {
@@ -54,10 +53,6 @@ vi.mock("next/navigation", () => ({
   useSearchParams: () => searchParamsMock.value,
 }))
 
-vi.mock("sonner", () => ({
-  toast: { error: toastErrorMock },
-}))
-
 vi.mock("@/components/file/file-preview-dialog", () => ({
   FilePreviewDialog: () => null,
 }))
@@ -87,14 +82,21 @@ vi.mock("@/components/chat/ChatStartScreen", () => ({
         ))}
         <button
           onClick={async () => {
-            // Mirrors the real ChatInput.handleSubmit: page.tsx's onSend
-            // (handleSend) catches its own errors internally and never
-            // rejects, so ChatInput always reaches its post-submit reset
-            // and calls onInputChange("") right after - not a mock
-            // artifact but the exact interaction that let the
-            // suppressNextInputChangeRef bug through untested.
-            await props.onSend?.("hello", [], { mode: "balanced" })
-            props.onInputChange?.("")
+            // Mirrors the real ChatInput.handleSubmit: its post-submit
+            // reset (calling onInputChange("")) only runs after onSend
+            // resolves successfully - a rejection is caught there instead
+            // (ChatInput shows its own toast and preserves its retry
+            // identity), never reaching this call. page.tsx's handleSend
+            // must actually reject on a failed send for that real
+            // behavior to ever trigger - it used to swallow every error
+            // and always resolve, so ChatInput could never tell a failure
+            // from a success.
+            try {
+              await props.onSend?.("hello", [], { mode: "balanced" })
+              props.onInputChange?.("")
+            } catch {
+              // matches real ChatInput: no reset on a rejected send
+            }
           }}
         >
           send
@@ -126,7 +128,6 @@ beforeEach(() => {
   sendMessageMock.mockReset()
   dispatchMock.mockReset()
   closeFilePreviewMock.mockReset()
-  toastErrorMock.mockReset()
   chatStartScreenProps.current = null
   searchParamsMock.value = new URLSearchParams()
 })
@@ -565,6 +566,59 @@ describe("TaskHomePage agents", () => {
 
     expect(screen.getByTestId("composer")).toHaveValue("My customized starting prompt")
   })
+
+  it("skips a blank first prompt and auto-fills with the next usable one instead of nothing", async () => {
+    const AGENT = {
+      id: 1,
+      name: "Vera",
+      status: "published",
+      // Nothing enforces non-blank strings at every writer of an agent's
+      // prompts - a blank/whitespace-only first entry must not read as
+      // "auto-fill with nothing" when a perfectly good one follows it.
+      suggested_prompts: ["", "  ", "Research a topic and report back"],
+    }
+    apiRequestMock.mockResolvedValueOnce(jsonResponse([AGENT]))
+    render(<TaskHomePage />)
+    await screen.findByText("pick-Vera")
+
+    fireEvent.click(screen.getByText("pick-Vera"))
+
+    expect(screen.getByTestId("composer")).toHaveValue("Research a topic and report back")
+  })
+
+  it("falls back to the template's sample prompt when a hired agent's own prompts are all blank", async () => {
+    const HIRED = {
+      id: 1,
+      name: "Vera",
+      status: "published",
+      suggested_prompts: ["", "   "],
+      template_id: "sales-research-enricher",
+    }
+    apiRequestMock.mockImplementation((url: string) => {
+      if (url === "http://api.local/api/agents") return Promise.resolve(jsonResponse([HIRED]))
+      if (url.startsWith("http://api.local/api/templates/")) {
+        return Promise.resolve(
+          jsonResponse([
+            {
+              id: "sales-research-enricher",
+              category: "Sales",
+              sample_prompts: [{ title: "Research", prompt: "The template's generic sample prompt" }],
+            },
+          ])
+        )
+      }
+      return Promise.resolve(new Response(null, { status: 404 }))
+    })
+
+    render(<TaskHomePage />)
+    await screen.findByText("pick-Vera")
+
+    fireEvent.click(screen.getByText("pick-Vera"))
+
+    // An all-blank own-prompts list must not read as "this agent has its
+    // own prompts" and suppress the template's usable sample.
+    expect(screen.getByTestId("composer")).toHaveValue("The template's generic sample prompt")
+  })
 })
 
 describe("TaskHomePage send", () => {
@@ -612,7 +666,8 @@ describe("TaskHomePage send", () => {
     expect(screen.getByTestId("composer")).toHaveValue("Turn my meetings into next steps")
   })
 
-  it("toasts and keeps state when sendMessage rejects", async () => {
+  it("propagates the failure (so ChatInput's own catch handles it) and keeps state when sendMessage rejects", async () => {
+    const consoleErrorSpy = vi.spyOn(console, "error").mockImplementation(() => {})
     apiRequestMock.mockResolvedValueOnce(jsonResponse([VERA]))
     sendMessageMock.mockRejectedValueOnce(new Error("network down"))
     render(<TaskHomePage />)
@@ -623,18 +678,25 @@ describe("TaskHomePage send", () => {
 
     fireEvent.click(screen.getByText("send"))
 
+    // handleSend must reject rather than swallow the error - ChatInput's
+    // own catch (not exercised by this mock) is what shows the toast and
+    // preserves its retry identity, and only actually runs if handleSend's
+    // promise rejects instead of always resolving as if the send succeeded.
     await waitFor(() => {
-      expect(toastErrorMock).toHaveBeenCalledWith("network down")
+      expect(consoleErrorSpy).toHaveBeenCalledWith("Failed to send message:", expect.any(Error))
     })
-    // handleSend's catch branch never touches inputValue/selectedAgents on
-    // failure - and ChatInput's own post-submit onInputChange("") echo
-    // (simulated by the mock's send button, same as a real send) must not
-    // be mistaken for the user clearing the box themselves.
+    // Neither handleSend's own catch branch nor ChatInput's post-submit
+    // reset (which the mock's send button correctly skips on a caught
+    // rejection, same as real ChatInput) ever touches inputValue/
+    // selectedAgents on failure.
     expect(screen.getByTestId("composer")).toHaveValue("Research a topic and report back")
     expect(chatStartScreenProps.current?.selectedAgents).toEqual([VERA])
+
+    consoleErrorSpy.mockRestore()
   })
 
   it("does not poison auto-fill for the next pick after a failed send", async () => {
+    const consoleErrorSpy = vi.spyOn(console, "error").mockImplementation(() => {})
     const KEVIN_WITH_PROMPT = { ...KEVIN, suggested_prompts: ["Turn my meetings into next steps"] }
     apiRequestMock.mockResolvedValueOnce(jsonResponse([VERA, KEVIN_WITH_PROMPT]))
     sendMessageMock.mockRejectedValueOnce(new Error("network down"))
@@ -644,15 +706,17 @@ describe("TaskHomePage send", () => {
     fireEvent.click(screen.getByText("pick-Vera"))
     fireEvent.click(screen.getByText("send"))
     await waitFor(() => {
-      expect(toastErrorMock).toHaveBeenCalledWith("network down")
+      expect(consoleErrorSpy).toHaveBeenCalledWith("Failed to send message:", expect.any(Error))
     })
 
-    // ChatInput's post-submit onInputChange("") echo fires even after a
-    // failed send (handleSend never rejects to ChatInput) - it must not
-    // have been mistaken for a real edit and left the composer "dirty"
+    // A failed send's catch branch (and ChatInput's own post-submit reset,
+    // which a rejected onSend correctly never reaches) must not have been
+    // mistaken for a real edit and left the composer "dirty"
     // for the rest of the session.
     fireEvent.click(screen.getByText("pick-Kevin"))
 
     expect(screen.getByTestId("composer")).toHaveValue("Turn my meetings into next steps")
+
+    consoleErrorSpy.mockRestore()
   })
 })

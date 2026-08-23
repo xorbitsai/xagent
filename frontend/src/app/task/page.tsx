@@ -14,7 +14,14 @@ import { toAgentId } from "@/lib/template-agent-resolution";
 import { categoryLabel } from "@/lib/template-categories";
 import type { Template } from "@/types/template";
 import { useSearchParams } from "next/navigation";
-import { toast } from "sonner";
+
+// A blank/whitespace-only entry (nothing enforces non-blank strings at
+// every writer of an agent's or template's prompts) must not shadow a
+// perfectly usable one that comes after it - shared by every place below
+// that needs "the first prompt actually worth auto-filling with".
+function firstNonBlankPrompt(prompts?: Array<string | undefined | null>): string | undefined {
+  return prompts?.find((prompt): prompt is string => Boolean(prompt && prompt.trim().length > 0));
+}
 
 function TaskHomePageContent() {
   const { t, locale } = useI18n();
@@ -149,12 +156,17 @@ function TaskHomePageContent() {
         // prompts once set, since /build's Suggested Prompts editor lets a
         // user customize them after hiring, and that edit must win here.
         const ownPrompts = agent.suggested_prompts;
-        const samplePrompt = template.sample_prompts?.[0]?.prompt;
+        // A blank first entry must not read as "this agent has its own
+        // prompts" (masking a perfectly good template sample) any more
+        // than it should read as "auto-fill with nothing" at click time -
+        // both need the first actually-usable entry, not just index 0.
+        const hasUsableOwnPrompt = firstNonBlankPrompt(ownPrompts) !== undefined;
+        const samplePrompt = firstNonBlankPrompt(template.sample_prompts?.map((p) => p.prompt));
         return {
           ...agent,
           persona_avatar: template.persona?.avatar,
           specialty: categoryLabel(t, template.category),
-          suggested_prompts: ownPrompts?.length ? ownPrompts : (samplePrompt ? [samplePrompt] : ownPrompts),
+          suggested_prompts: hasUsableOwnPrompt ? ownPrompts : (samplePrompt ? [samplePrompt] : ownPrompts),
         };
       }),
     [agents, templatesById, t]
@@ -185,17 +197,24 @@ function TaskHomePageContent() {
       return;
     }
 
+    // Batched into the same commit as setSelectedAgents below (both are
+    // called synchronously in this effect body) - see the longer note on
+    // this in handleAgentClick for why this must not be left to the
+    // separate config-fetch effect alone.
+    setSelectedAgentConfig(undefined);
     setSelectedAgents([selectedAgent]);
     appliedAgentFromQueryRef.current = agentFromQuery;
   }, [agentFromQuery, teammates]);
 
   useEffect(() => {
     let cancelled = false;
-    // Clear the previous agent's config synchronously the moment the
-    // selection changes - otherwise, switching from agent A to agent B and
-    // sending before B's fetch below resolves would submit A's stale
-    // model/executionMode under B's id (ChatInput reads `taskConfig`
-    // directly at submit time, not a value snapshotted per-agent).
+    // Defense-in-depth only: every caller that changes `selectedAgents`
+    // (handleAgentClick, the ?agent= deep-link effect) already clears
+    // `selectedAgentConfig` itself in the SAME synchronous batch as the
+    // selection change, so there is no render where a new lead's id is
+    // paired with a previous lead's config. This effect firing later
+    // (after render/paint, not synchronously with the state update that
+    // triggered it) would otherwise leave exactly that window open.
     setSelectedAgentConfig(undefined);
 
     const fetchSelectedAgentConfig = async () => {
@@ -279,7 +298,7 @@ function TaskHomePageContent() {
   useEffect(() => {
     if (composerDirtyRef.current) return;
     const lead = resolvedSelectedAgents[0];
-    const prompt = lead?.suggested_prompts?.[0];
+    const prompt = firstNonBlankPrompt(lead?.suggested_prompts);
     if (prompt && inputValue !== prompt) {
       setInputValue(prompt);
       setPromptHighlightTerms([]);
@@ -304,17 +323,25 @@ function TaskHomePageContent() {
       setPromptHighlightTerms([]);
       setSelectedAgents([]);
       composerDirtyRef.current = false;
+      // ChatInput's own post-submit reset calls this same onInputChange
+      // callback right after this promise resolves - suppress that echo
+      // so it isn't mistaken for a real edit.
+      suppressNextInputChangeRef.current = true;
     } catch (error) {
       console.error("Failed to send message:", error);
-      toast.error(error instanceof Error ? error.message : t("builds.list.chat.sendFailed"));
-    } finally {
-      // ChatInput calls its own post-submit onInputChange("") reset right
-      // after this function resolves, regardless of whether the send
-      // above succeeded or failed (this function only ever resolves,
-      // never rejects, to ChatInput) - suppress that echo either way, or
-      // a failed send would silently wipe the message it just failed to
-      // send.
-      suppressNextInputChangeRef.current = true;
+      // Rethrow rather than swallow: ChatInput's handleSubmit awaits this
+      // function and, on rejection, takes its own catch path instead of
+      // its success continuation - the one that resets `deliveryAttemptRef`
+      // (its retry/idempotency identity for this attempt) and clears the
+      // composer. Treating every send as successful here previously meant
+      // a failure could still reset that identity, so a retry after a
+      // delivery outcome that's actually unknown (e.g. the socket closing
+      // after the server durably accepted the task) would get a brand new
+      // attempt id instead of reusing the one the server may have already
+      // seen - risking the same task being enqueued twice. ChatInput's
+      // catch already shows the user-facing error toast, so this function
+      // no longer needs its own.
+      throw error;
     }
   };
 
@@ -331,13 +358,13 @@ function TaskHomePageContent() {
 
   const handleInputChange = (value: string) => {
     if (suppressNextInputChangeRef.current) {
-      // ChatInput's own post-submit reset, not a real edit - handleSend
-      // has already decided what the composer should hold after a send
-      // attempt (cleared on success, left exactly as the user had it on
-      // failure), so this echo carries no information of its own and
-      // must be ignored outright - applying its value would clear the
-      // composer even on a failed send, where handleSend's catch branch
-      // never touches it.
+      // ChatInput's own post-submit reset, not a real edit - only reached
+      // after a successful send now that handleSend rethrows on failure
+      // (ChatInput takes its own catch path instead, which never calls
+      // this). handleSend has already cleared the composer itself, so
+      // this echo carries no new information - ignored outright rather
+      // than reapplied, since reapplying it would still be harmless here
+      // but there's nothing for it to usefully do.
       suppressNextInputChangeRef.current = false;
       return;
     }
@@ -369,13 +396,22 @@ function TaskHomePageContent() {
       return;
     }
 
+    // Cleared here, in the same synchronous batch as setSelectedAgents,
+    // not left to the separate config-fetch effect: that effect only
+    // runs after this render commits and paints, so relying on it alone
+    // leaves a real render where `selectedAgents` already names the new
+    // lead while `taskConfig` (read straight from `selectedAgentConfig`
+    // at submit time) still holds the previous lead's - a submit landing
+    // in exactly that window would send the new agent's id with the old
+    // agent's model/executionMode.
+    setSelectedAgentConfig(undefined);
     setSelectedAgents([agent]);
     if (composerDirtyRef.current) {
       // The user's own text stays exactly as they left it.
       return;
     }
 
-    setInputValue(agent.suggested_prompts?.[0] || "");
+    setInputValue(firstNonBlankPrompt(agent.suggested_prompts) || "");
     setPromptHighlightTerms([]);
   };
 

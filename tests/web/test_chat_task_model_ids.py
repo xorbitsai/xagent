@@ -20,6 +20,7 @@ from xagent.web.api.chat import (
 )
 from xagent.web.api.model import model_router
 from xagent.web.models.database import Base, get_db, get_engine
+from xagent.web.schemas.chat import MAX_SEED_INTERACTIONS
 from xagent.web.services.workforce_access import WorkforcePolicy, set_workforce_policy
 
 
@@ -2070,7 +2071,8 @@ def test_task_create_rejects_more_than_five_seed_interactions(test_db, user1_hea
         json={
             "title": "Too many interactions",
             "seed_assistant_message": "Hi.",
-            "seed_interactions": [{"type": "connect_apps"}] * 6,
+            "seed_interactions": [{"type": "connect_apps"}]
+            * (MAX_SEED_INTERACTIONS + 1),
         },
         headers=user1_headers,
     )

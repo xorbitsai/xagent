@@ -48,8 +48,10 @@ vi.mock("@/lib/oauth-connect", () => ({
   openMcpOAuthPopup: openMcpOAuthPopupMock,
 }));
 
-import { ConnectAppsField } from "./connect-apps-field";
+import { ConnectAppsField, PROVIDER_DISPLAY_NAMES } from "./connect-apps-field";
 import type { Interaction } from "@/contexts/app-context-chat";
+import * as fs from "node:fs";
+import * as path from "node:path";
 
 function makeApp(overrides: Partial<Record<string, unknown>> = {}) {
   return {
@@ -364,7 +366,11 @@ describe("ConnectAppsField", () => {
     });
   });
 
-  it("toasts an error when the popup does not succeed", async () => {
+  it("toasts an error naming the app, not the provider, when only one app in the group is unconnected", async () => {
+    // A single-app group always resolves to that app's own id (see
+    // handleConnectOAuth's appId comment) - the toast should match, since
+    // the row's own button already reads "Continue with Gmail", not
+    // "Continue with Google".
     mcpAppsMock.apps = [makeApp({ provider: "google", is_connected: false })];
     openBuiltinOAuthPopupMock.mockResolvedValue({ success: false });
 
@@ -376,22 +382,30 @@ describe("ConnectAppsField", () => {
 
     await waitFor(() => {
       expect(toastErrorMock).toHaveBeenCalledWith(
-        'chatPage.clarification.connectApps.connectFailed:{"provider":"Google"}'
+        'chatPage.clarification.connectApps.connectFailed:{"provider":"Gmail"}'
       );
     });
   });
 
-  it("capitalizes github's failure toast as 'GitHub', not the generic capitalize() fallback's 'Github'", async () => {
+  it("capitalizes github's failure toast as 'GitHub', not the generic capitalize() fallback's 'Github', when the group's bare login covers more than one unconnected app", async () => {
+    // Two unconnected apps under the same provider keeps appId undefined
+    // (see handleConnectOAuth), which is the only case that still names the
+    // provider rather than one specific app - exercising
+    // PROVIDER_DISPLAY_NAMES's capitalize() fallback requires that path.
     mcpAppsMock.apps = [
-      makeApp({ id: "github", name: "GitHub", provider: "github", is_connected: false }),
+      makeApp({ id: "github-repos", name: "GitHub Repos", provider: "github", is_connected: false }),
+      makeApp({ id: "github-issues", name: "GitHub Issues", provider: "github", is_connected: false }),
     ];
     openBuiltinOAuthPopupMock.mockResolvedValue({ success: false });
 
     render(
-      <ConnectAppsField interaction={{ ...LEO_INTERACTION, apps: ["GitHub"] }} onSkip={vi.fn()} />
+      <ConnectAppsField
+        interaction={{ ...LEO_INTERACTION, apps: ["GitHub Repos", "GitHub Issues"] }}
+        onSkip={vi.fn()}
+      />
     );
 
-    fireEvent.click(continueButton("GitHub"));
+    fireEvent.click(continueButton("GitHub Repos"));
 
     await waitFor(() => {
       expect(toastErrorMock).toHaveBeenCalledWith(
@@ -830,5 +844,44 @@ describe("ConnectAppsField", () => {
     expect(
       screen.getByText("chatPage.clarification.connectApps.allConnectedNote")
     ).toBeInTheDocument();
+  });
+});
+
+describe("PROVIDER_DISPLAY_NAMES", () => {
+  // A plain regex scrape, not a real Python parse - good enough to catch the
+  // failure mode this guards against (a provider added to/renamed in the
+  // registry without updating this file's display-name map, so it silently
+  // falls back to capitalize() and gets a brand's casing wrong, e.g. "Github"
+  // instead of "GitHub") without pulling a Python toolchain into the
+  // frontend test run.
+  function readBackendProviderRows(): Array<{ providerName: string; displayName: string }> {
+    const registryPath = path.resolve(
+      __dirname,
+      "../../../../src/xagent/web/builtin_mcp_registry.py"
+    );
+    const source = fs.readFileSync(registryPath, "utf-8");
+    const functionStart = source.indexOf("def get_builtin_oauth_provider_rows(");
+    const functionEnd = source.indexOf("\ndef ", functionStart + 1);
+    const body = source.slice(functionStart, functionEnd === -1 ? undefined : functionEnd);
+
+    const rows: Array<{ providerName: string; displayName: string }> = [];
+    const rowPattern = /"provider_name":\s*"([^"]+)"[\s\S]*?"name":\s*"([^"]+)"/g;
+    let match: RegExpExecArray | null;
+    while ((match = rowPattern.exec(body)) !== null) {
+      rows.push({ providerName: match[1], displayName: match[2] });
+    }
+    return rows;
+  }
+
+  it("has a display name for every builtin OAuth provider in the backend registry", () => {
+    const backendRows = readBackendProviderRows();
+    // Guards the drift-guard itself: a regex mismatch (the registry's
+    // formatting changed) should fail loudly here, not silently scrape zero
+    // rows and let the loop below pass on an empty list.
+    expect(backendRows.length).toBeGreaterThan(0);
+
+    for (const { providerName, displayName } of backendRows) {
+      expect(PROVIDER_DISPLAY_NAMES[providerName]).toBe(displayName);
+    }
   });
 });

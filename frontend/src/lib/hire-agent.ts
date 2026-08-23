@@ -29,7 +29,12 @@ export function buildConnectAppsInteraction(
   connections: ConnectionInfo[],
   label: string
 ): { type: "connect_apps"; field: string; label: string; apps: string[] } | null {
-  const appNames = connections.map((connection) => connection.name).filter(Boolean);
+  // .trim() before the filter: a whitespace-only name (a template authoring
+  // slip - blank strings pass most "did they fill this in" checks) would
+  // otherwise pass Boolean() and reach ConnectAppsField as an app name
+  // nothing in the catalog can ever match, silently dropped by
+  // resolveRows/findMatchingMcpApp there instead of being caught here.
+  const appNames = connections.map((connection) => connection.name.trim()).filter(Boolean);
   if (appNames.length === 0) return null;
 
   return { type: "connect_apps", field: "connect_apps", label, apps: appNames };
@@ -84,12 +89,17 @@ export interface HireAgentResult {
  * from the "not yet hired" path and route straight to the agent's chat
  * (e.g. `/agent/{hired_agent_id}`) once `template.hired` is true.
  */
-export async function hireAgentFromTemplate(
-  templateId: string,
-  persona: PersonaInfo,
-  strings: HireMessageStrings,
-  connections: ConnectionInfo[] = []
-): Promise<HireAgentResult> {
+export async function hireAgentFromTemplate({
+  templateId,
+  persona,
+  strings,
+  connections = [],
+}: {
+  templateId: string;
+  persona: PersonaInfo;
+  strings: HireMessageStrings;
+  connections?: ConnectionInfo[];
+}): Promise<HireAgentResult> {
   const { agent, created } = await resolveAgentForTemplate(templateId, persona.name);
   const agentId = toAgentId(agent);
   if (agentId === null) {

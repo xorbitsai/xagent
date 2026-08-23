@@ -108,6 +108,24 @@ describe("buildConnectAppsInteraction", () => {
   it("returns null when there are no connections", () => {
     expect(buildConnectAppsInteraction([], "Connect your apps")).toBeNull();
   });
+
+  it("drops a whitespace-only connection name instead of passing it through as an unmatchable app", () => {
+    const connections: ConnectionInfo[] = [
+      { name: "   " },
+      { name: "LinkedIn", logo: "https://example.com/linkedin.png" },
+    ];
+
+    expect(buildConnectAppsInteraction(connections, "Connect your apps")).toEqual({
+      type: "connect_apps",
+      field: "connect_apps",
+      label: "Connect your apps",
+      apps: ["LinkedIn"],
+    });
+  });
+
+  it("returns null when every connection name is whitespace-only", () => {
+    expect(buildConnectAppsInteraction([{ name: "  " }], "Connect your apps")).toBeNull();
+  });
 });
 
 describe("hireAgentFromTemplate", () => {
@@ -123,11 +141,11 @@ describe("hireAgentFromTemplate", () => {
     });
     apiRequestMock.mockResolvedValueOnce(jsonResponse({ task_id: 7 }));
 
-    const result = await hireAgentFromTemplate(
-      "sales-email-lead-response-agent",
-      LEO_PERSONA,
-      STRINGS
-    );
+    const result = await hireAgentFromTemplate({
+      templateId: "sales-email-lead-response-agent",
+      persona: LEO_PERSONA,
+      strings: STRINGS,
+    });
 
     expect(result).toEqual({ taskId: 7, agentId: 42, created: true });
     expect(resolveAgentForTemplateMock).toHaveBeenCalledWith(
@@ -155,12 +173,12 @@ describe("hireAgentFromTemplate", () => {
       { name: "HubSpot", logo: "https://example.com/hubspot.png" },
     ];
 
-    await hireAgentFromTemplate(
-      "sales-email-lead-response-agent",
-      LEO_PERSONA,
-      STRINGS,
-      connections
-    );
+    await hireAgentFromTemplate({
+      templateId: "sales-email-lead-response-agent",
+      persona: LEO_PERSONA,
+      strings: STRINGS,
+      connections,
+    });
 
     const [, init] = apiRequestMock.mock.calls[0];
     const body = JSON.parse((init as RequestInit).body as string);
@@ -181,7 +199,11 @@ describe("hireAgentFromTemplate", () => {
     });
 
     await expect(
-      hireAgentFromTemplate("sales-email-lead-response-agent", LEO_PERSONA, STRINGS)
+      hireAgentFromTemplate({
+        templateId: "sales-email-lead-response-agent",
+        persona: LEO_PERSONA,
+        strings: STRINGS,
+      })
     ).rejects.toThrow("Malformed resolve response");
     expect(apiRequestMock).not.toHaveBeenCalled();
   });
@@ -194,7 +216,11 @@ describe("hireAgentFromTemplate", () => {
     apiRequestMock.mockResolvedValueOnce(jsonResponse({ detail: "boom" }, { status: 500 }));
 
     await expect(
-      hireAgentFromTemplate("sales-email-lead-response-agent", LEO_PERSONA, STRINGS)
+      hireAgentFromTemplate({
+        templateId: "sales-email-lead-response-agent",
+        persona: LEO_PERSONA,
+        strings: STRINGS,
+      })
     ).rejects.toThrow("Failed to create task for hired agent (500)");
   });
 
@@ -206,7 +232,11 @@ describe("hireAgentFromTemplate", () => {
     apiRequestMock.mockResolvedValueOnce(jsonResponse({}));
 
     await expect(
-      hireAgentFromTemplate("sales-email-lead-response-agent", LEO_PERSONA, STRINGS)
+      hireAgentFromTemplate({
+        templateId: "sales-email-lead-response-agent",
+        persona: LEO_PERSONA,
+        strings: STRINGS,
+      })
     ).rejects.toThrow("Malformed task create response");
   });
 });

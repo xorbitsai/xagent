@@ -14,7 +14,7 @@ import { cn, getApiUrl } from "@/lib/utils";
 import type { Interaction } from "@/contexts/app-context-chat";
 import { capitalize } from "@/lib/tool-category-labels";
 import { findMatchingMcpApp } from "@/lib/mcp-lookup";
-import { ApiKeyConnectDialog, CONNECT_TIMEOUT_MS, iconFallbackUrl } from "./api-key-connect-dialog";
+import { ApiKeyConnectDialog, CONNECT_TIMEOUT_MS, handleIconLoadError } from "./api-key-connect-dialog";
 
 // The 11 builtin-OAuth providers (see src/xagent/web/builtin_mcp_registry.py's
 // get_builtin_oauth_provider_rows) - brand names, left untranslated in both
@@ -22,7 +22,7 @@ import { ApiKeyConnectDialog, CONNECT_TIMEOUT_MS, iconFallbackUrl } from "./api-
 // capitalize() below still runs for any provider missing here, but gets the
 // casing wrong for a multi-cap brand name (e.g. "Github" instead of
 // "GitHub"), so every provider in the registry should have an entry here.
-const PROVIDER_DISPLAY_NAMES: Record<string, string> = {
+export const PROVIDER_DISPLAY_NAMES: Record<string, string> = {
   google: "Google",
   linkedin: "LinkedIn",
   microsoft: "Microsoft",
@@ -35,6 +35,21 @@ const PROVIDER_DISPLAY_NAMES: Record<string, string> = {
   linear: "Linear",
   jira: "Jira",
 };
+
+// connectingKeys/connectingKeysRef below hold both of these kinds of key in
+// the same Set - an OAuth provider name (shared across every app in that
+// provider's group) and an individual app id (mcp_oauth/keyless rows, which
+// don't share state with anything). Prefixing keeps a catalog app whose id
+// ever happened to collide with a provider name (e.g. an app literally
+// id'd "google") from being reported as "connecting" merely because that
+// provider's OAuth group is mid-login, or vice versa.
+function providerConnectingKey(provider: string): string {
+  return `provider:${provider}`;
+}
+
+function appConnectingKey(appId: string): string {
+  return `app:${appId}`;
+}
 
 interface OAuthProviderGroup {
   provider: string;
@@ -139,16 +154,7 @@ function RowIcon({
           src={url}
           alt=""
           className="h-full w-full object-contain p-1"
-          onError={(event) => {
-            // Comparing src, not nulling .onerror: React attaches this
-            // handler via addEventListener, not the element's .onerror IDL
-            // property, so clearing that property doesn't detach React's own
-            // listener - if the fallback URL is already what's showing and
-            // it still errored, stop instead of looping.
-            const fallback = iconFallbackUrl(fallbackName);
-            if (event.currentTarget.src === fallback) return;
-            event.currentTarget.src = fallback;
-          }}
+          onError={handleIconLoadError(fallbackName)}
         />
       ) : (
         <span className="text-[11.5px] font-bold text-muted-foreground">
@@ -266,7 +272,7 @@ export function ConnectAppsField({
   };
 
   const handleConnectOAuth = (group: OAuthProviderGroup) =>
-    withConnectingKey(group.provider, async () => {
+    withConnectingKey(providerConnectingKey(group.provider), async () => {
       const unconnectedApps = group.apps.filter((app) => !app.is_connected);
       if (unconnectedApps.length === 0) return;
       // More than one app still needs connecting: run the bare, app_id-less
@@ -279,35 +285,70 @@ export function ConnectAppsField({
       // that app's own id so a second click actually finishes the group
       // instead of repeating the same bare login forever.
       const appId = unconnectedApps.length === 1 ? unconnectedApps[0].id : undefined;
+      // Names whichever the popup call actually targets: the group's
+      // provider for a real bare batch login (more than one app still
+      // unconnected - the toast should describe what was actually
+      // attempted), or the one remaining app's own name once appId above
+      // narrows it to an app-scoped grant - matching the row's own button,
+      // which already reads "Continue with {app.name}" for this same case
+      // (see continueWith below), not the provider's name.
+      const failureTarget = appId
+        ? unconnectedApps[0].name
+        : PROVIDER_DISPLAY_NAMES[group.provider] || capitalize(group.provider);
 
-      const result = await openBuiltinOAuthPopup({ provider: group.provider, appId, token });
-      if (!isMountedRef.current) return;
-      if (!result.success) {
-        toast.error(
-          t(
-            result.popupBlocked
-              ? "chatPage.clarification.connectApps.popupBlocked"
-              : "chatPage.clarification.connectApps.connectFailed",
-            { provider: PROVIDER_DISPLAY_NAMES[group.provider] || capitalize(group.provider) }
-          )
-        );
-      }
-    });
-
-  const handleConnectMcpOAuth = (app: McpApp) =>
-    withConnectingKey(app.id, async () => {
-      const result = await openMcpOAuthPopup({ appId: app.id });
-      if (!isMountedRef.current) return;
-      if (!result.connected) {
-        toast.error(
-          result.message ||
+      // Both this and openMcpOAuthPopup below are documented to resolve
+      // rather than reject on every path they control - but window.open()
+      // inside openBuiltinOAuthPopup's Promise executor can still throw
+      // synchronously in some sandboxed/policy-restricted browser contexts,
+      // which the Promise constructor turns into a rejection. Catching it
+      // here (matching handleConnectKeyless's own try/catch around its raw
+      // apiRequest call, the one call in this file already documented to be
+      // able to throw) means that edge case surfaces as the same error toast
+      // instead of an unhandled promise rejection with connectingKeys stuck
+      // showing "Connecting...".
+      try {
+        const result = await openBuiltinOAuthPopup({ provider: group.provider, appId, token });
+        if (!isMountedRef.current) return;
+        if (!result.success) {
+          toast.error(
             t(
               result.popupBlocked
                 ? "chatPage.clarification.connectApps.popupBlocked"
                 : "chatPage.clarification.connectApps.connectFailed",
-              { provider: app.name }
+              { provider: failureTarget }
             )
-        );
+          );
+        }
+      } catch {
+        if (isMountedRef.current) {
+          toast.error(
+            t("chatPage.clarification.connectApps.connectFailed", { provider: failureTarget })
+          );
+        }
+      }
+    });
+
+  const handleConnectMcpOAuth = (app: McpApp) =>
+    withConnectingKey(appConnectingKey(app.id), async () => {
+      // Same reasoning as handleConnectOAuth above.
+      try {
+        const result = await openMcpOAuthPopup({ appId: app.id });
+        if (!isMountedRef.current) return;
+        if (!result.connected) {
+          toast.error(
+            result.message ||
+              t(
+                result.popupBlocked
+                  ? "chatPage.clarification.connectApps.popupBlocked"
+                  : "chatPage.clarification.connectApps.connectFailed",
+                { provider: app.name }
+              )
+          );
+        }
+      } catch {
+        if (isMountedRef.current) {
+          toast.error(t("chatPage.clarification.connectApps.connectFailed", { provider: app.name }));
+        }
       }
     });
 
@@ -318,7 +359,7 @@ export function ConnectAppsField({
   // submitKeylessConnect (is_active sent explicitly so re-connecting a
   // dormant association reactivates it).
   const handleConnectKeyless = (app: McpApp) =>
-    withConnectingKey(app.id, async () => {
+    withConnectingKey(appConnectingKey(app.id), async () => {
       try {
         const response = await apiRequest(`${getApiUrl()}/api/mcp/apps/${encodeURIComponent(app.id)}/connect`, {
           method: "POST",
@@ -379,7 +420,7 @@ export function ConnectAppsField({
           if (row.kind === "manual") {
             const hasKeyForm = (app.launch_config?.required_env?.length ?? 0) > 0;
             const isKeyless = app.auth_type === "keyless";
-            const isConnectingKeyless = connectingKeys.has(app.id);
+            const isConnectingKeyless = connectingKeys.has(appConnectingKey(app.id));
             return (
               <div key={app.id} className={rowClassName}>
                 <RowIcon url={app.icon} fallbackName={app.name} connected={!!app.is_connected} />
@@ -419,8 +460,8 @@ export function ConnectAppsField({
 
           const isConnecting =
             row.kind === "oauth"
-              ? connectingKeys.has(row.group.provider)
-              : connectingKeys.has(app.id);
+              ? connectingKeys.has(providerConnectingKey(row.group.provider))
+              : connectingKeys.has(appConnectingKey(app.id));
           const onConnect =
             row.kind === "oauth"
               ? () => handleConnectOAuth(row.group)

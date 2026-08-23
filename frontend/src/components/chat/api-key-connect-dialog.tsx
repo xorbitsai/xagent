@@ -4,7 +4,7 @@ import React, { useEffect, useRef, useState } from "react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
+import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { useI18n } from "@/contexts/i18n-context";
 import { apiRequest } from "@/lib/api-wrapper";
 import { getApiUrl } from "@/lib/utils";
@@ -28,6 +28,22 @@ const MASKED_SECRET_VALUE = "********";
 // same app.icon value for the same reason.
 export function iconFallbackUrl(name: string): string {
   return `https://ui-avatars.com/api/?name=${encodeURIComponent(name)}&background=random&color=fff&size=128`;
+}
+
+// Shared with connect-apps-field.tsx's RowIcon, which renders the same
+// fallback-on-404 <img> for the same reason - a real icon URL can still 404
+// (catalog data drifts, a favicon service hiccups).
+export function handleIconLoadError(fallbackName: string) {
+  return (event: React.SyntheticEvent<HTMLImageElement>) => {
+    // Comparing src, not nulling .onerror: React attaches this handler via
+    // addEventListener, not the element's .onerror IDL property, so clearing
+    // that property doesn't detach React's own listener - if the fallback URL
+    // is already what's showing and it still errored, stop instead of
+    // looping.
+    const fallback = iconFallbackUrl(fallbackName);
+    if (event.currentTarget.src === fallback) return;
+    event.currentTarget.src = fallback;
+  };
 }
 
 // FastAPI's RequestValidationError handler (src/xagent/web/app.py) returns
@@ -72,6 +88,20 @@ export function ApiKeyConnectDialog({
   // a commit cycle behind two clicks landing in the same tick, so relying on
   // `disabled={isSubmitting}` alone lets a fast double-click issue two POSTs.
   const isSubmittingRef = useRef(false);
+  // Same reason connect-apps-field.tsx keeps isMountedRef: a request in
+  // flight when this component unmounts (e.g. the whole card unmounts, not
+  // just this dialog closing - closing alone doesn't unmount it, `app` just
+  // goes null) must not call the state setters below afterward.
+  const isMountedRef = useRef(true);
+
+  useEffect(() => {
+    isMountedRef.current = true;
+    return () => {
+      isMountedRef.current = false;
+    };
+  }, []);
+
+  const requiredEnv = app?.launch_config?.required_env || [];
   // The connect endpoint accepts (and activates) a partial env - any key
   // left blank is dropped rather than rejected (see connect_mcp_app's
   // `provided` filter and _merge_masked_env in src/xagent/web/api/mcp.py),
@@ -82,11 +112,7 @@ export function ApiKeyConnectDialog({
   // has no honest interpretation other than "not done yet": require every
   // key to have some value before Connect is even clickable, so this flow
   // can't create a "Connected" row a real tool call would still fail against.
-  const canSubmit = (app?.launch_config?.required_env || []).every(
-    (key) => (values[key] ?? "").trim().length > 0
-  );
-
-  const requiredEnv = app?.launch_config?.required_env || [];
+  const canSubmit = requiredEnv.every((key) => (values[key] ?? "").trim().length > 0);
 
   // Re-seed on every app change (including re-opening for the same app after
   // a prior close), not just once on mount - a bare `useState({})` initial
@@ -137,6 +163,7 @@ export function ApiKeyConnectDialog({
         body: JSON.stringify({ env, env_source: "own" }),
         signal: AbortSignal.timeout(CONNECT_TIMEOUT_MS),
       });
+      if (!isMountedRef.current) return;
       if (response.ok) {
         toast.success(t("tools.mcp.dialog.connectSuccess", { name: app.name }));
         setValues({});
@@ -144,16 +171,21 @@ export function ApiKeyConnectDialog({
         onOpenChange(false);
       } else {
         const error = await response.json().catch(() => ({}));
+        if (!isMountedRef.current) return;
         toast.error(readableErrorDetail(error.detail) || t("tools.mcp.alerts.saveFailed"));
       }
     } catch (error) {
-      const timedOut = error instanceof DOMException && error.name === "TimeoutError";
-      toast.error(
-        timedOut ? t("tools.mcp.alerts.connectTimedOut") : t("tools.mcp.alerts.saveFailed")
-      );
+      if (isMountedRef.current) {
+        const timedOut = error instanceof DOMException && error.name === "TimeoutError";
+        toast.error(
+          timedOut ? t("tools.mcp.alerts.connectTimedOut") : t("tools.mcp.alerts.saveFailed")
+        );
+      }
     } finally {
       isSubmittingRef.current = false;
-      setIsSubmitting(false);
+      if (isMountedRef.current) {
+        setIsSubmitting(false);
+      }
     }
   };
 
@@ -168,21 +200,18 @@ export function ApiKeyConnectDialog({
                 src={app.icon}
                 alt=""
                 className="h-5 w-5"
-                onError={(event) => {
-                  // Comparing src, not nulling .onerror: React attaches this
-                  // handler via addEventListener, not the element's .onerror
-                  // IDL property, so clearing that property doesn't detach
-                  // React's own listener - if the fallback URL is already
-                  // what's showing and it still errored, stop instead of
-                  // looping.
-                  const fallback = iconFallbackUrl(app.name);
-                  if (event.currentTarget.src === fallback) return;
-                  event.currentTarget.src = fallback;
-                }}
+                onError={handleIconLoadError(app.name)}
               />
             )}
             {t("tools.mcp.dialog.connect")} {app?.name}
           </DialogTitle>
+          {/* Reuses connect-mcp-dialog.tsx's own key-form hint verbatim (this
+              dialog's narrow, no-fallback key form is what that hint already
+              describes) rather than adding a new string only this dialog
+              would carry - satisfies Radix's aria-describedby requirement on
+              DialogContent without a translation key that only ever renders
+              here. */}
+          <DialogDescription>{t("tools.mcp.dialog.apiKeyOptionalHint")}</DialogDescription>
         </DialogHeader>
         <div className="space-y-4 py-2">
           {requiredEnv.map((key) => (

@@ -7,6 +7,12 @@ from pydantic import BaseModel, Field, model_validator
 
 from ...core.task_runtime import MAX_TASK_RUNTIME_EXTENSIONS
 
+# Only ever read here (TaskCreateRequest.seed_interactions is passed straight
+# through to create_task_with_message as-is - see api/chat.py), unlike
+# MAX_TASK_RUNTIME_EXTENSIONS above, which is re-checked at bind time too and
+# so lives in core.task_runtime instead.
+MAX_SEED_INTERACTIONS = 5
+
 
 class ChatMessage(BaseModel):
     """Chat message model"""
@@ -102,7 +108,7 @@ class TaskCreateRequest(BaseModel):
     )
     seed_interactions: Optional[List[Dict[str, Any]]] = Field(
         default=None,
-        max_length=5,
+        max_length=MAX_SEED_INTERACTIONS,
         description=(
             "Structured interaction descriptors (the same shape the "
             "ask_user_question agent tool produces) attached to the "

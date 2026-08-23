@@ -90,10 +90,10 @@ export function ClarificationForm({
   // ever a t()'d string frozen into the DB row at hire time - see
   // hire-agent.ts's buildConnectAppsInteraction/HireMessageStrings) and
   // re-resolve live instead, so a locale switch after hiring doesn't leave
-  // it stuck in whatever language was active when the task was created.
-  // Shared by both the isConnectAppsOnly header below and the per-field
-  // label in the mixed-interaction-list branch further down - the singleton
-  // header fix alone missed that second render path entirely.
+  // it stuck in whatever language was active when the task was created. Used
+  // by both the isConnectAppsOnly header below and the per-field label in
+  // the mixed-interaction-list branch further down, since either render path
+  // can be the one displaying a live-widget interaction's label.
   const fieldLabel = (interaction: Interaction): string =>
     LIVE_WIDGET_TYPES.has(interaction.type)
       ? t("chatPage.clarification.connectApps.title")

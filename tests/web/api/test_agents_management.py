@@ -849,6 +849,7 @@ def _create_agent_row(
     share_token: str | None = None,
     widget_key: str | None = None,
     generate_widget_key: bool = True,
+    suggested_prompts: list[str] | None = None,
 ) -> int:
     db = _direct_db_session()
     try:
@@ -867,6 +868,7 @@ def _create_agent_row(
             share_enabled=share_enabled,
             share_token=share_token,
             widget_key=widget_key,
+            suggested_prompts=suggested_prompts or [],
         )
         db.add(agent)
         db.commit()
@@ -1057,6 +1059,52 @@ def test_list_agents_includes_owned_agents_and_policy_visible_agents() -> None:
     assert items_by_id[shared_draft_id]["access"] == "policy"
     assert items_by_id[shared_draft_id]["status"] == "draft"
     assert items_by_id[shared_draft_id]["readonly"] is True
+
+
+def test_list_agents_response_carries_suggested_prompts_through_owner_and_policy_rows() -> (
+    None
+):
+    # tests/web/test_agent_visibility.py only exercises
+    # AgentStore.agent_to_list_item_dict directly - this drives the real
+    # GET /api/agents route so a future regression in AgentListItem's
+    # response-model validation or the permission-merge step in
+    # _serialize_agent_list_item would actually be caught here, not just
+    # at the store layer the /task "My Team" picker's auto-fill depends on.
+    _admin_headers()
+    bob_headers = _register_second_user()
+    admin_id = _user_id("admin")
+    bob_id = _user_id("bob")
+
+    bob_with_prompts_id = _create_agent_row(
+        user_id=bob_id,
+        name="Bob With Prompts",
+        status=AgentStatus.PUBLISHED,
+        suggested_prompts=["Draft a status update"],
+    )
+    bob_without_prompts_id = _create_agent_row(
+        user_id=bob_id,
+        name="Bob Without Prompts",
+        status=AgentStatus.PUBLISHED,
+    )
+    shared_with_prompts_id = _create_agent_row(
+        user_id=admin_id,
+        name="Shared With Prompts",
+        status=AgentStatus.PUBLISHED,
+        suggested_prompts=["Summarize today's meetings"],
+    )
+    set_workforce_policy(_VisibleAgentPolicy({shared_with_prompts_id}))
+
+    response = client.get("/api/agents", headers=bob_headers)
+    assert response.status_code == 200, response.text
+    items_by_id = {item["id"]: item for item in response.json()}
+
+    assert items_by_id[bob_with_prompts_id]["suggested_prompts"] == [
+        "Draft a status update"
+    ]
+    assert items_by_id[bob_without_prompts_id]["suggested_prompts"] == []
+    assert items_by_id[shared_with_prompts_id]["suggested_prompts"] == [
+        "Summarize today's meetings"
+    ]
 
 
 def test_agent_lists_keep_reusable_managers_and_hide_generated_managers() -> None:

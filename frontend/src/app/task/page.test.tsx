@@ -7,6 +7,7 @@ const sendMessageMock = vi.hoisted(() => vi.fn())
 const dispatchMock = vi.hoisted(() => vi.fn())
 const closeFilePreviewMock = vi.hoisted(() => vi.fn())
 const searchParamsMock = vi.hoisted(() => ({ value: new URLSearchParams() }))
+const localeMock = vi.hoisted(() => ({ value: "en" }))
 
 interface MockAgent {
   id: number | string
@@ -46,6 +47,7 @@ vi.mock("@/contexts/i18n-context", () => ({
   useI18n: () => ({
     t: (key: string, vars?: Record<string, string | number>) =>
       vars ? `${key}:${JSON.stringify(vars)}` : key,
+    locale: localeMock.value,
   }),
 }))
 
@@ -130,6 +132,7 @@ beforeEach(() => {
   closeFilePreviewMock.mockReset()
   chatStartScreenProps.current = null
   searchParamsMock.value = new URLSearchParams()
+  localeMock.value = "en"
 })
 
 afterEach(cleanup)
@@ -383,6 +386,61 @@ describe("TaskHomePage agents", () => {
           specialty: "templates.categoryTitles.sales",
         },
       ])
+    })
+  })
+
+  it("refetches templates in the new locale when the app's locale changes, and re-enriches with the new response", async () => {
+    const HIRED = { ...VERA, template_id: "sales-research-enricher" }
+    apiRequestMock.mockImplementation((url: string) => {
+      if (url === "http://api.local/api/agents") return Promise.resolve(jsonResponse([HIRED]))
+      if (url === "http://api.local/api/templates/?lang=en") {
+        return Promise.resolve(
+          jsonResponse([
+            {
+              id: "sales-research-enricher",
+              category: "Sales",
+              persona: { avatar: "/marketplace/avatars/vera-en.png" },
+            },
+          ])
+        )
+      }
+      if (url === "http://api.local/api/templates/?lang=zh") {
+        return Promise.resolve(
+          jsonResponse([
+            {
+              id: "sales-research-enricher",
+              category: "Sales",
+              persona: { avatar: "/marketplace/avatars/vera-zh.png" },
+            },
+          ])
+        )
+      }
+      return Promise.resolve(new Response(null, { status: 404 }))
+    })
+
+    const { rerender } = render(<TaskHomePage />)
+    await waitFor(() => {
+      expect(apiRequestMock).toHaveBeenCalledWith("http://api.local/api/templates/?lang=en")
+    })
+    await waitFor(() => {
+      expect(chatStartScreenProps.current?.agents?.[0]).toEqual(
+        expect.objectContaining({ persona_avatar: "/marketplace/avatars/vera-en.png" })
+      )
+    })
+
+    // Locale changes elsewhere in the app (e.g. a language switcher) -
+    // the effect depends on `locale`, so it must refetch under the new
+    // one and re-enrich with whatever that locale's templates carry.
+    localeMock.value = "zh"
+    rerender(<TaskHomePage />)
+
+    await waitFor(() => {
+      expect(apiRequestMock).toHaveBeenCalledWith("http://api.local/api/templates/?lang=zh")
+    })
+    await waitFor(() => {
+      expect(chatStartScreenProps.current?.agents?.[0]).toEqual(
+        expect.objectContaining({ persona_avatar: "/marketplace/avatars/vera-zh.png" })
+      )
     })
   })
 

@@ -14,7 +14,13 @@ const chatInputProps = vi.hoisted(() => ({
 
 vi.mock("@/contexts/i18n-context", () => ({
   useI18n: () => ({
-    t: (key: string) => key,
+    // Echoes the key plus its interpolation variables (not a real
+    // translation) so a test can assert the actual value flowing through
+    // a variable (e.g. the selected agent's name) - a mock that always
+    // returns just the bare key would let a wrong/omitted/misnamed
+    // variable pass silently.
+    t: (key: string, vars?: Record<string, string | number>) =>
+      vars ? `${key}:${JSON.stringify(vars)}` : key,
   }),
 }))
 
@@ -141,7 +147,12 @@ describe("ChatStartScreen agents section", () => {
       />
     )
 
-    expect(screen.getByText("chatPage.sections.leadReady")).toBeTruthy()
+    // Asserts the actual interpolated agent name, not just that the
+    // translation key rendered - a wrong/omitted `name` variable would
+    // still pass a bare-key check.
+    expect(
+      screen.getByText('chatPage.sections.leadReady:{"name":"Maya"}')
+    ).toBeTruthy()
     // The hero portrait is named (it stands alone, not beside redundant
     // text in one interactive control) - the pill's own portrait is
     // decorative, so both are asserted by src via the DOM instead of by
@@ -168,7 +179,7 @@ describe("ChatStartScreen agents section", () => {
       { id: 7, name: "Maya", persona_avatar: "/marketplace/avatars/maya.png" },
     ])
 
-    expect(screen.queryByText("chatPage.sections.leadReady")).toBeNull()
+    expect(screen.queryByText(/chatPage\.sections\.leadReady/)).toBeNull()
     // No *named* portrait (the hero didn't swap in) - her picker pill
     // still renders its own (decorative) portrait either way.
     expect(screen.queryByRole("img", { name: "Maya" })).toBeNull()

@@ -77,6 +77,11 @@ class RuntimeUserFields:
 
     id: int
     is_admin: bool
+    # Onboarding "Launch" step voice choice, or None if unset/unrecognized -
+    # already reduced from the raw preferences JSON here so nothing
+    # downstream needs to touch that column again (see apply_user_voice
+    # in api/agents.py).
+    voice: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -272,7 +277,7 @@ def load_task_setup_snapshot_sync(
             raise TaskOwnerMismatchError(task_id, task_owner_user_id, owner_user_id)
 
         runtime_user_row = (
-            session.query(User.id, User.is_admin)
+            session.query(User.id, User.is_admin, User.preferences)
             .filter(User.id == owner_user_id)
             .first()
         )
@@ -280,6 +285,11 @@ def load_task_setup_snapshot_sync(
             RuntimeUserFields(
                 id=int(runtime_user_row[0]),
                 is_admin=bool(runtime_user_row[1]),
+                voice=(
+                    cast(dict, runtime_user_row[2] or {}).get("voice")
+                    if isinstance(runtime_user_row[2], dict)
+                    else None
+                ),
             )
             if runtime_user_row is not None
             else None

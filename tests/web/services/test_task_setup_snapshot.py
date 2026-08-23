@@ -197,6 +197,39 @@ def test_basic_task_no_agent_builder(db_session) -> None:
     assert snapshot.agent_config is None
     assert snapshot.excluded_agent_id is None
 
+
+def test_runtime_user_voice_reduced_from_preferences(db_session) -> None:
+    """`RuntimeUserFields.voice` is reduced from the owner's preferences
+    JSON by the SAME query that fetches id/is_admin - see
+    api/agents.py's apply_user_voice, which relies on this to avoid a
+    second query against a request session that may already be
+    released by the time a system prompt is assembled."""
+    user = _create_user(db_session)
+    user.preferences = {"voice": "warm", "department": "Sales"}
+    db_session.commit()
+    task = _create_task(db_session, user_id=int(user.id))
+
+    snapshot = load_task_setup_snapshot_sync(
+        task_id=int(task.id), task_owner_user_id=int(user.id)
+    )
+
+    assert snapshot is not None
+    assert snapshot.runtime_user == RuntimeUserFields(
+        id=int(user.id), is_admin=False, voice="warm"
+    )
+
+
+def test_runtime_user_voice_is_none_without_preferences(db_session) -> None:
+    user = _create_user(db_session)
+    task = _create_task(db_session, user_id=int(user.id))
+
+    snapshot = load_task_setup_snapshot_sync(
+        task_id=int(task.id), task_owner_user_id=int(user.id)
+    )
+
+    assert snapshot is not None
+    assert snapshot.runtime_user.voice is None
+
     # task_pattern derived from execution_mode
     assert snapshot.task_pattern == "single_call"  # "flash" -> single_call
 

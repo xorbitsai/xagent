@@ -2766,7 +2766,11 @@ class AgentServiceManager:
                     tools_list, tool_config = tools
 
                     # Get system prompt from agent config (if available)
-                    from .agents import enhance_system_prompt_with_kb
+                    from .agents import (
+                        apply_user_voice,
+                        enhance_system_prompt_with_kb,
+                        voice_from_runtime_user,
+                    )
 
                     system_prompt = (
                         agent_config.get("instructions") if agent_config else None
@@ -2779,6 +2783,13 @@ class AgentServiceManager:
                     )
                     system_prompt = _build_workforce_system_prompt(
                         system_prompt, workforce_runtime
+                    )
+                    # `runtime_user` (not a fresh query) - see
+                    # apply_user_voice's docstring for why: this session may
+                    # already be released back to the pool by this point
+                    # (release_db_connection_if_clean above).
+                    system_prompt = apply_user_voice(
+                        system_prompt, voice_from_runtime_user(runtime_user)
                     )
 
                     # Extract memory similarity threshold from agent config
@@ -3609,7 +3620,11 @@ class AgentServiceManager:
                 task_setup_snapshot=snapshot,
             )
 
-            from .agents import enhance_system_prompt_with_kb
+            from .agents import (
+                apply_user_voice,
+                enhance_system_prompt_with_kb,
+                voice_from_runtime_user,
+            )
 
             agent_config = snapshot.agent_config
             system_prompt = agent_config.get("instructions") if agent_config else None
@@ -3618,6 +3633,9 @@ class AgentServiceManager:
             system_prompt = _build_workforce_system_prompt(
                 system_prompt,
                 snapshot.workforce_runtime,
+            )
+            system_prompt = apply_user_voice(
+                system_prompt, voice_from_runtime_user(snapshot.runtime_user)
             )
             memory_similarity_threshold = (
                 agent_config.get("memory_similarity_threshold")

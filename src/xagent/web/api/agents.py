@@ -4,7 +4,7 @@ import logging
 import secrets
 import uuid
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Literal, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Union, cast
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
@@ -36,6 +36,9 @@ from ..services.agent_access import (
     accessible_agent_permissions,
     list_accessible_agents,
 )
+
+if TYPE_CHECKING:
+    from ..services.task_setup_snapshot import RuntimeUserFields
 from ..services.agent_management import (
     AgentManagementRuntime,
     AgentManagementService,
@@ -61,6 +64,7 @@ from ..services.llm_utils import UserAwareModelStorage
 from ..services.workforce_access import get_visible_agent_ids
 from ..tools.config import WebToolConfig
 from ..user_isolated_memory import UserContext
+from .auth import VALID_USER_VOICES
 from .templates import get_or_create_template_stats, increment_template_used_count
 
 logger = logging.getLogger(__name__)
@@ -303,6 +307,96 @@ def enhance_system_prompt_with_kb(
     if system_prompt:
         return system_prompt + kb_prompt
     return kb_prompt.lstrip("\n")
+
+
+# Short style instructions for each onboarding "Launch" step voice choice
+# (see VALID_USER_VOICES/UpdatePreferencesRequest in api/auth.py) - the
+# example line for each mirrors the reference UI's own "<voice> sounds
+# like" preview, so the model's actual output matches what the user was
+# shown when they picked it.
+_VOICE_INSTRUCTIONS: Dict[str, str] = {
+    "professional": (
+        "Formal and polished: precise word choice, complete sentences, no "
+        'slang. Example: "Thanks for reaching out. I have reviewed your '
+        'request and will come back to you with an answer by Thursday."'
+    ),
+    "friendly": (
+        "Warm and conversational, like a helpful colleague. Example: "
+        "\"Thanks so much for getting in touch! I've had a look and I'll "
+        'get you an answer by Thursday."'
+    ),
+    "concise": (
+        "As short as possible: drop pleasantries and filler words, state "
+        "only what's needed. Example: \"Reviewed. You will have an answer "
+        'by Thursday."'
+    ),
+    "warm": (
+        "Empathetic and reassuring: acknowledge the person's situation "
+        'before getting to the point. Example: "Thanks for flagging this '
+        "- I know the timing matters, so I've prioritised it and will "
+        'have an answer to you by Thursday."'
+    ),
+    "playful": (
+        "Light and upbeat, with personality, not stiff or overly formal. "
+        "Example: \"Got it - thanks for the nudge! I'm on it, and you'll "
+        'have an answer by Thursday."'
+    ),
+}
+assert set(_VOICE_INSTRUCTIONS) == VALID_USER_VOICES, (
+    "_VOICE_INSTRUCTIONS must define exactly the voices UpdatePreferencesRequest "
+    "accepts (api/auth.py's VALID_USER_VOICES) - otherwise a valid, storable "
+    "voice preference could silently have no prompt effect."
+)
+
+
+def apply_user_voice(
+    system_prompt: Optional[str], voice: Optional[str]
+) -> Optional[str]:
+    """Append the given output voice (the current user's onboarding Launch
+    step choice, set via PATCH /api/auth/me/preferences) as a `##
+    OUTPUT VOICE` section, so every agent this user talks to writes in
+    the tone they picked - deliberately separate from the existing
+    output LANGUAGE policy (core/agent/language.py), which controls what
+    language a response is in, not what tone it uses.
+
+    Takes the already-resolved voice string rather than a db/user_id:
+    callers already have a runtime user object in hand by the time a
+    system prompt is assembled (either the full `User` ORM row, or the
+    detached `RuntimeUserFields` from an off-loop snapshot -
+    task_setup_snapshot.py resolves `voice` onto it from the very same
+    query that fetches `id`/`is_admin`), and issuing a fresh query here
+    would either duplicate that lookup or - worse - run one against a
+    request session that may already have been released back to the
+    pool by this point in agent construction. A no-op when voice is
+    None/empty or doesn't match a known option (e.g. an
+    older/unrecognized value)."""
+    instruction = _VOICE_INSTRUCTIONS.get(voice) if voice else None
+    if not instruction:
+        return system_prompt
+
+    voice_prompt = f"\n\n## OUTPUT VOICE\n{instruction}"
+    if system_prompt:
+        return system_prompt + voice_prompt
+    return voice_prompt.lstrip("\n")
+
+
+def voice_from_runtime_user(
+    runtime_user: Optional[Union[User, "RuntimeUserFields"]],
+) -> Optional[str]:
+    """Extract the voice preference from whichever runtime-user shape a
+    caller has in hand, without issuing a new query - see
+    apply_user_voice's docstring for why. Handles both the full `User`
+    ORM row (has `.preferences`, a raw JSON dict) and the detached
+    `RuntimeUserFields` snapshot (already has a plain `.voice` string)."""
+    if runtime_user is None:
+        return None
+    voice = getattr(runtime_user, "voice", None)
+    if voice is not None:
+        return cast(Optional[str], voice)
+    preferences = getattr(runtime_user, "preferences", None)
+    if isinstance(preferences, dict):
+        return preferences.get("voice")
+    return None
 
 
 # ===== Helper Functions =====

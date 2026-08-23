@@ -360,6 +360,101 @@ class TestAuthAPI:
         assert data["success"] is True
         assert data["user"]["username"] == test_user_data["username"]
         assert data["user"]["email"] == test_user_data["email"]
+        assert data["user"]["preferences"] == {}
+
+    def test_update_current_user_preferences_merges_across_calls(
+        self, test_db, test_user_data
+    ):
+        """Onboarding writes preferences incrementally, one step at a time
+        (About you, then Goals, then Launch) - a later PATCH must not erase
+        an earlier step's answer."""
+        setup_first_admin()
+        register_response = client.post("/api/auth/register", json=test_user_data)
+        assert register_response.status_code == 200
+        token = login_and_get_token(
+            test_user_data["username"], test_user_data["password"]
+        )
+        headers = {"Authorization": f"Bearer {token}"}
+
+        first = client.patch(
+            "/api/auth/me/preferences",
+            json={"department": "Sales", "industry": "Real estate"},
+            headers=headers,
+        )
+        assert first.status_code == 200, first.text
+        assert first.json()["user"]["preferences"] == {
+            "department": "Sales",
+            "industry": "Real estate",
+        }
+
+        second = client.patch(
+            "/api/auth/me/preferences",
+            json={"voice": "friendly", "goals": ["Reply to new leads fast"]},
+            headers=headers,
+        )
+        assert second.status_code == 200, second.text
+        assert second.json()["user"]["preferences"] == {
+            "department": "Sales",
+            "industry": "Real estate",
+            "voice": "friendly",
+            "goals": ["Reply to new leads fast"],
+        }
+
+        # A later PATCH can also overwrite one earlier field while leaving
+        # the others untouched.
+        third = client.patch(
+            "/api/auth/me/preferences",
+            json={"onboarded": True},
+            headers=headers,
+        )
+        assert third.status_code == 200, third.text
+        assert third.json()["user"]["preferences"] == {
+            "department": "Sales",
+            "industry": "Real estate",
+            "voice": "friendly",
+            "goals": ["Reply to new leads fast"],
+            "onboarded": True,
+        }
+
+        # Persisted, not just echoed back - confirm a fresh /me sees it too.
+        me = client.get("/api/auth/me", headers=headers)
+        assert me.json()["user"]["preferences"]["onboarded"] is True
+
+    def test_update_current_user_preferences_rejects_unknown_voice(
+        self, test_db, test_user_data
+    ):
+        setup_first_admin()
+        register_response = client.post("/api/auth/register", json=test_user_data)
+        assert register_response.status_code == 200
+        token = login_and_get_token(
+            test_user_data["username"], test_user_data["password"]
+        )
+
+        response = client.patch(
+            "/api/auth/me/preferences",
+            json={"voice": "sarcastic"},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert response.status_code == 422
+
+    def test_update_current_user_preferences_with_empty_body_is_a_no_op(
+        self, test_db, test_user_data
+    ):
+        setup_first_admin()
+        register_response = client.post("/api/auth/register", json=test_user_data)
+        assert register_response.status_code == 200
+        token = login_and_get_token(
+            test_user_data["username"], test_user_data["password"]
+        )
+        headers = {"Authorization": f"Bearer {token}"}
+        client.patch(
+            "/api/auth/me/preferences", json={"department": "Sales"}, headers=headers
+        )
+
+        response = client.patch("/api/auth/me/preferences", json={}, headers=headers)
+
+        assert response.status_code == 200
+        assert response.json()["user"]["preferences"] == {"department": "Sales"}
 
     def test_update_current_user_email(self, test_db, test_user_data):
         setup_first_admin()

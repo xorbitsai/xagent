@@ -44,6 +44,7 @@ from xagent.web.services.task_runtime import (
     TASK_RUNTIME_BINDINGS_AGENT_CONFIG_KEY,
     task_extension_bindings_from_agent_config,
 )
+from xagent.web.services.task_setup_snapshot import RuntimeUserFields
 from xagent.web.services.workforce_access import WorkforcePolicy, set_workforce_policy
 from xagent.web.services.workforce_lifecycle import discard_draft_workforce
 
@@ -3681,3 +3682,96 @@ def test_policy_shared_non_admin_reads_agent_detail_read_only():
     body = resp.json()
     assert body["readonly"] is True
     assert body["can_edit"] is False
+
+
+def _set_preferences(user_id: int, preferences: dict[str, Any]) -> None:
+    db = _direct_db_session()
+    try:
+        user = db.query(User).filter(User.id == user_id).first()
+        assert user is not None
+        user.preferences = preferences
+        db.commit()
+    finally:
+        db.close()
+
+
+class TestApplyUserVoice:
+    """Unit tests for apply_user_voice - the onboarding Launch-step voice
+    preference's system-prompt injection, alongside enhance_system_prompt_with_kb."""
+
+    def test_no_voice_returns_prompt_unchanged(self):
+        assert agents_api.apply_user_voice("Be helpful.", None) == "Be helpful."
+
+    def test_unrecognized_voice_value_returns_prompt_unchanged(self):
+        assert agents_api.apply_user_voice("Be helpful.", "sarcastic") == "Be helpful."
+
+    def test_known_voice_appends_output_voice_section(self):
+        result = agents_api.apply_user_voice("Be helpful.", "concise")
+
+        assert result.startswith("Be helpful.\n\n## OUTPUT VOICE\n")
+        assert "As short as possible" in result
+
+    def test_none_system_prompt_with_voice_omits_leading_blank_lines(self):
+        result = agents_api.apply_user_voice(None, "warm")
+
+        assert result.startswith("## OUTPUT VOICE\n")
+
+    def test_every_valid_voice_has_a_matching_instruction(self):
+        # Guards the module-level consistency assertion in agents.py itself
+        # (VALID_USER_VOICES vs _VOICE_INSTRUCTIONS) with an explicit test,
+        # so a future divergence fails a test, not just an import-time assert.
+        assert set(agents_api._VOICE_INSTRUCTIONS) == agents_api.VALID_USER_VOICES
+
+
+class TestVoiceFromRuntimeUser:
+    """Unit tests for voice_from_runtime_user - extracts the voice
+    preference without issuing a new query, from whichever runtime-user
+    shape a caller already has in hand (see apply_user_voice's docstring
+    for why a fresh query is deliberately avoided here)."""
+
+    def test_none_runtime_user_returns_none(self):
+        assert agents_api.voice_from_runtime_user(None) is None
+
+    def test_runtime_user_fields_with_voice_set(self):
+        runtime_user = RuntimeUserFields(id=1, is_admin=False, voice="friendly")
+        assert agents_api.voice_from_runtime_user(runtime_user) == "friendly"
+
+    def test_runtime_user_fields_with_no_voice(self):
+        runtime_user = RuntimeUserFields(id=1, is_admin=False)
+        assert agents_api.voice_from_runtime_user(runtime_user) is None
+
+    def test_full_user_orm_row_reads_from_preferences(self):
+        _admin_headers()
+        user_id = _user_id("admin")
+        _set_preferences(user_id, {"voice": "playful"})
+
+        db = _direct_db_session()
+        try:
+            user = db.query(User).filter(User.id == user_id).first()
+            assert agents_api.voice_from_runtime_user(user) == "playful"
+        finally:
+            db.close()
+
+    def test_full_user_orm_row_with_no_preferences(self):
+        _admin_headers()
+        user_id = _user_id("admin")
+        _set_preferences(user_id, {})
+
+        db = _direct_db_session()
+        try:
+            user = db.query(User).filter(User.id == user_id).first()
+            assert agents_api.voice_from_runtime_user(user) is None
+        finally:
+            db.close()
+
+    def test_unexpected_shape_does_not_raise(self):
+        # A caller passing something that's neither RuntimeUserFields nor a
+        # real User row (e.g. a mismatched test double) must degrade to "no
+        # voice" rather than crash agent construction over a cosmetic
+        # preference - see test_agent_manager_reconstruction.py's
+        # test_admin_task_uses_task_owner_workspace_dirs, which broke this
+        # way when apply_user_voice used to query on its own.
+        class _NotAUser:
+            pass
+
+        assert agents_api.voice_from_runtime_user(_NotAUser()) is None

@@ -9,7 +9,7 @@ import os
 import re
 import secrets
 from datetime import datetime, timedelta, timezone
-from typing import Annotated, Any, Dict, Literal, Optional, cast
+from typing import Annotated, Any, Dict, List, Literal, Optional, cast
 
 import requests
 
@@ -621,6 +621,38 @@ class UpdateEmailResponse(BaseModel):
     user: Optional[Dict[str, Any]] = None
 
 
+# The 5 voice options the onboarding "Launch" step offers - each agent's
+# system prompt gets a short instruction derived from whichever one the
+# user picked (see _apply_user_voice in api/chat.py).
+VALID_USER_VOICES = {"professional", "friendly", "concise", "warm", "playful"}
+
+
+class UpdatePreferencesRequest(BaseModel):
+    """Partial update for the current user's onboarding/voice preferences.
+    Only fields actually present in the request body are merged into the
+    stored dict (see exclude_unset=True below) - onboarding writes these
+    incrementally, one step at a time, not all at once."""
+
+    onboarded: Optional[bool] = None
+    department: Optional[str] = None
+    industry: Optional[str] = None
+    voice: Optional[str] = None
+    goals: Optional[List[str]] = None
+
+    @field_validator("voice")
+    @classmethod
+    def _validate_voice(cls, value: Optional[str]) -> Optional[str]:
+        if value is not None and value not in VALID_USER_VOICES:
+            raise ValueError(f"voice must be one of {sorted(VALID_USER_VOICES)}")
+        return value
+
+
+class UpdatePreferencesResponse(BaseModel):
+    success: bool
+    message: str
+    user: Optional[Dict[str, Any]] = None
+
+
 class RefreshTokenRequest(BaseModel):
     """Refresh token request model"""
 
@@ -918,6 +950,7 @@ def serialize_auth_user(user: User, include_login_time: bool = False) -> Dict[st
         "username": user.username,
         "email": user.email,
         "is_admin": bool(cast(Any, user.is_admin)),
+        "preferences": dict(cast(Any, user.preferences) or {}),
     }
     if include_login_time:
         payload["loginTime"] = datetime.now(timezone.utc).timestamp()
@@ -1271,6 +1304,31 @@ async def update_current_user_email(
     return UpdateEmailResponse(
         success=True,
         message="Email updated successfully",
+        user=serialize_auth_user(user),
+    )
+
+
+@auth_router.patch("/me/preferences", response_model=UpdatePreferencesResponse)
+async def update_current_user_preferences(
+    request: UpdatePreferencesRequest,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> UpdatePreferencesResponse:
+    """Merge the given fields into the current user's stored preferences.
+    Each onboarding step (About you, Goals, Launch) calls this with only
+    its own fields - a merge, not a replace, so an earlier step's answer
+    survives a later step's PATCH."""
+    updates = request.model_dump(exclude_unset=True)
+    if updates:
+        current_preferences = dict(cast(Any, user.preferences) or {})
+        current_preferences.update(updates)
+        setattr(user, "preferences", current_preferences)
+        db.commit()
+        db.refresh(user)
+
+    return UpdatePreferencesResponse(
+        success=True,
+        message="Preferences updated successfully",
         user=serialize_auth_user(user),
     )
 

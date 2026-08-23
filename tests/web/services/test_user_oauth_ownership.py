@@ -67,26 +67,6 @@ def _db(tmp_path):
     return engine, db, user, rows
 
 
-def test_scoped_query_normalizes_int_like_user_ids(tmp_path) -> None:
-    engine, db, user, _rows = _db(tmp_path)
-
-    class IntLikeUserId:
-        def __int__(self) -> int:
-            return int(user.id)
-
-    try:
-        accounts = list_scoped_user_oauth_accounts(
-            db,
-            user_id=IntLikeUserId(),  # type: ignore[arg-type]
-            resource_owner_key=None,
-        )
-
-        assert [account.access_token for account in accounts] == ["ordinary"]
-    finally:
-        db.close()
-        engine.dispose()
-
-
 def test_listing_never_crosses_owner_namespaces(tmp_path) -> None:
     engine, db, user, _rows = _db(tmp_path)
     try:

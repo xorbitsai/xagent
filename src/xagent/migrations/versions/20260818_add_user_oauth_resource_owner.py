@@ -288,6 +288,8 @@ def upgrade() -> None:
     if not needs_column or not has_old_constraint:
         raise RuntimeError("UserOAuth schema is partially owner-aware")
 
+    # The partial-schema guard above proves that this is the exact legacy
+    # shape: the owner column is absent and the old constraint is present.
     if dialect == "sqlite":
         collisions = _sqlite_global_owner_relation_names()
         if collisions:
@@ -296,27 +298,21 @@ def upgrade() -> None:
                 "owner-aware SQLite schema names already exist before migration: "
                 f"{names}"
             )
-        if needs_column or has_old_constraint:
-            # SQLite cannot drop a named UNIQUE constraint directly. Batch mode
-            # rebuilds the table once while preserving every credential row.
-            with op.batch_alter_table(TABLE) as batch_op:
-                if needs_column:
-                    batch_op.add_column(
-                        sa.Column(OWNER_COLUMN, sa.String(OWNER_LENGTH))
-                    )
-                if needs_user_cascade_fk:
-                    batch_op.create_foreign_key(
-                        USER_CASCADE_FK,
-                        USERS_TABLE,
-                        ["user_id"],
-                        ["id"],
-                        ondelete="CASCADE",
-                    )
-                if has_old_constraint:
-                    batch_op.drop_constraint(OLD_CONSTRAINT, type_="unique")
+        # SQLite cannot drop a named UNIQUE constraint directly. Batch mode
+        # rebuilds the table once while preserving every credential row.
+        with op.batch_alter_table(TABLE) as batch_op:
+            batch_op.add_column(sa.Column(OWNER_COLUMN, sa.String(OWNER_LENGTH)))
+            if needs_user_cascade_fk:
+                batch_op.create_foreign_key(
+                    USER_CASCADE_FK,
+                    USERS_TABLE,
+                    ["user_id"],
+                    ["id"],
+                    ondelete="CASCADE",
+                )
+            batch_op.drop_constraint(OLD_CONSTRAINT, type_="unique")
     elif dialect == "postgresql":
-        if needs_column:
-            op.add_column(TABLE, sa.Column(OWNER_COLUMN, sa.String(OWNER_LENGTH)))
+        op.add_column(TABLE, sa.Column(OWNER_COLUMN, sa.String(OWNER_LENGTH)))
         if needs_user_cascade_fk:
             op.create_foreign_key(
                 USER_CASCADE_FK,
@@ -333,7 +329,7 @@ def upgrade() -> None:
     # therefore exist before the old constraint is removed, while any failure
     # rolls back the complete schema transition for a clean retry.
     _create_owner_indexes()
-    if dialect == "postgresql" and has_old_constraint:
+    if dialect == "postgresql":
         op.drop_constraint(OLD_CONSTRAINT, TABLE, type_="unique")
 
 

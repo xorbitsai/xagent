@@ -197,6 +197,9 @@ def test_basic_task_no_agent_builder(db_session) -> None:
     assert snapshot.agent_config is None
     assert snapshot.excluded_agent_id is None
 
+    # task_pattern derived from execution_mode
+    assert snapshot.task_pattern == "single_call"  # "flash" -> single_call
+
 
 def test_runtime_user_voice_reduced_from_preferences(db_session) -> None:
     """`RuntimeUserFields.voice` is reduced from the owner's preferences
@@ -229,9 +232,6 @@ def test_runtime_user_voice_is_none_without_preferences(db_session) -> None:
 
     assert snapshot is not None
     assert snapshot.runtime_user.voice is None
-
-    # task_pattern derived from execution_mode
-    assert snapshot.task_pattern == "single_call"  # "flash" -> single_call
 
 
 @pytest.mark.parametrize("source", ["sdk", "trigger", None])

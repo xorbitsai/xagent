@@ -1828,6 +1828,9 @@ async def preview_agent(
             request.instructions if request.instructions else None,
             request.knowledge_bases if request.knowledge_bases is not None else None,
         )
+        enhanced_system_prompt = apply_user_voice(
+            enhanced_system_prompt, voice_from_runtime_user(current_user)
+        )
 
         # Create agent service (Langfuse only, no database/websocket logging)
         memory = InMemoryMemoryStore()

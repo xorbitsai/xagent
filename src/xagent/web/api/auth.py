@@ -623,7 +623,7 @@ class UpdateEmailResponse(BaseModel):
 
 # The 5 voice options the onboarding "Launch" step offers - each agent's
 # system prompt gets a short instruction derived from whichever one the
-# user picked (see _apply_user_voice in api/chat.py).
+# user picked (see apply_user_voice in api/agents.py).
 VALID_USER_VOICES = {"professional", "friendly", "concise", "warm", "playful"}
 
 

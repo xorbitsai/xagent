@@ -33,6 +33,7 @@ def _build_reconstruction_snapshot(
     task_llm=None,
     task_pattern: str = "dag_plan_execute",
     agent_config: dict | None = None,
+    voice: str | None = None,
 ) -> TaskSetupSnapshot:
     """Build the detached reconstruction contract consumed on the event loop."""
     trace_events = trace_events or []
@@ -76,6 +77,7 @@ def _build_reconstruction_snapshot(
         runtime_user=RuntimeUserFields(
             id=int(user.id),
             is_admin=bool(user.is_admin),
+            voice=voice,
         ),
         has_reconstructable_history=reconstruction.has_history,
         task_pattern=task_pattern,
@@ -407,6 +409,79 @@ class TestAgentServiceManagerReconstruction:
         assert str(uploads_dir / "user_7") in workspace_config["allowed_external_dirs"]
 
     @pytest.mark.asyncio
+    async def test_owner_voice_preference_is_applied_to_the_system_prompt(
+        self, agent_manager, mock_db, tmp_path
+    ):
+        """End-to-end check of chat.py's own wiring (not just the
+        apply_user_voice/voice_from_runtime_user units in isolation): a
+        task owner with a voice preference set must get an `## OUTPUT
+        VOICE` section in the AgentService's actual system_prompt."""
+        owner_task = Task(
+            id=1,
+            user_id=7,
+            title="Owner Task",
+            description="Task owned by the acting user",
+            status=TaskStatus.PENDING,
+            agent_type="standard",
+        )
+        owner_user = User(
+            id=7,
+            username="owner",
+            password_hash="hashed_password",
+            is_admin=False,
+        )
+        snapshot = _build_reconstruction_snapshot(
+            owner_task,
+            owner_user,
+            task_llm=MagicMock(),
+            agent_config={
+                "instructions": "Base instructions.",
+                "knowledge_bases": [],
+                "skills": [],
+            },
+            voice="warm",
+        )
+        uploads_dir = tmp_path / "uploads"
+
+        with (
+            patch("xagent.web.api.chat.AgentService") as mock_agent_service_class,
+            patch(
+                "xagent.web.services.llm_utils.UserAwareModelStorage.resolve_llms_from_names"
+            ) as mock_resolve_llms,
+            patch("xagent.web.api.chat.get_memory_store") as mock_get_memory,
+            patch(
+                "xagent.web.services.workspace_binding.get_uploads_dir",
+                return_value=uploads_dir,
+            ),
+            patch(
+                "xagent.core.tools.adapters.vibe.factory.ToolFactory"
+            ) as mock_tool_factory,
+        ):
+            mock_resolve_llms.return_value = (MagicMock(), None, None, None)
+            mock_get_memory.return_value = MagicMock()
+            mock_tool_factory.create_all_tools = AsyncMock(return_value=[])
+            mock_agent_service = MagicMock()
+            mock_agent_service_class.return_value = mock_agent_service
+
+            mock_task_query = MagicMock()
+            mock_task_query.filter.return_value = mock_task_query
+            mock_task_query.first.return_value = owner_task
+            mock_db.query.return_value = mock_task_query
+
+            await agent_manager.get_agent_for_task(
+                1,
+                mock_db,
+                user=owner_user,
+                task_setup_snapshot=snapshot,
+                task_owner_user_id=7,
+                resolved_execution_scope=None,
+            )
+
+        system_prompt = mock_agent_service_class.call_args.kwargs["system_prompt"]
+        assert system_prompt.startswith("Base instructions.\n\n## OUTPUT VOICE\n")
+        assert "Empathetic and reassuring" in system_prompt
+
+    @pytest.mark.asyncio
     async def test_build_tools_maps_categories_from_full_catalog(
         self, agent_manager, mock_db, sample_task, mock_user, monkeypatch
     ):
@@ -671,6 +746,60 @@ class TestAgentServiceManagerReconstruction:
         _, agent_kwargs = mock_agent_service_class.call_args
         assert agent_kwargs["llm"] is runtime_llm
         assert agent_kwargs["pattern"] == "react"
+
+    @pytest.mark.asyncio
+    async def test_reconstruct_agent_from_history_applies_owner_voice_preference(
+        self,
+        agent_manager,
+        mock_user,
+        sample_task,
+        sample_trace_events,
+        sample_dag_execution,
+    ):
+        """End-to-end check of chat.py's own wiring in the resume/reconstruct
+        path (not just the apply_user_voice/voice_from_runtime_user units in
+        isolation): a task whose owner has a voice preference set must get
+        an `## OUTPUT VOICE` section in the AgentService's actual
+        system_prompt when the agent is reconstructed from persisted
+        history."""
+        runtime_llm = MagicMock()
+        runtime_llm.model_name = "task-qwen"
+        agent_config = {
+            "instructions": "Base instructions.",
+            "skills": [],
+            "knowledge_bases": [],
+        }
+        snapshot = _build_reconstruction_snapshot(
+            sample_task,
+            mock_user,
+            trace_events=sample_trace_events,
+            dag_execution=sample_dag_execution,
+            task_llm=runtime_llm,
+            agent_config=agent_config,
+            voice="warm",
+        )
+
+        with (
+            patch(
+                "xagent.web.api.chat.create_default_tools",
+                new=AsyncMock(return_value=(["tool"], "tool_config")),
+            ),
+            patch("xagent.web.sandbox_manager.get_sandbox_manager", return_value=None),
+            patch("xagent.web.api.chat.AgentService") as mock_agent_service_class,
+        ):
+            mock_agent_instance = MagicMock()
+            mock_agent_instance.reconstruct_from_history = AsyncMock()
+            mock_agent_service_class.return_value = mock_agent_instance
+
+            await agent_manager._reconstruct_agent_from_history(
+                1,
+                None,
+                task_setup_snapshot=snapshot,
+            )
+
+        system_prompt = mock_agent_service_class.call_args.kwargs["system_prompt"]
+        assert system_prompt.startswith("Base instructions.\n\n## OUTPUT VOICE\n")
+        assert "Empathetic and reassuring" in system_prompt
 
     @pytest.mark.asyncio
     async def test_reconstruct_agent_from_history_no_data(

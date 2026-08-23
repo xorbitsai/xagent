@@ -35,8 +35,8 @@ class User(Base):  # type: ignore
     # Onboarding-collected settings: {onboarded, department, industry, voice,
     # goals}. Written incrementally (one PATCH per onboarding step merges
     # into this dict, not replaces it) - see update_current_user_preferences
-    # in api/auth.py. `voice` feeds _apply_user_voice's system-prompt
-    # injection in api/chat.py.
+    # in api/auth.py. `voice` feeds apply_user_voice's system-prompt
+    # injection in api/agents.py.
     preferences = Column(JSON, nullable=True, default=dict)
 
     # Relationships

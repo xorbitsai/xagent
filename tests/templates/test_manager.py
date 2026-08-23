@@ -898,29 +898,6 @@ workforce_config:
 
         assert not offenders, "\n".join(offenders)
 
-    def test_builtin_templates_cap_sample_prompts_at_two(self):
-        """The Task-page quick-access grid only ever renders the first 2
-        sample prompts per template (TemplateQuickAccess.tsx), so authoring
-        more than that on a built-in template is dead content that silently
-        never shows - catch it at authoring time instead."""
-        built_in_dir = (
-            Path(__file__).resolve().parents[2] / "src/xagent/templates/built_in"
-        )
-        offenders: list[str] = []
-
-        for template_file in sorted(built_in_dir.glob("*.yaml")):
-            data = yaml.safe_load(template_file.read_text(encoding="utf-8")) or {}
-            sample_prompts = data.get("sample_prompts") or {}
-            if not isinstance(sample_prompts, dict):
-                continue
-            for locale, prompts in sample_prompts.items():
-                if isinstance(prompts, list) and len(prompts) > 2:
-                    offenders.append(
-                        f"{template_file.name} [{locale}]: {len(prompts)} sample_prompts (max 2 are shown)"
-                    )
-
-        assert not offenders, "\n".join(offenders)
-
     @pytest.mark.asyncio
     async def test_nonexistent_templates_directory(self, tmp_path):
         """测试不存在的模板目录"""

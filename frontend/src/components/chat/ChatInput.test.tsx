@@ -598,6 +598,43 @@ describe("ChatInput", () => {
     })
   })
 
+  it("submits the live taskConfig executionMode, not a stale value inherited by the internal mirror", async () => {
+    // Same root cause as the model test above, but for executionMode: the
+    // internal `agentConfig` mirror only clears its stale executionMode
+    // asynchronously (a separate effect, once taskConfig goes away), and
+    // the submit path used to spread that live-computed value only when
+    // truthy - so a falsy live value (taskConfig gone entirely, e.g. the
+    // new lead's own config fetch is still in flight) silently fell
+    // through to whatever executionMode the mirror still held from the
+    // PREVIOUS lead, instead of clearing it the same way `model` does.
+    const onSend = vi.fn()
+    const commonProps = {
+      hideFileUpload: true,
+      inputValue: "hello",
+      onInputChange: vi.fn(),
+      onSend,
+      readOnlyConfig: true,
+    }
+    const { container, rerender } = render(
+      <ChatInput {...commonProps} taskConfig={{ model: "agent-a-model", executionMode: "think" }} />
+    )
+
+    // Caller switched leads - the new lead's own config fetch resets
+    // taskConfig to undefined while still in flight (readOnlyConfig stays
+    // true throughout), same as the page-level race this whole family of
+    // fixes targets.
+    rerender(<ChatInput {...commonProps} taskConfig={undefined} />)
+
+    fireEvent.submit(container.querySelector("form") as HTMLFormElement)
+
+    await waitFor(() => {
+      expect(onSend).toHaveBeenCalledWith(
+        "hello",
+        expect.objectContaining({ executionMode: undefined })
+      )
+    })
+  })
+
   it("does not show pause for uppercase terminal task status", () => {
     const { container } = render(
       <ChatInput

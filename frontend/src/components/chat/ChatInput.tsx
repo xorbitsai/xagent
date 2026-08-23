@@ -716,6 +716,9 @@ export function ChatInput({
       const executionMode = showExecutionModePicker
         ? pickedExecutionMode
         : taskConfig?.executionMode;
+      const normalizedExecutionMode = executionMode
+        ? (typeof executionMode === "string" ? { mode: executionMode } : executionMode)
+        : undefined;
       const extraRuntimeExtensions = activeLocalBrowserTarget
         ? { local_browser: { ...activeLocalBrowserTarget } }
         : activeTaskRuntimeSelection?.runtimeExtensions;
@@ -742,6 +745,14 @@ export function ChatInput({
               smallFastModel: taskConfig?.smallFastModel,
               visualModel: taskConfig?.visualModel,
               compactModel: taskConfig?.compactModel,
+              // Same live-vs-mirror reasoning as the model fields above,
+              // applied to executionMode: a falsy live value must still
+              // explicitly clear the key here rather than being skipped,
+              // or it would silently fall through to whatever stale
+              // executionMode `agentConfig` (spread below) still carries
+              // from the previous lead while its own mirroring effect
+              // hasn't caught up yet.
+              executionMode: normalizedExecutionMode,
             }
           : {}),
         clientMessageId,
@@ -753,13 +764,8 @@ export function ChatInput({
               },
             }
           : {}),
-        ...(executionMode
-          ? {
-              executionMode:
-                typeof executionMode === "string"
-                  ? { mode: executionMode }
-                  : executionMode,
-            }
+        ...(!configIsDrivenByTaskConfig && normalizedExecutionMode
+          ? { executionMode: normalizedExecutionMode }
           : {}),
       };
 

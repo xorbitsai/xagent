@@ -39,6 +39,7 @@ from ..services.agent_access import (
 
 if TYPE_CHECKING:
     from ..services.task_setup_snapshot import RuntimeUserFields
+    from .websocket_auth import WebSocketPrincipal
 from ..services.agent_management import (
     AgentManagementRuntime,
     AgentManagementService,
@@ -384,13 +385,14 @@ def apply_user_voice(
 
 
 def voice_from_runtime_user(
-    runtime_user: Optional[Union[User, "RuntimeUserFields"]],
+    runtime_user: Optional[Union[User, "RuntimeUserFields", "WebSocketPrincipal"]],
 ) -> Optional[str]:
     """Extract the voice preference from whichever runtime-user shape a
     caller has in hand, without issuing a new query - see
-    apply_user_voice's docstring for why. Handles both the full `User`
-    ORM row (has `.preferences`, a raw JSON dict) and the detached
-    `RuntimeUserFields` snapshot (already has a plain `.voice` string)."""
+    apply_user_voice's docstring for why. Handles the full `User` ORM row
+    (has `.preferences`, a raw JSON dict) and the detached
+    `RuntimeUserFields`/`WebSocketPrincipal` snapshots (both already have
+    a plain `.voice` string)."""
     if runtime_user is None:
         return None
     voice = getattr(runtime_user, "voice", None)

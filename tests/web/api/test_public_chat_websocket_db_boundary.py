@@ -135,6 +135,7 @@ async def test_public_access_websocket_authorization_uses_worker_owned_session(
         "is_admin",
         "guest_id",
         "widget_entity_key",
+        "voice",
     }
     # Only the widget authorize path derives the entity rate-limit key (#1056).
     assert principal == WebSocketPrincipal(

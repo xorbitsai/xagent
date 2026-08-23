@@ -151,6 +151,40 @@ async def test_valid_token_returns_frozen_detached_principal_from_worker_session
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("preferences", "expected_voice"),
+    [
+        ({"voice": "concise"}, "concise"),
+        (None, None),
+        ("not-a-dict", None),
+    ],
+)
+async def test_principal_reduces_voice_from_preferences_without_a_second_query(
+    monkeypatch: pytest.MonkeyPatch,
+    preferences: object,
+    expected_voice: str | None,
+) -> None:
+    """The builder-chat websocket assistant applies the same voice
+    preference a saved agent does (see apply_user_voice's call sites) -
+    the principal must carry `voice` from the one query that already
+    authenticates the token, not a second lookup against a session that
+    may be closed by the time a system prompt is assembled."""
+
+    def authenticate(_token: str, _db: object) -> SimpleNamespace:
+        return SimpleNamespace(id=73, is_admin=True, preferences=preferences)
+
+    session = _BoundSQLiteSession()
+    monkeypatch.setattr(websocket_auth, "get_session_local", lambda: lambda: session)
+    monkeypatch.setattr(websocket_auth, "get_user_from_websocket_token", authenticate)
+
+    principal = await websocket_auth.get_authenticated_user(MagicMock(), "signed")
+
+    assert principal == websocket_auth.WebSocketPrincipal(
+        id=73, is_admin=True, voice=expected_voice
+    )
+
+
+@pytest.mark.asyncio
 async def test_cancellation_propagates_from_database_runner(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -24,6 +24,11 @@ class WebSocketPrincipal:
     is_admin: bool
     guest_id: str | None = None
     widget_entity_key: str | None = None
+    # Onboarding "Launch" step voice choice, or None if unset/unrecognized -
+    # already reduced from the raw preferences JSON here so nothing
+    # downstream needs to touch that column again (see apply_user_voice
+    # in api/agents.py).
+    voice: str | None = None
 
 
 class _WebSocketAuthenticationTerminated(Exception):
@@ -74,7 +79,11 @@ def _load_websocket_principal_sync(token: str) -> WebSocketPrincipal | None:
         user = get_user_from_websocket_token(token, db)
         if user is None or user.id is None:
             return None
-        return WebSocketPrincipal(id=int(user.id), is_admin=bool(user.is_admin))
+        preferences = getattr(user, "preferences", None)
+        voice = preferences.get("voice") if isinstance(preferences, dict) else None
+        return WebSocketPrincipal(
+            id=int(user.id), is_admin=bool(user.is_admin), voice=voice
+        )
 
 
 async def get_authenticated_user(

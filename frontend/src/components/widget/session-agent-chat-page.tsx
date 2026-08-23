@@ -222,8 +222,6 @@ function SessionConversationContent({
                   || isMessageDeliveryPending
                   || reloadRequired
                 }
-                files={[]}
-                onFilesChange={() => undefined}
                 readOnlyConfig={true}
                 hideConfig={true}
                 compactInput={true}

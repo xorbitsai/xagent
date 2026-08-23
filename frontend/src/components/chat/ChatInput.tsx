@@ -1,4 +1,4 @@
-import React, { useState, useRef, useEffect, useMemo } from "react";
+import React, { useState, useRef, useEffect, useLayoutEffect, useMemo } from "react";
 import { createFileChipHTML } from "./FileChip";
 import { useRouter } from "next/navigation";
 import { Paperclip, X, File as FileIcon, Sparkles, Pause, Play, Loader2, ArrowUp, Globe, Mic, Square } from "lucide-react";
@@ -132,6 +132,82 @@ interface ModelRecord {
 interface DefaultModelRecord {
   config_type?: string;
   model?: ModelRecord | null;
+}
+
+type ScheduledAttachmentUpload = {
+  execute: () => Promise<void>;
+  resolve: () => void;
+  reject: (reason: unknown) => void;
+  detachAbortListener: () => void;
+};
+
+const uploadAbortError = (message: string) =>
+  new DOMException(message, "AbortError");
+
+// A 15-minute request window permits a 100 MiB-class attachment to upload at
+// roughly 115 KiB/s while still ensuring one stalled request cannot own the
+// component FIFO indefinitely.
+const ATTACHMENT_UPLOAD_REQUEST_TIMEOUT_MS = 15 * 60 * 1000;
+const uploadTimeoutError = () =>
+  new DOMException("Attachment upload timed out", "TimeoutError");
+
+/** A component-owned FIFO that prevents one selection from bursting storage. */
+class AttachmentUploadQueue {
+  private readonly pending: ScheduledAttachmentUpload[] = [];
+  private active = false;
+
+  schedule(execute: () => Promise<void>, signal: AbortSignal): Promise<void> {
+    return new Promise((resolve, reject) => {
+      const task: ScheduledAttachmentUpload = {
+        execute,
+        resolve,
+        reject,
+        detachAbortListener: () => undefined,
+      };
+      const cancelBeforeStart = () => {
+        const index = this.pending.indexOf(task);
+        if (index === -1) return;
+        this.pending.splice(index, 1);
+        task.detachAbortListener();
+        reject(signal.reason ?? uploadAbortError("Upload cancelled"));
+        this.drain();
+      };
+      task.detachAbortListener = () => {
+        signal.removeEventListener("abort", cancelBeforeStart);
+      };
+
+      if (signal.aborted) {
+        reject(signal.reason ?? uploadAbortError("Upload cancelled"));
+        return;
+      }
+      signal.addEventListener("abort", cancelBeforeStart, { once: true });
+      this.pending.push(task);
+      this.drain();
+    });
+  }
+
+  cancelPending(reason: unknown): void {
+    this.pending.splice(0).forEach(task => {
+      task.detachAbortListener();
+      task.reject(reason);
+    });
+  }
+
+  private drain(): void {
+    if (this.active) return;
+    const task = this.pending.shift();
+    if (!task) return;
+    task.detachAbortListener();
+
+    this.active = true;
+    void Promise.resolve()
+      .then(task.execute)
+      .then(task.resolve, task.reject)
+      .finally(() => {
+        this.active = false;
+        this.drain();
+      });
+  }
 }
 
 export function ChatInput({
@@ -280,9 +356,19 @@ export function ChatInput({
     [files, filesDisabled],
   );
 
-  // Track files for async operations
+  // File object identity remains stable within one composer and does not
+  // collide when separate folders supply equal names and timestamps.
   const filesRef = useRef(enabledFiles);
-  const uploadAbortControllersRef = useRef<Map<string, AbortController>>(new Map());
+  const uploadAbortControllersRef = useRef<Map<File, AbortController>>(new Map());
+  const uploadQueueRef = useRef<AttachmentUploadQueue | null>(null);
+  const uploadsMountedRef = useRef(true);
+  const uploadsEnabledRef = useRef(!filesDisabled);
+  useLayoutEffect(() => {
+    uploadsEnabledRef.current = !filesDisabled;
+  }, [filesDisabled]);
+  if (!uploadQueueRef.current) {
+    uploadQueueRef.current = new AttachmentUploadQueue();
+  }
 
   useEffect(() => {
     filesRef.current = enabledFiles;
@@ -351,8 +437,14 @@ export function ChatInput({
   }>({ model: "" });
   const [models, setModels] = useState<ModelRecord[]>([]);
 
-  // State to track files currently being uploaded
-  const [uploadingFiles, setUploadingFiles] = useState<Set<string>>(new Set());
+  // Queued and active files share one set so sending remains blocked until all
+  // selected attachments settle.
+  const [uploadingFiles, setUploadingFiles] = useState<Set<File>>(new Set());
+
+  const publishFiles = (nextFiles: File[]) => {
+    filesRef.current = nextFiles;
+    onFilesChange?.(nextFiles);
+  };
 
   const extractDroppedFiles = (dataTransfer: DataTransfer) => {
     const itemFiles = Array.from(dataTransfer.items || [])
@@ -374,100 +466,146 @@ export function ChatInput({
   useEffect(() => {
     if (!filesDisabled) return;
 
-    uploadAbortControllersRef.current.forEach((controller) => {
-      controller.abort();
-    });
+    uploadAbortControllersRef.current.forEach(controller => controller.abort());
     uploadAbortControllersRef.current.clear();
+    uploadQueueRef.current?.cancelPending(
+      uploadAbortError("File uploads disabled")
+    );
     setUploadingFiles(new Set());
     dragDepthRef.current = 0;
     setIsDraggingFiles(false);
   }, [filesDisabled]);
 
+  useEffect(() => {
+    uploadsMountedRef.current = true;
+    const abortControllers = uploadAbortControllersRef.current;
+    const uploadQueue = uploadQueueRef.current;
+    return () => {
+      uploadsMountedRef.current = false;
+      abortControllers.forEach(controller => controller.abort());
+      abortControllers.clear();
+      uploadQueue?.cancelPending(uploadAbortError("File uploader unmounted"));
+    };
+  }, []);
+
   // Helper to upload files immediately
   const uploadFiles = async (newFiles: File[]) => {
     if (filesDisabled || newFiles.length === 0) return;
 
-    // Mark as uploading (use name + lastModified as rough unique ID)
-    const fileIds = newFiles.map(f => `${f.name}-${f.lastModified}`);
-    setUploadingFiles(prev => {
-      const next = new Set(prev);
-      fileIds.forEach(id => next.add(id));
-      return next;
-    });
+    setUploadingFiles(previous => new Set([...previous, ...newFiles]));
 
     const failedFiles = new Set<File>();
     let uploadErrorMessage: string | null = null;
 
-    // Upload files individually to ensure better reliability and progress tracking
-    await Promise.all(newFiles.map(async (file) => {
-      const fileId = `${file.name}-${file.lastModified}`;
+    // Queue every selection through the same component-owned FIFO.
+    const scheduled = newFiles.map(file => {
       const controller = new AbortController();
-      uploadAbortControllersRef.current.set(fileId, controller);
+      uploadAbortControllersRef.current.set(file, controller);
+      return uploadQueueRef.current!.schedule(async () => {
+        let didUploadTimeout = false;
+        try {
+          const currentTaskType = mode || 'task';
 
-      try {
-        const currentTaskType = mode || 'task';
-
-        if (uploadFile) {
-          const result = await uploadFile(file, { taskType: currentTaskType });
-          if (result && typeof result.file_id === 'string') {
-            (file as File & { file_id?: string }).file_id = result.file_id;
-          } else {
-            failedFiles.add(file);
-          }
-        } else {
-          const formData = new FormData();
-          formData.append('file', file);
-          // Default to task mode if not specified
-          formData.append('task_type', currentTaskType);
-
-          const response = await apiRequest(`${getUploadApiUrl()}/api/files/upload`, {
-            method: 'POST',
-            body: formData,
-            signal: controller.signal
-          });
-
-          const parsed = await parseApiResponse(response);
-
-          if (response.ok && isJsonRecord(parsed.data)) {
-            const data = parsed.data;
-            if (data.success && typeof data.file_id === 'string') {
-              // Attach file_id to the File object
-              (file as File & { file_id?: string }).file_id = data.file_id;
+          if (uploadFile) {
+            const result = await uploadFile(file, { taskType: currentTaskType });
+            if (
+              controller.signal.aborted
+              || !uploadsMountedRef.current
+              || !uploadsEnabledRef.current
+            ) return;
+            if (result && typeof result.file_id === 'string') {
+              (file as File & { file_id?: string }).file_id = result.file_id;
             } else {
               failedFiles.add(file);
             }
           } else {
+            const formData = new FormData();
+            formData.append('file', file);
+            // Default to task mode if not specified
+            formData.append('task_type', currentTaskType);
+
+            let uploadDeadline: ReturnType<typeof setTimeout> | undefined;
+            const clearUploadDeadline = () => {
+              if (uploadDeadline === undefined) return;
+              clearTimeout(uploadDeadline);
+              uploadDeadline = undefined;
+            };
+            controller.signal.addEventListener("abort", clearUploadDeadline, {
+              once: true,
+            });
+
+            let response: Response;
+            let parsed: Awaited<ReturnType<typeof parseApiResponse>>;
+            try {
+              uploadDeadline = setTimeout(() => {
+                didUploadTimeout = true;
+                controller.abort(uploadTimeoutError());
+              }, ATTACHMENT_UPLOAD_REQUEST_TIMEOUT_MS);
+              response = await apiRequest(`${getUploadApiUrl()}/api/files/upload`, {
+                method: 'POST',
+                body: formData,
+                signal: controller.signal
+              });
+              parsed = await parseApiResponse(response);
+            } finally {
+              clearUploadDeadline();
+              controller.signal.removeEventListener("abort", clearUploadDeadline);
+            }
+
+            if (response.ok && isJsonRecord(parsed.data)) {
+              const data = parsed.data;
+              if (data.success && typeof data.file_id === 'string') {
+                // Attach file_id to the File object
+                (file as File & { file_id?: string }).file_id = data.file_id;
+              } else {
+                failedFiles.add(file);
+              }
+            } else {
+              failedFiles.add(file);
+              uploadErrorMessage = uploadErrorMessage || getUploadErrorMessage(response, parsed, {
+                generic: t("files.uploadFailed") || "Failed to upload some files",
+                ...UPLOAD_ERROR_MESSAGES,
+              });
+            }
+          }
+        } catch (error) {
+          if (didUploadTimeout) {
             failedFiles.add(file);
-            uploadErrorMessage = uploadErrorMessage || getUploadErrorMessage(response, parsed, {
-              generic: t("files.uploadFailed") || "Failed to upload some files",
-              ...UPLOAD_ERROR_MESSAGES,
+            uploadErrorMessage = uploadErrorMessage
+              || t("files.uploadFailed")
+              || "Failed to upload some files";
+          } else if (
+            controller.signal.aborted
+            || (error instanceof DOMException && error.name === 'AbortError')
+          ) {
+            // Upload cancelled, do nothing
+          } else {
+            console.error("Error uploading file:", error);
+            failedFiles.add(file);
+            uploadErrorMessage = uploadErrorMessage || (error instanceof Error ? error.message : null);
+          }
+        } finally {
+          uploadAbortControllersRef.current.delete(file);
+          if (uploadsMountedRef.current && uploadsEnabledRef.current) {
+            setUploadingFiles(previous => {
+              const next = new Set(previous);
+              next.delete(file);
+              return next;
             });
           }
         }
-      } catch (error) {
-        if (error instanceof DOMException && error.name === 'AbortError') {
-          // Upload cancelled, do nothing
-        } else {
-          console.error("Error uploading file:", error);
-          failedFiles.add(file);
-          uploadErrorMessage = uploadErrorMessage || (error instanceof Error ? error.message : null);
-        }
-      } finally {
-        uploadAbortControllersRef.current.delete(fileId);
-        setUploadingFiles(prev => {
-          const next = new Set(prev);
-          next.delete(fileId);
-          return next;
-        });
-      }
-    }));
+      }, controller.signal);
+    });
+    await Promise.allSettled(scheduled);
 
     // Handle failed files
-    if (failedFiles.size > 0) {
+    if (
+      failedFiles.size > 0
+      && uploadsMountedRef.current
+      && uploadsEnabledRef.current
+    ) {
       toast.error(uploadErrorMessage || t("files.uploadFailed") || "Failed to upload some files");
-      if (onFilesChange) {
-        onFilesChange(filesRef.current.filter(f => !failedFiles.has(f)));
-      }
+      publishFiles(filesRef.current.filter(file => !failedFiles.has(file)));
     }
   };
 
@@ -478,7 +616,7 @@ export function ChatInput({
       || !onFilesChange
       || isInputBusy
     ) return;
-    onFilesChange([...filesRef.current, ...newFiles]);
+    publishFiles([...filesRef.current, ...newFiles]);
     if (!deferFileUpload) {
       uploadFiles(newFiles);
     }
@@ -862,17 +1000,24 @@ export function ChatInput({
     }
   };
 
-  const removeFile = (index: number) => {
-    const fileToRemove = enabledFiles[index];
-    if (fileToRemove) {
-      const fileId = `${fileToRemove.name}-${fileToRemove.lastModified}`;
-      const controller = uploadAbortControllersRef.current.get(fileId);
-      if (controller) {
-        controller.abort();
-        uploadAbortControllersRef.current.delete(fileId);
-      }
+  const removeFile = (fileToRemove: File) => {
+    const controller = uploadAbortControllersRef.current.get(fileToRemove);
+    if (controller) {
+      controller.abort();
+      uploadAbortControllersRef.current.delete(fileToRemove);
     }
-    onFilesChange?.(enabledFiles.filter((_, i) => i !== index));
+    setUploadingFiles(previous => {
+      const next = new Set(previous);
+      next.delete(fileToRemove);
+      return next;
+    });
+    const currentFiles = filesRef.current;
+    const liveIndex = currentFiles.indexOf(fileToRemove);
+    if (liveIndex === -1) return;
+    publishFiles([
+      ...currentFiles.slice(0, liveIndex),
+      ...currentFiles.slice(liveIndex + 1),
+    ]);
   };
 
   useEffect(() => {
@@ -993,7 +1138,7 @@ export function ChatInput({
           {enabledFiles.length > 0 && (
             <div className="flex flex-wrap gap-2 px-4 pt-3">
               {enabledFiles.map((file, index) => {
-                const isUploading = uploadingFiles.has(`${file.name}-${file.lastModified}`);
+                const isUploading = uploadingFiles.has(file);
                 return (
                   <div
                     key={index}
@@ -1012,7 +1157,7 @@ export function ChatInput({
                     <span className="max-w-[180px] truncate font-medium">{file.name}</span>
                     <button
                       type="button"
-                      onClick={() => removeFile(index)}
+                      onClick={() => removeFile(file)}
                       className="ml-0.5 rounded-sm p-0.5 text-slate-400 transition-colors hover:bg-slate-200 hover:text-slate-700"
                       title={isUploading ? t("common.cancel") : t("common.remove")}
                     >

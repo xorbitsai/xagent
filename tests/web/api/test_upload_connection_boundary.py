@@ -18,6 +18,7 @@ from xagent.core.file_storage.factory import get_unscoped_file_storage
 from xagent.core.file_storage.storage import FsspecFileStorage
 from xagent.core.workspace import TaskWorkspace
 from xagent.web.api import files as files_api
+from xagent.web.api import public_chat_access as public_chat_access_api
 from xagent.web.api import websocket as websocket_api
 from xagent.web.api.public_chat_access import (
     PublicChatAccessContext,
@@ -652,6 +653,137 @@ def test_jwt_upload_releases_auth_session_before_durable_io(
         assert engine.pool.checkedout() == 0
     finally:
         engine.dispose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("auth_mode", ["widget", "share"])
+async def test_public_batch_upload_preserves_successful_sibling_outcomes(
+    monkeypatch: pytest.MonkeyPatch,
+    auth_mode: str,
+) -> None:
+    """Public ``files`` batches isolate storage per item and correlate results."""
+
+    user = User(id=1, username="owner")
+    context = (
+        PublicChatAccessContext(
+            user=user,
+            channel_id=None,
+            guest_id="guest",
+            widget_workforce_id=1,
+        )
+        if auth_mode == "widget"
+        else ShareChatAccessContext(
+            user=user,
+            share_token="share",
+            guest_id="guest",
+            workforce=object(),  # type: ignore[arg-type]
+        )
+    )
+    stored: list[str] = []
+
+    async def store_each(*, upload_items, **_kwargs):  # type: ignore[no-untyped-def]
+        filename = upload_items[0].filename
+        stored.append(filename)
+        if filename.endswith("oversized.txt"):
+            raise HTTPException(
+                status_code=413, detail="File size exceeds maximum limit"
+            )
+        return {
+            "success": True,
+            "file_id": f"{filename}-id",
+            "filename": filename,
+            "file_size": 2,
+            "mime_type": "text/plain",
+            "content_preview": "",
+        }
+
+    monkeypatch.setattr(public_chat_access_api, "store_uploaded_files", store_each)
+    monkeypatch.setattr(
+        public_chat_access_api, "release_db_connection_if_clean", lambda _db: True
+    )
+    kwargs = {
+        "file": None,
+        "files": [
+            UploadFile(filename="ok.txt", file=io.BytesIO(b"ok")),
+            UploadFile(filename="../../oversized.txt", file=io.BytesIO(b"large")),
+        ],
+        "task_type": "general",
+        "message": "",
+        "task_id": None,
+        "folder": None,
+        "access_context": context,
+        "db": object(),
+    }
+
+    response = (
+        await upload_public_chat_files(**kwargs)  # type: ignore[arg-type]
+        if auth_mode == "widget"
+        else await upload_share_chat_files(**kwargs)  # type: ignore[arg-type]
+    )
+
+    assert stored == ["ok.txt", "../../oversized.txt"]
+    assert response == {
+        "success": True,
+        "files": [
+            {
+                "success": True,
+                "source_index": 0,
+                "file_id": "ok.txt-id",
+                "filename": "ok.txt",
+                "file_size": 2,
+                "mime_type": "text/plain",
+                "content_preview": "",
+            },
+            {
+                "success": False,
+                "source_index": 1,
+                "filename": "oversized.txt",
+                "error": "File size exceeds maximum limit",
+                "status_code": 413,
+            },
+        ],
+        "total_files": 2,
+        "uploaded_files": 1,
+        "failed_files": 1,
+        "task_type": "general",
+        "message": "Successfully uploaded 1 of 2 files",
+    }
+
+
+@pytest.mark.asyncio
+async def test_public_batch_upload_preserves_durable_storage_503(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    user = User(id=1, username="owner")
+    context = PublicChatAccessContext(
+        user=user,
+        channel_id=None,
+        guest_id="guest",
+        widget_workforce_id=1,
+    )
+
+    async def unavailable(**_kwargs):  # type: ignore[no-untyped-def]
+        raise HTTPException(status_code=503, detail="File storage is unavailable")
+
+    monkeypatch.setattr(public_chat_access_api, "store_uploaded_files", unavailable)
+    monkeypatch.setattr(
+        public_chat_access_api, "release_db_connection_if_clean", lambda _db: True
+    )
+
+    with pytest.raises(HTTPException) as raised:
+        await upload_public_chat_files(
+            file=None,
+            files=[UploadFile(filename="ok.txt", file=io.BytesIO(b"ok"))],
+            task_type="general",
+            message="",
+            task_id=None,
+            folder=None,
+            access_context=context,
+            db=object(),  # type: ignore[arg-type]
+        )
+
+    assert raised.value.status_code == 503
+    assert raised.value.detail == "File storage is unavailable"
 
 
 @pytest.mark.asyncio

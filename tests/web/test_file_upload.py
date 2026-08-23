@@ -1,5 +1,6 @@
 """Test file upload API functionality - Fixed for multi-tenant architecture"""
 
+import logging
 import os
 import tempfile
 from pathlib import Path
@@ -522,8 +523,14 @@ class TestFileUpload:
         assert "x-accel-redirect" not in preview.headers
         assert preview.content == b"<h1>preview</h1>"
 
-    def test_upload_remote_storage_outage_returns_503_and_rolls_back(
-        self, client, test_db, temp_uploads_dir, auth_headers, monkeypatch
+    def test_upload_remote_storage_outage_returns_503_and_logs_cause(
+        self,
+        client,
+        test_db,
+        temp_uploads_dir,
+        auth_headers,
+        monkeypatch,
+        caplog,
     ):
         from xagent.core.file_storage.storage import FsspecFileStorage
 
@@ -533,6 +540,7 @@ class TestFileUpload:
             raise RuntimeError("simulated remote write outage")
 
         monkeypatch.setattr(FsspecFileStorage, "put_file", fail_put_file)
+        caplog.set_level(logging.WARNING, logger="xagent.web.api.files")
 
         response = client.post(
             "/api/files/upload",
@@ -542,7 +550,23 @@ class TestFileUpload:
         )
 
         assert response.status_code == 503
-        assert "durable storage" in response.json()["detail"].lower()
+        assert response.json() == {
+            "detail": "Durable storage is temporarily unavailable"
+        }
+        failure_record = next(
+            record
+            for record in caplog.records
+            if "Durable storage unavailable during upload" in record.getMessage()
+        )
+        assert failure_record.levelno == logging.WARNING
+        assert failure_record.exc_info is not None
+        assert "operation=register_local_uploads" in failure_record.getMessage()
+        assert "backend=file" in failure_record.getMessage()
+        assert f"user_id={admin_user.id}" in failure_record.getMessage()
+        assert "task_id=None" in failure_record.getMessage()
+        assert "file_count=1" in failure_record.getMessage()
+        assert "simulated remote write outage" in caplog.text
+        assert "simulated remote write outage" not in response.text
         assert not list(temp_uploads_dir.rglob("outage.txt"))
 
         db = next(test_app.dependency_overrides[get_db]())

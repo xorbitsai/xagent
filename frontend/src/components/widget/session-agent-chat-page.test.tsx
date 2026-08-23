@@ -296,6 +296,8 @@ describe("SessionAgentChatPage", () => {
       filesDisabled: true,
       voiceInputEnabled: false,
     }))
+    expect(app.startProps).not.toHaveProperty("files")
+    expect(app.startProps).not.toHaveProperty("onFilesChange")
 
     fireEvent.click(screen.getByRole("button", { name: "start:Support Agent" }))
     expect(app.sendMessage).toHaveBeenCalledWith(

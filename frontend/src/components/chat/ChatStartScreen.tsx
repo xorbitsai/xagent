@@ -1,4 +1,4 @@
-import React from "react";
+import React, { useState } from "react";
 import { Bot, Sparkles } from "lucide-react";
 import { ChatInput } from "@/components/chat/ChatInput";
 import { TemplateQuickAccess } from "@/components/chat/TemplateQuickAccess";
@@ -108,7 +108,7 @@ export function ChatStartScreen({
   onInputChange,
   onPromptSelect,
   promptHighlightTerms = [],
-  files = [],
+  files,
   onFilesChange,
   showModeToggle = false,
   readOnlyConfig = false,
@@ -132,7 +132,14 @@ export function ChatStartScreen({
   onRetryTemplates,
 }: ChatStartScreenProps) {
   const { t } = useI18n();
-  const enabledFiles = filesDisabled ? [] : files;
+  const [internalFiles, setInternalFiles] = useState<File[]>(() => files ?? []);
+  // Supplying a change callback makes file ownership external. Without one,
+  // this start screen owns the default file input's live attachment state.
+  const currentFiles = onFilesChange ? (files ?? []) : internalFiles;
+  const enabledFiles = filesDisabled ? [] : currentFiles;
+  const handleFilesChange = filesDisabled
+    ? undefined
+    : (onFilesChange ?? setInternalFiles);
 
   const handlePromptClick = (prompt: string, promptHighlights?: string[]) => {
     if (onPromptSelect) {
@@ -159,9 +166,7 @@ export function ChatStartScreen({
             onSend={(msg, config) => onSend(msg, enabledFiles, config)}
             isLoading={isSending}
             files={enabledFiles}
-            onFilesChange={
-              filesDisabled ? undefined : (onFilesChange || (() => { }))
-            }
+            onFilesChange={handleFilesChange}
             showModeToggle={showModeToggle}
             inputValue={inputValue}
             onInputChange={onInputChange}

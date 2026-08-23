@@ -1,15 +1,6 @@
 import React from "react"
-import { cleanup, render, screen } from "@testing-library/react"
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react"
 import { afterEach, describe, expect, it, vi } from "vitest"
-
-const chatInputProps = vi.hoisted(() => ({
-  current: null as null | {
-    files?: File[]
-    filesDisabled?: boolean
-    hideFileUpload?: boolean
-    onSend: (message: string, config?: unknown) => void
-  },
-}))
 
 vi.mock("@/contexts/i18n-context", () => ({
   useI18n: () => ({
@@ -17,22 +8,49 @@ vi.mock("@/contexts/i18n-context", () => ({
   }),
 }))
 
+vi.mock("@/contexts/app-context-chat", () => ({
+  useApp: () => ({ openFilePreview: vi.fn() }),
+}))
+
+vi.mock("@/contexts/auth-context", () => ({
+  useAuth: () => ({ user: null }),
+}))
+
+vi.mock("next/navigation", () => ({
+  useRouter: () => ({ push: vi.fn() }),
+}))
+
+vi.mock("@/hooks/use-file-mention", () => ({
+  useFileMention: () => ({
+    checkTrigger: vi.fn(),
+    dropdownPosition: null,
+    fileList: [],
+    fileMentionsEnabled: false,
+    filteredFiles: [],
+    handleKeyDown: vi.fn(() => false),
+    insertFile: vi.fn(),
+    isLoadingFiles: false,
+    resetMention: vi.fn(),
+    selectedFileIndex: 0,
+    showFilePicker: false,
+  }),
+}))
+
+vi.mock("@/components/voice-input-controller", () => ({
+  useVoiceInputControls: () => ({
+    hasAsrModel: false,
+    startRecording: vi.fn(),
+    status: "idle",
+    stopRecording: vi.fn(),
+  }),
+}))
+
 vi.mock("@/lib/utils", () => ({
+  cn: (...classes: Array<string | false | null | undefined>) =>
+    classes.filter(Boolean).join(" "),
+  generateClientMessageId: () => "client-message-id",
   getApiUrl: () => "http://api.local",
-}))
-
-vi.mock("@/components/chat/ChatInput", () => ({
-  ChatInput: (props: NonNullable<typeof chatInputProps.current>) => {
-    chatInputProps.current = props
-    return <div data-testid="chat-input" />
-  },
-}))
-
-vi.mock("@/components/ui/tooltip", () => ({
-  Tooltip: ({ children }: { children: React.ReactNode }) => <>{children}</>,
-  TooltipContent: ({ children }: { children: React.ReactNode }) => <>{children}</>,
-  TooltipProvider: ({ children }: { children: React.ReactNode }) => <>{children}</>,
-  TooltipTrigger: ({ children }: { children: React.ReactNode }) => <>{children}</>,
+  getUploadApiUrl: () => "http://upload.local",
 }))
 
 import { ChatStartScreen } from "@/components/chat/ChatStartScreen"
@@ -44,6 +62,8 @@ const AGENTS_SECTION = "chatPage.sections.chatWithAgents"
 const renderScreen = (agents?: React.ComponentProps<typeof ChatStartScreen>["agents"]) =>
   render(
     <ChatStartScreen
+      hideConfig
+      voiceInputEnabled={false}
       title="Support Agent"
       prompts={["Summarize this page"]}
       agents={agents}
@@ -53,7 +73,6 @@ const renderScreen = (agents?: React.ComponentProps<typeof ChatStartScreen>["age
 
 afterEach(() => {
   cleanup()
-  chatInputProps.current = null
 })
 
 describe("ChatStartScreen agents section", () => {
@@ -79,40 +98,74 @@ describe("ChatStartScreen agents section", () => {
 
 describe("ChatStartScreen file capability", () => {
   it("forwards the disabled file capability to ChatInput", () => {
-    const onSend = vi.fn()
     const file = new File(["secret"], "secret.txt", { type: "text/plain" })
-    render(
+    const { container } = render(
       <ChatStartScreen
         files={[file]}
         filesDisabled
-        onSend={onSend}
+        hideConfig
+        voiceInputEnabled={false}
+        onSend={vi.fn()}
         title="Session Agent"
       />
     )
 
-    expect(screen.getByTestId("chat-input")).toBeInTheDocument()
-    expect(chatInputProps.current?.hideFileUpload).toBe(true)
-    expect(chatInputProps.current?.filesDisabled).toBe(true)
-    expect(chatInputProps.current?.files).toEqual([])
-    chatInputProps.current?.onSend("hello", { mode: "balanced" })
-    expect(onSend).toHaveBeenCalledWith("hello", [], { mode: "balanced" })
+    expect(container.querySelector('input[type="file"]')).toBeNull()
+    expect(screen.queryByText("secret.txt")).not.toBeInTheDocument()
   })
 
-  it("preserves file input by default", () => {
-    const onSend = vi.fn()
-    const file = new File(["legacy"], "legacy.txt", { type: "text/plain" })
-    render(
+  it("owns selected files internally and removes them when no owner is supplied", async () => {
+    const { container } = render(
       <ChatStartScreen
-        files={[file]}
-        onSend={onSend}
-        title="Legacy Agent"
+        deferFileUpload
+        hideConfig
+        voiceInputEnabled={false}
+        onSend={vi.fn()}
+        title="Uncontrolled Agent"
       />
     )
+    const fileInput = container.querySelector('input[type="file"]') as HTMLInputElement
+    const file = new File(["draft"], "draft.txt", { type: "text/plain" })
 
-    expect(chatInputProps.current?.hideFileUpload).toBe(false)
-    expect(chatInputProps.current?.filesDisabled).toBe(false)
-    expect(chatInputProps.current?.files).toEqual([file])
-    chatInputProps.current?.onSend("hello", { mode: "balanced" })
-    expect(onSend).toHaveBeenCalledWith("hello", [file], { mode: "balanced" })
+    fireEvent.change(fileInput, { target: { files: [file] } })
+    await waitFor(() => expect(screen.getByText("draft.txt")).toBeInTheDocument())
+
+    fireEvent.click(screen.getByTitle("common.remove"))
+    await waitFor(() => expect(screen.queryByText("draft.txt")).not.toBeInTheDocument())
+  })
+
+  it("preserves externally controlled files and change callback semantics", async () => {
+    const observedChanges: File[][] = []
+
+    function Harness() {
+      const [files, setFiles] = React.useState<File[]>([])
+      const handleFilesChange = (nextFiles: File[]) => {
+        observedChanges.push(nextFiles)
+        setFiles(nextFiles)
+      }
+      return (
+        <ChatStartScreen
+          deferFileUpload
+          files={files}
+          hideConfig
+          voiceInputEnabled={false}
+          onFilesChange={handleFilesChange}
+          onSend={vi.fn()}
+          title="Controlled Agent"
+        />
+      )
+    }
+
+    const { container } = render(<Harness />)
+    const fileInput = container.querySelector('input[type="file"]') as HTMLInputElement
+    const file = new File(["owned"], "owned.txt", { type: "text/plain" })
+
+    fireEvent.change(fileInput, { target: { files: [file] } })
+    await waitFor(() => expect(screen.getByText("owned.txt")).toBeInTheDocument())
+    expect(observedChanges).toEqual([[file]])
+
+    fireEvent.click(screen.getByTitle("common.remove"))
+    await waitFor(() => expect(screen.queryByText("owned.txt")).not.toBeInTheDocument())
+    expect(observedChanges).toEqual([[file], []])
   })
 })

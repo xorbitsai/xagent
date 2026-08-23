@@ -1809,7 +1809,7 @@ export interface AppProviderTransportConfig {
    * transports use this to keep guest credentials instance-scoped.
    */
   fileAccess?: FileAccessPolicy
-  uploadFiles?: (files: File[], params: { taskId?: number | null; taskType: string }) => Promise<Array<{ file_id: string; name?: string; size?: number; type?: string }>>
+  uploadFiles?: (files: File[], params: { taskId?: number | null; taskType: string; signal?: AbortSignal }) => Promise<Array<{ file_id: string; name?: string; size?: number; type?: string }>>
   capabilities?: AppProviderTransportCapabilities
   session?: {
     connection: WebSocketConnection | null

@@ -20,11 +20,23 @@ const app = vi.hoisted(() => ({
     transport?: AppProviderTransportConfig
   },
   startScreenProps: null as null | {
+    onSend: (
+      message: string,
+      files: File[],
+      config?: Record<string, string>,
+    ) => Promise<void>
     voiceInputEnabled?: boolean
   },
 }))
 
-const i18n = vi.hoisted(() => ({ t: (key: string) => key }))
+const toastError = vi.hoisted(() => vi.fn())
+
+const i18n = vi.hoisted(() => ({
+  t: (key: string, vars?: Record<string, string | number>) =>
+    key === "files.tooManyAttachments"
+      ? `You can attach up to ${vars?.max} files at once (received ${vars?.count}).`
+      : key,
+}))
 
 vi.mock("@/contexts/app-context-chat", () => ({
   AppProvider: ({
@@ -56,6 +68,10 @@ vi.mock("@/contexts/app-context-chat", () => ({
 
 vi.mock("@/contexts/i18n-context", () => ({
   useI18n: () => i18n,
+}))
+
+vi.mock("@/components/ui/sonner", () => ({
+  toast: { error: toastError },
 }))
 
 vi.mock("@/components/chat/ChatStartScreen", () => ({
@@ -234,6 +250,7 @@ describe("PublicAgentChatPage", () => {
     app.rerender = null
     app.provider = null
     app.startScreenProps = null
+    toastError.mockReset()
     sessionStorage.clear()
     fetchMock.mockReset()
     vi.stubGlobal("fetch", fetchMock)
@@ -761,5 +778,234 @@ describe("PublicAgentChatPage", () => {
     expect(app.setTaskId).toHaveBeenCalledWith(71, { navigate: false })
     expect(app.setTaskId).not.toHaveBeenCalledWith(null, { navigate: false })
     expect(localStorage.getItem(taskKey)).toBe("71")
+  })
+
+  it("uploads an established share turn as one multipart batch", async () => {
+    localStorage.clear()
+    const first = new File(["first"], "first.txt", { type: "text/plain" })
+    const second = new File(["second"], "second.txt", { type: "text/plain" })
+    fetchMock
+      .mockResolvedValueOnce(jsonResponse(successfulAgentAuth))
+      .mockResolvedValueOnce(jsonResponse({
+        success: true,
+        file_id: "first-id",
+        files: [
+          { file_id: "first-id", filename: "first.txt", file_size: 5, mime_type: "text/plain" },
+          { file_id: "second-id", filename: "second.txt", file_size: 6, mime_type: "text/plain" },
+        ],
+      }))
+
+    renderSharePage()
+    await screen.findByRole("button", { name: "start:Support Agent" })
+
+    const uploadFiles = app.provider?.transport?.uploadFiles
+    expect(uploadFiles).toEqual(expect.any(Function))
+    const controller = new AbortController()
+    await expect(uploadFiles?.([first, second], {
+      taskId: 42,
+      taskType: "task",
+      signal: controller.signal,
+    })).resolves.toEqual([
+      { file_id: "first-id", name: "first.txt", size: 5, type: "text/plain" },
+      { file_id: "second-id", name: "second.txt", size: 6, type: "text/plain" },
+    ])
+
+    const uploadCalls = fetchMock.mock.calls.filter(
+      ([url]) => url === "https://api.example/api/share/files/upload",
+    )
+    expect(uploadCalls).toHaveLength(1)
+    const body = uploadCalls[0][1]?.body as FormData
+    expect(body.getAll("files")).toEqual([first, second])
+    expect(body.get("file")).toBeNull()
+    expect(body.get("task_id")).toBe("42")
+    expect(uploadCalls[0][1]?.signal).toBe(controller.signal)
+  })
+
+  it("keeps established-turn successes and surfaces partial upload failures", async () => {
+    const first = new File(["first"], "first.txt", { type: "text/plain" })
+    const oversized = new File(["large"], "oversized.txt", { type: "text/plain" })
+    fetchMock
+      .mockResolvedValueOnce(jsonResponse(successfulAgentAuth))
+      .mockResolvedValueOnce(jsonResponse({
+        success: true,
+        files: [
+          {
+            success: true,
+            source_index: 0,
+            file_id: "first-id",
+            filename: "first.txt",
+            file_size: 5,
+            mime_type: "text/plain",
+          },
+          {
+            success: false,
+            source_index: 1,
+            filename: "oversized.txt",
+            error: "File size exceeds maximum limit of 100MB",
+          },
+        ],
+      }))
+
+    renderSharePage()
+    await screen.findByRole("button", { name: "start:Support Agent" })
+
+    await expect(app.provider?.transport?.uploadFiles?.([first, oversized], {
+      taskId: 42,
+      taskType: "task",
+    })).resolves.toEqual([
+      { file_id: "first-id", name: "first.txt", size: 5, type: "text/plain" },
+    ])
+    expect(toastError).toHaveBeenCalledWith(
+      "oversized.txt: File size exceeds maximum limit of 100MB",
+    )
+  })
+
+  it("rejects more than 10 workforce opening attachments with an empty message before any request", async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse(successfulWorkforceAuth))
+    const files = Array.from(
+      { length: 11 },
+      (_, index) => new File([String(index)], `${index}.txt`),
+    )
+
+    renderSharePage()
+    await screen.findByRole("button", { name: "start:Support Workforce" })
+
+    await expect(app.startScreenProps?.onSend(
+      "",
+      files,
+      { mode: "balanced" },
+    )).rejects.toThrow(
+      "You can attach up to 10 files at once (received 11).",
+    )
+
+    const openingRequests = fetchMock.mock.calls.filter(
+      ([url]) => url === "https://api.example/api/share/files/upload"
+        || url === "https://api.example/api/share/chat/task/create",
+    )
+    expect(openingRequests).toHaveLength(0)
+  })
+
+  it("rejects more than 10 workforce opening attachments before any request", async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse(successfulWorkforceAuth))
+    const files = Array.from(
+      { length: 11 },
+      (_, index) => new File([String(index)], `${index}.txt`),
+    )
+
+    renderSharePage()
+    await screen.findByRole("button", { name: "start:Support Workforce" })
+
+    await expect(app.startScreenProps?.onSend(
+      "first message",
+      files,
+      { mode: "balanced" },
+    )).rejects.toThrow(
+      "You can attach up to 10 files at once (received 11).",
+    )
+
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+    expect(fetchMock).not.toHaveBeenCalledWith(
+      "https://api.example/api/share/files/upload",
+      expect.anything(),
+    )
+    expect(fetchMock).not.toHaveBeenCalledWith(
+      "https://api.example/api/share/chat/task/create",
+      expect.anything(),
+    )
+  })
+
+  it("starts a workforce opening with successful IDs when a sibling upload fails", async () => {
+    const first = new File(["first"], "first.txt", { type: "text/plain" })
+    const invalid = new File(["invalid"], "invalid.exe", { type: "application/octet-stream" })
+    fetchMock.mockImplementation((url: string) => {
+      if (url === "https://api.example/api/widget/auth") {
+        return Promise.resolve(jsonResponse(successfulWorkforceAuth))
+      }
+      if (url === "https://api.example/api/widget/files/upload") {
+        return Promise.resolve(jsonResponse({
+          success: true,
+          files: [
+            { success: true, source_index: 0, file_id: "first-id", filename: "first.txt" },
+            {
+              success: false,
+              source_index: 1,
+              filename: "invalid.exe",
+              error: "File type .exe not supported for task type task",
+            },
+          ],
+        }))
+      }
+      if (url === "https://api.example/api/widget/chat/task/create") {
+        return Promise.resolve(jsonResponse(widgetTaskResponse(43, "running")))
+      }
+      throw new Error(`Unexpected request: ${url}`)
+    })
+
+    renderWidgetPage({ searchAgentId: null, widgetKey: "widget-secret" })
+    await screen.findByRole("button", { name: "start:Support Workforce" })
+
+    await app.startScreenProps?.onSend(
+      "first message",
+      [first, invalid],
+      { mode: "balanced" },
+    )
+
+    const taskCreateCall = fetchMock.mock.calls.find(
+      ([url]) => url === "https://api.example/api/widget/chat/task/create",
+    )
+    expect(JSON.parse(taskCreateCall?.[1]?.body as string)).toMatchObject({
+      files: ["first-id"],
+    })
+    expect(toastError).toHaveBeenCalledWith(
+      "invalid.exe: File type .exe not supported for task type task",
+    )
+  })
+
+  it("uploads workforce opening attachments as one multipart batch", async () => {
+    const first = new File(["first"], "first.txt", { type: "text/plain" })
+    const second = new File(["second"], "second.txt", { type: "text/plain" })
+    fetchMock.mockImplementation((url: string, request?: RequestInit) => {
+      if (url === "https://api.example/api/widget/auth") {
+        return Promise.resolve(jsonResponse(successfulWorkforceAuth))
+      }
+      if (url === "https://api.example/api/widget/files/upload") {
+        const body = request?.body as FormData
+        const singleFile = body.get("file") as File | null
+        return Promise.resolve(jsonResponse({
+          success: true,
+          file_id: singleFile ? `${singleFile.name}-id` : undefined,
+          files: [
+            { file_id: "first.txt-id", filename: "first.txt", file_size: 5, mime_type: "text/plain" },
+            { file_id: "second.txt-id", filename: "second.txt", file_size: 6, mime_type: "text/plain" },
+          ],
+        }))
+      }
+      if (url === "https://api.example/api/widget/chat/task/create") {
+        return Promise.resolve(jsonResponse(widgetTaskResponse(43, "running")))
+      }
+      throw new Error(`Unexpected request: ${url}`)
+    })
+
+    renderWidgetPage({ searchAgentId: null, widgetKey: "widget-secret" })
+    await screen.findByRole("button", { name: "start:Support Workforce" })
+
+    await app.startScreenProps?.onSend(
+      "first message",
+      [first, second],
+      { mode: "balanced" },
+    )
+
+    const uploadCalls = fetchMock.mock.calls.filter(
+      ([url]) => url === "https://api.example/api/widget/files/upload",
+    )
+    expect(uploadCalls).toHaveLength(1)
+    const uploadBody = uploadCalls[0][1]?.body as FormData
+    expect(uploadBody.getAll("files")).toEqual([first, second])
+    const taskCreateCall = fetchMock.mock.calls.find(
+      ([url]) => url === "https://api.example/api/widget/chat/task/create",
+    )
+    expect(JSON.parse(taskCreateCall?.[1]?.body as string)).toMatchObject({
+      files: ["first.txt-id", "second.txt-id"],
+    })
   })
 })

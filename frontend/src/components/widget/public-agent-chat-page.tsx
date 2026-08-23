@@ -2,12 +2,13 @@
 
 import React, { useCallback, useEffect, useMemo, useState } from "react"
 import { Loader2, MessageSquarePlus } from "lucide-react"
+import { toast } from "@/components/ui/sonner"
 import { ChatStartScreen } from "@/components/chat/ChatStartScreen"
 import { TaskConversationPanel } from "@/components/task/task-conversation-panel"
 import { AppProvider, useApp, type AppProviderTransportConfig } from "@/contexts/app-context-chat"
 import { usePublicFileAccessPolicy } from "@/contexts/file-access-context"
 import { useI18n } from "@/contexts/i18n-context"
-import { uploadPublicChatFile } from "@/lib/public-chat-file-upload"
+import { uploadPublicChatFiles } from "@/lib/public-chat-file-upload"
 import { normalizeTaskStatus } from "@/lib/task-status"
 import {
   getApiUrl,
@@ -126,6 +127,8 @@ const shareGuestIdFromToken = (token: string): string => {
 }
 
 type PublicMessageConfig = Record<string, unknown>
+
+const MAX_TASKLESS_PUBLIC_ATTACHMENTS = 10
 
 function PublicConversationContent({
   authMode,
@@ -249,6 +252,12 @@ function PublicConversationContent({
       return
     }
 
+    if (workforceId && files && files.length > MAX_TASKLESS_PUBLIC_ATTACHMENTS) {
+      throw new Error(t("files.tooManyAttachments", {
+        count: files.length,
+        max: MAX_TASKLESS_PUBLIC_ATTACHMENTS,
+      }))
+    }
     // For a workforce share the first turn starts inside task creation, which
     // rejects an empty message server-side (400) — AFTER any files uploaded
     // above would already be orphaned. Guard the empty case here so files are
@@ -274,13 +283,16 @@ function PublicConversationContent({
       // exists yet) and threaded in as file ids BEFORE the run begins;
       // otherwise the first turn never sees them.
       if (workforceId && files?.length) {
-        const uploaded = await Promise.all(files.map((file) => uploadPublicChatFile({
+        const uploaded = await uploadPublicChatFiles({
           url: `${getApiUrl()}${publicApiPrefix}/files/upload`,
           accessToken,
-          file,
+          files,
           taskType: "task",
           fallbackError: t("files.uploadFailed"),
-        })))
+          onFailures: failures => failures.forEach(({ name, error }) => {
+            toast.error(`${name}: ${error}`)
+          }),
+        })
         taskPayload.files = uploaded.map((item) => item.file_id)
       }
 
@@ -601,16 +613,18 @@ export function PublicAgentChatPage({
       `${baseUrl}/${authMode === "share" ? "api/share" : "api/widget"}/chat/ws/${taskId}${token ? `?token=${token}` : ""}`,
     fileAccess,
     uploadFiles: (files, params) =>
-      Promise.all(files.map((file) =>
-        uploadPublicChatFile({
-          url: `${getApiUrl()}/${authMode === "share" ? "api/share" : "api/widget"}/files/upload`,
-          accessToken: publicAccessToken,
-          file,
-          taskType: params.taskType,
-          taskId: params.taskId,
-          fallbackError: t("files.uploadFailed"),
+      uploadPublicChatFiles({
+        url: `${getApiUrl()}/${authMode === "share" ? "api/share" : "api/widget"}/files/upload`,
+        accessToken: publicAccessToken,
+        files,
+        taskType: params.taskType,
+        taskId: params.taskId,
+        fallbackError: t("files.uploadFailed"),
+        signal: params.signal,
+        onFailures: failures => failures.forEach(({ name, error }) => {
+          toast.error(`${name}: ${error}`)
         }),
-      )),
+      }),
   }), [authMode, fileAccess, publicAccessToken, t])
 
   if (isInitializing) {

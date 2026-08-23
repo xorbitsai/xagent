@@ -121,6 +121,7 @@ interface PendingDelivery {
 }
 
 interface MessagePreparationClaim {
+  abortController: AbortController
   cancellation: Promise<never>
   cancel: (error: Error) => void
   cancelled: boolean
@@ -208,7 +209,7 @@ export interface UseWebSocketOptions {
   taskId?: number
   token?: string
   buildWebSocketUrl?: (params: { baseUrl: string; taskId: number; token?: string }) => string
-  uploadFiles?: (files: File[], params: { taskId?: number | null; taskType: string }) => Promise<Array<{ file_id: string; name?: string; size?: number; type?: string }>>
+  uploadFiles?: (files: File[], params: { taskId?: number | null; taskType: string; signal?: AbortSignal }) => Promise<Array<{ file_id: string; name?: string; size?: number; type?: string }>>
   connection?: WebSocketConnection | null
   deliveryGeneration?: number
   onConnectionClose?: (event: CloseEvent) => "handled" | "default"
@@ -1146,12 +1147,15 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
     const cancellation = new Promise<never>((_resolve, reject) => {
       rejectCancellation = reject
     })
+    const abortController = new AbortController()
     const claim: MessagePreparationClaim = {
+      abortController,
       cancellation,
       cancel: (error) => {
         if (claim.cancelled) return
         claim.cancelled = true
         rejectCancellation(error)
+        claim.abortController.abort()
       },
       cancelled: false,
       connectionIdentity: connection.identity,
@@ -1193,6 +1197,7 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
             uploadFiles(filesToUpload, {
               taskId: currentTaskId,
               taskType: 'task',
+              signal: claim.abortController.signal,
             }),
             claim.cancellation,
           ])
@@ -1208,6 +1213,7 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
                 'Authorization': `Bearer ${tokenRef.current ?? localStorage.getItem('token') ?? ''}`,
               },
               body: formData,
+              signal: claim.abortController.signal,
             })
             const parsed = await parseApiResponse(response)
             if (!response.ok || !isJsonRecord(parsed.data)) {

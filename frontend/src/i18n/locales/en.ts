@@ -1403,6 +1403,7 @@ Build when you need.`,
   },
   files: {
     uploadFailed: "Upload failed",
+    tooManyAttachments: "You can attach up to {max} files at once (received {count}).",
     fileTooLarge: "File is too large for the configured upload limit",
     uploadProxyError: "Upload failed before reaching the application. Please check the server upload limit.",
     header: {

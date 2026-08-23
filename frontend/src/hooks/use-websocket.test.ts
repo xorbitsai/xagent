@@ -2366,6 +2366,65 @@ describe("useWebSocket normalized connections", () => {
     expect(socket.send).not.toHaveBeenCalled()
   })
 
+  it("aborts a custom upload when its preparation claim is cancelled", async () => {
+    let uploadSignal: AbortSignal | undefined
+    const uploadFiles = vi.fn((
+      _files: File[],
+      params: { signal?: AbortSignal },
+    ) => {
+      uploadSignal = params.signal
+      return new Promise<Array<{ file_id: string }>>(() => undefined)
+    })
+    const { result } = renderHook(() => useWebSocket({
+      url: "ws://localhost",
+      taskId: 1,
+      uploadFiles,
+    }))
+    await waitFor(() => expect(MockWebSocket.instances).toHaveLength(1))
+    act(() => MockWebSocket.instances[0].open())
+
+    const delivery = result.current.sendChatMessage(
+      "upload",
+      [new File(["data"], "data.txt")],
+    )
+    await waitFor(() => expect(uploadFiles).toHaveBeenCalledOnce())
+
+    act(() => result.current.disconnect())
+
+    await expect(delivery).rejects.toThrow("Disconnected")
+    expect(uploadSignal?.aborted).toBe(true)
+  })
+
+  it("aborts the fallback upload request when its preparation claim is cancelled", async () => {
+    let requestSignal: AbortSignal | null | undefined
+    const fetchMock = vi.fn((
+      _input: RequestInfo | URL,
+      request?: RequestInit,
+    ) => {
+      requestSignal = request?.signal
+      return new Promise<Response>(() => undefined)
+    })
+    vi.stubGlobal("fetch", fetchMock)
+    const { result } = renderHook(() => useWebSocket({
+      url: "ws://localhost",
+      taskId: 1,
+    }))
+    await waitFor(() => expect(MockWebSocket.instances).toHaveLength(1))
+    act(() => MockWebSocket.instances[0].open())
+
+    const delivery = result.current.sendChatMessage(
+      "upload",
+      [new File(["data"], "data.txt")],
+    )
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledOnce())
+
+    act(() => result.current.disconnect())
+
+    await expect(delivery).rejects.toThrow("Disconnected")
+    expect(requestSignal).toBeDefined()
+    expect(requestSignal?.aborted).toBe(true)
+  })
+
   it("claims a client message id before awaiting its upload", async () => {
     const upload = deferred<Array<{ file_id: string }>>()
     const uploadFiles = vi.fn(() => upload.promise)
@@ -2455,11 +2514,9 @@ describe("useWebSocket normalized connections", () => {
   it("rejects replaced upload preparation promptly and preserves the replacement claim", async () => {
     const oldUpload = deferred<Array<{ file_id: string }>>()
     const replacementUpload = deferred<Array<{ file_id: string }>>()
-    const unexpectedThirdUpload = deferred<Array<{ file_id: string }>>()
     const uploadFiles = vi.fn()
       .mockReturnValueOnce(oldUpload.promise)
       .mockReturnValueOnce(replacementUpload.promise)
-      .mockReturnValueOnce(unexpectedThirdUpload.promise)
     const { result, rerender } = renderHook(
       ({ taskId }) => useWebSocket({
         url: "ws://localhost",
@@ -2516,7 +2573,6 @@ describe("useWebSocket normalized connections", () => {
 
     await act(async () => {
       replacementUpload.resolve([{ file_id: "replacement-file" }])
-      unexpectedThirdUpload.resolve([{ file_id: "unexpected-file" }])
       await Promise.resolve()
     })
     act(() => replacementSocket.receive({

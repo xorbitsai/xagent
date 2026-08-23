@@ -37,7 +37,7 @@ from ...config import (
     get_uploads_dir,
 )
 from ...core.execution_scope import resolve_execution_scope
-from ...core.file_storage import get_user_file_storage
+from ...core.file_storage import get_file_storage_backend, get_user_file_storage
 from ...core.tools.adapters.vibe.file_tool import read_file
 from ...core.tools.core.file_analysis import collect_pptx_slide_blocks
 from ...core.utils.svg import rasterize_svg_bytes
@@ -588,7 +588,16 @@ async def store_uploaded_files(
             )
         completed = True
     except DurableStorageOperationError as exc:
-        logger.warning("Durable storage unavailable during upload: %s", exc)
+        logger.warning(
+            "Durable storage unavailable during upload: "
+            "operation=register_local_uploads backend=%s user_id=%s task_id=%s "
+            "file_count=%s",
+            get_file_storage_backend(),
+            user_id,
+            parsed_task_id,
+            len(upload_items),
+            exc_info=True,
+        )
         raise _durable_storage_unavailable() from exc
     finally:
         if not completed:

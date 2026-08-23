@@ -806,6 +806,117 @@ def _enforce_public_upload_storage_gate(db: Session, owner: User) -> None:
         raise HTTPException(status_code=402, detail=reason)
 
 
+def _public_upload_filename(uploaded: UploadFile) -> str:
+    """Return a bounded basename suitable for a public per-file outcome."""
+
+    filename = (uploaded.filename or "").replace("\\", "/").rsplit("/", 1)[-1]
+    return filename[:255] or "Unnamed file"
+
+
+def _is_public_item_failure(exc: HTTPException) -> bool:
+    """Whether an upload error belongs to one file rather than the request.
+
+    Durable-storage 503s and unexpected server failures retain their existing
+    HTTP response. The legacy unsupported-extension validation uses status 500,
+    so recognize only that established detail as a per-file validation result.
+    """
+
+    return (
+        exc.status_code == 413
+        or (exc.status_code == 422 and exc.detail == "No filename provided")
+        or (
+            exc.status_code == 500
+            and isinstance(exc.detail, str)
+            and exc.detail.startswith("File type ")
+        )
+    )
+
+
+async def _store_public_upload_items(
+    *,
+    upload_items: list[UploadFile],
+    task_type: str,
+    task_id: str | None,
+    folder: str | None,
+    user_id: int,
+    single_file_mode: bool,
+    upload_source: str | None = None,
+) -> dict[str, Any]:
+    """Store a public batch with an opt-in transaction boundary per item.
+
+    Authenticated and other shared callers continue using
+    :func:`store_uploaded_files` atomically. A pure singular ``file`` request
+    also delegates unchanged so its long-standing response shape is preserved.
+    """
+
+    if single_file_mode:
+        return await store_uploaded_files(
+            upload_items=upload_items,
+            task_type=task_type,
+            task_id=task_id,
+            folder=folder,
+            user_id=user_id,
+            single_file_mode=True,
+            upload_source=upload_source,
+        )
+
+    outcomes: list[dict[str, Any]] = []
+    uploaded_count = 0
+    for source_index, uploaded in enumerate(upload_items):
+        try:
+            result = await store_uploaded_files(
+                upload_items=[uploaded],
+                task_type=task_type,
+                task_id=task_id,
+                folder=folder,
+                user_id=user_id,
+                single_file_mode=True,
+                upload_source=upload_source,
+            )
+        except HTTPException as exc:
+            if not _is_public_item_failure(exc):
+                raise
+            detail = exc.detail if isinstance(exc.detail, str) else "Upload failed"
+            outcomes.append(
+                {
+                    "success": False,
+                    "source_index": source_index,
+                    "filename": _public_upload_filename(uploaded),
+                    "error": detail[:500],
+                    "status_code": exc.status_code,
+                }
+            )
+            continue
+
+        uploaded_count += 1
+        outcomes.append(
+            {
+                "success": True,
+                "source_index": source_index,
+                **{
+                    key: result[key]
+                    for key in (
+                        "file_id",
+                        "filename",
+                        "file_size",
+                        "mime_type",
+                        "content_preview",
+                    )
+                },
+            }
+        )
+
+    return {
+        "success": True,
+        "files": outcomes,
+        "total_files": len(outcomes),
+        "uploaded_files": uploaded_count,
+        "failed_files": len(outcomes) - uploaded_count,
+        "task_type": task_type,
+        "message": (f"Successfully uploaded {uploaded_count} of {len(outcomes)} files"),
+    }
+
+
 async def upload_public_chat_files(
     *,
     file: UploadFile | None,
@@ -860,7 +971,7 @@ async def upload_public_chat_files(
         # Stamp the task-less provenance marker so orphan GC (#973) can reap
         # these rows if the guest never completes task creation, without a
         # coarse task_id-IS-NULL sweep touching other paths' unbound drafts.
-        return await store_uploaded_files(
+        return await _store_public_upload_items(
             upload_items=upload_items,
             task_type=task_type,
             task_id=None,
@@ -881,7 +992,7 @@ async def upload_public_chat_files(
             detail="Upload authorization could not be finalized",
         )
 
-    return await store_uploaded_files(
+    return await _store_public_upload_items(
         upload_items=upload_items,
         task_type=task_type,
         task_id=task_id,
@@ -943,7 +1054,7 @@ async def upload_share_chat_files(
         # Stamp the task-less-share provenance marker so orphan GC (#973) can
         # reap these rows if the guest never completes task creation, without
         # a coarse task_id-IS-NULL sweep touching other paths' unbound drafts.
-        return await store_uploaded_files(
+        return await _store_public_upload_items(
             upload_items=upload_items,
             task_type=task_type,
             task_id=None,
@@ -964,7 +1075,7 @@ async def upload_share_chat_files(
             detail="Upload authorization could not be finalized",
         )
 
-    return await store_uploaded_files(
+    return await _store_public_upload_items(
         upload_items=upload_items,
         task_type=task_type,
         task_id=task_id,

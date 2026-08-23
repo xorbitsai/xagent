@@ -1403,6 +1403,7 @@ const zh = {
   },
   files: {
     uploadFailed: "上传失败",
+    tooManyAttachments: "一次最多可附加 {max} 个文件（已选择 {count} 个）。",
     fileTooLarge: "文件大小超过当前配置的上传限制",
     uploadProxyError: "上传在到达应用前被拦截，请检查服务器上传大小限制。",
     header: {

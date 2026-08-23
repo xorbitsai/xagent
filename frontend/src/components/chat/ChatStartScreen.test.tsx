@@ -67,6 +67,39 @@ describe("ChatStartScreen agents section", () => {
     expect(screen.queryByText(AGENTS_SECTION)).toBeNull()
   })
 
+  it("shows a retryable error instead of the picker when the agent-list fetch failed", () => {
+    const onRetryAgents = vi.fn()
+    render(
+      <ChatStartScreen
+        title="Support Agent"
+        agents={[]}
+        agentsError
+        onRetryAgents={onRetryAgents}
+        onSend={vi.fn()}
+      />
+    )
+
+    expect(screen.getByText("chatPage.sections.assignToTeammateError")).toBeTruthy()
+    expect(screen.queryByText(AGENTS_SECTION)).toBeNull()
+
+    fireEvent.click(screen.getByText("common.retry"))
+    expect(onRetryAgents).toHaveBeenCalledOnce()
+  })
+
+  it("prefers the picker over the error state once agents actually load", () => {
+    render(
+      <ChatStartScreen
+        title="Support Agent"
+        agents={[{ id: 7, name: "Billing Agent" }]}
+        agentsError={false}
+        onSend={vi.fn()}
+      />
+    )
+
+    expect(screen.queryByText("chatPage.sections.assignToTeammateError")).toBeNull()
+    expect(screen.getByText(AGENTS_SECTION)).toBeTruthy()
+  })
+
   it("renders the agents that were passed", () => {
     renderScreen([{ id: 7, name: "Billing Agent" }])
 
@@ -75,7 +108,11 @@ describe("ChatStartScreen agents section", () => {
   })
 
   it("shows a pill's specialty label and prefers its persona photo over logo_url", () => {
-    renderScreen([
+    // The pill's own avatar is decorative (its name is right there as
+    // visible text, `decorative` on PersonaAvatar avoids announcing it
+    // twice), so it's queried by tag/src here rather than by accessible
+    // role/name.
+    const { container } = renderScreen([
       {
         id: 7,
         name: "Maya",
@@ -86,7 +123,7 @@ describe("ChatStartScreen agents section", () => {
     ])
 
     expect(screen.getByText("Marketing")).toBeTruthy()
-    expect(screen.getByRole("img", { name: "Maya" })).toHaveAttribute(
+    expect(container.querySelector("img")).toHaveAttribute(
       "src",
       "/marketplace/avatars/maya.png"
     )
@@ -94,7 +131,7 @@ describe("ChatStartScreen agents section", () => {
 
   it("swaps the header for the selected teammate's portrait and a ready-to-lead subline", () => {
     const maya = { id: 7, name: "Maya", persona_avatar: "/marketplace/avatars/maya.png" }
-    render(
+    const { container } = render(
       <ChatStartScreen
         title="Describe the goal"
         description="Some description"
@@ -105,10 +142,17 @@ describe("ChatStartScreen agents section", () => {
     )
 
     expect(screen.getByText("chatPage.sections.leadReady")).toBeTruthy()
-    // One portrait in the swapped header, one in her still-visible picker pill.
-    const portraits = screen.getAllByRole("img", { name: "Maya" })
-    expect(portraits).toHaveLength(2)
-    portraits.forEach((portrait) =>
+    // The hero portrait is named (it stands alone, not beside redundant
+    // text in one interactive control) - the pill's own portrait is
+    // decorative, so both are asserted by src via the DOM instead of by
+    // accessible name.
+    expect(screen.getByRole("img", { name: "Maya" })).toHaveAttribute(
+      "src",
+      "/marketplace/avatars/maya.png"
+    )
+    const allPortraits = container.querySelectorAll("img")
+    expect(allPortraits).toHaveLength(2)
+    allPortraits.forEach((portrait) =>
       expect(portrait).toHaveAttribute("src", "/marketplace/avatars/maya.png")
     )
     // The plain (no-lead) description only renders in the fallback header.
@@ -120,12 +164,15 @@ describe("ChatStartScreen agents section", () => {
     // with no avatar at all, "no portrait in the header" would pass trivially
     // even if the hero-swap logic were broken, since PersonaAvatar always
     // falls back to text initials regardless of selection state.
-    renderScreen([{ id: 7, name: "Maya", persona_avatar: "/marketplace/avatars/maya.png" }])
+    const { container } = renderScreen([
+      { id: 7, name: "Maya", persona_avatar: "/marketplace/avatars/maya.png" },
+    ])
 
     expect(screen.queryByText("chatPage.sections.leadReady")).toBeNull()
-    // Her picker pill still renders its own portrait either way - only a
-    // second (hero) portrait would indicate the header wrongly swapped.
-    expect(screen.getAllByRole("img", { name: "Maya" })).toHaveLength(1)
+    // No *named* portrait (the hero didn't swap in) - her picker pill
+    // still renders its own (decorative) portrait either way.
+    expect(screen.queryByRole("img", { name: "Maya" })).toBeNull()
+    expect(container.querySelectorAll("img")).toHaveLength(1)
   })
 
   it("does not show a right-edge fade when the pill row does not overflow", () => {

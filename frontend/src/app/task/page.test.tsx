@@ -18,6 +18,8 @@ interface MockAgent {
 interface MockChatStartScreenProps {
   inputValue?: string
   agents?: MockAgent[]
+  agentsError?: boolean
+  onRetryAgents?: () => void
   selectedAgents?: MockAgent[]
   onAgentClick?: (agent: MockAgent) => void
   onInputChange?: (value: string) => void
@@ -75,12 +77,28 @@ vi.mock("@/components/chat/ChatStartScreen", () => ({
     return (
       <div>
         <input data-testid="composer" readOnly value={props.inputValue ?? ""} />
+        {props.agentsError && (
+          <button onClick={() => props.onRetryAgents?.()}>retry-agents</button>
+        )}
         {(props.agents ?? []).map((agent) => (
           <button key={agent.id} onClick={() => props.onAgentClick?.(agent)}>
             pick-{agent.name}
           </button>
         ))}
-        <button onClick={() => props.onSend?.("hello", [], { mode: "balanced" })}>send</button>
+        <button
+          onClick={async () => {
+            // Mirrors the real ChatInput.handleSubmit: page.tsx's onSend
+            // (handleSend) catches its own errors internally and never
+            // rejects, so ChatInput always reaches its post-submit reset
+            // and calls onInputChange("") right after - not a mock
+            // artifact but the exact interaction that let the
+            // suppressNextInputChangeRef bug through untested.
+            await props.onSend?.("hello", [], { mode: "balanced" })
+            props.onInputChange?.("")
+          }}
+        >
+          send
+        </button>
       </div>
     )
   },
@@ -125,6 +143,35 @@ describe("TaskHomePage agents", () => {
       expect(chatStartScreenProps.current?.agents).toEqual([VERA, KEVIN])
     })
     expect(apiRequestMock).toHaveBeenCalledWith("http://api.local/api/agents")
+  })
+
+  it("surfaces a retryable error when the agent-list request returns a non-OK response", async () => {
+    apiRequestMock.mockResolvedValueOnce(new Response(null, { status: 500 }))
+
+    render(<TaskHomePage />)
+
+    await waitFor(() => {
+      expect(chatStartScreenProps.current?.agentsError).toBe(true)
+    })
+    expect(chatStartScreenProps.current?.agents).toEqual([])
+  })
+
+  it("surfaces a retryable error when the agent-list request rejects, and clears it on a successful retry", async () => {
+    apiRequestMock.mockRejectedValueOnce(new Error("network down"))
+
+    render(<TaskHomePage />)
+
+    await waitFor(() => {
+      expect(chatStartScreenProps.current?.agentsError).toBe(true)
+    })
+
+    apiRequestMock.mockResolvedValueOnce(jsonResponse([VERA]))
+    fireEvent.click(screen.getByText("retry-agents"))
+
+    await waitFor(() => {
+      expect(chatStartScreenProps.current?.agentsError).toBe(false)
+      expect(chatStartScreenProps.current?.agents).toEqual([VERA])
+    })
   })
 
   it("selects the agent named in a ?agent= deep link once it's loaded, and also auto-fills its prompt", async () => {
@@ -541,6 +588,28 @@ describe("TaskHomePage send", () => {
       expect(screen.getByTestId("composer")).toHaveValue("")
     })
     expect(chatStartScreenProps.current?.selectedAgents).toEqual([])
+  })
+
+  it("still auto-fills the next pick after a send, despite ChatInput's own post-submit onInputChange(\"\") echo", async () => {
+    const KEVIN_WITH_PROMPT = { ...KEVIN, suggested_prompts: ["Turn my meetings into next steps"] }
+    apiRequestMock.mockResolvedValueOnce(jsonResponse([VERA, KEVIN_WITH_PROMPT]))
+    sendMessageMock.mockResolvedValueOnce(undefined)
+    render(<TaskHomePage />)
+    await screen.findByText("pick-Vera")
+
+    fireEvent.click(screen.getByText("pick-Vera"))
+    fireEvent.click(screen.getByText("send"))
+    await waitFor(() => {
+      expect(screen.getByTestId("composer")).toHaveValue("")
+    })
+
+    // A second task, right after the first: picking a teammate with a
+    // prompt must still auto-fill - ChatInput's own onInputChange("") call
+    // right after the send must not have poisoned the composer as
+    // "already dirty" for the rest of the session.
+    fireEvent.click(screen.getByText("pick-Kevin"))
+
+    expect(screen.getByTestId("composer")).toHaveValue("Turn my meetings into next steps")
   })
 
   it("toasts and keeps state when sendMessage rejects", async () => {

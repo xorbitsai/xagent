@@ -8,6 +8,7 @@ const en = {
     cancel: "Cancel",
     delete: "Delete",
     remove: "Remove",
+    retry: "Retry",
     confirm: "Confirm",
     deleteConfirm: "Are you sure you want to delete this item?",
     deleteFailed: "Failed to delete",
@@ -218,6 +219,7 @@ const en = {
       assignToTeammate: "MY TEAM",
       assignToTeammateLead: "Assign this to a teammate",
       assignToTeammateHint: " — or leave it and let {appName} choose.",
+      assignToTeammateError: "Couldn't load your team.",
       leadReady: "{name} is ready to lead this task.",
     },
     input: {

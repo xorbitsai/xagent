@@ -5,6 +5,7 @@ import { useI18n } from "@/contexts/i18n-context";
 import { resolveAgentLogoUrl, getApiUrl } from "@/lib/utils";
 import { PersonaAvatar } from "@/components/templates/persona-avatar";
 import { getBrandingFromEnv } from "@/lib/branding";
+import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 
 export interface PromptCard {
   icon?: any;
@@ -55,6 +56,11 @@ type ChatStartScreenProps = {
   icon?: React.ReactNode | string; // URL string or ReactNode
   prompts?: (PromptCard | string)[];
   agents?: AgentCard[];
+  // True when the caller's agent-list fetch failed - shown in place of the
+  // picker row (which would otherwise look identical to "no published
+  // agents exist" with no way to recover).
+  agentsError?: boolean;
+  onRetryAgents?: () => void;
   onAgentClick?: (agent: AgentCard) => void;
   selectedAgents?: AgentCard[];
   onSend: (message: string, files: File[], config?: any) => void | Promise<void>;
@@ -83,6 +89,8 @@ export function ChatStartScreen({
   icon,
   prompts,
   agents,
+  agentsError = false,
+  onRetryAgents,
   onAgentClick,
   selectedAgents = [],
   onSend,
@@ -251,7 +259,18 @@ export function ChatStartScreen({
           </div>
         )}
 
-        {agents && agents.length > 0 && (
+        {agentsError ? (
+          <div className="flex items-center justify-between gap-3 rounded-xl border border-destructive/30 bg-destructive/[0.04] px-4 py-3 text-left">
+            <p className="text-xs text-destructive">{t("chatPage.sections.assignToTeammateError")}</p>
+            <button
+              type="button"
+              onClick={onRetryAgents}
+              className="shrink-0 text-xs font-semibold text-destructive underline underline-offset-2 hover:no-underline"
+            >
+              {t("common.retry")}
+            </button>
+          </div>
+        ) : agents && agents.length > 0 && (
           <div className="space-y-2.5 text-left">
             <p className="text-xs text-muted-foreground px-1">
               <b className="font-semibold text-foreground/85">
@@ -270,40 +289,55 @@ export function ChatStartScreen({
                 <span className="shrink-0 text-[11px] font-bold uppercase tracking-[0.07em] text-muted-foreground/80 whitespace-nowrap">
                   {t("chatPage.sections.assignToTeammate")}
                 </span>
-                {agents.map((agent) => {
-                  const isSelected = selectedAgents.some(
-                    (selectedAgent) => selectedAgent.id === agent.id
-                  );
-                  const avatarUrl = resolveTeammateAvatar(agent);
+                <TooltipProvider delayDuration={200}>
+                  {agents.map((agent) => {
+                    const isSelected = selectedAgents.some(
+                      (selectedAgent) => selectedAgent.id === agent.id
+                    );
+                    const avatarUrl = resolveTeammateAvatar(agent);
 
-                  return (
-                    <button
-                      key={agent.id}
-                      type="button"
-                      aria-pressed={isSelected}
-                      title={agent.description || agent.name}
-                      onClick={() => onAgentClick?.(agent)}
-                      className={`shrink-0 flex items-center gap-[7px] rounded-full border pl-[3px] pr-3 py-[3px] transition-all whitespace-nowrap ${
-                        isSelected
-                          ? "border-primary/40 bg-primary/[0.06] shadow-[0_4px_14px_hsl(var(--primary)/0.11)]"
-                          : "border-border bg-background hover:border-primary/30 hover:bg-primary/[0.04] hover:-translate-y-px"
-                      }`}
-                    >
-                      <PersonaAvatar
-                        persona={{ name: agent.name, avatar: avatarUrl }}
-                        sizeClassName="h-[27px] w-[27px]"
-                        textClassName="text-[11px]"
-                        className={isSelected ? "shadow-[0_0_0_2px_hsl(var(--background)),0_0_0_3px_hsl(var(--primary))]" : ""}
-                      />
-                      <b className={`text-[12.5px] font-semibold ${isSelected ? "text-primary" : "text-foreground"}`}>
-                        {agent.name}
-                      </b>
-                      {agent.specialty && (
-                        <span className="text-[11.5px] text-muted-foreground">{agent.specialty}</span>
-                      )}
-                    </button>
-                  );
-                })}
+                    const pill = (
+                      <button
+                        type="button"
+                        aria-pressed={isSelected}
+                        onClick={() => onAgentClick?.(agent)}
+                        className={`shrink-0 flex items-center gap-[7px] rounded-full border pl-[3px] pr-3 py-[3px] transition-all whitespace-nowrap ${
+                          isSelected
+                            ? "border-primary/40 bg-primary/[0.06] shadow-[0_4px_14px_hsl(var(--primary)/0.11)]"
+                            : "border-border bg-background hover:border-primary/30 hover:bg-primary/[0.04] hover:-translate-y-px"
+                        }`}
+                      >
+                        <PersonaAvatar
+                          persona={{ name: agent.name, avatar: avatarUrl }}
+                          sizeClassName="h-[27px] w-[27px]"
+                          textClassName="text-[11px]"
+                          className={isSelected ? "shadow-[0_0_0_2px_hsl(var(--background)),0_0_0_3px_hsl(var(--primary))]" : ""}
+                          decorative
+                        />
+                        <b className={`text-[12.5px] font-semibold ${isSelected ? "text-primary" : "text-foreground"}`}>
+                          {agent.name}
+                        </b>
+                        {agent.specialty && (
+                          <span className="text-[11.5px] text-muted-foreground">{agent.specialty}</span>
+                        )}
+                      </button>
+                    );
+
+                    return (
+                      <Tooltip key={agent.id}>
+                        <TooltipTrigger asChild>{pill}</TooltipTrigger>
+                        {agent.description && (
+                          <TooltipContent side="top" className="max-w-[240px] text-left">
+                            <div className="space-y-1">
+                              <div className="font-medium">{agent.name}</div>
+                              <p className="text-xs text-muted-foreground">{agent.description}</p>
+                            </div>
+                          </TooltipContent>
+                        )}
+                      </Tooltip>
+                    );
+                  })}
+                </TooltipProvider>
               </div>
               {/* Fades the right edge so a horizontally-clipped pill reads as
                   "more to scroll" rather than an abruptly truncated name -

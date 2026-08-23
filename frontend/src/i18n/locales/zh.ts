@@ -8,6 +8,7 @@ const zh = {
     cancel: "取消",
     delete: "删除",
     remove: "移除",
+    retry: "重试",
     confirm: "确定",
     deleteConfirm: "确定要删除这个任务吗？",
     deleteFailed: "删除失败",
@@ -218,6 +219,7 @@ const zh = {
       assignToTeammate: "我的团队",
       assignToTeammateLead: "将此任务分配给一位队员",
       assignToTeammateHint: "——或者不选，让 {appName} 自行决定。",
+      assignToTeammateError: "无法加载你的团队。",
       leadReady: "{name} 已准备好接手这项任务。",
     },
     input: {

@@ -531,6 +531,27 @@ describe("ChatInput", () => {
     expect(screen.queryByText("chatPage.input.noModelAlert")).not.toBeInTheDocument()
   })
 
+  it("clears the read-only model display instead of showing a stale lead's model while a new one's config is still loading", () => {
+    const commonProps = {
+      hideFileUpload: true,
+      inputValue: "hello",
+      onInputChange: vi.fn(),
+      onSend: vi.fn(),
+      readOnlyConfig: true,
+    }
+    const { rerender } = render(<ChatInput {...commonProps} taskConfig={{ model: "agent-a-model" }} />)
+
+    expect(screen.getByText("agent-a-model")).toBeInTheDocument()
+
+    // Caller switched leads - the new lead's own config fetch resets
+    // taskConfig to undefined while still in flight (readOnlyConfig stays
+    // true throughout).
+    rerender(<ChatInput {...commonProps} taskConfig={undefined} />)
+
+    expect(screen.queryByText("agent-a-model")).not.toBeInTheDocument()
+    expect(screen.getByText("chatPage.input.noModel")).toBeInTheDocument()
+  })
+
   it("does not show pause for uppercase terminal task status", () => {
     const { container } = render(
       <ChatInput

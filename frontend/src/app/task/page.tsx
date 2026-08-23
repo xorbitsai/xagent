@@ -34,9 +34,20 @@ function TaskHomePageContent() {
   // "untouched" - which would then silently reinsert the very prompt they
   // just deleted.
   const composerDirtyRef = useRef(false);
+  // ChatInput clears its own controlled value via `onInputChange("")` right
+  // after a successful send (its own post-submit reset), which arrives
+  // through this exact same callback as a genuine user edit - without this
+  // flag, that call would immediately mark the just-cleared composer dirty
+  // again, permanently disabling auto-fill for the rest of the session
+  // after the very first send. Set synchronously right before the resolved
+  // `onSend` promise hands control back to ChatInput, so there is no
+  // window for a real keystroke to be mistaken for the echo.
+  const suppressNextInputChangeRef = useRef(false);
 
   const [files, setFiles] = useState<File[]>([]);
   const [agents, setAgents] = useState<AgentCard[]>([]);
+  const [agentsError, setAgentsError] = useState(false);
+  const [agentsRetryToken, setAgentsRetryToken] = useState(0);
   const [selectedAgents, setSelectedAgents] = useState<AgentCard[]>([]);
   const [selectedAgentConfig, setSelectedAgentConfig] = useState<{
     model?: string;
@@ -49,29 +60,36 @@ function TaskHomePageContent() {
     dispatch({ type: "RESET_STATE" });
   }, [dispatch]);
 
-  // Fetch agents on mount
+  // Fetch agents on mount (and again on retry) - a failure here must not
+  // just silently render zero teammates, since that reads identically to
+  // "no published agents exist" and gives the user nothing to act on.
   useEffect(() => {
     let cancelled = false;
     const fetchAgents = async () => {
+      setAgentsError(false);
       try {
         const response = await apiRequest(`${getApiUrl()}/api/agents`);
-        if (response.ok && !cancelled) {
-          const data = await response.json();
-          if (cancelled) return;
-          setAgents(
-            Array.isArray(data)
-              ? data.filter(
-                (agent) =>
-                  agent &&
-                  typeof agent === "object" &&
-                  agent.status === "published"
-              )
-              : []
-          );
+        if (cancelled) return;
+        if (!response.ok) {
+          setAgentsError(true);
+          return;
         }
+        const data = await response.json();
+        if (cancelled) return;
+        setAgents(
+          Array.isArray(data)
+            ? data.filter(
+              (agent) =>
+                agent &&
+                typeof agent === "object" &&
+                agent.status === "published"
+            )
+            : []
+        );
       } catch (error) {
         if (!cancelled) {
           console.error("Failed to fetch agents:", error);
+          setAgentsError(true);
         }
       }
     };
@@ -79,7 +97,11 @@ function TaskHomePageContent() {
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [agentsRetryToken]);
+
+  const handleRetryAgents = () => {
+    setAgentsRetryToken((token) => token + 1);
+  };
 
   // Best-effort enrichment only: a hired agent traces back to the template
   // it came from via `template_id`, and this lookup supplies that
@@ -282,6 +304,7 @@ function TaskHomePageContent() {
       setPromptHighlightTerms([]);
       setSelectedAgents([]);
       composerDirtyRef.current = false;
+      suppressNextInputChangeRef.current = true;
     } catch (error) {
       console.error("Failed to send message:", error);
       toast.error(error instanceof Error ? error.message : t("builds.list.chat.sendFailed"));
@@ -300,6 +323,14 @@ function TaskHomePageContent() {
   };
 
   const handleInputChange = (value: string) => {
+    if (suppressNextInputChangeRef.current) {
+      // ChatInput's own post-submit reset, not a real edit - let it clear
+      // the composer without disturbing the fresh (untouched) state
+      // handleSend just established.
+      suppressNextInputChangeRef.current = false;
+      setInputValue(value);
+      return;
+    }
     composerDirtyRef.current = true;
     setInputValue(value);
   };
@@ -347,6 +378,8 @@ function TaskHomePageContent() {
             description={t("chatPage.page.emptyDescription")}
             icon={<Bot className="w-10 h-10 text-[hsl(var(--gradient-from))]" />}
             agents={teammates}
+            agentsError={agentsError}
+            onRetryAgents={handleRetryAgents}
             onAgentClick={handleAgentClick}
             selectedAgents={resolvedSelectedAgents}
             onSend={handleSend}

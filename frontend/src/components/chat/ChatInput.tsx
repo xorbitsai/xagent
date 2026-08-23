@@ -532,6 +532,21 @@ export function ChatInput({
         compactModel: defaultAgentConfig.compactModel,
         executionMode: undefined
       }));
+    } else {
+      // readOnlyConfig is true but taskConfig hasn't arrived yet - e.g. the
+      // caller just switched to a different lead and that lead's own
+      // config fetch is still in flight. The disabled read-only model
+      // button below renders straight from `agentConfig`, so leaving the
+      // previous lead's stale model/mode in place would show it as if it
+      // belonged to whoever is selected now.
+      setAgentConfig(prev => ({
+        ...prev,
+        model: "",
+        smallFastModel: undefined,
+        visualModel: undefined,
+        compactModel: undefined,
+        executionMode: undefined
+      }));
     }
   }, [taskConfig, readOnlyConfig, defaultAgentConfig]);
 

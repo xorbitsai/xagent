@@ -81,6 +81,7 @@ vi.mock("sonner", () => ({
   },
 }))
 
+import { generateClientMessageId } from "@/lib/utils"
 import { ChatInput } from "./ChatInput"
 
 const emptyJsonResponse = () =>
@@ -1182,6 +1183,76 @@ describe("ChatInput", () => {
     expect(onSend.mock.calls[0][1]).toEqual(
       expect.objectContaining({ clientMessageId: expect.any(String) })
     )
+  })
+
+  it("reuses the same clientMessageId when retrying unchanged content after an outcome-unknown failure", async () => {
+    // Server-side dedup safety net: a failure that doesn't carry
+    // `retryWithNewId` means the send's outcome is unknown (it may have
+    // actually landed), so a retry with byte-identical content must reuse
+    // the same id instead of minting a new one - otherwise the server can't
+    // tell the retry apart from a genuine second message.
+    const onInputChange = vi.fn()
+    const onSend = vi.fn().mockRejectedValue(new Error("Message was rejected"))
+    const { container } = render(
+      <ChatInput
+        hideConfig
+        hideFileUpload
+        inputValue="keep this draft"
+        onInputChange={onInputChange}
+        onSend={onSend}
+        readOnlyConfig
+      />
+    )
+
+    fireEvent.submit(container.querySelector("form") as HTMLFormElement)
+    await waitFor(() => expect(onSend).toHaveBeenCalledTimes(1))
+    const firstId = onSend.mock.calls[0][1].clientMessageId
+
+    // isSubmittingRef only releases 500ms after a submit settles.
+    await new Promise((resolve) => setTimeout(resolve, 550))
+    fireEvent.submit(container.querySelector("form") as HTMLFormElement)
+    await waitFor(() => expect(onSend).toHaveBeenCalledTimes(2))
+
+    expect(onSend.mock.calls[1][1].clientMessageId).toBe(firstId)
+  })
+
+  it("generates a new clientMessageId when retrying after a retryWithNewId failure", async () => {
+    // The opposite case: a failure the caller marks `retryWithNewId` means
+    // the send is confirmed to have never landed, so a retry - even with
+    // identical content - should get its own fresh id rather than being
+    // conflated with the failed attempt.
+    // Override the shared module mock's queue for just these two calls -
+    // by this point in the suite it's already fallen through to its
+    // catch-all return value, which would make both ids look identical
+    // and defeat the point of this test regardless of the real behavior.
+    vi.mocked(generateClientMessageId)
+      .mockImplementationOnce(() => "retry-with-new-id-1")
+      .mockImplementationOnce(() => "retry-with-new-id-2")
+    const onInputChange = vi.fn()
+    const retryableError = Object.assign(new Error("Message was rejected"), {
+      retryWithNewId: true,
+    })
+    const onSend = vi.fn().mockRejectedValue(retryableError)
+    const { container } = render(
+      <ChatInput
+        hideConfig
+        hideFileUpload
+        inputValue="keep this draft"
+        onInputChange={onInputChange}
+        onSend={onSend}
+        readOnlyConfig
+      />
+    )
+
+    fireEvent.submit(container.querySelector("form") as HTMLFormElement)
+    await waitFor(() => expect(onSend).toHaveBeenCalledTimes(1))
+    const firstId = onSend.mock.calls[0][1].clientMessageId
+
+    await new Promise((resolve) => setTimeout(resolve, 550))
+    fireEvent.submit(container.querySelector("form") as HTMLFormElement)
+    await waitFor(() => expect(onSend).toHaveBeenCalledTimes(2))
+
+    expect(onSend.mock.calls[1][1].clientMessageId).not.toBe(firstId)
   })
 
   const mockDefaultModel = () => {

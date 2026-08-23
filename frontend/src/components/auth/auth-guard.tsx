@@ -1,11 +1,14 @@
 "use client"
 
-import React, { useEffect, useState } from "react"
+import React, { useEffect, useRef, useState } from "react"
 import { useAuth } from "@/contexts/auth-context"
 import { isAuthPublicPath } from "@/lib/auth-pages"
 import { useRouter, usePathname } from "next/navigation"
 import { useI18n } from "@/contexts/i18n-context"
 import { getBrandingFromEnv } from "@/lib/branding"
+import { fetchUserPreferences } from "@/lib/user-preferences"
+
+const ONBOARDING_PATH = "/onboarding"
 
 const branding = getBrandingFromEnv()
 
@@ -34,6 +37,28 @@ export function AuthGuard({ children }: AuthGuardProps) {
       router.push("/login")
     }
   }, [isAuthenticated, isLoading, router, mounted, isAuthPage])
+
+  // Checked once per app load (this component doesn't remount on client-side
+  // navigation), not on every route change - a stale read only matters until
+  // the user next completes or skips onboarding, at which point every exit
+  // path there PATCHes onboarded:true before leaving, so this won't loop.
+  const checkedOnboardingRef = useRef(false)
+  useEffect(() => {
+    if (!mounted || isAuthPage || pathname === ONBOARDING_PATH) return
+    if (isLoading || !isAuthenticated || checkedOnboardingRef.current) return
+    checkedOnboardingRef.current = true
+
+    let active = true
+    void (async () => {
+      const preferences = await fetchUserPreferences()
+      if (active && !preferences.onboarded) {
+        router.push(ONBOARDING_PATH)
+      }
+    })()
+    return () => {
+      active = false
+    }
+  }, [mounted, isAuthPage, pathname, isLoading, isAuthenticated, router])
 
   useEffect(() => {
     // Reduce check frequency, only check when user is active

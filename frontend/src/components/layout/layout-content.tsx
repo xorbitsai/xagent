@@ -4,7 +4,7 @@ import { usePathname } from "next/navigation";
 import { Sidebar } from "@/components/layout/sidebar";
 import { MobileHeader } from "@/components/layout/mobile-header";
 import { AppProvider } from "@/contexts/app-context-chat";
-import { isAuthPublicPath } from "@/lib/auth-pages";
+import { isAuthPublicPath, isChromelessAuthenticatedPath } from "@/lib/auth-pages";
 
 interface LayoutContentProps {
   children: React.ReactNode;
@@ -14,8 +14,11 @@ export function LayoutContent({ children }: LayoutContentProps) {
   const pathname = usePathname();
   const isAuthPage = isAuthPublicPath(pathname);
 
-  if (isAuthPage) {
-    // For auth pages, just render children without sidebar
+  if (isAuthPage || isChromelessAuthenticatedPath(pathname)) {
+    // Auth pages and full-screen authenticated pages (e.g. onboarding) both
+    // render without the sidebar shell - AuthGuard (a parent of this
+    // component) is what actually enforces the login requirement for the
+    // latter, this check is presentation-only.
     return <>{children}</>;
   }
 

@@ -39,3 +39,19 @@ export function isAuthPublicPath(pathname: string | null): boolean {
   }
   return AUTH_PUBLIC_PATHS.includes(pathname as (typeof AUTH_PUBLIC_PATHS)[number])
 }
+
+/** Paths that render full-screen with no sidebar/app chrome, but - unlike
+ * AUTH_PUBLIC_PATHS - still require a real authenticated session (AuthGuard
+ * still runs its login redirect for them). Kept separate from
+ * isAuthPublicPath so a page here is never accidentally treated as not
+ * requiring login. */
+export const CHROMELESS_AUTHENTICATED_PATHS = ["/onboarding"] as const
+
+export function isChromelessAuthenticatedPath(pathname: string | null): boolean {
+  if (!pathname) {
+    return false
+  }
+  return CHROMELESS_AUTHENTICATED_PATHS.includes(
+    pathname as (typeof CHROMELESS_AUTHENTICATED_PATHS)[number]
+  )
+}

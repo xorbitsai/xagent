@@ -1,15 +1,21 @@
 import React from "react"
-import { cleanup, render, screen } from "@testing-library/react"
+import { cleanup, render, screen, waitFor } from "@testing-library/react"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 import { AuthGuard } from "./auth-guard"
 import { resolveTranslation, type TranslationKey } from "@/i18n/translations"
 
 const route = vi.hoisted(() => ({ pathname: "/" as string | null }))
 const authState = vi.hoisted(() => ({ isAuthenticated: false, isLoading: true }))
+const routerPush = vi.hoisted(() => vi.fn())
+const fetchUserPreferencesMock = vi.hoisted(() => vi.fn())
 
 vi.mock("next/navigation", () => ({
   usePathname: () => route.pathname,
-  useRouter: () => ({ push: vi.fn() }),
+  useRouter: () => ({ push: routerPush }),
+}))
+
+vi.mock("@/lib/user-preferences", () => ({
+  fetchUserPreferences: fetchUserPreferencesMock,
 }))
 
 vi.mock("@/contexts/auth-context", () => ({
@@ -80,5 +86,56 @@ describe("AuthGuard loading state", () => {
 
     expect(screen.getByText("Loading...")).toBeInTheDocument()
     expect(screen.queryByText("Welcome to Xagent")).not.toBeInTheDocument()
+  })
+})
+
+// Pins the exact regression found during live onboarding verification: GET
+// /api/auth/me nests preferences under `user.preferences`, not top-level -
+// fetchUserPreferences must unwrap that shape correctly, and this hook must
+// act on the real result, not a shape that silently always reads as "not
+// onboarded".
+describe("AuthGuard onboarding redirect", () => {
+  beforeEach(() => {
+    route.pathname = "/settings"
+    authState.isAuthenticated = true
+    authState.isLoading = false
+    routerPush.mockClear()
+    fetchUserPreferencesMock.mockReset()
+  })
+
+  afterEach(cleanup)
+
+  it("redirects an authenticated but unonboarded user to /onboarding", async () => {
+    fetchUserPreferencesMock.mockResolvedValue({})
+
+    render(<AuthGuard><div data-testid="children" /></AuthGuard>)
+
+    await waitFor(() => expect(routerPush).toHaveBeenCalledWith("/onboarding"))
+  })
+
+  it("does not redirect a user whose preferences already have onboarded: true", async () => {
+    fetchUserPreferencesMock.mockResolvedValue({ onboarded: true })
+
+    render(<AuthGuard><div data-testid="children" /></AuthGuard>)
+
+    await waitFor(() => expect(fetchUserPreferencesMock).toHaveBeenCalled())
+    expect(routerPush).not.toHaveBeenCalledWith("/onboarding")
+  })
+
+  it("does not check preferences at all while already on the onboarding page", () => {
+    route.pathname = "/onboarding"
+
+    render(<AuthGuard><div data-testid="children" /></AuthGuard>)
+
+    expect(fetchUserPreferencesMock).not.toHaveBeenCalled()
+  })
+
+  it("does not check preferences on public auth pages", () => {
+    route.pathname = "/login"
+    authState.isAuthenticated = false
+
+    render(<AuthGuard><div data-testid="children" /></AuthGuard>)
+
+    expect(fetchUserPreferencesMock).not.toHaveBeenCalled()
   })
 })

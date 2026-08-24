@@ -945,13 +945,24 @@ def validate_email_for_login_namespace(
     return None
 
 
+def _normalized_preferences(user: User) -> Dict[str, Any]:
+    """The user's stored preferences as a plain dict, tolerating a NULL or
+    malformed value. ``preferences`` has no nested-type constraint (same
+    reasoning as apply_output_voice's isinstance guard on the ``voice``
+    value it holds), so a corrupted/hand-edited row could store a non-dict
+    JSON value here - ``dict(value or {})`` would raise on any of those
+    instead of degrading to an empty dict."""
+    preferences = cast(Any, user.preferences)
+    return dict(preferences) if isinstance(preferences, dict) else {}
+
+
 def serialize_auth_user(user: User, include_login_time: bool = False) -> Dict[str, Any]:
     payload: Dict[str, Any] = {
         "id": user.id,
         "username": user.username,
         "email": user.email,
         "is_admin": bool(cast(Any, user.is_admin)),
-        "preferences": dict(cast(Any, user.preferences) or {}),
+        "preferences": _normalized_preferences(user),
     }
     if include_login_time:
         payload["loginTime"] = datetime.now(timezone.utc).timestamp()
@@ -1309,22 +1320,31 @@ async def update_current_user_email(
     )
 
 
-def _lock_user_row_for_preferences_update(db: Session, user_id: int) -> None:
+def _lock_user_row_for_preferences_update(db: Session, user_id: int) -> bool:
     """Serialize concurrent preferences PATCHes for one user, in every
     database - mirrors acquire_runtime_key_transition_fence's dual-dialect
-    pattern (api/api_keys.py). PostgreSQL/MySQL take a row-level ``FOR
-    UPDATE`` lock; SQLite ignores that clause, so a no-op write grabs its
-    write lock instead. Held until this transaction commits, so a second
-    concurrent PATCH's read-modify-write of the same JSON column blocks
-    here instead of reading stale data and silently dropping the first
-    request's disjoint fields on its own commit."""
+    pattern (services/api_keys.py). PostgreSQL/MySQL take a row-level
+    ``FOR UPDATE`` lock; SQLite ignores that clause, so a no-op write grabs
+    its write lock instead. Held until this transaction commits, so a
+    second concurrent PATCH's read-modify-write of the same JSON column
+    blocks here instead of reading stale data and silently dropping the
+    first request's disjoint fields on its own commit.
+
+    Returns ``False`` when the user no longer exists (deleted between
+    ``get_current_user`` loading it and this call), the same contract the
+    mirrored helper uses - letting the caller turn that into a clean 404
+    instead of an unhandled ``ObjectDeletedError`` from a subsequent
+    ``db.refresh()``."""
     if db.get_bind().dialect.name == "sqlite":
         db.execute(
             text("UPDATE users SET id = id WHERE id = :user_id"),
             {"user_id": user_id},
         )
-    else:
+        return db.query(User.id).filter(User.id == user_id).first() is not None
+    return (
         db.query(User.id).filter(User.id == user_id).with_for_update().first()
+        is not None
+    )
 
 
 @auth_router.patch("/me/preferences", response_model=UpdatePreferencesResponse)
@@ -1339,12 +1359,15 @@ async def update_current_user_preferences(
     survives a later step's PATCH."""
     updates = request.model_dump(exclude_unset=True)
     if updates:
-        _lock_user_row_for_preferences_update(db, int(user.id))
+        if not _lock_user_row_for_preferences_update(db, int(user.id)):
+            # Deleted concurrently (e.g. account deletion) between
+            # get_current_user loading this row and the lock attempt.
+            raise HTTPException(status_code=404, detail="User not found")
         # Re-read after acquiring the lock: a concurrent PATCH may have
         # committed its own merge while this request was waiting on it,
         # and `user` was loaded before that lock was taken.
         db.refresh(user)
-        current_preferences = dict(cast(Any, user.preferences) or {})
+        current_preferences = _normalized_preferences(user)
         current_preferences.update(updates)
         setattr(user, "preferences", current_preferences)
         db.commit()

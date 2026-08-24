@@ -1751,6 +1751,7 @@ async def preview_agent(
             exclude_custom_api_when_unconfigured=True,
         )
 
+        current_user_voice = voice_from_runtime_user(current_user)
         tool_config = WebToolConfig(
             db=db,
             request=MinimalRequest(int(current_user.id)),
@@ -1773,7 +1774,7 @@ async def preview_agent(
             # Threaded through so a delegated AgentTool child the preview
             # calls also honors the previewing user's voice (see
             # BaseToolConfig.get_voice's docstring).
-            voice=voice_from_runtime_user(current_user),
+            voice=current_user_voice,
         )
 
         # Determine execution mode (default to "think")
@@ -1800,7 +1801,7 @@ async def preview_agent(
             request.knowledge_bases if request.knowledge_bases is not None else None,
         )
         enhanced_system_prompt = apply_user_voice(
-            enhanced_system_prompt, voice_from_runtime_user(current_user)
+            enhanced_system_prompt, current_user_voice
         )
 
         # Create agent service (Langfuse only, no database/websocket logging)

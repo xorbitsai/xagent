@@ -489,6 +489,71 @@ class TestAuthAPI:
         assert response.status_code == 200, response.text
         mock_manager.invalidate_cached_agents_for_owner.assert_called_once_with(user_id)
 
+    def test_serialize_auth_user_tolerates_malformed_non_dict_preferences(
+        self, test_db, test_user_data
+    ):
+        """`preferences` has no nested-type constraint, so a corrupted or
+        hand-edited row could hold a non-dict JSON value (e.g. a list).
+        Every endpoint that serializes the user (login, /me, this PATCH's
+        own response) must degrade to an empty dict instead of crashing on
+        `dict(value)`."""
+        import json
+
+        from sqlalchemy import text as sa_text
+
+        setup_first_admin()
+        register_response = client.post("/api/auth/register", json=test_user_data)
+        assert register_response.status_code == 200
+        user_id = register_response.json()["user"]["id"]
+        token = login_and_get_token(
+            test_user_data["username"], test_user_data["password"]
+        )
+        headers = {"Authorization": f"Bearer {token}"}
+
+        db = TestingSessionLocal()
+        try:
+            db.execute(
+                sa_text("UPDATE users SET preferences = :prefs WHERE id = :id"),
+                {"prefs": json.dumps(["not", "a", "dict"]), "id": user_id},
+            )
+            db.commit()
+        finally:
+            db.close()
+
+        response = client.get("/api/auth/me", headers=headers)
+        assert response.status_code == 200, response.text
+        assert response.json()["user"]["preferences"] == {}
+
+        patch_response = client.patch(
+            "/api/auth/me/preferences", json={"department": "Sales"}, headers=headers
+        )
+        assert patch_response.status_code == 200, patch_response.text
+        assert patch_response.json()["user"]["preferences"] == {"department": "Sales"}
+
+    def test_update_current_user_preferences_returns_404_for_deleted_user(
+        self, test_db, test_user_data, monkeypatch
+    ):
+        """`_lock_user_row_for_preferences_update` returning False (row
+        deleted between get_current_user loading it and the lock attempt)
+        must surface as a clean 404, not an unhandled
+        ObjectDeletedError/500 from the subsequent db.refresh(user)."""
+        setup_first_admin()
+        register_response = client.post("/api/auth/register", json=test_user_data)
+        assert register_response.status_code == 200
+        token = login_and_get_token(
+            test_user_data["username"], test_user_data["password"]
+        )
+        headers = {"Authorization": f"Bearer {token}"}
+
+        monkeypatch.setattr(
+            auth_api, "_lock_user_row_for_preferences_update", lambda db, user_id: False
+        )
+
+        response = client.patch(
+            "/api/auth/me/preferences", json={"voice": "warm"}, headers=headers
+        )
+        assert response.status_code == 404, response.text
+
     def test_update_current_user_email(self, test_db, test_user_data):
         setup_first_admin()
         register_response = client.post("/api/auth/register", json=test_user_data)

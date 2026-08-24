@@ -101,7 +101,7 @@ def test_unpublished_port_raises_and_removes_the_container(
     with pytest.raises(RuntimeError, match="did not publish a host port"):
         run_container_with_dynamic_ports(
             client,
-            "postgres:16-bookworm",
+            "postgres:17-bookworm",
             name="fixture-container",
             container_ports=("5432/tcp",),
         )

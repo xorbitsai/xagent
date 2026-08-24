@@ -18,7 +18,7 @@ Compose overlays, including sandbox runtime options, live in this directory.
 
 - **Frontend**: Next.js standalone build served by nginx
 - **Backend**: FastAPI with Python 3.11, Node.js 22, Playwright, LibreOffice
-- **PostgreSQL**: PostgreSQL 16 database
+- **PostgreSQL**: PostgreSQL 17 database
 
 ## Quick Start
 

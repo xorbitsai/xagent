@@ -79,7 +79,7 @@ def postgres_url() -> Iterator[str]:
     client = _docker_client()
     container, host_ports = run_container_with_dynamic_ports(
         client,
-        "postgres:16-bookworm",
+        "postgres:17-bookworm",
         name=f"xagent-postgres-e2e-{uuid4().hex[:12]}",
         container_ports=("5432/tcp",),
         tmpfs={"/var/lib/postgresql/data": "rw,size=256m"},

@@ -627,7 +627,7 @@ jobs:
         shell: bash
         run: |
           set -e
-          .github/scripts/docker-pull-retry.sh minio/minio postgres:16-bookworm
+          .github/scripts/docker-pull-retry.sh minio/minio postgres:17-bookworm
 
       - name: Run e2e tests
         shell: bash

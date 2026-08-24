@@ -487,13 +487,29 @@ class TestMigrations:
         stripe_revision = "20260818_seed_stripe_mcp_app"
         script_dir = ScriptDirectory.from_config(sqlite_tester.alembic_cfg)
 
-        assert script_dir.get_heads() == [owner_revision]
+        # Not `== [owner_revision]`: that only held while this was the sole
+        # unmerged branch. A sibling connector's migration branch merging
+        # with this one moves the single head to that merge revision instead
+        # -- the actual precondition this test needs is just that "head"
+        # resolves unambiguously (one head) and still descends from
+        # owner_revision, not that owner_revision is literally still it.
+        heads = script_dir.get_heads()
+        assert len(heads) == 1
+        assert _revision_reached(script_dir, owner_revision, set(heads))
 
         sqlite_tester.create_metadata_owned_users_table()
         command.upgrade(sqlite_tester.alembic_cfg, "head")
         command.downgrade(sqlite_tester.alembic_cfg, stripe_revision)
 
-        assert sqlite_tester.get_alembic_versions() == {stripe_revision}
+        # Not `== {stripe_revision}`: downgrading past a merge revision
+        # re-splits the version table back into each parent branch's own
+        # tip, and only the branch actually being downgraded (this one)
+        # continues past that split -- a sibling branch merged in here (this
+        # one has no dependency on the owner revision) legitimately keeps
+        # its own tip applied alongside stripe_revision.
+        assert _revision_reached(
+            script_dir, stripe_revision, sqlite_tester.get_alembic_versions()
+        )
         assert "resource_owner_key" not in sqlite_tester.get_column_names("user_oauth")
         with sqlite_tester.engine.begin() as conn:
             assert (

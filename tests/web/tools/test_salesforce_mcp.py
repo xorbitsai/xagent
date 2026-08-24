@@ -4,6 +4,7 @@ from unittest.mock import Mock
 import pytest
 
 from xagent.web.tools.mcp import salesforce
+from xagent.web.tools.mcp import utils as mcp_utils
 
 
 class MockResponse:
@@ -556,6 +557,51 @@ def test_list_sobjects_returns_summaries(monkeypatch):
     assert result["sobjects"][0]["name"] == "Account"
 
 
+def test_list_sobjects_filters_by_name_contains(monkeypatch):
+    monkeypatch.setattr(
+        salesforce.requests,
+        "request",
+        Mock(
+            return_value=MockResponse(
+                json_data={
+                    "sobjects": [
+                        {"name": "Account", "label": "Account"},
+                        {"name": "Contact", "label": "Contact"},
+                        {"name": "Invoice__c", "label": "Customer Invoice"},
+                    ]
+                }
+            )
+        ),
+    )
+
+    result = json.loads(salesforce.salesforce_list_sobjects(name_contains="invoice"))
+
+    assert [s["name"] for s in result["sobjects"]] == ["Invoice__c"]
+
+
+def test_list_sobjects_name_contains_matches_label_case_insensitively(monkeypatch):
+    # "Deal__c" only matches via its label ("Customer Deal"), not its own
+    # name -- proves the filter checks label too, not just name.
+    monkeypatch.setattr(
+        salesforce.requests,
+        "request",
+        Mock(
+            return_value=MockResponse(
+                json_data={
+                    "sobjects": [
+                        {"name": "Account", "label": "Account"},
+                        {"name": "Deal__c", "label": "Customer Deal"},
+                    ]
+                }
+            )
+        ),
+    )
+
+    result = json.loads(salesforce.salesforce_list_sobjects(name_contains="CUSTOMER"))
+
+    assert [s["name"] for s in result["sobjects"]] == ["Deal__c"]
+
+
 def test_list_sobjects_caps_output_size(monkeypatch):
     big_sobjects = [
         {"name": f"Object{i}__c", "label": "x" * 1000, "queryable": True}
@@ -623,6 +669,89 @@ def test_describe_sobject_extracts_picklist_values(monkeypatch):
     assert name_field["picklist_values"] is None
 
 
+def test_describe_sobject_names_only_returns_bare_names(monkeypatch):
+    monkeypatch.setattr(
+        salesforce.requests,
+        "request",
+        Mock(
+            return_value=MockResponse(
+                json_data={
+                    "name": "Account",
+                    "label": "Account",
+                    "fields": [
+                        {"name": "Industry", "label": "Industry", "type": "picklist"},
+                        {"name": "Name", "label": "Account Name", "type": "string"},
+                    ],
+                }
+            )
+        ),
+    )
+
+    result = json.loads(
+        salesforce.salesforce_describe_sobject("Account", names_only=True)
+    )
+
+    assert result["fields"] == ["Industry", "Name"]
+
+
+def test_describe_sobject_fields_filter_returns_only_requested_metadata(monkeypatch):
+    monkeypatch.setattr(
+        salesforce.requests,
+        "request",
+        Mock(
+            return_value=MockResponse(
+                json_data={
+                    "name": "Account",
+                    "label": "Account",
+                    "fields": [
+                        {
+                            "name": "Industry",
+                            "label": "Industry",
+                            "type": "picklist",
+                            "picklistValues": [{"value": "Tech", "active": True}],
+                        },
+                        {"name": "Name", "label": "Account Name", "type": "string"},
+                        {"name": "Website", "label": "Website", "type": "url"},
+                    ],
+                }
+            )
+        ),
+    )
+
+    result = json.loads(
+        salesforce.salesforce_describe_sobject("Account", fields=["Industry"])
+    )
+
+    assert [f["name"] for f in result["fields"]] == ["Industry"]
+    assert result["fields"][0]["picklist_values"] == ["Tech"]
+
+
+def test_describe_sobject_fields_takes_precedence_over_names_only(monkeypatch):
+    monkeypatch.setattr(
+        salesforce.requests,
+        "request",
+        Mock(
+            return_value=MockResponse(
+                json_data={
+                    "name": "Account",
+                    "fields": [
+                        {"name": "Industry", "type": "picklist"},
+                        {"name": "Name", "type": "string"},
+                    ],
+                }
+            )
+        ),
+    )
+
+    result = json.loads(
+        salesforce.salesforce_describe_sobject(
+            "Account", fields=["Name"], names_only=True
+        )
+    )
+
+    assert [f["name"] for f in result["fields"]] == ["Name"]
+
+
 def test_describe_sobject_caps_output_size(monkeypatch):
     big_fields = [
         {"name": f"Field{i}__c", "label": "x" * 1000, "type": "string"}
@@ -676,6 +805,28 @@ def test_get_record_omits_fields_param_when_not_provided(monkeypatch):
     salesforce.salesforce_get_record("Account", "001xx")
 
     assert mock_request.call_args.kwargs["params"] == {}
+
+
+def test_get_record_caps_output_size(monkeypatch):
+    # fields="" (the documented "return every field") against a record with
+    # a large Long Text Area value can serialize past the output limit --
+    # the platform filter treats the whole JSON blob as one opaque string
+    # leaf and cuts mid-string, unlike the list-shaped tools above which
+    # halve item-by-item.
+    big_record = {"Id": "001xx", "Description": "x" * 5000}
+    monkeypatch.setattr(
+        salesforce.requests,
+        "request",
+        Mock(return_value=MockResponse(json_data=big_record)),
+    )
+    monkeypatch.setattr(mcp_utils, "get_tool_max_output_length", lambda: 200)
+
+    raw = salesforce.salesforce_get_record("Account", "001xx")
+    result = json.loads(raw)
+
+    assert len(raw) <= 200
+    assert result["status"] == "success"
+    assert result["truncated"] is True
 
 
 def test_create_record_sends_fields_as_json_body(monkeypatch):

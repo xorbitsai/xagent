@@ -8,7 +8,7 @@ import requests
 from mcp.server.fastmcp import FastMCP
 
 from ....config import get_tool_max_output_length
-from .utils import setup_proxy_env, url_path_id
+from .utils import setup_proxy_env, success_with_capped_dict, url_path_id
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("salesforce-mcp")
@@ -199,7 +199,7 @@ def _extract_error_detail(response: requests.Response) -> str | None:
         else str(item)
         for item in payload
     ]
-    return "; ".join(messages) if messages else None
+    return "; ".join(messages)
 
 
 def _request_absolute(
@@ -314,15 +314,24 @@ def salesforce_search(sosl: str) -> str:
 
 
 @mcp.tool()
-def salesforce_list_sobjects() -> str:
+def salesforce_list_sobjects(name_contains: str = "") -> str:
     """
     List the object types (standard, e.g. Account/Contact/Lead/Opportunity/
     Case, and custom, e.g. ending in "__c") this org exposes -- name, label,
     and whether it's queryable/creatable/updateable/deletable. Use the
     returned name with every other tool here.
+
+    An org can expose hundreds of objects, more than fits one response;
+    unlike salesforce_query/salesforce_search (which the model can narrow
+    with SOQL/SOSL), this endpoint has no server-side filter, so a
+    truncated answer here would otherwise have no way to reach the rest.
+    name_contains: optional case-insensitive substring to match against
+    each object's name or label (e.g. "invoice"), narrowing the result
+    before it's capped instead of after.
     """
     try:
         result = _request("GET", f"/services/data/{API_VERSION}/sobjects")
+        needle = name_contains.strip().lower()
         sobjects = [
             {
                 "name": s.get("name"),
@@ -334,6 +343,9 @@ def salesforce_list_sobjects() -> str:
                 "custom": s.get("custom"),
             }
             for s in result.get("sobjects") or []
+            if not needle
+            or needle in (s.get("name") or "").lower()
+            or needle in (s.get("label") or "").lower()
         ]
         return _success_with_capped_list("sobjects", sobjects)
     except Exception as e:
@@ -342,13 +354,33 @@ def salesforce_list_sobjects() -> str:
 
 
 @mcp.tool()
-def salesforce_describe_sobject(sobject_type: str) -> str:
+def salesforce_describe_sobject(
+    sobject_type: str,
+    fields: list[str] | None = None,
+    names_only: bool = False,
+) -> str:
     """
     Get an object type's field schema -- name, label, type, and whether
     each field is required/updateable/a picklist (with its valid values).
     Use this before salesforce_create_record/salesforce_update_record to
     learn which fields exist and what values they accept.
+
+    A custom object can have far more fields than fit one response, with
+    no server-side pagination for this endpoint; unlike a truncated
+    salesforce_query/salesforce_search result (where a narrower SOQL/SOSL
+    retry recovers the rest), a truncated field list here would otherwise
+    have no way to reach the remaining fields. When a describe call comes
+    back truncated, call this again with names_only=True to get the
+    complete (much smaller) list of field names, then again with fields=
+    the specific ones you need full metadata for.
+
     sobject_type: an object's API name, e.g. "Account" or "My_Object__c".
+    fields: optional list of field API names to return full metadata for,
+    skipping every other field. Takes precedence over names_only.
+    names_only: if true and fields is not given, return just the list of
+    field API names (no label/type/picklist metadata) instead of full
+    per-field metadata -- a small, effectively never-truncated response
+    useful for discovering what to ask for next.
     """
     try:
         safe_sobject_type = url_path_id(sobject_type, "sobject_type")
@@ -356,7 +388,19 @@ def salesforce_describe_sobject(sobject_type: str) -> str:
             "GET",
             f"/services/data/{API_VERSION}/sobjects/{safe_sobject_type}/describe",
         )
-        fields = [
+        raw_fields = result.get("fields") or []
+
+        if names_only and not fields:
+            field_names = [f.get("name") for f in raw_fields]
+            return _success_with_capped_list(
+                "fields",
+                field_names,
+                name=result.get("name"),
+                label=result.get("label"),
+            )
+
+        wanted = set(fields) if fields else None
+        described_fields = [
             {
                 "name": f.get("name"),
                 "label": f.get("label"),
@@ -374,10 +418,14 @@ def salesforce_describe_sobject(sobject_type: str) -> str:
                     else None
                 ),
             }
-            for f in result.get("fields") or []
+            for f in raw_fields
+            if wanted is None or f.get("name") in wanted
         ]
         return _success_with_capped_list(
-            "fields", fields, name=result.get("name"), label=result.get("label")
+            "fields",
+            described_fields,
+            name=result.get("name"),
+            label=result.get("label"),
         )
     except Exception as e:
         logger.error(f"Error describing Salesforce sobject {sobject_type}: {e}")
@@ -401,7 +449,7 @@ def salesforce_get_record(sobject_type: str, record_id: str, fields: str = "") -
             f"/services/data/{API_VERSION}/sobjects/{safe_sobject_type}/{safe_record_id}",
             params=params,
         )
-        return _success(record=result)
+        return success_with_capped_dict("record", result)
     except Exception as e:
         logger.error(
             f"Error fetching Salesforce {sobject_type} record {record_id}: {e}"

@@ -138,6 +138,21 @@ def _oauth_env_name(provider: str, suffix: str) -> str:
     return f"{provider.upper()}_{suffix}"
 
 
+def _is_salesforce_provider(provider: str) -> bool:
+    """Match the Salesforce family, including admin-created sandbox rows.
+
+    A prefix match, not exact equality: example.env's documented sandbox
+    workaround is an admin hand-creating a second provider row (e.g.
+    "salesforce-sandbox") pointing at test.salesforce.com, since the
+    provider-row model has no per-user sandbox toggle. Every Salesforce-only
+    code path -- PKCE, the instance_url presence guard, and the
+    provider_user_id identity backfill -- must use this same predicate; an
+    exact match on any one of them would silently grant that row the
+    capability while skipping its safeguard.
+    """
+    return provider.lower().startswith("salesforce")
+
+
 def _resolve_oauth_secret(
     provider: str, encrypted_value: Optional[str], env_suffix: str
 ) -> str:
@@ -1481,14 +1496,8 @@ def generic_oauth_login(
     # below. The token exchange still requires the server-held client_secret
     # regardless, so this is defense-in-depth on top of that, not the only
     # thing standing between an interceptor and a token.
-    # .startswith rather than an exact match: example.env's documented
-    # sandbox-org workaround is an admin hand-creating a second provider row
-    # (e.g. "salesforce-sandbox") pointing at test.salesforce.com, since this
-    # provider-row model has no per-user sandbox toggle. An exact match would
-    # silently skip PKCE for that row and then fail opaquely against a
-    # PKCE-enforcing org.
     code_verifier = (
-        secrets.token_urlsafe(64) if provider.lower().startswith("salesforce") else None
+        secrets.token_urlsafe(64) if _is_salesforce_provider(provider) else None
     )
     if code_verifier:
         from ...core.utils.encryption import encrypt_value
@@ -2028,7 +2037,7 @@ def generic_oauth_callback(
             )
 
         salesforce_instance_url = token_data.get("instance_url")
-        if provider.lower() == "salesforce" and (
+        if _is_salesforce_provider(provider) and (
             not isinstance(salesforce_instance_url, str) or not salesforce_instance_url
         ):
             # Every real Salesforce token exchange includes a non-empty
@@ -2092,7 +2101,7 @@ def generic_oauth_callback(
                     ),
                     status_code=400,
                 )
-        elif provider.lower() == "salesforce":
+        elif _is_salesforce_provider(provider):
             # Salesforce's userinfo_url is deliberately left empty (see the
             # registry row's comment: an extra round-trip just for a label
             # this connector doesn't otherwise need), which also means

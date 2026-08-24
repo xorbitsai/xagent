@@ -58,9 +58,9 @@ def db_session(tmp_path):
     engine.dispose()
 
 
-def _salesforce_provider() -> SimpleNamespace:
+def _salesforce_provider(provider_name: str = "salesforce") -> SimpleNamespace:
     return SimpleNamespace(
-        provider_name="salesforce",
+        provider_name=provider_name,
         client_id=encrypt_value("salesforce-client-id"),
         client_secret=encrypt_value("salesforce-client-secret"),
         auth_url="https://login.salesforce.com/services/oauth2/authorize",
@@ -73,98 +73,139 @@ def _salesforce_provider() -> SimpleNamespace:
     )
 
 
-def _callback_request(db, user) -> SimpleNamespace:
+def _callback_request(db, user, provider: str = "salesforce") -> SimpleNamespace:
     state = create_access_token(
         data={
             "type": "oauth_state",
             "user_id": user.id,
-            "provider": "salesforce",
-            "app_id": "salesforce",
+            "provider": provider,
+            "app_id": provider,
         },
         expires_delta=timedelta(minutes=10),
     )
     return SimpleNamespace(query_params={"code": "sf-code", "state": state})
 
 
-def test_callback_rejects_missing_instance_url_without_touching_prior_grant(
-    db_session, monkeypatch
-):
-    """A token response missing instance_url must be rejected before the
-    delete-then-recreate persistence step runs -- letting it through would
-    destroy any prior *working* grant for this user while still reporting
-    success, since instance_url is required for the connector to launch at
-    all (launch_config.env_mapping)."""
-    db, user = db_session
-    existing = UserOAuth(
-        user_id=user.id,
-        provider="salesforce",
-        access_token="old-working-token",
-        instance_url="https://old.my.salesforce.com",
-    )
-    db.add(existing)
-    db.commit()
-
-    mock_post = Mock(
-        return_value=MockResponse({"access_token": "sf-token", "token_type": "Bearer"})
-    )
-    monkeypatch.setattr(auth_api.requests, "post", mock_post)
-    monkeypatch.setattr(auth_api.requests, "get", Mock())
-
-    response = generic_oauth_callback(
-        "salesforce", _callback_request(db, user), db, _salesforce_provider()
-    )
-
-    assert response.status_code == 400
-    oauth_account = (
-        db.query(UserOAuth)
-        .filter(UserOAuth.user_id == user.id, UserOAuth.provider == "salesforce")
-        .one()
-    )
-    assert oauth_account.access_token == "old-working-token"
-    assert oauth_account.instance_url == "https://old.my.salesforce.com"
-
-
-def test_callback_rejects_non_string_instance_url_without_touching_prior_grant(
-    db_session, monkeypatch
-):
-    """Same guard, the malformed-rather-than-missing case: a non-string
-    instance_url (e.g. a provider bug or a proxy mangling the response)
-    must be rejected the same way, not committed as-is only to fail later
-    at salesforce.py's own type-agnostic _instance_url() use-time check."""
-    db, user = db_session
-    existing = UserOAuth(
-        user_id=user.id,
-        provider="salesforce",
-        access_token="old-working-token",
-        instance_url="https://old.my.salesforce.com",
-    )
-    db.add(existing)
-    db.commit()
-
-    mock_post = Mock(
-        return_value=MockResponse(
+@pytest.mark.parametrize(
+    "provider,token_data",
+    [
+        (
+            "salesforce",
+            {"access_token": "sf-token", "token_type": "Bearer"},
+        ),
+        (
+            "salesforce",
             {
                 "access_token": "sf-token",
                 "token_type": "Bearer",
                 "instance_url": 12345,
-            }
-        )
+            },
+        ),
+        (
+            "salesforce",
+            {
+                "access_token": "sf-token",
+                "token_type": "Bearer",
+                "instance_url": "",
+            },
+        ),
+        (
+            "salesforce-sandbox",
+            {"access_token": "sf-token", "token_type": "Bearer"},
+        ),
+    ],
+    ids=["missing", "non-string", "empty-string", "sandbox-prefixed-missing"],
+)
+def test_callback_rejects_missing_instance_url_without_touching_prior_grant(
+    db_session, monkeypatch, provider, token_data
+):
+    """A token response with a missing, non-string, or empty-string
+    instance_url must be rejected before the delete-then-recreate
+    persistence step runs --
+    letting it through would destroy any prior *working* grant for this
+    user while still reporting success, since instance_url is required for
+    the connector to launch at all (launch_config.env_mapping).
+
+    The "salesforce-sandbox" case is the same guard applied to
+    example.env's documented admin-created sandbox provider row: the guard
+    matches on a provider-name *prefix* (_is_salesforce_provider), not
+    exact equality, so this row gets the same protection as "salesforce"
+    itself rather than falling through to an unconditional delete-then-
+    recreate."""
+    db, user = db_session
+    existing = UserOAuth(
+        user_id=user.id,
+        provider=provider,
+        access_token="old-working-token",
+        instance_url="https://old.my.salesforce.com",
     )
+    db.add(existing)
+    db.commit()
+
+    mock_post = Mock(return_value=MockResponse(token_data))
     monkeypatch.setattr(auth_api.requests, "post", mock_post)
     monkeypatch.setattr(auth_api.requests, "get", Mock())
 
     response = generic_oauth_callback(
-        "salesforce", _callback_request(db, user), db, _salesforce_provider()
+        provider,
+        _callback_request(db, user, provider=provider),
+        db,
+        _salesforce_provider(provider_name=provider),
     )
 
     assert response.status_code == 400
     oauth_account = (
         db.query(UserOAuth)
-        .filter(UserOAuth.user_id == user.id, UserOAuth.provider == "salesforce")
+        .filter(UserOAuth.user_id == user.id, UserOAuth.provider == provider)
         .one()
     )
     assert oauth_account.access_token == "old-working-token"
     assert oauth_account.instance_url == "https://old.my.salesforce.com"
+
+
+def test_sandbox_provider_backfills_provider_user_id_from_token_id(
+    db_session, monkeypatch
+):
+    """The provider_user_id backfill (from the token response's own "id"
+    field, closing the NULL-identity gap left by Salesforce's empty
+    userinfo_url) is gated on the same provider-name prefix match as the
+    instance_url guard above and PKCE -- an admin-created "salesforce-
+    sandbox" row (example.env's documented sandbox workaround) must get it
+    too, not just the exact string "salesforce"."""
+    db, user = db_session
+    mock_post = Mock(
+        return_value=MockResponse(
+            {
+                "access_token": "sf-token",
+                "instance_url": "https://acme--sandbox.my.salesforce.com",
+                "token_type": "Bearer",
+                "id": "https://test.salesforce.com/id/00D.../005...",
+            }
+        )
+    )
+    mock_get = Mock()
+    monkeypatch.setattr(auth_api.requests, "post", mock_post)
+    monkeypatch.setattr(auth_api.requests, "get", mock_get)
+
+    response = generic_oauth_callback(
+        "salesforce-sandbox",
+        _callback_request(db, user, provider="salesforce-sandbox"),
+        db,
+        _salesforce_provider(provider_name="salesforce-sandbox"),
+    )
+
+    assert response.status_code == 200
+    mock_get.assert_not_called()
+    oauth_account = (
+        db.query(UserOAuth)
+        .filter(
+            UserOAuth.user_id == user.id, UserOAuth.provider == "salesforce-sandbox"
+        )
+        .one()
+    )
+    assert oauth_account.provider_user_id == (
+        "https://test.salesforce.com/id/00D.../005..."
+    )
 
 
 def test_callback_persists_instance_url_and_skips_userinfo_lookup(

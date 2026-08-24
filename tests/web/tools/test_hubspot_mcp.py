@@ -5,6 +5,7 @@ import pytest
 import requests
 
 from xagent.web.tools.mcp import hubspot
+from xagent.web.tools.mcp import utils as mcp_utils
 
 
 class MockResponse:
@@ -742,7 +743,7 @@ def test_get_analytics_report_caps_output_preserving_scalar_keys(monkeypatch):
     }
     mock_request = Mock(return_value=MockResponse(json_data=report))
     monkeypatch.setattr(hubspot.requests, "request", mock_request)
-    monkeypatch.setattr(hubspot, "get_tool_max_output_length", lambda: 2000)
+    monkeypatch.setattr(mcp_utils, "get_tool_max_output_length", lambda: 2000)
 
     result = json.loads(
         hubspot.hubspot_get_analytics_report(
@@ -767,7 +768,7 @@ def test_get_analytics_report_falls_back_to_dropping_keys_with_no_collections(
     report = {"totals": "x" * 5000}
     mock_request = Mock(return_value=MockResponse(json_data=report))
     monkeypatch.setattr(hubspot.requests, "request", mock_request)
-    monkeypatch.setattr(hubspot, "get_tool_max_output_length", lambda: 200)
+    monkeypatch.setattr(mcp_utils, "get_tool_max_output_length", lambda: 200)
 
     result = json.loads(
         hubspot.hubspot_get_analytics_report("sources", "20260101", "20260131")

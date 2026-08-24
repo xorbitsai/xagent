@@ -3257,7 +3257,7 @@ class WebToolConfig(BaseToolConfig):
                 )
 
             access_token = str(oauth_account.access_token)
-            instance_url = getattr(oauth_account, "instance_url", None)
+            instance_url = oauth_account.instance_url
             oauth_db.commit()
             return _LegacyOAuthTokenResolution(
                 access_token=access_token, instance_url=instance_url

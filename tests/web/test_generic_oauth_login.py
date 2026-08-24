@@ -215,6 +215,36 @@ def test_salesforce_provider_includes_pkce_code_challenge(db_session):
     assert qs["code_challenge"][0] == expected_challenge
 
 
+def test_salesforce_sandbox_provider_includes_pkce_code_challenge(db_session):
+    """PKCE is gated on a provider-name *prefix* match
+    (_is_salesforce_provider), not exact equality -- specifically so an
+    admin-created "salesforce-sandbox" row (example.env's documented
+    workaround for sandbox orgs, which have no per-user toggle otherwise)
+    also gets it. An exact match here would silently skip PKCE for that row
+    and then fail opaquely against a PKCE-enforcing sandbox org."""
+    db, user = db_session
+    token = _token_for(user)
+
+    provider = _provider(
+        auth_url="https://test.salesforce.com/services/oauth2/authorize",
+        default_scopes=["api", "refresh_token", "openid"],
+        redirect_uri="https://app.example.com/cb",
+    )
+
+    resp = generic_oauth_login(
+        provider="salesforce-sandbox",
+        token=token,
+        app_id=None,
+        redirect=None,
+        db=db,
+        db_provider=provider,
+    )
+    qs = parse_qs(urlparse(_location(resp)).query)
+
+    assert qs.get("code_challenge_method") == ["S256"]
+    assert "code_challenge" in qs
+
+
 def test_salesforce_login_returns_clear_error_when_encryption_key_missing(
     db_session, monkeypatch
 ):

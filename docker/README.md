@@ -18,7 +18,7 @@ Compose overlays, including sandbox runtime options, live in this directory.
 
 - **Frontend**: Next.js standalone build served by nginx
 - **Backend**: FastAPI with Python 3.11, Node.js 22, Playwright, LibreOffice
-- **PostgreSQL**: PostgreSQL 17 database
+- **PostgreSQL**: PostgreSQL 17 database (Note: Upgrading an existing self-hosted deployment from v16 to v17 requires manual database migration or volume recreation, as PostgreSQL does not automatically upgrade data directories between major versions.)
 
 ## Quick Start
 

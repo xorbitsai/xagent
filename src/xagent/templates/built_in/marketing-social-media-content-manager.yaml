@@ -62,7 +62,7 @@ persona:
 connections:
 - name: LinkedIn
   logo: https://www.google.com/s2/favicons?domain=linkedin.com&sz=64
-- name: Facebook
+- name: Facebook Pages
   logo: https://www.google.com/s2/favicons?domain=facebook.com&sz=64
 - name: Instagram
   logo: https://www.google.com/s2/favicons?domain=instagram.com&sz=64

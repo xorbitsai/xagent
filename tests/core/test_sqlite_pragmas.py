@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import logging
 
+import pytest
 from sqlalchemy import create_engine
 
 
@@ -44,7 +45,7 @@ def test_apply_pragmas_default_busy_timeout(tmp_path) -> None:
     engine.dispose()
 
 
-def test_apply_pragmas_swallows_pragma_failures(caplog) -> None:
+def test_apply_pragmas_swallows_concurrency_pragma_failures(caplog) -> None:
     # A read-only database/directory makes ``PRAGMA journal_mode=WAL`` raise (the
     # -wal/-shm sidecars cannot be created). The connect hook must degrade with a
     # warning instead of crashing every connection, and still attempt the
@@ -60,6 +61,9 @@ def test_apply_pragmas_swallows_pragma_failures(caplog) -> None:
             if "journal_mode" in sql:
                 raise RuntimeError("attempt to write a readonly database")
 
+        def fetchone(self) -> tuple[int]:
+            return (1,)
+
     cursor = _FailWALCursor()
     with caplog.at_level(logging.WARNING):
         _apply_concurrency_pragmas(cursor, 5000)  # must not raise
@@ -67,6 +71,32 @@ def test_apply_pragmas_swallows_pragma_failures(caplog) -> None:
     assert any("journal_mode" in sql for sql in cursor.executed)
     assert any("busy_timeout=5000" in sql for sql in cursor.executed)
     assert any("WAL" in record.message for record in caplog.records)
+
+
+def test_apply_pragmas_fails_when_foreign_keys_cannot_be_enabled() -> None:
+    from xagent.db.sqlite import _apply_concurrency_pragmas
+
+    class _FailForeignKeysCursor:
+        def execute(self, sql: str) -> None:
+            if sql == "PRAGMA foreign_keys=ON":
+                raise RuntimeError("foreign keys unavailable")
+
+    with pytest.raises(RuntimeError, match="foreign keys unavailable"):
+        _apply_concurrency_pragmas(_FailForeignKeysCursor(), 5000)
+
+
+def test_apply_pragmas_fails_when_foreign_keys_remain_disabled() -> None:
+    from xagent.db.sqlite import _apply_concurrency_pragmas
+
+    class _DisabledForeignKeysCursor:
+        def execute(self, _sql: str) -> None:
+            pass
+
+        def fetchone(self) -> tuple[int]:
+            return (0,)
+
+    with pytest.raises(RuntimeError, match="foreign-key enforcement"):
+        _apply_concurrency_pragmas(_DisabledForeignKeysCursor(), 5000)
 
 
 def test_apply_pragmas_noop_for_non_sqlite() -> None:

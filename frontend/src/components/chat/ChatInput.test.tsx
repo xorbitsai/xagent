@@ -81,6 +81,7 @@ vi.mock("sonner", () => ({
   },
 }))
 
+import { generateClientMessageId } from "@/lib/utils"
 import { ChatInput } from "./ChatInput"
 
 const emptyJsonResponse = () =>
@@ -529,6 +530,109 @@ describe("ChatInput", () => {
     })
     expect(resetMentionMock).toHaveBeenCalledTimes(1)
     expect(screen.queryByText("chatPage.input.noModelAlert")).not.toBeInTheDocument()
+    // selectedAgents no longer renders a "Using @name" chip (that
+    // mechanism was removed as unreachable dead code) - only drives the
+    // no-model guard above. A regression reintroducing it would leave
+    // this test green without an explicit check.
+    expect(screen.queryByText("@Shared Agent")).not.toBeInTheDocument()
+  })
+
+  it("clears the read-only model display instead of showing a stale lead's model while a new one's config is still loading", () => {
+    const commonProps = {
+      hideFileUpload: true,
+      inputValue: "hello",
+      onInputChange: vi.fn(),
+      onSend: vi.fn(),
+      readOnlyConfig: true,
+    }
+    const { rerender } = render(<ChatInput {...commonProps} taskConfig={{ model: "agent-a-model" }} />)
+
+    expect(screen.getByText("agent-a-model")).toBeInTheDocument()
+
+    // Caller switched leads - the new lead's own config fetch resets
+    // taskConfig to undefined while still in flight (readOnlyConfig stays
+    // true throughout).
+    rerender(<ChatInput {...commonProps} taskConfig={undefined} />)
+
+    expect(screen.queryByText("agent-a-model")).not.toBeInTheDocument()
+    expect(screen.getByText("chatPage.input.noModel")).toBeInTheDocument()
+  })
+
+  it("submits the live taskConfig model, not a stale value inherited by the internal mirror", async () => {
+    // The internal `agentConfig` mirror inherits the previous model when a
+    // new taskConfig doesn't specify one (`taskConfig.model || prev.model`
+    // in the syncing effect) - correct for genuine partial updates to the
+    // SAME lead, but submission (and the read-only model badge, which reads
+    // the same live-`taskConfig` value) must still prefer the live prop over
+    // that mirror once a config is meant to be authoritative (readOnlyConfig),
+    // so a real timing gap between a lead switch and its own effect catching
+    // up can't submit - or display - an unrelated previous lead's model.
+    const onSend = vi.fn()
+    const commonProps = {
+      hideFileUpload: true,
+      inputValue: "hello",
+      onInputChange: vi.fn(),
+      onSend,
+      readOnlyConfig: true,
+    }
+    const { container, rerender } = render(
+      <ChatInput {...commonProps} taskConfig={{ model: "agent-a-model", executionMode: "think" }} />
+    )
+    expect(screen.getByText("agent-a-model")).toBeInTheDocument()
+
+    // New lead's taskConfig arrives without its own model yet (e.g. only
+    // executionMode resolved so far) - the internal mirror would inherit the
+    // previous lead's model rather than clearing it, but the live-read badge
+    // must not show that stale value either.
+    rerender(<ChatInput {...commonProps} taskConfig={{ executionMode: "flash" }} />)
+    expect(screen.queryByText("agent-a-model")).not.toBeInTheDocument()
+    expect(screen.getByText("chatPage.input.noModel")).toBeInTheDocument()
+
+    fireEvent.submit(container.querySelector("form") as HTMLFormElement)
+
+    await waitFor(() => {
+      expect(onSend).toHaveBeenCalledWith(
+        "hello",
+        expect.objectContaining({ model: "" })
+      )
+    })
+  })
+
+  it("submits the live taskConfig executionMode, not a stale value inherited by the internal mirror", async () => {
+    // Same root cause as the model test above, but for executionMode: the
+    // internal `agentConfig` mirror only clears its stale executionMode
+    // asynchronously (a separate effect, once taskConfig goes away), and
+    // the submit path used to spread that live-computed value only when
+    // truthy - so a falsy live value (taskConfig gone entirely, e.g. the
+    // new lead's own config fetch is still in flight) silently fell
+    // through to whatever executionMode the mirror still held from the
+    // PREVIOUS lead, instead of clearing it the same way `model` does.
+    const onSend = vi.fn()
+    const commonProps = {
+      hideFileUpload: true,
+      inputValue: "hello",
+      onInputChange: vi.fn(),
+      onSend,
+      readOnlyConfig: true,
+    }
+    const { container, rerender } = render(
+      <ChatInput {...commonProps} taskConfig={{ model: "agent-a-model", executionMode: "think" }} />
+    )
+
+    // Caller switched leads - the new lead's own config fetch resets
+    // taskConfig to undefined while still in flight (readOnlyConfig stays
+    // true throughout), same as the page-level race this whole family of
+    // fixes targets.
+    rerender(<ChatInput {...commonProps} taskConfig={undefined} />)
+
+    fireEvent.submit(container.querySelector("form") as HTMLFormElement)
+
+    await waitFor(() => {
+      expect(onSend).toHaveBeenCalledWith(
+        "hello",
+        expect.objectContaining({ executionMode: undefined })
+      )
+    })
   })
 
   it("does not show pause for uppercase terminal task status", () => {
@@ -1118,6 +1222,76 @@ describe("ChatInput", () => {
     )
   })
 
+  it("reuses the same clientMessageId when retrying unchanged content after an outcome-unknown failure", async () => {
+    // Server-side dedup safety net: a failure that doesn't carry
+    // `retryWithNewId` means the send's outcome is unknown (it may have
+    // actually landed), so a retry with byte-identical content must reuse
+    // the same id instead of minting a new one - otherwise the server can't
+    // tell the retry apart from a genuine second message.
+    const onInputChange = vi.fn()
+    const onSend = vi.fn().mockRejectedValue(new Error("Message was rejected"))
+    const { container } = render(
+      <ChatInput
+        hideConfig
+        hideFileUpload
+        inputValue="keep this draft"
+        onInputChange={onInputChange}
+        onSend={onSend}
+        readOnlyConfig
+      />
+    )
+
+    fireEvent.submit(container.querySelector("form") as HTMLFormElement)
+    await waitFor(() => expect(onSend).toHaveBeenCalledTimes(1))
+    const firstId = onSend.mock.calls[0][1].clientMessageId
+
+    // isSubmittingRef only releases 500ms after a submit settles.
+    await new Promise((resolve) => setTimeout(resolve, 550))
+    fireEvent.submit(container.querySelector("form") as HTMLFormElement)
+    await waitFor(() => expect(onSend).toHaveBeenCalledTimes(2))
+
+    expect(onSend.mock.calls[1][1].clientMessageId).toBe(firstId)
+  })
+
+  it("generates a new clientMessageId when retrying after a retryWithNewId failure", async () => {
+    // The opposite case: a failure the caller marks `retryWithNewId` means
+    // the send is confirmed to have never landed, so a retry - even with
+    // identical content - should get its own fresh id rather than being
+    // conflated with the failed attempt.
+    // Override the shared module mock's queue for just these two calls -
+    // by this point in the suite it's already fallen through to its
+    // catch-all return value, which would make both ids look identical
+    // and defeat the point of this test regardless of the real behavior.
+    vi.mocked(generateClientMessageId)
+      .mockImplementationOnce(() => "retry-with-new-id-1")
+      .mockImplementationOnce(() => "retry-with-new-id-2")
+    const onInputChange = vi.fn()
+    const retryableError = Object.assign(new Error("Message was rejected"), {
+      retryWithNewId: true,
+    })
+    const onSend = vi.fn().mockRejectedValue(retryableError)
+    const { container } = render(
+      <ChatInput
+        hideConfig
+        hideFileUpload
+        inputValue="keep this draft"
+        onInputChange={onInputChange}
+        onSend={onSend}
+        readOnlyConfig
+      />
+    )
+
+    fireEvent.submit(container.querySelector("form") as HTMLFormElement)
+    await waitFor(() => expect(onSend).toHaveBeenCalledTimes(1))
+    const firstId = onSend.mock.calls[0][1].clientMessageId
+
+    await new Promise((resolve) => setTimeout(resolve, 550))
+    fireEvent.submit(container.querySelector("form") as HTMLFormElement)
+    await waitFor(() => expect(onSend).toHaveBeenCalledTimes(2))
+
+    expect(onSend.mock.calls[1][1].clientMessageId).not.toBe(firstId)
+  })
+
   const mockDefaultModel = () => {
     apiRequestMock.mockImplementation((url: string) => {
       if (url === "http://api.local/api/models/?category=llm") {
@@ -1205,7 +1379,7 @@ describe("ChatInput", () => {
     expect(onSend.mock.calls[0][1].executionMode).toBeUndefined()
   })
 
-  it("hides the execution mode picker for a template-resolved task", async () => {
+  it("hides the execution mode picker for a read-only (agent-resolved) task", async () => {
     mockDefaultModel()
     render(
       <ChatInput
@@ -1213,7 +1387,7 @@ describe("ChatInput", () => {
         inputValue="summarize this doc"
         onInputChange={vi.fn()}
         onSend={vi.fn()}
-        selectedTemplate={{ id: "doc-summarizer", name: "Doc Summarizer" }}
+        readOnlyConfig
       />
     )
 
@@ -1235,9 +1409,7 @@ describe("ChatInput", () => {
     fireEvent.click(screen.getByText(executionModeLabel("think")))
     expect(screen.getByText(executionModeLabel("think"))).toBeInTheDocument()
 
-    rerender(
-      <ChatInput {...props} selectedTemplate={{ id: "doc-summarizer", name: "Doc Summarizer" }} />
-    )
+    rerender(<ChatInput {...props} readOnlyConfig />)
     rerender(<ChatInput {...props} />)
 
     expect(screen.getByText(UNSET_MODE_LABEL)).toBeInTheDocument()

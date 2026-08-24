@@ -95,6 +95,19 @@ class _DAGStepRuntime:
     def active_react_step_id(self) -> str:
         return self.step_id
 
+    @property
+    def active_turn_id(self) -> str | None:
+        # Unlike active_react_step_id (fixed to this step at construction),
+        # this is resolved from root_context on every access rather than
+        # cached: on_pattern_start never fires for a DAG step's inner ReAct
+        # run (this adapter's own on_pattern_start below is a no-op), so
+        # there is no per-step hook to compute it once. root_context is the
+        # DAG's real conversation context (unlike the synthetic per-step
+        # child_context ReActPattern actually runs against), so this reaches
+        # the same turn_id PatternRuntime._dag_turn_id already surfaces for
+        # the on_dag_step_start/end hooks.
+        return self.parent._dag_turn_id(self.root_context)
+
     async def should_interrupt(self) -> bool:
         return await self.parent.should_interrupt()
 

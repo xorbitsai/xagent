@@ -111,6 +111,27 @@ def test_github_callback_requests_json_and_sends_secret_in_body(
         expires_delta=timedelta(minutes=10),
     )
     request = SimpleNamespace(query_params={"code": "github-code", "state": state})
+    actor_account = UserOAuth(
+        user_id=user.id,
+        provider="github",
+        provider_user_id="actor-octocat",
+        resource_owner_key="actor:github",
+        access_token="actor-token",
+        email="actor@example.com",
+    )
+    db.add_all(
+        [
+            UserOAuth(
+                user_id=user.id,
+                provider="github",
+                provider_user_id="stale-ordinary",
+                access_token="stale-ordinary-token",
+            ),
+            actor_account,
+        ]
+    )
+    db.commit()
+    actor_account_id = int(actor_account.id)
 
     post = Mock(
         return_value=MockResponse(
@@ -138,12 +159,22 @@ def test_github_callback_requests_json_and_sends_secret_in_body(
 
     oauth_account = (
         db.query(UserOAuth)
-        .filter(UserOAuth.user_id == user.id, UserOAuth.provider == "github")
+        .filter(
+            UserOAuth.user_id == user.id,
+            UserOAuth.provider == "github",
+            UserOAuth.resource_owner_key.is_(None),
+        )
         .one()
     )
     assert oauth_account.access_token == "github-token"
     assert oauth_account.provider_user_id == "42"
     assert oauth_account.email == "octocat"
+
+    preserved_actor = db.get(UserOAuth, actor_account_id)
+    assert preserved_actor is actor_account
+    assert preserved_actor.resource_owner_key == "actor:github"
+    assert preserved_actor.access_token == "actor-token"
+    assert preserved_actor.provider_user_id == "actor-octocat"
 
     server = db.query(MCPServer).filter(MCPServer.name == "GitHub").one()
     assert server.transport == "oauth"

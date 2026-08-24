@@ -52,9 +52,8 @@ function TemplatesPageContent() {
   const { t, tDynamic, locale } = useI18n();
   const router = useRouter();
   const searchParams = useSearchParams();
-  // Honors the category the "All templates" escape hatch on the /task
-  // quick-access panel links back to (?category=<id>), so following it
-  // lands on the same category instead of always resetting to "All".
+  // Honors a deep-linked category (?category=<id>), so landing here from
+  // an external link opens on that category instead of always "All".
   const [selectedCategory, setSelectedCategory] = useState(
     () => searchParams.get("category") || "All"
   );

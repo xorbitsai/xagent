@@ -8027,7 +8027,7 @@ requires-dist = [
     { name = "itsdangerous", specifier = ">=2.2.0" },
     { name = "json-repair", specifier = "==0.35.0" },
     { name = "jsonschema", specifier = ">=4.25.1" },
-    { name = "lancedb", specifier = ">=0.13.0" },
+    { name = "lancedb", specifier = ">=0.24.2" },
     { name = "langchain", specifier = ">=0.3.26" },
     { name = "langchain-community", specifier = ">=0.3.21" },
     { name = "langchain-openai", specifier = ">=0.3.27" },

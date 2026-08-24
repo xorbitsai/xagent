@@ -72,6 +72,10 @@ from ..services.mcp_oauth import (
     validate_mcp_oauth_persisted_value,
 )
 from ..services.mcp_runtime import HTTP_MCP_TRANSPORTS
+from ..services.user_oauth import (
+    delete_scoped_user_oauth_accounts,
+    list_scoped_user_oauth_accounts,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -1837,22 +1841,48 @@ def _app_platform_env_available(
     return _env_covers_required(getattr(server, "env", None), required)
 
 
-def _app_user_env_configured(
+def _app_configured_env_keys(
     app: dict,
     server: Optional[MCPServer],
     user_mcp_by_server_id: dict[int, UserMCPServer],
-) -> bool:
-    """Whether this user has their own per-user key covering the app's required
-    env (vs falling back to the admin's global key). Non-oauth apps only.
-    `server` is the app's already-resolved shared row (see _shared_server_for_app).
+) -> list[str]:
+    """Which of the app's required_env keys this user already has a stored
+    value for, vs missing entirely - a per-key breakdown of
+    _app_user_env_configured's all-or-nothing boolean below. A reconnect
+    dialog that only knows the all-or-nothing flag has to seed every
+    required key as either fully-masked or fully-blank; for an app with
+    more than one required key (e.g. AWS's 3, PostHog's 2) that's configured
+    key-by-key over time, "not fully configured yet" would make it blank
+    every field, and submitting a blank as a real value clears whatever was
+    already stored for it (see connect_mcp_app's provided/_merge_masked_env
+    handling) - a caller needs to know per key, not just overall, to avoid
+    that. Non-oauth apps only; same resolution as _app_user_env_configured.
     """
     required = (app.get("launch_config") or {}).get("required_env") or []
     if not required or not server:
-        return False
+        return []
     assoc = user_mcp_by_server_id.get(cast(int, server.id))
     if not assoc:
+        return []
+    from ...core.utils.encryption import decrypt_env_dict
+
+    decrypted = decrypt_env_dict(getattr(assoc, "env", None)) or {}
+    return [key for key in required if str(decrypted.get(key) or "").strip()]
+
+
+def _app_user_env_configured(configured_keys: list[str], required: list[str]) -> bool:
+    """Whether this user has their own per-user key covering the app's required
+    env (vs falling back to the admin's global key). Non-oauth apps only.
+
+    Takes the already-computed per-key breakdown (_app_configured_env_keys)
+    rather than re-deriving it from (app, server, user_mcp_by_server_id) -
+    the original shape of this function - so a caller that needs both the
+    boolean and the per-key list (list_mcp_apps below) only decrypts the
+    association's env once instead of twice.
+    """
+    if not required:
         return False
-    return _env_covers_required(getattr(assoc, "env", None), required)
+    return set(configured_keys) == set(required)
 
 
 def _connected_non_oauth_server_for_app(
@@ -2059,11 +2089,11 @@ def list_mcp_apps(
         )
     ]
 
-    # Also fetch user oauth accounts to get the connected email
-    from ..models.user_oauth import UserOAuth
-
-    oauth_accounts = (
-        db.query(UserOAuth).filter(UserOAuth.user_id == current_user.id).all()
+    # Actor credentials are not personal catalog connections.
+    oauth_accounts = list_scoped_user_oauth_accounts(
+        db,
+        user_id=int(current_user.id),
+        resource_owner_key=None,
     )
 
     results = []
@@ -2132,6 +2162,7 @@ def list_mcp_apps(
                 app_shared_env = False
                 app_platform_env = False
                 app_user_env = False
+                app_configured_keys: list[str] = []
                 app_env_source = None
             else:
                 server_id = _connected_non_oauth_server_for_app(
@@ -2152,8 +2183,20 @@ def list_mcp_apps(
                     app, shared_server, shared_env_by_id
                 )
                 app_platform_env = _app_platform_env_available(app, shared_server)
-                app_user_env = _app_user_env_configured(
+                # Decrypt this association's env once via
+                # _app_configured_env_keys and derive the all-or-nothing flag
+                # from that result, rather than also calling
+                # _app_user_env_configured's old (app, server,
+                # user_mcp_by_server_id) form, which decrypted the same env
+                # a second time internally.
+                app_configured_keys = _app_configured_env_keys(
                     app, shared_server, user_mcp_by_server_id
+                )
+                app_required_env = (app.get("launch_config") or {}).get(
+                    "required_env"
+                ) or []
+                app_user_env = _app_user_env_configured(
+                    app_configured_keys, app_required_env
                 )
                 _assoc = (
                     user_mcp_by_server_id.get(cast(int, shared_server.id))
@@ -2199,6 +2242,7 @@ def list_mcp_apps(
             app_copy["shared_env_available"] = app_shared_env
             app_copy["platform_env_available"] = app_platform_env
             app_copy["user_env_configured"] = app_user_env
+            app_copy["configured_env_keys"] = app_configured_keys
             app_copy["env_source"] = app_env_source
 
             if is_connected:
@@ -2450,11 +2494,11 @@ def get_mcp_servers(
             .all()
         )
 
-        # Fetch oauth emails
-        from ..models.user_oauth import UserOAuth
-
-        oauth_accounts = (
-            db.query(UserOAuth).filter(UserOAuth.user_id == effective_user_id).all()
+        # Actor credentials are not personal server connections.
+        oauth_accounts = list_scoped_user_oauth_accounts(
+            db,
+            user_id=effective_user_id,
+            resource_owner_key=None,
         )
         oauth_emails = {
             str(oauth.provider): str(oauth.email)
@@ -2566,10 +2610,12 @@ def get_mcp_server(
 
         user_mcp, server = result
 
-        # Fetch oauth emails for this user to enrich the server info
-        from ..models.user_oauth import UserOAuth
-
-        oauth_accounts = db.query(UserOAuth).filter(UserOAuth.user_id == user_id).all()
+        # Actor credentials are not personal server connections.
+        oauth_accounts = list_scoped_user_oauth_accounts(
+            db,
+            user_id=int(user_id),
+            resource_owner_key=None,
+        )
         oauth_emails = {
             oauth.provider: oauth.email
             for oauth in oauth_accounts
@@ -3426,7 +3472,6 @@ async def delete_mcp_server(
         # If it's an OAuth server, also delete the corresponding OAuth tokens
         if server.transport == "oauth":
             from ..mcp_apps import get_app_by_name
-            from ..models.user_oauth import UserOAuth
 
             # Find the corresponding app_id and provider
             app_info = get_app_by_name(db, str(server.name))
@@ -3444,10 +3489,12 @@ async def delete_mcp_server(
                     app_id, [provider, app_id]
                 )
                 if providers_to_delete:
-                    db.query(UserOAuth).filter(
-                        UserOAuth.user_id == user_id,
-                        UserOAuth.provider.in_(providers_to_delete),
-                    ).delete(synchronize_session=False)
+                    delete_scoped_user_oauth_accounts(
+                        db,
+                        user_id=int(user_id),
+                        resource_owner_key=None,
+                        providers=providers_to_delete,
+                    )
 
                 # The app-scoped restriction above deliberately excluded the
                 # bare provider row (e.g. "meta") so a sibling app under the
@@ -3478,10 +3525,12 @@ async def delete_mcp_server(
                         for other_server in other_servers
                     )
                     if not sibling_still_connected:
-                        db.query(UserOAuth).filter(
-                            UserOAuth.user_id == user_id,
-                            UserOAuth.provider == provider,
-                        ).delete(synchronize_session=False)
+                        delete_scoped_user_oauth_accounts(
+                            db,
+                            user_id=int(user_id),
+                            resource_owner_key=None,
+                            providers=[provider],
+                        )
 
         # Revoke and purge this user's MCP OAuth grants for the server. On a
         # shared (multi-user) row the server outlives this disconnect, so

@@ -124,6 +124,29 @@ def test_legacy_token_resolution_still_uses_bare_meta_grant_for_instagram(db_ses
     assert resolution.access_token == "bare-meta-token"
 
 
+def test_ordinary_token_resolution_ignores_actor_owned_grant(db_session):
+    db_session.add(
+        UserOAuth(
+            user_id=1,
+            provider="instagram",
+            resource_owner_key="toby:slack:41:UALICE",
+            access_token="actor-token",
+        )
+    )
+    db_session.commit()
+
+    cfg = WebToolConfig(db=None, request=None, db_factory=lambda: db_session, user_id=1)
+
+    resolution = asyncio.run(
+        cfg._resolve_legacy_oauth_access_token(
+            provider_name="meta",
+            app_id="instagram",
+        )
+    )
+
+    assert resolution.access_token is None
+
+
 def test_legacy_token_resolution_uses_app_scoped_facebook_grant(db_session):
     db_session.add(
         UserOAuth(

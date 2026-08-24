@@ -450,52 +450,46 @@ def test_oauth_callback_still_fails_when_the_success_page_cannot_be_rendered(
     assert "Authentication Failed" in response.body.decode()
 
 
-def test_oauth_callback_survives_a_non_integer_user_id_claim(
-    db_session, monkeypatch, caplog
+@pytest.mark.parametrize(
+    "user_id_claim",
+    [
+        pytest.param("7abc", id="non-integer-string"),
+        pytest.param(True, id="boolean"),
+        pytest.param(7.9, id="fractional-float"),
+        pytest.param(7.0, id="integral-float"),
+        pytest.param(float("inf"), id="infinite-float"),
+        pytest.param(0, id="zero"),
+        pytest.param(-1, id="negative"),
+        pytest.param(2**31, id="larger-than-database-integer"),
+    ],
+)
+def test_oauth_callback_rejects_an_invalid_user_id_claim_before_exchange(
+    db_session, monkeypatch, user_id_claim: object
 ):
-    """Coercing the state claim is post-commit work, so it belongs in the guard.
-
-    A ``user_id`` claim that is not an integer only becomes observable once the
-    OAuth row is committed, so failing the coercion has to behave like any
-    other post-commit failure rather than rendering a 500 for a connect that
-    already succeeded. Reachable if a deployment is still running on the
-    default ``XAGENT_JWT_SECRET``, which makes the state token forgeable.
-    """
+    """An invalid state owner must fail before provider and database effects."""
     db, _user = db_session
     state = create_access_token(
         data={
             "type": "oauth_state",
-            "user_id": "7abc",
+            "user_id": user_id_claim,
             "provider": "google",
             "app_id": "gmail",
         },
         expires_delta=timedelta(minutes=10),
     )
     request = SimpleNamespace(query_params={"code": "gmail-code", "state": state})
-    monkeypatch.setattr(
-        auth_api.requests,
-        "post",
-        Mock(
-            return_value=MockResponse(
-                {
-                    "access_token": "gmail-token",
-                    "refresh_token": "gmail-refresh",
-                    "token_type": "Bearer",
-                    "expires_in": 3600,
-                    "scope": "https://www.googleapis.com/auth/gmail.modify",
-                }
-            )
-        ),
+    token_exchange = Mock(
+        return_value=MockResponse(
+            {
+                "access_token": "gmail-token",
+                "refresh_token": "gmail-refresh",
+                "token_type": "Bearer",
+                "expires_in": 3600,
+                "scope": "https://www.googleapis.com/auth/gmail.modify",
+            }
+        )
     )
-    monkeypatch.setattr(
-        auth_api.requests,
-        "get",
-        Mock(
-            return_value=MockResponse(
-                {"sub": "google-user-1", "email": "alice@gmail.com"}
-            )
-        ),
-    )
+    monkeypatch.setattr(auth_api.requests, "post", token_exchange)
     provision = Mock()
     monkeypatch.setattr(
         "xagent.web.services.gmail_provisioning."
@@ -503,14 +497,16 @@ def test_oauth_callback_survives_a_non_integer_user_id_claim(
         provision,
     )
 
-    caplog.set_level(logging.WARNING, logger=auth_api.__name__)
+    try:
+        response = generic_oauth_callback("google", request, db, _google_provider())
+    except Exception as exc:
+        pytest.fail(f"invalid user ID claim escaped the callback: {exc!r}")
 
-    response = generic_oauth_callback("google", request, db, _google_provider())
-
-    assert response.status_code == 200
-    assert "Authentication Failed" not in response.body.decode()
+    assert response.status_code == 400
+    assert "Invalid or expired state" in response.body.decode()
+    token_exchange.assert_not_called()
     provision.assert_not_called()
-    assert "Post-commit OAuth side effects failed" in caplog.text
+    assert db.query(UserOAuth).count() == 0
 
 
 def test_bare_google_callback_does_not_provision_gmail_watches(db_session, monkeypatch):
@@ -1150,6 +1146,25 @@ async def test_disconnecting_facebook_preserves_shared_bare_meta_grant_for_insta
 
     assert db.query(UserOAuth).filter(UserOAuth.provider == "meta").count() == 1
     assert db.query(UserOAuth).filter(UserOAuth.provider == "facebook").count() == 1
+    db.add_all(
+        [
+            UserOAuth(
+                user_id=user.id,
+                provider="meta",
+                provider_user_id="actor-meta",
+                resource_owner_key="actor:meta",
+                access_token="actor-meta-token",
+            ),
+            UserOAuth(
+                user_id=user.id,
+                provider="facebook",
+                provider_user_id="actor-facebook",
+                resource_owner_key="actor:facebook",
+                access_token="actor-facebook-token",
+            ),
+        ]
+    )
+    db.commit()
 
     from xagent.web.api.mcp import delete_mcp_server
 
@@ -1158,9 +1173,31 @@ async def test_disconnecting_facebook_preserves_shared_bare_meta_grant_for_insta
     )
     await delete_mcp_server(facebook_server.id, current_user=user, db=db)
 
-    assert db.query(UserOAuth).filter(UserOAuth.provider == "facebook").count() == 0
+    assert (
+        db.query(UserOAuth)
+        .filter(
+            UserOAuth.provider == "facebook",
+            UserOAuth.resource_owner_key.is_(None),
+        )
+        .count()
+        == 0
+    )
     # The shared bare grant Instagram still relies on must survive.
-    assert db.query(UserOAuth).filter(UserOAuth.provider == "meta").count() == 1
+    assert (
+        db.query(UserOAuth)
+        .filter(
+            UserOAuth.provider == "meta",
+            UserOAuth.resource_owner_key.is_(None),
+        )
+        .count()
+        == 1
+    )
+    assert {
+        row.access_token
+        for row in db.query(UserOAuth)
+        .filter(UserOAuth.resource_owner_key.is_not(None))
+        .all()
+    } == {"actor-meta-token", "actor-facebook-token"}
 
 
 async def test_disconnecting_facebook_only_user_also_removes_orphaned_bare_meta_grant(
@@ -1178,6 +1215,24 @@ async def test_disconnecting_facebook_only_user_also_removes_orphaned_bare_meta_
     db.add(
         UserOAuth(user_id=user.id, provider="facebook", access_token="app-scoped-token")
     )
+    db.add_all(
+        [
+            UserOAuth(
+                user_id=user.id,
+                provider="meta",
+                provider_user_id="actor-meta",
+                resource_owner_key="actor:meta",
+                access_token="actor-meta-token",
+            ),
+            UserOAuth(
+                user_id=user.id,
+                provider="facebook",
+                provider_user_id="actor-facebook",
+                resource_owner_key="actor:facebook",
+                access_token="actor-facebook-token",
+            ),
+        ]
+    )
     server = MCPServer(name="Facebook Pages", transport="oauth", managed="external")
     db.add(server)
     db.commit()
@@ -1188,15 +1243,19 @@ async def test_disconnecting_facebook_only_user_also_removes_orphaned_bare_meta_
 
     await delete_mcp_server(server.id, current_user=user, db=db)
 
-    assert db.query(UserOAuth).filter(UserOAuth.provider == "facebook").count() == 0
-    assert db.query(UserOAuth).filter(UserOAuth.provider == "meta").count() == 0
+    assert (
+        db.query(UserOAuth).filter(UserOAuth.resource_owner_key.is_(None)).count() == 0
+    )
+    assert {
+        row.access_token
+        for row in db.query(UserOAuth)
+        .filter(UserOAuth.resource_owner_key.is_not(None))
+        .all()
+    } == {"actor-meta-token", "actor-facebook-token"}
 
 
-def test_facebook_server_list_does_not_show_bare_meta_email_as_connected(db_session):
-    """GET /servers must agree with the app-scoped-grant policy: showing a
-    bare "meta" account's email as Facebook's connected_account would tell
-    the user Facebook is connected when _oauth_keys_for_app (and the runtime
-    token resolver) say it isn't."""
+def test_facebook_server_reads_ignore_actor_owned_email(db_session):
+    """Personal server reads must ignore actor-owned OAuth accounts."""
     db, user = db_session
     db.add(
         UserOAuth(
@@ -1206,18 +1265,30 @@ def test_facebook_server_list_does_not_show_bare_meta_email_as_connected(db_sess
             email="alice@example.com",
         )
     )
+    db.add(
+        UserOAuth(
+            user_id=user.id,
+            provider="facebook",
+            provider_user_id="actor-facebook",
+            resource_owner_key="actor:facebook",
+            access_token="actor-facebook-token",
+            email="actor@example.com",
+        )
+    )
     server = MCPServer(name="Facebook Pages", transport="oauth", managed="external")
     db.add(server)
     db.commit()
     db.add(UserMCPServer(user_id=user.id, mcpserver_id=server.id, is_owner=True))
     db.commit()
 
-    from xagent.web.api.mcp import get_mcp_servers
+    from xagent.web.api.mcp import get_mcp_server, get_mcp_servers
 
     responses = get_mcp_servers(current_user=user, db=db)
+    response = get_mcp_server(server.id, current_user=user, db=db)
 
     assert len(responses) == 1
     assert responses[0].connected_account is None
+    assert response.connected_account is None
 
 
 def test_facebook_server_list_does_not_show_blanked_token_as_connected(db_session):

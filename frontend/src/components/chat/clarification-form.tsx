@@ -12,6 +12,7 @@ import { useI18n } from "@/contexts/i18n-context"
 import { toast } from "@/components/ui/sonner"
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible"
 import { ChevronDown, ChevronRight, MessageSquare, Upload, File as FileIcon, X, Globe } from "lucide-react"
+import { ConnectAppsField } from "./connect-apps-field"
 
 interface ClarificationFormProps {
   message?: string
@@ -44,6 +45,15 @@ const isFileActionSelection = (
   ? isFileActionOption(option)
   : isFileActionValue(value)
 
+// Interaction types that are "live widgets" reflecting external state (e.g.
+// useMcpApps()'s connection state), not a question with an answer to submit
+// - see the comment on isConnectAppsOnly below for why that distinction
+// matters. Named so a list mixing one of these with an ordinary field (not
+// currently produced by any seeder, but nothing in the type system or
+// backend schema rules it out) still renders correctly via renderField's
+// switch below instead of falling through to its "unsupported type" case.
+const LIVE_WIDGET_TYPES = new Set(["connect_apps"])
+
 export function ClarificationForm({
   interactions,
   messageId,
@@ -63,11 +73,36 @@ export function ClarificationForm({
   }
   const filesDisabled = filesDisabledOverride ?? contextFilesDisabled ?? true
 
+  // "connect_apps" is a live widget (OAuth-popup buttons that reflect
+  // useMcpApps()'s current connection state), not a question-and-submit
+  // form field - it has no "answer" to gate behind `active`/waiting_for_user
+  // the way every other interaction type does (see the type's doc comment
+  // on Interaction.apps). A seed message attached at task-creation time
+  // (the marketplace Hire flow) never transitions the task through
+  // waiting_for_user at all, so gating this on `active` the normal way
+  // would leave it permanently collapsed and inert.
+  const isConnectAppsOnly =
+    interactions.length > 0 && interactions.every((interaction) => LIVE_WIDGET_TYPES.has(interaction.type))
+
   const { t } = useI18n()
+
+  // Ignore the persisted interaction.label for a live-widget type (it's only
+  // ever a t()'d string frozen into the DB row at hire time - see
+  // hire-agent.ts's buildConnectAppsInteraction/HireMessageStrings) and
+  // re-resolve live instead, so a locale switch after hiring doesn't leave
+  // it stuck in whatever language was active when the task was created. Used
+  // by both the isConnectAppsOnly header below and the per-field label in
+  // the mixed-interaction-list branch further down, since either render path
+  // can be the one displaying a live-widget interaction's label.
+  const fieldLabel = (interaction: Interaction): string =>
+    LIVE_WIDGET_TYPES.has(interaction.type)
+      ? t("chatPage.clarification.connectApps.title")
+      : interaction.label || interaction.field
+
   const [formState, setFormState] = useState<Record<string, any>>({})
   const [isSubmitting, setIsSubmitting] = useState(false)
-  const [isSubmitted, setIsSubmitted] = useState(!active)
-  const [isOpen, setIsOpen] = useState(active)
+  const [isSubmitted, setIsSubmitted] = useState(!active && !isConnectAppsOnly)
+  const [isOpen, setIsOpen] = useState(active || isConnectAppsOnly)
 
   useEffect(() => {
     if (active) {
@@ -269,6 +304,24 @@ export function ClarificationForm({
     }
   }
 
+  // "connect_apps" has no form fields to gather - skipping just logs a
+  // plain acknowledgement message, matching every other interaction type's
+  // "answer becomes a chat message" contract, but without the lines/
+  // formState machinery handleSubmit above uses (there's nothing to gather).
+  const handleSkipConnectApps = async () => {
+    const message = t("chatPage.clarification.connectApps.skip")
+    try {
+      if (onSend) {
+        await onSend(message, [], {})
+      } else if (sendMessage) {
+        await sendMessage(message, { force: true }, [])
+      }
+    } catch (error) {
+      console.error("Failed to send connect-apps skip response", error)
+      toast.error(t("chatPage.clarification.sendError"))
+    }
+  }
+
   const renderField = (interaction: Interaction) => {
     const value = formState[interaction.field]
 
@@ -460,6 +513,14 @@ export function ClarificationForm({
           </div>
         )
 
+      // Normally rendered via the isConnectAppsOnly branch below, which skips
+      // renderField entirely - this case only matters if connect_apps is
+      // ever mixed into a list with another interaction type (not producible
+      // today, see LIVE_WIDGET_TYPES's comment), so that path still gets the
+      // real widget instead of falling to the "unsupported type" case below.
+      case "connect_apps":
+        return <ConnectAppsField interaction={interaction} onSkip={handleSkipConnectApps} />
+
       default:
         return <div className="text-destructive text-sm">{t("chatPage.clarification.unsupportedType", { type: interaction.type })}</div>
     }
@@ -475,7 +536,17 @@ export function ClarificationForm({
         <div className="flex items-center justify-between p-4 bg-muted/80 cursor-pointer hover:bg-muted/60 transition-colors">
           <div className="flex items-center gap-2 font-semibold">
             <MessageSquare className="h-4 w-4" />
-            <span className="text-sm">{t("chatPage.clarification.title")}</span>
+            <span className="text-sm">
+              {isConnectAppsOnly
+                ? // Ignore the persisted interaction.label here (it's only ever a
+                  // t()'d string frozen into the DB row at hire time - see
+                  // hire-agent.ts's buildConnectAppsInteraction/HireMessageStrings)
+                  // and re-resolve live instead, so a locale switch after hiring
+                  // doesn't leave this header stuck in whatever language was
+                  // active when the task was created.
+                  t("chatPage.clarification.connectApps.title")
+                : t("chatPage.clarification.title")}
+            </span>
           </div>
           <div>
             {isOpen ? <ChevronDown className="h-4 w-4" /> : <ChevronRight className="h-4 w-4" />}
@@ -484,26 +555,40 @@ export function ClarificationForm({
       </CollapsibleTrigger>
 
       <CollapsibleContent className="space-y-4 p-4">
-        <div className="space-y-4">
-          {normalizedInteractions.map((interaction, index) => (
-            filesDisabled && interaction.type === "file_upload" ? null : (
-            <div key={`${interaction.field}-${index}`} className="space-y-2">
-              <Label className="text-sm font-medium">
-                {interaction.label || interaction.field}
-                {interaction.type === "confirm" ? "" : ":"}
-              </Label>
+        {isConnectAppsOnly ? (
+          <div className="space-y-4">
+            {normalizedInteractions.map((interaction, index) => (
+              <ConnectAppsField
+                key={`${interaction.field}-${index}`}
+                interaction={interaction}
+                onSkip={handleSkipConnectApps}
+              />
+            ))}
+          </div>
+        ) : (
+          <>
+            <div className="space-y-4">
+              {normalizedInteractions.map((interaction, index) => (
+                filesDisabled && interaction.type === "file_upload" ? null : (
+                <div key={`${interaction.field}-${index}`} className="space-y-2">
+                  <Label className="text-sm font-medium">
+                    {fieldLabel(interaction)}
+                    {interaction.type === "confirm" || LIVE_WIDGET_TYPES.has(interaction.type) ? "" : ":"}
+                  </Label>
 
-              {renderField(interaction)}
+                  {renderField(interaction)}
+                </div>
+                )
+              ))}
             </div>
-            )
-          ))}
-        </div>
 
-        <div className="pt-2 flex gap-2">
-          <Button className="flex-1" size="sm" onClick={handleSubmit} disabled={!active || isSubmitting || isSubmitted}>
-            {isSubmitting ? t("chatPage.clarification.submitting") : t("chatPage.clarification.submit")}
-          </Button>
-        </div>
+            <div className="pt-2 flex gap-2">
+              <Button className="flex-1" size="sm" onClick={handleSubmit} disabled={!active || isSubmitting || isSubmitted}>
+                {isSubmitting ? t("chatPage.clarification.submitting") : t("chatPage.clarification.submit")}
+              </Button>
+            </div>
+          </>
+        )}
       </CollapsibleContent>
     </Collapsible>
   )

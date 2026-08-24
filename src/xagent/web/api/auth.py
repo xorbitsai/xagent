@@ -40,6 +40,7 @@ from ..models.user_oauth import UserOAuth
 from ..oauth_provider_quirks import requires_json_accept_header
 from ..services import gmail_provisioning
 from ..services.auth_email import send_password_reset_email
+from ..services.user_oauth import delete_scoped_user_oauth_accounts
 from ..utils.graphql_errors import graphql_errors_message, truncate_error_text
 
 logger = logging.getLogger(__name__)
@@ -49,6 +50,7 @@ auth_router = APIRouter(prefix="/api/auth", tags=["Authentication"])
 REGISTRATION_ENABLED_SETTING_KEY = "registration_enabled"
 SETUP_COMPLETED_SETTING_KEY = "setup_completed"
 EMAIL_PATTERN = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+_MAX_USER_ID = 2_147_483_647
 
 
 def _best_effort_ensure_gmail_watches_for_user(db: Session, *, user_id: int) -> None:
@@ -80,7 +82,7 @@ def _best_effort_ensure_gmail_watches_for_user(db: Session, *, user_id: int) -> 
 
 
 def _run_post_commit_oauth_side_effects(
-    db: Session, *, user_id: Any, connector_key: str
+    db: Session, *, user_id: int, connector_key: str
 ) -> None:
     """Run the OAuth callback's post-commit work; never raise.
 
@@ -88,11 +90,8 @@ def _run_post_commit_oauth_side_effects(
     id when the connect is app-scoped (``"gmail"``), otherwise the provider
     name (``"google"``).
 
-    ``user_id`` is the raw ``oauth_state`` claim rather than an ``int`` so that
-    its coercion happens inside the guard below. Coercing it into the argument
-    would put that conversion post-commit but outside the guard, which is the
-    one thing this helper exists to prevent, and would lose the offending value
-    to a 500 instead of logging it.
+    ``user_id`` is a validated ``oauth_state`` claim. The callback validates
+    this claim before the provider exchange and database changes.
 
     Everything here runs once ``db.commit()`` has persisted the OAuth token, so
     the connect has already succeeded as far as the user is concerned. The
@@ -123,7 +122,7 @@ def _run_post_commit_oauth_side_effects(
     """
     try:
         if connector_key == "gmail":
-            _best_effort_ensure_gmail_watches_for_user(db, user_id=int(user_id))
+            _best_effort_ensure_gmail_watches_for_user(db, user_id=user_id)
     except Exception:
         logger.warning(
             "Post-commit OAuth side effects failed for user %s on connector %s; "
@@ -1642,7 +1641,7 @@ class AppNotOAuthError(ValueError):
 
 
 def _ensure_user_mcp_server(
-    db: Session, user_id: str, app_info: Dict[str, Any]
+    db: Session, user_id: int, app_info: Dict[str, Any]
 ) -> None:
     """Ensure MCPServer and UserMCPServer records exist for an OAuth app."""
     from sqlalchemy.exc import IntegrityError
@@ -1769,7 +1768,17 @@ def generic_oauth_callback(
             content="<h1>Error: Invalid or expired state</h1>", status_code=400
         )
 
-    user_id = payload.get("user_id")
+    user_id_claim = payload.get("user_id")
+    if user_id_claim is not None and (
+        type(user_id_claim) is not int or not 0 < user_id_claim <= _MAX_USER_ID
+    ):
+        # Reject malformed state before exchanging the provider code or
+        # mutating OAuth rows. ``User.id`` uses a signed database integer, so
+        # values accepted only by SQLite must also fail at this boundary.
+        return HTMLResponse(
+            content="<h1>Error: Invalid or expired state</h1>", status_code=400
+        )
+    user_id = user_id_claim
     app_id = payload.get("app_id")
     encrypted_code_verifier = payload.get("code_verifier")
     code_verifier = None
@@ -2198,13 +2207,17 @@ def generic_oauth_callback(
             email = info_data.get(db_provider.email_path or "email")
 
         if user_id:
-            db.query(UserOAuth).filter(
-                UserOAuth.user_id == user_id, UserOAuth.provider == (app_id or provider)
-            ).delete()
+            delete_scoped_user_oauth_accounts(
+                db,
+                user_id=user_id,
+                resource_owner_key=None,
+                providers=[app_id or provider],
+            )
 
             oauth_account = UserOAuth(
                 user_id=user_id,
                 provider=(app_id or provider),
+                resource_owner_key=None,
                 provider_user_id=str(provider_user_id) if provider_user_id else None,
             )
             db.add(oauth_account)

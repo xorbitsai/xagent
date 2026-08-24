@@ -947,7 +947,13 @@ def get_background_job_max_retries() -> int:
 
 
 def get_background_job_stale_seconds() -> int:
-    """Return the age after which non-terminal jobs should be requeued."""
+    """Return the longest gap without a durable row update before requeueing.
+
+    Measured against ``updated_at`` -- progress or status persistence -- not
+    against how long the job has been running, so a job that keeps reporting is
+    never requeued for being long. Liveness rides on whatever the work loop
+    persists; there is no timer heartbeat.
+    """
     return _get_positive_int_env(BACKGROUND_JOB_STALE_SECONDS, 7200, minimum=60)
 
 

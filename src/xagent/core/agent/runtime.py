@@ -132,6 +132,13 @@ class PatternRuntime:
     finished_spans: list[dict[str, Any]] = field(default_factory=list)
     trace_runs: list[dict[str, Any]] = field(default_factory=list)
     active_react_step_id: str | None = None
+    # The durable per-turn id (sourced from the triggering user Message's
+    # metadata["turn_id"], see _dag_turn_id) for whichever ReAct turn is
+    # currently running. Set in on_pattern_start alongside
+    # active_react_step_id, and read back by on_tool_start/on_tool_end/
+    # on_tool_error so tool trace events can be joined to their turn without
+    # relying on step_id or timestamp-adjacency heuristics.
+    active_turn_id: str | None = None
     last_final_answer_stream_message_id: str | None = None
     _active_llm_tasks: set[asyncio.Future[Any]] = field(
         default_factory=set,
@@ -665,6 +672,7 @@ class PatternRuntime:
     async def on_pattern_start(self, *, context: Any, pattern: Any) -> None:
         if pattern.__class__.__name__ == "ReActPattern":
             self.active_react_step_id = f"react_{uuid4().hex[:8]}"
+            self.active_turn_id = self._dag_turn_id(context)
         await self._emit_pattern_trace(context=context, pattern=pattern, action="start")
         if self.tracer is None:
             return
@@ -701,6 +709,7 @@ class PatternRuntime:
         )
         if pattern.__class__.__name__ == "ReActPattern":
             self.active_react_step_id = None
+            self.active_turn_id = None
         if self.tracer is None:
             return
         finish_trace = getattr(self.tracer, "finish_trace", None)
@@ -738,6 +747,7 @@ class PatternRuntime:
         )
         if pattern.__class__.__name__ == "ReActPattern":
             self.active_react_step_id = None
+            self.active_turn_id = None
         if self.tracer is None:
             return
         finish_trace = getattr(self.tracer, "finish_trace", None)
@@ -779,6 +789,9 @@ class PatternRuntime:
         assistant_content = tool_call.get("assistant_content")
         if isinstance(assistant_content, str) and assistant_content.strip():
             data["assistant_content"] = assistant_content.strip()
+        turn_id = self._turn_id_from_payload(tool_call)
+        if turn_id:
+            data["turn_id"] = turn_id
 
         await self._emit_trace_event(
             TraceEventType(TraceScope.ACTION, TraceAction.START, TraceCategory.TOOL),
@@ -799,7 +812,19 @@ class PatternRuntime:
             await self._maybe_await(start_span(**payload))
 
     async def on_tool_end(self, *, tool_call: dict[str, Any], result: Any) -> None:
+        turn_id = self._turn_id_from_payload(tool_call)
         if tool_result_waits_for_user(result):
+            data = {
+                "tool_name": tool_call.get("name"),
+                "tool_params": tool_call.get("args", {}),
+                "tool_call_id": tool_call.get("id"),
+                "result": result,
+                "success": False,
+                "status": WAITING_FOR_USER_STATUS,
+                "control_state": WAITING_FOR_USER_STATUS,
+            }
+            if turn_id:
+                data["turn_id"] = turn_id
             await self._emit_trace_event(
                 TraceEventType(
                     TraceScope.ACTION,
@@ -808,15 +833,7 @@ class PatternRuntime:
                 ),
                 task_id=self._task_id_from_payload(tool_call),
                 step_id=self._step_id_from_payload(tool_call),
-                data={
-                    "tool_name": tool_call.get("name"),
-                    "tool_params": tool_call.get("args", {}),
-                    "tool_call_id": tool_call.get("id"),
-                    "result": result,
-                    "success": False,
-                    "status": WAITING_FOR_USER_STATUS,
-                    "control_state": WAITING_FOR_USER_STATUS,
-                },
+                data=data,
             )
             await self._finish_tool_span(
                 tool_call=tool_call,
@@ -834,17 +851,20 @@ class PatternRuntime:
             )
             return
 
+        data = {
+            "tool_name": tool_call.get("name"),
+            "tool_params": tool_call.get("args", {}),
+            "tool_call_id": tool_call.get("id"),
+            "result": result,
+            "success": True,
+        }
+        if turn_id:
+            data["turn_id"] = turn_id
         await self._emit_trace_event(
             TraceEventType(TraceScope.ACTION, TraceAction.END, TraceCategory.TOOL),
             task_id=self._task_id_from_payload(tool_call),
             step_id=self._step_id_from_payload(tool_call),
-            data={
-                "tool_name": tool_call.get("name"),
-                "tool_params": tool_call.get("args", {}),
-                "tool_call_id": tool_call.get("id"),
-                "result": result,
-                "success": True,
-            },
+            data=data,
         )
         await self._finish_tool_span(
             tool_call=tool_call,
@@ -873,6 +893,9 @@ class PatternRuntime:
         )
         if failure_code is not None:
             data["failure_code"] = failure_code
+        turn_id = self._turn_id_from_payload(tool_call)
+        if turn_id:
+            data["turn_id"] = turn_id
 
         await self._emit_trace_event(
             TraceEventType(TraceScope.ACTION, TraceAction.ERROR, TraceCategory.TOOL),
@@ -895,18 +918,22 @@ class PatternRuntime:
         """Close an in-flight tool trace without reporting a pause as an error."""
 
         cancellation_reason = reason or "Tool execution interrupted"
+        data: dict[str, Any] = {
+            "tool_name": tool_call.get("name"),
+            "tool_params": tool_call.get("args", {}),
+            "tool_call_id": tool_call.get("id"),
+            "success": False,
+            "interrupted": True,
+            "interrupt_reason": cancellation_reason,
+        }
+        turn_id = self._turn_id_from_payload(tool_call)
+        if turn_id:
+            data["turn_id"] = turn_id
         await self._emit_trace_event(
             TraceEventType(TraceScope.ACTION, TraceAction.END, TraceCategory.TOOL),
             task_id=self._task_id_from_payload(tool_call),
             step_id=self._step_id_from_payload(tool_call),
-            data={
-                "tool_name": tool_call.get("name"),
-                "tool_params": tool_call.get("args", {}),
-                "tool_call_id": tool_call.get("id"),
-                "success": False,
-                "interrupted": True,
-                "interrupt_reason": cancellation_reason,
-            },
+            data=data,
         )
         await self._finish_tool_span(
             tool_call=tool_call,
@@ -1426,6 +1453,16 @@ class PatternRuntime:
             or self.execution_id
             or "root"
         )
+
+    def _turn_id_from_payload(self, payload: dict[str, Any]) -> str | None:
+        # Mirrors _step_id_from_payload's shape: a tool_call dict is stamped
+        # with "turn_id" before reaching on_tool_start/on_tool_end/
+        # on_tool_error (_with_runtime_step's sibling in react.py, and
+        # _DAGStepRuntime.active_turn_id for DAG steps), so the payload is
+        # the primary source; self.active_turn_id is the fallback for a
+        # payload that predates that stamping.
+        turn_id = payload.get("turn_id") or self.active_turn_id
+        return str(turn_id) if turn_id else None
 
     def _short_response(self, response: Any) -> Any:
         if isinstance(response, str):

@@ -276,6 +276,10 @@ def requeue_stale_background_jobs(
     Redis/Celery can lose in-flight delivery state during broker loss or worker
     crashes. The database row remains authoritative, so the scheduler can safely
     put old pending/enqueued/running jobs back on the broker.
+
+    Staleness is judged on ``updated_at`` for every status, never ``started_at``:
+    the latter is written once and never advances, so a RUNNING job judged by it
+    is requeued for being long, not for being dead.
     """
     stale_seconds = stale_after_seconds or get_background_job_stale_seconds()
     cutoff = datetime.now(timezone.utc) - timedelta(seconds=stale_seconds)
@@ -291,12 +295,6 @@ def requeue_stale_background_jobs(
         .filter(
             or_(
                 and_(
-                    BackgroundJob.status == BackgroundJobStatus.RUNNING.value,
-                    BackgroundJob.started_at.is_not(None),
-                    BackgroundJob.started_at <= cutoff,
-                ),
-                and_(
-                    BackgroundJob.status != BackgroundJobStatus.RUNNING.value,
                     BackgroundJob.updated_at.is_not(None),
                     BackgroundJob.updated_at <= cutoff,
                 ),

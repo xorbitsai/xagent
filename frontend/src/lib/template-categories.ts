@@ -1,8 +1,5 @@
-import type { Template } from "@/types/template";
 import type { Translate } from "@/contexts/i18n-context";
 import type { TranslationKey } from "@/i18n/translations";
-
-export const FEATURED_CATEGORY_ID = "Featured";
 
 const CATEGORY_LABEL_KEYS: Record<string, TranslationKey> = {
   general: "templates.categoryTitles.general",
@@ -37,20 +34,10 @@ export function categoryLabel(t: Translate, category: string | undefined): strin
   return key ? t(key) : formatFallbackLabel(c);
 }
 
-const PREFERRED_ORDER = ["Marketing", "Sales", "Support", "Research", "Productivity"];
-
-export interface CategoryTab {
-  id: string;
-  count: number;
-}
-
 /**
- * Shared by every page that renders a category filter (this quick-access
- * pill row and the /templates library page): a known-first subset in
- * caller-supplied preferred order, then any remaining categories in
- * first-seen order. Each caller keeps its own preferred order (the two
- * pages intentionally differ here - Featured/Marketing/Sales/Support for
- * this compact panel vs Sales/Marketing/Support for the full library) while
+ * Shared by every page that renders a category filter: a known-first
+ * subset in caller-supplied preferred order, then any remaining categories
+ * in first-seen order - each caller keeps its own preferred order while
  * sharing the actual ordering algorithm instead of each reimplementing it.
  */
 export function orderCategoriesWithPreferred(
@@ -71,43 +58,4 @@ export function orderCategoriesWithPreferred(
  */
 export function normalizeCategoryKey(category: string): string {
   return category.toLowerCase().replace(/\s*&\s*/g, "_").replace(/\s+/g, "_");
-}
-
-/**
- * Ordered category tabs with counts: Featured first (when any template is
- * featured), then known categories in PREFERRED_ORDER, then any remaining
- * categories in first-seen order.
- */
-export function getOrderedCategoriesWithCounts(templates: Template[]): CategoryTab[] {
-  const featuredCount = templates.filter((template) => template.featured).length;
-  const dynamicCategories = Array.from(
-    new Set(templates.map((template) => template.category).filter(Boolean))
-  );
-  const orderedCategories = orderCategoriesWithPreferred(dynamicCategories, PREFERRED_ORDER);
-
-  const tabs: CategoryTab[] = [];
-  if (featuredCount > 0) {
-    tabs.push({ id: FEATURED_CATEGORY_ID, count: featuredCount });
-  }
-  orderedCategories.forEach((category) => {
-    tabs.push({
-      id: category,
-      count: templates.filter((template) => template.category === category).length,
-    });
-  });
-
-  return tabs;
-}
-
-/** Top `limit` templates for a given category tab, in natural API order. */
-export function getTemplatesForCategory(
-  templates: Template[],
-  categoryId: string,
-  limit = 4
-): Template[] {
-  const filtered =
-    categoryId === FEATURED_CATEGORY_ID
-      ? templates.filter((template) => template.featured)
-      : templates.filter((template) => template.category === categoryId);
-  return filtered.slice(0, limit);
 }

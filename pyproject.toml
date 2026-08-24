@@ -48,7 +48,7 @@ dependencies = [
   "pillow >= 10.0.0",
   "pypinyin>=0.53.0",
   "cairosvg >= 2.7.1",
-  "lancedb>=0.13.0",
+  "lancedb>=0.24.2",
   "pyarrow>=16.1.0",
   # Basic document processing (keep pypdf for basic PDF support)
   "pypdf>=4.0.0",

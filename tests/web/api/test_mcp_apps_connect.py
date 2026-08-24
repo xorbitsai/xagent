@@ -251,11 +251,107 @@ def test_platform_and_shared_env_available_flags(test_db):
     assert _app_shared_env_available(app, server, {server.id: {"X": "y"}}) is False
 
 
+def test_configured_env_keys_reflects_per_key_state_for_a_partially_configured_app(
+    test_db,
+):
+    """_app_user_env_configured is all-or-nothing over required_env, which a
+    multi-key app (e.g. AWS's 3 keys) can't use to tell a reconnect dialog
+    which keys already have a stored value - the dialog would have to blank
+    every field the moment even one is missing, and submitting a blank value
+    clears whatever was already there (see connect_mcp_app's provided/
+    _merge_masked_env handling). _app_configured_env_keys exists to answer
+    that per key instead."""
+    from xagent.web.api.mcp import (
+        MCPAppConnectRequest,
+        _app_configured_env_keys,
+        _app_user_env_configured,
+        connect_mcp_app,
+    )
+
+    test_db.add(
+        PublicMCPApp(
+            app_id="multi-key-app",
+            name="multi-key-app",
+            description="Multi-key test app",
+            transport="stdio",
+            launch_config={
+                "command": "npx",
+                "args": ["multi-key-app"],
+                "required_env": ["KEY_A", "KEY_B"],
+            },
+        )
+    )
+    test_db.commit()
+
+    app = {
+        "id": "multi-key-app",
+        "name": "multi-key-app",
+        "transport": "stdio",
+        "launch_config": {"required_env": ["KEY_A", "KEY_B"]},
+    }
+
+    # Only KEY_A is set - not fully configured, but KEY_A specifically is.
+    connect_mcp_app(
+        "multi-key-app",
+        MCPAppConnectRequest(env={"KEY_A": "value-a"}),
+        current_user=_user(test_db, 1),
+        db=test_db,
+    )
+    server = test_db.query(MCPServer).filter(MCPServer.name == "multi-key-app").first()
+    um_by_id = {
+        um.mcpserver_id: um
+        for um in test_db.query(UserMCPServer).filter(UserMCPServer.user_id == 1).all()
+    }
+
+    configured_keys = _app_configured_env_keys(app, server, um_by_id)
+    assert configured_keys == ["KEY_A"]
+    assert _app_user_env_configured(configured_keys, ["KEY_A", "KEY_B"]) is False
+
+
+def test_list_mcp_apps_serializes_configured_env_keys_for_a_partially_configured_app(
+    test_db,
+):
+    """Asserting only the private helpers (test above) would still pass if
+    the serialization step in list_mcp_apps that copies configured_env_keys
+    onto the response dict were ever deleted or renamed - assert the actual
+    GET /api/mcp/apps response shape too."""
+    from xagent.web.api.mcp import MCPAppConnectRequest, connect_mcp_app, list_mcp_apps
+
+    test_db.add(
+        PublicMCPApp(
+            app_id="multi-key-app",
+            name="multi-key-app",
+            description="Multi-key test app",
+            transport="stdio",
+            launch_config={
+                "command": "npx",
+                "args": ["multi-key-app"],
+                "required_env": ["KEY_A", "KEY_B"],
+            },
+        )
+    )
+    test_db.commit()
+
+    connect_mcp_app(
+        "multi-key-app",
+        MCPAppConnectRequest(env={"KEY_A": "value-a"}),
+        current_user=_user(test_db, 1),
+        db=test_db,
+    )
+
+    apps = list_mcp_apps(current_user=_user(test_db, 1), db=test_db)
+    multi_key_app = next(app for app in apps if app["id"] == "multi-key-app")
+
+    assert multi_key_app["configured_env_keys"] == ["KEY_A"]
+    assert multi_key_app["user_env_configured"] is False
+
+
 def test_user_env_configured_reflects_own_key(test_db):
     """The catalog exposes whether the current user has their own per-user key
     (vs relying on the admin's global key), so the manage dialog can show it."""
     from xagent.web.api.mcp import (
         MCPAppConnectRequest,
+        _app_configured_env_keys,
         _app_user_env_configured,
         connect_mcp_app,
     )
@@ -266,6 +362,7 @@ def test_user_env_configured_reflects_own_key(test_db):
         "transport": "stdio",
         "launch_config": {"required_env": ["GOOGLE_MAPS_API_KEY"]},
     }
+    required = ["GOOGLE_MAPS_API_KEY"]
 
     def _server():
         return test_db.query(MCPServer).filter(MCPServer.name == "google-maps").first()
@@ -285,7 +382,12 @@ def test_user_env_configured_reflects_own_key(test_db):
         current_user=_user(test_db, 1),
         db=test_db,
     )
-    assert _app_user_env_configured(app, _server(), _um_by_id(1)) is False
+    assert (
+        _app_user_env_configured(
+            _app_configured_env_keys(app, _server(), _um_by_id(1)), required
+        )
+        is False
+    )
 
     # Connected with own key -> configured.
     connect_mcp_app(
@@ -294,7 +396,12 @@ def test_user_env_configured_reflects_own_key(test_db):
         current_user=_user(test_db, 2),
         db=test_db,
     )
-    assert _app_user_env_configured(app, _server(), _um_by_id(2)) is True
+    assert (
+        _app_user_env_configured(
+            _app_configured_env_keys(app, _server(), _um_by_id(2)), required
+        )
+        is True
+    )
 
 
 def test_connect_only_stores_required_env_keys(test_db):

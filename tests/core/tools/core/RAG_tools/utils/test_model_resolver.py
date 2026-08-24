@@ -716,3 +716,98 @@ class TestModelHubEngineHideParameters:
 
         assert hub is not None
         assert model_resolver._MODEL_HUB_ENGINE.hide_parameters is True
+
+
+class TestModelHubEnginePoolKwargs:
+    """The model hub engine must take its pool health knobs from the shared
+    policy, not a local copy: a hardcoded value drifts silently the next time
+    ``get_db_pool_kwargs`` changes."""
+
+    class _StopBeforeConnect(Exception):
+        pass
+
+    def teardown_method(self) -> None:
+        model_resolver._reset_model_hub_cache()
+
+    def _capture_create_engine_kwargs(self, monkeypatch, url: str) -> Dict:
+        captured: Dict = {}
+
+        def _spy(_url, **kwargs):
+            captured.update(kwargs)
+            raise self._StopBeforeConnect("captured")
+
+        model_resolver._reset_model_hub_cache()
+        monkeypatch.setattr(model_resolver, "get_default_db_url", lambda: url)
+        monkeypatch.setattr(model_resolver, "create_engine", _spy)
+        with pytest.raises(self._StopBeforeConnect):
+            model_resolver._get_or_init_model_hub()
+        return captured
+
+    def test_non_sqlite_engine_takes_every_health_kwarg_from_shared_policy(
+        self, monkeypatch
+    ):
+        from xagent.config import get_db_pool_kwargs
+
+        policy = get_db_pool_kwargs()
+        expected = {
+            key: value
+            for key, value in policy.items()
+            if key not in model_resolver._POOL_SIZING_KEYS
+        }
+        assert "pool_timeout" in expected
+
+        kwargs = self._capture_create_engine_kwargs(
+            monkeypatch, "postgresql+psycopg2://u:p@127.0.0.1:5432/xagent"
+        )
+
+        assert kwargs == {
+            "connect_args": {},
+            "hide_parameters": True,
+            **expected,
+        }
+        # Sizing stays per-engine: a worker already holds the web engine's pool.
+        assert not model_resolver._POOL_SIZING_KEYS & set(kwargs)
+
+    def test_non_sqlite_engine_follows_shared_policy_changes(self, monkeypatch):
+        """Nothing may be copied locally: a changed policy must reach this engine."""
+        drifted = {
+            "pool_size": 999,
+            "max_overflow": 999,
+            "pool_timeout": 999,
+            "pool_recycle": 61,
+            "pool_pre_ping": False,
+            "pool_use_lifo": True,
+        }
+        monkeypatch.setattr(model_resolver, "get_db_pool_kwargs", lambda: drifted)
+
+        kwargs = self._capture_create_engine_kwargs(
+            monkeypatch, "postgresql+psycopg2://u:p@127.0.0.1:5432/xagent"
+        )
+
+        assert kwargs == {
+            "connect_args": {},
+            "hide_parameters": True,
+            "pool_timeout": 999,
+            "pool_recycle": 61,
+            "pool_pre_ping": False,
+            "pool_use_lifo": True,
+        }
+
+    def test_configured_pool_timeout_reaches_the_engine(self, monkeypatch):
+        monkeypatch.setenv("XAGENT_DB_POOL_TIMEOUT_SECONDS", "7")
+
+        kwargs = self._capture_create_engine_kwargs(
+            monkeypatch, "postgresql+psycopg2://u:p@127.0.0.1:5432/xagent"
+        )
+
+        assert kwargs["pool_timeout"] == 7
+
+    def test_sqlite_engine_takes_no_pool_kwargs(self, monkeypatch, tmp_path):
+        kwargs = self._capture_create_engine_kwargs(
+            monkeypatch, f"sqlite:///{tmp_path / 'hub.db'}"
+        )
+
+        assert kwargs == {
+            "connect_args": {"check_same_thread": False},
+            "hide_parameters": True,
+        }

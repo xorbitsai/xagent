@@ -8,6 +8,7 @@ import {
   waitFor,
 } from "@testing-library/react"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
+import type { McpApp } from "@/contexts/mcp-apps-context"
 
 const appContextMock = vi.hoisted(() => ({
   dispatch: vi.fn(),
@@ -16,6 +17,10 @@ const appContextMock = vi.hoisted(() => ({
   sendMessage: vi.fn(),
 }))
 const toastErrorMock = vi.hoisted(() => vi.fn())
+const mcpAppsMock = vi.hoisted(() => ({
+  apps: [] as McpApp[],
+  refresh: vi.fn(),
+}))
 
 vi.mock("@/contexts/app-context-chat", () => ({
   useApp: () => {
@@ -28,7 +33,8 @@ vi.mock("@/contexts/app-context-chat", () => ({
 
 vi.mock("@/contexts/i18n-context", () => ({
   useI18n: () => ({
-    t: (key: string) => key,
+    t: (key: string, vars?: Record<string, string | number>) =>
+      vars ? `${key}:${JSON.stringify(vars)}` : key,
   }),
 }))
 
@@ -36,6 +42,15 @@ vi.mock("@/components/ui/sonner", () => ({
   toast: {
     error: toastErrorMock,
   },
+}))
+
+// Only exercised by connect_apps interactions (below); every other test in
+// this file never mounts ConnectAppsField, so these mocks are inert for them.
+vi.mock("@/contexts/mcp-apps-context", () => ({
+  useMcpApps: () => mcpAppsMock,
+}))
+vi.mock("@/contexts/auth-context", () => ({
+  useAuth: () => ({ token: "test-token" }),
 }))
 
 import { ClarificationForm } from "./clarification-form"
@@ -224,5 +239,152 @@ describe("ClarificationForm Session file capability", () => {
     )
 
     expect(container.querySelector('input[type="file"]')).not.toBeNull()
+  })
+})
+
+describe("ClarificationForm connect_apps interaction", () => {
+  const CONNECT_APPS_INTERACTION = {
+    type: "connect_apps" as const,
+    field: "connect_apps",
+    label: "Connect your apps",
+    apps: ["Gmail"],
+  }
+
+  beforeEach(() => {
+    appContextMock.dispatch.mockReset()
+    appContextMock.filesDisabled = false
+    appContextMock.providerAvailable = true
+    appContextMock.sendMessage.mockReset()
+    toastErrorMock.mockReset()
+    mcpAppsMock.apps = [
+      {
+        id: "gmail",
+        name: "Gmail",
+        description: "",
+        icon: "",
+        users: "",
+        transport: "builtin",
+        provider: "google",
+        category: "Communication",
+        is_connected: false,
+      },
+    ]
+    mcpAppsMock.refresh.mockReset().mockResolvedValue(undefined)
+  })
+
+  afterEach(() => {
+    cleanup()
+  })
+
+  it("renders open by default even when active=false, unlike every other interaction type", () => {
+    // Simulates the AI Team Marketplace Hire flow: the interaction is seeded
+    // onto a task that never enters waiting_for_user, so `active` is false
+    // from the very first render - a plain question field would stay
+    // collapsed/disabled forever, but connect_apps must not.
+    render(
+      <ClarificationForm
+        interactions={[CONNECT_APPS_INTERACTION]}
+        active={false}
+        onSend={vi.fn()}
+      />,
+    )
+
+    expect(screen.getByText("Gmail")).toBeInTheDocument()
+    expect(
+      screen.getByRole("button", {
+        name: 'chatPage.clarification.connectApps.continueWith:{"provider":"Gmail"}',
+      }),
+    ).toBeInTheDocument()
+  })
+
+  it("shows the live-translated connectApps title in the header instead of the generic 'Ask User' title, ignoring the persisted label", () => {
+    // CONNECT_APPS_INTERACTION.label ("Connect your apps") stands in for the
+    // DB-persisted, hire-time-translated string (see hire-agent.ts's
+    // buildConnectAppsInteraction) - the header must not use it, or a locale
+    // switch after hiring would leave it frozen in the original language.
+    render(
+      <ClarificationForm interactions={[CONNECT_APPS_INTERACTION]} onSend={vi.fn()} />,
+    )
+
+    expect(screen.getByText("chatPage.clarification.connectApps.title")).toBeInTheDocument()
+    expect(screen.queryByText("chatPage.clarification.title")).not.toBeInTheDocument()
+    expect(screen.queryByText(CONNECT_APPS_INTERACTION.label)).not.toBeInTheDocument()
+  })
+
+  it("does not render the generic Submit button - connecting happens per-provider, not via a form submit", () => {
+    render(
+      <ClarificationForm interactions={[CONNECT_APPS_INTERACTION]} onSend={vi.fn()} />,
+    )
+
+    expect(
+      screen.queryByRole("button", { name: "chatPage.clarification.submit" }),
+    ).not.toBeInTheDocument()
+  })
+
+  it("sends a skip acknowledgement message when 'I'll do this later' is clicked", async () => {
+    const onSend = vi.fn()
+    render(
+      <ClarificationForm interactions={[CONNECT_APPS_INTERACTION]} onSend={onSend} />,
+    )
+
+    fireEvent.click(screen.getByText("chatPage.clarification.connectApps.skip"))
+
+    await waitFor(() => {
+      expect(onSend).toHaveBeenCalledWith(
+        "chatPage.clarification.connectApps.skip",
+        [],
+        {},
+      )
+    })
+  })
+
+  it("renders the real connect_apps widget instead of an 'unsupported type' error when mixed into a list with another interaction type", () => {
+    // Not producible by any seeder today (see LIVE_WIDGET_TYPES's comment in
+    // clarification-form.tsx), but nothing rules it out - isConnectAppsOnly
+    // is false here since the list isn't every() connect_apps, so this must
+    // go through renderField's normal per-field switch instead of the
+    // dedicated isConnectAppsOnly branch.
+    render(
+      <ClarificationForm
+        interactions={[
+          CONNECT_APPS_INTERACTION,
+          { type: "text_input", field: "note", label: "Note" },
+        ]}
+        onSend={vi.fn()}
+      />,
+    )
+
+    expect(screen.getByText("Gmail")).toBeInTheDocument()
+    expect(
+      screen.getByRole("button", {
+        name: 'chatPage.clarification.connectApps.continueWith:{"provider":"Gmail"}',
+      }),
+    ).toBeInTheDocument()
+    expect(
+      screen.queryByText('chatPage.clarification.unsupportedType:{"type":"connect_apps"}'),
+    ).not.toBeInTheDocument()
+  })
+
+  it("resolves the connect_apps field label live in the mixed-list branch too, not the persisted hire-time label", () => {
+    // The singleton isConnectAppsOnly header was fixed to call t() live, but
+    // that branch is skipped entirely for a mixed list (isConnectAppsOnly is
+    // false) - the per-field label above renderField's switch is a second,
+    // separate render path that has to make the same fix independently.
+    render(
+      <ClarificationForm
+        interactions={[
+          CONNECT_APPS_INTERACTION,
+          { type: "text_input", field: "note", label: "Note" },
+        ]}
+        onSend={vi.fn()}
+      />,
+    )
+
+    expect(
+      screen.getByText("chatPage.clarification.connectApps.title"),
+    ).toBeInTheDocument()
+    expect(screen.queryByText(CONNECT_APPS_INTERACTION.label)).not.toBeInTheDocument()
+    // An ordinary field's own persisted label is untouched by this.
+    expect(screen.getByText("Note:")).toBeInTheDocument()
   })
 })

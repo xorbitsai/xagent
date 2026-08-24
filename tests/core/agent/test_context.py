@@ -1290,6 +1290,97 @@ def test_compact_with_llm_preserves_waiting_for_user_response() -> None:
     }
 
 
+def test_reconstructed_context_below_threshold_is_not_compacted() -> None:
+    """A faithfully-replayed prior turn (assistant tool_calls + add_tool_result
+    pairs) is small relative to the default threshold, so compaction must stay
+    a no-op -- only compress when the reconstructed history actually grows
+    past the budget.
+    """
+    ctx = ExecutionContext()
+    ctx.add_user_message("Reconstructed turn 1")
+    ctx.add_assistant_message(
+        "",
+        tool_calls=[
+            {"id": "call-1", "type": "function", "function": {"name": "read_file"}},
+        ],
+    )
+    ctx.add_tool_result("read_file", {"output": "line one"}, tool_call_id="call-1")
+    ctx.add_user_message("Reconstructed turn 2")
+    ctx.add_assistant_message(
+        "",
+        tool_calls=[
+            {"id": "call-2", "type": "function", "function": {"name": "web_search"}},
+        ],
+    )
+    ctx.add_tool_result("web_search", {"output": "search rows"}, tool_call_id="call-2")
+    original_messages = list(ctx.messages)
+
+    result = ctx.compact_if_needed()
+
+    assert result.compacted is False
+    assert result.strategy == "none"
+    assert ctx.messages == original_messages
+
+
+def test_reconstructed_context_above_threshold_triggers_llm_summary() -> None:
+    """Regression guard: reconstructed tool observations must be ingested via
+    ``add_tool_result`` (which stamps ``metadata["tool_name"]``/["raw_result"])
+    rather than pre-formatted into a plain string. If a future "optimization"
+    skipped ``add_tool_result``, the dropped-tool-results-by-name notice below
+    would silently stop counting reconstructed observations.
+    """
+
+    class CompactLLM:
+        model_name = "compact-test"
+
+    ctx = ExecutionContext()
+    ctx.compact_config.threshold = 1
+    ctx.add_user_message("Build the quarterly report")
+    ctx.add_assistant_message(
+        "",
+        tool_calls=[
+            {"id": "call-1", "type": "function", "function": {"name": "web_search"}},
+        ],
+    )
+    ctx.add_tool_result("web_search", {"output": "revenue rows"}, tool_call_id="call-1")
+    ctx.add_assistant_message(
+        "",
+        tool_calls=[
+            {"id": "call-2", "type": "function", "function": {"name": "read_file"}},
+        ],
+    )
+    ctx.add_tool_result("read_file", {"output": "kpi table"}, tool_call_id="call-2")
+
+    # Pin the ingestion contract itself: add_tool_result must have stamped the
+    # metadata the dropped-tool-result accounting reads from.
+    web_search_message = ctx.messages[2]
+    assert web_search_message.role == "tool"
+    assert web_search_message.metadata["tool_name"] == "web_search"
+    assert web_search_message.metadata["raw_result"] == {"output": "revenue rows"}
+    read_file_message = ctx.messages[4]
+    assert read_file_message.role == "tool"
+    assert read_file_message.metadata["tool_name"] == "read_file"
+    assert read_file_message.metadata["raw_result"] == {"output": "kpi table"}
+
+    llm = CompactLLM()
+    request = ctx.build_llm_compact_request_if_needed()
+    assert request is not None
+
+    result = ctx.compact_with_llm_response(
+        {"content": "Collected KPI inputs."},
+        llm=llm,
+        original_tokens=request["original_tokens"],
+    )
+
+    assert result.compacted
+    assert result.strategy == "llm_summary"
+    assert result.metadata["dropped_tool_results_by_name"] == {
+        "web_search": 1,
+        "read_file": 1,
+    }
+    assert result.metadata["dropped_tool_result_count"] == 2
+
+
 def test_get_messages_for_llm_drops_orphan_tool_messages() -> None:
     ctx = ExecutionContext()
     ctx.add_tool_result("read_file", {"output": "orphaned"}, tool_call_id="call-1")

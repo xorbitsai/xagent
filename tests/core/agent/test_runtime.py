@@ -1138,3 +1138,113 @@ async def test_runtime_surfaces_cached_tokens_in_usage_and_trace() -> None:
     await runtime.on_llm_end(context=context, response=result)
     assert events[-1]["data"]["cached_input_tokens"] == 4
     assert events[-1]["data"]["input_tokens"] == 7
+
+
+class RaisingCompactLLM:
+    """Stub whose ``chat`` always fails, driving the llm_summary -> truncate
+    fallback in ``PatternRuntime.compact_context_if_needed``."""
+
+    model_name = "raising-compact-llm"
+
+    async def chat(self, **_: Any) -> Any:
+        raise RuntimeError("compact llm exploded")
+
+
+@pytest.mark.asyncio
+async def test_compact_context_if_needed_falls_back_to_truncate_without_orphans() -> (
+    None
+):
+    """When the LLM-summary compaction path raises, the runtime must fall back
+    to ``truncate`` -- and the fallback must never leave a native ``tool``
+    message without the assistant message that declared its ``tool_calls``
+    immediately before it, since providers reject that shape outright.
+    """
+    runtime = PatternRuntime(execution_id="task-compact-fallback")
+    ctx = ExecutionContext()
+    ctx.compact_config.threshold = 1
+    # 9 messages total (u0, assistant+2 tool results, tail-0..tail-4). A
+    # max_messages of 4 would land the naive tail slice entirely inside the
+    # 5 trailing user messages (tail-1..tail-4) -- no "tool" message would
+    # ever survive, making assert_no_orphan_tool_messages below vacuous: it
+    # would pass identically even if `_tail_window_preserving_tool_pairs`
+    # were replaced by a naive `messages[-keep_count:]`. max_messages=6 puts
+    # the boundary inside the assistant+tool block instead, so the
+    # pair-preservation walk-back must expand the window back to include
+    # both tool results and their declaring assistant message, giving the
+    # assertions below something real to check.
+    ctx.compact_config.max_messages = 6
+    ctx.add_user_message("u0")
+    ctx.add_assistant_message(
+        "",
+        tool_calls=[
+            {"id": "call-1", "type": "function", "function": {"name": "read_file"}},
+            {"id": "call-2", "type": "function", "function": {"name": "write_file"}},
+        ],
+    )
+    ctx.add_tool_result("read_file", {"output": "read"}, tool_call_id="call-1")
+    ctx.add_tool_result("write_file", {"output": "written"}, tool_call_id="call-2")
+    for i in range(5):
+        ctx.add_user_message(f"tail-{i}")
+
+    result = await runtime.compact_context_if_needed(
+        context=ctx, llm=RaisingCompactLLM()
+    )
+
+    assert result is not None
+    assert result.compacted is True
+    assert result.strategy == "truncate"
+    assert result.metadata["fallback_strategy"] == "truncate"
+    assert "llm_compact_error" in result.metadata
+
+    # This is the load-bearing check for this test: with a naive
+    # `messages[-keep_count:]` slice (keep_count=6 here), the survivors would
+    # be tail-1..tail-4 plus the two dangling tool results with no preceding
+    # assistant message -- 0 messages would have role "assistant" among the
+    # last 6. The real pair-preserving walk-back must expand the window left
+    # to include the assistant message that declared both tool_calls.
+    final_roles = [message.role for message in ctx.messages]
+    assert final_roles.count("tool") == 2, (
+        "expected both tool results to survive the pair-preserving "
+        "walk-back -- if this is 0, `_tail_window_preserving_tool_pairs` "
+        "has regressed to a naive `messages[-keep_count:]` slice"
+    )
+    assert final_roles[:3] == ["assistant", "tool", "tool"]
+
+    def assert_no_orphan_tool_messages(messages: list[dict[str, Any]]) -> None:
+        for index, message in enumerate(messages):
+            if message.get("role") != "tool":
+                continue
+            assert index > 0, "tool message with no preceding message"
+            # A parallel tool-call batch is one assistant(tool_calls) message
+            # followed by a contiguous run of "tool" messages -- so a tool
+            # message's own predecessor can itself be another "tool" message
+            # from the same batch. Walk back over that run to find the
+            # declaring assistant message.
+            declaring_index = index - 1
+            while (
+                declaring_index >= 0 and messages[declaring_index].get("role") == "tool"
+            ):
+                declaring_index -= 1
+            assert declaring_index >= 0, "tool message with no preceding message"
+            declaring = messages[declaring_index]
+            assert declaring.get("role") == "assistant" and declaring.get(
+                "tool_calls"
+            ), "tool message not immediately preceded by its assistant tool_calls"
+            declared_ids = {
+                str(tool_call.get("id"))
+                for tool_call in declaring["tool_calls"]
+                if isinstance(tool_call, dict) and tool_call.get("id")
+            }
+            assert message.get("tool_call_id") in declared_ids
+
+    assert_no_orphan_tool_messages(ctx.get_messages_for_llm())
+    assert_no_orphan_tool_messages(
+        [
+            {
+                "role": message.role,
+                "tool_calls": message.tool_calls,
+                "tool_call_id": message.tool_call_id,
+            }
+            for message in ctx.messages
+        ]
+    )

@@ -65,6 +65,10 @@ from ..services.tool_credentials import (
     has_user_tool_policy_hooks,
     resolve_tool_credential,
 )
+from ..services.user_oauth import (
+    get_scoped_user_oauth_account,
+    scoped_user_oauth_query,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -3183,6 +3187,9 @@ class WebToolConfig(BaseToolConfig):
         from ...web.mcp_apps import restrict_to_app_scoped_oauth_grant
         from ...web.models.user_oauth import UserOAuth
 
+        if self._user_id is None:
+            return _LegacyOAuthTokenResolution(access_token=None)
+        user_id = int(self._user_id)
         oauth_db = self._new_legacy_oauth_session()
         try:
             if app_id:
@@ -3194,11 +3201,12 @@ class WebToolConfig(BaseToolConfig):
                     app_id, [provider_name, app_id]
                 )
                 oauth_account = (
-                    oauth_db.query(UserOAuth)
-                    .filter(
-                        UserOAuth.user_id == self._user_id,
-                        UserOAuth.provider.in_(providers_to_check),
+                    scoped_user_oauth_query(
+                        oauth_db,
+                        user_id=user_id,
+                        resource_owner_key=None,
                     )
+                    .filter(UserOAuth.provider.in_(providers_to_check))
                     .first()
                 )
                 logger.info(
@@ -3209,11 +3217,12 @@ class WebToolConfig(BaseToolConfig):
                 )
             else:
                 oauth_account = (
-                    oauth_db.query(UserOAuth)
-                    .filter(
-                        UserOAuth.user_id == self._user_id,
-                        UserOAuth.provider == provider_name,
+                    scoped_user_oauth_query(
+                        oauth_db,
+                        user_id=user_id,
+                        resource_owner_key=None,
                     )
+                    .filter(UserOAuth.provider == provider_name)
                     .first()
                 )
                 logger.info(
@@ -3247,7 +3256,12 @@ class WebToolConfig(BaseToolConfig):
                 # A failed flush leaves the transaction unusable. Roll it back,
                 # reload the account, then persist the disconnection atomically.
                 oauth_db.rollback()
-                oauth_account = oauth_db.get(UserOAuth, account_id)
+                oauth_account = get_scoped_user_oauth_account(
+                    oauth_db,
+                    user_id=user_id,
+                    account_id=account_id,
+                    resource_owner_key=None,
+                )
                 if oauth_account is not None:
                     oauth_db.delete(oauth_account)
                     oauth_db.commit()

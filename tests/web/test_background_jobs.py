@@ -29,6 +29,7 @@ from xagent.web.services.background_jobs import (
     enqueue_background_job,
     is_background_job_enqueue_available,
     requeue_stale_background_jobs,
+    update_job_progress,
 )
 from xagent.web.services.triggers import enqueue_trigger_event_job
 
@@ -36,6 +37,25 @@ from xagent.web.services.triggers import enqueue_trigger_event_job
 def _init_test_db(path: Path):
     init_db(f"sqlite:///{path}")
     return get_session_local()
+
+
+def _age_job(db, job, *, updated_at=None, started_at=None) -> None:
+    """Backdate a job row. A plain ORM write cannot: ``updated_at`` carries
+    ``onupdate=func.now()``, which any flush would overwrite."""
+    values = {}
+    if updated_at is not None:
+        values["updated_at"] = updated_at
+    if started_at is not None:
+        values["started_at"] = started_at
+    if not values:
+        # An empty SET still carries onupdate=func.now(), so this would push
+        # updated_at forward -- the opposite of backdating.
+        raise ValueError("_age_job needs updated_at or started_at")
+    db.query(BackgroundJob).filter(BackgroundJob.id == job.id).update(
+        values, synchronize_session=False
+    )
+    db.commit()
+    db.expire_all()
 
 
 def _create_user(db, username: str = "background-job-test") -> User:
@@ -1470,9 +1490,9 @@ def test_requeue_stale_background_jobs_marks_old_running_pending(tmp_path, monke
         )
         old = datetime.now(timezone.utc) - timedelta(hours=3)
         setattr(job, "status", BackgroundJobStatus.RUNNING.value)
-        setattr(job, "started_at", old)
         db.add(job)
         db.commit()
+        _age_job(db, job, updated_at=old, started_at=old)
         db.refresh(job)
 
         requeued = requeue_stale_background_jobs(db, stale_after_seconds=60)
@@ -1483,6 +1503,83 @@ def test_requeue_stale_background_jobs_marks_old_running_pending(tmp_path, monke
         assert job.celery_task_id is None
         assert job.started_at is None
         assert job.progress["message"] == "Requeued stale background job"
+    finally:
+        db.close()
+
+
+def test_requeue_spares_running_job_that_is_still_reporting_progress(
+    tmp_path, monkeypatch
+):
+    """A long job that keeps working must not be requeued.
+
+    ``started_at`` never advances, so judging a RUNNING job by it means any job
+    outliving the cutoff gets a second copy started alongside it.
+    """
+    monkeypatch.setenv(CELERY_ENABLED, "false")
+    monkeypatch.delenv(CELERY_BROKER_URL, raising=False)
+
+    SessionLocal = _init_test_db(tmp_path / "jobs-live.db")
+    db = SessionLocal()
+    try:
+        user = _create_user(db, username="live-test")
+        job = create_background_job(
+            db,
+            user_id=int(user.id),
+            job_type=BackgroundJobType.KB_INGEST_WEB,
+            payload={"collection": "kb"},
+        )
+        setattr(job, "status", BackgroundJobStatus.RUNNING.value)
+        db.add(job)
+        db.commit()
+        old = datetime.now(timezone.utc) - timedelta(hours=4)
+        _age_job(db, job, updated_at=old, started_at=old)
+        db.refresh(job)
+        stale_updated_at = job.updated_at
+
+        # Go through the real reporting path, not a hand-set timestamp: that
+        # progress advances updated_at is the premise the whole predicate rests
+        # on, so the test has to fail if it ever stops holding.
+        update_job_progress(db, job, message="Still working", completed=536, total=699)
+        db.refresh(job)
+        assert job.updated_at > stale_updated_at
+
+        requeued = requeue_stale_background_jobs(db, stale_after_seconds=60)
+
+        assert requeued == []
+        db.refresh(job)
+        assert job.status == BackgroundJobStatus.RUNNING.value
+        assert job.started_at is not None
+    finally:
+        db.close()
+
+
+def test_requeue_reclaims_running_job_that_stopped_reporting(tmp_path, monkeypatch):
+    """A RUNNING job whose heartbeat went stale is still reclaimed."""
+    monkeypatch.setenv(CELERY_ENABLED, "false")
+    monkeypatch.delenv(CELERY_BROKER_URL, raising=False)
+
+    SessionLocal = _init_test_db(tmp_path / "jobs-dead.db")
+    db = SessionLocal()
+    try:
+        user = _create_user(db, username="dead-test")
+        job = create_background_job(
+            db,
+            user_id=int(user.id),
+            job_type=BackgroundJobType.KB_INGEST_WEB,
+            payload={"collection": "kb"},
+        )
+        setattr(job, "status", BackgroundJobStatus.RUNNING.value)
+        db.add(job)
+        db.commit()
+        # Started recently, but has not touched the row since.
+        _age_job(db, job, updated_at=datetime.now(timezone.utc) - timedelta(hours=3))
+        db.refresh(job)
+
+        requeued = requeue_stale_background_jobs(db, stale_after_seconds=60)
+
+        assert [item.id for item in requeued] == [job.id]
+        db.refresh(job)
+        assert job.status == BackgroundJobStatus.PENDING.value
     finally:
         db.close()
 

@@ -2,7 +2,7 @@
 
 import { apiRequest } from "@/lib/api-wrapper";
 import { getApiUrl } from "@/lib/utils";
-import type { PersonaInfo } from "@/types/template";
+import type { ConnectionInfo, PersonaInfo } from "@/types/template";
 import { resolveAgentForTemplate, toAgentId } from "@/lib/template-agent-resolution";
 
 /** Strings the caller supplies (already localized via useI18n) to compose
@@ -11,6 +11,33 @@ import { resolveAgentForTemplate, toAgentId } from "@/lib/template-agent-resolut
 export interface HireMessageStrings {
   beforeWeStart: string;
   closingNote: string;
+  /** Label for the "connect your apps" card, seeded alongside the message
+   * when the template has any connections. See buildConnectAppsInteraction. */
+  connectAppsLabel: string;
+}
+
+/**
+ * Build the "connect_apps" interaction seeded alongside the opening
+ * message, from the template's own `connections` list - just their display
+ * names, matched against useMcpApps() by ConnectAppsField at render time
+ * (grouping by OAuth provider so e.g. Gmail + Calendar share one Google
+ * sign-in). `null` when the template has no connections, so callers can
+ * skip attaching seed_interactions entirely rather than sending an empty
+ * card.
+ */
+export function buildConnectAppsInteraction(
+  connections: ConnectionInfo[],
+  label: string
+): { type: "connect_apps"; field: string; label: string; apps: string[] } | null {
+  // .trim() before the filter: a whitespace-only name (a template authoring
+  // slip - blank strings pass most "did they fill this in" checks) would
+  // otherwise pass Boolean() and reach ConnectAppsField as an app name
+  // nothing in the catalog can ever match, silently dropped by
+  // resolveRows/findMatchingMcpApp there instead of being caught here.
+  const appNames = connections.map((connection) => connection.name.trim()).filter(Boolean);
+  if (appNames.length === 0) return null;
+
+  return { type: "connect_apps", field: "connect_apps", label, apps: appNames };
 }
 
 /**
@@ -62,11 +89,17 @@ export interface HireAgentResult {
  * from the "not yet hired" path and route straight to the agent's chat
  * (e.g. `/agent/{hired_agent_id}`) once `template.hired` is true.
  */
-export async function hireAgentFromTemplate(
-  templateId: string,
-  persona: PersonaInfo,
-  strings: HireMessageStrings
-): Promise<HireAgentResult> {
+export async function hireAgentFromTemplate({
+  templateId,
+  persona,
+  strings,
+  connections = [],
+}: {
+  templateId: string;
+  persona: PersonaInfo;
+  strings: HireMessageStrings;
+  connections?: ConnectionInfo[];
+}): Promise<HireAgentResult> {
   const { agent, created } = await resolveAgentForTemplate(templateId, persona.name);
   const agentId = toAgentId(agent);
   if (agentId === null) {
@@ -74,6 +107,7 @@ export async function hireAgentFromTemplate(
   }
 
   const title = persona.role ? `${persona.name} — ${persona.role}` : persona.name;
+  const connectAppsInteraction = buildConnectAppsInteraction(connections, strings.connectAppsLabel);
   const response = await apiRequest(`${getApiUrl()}/api/chat/task/create`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -81,6 +115,7 @@ export async function hireAgentFromTemplate(
       title,
       agent_id: agentId,
       seed_assistant_message: buildSeedAssistantMessage(persona, strings),
+      ...(connectAppsInteraction ? { seed_interactions: [connectAppsInteraction] } : {}),
     }),
   });
   if (!response.ok) {

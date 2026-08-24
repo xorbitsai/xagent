@@ -183,6 +183,7 @@ class AgentStore:
             "description": agent.description,
             "template_id": agent.template_id,
             "logo_url": agent.logo_url,
+            "suggested_prompts": ensure_list(agent.suggested_prompts) or [],
             "status": agent.status.value,
             "visibility": agent.visibility,
             "created_at": agent.created_at.isoformat(),

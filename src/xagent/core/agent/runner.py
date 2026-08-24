@@ -141,7 +141,36 @@ class AgentRunner:
                 context_refs = message.get(
                     CONTEXT_REFS_KEY, message.get("context_refs", ())
                 )
-                if role and (content or context_refs):
+                if not role:
+                    continue
+                if not (
+                    content
+                    or context_refs
+                    or message.get("tool_calls")
+                    or role == "tool"
+                ):
+                    continue
+                if (
+                    role == "tool"
+                    and message.get("tool_name") is not None
+                    and "raw_result" in message
+                ):
+                    # Replay through add_tool_result so it gets the same
+                    # sanitization/formatting and metadata (raw_result,
+                    # tool_name) as a live tool observation would.
+                    context.add_tool_result(
+                        tool_name=str(message["tool_name"]),
+                        result=message["raw_result"],
+                        tool_call_id=message.get("tool_call_id"),
+                        context_refs=context_refs,
+                    )
+                elif role == "assistant" and message.get("tool_calls"):
+                    context.add_assistant_message(
+                        content,
+                        tool_calls=message["tool_calls"],
+                        context_refs=context_refs,
+                    )
+                else:
                     context.add_message(
                         role,
                         content,

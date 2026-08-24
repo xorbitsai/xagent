@@ -1,0 +1,204 @@
+"""Storage identity tests for ordinary and actor-owned builtin OAuth rows."""
+
+import pytest
+from sqlalchemy import create_engine, event
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import sessionmaker
+
+from xagent.web.models import database
+from xagent.web.models.database import Base
+from xagent.web.models.user import User
+from xagent.web.models.user_oauth import UserOAuth
+
+
+def _where(index) -> str:
+    clause = index.dialect_options["sqlite"].get("where")
+    if clause is None:
+        clause = index.dialect_options["postgresql"].get("where")
+    return str(clause if clause is not None else "").lower()
+
+
+def test_resource_owner_key_is_nullable_and_bounded() -> None:
+    column = UserOAuth.__table__.columns["resource_owner_key"]
+
+    assert column.nullable is True
+    assert column.type.length == 512
+
+
+def test_model_declares_ordinary_and_actor_owned_partial_uniqueness() -> None:
+    indexes = {index.name: index for index in UserOAuth.__table__.indexes}
+
+    ordinary = indexes["uq_user_oauth_ordinary_account"]
+    assert ordinary.unique is True
+    assert tuple(column.name for column in ordinary.columns) == (
+        "user_id",
+        "provider",
+        "provider_user_id",
+    )
+    assert "resource_owner_key is null" in _where(ordinary)
+
+    actor = indexes["uq_user_oauth_actor_account"]
+    assert actor.unique is True
+    assert tuple(column.name for column in actor.columns) == (
+        "user_id",
+        "resource_owner_key",
+        "provider",
+        "provider_user_id",
+    )
+    assert "resource_owner_key is not null" in _where(actor)
+
+    assert "ix_user_oauth_owner_provider" not in indexes
+
+
+def _oauth_relationship_db(tmp_path):
+    engine = create_engine(f"sqlite:///{tmp_path / 'oauth-relationship.db'}")
+
+    @event.listens_for(engine, "connect")
+    def _enable_foreign_keys(dbapi_connection, _connection_record) -> None:
+        cursor = dbapi_connection.cursor()
+        cursor.execute("PRAGMA foreign_keys=ON")
+        cursor.close()
+
+    Base.metadata.create_all(engine)
+    db = sessionmaker(bind=engine, autoflush=False, autocommit=False)()
+    user = User(username="oauth-owner", password_hash="hash")
+    db.add(user)
+    db.commit()
+    db.refresh(user)
+    db.add_all(
+        [
+            UserOAuth(
+                user_id=int(user.id),
+                provider="gmail",
+                provider_user_id="ordinary",
+                access_token="ordinary-token",
+            ),
+            UserOAuth(
+                user_id=int(user.id),
+                provider="gmail",
+                resource_owner_key="actor:alice",
+                provider_user_id="alice",
+                access_token="actor-token",
+            ),
+        ]
+    )
+    db.commit()
+    db.expire(user, ["oauth_accounts"])
+    return engine, db, user
+
+
+def test_create_all_enforces_owner_aware_uniqueness(tmp_path) -> None:
+    engine, db, user = _oauth_relationship_db(tmp_path)
+    try:
+        # Partial uniqueness must separate the ordinary and actor namespaces,
+        # not impose one full-table identity constraint.
+        db.add(
+            UserOAuth(
+                user_id=int(user.id),
+                provider="gmail",
+                resource_owner_key="actor:bob",
+                provider_user_id="ordinary",
+                access_token="same-provider-identity-in-actor-namespace",
+            )
+        )
+        db.commit()
+
+        db.add(
+            UserOAuth(
+                user_id=int(user.id),
+                provider="gmail",
+                provider_user_id="ordinary",
+                access_token="duplicate-ordinary",
+            )
+        )
+        with pytest.raises(IntegrityError):
+            db.commit()
+        db.rollback()
+
+        db.add(
+            UserOAuth(
+                user_id=int(user.id),
+                provider="gmail",
+                resource_owner_key="actor:alice",
+                provider_user_id="alice",
+                access_token="duplicate-actor",
+            )
+        )
+        with pytest.raises(IntegrityError):
+            db.commit()
+    finally:
+        db.rollback()
+        db.close()
+        engine.dispose()
+
+
+def test_actor_assignment_does_not_enter_ordinary_oauth_collection() -> None:
+    user = User(username="actor-assignment", password_hash="hash")
+    actor_account = UserOAuth(
+        provider="gmail",
+        resource_owner_key="actor:alice",
+        provider_user_id="alice",
+        access_token="actor-token",
+    )
+
+    actor_account.user = user
+
+    assert actor_account not in user.oauth_accounts
+
+
+def test_user_oauth_accounts_relationship_contains_only_ordinary_rows(tmp_path) -> None:
+    engine, db, user = _oauth_relationship_db(tmp_path)
+    try:
+        assert [row.resource_owner_key for row in user.oauth_accounts] == [None]
+    finally:
+        db.close()
+        engine.dispose()
+
+
+def test_production_sqlite_engine_cascades_hidden_actor_oauth_rows(tmp_path) -> None:
+    previous_engine = database._engine
+    previous_session_local = database._SessionLocal
+    database.configure_db(db_url=f"sqlite:///{tmp_path / 'production-cascade.db'}")
+    engine = database.get_engine()
+    Base.metadata.create_all(engine)
+    db = database.get_session_local()()
+    try:
+        assert db.connection().exec_driver_sql("PRAGMA foreign_keys").scalar_one() == 1
+        user = User(username="production-cascade-owner", password_hash="hash")
+        db.add(user)
+        db.commit()
+        db.refresh(user)
+        db.add(
+            UserOAuth(
+                user_id=int(user.id),
+                provider="gmail",
+                resource_owner_key="actor:alice",
+                provider_user_id="alice",
+                access_token="actor-token",
+            )
+        )
+        db.commit()
+
+        db.delete(user)
+        db.commit()
+
+        assert db.query(UserOAuth).count() == 0
+    finally:
+        db.close()
+        engine.dispose()
+        database._engine = previous_engine
+        database._SessionLocal = previous_session_local
+
+
+def test_sqlite_user_delete_cascades_hidden_actor_oauth_rows(tmp_path) -> None:
+    engine, db, user = _oauth_relationship_db(tmp_path)
+    try:
+        assert [row.resource_owner_key for row in user.oauth_accounts] == [None]
+
+        db.delete(user)
+        db.commit()
+
+        assert db.query(UserOAuth).count() == 0
+    finally:
+        db.close()
+        engine.dispose()

@@ -178,14 +178,16 @@ describe("TemplateDetailPage", () => {
     await waitFor(() => {
       expect(routerPushMock).toHaveBeenCalledWith("/task/99");
     });
-    expect(hireAgentFromTemplateMock).toHaveBeenCalledWith(
-      "sales-email-lead-response-agent",
-      expect.objectContaining({ name: "Leo" }),
-      expect.objectContaining({
+    expect(hireAgentFromTemplateMock).toHaveBeenCalledWith({
+      templateId: "sales-email-lead-response-agent",
+      persona: expect.objectContaining({ name: "Leo" }),
+      strings: expect.objectContaining({
         beforeWeStart: "templates.marketplace.beforeWeStart",
         closingNote: "templates.marketplace.hireClosingNote",
-      })
-    );
+        connectAppsLabel: "chatPage.clarification.connectApps.title",
+      }),
+      connections: [{ name: "HubSpot", logo: "https://example.com/hubspot.png" }],
+    });
   });
 
   it("routes straight to the agent's chat, without hiring, if a fresh recheck reveals the template was hired elsewhere in the meantime", async () => {

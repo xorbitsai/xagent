@@ -3271,7 +3271,13 @@ class WebToolConfig(BaseToolConfig):
                 )
 
             access_token = str(oauth_account.access_token)
-            instance_url = oauth_account.instance_url
+            # Not direct attribute access: mypy infers oauth_account's
+            # instance_url as Column[str] here (get_scoped_user_oauth_account
+            # returns a type the SQLAlchemy plugin doesn't narrow the same
+            # way as a plain query result), so getattr's own 3-arg overload
+            # is what actually produces the correct `str | None` this
+            # function's return type declares.
+            instance_url = getattr(oauth_account, "instance_url", None)
             oauth_db.commit()
             return _LegacyOAuthTokenResolution(
                 access_token=access_token, instance_url=instance_url

@@ -11,6 +11,12 @@ interface PersonaAvatarProps {
   /** Tailwind text-size class for the fallback initial, e.g. "text-sm" or "text-xl". */
   textClassName?: string;
   className?: string;
+  /** Set when the caller's own visible text already names this persona
+   * (e.g. a picker button rendering the name right next to the avatar) -
+   * without this, an `<img alt="Maya">`/initial sitting beside a "Maya"
+   * text node inside the same interactive control gets its accessible
+   * name announced twice ("Maya Maya"). */
+  decorative?: boolean;
 }
 
 /** A persona's circular avatar image, falling back to its first initial on a
@@ -22,12 +28,13 @@ export function PersonaAvatar({
   sizeClassName,
   textClassName = "text-sm",
   className,
+  decorative = false,
 }: PersonaAvatarProps) {
   if (persona.avatar) {
     return (
       <img
         src={persona.avatar}
-        alt={persona.name}
+        alt={decorative ? "" : persona.name}
         className={cn(sizeClassName, "flex-shrink-0 rounded-full object-cover", className)}
       />
     );
@@ -35,6 +42,7 @@ export function PersonaAvatar({
 
   return (
     <div
+      aria-hidden={decorative || undefined}
       className={cn(
         sizeClassName,
         "flex flex-shrink-0 items-center justify-center rounded-full bg-muted font-semibold text-muted-foreground",

@@ -1,16 +1,11 @@
-import React from "react";
-import { Bot, Sparkles } from "lucide-react";
+import React, { useEffect, useRef, useState } from "react";
+import { Sparkles } from "lucide-react";
 import { ChatInput } from "@/components/chat/ChatInput";
-import { TemplateQuickAccess } from "@/components/chat/TemplateQuickAccess";
 import { useI18n } from "@/contexts/i18n-context";
-import {
-  Tooltip,
-  TooltipContent,
-  TooltipProvider,
-  TooltipTrigger,
-} from "@/components/ui/tooltip";
-import { getApiUrl } from "@/lib/utils";
-import type { Template, SamplePrompt } from "@/types/template";
+import { resolveAgentLogoUrl, getApiUrl } from "@/lib/utils";
+import { PersonaAvatar } from "@/components/templates/persona-avatar";
+import { getBrandingFromEnv } from "@/lib/branding";
+import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 
 export interface PromptCard {
   icon?: any;
@@ -34,32 +29,26 @@ export interface AgentCard {
   // for agents built from scratch. Used to key template-reuse matching off a
   // stable id instead of the user-editable display name.
   template_id?: string | null;
+  // The agent's own suggested starting prompts (from its `suggested_prompts`
+  // config). Read by callers that auto-fill the composer from the first one
+  // when this agent is picked as the task's lead - not consumed here.
+  suggested_prompts?: string[];
+  // A hired agent's persona portrait (resolved by the caller from the
+  // template it traces back to via `template_id`) - preferred over
+  // `logo_url` when present, since a hired agent's `logo_url` is never
+  // actually set to its persona's face today.
+  persona_avatar?: string | null;
+  // A short label shown next to the agent's name in the picker row (e.g.
+  // its template's category) - purely cosmetic, omitted when unknown.
+  specialty?: string;
 }
 
-// When `templates` is supplied, TemplateQuickAccess is rendered and needs a
-// real handler for both callbacks - a `|| (() => {})` fallback would silently
-// swallow category switches/prompt picks instead of surfacing the missing
-// wiring at compile time. Omitting `templates` falls back to the plain
-// prompt-card grid, which doesn't use either handler.
-type TemplateQuickAccessSlotProps =
-  | {
-      templates?: undefined;
-      selectedCategory?: string;
-      onCategoryChange?: (category: string) => void;
-      onTemplatePromptSelect?: (template: Template, prompt: SamplePrompt, index: number) => void;
-      templatesLoading?: boolean;
-      templatesError?: boolean;
-      onRetryTemplates?: () => void;
-    }
-  | {
-      templates: Template[];
-      selectedCategory?: string;
-      onCategoryChange: (category: string) => void;
-      onTemplatePromptSelect: (template: Template, prompt: SamplePrompt, index: number) => void;
-      templatesLoading?: boolean;
-      templatesError?: boolean;
-      onRetryTemplates?: () => void;
-    };
+// A hired agent's persona photo, falling back to a resolved `logo_url` -
+// shared by the hero swap and the picker pill so both always agree on
+// which photo an agent shows.
+function resolveTeammateAvatar(agent: Pick<AgentCard, "persona_avatar" | "logo_url">): string | null {
+  return agent.persona_avatar || resolveAgentLogoUrl(agent.logo_url ?? null, getApiUrl());
+}
 
 type ChatStartScreenProps = {
   title: string;
@@ -67,13 +56,18 @@ type ChatStartScreenProps = {
   icon?: React.ReactNode | string; // URL string or ReactNode
   prompts?: (PromptCard | string)[];
   agents?: AgentCard[];
+  // True when the caller's agent-list fetch failed - shown in place of the
+  // picker row (which would otherwise look identical to "no published
+  // agents exist" with no way to recover).
+  agentsError?: boolean;
+  onRetryAgents?: () => void;
   onAgentClick?: (agent: AgentCard) => void;
   selectedAgents?: AgentCard[];
-  onRemoveSelectedAgent?: (agentId: number | string) => void;
   onSend: (message: string, files: File[], config?: any) => void | Promise<void>;
   isSending?: boolean;
   inputValue?: string;
   onInputChange?: (value: string) => void;
+  onFocusChange?: (focused: boolean) => void;
   onPromptSelect?: (prompt: string, promptHighlights?: string[]) => void;
   promptHighlightTerms?: string[];
   files?: File[];
@@ -88,10 +82,7 @@ type ChatStartScreenProps = {
   taskConfig?: any;
   autoFocus?: boolean;
   inputMinHeightClass?: string;
-  selectedTemplate?: { id: string; name: string } | null;
-  onRemoveSelectedTemplate?: () => void;
-  selectedPromptKey?: string | null;
-} & TemplateQuickAccessSlotProps;
+};
 
 export function ChatStartScreen({
   title,
@@ -99,13 +90,15 @@ export function ChatStartScreen({
   icon,
   prompts,
   agents,
+  agentsError = false,
+  onRetryAgents,
   onAgentClick,
   selectedAgents = [],
-  onRemoveSelectedAgent,
   onSend,
   isSending = false,
   inputValue,
   onInputChange,
+  onFocusChange,
   onPromptSelect,
   promptHighlightTerms = [],
   files = [],
@@ -120,18 +113,9 @@ export function ChatStartScreen({
   taskConfig,
   autoFocus = false,
   inputMinHeightClass,
-  templates,
-  selectedCategory,
-  onCategoryChange,
-  selectedTemplate,
-  onRemoveSelectedTemplate,
-  selectedPromptKey,
-  onTemplatePromptSelect,
-  templatesLoading = false,
-  templatesError = false,
-  onRetryTemplates,
 }: ChatStartScreenProps) {
   const { t } = useI18n();
+  const branding = getBrandingFromEnv();
   const enabledFiles = filesDisabled ? [] : files;
 
   const handlePromptClick = (prompt: string, promptHighlights?: string[]) => {
@@ -144,13 +128,69 @@ export function ChatStartScreen({
     }
   };
 
+  // Only meaningful in the "My Team" picker context (`agents` supplied) -
+  // other callers (an agent's own chat, widget pages) pass `selectedAgents`
+  // for a different purpose or not at all, so this stays undefined for them
+  // and the header falls back to the plain title/description below.
+  const leadAgent = agents && agents.length > 0 ? selectedAgents[0] : undefined;
+
+  // The right-edge fade only earns its place when there's actually
+  // something past the edge to scroll to - otherwise it's a gradient
+  // fading into nothing over the last, fully-visible pill.
+  const teamStripRef = useRef<HTMLDivElement>(null);
+  const [teamStripHasMore, setTeamStripHasMore] = useState(false);
+  useEffect(() => {
+    const strip = teamStripRef.current;
+    if (!strip) {
+      setTeamStripHasMore(false);
+      return;
+    }
+    const sync = () => {
+      setTeamStripHasMore(strip.scrollWidth - strip.scrollLeft - strip.clientWidth > 8);
+    };
+    sync();
+    strip.addEventListener("scroll", sync);
+    // A ResizeObserver on the strip itself catches every way its available
+    // width can change (window resize, but also a sidebar toggling or any
+    // other local layout shift) - a window `resize` listener alone would
+    // miss the ones that aren't the window itself resizing.
+    const observer = new ResizeObserver(sync);
+    observer.observe(strip);
+    return () => {
+      strip.removeEventListener("scroll", sync);
+      observer.disconnect();
+    };
+  }, [agents]);
+
   return (
     <div className="flex flex-col items-center justify-start min-h-[80vh] pt-10 pb-16 px-6 text-center">
-      <h2 className="text-[26px] font-extrabold mb-2 bg-gradient-to-r from-[hsl(234_62%_45%)] to-[hsl(234_62%_60%)] bg-clip-text text-transparent leading-[1.2] tracking-tight">
-        {title}
-      </h2>
-      {description && (
-        <p className="text-[13.5px] text-muted-foreground mb-7 max-w-md leading-[1.7]">{description}</p>
+      {leadAgent ? (
+        <div className="w-full max-w-[680px] mx-auto flex items-center gap-4 mb-6 text-left">
+          <PersonaAvatar
+            persona={{
+              name: leadAgent.name,
+              avatar: resolveTeammateAvatar(leadAgent),
+            }}
+            sizeClassName="h-16 w-16"
+            textClassName="text-xl"
+            className="rounded-[22px] shrink-0"
+          />
+          <div className="min-w-0">
+            <h2 className="text-2xl font-bold leading-tight break-words">{title}</h2>
+            <p className="text-sm text-muted-foreground mt-1 break-words">
+              {t("chatPage.sections.leadReady", { name: leadAgent.name })}
+            </p>
+          </div>
+        </div>
+      ) : (
+        <>
+          <h2 className="text-[26px] font-extrabold mb-2 bg-gradient-to-r from-[hsl(234_62%_45%)] to-[hsl(234_62%_60%)] bg-clip-text text-transparent leading-[1.2] tracking-tight">
+            {title}
+          </h2>
+          {description && (
+            <p className="text-[13.5px] text-muted-foreground mb-7 max-w-md leading-[1.7]">{description}</p>
+          )}
+        </>
       )}
 
       <div className="w-full max-w-[680px] mx-auto space-y-6">
@@ -165,6 +205,7 @@ export function ChatStartScreen({
             showModeToggle={showModeToggle}
             inputValue={inputValue}
             onInputChange={onInputChange}
+            onFocusChange={onFocusChange}
             promptHighlightTerms={promptHighlightTerms}
             readOnlyConfig={readOnlyConfig}
             hideConfig={hideConfig}
@@ -177,24 +218,10 @@ export function ChatStartScreen({
             autoFocus={autoFocus}
             minHeightClass={inputMinHeightClass}
             selectedAgents={selectedAgents}
-            onRemoveSelectedAgent={onRemoveSelectedAgent}
-            selectedTemplate={selectedTemplate}
-            onRemoveSelectedTemplate={onRemoveSelectedTemplate}
           />
         </div>
 
-        {templates ? (
-          <TemplateQuickAccess
-            templates={templates}
-            selectedCategory={selectedCategory || ""}
-            onCategoryChange={onCategoryChange}
-            selectedPromptKey={selectedPromptKey ?? null}
-            onPromptSelect={onTemplatePromptSelect}
-            isLoading={templatesLoading}
-            loadError={templatesError}
-            onRetryLoad={onRetryTemplates}
-          />
-        ) : prompts && prompts.length > 0 && (
+        {prompts && prompts.length > 0 && (
           <div className="space-y-3">
             <div className="flex items-center gap-2 text-[10.5px] font-semibold text-muted-foreground uppercase tracking-[0.08em] px-1">
               <Sparkles className="w-3.5 h-3.5" />
@@ -232,54 +259,97 @@ export function ChatStartScreen({
                 );
               })}
             </div>
+          </div>
+        )}
 
-            {/* Chat with Agents section */}
-            {agents && agents.length > 0 ? (
-              <>
-                <div className="flex items-center gap-2 text-[10.5px] font-semibold text-muted-foreground uppercase tracking-[0.08em] mt-6 px-1">
-                  <Bot className="w-3.5 h-3.5" />
-                  <span>{t("chatPage.sections.chatWithAgents")}</span>
-                </div>
-                {/* Horizontal scroll container for agents, limited width to show about 3 items initially */}
+        {agentsError ? (
+          <div className="flex items-center justify-between gap-3 rounded-xl border border-destructive/30 bg-destructive/[0.04] px-4 py-3 text-left">
+            <p className="text-xs text-destructive">{t("chatPage.sections.assignToTeammateError")}</p>
+            <button
+              type="button"
+              onClick={onRetryAgents}
+              className="shrink-0 text-xs font-semibold text-destructive underline underline-offset-2 hover:no-underline"
+            >
+              {t("common.retry")}
+            </button>
+          </div>
+        ) : agents && agents.length > 0 && (
+          <div className="space-y-2.5 text-left">
+            <p className="text-xs text-muted-foreground px-1">
+              <b className="font-semibold text-foreground/85">
+                {t("chatPage.sections.assignToTeammateLead")}
+              </b>
+              {t("chatPage.sections.assignToTeammateHint", { appName: branding.appName })}
+            </p>
+            <div className="relative">
+              <div
+                ref={teamStripRef}
+                data-testid="team-strip"
+                role="group"
+                aria-label={t("chatPage.sections.assignToTeammate")}
+                className="flex items-center gap-2 overflow-x-auto p-1 pr-8 [scrollbar-width:none] [-ms-overflow-style:none] [&::-webkit-scrollbar]:hidden"
+              >
+                <span className="shrink-0 text-[11px] font-bold uppercase tracking-[0.07em] text-muted-foreground/80 whitespace-nowrap">
+                  {t("chatPage.sections.assignToTeammate")}
+                </span>
                 <TooltipProvider delayDuration={200}>
-                  <div className="flex gap-8 mt-4 overflow-x-auto pb-4 pt-2 px-1 snap-x snap-mandatory scrollbar-hide" style={{ scrollbarWidth: 'none', msOverflowStyle: 'none' }}>
-                    {agents.map((agent) => {
-                      const isSelected = selectedAgents.some(
-                        (selectedAgent) => selectedAgent.id === agent.id
-                      );
+                  {agents.map((agent) => {
+                    const isSelected = selectedAgents.some(
+                      (selectedAgent) => selectedAgent.id === agent.id
+                    );
+                    const avatarUrl = resolveTeammateAvatar(agent);
 
-                      return (
-                        <Tooltip key={agent.id}>
-                          <TooltipTrigger asChild>
-                            <div
-                              className="flex flex-col items-center gap-2 cursor-pointer group flex-shrink-0 snap-start w-[64px]"
-                              onClick={() => onAgentClick?.(agent)}
-                            >
-                              <div className={`w-12 h-12 rounded-full bg-blue-100 flex items-center justify-center text-blue-600 shadow-sm border overflow-hidden transition-all ${isSelected ? "border-primary ring-2 ring-primary/20" : "border-blue-200 group-hover:shadow-md"}`}>
-                                {agent.logo_url ? (
-                                  <img src={agent.logo_url.startsWith('http') ? agent.logo_url : `${getApiUrl()}${agent.logo_url}`} alt={agent.name} className="w-full h-full object-cover" />
-                                ) : (
-                                  <Bot className="w-6 h-6" />
-                                )}
-                              </div>
-                              <span className={`text-xs font-medium text-center leading-tight max-w-[64px] line-clamp-2 ${isSelected ? "text-primary" : "text-muted-foreground"}`} title={agent.name}>{agent.name}</span>
+                    const pill = (
+                      <button
+                        type="button"
+                        aria-pressed={isSelected}
+                        onClick={() => onAgentClick?.(agent)}
+                        className={`shrink-0 flex items-center gap-[7px] rounded-full border pl-[3px] pr-3 py-[3px] transition-all whitespace-nowrap ${
+                          isSelected
+                            ? "border-primary/40 bg-primary/[0.06] shadow-[0_4px_14px_hsl(var(--primary)/0.11)]"
+                            : "border-border bg-background hover:border-primary/30 hover:bg-primary/[0.04] hover:-translate-y-px"
+                        }`}
+                      >
+                        <PersonaAvatar
+                          persona={{ name: agent.name, avatar: avatarUrl }}
+                          sizeClassName="h-[27px] w-[27px]"
+                          textClassName="text-[11px]"
+                          className={isSelected ? "shadow-[0_0_0_2px_hsl(var(--background)),0_0_0_3px_hsl(var(--primary))]" : ""}
+                          decorative
+                        />
+                        <b className={`text-[12.5px] font-semibold ${isSelected ? "text-primary" : "text-foreground"}`}>
+                          {agent.name}
+                        </b>
+                        {agent.specialty && (
+                          <span className="text-[11.5px] text-muted-foreground">{agent.specialty}</span>
+                        )}
+                      </button>
+                    );
+
+                    return (
+                      <Tooltip key={agent.id}>
+                        <TooltipTrigger asChild>{pill}</TooltipTrigger>
+                        {agent.description && (
+                          <TooltipContent side="top" className="max-w-[240px] text-left">
+                            <div className="space-y-1">
+                              <div className="font-medium">{agent.name}</div>
+                              <p className="text-xs text-muted-foreground">{agent.description}</p>
                             </div>
-                          </TooltipTrigger>
-                          {agent.description ? (
-                            <TooltipContent side="top" className="max-w-[240px] text-left">
-                              <div className="space-y-1">
-                                <div className="font-medium">{agent.name}</div>
-                                <p className="text-xs text-muted-foreground">{agent.description}</p>
-                              </div>
-                            </TooltipContent>
-                          ) : null}
-                        </Tooltip>
-                      );
-                    })}
-                  </div>
+                          </TooltipContent>
+                        )}
+                      </Tooltip>
+                    );
+                  })}
                 </TooltipProvider>
-              </>
-            ) : null}
+              </div>
+              {/* Fades the right edge so a horizontally-clipped pill reads as
+                  "more to scroll" rather than an abruptly truncated name -
+                  only when there's actually more past the edge, or it's a
+                  gradient fading into nothing over a fully-visible pill. */}
+              {teamStripHasMore && (
+                <div className="pointer-events-none absolute inset-y-0 right-0 w-8 bg-gradient-to-l from-background to-transparent" />
+              )}
+            </div>
           </div>
         )}
       </div>

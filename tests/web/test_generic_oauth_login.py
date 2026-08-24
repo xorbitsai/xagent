@@ -8,6 +8,8 @@ Covers two bugs the PR fixed:
 
 from __future__ import annotations
 
+import base64
+import hashlib
 from datetime import timedelta
 from types import SimpleNamespace
 from urllib.parse import parse_qs, urlparse
@@ -16,11 +18,13 @@ import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
-from xagent.core.utils.encryption import encrypt_value
+from xagent.core.utils.encryption import _is_encrypted, decrypt_value, encrypt_value
 from xagent.web.api.auth import (
+    _is_salesforce_provider,
     _resolve_oauth_secret,
     create_access_token,
     generic_oauth_login,
+    verify_token,
 )
 from xagent.web.models.database import Base
 from xagent.web.models.public_mcp import PublicMCPApp
@@ -162,6 +166,173 @@ def test_zoom_provider_sets_prompt_login(db_session):
     qs = parse_qs(urlparse(url).query)
 
     assert qs.get("prompt") == ["login"], f"zoom prompt missing: {url}"
+
+
+def test_salesforce_provider_includes_pkce_code_challenge(db_session):
+    """Newer Salesforce orgs enforce PKCE on this grant with no per-app
+    opt-out; the authorize redirect must carry a code_challenge derived from
+    a verifier that (a) round-trips through the signed state token via
+    decrypt_value (not left as plaintext in it) and (b) actually matches the
+    S256 challenge sent to Salesforce."""
+    db, user = db_session
+    token = _token_for(user)
+
+    provider = _provider(
+        auth_url="https://login.salesforce.com/services/oauth2/authorize",
+        default_scopes=["api", "refresh_token", "openid"],
+        redirect_uri="https://app.example.com/cb",
+    )
+
+    resp = generic_oauth_login(
+        provider="salesforce",
+        token=token,
+        app_id=None,
+        redirect=None,
+        db=db,
+        db_provider=provider,
+    )
+    qs = parse_qs(urlparse(_location(resp)).query)
+
+    assert qs.get("code_challenge_method") == ["S256"]
+    assert "code_challenge" in qs
+
+    state_payload = verify_token(qs["state"][0])
+    encrypted_verifier = state_payload["code_verifier"]
+    decrypted_verifier = decrypt_value(encrypted_verifier)
+    # The real regression this guards: encryption actually changed the
+    # value. `encrypted_verifier != qs["code_challenge"][0]` alone proves
+    # nothing -- a verifier trivially differs from its own derived S256
+    # hash regardless of whether encryption ever ran.
+    assert encrypted_verifier != decrypted_verifier
+    assert _is_encrypted(encrypted_verifier)
+
+    expected_challenge = (
+        base64.urlsafe_b64encode(
+            hashlib.sha256(decrypted_verifier.encode("ascii")).digest()
+        )
+        .decode("ascii")
+        .rstrip("=")
+    )
+    assert qs["code_challenge"][0] == expected_challenge
+
+
+@pytest.mark.parametrize(
+    "provider,expected",
+    [
+        ("salesforce", True),
+        ("SALESFORCE", True),
+        ("salesforce-sandbox", True),
+        ("salesforce-govcloud", True),
+        ("salesforcelite", False),
+        ("salesforce2", False),
+        ("hubspot", False),
+        ("", False),
+    ],
+)
+def test_is_salesforce_provider_requires_exact_name_or_hyphenated_suffix(
+    provider, expected
+):
+    """Anchored to a "-" separator, not a bare prefix: oauth_providers.name
+    is admin-settable via POST/PUT /admin/mcp/providers, so a bare
+    startswith("salesforce") would also match an unrelated custom provider
+    an admin happened to name e.g. "salesforcelite" -- silently routing it
+    through PKCE and the instance_url-required guard it has no reason to
+    satisfy."""
+    assert _is_salesforce_provider(provider) is expected
+
+
+def test_salesforce_sandbox_provider_includes_pkce_code_challenge(db_session):
+    """PKCE is gated on a provider-name *prefix* match
+    (_is_salesforce_provider), not exact equality -- specifically so an
+    admin-created "salesforce-sandbox" row (example.env's documented
+    workaround for sandbox orgs, which have no per-user toggle otherwise)
+    also gets it. An exact match here would silently skip PKCE for that row
+    and then fail opaquely against a PKCE-enforcing sandbox org."""
+    db, user = db_session
+    token = _token_for(user)
+
+    provider = _provider(
+        auth_url="https://test.salesforce.com/services/oauth2/authorize",
+        default_scopes=["api", "refresh_token", "openid"],
+        redirect_uri="https://app.example.com/cb",
+    )
+
+    resp = generic_oauth_login(
+        provider="salesforce-sandbox",
+        token=token,
+        app_id=None,
+        redirect=None,
+        db=db,
+        db_provider=provider,
+    )
+    qs = parse_qs(urlparse(_location(resp)).query)
+
+    assert qs.get("code_challenge_method") == ["S256"]
+    assert "code_challenge" in qs
+
+
+def test_salesforce_login_returns_clear_error_when_encryption_key_missing(
+    db_session, monkeypatch
+):
+    """encrypt_value() raises a bare ValueError when ENCRYPTION_KEY is unset
+    outside development. Every other provider's login route never calls
+    encrypt_value at all, so this misconfiguration would otherwise be
+    invisible until the first Salesforce connect attempt -- and uncaught,
+    it would 500 with an opaque traceback instead of a clear cause."""
+    from xagent.core.utils.encryption import get_cipher
+
+    db, user = db_session
+    token = _token_for(user)
+
+    provider = _provider(
+        auth_url="https://login.salesforce.com/services/oauth2/authorize",
+        default_scopes=["api", "refresh_token", "openid"],
+        redirect_uri="https://app.example.com/cb",
+    )
+
+    monkeypatch.delenv("ENCRYPTION_KEY", raising=False)
+    monkeypatch.setenv("ENVIRONMENT", "production")
+    get_cipher.cache_clear()
+    try:
+        resp = generic_oauth_login(
+            provider="salesforce",
+            token=token,
+            app_id=None,
+            redirect=None,
+            db=db,
+            db_provider=provider,
+        )
+    finally:
+        get_cipher.cache_clear()
+
+    assert resp.status_code == 500
+    assert "ENCRYPTION_KEY" in resp.body.decode()
+
+
+def test_non_salesforce_provider_omits_pkce_code_challenge(db_session):
+    db, user = db_session
+    token = _token_for(user)
+
+    provider = _provider(
+        auth_url="https://example.com/oauth/authorize",
+        default_scopes=["openid"],
+        redirect_uri="https://app.example.com/cb",
+    )
+
+    resp = generic_oauth_login(
+        provider="custom",
+        token=token,
+        app_id=None,
+        redirect=None,
+        db=db,
+        db_provider=provider,
+    )
+    qs = parse_qs(urlparse(_location(resp)).query)
+
+    assert "code_challenge" not in qs
+    assert "code_challenge_method" not in qs
+    state_payload = verify_token(qs["state"][0])
+    assert "code_verifier" not in state_payload
 
 
 def test_non_zoom_provider_does_not_set_prompt_login(db_session):

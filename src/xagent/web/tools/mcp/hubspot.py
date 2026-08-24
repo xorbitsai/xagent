@@ -4,13 +4,15 @@ import os
 from collections.abc import Callable
 from datetime import datetime, timezone
 from typing import Any
-from urllib.parse import quote
 
 import requests
 from mcp.server.fastmcp import FastMCP
 
 from ....config import get_tool_max_output_length
+from .utils import require_clean_identifier as _require_clean_identifier
 from .utils import setup_proxy_env
+from .utils import success_with_capped_dict as _success_with_capped_dict
+from .utils import url_path_id as _url_path_id
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("hubspot-mcp")
@@ -142,6 +144,12 @@ def _paged_list(
     next page would permanently skip whatever this page didn't return for
     space reasons. Retrying with the same ``after`` and a smaller ``limit``
     is what actually surfaces the trimmed entries.
+
+    The explanatory "dead end" message added when halving collapses to
+    zero items is itself re-checked against the size limit before being
+    kept -- appending it unconditionally after the halving loop already
+    converged could push an already-fitted response back over the limit,
+    the exact failure mode this function exists to prevent.
     """
     result = _request("GET", path, params=params)
     next_after = ((result.get("paging") or {}).get("next") or {}).get("after")
@@ -172,106 +180,28 @@ def _paged_list(
         # (the general truncated-page guidance) isn't guaranteed to help
         # here, so say so plainly instead of implying a fix that may not
         # exist.
-        payload["message"] = (
-            "Every record in this page was individually too large to fit "
-            "the output size limit, so none could be returned. Retrying "
-            "with a smaller `limit` may surface different records if more "
-            "exist, but cannot shrink an individually oversized record."
-        )
-        response = _success(**payload)
-    return response
-
-
-def _success_with_capped_dict(field_name: str, data: Any) -> str:
-    """Build a success payload, trimming a dict until the response fits the
-    platform's output limit.
-
-    HubSpot's analytics/statistics/metrics responses are dicts keyed by
-    date, dimension, or id depending on the endpoint and parameters (e.g.
-    one key per day for a "daily" analytics breakdown over a wide date
-    range), where most of the payload's size typically lives in one or two
-    large nested list/dict values while the rest are small scalars (an
-    "offset" or "total" field alongside a big "breakdowns" list). Dropping
-    whole top-level keys to shrink such a dict can discard the entire
-    useful payload on the very first step while leaving small, mostly
-    empty scalar fields behind - and there's no cursor to retry with, so
-    that data is gone for this call. Phase 1 instead repeatedly finds the
-    largest list/dict-valued key and halves *its* contents (recursing one
-    level, not further), so small scalar keys survive untouched as long as
-    there is a bigger key left to shrink first. Phase 2 is a fallback for
-    the residual case - a dict with no list/dict-valued keys at all (e.g.
-    a handful of scalar keys with huge string values) - and drops whole
-    keys, exactly as phase 1 replaces; it's guaranteed to terminate at {}.
-    """
-    max_output_length = get_tool_max_output_length()
-    response = _success(**{field_name: data, "truncated": False})
-    if not isinstance(data, dict) or len(response) <= max_output_length:
-        return response
-
-    working = dict(data)
-    truncated = False
-    while len(response) > max_output_length:
-        collection_keys = [
-            key
-            for key, value in working.items()
-            if isinstance(value, (list, dict)) and len(value) > 0
-        ]
-        if not collection_keys:
-            break
-        target_key = max(
-            collection_keys,
-            key=lambda key: len(json.dumps(working[key], ensure_ascii=False)),
-        )
-        target_value = working[target_key]
-        if isinstance(target_value, list):
-            working[target_key] = target_value[: len(target_value) // 2]
-        else:
-            sub_keys = list(target_value.keys())
-            working[target_key] = {
-                sub_key: target_value[sub_key]
-                for sub_key in sub_keys[: len(sub_keys) // 2]
+        response_with_message = _success(
+            **{
+                **payload,
+                "message": (
+                    "Every record in this page was individually too large "
+                    "to fit the output size limit, so none could be "
+                    "returned. Retrying with a smaller `limit` may surface "
+                    "different records if more exist, but cannot shrink an "
+                    "individually oversized record."
+                ),
             }
-        truncated = True
-        response = _success(**{field_name: working, "truncated": truncated})
-
-    keys = list(working.keys())
-    while len(response) > max_output_length and keys:
-        keys = keys[: len(keys) // 2]
-        working = {key: working[key] for key in keys}
-        truncated = True
-        response = _success(**{field_name: working, "truncated": truncated})
-    return response
-
-
-def _require_clean_identifier(value: str, field_name: str) -> str:
-    """Reject an empty or whitespace-padded id rather than silently fixing it.
-
-    An id copy-pasted or concatenated by a caller with accidental whitespace
-    is more likely a bug worth surfacing than a value to repair - repairing
-    it would mask the bug and could send a query for a different object.
-    Use this for ids that go into a JSON request body; for ids interpolated
-    into a URL path, use _url_path_id instead - encoding (not just
-    rejecting whitespace) is what actually closes path/query injection.
-    """
-    if not value or value.strip() != value:
-        raise ValueError(
-            f"{field_name} must be a non-empty id with no surrounding whitespace"
         )
-    return value
-
-
-def _url_path_id(value: str, field_name: str) -> str:
-    """Validate then percent-encode an id for safe interpolation into a URL
-    path segment.
-
-    Percent-encoding - not a blocklist of "/", "?", "#", or ".." - is what
-    actually prevents a value like "x?limit=1&foo=/reports/metrics" from
-    escaping its intended path segment: any character that could do that
-    gets encoded regardless of which one it is, rather than relying on an
-    enumeration that could miss one.
-    """
-    _require_clean_identifier(value, field_name)
-    return quote(value, safe="")
+        # Only use the enriched response if it still fits -- an operator can
+        # configure XAGENT_TOOL_MAX_OUTPUT_LENGTH small enough that even this
+        # already-empty payload plus the message text pushes back over the
+        # limit, and appending it unconditionally would silently reintroduce
+        # the hard-truncated-into-broken-JSON failure mode this whole
+        # function exists to prevent. Falling back to the message-less
+        # payload keeps the caller's own size contract intact instead.
+        if len(response_with_message) <= max_output_length:
+            response = response_with_message
+    return response
 
 
 def _require_date_format(

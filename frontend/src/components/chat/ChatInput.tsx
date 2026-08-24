@@ -32,47 +32,6 @@ import {
   AlertDialogTitle,
 } from "@/components/ui/alert-dialog";
 
-// Shared accent styling for the "Using @agent" / "Agent template: X" chips
-// rendered above the input.
-const CHIP_ACCENT_STYLE = { borderColor: "#3040cf", color: "#3040cf", backgroundColor: "#eef1ff" };
-
-// The "Using @agent" and "Agent template: X" chips are the same shape (an
-// italic label, a pill with the value, an optional remove button) - one
-// component instead of two near-identical blocks.
-function SelectionChip({
-  label,
-  value,
-  onRemove,
-  removeLabel,
-}: {
-  label: string;
-  value: string;
-  onRemove?: () => void;
-  removeLabel: string;
-}) {
-  return (
-    <div
-      className="inline-flex h-9 items-center gap-1 rounded-t-xl rounded-b-none border border-b-0 px-3 text-xs font-medium shadow-[0_-1px_0_rgba(53,88,255,0.08)]"
-      style={CHIP_ACCENT_STYLE}
-    >
-      <span className="italic">{label}</span>
-      <span className="rounded-md border px-2 py-0.5 not-italic" style={CHIP_ACCENT_STYLE}>
-        {value}
-      </span>
-      {onRemove && (
-        <button
-          type="button"
-          onClick={onRemove}
-          className="rounded-sm p-0.5 hover:bg-[#dfe6ff]"
-          title={removeLabel}
-        >
-          <X className="h-3 w-3" />
-        </button>
-      )}
-    </div>
-  );
-}
-
 interface ChatInputProps {
   onSend: (message: string, config?: AgentConfig) => void | Promise<void>;
   isLoading?: boolean;
@@ -83,6 +42,12 @@ interface ChatInputProps {
   onModeChange?: (mode: "task" | "process") => void;
   inputValue?: string;
   onInputChange?: (value: string) => void;
+  // Fires on the editor's own focus/blur, independent of `isLoading`/task
+  // status - lets a controlled caller know it's currently unsafe to rely
+  // on a programmatic `inputValue` change being reflected in the visible
+  // editor (see the DOM-sync effect below, which intentionally skips
+  // updating a focused editor from an external value change).
+  onFocusChange?: (focused: boolean) => void;
   taskStatus?: TaskStatus | string;
   onPause?: () => void;
   onResume?: () => void;
@@ -96,13 +61,13 @@ interface ChatInputProps {
   autoFocus?: boolean;
   minHeightClass?: string;
   promptHighlightTerms?: string[];
+  // Drives `hasSelectedAgent` below (skips the no-model-selected guard) -
+  // never rendered as a visible chip; callers that assign a task lead show
+  // that in their own header instead (see ChatStartScreen's hero swap).
   selectedAgents?: Array<{
     id: number | string;
     name: string;
   }>;
-  onRemoveSelectedAgent?: (agentId: number | string) => void;
-  selectedTemplate?: { id: string; name: string } | null;
-  onRemoveSelectedTemplate?: () => void;
   uploadFile?: (file: File, params: { taskType: string }) => Promise<{ file_id: string }>;
   deferFileUpload?: boolean;
 }
@@ -142,6 +107,7 @@ export function ChatInput({
   mode,
   inputValue,
   onInputChange,
+  onFocusChange,
   taskStatus,
   onPause,
   onResume,
@@ -156,9 +122,6 @@ export function ChatInput({
   minHeightClass = "min-h-[130px]",
   promptHighlightTerms = [],
   selectedAgents = [],
-  onRemoveSelectedAgent,
-  selectedTemplate = null,
-  onRemoveSelectedTemplate,
   uploadFile,
   deferFileUpload = false,
 }: ChatInputProps) {
@@ -576,6 +539,21 @@ export function ChatInput({
         compactModel: defaultAgentConfig.compactModel,
         executionMode: undefined
       }));
+    } else {
+      // readOnlyConfig is true but taskConfig hasn't arrived yet - e.g. the
+      // caller just switched to a different lead and that lead's own
+      // config fetch is still in flight. The disabled read-only model
+      // button below renders straight from `agentConfig`, so leaving the
+      // previous lead's stale model/mode in place would show it as if it
+      // belonged to whoever is selected now.
+      setAgentConfig(prev => ({
+        ...prev,
+        model: "",
+        smallFastModel: undefined,
+        visualModel: undefined,
+        compactModel: undefined,
+        executionMode: undefined
+      }));
     }
   }, [taskConfig, readOnlyConfig, defaultAgentConfig]);
 
@@ -595,7 +573,7 @@ export function ChatInput({
   // Only a new standalone task: the backend takes execution_mode at creation
   // only, and an agent (a template resolves into one) overrides it anyway.
   const showExecutionModePicker =
-    !hideConfig && !readOnlyConfig && !taskConfig && !selectedTemplate;
+    !hideConfig && !readOnlyConfig && !taskConfig;
   // Unset reads as "Default", not "Auto": the server default is auto only when
   // XAGENT_AGENT_RUNTIME is unset (config.get_default_task_execution_mode).
   const executionModeTriggerLabel = pickedExecutionMode
@@ -608,6 +586,23 @@ export function ChatInput({
   const activeTaskRuntimeSelection = showTaskRuntimeExtension
     ? taskRuntimeSelection
     : null;
+  // `agentConfig` mirrors `taskConfig` via a separate effect (below) that
+  // runs asynchronously after a prop change, not synchronously with it - a
+  // read landing in that gap (e.g. right after switching to a different
+  // read-only lead, before its own config has finished loading) would
+  // otherwise still show/send the PREVIOUS lead's model, even though
+  // `taskConfig` itself already correctly reflects the new one (or the
+  // absence of one yet). Read model fields straight from the live prop
+  // instead of the mirror, whenever one is meant to be authoritative -
+  // shared by both the read-only model badge below and handleSubmit, so a
+  // future caller of either one doesn't have to remember this separately.
+  // `hideConfig` alone (no taskConfig, not read-only) legitimately means
+  // "use my own configured default", not "mirror of taskConfig", so it's
+  // excluded here even though no current caller combines them.
+  const configIsDrivenByTaskConfig = readOnlyConfig || Boolean(taskConfig);
+  const displayModel = configIsDrivenByTaskConfig
+    ? taskConfig?.model || ""
+    : agentConfig.model;
   useEffect(() => {
     if (!showExecutionModePicker) {
       setPickedExecutionMode(undefined);
@@ -721,6 +716,9 @@ export function ChatInput({
       const executionMode = showExecutionModePicker
         ? pickedExecutionMode
         : taskConfig?.executionMode;
+      const normalizedExecutionMode = executionMode
+        ? (typeof executionMode === "string" ? { mode: executionMode } : executionMode)
+        : undefined;
       const extraRuntimeExtensions = activeLocalBrowserTarget
         ? { local_browser: { ...activeLocalBrowserTarget } }
         : activeTaskRuntimeSelection?.runtimeExtensions;
@@ -741,6 +739,22 @@ export function ChatInput({
 
       const configToSend = {
         ...agentConfig,
+        ...(configIsDrivenByTaskConfig
+          ? {
+              model: displayModel,
+              smallFastModel: taskConfig?.smallFastModel,
+              visualModel: taskConfig?.visualModel,
+              compactModel: taskConfig?.compactModel,
+              // Same live-vs-mirror reasoning as the model fields above,
+              // applied to executionMode: a falsy live value must still
+              // explicitly clear the key here rather than being skipped,
+              // or it would silently fall through to whatever stale
+              // executionMode `agentConfig` (spread below) still carries
+              // from the previous lead while its own mirroring effect
+              // hasn't caught up yet.
+              executionMode: normalizedExecutionMode,
+            }
+          : {}),
         clientMessageId,
         ...(extraRuntimeExtensions
           ? {
@@ -750,13 +764,8 @@ export function ChatInput({
               },
             }
           : {}),
-        ...(executionMode
-          ? {
-              executionMode:
-                typeof executionMode === "string"
-                  ? { mode: executionMode }
-                  : executionMode,
-            }
+        ...(!configIsDrivenByTaskConfig && normalizedExecutionMode
+          ? { executionMode: normalizedExecutionMode }
           : {}),
       };
 
@@ -918,13 +927,11 @@ export function ChatInput({
     }
   }, [filesDisabled, message, promptHighlightTerms]);
 
-  const hasTopChip = selectedAgents.length > 0 || !!selectedTemplate;
-
   return (
     <div className="space-y-3">
       {/* Input area */}
       <div
-        className={cn("relative", hasTopChip && "pt-9")}
+        className="relative"
         ref={containerRef}
       >
         {fileMention.fileMentionsEnabled && (
@@ -938,34 +945,10 @@ export function ChatInput({
             position={fileMention.dropdownPosition}
           />
         )}
-        {hasTopChip && (
-          <div className="absolute top-0 z-10 flex flex-wrap gap-2">
-            {selectedAgents.map((agent) => (
-              <SelectionChip
-                key={agent.id}
-                label={t("chatPage.input.usingAgentLabel")}
-                value={`@${agent.name}`}
-                onRemove={onRemoveSelectedAgent ? () => onRemoveSelectedAgent(agent.id) : undefined}
-                removeLabel={t("common.remove")}
-              />
-            ))}
-            {selectedTemplate && (
-              <SelectionChip
-                label={t("chatPage.templateQuickAccess.usingTemplateLabel")}
-                value={selectedTemplate.name}
-                onRemove={onRemoveSelectedTemplate}
-                removeLabel={t("common.remove")}
-              />
-            )}
-          </div>
-        )}
         <form
           onSubmit={handleSubmit}
           className={cn(
-            "relative flex flex-col overflow-hidden border-2 bg-card shadow-sm",
-            hasTopChip
-              ? "rounded-tr-2xl rounded-br-2xl rounded-bl-2xl rounded-tl-none"
-              : "rounded-2xl",
+            "relative flex flex-col overflow-hidden border-2 bg-card shadow-sm rounded-2xl",
             isFocused
               ? "shadow-[0_0_0_3px_rgba(48,64,207,0.16)]"
               : ""
@@ -975,7 +958,7 @@ export function ChatInput({
           onDragLeave={handleDragLeave}
           onDrop={handleDrop}
           style={{
-            borderColor: hasTopChip ? "#3040cf" : isDraggingFiles || isFocused ? "#3040cf" : "#d7deec"
+            borderColor: isDraggingFiles || isFocused ? "#3040cf" : "#d7deec"
           }}
         >
           {isDraggingFiles && (
@@ -1037,8 +1020,14 @@ export function ChatInput({
               onInput={handleInput}
               onKeyDown={handleKeyDown}
               onPaste={handlePaste}
-              onFocus={() => setIsFocused(true)}
-              onBlur={() => setIsFocused(false)}
+              onFocus={() => {
+                setIsFocused(true);
+                onFocusChange?.(true);
+              }}
+              onBlur={() => {
+                setIsFocused(false);
+                onFocusChange?.(false);
+              }}
               role="textbox"
               aria-multiline="true"
             />
@@ -1131,11 +1120,11 @@ export function ChatInput({
                         size="sm"
                         className="h-9 px-3 text-muted-foreground rounded-xl gap-2 cursor-default hover:bg-transparent"
                         disabled={true}
-                        title={models.find(m => String(m.id) === String(agentConfig.model) || String(m.model_id) === String(agentConfig.model))?.model_name || agentConfig.model || t("chatPage.input.noModel")}
+                        title={models.find(m => String(m.id) === String(displayModel) || String(m.model_id) === String(displayModel))?.model_name || displayModel || t("chatPage.input.noModel")}
                       >
                         <Globe className="h-4 w-4" />
                         <span className="text-xs font-normal max-w-[150px] truncate hidden sm:inline-block">
-                          {models.find(m => String(m.id) === String(agentConfig.model) || String(m.model_id) === String(agentConfig.model))?.model_name || agentConfig.model || t("chatPage.input.noModel")}
+                          {models.find(m => String(m.id) === String(displayModel) || String(m.model_id) === String(displayModel))?.model_name || displayModel || t("chatPage.input.noModel")}
                         </span>
                       </Button>
                     ) : (

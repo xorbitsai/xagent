@@ -3055,6 +3055,7 @@ class ReActPattern(AgentPattern):
             tool_call["id"] = f"tool_call_{len(self.tool_ledger)}"
         tool_call = self._with_tool_call_content(tool_call)
         tool_call = self._with_runtime_step(tool_call, runtime)
+        tool_call = self._with_runtime_turn_id(tool_call, runtime)
         tool_call = self._with_trace_safe_tool_args(tool_call, tools)
         self._record_tool_call(tool_call, status="running")
         recorded_terminal = False
@@ -3180,6 +3181,28 @@ class ReActPattern(AgentPattern):
             "step_id": str(step_id),
             "dag_step_id": str(step_id),
         }
+
+    def _with_runtime_turn_id(
+        self, tool_call: dict[str, Any], runtime: PatternRuntime
+    ) -> dict[str, Any]:
+        """Stamp the current turn's id onto ``tool_call`` for on_tool_* to read.
+
+        ``runtime.active_turn_id`` carries the durable turn_id: on the real
+        ``PatternRuntime`` it's set in ``on_pattern_start`` from the
+        triggering user message's metadata; on ``_DAGStepRuntime`` (dag.py)
+        it's a property resolving the same value from the DAG's root
+        context. Either way this lets ``PatternRuntime.on_tool_start`` /
+        ``on_tool_end`` / ``on_tool_error`` attribute the resulting trace
+        event to its turn by join, not by timestamp adjacency.
+        """
+        if tool_call.get("turn_id"):
+            return tool_call
+
+        turn_id = getattr(runtime, "active_turn_id", None)
+        if not turn_id:
+            return tool_call
+
+        return {**tool_call, "turn_id": str(turn_id)}
 
     def _with_tool_call_content(self, tool_call: dict[str, Any]) -> dict[str, Any]:
         tool_call_id = str(tool_call.get("id") or "")

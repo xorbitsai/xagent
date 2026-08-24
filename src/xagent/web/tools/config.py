@@ -137,17 +137,23 @@ class ResolvedToken:
     comparison. Resolvers SHOULD set ``expires_at`` to enable MCP config
     caching; ``expires_at=None`` means the token is usable for this build only
     and this ``WebToolConfig`` instance will reload MCP configs on later calls.
+    ``instance_url`` carries the per-org API host a provider like Salesforce
+    returns alongside its access token; providers without one leave it None.
     """
 
     access_token: str = field(repr=False)
     expires_at: datetime | None = None
     generation: str | None = field(default=None, repr=False)
+    instance_url: str | None = None
 
 
 @dataclass(frozen=True)
 class _LegacyOAuthTokenResolution:
     access_token: str | None
     refresh_failed: bool = False
+    # Set only for providers that return a per-org API host instead of
+    # using a fixed domain (Salesforce) -- None for everyone else.
+    instance_url: str | None = None
 
 
 TokenResolverResult = ResolvedToken | Awaitable[ResolvedToken | None] | None
@@ -260,6 +266,7 @@ class _ResolvedHookToken:
     access_token: str = field(repr=False)
     expires_at: datetime | None
     generation: str | None = field(repr=False)
+    instance_url: str | None = None
 
 
 class _OAuthTokenResolverFailed(Exception):
@@ -284,6 +291,24 @@ class _OAuthLaunchConfigInvalid(Exception):
     def __init__(self, *, field: str) -> None:
         super().__init__(field)
         self.field = field
+
+
+class _OAuthInstanceUrlRequired(Exception):
+    """The launch_config declares an instance_url env mapping, but the
+    resolved token (hook or legacy DB path) didn't supply one.
+
+    Raised instead of silently omitting the env var so the connector comes
+    back as unavailable/reconnect-required, matching how a missing
+    access_token is already surfaced, rather than launching a subprocess
+    that fails opaquely on its first real tool call. Carries the env_mapping
+    key that triggered it, mirroring _OAuthLaunchConfigInvalid.field, so a
+    second provider adding its own instance_url-mapped key someday doesn't
+    leave both call sites' log lines unable to say which one failed.
+    """
+
+    def __init__(self, *, env_key: str) -> None:
+        super().__init__(env_key)
+        self.env_key = env_key
 
 
 @dataclass(frozen=True)
@@ -697,6 +722,30 @@ async def refresh_oauth_token_if_needed(
                 oauth_account.access_token = data["access_token"]
                 if "refresh_token" in data:
                     oauth_account.refresh_token = data["refresh_token"]
+                if "instance_url" in data:
+                    # Matches the code-exchange branch in api/auth.py:
+                    # Salesforce can return a different instance_url on
+                    # refresh (e.g. after an org migration), so this is
+                    # re-persisted here too, not just at initial connect.
+                    # Type/non-empty checked (not full host/scheme
+                    # validation -- that stays salesforce.py's own
+                    # use-time job) before overwriting: this row's
+                    # existing instance_url is a previously-valid value,
+                    # and a malformed refresh response replacing it would
+                    # break the connector on its next use with no signal
+                    # at refresh time that anything went wrong.
+                    refreshed_instance_url = data["instance_url"]
+                    if (
+                        isinstance(refreshed_instance_url, str)
+                        and refreshed_instance_url
+                    ):
+                        oauth_account.instance_url = refreshed_instance_url
+                    else:
+                        logger.warning(
+                            f"Refresh response for {provider_name} (user "
+                            f"{oauth_account.user_id}) had a malformed "
+                            "instance_url; keeping the previously stored value"
+                        )
                 if "expires_in" in data:
                     oauth_account.expires_at = datetime.now(timezone.utc) + timedelta(
                         seconds=data["expires_in"]
@@ -2924,6 +2973,14 @@ class WebToolConfig(BaseToolConfig):
                 exception_type="InvalidGeneration",
                 resource=resource,
             )
+        if resolved.instance_url is not None and (
+            type(resolved.instance_url) is not str or not resolved.instance_url
+        ):
+            raise _OAuthTokenResolverFailed(
+                providers=providers,
+                exception_type="InvalidInstanceUrl",
+                resource=resource,
+            )
 
         expires_at = _normalize_oauth_expires_at(resolved.expires_at)
         if expires_at is not None and _oauth_token_is_expired(expires_at):
@@ -2938,6 +2995,7 @@ class WebToolConfig(BaseToolConfig):
             access_token=resolved.access_token,
             expires_at=expires_at,
             generation=resolved.generation,
+            instance_url=resolved.instance_url,
         )
 
     def _mark_hook_token_cache_metadata(self, resolved: _ResolvedHookToken) -> None:
@@ -3045,6 +3103,7 @@ class WebToolConfig(BaseToolConfig):
         server: Any,
         app_info: Mapping[str, Any],
         access_token: str,
+        instance_url: str | None = None,
     ) -> Dict[str, Any]:
         launch_config = _oauth_launch_config_mapping(app_info.get("launch_config"))
         if launch_config:
@@ -3060,6 +3119,28 @@ class WebToolConfig(BaseToolConfig):
             ).items():
                 if token_type == "access_token":
                     env[env_key] = access_token
+                elif token_type == "instance_url":
+                    if not instance_url:
+                        raise _OAuthInstanceUrlRequired(env_key=env_key)
+                    env[env_key] = instance_url
+                else:
+                    # A typo'd env_mapping value (e.g. "acess_token") would
+                    # otherwise silently emit neither an env var nor an
+                    # error -- the exact opaque failure mode
+                    # _OAuthInstanceUrlRequired exists to prevent for the
+                    # one token_type above it. Not developer-only: an admin
+                    # can reach this through POST /admin/mcp/apps, whose
+                    # launch_config is an unvalidated free-form dict (see
+                    # PublicMCPAppCreate in admin_mcp.py -- its validator
+                    # checks command/required_env/url/auth.type, not
+                    # env_mapping's values), so a hand-typed custom OAuth
+                    # app's env_mapping can carry this too.
+                    logger.warning(
+                        "Unrecognized launch_config.env_mapping token_type "
+                        "'%s' for env var '%s'; no value forwarded",
+                        token_type,
+                        env_key,
+                    )
 
             for env_key, host_env_var in _oauth_launch_config_static_env(
                 launch_config
@@ -3203,8 +3284,17 @@ class WebToolConfig(BaseToolConfig):
                 )
 
             access_token = str(oauth_account.access_token)
+            # Not direct attribute access: mypy infers oauth_account's
+            # instance_url as Column[str] here (get_scoped_user_oauth_account
+            # returns a type the SQLAlchemy plugin doesn't narrow the same
+            # way as a plain query result), so getattr's own 3-arg overload
+            # is what actually produces the correct `str | None` this
+            # function's return type declares.
+            instance_url = getattr(oauth_account, "instance_url", None)
             oauth_db.commit()
-            return _LegacyOAuthTokenResolution(access_token=access_token)
+            return _LegacyOAuthTokenResolution(
+                access_token=access_token, instance_url=instance_url
+            )
         except Exception:
             oauth_db.rollback()
             raise
@@ -3292,6 +3382,7 @@ class WebToolConfig(BaseToolConfig):
                         server=server,
                         app_info=app_info,
                         access_token=hook_token.access_token,
+                        instance_url=hook_token.instance_url,
                     )
                 except _OAuthLaunchConfigInvalid as error:
                     logger.warning(
@@ -3302,6 +3393,18 @@ class WebToolConfig(BaseToolConfig):
                     return self._build_unavailable_mcp_config(
                         server=server,
                         reason="invalid_launch_config",
+                    )
+                except _OAuthInstanceUrlRequired as error:
+                    logger.info(
+                        "OAuth token resolver hook did not supply %s for MCP server '%s'",
+                        error.env_key,
+                        getattr(server, "name", "<unknown>"),
+                    )
+                    return self._build_unavailable_mcp_config(
+                        server=server,
+                        reason="oauth_token_required",
+                        message=UNAVAILABLE_MCP_CREDENTIAL_MESSAGE,
+                        failure_code="oauth_token_required",
                     )
                 config["transport"] = "stdio"
                 logger.info(
@@ -3337,6 +3440,7 @@ class WebToolConfig(BaseToolConfig):
                         server=server,
                         app_info=app_info,
                         access_token=legacy_token.access_token,
+                        instance_url=legacy_token.instance_url,
                     )
                 except _OAuthLaunchConfigInvalid as error:
                     logger.warning(
@@ -3347,6 +3451,18 @@ class WebToolConfig(BaseToolConfig):
                     return self._build_unavailable_mcp_config(
                         server=server,
                         reason="invalid_launch_config",
+                    )
+                except _OAuthInstanceUrlRequired as error:
+                    logger.info(
+                        "OAUTH CONFIG: No %s found for '%s'.",
+                        error.env_key,
+                        provider_name,
+                    )
+                    return self._build_unavailable_mcp_config(
+                        server=server,
+                        reason="oauth_token_required",
+                        message=UNAVAILABLE_MCP_CREDENTIAL_MESSAGE,
+                        failure_code="oauth_token_required",
                     )
                 config["transport"] = "stdio"
 

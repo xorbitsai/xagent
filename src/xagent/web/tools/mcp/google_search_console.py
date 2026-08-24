@@ -103,7 +103,12 @@ def _request(
 
     if response.status_code == 204 or not response.content:
         return {}
-    return response.json()
+    try:
+        return response.json()
+    except ValueError as exc:
+        raise RuntimeError(
+            f"Failed to parse JSON response from Google Search Console API: {response.text[:200]}"
+        ) from exc
 
 
 def _require_dict_result(result: Any) -> dict[str, Any]:
@@ -153,7 +158,7 @@ def google_search_console_list_sites() -> str:
                 "permission_level": entry.get("permissionLevel"),
             }
             for entry in (result.get("siteEntry") or [])
-            if isinstance(entry, dict)
+            if isinstance(entry, dict) and entry.get("siteUrl")
         ]
         return _success(sites=sites)
     except Exception as e:
@@ -227,7 +232,7 @@ def google_search_console_query_search_analytics(
         if start_row < 0:
             raise ValueError("start_row must be >= 0")
         if dimensions:
-            invalid = sorted(set(dimensions) - VALID_DIMENSIONS)
+            invalid = sorted(set(dimensions) - VALID_DIMENSIONS, key=str)
             if invalid:
                 raise ValueError(
                     f"invalid dimensions {invalid}; must be from {sorted(VALID_DIMENSIONS)}"
@@ -252,7 +257,9 @@ def google_search_console_query_search_analytics(
                 body=body,
             )
         )
-        rows = result.get("rows") or []
+        rows = result.get("rows")
+        if not isinstance(rows, list):
+            rows = []
 
         # row_limit bounds row *count*, not bytes: several "query"/"page"
         # dimension values (often full URLs) at once can still cross the

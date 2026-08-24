@@ -111,6 +111,28 @@ def test_request_caps_unstructured_error_body(monkeypatch):
     assert len(str(excinfo.value)) < 1200
 
 
+def test_request_raises_runtime_error_on_non_json_success_body(monkeypatch):
+    """A 200 response whose body isn't JSON (e.g. an HTML page from an
+    intermediate proxy) must fail with a clear RuntimeError, not a raw
+    ValueError/JSONDecodeError from response.json()."""
+    bad_response = Mock()
+    bad_response.status_code = 200
+    bad_response.content = b"<html>not json</html>"
+    bad_response.text = "<html>not json</html>"
+    bad_response.raise_for_status = Mock()
+    bad_response.json = Mock(side_effect=ValueError("Expecting value"))
+    monkeypatch.setattr(
+        google_search_console.requests,
+        "request",
+        Mock(return_value=bad_response),
+    )
+
+    with pytest.raises(RuntimeError, match="Failed to parse JSON response"):
+        google_search_console._request(
+            "GET", f"{google_search_console.WEBMASTERS_API_BASE_URL}/sites"
+        )
+
+
 def test_list_sites_projects_site_entries(monkeypatch):
     monkeypatch.setattr(
         google_search_console.requests,
@@ -139,6 +161,34 @@ def test_list_sites_projects_site_entries(monkeypatch):
     assert result["sites"] == [
         {"site_url": "https://example.com/", "permission_level": "siteOwner"},
         {"site_url": "sc-domain:example.com", "permission_level": "siteFullUser"},
+    ]
+
+
+def test_list_sites_filters_out_entries_without_site_url(monkeypatch):
+    monkeypatch.setattr(
+        google_search_console.requests,
+        "request",
+        Mock(
+            return_value=MockResponse(
+                json_data={
+                    "siteEntry": [
+                        {"siteUrl": None, "permissionLevel": "siteOwner"},
+                        {"permissionLevel": "siteOwner"},
+                        {
+                            "siteUrl": "https://example.com/",
+                            "permissionLevel": "siteOwner",
+                        },
+                    ]
+                }
+            )
+        ),
+    )
+
+    result = json.loads(google_search_console.google_search_console_list_sites())
+
+    assert result["status"] == "success"
+    assert result["sites"] == [
+        {"site_url": "https://example.com/", "permission_level": "siteOwner"}
     ]
 
 
@@ -424,6 +474,24 @@ def test_query_search_analytics_trims_rows_and_flags_truncated_when_over_budget(
     assert result["truncated"] is True
     assert len(result["rows"]) < google_search_console.QUERY_MAX_ROW_LIMIT
     assert len(response) < get_tool_max_output_length()
+
+
+def test_query_search_analytics_treats_non_list_rows_as_empty(monkeypatch):
+    """A malformed API response where "rows" isn't a list (e.g. null or a
+    dict) must not raise a TypeError out of len()/slicing; it degrades to an
+    empty result instead."""
+    mock_request = Mock(return_value=MockResponse(json_data={"rows": "not-a-list"}))
+    monkeypatch.setattr(google_search_console.requests, "request", mock_request)
+
+    result = json.loads(
+        google_search_console.google_search_console_query_search_analytics(
+            "https://example.com/", start_date="2026-07-01", end_date="2026-07-28"
+        )
+    )
+
+    assert result["status"] == "success"
+    assert result["rows"] == []
+    assert result["row_count"] == 0
 
 
 def test_query_search_analytics_returns_error_payload_on_api_failure(monkeypatch):

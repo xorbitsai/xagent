@@ -114,8 +114,31 @@ def _callback_request(db, user, provider: str = "salesforce") -> SimpleNamespace
             "salesforce-sandbox",
             {"access_token": "sf-token", "token_type": "Bearer"},
         ),
+        (
+            "salesforce-sandbox",
+            {
+                "access_token": "sf-token",
+                "token_type": "Bearer",
+                "instance_url": 12345,
+            },
+        ),
+        (
+            "salesforce-sandbox",
+            {
+                "access_token": "sf-token",
+                "token_type": "Bearer",
+                "instance_url": "",
+            },
+        ),
     ],
-    ids=["missing", "non-string", "empty-string", "sandbox-prefixed-missing"],
+    ids=[
+        "missing",
+        "non-string",
+        "empty-string",
+        "sandbox-prefixed-missing",
+        "sandbox-prefixed-non-string",
+        "sandbox-prefixed-empty-string",
+    ],
 )
 def test_callback_rejects_missing_instance_url_without_touching_prior_grant(
     db_session, monkeypatch, provider, token_data
@@ -312,15 +335,33 @@ def test_callback_persists_instance_url_and_skips_userinfo_lookup(
         == "https://login.salesforce.com/id/00D.../005..."
     )
 
+    server = db.query(MCPServer).filter(MCPServer.name == "Salesforce").one()
+    assert server.transport == "oauth"
+    user_mcp = (
+        db.query(UserMCPServer)
+        .filter(
+            UserMCPServer.user_id == user.id,
+            UserMCPServer.mcpserver_id == server.id,
+        )
+        .one()
+    )
+    assert user_mcp.is_active is True
 
+
+@pytest.mark.parametrize("provider", ["salesforce", "salesforce-sandbox"])
 def test_callback_falls_back_to_null_identity_for_non_string_id(
-    db_session, monkeypatch
+    db_session, monkeypatch, caplog, provider
 ):
     """A non-string "id" (a malformed or proxy-mangled response) must fall
     back to the same NULL provider_user_id a missing "id" already takes,
     not get str()-ified into the uniqueness key -- a raw non-string value
     reaching str() would produce a technically-unique but meaningless key
-    (e.g. a Python dict repr) instead of a real, comparable identity."""
+    (e.g. a Python dict repr) instead of a real, comparable identity. Unlike
+    a genuinely missing "id" (the expected, silent case every other
+    provider's fallback also hits), this truthy-but-wrong-type value is
+    anomalous enough to warn about. Parametrized over "salesforce-sandbox"
+    since this fallback is gated by the same _is_salesforce_provider prefix
+    match as the instance_url guard and PKCE."""
     db, user = db_session
     mock_post = Mock(
         return_value=MockResponse(
@@ -335,9 +376,48 @@ def test_callback_falls_back_to_null_identity_for_non_string_id(
     monkeypatch.setattr(auth_api.requests, "post", mock_post)
     monkeypatch.setattr(auth_api.requests, "get", Mock())
 
-    response = generic_oauth_callback(
-        "salesforce", _callback_request(db, user), db, _salesforce_provider()
+    with caplog.at_level("WARNING"):
+        response = generic_oauth_callback(
+            provider,
+            _callback_request(db, user, provider=provider),
+            db,
+            _salesforce_provider(provider_name=provider),
+        )
+
+    assert response.status_code == 200
+    oauth_account = (
+        db.query(UserOAuth)
+        .filter(UserOAuth.user_id == user.id, UserOAuth.provider == provider)
+        .one()
     )
+    assert oauth_account.provider_user_id is None
+    assert any("not a usable string" in record.message for record in caplog.records)
+
+
+def test_callback_falls_back_to_null_identity_for_empty_string_id(
+    db_session, monkeypatch, caplog
+):
+    """An empty-string "id" is treated as equivalent to a missing one --
+    NULL provider_user_id, no warning -- not persisted as a technically
+    non-NULL but useless empty-string uniqueness key."""
+    db, user = db_session
+    mock_post = Mock(
+        return_value=MockResponse(
+            {
+                "access_token": "sf-token",
+                "instance_url": "https://acme.my.salesforce.com",
+                "token_type": "Bearer",
+                "id": "",
+            }
+        )
+    )
+    monkeypatch.setattr(auth_api.requests, "post", mock_post)
+    monkeypatch.setattr(auth_api.requests, "get", Mock())
+
+    with caplog.at_level("WARNING"):
+        response = generic_oauth_callback(
+            "salesforce", _callback_request(db, user), db, _salesforce_provider()
+        )
 
     assert response.status_code == 200
     oauth_account = (
@@ -346,18 +426,7 @@ def test_callback_falls_back_to_null_identity_for_non_string_id(
         .one()
     )
     assert oauth_account.provider_user_id is None
-
-    server = db.query(MCPServer).filter(MCPServer.name == "Salesforce").one()
-    assert server.transport == "oauth"
-    user_mcp = (
-        db.query(UserMCPServer)
-        .filter(
-            UserMCPServer.user_id == user.id,
-            UserMCPServer.mcpserver_id == server.id,
-        )
-        .one()
-    )
-    assert user_mcp.is_active is True
+    assert not any("not a usable string" in record.message for record in caplog.records)
 
 
 def test_connected_salesforce_server_reports_no_account_label(db_session, monkeypatch):
@@ -436,14 +505,22 @@ def test_callback_sends_decrypted_code_verifier_in_token_exchange(
     assert mock_post.call_args.kwargs["data"]["code_verifier"] == verifier
 
 
+@pytest.mark.parametrize("provider", ["salesforce", "salesforce-sandbox"])
 def test_callback_returns_session_expired_when_encryption_key_missing(
-    db_session, monkeypatch
+    db_session, monkeypatch, provider
 ):
     """decrypt_value_strict's own get_cipher() call raises a bare ValueError
     (not its EncryptionDecodeError subclass) when ENCRYPTION_KEY is unset --
     the callback's except clause must catch ValueError broadly, or this
     exact misconfiguration 500s with an opaque traceback instead of the
-    same clear "session expired" page a corrupted/foreign token gets."""
+    same clear "session expired" page a corrupted/foreign token gets.
+
+    Parametrized over "salesforce-sandbox" too: the state payload only
+    carries a code_verifier at all because generic_oauth_login's PKCE gate
+    matched this provider name via _is_salesforce_provider's prefix match --
+    if that gate or this decrypt path ever diverged for the sandbox row,
+    this would be the only place it could be caught, since _callback_request
+    (used by most other sandbox tests) never sets code_verifier at all."""
     from xagent.core.utils.encryption import get_cipher
 
     db, user = db_session
@@ -451,21 +528,21 @@ def test_callback_returns_session_expired_when_encryption_key_missing(
         data={
             "type": "oauth_state",
             "user_id": user.id,
-            "provider": "salesforce",
-            "app_id": "salesforce",
+            "provider": provider,
+            "app_id": provider,
             "code_verifier": encrypt_value("plain-text-verifier-value"),
         },
         expires_delta=timedelta(minutes=10),
     )
     request = SimpleNamespace(query_params={"code": "sf-code", "state": state})
     monkeypatch.setattr(auth_api.requests, "post", Mock())
-    provider = _salesforce_provider()
+    db_provider = _salesforce_provider(provider_name=provider)
 
     monkeypatch.delenv("ENCRYPTION_KEY", raising=False)
     monkeypatch.setenv("ENVIRONMENT", "production")
     get_cipher.cache_clear()
     try:
-        response = generic_oauth_callback("salesforce", request, db, provider)
+        response = generic_oauth_callback(provider, request, db, db_provider)
     finally:
         get_cipher.cache_clear()
 
@@ -473,15 +550,17 @@ def test_callback_returns_session_expired_when_encryption_key_missing(
     assert "expired" in response.body.decode().lower()
 
 
+@pytest.mark.parametrize("provider", ["salesforce", "salesforce-sandbox"])
 def test_callback_returns_session_expired_when_code_verifier_is_foreign_ciphertext(
-    db_session, monkeypatch
+    db_session, monkeypatch, provider
 ):
     """A distinct branch from the missing-key case above: ENCRYPTION_KEY is
     present and valid, but the verifier is Fernet-shaped ciphertext produced
     under a *different* key (e.g. a stale token from before a key rotation).
     decrypt_value_strict raises EncryptionDecodeError (an InvalidToken, not
     a missing-key ValueError) here -- must hit the same "session expired"
-    page, not a raw exception."""
+    page, not a raw exception. Parametrized over "salesforce-sandbox" for
+    the same reason as the sibling test above."""
     from cryptography.fernet import Fernet
 
     db, user = db_session
@@ -490,8 +569,8 @@ def test_callback_returns_session_expired_when_code_verifier_is_foreign_cipherte
         data={
             "type": "oauth_state",
             "user_id": user.id,
-            "provider": "salesforce",
-            "app_id": "salesforce",
+            "provider": provider,
+            "app_id": provider,
             "code_verifier": foreign_ciphertext,
         },
         expires_delta=timedelta(minutes=10),
@@ -499,7 +578,9 @@ def test_callback_returns_session_expired_when_code_verifier_is_foreign_cipherte
     request = SimpleNamespace(query_params={"code": "sf-code", "state": state})
     monkeypatch.setattr(auth_api.requests, "post", Mock())
 
-    response = generic_oauth_callback("salesforce", request, db, _salesforce_provider())
+    response = generic_oauth_callback(
+        provider, request, db, _salesforce_provider(provider_name=provider)
+    )
 
     assert response.status_code == 400
     assert "expired" in response.body.decode().lower()

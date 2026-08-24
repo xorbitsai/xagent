@@ -440,6 +440,17 @@ def salesforce_list_sobjects(
         limit = clamp_limit(limit, max_limit=MAX_PAGE_LIMIT)
         result = _request("GET", f"/services/data/{API_VERSION}/sobjects")
         needle = name_contains.strip().lower()
+        matching = [
+            s
+            for s in result.get("sobjects") or []
+            if not needle
+            or needle in (s.get("name") or "").lower()
+            or needle in (s.get("label") or "").lower()
+        ]
+        # Slice to the requested page before building each summary dict, not
+        # after -- an org with hundreds of objects would otherwise build a
+        # dict for every match only to discard all but `limit` of them.
+        page_sobjects = matching[offset : offset + limit]
         sobjects = [
             {
                 "name": s.get("name"),
@@ -450,14 +461,10 @@ def salesforce_list_sobjects(
                 "deletable": s.get("deletable"),
                 "custom": s.get("custom"),
             }
-            for s in result.get("sobjects") or []
-            if not needle
-            or needle in (s.get("name") or "").lower()
-            or needle in (s.get("label") or "").lower()
+            for s in page_sobjects
         ]
-        page = sobjects[offset : offset + limit]
         return _success_with_capped_page(
-            "sobjects", page, offset=offset, total_count=len(sobjects)
+            "sobjects", sobjects, offset=offset, total_count=len(matching)
         )
     except Exception as e:
         logger.error(f"Error listing Salesforce sobjects: {e}")
@@ -518,6 +525,18 @@ def salesforce_describe_sobject(
             )
 
         wanted = set(fields) if fields else None
+        filtered_fields = (
+            raw_fields
+            if wanted is None
+            else [f for f in raw_fields if f.get("name") in wanted]
+        )
+        # Slice to the requested page BEFORE building each field's full
+        # metadata dict, not after: an object with hundreds of fields (and
+        # picklists with dozens of values each) would otherwise pay for
+        # every field's picklist-value extraction only to discard all but
+        # `limit` of them, the same waste names_only already avoids above
+        # by building bare names before slicing.
+        page_fields = filtered_fields[offset : offset + limit]
         described_fields = [
             {
                 "name": f.get("name"),
@@ -536,15 +555,13 @@ def salesforce_describe_sobject(
                     else None
                 ),
             }
-            for f in raw_fields
-            if wanted is None or f.get("name") in wanted
+            for f in page_fields
         ]
-        page = described_fields[offset : offset + limit]
         return _success_with_capped_page(
             "fields",
-            page,
+            described_fields,
             offset=offset,
-            total_count=len(described_fields),
+            total_count=len(filtered_fields),
             name=result.get("name"),
             label=result.get("label"),
         )

@@ -33,6 +33,36 @@ def test_url_path_id_rejects_exact_dot_segments():
         utils.url_path_id(".", "record_id")
 
 
+@pytest.mark.parametrize(
+    "limit,expected",
+    [
+        (50, 50),  # within range, passed through unchanged
+        (1, 1),  # lower boundary, passed through unchanged
+        (200, 200),  # exactly max_limit, passed through unchanged
+        (201, 200),  # just above max_limit, clamped down
+        (10**9, 200),  # extreme, clamped down the same as a mild overage
+        (0, 1),  # zero would slice to an empty page forever -- clamped up
+        (-1, 1),  # mild negative, clamped up
+        (-(10**9), 1),  # extreme negative, clamped up the same as mild
+    ],
+)
+def test_clamp_limit_boundaries(limit, expected):
+    assert utils.clamp_limit(limit, max_limit=200) == expected
+
+
+@pytest.mark.parametrize(
+    "offset,expected",
+    [
+        (0, 0),
+        (5, 5),
+        (-1, 0),  # mild negative -- would slice from the end unclamped
+        (-(10**9), 0),  # extreme negative, clamped the same as mild
+    ],
+)
+def test_clamp_offset_boundaries(offset, expected):
+    assert utils.clamp_offset(offset) == expected
+
+
 def test_url_path_id_output_survives_requests_url_normalization():
     """Confirms the actual exploit this guards against: a naively
     interpolated ".." collapses the path via requests' own URL

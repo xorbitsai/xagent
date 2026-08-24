@@ -148,8 +148,17 @@ def _is_salesforce_provider(provider: str) -> bool:
     provider_user_id identity backfill -- must use this same predicate; an
     exact match on any one of them would silently grant that row the
     capability while skipping its safeguard.
+
+    Anchored to a "-" separator, not a bare prefix: `oauth_providers.name` is
+    admin-settable via POST/PUT /admin/mcp/providers, so a bare
+    `.startswith("salesforce")` would also match an unrelated custom
+    provider an admin happened to name e.g. "salesforcelite" -- routing it
+    through PKCE and the instance_url-required guard it has no reason to
+    satisfy. Requiring "salesforce" or "salesforce-<anything>" keeps the
+    sandbox row matched without widening the blast radius that far.
     """
-    return provider.lower().startswith("salesforce")
+    lowered = provider.lower()
+    return lowered == "salesforce" or lowered.startswith("salesforce-")
 
 
 def _resolve_oauth_secret(
@@ -2132,14 +2141,27 @@ def generic_oauth_callback(
             # directly against the fixed USERINFO_URL host), it's just not
             # used for callback-time identity, on purpose.
             raw_provider_user_id = token_data.get("id")
-            # Every real Salesforce token response's "id" is a string URL;
-            # a non-string value (a malformed/proxy-mangled response) would
-            # otherwise get str()-ified into the uniqueness key below
-            # instead of falling back to the same NULL-tolerant path a
-            # missing "id" already takes.
+            # Every real Salesforce token response's "id" is a non-empty
+            # string URL; a non-string or empty value (a malformed/
+            # proxy-mangled response) would otherwise get str()-ified into
+            # the uniqueness key below instead of falling back to the same
+            # NULL-tolerant path a missing "id" already takes.
             provider_user_id = (
-                raw_provider_user_id if isinstance(raw_provider_user_id, str) else None
+                raw_provider_user_id
+                if isinstance(raw_provider_user_id, str) and raw_provider_user_id
+                else None
             )
+            if raw_provider_user_id and provider_user_id is None:
+                # Only a truthy-but-wrong-type "id" is anomalous enough to
+                # warn about -- a falsy one (missing entirely) is the
+                # already-expected, silent case every other provider using
+                # this same fallback also hits.
+                logger.warning(
+                    'Salesforce token response\'s "id" field was not a '
+                    "usable string (got %s); falling back to NULL "
+                    "provider_user_id for this grant",
+                    type(raw_provider_user_id).__name__,
+                )
         elif userinfo_url and access_token:
             info_headers = {"Authorization": f"Bearer {access_token}"}
             # Replace {{access_token}} placeholder if present

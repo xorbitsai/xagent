@@ -20,6 +20,7 @@ from sqlalchemy.orm import sessionmaker
 
 from xagent.core.utils.encryption import _is_encrypted, decrypt_value, encrypt_value
 from xagent.web.api.auth import (
+    _is_salesforce_provider,
     _resolve_oauth_secret,
     create_access_token,
     generic_oauth_login,
@@ -213,6 +214,31 @@ def test_salesforce_provider_includes_pkce_code_challenge(db_session):
         .rstrip("=")
     )
     assert qs["code_challenge"][0] == expected_challenge
+
+
+@pytest.mark.parametrize(
+    "provider,expected",
+    [
+        ("salesforce", True),
+        ("SALESFORCE", True),
+        ("salesforce-sandbox", True),
+        ("salesforce-govcloud", True),
+        ("salesforcelite", False),
+        ("salesforce2", False),
+        ("hubspot", False),
+        ("", False),
+    ],
+)
+def test_is_salesforce_provider_requires_exact_name_or_hyphenated_suffix(
+    provider, expected
+):
+    """Anchored to a "-" separator, not a bare prefix: oauth_providers.name
+    is admin-settable via POST/PUT /admin/mcp/providers, so a bare
+    startswith("salesforce") would also match an unrelated custom provider
+    an admin happened to name e.g. "salesforcelite" -- silently routing it
+    through PKCE and the instance_url-required guard it has no reason to
+    satisfy."""
+    assert _is_salesforce_provider(provider) is expected
 
 
 def test_salesforce_sandbox_provider_includes_pkce_code_challenge(db_session):

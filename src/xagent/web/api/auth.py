@@ -1365,55 +1365,69 @@ async def update_current_user_preferences(
     its own fields - a merge, not a replace, so an earlier step's answer
     survives a later step's PATCH."""
     updates = request.model_dump(exclude_unset=True)
-    if updates:
+    if not updates:
+        return UpdatePreferencesResponse(
+            success=True,
+            message="Preferences updated successfully",
+            user=serialize_auth_user(user),
+        )
 
-        def _merge_preferences_sync() -> bool:
-            """The lock wait this is built around is a real, potentially
-            slow blocking DB call under contention - run the whole
-            lock -> refresh -> merge -> commit transaction in a worker
-            thread so it never blocks the event loop for unrelated
-            requests/WebSockets on this worker, matching this file's own
-            asyncio.to_thread convention for synchronous DB work (see
-            login's _update_user_sync). `db`/`user` are only touched here
-            and, sequentially after this awaited call returns, by the
-            caller - never concurrently from two threads at once."""
-            if not _lock_user_row_for_preferences_update(db, int(user.id)):
-                # Deleted concurrently (e.g. account deletion) between
-                # get_current_user loading this row and the lock attempt.
-                return False
-            # Re-read after acquiring the lock: a concurrent PATCH may
-            # have committed its own merge while this request was
-            # waiting on it, and `user` was loaded before that lock was
-            # taken. Once acquired, the lock (FOR UPDATE, or SQLite's
-            # write lock via the no-op update) also rules out a
-            # concurrent deletion for the rest of this transaction, so a
-            # trailing refresh to pick that case up is unnecessary - the
-            # response is serialized from the in-memory `user` object
-            # this same merge already updated.
-            db.refresh(user)
-            current_preferences = _normalized_preferences(user)
-            current_preferences.update(updates)
-            setattr(user, "preferences", current_preferences)
-            db.commit()
-            return True
+    def _merge_preferences_sync() -> tuple[int, Dict[str, Any]] | None:
+        """The lock wait this is built around is a real, potentially
+        slow blocking DB call under contention - run the whole
+        lock -> refresh -> merge -> commit transaction in a worker
+        thread so it never blocks the event loop for unrelated
+        requests/WebSockets on this worker, matching this file's own
+        asyncio.to_thread convention for synchronous DB work (see
+        login's _update_user_sync). `db`/`user` are only touched here
+        and, sequentially after this awaited call returns, by the
+        caller - never concurrently from two threads at once.
 
-        if not await asyncio.to_thread(_merge_preferences_sync):
-            raise HTTPException(status_code=404, detail="User not found")
+        Returns the serialized response payload (not the ORM object):
+        Session.commit() defaults to expire_on_commit=True, so any
+        attribute access on `user` after this function returns would
+        otherwise trigger an implicit reload - a blocking SELECT that
+        would land back on the event loop instead of this thread. Read
+        everything the caller needs here, while still off-loop."""
+        if not _lock_user_row_for_preferences_update(db, int(user.id)):
+            # Deleted concurrently (e.g. account deletion) between
+            # get_current_user loading this row and the lock attempt.
+            return None
+        # Re-read after acquiring the lock: a concurrent PATCH may
+        # have committed its own merge while this request was
+        # waiting on it, and `user` was loaded before that lock was
+        # taken. Once acquired, the lock (FOR UPDATE, or SQLite's
+        # write lock via the no-op update) also rules out a
+        # concurrent deletion for the rest of this transaction, so a
+        # trailing refresh to pick that case up is unnecessary - the
+        # response is serialized from the in-memory `user` object
+        # this same merge already updated.
+        db.refresh(user)
+        current_preferences = _normalized_preferences(user)
+        current_preferences.update(updates)
+        setattr(user, "preferences", current_preferences)
+        db.commit()
+        return int(user.id), serialize_auth_user(user)
 
-        if "voice" in updates:
-            # A cached AgentService bakes voice into its system prompt at
-            # construction time and won't re-check preferences on later
-            # turns (see invalidate_cached_agents_for_owner's docstring),
-            # so an already-warm task would otherwise keep speaking in the
-            # old (or now-cleared) voice until incidental eviction/rebuild.
-            from .chat import get_agent_manager
+    merged = await asyncio.to_thread(_merge_preferences_sync)
+    if merged is None:
+        raise HTTPException(status_code=404, detail="User not found")
+    user_id, serialized_user = merged
 
-            get_agent_manager().invalidate_cached_agents_for_owner(int(user.id))
+    if "voice" in updates:
+        # A cached AgentService bakes voice into its system prompt at
+        # construction time and won't re-check preferences on later
+        # turns (see invalidate_cached_agents_for_owner's docstring),
+        # so an already-warm task would otherwise keep speaking in the
+        # old (or now-cleared) voice until incidental eviction/rebuild.
+        from .chat import get_agent_manager
+
+        get_agent_manager().invalidate_cached_agents_for_owner(user_id)
 
     return UpdatePreferencesResponse(
         success=True,
         message="Preferences updated successfully",
-        user=serialize_auth_user(user),
+        user=serialized_user,
     )
 
 

@@ -2,13 +2,14 @@
 
 import os
 import tempfile
+import threading
 from unittest.mock import MagicMock
 from urllib.parse import parse_qs, urlparse
 
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, event
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import sessionmaker
 
@@ -574,6 +575,60 @@ class TestAuthAPI:
             "/api/auth/me/preferences", json={"voice": "warm"}, headers=headers
         )
         assert response.status_code == 404, response.text
+
+    @pytest.mark.asyncio
+    async def test_update_current_user_preferences_keeps_all_sql_off_the_event_loop(
+        self, test_db, test_user_data
+    ):
+        """The row lock this endpoint takes is a real, potentially slow
+        blocking wait under contention - the whole reason its transaction
+        runs inside asyncio.to_thread. That protection is easy to
+        half-lose: Session.commit() defaults to expire_on_commit=True, so
+        any attribute access on `user` after the awaited call returns
+        (e.g. building the response, or reading user.id for cache
+        invalidation) would otherwise trigger an implicit reload - a
+        blocking SELECT landing back on the event loop instead of the
+        worker thread. This asserts no SQL for the request executes on
+        the calling (event-loop) thread at all, not just that the
+        response content is correct."""
+        setup_first_admin()
+        register_response = client.post("/api/auth/register", json=test_user_data)
+        assert register_response.status_code == 200
+
+        db = TestingSessionLocal()
+        try:
+            user = (
+                db.query(User).filter(User.username == test_user_data["username"]).one()
+            )
+
+            event_loop_thread_id = threading.get_ident()
+            executed_thread_ids: list[int] = []
+
+            def _record_thread(*_args: object, **_kwargs: object) -> None:
+                executed_thread_ids.append(threading.get_ident())
+
+            event.listen(engine, "before_cursor_execute", _record_thread)
+            try:
+                response = await auth_api.update_current_user_preferences(
+                    request=auth_api.UpdatePreferencesRequest(voice="warm"),
+                    db=db,
+                    user=user,
+                )
+            finally:
+                event.remove(engine, "before_cursor_execute", _record_thread)
+        finally:
+            db.close()
+
+        assert response.success is True
+        assert response.user is not None
+        assert response.user["preferences"]["voice"] == "warm"
+        assert executed_thread_ids, "expected the merge to issue at least one query"
+        assert event_loop_thread_id not in executed_thread_ids, (
+            "a query ran on the event-loop thread instead of the "
+            "asyncio.to_thread worker - the lock/refresh/merge/commit "
+            "transaction (or the post-commit reload expire_on_commit "
+            "forces) leaked back onto the event loop"
+        )
 
     def test_update_current_user_email(self, test_db, test_user_data):
         setup_first_admin()

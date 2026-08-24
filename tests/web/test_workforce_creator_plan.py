@@ -344,15 +344,10 @@ async def test_react_builder_creates_multiple_agents_before_workforce() -> None:
     }
 
 
-@pytest.mark.asyncio
-async def test_build_workforce_prompt_plan_applies_voice_to_system_prompt(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """builder_response is a free-text assistant reply persisted into the
-    Workforce's conversation - the same "every agent this user talks to"
-    voice policy that Builder chat and task chat already apply must reach
-    this runtime's own AgentService too."""
-    captured_kwargs: dict[str, Any] = {}
+def _recording_agent_service_class(captured_kwargs: dict[str, Any]) -> type:
+    """A fake AgentService that records its constructor kwargs and reports
+    a bare completion with no finalized Workforce - used by the two voice
+    tests below, which only need the constructor call to have happened."""
 
     class RecordingAgentService:
         def __init__(self, **kwargs: Any) -> None:
@@ -364,7 +359,23 @@ async def test_build_workforce_prompt_plan_applies_voice_to_system_prompt(
         async def execute_task(self, *_args: Any, **_kwargs: Any) -> dict[str, Any]:
             return {"success": True, "completion_outcome": "completed"}
 
-    monkeypatch.setattr(workforce_prompt_runtime, "AgentService", RecordingAgentService)
+    return RecordingAgentService
+
+
+@pytest.mark.asyncio
+async def test_build_workforce_prompt_plan_applies_voice_to_system_prompt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """builder_response is a free-text assistant reply persisted into the
+    Workforce's conversation - the same "every agent this user talks to"
+    voice policy that Builder chat and task chat already apply must reach
+    this runtime's own AgentService too."""
+    captured_kwargs: dict[str, Any] = {}
+    monkeypatch.setattr(
+        workforce_prompt_runtime,
+        "AgentService",
+        _recording_agent_service_class(captured_kwargs),
+    )
     monkeypatch.setattr(
         workforce_prompt_runtime,
         "extract_assistant_message",
@@ -394,18 +405,11 @@ async def test_build_workforce_prompt_plan_without_voice_leaves_prompt_unchanged
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     captured_kwargs: dict[str, Any] = {}
-
-    class RecordingAgentService:
-        def __init__(self, **kwargs: Any) -> None:
-            captured_kwargs.update(kwargs)
-
-        def set_allowed_skills(self, _allowed_skills: list[str]) -> None:
-            pass
-
-        async def execute_task(self, *_args: Any, **_kwargs: Any) -> dict[str, Any]:
-            return {"success": True, "completion_outcome": "completed"}
-
-    monkeypatch.setattr(workforce_prompt_runtime, "AgentService", RecordingAgentService)
+    monkeypatch.setattr(
+        workforce_prompt_runtime,
+        "AgentService",
+        _recording_agent_service_class(captured_kwargs),
+    )
 
     with pytest.raises(WorkforcePromptBuilderError):
         await build_workforce_prompt_plan(
@@ -599,6 +603,53 @@ async def test_generation_releases_database_before_react_runtime(
     assert result == {"name": "Research Workforce"}
     assert events == ["release", "runtime"]
     assert catalog_limits == [MAX_WORKFORCE_BUILDER_EXISTING_AGENTS]
+
+
+@pytest.mark.asyncio
+async def test_generation_resolves_voice_from_the_user_row(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """generate_workforce_creation_plan must resolve voice from the live
+    `user` row and thread it into build_workforce_prompt_plan - this is
+    the actual wiring under test in G11 (the two build_workforce_prompt_plan
+    tests above only exercise that function directly with an explicit
+    voice= kwarg, not this caller's own resolution step)."""
+    llm = FakeLLM([])
+    captured_voice: list[str | None] = []
+
+    class ModelStorage:
+        def __init__(self, _db: object) -> None:
+            pass
+
+        def get_configured_defaults(self, _user_id: int | None) -> tuple[Any, ...]:
+            return (llm, None, None, None)
+
+    async def fake_build_workforce_prompt_plan(**kwargs: Any) -> dict[str, Any]:
+        captured_voice.append(kwargs["voice"])
+        return {"name": "Research Workforce"}
+
+    monkeypatch.setattr(workforce_creator, "UserAwareModelStorage", ModelStorage)
+    monkeypatch.setattr(
+        workforce_creator,
+        "list_accessible_published_agents",
+        lambda _db, _user, **_kwargs: [],
+    )
+    monkeypatch.setattr(
+        workforce_creator, "release_db_connection_if_clean", lambda _db: True
+    )
+    monkeypatch.setattr(
+        workforce_creator,
+        "build_workforce_prompt_plan",
+        fake_build_workforce_prompt_plan,
+    )
+
+    await generate_workforce_creation_plan(
+        object(),
+        SimpleNamespace(id=7, preferences={"voice": "warm"}),
+        "Create a research Workforce.",
+    )
+
+    assert captured_voice == ["warm"]
 
 
 @pytest.mark.asyncio

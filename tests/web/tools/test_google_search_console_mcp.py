@@ -205,6 +205,23 @@ def test_list_sites_handles_no_sites(monkeypatch):
     assert result["sites"] == []
 
 
+def test_list_sites_treats_non_list_site_entry_field_as_empty(monkeypatch, caplog):
+    """A malformed API response where "siteEntry" isn't a list (e.g. a dict
+    or string) must not silently iterate its characters/keys; it degrades to
+    an empty list and logs the anomaly."""
+    mock_request = Mock(
+        return_value=MockResponse(json_data={"siteEntry": "not-a-list"})
+    )
+    monkeypatch.setattr(google_search_console.requests, "request", mock_request)
+
+    with caplog.at_level("WARNING", logger=google_search_console.logger.name):
+        result = json.loads(google_search_console.google_search_console_list_sites())
+
+    assert result["status"] == "success"
+    assert result["sites"] == []
+    assert "non-list 'siteEntry'" in caplog.text
+
+
 def test_list_sites_returns_error_payload_on_failure(monkeypatch):
     monkeypatch.setattr(
         google_search_console.requests,
@@ -621,6 +638,27 @@ def test_inspect_url_returns_inspection_result(monkeypatch):
     assert body["siteUrl"] == "https://example.com/"
     assert body["languageCode"] == "en-US"
     assert mock_request.call_args.kwargs["url"].endswith("/urlInspection/index:inspect")
+
+
+def test_inspect_url_treats_non_dict_inspection_result_as_empty(monkeypatch, caplog):
+    """A malformed API response where "inspectionResult" isn't a dict must
+    not be passed through as-is; it degrades to an empty dict and logs the
+    anomaly."""
+    mock_request = Mock(
+        return_value=MockResponse(json_data={"inspectionResult": "not-a-dict"})
+    )
+    monkeypatch.setattr(google_search_console.requests, "request", mock_request)
+
+    with caplog.at_level("WARNING", logger=google_search_console.logger.name):
+        result = json.loads(
+            google_search_console.google_search_console_inspect_url(
+                "https://example.com/", "https://example.com/page"
+            )
+        )
+
+    assert result["status"] == "success"
+    assert result["inspection_result"] == {}
+    assert "non-dict 'inspectionResult'" in caplog.text
 
 
 def test_inspect_url_rejects_empty_inspection_url(monkeypatch):

@@ -156,12 +156,21 @@ def google_search_console_list_sites() -> str:
         result = _require_dict_result(
             _request("GET", f"{WEBMASTERS_API_BASE_URL}/sites")
         )
+        site_entries = result.get("siteEntry")
+        if not isinstance(site_entries, list):
+            if site_entries is not None:
+                logger.warning(
+                    f"Google Search Console list_sites returned a non-list "
+                    f"'siteEntry' field ({type(site_entries).__name__}); "
+                    f"treating as empty"
+                )
+            site_entries = []
         sites = [
             {
                 "site_url": entry.get("siteUrl"),
                 "permission_level": entry.get("permissionLevel"),
             }
-            for entry in (result.get("siteEntry") or [])
+            for entry in site_entries
             if isinstance(entry, dict) and entry.get("siteUrl")
         ]
         return _success(sites=sites)
@@ -329,7 +338,16 @@ def google_search_console_inspect_url(
                 body=body,
             )
         )
-        return _success(inspection_result=result.get("inspectionResult") or {})
+        inspection_result = result.get("inspectionResult")
+        if not isinstance(inspection_result, dict):
+            if inspection_result is not None:
+                logger.warning(
+                    f"Google Search Console inspect_url returned a non-dict "
+                    f"'inspectionResult' field "
+                    f"({type(inspection_result).__name__}); treating as empty"
+                )
+            inspection_result = {}
+        return _success(inspection_result=inspection_result)
     except Exception as e:
         logger.error(f"Error inspecting URL {inspection_url!r}: {e}")
         return _error(str(e))

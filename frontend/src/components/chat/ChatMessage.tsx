@@ -450,6 +450,29 @@ export function ChatMessage({
     showEmptyStatus === false &&
     (showProcessView || !isStoppedWithoutAnswer);
 
+  // A connect_apps-only pause's bubble text comes from UnavailableMCPTool's
+  // hardcoded English message (see _run_unavailable) - the backend has no
+  // locale-awareness to draw on there, so re-render it from live i18n data
+  // instead, the same way ClarificationForm already re-resolves this
+  // interaction type's label instead of trusting the persisted one.
+  const connectAppsOnlyApps =
+    !isUser && interactions && interactions.length > 0 &&
+    interactions.every((interaction) => interaction?.type === "connect_apps")
+      ? Array.from(
+          new Set(
+            interactions.flatMap((interaction) =>
+              Array.isArray(interaction.apps) ? interaction.apps : []
+            )
+          )
+        )
+      : null;
+  const displayContent =
+    connectAppsOnlyApps && connectAppsOnlyApps.length > 0
+      ? t("chatPage.clarification.connectApps.needAccess", {
+          apps: connectAppsOnlyApps.join(", "),
+        })
+      : content;
+
   // The trace carries the backend's raw error string (a Python exception, more
   // often than not). With the trace hidden the failure line must not become its
   // replacement channel, so only mine the events when the process view is on.
@@ -479,7 +502,7 @@ export function ChatMessage({
   const isAssistantFailure = !isUser && resolvedProcessStatus === "failed";
   const copyableContent = isAssistantFailure
     ? failedMessageText
-    : typeof content === "string" ? content : rawContent;
+    : typeof displayContent === "string" ? displayContent : rawContent;
   const displayCopyableContent = filesDisabled && copyableContent
     ? serializeFilesDisabledPresentation(copyableContent)
     : copyableContent;
@@ -540,16 +563,16 @@ export function ChatMessage({
                 <div className="py-3 text-sm leading-relaxed text-red-500 break-words [overflow-wrap:anywhere]">
                   {displayCopyableContent}
                 </div>
-              ) : content ? (
-                typeof content === "string" ? (
+              ) : displayContent ? (
+                typeof displayContent === "string" ? (
                   isUser ? (
                     <ExpandableMessage
-                      content={content}
+                      content={displayContent}
                       filesDisabled={filesDisabled}
                     />
                   ) : (
                     <MarkdownRenderer
-                      content={content}
+                      content={displayContent}
                       className="prose-sm pt-2 leading-relaxed break-words [overflow-wrap:anywhere]"
                       filesDisabled={filesDisabled}
                       onAgentClick={handleAgentClick}
@@ -557,7 +580,7 @@ export function ChatMessage({
                     />
                   )
                 ) : (
-                  <div className="text-sm leading-relaxed break-words [overflow-wrap:anywhere]">{content}</div>
+                  <div className="text-sm leading-relaxed break-words [overflow-wrap:anywhere]">{displayContent}</div>
                 )
               ) : (
                 // A past paused/waiting turn has showEmptyStatus=false, but with

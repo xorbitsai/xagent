@@ -351,6 +351,7 @@ const zh = {
         connecting: "连接中…",
         skip: "我稍后再连接",
         continue: "继续",
+        needAccess: "我需要访问 {apps} 才能继续，请在下方连接后告诉我。",
         connectFailed: "连接 {provider} 失败，请重试。",
         popupBlocked: "弹窗被拦截了——请允许本站弹窗以完成连接。",
         privacyNote: "{appName} 不会看到你的密码。",

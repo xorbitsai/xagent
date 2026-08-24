@@ -156,6 +156,41 @@ describe("ChatMessage Session file capability", () => {
     )
   })
 
+  it("replaces the raw backend pause text with a localized message when every interaction is connect_apps", () => {
+    render(
+      <ChatMessage
+        role="assistant"
+        content="I need access to Gmail to continue. Please connect it below, then let me know once you have."
+        interactions={[{ type: "connect_apps", field: "connect_apps", apps: ["Gmail"] }]}
+      />,
+    )
+
+    expect(
+      screen.getByText("chatPage.clarification.connectApps.needAccess"),
+    ).toBeInTheDocument()
+    expect(
+      screen.queryByText(/I need access to Gmail to continue\. Please connect/),
+    ).not.toBeInTheDocument()
+  })
+
+  it("keeps the raw backend content when the interaction list mixes connect_apps with another type", () => {
+    render(
+      <ChatMessage
+        role="assistant"
+        content="Which app should I use?"
+        interactions={[
+          { type: "connect_apps", field: "connect_apps", apps: ["Gmail"] },
+          { type: "select", field: "app_choice", label: "App" },
+        ]}
+      />,
+    )
+
+    expect(screen.getByText("Which app should I use?")).toBeInTheDocument()
+    expect(
+      screen.queryByText("chatPage.clarification.connectApps.needAccess"),
+    ).not.toBeInTheDocument()
+  })
+
   it("renders Computer use context on a user message", () => {
     render(
       <ChatMessage

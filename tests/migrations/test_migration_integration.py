@@ -483,11 +483,14 @@ class TestMigrations:
 
     def test_sqlite_owner_downgrade_preserves_stripe_head(self, sqlite_tester):
         """Rollback removes owner storage without removing the Stripe seed."""
-        owner_revision = "20260818_user_oauth_resource_owner"
         stripe_revision = "20260818_seed_stripe_mcp_app"
         script_dir = ScriptDirectory.from_config(sqlite_tester.alembic_cfg)
 
-        assert script_dir.get_heads() == [owner_revision]
+        # A single unambiguous head is what makes "head" below resolve
+        # deterministically; the exact revision id is expected to change as
+        # later migrations are added and isn't itself part of this test's
+        # invariant.
+        assert len(script_dir.get_heads()) == 1
 
         sqlite_tester.create_metadata_owned_users_table()
         command.upgrade(sqlite_tester.alembic_cfg, "head")

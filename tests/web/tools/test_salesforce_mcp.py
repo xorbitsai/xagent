@@ -488,6 +488,52 @@ def test_capped_list_drops_message_when_it_alone_exceeds_the_limit(monkeypatch):
     assert "message" not in result
 
 
+def test_capped_page_next_offset_is_unchanged_when_a_single_item_is_too_big(
+    monkeypatch,
+):
+    # A single oversized item halves down to nothing -- next_offset must
+    # stay at the caller's own offset (not silently skip past the item
+    # that didn't fit), so the caller knows to retry with a smaller limit
+    # rather than a bigger offset that would skip it entirely. The message
+    # explaining that is itself smaller than this 400-char item but bigger
+    # than a 260-char limit's room with total_count still included, so
+    # this also exercises the "total_count dropped, message kept"
+    # fallback tier.
+    monkeypatch.setattr(salesforce, "get_tool_max_output_length", lambda: 260)
+
+    raw = salesforce._success_with_capped_page(
+        "fields", [{"name": "x" * 400}], offset=10, total_count=20
+    )
+    result = json.loads(raw)
+
+    assert len(raw) <= 260
+    assert result["fields"] == []
+    assert result["has_more"] is True
+    assert result["next_offset"] == 10
+    assert "total_count" not in result
+    assert "retry with a smaller limit" in result["message"]
+
+
+def test_capped_page_drops_message_when_it_alone_exceeds_the_limit(monkeypatch):
+    # Below the bare envelope's own floor (status/list_field/offset/
+    # has_more/next_offset, none of which can be dropped without breaking
+    # the pagination contract itself), even the explanatory message must
+    # go -- the response still can't be made to comply, but it must not
+    # get bigger than necessary while failing to.
+    monkeypatch.setattr(salesforce, "get_tool_max_output_length", lambda: 60)
+
+    raw = salesforce._success_with_capped_page(
+        "fields", [{"name": "x" * 400}], offset=10, total_count=20
+    )
+    result = json.loads(raw)
+
+    assert result["fields"] == []
+    assert result["has_more"] is True
+    assert result["next_offset"] == 10
+    assert "total_count" not in result
+    assert "message" not in result
+
+
 def test_search_sends_sosl_as_query_param(monkeypatch):
     mock_request = Mock(
         return_value=MockResponse(
@@ -555,6 +601,92 @@ def test_list_sobjects_returns_summaries(monkeypatch):
 
     assert result["status"] == "success"
     assert result["sobjects"][0]["name"] == "Account"
+    assert result["has_more"] is False
+    assert result["total_count"] == 1
+    assert "next_offset" not in result
+
+
+def test_list_sobjects_pages_through_offset_and_limit(monkeypatch):
+    monkeypatch.setattr(
+        salesforce.requests,
+        "request",
+        Mock(
+            return_value=MockResponse(
+                json_data={"sobjects": [{"name": f"Object{i}__c"} for i in range(5)]}
+            )
+        ),
+    )
+
+    first_page = json.loads(salesforce.salesforce_list_sobjects(limit=2))
+    assert [s["name"] for s in first_page["sobjects"]] == [
+        "Object0__c",
+        "Object1__c",
+    ]
+    assert first_page["has_more"] is True
+    assert first_page["next_offset"] == 2
+    assert first_page["total_count"] == 5
+
+    second_page = json.loads(
+        salesforce.salesforce_list_sobjects(offset=first_page["next_offset"], limit=2)
+    )
+    assert [s["name"] for s in second_page["sobjects"]] == [
+        "Object2__c",
+        "Object3__c",
+    ]
+    assert second_page["has_more"] is True
+    assert second_page["next_offset"] == 4
+
+    last_page = json.loads(
+        salesforce.salesforce_list_sobjects(offset=second_page["next_offset"], limit=2)
+    )
+    assert [s["name"] for s in last_page["sobjects"]] == ["Object4__c"]
+    assert last_page["has_more"] is False
+    assert "next_offset" not in last_page
+
+
+def test_list_sobjects_clamps_non_positive_limit_instead_of_looping_forever(
+    monkeypatch,
+):
+    # limit=0 (or negative) always slices to an empty page regardless of
+    # offset, which would make next_offset equal the caller's own offset
+    # forever -- a stuck pagination loop indistinguishable from the
+    # single-oversized-item case, but caused by a plain bad input instead.
+    monkeypatch.setattr(
+        salesforce.requests,
+        "request",
+        Mock(
+            return_value=MockResponse(
+                json_data={"sobjects": [{"name": f"Object{i}__c"} for i in range(5)]}
+            )
+        ),
+    )
+
+    result = json.loads(salesforce.salesforce_list_sobjects(limit=0))
+
+    assert len(result["sobjects"]) >= 1
+    assert result["sobjects"][0]["name"] == "Object0__c"
+
+
+def test_list_sobjects_clamps_negative_offset_instead_of_wrapping_from_the_end(
+    monkeypatch,
+):
+    # Python slicing treats a negative start as "count from the end" --
+    # unclamped, offset=-2 against a 5-item list would return the *last*
+    # two items instead of being treated as the first page.
+    monkeypatch.setattr(
+        salesforce.requests,
+        "request",
+        Mock(
+            return_value=MockResponse(
+                json_data={"sobjects": [{"name": f"Object{i}__c"} for i in range(5)]}
+            )
+        ),
+    )
+
+    result = json.loads(salesforce.salesforce_list_sobjects(offset=-2, limit=2))
+
+    assert [s["name"] for s in result["sobjects"]] == ["Object0__c", "Object1__c"]
+    assert result["offset"] == 0
 
 
 def test_list_sobjects_filters_by_name_contains(monkeypatch):
@@ -619,9 +751,114 @@ def test_list_sobjects_caps_output_size(monkeypatch):
 
     assert len(raw) <= 2000
     assert result["status"] == "success"
-    assert result["truncated"] is True
+    assert result["has_more"] is True
     assert len(result["sobjects"]) < len(big_sobjects)
-    assert "cannot be recovered" in result["message"]
+    assert result["total_count"] == len(big_sobjects)
+    # next_offset must reflect how many items actually made it into this
+    # response, not the requested page size -- that's what makes every
+    # dropped item recoverable via a follow-up call, unlike
+    # _success_with_capped_list's "cannot be recovered" contract.
+    assert result["next_offset"] == len(result["sobjects"])
+
+
+def test_describe_sobject_pages_through_offset_and_limit(monkeypatch):
+    monkeypatch.setattr(
+        salesforce.requests,
+        "request",
+        Mock(
+            return_value=MockResponse(
+                json_data={
+                    "name": "Account",
+                    "fields": [{"name": f"Field{i}__c"} for i in range(5)],
+                }
+            )
+        ),
+    )
+
+    first_page = json.loads(salesforce.salesforce_describe_sobject("Account", limit=2))
+    assert [f["name"] for f in first_page["fields"]] == ["Field0__c", "Field1__c"]
+    assert first_page["has_more"] is True
+    assert first_page["next_offset"] == 2
+    assert first_page["total_count"] == 5
+
+    last_page = json.loads(
+        salesforce.salesforce_describe_sobject("Account", offset=4, limit=2)
+    )
+    assert [f["name"] for f in last_page["fields"]] == ["Field4__c"]
+    assert last_page["has_more"] is False
+    assert "next_offset" not in last_page
+
+
+def test_describe_sobject_names_only_pages_through_offset_and_limit(monkeypatch):
+    monkeypatch.setattr(
+        salesforce.requests,
+        "request",
+        Mock(
+            return_value=MockResponse(
+                json_data={
+                    "name": "Account",
+                    "fields": [{"name": f"Field{i}__c"} for i in range(5)],
+                }
+            )
+        ),
+    )
+
+    first_page = json.loads(
+        salesforce.salesforce_describe_sobject("Account", names_only=True, limit=2)
+    )
+    assert first_page["fields"] == ["Field0__c", "Field1__c"]
+    assert first_page["has_more"] is True
+    assert first_page["next_offset"] == 2
+
+
+def test_describe_sobject_clamps_non_positive_limit_instead_of_looping_forever(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        salesforce.requests,
+        "request",
+        Mock(
+            return_value=MockResponse(
+                json_data={
+                    "name": "Account",
+                    "fields": [{"name": f"Field{i}__c"} for i in range(5)],
+                }
+            )
+        ),
+    )
+
+    result = json.loads(
+        salesforce.salesforce_describe_sobject("Account", names_only=True, limit=-1)
+    )
+
+    assert len(result["fields"]) >= 1
+    assert result["fields"][0] == "Field0__c"
+
+
+def test_describe_sobject_clamps_negative_offset_instead_of_wrapping_from_the_end(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        salesforce.requests,
+        "request",
+        Mock(
+            return_value=MockResponse(
+                json_data={
+                    "name": "Account",
+                    "fields": [{"name": f"Field{i}__c"} for i in range(5)],
+                }
+            )
+        ),
+    )
+
+    result = json.loads(
+        salesforce.salesforce_describe_sobject(
+            "Account", names_only=True, offset=-3, limit=2
+        )
+    )
+
+    assert result["fields"] == ["Field0__c", "Field1__c"]
+    assert result["offset"] == 0
 
 
 def test_describe_sobject_extracts_picklist_values(monkeypatch):
@@ -773,9 +1010,10 @@ def test_describe_sobject_caps_output_size(monkeypatch):
 
     assert len(raw) <= 2000
     assert result["status"] == "success"
-    assert result["truncated"] is True
+    assert result["has_more"] is True
     assert len(result["fields"]) < len(big_fields)
-    assert "cannot be recovered" in result["message"]
+    assert result["total_count"] == len(big_fields)
+    assert result["next_offset"] == len(result["fields"])
 
 
 def test_get_record_sends_fields_param_when_provided(monkeypatch):

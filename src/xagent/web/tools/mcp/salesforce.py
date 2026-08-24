@@ -8,7 +8,13 @@ import requests
 from mcp.server.fastmcp import FastMCP
 
 from ....config import get_tool_max_output_length
-from .utils import setup_proxy_env, success_with_capped_dict, url_path_id
+from .utils import (
+    clamp_limit,
+    clamp_offset,
+    setup_proxy_env,
+    success_with_capped_dict,
+    url_path_id,
+)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("salesforce-mcp")
@@ -33,6 +39,21 @@ DEFAULT_TIMEOUT_SECONDS = 30
 # expected shape (e.g. an HTML gateway error page) must not be forwarded to
 # the LLM/logs verbatim and unbounded.
 MAX_ERROR_RESPONSE_TEXT_CHARS = 1000
+# Default and max page size for salesforce_list_sobjects/
+# salesforce_describe_sobject's offset/limit pagination -- neither endpoint
+# supports server-side paging, so this is a client-side window over the full
+# list/describe response. DEFAULT_PAGE_LIMIT is sized to comfortably fit a
+# page of salesforce_list_sobjects' small, fixed-shape summaries under the
+# default output limit without needing _success_with_capped_page's halving
+# fallback -- salesforce_describe_sobject's per-field metadata (unbounded
+# picklist_values in particular) can still be large enough per item to hit
+# that fallback at this same default, which is fine: the fallback exists
+# for exactly that case. MAX_PAGE_LIMIT bounds how large a page a caller can
+# request in one call -- matches posthog.py's MAX_LIMIT convention for the
+# same reason: an unbounded limit would let one call demand the entire
+# result set back, defeating the point of paging at all.
+DEFAULT_PAGE_LIMIT = 50
+MAX_PAGE_LIMIT = 200
 
 
 def _success(**payload: Any) -> str:
@@ -45,24 +66,26 @@ def _success_with_capped_list(
     """Build a success payload, halving ``items`` until the response fits
     the platform's output limit.
 
-    A SOQL result page, search hit list, sobject list, or field/picklist
-    describe can each serialize past the output filter's fixed character
-    threshold and get hard-truncated into broken JSON -- the same failure
-    mode hubspot.py's _paged_list/_success_with_capped_dict exist to avoid.
-    Halving (rather than a fixed slice) adapts to whatever size a given
-    org's records/schema happen to have, and continues down to zero items:
-    a single oversized item must still be capped, not returned whole
-    because there's nothing left to halve away from it. ``truncated`` seeds
-    from any upstream-reported truncation (e.g. Salesforce's own SOQL
-    ``done`` flag) and is OR'd with whatever local capping adds.
+    A SOQL result page or search hit list can each serialize past the
+    output filter's fixed character threshold and get hard-truncated into
+    broken JSON -- the same failure mode hubspot.py's
+    _paged_list/_success_with_capped_dict exist to avoid. Halving (rather
+    than a fixed slice) adapts to whatever size a given org's records
+    happen to have, and continues down to zero items: a single oversized
+    item must still be capped, not returned whole because there's nothing
+    left to halve away from it. ``truncated`` seeds from any
+    upstream-reported truncation (e.g. Salesforce's own SOQL ``done``
+    flag) and is OR'd with whatever local capping adds.
 
-    None of the four tools calling this expose a cursor/offset the caller
-    could retry with to recover items this halving drops (unlike Salesforce
-    query's own separate, still-unimplemented nextRecordsUrl pagination,
-    tracked in #1541) -- items dropped here are gone for this call, not
-    just this page. When halving actually ran, the message says so plainly
-    instead of leaving a bare ``truncated: true`` to imply a retry would
-    help.
+    Only salesforce_query/salesforce_search call this now, and neither
+    exposes a cursor/offset the caller could retry with to recover items
+    this halving drops (unlike Salesforce query's own separate,
+    still-unimplemented nextRecordsUrl pagination, tracked in #1541) --
+    items dropped here are gone for this call, not just this page. When
+    halving actually ran, the message says so plainly instead of leaving a
+    bare ``truncated: true`` to imply a retry would help.
+    salesforce_list_sobjects/salesforce_describe_sobject use
+    _success_with_capped_page below instead, which does expose one.
     """
 
     def _build(items: list[Any], truncated: bool, halved: bool) -> str:
@@ -98,6 +121,80 @@ def _success_with_capped_list(
         # than return a payload that violates the caller's own size
         # contract.
         response = _build(items, truncated, False)
+    return response
+
+
+def _success_with_capped_page(
+    list_field: str, page: list[Any], *, offset: int, total_count: int, **extra: Any
+) -> str:
+    """Build a paginated success payload for an already-sliced ``page``,
+    halving it further only as a last resort if it still doesn't fit the
+    platform's output limit.
+
+    Unlike _success_with_capped_list, nothing returned by this function is
+    ever unrecoverable: ``next_offset`` always reflects how many items
+    actually made it into the response, not how many the caller's
+    offset/limit window requested. So whether the caller simply hasn't
+    reached the end of the result yet, or this call's own halving had to
+    shrink the page further to fit the output limit, the same
+    has_more/next_offset pair tells it exactly where to resume -- there is
+    no separate "cannot be recovered" case to report.
+
+    One edge case still needs a smaller ``limit``, not a bigger ``offset``:
+    if a single item is itself too large to fit (e.g. one field with an
+    enormous picklist), halving can empty ``returned`` entirely, and
+    ``next_offset`` then equals the same ``offset`` the caller just
+    passed in. Retrying with that unchanged offset only reproduces the
+    same result -- the caller must lower ``limit`` instead so this
+    function has more than one oversized item's worth of room to shrink
+    within. When that happens, an explicit ``message`` says so plainly,
+    the same reasoning _success_with_capped_list applies to its own
+    halved-to-empty case.
+
+    If even an empty page's fixed envelope (offset/has_more/next_offset/
+    **extra, all load-bearing for the pagination contract, so none of
+    them can be dropped the way a message can) still doesn't fit,
+    ``total_count`` -- informational only, not required for the caller to
+    make progress -- is dropped as a last resort, then the explanatory
+    ``message`` itself if the envelope still doesn't fit without it.
+    """
+
+    def _build(
+        returned: list[Any],
+        *,
+        include_total_count: bool = True,
+        include_message: bool = True,
+    ) -> str:
+        next_offset = offset + len(returned)
+        has_more = next_offset < total_count
+        payload: dict[str, Any] = {
+            list_field: returned,
+            "offset": offset,
+            "has_more": has_more,
+            **extra,
+        }
+        if include_total_count:
+            payload["total_count"] = total_count
+        if has_more:
+            payload["next_offset"] = next_offset
+        if include_message and has_more and not returned:
+            payload["message"] = (
+                f"A single {list_field} item did not fit the output size "
+                f"limit on its own; retry with a smaller limit at the same "
+                f"offset ({offset}) rather than following next_offset."
+            )
+        return _success(**payload)
+
+    max_output_length = get_tool_max_output_length()
+    returned = page
+    response = _build(returned)
+    while len(response) > max_output_length and returned:
+        returned = returned[: len(returned) // 2]
+        response = _build(returned)
+    if len(response) > max_output_length:
+        response = _build(returned, include_total_count=False)
+    if len(response) > max_output_length:
+        response = _build(returned, include_total_count=False, include_message=False)
     return response
 
 
@@ -314,22 +411,33 @@ def salesforce_search(sosl: str) -> str:
 
 
 @mcp.tool()
-def salesforce_list_sobjects(name_contains: str = "") -> str:
+def salesforce_list_sobjects(
+    name_contains: str = "",
+    offset: int = 0,
+    limit: int = DEFAULT_PAGE_LIMIT,
+) -> str:
     """
     List the object types (standard, e.g. Account/Contact/Lead/Opportunity/
     Case, and custom, e.g. ending in "__c") this org exposes -- name, label,
     and whether it's queryable/creatable/updateable/deletable. Use the
     returned name with every other tool here.
 
-    An org can expose hundreds of objects, more than fits one response;
-    unlike salesforce_query/salesforce_search (which the model can narrow
-    with SOQL/SOSL), this endpoint has no server-side filter, so a
-    truncated answer here would otherwise have no way to reach the rest.
+    An org can expose hundreds of objects, more than fits one response.
+    name_contains narrows the result before pagination for when you know
+    roughly what you're looking for; offset/limit page through it either
+    way -- check the response's has_more/next_offset to fetch the rest
+    instead of assuming one call returns everything.
+
     name_contains: optional case-insensitive substring to match against
-    each object's name or label (e.g. "invoice"), narrowing the result
-    before it's capped instead of after.
+    each object's name or label (e.g. "invoice").
+    offset: pagination offset into the (optionally filtered) result set;
+    0 for the first page. Clamped to >= 0.
+    limit: maximum objects to return in this call. Clamped to
+    [1, 200].
     """
     try:
+        offset = clamp_offset(offset)
+        limit = clamp_limit(limit, max_limit=MAX_PAGE_LIMIT)
         result = _request("GET", f"/services/data/{API_VERSION}/sobjects")
         needle = name_contains.strip().lower()
         sobjects = [
@@ -347,7 +455,10 @@ def salesforce_list_sobjects(name_contains: str = "") -> str:
             or needle in (s.get("name") or "").lower()
             or needle in (s.get("label") or "").lower()
         ]
-        return _success_with_capped_list("sobjects", sobjects)
+        page = sobjects[offset : offset + limit]
+        return _success_with_capped_page(
+            "sobjects", page, offset=offset, total_count=len(sobjects)
+        )
     except Exception as e:
         logger.error(f"Error listing Salesforce sobjects: {e}")
         return _error(str(e))
@@ -358,6 +469,8 @@ def salesforce_describe_sobject(
     sobject_type: str,
     fields: list[str] | None = None,
     names_only: bool = False,
+    offset: int = 0,
+    limit: int = DEFAULT_PAGE_LIMIT,
 ) -> str:
     """
     Get an object type's field schema -- name, label, type, and whether
@@ -365,24 +478,26 @@ def salesforce_describe_sobject(
     Use this before salesforce_create_record/salesforce_update_record to
     learn which fields exist and what values they accept.
 
-    A custom object can have far more fields than fit one response, with
-    no server-side pagination for this endpoint; unlike a truncated
-    salesforce_query/salesforce_search result (where a narrower SOQL/SOSL
-    retry recovers the rest), a truncated field list here would otherwise
-    have no way to reach the remaining fields. When a describe call comes
-    back truncated, call this again with names_only=True to get the
-    complete (much smaller) list of field names, then again with fields=
-    the specific ones you need full metadata for.
+    A custom object can have far more fields than fit one response.
+    names_only/fields narrow the result for when you know roughly what
+    you're looking for; offset/limit page through it either way -- check
+    the response's has_more/next_offset to fetch the rest instead of
+    assuming one call returns everything.
 
     sobject_type: an object's API name, e.g. "Account" or "My_Object__c".
     fields: optional list of field API names to return full metadata for,
     skipping every other field. Takes precedence over names_only.
     names_only: if true and fields is not given, return just the list of
     field API names (no label/type/picklist metadata) instead of full
-    per-field metadata -- a small, effectively never-truncated response
-    useful for discovering what to ask for next.
+    per-field metadata -- a small, cheap response useful for discovering
+    what to ask for next.
+    offset: pagination offset into the (optionally filtered) field list;
+    0 for the first page. Clamped to >= 0.
+    limit: maximum fields to return in this call. Clamped to [1, 200].
     """
     try:
+        offset = clamp_offset(offset)
+        limit = clamp_limit(limit, max_limit=MAX_PAGE_LIMIT)
         safe_sobject_type = url_path_id(sobject_type, "sobject_type")
         result = _request(
             "GET",
@@ -392,9 +507,12 @@ def salesforce_describe_sobject(
 
         if names_only and not fields:
             field_names = [f.get("name") for f in raw_fields]
-            return _success_with_capped_list(
+            page = field_names[offset : offset + limit]
+            return _success_with_capped_page(
                 "fields",
-                field_names,
+                page,
+                offset=offset,
+                total_count=len(field_names),
                 name=result.get("name"),
                 label=result.get("label"),
             )
@@ -421,9 +539,12 @@ def salesforce_describe_sobject(
             for f in raw_fields
             if wanted is None or f.get("name") in wanted
         ]
-        return _success_with_capped_list(
+        page = described_fields[offset : offset + limit]
+        return _success_with_capped_page(
             "fields",
-            described_fields,
+            page,
+            offset=offset,
+            total_count=len(described_fields),
             name=result.get("name"),
             label=result.get("label"),
         )

@@ -118,6 +118,31 @@ def success_with_capped_dict(field_name: str, data: Any) -> str:
     return response
 
 
+def clamp_limit(limit: int, *, max_limit: int) -> int:
+    """Clamp a caller-supplied pagination page size to ``[1, max_limit]``.
+
+    An LLM caller can pass 0, a negative number, or an absurdly large value
+    for a tool's ``limit`` parameter. Silently clamping (rather than
+    raising) keeps a malformed value from producing a permanently-stuck,
+    zero-progress page -- 0 or a negative limit always slices to an empty
+    page regardless of offset, so a caller mechanically following a
+    pagination contract's own has_more/next_offset would retry forever
+    with no error to signal why.
+    """
+    return max(1, min(int(limit), max_limit))
+
+
+def clamp_offset(offset: int) -> int:
+    """Clamp a caller-supplied pagination offset to ``>= 0``.
+
+    Python slicing treats a negative start index as "count from the end",
+    so an unclamped negative offset would silently return items from the
+    tail of the list instead of erroring or being treated as the first
+    page.
+    """
+    return max(0, int(offset))
+
+
 def resolve_id_from_url(value: str, pattern: re.Pattern[str]) -> str:
     """Return the id captured by ``pattern`` when ``value`` is a matching URL,
     otherwise the stripped value itself."""

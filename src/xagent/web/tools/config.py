@@ -2971,6 +2971,7 @@ class WebToolConfig(BaseToolConfig):
         *,
         server: Any,
         error: _OAuthTokenResolverFailed,
+        app_info: Mapping[str, Any] | None = None,
     ) -> Dict[str, Any]:
         self._mcp_hook_resolution_failed = True
         diagnostic = self._build_oauth_token_resolver_diagnostic(
@@ -2989,6 +2990,7 @@ class WebToolConfig(BaseToolConfig):
             message=UNAVAILABLE_MCP_CREDENTIAL_MESSAGE,
             diagnostic=diagnostic,
             failure_code=error.failure_code,
+            app_info=app_info,
         )
 
     def _build_unavailable_mcp_config(
@@ -2999,6 +3001,7 @@ class WebToolConfig(BaseToolConfig):
         message: str = UNAVAILABLE_MCP_MESSAGE,
         diagnostic: Mapping[str, Any] | None = None,
         failure_code: object = None,
+        app_info: Mapping[str, Any] | None = None,
     ) -> Dict[str, Any]:
         safe_reason = (
             reason
@@ -3016,6 +3019,15 @@ class WebToolConfig(BaseToolConfig):
         normalized_failure_code = normalize_tool_failure_code(failure_code)
         if normalized_failure_code is not None:
             inner_config["failure_code"] = normalized_failure_code
+        # Lets the runtime pause with a `connect_apps` card naming the actual
+        # app (see `UnavailableMCPTool._run_unavailable`) instead of only
+        # ever surfacing a raw error - only populated when the caller already
+        # resolved the catalog app, so an unresolvable server keeps the old
+        # error-only behavior.
+        if app_info is not None:
+            app_name = app_info.get("name")
+            if isinstance(app_name, str) and app_name:
+                inner_config["app_name"] = app_name
         serialized_user_id = self._serialize_mcp_user_id()
         return {
             "name": getattr(server, "name", ""),
@@ -3270,6 +3282,7 @@ class WebToolConfig(BaseToolConfig):
                     return self._resolver_failure_config(
                         server=server,
                         error=error,
+                        app_info=app_info,
                     )
 
             if app_info and hook_token is not None:
@@ -3307,6 +3320,7 @@ class WebToolConfig(BaseToolConfig):
                         reason="oauth_token_refresh_failed",
                         message=UNAVAILABLE_MCP_CREDENTIAL_MESSAGE,
                         failure_code="oauth_token_required",
+                        app_info=app_info,
                     )
                 if legacy_token.access_token is None:
                     logger.info(
@@ -3317,6 +3331,7 @@ class WebToolConfig(BaseToolConfig):
                         reason="oauth_token_required",
                         message=UNAVAILABLE_MCP_CREDENTIAL_MESSAGE,
                         failure_code="oauth_token_required",
+                        app_info=app_info,
                     )
                 logger.info("OAUTH CONFIG: Mapping '%s' to executable proxy", app_id)
                 try:
@@ -3396,6 +3411,7 @@ class WebToolConfig(BaseToolConfig):
                         return self._resolver_failure_config(
                             server=server,
                             error=error,
+                            app_info=app_info,
                         )
 
             if remote_hook_token is not None and resolver is not None:

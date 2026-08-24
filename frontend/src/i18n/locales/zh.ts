@@ -350,6 +350,7 @@ const zh = {
         connected: "已连接",
         connecting: "连接中…",
         skip: "我稍后再连接",
+        continue: "继续",
         connectFailed: "连接 {provider} 失败，请重试。",
         popupBlocked: "弹窗被拦截了——请允许本站弹窗以完成连接。",
         privacyNote: "{appName} 不会看到你的密码。",

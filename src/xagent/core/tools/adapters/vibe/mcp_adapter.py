@@ -1071,6 +1071,7 @@ class UnavailableMCPTool(AbstractBaseTool):
         failure_code: str | None = None,
         reason: str | None = None,
         message: str = _DEFAULT_UNAVAILABLE_MCP_MESSAGE,
+        app_name: str | None = None,
     ) -> None:
         from ....agent.result import normalize_tool_failure_code
         from .base import ToolCategory
@@ -1082,6 +1083,12 @@ class UnavailableMCPTool(AbstractBaseTool):
         self._failure_code = normalize_tool_failure_code(failure_code)
         self._reason = reason
         self._message = message
+        # The catalog app's own display name, when resolvable (see
+        # `_build_unavailable_mcp_config`'s `app_info` threading) - lets an
+        # OAuth-credential failure pause for the user to reconnect (see
+        # `_run_unavailable` below) with a `connect_apps` card naming the
+        # actual app, instead of only ever surfacing a raw error string.
+        self._app_name = app_name
         self._name = _format_unavailable_mcp_tool_name(server_name, server_id)
         self.source_server = normalize_mcp_server_name(server_name)
         self.category = ToolCategory.MCP
@@ -1118,9 +1125,36 @@ class UnavailableMCPTool(AbstractBaseTool):
         return None
 
     def _run_unavailable(self) -> Dict[str, Any]:
+        from ....agent.result import is_oauth_token_required_code
+
         current_user_id = _get_current_mcp_user_id()
         if not _is_mcp_user_allowed(current_user_id, self._allow_users):
             return _mcp_access_denied_result(current_user_id, self.name)
+
+        # An OAuth-credential failure for a catalog app we can name is
+        # actionable by the user right now, in-conversation - pause and ask
+        # them to (re)connect it instead of surfacing a raw error the agent
+        # can only relay. Every other failure (unknown app, non-OAuth
+        # transport issue, etc.) keeps the original error behavior: there is
+        # nothing a `connect_apps` card could offer for those.
+        if self._app_name and is_oauth_token_required_code(self._failure_code):
+            return {
+                "success": False,
+                "status": "waiting_for_user",
+                "message": (
+                    f"I need access to {self._app_name} to continue. "
+                    "Please connect it below, then let me know once you have."
+                ),
+                "interactions": [
+                    {
+                        "type": "connect_apps",
+                        "field": "connect_apps",
+                        "label": "Connect your apps",
+                        "apps": [self._app_name],
+                    }
+                ],
+            }
+
         content_message = self._message
         if self._message == _DEFAULT_UNAVAILABLE_MCP_MESSAGE:
             content_message = (

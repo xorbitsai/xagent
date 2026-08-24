@@ -350,6 +350,7 @@ const en = {
         connected: "Connected",
         connecting: "Connecting…",
         skip: "I'll do this later",
+        continue: "Continue",
         connectFailed: "Couldn't connect {provider}. Please try again.",
         popupBlocked: "Popup blocked — please allow popups for this site to connect.",
         privacyNote: "{appName} never sees your password.",

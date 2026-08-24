@@ -29,6 +29,7 @@ def _unavailable_tool(
     failure_code: str | None = None,
     reason: str | None = None,
     message: str | None = None,
+    app_name: str | None = None,
 ) -> UnavailableMCPTool:
     kwargs: dict[str, Any] = {
         "server_name": server_name,
@@ -40,6 +41,8 @@ def _unavailable_tool(
         kwargs["reason"] = reason
     if message is not None:
         kwargs["message"] = message
+    if app_name is not None:
+        kwargs["app_name"] = app_name
     return UnavailableMCPTool(
         **kwargs,
     )
@@ -51,6 +54,7 @@ def _unavailable_config(
     server_id: int | None = 42,
     allow_users: list[str] | None = None,
     failure_code: object | None = None,
+    app_name: str | None = None,
 ) -> dict:
     config = {
         "name": name,
@@ -66,6 +70,8 @@ def _unavailable_config(
     }
     if failure_code is not None:
         config["config"]["failure_code"] = failure_code
+    if app_name is not None:
+        config["config"]["app_name"] = app_name
     return config
 
 
@@ -139,6 +145,74 @@ async def test_unavailable_tool_authorized_returns_classified_failure(monkeypatc
             }
         ],
     }
+
+
+@pytest.mark.asyncio
+async def test_unavailable_tool_oauth_required_with_app_name_pauses_for_connect_apps(
+    monkeypatch,
+):
+    monkeypatch.setenv("XAGENT_USER_ID", "7")
+    tool = _unavailable_tool(
+        allow_users=["7"],
+        failure_code="oauth_token_required",
+        app_name="Gmail",
+    )
+
+    result = await tool.run_json_async({})
+
+    assert result == {
+        "success": False,
+        "status": "waiting_for_user",
+        "message": (
+            "I need access to Gmail to continue. "
+            "Please connect it below, then let me know once you have."
+        ),
+        "interactions": [
+            {
+                "type": "connect_apps",
+                "field": "connect_apps",
+                "label": "Connect your apps",
+                "apps": ["Gmail"],
+            }
+        ],
+    }
+
+
+@pytest.mark.asyncio
+async def test_unavailable_tool_oauth_required_without_app_name_keeps_error(
+    monkeypatch,
+):
+    """No catalog app was resolvable - a connect_apps card would have
+    nothing to point the user at, so this keeps the original error contract
+    rather than pausing with an interaction naming no app at all."""
+    monkeypatch.setenv("XAGENT_USER_ID", "7")
+    tool = _unavailable_tool(allow_users=["7"], failure_code="oauth_token_required")
+
+    result = await tool.run_json_async({})
+
+    assert result["status"] == "error"
+    assert result["is_error"] is True
+
+
+@pytest.mark.asyncio
+async def test_unavailable_tool_non_oauth_failure_keeps_error_even_with_app_name(
+    monkeypatch,
+):
+    """An app_name being resolvable doesn't by itself mean the failure is
+    something the user can fix by connecting - only an actual
+    oauth_token_required failure_code pauses; every other failure (a broken
+    launch config, a runtime connection error, etc.) keeps erroring."""
+    monkeypatch.setenv("XAGENT_USER_ID", "7")
+    tool = _unavailable_tool(
+        allow_users=["7"],
+        reason="runtime_connection_failed",
+        app_name="Gmail",
+    )
+
+    result = await tool.run_json_async({})
+
+    assert result["status"] == "error"
+    assert result["is_error"] is True
 
 
 @pytest.mark.asyncio
@@ -340,6 +414,35 @@ async def test_factory_revalidates_unavailable_failure_code(
 
     assert result.get("failure_code") == expected_failure_code
     assert "internal-" not in repr(result)
+
+
+@pytest.mark.asyncio
+async def test_factory_threads_app_name_into_unavailable_tool(
+    monkeypatch,
+):
+    monkeypatch.setenv("XAGENT_USER_ID", "7")
+    config = _unavailable_config(
+        allow_users=["7"],
+        failure_code="oauth_token_required",
+        app_name="Gmail",
+    )
+
+    tools = await ToolFactory._create_mcp_tools_from_configs([config])
+    result = await tools[0].run_json_async({})
+
+    assert result["status"] == "waiting_for_user"
+    assert result["interactions"][0]["apps"] == ["Gmail"]
+
+
+@pytest.mark.asyncio
+async def test_factory_without_app_name_keeps_unavailable_tool_erroring(monkeypatch):
+    monkeypatch.setenv("XAGENT_USER_ID", "7")
+    config = _unavailable_config(allow_users=["7"], failure_code="oauth_token_required")
+
+    tools = await ToolFactory._create_mcp_tools_from_configs([config])
+    result = await tools[0].run_json_async({})
+
+    assert result["status"] == "error"
 
 
 @pytest.mark.asyncio

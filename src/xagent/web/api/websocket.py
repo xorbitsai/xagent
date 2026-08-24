@@ -5888,6 +5888,16 @@ async def _handle_chat_message_unserialized(
                     user=task_setup_snapshot.runtime_user,
                     task_setup_snapshot=task_setup_snapshot,
                     task_owner_user_id=task_owner_user_id,
+                    # Without this, a cached AgentService whose tools were
+                    # already built (e.g. paused waiting for the user to
+                    # connect an app) keeps its stale MCP config forever:
+                    # `_sync_connector_runtime_turn` only invalidates tools
+                    # when the turn id actually changes, and every resume
+                    # this message carries a fresh one from the incoming
+                    # message that triggered it, matching what
+                    # `execute_task_background` already passes for a fresh
+                    # run (`context_dict.get("turn_id")`).
+                    connector_runtime_turn_id=turn_id,
                     resolved_execution_scope=resolved_execution_scope,
                 )
                 if hasattr(agent_service, "set_outbound_message_handler"):
@@ -7946,6 +7956,16 @@ async def _handle_resume_task_unserialized(
             user=task_setup_snapshot.runtime_user,
             task_setup_snapshot=task_setup_snapshot,
             task_owner_user_id=task_owner_user_id,
+            # No per-message turn id exists on this explicit-command resume
+            # path (unlike the new-user-message resume above), but a cached
+            # AgentService's tools still need the same fresh-turn-id nudge to
+            # rebuild against connector state that may have changed (e.g. the
+            # user connecting an app) since it paused - see the sibling
+            # get_agent_for_task call's comment. A fresh id every call is
+            # deliberate: this path is infrequent enough that always
+            # rebuilding is cheaper than trying to detect whether anything
+            # actually changed.
+            connector_runtime_turn_id=str(uuid.uuid4()),
             resolved_execution_scope=resolved_execution_scope,
         )
         if getattr(agent_service, "supports_live_control", lambda: False)():

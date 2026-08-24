@@ -1,3 +1,4 @@
+import datetime
 import json
 import logging
 import os
@@ -138,6 +139,10 @@ def _encoded_site_url(site_url: str) -> str:
 def _validate_date(label: str, value: str) -> None:
     if not isinstance(value, str) or not _DATE_PATTERN.match(value):
         raise ValueError(f"{label} must be a date string in YYYY-MM-DD format")
+    try:
+        datetime.date.fromisoformat(value)
+    except ValueError:
+        raise ValueError(f"{label} must be a valid calendar date") from None
 
 
 @mcp.tool()
@@ -269,7 +274,7 @@ def google_search_console_query_search_analytics(
         max_output_length = get_tool_max_output_length()
         original_row_count = len(rows)
         response = _success(rows=rows, row_count=len(rows), truncated=False)
-        while len(response) > max_output_length and len(rows) > 1:
+        while len(response) > max_output_length and rows:
             rows = rows[: len(rows) // 2]
             response = _success(rows=rows, row_count=len(rows), truncated=True)
         if len(rows) < original_row_count:

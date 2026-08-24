@@ -340,6 +340,23 @@ def test_query_search_analytics_rejects_invalid_date(monkeypatch):
     mock_request.assert_not_called()
 
 
+def test_query_search_analytics_rejects_invalid_calendar_date(monkeypatch):
+    """The date regex alone accepts "2026-02-31" (right shape, impossible
+    date); fromisoformat catches what the regex can't."""
+    mock_request = Mock()
+    monkeypatch.setattr(google_search_console.requests, "request", mock_request)
+
+    result = json.loads(
+        google_search_console.google_search_console_query_search_analytics(
+            "https://example.com/", start_date="2026-02-31", end_date="2026-07-28"
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "valid calendar date" in result["message"]
+    mock_request.assert_not_called()
+
+
 def test_query_search_analytics_rejects_start_date_after_end_date(monkeypatch):
     mock_request = Mock()
     monkeypatch.setattr(google_search_console.requests, "request", mock_request)
@@ -474,6 +491,28 @@ def test_query_search_analytics_trims_rows_and_flags_truncated_when_over_budget(
     assert result["truncated"] is True
     assert len(result["rows"]) < google_search_console.QUERY_MAX_ROW_LIMIT
     assert len(response) < get_tool_max_output_length()
+
+
+def test_query_search_analytics_trims_to_empty_when_single_row_exceeds_budget(
+    monkeypatch,
+):
+    """A single row whose own serialized size exceeds max_output_length must
+    still end up under budget — the halving loop must not stop at
+    len(rows) == 1 just because it can't halve further."""
+    max_output_length = get_tool_max_output_length()
+    oversized_row = {"keys": ["x" * (max_output_length + 1000)]}
+    mock_request = Mock(return_value=MockResponse(json_data={"rows": [oversized_row]}))
+    monkeypatch.setattr(google_search_console.requests, "request", mock_request)
+
+    response = google_search_console.google_search_console_query_search_analytics(
+        "https://example.com/", start_date="2026-07-01", end_date="2026-07-28"
+    )
+
+    result = json.loads(response)
+    assert result["status"] == "success"
+    assert result["rows"] == []
+    assert result["truncated"] is True
+    assert len(response) < max_output_length
 
 
 def test_query_search_analytics_treats_non_list_rows_as_empty(monkeypatch):

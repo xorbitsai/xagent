@@ -4480,6 +4480,64 @@ async def get_tasks(
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@chat_router.get("/waiting-on-you")
+async def get_waiting_on_you(
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> Dict[str, Any]:
+    """The Home page's "Waiting on you" list: this user's own tasks
+    currently in `waiting_for_user`, each with its real pending question
+    (never a fabricated summary - a task's own recent-activity data is
+    already covered by the existing `GET /api/chat/tasks` list, so this
+    endpoint's only job is the one thing that list does not carry)."""
+    try:
+
+        def _get_waiting_on_you_sync() -> Dict[str, Any]:
+            waiting_tasks = (
+                db.query(Task)
+                .filter(
+                    Task.user_id == user.id,
+                    Task.status == TaskStatus.WAITING_FOR_USER,
+                    Task.is_visible.is_(True),
+                )
+                .order_by(Task.updated_at.desc())
+                .limit(10)
+                .all()
+            )
+
+            agent_ids = {task.agent_id for task in waiting_tasks if task.agent_id}
+            agents_map = (
+                {a.id: a for a in db.query(Agent).filter(Agent.id.in_(agent_ids)).all()}
+                if agent_ids
+                else {}
+            )
+
+            waiting_on_you = []
+            for task in waiting_tasks:
+                # The real question this task is actually waiting on - never a
+                # fabricated summary, since we cannot know what an agent will
+                # ask before it asks it.
+                question, _ = get_pending_interaction_question(db, task)
+                agent = agents_map.get(task.agent_id) if task.agent_id else None
+                waiting_on_you.append(
+                    {
+                        "task_id": task.id,
+                        "agent_id": task.agent_id,
+                        "agent_name": agent.name if agent else None,
+                        "agent_logo_url": agent.logo_url if agent else None,
+                        "question": question or task.title,
+                        "updated_at": format_datetime_for_api(task.updated_at),
+                    }
+                )
+
+            return {"waiting_on_you": waiting_on_you}
+
+        return await asyncio.to_thread(_get_waiting_on_you_sync)
+    except Exception as e:
+        logger.error(f"Get waiting-on-you failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @chat_router.get("/task/{task_id}")
 async def get_task(
     task_id: int, db: Session = Depends(get_db), user: User = Depends(get_current_user)

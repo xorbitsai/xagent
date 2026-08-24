@@ -2171,3 +2171,101 @@ def test_task_create_warns_for_a_plain_empty_seed_assistant_message_too(
         "normalized to" in record.message and str(task_id) in record.message
         for record in caplog.records
     )
+
+
+def test_waiting_on_you_reports_the_real_pending_task(test_db, user1_headers):
+    """A `waiting_for_user` task's card must carry its own real agent
+    identity and a real fallback question (its title) rather than an
+    invented placeholder - there is no interaction row here, so the
+    question falls all the way back to `task.title`."""
+    from xagent.web.models.agent import Agent, AgentStatus
+    from xagent.web.models.database import get_db
+    from xagent.web.models.task import Task, TaskStatus
+    from xagent.web.models.user import User
+
+    db = next(get_db())
+    try:
+        user = db.query(User).filter(User.username == "user1").one()
+        agent = Agent(
+            user_id=user.id,
+            name="Sophie",
+            description="",
+            status=AgentStatus.PUBLISHED,
+        )
+        db.add(agent)
+        db.flush()
+
+        waiting_task = Task(
+            user_id=user.id,
+            title="Approve a refund that falls outside policy",
+            description="",
+            status=TaskStatus.WAITING_FOR_USER,
+            agent_id=agent.id,
+        )
+        pending_task = Task(
+            user_id=user.id,
+            title="still running",
+            description="",
+            status=TaskStatus.PENDING,
+            agent_id=agent.id,
+        )
+        hidden_waiting = Task(
+            user_id=user.id,
+            title="hidden waiting task",
+            description="",
+            status=TaskStatus.WAITING_FOR_USER,
+            source="sdk",
+            is_visible=False,
+        )
+        db.add_all([waiting_task, pending_task, hidden_waiting])
+        db.commit()
+        db.refresh(waiting_task)
+
+        response = client.get("/api/chat/waiting-on-you", headers=user1_headers)
+        assert response.status_code == 200
+        body = response.json()
+
+        assert len(body["waiting_on_you"]) == 1
+        card = body["waiting_on_you"][0]
+        assert card["task_id"] == waiting_task.id
+        assert card["agent_name"] == "Sophie"
+        assert card["question"] == "Approve a refund that falls outside policy"
+    finally:
+        db.close()
+
+
+def test_waiting_on_you_only_sees_the_requesting_users_own_data(
+    test_db, user1_headers, user2_headers
+):
+    from xagent.web.models.agent import Agent, AgentStatus
+    from xagent.web.models.database import get_db
+    from xagent.web.models.task import Task, TaskStatus
+    from xagent.web.models.user import User
+
+    db = next(get_db())
+    try:
+        user2 = db.query(User).filter(User.username == "user2").one()
+        other_agent = Agent(
+            user_id=user2.id,
+            name="Other User's Agent",
+            description="",
+            status=AgentStatus.PUBLISHED,
+        )
+        db.add(other_agent)
+        db.flush()
+        db.add(
+            Task(
+                user_id=user2.id,
+                title="someone else's waiting task",
+                description="",
+                status=TaskStatus.WAITING_FOR_USER,
+                agent_id=other_agent.id,
+            )
+        )
+        db.commit()
+
+        response = client.get("/api/chat/waiting-on-you", headers=user1_headers)
+        assert response.status_code == 200
+        assert response.json()["waiting_on_you"] == []
+    finally:
+        db.close()

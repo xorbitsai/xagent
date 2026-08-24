@@ -43,6 +43,14 @@ const zh = {
       unknown: "未知错误",
       taskFailed: "出了点问题，请重试。",
     },
+    time: {
+      justNow: "刚刚",
+      minsAgo: "{count} 分钟前",
+      hoursAgo: "{count} 小时前",
+      daysAgo: "{count} 天前",
+      monthsAgo: "{count} 个月前",
+      yearsAgo: "{count} 年前",
+    },
   },
   voiceInput: {
     start: "语音输入",
@@ -164,6 +172,12 @@ const zh = {
       followupTitle: "希望它以后能反复自动执行？",
       followupDescription: "把这次流程沉淀成可复用 Agent，下次一句话就能调用。",
       buildAgent: "构建一个 Agent",
+      teamReadyOne: "你的团队已就绪 —— 有 {count} 位队员在待命。",
+      teamReadyOther: "你的团队已就绪 —— 有 {count} 位队员在待命。",
+      teamEmpty: "雇佣你的第一位队员，开始使用。",
+      newTask: "新建任务",
+      addTeammate: "添加队员",
+      waitingOnYou: "等你处理",
     },
     agents: {
       title: "你的 Agents",
@@ -1443,14 +1457,6 @@ const zh = {
         noMatch: "没有匹配的文件。",
         noFiles: "未找到文件。",
       },
-    },
-    time: {
-      justNow: "刚刚",
-      minsAgo: "{count} 分钟前",
-      hoursAgo: "{count} 小时前",
-      daysAgo: "{count} 天前",
-      monthsAgo: "{count} 个月前",
-      yearsAgo: "{count} 年前",
     },
     delete: {
       confirmSingle: "确定要删除 {name} 吗？",

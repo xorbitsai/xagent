@@ -3,6 +3,7 @@
  * Unified handling of timestamp and ISO format time display
  */
 import type { Locale } from "@/i18n/translations"
+import type { Translate } from "@/contexts/i18n-context"
 
 // Partial with a lookup fallback: distributions may replace @/i18n/translations
 // with a widened Locale union, and any unmapped locale is itself a BCP 47 tag.
@@ -67,6 +68,28 @@ export function normalizeTimestampMs(ts?: string | number | Date | null): number
   }
 
   return Date.now()
+}
+
+/** Formats a timestamp as "N min/hr/days ago". Malformed/absent input
+ * normalizes to "now" (see `normalizeTimestampMs`'s own convention), so
+ * this renders "Just now" rather than a raw "NaN ago" in that case. */
+export function formatRelativeTime(
+  value: string | number | Date | null | undefined,
+  t: Translate,
+): string {
+  const diff = Date.now() - normalizeTimestampMs(value)
+  const minute = 60 * 1000
+  const hour = 60 * minute
+  const day = 24 * hour
+  const month = 30 * day
+  const year = 365 * day
+
+  if (diff < minute) return t("common.time.justNow")
+  if (diff < hour) return t("common.time.minsAgo", { count: Math.floor(diff / minute) })
+  if (diff < day) return t("common.time.hoursAgo", { count: Math.floor(diff / hour) })
+  if (diff < month) return t("common.time.daysAgo", { count: Math.floor(diff / day) })
+  if (diff < year) return t("common.time.monthsAgo", { count: Math.floor(diff / month) })
+  return t("common.time.yearsAgo", { count: Math.floor(diff / year) })
 }
 
 /**

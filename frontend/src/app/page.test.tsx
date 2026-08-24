@@ -92,6 +92,10 @@ vi.mock("@/contexts/app-context-chat", () => ({
   }),
 }))
 
+vi.mock("@/contexts/auth-context", () => ({
+  useAuth: () => ({ user: { id: "1", username: "Gerard" } }),
+}))
+
 vi.mock("@/lib/branding", () => ({
   getBrandingFromEnv: () => ({
     appName: "Xagent",
@@ -387,6 +391,12 @@ describe("Home", () => {
       if (url === "http://api.local/api/chat/tasks?page=1&per_page=5") {
         return Promise.resolve(jsonResponse({ tasks: [] }))
       }
+      if (url === "http://api.local/api/agents") {
+        return Promise.resolve(jsonResponse([]))
+      }
+      if (url === "http://api.local/api/chat/waiting-on-you") {
+        return Promise.resolve(jsonResponse({ waiting_on_you: [] }))
+      }
       throw new Error(`Unhandled apiRequest: ${url}`)
     })
   })
@@ -406,7 +416,7 @@ describe("Home", () => {
     expect(extension.parentElement).toHaveClass("shrink-0")
     expect(screen.getAllByTestId("home-extension")).toHaveLength(1)
     expect(homeExtensionRenderMock).toHaveBeenCalled()
-    await waitFor(() => expect(apiRequestMock).toHaveBeenCalledTimes(2))
+    await waitFor(() => expect(apiRequestMock).toHaveBeenCalledTimes(4))
   })
 
   it("renders the shipped default extension in an inert canonical slot", async () => {
@@ -840,6 +850,12 @@ describe("Home", () => {
         })
         return Promise.resolve(jsonResponse(taskCore(9)))
       }
+      if (url === "http://api.local/api/agents") {
+        return Promise.resolve(jsonResponse([]))
+      }
+      if (url === "http://api.local/api/chat/waiting-on-you") {
+        return Promise.resolve(jsonResponse({ waiting_on_you: [] }))
+      }
       throw new Error(`Unexpected apiRequest: ${url}`)
     })
 
@@ -947,6 +963,12 @@ describe("Home", () => {
       if (url.startsWith("http://api.local/api/templates/")) return Promise.resolve(jsonResponse([]))
       if (url === "http://api.local/api/chat/tasks?page=1&per_page=5") return Promise.resolve(jsonResponse({ tasks: [] }))
       if (url === "http://api.local/api/chat/task/create") return response.promise
+      if (url === "http://api.local/api/agents") {
+        return Promise.resolve(jsonResponse([]))
+      }
+      if (url === "http://api.local/api/chat/waiting-on-you") {
+        return Promise.resolve(jsonResponse({ waiting_on_you: [] }))
+      }
       throw new Error(`Unexpected apiRequest: ${url}`)
     })
     const view = render(<Home />)
@@ -969,6 +991,12 @@ describe("Home", () => {
       if (url.startsWith("http://api.local/api/templates/")) return Promise.resolve(jsonResponse([]))
       if (url === "http://api.local/api/chat/tasks?page=1&per_page=5") return Promise.resolve(jsonResponse({ tasks: [] }))
       if (url === "http://api.local/api/chat/task/create") return Promise.resolve(taskResponse)
+      if (url === "http://api.local/api/agents") {
+        return Promise.resolve(jsonResponse([]))
+      }
+      if (url === "http://api.local/api/chat/waiting-on-you") {
+        return Promise.resolve(jsonResponse({ waiting_on_you: [] }))
+      }
       throw new Error(`Unexpected apiRequest: ${url}`)
     })
     const view = render(<Home />)
@@ -994,6 +1022,12 @@ describe("Home", () => {
       if (url.startsWith("http://api.local/api/templates/")) return Promise.resolve(jsonResponse([]))
       if (url === "http://api.local/api/chat/tasks?page=1&per_page=5") return Promise.resolve(jsonResponse({ tasks: [] }))
       if (url === "http://api.local/api/chat/task/create") return response.promise
+      if (url === "http://api.local/api/agents") {
+        return Promise.resolve(jsonResponse([]))
+      }
+      if (url === "http://api.local/api/chat/waiting-on-you") {
+        return Promise.resolve(jsonResponse({ waiting_on_you: [] }))
+      }
       throw new Error(`Unexpected apiRequest: ${url}`)
     })
     const view = render(<Home />)
@@ -1020,6 +1054,12 @@ describe("Home", () => {
       if (url.startsWith("http://api.local/api/templates/")) return Promise.resolve(jsonResponse([]))
       if (url === "http://api.local/api/chat/tasks?page=1&per_page=5") return Promise.resolve(jsonResponse({ tasks: [] }))
       if (url === "http://api.local/api/chat/task/create") return Promise.resolve(taskResponse)
+      if (url === "http://api.local/api/agents") {
+        return Promise.resolve(jsonResponse([]))
+      }
+      if (url === "http://api.local/api/chat/waiting-on-you") {
+        return Promise.resolve(jsonResponse({ waiting_on_you: [] }))
+      }
       throw new Error(`Unexpected apiRequest: ${url}`)
     })
     const view = render(<Home />)
@@ -1042,6 +1082,12 @@ describe("Home", () => {
       if (url.startsWith("http://api.local/api/templates/")) return Promise.resolve(jsonResponse([]))
       if (url === "http://api.local/api/chat/tasks?page=1&per_page=5") return Promise.resolve(jsonResponse({ tasks: [] }))
       if (url === "http://api.local/api/chat/task/create") return response.promise
+      if (url === "http://api.local/api/agents") {
+        return Promise.resolve(jsonResponse([]))
+      }
+      if (url === "http://api.local/api/chat/waiting-on-you") {
+        return Promise.resolve(jsonResponse({ waiting_on_you: [] }))
+      }
       throw new Error(`Unexpected apiRequest: ${url}`)
     })
     render(<Home />)
@@ -1073,6 +1119,12 @@ describe("Home", () => {
       if (url.startsWith("http://api.local/api/templates/")) return Promise.resolve(jsonResponse([]))
       if (url === "http://api.local/api/chat/tasks?page=1&per_page=5") return Promise.resolve(jsonResponse({ tasks: [] }))
       if (url === "http://api.local/api/chat/task/create") return Promise.resolve(taskResponse)
+      if (url === "http://api.local/api/agents") {
+        return Promise.resolve(jsonResponse([]))
+      }
+      if (url === "http://api.local/api/chat/waiting-on-you") {
+        return Promise.resolve(jsonResponse({ waiting_on_you: [] }))
+      }
       throw new Error(`Unexpected apiRequest: ${url}`)
     })
     render(<Home />)
@@ -1099,6 +1151,12 @@ describe("Home", () => {
       if (url.startsWith("http://api.local/api/templates/")) return Promise.resolve(jsonResponse([]))
       if (url === "http://api.local/api/chat/tasks?page=1&per_page=5") return Promise.resolve(jsonResponse({ tasks: [] }))
       if (url === "http://api.local/api/chat/task/create") return Promise.resolve(taskResponse)
+      if (url === "http://api.local/api/agents") {
+        return Promise.resolve(jsonResponse([]))
+      }
+      if (url === "http://api.local/api/chat/waiting-on-you") {
+        return Promise.resolve(jsonResponse({ waiting_on_you: [] }))
+      }
       throw new Error(`Unexpected apiRequest: ${url}`)
     })
     render(<Home />)
@@ -1121,6 +1179,12 @@ describe("Home", () => {
       if (url.startsWith("http://api.local/api/templates/")) return Promise.resolve(jsonResponse([]))
       if (url === "http://api.local/api/chat/tasks?page=1&per_page=5") return Promise.resolve(jsonResponse({ tasks: [] }))
       if (url === "http://api.local/api/chat/task/create") return result.promise
+      if (url === "http://api.local/api/agents") {
+        return Promise.resolve(jsonResponse([]))
+      }
+      if (url === "http://api.local/api/chat/waiting-on-you") {
+        return Promise.resolve(jsonResponse({ waiting_on_you: [] }))
+      }
       throw new Error(`Unexpected apiRequest: ${url}`)
     })
     render(<Home />)
@@ -1140,6 +1204,12 @@ describe("Home", () => {
       if (url.startsWith("http://api.local/api/templates/")) return Promise.resolve(jsonResponse([]))
       if (url === "http://api.local/api/chat/tasks?page=1&per_page=5") return Promise.resolve(jsonResponse({ tasks: [] }))
       if (url === "http://api.local/api/chat/task/create") return failed.promise
+      if (url === "http://api.local/api/agents") {
+        return Promise.resolve(jsonResponse([]))
+      }
+      if (url === "http://api.local/api/chat/waiting-on-you") {
+        return Promise.resolve(jsonResponse({ waiting_on_you: [] }))
+      }
       throw new Error(`Unexpected apiRequest: ${url}`)
     })
     render(<Home />)
@@ -1160,6 +1230,12 @@ describe("Home", () => {
       if (url.startsWith("http://api.local/api/templates/")) return Promise.resolve(jsonResponse([]))
       if (url === "http://api.local/api/chat/tasks?page=1&per_page=5") return Promise.resolve(jsonResponse({ tasks: [] }))
       if (url === "http://api.local/api/chat/task/create") return result.promise
+      if (url === "http://api.local/api/agents") {
+        return Promise.resolve(jsonResponse([]))
+      }
+      if (url === "http://api.local/api/chat/waiting-on-you") {
+        return Promise.resolve(jsonResponse({ waiting_on_you: [] }))
+      }
       throw new Error(`Unexpected apiRequest: ${url}`)
     })
     render(<Home />)
@@ -1182,6 +1258,12 @@ describe("Home", () => {
       if (url.startsWith("http://api.local/api/templates/")) return Promise.resolve(jsonResponse([]))
       if (url === "http://api.local/api/chat/tasks?page=1&per_page=5") return Promise.resolve(jsonResponse({ tasks: [] }))
       if (url === "http://api.local/api/chat/task/create") return result.promise
+      if (url === "http://api.local/api/agents") {
+        return Promise.resolve(jsonResponse([]))
+      }
+      if (url === "http://api.local/api/chat/waiting-on-you") {
+        return Promise.resolve(jsonResponse({ waiting_on_you: [] }))
+      }
       throw new Error(`Unexpected apiRequest: ${url}`)
     })
     render(<Home />)
@@ -1205,6 +1287,12 @@ describe("Home", () => {
       if (url.startsWith("http://api.local/api/templates/")) return Promise.resolve(jsonResponse([]))
       if (url === "http://api.local/api/chat/tasks?page=1&per_page=5") return Promise.resolve(jsonResponse({ tasks: [] }))
       if (url === "http://api.local/api/chat/task/create") return Promise.resolve(jsonResponse(taskCore()))
+      if (url === "http://api.local/api/agents") {
+        return Promise.resolve(jsonResponse([]))
+      }
+      if (url === "http://api.local/api/chat/waiting-on-you") {
+        return Promise.resolve(jsonResponse({ waiting_on_you: [] }))
+      }
       throw new Error(`Unexpected apiRequest: ${url}`)
     })
     render(<Home />)
@@ -1235,6 +1323,12 @@ describe("Home", () => {
       apiRequestMock.mockImplementation((url: string) => {
         if (url === templateUrl()) return Promise.reject(new Error("templates down"))
         if (url === recentTasksUrl) return Promise.resolve(jsonResponse({ tasks: [recentTask(1)] }))
+        if (url === "http://api.local/api/agents") {
+          return Promise.resolve(jsonResponse([]))
+        }
+        if (url === "http://api.local/api/chat/waiting-on-you") {
+          return Promise.resolve(jsonResponse({ waiting_on_you: [] }))
+        }
         throw new Error(`Unexpected apiRequest: ${url}`)
       })
       render(<Home />)
@@ -1248,6 +1342,12 @@ describe("Home", () => {
       apiRequestMock.mockImplementation((url: string) => {
         if (url === templateUrl()) return Promise.resolve(jsonResponse([templateCard("one")]))
         if (url === recentTasksUrl) return Promise.reject(new Error("tasks down"))
+        if (url === "http://api.local/api/agents") {
+          return Promise.resolve(jsonResponse([]))
+        }
+        if (url === "http://api.local/api/chat/waiting-on-you") {
+          return Promise.resolve(jsonResponse({ waiting_on_you: [] }))
+        }
         throw new Error(`Unexpected apiRequest: ${url}`)
       })
       render(<Home />)
@@ -1267,6 +1367,12 @@ describe("Home", () => {
       apiRequestMock.mockImplementation((url: string) => {
         if (url === templateUrl()) return Promise.resolve(response)
         if (url === recentTasksUrl) return Promise.resolve(jsonResponse({ tasks: [recentTask(2)] }))
+        if (url === "http://api.local/api/agents") {
+          return Promise.resolve(jsonResponse([]))
+        }
+        if (url === "http://api.local/api/chat/waiting-on-you") {
+          return Promise.resolve(jsonResponse({ waiting_on_you: [] }))
+        }
         throw new Error(`Unexpected apiRequest: ${url}`)
       })
       render(<Home />)
@@ -1286,6 +1392,12 @@ describe("Home", () => {
       apiRequestMock.mockImplementation((url: string) => {
         if (url === templateUrl()) return Promise.resolve(jsonResponse([templateCard("kept")]))
         if (url === recentTasksUrl) return Promise.resolve(response)
+        if (url === "http://api.local/api/agents") {
+          return Promise.resolve(jsonResponse([]))
+        }
+        if (url === "http://api.local/api/chat/waiting-on-you") {
+          return Promise.resolve(jsonResponse({ waiting_on_you: [] }))
+        }
         throw new Error(`Unexpected apiRequest: ${url}`)
       })
       render(<Home />)
@@ -1307,6 +1419,12 @@ describe("Home", () => {
           return Promise.resolve(response)
         }
         if (url === recentTasksUrl) return Promise.resolve(jsonResponse({ tasks: [recentTask(4)] }))
+        if (url === "http://api.local/api/agents") {
+          return Promise.resolve(jsonResponse([]))
+        }
+        if (url === "http://api.local/api/chat/waiting-on-you") {
+          return Promise.resolve(jsonResponse({ waiting_on_you: [] }))
+        }
         throw new Error(`Unexpected apiRequest: ${url}`)
       })
       const view = render(<Home />)
@@ -1329,6 +1447,12 @@ describe("Home", () => {
       apiRequestMock.mockImplementation((url: string) => {
         if (url === templateUrl()) return Promise.resolve(jsonResponse([templateCard("kept")]))
         if (url === recentTasksUrl) return Promise.resolve(recentResponse)
+        if (url === "http://api.local/api/agents") {
+          return Promise.resolve(jsonResponse([]))
+        }
+        if (url === "http://api.local/api/chat/waiting-on-you") {
+          return Promise.resolve(jsonResponse({ waiting_on_you: [] }))
+        }
         throw new Error(`Unexpected apiRequest: ${url}`)
       })
       render(<Home />)
@@ -1346,6 +1470,12 @@ describe("Home", () => {
         ]))
         if (url === recentTasksUrl) return Promise.resolve(jsonResponse({ tasks: [] }))
         if (url === "http://api.local/api/templates/two/use") return Promise.resolve(jsonResponse({}))
+        if (url === "http://api.local/api/agents") {
+          return Promise.resolve(jsonResponse([]))
+        }
+        if (url === "http://api.local/api/chat/waiting-on-you") {
+          return Promise.resolve(jsonResponse({ waiting_on_you: [] }))
+        }
         throw new Error(`Unexpected apiRequest: ${url}`)
       })
       render(<Home />)
@@ -1385,6 +1515,12 @@ describe("Home", () => {
           agent_logo_url: "https://assets.local/distinct-agent.png",
         })] }))
         if (url === "http://api.local/api/templates/distinct-template-id/use") return Promise.resolve(jsonResponse({}))
+        if (url === "http://api.local/api/agents") {
+          return Promise.resolve(jsonResponse([]))
+        }
+        if (url === "http://api.local/api/chat/waiting-on-you") {
+          return Promise.resolve(jsonResponse({ waiting_on_you: [] }))
+        }
         throw new Error(`Unexpected apiRequest: ${url}`)
       })
       render(<Home />)
@@ -1417,6 +1553,12 @@ describe("Home", () => {
           templateCard("one"), templateCard("two"), templateCard("three"), templateCard("bad", { likes: 1.5 }),
         ]))
         if (url === recentTasksUrl) return Promise.resolve(jsonResponse({ tasks: [recentTask(5)] }))
+        if (url === "http://api.local/api/agents") {
+          return Promise.resolve(jsonResponse([]))
+        }
+        if (url === "http://api.local/api/chat/waiting-on-you") {
+          return Promise.resolve(jsonResponse({ waiting_on_you: [] }))
+        }
         throw new Error(`Unexpected apiRequest: ${url}`)
       })
       render(<Home />)
@@ -1441,6 +1583,12 @@ describe("Home", () => {
       apiRequestMock.mockImplementation((url: string) => {
         if (url === templateUrl()) return Promise.resolve(jsonResponse([templateCard("bad", patch)]))
         if (url === recentTasksUrl) return Promise.resolve(jsonResponse({ tasks: [] }))
+        if (url === "http://api.local/api/agents") {
+          return Promise.resolve(jsonResponse([]))
+        }
+        if (url === "http://api.local/api/chat/waiting-on-you") {
+          return Promise.resolve(jsonResponse({ waiting_on_you: [] }))
+        }
         throw new Error(`Unexpected apiRequest: ${url}`)
       })
       render(<Home />)
@@ -1464,6 +1612,12 @@ describe("Home", () => {
       apiRequestMock.mockImplementation((url: string) => {
         if (url === templateUrl()) return Promise.resolve(jsonResponse([record]))
         if (url === recentTasksUrl) return Promise.resolve(jsonResponse({ tasks: [recentTask(51)] }))
+        if (url === "http://api.local/api/agents") {
+          return Promise.resolve(jsonResponse([]))
+        }
+        if (url === "http://api.local/api/chat/waiting-on-you") {
+          return Promise.resolve(jsonResponse({ waiting_on_you: [] }))
+        }
         throw new Error(`Unexpected apiRequest: ${url}`)
       })
       render(<Home />)
@@ -1479,6 +1633,12 @@ describe("Home", () => {
           featured: "wrong", sample_prompts: "wrong", tags: "wrong", author: 1, version: null, views: "wrong", is_liked: "wrong",
         }), templateCard("null-logo", { connections: [{ name: "", logo: null }] })]))
         if (url === recentTasksUrl) return Promise.resolve(jsonResponse({ tasks: [] }))
+        if (url === "http://api.local/api/agents") {
+          return Promise.resolve(jsonResponse([]))
+        }
+        if (url === "http://api.local/api/chat/waiting-on-you") {
+          return Promise.resolve(jsonResponse({ waiting_on_you: [] }))
+        }
         throw new Error(`Unexpected apiRequest: ${url}`)
       })
       render(<Home />)
@@ -1495,6 +1655,12 @@ describe("Home", () => {
       apiRequestMock.mockImplementation((url: string) => {
         if (url === templateUrl()) return Promise.resolve(jsonResponse([templateCard("kept")]))
         if (url === recentTasksUrl) return Promise.resolve(jsonResponse({ tasks: [recentTask(6, patch)] }))
+        if (url === "http://api.local/api/agents") {
+          return Promise.resolve(jsonResponse([]))
+        }
+        if (url === "http://api.local/api/chat/waiting-on-you") {
+          return Promise.resolve(jsonResponse({ waiting_on_you: [] }))
+        }
         throw new Error(`Unexpected apiRequest: ${url}`)
       })
       render(<Home />)
@@ -1511,6 +1677,12 @@ describe("Home", () => {
       apiRequestMock.mockImplementation((url: string) => {
         if (url === templateUrl()) return Promise.resolve(jsonResponse([templateCard("kept-required")]))
         if (url === recentTasksUrl) return Promise.resolve(jsonResponse({ tasks: [record] }))
+        if (url === "http://api.local/api/agents") {
+          return Promise.resolve(jsonResponse([]))
+        }
+        if (url === "http://api.local/api/chat/waiting-on-you") {
+          return Promise.resolve(jsonResponse({ waiting_on_you: [] }))
+        }
         throw new Error(`Unexpected apiRequest: ${url}`)
       })
       render(<Home />)
@@ -1522,6 +1694,12 @@ describe("Home", () => {
       apiRequestMock.mockImplementation((url: string) => {
         if (url === templateUrl()) return Promise.resolve(jsonResponse([templateCard("kept-null-tasks")]))
         if (url === recentTasksUrl) return Promise.resolve(jsonResponse({ tasks: null }))
+        if (url === "http://api.local/api/agents") {
+          return Promise.resolve(jsonResponse([]))
+        }
+        if (url === "http://api.local/api/chat/waiting-on-you") {
+          return Promise.resolve(jsonResponse({ waiting_on_you: [] }))
+        }
         throw new Error(`Unexpected apiRequest: ${url}`)
       })
       render(<Home />)
@@ -1548,6 +1726,12 @@ describe("Home", () => {
           return Promise.resolve(jsonResponse({
             tasks: [withoutAgentName, withoutAgentLogo, withoutAgent],
           }))
+        }
+        if (url === "http://api.local/api/agents") {
+          return Promise.resolve(jsonResponse([]))
+        }
+        if (url === "http://api.local/api/chat/waiting-on-you") {
+          return Promise.resolve(jsonResponse({ waiting_on_you: [] }))
         }
         throw new Error(`Unexpected apiRequest: ${url}`)
       })
@@ -1585,6 +1769,12 @@ describe("Home", () => {
           ],
           pagination: "wrong",
         }))
+        if (url === "http://api.local/api/agents") {
+          return Promise.resolve(jsonResponse([]))
+        }
+        if (url === "http://api.local/api/chat/waiting-on-you") {
+          return Promise.resolve(jsonResponse({ waiting_on_you: [] }))
+        }
         throw new Error(`Unexpected apiRequest: ${url}`)
       })
       render(<Home />)
@@ -1610,6 +1800,12 @@ describe("Home", () => {
             }),
           ],
         }))
+        if (url === "http://api.local/api/agents") {
+          return Promise.resolve(jsonResponse([]))
+        }
+        if (url === "http://api.local/api/chat/waiting-on-you") {
+          return Promise.resolve(jsonResponse({ waiting_on_you: [] }))
+        }
         throw new Error(`Unexpected apiRequest: ${url}`)
       })
 
@@ -1660,6 +1856,12 @@ describe("Home", () => {
         if (url === templateUrl("en")) return en.promise
         if (url === templateUrl("zh")) return zh.promise
         if (url === recentTasksUrl) return Promise.resolve(jsonResponse({ tasks: [recentTask(8)] }))
+        if (url === "http://api.local/api/agents") {
+          return Promise.resolve(jsonResponse([]))
+        }
+        if (url === "http://api.local/api/chat/waiting-on-you") {
+          return Promise.resolve(jsonResponse({ waiting_on_you: [] }))
+        }
         throw new Error(`Unexpected apiRequest: ${url}`)
       })
       const view = render(<Home />)
@@ -1683,6 +1885,12 @@ describe("Home", () => {
         if (url === templateUrl("en")) return Promise.resolve(oldResponse)
         if (url === templateUrl("zh")) return Promise.resolve(jsonResponse([templateCard("current-zh")]))
         if (url === recentTasksUrl) return Promise.resolve(jsonResponse({ tasks: [] }))
+        if (url === "http://api.local/api/agents") {
+          return Promise.resolve(jsonResponse([]))
+        }
+        if (url === "http://api.local/api/chat/waiting-on-you") {
+          return Promise.resolve(jsonResponse({ waiting_on_you: [] }))
+        }
         throw new Error(`Unexpected apiRequest: ${url}`)
       })
       const view = render(<Home />)
@@ -1710,6 +1918,12 @@ describe("Home", () => {
       apiRequestMock.mockImplementation((url: string) => {
         if (url === templateUrl()) return templates.promise
         if (url === recentTasksUrl) return tasks.promise
+        if (url === "http://api.local/api/agents") {
+          return Promise.resolve(jsonResponse([]))
+        }
+        if (url === "http://api.local/api/chat/waiting-on-you") {
+          return Promise.resolve(jsonResponse({ waiting_on_you: [] }))
+        }
         throw new Error(`Unexpected apiRequest: ${url}`)
       })
       const view = render(<Home />)
@@ -1729,6 +1943,12 @@ describe("Home", () => {
       apiRequestMock.mockImplementation((url: string) => {
         if (url === templateUrl()) return templates.promise
         if (url === recentTasksUrl) return tasks.promise
+        if (url === "http://api.local/api/agents") {
+          return Promise.resolve(jsonResponse([]))
+        }
+        if (url === "http://api.local/api/chat/waiting-on-you") {
+          return Promise.resolve(jsonResponse({ waiting_on_you: [] }))
+        }
         throw new Error(`Unexpected apiRequest: ${url}`)
       })
       const view = render(<Home />)
@@ -1752,6 +1972,12 @@ describe("Home", () => {
       apiRequestMock.mockImplementation((url: string) => {
         if (url === templateUrl()) return Promise.resolve(templateResponse)
         if (url === recentTasksUrl) return Promise.resolve(recentResponse)
+        if (url === "http://api.local/api/agents") {
+          return Promise.resolve(jsonResponse([]))
+        }
+        if (url === "http://api.local/api/chat/waiting-on-you") {
+          return Promise.resolve(jsonResponse({ waiting_on_you: [] }))
+        }
         throw new Error(`Unexpected apiRequest: ${url}`)
       })
       const view = render(<Home />)
@@ -1777,6 +2003,12 @@ describe("Home", () => {
       apiRequestMock.mockImplementation((url: string) => {
         if (url === templateUrl()) return (++templateCall === 1 ? firstTemplates : secondTemplates).promise
         if (url === recentTasksUrl) return (++recentCall === 1 ? firstRecent : secondRecent).promise
+        if (url === "http://api.local/api/agents") {
+          return Promise.resolve(jsonResponse([]))
+        }
+        if (url === "http://api.local/api/chat/waiting-on-you") {
+          return Promise.resolve(jsonResponse({ waiting_on_you: [] }))
+        }
         throw new Error(`Unexpected apiRequest: ${url}`)
       })
       render(<StrictMode><Home /></StrictMode>)

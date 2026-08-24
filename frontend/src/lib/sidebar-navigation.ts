@@ -19,6 +19,7 @@ import {
     Globe,
     Key,
     MoreHorizontal,
+    Home,
 } from "lucide-react"
 
 interface SidebarUser {
@@ -116,6 +117,13 @@ export const getNavigationGroupsForUser = (user?: SidebarUser | null): Navigatio
         title: "Agent Development",
         titleKey: "nav.sections.agentDevelopment",
         items: [
+            {
+                name: "Home",
+                nameKey: "nav.home",
+                href: "/",
+                icon: Home,
+                color: "text-indigo-500"
+            },
             {
                 name: "Task",
                 nameKey: "nav.task",

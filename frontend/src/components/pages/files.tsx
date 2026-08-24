@@ -6,6 +6,7 @@ import { Button } from "@/components/ui/button"
 import { Badge } from "@/components/ui/badge"
 import { getApiUrl, getUploadApiUrl } from "@/lib/utils"
 import { apiRequest, getApiErrorMessage, getUploadErrorMessage, parseApiResponse, UPLOAD_ERROR_MESSAGES } from "@/lib/api-wrapper"
+import { formatRelativeTime } from "@/lib/time-utils"
 import { useI18n } from "@/contexts/i18n-context"
 import { StandaloneFilePreviewDialog } from "@/components/file/standalone-file-preview-dialog"
 import { SearchInput } from "@/components/ui/search-input"
@@ -65,24 +66,6 @@ export function FilesPage() {
   const latestFilesRequestRef = useRef(0)
 
   const { t } = useI18n()
-
-  const formatRelativeTime = (timestamp: number): string => {
-    const now = Date.now()
-    const diff = now - timestamp * 1000 // timestamp is in seconds
-
-    const minute = 60 * 1000
-    const hour = 60 * minute
-    const day = 24 * hour
-    const month = 30 * day
-    const year = 365 * day
-
-    if (diff < minute) return t('files.time.justNow')
-    if (diff < hour) return t('files.time.minsAgo', { count: Math.floor(diff / minute) })
-    if (diff < day) return t('files.time.hoursAgo', { count: Math.floor(diff / hour) })
-    if (diff < month) return t('files.time.daysAgo', { count: Math.floor(diff / day) })
-    if (diff < year) return t('files.time.monthsAgo', { count: Math.floor(diff / month) })
-    return t('files.time.yearsAgo', { count: Math.floor(diff / year) })
-  }
 
   // File preview state
   const [previewFile, setPreviewFile] = useState<{ fileId: string; fileName: string } | null>(null)
@@ -560,7 +543,7 @@ export function FilesPage() {
                       </div>
 
                       <div className="col-span-3 text-muted-foreground text-xs flex items-center justify-between">
-                        <span>{formatRelativeTime(file.modified_time)}</span>
+                        <span>{formatRelativeTime(file.modified_time, t)}</span>
 
                         {/* Actions */}
                         <div className="flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity justify-end">

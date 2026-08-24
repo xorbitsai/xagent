@@ -817,6 +817,51 @@ describe("ConnectAppsField", () => {
     ).not.toBeInTheDocument();
   });
 
+  it("shows a Continue button instead of the completion note alone once every row is Connected, when onContinue is supplied", () => {
+    mcpAppsMock.apps = [makeApp({ provider: "google", is_connected: true })];
+    const onContinue = vi.fn();
+
+    render(
+      <ConnectAppsField
+        interaction={{ ...LEO_INTERACTION, apps: ["Gmail"] }}
+        onSkip={vi.fn()}
+        onContinue={onContinue}
+      />
+    );
+
+    expect(screen.queryByText("chatPage.clarification.connectApps.skip")).not.toBeInTheDocument();
+    expect(
+      screen.getByText("chatPage.clarification.connectApps.allConnectedNote")
+    ).toBeInTheDocument();
+    const continueButton = screen.getByRole("button", {
+      name: "chatPage.clarification.connectApps.continue",
+    });
+
+    fireEvent.click(continueButton);
+
+    expect(onContinue).toHaveBeenCalledTimes(1);
+    expect(
+      screen.queryByRole("button", { name: "chatPage.clarification.connectApps.continue" })
+    ).not.toBeInTheDocument();
+  });
+
+  it("does not show a Continue button while an app is still unconnected, even when onContinue is supplied", () => {
+    mcpAppsMock.apps = [makeApp({ provider: "google", is_connected: false })];
+
+    render(
+      <ConnectAppsField
+        interaction={{ ...LEO_INTERACTION, apps: ["Gmail"] }}
+        onSkip={vi.fn()}
+        onContinue={vi.fn()}
+      />
+    );
+
+    expect(
+      screen.queryByRole("button", { name: "chatPage.clarification.connectApps.continue" })
+    ).not.toBeInTheDocument();
+    expect(screen.getByText("chatPage.clarification.connectApps.skip")).toBeInTheDocument();
+  });
+
   it("hides the Skip link once a refresh brings every row to Connected, even though it started out actionable", async () => {
     mcpAppsMock.apps = [
       makeApp({ id: "hubspot", name: "HubSpot", provider: "hubspot", is_connected: false }),

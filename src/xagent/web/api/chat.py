@@ -3079,10 +3079,12 @@ class AgentServiceManager:
             return
 
         tool_config = agent.tool_config
-        if tool_config is None:
+        if tool_config is None or not hasattr(
+            tool_config, "set_connector_runtime_turn_id"
+        ):
             logger.debug(
                 "Skipping connector runtime turn sync for task %s turn %s: "
-                "agent has no tool config",
+                "agent has no tool config supporting connector runtime turn sync",
                 task_id,
                 connector_runtime_turn_id,
             )

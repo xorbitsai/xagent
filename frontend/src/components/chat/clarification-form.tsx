@@ -446,6 +446,30 @@ export function ClarificationForm({
     }
   }
 
+  // A distinct message from Skip's, sent once every requested app is
+  // connected. Functionally this is the same "acknowledgement becomes a
+  // chat message" mechanism as Skip - but the wording matters here beyond
+  // just what the user reads: when this card is paused mid-task (a tool
+  // itself returned waiting_for_user because a connector it needed was
+  // missing - see UnavailableMCPTool._run_unavailable), the task's own
+  // resume protocol only replans once a *new* message has been appended
+  // (ReActPattern._resume_waiting_for_user_if_needed compares message
+  // counts) - Skip's "I'll do this later" text would read as a non sequitur
+  // once every app the agent actually asked for is already connected.
+  const handleContinueConnectApps = async () => {
+    const message = t("chatPage.clarification.connectApps.continue")
+    try {
+      if (onSend) {
+        await onSend(message, [], {})
+      } else if (sendMessage) {
+        await sendMessage(message, { force: true }, [])
+      }
+    } catch (error) {
+      console.error("Failed to send connect-apps continue response", error)
+      toast.error(t("chatPage.clarification.sendError"))
+    }
+  }
+
   const renderField = (interaction: Interaction) => {
     const value = formState[interaction.field]
 
@@ -643,7 +667,13 @@ export function ClarificationForm({
       // today, see LIVE_WIDGET_TYPES's comment), so that path still gets the
       // real widget instead of falling to the "unsupported type" case below.
       case "connect_apps":
-        return <ConnectAppsField interaction={interaction} onSkip={handleSkipConnectApps} />
+        return (
+          <ConnectAppsField
+            interaction={interaction}
+            onSkip={handleSkipConnectApps}
+            onContinue={handleContinueConnectApps}
+          />
+        )
 
       default:
         return <div className="text-destructive text-sm">{t("chatPage.clarification.unsupportedType", { type: interaction.type })}</div>
@@ -693,6 +723,7 @@ export function ClarificationForm({
                 key={`${interaction.field}-${index}`}
                 interaction={interaction}
                 onSkip={handleSkipConnectApps}
+                onContinue={handleContinueConnectApps}
               />
             ))}
           </div>

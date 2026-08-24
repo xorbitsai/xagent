@@ -180,9 +180,17 @@ function ConnectedBadge({ label }: { label: string }) {
 export function ConnectAppsField({
   interaction,
   onSkip,
+  onContinue,
 }: {
   interaction: Interaction;
   onSkip: () => void;
+  /** Called once every requested app is connected, in place of onSkip -
+   * distinct so the message it sends can say "connected" rather than
+   * "I'll do this later" (see clarification-form.tsx's
+   * handleContinueConnectApps). Optional so an older/mixed-list caller
+   * that doesn't pass it just keeps the allConnectedNote-only footer this
+   * card had before, rather than crashing. */
+  onContinue?: () => void;
 }) {
   const { apps, refresh, isLoading, error } = useMcpApps();
   const { token } = useAuth();
@@ -195,6 +203,7 @@ export function ConnectAppsField({
   // app id for an "mcp_oauth" row (no such sharing exists there).
   const [connectingKeys, setConnectingKeys] = useState<Set<string>>(new Set());
   const [skipped, setSkipped] = useState(false);
+  const [continued, setContinued] = useState(false);
   const [keyConnectApp, setKeyConnectApp] = useState<McpApp | null>(null);
   const isMountedRef = useRef(true);
   // Synchronous shadow of connectingKeys, same reason connect-mcp-dialog.tsx
@@ -499,21 +508,40 @@ export function ConnectAppsField({
                 ? t("chatPage.clarification.connectApps.skippedNote")
                 : t("chatPage.clarification.connectApps.privacyNote", { appName: branding.appName })}
           </span>
-          {/* Hidden once every row is Connected (whether that was already
-              true on first render or only became true after a later
-              refresh) - a Skip button next to an "I'll do this later" -
-              flavored note would contradict a card with nothing left to do. */}
-          {!skipped && !allConnected && (
-            <button
-              type="button"
-              className="flex-shrink-0 rounded-md px-2 py-1 text-xs font-medium text-muted-foreground hover:bg-muted hover:text-foreground"
-              onClick={() => {
-                setSkipped(true);
-                onSkip();
-              }}
-            >
-              {t("chatPage.clarification.connectApps.skip")}
-            </button>
+          {/* Swaps for a Continue button once every row is Connected (see
+              onContinue's doc comment) - a Skip button next to an "I'll do
+              this later" note would contradict a card with nothing left to
+              do, and without any button at all a card seeded onto a task
+              that's genuinely paused waiting for this connection (not just
+              the Hire-flow seed message, which was never actually waiting)
+              would have no way to tell the task to resume. */}
+          {allConnected ? (
+            onContinue &&
+            !continued && (
+              <button
+                type="button"
+                className="flex-shrink-0 rounded-md bg-primary px-2.5 py-1 text-xs font-medium text-primary-foreground hover:bg-primary/90"
+                onClick={() => {
+                  setContinued(true);
+                  onContinue();
+                }}
+              >
+                {t("chatPage.clarification.connectApps.continue")}
+              </button>
+            )
+          ) : (
+            !skipped && (
+              <button
+                type="button"
+                className="flex-shrink-0 rounded-md px-2 py-1 text-xs font-medium text-muted-foreground hover:bg-muted hover:text-foreground"
+                onClick={() => {
+                  setSkipped(true);
+                  onSkip();
+                }}
+              >
+                {t("chatPage.clarification.connectApps.skip")}
+              </button>
+            )
           )}
         </div>
       </div>

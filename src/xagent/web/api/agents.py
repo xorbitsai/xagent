@@ -17,6 +17,8 @@ from ...core.agent.language import (
     response_language_rules,
 )
 from ...core.agent.service import AgentService
+from ...core.agent.voice_policy import _VOICE_INSTRUCTIONS as _core_voice_instructions
+from ...core.agent.voice_policy import apply_output_voice
 from ...core.memory.in_memory import InMemoryMemoryStore
 from ...core.tools.core.document_search import find_missing_knowledge_bases
 from ...core.tracing import create_agent_tracer
@@ -310,46 +312,20 @@ def enhance_system_prompt_with_kb(
     return kb_prompt.lstrip("\n")
 
 
-# Short style instructions for each onboarding "Launch" step voice choice
-# (see VALID_USER_VOICES/UpdatePreferencesRequest in api/auth.py) - the
-# example line for each mirrors the reference UI's own "<voice> sounds
-# like" preview, so the model's actual output matches what the user was
-# shown when they picked it.
-_VOICE_INSTRUCTIONS: Dict[str, str] = {
-    "professional": (
-        "Formal and polished: precise word choice, complete sentences, no "
-        'slang. Example: "Thanks for reaching out. I have reviewed your '
-        'request and will come back to you with an answer by Thursday."'
-    ),
-    "friendly": (
-        "Warm and conversational, like a helpful colleague. Example: "
-        "\"Thanks so much for getting in touch! I've had a look and I'll "
-        'get you an answer by Thursday."'
-    ),
-    "concise": (
-        "As short as possible: drop pleasantries and filler words, state "
-        "only what's needed. Example: \"Reviewed. You will have an answer "
-        'by Thursday."'
-    ),
-    "warm": (
-        "Empathetic and reassuring: acknowledge the person's situation "
-        'before getting to the point. Example: "Thanks for flagging this '
-        "- I know the timing matters, so I've prioritised it and will "
-        'have an answer to you by Thursday."'
-    ),
-    "playful": (
-        "Light and upbeat, with personality, not stiff or overly formal. "
-        "Example: \"Got it - thanks for the nudge! I'm on it, and you'll "
-        'have an answer by Thursday."'
-    ),
-}
+# Re-exported from core.agent.voice_policy (not defined here) so a
+# delegated AgentTool child - built in core/tools/adapters/vibe/agent_tool.py,
+# which cannot import a web route module - applies the exact same policy.
+# See VALID_USER_VOICES/UpdatePreferencesRequest in api/auth.py for the
+# schema-level source of truth this module-level check guards.
+_VOICE_INSTRUCTIONS = _core_voice_instructions
 if set(_VOICE_INSTRUCTIONS) != VALID_USER_VOICES:
     # A plain assert would be stripped under `python -O`, silently losing
     # this consistency guarantee in production rather than failing loudly.
     raise ValueError(
-        "_VOICE_INSTRUCTIONS must define exactly the voices UpdatePreferencesRequest "
-        "accepts (api/auth.py's VALID_USER_VOICES) - otherwise a valid, storable "
-        "voice preference could silently have no prompt effect."
+        "core.agent.voice_policy._VOICE_INSTRUCTIONS must define exactly the "
+        "voices UpdatePreferencesRequest accepts (api/auth.py's "
+        "VALID_USER_VOICES) - otherwise a valid, storable voice preference "
+        "could silently have no prompt effect."
     )
 
 
@@ -358,10 +334,8 @@ def apply_user_voice(
 ) -> Optional[str]:
     """Append the given output voice (the current user's onboarding Launch
     step choice, set via PATCH /api/auth/me/preferences) as a `##
-    OUTPUT VOICE` section, so every agent this user talks to writes in
-    the tone they picked - deliberately separate from the existing
-    output LANGUAGE policy (core/agent/language.py), which controls what
-    language a response is in, not what tone it uses.
+    OUTPUT VOICE` section - see core.agent.voice_policy.apply_output_voice
+    for the actual policy (shared with delegated AgentTool children).
 
     Takes the already-resolved voice string rather than a db/user_id:
     callers already have a runtime user object in hand by the time a
@@ -371,21 +345,8 @@ def apply_user_voice(
     query that fetches `id`/`is_admin`), and issuing a fresh query here
     would either duplicate that lookup or - worse - run one against a
     request session that may already have been released back to the
-    pool by this point in agent construction. A no-op when voice is
-    None/empty, doesn't match a known option (e.g. an
-    older/unrecognized value), or isn't even a string - the JSON
-    ``preferences`` column has no nested-type constraint, so a
-    corrupted/hand-edited row could hold a list or dict here, which
-    would otherwise reach ``dict.get`` as an unhashable key and raise
-    ``TypeError`` instead of degrading to plain output."""
-    instruction = _VOICE_INSTRUCTIONS.get(voice) if isinstance(voice, str) else None
-    if not instruction:
-        return system_prompt
-
-    voice_prompt = f"\n\n## OUTPUT VOICE\n{instruction}"
-    if system_prompt:
-        return system_prompt + voice_prompt
-    return voice_prompt.lstrip("\n")
+    pool by this point in agent construction."""
+    return apply_output_voice(system_prompt, voice)
 
 
 def voice_from_runtime_user(
@@ -1809,6 +1770,10 @@ async def preview_agent(
             # on. The live agent (once promoted) can still diverge from
             # this preview for a team connector -- a known, accepted gap.
             connector_team_id=None,
+            # Threaded through so a delegated AgentTool child the preview
+            # calls also honors the previewing user's voice (see
+            # BaseToolConfig.get_voice's docstring).
+            voice=voice_from_runtime_user(current_user),
         )
 
         # Determine execution mode (default to "think")

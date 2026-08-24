@@ -640,6 +640,7 @@ async def create_default_tools(
 
     # Create a WebToolConfig to properly initialize tools
     from ..tools.config import WebToolConfig
+    from .agents import voice_from_runtime_user
 
     db_factory = None
     if db is None:
@@ -700,6 +701,7 @@ async def create_default_tools(
         parent_task_id=parent_task_id,
         parent_tracer=parent_tracer,
         agent_call_stack=agent_call_stack,
+        voice=voice_from_runtime_user(user),
         connector_runtime_turn_id=connector_runtime_turn_id,
         mcp_failure_policy=mcp_failure_policy,
         mcp_load_summary_tracer=mcp_load_summary_tracer,

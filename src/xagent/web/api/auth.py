@@ -20,6 +20,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request, status
 from fastapi.responses import HTMLResponse, RedirectResponse
 from jose import JWTError, jwt
 from pydantic import BaseModel, Field, StrictInt, StrictStr, field_validator
+from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session
 
@@ -1308,6 +1309,24 @@ async def update_current_user_email(
     )
 
 
+def _lock_user_row_for_preferences_update(db: Session, user_id: int) -> None:
+    """Serialize concurrent preferences PATCHes for one user, in every
+    database - mirrors acquire_runtime_key_transition_fence's dual-dialect
+    pattern (api/api_keys.py). PostgreSQL/MySQL take a row-level ``FOR
+    UPDATE`` lock; SQLite ignores that clause, so a no-op write grabs its
+    write lock instead. Held until this transaction commits, so a second
+    concurrent PATCH's read-modify-write of the same JSON column blocks
+    here instead of reading stale data and silently dropping the first
+    request's disjoint fields on its own commit."""
+    if db.get_bind().dialect.name == "sqlite":
+        db.execute(
+            text("UPDATE users SET id = id WHERE id = :user_id"),
+            {"user_id": user_id},
+        )
+    else:
+        db.query(User.id).filter(User.id == user_id).with_for_update().first()
+
+
 @auth_router.patch("/me/preferences", response_model=UpdatePreferencesResponse)
 async def update_current_user_preferences(
     request: UpdatePreferencesRequest,
@@ -1320,6 +1339,11 @@ async def update_current_user_preferences(
     survives a later step's PATCH."""
     updates = request.model_dump(exclude_unset=True)
     if updates:
+        _lock_user_row_for_preferences_update(db, int(user.id))
+        # Re-read after acquiring the lock: a concurrent PATCH may have
+        # committed its own merge while this request was waiting on it,
+        # and `user` was loaded before that lock was taken.
+        db.refresh(user)
         current_preferences = dict(cast(Any, user.preferences) or {})
         current_preferences.update(updates)
         setattr(user, "preferences", current_preferences)

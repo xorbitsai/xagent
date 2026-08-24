@@ -504,6 +504,99 @@ class TestCreateAgentTool:
             except OSError:
                 pass
 
+    @pytest.mark.asyncio
+    async def test_agent_tool_applies_parent_voice_to_delegated_child(self) -> None:
+        """A delegated child must honor the same onboarding voice
+        preference the top-level agent does (see
+        core.agent.voice_policy.apply_output_voice) - before this fix,
+        AgentTool had no ``voice`` at all, so a worker agent's own output
+        (visibly forwarded/traced to the user, per PR #1612 review N4)
+        stayed in the default tone regardless of what the user picked."""
+        db, db_path, SessionLocal = _create_session()
+        try:
+            user = User(username="voice-worker-owner", password_hash="x")
+            db.add(user)
+            db.commit()
+            db.refresh(user)
+
+            model = Model(
+                model_id="test-model-id",
+                category="llm",
+                model_provider="openai",
+                model_name="gpt-4",
+                api_key="test-api-key",
+                base_url="https://api.openai.com/v1",
+                temperature=0.7,
+                abilities=["chat"],
+            )
+            db.add(model)
+            db.commit()
+            db.refresh(model)
+
+            agent = Agent(
+                user_id=user.id,
+                name="Worker Agent",
+                description="A worker",
+                instructions="Base worker instructions.",
+                status=AgentStatus.PUBLISHED,
+                models={"general": model.id},
+            )
+            db.add(agent)
+            db.commit()
+            db.refresh(agent)
+
+            tool = AgentTool(
+                agent_id=agent.id,
+                agent_name=agent.name,
+                agent_description=agent.description or "",
+                session_factory=SessionLocal,
+                user_id=user.id,
+                task_id="tool-session-voice",
+                voice="warm",
+            )
+
+            with (
+                patch(
+                    "xagent.web.services.llm_utils.UserAwareModelStorage"
+                ) as mock_storage_class,
+                patch(
+                    "xagent.core.agent.service.AgentService"
+                ) as mock_agent_service_class,
+                patch("xagent.core.memory.in_memory.InMemoryMemoryStore"),
+            ):
+                mock_storage = Mock()
+                mock_storage.get_llm_by_name_with_access.return_value = Mock()
+                mock_storage_class.return_value = mock_storage
+
+                mock_agent_service = mock_agent_service_class.return_value
+                mock_agent_service.execute_task = AsyncMock(
+                    return_value={"output": "worker response", "file_outputs": []}
+                )
+
+                await tool.run_json_async({"task": "draft report"})
+
+            execute_context = mock_agent_service.execute_task.call_args.kwargs[
+                "context"
+            ]
+            assert execute_context["system_prompt"].startswith(
+                "Base worker instructions.\n\n## OUTPUT VOICE\n"
+            )
+            assert "Empathetic and reassuring" in execute_context["system_prompt"]
+
+            # Propagated into the child's own tool config too, so a
+            # grandchild delegation (a worker calling another agent) would
+            # inherit the same voice.
+            tool_config = mock_agent_service_class.call_args.kwargs["tool_config"]
+            assert tool_config.get_voice() == "warm"
+        finally:
+            db.close()
+            try:
+                import os
+
+                os.remove(db_path)
+            except OSError:
+                pass
+
     def test_agent_tool_accepts_parent_file_operation_policy(self) -> None:
         assert (
             "file_operation_access_version" in inspect.signature(AgentTool).parameters

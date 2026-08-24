@@ -22,6 +22,7 @@ from .....web.services.model_service import (
 # (which also keeps it patchable in tests).
 from .....web.tools.config import WebToolConfig
 from ....agent.result import NO_OUTPUT_PLACEHOLDER, NO_RESPONSE_PLACEHOLDER
+from ....agent.voice_policy import apply_output_voice
 from ....task_runtime import FILE_OPERATION_ACCESS_VERSION_KEY
 from ....tracing import create_agent_tracer
 from ....utils.type_check import ensure_list
@@ -1735,6 +1736,7 @@ class AgentTool(AbstractBaseTool):
         runtime_metadata: Optional[dict[str, Any]] = None,
         execution_scope: Optional[Any] = None,
         file_operation_access_version: Any = None,
+        voice: Optional[str] = None,
     ):
         """
         Initialize an agent tool.
@@ -1765,6 +1767,12 @@ class AgentTool(AbstractBaseTool):
             execution_scope: Parent execution scope inherited by the child
             file_operation_access_version: Server-derived parent File Operation
                 policy version. ``None`` preserves legacy behavior.
+            voice: Already-resolved onboarding output-voice preference,
+                applied to this delegated agent's own system prompt and
+                propagated into any further tool set it builds (see
+                core.agent.voice_policy.apply_output_voice and
+                BaseToolConfig.get_voice), so a task's chosen voice reaches
+                every agent this user talks to, not just the top-level one.
         """
         self._agent_id = agent_id
         self._agent_name = agent_name
@@ -1797,6 +1805,7 @@ class AgentTool(AbstractBaseTool):
         )
         self._runtime_metadata = dict(runtime_metadata or {})
         self._file_operation_access_version = file_operation_access_version
+        self._voice = voice
         self._agent_call_stack = _normalize_agent_ids(agent_call_stack) or []
         if agent_id not in self._agent_call_stack:
             self._agent_call_stack.append(agent_id)
@@ -2243,6 +2252,7 @@ class AgentTool(AbstractBaseTool):
                 parent_task_id=self._parent_task_id,
                 parent_tracer=self._parent_tracer,
                 agent_call_stack=self._agent_call_stack,
+                voice=self._voice,
                 task_id=execution_task_id,
                 workspace_config={
                     "base_dir": self._workspace_base_dir,
@@ -2304,8 +2314,14 @@ class AgentTool(AbstractBaseTool):
                     system_prompts.append(agent_instructions)
                 if self._extra_system_prompt:
                     system_prompts.append(self._extra_system_prompt)
-                if system_prompts:
-                    execution_context["system_prompt"] = "\n\n".join(system_prompts)
+                delegated_system_prompt = (
+                    "\n\n".join(system_prompts) if system_prompts else None
+                )
+                delegated_system_prompt = apply_output_voice(
+                    delegated_system_prompt, self._voice
+                )
+                if delegated_system_prompt:
+                    execution_context["system_prompt"] = delegated_system_prompt
 
                 # Execute task. Re-activate the parent turn's scope snapshot
                 # around the nested run (no re-resolution — the nested call
@@ -2501,6 +2517,7 @@ def build_published_agent_tools_from_records(
     agent_call_stack: Optional[list[int]] = None,
     execution_scope: Optional[Any] = None,
     file_operation_access_version: Any = None,
+    voice: Optional[str] = None,
 ) -> list[AbstractBaseTool]:
     """Construct AgentTool instances from ORM-free worker results."""
     if workspace_base_dir is None:
@@ -2588,6 +2605,7 @@ def build_published_agent_tools_from_records(
             runtime_metadata=runtime_metadata,
             execution_scope=execution_scope,
             file_operation_access_version=file_operation_access_version,
+            voice=voice,
         )
         tools.append(tool)
         logger.debug("Created agent tool: %s", tool.name)
@@ -2612,6 +2630,7 @@ def get_published_agents_tools(
     agent_call_stack: Optional[list[int]] = None,
     execution_scope: Optional[Any] = None,
     file_operation_access_version: Any = None,
+    voice: Optional[str] = None,
 ) -> list[AbstractBaseTool]:
     """
     Get tools for published (and optionally draft) agents.
@@ -2673,6 +2692,7 @@ def get_published_agents_tools(
             agent_call_stack=agent_call_stack,
             execution_scope=execution_scope,
             file_operation_access_version=file_operation_access_version,
+            voice=voice,
         )
 
     except Exception as e:
@@ -2737,6 +2757,7 @@ async def create_agent_tools(config: "WebToolConfig") -> list[AbstractBaseTool]:
             file_operation_access_version=(config.get_workspace_config() or {}).get(
                 FILE_OPERATION_ACCESS_VERSION_KEY
             ),
+            voice=config.get_voice() if hasattr(config, "get_voice") else None,
         )
         records_getter = getattr(config, "get_published_agent_tool_records", None)
         records = records_getter() if callable(records_getter) else None

@@ -643,6 +643,41 @@ class TestAgentServiceManagerReconstruction:
         assert "browser" in spec.categories
 
     @pytest.mark.asyncio
+    async def test_build_tools_for_task_threads_voice_into_tool_config(
+        self, agent_manager, mock_db, sample_task, monkeypatch
+    ):
+        """The owner's voice preference must reach WebToolConfig.get_voice()
+        so a delegated AgentTool this task calls also honors it (see
+        AgentTool.__init__'s ``voice`` param and BaseToolConfig.get_voice) -
+        not just the top-level agent's own system prompt."""
+
+        async def create_all_tools(config, apply_user_override_filter=True, **_):
+            return []
+
+        monkeypatch.setattr(
+            "xagent.core.tools.adapters.vibe.factory.ToolFactory.create_all_tools",
+            create_all_tools,
+        )
+        runtime_user = RuntimeUserFields(id=7, is_admin=False, voice="playful")
+
+        with patch("xagent.web.sandbox_manager.get_sandbox_manager", return_value=None):
+            _tools, tool_config = await agent_manager._build_tools_for_task(
+                task_id=sample_task.id,
+                task=sample_task,
+                db=mock_db,
+                user=runtime_user,
+                agent_config={
+                    "tool_categories": [],
+                    "knowledge_bases": [],
+                    "skills": [],
+                },
+                task_llm=None,
+                task_vision_llm=None,
+            )
+
+        assert tool_config.get_voice() == "playful"
+
+    @pytest.mark.asyncio
     @pytest.mark.parametrize(
         ("source", "expected_policy"),
         [

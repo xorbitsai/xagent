@@ -246,6 +246,22 @@ def test_list_sitemaps_returns_sitemap_list(monkeypatch):
     assert "https%3A%2F%2Fexample.com%2F" in mock_request.call_args.kwargs["url"]
 
 
+def test_list_sitemaps_treats_non_list_sitemap_field_as_empty(monkeypatch):
+    """A malformed API response where "sitemap" isn't a list must not
+    crash or leak the raw value; it degrades to an empty list."""
+    mock_request = Mock(return_value=MockResponse(json_data={"sitemap": "not-a-list"}))
+    monkeypatch.setattr(google_search_console.requests, "request", mock_request)
+
+    result = json.loads(
+        google_search_console.google_search_console_list_sitemaps(
+            "https://example.com/"
+        )
+    )
+
+    assert result["status"] == "success"
+    assert result["sitemaps"] == []
+
+
 def test_query_search_analytics_builds_body_and_returns_rows(monkeypatch):
     mock_request = Mock(
         return_value=MockResponse(
@@ -515,22 +531,46 @@ def test_query_search_analytics_trims_to_empty_when_single_row_exceeds_budget(
     assert len(response) < max_output_length
 
 
-def test_query_search_analytics_treats_non_list_rows_as_empty(monkeypatch):
+def test_query_search_analytics_treats_non_list_rows_as_empty(monkeypatch, caplog):
     """A malformed API response where "rows" isn't a list (e.g. null or a
     dict) must not raise a TypeError out of len()/slicing; it degrades to an
-    empty result instead."""
+    empty result instead, and the anomaly is logged so it's distinguishable
+    from a real zero-row answer."""
     mock_request = Mock(return_value=MockResponse(json_data={"rows": "not-a-list"}))
     monkeypatch.setattr(google_search_console.requests, "request", mock_request)
 
-    result = json.loads(
-        google_search_console.google_search_console_query_search_analytics(
-            "https://example.com/", start_date="2026-07-01", end_date="2026-07-28"
+    with caplog.at_level("WARNING", logger=google_search_console.logger.name):
+        result = json.loads(
+            google_search_console.google_search_console_query_search_analytics(
+                "https://example.com/", start_date="2026-07-01", end_date="2026-07-28"
+            )
         )
-    )
 
     assert result["status"] == "success"
     assert result["rows"] == []
     assert result["row_count"] == 0
+    assert "non-list 'rows'" in caplog.text
+
+
+def test_query_search_analytics_omits_warning_when_rows_key_missing(
+    monkeypatch, caplog
+):
+    """A genuinely absent "rows" key (a normal zero-result answer) should not
+    log the malformed-response warning — only a present-but-wrong-type value
+    should."""
+    mock_request = Mock(return_value=MockResponse(json_data={}))
+    monkeypatch.setattr(google_search_console.requests, "request", mock_request)
+
+    with caplog.at_level("WARNING", logger=google_search_console.logger.name):
+        result = json.loads(
+            google_search_console.google_search_console_query_search_analytics(
+                "https://example.com/", start_date="2026-07-01", end_date="2026-07-28"
+            )
+        )
+
+    assert result["status"] == "success"
+    assert result["rows"] == []
+    assert "non-list 'rows'" not in caplog.text
 
 
 def test_query_search_analytics_returns_error_payload_on_api_failure(monkeypatch):

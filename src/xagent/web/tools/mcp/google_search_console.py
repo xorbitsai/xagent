@@ -187,7 +187,10 @@ def google_search_console_list_sitemaps(site_url: str) -> str:
                 f"{WEBMASTERS_API_BASE_URL}/sites/{encoded_site_url}/sitemaps",
             )
         )
-        return _success(sitemaps=result.get("sitemap") or [])
+        sitemaps = result.get("sitemap")
+        if not isinstance(sitemaps, list):
+            sitemaps = []
+        return _success(sitemaps=sitemaps)
     except Exception as e:
         logger.error(f"Error listing sitemaps for {site_url!r}: {e}")
         return _error(str(e))
@@ -263,6 +266,12 @@ def google_search_console_query_search_analytics(
         )
         rows = result.get("rows")
         if not isinstance(rows, list):
+            if rows is not None:
+                logger.warning(
+                    f"Google Search Console query_search_analytics returned a "
+                    f"non-list 'rows' field ({type(rows).__name__}); treating "
+                    f"as empty"
+                )
             rows = []
 
         # row_limit bounds row *count*, not bytes: several "query"/"page"

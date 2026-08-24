@@ -40,7 +40,7 @@ ROW = {
     "icon": "https://www.google.com/s2/favicons?domain=search.google.com&sz=128",
     "transport": "oauth",
     "provider_name": "google",
-    "category": "Marketing",
+    "category": "Analytics",
     "oauth_scopes": ["https://www.googleapis.com/auth/webmasters.readonly"],
     "is_visible_in_connector": True,
     "launch_config": {

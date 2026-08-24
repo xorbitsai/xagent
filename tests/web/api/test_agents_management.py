@@ -3705,6 +3705,19 @@ class TestApplyUserVoice:
     def test_unrecognized_voice_value_returns_prompt_unchanged(self):
         assert agents_api.apply_user_voice("Be helpful.", "sarcastic") == "Be helpful."
 
+    def test_list_voice_value_does_not_raise_and_returns_prompt_unchanged(self):
+        # The JSON `preferences` column has no nested-type constraint, so a
+        # corrupted/hand-edited row could hold a list here. A list is truthy
+        # but unhashable - `dict.get` on it would raise TypeError instead of
+        # degrading to plain output.
+        assert agents_api.apply_user_voice("Be helpful.", ["concise"]) == "Be helpful."
+
+    def test_dict_voice_value_does_not_raise_and_returns_prompt_unchanged(self):
+        assert (
+            agents_api.apply_user_voice("Be helpful.", {"voice": "concise"})
+            == "Be helpful."
+        )
+
     def test_known_voice_appends_output_voice_section(self):
         result = agents_api.apply_user_voice("Be helpful.", "concise")
 

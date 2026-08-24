@@ -372,9 +372,13 @@ def apply_user_voice(
     would either duplicate that lookup or - worse - run one against a
     request session that may already have been released back to the
     pool by this point in agent construction. A no-op when voice is
-    None/empty or doesn't match a known option (e.g. an
-    older/unrecognized value)."""
-    instruction = _VOICE_INSTRUCTIONS.get(voice) if voice else None
+    None/empty, doesn't match a known option (e.g. an
+    older/unrecognized value), or isn't even a string - the JSON
+    ``preferences`` column has no nested-type constraint, so a
+    corrupted/hand-edited row could hold a list or dict here, which
+    would otherwise reach ``dict.get`` as an unhashable key and raise
+    ``TypeError`` instead of degrading to plain output."""
+    instruction = _VOICE_INSTRUCTIONS.get(voice) if isinstance(voice, str) else None
     if not instruction:
         return system_prompt
 

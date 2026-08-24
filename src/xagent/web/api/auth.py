@@ -1326,6 +1326,16 @@ async def update_current_user_preferences(
         db.commit()
         db.refresh(user)
 
+        if "voice" in updates:
+            # A cached AgentService bakes voice into its system prompt at
+            # construction time and won't re-check preferences on later
+            # turns (see invalidate_cached_agents_for_owner's docstring),
+            # so an already-warm task would otherwise keep speaking in the
+            # old (or now-cleared) voice until incidental eviction/rebuild.
+            from .chat import get_agent_manager
+
+            get_agent_manager().invalidate_cached_agents_for_owner(int(user.id))
+
     return UpdatePreferencesResponse(
         success=True,
         message="Preferences updated successfully",

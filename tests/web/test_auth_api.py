@@ -2,6 +2,7 @@
 
 import os
 import tempfile
+from unittest.mock import MagicMock
 from urllib.parse import parse_qs, urlparse
 
 import pytest
@@ -12,6 +13,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import sessionmaker
 
 from xagent.web.api import auth as auth_api
+from xagent.web.api import chat as chat_api
 from xagent.web.api.auth import RefreshTokenResponse, auth_router, hash_password
 from xagent.web.models.database import Base, get_db
 from xagent.web.models.user import User
@@ -455,6 +457,37 @@ class TestAuthAPI:
 
         assert response.status_code == 200
         assert response.json()["user"]["preferences"] == {"department": "Sales"}
+
+    def test_update_current_user_preferences_invalidates_cache_only_for_voice(
+        self, test_db, test_user_data, monkeypatch
+    ):
+        """A voice change must evict any cached AgentService for this user
+        (see AgentServiceManager.invalidate_cached_agents_for_owner) so an
+        already-warm task rebuilds with the new voice on its next turn -
+        an unrelated field (e.g. department) must not trigger that."""
+        setup_first_admin()
+        register_response = client.post("/api/auth/register", json=test_user_data)
+        assert register_response.status_code == 200
+        token = login_and_get_token(
+            test_user_data["username"], test_user_data["password"]
+        )
+        headers = {"Authorization": f"Bearer {token}"}
+        user_id = register_response.json()["user"]["id"]
+
+        mock_manager = MagicMock()
+        monkeypatch.setattr(chat_api, "get_agent_manager", lambda: mock_manager)
+
+        response = client.patch(
+            "/api/auth/me/preferences", json={"department": "Sales"}, headers=headers
+        )
+        assert response.status_code == 200, response.text
+        mock_manager.invalidate_cached_agents_for_owner.assert_not_called()
+
+        response = client.patch(
+            "/api/auth/me/preferences", json={"voice": "warm"}, headers=headers
+        )
+        assert response.status_code == 200, response.text
+        mock_manager.invalidate_cached_agents_for_owner.assert_called_once_with(user_id)
 
     def test_update_current_user_email(self, test_db, test_user_data):
         setup_first_admin()

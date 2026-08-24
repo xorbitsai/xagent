@@ -2949,6 +2949,43 @@ class AgentServiceManager:
             )
             agent.invalidate_tools()
 
+    def invalidate_cached_agents_for_owner(self, owner_user_id: int) -> None:
+        """Evict every cached AgentService owned by ``owner_user_id``.
+
+        A cached AgentService bakes its system prompt in at construction
+        time (``AgentService.__init__`` -> ``self._base_system_prompt``)
+        and the cache-hit path only re-checks owner/scope invariants, not
+        preferences - so a voice PATCH would otherwise be silently ignored
+        by every already-warm task until incidental eviction/rebuild.
+        Call this right after committing a voice change so the next turn
+        on each affected task rebuilds from a fresh snapshot instead.
+
+        Mirrors the scope-fingerprint-mismatch eviction above: the
+        workspace is deliberately NOT cleaned up here (same owner, same
+        on-disk data must survive the rebuild) - only the manager's cache
+        bookkeeping is cleared.
+        """
+        stale_task_ids = [
+            task_id
+            for task_id, cached_owner_id in self._agent_owner_ids.items()
+            if cached_owner_id == owner_user_id
+        ]
+        for task_id in stale_task_ids:
+            self._agents.pop(task_id, None)
+            self._agent_owner_ids.pop(task_id, None)
+            self._agent_sandbox_keys.pop(task_id, None)
+            self._agent_sandbox_providers.pop(task_id, None)
+            self._agent_scope_fingerprints.pop(task_id, None)
+            self._agent_evicted_scope_fingerprints.pop(task_id, None)
+        if stale_task_ids:
+            logger.info(
+                "Invalidated %d cached AgentService(s) for user %s after a "
+                "preference change: %s",
+                len(stale_task_ids),
+                owner_user_id,
+                stale_task_ids,
+            )
+
     def remove_agent(self, task_id: int, user_id: Optional[int] = None) -> None:
         """Remove AgentService instance for completed task"""
         if task_id in self._agents:

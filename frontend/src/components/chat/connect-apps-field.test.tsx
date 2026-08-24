@@ -845,6 +845,30 @@ describe("ConnectAppsField", () => {
     ).not.toBeInTheDocument();
   });
 
+  it("restores the Continue button when onContinue rejects, so the user can retry", async () => {
+    mcpAppsMock.apps = [makeApp({ provider: "google", is_connected: true })];
+    const onContinue = vi.fn().mockRejectedValue(new Error("network error"));
+
+    render(
+      <ConnectAppsField
+        interaction={{ ...LEO_INTERACTION, apps: ["Gmail"] }}
+        onSkip={vi.fn()}
+        onContinue={onContinue}
+      />
+    );
+
+    fireEvent.click(
+      screen.getByRole("button", { name: "chatPage.clarification.connectApps.continue" })
+    );
+
+    await waitFor(() => {
+      expect(
+        screen.getByRole("button", { name: "chatPage.clarification.connectApps.continue" })
+      ).toBeInTheDocument();
+    });
+    expect(onContinue).toHaveBeenCalledTimes(1);
+  });
+
   it("does not show a Continue button while an app is still unconnected, even when onContinue is supplied", () => {
     mcpAppsMock.apps = [makeApp({ provider: "google", is_connected: false })];
 

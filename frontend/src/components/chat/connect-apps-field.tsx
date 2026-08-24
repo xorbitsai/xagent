@@ -190,7 +190,7 @@ export function ConnectAppsField({
    * handleContinueConnectApps). Optional so an older/mixed-list caller
    * that doesn't pass it just keeps the allConnectedNote-only footer this
    * card had before, rather than crashing. */
-  onContinue?: () => void;
+  onContinue?: () => Promise<void> | void;
 }) {
   const { apps, refresh, isLoading, error } = useMcpApps();
   const { token } = useAuth();
@@ -521,9 +521,13 @@ export function ConnectAppsField({
               <button
                 type="button"
                 className="flex-shrink-0 rounded-md bg-primary px-2.5 py-1 text-xs font-medium text-primary-foreground hover:bg-primary/90"
-                onClick={() => {
+                onClick={async () => {
                   setContinued(true);
-                  onContinue();
+                  try {
+                    await onContinue();
+                  } catch {
+                    setContinued(false);
+                  }
                 }}
               >
                 {t("chatPage.clarification.connectApps.continue")}

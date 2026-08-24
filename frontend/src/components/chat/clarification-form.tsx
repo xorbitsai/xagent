@@ -343,6 +343,7 @@ export function ClarificationForm({
     } catch (error) {
       console.error("Failed to send connect-apps continue response", error)
       toast.error(t("chatPage.clarification.sendError"))
+      throw error
     }
   }
 

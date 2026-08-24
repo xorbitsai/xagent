@@ -665,31 +665,17 @@ jobs:
         working-directory: ./frontend
         run: npm run test:widget:coverage
 
-      # The widget lane above is an explicit regression suite for the widget,
-      # Session, and browser-auth contracts. Keep the broader page-directory,
-      # KB component, and App Router suites so newly added tests are discovered
-      # automatically.
+      # The full lane auto-discovers regular tests, the Widget lane retains
+      # coverage semantics, and the manifest is an independent launcher.
       - name: Run frontend test manifest contract
         working-directory: ./frontend
         shell: bash
         run: npm run test:ci-manifest
 
-      - name: Run page component tests
+      - name: Run full frontend test suite
         working-directory: ./frontend
         shell: bash
-        run: npm run test:pages
-
-      - name: Run knowledge base component tests
-        working-directory: ./frontend
-        run: npm run test:kb-components
-
-      - name: Run App Router tests
-        working-directory: ./frontend
-        run: npm run test:app-pages
-
-      - name: Run Home and Build supporting contract tests
-        working-directory: ./frontend
-        run: npm run test:home-build-contracts
+        run: npm run test:run
 
       # Static export is the default build (served by FastAPI in the pip/uvx
       # deployment). Verify it produces a servable bundle: index shell plus the

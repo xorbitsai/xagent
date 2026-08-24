@@ -1,16 +1,25 @@
 /**
  * Guards accidental drift across .github/workflows/ci.yml, package.json launchers,
- * and vitest.config.ts discovery. test:ci-manifest and test:pages are independent
+ * and vitest.config.ts discovery. test:ci-manifest and test:run are independent
  * launchers; legitimate changes update the owner files and these invariants together.
  */
 import { spawnSync } from "node:child_process"
-import { readFileSync } from "node:fs"
+import { existsSync, readdirSync, readFileSync } from "node:fs"
 import path from "node:path"
 import { fileURLToPath } from "node:url"
+import ts from "typescript"
 import { isMap, isScalar, isSeq, parseDocument } from "yaml"
 import type { Node } from "yaml"
 import { describe, expect, it, vi } from "vitest"
 import vitestConfig from "../../vitest.config"
+import widgetVitestConfig from "../../vitest.widget.config"
+import {
+  buildWidgetTestOptions,
+  widgetCoverageExtensions,
+  widgetCoverageOwners,
+  widgetTestFiles,
+} from "../../vitest.widget.policy"
+import type { WidgetCoverageOwner } from "../../vitest.widget.policy"
 
 // jsdom can load Vitest config in a second realm where vitest/config cannot initialize.
 vi.mock("vitest/config", () => ({
@@ -18,12 +27,7 @@ vi.mock("vitest/config", () => ({
 }))
 
 const manifestCommand = "vitest run --config vitest.config.ts src/ci/frontend-test-manifest.test.ts"
-const pagesCommand =
-  "vitest run --config vitest.config.ts src/components/pages src/ci/frontend-test-manifest.test.ts"
-const kbComponentsCommand = "vitest run --config vitest.config.ts src/components/kb"
-const appPagesCommand = "vitest run --config vitest.config.ts src/app"
-const homeBuildContractsCommand =
-  "vitest run --config vitest.config.ts src/lib/models.test.ts src/lib/task-create.test.ts src/i18n/translations.test.ts src/lib/utils.test.ts src/lib/time-utils.test.ts"
+const fullSuiteCommand = "vitest run"
 const ciSummaryCondition =
   "always() && (github.event_name != 'pull_request' || github.event.pull_request.draft == false)"
 const frontendSummaryCheckCommand =
@@ -51,14 +55,26 @@ const ciSummaryFailurePropagationCommands = [
 const requiredFrontendSteps = [
   { command: "npm run test:widget:coverage", requiresExplicitBash: false },
   { command: "npm run test:ci-manifest", requiresExplicitBash: true },
-  { command: "npm run test:pages", requiresExplicitBash: true },
-  { command: "npm run test:kb-components", requiresExplicitBash: false },
-  { command: "npm run test:app-pages", requiresExplicitBash: false },
-  { command: "npm run test:home-build-contracts", requiresExplicitBash: false },
+  { command: "npm run test:run", requiresExplicitBash: true },
 ] as const
+const retiredFrontendLaunchers = new Set([
+  "npm run test:pages",
+  "npm run test:kb-components",
+  "npm run test:app-pages",
+  "npm run test:home-build-contracts",
+])
 const moduleDir = path.dirname(fileURLToPath(import.meta.url))
+const frontendRoot = path.resolve(moduleDir, "../..")
+const frontendRootEntryNames = readdirSync(frontendRoot)
+const recognizedWorkspaceProjectFilenames = ["vitest.workspace", "vitest.projects"].flatMap(
+  (basename) =>
+    [".ts", ".mts", ".cts", ".js", ".mjs", ".cjs", ".json"].map(
+      (extension) => `${basename}${extension}`,
+    ),
+)
 const packageJsonPath = path.resolve(moduleDir, "../../package.json")
 const workflowPath = path.resolve(moduleDir, "../../../.github/workflows/ci.yml")
+const widgetConfigPath = path.resolve(moduleDir, "../../vitest.widget.config.ts")
 const realWorkflowSource = readFileSync(workflowPath, "utf8")
 
 function replaceExactlyOnce(source: string, search: string, replacement: string, owner: string) {
@@ -71,7 +87,7 @@ function replaceExactlyOnce(source: string, search: string, replacement: string,
     throw new Error(`${owner} must appear exactly once; found ${count}`)
   }
 
-  const mutated = source.replace(search, replacement)
+  const mutated = source.replace(search, () => replacement)
   if (mutated === source) {
     throw new Error(`${owner} mutation must change the source`)
   }
@@ -403,12 +419,699 @@ function assertSemanticWorkflowManifest(source: string) {
     }
   }
 
-  if (frontendBuild.steps.some((step) => step.run === "npm run test:home-build-pages")) {
-    throw new Error("legacy test:home-build-pages must not run in frontend-build")
+  const retiredDirectLauncher = frontendBuild.steps
+    .map((step) => {
+      requireRecord(step, "jobs.frontend-build.steps entry")
+      return typeof step.run === "string" ? step.run.trim() : undefined
+    })
+    .find((run) => run !== undefined && retiredFrontendLaunchers.has(run))
+
+  if (retiredDirectLauncher !== undefined) {
+    throw new Error(
+      `jobs.frontend-build must not directly run retired targeted launcher ${retiredDirectLauncher}`,
+    )
   }
 }
 
+function assertRegularSuiteDiscovery(
+  config: unknown,
+  scripts: Record<string, string>,
+  rootEntryNames: readonly string[],
+) {
+  requireRecord(config, "regular Vitest config")
+  if (scripts["test:run"] !== fullSuiteCommand) {
+    throw new Error("regular launcher must keep test:run as vitest run")
+  }
+
+  const testConfig = config.test
+  requireRecord(testConfig, "regular Vitest config.test")
+  const expectedBaseInclude = ["src/**/*.test.ts", "src/**/*.test.tsx"]
+  const actualBaseInclude = Array.isArray(testConfig.include) ? [...testConfig.include].sort() : []
+  if (JSON.stringify(actualBaseInclude) !== JSON.stringify(expectedBaseInclude)) {
+    throw new Error("regular base discovery must preserve automatic discovery")
+  }
+  if (testConfig.exclude !== undefined) {
+    throw new Error("regular base discovery must preserve automatic discovery")
+  }
+  if (Boolean(testConfig.passWithNoTests)) {
+    throw new Error("regular base discovery must preserve automatic discovery")
+  }
+
+  if (
+    config.workspace !== undefined ||
+    testConfig.workspace !== undefined ||
+    rootEntryNames.some((entryName) => recognizedWorkspaceProjectFilenames.includes(entryName))
+  ) {
+    throw new Error("regular workspace/project graph must be disabled")
+  }
+
+  const selectionValues = [
+    config.root,
+    testConfig.root,
+    testConfig.dir,
+    config.testNamePattern,
+    testConfig.testNamePattern,
+    config.related,
+    testConfig.related,
+    config.changed,
+    testConfig.changed,
+    config.shard,
+    testConfig.shard,
+    config.project,
+    testConfig.project,
+    config.filters,
+    testConfig.filters,
+    config.cliExclude,
+    testConfig.cliExclude,
+  ]
+  if (
+    selectionValues.some((value) => value !== undefined) ||
+    Boolean(config.standalone) ||
+    Boolean(testConfig.standalone) ||
+    Boolean(config.allowOnly) ||
+    Boolean(testConfig.allowOnly)
+  ) {
+    throw new Error("regular execution must be selection-neutral")
+  }
+}
+
+const coverageMetrics = ["statements", "branches", "functions", "lines"] as const
+const expectedWidgetCoverageExtensions = [".js", ".ts", ".tsx"]
+const widgetCoverageRawKeys = [
+  "provider",
+  "all",
+  "include",
+  "exclude",
+  "extension",
+  "reporter",
+  "reportsDirectory",
+  "thresholds",
+].sort()
+
+function assertFrontendRootRelativePath(value: string, owner: string) {
+  if (
+    value.length === 0 ||
+    path.isAbsolute(value) ||
+    path.win32.isAbsolute(value) ||
+    value.includes("\\") ||
+    value.split("/").includes("..")
+  ) {
+    throw new Error(`${owner} must be a frontend-root-relative POSIX path`)
+  }
+
+  const resolvedPath = path.resolve(frontendRoot, value)
+  if (!resolvedPath.startsWith(`${frontendRoot}${path.sep}`)) {
+    throw new Error(`${owner} must resolve under the frontend root`)
+  }
+  return resolvedPath
+}
+
+function escapeCoverageBrackets(sourcePath: string) {
+  return sourcePath.replace(/[\[\]]/g, (character) => (character === "[" ? "[[]" : "[]]"))
+}
+
+function assertWidgetTestFilePolicy(testFiles: readonly string[]) {
+  const seen = new Set<string>()
+  for (const testFile of testFiles) {
+    const resolvedPath = assertFrontendRootRelativePath(testFile, "Widget test path")
+    if (seen.has(testFile)) {
+      throw new Error("Widget test paths must be unique")
+    }
+    seen.add(testFile)
+    if (!testFile.startsWith("src/")) {
+      throw new Error("Widget test paths must remain under src/")
+    }
+    if (!testFile.endsWith(".test.ts") && !testFile.endsWith(".test.tsx")) {
+      throw new Error("Widget test paths must name Vitest test files")
+    }
+    if (!existsSync(resolvedPath)) {
+      throw new Error("Widget test paths must exist")
+    }
+  }
+}
+
+function assertWidgetCoverageOwnerPolicy(owners: readonly WidgetCoverageOwner[]) {
+  const sourcePaths = new Set<string>()
+  const coveragePatterns = new Set<string>()
+  for (const owner of owners) {
+    const resolvedPath = assertFrontendRootRelativePath(owner.sourcePath, "Widget coverage source path")
+    if (sourcePaths.has(owner.sourcePath)) {
+      throw new Error("Widget coverage source paths must be unique")
+    }
+    sourcePaths.add(owner.sourcePath)
+    if (!existsSync(resolvedPath)) {
+      throw new Error("Widget coverage source paths must exist")
+    }
+    if (/[*?{}()!]/.test(owner.sourcePath)) {
+      throw new Error("Widget coverage source paths must not contain glob metacharacters")
+    }
+
+    const coveragePattern = owner.coveragePattern ?? owner.sourcePath
+    if (coveragePatterns.has(coveragePattern)) {
+      throw new Error("Widget coverage patterns must be unique")
+    }
+    coveragePatterns.add(coveragePattern)
+    const hasBrackets = /[\[\]]/.test(owner.sourcePath)
+    if (hasBrackets && owner.coveragePattern === undefined) {
+      throw new Error("Widget coverage patterns must escape bracketed source paths")
+    }
+    if (!hasBrackets && owner.coveragePattern !== undefined) {
+      throw new Error("Widget coverage patterns must be absent for unbracketed source paths")
+    }
+    if (owner.coveragePattern !== undefined && owner.coveragePattern !== escapeCoverageBrackets(owner.sourcePath)) {
+      throw new Error("Widget coverage patterns must use canonical bracket escaping")
+    }
+    if (!expectedWidgetCoverageExtensions.includes(path.extname(owner.sourcePath))) {
+      throw new Error("Widget coverage source paths must use an owned extension")
+    }
+
+    const thresholdKeys = Object.keys(owner.thresholds).sort()
+    if (JSON.stringify(thresholdKeys) !== JSON.stringify([...coverageMetrics].sort())) {
+      throw new Error("Widget coverage thresholds must contain exactly four metrics")
+    }
+    for (const metric of coverageMetrics) {
+      const threshold = owner.thresholds[metric]
+      if (
+        typeof threshold !== "number" ||
+        !Number.isFinite(threshold) ||
+        threshold <= 0 ||
+        threshold > 100
+      ) {
+        throw new Error("Widget coverage thresholds must be finite positive percentages")
+      }
+    }
+  }
+}
+
+function assertWidgetCoveragePolicy(
+  coverage: unknown,
+  owners: readonly WidgetCoverageOwner[] = widgetCoverageOwners,
+) {
+  requireRecord(coverage, "Widget coverage")
+  if (JSON.stringify(Object.keys(coverage).sort()) !== JSON.stringify(widgetCoverageRawKeys)) {
+    throw new Error("Widget coverage raw keys must match the policy")
+  }
+  const effectiveOwners = owners.map((owner) => owner.coveragePattern ?? owner.sourcePath)
+  if (coverage.provider !== "v8") {
+    throw new Error("Widget coverage provider must be v8")
+  }
+  if (coverage.all !== true) {
+    throw new Error("Widget coverage all must be true")
+  }
+  if (JSON.stringify(coverage.include) !== JSON.stringify(effectiveOwners)) {
+    throw new Error("Widget coverage include must match the owner policy")
+  }
+  if (JSON.stringify(coverage.exclude) !== JSON.stringify([])) {
+    throw new Error("Widget coverage exclude must be empty")
+  }
+  if (JSON.stringify(coverage.extension) !== JSON.stringify(expectedWidgetCoverageExtensions)) {
+    throw new Error("Widget coverage extension must match the policy")
+  }
+  if (JSON.stringify(coverage.reporter) !== JSON.stringify(["text", "json-summary"])) {
+    throw new Error("Widget coverage reporter must match the policy")
+  }
+  if (coverage.reportsDirectory !== "coverage/widget") {
+    throw new Error("Widget coverage reports directory must match the policy")
+  }
+
+  requireRecord(coverage.thresholds, "Widget coverage thresholds")
+  const thresholds = coverage.thresholds
+  const thresholdKeys = ["perFile", ...effectiveOwners].sort()
+  if (JSON.stringify(Object.keys(thresholds).sort()) !== JSON.stringify(thresholdKeys)) {
+    throw new Error("Widget coverage threshold keys must match the owner policy")
+  }
+  if (thresholds.perFile !== true) {
+    throw new Error("Widget coverage perFile must be true")
+  }
+  for (const owner of owners) {
+    const coveragePattern = owner.coveragePattern ?? owner.sourcePath
+    if (JSON.stringify(thresholds[coveragePattern]) !== JSON.stringify(owner.thresholds)) {
+      throw new Error("Widget coverage thresholds must match the owner policy")
+    }
+  }
+}
+
+function buildValidWidgetCoverageFixture(owners: readonly WidgetCoverageOwner[] = widgetCoverageOwners) {
+  return {
+    provider: "v8",
+    all: true,
+    include: owners.map((owner) => owner.coveragePattern ?? owner.sourcePath),
+    exclude: [],
+    extension: [...expectedWidgetCoverageExtensions],
+    reporter: ["text", "json-summary"],
+    reportsDirectory: "coverage/widget",
+    thresholds: {
+      perFile: true,
+      ...Object.fromEntries(owners.map((owner) => [
+        owner.coveragePattern ?? owner.sourcePath,
+        owner.thresholds,
+      ])),
+    },
+  }
+}
+
+function assertWidgetConfigSourceConsumesPolicy(source: string) {
+  const ownerError = "Widget config test must be exactly buildWidgetTestOptions(baseConfig.test)"
+  const sourceFile = ts.createSourceFile(
+    widgetConfigPath,
+    source,
+    ts.ScriptTarget.Latest,
+    true,
+    ts.ScriptKind.TS,
+  )
+  const defaultExports = sourceFile.statements.filter(
+    (statement): statement is ts.ExportAssignment =>
+      ts.isExportAssignment(statement) && !statement.isExportEquals,
+  )
+  if (defaultExports.length !== 1) {
+    throw new Error(ownerError)
+  }
+
+  const defineConfigCall = defaultExports[0]!.expression
+  if (
+    !ts.isCallExpression(defineConfigCall) ||
+    !ts.isIdentifier(defineConfigCall.expression) ||
+    defineConfigCall.expression.text !== "defineConfig" ||
+    defineConfigCall.arguments.length !== 1
+  ) {
+    throw new Error(ownerError)
+  }
+  const configObject = defineConfigCall.arguments[0]!
+  if (!ts.isObjectLiteralExpression(configObject)) {
+    throw new Error(ownerError)
+  }
+
+  const testProperties = configObject.properties.filter((property) => {
+    if (!("name" in property) || property.name === undefined) {
+      return false
+    }
+    if (ts.isIdentifier(property.name) || ts.isStringLiteral(property.name)) {
+      return property.name.text === "test"
+    }
+    return (
+      ts.isComputedPropertyName(property.name) &&
+      ts.isStringLiteral(property.name.expression) &&
+      property.name.expression.text === "test"
+    )
+  })
+  if (testProperties.length !== 1 || !ts.isPropertyAssignment(testProperties[0]!)) {
+    throw new Error(ownerError)
+  }
+  const testProperty = testProperties[0]
+  const laterProperties = configObject.properties.slice(
+    configObject.properties.indexOf(testProperty) + 1,
+  )
+  if (laterProperties.length !== 0) {
+    throw new Error(ownerError)
+  }
+
+  const builderCall = testProperty.initializer
+  if (
+    !ts.isCallExpression(builderCall) ||
+    !ts.isIdentifier(builderCall.expression) ||
+    builderCall.expression.text !== "buildWidgetTestOptions" ||
+    builderCall.arguments.length !== 1
+  ) {
+    throw new Error(ownerError)
+  }
+  const baseTest = builderCall.arguments[0]!
+  if (
+    !ts.isPropertyAccessExpression(baseTest) ||
+    baseTest.questionDotToken !== undefined ||
+    !ts.isIdentifier(baseTest.expression) ||
+    baseTest.expression.text !== "baseConfig" ||
+    baseTest.name.text !== "test"
+  ) {
+    throw new Error(ownerError)
+  }
+}
+
+function assertWidgetConfigConsumesPolicy(config: unknown) {
+  requireRecord(config, "Widget config")
+  requireRecord(config.test, "Widget config.test")
+  const expected = buildWidgetTestOptions(vitestConfig.test)
+  if (JSON.stringify(config.test.include) !== JSON.stringify(expected.include)) {
+    throw new Error("Widget config must consume policy test files")
+  }
+  if (JSON.stringify(config.test.coverage) !== JSON.stringify(expected.coverage)) {
+    throw new Error("Widget config must consume policy coverage")
+  }
+  assertWidgetCoveragePolicy(config.test.coverage)
+}
+
 describe("frontend CI test manifest", () => {
+  it("keeps the current Widget coverage contract available to the real config", () => {
+    const expectedWidgetTestFiles = [
+      "src/app/layout.test.tsx",
+      "src/app/widget/chat/[token]/page-client.test.tsx",
+      "src/app/settings/page.test.tsx",
+      "src/components/chat/ChatInput.test.tsx",
+      "src/components/chat/chat-input-public-file-access.test.tsx",
+      "src/components/chat/ChatMessage.test.tsx",
+      "src/components/chat/TraceEventRenderer.test.tsx",
+      "src/components/chat/clarification-form.test.tsx",
+      "src/components/file/file-preview-content.test.tsx",
+      "src/components/file/file-viewer.test.tsx",
+      "src/components/file/inline-file-preview.test.tsx",
+      "src/components/file/pptx-preview-renderer.test.tsx",
+      "src/components/layout/sidebar.test.tsx",
+      "src/components/pages/login.test.tsx",
+      "src/components/pages/oidc-callback.test.tsx",
+      "src/components/task/task-conversation-panel.test.tsx",
+      "src/components/ui/__tests__/markdown-renderer.test.tsx",
+      "src/components/widget/widget-bootstrap.test.ts",
+      "src/components/widget/widget-session.test.ts",
+      "src/components/widget/public-agent-chat-page.test.tsx",
+      "src/components/widget/session-agent-chat-page.test.tsx",
+      "src/components/widget/session-agent-chat-page.integration.test.tsx",
+      "src/components/widget/use-widget-session.test.tsx",
+      "src/contexts/app-context-chat.test.tsx",
+      "src/contexts/auth-context.test.tsx",
+      "src/contexts/file-access-context.test.tsx",
+      "src/hooks/use-file-mention.test.tsx",
+      "src/hooks/use-websocket.test.ts",
+      "src/lib/api-wrapper.test.ts",
+      "src/lib/auth-cache.test.ts",
+      "src/lib/files-disabled-presentation.test.ts",
+    ]
+    const expectedWidgetCoverageThresholds = {
+      "public/widget.js": { statements: 95, branches: 90, functions: 95, lines: 95 },
+      "src/app/widget/chat/[[]token[]]/page-client.tsx": { statements: 90, branches: 75, functions: 90, lines: 90 },
+      "src/components/chat/ChatInput.tsx": { statements: 60, branches: 60, functions: 40, lines: 60 },
+      "src/components/chat/ChatMessage.tsx": { statements: 50, branches: 50, functions: 40, lines: 50 },
+      "src/components/chat/TraceEventRenderer.tsx": { statements: 80, branches: 75, functions: 75, lines: 80 },
+      "src/components/file/file-preview-content.tsx": { statements: 70, branches: 50, functions: 55, lines: 70 },
+      "src/components/file/file-viewer.tsx": { statements: 70, branches: 55, functions: 80, lines: 70 },
+      "src/components/file/inline-file-preview.tsx": { statements: 70, branches: 55, functions: 60, lines: 70 },
+      "src/components/file/pptx-preview-renderer.tsx": { statements: 45, branches: 35, functions: 30, lines: 45 },
+      "src/components/task/task-conversation-panel.tsx": { statements: 80, branches: 70, functions: 60, lines: 80 },
+      "src/components/ui/markdown-renderer.tsx": { statements: 65, branches: 65, functions: 75, lines: 65 },
+      "src/components/widget/public-agent-chat-page.tsx": { statements: 80, branches: 55, functions: 45, lines: 80 },
+      "src/components/widget/session-agent-chat-page.tsx": { statements: 90, branches: 85, functions: 75, lines: 90 },
+      "src/components/widget/use-widget-session.ts": { statements: 95, branches: 80, functions: 90, lines: 95 },
+      "src/contexts/app-context-chat.tsx": { statements: 40, branches: 60, functions: 60, lines: 40 },
+      "src/contexts/auth-context.tsx": { statements: 70, branches: 65, functions: 90, lines: 70 },
+      "src/contexts/file-access-context.tsx": { statements: 85, branches: 75, functions: 85, lines: 85 },
+      "src/hooks/use-file-mention.ts": { statements: 60, branches: 60, functions: 60, lines: 60 },
+      "src/hooks/use-websocket.ts": { statements: 80, branches: 75, functions: 65, lines: 80 },
+      "src/lib/api-wrapper.ts": { statements: 75, branches: 65, functions: 60, lines: 75 },
+      "src/lib/auth-cache.ts": { statements: 90, branches: 80, functions: 90, lines: 90 },
+      "src/lib/files-disabled-presentation.ts": { statements: 85, branches: 80, functions: 90, lines: 85 },
+      "src/contexts/presentation-capabilities.tsx": { statements: 100, branches: 100, functions: 100, lines: 100 },
+      "src/app/settings/page.tsx": { statements: 75, branches: 50, functions: 50, lines: 75 },
+      "src/components/layout/sidebar.tsx": { statements: 35, branches: 40, functions: 10, lines: 35 },
+      "src/components/pages/login.tsx": { statements: 85, branches: 55, functions: 60, lines: 85 },
+      "src/components/pages/oidc-callback.tsx": { statements: 75, branches: 45, functions: 95, lines: 75 },
+    }
+    const widgetTest = widgetVitestConfig.test as Record<string, unknown>
+    const coverage = widgetTest.coverage as Record<string, unknown>
+    const thresholds = coverage.thresholds as Record<string, unknown>
+
+    expect(widgetTest.include).toEqual(expectedWidgetTestFiles)
+    expect(widgetCoverageExtensions).toEqual(expectedWidgetCoverageExtensions)
+    expect(coverage.provider).toBe("v8")
+    expect(coverage.reporter).toEqual(["text", "json-summary"])
+    expect(coverage.reportsDirectory).toBe("coverage/widget")
+    expect(thresholds.perFile).toBe(true)
+    expect(Object.keys(thresholds).filter((key) => key !== "perFile").sort()).toEqual(
+      [...(coverage.include as string[])].sort(),
+    )
+    expect(Object.fromEntries(widgetCoverageOwners.map((owner) => [
+      owner.coveragePattern ?? owner.sourcePath,
+      owner.thresholds,
+    ]))).toEqual(expectedWidgetCoverageThresholds)
+  })
+
+  it("requires the real Widget config to fail close on every coverage owner", () => {
+    const widgetTest = widgetVitestConfig.test as Record<string, unknown>
+    const coverage = widgetTest.coverage as Record<string, unknown>
+    const widgetConfigSource = readFileSync(widgetConfigPath, "utf8")
+
+    expect.soft(coverage.all).toBe(true)
+    expect.soft(coverage.exclude).toEqual([])
+    expect.soft(coverage.extension).toEqual([".js", ".ts", ".tsx"])
+    expect(() => assertWidgetConfigSourceConsumesPolicy(widgetConfigSource)).not.toThrow()
+  })
+
+  it("keeps Widget policy paths, patterns, and thresholds independently valid", () => {
+    assertWidgetTestFilePolicy(widgetTestFiles)
+    assertWidgetCoverageOwnerPolicy(widgetCoverageOwners)
+    assertWidgetCoveragePolicy(buildWidgetTestOptions(vitestConfig.test).coverage)
+  })
+
+  it("makes the real Widget config consume the complete policy builder", () => {
+    assertWidgetConfigConsumesPolicy(widgetVitestConfig)
+  })
+
+  it.each([
+    ["duplicate test paths", () => assertWidgetTestFilePolicy([...widgetTestFiles, widgetTestFiles[0]!]), "Widget test paths must be unique"],
+    ["a missing test path", () => assertWidgetTestFilePolicy([""]), "Widget test path must be a frontend-root-relative POSIX path"],
+    ["a nonexistent test path", () => assertWidgetTestFilePolicy(["src/ci/missing.test.ts"]), "Widget test paths must exist"],
+    ["a parent-relative test path", () => assertWidgetTestFilePolicy(["../outside.test.ts"]), "Widget test path must be a frontend-root-relative POSIX path"],
+    ["an absolute test path", () => assertWidgetTestFilePolicy(["/tmp/outside.test.ts"]), "Widget test path must be a frontend-root-relative POSIX path"],
+    ["a backslash test path", () => assertWidgetTestFilePolicy(["src\\ci\\frontend-test-manifest.test.ts"]), "Widget test path must be a frontend-root-relative POSIX path"],
+  ])("rejects %s at the Widget test-path owner", (_, mutate, expectedError) => {
+    expect(mutate).toThrow(expectedError)
+  })
+
+  it.each([
+    [
+      "duplicate source paths",
+      () => assertWidgetCoverageOwnerPolicy([...widgetCoverageOwners, { ...widgetCoverageOwners[0]! }]),
+      "Widget coverage source paths must be unique",
+    ],
+    [
+      "duplicate effective coverage patterns",
+      () => assertWidgetCoverageOwnerPolicy([
+        ...widgetCoverageOwners,
+        {
+          sourcePath: "package.json",
+          coveragePattern: "public/widget.js",
+          thresholds: { statements: 1, branches: 1, functions: 1, lines: 1 },
+        },
+      ]),
+      "Widget coverage patterns must be unique",
+    ],
+    [
+      "a missing source path",
+      () => assertWidgetCoverageOwnerPolicy([
+        ...widgetCoverageOwners,
+        {
+          sourcePath: "",
+          thresholds: { statements: 1, branches: 1, functions: 1, lines: 1 },
+        },
+      ]),
+      "Widget coverage source path must be a frontend-root-relative POSIX path",
+    ],
+    [
+      "a nonexistent source path",
+      () => assertWidgetCoverageOwnerPolicy([
+        ...widgetCoverageOwners,
+        {
+          sourcePath: "src/ci/missing-source.ts",
+          thresholds: { statements: 1, branches: 1, functions: 1, lines: 1 },
+        },
+      ]),
+      "Widget coverage source paths must exist",
+    ],
+    [
+      "an outside-root source path",
+      () => assertWidgetCoverageOwnerPolicy([
+        ...widgetCoverageOwners,
+        {
+          sourcePath: "../outside.ts",
+          thresholds: { statements: 1, branches: 1, functions: 1, lines: 1 },
+        },
+      ]),
+      "Widget coverage source path must be a frontend-root-relative POSIX path",
+    ],
+    [
+      "a mismatched bracket escape",
+      () => assertWidgetCoverageOwnerPolicy(widgetCoverageOwners.map((owner, index) => index === 1
+        ? { ...owner, coveragePattern: "src/app/widget/chat/[token]/page-client.tsx" }
+        : owner)),
+      "Widget coverage patterns must use canonical bracket escaping",
+    ],
+    [
+      "an unsupported source extension",
+      () => assertWidgetCoverageOwnerPolicy([
+        ...widgetCoverageOwners,
+        {
+          sourcePath: "package.json",
+          thresholds: { statements: 1, branches: 1, functions: 1, lines: 1 },
+        },
+      ]),
+      "Widget coverage source paths must use an owned extension",
+    ],
+    [
+      "a missing coverage metric",
+      () => assertWidgetCoverageOwnerPolicy(widgetCoverageOwners.map((owner, index) => index === 0
+        ? {
+            ...owner,
+            thresholds: { statements: 1, branches: 1, functions: 1 } as unknown as WidgetCoverageOwner["thresholds"],
+          }
+        : owner)),
+      "Widget coverage thresholds must contain exactly four metrics",
+    ],
+    [
+      "a zero coverage metric",
+      () => assertWidgetCoverageOwnerPolicy(widgetCoverageOwners.map((owner, index) => index === 0
+        ? { ...owner, thresholds: { ...owner.thresholds, lines: 0 } }
+        : owner)),
+      "Widget coverage thresholds must be finite positive percentages",
+    ],
+    [
+      "a NaN coverage metric",
+      () => assertWidgetCoverageOwnerPolicy(widgetCoverageOwners.map((owner, index) => index === 0
+        ? { ...owner, thresholds: { ...owner.thresholds, statements: Number.NaN } }
+        : owner)),
+      "Widget coverage thresholds must be finite positive percentages",
+    ],
+    [
+      "an infinite coverage metric",
+      () => assertWidgetCoverageOwnerPolicy(widgetCoverageOwners.map((owner, index) => index === 0
+        ? { ...owner, thresholds: { ...owner.thresholds, statements: Number.POSITIVE_INFINITY } }
+        : owner)),
+      "Widget coverage thresholds must be finite positive percentages",
+    ],
+  ])("rejects %s at the Widget coverage-owner owner", (_, mutate, expectedError) => {
+    expect(mutate).toThrow(expectedError)
+  })
+
+  it.each([
+    ["all: false", (coverage: Record<string, unknown>) => ({ ...coverage, all: false }), "Widget coverage all must be true"],
+    ["an owner exclusion", (coverage: Record<string, unknown>) => ({ ...coverage, exclude: ["public/widget.js"] }), "Widget coverage exclude must be empty"],
+    ["a lost extension", (coverage: Record<string, unknown>) => ({ ...coverage, extension: [".js", ".ts"] }), "Widget coverage extension must match the policy"],
+    ["a changed provider", (coverage: Record<string, unknown>) => ({ ...coverage, provider: "istanbul" }), "Widget coverage provider must be v8"],
+    ["a changed reporter", (coverage: Record<string, unknown>) => ({ ...coverage, reporter: ["text"] }), "Widget coverage reporter must match the policy"],
+    ["a changed report directory", (coverage: Record<string, unknown>) => ({ ...coverage, reportsDirectory: "coverage/other" }), "Widget coverage reports directory must match the policy"],
+    [
+      "a disabled per-file threshold",
+      (coverage: Record<string, unknown>) => ({
+        ...coverage,
+        thresholds: { ...(coverage.thresholds as Record<string, unknown>), perFile: false },
+      }),
+      "Widget coverage perFile must be true",
+    ],
+    [
+      "an orphan threshold",
+      (coverage: Record<string, unknown>) => ({
+        ...coverage,
+        thresholds: {
+          ...(coverage.thresholds as Record<string, unknown>),
+          orphan: { statements: 1, branches: 1, functions: 1, lines: 1 },
+        },
+      }),
+      "Widget coverage threshold keys must match the owner policy",
+    ],
+    [
+      "a missing owner threshold",
+      (coverage: Record<string, unknown>) => {
+        const thresholds = { ...(coverage.thresholds as Record<string, unknown>) }
+        delete thresholds["public/widget.js"]
+        return { ...coverage, thresholds }
+      },
+      "Widget coverage threshold keys must match the owner policy",
+    ],
+    [
+      "a global floor",
+      (coverage: Record<string, unknown>) => ({
+        ...coverage,
+        thresholds: { ...(coverage.thresholds as Record<string, unknown>), 100: 1 },
+      }),
+      "Widget coverage threshold keys must match the owner policy",
+    ],
+    ["an unowned coverage key", (coverage: Record<string, unknown>) => ({ ...coverage, autoUpdate: true }), "Widget coverage raw keys must match the policy"],
+  ])("rejects %s at the Widget coverage-config owner", (_, mutate, expectedError) => {
+    const coverage = buildValidWidgetCoverageFixture()
+    expect(() => assertWidgetCoveragePolicy(mutate(coverage))).toThrow(expectedError)
+  })
+
+  it("rejects a Widget config detached from the policy builder", () => {
+    expect(() => assertWidgetConfigConsumesPolicy({
+      ...widgetVitestConfig,
+      test: {
+        ...widgetVitestConfig.test,
+        include: [],
+      },
+    })).toThrow("Widget config must consume policy test files")
+    expect(() => assertWidgetConfigConsumesPolicy({
+      ...widgetVitestConfig,
+      test: {
+        ...widgetVitestConfig.test,
+        coverage: {},
+      },
+    })).toThrow("Widget config must consume policy coverage")
+  })
+
+  it("rejects a redundant Widget include override at the config-source owner", () => {
+    const widgetConfigSource = readFileSync(widgetConfigPath, "utf8")
+    const source = replaceExactlyOnce(
+      widgetConfigSource,
+      "  test: buildWidgetTestOptions(baseConfig.test),\n",
+      "  test: {\n    ...buildWidgetTestOptions(baseConfig.test),\n    include: Array.from(widgetTestFiles),\n  },\n",
+      "Widget config redundant include override",
+    )
+
+    expect(() => assertWidgetConfigSourceConsumesPolicy(source)).toThrow(
+      "Widget config test must be exactly buildWidgetTestOptions(baseConfig.test)",
+    )
+  })
+
+  it("rejects a later dynamic Widget test override at the config-source owner", () => {
+    const widgetConfigSource = readFileSync(widgetConfigPath, "utf8")
+    const withComputedKey = replaceExactlyOnce(
+      widgetConfigSource,
+      'import { buildWidgetTestOptions } from "./vitest.widget.policy"\n',
+      'import { buildWidgetTestOptions } from "./vitest.widget.policy"\n\nconst widgetTestKey = "test"\n',
+      "Widget config computed test key",
+    )
+    const source = replaceExactlyOnce(
+      withComputedKey,
+      "  test: buildWidgetTestOptions(baseConfig.test),\n",
+      "  test: buildWidgetTestOptions(baseConfig.test),\n  [widgetTestKey]: {\n    ...buildWidgetTestOptions(baseConfig.test),\n    include: Array.from(widgetTestFiles),\n  },\n",
+      "Widget config dynamic test override",
+    )
+
+    expect(() => assertWidgetConfigSourceConsumesPolicy(source)).toThrow(
+      "Widget config test must be exactly buildWidgetTestOptions(baseConfig.test)",
+    )
+  })
+
+  it("requires the full regular suite in frontend-build", () => {
+    expect(() => assertSemanticWorkflowManifest(realWorkflowSource)).not.toThrow()
+  })
+
+  it.each([
+    [
+      "npm run test:pages",
+      "      - name: Retired page test lane\n        working-directory: ./frontend\n        run: |\n\n          npm run test:pages\n\n",
+    ],
+    [
+      "npm run test:kb-components",
+      "      - name: Retired KB component test lane\n        working-directory: ./frontend\n        run: npm run test:kb-components\n\n",
+    ],
+    [
+      "npm run test:app-pages",
+      "      - name: Retired App Router test lane\n        working-directory: ./frontend\n        run: npm run test:app-pages\n\n",
+    ],
+    [
+      "npm run test:home-build-contracts",
+      "      - name: Retired home build contract lane\n        working-directory: ./frontend\n        run: npm run test:home-build-contracts\n\n",
+    ],
+  ])("rejects retired direct launcher %s", (launcher, retiredStep) => {
+    const source = replaceExactlyOnce(
+      realWorkflowSource,
+      "      - name: Build frontend (static export)\n",
+      `${retiredStep}      - name: Build frontend (static export)\n`,
+      `${launcher} direct launcher insertion`,
+    )
+
+    expect(() => assertSemanticWorkflowManifest(source)).toThrow(
+      `jobs.frontend-build must not directly run retired targeted launcher ${launcher}`,
+    )
+  })
+
   it.each([
     ["LF", realWorkflowSource],
     ["CRLF", realWorkflowSource.replace(/\r?\n/g, "\r\n")],
@@ -416,26 +1119,25 @@ describe("frontend CI test manifest", () => {
     expect(() => assertSemanticWorkflowManifest(source)).not.toThrow()
   })
 
-  it("removes the App Router step semantically when its presentation drifts", () => {
+  it("removes the full regular suite semantically when its presentation drifts", () => {
     const workflowSource = realWorkflowSource
     const source = replaceExactlyOnce(
       workflowSource,
-      "      - name: Run App Router tests\n        working-directory: ./frontend\n        run: npm run test:app-pages\n",
-      "      - run: npm run test:app-pages\n        env:\n          APP_ROUTER_TEST_MODE: manifest\n        working-directory: ./frontend\n        name: Run App Router tests\n",
-      "App Router step presentation drift",
+      "      - name: Run full frontend test suite\n        working-directory: ./frontend\n        shell: bash\n        run: npm run test:run\n",
+      "      - run: npm run test:run\n        env:\n          FULL_SUITE_MODE: manifest\n        working-directory: ./frontend\n        shell: bash\n        name: Run full frontend test suite\n",
+      "full regular suite presentation drift",
     )
     const followingJobs = source.slice(source.indexOf("\n  ci-summary:\n"))
-    const withoutAppStep = removeWorkflowStepByCommand(
+    const withoutFullSuiteStep = removeWorkflowStepByCommand(
       source,
       "frontend-build",
-      "npm run test:app-pages",
-      "App Router step removal",
+      "npm run test:run",
+      "full regular suite removal",
     )
 
-    expect(withoutAppStep).toContain(followingJobs)
-    expect(withoutAppStep).toContain("# The widget lane above is an explicit regression suite")
-    expect(() => assertSemanticWorkflowManifest(withoutAppStep)).toThrow(
-      "npm run test:app-pages must appear in exactly one frontend step",
+    expect(withoutFullSuiteStep).toContain(followingJobs)
+    expect(() => assertSemanticWorkflowManifest(withoutFullSuiteStep)).toThrow(
+      "npm run test:run must appear in exactly one frontend step",
     )
   })
 
@@ -652,24 +1354,19 @@ describe("frontend CI test manifest", () => {
   it("accepts a folded required command with the same semantic value", () => {
     const source = replaceExactlyOnce(
       realWorkflowSource,
-      "        run: npm run test:app-pages\n",
-      "        run: >-\n          npm run\n          test:app-pages\n",
-      "App Router command",
+      "        run: npm run test:run\n",
+      "        run: >-\n          npm run\n          test:run\n",
+      "full regular suite command",
     )
     expect(() => assertSemanticWorkflowManifest(source)).not.toThrow()
   })
 
-  it.each([
-    "npm run test:widget:coverage",
-    "npm run test:kb-components",
-    "npm run test:app-pages",
-    "npm run test:home-build-contracts",
-  ])("accepts an explicit bash shell on the %s non-launcher step", (command) => {
+  it("accepts an explicit bash shell on the Widget coverage step", () => {
     const source = replaceExactlyOnce(
       realWorkflowSource,
-      `        run: ${command}\n`,
-      `        shell: bash\n        run: ${command}\n`,
-      `${command} shell insertion`,
+      "        run: npm run test:widget:coverage\n",
+      "        shell: bash\n        run: npm run test:widget:coverage\n",
+      "Widget coverage shell insertion",
     )
     expect(() => assertSemanticWorkflowManifest(source)).not.toThrow()
   })
@@ -718,7 +1415,7 @@ describe("frontend CI test manifest", () => {
       "npm run test:ci-manifest has an unexpected shell policy",
     ],
     [
-      "pages launcher with job defaults",
+      "full suite launcher with job defaults",
       (source: string) =>
         replaceExactlyOnce(
           replaceExactlyOnce(
@@ -727,11 +1424,11 @@ describe("frontend CI test manifest", () => {
             "  frontend-build:\n    defaults:\n      run:\n        shell: bash\n",
             "frontend-build owner",
           ),
-          "        shell: bash\n        run: npm run test:pages\n",
-          "        run: npm run test:pages\n",
-          "pages launcher shell",
+          "        shell: bash\n        run: npm run test:run\n",
+          "        run: npm run test:run\n",
+          "full suite launcher shell",
         ),
-      "npm run test:pages has an unexpected shell policy",
+      "npm run test:run has an unexpected shell policy",
     ],
   ])("requires explicit bash for the %s", (_, transform, expectedError) => {
     const source = transform(realWorkflowSource)
@@ -865,64 +1562,64 @@ describe("frontend CI test manifest", () => {
   })
 
   it("rejects a required command moved to a sibling job", () => {
-    const withoutAppStep = removeWorkflowStepByCommand(
+    const withoutFullSuiteStep = removeWorkflowStepByCommand(
       realWorkflowSource,
       "frontend-build",
-      "npm run test:app-pages",
-      "App Router step removal",
+      "npm run test:run",
+      "full regular suite removal",
     )
     const source = replaceExactlyOnce(
-      withoutAppStep,
+      withoutFullSuiteStep,
       "\n  ci-summary:\n",
-      "\n  manifest-sibling:\n    runs-on: ubuntu-latest\n    steps:\n      - working-directory: ./frontend\n        run: npm run test:app-pages\n\n  ci-summary:\n",
+      "\n  manifest-sibling:\n    runs-on: ubuntu-latest\n    steps:\n      - working-directory: ./frontend\n        shell: bash\n        run: npm run test:run\n\n  ci-summary:\n",
       "ci-summary insertion point",
     )
 
     expect(source).toContain("  manifest-sibling:\n")
     expect(() => assertSemanticWorkflowManifest(source)).toThrow(
-      "npm run test:app-pages must appear in exactly one frontend step",
+      "npm run test:run must appear in exactly one frontend step",
     )
   })
 
-  it("keeps the moved-to-sibling fixture live when the App step presentation drifts", () => {
+  it("keeps the moved-to-sibling fixture live when full-suite presentation drifts", () => {
     const workflowSource = realWorkflowSource
     const driftedSource = replaceExactlyOnce(
       workflowSource,
-      "      - name: Run App Router tests\n        working-directory: ./frontend\n        run: npm run test:app-pages\n",
-      "      - run: npm run test:app-pages\n        env:\n          APP_ROUTER_TEST_MODE: manifest\n        working-directory: ./frontend\n        name: Run App Router tests\n",
-      "App Router step presentation drift",
+      "      - name: Run full frontend test suite\n        working-directory: ./frontend\n        shell: bash\n        run: npm run test:run\n",
+      "      - run: npm run test:run\n        env:\n          FULL_SUITE_MODE: manifest\n        working-directory: ./frontend\n        shell: bash\n        name: Run full frontend test suite\n",
+      "full regular suite presentation drift",
     )
-    const withoutAppStep = removeWorkflowStepByCommand(
+    const withoutFullSuiteStep = removeWorkflowStepByCommand(
       driftedSource,
       "frontend-build",
-      "npm run test:app-pages",
-      "App Router step removal",
+      "npm run test:run",
+      "full regular suite removal",
     )
 
     expect(driftedSource).not.toBe(workflowSource)
-    expect(() => assertSemanticWorkflowManifest(withoutAppStep)).toThrow(
-      "npm run test:app-pages must appear in exactly one frontend step",
+    expect(() => assertSemanticWorkflowManifest(withoutFullSuiteStep)).toThrow(
+      "npm run test:run must appear in exactly one frontend step",
     )
   })
 
-  it("rejects a same-job heredoc decoy after the real pages step is removed", () => {
-    const withoutPagesStep = replaceExactlyOnce(
+  it("rejects a same-job heredoc decoy after the full regular suite is removed", () => {
+    const withoutFullSuiteStep = replaceExactlyOnce(
       realWorkflowSource,
-      "\n      - name: Run page component tests\n        working-directory: ./frontend\n        shell: bash\n        run: npm run test:pages\n",
+      "\n      - name: Run full frontend test suite\n        working-directory: ./frontend\n        shell: bash\n        run: npm run test:run\n",
       "",
-      "pages launcher step removal",
+      "full regular suite removal",
     )
     const source = replaceExactlyOnce(
-      withoutPagesStep,
-      "\n      - name: Run App Router tests\n",
-      "\n      - name: Preserve page launcher text as a shell heredoc\n        run: |\n          run: npm run test:pages\n\n      - name: Run App Router tests\n",
-      "App Router step insertion point",
+      withoutFullSuiteStep,
+      "\n      - name: Build frontend (static export)\n",
+      "\n      - name: Preserve full-suite text as a shell heredoc\n        run: |\n          run: npm run test:run\n\n      - name: Build frontend (static export)\n",
+      "frontend build insertion point",
     )
 
-    expect(source).not.toContain("      - name: Run page component tests\n")
-    expect(source).toContain("          run: npm run test:pages\n")
+    expect(source).not.toContain("      - name: Run full frontend test suite\n")
+    expect(source).toContain("          run: npm run test:run\n")
     expect(() => assertSemanticWorkflowManifest(source)).toThrow(
-      "npm run test:pages must appear in exactly one frontend step",
+      "npm run test:run must appear in exactly one frontend step",
     )
   })
 
@@ -930,88 +1627,66 @@ describe("frontend CI test manifest", () => {
     const source = realWorkflowSource
     const missing = replaceExactlyOnce(
       source,
-      "        run: npm run test:app-pages\n",
+      "        run: npm run test:run\n",
       "",
-      "App Router command removal",
+      "full regular suite command removal",
     )
     const duplicate = replaceExactlyOnce(
       source,
-      "\n      - name: Run App Router tests\n",
-      "\n      - name: Duplicate App Router tests\n        working-directory: ./frontend\n        run: npm run test:app-pages\n\n      - name: Run App Router tests\n",
-      "App Router duplicate insertion point",
+      "\n      - name: Run full frontend test suite\n",
+      "\n      - name: Duplicate full frontend test suite\n        working-directory: ./frontend\n        shell: bash\n        run: npm run test:run\n\n      - name: Run full frontend test suite\n",
+      "full regular suite duplicate insertion point",
     )
 
-    expect(missing).not.toContain("        run: npm run test:app-pages\n")
-    expect(duplicate.match(/run: npm run test:app-pages/g)).toHaveLength(2)
+    expect(missing).not.toContain("        run: npm run test:run\n")
+    expect(duplicate.match(/run: npm run test:run/g)).toHaveLength(2)
     expect(() => assertSemanticWorkflowManifest(missing)).toThrow(
-      "npm run test:app-pages must appear in exactly one frontend step",
+      "npm run test:run must appear in exactly one frontend step",
     )
     expect(() => assertSemanticWorkflowManifest(duplicate)).toThrow(
-      "npm run test:app-pages must appear in exactly one frontend step",
-    )
-  })
-
-  it("rejects missing and duplicate KB directory steps", () => {
-    const workflowSource = realWorkflowSource
-    const kbStep =
-      "\n      - name: Run knowledge base component tests\n        working-directory: ./frontend\n        run: npm run test:kb-components\n"
-    const missing = replaceExactlyOnce(workflowSource, kbStep, "", "KB test step removal")
-    const duplicate = replaceExactlyOnce(
-      workflowSource,
-      kbStep,
-      kbStep.repeat(2),
-      "KB test step duplication",
-    )
-
-    expect(missing).not.toContain("run: npm run test:kb-components")
-    expect(duplicate.match(/run: npm run test:kb-components/g)).toHaveLength(2)
-    expect(() => assertSemanticWorkflowManifest(missing)).toThrow(
-      "npm run test:kb-components must appear in exactly one frontend step",
-    )
-    expect(() => assertSemanticWorkflowManifest(duplicate)).toThrow(
-      "npm run test:kb-components must appear in exactly one frontend step",
+      "npm run test:run must appear in exactly one frontend step",
     )
   })
 
   it("rejects a required step with the wrong working directory", () => {
     const source = replaceExactlyOnce(
       realWorkflowSource,
-      "      - name: Run App Router tests\n        working-directory: ./frontend\n",
-      "      - name: Run App Router tests\n        working-directory: .\n",
-      "App Router working directory",
+      "      - name: Run full frontend test suite\n        working-directory: ./frontend\n",
+      "      - name: Run full frontend test suite\n        working-directory: .\n",
+      "full regular suite working directory",
     )
 
-    expect(source).toContain("      - name: Run App Router tests\n        working-directory: .\n")
+    expect(source).toContain("      - name: Run full frontend test suite\n        working-directory: .\n")
     expect(() => assertSemanticWorkflowManifest(source)).toThrow(
-      "npm run test:app-pages must use ./frontend",
+      "npm run test:run must use ./frontend",
     )
   })
 
   it("rejects a required step-level condition", () => {
     const source = replaceExactlyOnce(
       realWorkflowSource,
-      "      - name: Run App Router tests\n",
-      "      - name: Run App Router tests\n        if: github.event_name == 'schedule'\n",
-      "App Router step condition",
+      "      - name: Run full frontend test suite\n",
+      "      - name: Run full frontend test suite\n        if: github.event_name == 'schedule'\n",
+      "full regular suite condition",
     )
 
     expect(source).toContain("        if: github.event_name == 'schedule'\n")
     expect(() => assertSemanticWorkflowManifest(source)).toThrow(
-      "npm run test:app-pages must not set if",
+      "npm run test:run must not set if",
     )
   })
 
-  it("rejects custom shells on non-launcher required steps", () => {
+  it("rejects custom shells on the Widget coverage step", () => {
     const source = replaceExactlyOnce(
       realWorkflowSource,
-      "      - name: Run App Router tests\n        working-directory: ./frontend\n",
-      "      - name: Run App Router tests\n        working-directory: ./frontend\n        shell: echo {0}\n",
-      "App Router step shell",
+      "      - name: Run widget regression tests with coverage\n        working-directory: ./frontend\n",
+      "      - name: Run widget regression tests with coverage\n        working-directory: ./frontend\n        shell: echo {0}\n",
+      "Widget coverage shell",
     )
 
     expect(source).toContain("        shell: echo {0}\n")
     expect(() => assertSemanticWorkflowManifest(source)).toThrow(
-      "npm run test:app-pages has an unexpected shell policy",
+      "npm run test:widget:coverage has an unexpected shell policy",
     )
   })
 
@@ -1027,13 +1702,13 @@ describe("frontend CI test manifest", () => {
         ),
     ],
     [
-      "test:pages",
+      "test:run",
       (source: string) =>
         replaceExactlyOnce(
           source,
-          "      - name: Run page component tests\n        working-directory: ./frontend\n        shell: bash\n",
-          "      - name: Run page component tests\n        working-directory: ./frontend\n        shell: echo {0}\n",
-          "pages launcher shell",
+          "      - name: Run full frontend test suite\n        working-directory: ./frontend\n        shell: bash\n",
+          "      - name: Run full frontend test suite\n        working-directory: ./frontend\n        shell: echo {0}\n",
+          "full regular suite launcher shell",
         ),
     ],
   ])("rejects a non-bash %s launcher", (_, transform) => {
@@ -1051,9 +1726,9 @@ describe("frontend CI test manifest", () => {
       (source: string) =>
         replaceExactlyOnce(
           source,
-          "        run: npm run test:app-pages\n",
-          "        continue-on-error: true\n        run: npm run test:app-pages\n",
-          "App Router continue-on-error insertion",
+          "        run: npm run test:run\n",
+          "        continue-on-error: true\n        run: npm run test:run\n",
+          "full regular suite continue-on-error insertion",
         ),
       "frontend-build steps must not set continue-on-error",
     ],
@@ -1344,24 +2019,128 @@ describe("frontend CI test manifest", () => {
     )
   })
 
-  it("keeps package launchers and Vitest discovery contracts source-locked", () => {
+  const buildRegularSuiteFixture = () => {
+    const packageJson = JSON.parse(readFileSync(packageJsonPath, "utf8")) as {
+      scripts: Record<string, string>
+    }
+    return {
+      config: { ...vitestConfig, test: { ...vitestConfig.test } } as Record<string, unknown>,
+      scripts: { ...packageJson.scripts },
+      rootEntryNames: [...frontendRootEntryNames],
+    }
+  }
+
+  it.each([
+    ["a missing test:run launcher", (scripts: Record<string, string>) => delete scripts["test:run"]],
+    ["a wrong test:run launcher", (scripts: Record<string, string>) => (scripts["test:run"] = "vitest")],
+  ])("rejects %s at the regular launcher owner", (_, mutate) => {
+    const fixture = buildRegularSuiteFixture()
+    mutate(fixture.scripts)
+
+    expect(() => assertRegularSuiteDiscovery(fixture.config, fixture.scripts, fixture.rootEntryNames)).toThrow(
+      "regular launcher must keep test:run as vitest run",
+    )
+  })
+
+  it.each([
+    ["a wrong include", (test: Record<string, unknown>) => (test.include = ["src/**/*.test.ts"])],
+    ["any exclude", (test: Record<string, unknown>) => (test.exclude = [])],
+    ["truthy passWithNoTests", (test: Record<string, unknown>) => (test.passWithNoTests = true)],
+  ])("rejects %s at the regular base discovery owner", (_, mutate) => {
+    const fixture = buildRegularSuiteFixture()
+    mutate(fixture.config.test as Record<string, unknown>)
+
+    expect(() => assertRegularSuiteDiscovery(fixture.config, fixture.scripts, fixture.rootEntryNames)).toThrow(
+      "regular base discovery must preserve automatic discovery",
+    )
+  })
+
+  it.each([
+    ["a top-level root", "top-level", "root", "src"],
+    ["a test-level root", "test", "root", "src"],
+    ["a test-level dir", "test", "dir", "src"],
+    ["a top-level test name pattern", "top-level", "testNamePattern", "frontend CI test manifest"],
+    ["a test-level test name pattern", "test", "testNamePattern", "frontend CI test manifest"],
+    ["a top-level related selector", "top-level", "related", ["src/components/pages"]],
+    ["a test-level related selector", "test", "related", ["src/components/pages"]],
+    ["a top-level changed selector", "top-level", "changed", true],
+    ["a test-level changed selector", "test", "changed", true],
+    ["a top-level partial shard", "top-level", "shard", { index: 1, count: 2 }],
+    ["a test-level partial shard", "test", "shard", { index: 1, count: 2 }],
+    ["a top-level project selector", "top-level", "project", "focused"],
+    ["a test-level project selector", "test", "project", "focused"],
+    ["a top-level filters selector", "top-level", "filters", ["src"]],
+    ["a test-level filters selector", "test", "filters", ["src"]],
+    ["a top-level cliExclude selector", "top-level", "cliExclude", ["src/components"]],
+    ["a test-level cliExclude selector", "test", "cliExclude", ["src/components"]],
+    ["a truthy top-level standalone", "top-level", "standalone", true],
+    ["a truthy test-level standalone", "test", "standalone", true],
+    ["a truthy top-level allowOnly", "top-level", "allowOnly", true],
+    ["a truthy test-level allowOnly", "test", "allowOnly", true],
+  ])("rejects %s at the regular selection owner", (_, location, key, value) => {
+    const fixture = buildRegularSuiteFixture()
+    const owner = location === "test" ? fixture.config.test : fixture.config
+    ;(owner as Record<string, unknown>)[key as string] = value
+
+    expect(() => assertRegularSuiteDiscovery(fixture.config, fixture.scripts, fixture.rootEntryNames)).toThrow(
+      "regular execution must be selection-neutral",
+    )
+  })
+
+  it.each([
+    ["top-level workspace", "top-level"],
+    ["test workspace", "test"],
+  ])("rejects %s at the regular workspace/project graph owner", (_, location) => {
+    const fixture = buildRegularSuiteFixture()
+    const owner = location === "test" ? fixture.config.test : fixture.config
+    ;(owner as Record<string, unknown>).workspace = "vitest.workspace.ts"
+
+    expect(() => assertRegularSuiteDiscovery(fixture.config, fixture.scripts, fixture.rootEntryNames)).toThrow(
+      "regular workspace/project graph must be disabled",
+    )
+  })
+
+  it.each(recognizedWorkspaceProjectFilenames)(
+    "rejects the recognized workspace/project filename %s at the graph owner",
+    (filename) => {
+      const fixture = buildRegularSuiteFixture()
+      fixture.rootEntryNames.push(filename)
+
+      expect(() =>
+        assertRegularSuiteDiscovery(fixture.config, fixture.scripts, fixture.rootEntryNames),
+      ).toThrow("regular workspace/project graph must be disabled")
+    },
+  )
+
+  it.each([
+    ["top-level standalone false", "top-level", "standalone", false],
+    ["top-level standalone zero", "top-level", "standalone", 0],
+    ["top-level standalone empty string", "top-level", "standalone", ""],
+    ["test standalone false", "test", "standalone", false],
+    ["test standalone zero", "test", "standalone", 0],
+    ["test standalone empty string", "test", "standalone", ""],
+    ["top-level allowOnly false", "top-level", "allowOnly", false],
+    ["top-level allowOnly zero", "top-level", "allowOnly", 0],
+    ["top-level allowOnly empty string", "top-level", "allowOnly", ""],
+    ["test allowOnly false", "test", "allowOnly", false],
+    ["test allowOnly zero", "test", "allowOnly", 0],
+    ["test allowOnly empty string", "test", "allowOnly", ""],
+  ])("accepts falsey %s", (_, location, key, value) => {
+    const fixture = buildRegularSuiteFixture()
+    const owner = location === "test" ? fixture.config.test : fixture.config
+    ;(owner as Record<string, unknown>)[key as string] = value
+
+    expect(() =>
+      assertRegularSuiteDiscovery(fixture.config, fixture.scripts, fixture.rootEntryNames),
+    ).not.toThrow()
+  })
+
+  it("keeps package launchers and regular Vitest discovery contracts source-locked", () => {
     const packageJson = JSON.parse(readFileSync(packageJsonPath, "utf8")) as {
       scripts: Record<string, string>
     }
 
     expect(packageJson.scripts["test:ci-manifest"]).toBe(manifestCommand)
-    expect(packageJson.scripts["test:pages"]).toBe(pagesCommand)
-    expect(packageJson.scripts["test:kb-components"]).toBe(kbComponentsCommand)
-    expect(packageJson.scripts["test:app-pages"]).toBe(appPagesCommand)
-    expect(packageJson.scripts["test:home-build-contracts"]).toBe(homeBuildContractsCommand)
-    expect(packageJson.scripts["test:home-build-pages"]).toBeUndefined()
-
-    const testConfig = vitestConfig.test
-    expect([...(testConfig?.include ?? [])].sort()).toEqual([
-      "src/**/*.test.ts",
-      "src/**/*.test.tsx",
-    ])
-    expect(testConfig?.exclude).toBeUndefined()
-    expect(testConfig?.passWithNoTests).toBeFalsy()
+    assertRegularSuiteDiscovery(vitestConfig, packageJson.scripts, frontendRootEntryNames)
   })
 })

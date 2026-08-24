@@ -18,7 +18,7 @@ Compose overlays, including sandbox runtime options, live in this directory.
 
 - **Frontend**: Next.js standalone build served by nginx
 - **Backend**: FastAPI with Python 3.11, Node.js 22, Playwright, LibreOffice
-- **PostgreSQL**: PostgreSQL 17 database (Note: Upgrading an existing self-hosted deployment from v16 to v17 requires manual database migration or volume recreation, as PostgreSQL does not automatically upgrade data directories between major versions.)
+- **PostgreSQL**: PostgreSQL 17 database. The image tag is overridable via `POSTGRES_IMAGE_TAG`. A deployment whose `postgres_data` volume was initialized by PostgreSQL 16 cannot be switched to 17 in place; see [PostgreSQL major version upgrade (16 to 17)](#postgresql-major-version-upgrade-16-to-17).
 
 ## Quick Start
 
@@ -562,6 +562,95 @@ docker compose exec postgres pg_dump -U xagent xagent > backup.sql
 docker compose exec -T postgres psql -U xagent xagent < backup.sql
 ```
 
+### PostgreSQL major version upgrade (16 to 17)
+
+The bundled `postgres` service defaults to `postgres:17-bookworm`. PostgreSQL never upgrades a data directory across major versions: a v17 server refuses to open a directory initialized by v16, exits with `FATAL: database files are incompatible with server`, and — under `restart: unless-stopped` — restart-loops as `unhealthy`, which blocks `backend`, `worker`, and `scheduler` because they wait for `service_healthy`.
+
+Nothing is written to the old directory when this happens, so the situation is recoverable by pinning the previous tag. The migration itself still has to be performed deliberately, using the steps below.
+
+> **Data loss warning:** `docker compose down -v`, `docker volume rm <project>_postgres_data`, and any other form of "recreating the volume" destroy the database irreversibly. None of them is an upgrade step.
+
+Throughout, `PGVOL` is the Compose-prefixed volume name. Find it with `docker volume ls | grep postgres_data`; for the default project name it is `xagent_postgres_data`.
+
+```bash
+PGVOL=xagent_postgres_data
+```
+
+**1. Pin the current major version and confirm the deployment is healthy before changing anything.**
+
+```bash
+echo 'POSTGRES_IMAGE_TAG="16-bookworm"' >> .env
+docker compose up -d postgres
+docker compose exec postgres psql -U xagent -d xagent -tAc 'SHOW server_version'
+```
+
+**2. Stop every writer, leaving `postgres` running.**
+
+```bash
+docker compose stop backend worker scheduler
+```
+
+**3. Back up, and verify the backup is complete.** An interrupted `pg_dump` still leaves a plausible-looking file, so check for the completion marker and record the values you will compare against after the restore.
+
+```bash
+docker compose exec -T postgres pg_dump -U xagent -d xagent > backup.sql
+grep -q 'PostgreSQL database dump complete' backup.sql \
+  && echo "backup complete" \
+  || echo "BACKUP INCOMPLETE - do not proceed"
+docker compose exec -T postgres psql -U xagent -d xagent -tAc 'SELECT version_num FROM alembic_version'
+```
+
+**4. Stop the stack, keeping the volumes.** Do not pass `-v`.
+
+```bash
+docker compose down
+```
+
+**5. Copy the v16 volume so rollback never depends on the dump alone.**
+
+```bash
+docker volume create "${PGVOL}_pg16_backup"
+docker run --rm -v "$PGVOL":/from:ro -v "${PGVOL}_pg16_backup":/to alpine sh -c 'cp -a /from/. /to/'
+docker run --rm -v "${PGVOL}_pg16_backup":/d alpine cat /d/pgdata/PG_VERSION   # expect: 16
+```
+
+**6. Remove the v16 data directory from the live volume and start v17,** which initializes a fresh cluster. Dropping the `POSTGRES_IMAGE_TAG` line added in step 1 restores the v17 default.
+
+```bash
+docker run --rm -v "$PGVOL":/d alpine sh -c 'rm -rf /d/pgdata'
+sed -i.bak '/^POSTGRES_IMAGE_TAG=/d' .env && rm -f .env.bak   # .env.bak is not gitignored
+docker compose up -d postgres
+docker compose exec postgres pg_isready -U xagent -d xagent
+```
+
+**7. Restore and verify.** `ON_ERROR_STOP=1` makes a partial restore fail loudly instead of leaving a half-populated database.
+
+```bash
+docker compose exec -T postgres psql -U xagent -d xagent -v ON_ERROR_STOP=1 < backup.sql
+docker compose exec -T postgres psql -U xagent -d xagent -tAc 'SHOW server_version'
+docker compose exec -T postgres psql -U xagent -d xagent -tAc 'SELECT version_num FROM alembic_version'
+```
+
+The reported version must be 17.x, and the schema-level checks must match what step 3 recorded.
+
+**8. Only after verification passes, bring the writers back.**
+
+```bash
+docker compose up -d
+```
+
+**Rollback.** If any step fails, the volume copy from step 5 was never written to by v17:
+
+```bash
+docker compose down
+docker run --rm -v "$PGVOL":/d alpine sh -c 'rm -rf /d/pgdata'
+docker run --rm -v "${PGVOL}_pg16_backup":/from:ro -v "$PGVOL":/to alpine sh -c 'cp -a /from/. /to/'
+echo 'POSTGRES_IMAGE_TAG="16-bookworm"' >> .env
+docker compose up -d
+```
+
+Keep `${PGVOL}_pg16_backup` until the v17 deployment has been running to your satisfaction, then remove it with `docker volume rm`.
+
 ## Troubleshooting
 
 ### Container Won't Start
@@ -582,6 +671,22 @@ docker compose exec postgres pg_isready -U xagent
 
 # Check database logs
 docker compose logs postgres
+```
+
+### PostgreSQL Won't Start After an Upgrade
+
+`docker compose ps` reports `postgres` as `restarting` and `unhealthy`, and `backend`, `worker`, and `scheduler` never start because they wait for `service_healthy`. A data directory initialized by an older major version produces this in `docker compose logs postgres`:
+
+```
+FATAL:  database files are incompatible with server
+DETAIL:  The data directory was initialized by PostgreSQL version 16, which is not compatible with this version 17.11 (Debian 17.11-1.pgdg12+2).
+```
+
+PostgreSQL 17 refuses to open the directory rather than modifying it, so the v16 data is intact. Pin the previous major version to restore service immediately, then upgrade deliberately using [PostgreSQL major version upgrade (16 to 17)](#postgresql-major-version-upgrade-16-to-17).
+
+```bash
+echo 'POSTGRES_IMAGE_TAG="16-bookworm"' >> .env
+docker compose up -d postgres
 ```
 
 ### Rebuild After Code Changes

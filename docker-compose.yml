@@ -143,7 +143,7 @@ services:
 
   # PostgreSQL Database
   postgres:
-    image: postgres:17-bookworm
+    image: postgres:${POSTGRES_IMAGE_TAG:-17-bookworm}
     container_name: xagent_postgres
     restart: unless-stopped
     environment:

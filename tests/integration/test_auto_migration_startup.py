@@ -1276,6 +1276,196 @@ async def test_start_temp_file_cleanup_task_wires_stop_event(
 
 
 @pytest.mark.asyncio
+async def test_failed_startup_leaves_no_unsignaled_temp_file_cleanup(
+    monkeypatch: pytest.MonkeyPatch, temp_lancedb_dir
+):
+    """A startup that fails must not leave the sweep walking unsignaled.
+
+    Starlette's default lifespan is an ``async with``: when startup raises,
+    ``__aexit__`` -- and therefore ``shutdown_event`` -- never runs, so the
+    only ``stop_event.set()`` is skipped. Sandbox static readiness raises
+    deliberately on a mount conflict, so the walk would keep sweeping the
+    whole uploads tree in an executor thread that ``asyncio.run()``'s teardown
+    then joins (with no timeout at all before 3.12), turning a fast
+    config-error crash into a multi-minute one.
+
+    Asserts the invariant rather than a call position: after the failure there
+    must be no cleanup task that is both unfinished and unsignaled. Scheduling
+    the sweep only after every failure-prone startup step satisfies it, and so
+    would signalling the flag on the way out.
+    """
+    import importlib
+
+    _patch_channel_modules_disabled(monkeypatch)
+    _patch_task_command_dispatcher_disabled(monkeypatch)
+    web_app_module = importlib.import_module("xagent.web.app")
+    app = web_app_module.app
+
+    class _FakeManager:
+        async def initialize(self) -> None:
+            return None
+
+        async def list_skills(self) -> list[str]:
+            return []
+
+        async def list_templates(self) -> list[str]:
+            return []
+
+    class _FakeMemoryStoreManager:
+        def get_store_info(self) -> dict[str, object]:
+            return {
+                "is_lancedb": True,
+                "embedding_model_id": "test-model",
+                "similarity_threshold": 0.5,
+            }
+
+    class _FakeSandboxManager:
+        async def _resolve_backend_probe(self) -> bool:
+            return True
+
+        async def cleanup(self) -> None:
+            return None
+
+        async def warmup(self) -> None:
+            return None
+
+    class _FakeConn:
+        pass
+
+    created_tasks: list[asyncio.Task] = []
+    original_create_task = asyncio.create_task
+    real_to_thread = asyncio.to_thread
+
+    # The sweep only runs under the auto-migrate gate, so it has to be on for
+    # the failure path under test to be reachable at all.
+    monkeypatch.setenv("LANCEDB_AUTO_MIGRATE", "true")
+    # The same genuine SANDBOX_VOLUMES/code-mount conflict as
+    # test_startup_event_raises_on_readiness_conflict_with_probe_true: startup
+    # fails *after* the point where the sweep is scheduled today.
+    monkeypatch.setenv("SANDBOX_VOLUMES", "/foo:/guest1:ro")
+    monkeypatch.setattr(
+        "xagent.web.sandbox_manager.build_code_mount_volumes",
+        lambda: [("/foo", "/guest2", "ro")],
+    )
+    monkeypatch.setattr(web_app_module, "init_db", lambda: None)
+    monkeypatch.setattr(
+        web_app_module, "start_file_storage_startup_sync_task", lambda _app: None
+    )
+    monkeypatch.setattr(web_app_module, "_migration_task", None)
+    monkeypatch.setattr(
+        "xagent.skills.utils.create_skill_manager",
+        lambda: _FakeManager(),
+    )
+    monkeypatch.setattr(
+        "xagent.templates.utils.create_template_manager",
+        lambda: _FakeManager(),
+    )
+    monkeypatch.setattr(
+        "xagent.web.dynamic_memory_store.get_memory_store_manager",
+        lambda: _FakeMemoryStoreManager(),
+    )
+    monkeypatch.setattr(
+        "xagent.web.sandbox_manager.get_sandbox_manager",
+        lambda: _FakeSandboxManager(),
+    )
+    monkeypatch.setattr(
+        "xagent.providers.vector_store.lancedb.get_connection_from_env",
+        lambda: _FakeConn(),
+    )
+    monkeypatch.setattr(
+        "xagent.core.tools.core.RAG_tools.LanceDB.schema_manager.check_table_needs_migration",
+        lambda _conn, table_name: False,
+    )
+    monkeypatch.setattr(
+        "xagent.core.tools.core.RAG_tools.utils.lancedb_query_utils.list_embeddings_table_names",
+        lambda _conn: [],
+    )
+
+    # The uploaded-files reconcile task is scheduled just before the sweep and
+    # is not what this test is about; stub its units of work so it cannot spray
+    # unrelated LanceDB/DB tracebacks over this test's output.
+    class _FakeSession:
+        def close(self) -> None:
+            return None
+
+    monkeypatch.setattr(
+        "xagent.migrations.lancedb.backfill_uploaded_file_links.backfill_all",
+        lambda *args, **kwargs: {},
+    )
+    monkeypatch.setattr(
+        "xagent.web.services.kb_file_service.reconcile_uploaded_files",
+        lambda *args, **kwargs: {},
+    )
+    monkeypatch.setattr(
+        "xagent.web.models.database.get_session_local", lambda: _FakeSession
+    )
+
+    def _blocking_cleanup(*, stop_event=None) -> int:
+        # Stand in for a real sweep of a large tree: an executor walk that only
+        # unwinds once the cooperative stop flag is set. The timeout is a test
+        # safety net so a regression cannot hang the suite, not part of the
+        # contract under test.
+        assert stop_event is not None
+        stop_event.wait(timeout=30)
+        return 0
+
+    monkeypatch.setattr(
+        "xagent.web.api.kb.cleanup_orphaned_temp_files", _blocking_cleanup
+    )
+
+    real_start = web_app_module.start_temp_file_cleanup_task
+
+    def _start_ungated(app_instance):
+        # Exercise the REAL wrapper, whose own PYTEST_CURRENT_TEST gate would
+        # otherwise skip the sweep entirely. Clearing the variable only around
+        # this call keeps the five unrelated gates in startup_event (trigger
+        # dispatcher, lease/upload recovery, orphan GC, metadata rebuild) in
+        # force, so the failure path is the only thing this test un-gates.
+        saved = os.environ.pop("PYTEST_CURRENT_TEST", None)
+        try:
+            return real_start(app_instance)
+        finally:
+            if saved is not None:
+                os.environ["PYTEST_CURRENT_TEST"] = saved
+
+    monkeypatch.setattr(web_app_module, "start_temp_file_cleanup_task", _start_ungated)
+
+    async def _selective_to_thread(fn, *args, **kwargs):
+        # The sweep must run in a real thread: the stub above blocks until the
+        # stop flag is set, which can never happen if it runs inline on the
+        # event loop. Everything else stays inline, like the sibling tests.
+        if fn is _blocking_cleanup:
+            return await real_to_thread(fn, *args, **kwargs)
+        return fn(*args, **kwargs)
+
+    def _track_create_task(coro):
+        task = original_create_task(coro)
+        created_tasks.append(task)
+        return task
+
+    monkeypatch.setattr(web_app_module.asyncio, "to_thread", _selective_to_thread)
+    monkeypatch.setattr(web_app_module.asyncio, "create_task", _track_create_task)
+
+    try:
+        with pytest.raises(SandboxRuntimeConflictError):
+            await web_app_module.startup_event()
+
+        task = getattr(app.state, "temp_file_cleanup_task", None)
+        stop = getattr(app.state, "temp_file_cleanup_stop", None)
+        assert task is None or task.done() or (stop is not None and stop.is_set())
+    finally:
+        # Never leave a blocked executor thread, a pending task, or populated
+        # app.state behind for the rest of the session.
+        stop = getattr(app.state, "temp_file_cleanup_stop", None)
+        if stop is not None:
+            stop.set()
+        app.state.temp_file_cleanup_task = None
+        app.state.temp_file_cleanup_stop = None
+        if created_tasks:
+            await asyncio.gather(*created_tasks, return_exceptions=True)
+
+
+@pytest.mark.asyncio
 async def test_startup_event_runs_sandbox_readiness_before_cleanup_and_warmup(
     monkeypatch: pytest.MonkeyPatch, temp_lancedb_dir
 ):

@@ -1636,10 +1636,6 @@ async def startup_event() -> None:
         asyncio.create_task(run_uploaded_file_reconcile_background())
         logger.info("Started background uploaded files reconcile task")
 
-        # Clean up orphaned temporary files from interrupted atomic replacements.
-        # See start_temp_file_cleanup_task for the backgrounding/shutdown rationale.
-        start_temp_file_cleanup_task(app)
-
     # Warmup sandbox manager
     from .sandbox_manager import check_sandbox_static_readiness, get_sandbox_manager
 
@@ -1714,6 +1710,19 @@ async def startup_event() -> None:
             logger.info("Slack channel background task created successfully")
     except Exception as e:
         logger.error(f"Failed to start chat channel managers: {e}", exc_info=True)
+
+    # Kept under the same migration toggle as the uploaded-files reconcile above;
+    # see start_temp_file_cleanup_task for the backgrounding/shutdown rationale.
+    #
+    # WHY LAST: a startup exception skips Starlette's ``async with`` teardown, so
+    # shutdown_event -- the only place the sweep's stop flag is set -- never runs.
+    # Scheduling before a step that can raise (sandbox static readiness raises on
+    # a mount conflict) leaves the walk sweeping the whole uploads tree in an
+    # executor thread that asyncio.run()'s teardown joins, untimed before 3.12.
+    # WARN: anything appended below must not raise, or must set the flag itself;
+    # test_failed_startup_leaves_no_unsignaled_temp_file_cleanup pins this.
+    if auto_migrate:
+        start_temp_file_cleanup_task(app)
 
 
 @app.on_event("shutdown")

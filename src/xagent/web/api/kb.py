@@ -1622,6 +1622,7 @@ async def _rollback_failed_cloud_ingestion(
 # WHY: a single very large flat directory must still be interruptible within
 # the shutdown grace period, not only at directory boundaries -- checking
 # every entry would add per-entry overhead for no benefit at typical sizes.
+# The same chunk size bounds that directory's deletion phase below.
 _TEMP_CLEANUP_STOP_CHECK_ENTRIES = 500
 
 
@@ -1683,7 +1684,8 @@ def cleanup_orphaned_temp_files(
     # entry on a large tree. Clean temp files older than 1 hour to avoid
     # deleting files that might still be in use; per-entry OSError is tolerated
     # below so a file vanishing mid-scan skips instead of aborting the sweep.
-    stack = [str(base_dir)]
+    root = str(base_dir)
+    stack = [root]
     # WHY: track "did we stop early" as we go instead of re-reading stop_event
     # after the loop. The flag can be set by shutdown *while* the final
     # directory is being scanned, in which case the tree still gets fully
@@ -1696,6 +1698,20 @@ def cleanup_orphaned_temp_files(
             stopped_early = True
             break
         current = stack.pop()
+        # WHY: os.scandir() on this str path follows symlinks, and the DFS stack
+        # can hold a queued pathname for the rest of the sweep -- so without a
+        # fresh check, a directory swapped for a symlink after its parent's
+        # is_dir(follow_symlinks=False) sends the sweep outside the uploads root.
+        # os.walk() guards the same race the same way (CPython bpo-23605), at the
+        # same cost of one lstat per directory. The root stays exempt because
+        # os.walk() never tested `top` either, and a symlinked uploads root
+        # (a mounted volume) is a legitimate deployment.
+        if current != root and os.path.islink(current):
+            logger.warning(
+                "Not descending into %s: it was replaced by a symlink during the sweep",
+                current,
+            )
+            continue
         try:
             scandir_it = os.scandir(current)
         except OSError as e:
@@ -1751,7 +1767,21 @@ def cleanup_orphaned_temp_files(
                     continue
                 victims.append(entry.path)
 
-        for victim in victims:
+        for victims_seen, victim in enumerate(victims):
+            # WHY: an unpolled deletion phase can outlive both the shutdown grace
+            # period and asyncio.run()'s executor join -- one directory can hold
+            # many aged temp files (an agent workspace's temp/output) and unlink
+            # latency on network storage is tens of milliseconds. Chunked rather
+            # than per-victim so a stop mid-deletion does not discard a typical
+            # directory's few victims, which nothing reclaims until next startup.
+            if (
+                stop_event is not None
+                and victims_seen
+                and victims_seen % _TEMP_CLEANUP_STOP_CHECK_ENTRIES == 0
+                and stop_event.is_set()
+            ):
+                stopped_early = True
+                break
             try:
                 os.unlink(victim)
                 cleaned_count += 1

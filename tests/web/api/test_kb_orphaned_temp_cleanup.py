@@ -393,3 +393,129 @@ def test_completed_sweep_is_not_reported_as_truncated(tmp_path, monkeypatch, cap
     assert stop.is_set()
     assert "was not fully walked" not in caplog.text
     assert "Cleaned up 1 orphaned temporary file(s)" in caplog.text
+
+
+class _StopAfterNPolls:
+    """Stop flag that stays unset for the first ``allowed`` polls, then trips.
+
+    Lets a test place the stop signal at an exact point in the walk's poll
+    sequence -- per-directory check, per-entry check, per-victim check --
+    without depending on wall-clock timing or on scandir ordering.
+    """
+
+    def __init__(self, allowed: int) -> None:
+        self._polls = 0
+        self._allowed = allowed
+
+    def is_set(self) -> bool:
+        self._polls += 1
+        return self._polls > self._allowed
+
+
+def test_cleanup_stops_mid_deletion_on_a_directory_with_many_victims(
+    tmp_path: Path, caplog
+):
+    """A stop signalled mid-deletion must leave the remaining victims alone.
+
+    The scan polls the stop flag, but the deletion phase that follows it used
+    to run every queued unlink unconditionally. A directory holding many aged
+    temp files (an agent workspace's ``temp``/``output``, where unlink latency
+    on network storage is tens of milliseconds) could therefore outlive both
+    the shutdown grace period and the executor join. The deletion phase is
+    bounded by the same chunk size as the scan, so it stops after at most one
+    chunk instead of draining the whole list.
+    """
+    import logging
+
+    # A dedicated root: a shared conftest fixture seeds tmp_path itself with a
+    # lancedb/ subdirectory, which would consume a poll and shift the counts
+    # this test pins.
+    root = tmp_path / "uploads"
+    root.mkdir()
+    leftover = 100
+    total = _TEMP_CLEANUP_STOP_CHECK_ENTRIES + leftover
+    for i in range(total):
+        _write_aged(root / f"v{i:04d}.ab12cd.tmp", age=ORPHAN_AGE_SECONDS + 600)
+
+    # Poll 1 is the per-directory check and poll 2 the scan's per-entry check
+    # at entry _TEMP_CLEANUP_STOP_CHECK_ENTRIES -- both must be unset so the
+    # walk reaches the deletion phase with a full chunk queued. Poll 3 is the
+    # deletion phase's own check, one chunk in.
+    stop = _StopAfterNPolls(2)
+
+    with caplog.at_level(logging.INFO, logger="xagent.web.api.kb"):
+        removed = cleanup_orphaned_temp_files(upload_dir=root, stop_event=stop)
+
+    assert removed == _TEMP_CLEANUP_STOP_CHECK_ENTRIES
+    assert len(list(root.iterdir())) == leftover
+    assert "was not fully walked" in caplog.text
+
+
+class _SwapQueuedDirForSymlinkOnDescend:
+    """Replaces ``target`` with a symlink to ``elsewhere`` just before descend.
+
+    The per-directory stop poll is the injection point: it runs after one
+    directory has been scanned (so ``target`` is already on the walk's stack)
+    and before the next directory is popped and opened. Never sets the flag,
+    so the walk is not interrupted -- only the queued pathname changes under
+    it, exactly as a concurrent writer could do.
+    """
+
+    def __init__(self, target: Path, elsewhere: Path) -> None:
+        self._polls = 0
+        self._target = target
+        self._elsewhere = elsewhere
+
+    def is_set(self) -> bool:
+        self._polls += 1
+        if self._polls == 2:
+            self._target.rmdir()
+            self._target.symlink_to(self._elsewhere, target_is_directory=True)
+        return False
+
+
+def test_cleanup_does_not_descend_into_a_queued_dir_swapped_for_a_symlink(
+    tmp_path: Path,
+):
+    """A queued directory replaced by a symlink must not be followed.
+
+    ``entry.is_dir(follow_symlinks=False)`` is evaluated while the *parent* is
+    being scanned, but ``os.scandir()`` on the retained str path follows
+    symlinks, and the DFS stack can hold that pathname for the rest of the
+    sweep. os.walk() guards exactly this with a fresh ``islink()`` immediately
+    before recursing (CPython bpo-23605: "the caller can replace the directory
+    entry during the yield"), so dropping the recheck would let the sweep
+    escape the uploads root and delete aged temp-named files anywhere.
+    """
+    inside = tmp_path / "uploads"
+    outside = tmp_path / "outside_the_uploads_root"
+    inside.mkdir()
+    _write_aged(outside / "secret.ab12cd.tmp", age=ORPHAN_AGE_SECONDS + 600)
+    queued = inside / "queued"
+    queued.mkdir()
+
+    swap = _SwapQueuedDirForSymlinkOnDescend(queued, outside)
+
+    removed = cleanup_orphaned_temp_files(upload_dir=inside, stop_event=swap)
+
+    assert removed == 0
+    assert (outside / "secret.ab12cd.tmp").exists()
+
+
+def test_cleanup_walks_an_uploads_root_that_is_itself_a_symlink(tmp_path: Path):
+    """The no-follow recheck must apply to descended dirs, not to the root.
+
+    os.walk() never tested whether ``top`` itself is a symlink, and the uploads
+    root legitimately is one in deployments that point it at a mounted volume.
+    Rejecting a symlinked root would silently stop reclaiming temp files on
+    exactly those hosts.
+    """
+    real_root = tmp_path / "mounted_volume"
+    _write_aged(real_root / "old.tmp-replace", age=ORPHAN_AGE_SECONDS + 600)
+    link_root = tmp_path / "uploads"
+    link_root.symlink_to(real_root, target_is_directory=True)
+
+    removed = cleanup_orphaned_temp_files(upload_dir=link_root)
+
+    assert removed == 1
+    assert not (real_root / "old.tmp-replace").exists()

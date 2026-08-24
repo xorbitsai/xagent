@@ -439,6 +439,27 @@ class TestAuthAPI:
         )
         assert response.status_code == 422
 
+    def test_update_current_user_preferences_rejects_an_unknown_field(
+        self, test_db, test_user_data
+    ):
+        """A typo'd key (e.g. "voce") must be a validation error, not a
+        silently-empty update that still reports success - extra="forbid"
+        is what makes model_dump(exclude_unset=True) fail loudly instead
+        of returning {} for a body with no recognized fields."""
+        setup_first_admin()
+        register_response = client.post("/api/auth/register", json=test_user_data)
+        assert register_response.status_code == 200
+        token = login_and_get_token(
+            test_user_data["username"], test_user_data["password"]
+        )
+
+        response = client.patch(
+            "/api/auth/me/preferences",
+            json={"voce": "friendly"},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert response.status_code == 422
+
     def test_update_current_user_preferences_with_empty_body_is_a_no_op(
         self, test_db, test_user_data
     ):

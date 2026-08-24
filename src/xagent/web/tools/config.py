@@ -1223,7 +1223,6 @@ class WebToolConfig(BaseToolConfig):
         parent_task_id: Optional[str] = None,
         parent_tracer: Optional[Any] = None,
         agent_call_stack: Optional[List[int]] = None,
-        voice: Optional[str] = None,
         sandbox: Optional[Any] = None,
         tool_selection_spec: Optional[Any] = None,
         mcp_auth_context: Optional[Dict[str, Any]] = None,
@@ -1235,6 +1234,11 @@ class WebToolConfig(BaseToolConfig):
         connector_team_id: Optional[int] = None,
         agent_creator_user_id: Optional[int] = None,
         declared_knowledge_bases: Optional[List[str]] = None,
+        # Appended after every pre-existing parameter (not inserted
+        # alongside its closest siblings above) so a caller still using
+        # positional arguments for anything after agent_call_stack keeps
+        # binding the same values it always did.
+        voice: Optional[str] = None,
     ):
         # ``tool_selection_spec`` accepts :class:`ToolSelectionSpec` from
         # the tools adapter package; typed as ``Any`` here to avoid an

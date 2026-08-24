@@ -19,7 +19,7 @@ os.environ["OAUTHLIB_RELAX_TOKEN_SCOPE"] = "1"
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from fastapi.responses import HTMLResponse, RedirectResponse
 from jose import JWTError, jwt
-from pydantic import BaseModel, Field, StrictInt, StrictStr, field_validator
+from pydantic import BaseModel, ConfigDict, Field, StrictInt, StrictStr, field_validator
 from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session
@@ -633,6 +633,13 @@ class UpdatePreferencesRequest(BaseModel):
     Only fields actually present in the request body are merged into the
     stored dict (see exclude_unset=True below) - onboarding writes these
     incrementally, one step at a time, not all at once."""
+
+    # Pydantic's default (extra="ignore") would validate a typo'd key
+    # (e.g. "voce") to an empty, all-unset model: model_dump(exclude_unset=True)
+    # then returns {}, so the PATCH silently skips persistence and cache
+    # invalidation while still reporting success - forbid so a typo/unknown
+    # key is a 422, not a lost write the client believes succeeded.
+    model_config = ConfigDict(extra="forbid")
 
     onboarded: Optional[bool] = None
     department: Optional[str] = None
@@ -1359,19 +1366,39 @@ async def update_current_user_preferences(
     survives a later step's PATCH."""
     updates = request.model_dump(exclude_unset=True)
     if updates:
-        if not _lock_user_row_for_preferences_update(db, int(user.id)):
-            # Deleted concurrently (e.g. account deletion) between
-            # get_current_user loading this row and the lock attempt.
+
+        def _merge_preferences_sync() -> bool:
+            """The lock wait this is built around is a real, potentially
+            slow blocking DB call under contention - run the whole
+            lock -> refresh -> merge -> commit transaction in a worker
+            thread so it never blocks the event loop for unrelated
+            requests/WebSockets on this worker, matching this file's own
+            asyncio.to_thread convention for synchronous DB work (see
+            login's _update_user_sync). `db`/`user` are only touched here
+            and, sequentially after this awaited call returns, by the
+            caller - never concurrently from two threads at once."""
+            if not _lock_user_row_for_preferences_update(db, int(user.id)):
+                # Deleted concurrently (e.g. account deletion) between
+                # get_current_user loading this row and the lock attempt.
+                return False
+            # Re-read after acquiring the lock: a concurrent PATCH may
+            # have committed its own merge while this request was
+            # waiting on it, and `user` was loaded before that lock was
+            # taken. Once acquired, the lock (FOR UPDATE, or SQLite's
+            # write lock via the no-op update) also rules out a
+            # concurrent deletion for the rest of this transaction, so a
+            # trailing refresh to pick that case up is unnecessary - the
+            # response is serialized from the in-memory `user` object
+            # this same merge already updated.
+            db.refresh(user)
+            current_preferences = _normalized_preferences(user)
+            current_preferences.update(updates)
+            setattr(user, "preferences", current_preferences)
+            db.commit()
+            return True
+
+        if not await asyncio.to_thread(_merge_preferences_sync):
             raise HTTPException(status_code=404, detail="User not found")
-        # Re-read after acquiring the lock: a concurrent PATCH may have
-        # committed its own merge while this request was waiting on it,
-        # and `user` was loaded before that lock was taken.
-        db.refresh(user)
-        current_preferences = _normalized_preferences(user)
-        current_preferences.update(updates)
-        setattr(user, "preferences", current_preferences)
-        db.commit()
-        db.refresh(user)
 
         if "voice" in updates:
             # A cached AgentService bakes voice into its system prompt at

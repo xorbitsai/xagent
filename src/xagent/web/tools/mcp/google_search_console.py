@@ -12,7 +12,6 @@ from mcp.server.fastmcp import FastMCP
 from ....config import get_tool_max_output_length
 from .utils import setup_proxy_env
 
-logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("google-search-console-mcp")
 
 # Ensure standard proxy environment variables are set to prevent hanging requests
@@ -328,4 +327,5 @@ def google_search_console_inspect_url(
 
 
 if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO)
     mcp.run()

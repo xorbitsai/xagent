@@ -220,12 +220,14 @@ def _add_user_oauth(
     *,
     provider: str = "google",
     access_token: str = "user-token",
+    instance_url: str | None = None,
 ) -> UserOAuth:
     account = UserOAuth(
         user_id=user.id,
         provider=provider,
         access_token=access_token,
         provider_user_id=f"{provider}-user",
+        instance_url=instance_url,
     )
     db.add(account)
     db.commit()
@@ -520,6 +522,110 @@ async def test_hook_supply_launch_config_env_matches_user_oauth_shape(db_session
         token_key="CUSTOM_ACCESS_TOKEN",
         hook_token="hook-token",
         user_token="user-token",
+    )
+
+
+@pytest.mark.asyncio
+async def test_hook_supply_instance_url_env_matches_user_oauth_shape(db_session):
+    launch_config = {
+        "command": "python",
+        "args": ["-m", "xagent.web.tools.mcp.salesforce"],
+        "env_mapping": {
+            "SALESFORCE_ACCESS_TOKEN": "access_token",
+            "SALESFORCE_INSTANCE_URL": "instance_url",
+        },
+    }
+    db, user = db_session
+    _add_oauth_server(db, user, provider="salesforce", launch_config=launch_config)
+
+    async def resolver(request: TokenRequest) -> ResolvedToken | None:
+        return ResolvedToken(
+            access_token="hook-token",
+            expires_at=datetime.now(timezone.utc) + timedelta(hours=1),
+            instance_url="https://acme.my.salesforce.com",
+        )
+
+    set_oauth_token_resolver_hook(resolver)
+
+    hook_config = (await _tool_config(db, user).get_mcp_server_configs())[0]
+    set_oauth_token_resolver_hook(None)
+    _add_user_oauth(
+        db,
+        user,
+        provider="salesforce",
+        access_token="user-token",
+        instance_url="https://acme.my.salesforce.com",
+    )
+    user_config = (await _tool_config(db, user).get_mcp_server_configs())[0]
+
+    assert (
+        hook_config["config"]["env"]["SALESFORCE_INSTANCE_URL"]
+        == "https://acme.my.salesforce.com"
+    )
+    _assert_same_oauth_config_except_token(
+        hook_config,
+        user_config,
+        token_key="SALESFORCE_ACCESS_TOKEN",
+        hook_token="hook-token",
+        user_token="user-token",
+    )
+
+
+@pytest.mark.asyncio
+async def test_hook_missing_instance_url_retains_unavailable_server(db_session):
+    launch_config = {
+        "command": "python",
+        "args": ["-m", "xagent.web.tools.mcp.salesforce"],
+        "env_mapping": {
+            "SALESFORCE_ACCESS_TOKEN": "access_token",
+            "SALESFORCE_INSTANCE_URL": "instance_url",
+        },
+    }
+    db, user = db_session
+    server = _add_oauth_server(
+        db, user, provider="salesforce", launch_config=launch_config
+    )
+
+    async def resolver(request: TokenRequest) -> ResolvedToken | None:
+        return ResolvedToken(
+            access_token="hook-token",
+            expires_at=datetime.now(timezone.utc) + timedelta(hours=1),
+        )
+
+    set_oauth_token_resolver_hook(resolver)
+
+    config = (await _tool_config(db, user).get_mcp_server_configs())[0]
+
+    _assert_unavailable_mcp_config(
+        config, server, reason="oauth_token_required", oauth_token_required=True
+    )
+
+
+@pytest.mark.asyncio
+async def test_legacy_missing_instance_url_retains_unavailable_server(db_session):
+    """Same as test_hook_missing_instance_url_retains_unavailable_server but
+    via the legacy UserOAuth DB path (no resolver hook installed) -- the two
+    call sites of _build_oauth_mcp_stdio_transport_config each have their
+    own except _OAuthInstanceUrlRequired handler, and only the hook path had
+    a regression test for it."""
+    launch_config = {
+        "command": "python",
+        "args": ["-m", "xagent.web.tools.mcp.salesforce"],
+        "env_mapping": {
+            "SALESFORCE_ACCESS_TOKEN": "access_token",
+            "SALESFORCE_INSTANCE_URL": "instance_url",
+        },
+    }
+    db, user = db_session
+    server = _add_oauth_server(
+        db, user, provider="salesforce", launch_config=launch_config
+    )
+    _add_user_oauth(db, user, provider="salesforce", access_token="user-token")
+
+    config = (await _tool_config(db, user).get_mcp_server_configs())[0]
+
+    _assert_unavailable_mcp_config(
+        config, server, reason="oauth_token_required", oauth_token_required=True
     )
 
 
@@ -1302,6 +1408,14 @@ async def test_hook_failure_drops_non_string_or_empty_actor_id(
         (
             ResolvedToken(access_token="hook-token", expires_at="soon"),
             "InvalidExpiresAt",
+        ),
+        (
+            ResolvedToken(access_token="hook-token", instance_url=123),
+            "InvalidInstanceUrl",
+        ),
+        (
+            ResolvedToken(access_token="hook-token", instance_url=""),
+            "InvalidInstanceUrl",
         ),
     ],
 )

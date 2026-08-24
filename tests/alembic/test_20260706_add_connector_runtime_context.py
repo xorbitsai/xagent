@@ -175,12 +175,20 @@ def test_empty_database_alembic_upgrade_fails_closed_at_owner_revision(
         assert "resource_owner_key" not in {
             column["name"] for column in inspector.get_columns("user_oauth")
         }
-        assert (
-            connection.execute(
+        # Not scalar_one(): alembic_version can legitimately hold more than
+        # one row here. Any other connector's migration branch that hasn't
+        # yet been reunited with this one by a merge revision has no
+        # dependency on the users table this owner-aware migration requires,
+        # so it fully applies to its own independent tip while this branch
+        # is blocked -- exactly one row (this branch's) is pinned at
+        # "20260818_seed_stripe_mcp_app", not necessarily the only row.
+        applied_revisions = {
+            row[0]
+            for row in connection.execute(
                 text("SELECT version_num FROM alembic_version")
-            ).scalar_one()
-            == "20260818_seed_stripe_mcp_app"
-        )
+            ).fetchall()
+        }
+        assert "20260818_seed_stripe_mcp_app" in applied_revisions
         assert (
             connection.execute(
                 text("SELECT count(*) FROM public_mcp_apps WHERE app_id = 'stripe'")

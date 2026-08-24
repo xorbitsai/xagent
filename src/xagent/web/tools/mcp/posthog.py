@@ -14,6 +14,8 @@ from ....core.utils.security import (
     redact_sensitive_text,
     reject_private_network_host,
 )
+from .utils import clamp_limit
+from .utils import clamp_offset as _clamp_offset
 from .utils import setup_proxy_env
 
 logging.basicConfig(level=logging.INFO)
@@ -143,11 +145,7 @@ def _base_url() -> str:
 
 
 def _clamp_limit(limit: int) -> int:
-    return max(1, min(int(limit), MAX_LIMIT))
-
-
-def _clamp_offset(offset: int) -> int:
-    return max(0, int(offset))
+    return clamp_limit(limit, max_limit=MAX_LIMIT)
 
 
 def _path_segment(value: str, field_name: str = "id") -> str:

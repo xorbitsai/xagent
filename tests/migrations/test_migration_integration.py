@@ -483,20 +483,37 @@ class TestMigrations:
 
     def test_sqlite_owner_downgrade_preserves_stripe_head(self, sqlite_tester):
         """Rollback removes owner storage without removing the Stripe seed."""
+        owner_revision = "20260818_user_oauth_resource_owner"
         stripe_revision = "20260818_seed_stripe_mcp_app"
         script_dir = ScriptDirectory.from_config(sqlite_tester.alembic_cfg)
 
-        # A single unambiguous head is what makes "head" below resolve
-        # deterministically; the exact revision id is expected to change as
-        # later migrations are added and isn't itself part of this test's
-        # invariant.
-        assert len(script_dir.get_heads()) == 1
+        # Not `== [owner_revision]`: that only held while this was the sole
+        # unmerged branch. A sibling connector's migration branch merging
+        # with this one moves the single head to that merge revision instead
+        # -- the actual precondition this test needs is just that "head"
+        # resolves unambiguously (one head) and still descends from
+        # owner_revision, not that owner_revision is literally still it.
+        heads = script_dir.get_heads()
+        assert len(heads) == 1
+        assert _revision_reached(script_dir, owner_revision, set(heads))
 
         sqlite_tester.create_metadata_owned_users_table()
         command.upgrade(sqlite_tester.alembic_cfg, "head")
         command.downgrade(sqlite_tester.alembic_cfg, stripe_revision)
 
-        assert sqlite_tester.get_alembic_versions() == {stripe_revision}
+        # Not `== {stripe_revision}`: downgrading past a merge revision
+        # re-splits the version table back into each parent branch's own
+        # tip, and only the branch actually being downgraded (this one)
+        # continues past that split -- a sibling branch merged in here (this
+        # one has no dependency on the owner revision) legitimately keeps
+        # its own tip applied alongside stripe_revision.
+        #
+        # Plain membership, not _revision_reached: this checks the actual
+        # applied version rows, not ancestry, so it still fails if
+        # downgrade() silently no-ops and leaves a later descendant of
+        # stripe_revision applied instead -- _revision_reached would treat
+        # that descendant as "reaching" stripe_revision and miss the bug.
+        assert stripe_revision in sqlite_tester.get_alembic_versions()
         assert "resource_owner_key" not in sqlite_tester.get_column_names("user_oauth")
         with sqlite_tester.engine.begin() as conn:
             assert (

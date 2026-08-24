@@ -714,9 +714,10 @@ async def test_model_connection(
                 "base_url": base_url,
             }
 
-            # Add temperature only if it's not a known reasoning model that rejects it
-            if not is_reasoning_model:
-                config_kwargs["default_temperature"] = request.temperature or 0.7
+            # Forward temperature only if the caller explicitly set one and
+            # the model isn't a known reasoning model that rejects it.
+            if not is_reasoning_model and request.temperature is not None:
+                config_kwargs["default_temperature"] = request.temperature
 
             config = ChatModelConfig(**config_kwargs)
             llm = create_base_llm(config)

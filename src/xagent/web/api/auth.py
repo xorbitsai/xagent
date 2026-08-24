@@ -1,6 +1,7 @@
 """Authentication API endpoints"""
 
 import asyncio
+import base64
 import hashlib
 import html
 import json
@@ -134,6 +135,30 @@ def _run_post_commit_oauth_side_effects(
 
 def _oauth_env_name(provider: str, suffix: str) -> str:
     return f"{provider.upper()}_{suffix}"
+
+
+def _is_salesforce_provider(provider: str) -> bool:
+    """Match the Salesforce family, including admin-created sandbox rows.
+
+    A prefix match, not exact equality: example.env's documented sandbox
+    workaround is an admin hand-creating a second provider row (e.g.
+    "salesforce-sandbox") pointing at test.salesforce.com, since the
+    provider-row model has no per-user sandbox toggle. Every Salesforce-only
+    code path -- PKCE, the instance_url presence guard, and the
+    provider_user_id identity backfill -- must use this same predicate; an
+    exact match on any one of them would silently grant that row the
+    capability while skipping its safeguard.
+
+    Anchored to a "-" separator, not a bare prefix: `oauth_providers.name` is
+    admin-settable via POST/PUT /admin/mcp/providers, so a bare
+    `.startswith("salesforce")` would also match an unrelated custom
+    provider an admin happened to name e.g. "salesforcelite" -- routing it
+    through PKCE and the instance_url-required guard it has no reason to
+    satisfy. Requiring "salesforce" or "salesforce-<anything>" keeps the
+    sandbox row matched without widening the blast radius that far.
+    """
+    lowered = provider.lower()
+    return lowered == "salesforce" or lowered.startswith("salesforce-")
 
 
 def _resolve_oauth_secret(
@@ -1466,6 +1491,47 @@ def generic_oauth_login(
         "app_id": app_id,
         "redirect": redirect,
     }
+    # Newer Salesforce orgs enforce PKCE on this authorization-code grant at
+    # the org level, with no per-app way to disable it (Setup > External
+    # Client Apps > Security > "Require Proof Key for Code Exchange" is
+    # locked once an org has it on). The verifier rides inside this signed,
+    # short-lived state token rather than a new DB row, to avoid a schema
+    # change for one provider -- but `state` itself goes out as a URL query
+    # param on the redirect to Salesforce and back, so it lands in browser
+    # history/Referer headers/proxy logs. HS256 signing alone doesn't hide
+    # the payload (it's base64, not encrypted), so the verifier is encrypted
+    # here before being embedded, and decrypted back out in the callback
+    # below. The token exchange still requires the server-held client_secret
+    # regardless, so this is defense-in-depth on top of that, not the only
+    # thing standing between an interceptor and a token.
+    code_verifier = (
+        secrets.token_urlsafe(64) if _is_salesforce_provider(provider) else None
+    )
+    if code_verifier:
+        from ...core.utils.encryption import encrypt_value
+
+        try:
+            state_payload["code_verifier"] = encrypt_value(code_verifier)
+        except ValueError:
+            # get_cipher() raises this when ENCRYPTION_KEY is unset outside
+            # development -- every other provider's login route never calls
+            # encrypt_value at all, so this misconfiguration is otherwise
+            # invisible until the first Salesforce connect attempt. Not
+            # routed through _oauth_provider_config_error: that helper's
+            # "Missing X for provider Y" phrasing is written for a
+            # provider-prefixed env var (e.g. SALESFORCE_CLIENT_ID) and
+            # would misleadingly suggest a SALESFORCE_ENCRYPTION_KEY-style
+            # variable exists, when ENCRYPTION_KEY is a single global
+            # setting unrelated to any one provider.
+            return HTMLResponse(
+                content=(
+                    "<h1>Error: Server misconfigured</h1>"
+                    "<p>The ENCRYPTION_KEY environment variable is not set. "
+                    "This is required to connect Salesforce; set it and "
+                    "restart the backend.</p>"
+                ),
+                status_code=500,
+            )
     state = create_access_token(data=state_payload, expires_delta=timedelta(minutes=10))
 
     app_scopes: list[str] | None = None
@@ -1535,6 +1601,12 @@ def generic_oauth_login(
         params["prompt"] = "consent"
     if provider.lower() == "zoom":
         params["prompt"] = "login"
+    if code_verifier:
+        digest = hashlib.sha256(code_verifier.encode("ascii")).digest()
+        params["code_challenge"] = (
+            base64.urlsafe_b64encode(digest).decode("ascii").rstrip("=")
+        )
+        params["code_challenge_method"] = "S256"
     if provider.lower() == "jira":
         # Required by Atlassian's authorize endpoint for every 3LO app,
         # regardless of scopes requested -- identifies the resource server
@@ -1717,6 +1789,30 @@ def generic_oauth_callback(
         )
     user_id = user_id_claim
     app_id = payload.get("app_id")
+    encrypted_code_verifier = payload.get("code_verifier")
+    code_verifier = None
+    if encrypted_code_verifier:
+        from ...core.utils.encryption import decrypt_value_strict
+
+        # Strict, not the lenient decrypt_value: a verifier this can't open
+        # (e.g. ENCRYPTION_KEY rotated mid-flight, inside the state token's
+        # 10-minute window) must not silently fall back to sending the raw
+        # ciphertext to Salesforce as code_verifier -- that only surfaces as
+        # an opaque invalid_grant from Salesforce instead of a clear cause.
+        # Catching ValueError, not just its EncryptionDecodeError subclass:
+        # decrypt_value_strict's own get_cipher() call raises a bare
+        # ValueError when ENCRYPTION_KEY is unset outside development,
+        # which is exactly the same "surface it clearly" case, not just a
+        # token that fails to decrypt under a present key.
+        try:
+            code_verifier = decrypt_value_strict(encrypted_code_verifier)
+        except ValueError:
+            return HTMLResponse(
+                content=(
+                    "<h1>Error: Session expired</h1><p>Please try connecting again.</p>"
+                ),
+                status_code=400,
+            )
 
     if not app_id:
         from ..mcp_apps import requires_app_scoped_oauth_grant
@@ -1806,6 +1902,8 @@ def generic_oauth_callback(
             "code": code,
             "redirect_uri": redirect_uri,
         }
+        if code_verifier:
+            data["code_verifier"] = code_verifier
         headers = {"Content-Type": "application/x-www-form-urlencoded"}
         if requires_json_accept_header(provider):
             headers["Accept"] = "application/json"
@@ -1956,6 +2054,31 @@ def generic_oauth_callback(
                 status_code=400,
             )
 
+        salesforce_instance_url = token_data.get("instance_url")
+        if _is_salesforce_provider(provider) and (
+            not isinstance(salesforce_instance_url, str) or not salesforce_instance_url
+        ):
+            # Every real Salesforce token exchange includes a non-empty
+            # string instance_url; anything else here (missing, empty, or a
+            # non-string value) means the response is unusable for this
+            # connector (launch_config.env_mapping requires it, so the
+            # server would come back unavailable/reconnect-required on the
+            # very next load) -- full host/scheme validation still only
+            # happens at use-time in salesforce.py's _instance_url(), this
+            # is just "is this even a plausible value to store" before
+            # committing it. Checked before the delete-then-recreate below,
+            # not after: that block unconditionally drops any existing
+            # UserOAuth row for this user+provider first, so letting a bad
+            # response through here would destroy a prior *working* grant
+            # while still telling the user "Connected Successfully".
+            return HTMLResponse(
+                content=(
+                    "<h1>Error exchanging token</h1>"
+                    f"<p>{html.escape(provider)} did not return an instance_url.</p>"
+                ),
+                status_code=400,
+            )
+
         provider_user_id = None
         email = None
 
@@ -1995,6 +2118,49 @@ def generic_oauth_callback(
                         f"{html.escape(str(e))}</p>"
                     ),
                     status_code=400,
+                )
+        elif _is_salesforce_provider(provider):
+            # Salesforce's userinfo_url is deliberately left empty (see the
+            # registry row's comment: an extra round-trip just for a label
+            # this connector doesn't otherwise need), which also means
+            # provider_user_id stays NULL here -- and UserOAuth's unique
+            # constraint is (user_id, provider, provider_user_id), which
+            # SQL treats as non-conflicting across multiple NULLs. Every
+            # other provider gets real protection from that constraint
+            # because their provider_user_id is a real value; Salesforce
+            # would get none at all, letting concurrent callbacks for the
+            # same user leave more than one row with no error. The token
+            # response's own "id" field (Salesforce's identity URL, unique
+            # per org+user) closes that gap for free -- no extra network
+            # call, unlike a real userinfo lookup. This branch preempting
+            # the generic `elif userinfo_url and access_token` branch below
+            # is deliberate, not an oversight: it means the seeded row's
+            # user_id_path/email_path columns are dead by construction for
+            # Salesforce, which is fine -- Salesforce's userinfo endpoint is
+            # still reachable (salesforce_get_current_user calls it
+            # directly against the fixed USERINFO_URL host), it's just not
+            # used for callback-time identity, on purpose.
+            raw_provider_user_id = token_data.get("id")
+            # Every real Salesforce token response's "id" is a non-empty
+            # string URL; a non-string or empty value (a malformed/
+            # proxy-mangled response) would otherwise get str()-ified into
+            # the uniqueness key below instead of falling back to the same
+            # NULL-tolerant path a missing "id" already takes.
+            provider_user_id = (
+                raw_provider_user_id
+                if isinstance(raw_provider_user_id, str) and raw_provider_user_id
+                else None
+            )
+            if raw_provider_user_id and provider_user_id is None:
+                # Only a truthy-but-wrong-type "id" is anomalous enough to
+                # warn about -- a falsy one (missing entirely) is the
+                # already-expected, silent case every other provider using
+                # this same fallback also hits.
+                logger.warning(
+                    'Salesforce token response\'s "id" field was not a '
+                    "usable string (got %s); falling back to NULL "
+                    "provider_user_id for this grant",
+                    type(raw_provider_user_id).__name__,
                 )
         elif userinfo_url and access_token:
             info_headers = {"Authorization": f"Bearer {access_token}"}
@@ -2113,6 +2279,14 @@ def generic_oauth_callback(
             setattr(oauth_account, "email", email)
             if "refresh_token" in token_data:
                 setattr(oauth_account, "refresh_token", token_data.get("refresh_token"))
+            # Salesforce returns the per-org API host here instead of using a
+            # fixed domain -- no other provider sends this key, and
+            # oauth_account is freshly created above (never an update to an
+            # existing row), so token_data.get() returning None for every
+            # other provider is already the correct, final value: no `if
+            # "instance_url" in token_data` guard needed to avoid clobbering
+            # anything.
+            setattr(oauth_account, "instance_url", token_data.get("instance_url"))
             if "expires_in" in token_data:
                 setattr(
                     oauth_account,

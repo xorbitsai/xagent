@@ -523,7 +523,6 @@ async def test_openrouter_deepseek_uses_official_provider(
     assert call_kwargs["extra_body"]["provider"] == {
         "only": ["deepseek"],
         "allow_fallbacks": False,
-        "require_parameters": True,
     }
 
 
@@ -550,9 +549,10 @@ def test_openrouter_official_provider_mapping_covers_auto_router_authors(
 
         extra_body = llm._prepare_extra_body({})
 
-        assert extra_body["provider"]["only"] == expected_providers
-        assert extra_body["provider"]["allow_fallbacks"] is False
-        assert extra_body["provider"]["require_parameters"] is True
+        assert extra_body["provider"] == {
+            "only": expected_providers,
+            "allow_fallbacks": False,
+        }
 
 
 @pytest.mark.asyncio
@@ -901,7 +901,6 @@ async def test_openrouter_stream_deepseek_uses_official_provider(mocker, monkeyp
     assert call_kwargs["extra_body"]["provider"] == {
         "only": ["deepseek"],
         "allow_fallbacks": False,
-        "require_parameters": True,
     }
 
 

@@ -136,6 +136,7 @@ vi.mock("sonner", () => ({
 import {
   AppProvider,
   extractTaskControlEnvelope,
+  type AppProviderTransportConfig,
   useApp,
 } from "./app-context-chat"
 import { ChatStartScreen } from "@/components/chat/ChatStartScreen"
@@ -3126,6 +3127,58 @@ describe("AppProvider websocket message routing", () => {
       "First Session turn"
     )
     expect(apiRequestMock).not.toHaveBeenCalled()
+  })
+
+  it("forwards taskless Session files so unsupported delivery rejects instead of sending text alone", async () => {
+    const transport = makeSessionTransport()
+    // Exercise the branch-level contract independently from today's
+    // intentionally literal-disabled Session descriptor.
+    const enabledTransport = {
+      ...transport,
+      session: {
+        ...transport.session,
+        files: "enabled",
+      },
+    } as unknown as AppProviderTransportConfig
+    const file = new File(["secret"], "secret.txt", { type: "text/plain" })
+    const deliveryError = Object.assign(
+      new Error("File delivery is not supported for this connection."),
+      { disposition: "not_sent" as const },
+    )
+    sendChatMessageMock.mockImplementationOnce(async (_message: string, files?: File[]) => {
+      if (files?.length) throw deliveryError
+      return {
+        client_message_id: "session-file-turn",
+        turn_id: "session-file-turn",
+      }
+    })
+
+    render(
+      <AppProvider token="token" transport={enabledTransport}>
+        <SessionControlsProbe />
+        <StateProbe />
+      </AppProvider>
+    )
+
+    expect(screen.getByTestId("files-disabled").textContent).toBe("false")
+    await expect(
+      getSessionControls().sendMessage(
+        "Read the attached file",
+        { clientMessageId: "session-file-turn" },
+        [file],
+      )
+    ).rejects.toMatchObject({ disposition: "not_sent" })
+    expect(sendChatMessageMock).toHaveBeenCalledWith(
+      "Read the attached file",
+      [file],
+      undefined,
+      "session-file-turn",
+    )
+    expect(apiRequestMock).not.toHaveBeenCalled()
+    expect(transport.uploadFiles).not.toHaveBeenCalled()
+    expect(screen.getByTestId("messages").textContent).not.toContain(
+      "Read the attached file"
+    )
   })
 
   it("applies explicit public transport capabilities without disabling public files", () => {

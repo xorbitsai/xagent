@@ -5992,7 +5992,7 @@ export function AppProvider({
       try {
         await sendChatMessage(
           message,
-          undefined,
+          files,
           config?.force,
           clientMessageId,
         )

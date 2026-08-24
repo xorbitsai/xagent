@@ -2359,9 +2359,12 @@ describe("useWebSocket normalized connections", () => {
     act(() => socket.open())
 
     const file = new File(["secret"], "secret.txt", { type: "text/plain" })
-    await expect(result.current.sendChatMessage("with file", [file])).rejects.toThrow(
-      "not supported",
-    )
+    await expect(
+      result.current.sendChatMessage("with file", [file])
+    ).rejects.toMatchObject({
+      message: "File delivery is not supported for this connection.",
+      disposition: "not_sent",
+    })
     expect(uploadFiles).not.toHaveBeenCalled()
     expect(socket.send).not.toHaveBeenCalled()
   })

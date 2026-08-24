@@ -231,6 +231,41 @@ def get_builtin_oauth_provider_rows() -> list[dict[str, Any]]:
             "default_scopes": [],
         },
         {
+            "provider_name": "salesforce",
+            "name": "Salesforce",
+            "client_id": os.environ.get("SALESFORCE_CLIENT_ID", ""),
+            "client_secret": os.environ.get("SALESFORCE_CLIENT_SECRET", ""),
+            # The generic login.salesforce.com/test.salesforce.com hosts
+            # (rather than a customer's own My Domain, e.g.
+            # acme.my.salesforce.com) work for any org: Salesforce resolves
+            # the actual org during login and issues a token scoped to it,
+            # returning that org's real API host as `instance_url` in the
+            # token response -- see the userinfo_url note below and
+            # UserOAuth.instance_url (api/auth.py persists it generically
+            # for any provider that returns this key).
+            "auth_url": "https://login.salesforce.com/services/oauth2/authorize",
+            "token_url": "https://login.salesforce.com/services/oauth2/token",
+            "redirect_uri": os.environ.get("SALESFORCE_REDIRECT_URI", ""),
+            # Salesforce's OIDC userinfo endpoint IS a fixed host
+            # (login.salesforce.com, same as auth_url/token_url -- see
+            # salesforce.py's USERINFO_URL), not the per-org instance_url
+            # used by every other endpoint. Left empty anyway, on purpose:
+            # populating it here would add a network round-trip to every
+            # OAuth connect just to fill in email/provider_user_id, which
+            # this connector doesn't otherwise need -- identity is instead
+            # fetched lazily, on demand, via salesforce_get_current_user.
+            # UserOAuth.email/provider_user_id stay NULL for every Salesforce
+            # grant as a result; is_connected still works from access_token
+            # alone (see test_salesforce_oauth.py's dedicated coverage).
+            "userinfo_url": "",
+            "user_id_path": "user_id",
+            "email_path": "email",
+            # refresh_token: required to get a refresh_token back at all.
+            # openid: required for the OIDC userinfo endpoint
+            # salesforce_get_current_user calls.
+            "default_scopes": ["api", "refresh_token", "openid"],
+        },
+        {
             "provider_name": "linear",
             "name": "Linear",
             "client_id": os.environ.get("LINEAR_CLIENT_ID", ""),
@@ -933,6 +968,29 @@ def get_builtin_public_mcp_app_rows() -> list[dict[str, Any]]:
                 "command": "python",
                 "args": ["-m", "xagent.web.tools.mcp.intercom"],
                 "env_mapping": {"INTERCOM_ACCESS_TOKEN": "access_token"},
+            },
+        },
+        {
+            "app_id": "salesforce",
+            "name": "Salesforce",
+            "description": "Connect to Salesforce to query and manage records (accounts, contacts, leads, opportunities, and custom objects) with SOQL/SOSL, and browse object schemas.",
+            "icon": "https://www.google.com/s2/favicons?domain=salesforce.com&sz=128",
+            "transport": "oauth",
+            "provider_name": "salesforce",
+            "category": "CRM",
+            "oauth_scopes": ["api", "refresh_token", "openid"],
+            "is_visible_in_connector": True,
+            "launch_config": {
+                "command": "python",
+                "args": ["-m", "xagent.web.tools.mcp.salesforce"],
+                # instance_url is the per-org API host from the OAuth grant
+                # (UserOAuth.instance_url) -- see the oauth_providers row
+                # above for why Salesforce needs this second mapping entry
+                # that no other connector here does.
+                "env_mapping": {
+                    "SALESFORCE_ACCESS_TOKEN": "access_token",
+                    "SALESFORCE_INSTANCE_URL": "instance_url",
+                },
             },
         },
         {

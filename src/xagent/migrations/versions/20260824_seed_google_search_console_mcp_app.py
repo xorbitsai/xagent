@@ -1,7 +1,7 @@
 """seed built-in Google Search Console (OAuth) MCP connector
 
 Revision ID: 20260824_seed_google_search_console_mcp_app
-Revises: 20260818_user_oauth_resource_owner
+Revises: a3b70c638cc3
 Create Date: 2026-08-24 00:00:00.000000
 
 """
@@ -13,7 +13,7 @@ from alembic import op
 
 # revision identifiers, used by Alembic.
 revision: str = "20260824_seed_google_search_console_mcp_app"
-down_revision: Union[str, None] = "20260818_user_oauth_resource_owner"
+down_revision: Union[str, None] = "a3b70c638cc3"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 

@@ -2123,8 +2123,23 @@ def generic_oauth_callback(
             # same user leave more than one row with no error. The token
             # response's own "id" field (Salesforce's identity URL, unique
             # per org+user) closes that gap for free -- no extra network
-            # call, unlike a real userinfo lookup.
-            provider_user_id = token_data.get("id")
+            # call, unlike a real userinfo lookup. This branch preempting
+            # the generic `elif userinfo_url and access_token` branch below
+            # is deliberate, not an oversight: it means the seeded row's
+            # user_id_path/email_path columns are dead by construction for
+            # Salesforce, which is fine -- Salesforce's userinfo endpoint is
+            # still reachable (salesforce_get_current_user calls it
+            # directly against the fixed USERINFO_URL host), it's just not
+            # used for callback-time identity, on purpose.
+            raw_provider_user_id = token_data.get("id")
+            # Every real Salesforce token response's "id" is a string URL;
+            # a non-string value (a malformed/proxy-mangled response) would
+            # otherwise get str()-ified into the uniqueness key below
+            # instead of falling back to the same NULL-tolerant path a
+            # missing "id" already takes.
+            provider_user_id = (
+                raw_provider_user_id if isinstance(raw_provider_user_id, str) else None
+            )
         elif userinfo_url and access_token:
             info_headers = {"Authorization": f"Bearer {access_token}"}
             # Replace {{access_token}} placeholder if present

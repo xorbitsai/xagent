@@ -507,9 +507,13 @@ class TestMigrations:
         # continues past that split -- a sibling branch merged in here (this
         # one has no dependency on the owner revision) legitimately keeps
         # its own tip applied alongside stripe_revision.
-        assert _revision_reached(
-            script_dir, stripe_revision, sqlite_tester.get_alembic_versions()
-        )
+        #
+        # Plain membership, not _revision_reached: this checks the actual
+        # applied version rows, not ancestry, so it still fails if
+        # downgrade() silently no-ops and leaves a later descendant of
+        # stripe_revision applied instead -- _revision_reached would treat
+        # that descendant as "reaching" stripe_revision and miss the bug.
+        assert stripe_revision in sqlite_tester.get_alembic_versions()
         assert "resource_owner_key" not in sqlite_tester.get_column_names("user_oauth")
         with sqlite_tester.engine.begin() as conn:
             assert (

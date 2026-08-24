@@ -356,16 +356,43 @@ def test_paged_list_explains_the_dead_end_when_collapsed_to_empty(monkeypatch):
     """has_more=true with no cursor and an empty page (the collapse case
     above) is otherwise a dead end for the caller - a smaller `limit` than
     1 doesn't exist, and there's no cursor to retry a different page with.
-    An explicit message must say so instead of leaving that implicit."""
+    An explicit message must say so instead of leaving that implicit.
+
+    Limit is large enough to fit the message itself (unlike the sibling
+    test below): this test is specifically about the message being added
+    when there's room for it, not about the size-cap interaction."""
     huge_form = {"id": "f1", "name": "x" * 5000}
     mock_request = Mock(return_value=MockResponse(json_data={"results": [huge_form]}))
     monkeypatch.setattr(hubspot.requests, "request", mock_request)
-    monkeypatch.setattr(hubspot, "get_tool_max_output_length", lambda: 200)
+    monkeypatch.setattr(hubspot, "get_tool_max_output_length", lambda: 400)
 
     result = json.loads(hubspot.hubspot_list_forms(limit=1))
 
     assert "message" in result
     assert "too large" in result["message"]
+
+
+def test_paged_list_drops_message_when_it_alone_exceeds_the_limit(monkeypatch):
+    """The dead-end message added above must not be appended
+    unconditionally: rebuilding with it included must still respect
+    max_output_length, or appending it would silently reintroduce the
+    hard-truncated-into-broken-JSON failure mode this function exists to
+    prevent. A limit that fits the empty-page envelope (86 chars) but not
+    envelope-plus-message (339 chars) must fall back to omitting the
+    message rather than exceeding the cap."""
+    huge_form = {"id": "f1", "name": "x" * 5000}
+    mock_request = Mock(return_value=MockResponse(json_data={"results": [huge_form]}))
+    monkeypatch.setattr(hubspot.requests, "request", mock_request)
+    monkeypatch.setattr(hubspot, "get_tool_max_output_length", lambda: 200)
+
+    raw = hubspot.hubspot_list_forms(limit=1)
+    result = json.loads(raw)
+
+    assert len(raw) <= 200
+    assert result["status"] == "success"
+    assert result["truncated"] is True
+    assert result["forms"] == []
+    assert "message" not in result
 
 
 def test_paged_list_reports_input_after_not_next_after_when_truncated(monkeypatch):

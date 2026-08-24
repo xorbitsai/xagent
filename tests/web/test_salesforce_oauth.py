@@ -18,6 +18,7 @@ from xagent.web.models.public_mcp import PublicMCPApp
 from xagent.web.models.user import User
 from xagent.web.models.user_oauth import UserOAuth
 from xagent.web.tools import config as tool_config
+from xagent.web.tools.mcp import salesforce as salesforce_mcp
 
 
 class MockResponse:
@@ -208,6 +209,50 @@ def test_sandbox_provider_backfills_provider_user_id_from_token_id(
     )
 
 
+def test_callback_accepts_a_host_that_salesforce_py_would_later_reject(
+    db_session, monkeypatch
+):
+    """Documents a real validation-seam gap, not a fix for it: the callback
+    guard only checks that instance_url is a non-empty string (see the
+    comment on that guard -- full host/scheme validation is deliberately
+    deferred to use-time), while salesforce.py's _instance_url() enforces
+    https + a *.salesforce.com host suffix. A token response with a
+    non-Salesforce host (e.g. a hypothetical Government Cloud
+    *.salesforce.mil org, or a misconfigured/compromised token endpoint)
+    passes the callback and gets persisted, then fails every subsequent
+    tool call. This pins down the current (narrow) contract so a future
+    change to either validator's strictness shows up as a test failure
+    here instead of silently drifting further apart."""
+    db, user = db_session
+    mock_post = Mock(
+        return_value=MockResponse(
+            {
+                "access_token": "sf-token",
+                "instance_url": "https://acme.example.mil",
+                "token_type": "Bearer",
+            }
+        )
+    )
+    monkeypatch.setattr(auth_api.requests, "post", mock_post)
+    monkeypatch.setattr(auth_api.requests, "get", Mock())
+
+    response = generic_oauth_callback(
+        "salesforce", _callback_request(db, user), db, _salesforce_provider()
+    )
+
+    assert response.status_code == 200
+    oauth_account = (
+        db.query(UserOAuth)
+        .filter(UserOAuth.user_id == user.id, UserOAuth.provider == "salesforce")
+        .one()
+    )
+    assert oauth_account.instance_url == "https://acme.example.mil"
+
+    monkeypatch.setenv("SALESFORCE_INSTANCE_URL", oauth_account.instance_url)
+    with pytest.raises(ValueError, match="not a valid Salesforce host"):
+        salesforce_mcp._instance_url()
+
+
 def test_callback_persists_instance_url_and_skips_userinfo_lookup(
     db_session, monkeypatch
 ):
@@ -266,6 +311,41 @@ def test_callback_persists_instance_url_and_skips_userinfo_lookup(
         oauth_account.provider_user_id
         == "https://login.salesforce.com/id/00D.../005..."
     )
+
+
+def test_callback_falls_back_to_null_identity_for_non_string_id(
+    db_session, monkeypatch
+):
+    """A non-string "id" (a malformed or proxy-mangled response) must fall
+    back to the same NULL provider_user_id a missing "id" already takes,
+    not get str()-ified into the uniqueness key -- a raw non-string value
+    reaching str() would produce a technically-unique but meaningless key
+    (e.g. a Python dict repr) instead of a real, comparable identity."""
+    db, user = db_session
+    mock_post = Mock(
+        return_value=MockResponse(
+            {
+                "access_token": "sf-token",
+                "instance_url": "https://acme.my.salesforce.com",
+                "token_type": "Bearer",
+                "id": 12345,
+            }
+        )
+    )
+    monkeypatch.setattr(auth_api.requests, "post", mock_post)
+    monkeypatch.setattr(auth_api.requests, "get", Mock())
+
+    response = generic_oauth_callback(
+        "salesforce", _callback_request(db, user), db, _salesforce_provider()
+    )
+
+    assert response.status_code == 200
+    oauth_account = (
+        db.query(UserOAuth)
+        .filter(UserOAuth.user_id == user.id, UserOAuth.provider == "salesforce")
+        .one()
+    )
+    assert oauth_account.provider_user_id is None
 
     server = db.query(MCPServer).filter(MCPServer.name == "Salesforce").one()
     assert server.transport == "oauth"

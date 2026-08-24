@@ -144,6 +144,12 @@ def _paged_list(
     next page would permanently skip whatever this page didn't return for
     space reasons. Retrying with the same ``after`` and a smaller ``limit``
     is what actually surfaces the trimmed entries.
+
+    The explanatory "dead end" message added when halving collapses to
+    zero items is itself re-checked against the size limit before being
+    kept -- appending it unconditionally after the halving loop already
+    converged could push an already-fitted response back over the limit,
+    the exact failure mode this function exists to prevent.
     """
     result = _request("GET", path, params=params)
     next_after = ((result.get("paging") or {}).get("next") or {}).get("after")
@@ -174,13 +180,27 @@ def _paged_list(
         # (the general truncated-page guidance) isn't guaranteed to help
         # here, so say so plainly instead of implying a fix that may not
         # exist.
-        payload["message"] = (
-            "Every record in this page was individually too large to fit "
-            "the output size limit, so none could be returned. Retrying "
-            "with a smaller `limit` may surface different records if more "
-            "exist, but cannot shrink an individually oversized record."
+        response_with_message = _success(
+            **{
+                **payload,
+                "message": (
+                    "Every record in this page was individually too large "
+                    "to fit the output size limit, so none could be "
+                    "returned. Retrying with a smaller `limit` may surface "
+                    "different records if more exist, but cannot shrink an "
+                    "individually oversized record."
+                ),
+            }
         )
-        response = _success(**payload)
+        # Only use the enriched response if it still fits -- an operator can
+        # configure XAGENT_TOOL_MAX_OUTPUT_LENGTH small enough that even this
+        # already-empty payload plus the message text pushes back over the
+        # limit, and appending it unconditionally would silently reintroduce
+        # the hard-truncated-into-broken-JSON failure mode this whole
+        # function exists to prevent. Falling back to the message-less
+        # payload keeps the caller's own size contract intact instead.
+        if len(response_with_message) <= max_output_length:
+            response = response_with_message
     return response
 
 

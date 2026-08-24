@@ -15,6 +15,7 @@ from ...core.agent.language import (
 )
 from ...core.agent.result import extract_assistant_message
 from ...core.agent.service import AgentService
+from ...core.agent.voice_policy import apply_output_voice
 from ...core.model.chat.basic.base import BaseLLM
 from ...core.tools.adapters.vibe.agent_tool import (
     ListAvailableSkillsTool,
@@ -569,6 +570,7 @@ async def build_workforce_prompt_plan(
     llm: BaseLLM,
     available_agents: Sequence[Mapping[str, Any]],
     compact_llm: BaseLLM | None = None,
+    voice: str | None = None,
 ) -> dict[str, Any]:
     """Run the ReAct builder and return its validated in-memory plan."""
 
@@ -579,6 +581,10 @@ async def build_workforce_prompt_plan(
 
     state = WorkforcePromptBuilderState.from_agents(available_agents)
     execution_id = f"workforce-prompt-builder-{uuid4().hex}"
+    # builder_response below is a free-text assistant reply persisted into
+    # the conversation - the same "every agent this user talks to" sink
+    # apply_output_voice's other callers cover.
+    system_prompt = apply_output_voice(workforce_prompt_builder_system_prompt(), voice)
     service = AgentService(
         name="Workforce Prompt Builder",
         id=execution_id,
@@ -593,7 +599,7 @@ async def build_workforce_prompt_plan(
             ListAvailableSkillsTool(),
             ListToolCategoriesTool(),
         ],
-        system_prompt=workforce_prompt_builder_system_prompt(),
+        system_prompt=system_prompt,
         memory_enabled=False,
         enable_workspace=False,
         react_max_iterations=WORKFORCE_BUILDER_MAX_ITERATIONS,

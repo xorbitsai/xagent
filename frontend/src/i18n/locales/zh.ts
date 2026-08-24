@@ -172,12 +172,23 @@ const zh = {
       followupTitle: "希望它以后能反复自动执行？",
       followupDescription: "把这次流程沉淀成可复用 Agent，下次一句话就能调用。",
       buildAgent: "构建一个 Agent",
+      teamReady: "你的团队已就绪",
       teamReadyOne: "你的团队已就绪 —— 有 {count} 位队员在待命。",
       teamReadyOther: "你的团队已就绪 —— 有 {count} 位队员在待命。",
       teamEmpty: "雇佣你的第一位队员，开始使用。",
       newTask: "新建任务",
       addTeammate: "添加队员",
       waitingOnYou: "等你处理",
+      activityFeed: "动态",
+      activity: {
+        completed: "完成了",
+        running: "正在处理",
+        paused: "暂停了",
+        waitingForUser: "正在等你处理",
+        failed: "遇到了问题",
+        pending: "已排队",
+        updated: "更新了",
+      },
     },
     agents: {
       title: "你的 Agents",
@@ -219,7 +230,8 @@ const zh = {
       subtitle: "继续处理最近的任务，或查看最新执行结果。",
       viewTask: "查看任务",
       untitledTask: "未命名任务",
-      defaultAgent: "智能体"
+      defaultAgent: "智能体",
+      empty: "暂无动态。"
     }
   },
   chatPage: {

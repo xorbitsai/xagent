@@ -4,7 +4,7 @@ import React from "react";
 import { useRouter } from "next/navigation";
 import {
   ChevronRight, Layers, Bot, Database,
-  Sparkles, Play, Heart, Clock, Send, ListChecks, Loader2, Mic, Square, UserPlus,
+  Sparkles, Play, Heart, Clock, Send, ListChecks, Loader2, Mic, Square, UserPlus, Zap,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
@@ -22,10 +22,11 @@ import Link from "next/link";
 import { useState, useEffect, useRef } from "react";
 import { apiRequest, isJsonRecord, parseApiResponse } from "@/lib/api-wrapper";
 import { cn, getApiUrl, resolveAgentLogoUrl } from "@/lib/utils";
-import { formatDisplayDate, formatRelativeTime } from "@/lib/time-utils";
+import { formatRelativeTime } from "@/lib/time-utils";
 import { resolveTaskLlmSelection } from "@/lib/models";
 import { normalizeTaskPromptTitle, parseTaskCreateCore } from "@/lib/task-create";
 import { useI18n } from "@/contexts/i18n-context";
+import type { Translate } from "@/contexts/i18n-context";
 import { useApp } from "@/contexts/app-context-chat";
 import { useAuth } from "@/contexts/auth-context";
 import { WelcomeModal } from "@/components/welcome-modal";
@@ -59,7 +60,9 @@ interface HomeTemplateCard {
 interface RecentTask {
   task_id: number;
   title: string;
+  status: string;
   created_at?: string | null;
+  updated_at?: string | null;
   agent_name?: string;
   agent_logo_url?: string | null;
 }
@@ -198,7 +201,9 @@ function decodeRecentTask(value: unknown): RecentTask | null {
     !isSafeInteger(value.task_id) ||
     value.task_id <= 0 ||
     typeof value.title !== "string" ||
+    typeof value.status !== "string" ||
     (value.created_at !== undefined && value.created_at !== null && typeof value.created_at !== "string") ||
+    (value.updated_at !== undefined && value.updated_at !== null && typeof value.updated_at !== "string") ||
     (value.agent_name !== undefined && typeof value.agent_name !== "string") ||
     (value.agent_logo_url !== undefined && value.agent_logo_url !== null && typeof value.agent_logo_url !== "string")
   ) return null;
@@ -206,10 +211,26 @@ function decodeRecentTask(value: unknown): RecentTask | null {
   return {
     task_id: value.task_id,
     title: value.title,
+    status: value.status,
     created_at: value.created_at,
+    updated_at: value.updated_at,
     agent_name: value.agent_name,
     agent_logo_url: value.agent_logo_url,
   };
+}
+
+/** A short, real verb phrase for a task's actual status - never a fabricated
+ * narrative summary, just what the status enum already says happened. */
+function describeTaskActivity(status: string, t: Translate): string {
+  switch (status) {
+    case "completed": return t("home.revamp.activity.completed");
+    case "running": return t("home.revamp.activity.running");
+    case "paused": return t("home.revamp.activity.paused");
+    case "waiting_for_user": return t("home.revamp.activity.waitingForUser");
+    case "failed": return t("home.revamp.activity.failed");
+    case "pending": return t("home.revamp.activity.pending");
+    default: return t("home.revamp.activity.updated");
+  }
 }
 
 function decodeRecentTasks(value: unknown): RecentTask[] | null {
@@ -375,7 +396,7 @@ export default function Home() {
 
     const fetchRecentTasks = async () => {
       try {
-        const response = await apiRequest(`${getApiUrl()}/api/chat/tasks?page=1&per_page=5`);
+        const response = await apiRequest(`${getApiUrl()}/api/chat/tasks?page=1&per_page=8`);
         if (!active) return;
         if (!response.ok) throw new Error(`Recent task request failed: ${response.status}`);
 
@@ -431,16 +452,7 @@ export default function Home() {
     return () => observer.disconnect();
   }, []);
 
-  // Real wall-clock hour, not a fabricated always-morning greeting - this
-  // is fine to compute at render time (a client component, not a cached
-  // static one), and a stale hour across a long-open tab is a cosmetic
-  // non-issue for a greeting.
-  const greetingHour = new Date().getHours();
-  const greeting = greetingHour < 12
-    ? t("home.revamp.greetingMorning")
-    : greetingHour < 18
-      ? t("home.revamp.greetingAfternoon")
-      : t("home.revamp.greetingEvening");
+  const greeting = t("home.revamp.teamReady");
 
   const handleUseTemplate = async (templateId: string) => {
     try {
@@ -561,8 +573,312 @@ export default function Home() {
   return (
     <div className="h-full flex flex-col overflow-hidden bg-[#FAFAFA] dark:bg-background overflow-y-auto">
       <WelcomeModal />
-      {/* Hero Section */}
-      <div className="relative shrink-0 flex items-center justify-center overflow-hidden py-14 px-8 sm:px-16 bg-[linear-gradient(160deg,hsl(230_72%_10%)_0%,hsl(234_62%_15%)_35%,hsl(255_60%_17%)_70%,hsl(262_55%_13%)_100%)]">
+
+      {/* Dashboard: real hired-agent avatars, real greeting, a real
+          "waiting on you" list (each item's own pending question - never a
+          fabricated confidence score or approve/decline), and a real
+          activity feed built from actual task status/title/timestamp - no
+          invented team-utilization or system-uptime numbers. */}
+      <div className="mx-auto w-full max-w-[1200px] px-8 sm:px-14 pt-9">
+        <div className="relative overflow-hidden rounded-[28px] border border-[#E4E1F2] dark:border-border bg-[linear-gradient(135deg,#F8F6FF,#F7FAFF)] dark:bg-card px-6 py-6 sm:px-[26px] sm:py-[25px] mb-6 flex flex-col sm:flex-row sm:items-center gap-[18px]">
+          <div className="pointer-events-none absolute inset-0 bg-[radial-gradient(500px_220px_at_0_0,rgba(37,54,224,0.12),transparent_70%)]" />
+          {hiredAgents.length > 0 && (
+            <div className="relative flex -space-x-[11px] shrink-0">
+              {hiredAgents.slice(0, 4).map((agent) => {
+                const template = agent.template_id ? templatesById[agent.template_id] : undefined;
+                return (
+                  <PersonaAvatar
+                    key={agent.id}
+                    persona={{
+                      name: agent.name,
+                      avatar: resolveAgentLogoUrl(agent.logo_url, getApiUrl()) || template?.persona?.avatar,
+                    }}
+                    sizeClassName="h-[52px] w-[52px]"
+                    textClassName="text-base"
+                    className="rounded-[18px] border-4 border-white dark:border-card shadow-[0_5px_14px_rgba(44,38,83,0.11)]"
+                  />
+                );
+              })}
+            </div>
+          )}
+          <div className="relative flex-1 min-w-0">
+            <h1 className="text-[22px] sm:text-[27px] font-bold tracking-[-0.04em] leading-[1.4] text-foreground">
+              {greeting}{user?.username ? `, ${user.username}` : ""}.
+            </h1>
+            <p className="text-[13.5px] sm:text-[14px] text-muted-foreground mt-1">
+              {hiredAgents.length > 0
+                ? t(
+                    hiredAgents.length === 1 ? "home.revamp.teamReadyOne" : "home.revamp.teamReadyOther",
+                    { count: hiredAgents.length },
+                  )
+                : t("home.revamp.teamEmpty")}
+            </p>
+          </div>
+          <div className="relative flex items-center gap-2 shrink-0">
+            <Button
+              variant="outline"
+              className="rounded-full h-[38px] px-[14px] gap-[7px] text-[13px] bg-white dark:bg-card border-[#E7E7EC] dark:border-border text-[#3D3D46] dark:text-foreground hover:bg-[#FAFAFA] dark:hover:bg-muted"
+              onClick={() => router.push("/task")}
+            >
+              <Sparkles className="w-[15px] h-[15px]" /> {t("home.revamp.newTask")}
+            </Button>
+            <Button
+              className="rounded-full h-[38px] px-[15px] gap-[7px] text-[13px] font-semibold bg-[#2536E0] hover:bg-[#1F2BC4] text-white"
+              onClick={() => router.push("/templates")}
+            >
+              <UserPlus className="w-[15px] h-[15px]" /> {t("home.revamp.addTeammate")}
+            </Button>
+          </div>
+        </div>
+
+        <div className="grid grid-cols-1 lg:grid-cols-[minmax(0,1fr)_320px] gap-5 items-start">
+          <div className="min-w-0 flex flex-col gap-8">
+            {/* Waiting on you: real `waiting_for_user` tasks with their real
+                pending question - no fabricated confidence score or inline
+                approve/decline, since there is nothing real behind either. */}
+            {waitingOnYou.length > 0 && (
+              <section>
+                <h2 className="text-[18px] font-bold mb-3 text-foreground flex items-center gap-2">
+                  {t("home.revamp.waitingOnYou")}
+                  <span className="text-[11.5px] font-medium text-muted-foreground bg-muted rounded-full px-2 py-0.5">
+                    {waitingOnYou.length}
+                  </span>
+                </h2>
+                <div className="flex flex-col gap-3">
+                  {waitingOnYou.map((item) => {
+                    const resolvedLogoUrl = resolveAgentLogoUrl(item.agent_logo_url, getApiUrl());
+                    return (
+                      <div
+                        key={item.task_id}
+                        className="flex gap-[13px] rounded-2xl border border-border/60 bg-card p-4"
+                      >
+                        <PersonaAvatar
+                          persona={{ name: item.agent_name || t("home.recent.defaultAgent"), avatar: resolvedLogoUrl }}
+                          sizeClassName="h-[34px] w-[34px]"
+                          textClassName="text-xs"
+                          className="rounded-full shrink-0"
+                          decorative
+                        />
+                        <div className="min-w-0 flex-1">
+                          <div className="flex items-baseline gap-2 flex-wrap">
+                            <span className="font-semibold text-[13px]">
+                              {item.agent_name || t("home.recent.defaultAgent")}
+                            </span>
+                            <span className="text-[11.5px] text-muted-foreground">
+                              {formatRelativeTime(item.updated_at, t)}
+                            </span>
+                          </div>
+                          <p className="text-[14px] text-foreground mt-1 leading-[1.5]">{item.question}</p>
+                          <Link
+                            href={`/task/${item.task_id}`}
+                            className="inline-flex items-center gap-[7px] mt-2.5 rounded-lg border border-border bg-muted/40 px-2.5 py-[5px] text-[12px] text-foreground/80 hover:border-primary/40 hover:text-primary transition-colors"
+                          >
+                            <Zap className="w-3 h-3" /> {t("home.recent.viewTask")}
+                          </Link>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              </section>
+            )}
+
+          {/* Get Started Section */}
+          <section>
+          <h2 className="text-[16px] font-bold mb-4 text-foreground">{t("home.getStarted.title")}</h2>
+          <div ref={getStartedSectionRef} className="grid grid-cols-1 md:grid-cols-2 gap-4">
+            {[
+              { title: t("home.getStarted.video.title"), desc: t("home.getStarted.video.description", { appName: branding.appName }), video: "/videos/Tutorial.mp4", link: resolveHomeGetStartedDestination(homeGetStartedDestinationOverrides.video, defaultHomeGetStartedDestinations.video) },
+              { title: t("home.getStarted.docs.title"), desc: t("home.getStarted.docs.description"), video: "/videos/Documentation.mp4", link: resolveHomeGetStartedDestination(homeGetStartedDestinationOverrides.docs, defaultHomeGetStartedDestinations.docs) },
+              { title: t("home.getStarted.guides.title"), desc: t("home.getStarted.guides.description"), icon: <ListChecks className="w-8 h-8 text-green-500" />, bg: "bg-green-50 dark:bg-green-950/30", link: resolveHomeGetStartedDestination(homeGetStartedDestinationOverrides.guides, defaultHomeGetStartedDestinations.guides) },
+              { title: t("home.getStarted.whatsNew.title"), desc: t("home.getStarted.whatsNew.description"), icon: <Sparkles className="w-8 h-8 text-orange-500" />, bg: "bg-orange-50 dark:bg-orange-950/30", link: resolveHomeGetStartedDestination(homeGetStartedDestinationOverrides.whatsNew, defaultHomeGetStartedDestinations.whatsNew) }
+            ].map((card, i) => {
+              const shouldLoadVideo = card.video ? visibleGetStartedVideos.has(i) : false;
+              const isLinked = typeof card.link === "string";
+              const cardContent = (
+                <Card className={cn(
+                  "py-0 gap-0 overflow-hidden border-border/60 transition-all duration-300 bg-card rounded-xl flex flex-col h-full",
+                  isLinked && "hover:shadow-md group cursor-pointer",
+                )}>
+                  <div
+                    className={`h-[180px] relative flex items-center justify-center overflow-hidden ${card.video ? 'bg-muted' : card.bg}`}
+                    data-get-started-video={card.video ? "true" : undefined}
+                    data-video-index={card.video ? String(i) : undefined}
+                  >
+                    {card.video ? (
+                      shouldLoadVideo ? (
+                        <video
+                          src={card.video}
+                          autoPlay
+                          loop
+                          muted
+                          playsInline
+                          preload="metadata"
+                          className="w-full h-full object-cover"
+                        />
+                      ) : (
+                        <div className="absolute inset-0 bg-[radial-gradient(circle_at_top,hsl(231_55%_62%/0.35),transparent_55%),linear-gradient(160deg,hsl(229_39%_16%)_0%,hsl(236_42%_20%)_100%)]">
+                          <div className="absolute inset-0 bg-[linear-gradient(rgba(255,255,255,0.04)_1px,transparent_1px),linear-gradient(90deg,rgba(255,255,255,0.04)_1px,transparent_1px)] bg-[size:28px_28px]" />
+                          <div className="relative z-10 flex h-full items-center justify-center text-white/85">
+                            <Play className="h-10 w-10 fill-current" />
+                          </div>
+                        </div>
+                      )
+                    ) : (
+                      <div className={cn(
+                        "transition-transform duration-300",
+                        isLinked && "group-hover:scale-110",
+                      )}>
+                        {card.icon}
+                      </div>
+                    )}
+                  </div>
+                  <CardContent className="p-4 flex-1">
+                    <h3 className={cn(
+                      "font-semibold text-[13px] mb-1 transition-colors",
+                      isLinked && "group-hover:text-primary",
+                    )}>{card.title}</h3>
+                    <p className="text-[12px] text-muted-foreground leading-relaxed">{card.desc}</p>
+                  </CardContent>
+                </Card>
+              );
+
+              return isLinked ? (
+                <a key={i} href={card.link!} target="_blank" rel="noopener noreferrer" className="block rounded-xl focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background">
+                  {cardContent}
+                </a>
+              ) : (
+                <div key={i} className="block">
+                  {cardContent}
+                </div>
+              );
+            })}
+          </div>
+          </section>
+
+          {/* Build agents with templates */}
+          {templates.length > 0 && (
+            <section>
+              <div className="flex items-center justify-between mb-4">
+                <h2 className="text-[16px] font-bold text-foreground">{t("home.templates.title")}</h2>
+                <Link href="/templates" className="text-[14px] font-semibold text-primary hover:underline flex items-center group">
+                  {t("home.templates.viewAll")} <ChevronRight className="w-4 h-4 ml-1 group-hover:translate-x-1 transition-transform" />
+                </Link>
+              </div>
+
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                {templates.map(template => (
+                  <Card key={template.id} className="flex flex-col border-border/60 hover:shadow-md transition-all duration-300 p-5 group bg-card rounded-xl">
+                    <div className="flex justify-between items-center mb-2">
+                      <span className="text-[11px] font-bold text-primary tracking-wider uppercase bg-primary/10 px-2.5 py-1 rounded-md">
+                        {template.category}
+                      </span>
+                      <div className="flex items-center gap-1.5 text-muted-foreground text-xs font-medium">
+                        <Clock className="w-3.5 h-3.5" />
+                        <span>{template.setup_time || t("home.templates.setupTime", { time: "5 min" })}</span>
+                      </div>
+                    </div>
+                    <h3 className="font-bold text-[15px] text-foreground group-hover:text-primary transition-colors line-clamp-1">
+                      {template.name}
+                    </h3>
+                    <div className="flex-1 space-y-2.5">
+                      {(template.features && template.features.length > 0) ? (
+                        template.features.slice(0, 3).map((feature: string, idx: number) => (
+                          <div key={idx} className="flex items-start gap-2 text-[14px] text-muted-foreground">
+                            <ChevronRight className="w-4 h-4 text-primary shrink-0 mt-0.5 opacity-70" />
+                            <span className="line-clamp-2 leading-snug">{feature}</span>
+                          </div>
+                        ))
+                      ) : (
+                        <div className="flex items-start gap-2 text-[14px] text-muted-foreground">
+                          <ChevronRight className="w-4 h-4 text-primary shrink-0 mt-0.5 opacity-70" />
+                          <span className="line-clamp-3 leading-snug">{template.description}</span>
+                        </div>
+                      )}
+                    </div>
+                    <div className="h-[1px] bg-border/60" />
+                    <div className="mt-auto">
+                      <div className="flex items-center justify-between text-sm text-muted-foreground mb-5">
+                        <div className="flex items-center">
+                          {template.connections && template.connections.length > 0 ? (
+                            <div className="flex gap-1.5">
+                              {template.connections.slice(0, 4).map((conn, idx: number) => (
+                                <div key={idx} className="w-8 h-8 rounded-lg bg-background border border-border flex items-center justify-center overflow-hidden shadow-sm">
+                                  {conn.logo ? <img src={conn.logo} alt={conn.name} className="w-5 h-5 object-contain" /> : <span className="text-[10px] font-bold text-primary/70">{(conn.name || "").substring(0, 2).toUpperCase()}</span>}
+                                </div>
+                              ))}
+                            </div>
+                          ) : <div className="h-8" />}
+                        </div>
+                        <div className="flex items-center gap-4">
+                          <div className="flex items-center gap-1.5">
+                            <Play className="w-3.5 h-3.5 fill-current text-primary/60" />
+                            <span className="font-semibold text-foreground/80">{template.used_count || 0}</span>
+                          </div>
+                          <div className="flex items-center gap-1.5">
+                            <Heart className="w-3.5 h-3.5 fill-current text-rose-400/70" />
+                            <span className="font-semibold text-foreground/80">{template.likes || 0}</span>
+                          </div>
+                        </div>
+                      </div>
+                      <button
+                        onClick={() => handleUseTemplate(template.id)}
+                        className="w-full py-2.5 text-primary text-[13px] font-bold uppercase tracking-wide rounded-xl border border-primary/20 hover:bg-primary hover:text-primary-foreground transition-all duration-300"
+                      >
+                        {t("home.templates.useTemplate")}
+                      </button>
+                    </div>
+                  </Card>
+                ))}
+              </div>
+            </section>
+          )}
+          </div>
+
+          <aside className="lg:sticky lg:top-[18px] flex flex-col gap-4">
+            <div className="rounded-2xl border border-border/60 bg-card overflow-hidden">
+              <div className="flex items-center px-4 pt-3.5 pb-3 border-b border-border/60">
+                <h2 className="text-[14px] font-semibold text-foreground">{t("home.revamp.activityFeed")}</h2>
+              </div>
+              <div className="flex flex-col divide-y divide-border/60 max-h-[520px] overflow-y-auto">
+                {recentTasks.length === 0 ? (
+                  <p className="px-4 py-6 text-[12.5px] text-muted-foreground">{t("home.recent.empty")}</p>
+                ) : recentTasks.map((task) => {
+                  const resolvedLogoUrl = resolveAgentLogoUrl(task.agent_logo_url, getApiUrl());
+                  return (
+                    <Link
+                      key={task.task_id}
+                      href={`/task/${task.task_id}`}
+                      className="flex items-start gap-2.5 px-4 py-2.5 hover:bg-muted/40 transition-colors"
+                    >
+                      <PersonaAvatar
+                        persona={{ name: task.agent_name || t("home.recent.defaultAgent"), avatar: resolvedLogoUrl }}
+                        sizeClassName="h-[26px] w-[26px]"
+                        textClassName="text-[10px]"
+                        className="rounded-full shrink-0 mt-0.5"
+                        decorative
+                      />
+                      <div className="min-w-0 flex-1">
+                        <p className="text-[12.5px] leading-[1.45] text-foreground/80">
+                          <b className="font-semibold text-foreground">{task.agent_name || t("home.recent.defaultAgent")}</b>{" "}
+                          {describeTaskActivity(task.status, t)} — {task.title || t("home.recent.untitledTask")}
+                        </p>
+                        <time className="block text-[11px] text-muted-foreground mt-0.5">
+                          {formatRelativeTime(task.updated_at || task.created_at, t)}
+                        </time>
+                      </div>
+                    </Link>
+                  );
+                })}
+              </div>
+            </div>
+          </aside>
+        </div>
+      </div>
+
+      {/* Task composer: the same real create-task entry point as /task,
+          offered here as a quick-launch surface below the dashboard. */}
+      <div className="relative shrink-0 flex items-center justify-center overflow-hidden py-14 px-8 sm:px-16 mt-10 bg-[linear-gradient(160deg,hsl(230_72%_10%)_0%,hsl(234_62%_15%)_35%,hsl(255_60%_17%)_70%,hsl(262_55%_13%)_100%)]">
         {/* grid background */}
         <div className="absolute inset-0 pointer-events-none bg-[linear-gradient(rgba(255,255,255,0.028)_1px,transparent_1px),linear-gradient(90deg,rgba(255,255,255,0.028)_1px,transparent_1px)] bg-[size:48px_48px]" />
         {/* central orb */}
@@ -651,6 +967,7 @@ export default function Home() {
           </div>
         </div>
       </div>
+
       <AlertDialog open={showNoModelAlert} onOpenChange={setShowNoModelAlert}>
         <AlertDialogContent>
           <AlertDialogHeader>
@@ -668,289 +985,6 @@ export default function Home() {
         </AlertDialogContent>
       </AlertDialog>
 
-      {/* Main Content Scrollable */}
-      <div className="flex-1">
-        <div className="mx-auto py-9 px-8 sm:px-14">
-
-          {/* Greeting banner: real hired-agent avatars, real greeting, no
-              fabricated "5 agents online" or team-utilization numbers. */}
-          <div className="relative overflow-hidden rounded-[28px] border border-[#E4E1F2] bg-gradient-to-br from-[#F8F6FF] to-[#F7FAFF] dark:border-border dark:from-card dark:to-card px-6 py-6 sm:px-8 sm:py-7 mb-8 flex flex-col sm:flex-row sm:items-center gap-5">
-            {hiredAgents.length > 0 && (
-              <div className="flex -space-x-3 shrink-0">
-                {hiredAgents.slice(0, 4).map((agent) => {
-                  const template = agent.template_id ? templatesById[agent.template_id] : undefined;
-                  return (
-                    <PersonaAvatar
-                      key={agent.id}
-                      persona={{
-                        name: agent.name,
-                        avatar: resolveAgentLogoUrl(agent.logo_url, getApiUrl()) || template?.persona?.avatar,
-                      }}
-                      sizeClassName="h-12 w-12"
-                      textClassName="text-base"
-                      className="rounded-2xl border-4 border-white dark:border-card shadow-md"
-                    />
-                  );
-                })}
-              </div>
-            )}
-            <div className="flex-1 min-w-0">
-              <h1 className="text-[22px] sm:text-[27px] font-bold tracking-tight text-foreground">
-                {greeting}{user?.username ? `, ${user.username}` : ""}
-              </h1>
-              <p className="text-[13.5px] sm:text-[14px] text-muted-foreground mt-1">
-                {hiredAgents.length > 0
-                  ? t(
-                      hiredAgents.length === 1 ? "home.revamp.teamReadyOne" : "home.revamp.teamReadyOther",
-                      { count: hiredAgents.length },
-                    )
-                  : t("home.revamp.teamEmpty")}
-              </p>
-            </div>
-            <div className="flex items-center gap-2 shrink-0">
-              <Button variant="outline" className="rounded-full" onClick={() => router.push("/task")}>
-                <Sparkles className="w-4 h-4 mr-1.5" /> {t("home.revamp.newTask")}
-              </Button>
-              <Button className="rounded-full" onClick={() => router.push("/templates")}>
-                <UserPlus className="w-4 h-4 mr-1.5" /> {t("home.revamp.addTeammate")}
-              </Button>
-            </div>
-          </div>
-
-          {/* Waiting on you: real `waiting_for_user` tasks with their real
-              pending question - no fabricated confidence score or inline
-              approve/decline, since there is nothing real behind either. */}
-          {waitingOnYou.length > 0 && (
-            <div className="mb-10">
-              <h2 className="text-[18px] font-bold mb-3 text-foreground flex items-center gap-2">
-                {t("home.revamp.waitingOnYou")}
-                <span className="text-[11.5px] font-medium text-muted-foreground bg-muted rounded-full px-2 py-0.5">
-                  {waitingOnYou.length}
-                </span>
-              </h2>
-              <div className="flex flex-col gap-3">
-                {waitingOnYou.map((item) => {
-                  const resolvedLogoUrl = resolveAgentLogoUrl(item.agent_logo_url, getApiUrl());
-                  return (
-                    <Link
-                      key={item.task_id}
-                      href={`/task/${item.task_id}`}
-                      className="flex items-start gap-3 rounded-2xl border border-border/60 bg-card p-4 hover:border-primary/30 hover:shadow-md transition-all group"
-                    >
-                      <PersonaAvatar
-                        persona={{ name: item.agent_name || "?", avatar: resolvedLogoUrl }}
-                        sizeClassName="h-9 w-9"
-                        textClassName="text-sm"
-                        className="rounded-full shrink-0"
-                        decorative
-                      />
-                      <div className="min-w-0 flex-1">
-                        <div className="flex items-baseline gap-2 flex-wrap">
-                          <span className="font-semibold text-[13px]">
-                            {item.agent_name || t("home.recent.defaultAgent")}
-                          </span>
-                          <span className="text-[11.5px] text-muted-foreground">
-                            {formatRelativeTime(item.updated_at, t)}
-                          </span>
-                        </div>
-                        <p className="text-[14px] text-foreground mt-1">{item.question}</p>
-                      </div>
-                      <ChevronRight className="w-4 h-4 text-muted-foreground shrink-0 mt-1 group-hover:translate-x-0.5 transition-transform" />
-                    </Link>
-                  );
-                })}
-              </div>
-            </div>
-          )}
-
-          {/* Get Started Section */}
-          <h2 className="text-[16px] font-bold mb-4 text-foreground">{t("home.getStarted.title")}</h2>
-          <div ref={getStartedSectionRef} className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-4 gap-4 mb-10">
-            {[
-              { title: t("home.getStarted.video.title"), desc: t("home.getStarted.video.description", { appName: branding.appName }), video: "/videos/Tutorial.mp4", link: resolveHomeGetStartedDestination(homeGetStartedDestinationOverrides.video, defaultHomeGetStartedDestinations.video) },
-              { title: t("home.getStarted.docs.title"), desc: t("home.getStarted.docs.description"), video: "/videos/Documentation.mp4", link: resolveHomeGetStartedDestination(homeGetStartedDestinationOverrides.docs, defaultHomeGetStartedDestinations.docs) },
-              { title: t("home.getStarted.guides.title"), desc: t("home.getStarted.guides.description"), icon: <ListChecks className="w-8 h-8 text-green-500" />, bg: "bg-green-50 dark:bg-green-950/30", link: resolveHomeGetStartedDestination(homeGetStartedDestinationOverrides.guides, defaultHomeGetStartedDestinations.guides) },
-              { title: t("home.getStarted.whatsNew.title"), desc: t("home.getStarted.whatsNew.description"), icon: <Sparkles className="w-8 h-8 text-orange-500" />, bg: "bg-orange-50 dark:bg-orange-950/30", link: resolveHomeGetStartedDestination(homeGetStartedDestinationOverrides.whatsNew, defaultHomeGetStartedDestinations.whatsNew) }
-            ].map((card, i) => {
-              const shouldLoadVideo = card.video ? visibleGetStartedVideos.has(i) : false;
-              const isLinked = typeof card.link === "string";
-              const cardContent = (
-                <Card className={cn(
-                  "py-0 gap-0 overflow-hidden border-border/60 transition-all duration-300 bg-card rounded-xl flex flex-col h-full",
-                  isLinked && "hover:shadow-md group cursor-pointer",
-                )}>
-                  <div
-                    className={`h-[180px] relative flex items-center justify-center overflow-hidden ${card.video ? 'bg-muted' : card.bg}`}
-                    data-get-started-video={card.video ? "true" : undefined}
-                    data-video-index={card.video ? String(i) : undefined}
-                  >
-                    {card.video ? (
-                      shouldLoadVideo ? (
-                        <video
-                          src={card.video}
-                          autoPlay
-                          loop
-                          muted
-                          playsInline
-                          preload="metadata"
-                          className="w-full h-full object-cover"
-                        />
-                      ) : (
-                        <div className="absolute inset-0 bg-[radial-gradient(circle_at_top,hsl(231_55%_62%/0.35),transparent_55%),linear-gradient(160deg,hsl(229_39%_16%)_0%,hsl(236_42%_20%)_100%)]">
-                          <div className="absolute inset-0 bg-[linear-gradient(rgba(255,255,255,0.04)_1px,transparent_1px),linear-gradient(90deg,rgba(255,255,255,0.04)_1px,transparent_1px)] bg-[size:28px_28px]" />
-                          <div className="relative z-10 flex h-full items-center justify-center text-white/85">
-                            <Play className="h-10 w-10 fill-current" />
-                          </div>
-                        </div>
-                      )
-                    ) : (
-                      <div className={cn(
-                        "transition-transform duration-300",
-                        isLinked && "group-hover:scale-110",
-                      )}>
-                        {card.icon}
-                      </div>
-                    )}
-                  </div>
-                  <CardContent className="p-4 flex-1">
-                    <h3 className={cn(
-                      "font-semibold text-[13px] mb-1 transition-colors",
-                      isLinked && "group-hover:text-primary",
-                    )}>{card.title}</h3>
-                    <p className="text-[12px] text-muted-foreground leading-relaxed">{card.desc}</p>
-                  </CardContent>
-                </Card>
-              );
-
-              return isLinked ? (
-                <a key={i} href={card.link!} target="_blank" rel="noopener noreferrer" className="block rounded-xl focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background">
-                  {cardContent}
-                </a>
-              ) : (
-                <div key={i} className="block">
-                  {cardContent}
-                </div>
-              );
-            })}
-          </div>
-
-          {/* Build agents with templates */}
-          {templates.length > 0 && (
-            <>
-              <div className="flex items-center justify-between mb-4">
-                <h2 className="text-[16px] font-bold text-foreground">{t("home.templates.title")}</h2>
-                <Link href="/templates" className="text-[14px] font-semibold text-primary hover:underline flex items-center group">
-                  {t("home.templates.viewAll")} <ChevronRight className="w-4 h-4 ml-1 group-hover:translate-x-1 transition-transform" />
-                </Link>
-              </div>
-
-              <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4 mb-10">
-                {templates.map(template => (
-                  <Card key={template.id} className="flex flex-col border-border/60 hover:shadow-md transition-all duration-300 p-5 group bg-card rounded-xl">
-                    <div className="flex justify-between items-center mb-2">
-                      <span className="text-[11px] font-bold text-primary tracking-wider uppercase bg-primary/10 px-2.5 py-1 rounded-md">
-                        {template.category}
-                      </span>
-                      <div className="flex items-center gap-1.5 text-muted-foreground text-xs font-medium">
-                        <Clock className="w-3.5 h-3.5" />
-                        <span>{template.setup_time || t("home.templates.setupTime", { time: "5 min" })}</span>
-                      </div>
-                    </div>
-                    <h3 className="font-bold text-[15px] text-foreground group-hover:text-primary transition-colors line-clamp-1">
-                      {template.name}
-                    </h3>
-                    <div className="flex-1 space-y-2.5">
-                      {(template.features && template.features.length > 0) ? (
-                        template.features.slice(0, 3).map((feature: string, idx: number) => (
-                          <div key={idx} className="flex items-start gap-2 text-[14px] text-muted-foreground">
-                            <ChevronRight className="w-4 h-4 text-primary shrink-0 mt-0.5 opacity-70" />
-                            <span className="line-clamp-2 leading-snug">{feature}</span>
-                          </div>
-                        ))
-                      ) : (
-                        <div className="flex items-start gap-2 text-[14px] text-muted-foreground">
-                          <ChevronRight className="w-4 h-4 text-primary shrink-0 mt-0.5 opacity-70" />
-                          <span className="line-clamp-3 leading-snug">{template.description}</span>
-                        </div>
-                      )}
-                    </div>
-                    <div className="h-[1px] bg-border/60" />
-                    <div className="mt-auto">
-                      <div className="flex items-center justify-between text-sm text-muted-foreground mb-5">
-                        <div className="flex items-center">
-                          {template.connections && template.connections.length > 0 ? (
-                            <div className="flex gap-1.5">
-                              {template.connections.slice(0, 4).map((conn, idx: number) => (
-                                <div key={idx} className="w-8 h-8 rounded-lg bg-background border border-border flex items-center justify-center overflow-hidden shadow-sm">
-                                  {conn.logo ? <img src={conn.logo} alt={conn.name} className="w-5 h-5 object-contain" /> : <span className="text-[10px] font-bold text-primary/70">{(conn.name || "").substring(0, 2).toUpperCase()}</span>}
-                                </div>
-                              ))}
-                            </div>
-                          ) : <div className="h-8" />}
-                        </div>
-                        <div className="flex items-center gap-4">
-                          <div className="flex items-center gap-1.5">
-                            <Play className="w-3.5 h-3.5 fill-current text-primary/60" />
-                            <span className="font-semibold text-foreground/80">{template.used_count || 0}</span>
-                          </div>
-                          <div className="flex items-center gap-1.5">
-                            <Heart className="w-3.5 h-3.5 fill-current text-rose-400/70" />
-                            <span className="font-semibold text-foreground/80">{template.likes || 0}</span>
-                          </div>
-                        </div>
-                      </div>
-                      <button
-                        onClick={() => handleUseTemplate(template.id)}
-                        className="w-full py-2.5 text-primary text-[13px] font-bold uppercase tracking-wide rounded-xl border border-primary/20 hover:bg-primary hover:text-primary-foreground transition-all duration-300"
-                      >
-                        {t("home.templates.useTemplate")}
-                      </button>
-                    </div>
-                  </Card>
-                ))}
-              </div>
-            </>
-          )}
-
-          {/* Recent Tasks */}
-          {recentTasks.length > 0 && (
-            <>
-              <h2 className="text-[16px] font-bold mb-4 text-foreground">{t("home.recent.title")}</h2>
-              <div className="space-y-3">
-                {recentTasks.map((task) => {
-                  const resolvedLogoUrl = resolveAgentLogoUrl(task.agent_logo_url, getApiUrl());
-                  const displayDate = formatDisplayDate(task.created_at, locale, {
-                    month: "short", day: "numeric", hour: "2-digit", minute: "2-digit",
-                  });
-                  return (
-                  <Link key={task.task_id} href={`/task/${task.task_id}`} className="flex items-center justify-between p-4 rounded-2xl border border-border/60 bg-card hover:border-primary/30 hover:shadow-md transition-all duration-300 group">
-                    <div className="flex items-center gap-5">
-                      <div className="w-12 h-12 rounded-xl bg-primary/5 flex items-center justify-center shrink-0 border border-primary/10">
-                        {resolvedLogoUrl ? (
-                          <img src={resolvedLogoUrl} alt="Agent" className="w-7 h-7 rounded object-cover" />
-                        ) : (
-                          <Bot className="w-6 h-6 text-primary/80" />
-                        )}
-                      </div>
-                      <div>
-                        <h4 className="font-semibold text-[16px] group-hover:text-primary transition-colors">{task.title || t("home.recent.untitledTask")}</h4>
-                        <p className="text-[13px] text-muted-foreground mt-0.5 font-medium">
-                          {task.agent_name || t("home.recent.defaultAgent")}{displayDate ? ` • ${displayDate}` : ""}
-                        </p>
-                      </div>
-                    </div>
-                    <div className="w-8 h-8 rounded-full bg-accent/50 flex items-center justify-center group-hover:bg-primary group-hover:text-primary-foreground transition-all duration-300 mr-2">
-                      <ChevronRight className="w-4 h-4" />
-                    </div>
-                  </Link>
-                  );
-                })}
-              </div>
-            </>
-          )}
-
-        </div>
-      </div>
       <div data-slot="home-page-extension" className="shrink-0">
         <HomePageExtension />
       </div>

@@ -13,7 +13,6 @@ const routerPushMock = vi.hoisted(() => vi.fn())
 const toastErrorMock = vi.hoisted(() => vi.fn())
 const localeMock = vi.hoisted(() => ({ value: "en" as "en" | "zh" }))
 const resolveAgentLogoUrlMock = vi.hoisted(() => vi.fn())
-const formatDisplayDateMock = vi.hoisted(() => vi.fn())
 const homeGetStartedDestinationOverridesMock = vi.hoisted(() => (
   {} as HomeGetStartedDestinationOverrides
 ))
@@ -52,12 +51,8 @@ vi.mock("@/lib/utils", async () => {
 })
 
 vi.mock("@/lib/time-utils", () => ({
-  formatDisplayDate: (...args: [unknown, "en" | "zh", Intl.DateTimeFormatOptions]) => {
-    formatDisplayDateMock(...args)
-    return typeof args[0] === "string" && args[0].startsWith("2024-")
-      ? `formatted:${args[0]}`
-      : ""
-  },
+  formatRelativeTime: (value: unknown) =>
+    typeof value === "string" && value ? `relative:${value}` : "relative:now",
 }))
 
 vi.mock("@/components/ui/sonner", () => ({
@@ -217,7 +212,9 @@ function recentTask(taskId: number, overrides: Record<string, unknown> = {}) {
   return {
     task_id: taskId,
     title: `Task ${taskId}`,
+    status: "completed",
     created_at: "2026-01-01T00:00:00Z",
+    updated_at: "2026-01-01T00:00:00Z",
     agent_name: "Agent",
     agent_logo_url: null,
     ...overrides,
@@ -355,7 +352,7 @@ function templateUrl(locale = localeMock.value) {
   return `http://api.local/api/templates/?lang=${locale}`
 }
 
-const recentTasksUrl = "http://api.local/api/chat/tasks?page=1&per_page=5"
+const recentTasksUrl = "http://api.local/api/chat/tasks?page=1&per_page=8"
 
 describe("Home", () => {
   let consoleErrorMock: ReturnType<typeof vi.spyOn>
@@ -381,14 +378,13 @@ describe("Home", () => {
     routerPushMock.mockReset()
     toastErrorMock.mockReset()
     resolveAgentLogoUrlMock.mockReset()
-    formatDisplayDateMock.mockReset()
     consoleErrorMock = vi.spyOn(console, "error").mockImplementation(() => undefined)
     resolveTaskLlmSelectionMock.mockResolvedValue(successfulSelection)
     apiRequestMock.mockImplementation((url: string) => {
       if (url.startsWith("http://api.local/api/templates/")) {
         return Promise.resolve(jsonResponse([]))
       }
-      if (url === "http://api.local/api/chat/tasks?page=1&per_page=5") {
+      if (url === "http://api.local/api/chat/tasks?page=1&per_page=8") {
         return Promise.resolve(jsonResponse({ tasks: [] }))
       }
       if (url === "http://api.local/api/agents") {
@@ -840,7 +836,7 @@ describe("Home", () => {
     })
     apiRequestMock.mockImplementation((url: string, options?: RequestInit) => {
       if (url.startsWith("http://api.local/api/templates/")) return Promise.resolve(jsonResponse([]))
-      if (url === "http://api.local/api/chat/tasks?page=1&per_page=5") return Promise.resolve(jsonResponse({ tasks: [] }))
+      if (url === "http://api.local/api/chat/tasks?page=1&per_page=8") return Promise.resolve(jsonResponse({ tasks: [] }))
       if (url === "http://api.local/api/chat/task/create") {
         expect(options?.method).toBe("POST")
         expect(JSON.parse(String(options?.body))).toEqual({
@@ -961,7 +957,7 @@ describe("Home", () => {
     const response = deferred<Response>()
     apiRequestMock.mockImplementation((url: string) => {
       if (url.startsWith("http://api.local/api/templates/")) return Promise.resolve(jsonResponse([]))
-      if (url === "http://api.local/api/chat/tasks?page=1&per_page=5") return Promise.resolve(jsonResponse({ tasks: [] }))
+      if (url === "http://api.local/api/chat/tasks?page=1&per_page=8") return Promise.resolve(jsonResponse({ tasks: [] }))
       if (url === "http://api.local/api/chat/task/create") return response.promise
       if (url === "http://api.local/api/agents") {
         return Promise.resolve(jsonResponse([]))
@@ -989,7 +985,7 @@ describe("Home", () => {
     Object.defineProperty(taskResponse, "text", { value: text })
     apiRequestMock.mockImplementation((url: string) => {
       if (url.startsWith("http://api.local/api/templates/")) return Promise.resolve(jsonResponse([]))
-      if (url === "http://api.local/api/chat/tasks?page=1&per_page=5") return Promise.resolve(jsonResponse({ tasks: [] }))
+      if (url === "http://api.local/api/chat/tasks?page=1&per_page=8") return Promise.resolve(jsonResponse({ tasks: [] }))
       if (url === "http://api.local/api/chat/task/create") return Promise.resolve(taskResponse)
       if (url === "http://api.local/api/agents") {
         return Promise.resolve(jsonResponse([]))
@@ -1020,7 +1016,7 @@ describe("Home", () => {
     Object.defineProperty(taskResponse, "text", { value: text })
     apiRequestMock.mockImplementation((url: string) => {
       if (url.startsWith("http://api.local/api/templates/")) return Promise.resolve(jsonResponse([]))
-      if (url === "http://api.local/api/chat/tasks?page=1&per_page=5") return Promise.resolve(jsonResponse({ tasks: [] }))
+      if (url === "http://api.local/api/chat/tasks?page=1&per_page=8") return Promise.resolve(jsonResponse({ tasks: [] }))
       if (url === "http://api.local/api/chat/task/create") return response.promise
       if (url === "http://api.local/api/agents") {
         return Promise.resolve(jsonResponse([]))
@@ -1052,7 +1048,7 @@ describe("Home", () => {
     Object.defineProperty(taskResponse, "text", { value: text })
     apiRequestMock.mockImplementation((url: string) => {
       if (url.startsWith("http://api.local/api/templates/")) return Promise.resolve(jsonResponse([]))
-      if (url === "http://api.local/api/chat/tasks?page=1&per_page=5") return Promise.resolve(jsonResponse({ tasks: [] }))
+      if (url === "http://api.local/api/chat/tasks?page=1&per_page=8") return Promise.resolve(jsonResponse({ tasks: [] }))
       if (url === "http://api.local/api/chat/task/create") return Promise.resolve(taskResponse)
       if (url === "http://api.local/api/agents") {
         return Promise.resolve(jsonResponse([]))
@@ -1080,7 +1076,7 @@ describe("Home", () => {
     const response = deferred<Response>()
     apiRequestMock.mockImplementation((url: string) => {
       if (url.startsWith("http://api.local/api/templates/")) return Promise.resolve(jsonResponse([]))
-      if (url === "http://api.local/api/chat/tasks?page=1&per_page=5") return Promise.resolve(jsonResponse({ tasks: [] }))
+      if (url === "http://api.local/api/chat/tasks?page=1&per_page=8") return Promise.resolve(jsonResponse({ tasks: [] }))
       if (url === "http://api.local/api/chat/task/create") return response.promise
       if (url === "http://api.local/api/agents") {
         return Promise.resolve(jsonResponse([]))
@@ -1117,7 +1113,7 @@ describe("Home", () => {
   ])("keeps task actions at zero and reports current %s create failure", async (_name, taskResponse) => {
     apiRequestMock.mockImplementation((url: string) => {
       if (url.startsWith("http://api.local/api/templates/")) return Promise.resolve(jsonResponse([]))
-      if (url === "http://api.local/api/chat/tasks?page=1&per_page=5") return Promise.resolve(jsonResponse({ tasks: [] }))
+      if (url === "http://api.local/api/chat/tasks?page=1&per_page=8") return Promise.resolve(jsonResponse({ tasks: [] }))
       if (url === "http://api.local/api/chat/task/create") return Promise.resolve(taskResponse)
       if (url === "http://api.local/api/agents") {
         return Promise.resolve(jsonResponse([]))
@@ -1149,7 +1145,7 @@ describe("Home", () => {
     })
     apiRequestMock.mockImplementation((url: string) => {
       if (url.startsWith("http://api.local/api/templates/")) return Promise.resolve(jsonResponse([]))
-      if (url === "http://api.local/api/chat/tasks?page=1&per_page=5") return Promise.resolve(jsonResponse({ tasks: [] }))
+      if (url === "http://api.local/api/chat/tasks?page=1&per_page=8") return Promise.resolve(jsonResponse({ tasks: [] }))
       if (url === "http://api.local/api/chat/task/create") return Promise.resolve(taskResponse)
       if (url === "http://api.local/api/agents") {
         return Promise.resolve(jsonResponse([]))
@@ -1177,7 +1173,7 @@ describe("Home", () => {
     const result = deferred<Response>()
     apiRequestMock.mockImplementation((url: string) => {
       if (url.startsWith("http://api.local/api/templates/")) return Promise.resolve(jsonResponse([]))
-      if (url === "http://api.local/api/chat/tasks?page=1&per_page=5") return Promise.resolve(jsonResponse({ tasks: [] }))
+      if (url === "http://api.local/api/chat/tasks?page=1&per_page=8") return Promise.resolve(jsonResponse({ tasks: [] }))
       if (url === "http://api.local/api/chat/task/create") return result.promise
       if (url === "http://api.local/api/agents") {
         return Promise.resolve(jsonResponse([]))
@@ -1202,7 +1198,7 @@ describe("Home", () => {
     const failed = deferred<Response>()
     apiRequestMock.mockImplementation((url: string) => {
       if (url.startsWith("http://api.local/api/templates/")) return Promise.resolve(jsonResponse([]))
-      if (url === "http://api.local/api/chat/tasks?page=1&per_page=5") return Promise.resolve(jsonResponse({ tasks: [] }))
+      if (url === "http://api.local/api/chat/tasks?page=1&per_page=8") return Promise.resolve(jsonResponse({ tasks: [] }))
       if (url === "http://api.local/api/chat/task/create") return failed.promise
       if (url === "http://api.local/api/agents") {
         return Promise.resolve(jsonResponse([]))
@@ -1228,7 +1224,7 @@ describe("Home", () => {
     const result = deferred<Response>()
     apiRequestMock.mockImplementation((url: string) => {
       if (url.startsWith("http://api.local/api/templates/")) return Promise.resolve(jsonResponse([]))
-      if (url === "http://api.local/api/chat/tasks?page=1&per_page=5") return Promise.resolve(jsonResponse({ tasks: [] }))
+      if (url === "http://api.local/api/chat/tasks?page=1&per_page=8") return Promise.resolve(jsonResponse({ tasks: [] }))
       if (url === "http://api.local/api/chat/task/create") return result.promise
       if (url === "http://api.local/api/agents") {
         return Promise.resolve(jsonResponse([]))
@@ -1256,7 +1252,7 @@ describe("Home", () => {
     const result = deferred<Response>()
     apiRequestMock.mockImplementation((url: string) => {
       if (url.startsWith("http://api.local/api/templates/")) return Promise.resolve(jsonResponse([]))
-      if (url === "http://api.local/api/chat/tasks?page=1&per_page=5") return Promise.resolve(jsonResponse({ tasks: [] }))
+      if (url === "http://api.local/api/chat/tasks?page=1&per_page=8") return Promise.resolve(jsonResponse({ tasks: [] }))
       if (url === "http://api.local/api/chat/task/create") return result.promise
       if (url === "http://api.local/api/agents") {
         return Promise.resolve(jsonResponse([]))
@@ -1285,7 +1281,7 @@ describe("Home", () => {
     setTaskIdMock.mockImplementation(() => { throw new Error("commit failed") })
     apiRequestMock.mockImplementation((url: string) => {
       if (url.startsWith("http://api.local/api/templates/")) return Promise.resolve(jsonResponse([]))
-      if (url === "http://api.local/api/chat/tasks?page=1&per_page=5") return Promise.resolve(jsonResponse({ tasks: [] }))
+      if (url === "http://api.local/api/chat/tasks?page=1&per_page=8") return Promise.resolve(jsonResponse({ tasks: [] }))
       if (url === "http://api.local/api/chat/task/create") return Promise.resolve(jsonResponse(taskCore()))
       if (url === "http://api.local/api/agents") {
         return Promise.resolve(jsonResponse([]))
@@ -1333,7 +1329,7 @@ describe("Home", () => {
       })
       render(<Home />)
 
-      expect(await screen.findByText("Task 1")).toBeInTheDocument()
+      expect(await screen.findByRole("link", { name: /Task 1/ })).toBeInTheDocument()
       await waitFor(() => expect(consoleErrorMock).toHaveBeenCalledWith("Failed to fetch templates:", expect.any(Error)))
       expect(screen.queryByText("Template 1")).not.toBeInTheDocument()
     })
@@ -1377,7 +1373,7 @@ describe("Home", () => {
       })
       render(<Home />)
 
-      expect(await screen.findByText("Task 2")).toBeInTheDocument()
+      expect(await screen.findByRole("link", { name: /Task 2/ })).toBeInTheDocument()
       await waitFor(() => expect(consoleErrorMock).toHaveBeenCalledWith("Failed to fetch templates:", expect.any(Error)))
     })
 
@@ -1436,7 +1432,7 @@ describe("Home", () => {
 
       await waitFor(() => expect(consoleErrorMock).toHaveBeenCalledWith("Failed to fetch templates:", expect.any(Error)))
       expect(screen.queryByText("Template old")).not.toBeInTheDocument()
-      expect(screen.getByText("Task 4")).toBeInTheDocument()
+      expect(screen.getByRole("link", { name: /Task 4/ })).toBeInTheDocument()
       expect(currentBody).not.toHaveBeenCalled()
     })
 
@@ -1490,7 +1486,6 @@ describe("Home", () => {
 
     it("renders every copied template and recent-task value from distinctive wire fields", async () => {
       const createdAt = "2024-05-06T07:08:09Z"
-      const formattedDate = `formatted:${createdAt}`
       apiRequestMock.mockImplementation((url: string) => {
         if (url === templateUrl()) return Promise.resolve(jsonResponse([
           templateCard("distinct-template-id", {
@@ -1511,6 +1506,7 @@ describe("Home", () => {
         if (url === recentTasksUrl) return Promise.resolve(jsonResponse({ tasks: [recentTask(8765432, {
           title: "Distinct Recent Title",
           created_at: createdAt,
+          updated_at: createdAt,
           agent_name: "Distinct Recent Agent",
           agent_logo_url: "https://assets.local/distinct-agent.png",
         })] }))
@@ -1541,8 +1537,8 @@ describe("Home", () => {
       const recentLink = screen.getByRole("link", { name: /Distinct Recent Title/ })
       expect(recentLink).toHaveAttribute("href", "/task/8765432")
       expect(recentLink).toHaveTextContent("Distinct Recent Agent")
-      expect(recentLink).toHaveTextContent(formattedDate)
-      expect(screen.getByRole("img", { name: "Agent" })).toHaveAttribute(
+      expect(recentLink).toHaveTextContent(`relative:${createdAt}`)
+      expect(recentLink.querySelector("img")).toHaveAttribute(
         "src", "https://assets.local/distinct-agent.png",
       )
     })
@@ -1563,7 +1559,7 @@ describe("Home", () => {
       })
       render(<Home />)
 
-      expect(await screen.findByText("Task 5")).toBeInTheDocument()
+      expect(await screen.findByRole("link", { name: /Task 5/ })).toBeInTheDocument()
       await waitFor(() => expect(consoleErrorMock).toHaveBeenCalledWith("Failed to fetch templates:", expect.any(Error)))
       expect(screen.queryByText("Template one")).not.toBeInTheDocument()
     })
@@ -1621,7 +1617,7 @@ describe("Home", () => {
         throw new Error(`Unexpected apiRequest: ${url}`)
       })
       render(<Home />)
-      expect(await screen.findByText("Task 51")).toBeInTheDocument()
+      expect(await screen.findByRole("link", { name: /Task 51/ })).toBeInTheDocument()
       await waitFor(() => expect(consoleErrorMock).toHaveBeenCalledWith("Failed to fetch templates:", expect.any(Error)))
     })
 
@@ -1651,6 +1647,7 @@ describe("Home", () => {
       ["fraction ID", { task_id: 1.5 }], ["unsafe ID", { task_id: Number.MAX_SAFE_INTEGER + 1 }],
       ["non-string title", { title: 1 }], ["invalid date", { created_at: 1 }],
       ["invalid name", { agent_name: null }], ["invalid logo", { agent_logo_url: 1 }],
+      ["invalid status", { status: 1 }], ["invalid updated_at", { updated_at: 1 }],
     ])("rejects malformed consumed recent-task %s", async (_name, patch) => {
       apiRequestMock.mockImplementation((url: string) => {
         if (url === templateUrl()) return Promise.resolve(jsonResponse([templateCard("kept")]))
@@ -1673,6 +1670,8 @@ describe("Home", () => {
       ["null task_id", recentTask(52, { task_id: null })],
       ["missing title", omitField(recentTask(52), "title")],
       ["null title", recentTask(52, { title: null })],
+      ["missing status", omitField(recentTask(52), "status")],
+      ["null status", recentTask(52, { status: null })],
     ])("rejects producer-required recent-task field when %s", async (_name, record) => {
       apiRequestMock.mockImplementation((url: string) => {
         if (url === templateUrl()) return Promise.resolve(jsonResponse([templateCard("kept-required")]))
@@ -1748,12 +1747,12 @@ describe("Home", () => {
       const withoutLogoLink = screen.getByRole("link", { name: /Task 12/ })
       expect(withoutLogoLink).toHaveTextContent("Named Agent")
       expect(withoutLogoLink.querySelector("img")).not.toBeInTheDocument()
-      expect(withoutLogoLink.firstElementChild?.firstElementChild?.querySelector("svg")).toBeInTheDocument()
+      expect(withoutLogoLink.querySelector('[aria-hidden="true"]')).toHaveTextContent("N")
 
       const withoutAgentLink = screen.getByRole("link", { name: /Task 13/ })
       expect(withoutAgentLink).toHaveTextContent("home.recent.defaultAgent")
       expect(withoutAgentLink.querySelector("img")).not.toBeInTheDocument()
-      expect(withoutAgentLink.firstElementChild?.firstElementChild?.querySelector("svg")).toBeInTheDocument()
+      expect(withoutAgentLink.querySelector('[aria-hidden="true"]')).toHaveTextContent("H")
       expect(consoleErrorMock).not.toHaveBeenCalled()
     })
 
@@ -1762,10 +1761,10 @@ describe("Home", () => {
         if (url === templateUrl()) return Promise.resolve(jsonResponse([]))
         if (url === recentTasksUrl) return Promise.resolve(jsonResponse({
           tasks: [
-            recentTask(7, { title: "", created_at: "not a date", agent_name: "", agent_logo_url: "", status: 1, model_id: {}, total_tokens: "wrong" }),
+            recentTask(7, { title: "", created_at: "not a date", agent_name: "", agent_logo_url: "", model_id: {}, total_tokens: "wrong" }),
             recentTask(8, { created_at: null }),
             recentTask(9, { created_at: "" }),
-            { task_id: 10, title: "Task 10", agent_name: "Agent", agent_logo_url: null },
+            { task_id: 10, title: "Task 10", status: "completed", agent_name: "Agent", agent_logo_url: null },
           ],
           pagination: "wrong",
         }))
@@ -1817,17 +1816,12 @@ describe("Home", () => {
         "src",
         "http://api.local/logos/resolved.png",
       )
-      const invalidAvatar = invalidLink.querySelector('div[class*="w-12"][class*="h-12"]')
+      const invalidAvatar = invalidLink.querySelector('[aria-hidden="true"]')
       expect(invalidAvatar).not.toBeNull()
       expect(invalidAvatar?.querySelectorAll("img")).toHaveLength(0)
-      expect(invalidAvatar?.querySelectorAll("svg")).toHaveLength(1)
-      const invalidBot = invalidAvatar?.querySelector("svg")
-      expect(invalidBot).not.toHaveClass("lucide-chevron-right")
-      expect(invalidBot?.querySelector('rect[width="18"][height="10"]')).toBeInTheDocument()
-      const validMetadata = validLink.querySelector("p.text-muted-foreground.font-medium")
-      const invalidMetadata = invalidLink.querySelector("p.text-muted-foreground.font-medium")
-      expect(validMetadata?.textContent).toBe(`Resolved Agent • formatted:${validCreatedAt}`)
-      expect(invalidMetadata?.textContent).toBe("Fallback Agent")
+      expect(invalidAvatar).toHaveTextContent("F")
+      expect(validLink).toHaveTextContent("Resolved Agent")
+      expect(invalidLink).toHaveTextContent("Fallback Agent")
       expect(invalidLink).not.toHaveTextContent("Invalid Date")
       expect(resolveAgentLogoUrlMock).toHaveBeenCalledTimes(2)
       expect(resolveAgentLogoUrlMock).toHaveBeenNthCalledWith(
@@ -1840,13 +1834,6 @@ describe("Home", () => {
         "javascript:alert(1)",
         "http://api.local",
       )
-      expect(formatDisplayDateMock).toHaveBeenCalledTimes(2)
-      expect(formatDisplayDateMock).toHaveBeenNthCalledWith(1, validCreatedAt, "en", {
-        month: "short", day: "numeric", hour: "2-digit", minute: "2-digit",
-      })
-      expect(formatDisplayDateMock).toHaveBeenNthCalledWith(2, "not-a-date", "en", {
-        month: "short", day: "numeric", hour: "2-digit", minute: "2-digit",
-      })
     })
 
     it("does not refetch recents on locale change and suppresses an old locale completion", async () => {
@@ -2020,7 +2007,7 @@ describe("Home", () => {
       })
       expect(await screen.findByText("Template active")).toBeInTheDocument()
       expect(screen.queryByText("Template obsolete")).not.toBeInTheDocument()
-      expect(screen.getByText("Task 9")).toBeInTheDocument()
+      expect(screen.getByRole("link", { name: /Task 9/ })).toBeInTheDocument()
       expect(consoleErrorMock).not.toHaveBeenCalled()
     })
 
@@ -2057,7 +2044,7 @@ describe("Home", () => {
         /const response = await apiRequest\(`\$\{getApiUrl\(\)\}\/api\/templates\/\?lang=\$\{locale\}`\);\s*if \(!isCurrent\(\)\) return;\s*if \(!response\.ok\)[\s\S]*?const parsed = await parseApiResponse\(response\);\s*if \(!isCurrent\(\)\) return;\s*const decoded = decodeHomeTemplates\(parsed\.data\);/,
       )
       expect(recentLoader).toMatch(
-        /const response = await apiRequest\(`\$\{getApiUrl\(\)\}\/api\/chat\/tasks\?page=1&per_page=5`\);\s*if \(!active\) return;\s*if \(!response\.ok\)[\s\S]*?const parsed = await parseApiResponse\(response\);\s*if \(!active\) return;\s*const decoded = decodeRecentTasks\(parsed\.data\);/,
+        /const response = await apiRequest\(`\$\{getApiUrl\(\)\}\/api\/chat\/tasks\?page=1&per_page=8`\);\s*if \(!active\) return;\s*if \(!response\.ok\)[\s\S]*?const parsed = await parseApiResponse\(response\);\s*if \(!active\) return;\s*const decoded = decodeRecentTasks\(parsed\.data\);/,
       )
 
       expect(templateDecoder.match(/return \{/g)).toHaveLength(1)
@@ -2066,7 +2053,7 @@ describe("Home", () => {
       )
       expect(recentDecoder.match(/return \{/g)).toHaveLength(1)
       expect(recentDecoder).toMatch(
-        /return \{\s*task_id: value\.task_id,\s*title: value\.title,\s*created_at: value\.created_at,\s*agent_name: value\.agent_name,\s*agent_logo_url: value\.agent_logo_url,\s*\};/,
+        /return \{\s*task_id: value\.task_id,\s*title: value\.title,\s*status: value\.status,\s*created_at: value\.created_at,\s*updated_at: value\.updated_at,\s*agent_name: value\.agent_name,\s*agent_logo_url: value\.agent_logo_url,\s*\};/,
       )
       expect(templateDecoder).not.toMatch(/\.\.\.value\s*[,}]|\.\.\.connection\s*[,}]|Object\.assign/)
       expect(recentDecoder).not.toMatch(/\.\.\.value\s*[,}]|Object\.assign/)
@@ -2075,15 +2062,14 @@ describe("Home", () => {
       )
       const recentRender = sourceSlice(
         source,
-        "{recentTasks.map((task) => {",
-        "              </div>\n            </>",
+        "{recentTasks.length === 0 ? (",
+        "                })}\n              </div>",
       )
       expect(recentRender).toContain("const resolvedLogoUrl = resolveAgentLogoUrl(task.agent_logo_url, getApiUrl());")
       expect(recentRender.match(/resolveAgentLogoUrl\(/g)).toHaveLength(1)
-      expect(recentRender).toContain("const displayDate = formatDisplayDate(task.created_at, locale, {")
-      expect(recentRender).toContain("{resolvedLogoUrl ? (")
-      expect(recentRender.match(/\{displayDate \? ` • \$\{displayDate\}` : ""\}/g)).toHaveLength(1)
-      expect(recentRender).not.toMatch(/startsWith\(["']http|new Date\(|toLocaleDateString|\$\{getApiUrl\(\)\}\$\{task\.agent_logo_url\}/)
+      expect(recentRender).toContain("{describeTaskActivity(task.status, t)}")
+      expect(recentRender).toContain("{formatRelativeTime(task.updated_at || task.created_at, t)}")
+      expect(recentRender).not.toMatch(/startsWith\(["']http|new Date\(|toLocaleDateString|\$\{getApiUrl\(\)\}\$\{task\.agent_logo_url\}|formatDisplayDate\(/)
       expect(source).not.toMatch(/Promise\.all\(\[\s*apiRequest\(`\$\{getApiUrl\(\)\}\/api\/templates/)
     })
   })

@@ -172,12 +172,23 @@ const en = {
       followupTitle: "Need it to run again and again?",
       followupDescription: "Turn this workflow into a reusable agent you can call any time.",
       buildAgent: "Build an agent",
+      teamReady: "Your team is ready",
       teamReadyOne: "Your team is ready — {count} teammate on hand.",
       teamReadyOther: "Your team is ready — {count} teammates on hand.",
       teamEmpty: "Hire your first teammate to get started.",
       newTask: "New task",
       addTeammate: "Add teammate",
       waitingOnYou: "Waiting on you",
+      activityFeed: "Activity feed",
+      activity: {
+        completed: "completed",
+        running: "is working on",
+        paused: "paused",
+        waitingForUser: "is waiting on you",
+        failed: "hit an issue",
+        pending: "queued",
+        updated: "updated",
+      },
     },
     agents: {
       title: "Your agents",
@@ -219,7 +230,8 @@ const en = {
       subtitle: "Jump back into recent tasks and pick up where you left off.",
       viewTask: "Open task",
       untitledTask: "Untitled Task",
-      defaultAgent: "Agent"
+      defaultAgent: "Agent",
+      empty: "No activity yet."
     }
   },
   chatPage: {

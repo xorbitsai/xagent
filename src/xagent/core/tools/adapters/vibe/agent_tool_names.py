@@ -4,7 +4,18 @@ import re
 import unicodedata
 from typing import Any
 
-from pypinyin import lazy_pinyin  # type: ignore[import-not-found]
+try:
+    # This module is transitively imported by mcp_adapter.py, which
+    # sandboxed tool execution (tool_runner.py's _load_tool_class) also
+    # imports just to reach an unrelated class in the same module tree.
+    # The sandbox's Python environment never installs pypinyin (nothing
+    # it runs calls _semantic_slug), so a hard import here raised
+    # ModuleNotFoundError for every sandboxed tool call, not just this
+    # module's own users -- fall back to None instead, and skip
+    # romanization on the (never exercised in a sandbox) non-ASCII path.
+    from pypinyin import lazy_pinyin  # type: ignore[import-not-found]
+except ImportError:
+    lazy_pinyin = None
 
 AGENT_TOOL_NAME_PREFIX = "agent_"
 LEGACY_AGENT_TOOL_NAME_PREFIX = "call_agent_"
@@ -35,7 +46,7 @@ def _semantic_slug(value: Any) -> str:
     normalized_name = unicodedata.normalize("NFKD", raw_name.strip())
     romanized_name = (
         normalized_name
-        if normalized_name.isascii()
+        if normalized_name.isascii() or lazy_pinyin is None
         else "_".join(lazy_pinyin(normalized_name))
     )
     ascii_name = romanized_name.encode("ascii", "ignore").decode("ascii")

@@ -41,7 +41,7 @@ from ..models.user_oauth import UserOAuth
 from ..oauth_provider_quirks import requires_json_accept_header
 from ..services import gmail_provisioning
 from ..services.auth_email import send_password_reset_email
-from ..services.db_runtime import run_db_io_cancellation_safe
+from ..services.db_runtime import await_task_settlement
 from ..services.user_oauth import delete_scoped_user_oauth_accounts
 from ..utils.graphql_errors import graphql_errors_message, truncate_error_text
 
@@ -653,6 +653,16 @@ class UpdateEmailResponse(BaseModel):
 # user picked (see apply_user_voice in api/agents.py).
 VALID_USER_VOICES = {"professional", "friendly", "concise", "warm", "playful"}
 
+# Onboarding's "About you"/"Goals" steps are short free-text labels and a
+# handful of goal picks, not open-ended documents - these mirror the
+# max_length this codebase already puts on comparably-scoped free-text
+# fields (e.g. agents.py's/custom_api.py's name/description Fields).
+# Without a bound, the full preferences JSON is replayed through every
+# login/`/me`/email-update/token-validation/PATCH response, so an
+# unbounded field lets a user inflate all of those response bodies.
+PREFERENCES_TEXT_FIELD_MAX_LENGTH = 200
+PREFERENCES_GOALS_MAX_ITEMS = 20
+
 
 class UpdatePreferencesRequest(BaseModel):
     """Partial update for the current user's onboarding/voice preferences.
@@ -668,10 +678,16 @@ class UpdatePreferencesRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     onboarded: Optional[bool] = None
-    department: Optional[str] = None
-    industry: Optional[str] = None
+    department: Optional[str] = Field(
+        default=None, max_length=PREFERENCES_TEXT_FIELD_MAX_LENGTH
+    )
+    industry: Optional[str] = Field(
+        default=None, max_length=PREFERENCES_TEXT_FIELD_MAX_LENGTH
+    )
     voice: Optional[str] = None
-    goals: Optional[List[str]] = None
+    goals: Optional[
+        List[Annotated[str, Field(max_length=PREFERENCES_TEXT_FIELD_MAX_LENGTH)]]
+    ] = Field(default=None, max_length=PREFERENCES_GOALS_MAX_ITEMS)
 
     @field_validator("voice")
     @classmethod
@@ -1387,13 +1403,16 @@ def _merge_user_preferences_locked(
     touches a request-scoped `user`/`db`. This is required, not just
     tidy: the lock wait this is built around is a real, potentially slow
     blocking DB call under contention, so the endpoint runs this whole
-    operation through run_db_io_cancellation_safe - if the request is
-    cancelled (client disconnect, timeout) while this worker is
-    mid-transaction, FastAPI can tear down the request's own Session
-    concurrently, and run_db_io_cancellation_safe's contract is exactly
-    "operation must create/use/close its own Session and return only
-    detached data" so that race can't happen (see db_runtime.py's
-    docstring on it; this mirrors admin_users.py's
+    operation through asyncio.to_thread and drains it via
+    await_task_settlement (the same primitive run_db_io_cancellation_safe
+    wraps, called directly here so the endpoint can still invalidate the
+    voice cache off a settled-but-cancelled result before that
+    cancellation propagates) - if the request is cancelled (client
+    disconnect, timeout) while this worker is mid-transaction, FastAPI
+    can tear down the request's own Session concurrently, and the
+    contract is exactly "operation must create/use/close its own Session
+    and return only detached data" so that race can't happen (see
+    db_runtime.py's docstring on it; this mirrors admin_users.py's
     _delete_user_rows_sync).
 
     Returns the serialized response payload (not the ORM object), built
@@ -1466,21 +1485,37 @@ async def update_current_user_preferences(
     # pattern already used before chat.py's sandbox startup and
     # workforce_creator.py's ReAct builder call).
     release_db_connection_if_clean(db)
-    serialized_user = await run_db_io_cancellation_safe(
-        lambda: _merge_user_preferences_locked(user_id, updates)
+
+    def _invalidate_voice_cache_if_needed() -> None:
+        if "voice" in updates:
+            # A cached AgentService bakes voice into its system prompt at
+            # construction time and won't re-check preferences on later
+            # turns (see invalidate_cached_agents_for_owner's docstring),
+            # so an already-warm task would otherwise keep speaking in the
+            # old (or now-cleared) voice until incidental eviction/rebuild.
+            from .chat import get_agent_manager
+
+            get_agent_manager().invalidate_cached_agents_for_owner(user_id)
+
+    # run_db_io_cancellation_safe's own contract discards a settled result
+    # in favor of re-raising the caller's deferred cancellation (see its
+    # docstring), which would otherwise skip the cache invalidation below
+    # entirely - the merge already committed by the time that cancellation
+    # is observed, so the cache must still be invalidated before this
+    # function lets that cancellation propagate.
+    worker = asyncio.get_running_loop().create_task(
+        asyncio.to_thread(_merge_user_preferences_locked, user_id, updates)
     )
+    serialized_user, cancellation = await await_task_settlement(worker)
+    if cancellation is not None:
+        if serialized_user is not None:
+            _invalidate_voice_cache_if_needed()
+        raise cancellation
+
     if serialized_user is None:
         raise HTTPException(status_code=404, detail="User not found")
 
-    if "voice" in updates:
-        # A cached AgentService bakes voice into its system prompt at
-        # construction time and won't re-check preferences on later
-        # turns (see invalidate_cached_agents_for_owner's docstring),
-        # so an already-warm task would otherwise keep speaking in the
-        # old (or now-cleared) voice until incidental eviction/rebuild.
-        from .chat import get_agent_manager
-
-        get_agent_manager().invalidate_cached_agents_for_owner(user_id)
+    _invalidate_voice_cache_if_needed()
 
     return UpdatePreferencesResponse(
         success=True,

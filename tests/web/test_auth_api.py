@@ -484,6 +484,100 @@ class TestAuthAPI:
         )
         assert response.status_code == 422
 
+    def test_update_current_user_preferences_accepts_fields_at_their_bounds(
+        self, test_db, test_user_data
+    ):
+        """The full preferences JSON is replayed through every login/`/me`/
+        email-update/token-validation/PATCH response, so these bounds
+        exist to cap that payload size, not to reject realistic input -
+        exactly-at-the-limit values must still succeed."""
+        setup_first_admin()
+        register_response = client.post("/api/auth/register", json=test_user_data)
+        assert register_response.status_code == 200
+        token = login_and_get_token(
+            test_user_data["username"], test_user_data["password"]
+        )
+
+        response = client.patch(
+            "/api/auth/me/preferences",
+            json={
+                "department": "d" * auth_api.PREFERENCES_TEXT_FIELD_MAX_LENGTH,
+                "industry": "i" * auth_api.PREFERENCES_TEXT_FIELD_MAX_LENGTH,
+                "goals": ["g" * auth_api.PREFERENCES_TEXT_FIELD_MAX_LENGTH]
+                * auth_api.PREFERENCES_GOALS_MAX_ITEMS,
+            },
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert response.status_code == 200, response.text
+
+    def test_update_current_user_preferences_rejects_department_over_the_length_limit(
+        self, test_db, test_user_data
+    ):
+        setup_first_admin()
+        register_response = client.post("/api/auth/register", json=test_user_data)
+        assert register_response.status_code == 200
+        token = login_and_get_token(
+            test_user_data["username"], test_user_data["password"]
+        )
+
+        response = client.patch(
+            "/api/auth/me/preferences",
+            json={"department": "d" * (auth_api.PREFERENCES_TEXT_FIELD_MAX_LENGTH + 1)},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert response.status_code == 422
+
+    def test_update_current_user_preferences_rejects_industry_over_the_length_limit(
+        self, test_db, test_user_data
+    ):
+        setup_first_admin()
+        register_response = client.post("/api/auth/register", json=test_user_data)
+        assert register_response.status_code == 200
+        token = login_and_get_token(
+            test_user_data["username"], test_user_data["password"]
+        )
+
+        response = client.patch(
+            "/api/auth/me/preferences",
+            json={"industry": "i" * (auth_api.PREFERENCES_TEXT_FIELD_MAX_LENGTH + 1)},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert response.status_code == 422
+
+    def test_update_current_user_preferences_rejects_a_goal_over_the_length_limit(
+        self, test_db, test_user_data
+    ):
+        setup_first_admin()
+        register_response = client.post("/api/auth/register", json=test_user_data)
+        assert register_response.status_code == 200
+        token = login_and_get_token(
+            test_user_data["username"], test_user_data["password"]
+        )
+
+        response = client.patch(
+            "/api/auth/me/preferences",
+            json={"goals": ["g" * (auth_api.PREFERENCES_TEXT_FIELD_MAX_LENGTH + 1)]},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert response.status_code == 422
+
+    def test_update_current_user_preferences_rejects_too_many_goals(
+        self, test_db, test_user_data
+    ):
+        setup_first_admin()
+        register_response = client.post("/api/auth/register", json=test_user_data)
+        assert register_response.status_code == 200
+        token = login_and_get_token(
+            test_user_data["username"], test_user_data["password"]
+        )
+
+        response = client.patch(
+            "/api/auth/me/preferences",
+            json={"goals": ["g"] * (auth_api.PREFERENCES_GOALS_MAX_ITEMS + 1)},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert response.status_code == 422
+
     def test_update_current_user_preferences_with_empty_body_is_a_no_op(
         self, test_db, test_user_data
     ):
@@ -863,6 +957,74 @@ class TestAuthAPI:
             assert stored.preferences["voice"] == "warm"
         finally:
             verify_db.close()
+
+    @pytest.mark.asyncio
+    async def test_update_current_user_preferences_invalidates_cache_after_committed_cancellation(
+        self, test_db, test_user_data, monkeypatch
+    ):
+        """run_db_io_cancellation_safe's own contract discards a settled
+        result in favor of re-raising the caller's cancellation - so a
+        request cancelled after the merge has already committed must
+        still invalidate the voice cache before that cancellation is
+        allowed to propagate, or an already-warm task keeps speaking in
+        the stale voice until incidental cache eviction. Delays the
+        worker's return (not its commit) after the merge has
+        genuinely committed, so cancelling here reproduces "committed,
+        but not yet observed by the caller" rather than "not committed
+        yet" (which the sibling drain test above already covers)."""
+        setup_first_admin()
+        register_response = client.post("/api/auth/register", json=test_user_data)
+        assert register_response.status_code == 200
+
+        request_db = TestingSessionLocal()
+        user = (
+            request_db.query(User)
+            .filter(User.username == test_user_data["username"])
+            .one()
+        )
+        user_id = int(user.id)
+
+        committed = threading.Event()
+        allow_return = threading.Event()
+
+        def _on_commit(_conn):
+            committed.set()
+
+        original_merge = auth_api._merge_user_preferences_locked
+
+        def delayed_merge(merge_user_id, merge_updates):
+            result = original_merge(merge_user_id, merge_updates)
+            assert allow_return.wait(timeout=2)
+            return result
+
+        monkeypatch.setattr(auth_api, "_merge_user_preferences_locked", delayed_merge)
+
+        mock_manager = MagicMock()
+        monkeypatch.setattr(chat_api, "get_agent_manager", lambda: mock_manager)
+
+        merge_engine = get_engine()
+        event.listen(merge_engine, "commit", _on_commit)
+        try:
+            request_task = asyncio.create_task(
+                auth_api.update_current_user_preferences(
+                    request=auth_api.UpdatePreferencesRequest(voice="warm"),
+                    db=request_db,
+                    user=user,
+                )
+            )
+            await asyncio.wait_for(asyncio.to_thread(committed.wait, 2), timeout=2)
+            request_task.cancel()
+            await asyncio.sleep(0.02)
+            assert not request_task.done()
+        finally:
+            allow_return.set()
+            event.remove(merge_engine, "commit", _on_commit)
+            request_db.close()
+
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(request_task, timeout=2)
+
+        mock_manager.invalidate_cached_agents_for_owner.assert_called_once_with(user_id)
 
     def test_update_current_user_email(self, test_db, test_user_data):
         setup_first_admin()

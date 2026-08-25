@@ -668,6 +668,67 @@ class TestAuthAPI:
         )
 
     @pytest.mark.asyncio
+    async def test_update_current_user_preferences_builds_response_before_commit(
+        self, test_db, test_user_data
+    ):
+        """G16: Session.commit() defaults to expire_on_commit=True, so any
+        attribute access on `worker_user` after `worker_db.commit()`
+        returns would force an implicit reload SELECT - itself a race,
+        since the row lock is released the instant commit() returns and
+        a concurrent delete could land in that gap (see
+        _merge_user_preferences_locked's own docstring). The SQL-off-the-
+        event-loop test above can't catch a regression here: a reload
+        forced back onto the same worker thread would still pass that
+        assertion. This instead asserts no query at all executes on the
+        merge's connection after its COMMIT, proving the response
+        payload really is built from the ORM object beforehand."""
+        setup_first_admin()
+        register_response = client.post("/api/auth/register", json=test_user_data)
+        assert register_response.status_code == 200
+
+        db = TestingSessionLocal()
+        try:
+            user = (
+                db.query(User).filter(User.username == test_user_data["username"]).one()
+            )
+        finally:
+            db.close()
+
+        committed = threading.Event()
+        queries_after_commit: list[str] = []
+
+        def _on_commit(_conn):
+            committed.set()
+
+        def _on_cursor_execute(_conn, _cursor, statement, *_args, **_kwargs):
+            if committed.is_set():
+                queries_after_commit.append(statement)
+
+        merge_engine = get_engine()
+        event.listen(merge_engine, "commit", _on_commit)
+        event.listen(merge_engine, "before_cursor_execute", _on_cursor_execute)
+        request_db = TestingSessionLocal()
+        try:
+            response = await auth_api.update_current_user_preferences(
+                request=auth_api.UpdatePreferencesRequest(voice="warm"),
+                db=request_db,
+                user=user,
+            )
+        finally:
+            event.remove(merge_engine, "commit", _on_commit)
+            event.remove(merge_engine, "before_cursor_execute", _on_cursor_execute)
+            request_db.close()
+
+        assert response.success is True
+        assert committed.is_set(), "expected the merge to actually commit"
+        assert not queries_after_commit, (
+            "a query executed after commit() - the response payload must "
+            "be built from the ORM object strictly before commit, since "
+            "expire_on_commit=True would otherwise force a reload here: "
+            f"{queries_after_commit}"
+        )
+
+    @pytest.mark.asyncio
     async def test_update_current_user_preferences_cancellation_drains_merge_worker(
         self, test_db, test_user_data, monkeypatch
     ):

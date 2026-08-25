@@ -484,9 +484,9 @@ def get_builtin_public_mcp_app_rows() -> list[dict[str, Any]]:
             "icon": "https://www.google.com/s2/favicons?domain=search.google.com&sz=128",
             "transport": "oauth",
             "provider_name": "google",
-            # "Analytics" (not "Marketing", which google-analytics uses as a
-            # pre-existing mismatch — see the posthog entry's comment below)
-            # since this connector is squarely a search-analytics tool.
+            # "Analytics" (not "Marketing", which google-analytics uses —
+            # a pre-existing mismatch, not a precedent to repeat) since this
+            # connector is squarely a search-analytics tool.
             "category": "Analytics",
             "oauth_scopes": ["https://www.googleapis.com/auth/webmasters.readonly"],
             "is_visible_in_connector": True,

@@ -4,13 +4,12 @@ import logging
 import os
 import re
 from typing import Any
-from urllib.parse import quote
 
 import requests
 from mcp.server.fastmcp import FastMCP
 
 from ....config import get_tool_max_output_length
-from .utils import setup_proxy_env
+from .utils import require_clean_identifier, setup_proxy_env, url_path_id
 
 logger = logging.getLogger("google-search-console-mcp")
 
@@ -125,14 +124,17 @@ def _encoded_site_url(site_url: str) -> str:
     """Search Console site identifiers are either a URL-prefix property
     (e.g. "https://example.com/") or a domain property
     (e.g. "sc-domain:example.com"); both must be percent-encoded before use
-    in a URL path segment.
+    in a URL path segment. Delegates to the shared url_path_id helper (used
+    by the other stdio MCP connectors) for that encoding plus its "."/".."
+    guard, after our own check for the more actionable message on the
+    empty/wrong-type case.
     """
     if not isinstance(site_url, str) or not site_url:
         raise ValueError(
             'site_url must be a non-empty string, e.g. "https://example.com/" '
             'or "sc-domain:example.com" (see google_search_console_list_sites)'
         )
-    return quote(site_url, safe="")
+    return url_path_id(site_url, "site_url")
 
 
 def _validate_date(label: str, value: str) -> None:
@@ -232,8 +234,10 @@ def google_search_console_query_search_analytics(
       "expression": "usa"}]}]. Optional.
     row_limit: max rows to return (default 100, max 1000 — keeps a wide
       query's serialized response under the MCP output size limit).
-    start_row: row offset for paging — if the response returns exactly
-      row_limit rows, call again with start_row += row_limit to fetch more.
+    start_row: row offset for paging — if row_count equals row_limit, call
+      again with start_row += row_limit to fetch more (row_count reflects
+      how many rows this query actually matched, independent of whether
+      "rows" was shortened below — see "truncated").
     """
     try:
         encoded_site_url = _encoded_site_url(site_url)
@@ -288,12 +292,21 @@ def google_search_console_query_search_analytics(
         # platform's output truncation threshold. Halve the returned rows
         # until the serialized response fits, mirroring
         # google_analytics_run_report's trimming approach.
+        #
+        # row_count is pinned to the pre-trim count and never recomputed
+        # from the (possibly shrunk) "rows" list: it's the pagination
+        # signal the docstring tells callers to check against row_limit,
+        # and trimming rows for output-size reasons must not be confused
+        # with "this page had fewer matches than row_limit" — that would
+        # make a caller stop paging early and silently miss rows, with no
+        # way to resume since the dropped rows already consumed part of
+        # this request's offset window.
         max_output_length = get_tool_max_output_length()
         original_row_count = len(rows)
-        response = _success(rows=rows, row_count=len(rows), truncated=False)
+        response = _success(rows=rows, row_count=original_row_count, truncated=False)
         while len(response) > max_output_length and rows:
             rows = rows[: len(rows) // 2]
-            response = _success(rows=rows, row_count=len(rows), truncated=True)
+            response = _success(rows=rows, row_count=original_row_count, truncated=True)
         if len(rows) < original_row_count:
             logger.warning(
                 f"Google Search Console query_search_analytics response trimmed "
@@ -322,10 +335,8 @@ def google_search_console_inspect_url(
       (default "en-US").
     """
     try:
-        if not isinstance(site_url, str) or not site_url:
-            raise ValueError("site_url must be a non-empty string")
-        if not isinstance(inspection_url, str) or not inspection_url:
-            raise ValueError("inspection_url must be a non-empty string")
+        site_url = require_clean_identifier(site_url, "site_url")
+        inspection_url = require_clean_identifier(inspection_url, "inspection_url")
         body = {
             "inspectionUrl": inspection_url,
             "siteUrl": site_url,

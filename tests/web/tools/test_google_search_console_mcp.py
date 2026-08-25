@@ -60,6 +60,21 @@ def test_encoded_site_url_rejects_empty():
         google_search_console._encoded_site_url("")
 
 
+@pytest.mark.parametrize("bad_value", [".", ".."])
+def test_encoded_site_url_rejects_dot_segments(bad_value):
+    """ "." and ".." survive quote() unchanged (unreserved per RFC 3986), and
+    requests/urllib3 normalize them out of the final URL path client-side —
+    delegating to the shared url_path_id helper rejects them explicitly
+    instead of silently hitting an unintended endpoint."""
+    with pytest.raises(ValueError, match="site_url"):
+        google_search_console._encoded_site_url(bad_value)
+
+
+def test_encoded_site_url_rejects_surrounding_whitespace():
+    with pytest.raises(ValueError, match="site_url"):
+        google_search_console._encoded_site_url(" https://example.com/ ")
+
+
 def test_request_wraps_http_error_with_google_error_message(monkeypatch):
     monkeypatch.setattr(
         google_search_console.requests,
@@ -524,6 +539,14 @@ def test_query_search_analytics_trims_rows_and_flags_truncated_when_over_budget(
     assert result["truncated"] is True
     assert len(result["rows"]) < google_search_console.QUERY_MAX_ROW_LIMIT
     assert len(response) < get_tool_max_output_length()
+    # Regression for the pagination-contract bug: row_count must reflect
+    # how many rows this query actually matched (== row_limit here, since
+    # the API returned a full page), independent of how many rows survived
+    # output-size trimming. A caller comparing row_count to row_limit to
+    # decide whether to fetch the next page must not be misled by
+    # trimming into thinking it already reached the last page.
+    assert result["row_count"] == google_search_console.QUERY_MAX_ROW_LIMIT
+    assert result["row_count"] != len(result["rows"])
 
 
 def test_query_search_analytics_trims_to_empty_when_single_row_exceeds_budget(
@@ -546,6 +569,9 @@ def test_query_search_analytics_trims_to_empty_when_single_row_exceeds_budget(
     assert result["rows"] == []
     assert result["truncated"] is True
     assert len(response) < max_output_length
+    # Even trimmed to zero rows, row_count still reports the actual match
+    # count (1), not len(rows) (0) — the pagination signal.
+    assert result["row_count"] == 1
 
 
 def test_query_search_analytics_treats_non_list_rows_as_empty(monkeypatch, caplog):
@@ -668,6 +694,21 @@ def test_inspect_url_rejects_empty_inspection_url(monkeypatch):
     result = json.loads(
         google_search_console.google_search_console_inspect_url(
             "https://example.com/", ""
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "inspection_url" in result["message"]
+    mock_request.assert_not_called()
+
+
+def test_inspect_url_rejects_surrounding_whitespace(monkeypatch):
+    mock_request = Mock()
+    monkeypatch.setattr(google_search_console.requests, "request", mock_request)
+
+    result = json.loads(
+        google_search_console.google_search_console_inspect_url(
+            "https://example.com/", " https://example.com/page "
         )
     )
 

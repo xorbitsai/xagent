@@ -2659,12 +2659,17 @@ def _durable_pause_command(task: Task, owner: User) -> ClaimedTaskCommand:
 
 
 @pytest.mark.asyncio
-async def test_durable_command_skips_broadcast_only_connections(db_session) -> None:
-    """A v1 SSE sink registers into the same shared connection list as
-    real WebSocket connections but only understands versioned status
-    events; it must never be selected as the target for a personal reply
-    to a durable command. With a broadcast-only connection ahead of a
-    real one in the list, the real one is still picked."""
+async def test_durable_command_targets_the_registered_origin_not_list_order(
+    db_session,
+) -> None:
+    """Origin is never inferred from connection order (#1514 round 6).
+
+    This test previously pinned the opposite: "the first real connection is
+    picked". That guess could hand a personal reply - including raw error
+    text - to whichever socket happened to be first, e.g. an anonymous
+    public visitor. A durable command now targets the socket registered as
+    its origin at enqueue; without a registration it gets the discarding
+    sink even when real connections exist."""
     owner = _user(db_session, "broadcast-skip-owner")
     task = _task(db_session, owner.id)
     task.runner_id = None
@@ -2672,23 +2677,44 @@ async def test_durable_command_skips_broadcast_only_connections(db_session) -> N
     db_session.commit()
     command = _durable_pause_command(task, owner)
 
-    broadcast_only = SimpleNamespace(is_broadcast_only=True)
-    real_connection = SimpleNamespace()  # no `is_broadcast_only` attribute at all
+    first_real = SimpleNamespace()  # would have been picked by the old guess
+    origin = SimpleNamespace()
 
-    with (
-        patch.object(
-            websocket_api.manager,
-            "connections_for_task",
-            return_value=[broadcast_only, real_connection],
-        ),
-        patch(
-            "xagent.web.api.websocket._handle_pause_task_unserialized",
-            new=AsyncMock(return_value=None),
-        ) as handler,
-    ):
-        await _execute_durable_task_command(command)
+    websocket_api._command_origins.register(command.command_id, origin, int(task.id))
+    try:
+        with (
+            patch.object(
+                websocket_api.manager,
+                "is_connection_registered",
+                return_value=True,
+            ),
+            patch(
+                "xagent.web.api.websocket._handle_pause_task_unserialized",
+                new=AsyncMock(return_value=None),
+            ) as handler,
+        ):
+            await _execute_durable_task_command(command)
+        assert handler.await_args.args[0] is origin
 
-    assert handler.await_args.args[0] is real_connection
+        # Without a registration, real connections in the list are ignored.
+        websocket_api._command_origins.discard_command(command.command_id, int(task.id))
+        with (
+            patch.object(
+                websocket_api.manager,
+                "connections_for_task",
+                return_value=[first_real],
+            ),
+            patch(
+                "xagent.web.api.websocket._handle_pause_task_unserialized",
+                new=AsyncMock(return_value=None),
+            ) as handler,
+        ):
+            await _execute_durable_task_command(command)
+        assert isinstance(
+            handler.await_args.args[0], websocket_api._DiscardingCommandWebSocket
+        )
+    finally:
+        websocket_api._command_origins.discard_command(command.command_id, int(task.id))
 
 
 @pytest.mark.asyncio

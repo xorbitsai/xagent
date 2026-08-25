@@ -827,7 +827,9 @@ async def test_failed_compensation_does_not_skip_request_local_cleanup(
         raise RuntimeError("registration failed")
 
     def fail_compensation(_claims) -> None:  # type: ignore[no-untyped-def]
-        raise DurableStorageOperationError("storage cleanup unavailable")
+        raise DurableStorageOperationError(
+            "storage cleanup unavailable", storage_key=None
+        )
 
     monkeypatch.setattr(
         files_api,

@@ -48,7 +48,9 @@ def get_slides_service() -> Any:
 
 def _resolve_presentation_id(presentation_id: str) -> str:
     """Accept either a bare presentation id or a full Google Slides URL."""
-    return resolve_id_from_url(presentation_id, _PRESENTATION_URL_ID_PATTERN)
+    return resolve_id_from_url(
+        presentation_id, _PRESENTATION_URL_ID_PATTERN, "presentation_id"
+    )
 
 
 def _element_text(element: dict[str, Any]) -> str:

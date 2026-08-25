@@ -66,7 +66,7 @@ def get_drive_service() -> Any:
 
 def _resolve_document_id(document_id: str) -> str:
     """Accept either a bare document id or a full Google Docs URL."""
-    return resolve_id_from_url(document_id, _DOCUMENT_URL_ID_PATTERN)
+    return resolve_id_from_url(document_id, _DOCUMENT_URL_ID_PATTERN, "document_id")
 
 
 def _paragraph_text(paragraph: dict[str, Any]) -> str:

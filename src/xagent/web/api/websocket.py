@@ -7,6 +7,7 @@ import re
 import shutil
 import time
 import uuid
+from collections import OrderedDict
 from contextlib import contextmanager
 from copy import deepcopy
 from dataclasses import dataclass
@@ -320,6 +321,112 @@ def _client_message_id(value: Any) -> str | None:
     if COMMAND_ID_PATTERN.fullmatch(normalized) is None:
         return None
     return normalized
+
+
+# Exception text can carry file paths, SQL fragments, provider payloads and
+# other internals. It reaches anonymous widget/share visitors through both the
+# error bubble and the message_rejected ack, so an *incidental* validation
+# failure only ever surfaces as this fixed string; the detail stays in the log.
+#
+# Agent RuntimeError text is passed through to the INITIATING SENDER only -
+# the rejection ack and the personal error bubble - which is the existing
+# contract, and narrowing that wording is the product decision left in #1479.
+#
+# The broadcast half of that passthrough is closed (maintainer scope ruling
+# on #1514): once a task resolves, the task-wide broadcast reaches every
+# connection under the task_id, anonymous widget and share visitors included,
+# and DurableStorageOperationError subclasses RuntimeError with tenant-scope
+# text in its message - so broadcasts carry CLIENT_SAFE_TASK_FAILURE, never
+# the exception text. Still #1479: whether the sender copy should also be
+# narrowed when the initiator is an anonymous public connection.
+CLIENT_SAFE_VALIDATION_ERROR = "The message could not be processed. Please try again."
+
+# Broadcast audiences did not send anything, so the validation wording above
+# would be misdirected; task-level failure broadcasts use this instead.
+CLIENT_SAFE_TASK_FAILURE = "Task execution failed."
+
+
+class ClientVisibleError(Exception):
+    """Marker: this exception's text was written for the end user.
+
+    Raise a subclass - never a bare builtin - when the message itself is the
+    actionable answer ("authentication required", "access denied"). Everything
+    else reaching a client-facing handler is treated as incidental and
+    redacted, so forgetting the marker fails closed.
+    """
+
+
+class ClientVisibleValidationError(ClientVisibleError, ValueError):
+    """A validation failure whose text is safe to show the sender."""
+
+
+class ClientVisiblePermissionError(ClientVisibleError, PermissionError):
+    """An authorization refusal whose text is safe to show the sender."""
+
+
+class ClientVisibleTaskCommandDeferred(ClientVisibleError, TaskCommandDeferred):
+    """A deferral whose wording this module wrote for the sender.
+
+    Terminal deferral broadcasts go through the chokepoint like everything
+    else, so without the marker "waiting for the active task lease owner"
+    would reach the client as the generic string and become
+    indistinguishable from an outright failure.
+    """
+
+
+def client_safe_error_message(error: BaseException) -> str:
+    """The only way an exception may become text a chat client can see.
+
+    ``tests/web/api/test_websocket_client_safe_errors.py`` enforces this for
+    the shapes it recognizes: direct calls to the delivery producers, and
+    ``error``/``agent_error`` dict *literals* handed to ``send_personal_message``,
+    ``broadcast_to_task`` or ``send_text``.
+
+    It does not reach payloads assembled by a helper, spread into a dict, or
+    forwarded through a wrapper (#1497). It also only ever inspects the
+    ``message`` key of a literal ``type`` it already knows: the background
+    failure broadcast at ``execute_task_background`` is invisible on both
+    counts at once, carrying its text under ``error`` with type ``task_error``
+    (#1497). A ``type`` built from a variable is likewise unseen (#1547).
+
+    Read a passing sweep as "the recognized shapes are clean", never as
+    "nothing reaches a client raw".
+    """
+    return (
+        str(error)
+        if isinstance(error, ClientVisibleError)
+        else CLIENT_SAFE_VALIDATION_ERROR
+    )
+
+
+def client_safe_task_command_failure(
+    kind: TaskCommandKind, error: BaseException
+) -> str:
+    """Terminal command failure: server-owned kind prefix + redacted detail.
+
+    The frontend renders ``message`` verbatim for ``agent_error``, so dropping
+    the prefix entirely removed user-visible context. The kind comes from our
+    own enum, never from the exception, which is what makes the prefix safe.
+    """
+    return f"Task command {kind.value} failed: {client_safe_error_message(error)}"
+
+
+def log_client_facing_failure(error: Exception, template: str, *args: object) -> None:
+    """Record a failure whose text the client will not see in full.
+
+    A ``ClientVisibleError`` is an answer written for the sender - an
+    unauthenticated frame, a task that no longer exists - so it is routine
+    and gets no traceback; otherwise any visitor could emit stack dumps on
+    demand. Anything else is incidental, and once its text is redacted the
+    traceback is the only record left.
+
+    ``template`` ends in the ``%s`` that receives ``error``; ``args`` fill the
+    placeholders before it.
+    """
+    if isinstance(error, ClientVisibleError):
+        logger.warning(template, *args, error)
+    else:
+        logger.error(template, *args, error, exc_info=True)
 
 
 async def send_message_delivery(
@@ -2446,7 +2553,7 @@ async def execute_task_background(
                 )
             )
         if snapshot is None:
-            raise ValueError(f"Task {task_id} not found")
+            raise ClientVisibleValidationError(f"Task {task_id} not found")
 
         context_dict = context if isinstance(context, dict) else {}
         logger.info(f"Background task execution started for task {task_id}")
@@ -4503,6 +4610,91 @@ async def _with_current_task_control_state(
 
 
 # Connection manager
+class _CommandOriginRegistry:
+    """(task_id, command_id) -> the exact socket that submitted the command.
+
+    Recorded at the ingress handler, where the connection is the verified
+    origin, and consulted by the durable executor in place of any guess:
+    origin is never inferred from task membership, actor id, guest id, or
+    connection order. Same-worker only, by design - when the command executes
+    after a worker restart or on a different worker, ``resolve`` finds nothing
+    and the executor degrades to a discarding socket, so personal detail is
+    dropped rather than sent to an unverified connection.
+
+    ``command_id`` is client-supplied and only unique per task (the DB carries
+    a ``(task_id, command_id)`` uniqueness constraint), so the key is the pair,
+    never the id alone - otherwise a command_id shared across two tasks would
+    let one void or overwrite the other's entry.
+
+    First registration wins. A second connection on the same task cannot
+    overwrite an existing origin by resubmitting the same command_id: the
+    enqueue dedupe returns the in-flight row for such a resubmission, so
+    without this rule a co-tenant on a public/share task could redirect
+    another sender's error detail to itself. Re-registering the *same* socket
+    is idempotent.
+
+    Only the ingress that *created* the durable row registers (callers gate on
+    ``EnqueuedTaskCommand.created``); a payload-matching duplicate never binds,
+    which is what keeps a co-tenant, a post-disconnect resubmission, or a
+    duplicate handled on another worker from acquiring the origin.
+
+    Lifecycle: an entry dies with its socket (``discard_socket`` from
+    ``ConnectionManager.disconnect`` and ``detach_task_connections``) or with
+    its command's terminal outcome (``discard_command`` from the durable
+    dispatch wrapper), whichever comes first. A deferred command that will
+    retry keeps its entry. An entry whose command is claimed by another worker
+    is never resolved here (wrong worker) and its local cleanup never runs, so
+    to bound that case the store is an LRU capped at ``_MAX_ORIGINS``: an
+    eviction just makes ``resolve`` miss and the executor degrade to the safe
+    discard, so a socket that never disconnects while its commands always run
+    elsewhere can cost at most the wording on the oldest few, never unbounded
+    memory.
+    """
+
+    _MAX_ORIGINS = 4096
+
+    def __init__(self) -> None:
+        self._origins: OrderedDict[tuple[int, str], Any] = OrderedDict()
+
+    def register(self, command_id: str, websocket: Any, task_id: int) -> None:
+        if not command_id:
+            return
+        key = (int(task_id), command_id)
+        existing = self._origins.get(key)
+        if existing is not None and existing is not websocket:
+            # First registration wins; a resubmission from another socket
+            # must not capture this command's origin.
+            return
+        self._origins[key] = websocket
+        self._origins.move_to_end(key)
+        while len(self._origins) > self._MAX_ORIGINS:
+            # Oldest first: eviction degrades that command to the safe discard,
+            # it never reroutes detail.
+            self._origins.popitem(last=False)
+
+    def resolve(self, command_id: str, task_id: int) -> Any | None:
+        websocket = self._origins.get((int(task_id), command_id))
+        if websocket is None:
+            return None
+        if not manager.is_connection_registered(websocket, int(task_id)):
+            return None
+        return websocket
+
+    def discard_command(self, command_id: str, task_id: int) -> None:
+        self._origins.pop((int(task_id), command_id), None)
+
+    def has(self, command_id: str, task_id: int) -> bool:
+        """Whether an origin is currently recorded for this command."""
+        return (int(task_id), command_id) in self._origins
+
+    def discard_socket(self, websocket: Any) -> None:
+        for key in [k for k, ws in self._origins.items() if ws is websocket]:
+            del self._origins[key]
+
+
+_command_origins = _CommandOriginRegistry()
+
+
 class ConnectionManager:
     def __init__(self) -> None:
         # task_id -> List[WebSocket]
@@ -4538,6 +4730,7 @@ class ConnectionManager:
         task_id = self._connection_task_ids.pop(websocket, None)
         if task_id is not None:
             self._remove_from_task(websocket, task_id)
+        _command_origins.discard_socket(websocket)
 
     def detach_task_connections(self, task_id: int) -> List[WebSocket]:
         """Remove and return every connection currently owned by a task."""
@@ -4545,6 +4738,7 @@ class ConnectionManager:
         for connection in connections:
             if self._connection_task_ids.get(connection) == task_id:
                 del self._connection_task_ids[connection]
+            _command_origins.discard_socket(connection)
         return connections
 
     def connections_for_task(self, task_id: int) -> List[WebSocket]:
@@ -4860,7 +5054,7 @@ def _claim_user_message_delivery_isolated(
                     db=db,
                 )
                 if missing:
-                    raise ValueError(
+                    raise ClientVisibleValidationError(
                         "Files are no longer bindable: " + ", ".join(missing)
                     )
             claim_snapshot = _snapshot_user_message_delivery(claim)
@@ -4967,17 +5161,19 @@ async def handle_chat_message(
             allow_missing_task=True,
         )
     except (PermissionError, ValueError) as exc:
+        log_client_facing_failure(exc, "Chat command rejected for task %s: %s", task_id)
         client_message_id = _client_message_id(message_data.get("client_message_id"))
+        message = client_safe_error_message(exc)
         await send_message_delivery(
             websocket,
             client_message_id=client_message_id,
             turn_id=client_message_id or str(uuid.uuid4()),
             accepted=False,
-            message=str(exc),
+            message=message,
             rejection_outcome="not_accepted",
         )
         await manager.send_personal_message(
-            {"type": "error", "message": str(exc)}, websocket
+            {"type": "error", "message": message}, websocket
         )
         return
     if enqueued is None:
@@ -5016,6 +5212,14 @@ async def handle_chat_message(
         accepted=True,
     )
     if enqueued.command_id:
+        if enqueued.created:
+            # Only the ingress that created the durable row owns the origin.
+            # A payload-matching duplicate (created=False) - a co-tenant
+            # resubmission, one arriving after the creator disconnected, or one
+            # handled on another worker - must never bind, or it could receive
+            # the creator's raw error detail. Registered before dispatch so
+            # local execution cannot outrun the binding.
+            _command_origins.register(enqueued.client_command_id, websocket, task_id)
         await dispatch_task_command_promptly(
             execute_durable_task_command,
             command_db_id=enqueued.command_id,
@@ -5038,9 +5242,9 @@ def _enqueue_websocket_task_command_sync(
         if task is None:
             if allow_missing_task:
                 return None
-            raise ValueError(f"Task {task_id} not found")
+            raise ClientVisibleValidationError(f"Task {task_id} not found")
         if not actor_is_admin and int(task.user_id) != actor_user_id:
-            raise PermissionError(
+            raise ClientVisiblePermissionError(
                 f"Access denied: Task {task_id} does not belong to you"
             )
         if kind == TaskCommandKind.MESSAGE:
@@ -5084,13 +5288,17 @@ def _enqueue_websocket_task_command_sync(
                 kind=kind,
                 payload=payload,
             )
-        except TaskCommandTaskMissing:
+        except TaskCommandTaskMissing as exc:
             # The row was deleted after the check above, so route this through
             # the same sentinel as a task that was already gone. Otherwise the
             # caller rejects the delivery instead of creating a replacement.
             if allow_missing_task:
                 return None
-            raise
+            # Same answer as the direct lookup above, in the same wording.
+            # The sentinel is a bare ValueError, so re-raising it as-is let
+            # the pause/resume catch redact "not found" on this race alone.
+            # Converted at this boundary only; transport semantics unchanged.
+            raise ClientVisibleValidationError(str(exc)) from exc
         return result
 
 
@@ -5104,7 +5312,9 @@ async def _enqueue_websocket_task_command(
 ) -> EnqueuedTaskCommand | None:
     user = message_data.get("user")
     if user is None:
-        raise ValueError("User authentication required for task command")
+        raise ClientVisibleValidationError(
+            "User authentication required for task command"
+        )
     resolved_command_id = command_id or f"{kind.value}:{uuid.uuid4()}"
     # User ORM instances and server-only authentication fields are never put
     # into the JSON inbox. The consumer re-resolves the actor by id.
@@ -5748,13 +5958,15 @@ async def _handle_chat_message_unserialized(
         authorized_task_id: int | None = None
 
         if user is None:
-            raise ValueError("User authentication required for task access")
+            raise ClientVisibleValidationError(
+                "User authentication required for task access"
+            )
         if not isinstance(user_message, str):
-            raise TypeError("Chat message must be a string")
+            raise ClientVisibleValidationError("Chat message must be a string")
         if not isinstance(raw_context, dict):
-            raise TypeError("Chat context must be an object")
+            raise ClientVisibleValidationError("Chat context must be an object")
         if not isinstance(raw_files, list):
-            raise TypeError("Chat files must be a list")
+            raise ClientVisibleValidationError("Chat files must be a list")
 
         actor_user_id = int(user.id)
         actor_is_admin = bool(user.is_admin)
@@ -6381,8 +6593,8 @@ async def _handle_chat_message_unserialized(
             )
         except (ValueError, KeyError, TypeError) as e:
             # Data validation and format error
-            message = f"Data validation error: {str(e)}"
-            logger.error(f"Data validation error in agent execution: {e}")
+            message = client_safe_error_message(e)
+            log_client_facing_failure(e, "Data validation error in agent execution: %s")
             if not await finish_delivery_failure(message):
                 return
             timestamp = datetime.now(timezone.utc).timestamp()
@@ -6408,16 +6620,18 @@ async def _handle_chat_message_unserialized(
                     websocket,
                 )
         except RuntimeError as e:
-            # Runtime error
+            # Runtime error. The sender's rejection ack keeps the wording
+            # (#1479 contract); the task-wide broadcast reaches anonymous
+            # subscribers and gets the fixed string instead.
             message = f"Runtime error: {str(e)}"
-            logger.error(f"Runtime error in agent execution: {e}")
+            logger.error("Runtime error in agent execution: %s", e, exc_info=True)
             if not await finish_delivery_failure(message):
                 return
             timestamp = datetime.now(timezone.utc).timestamp()
             if authorized_task_id is not None:
                 error_payload = await _read_task_error_payload_offloop(
                     authorized_task_id,
-                    message,
+                    CLIENT_SAFE_TASK_FAILURE,
                 )
                 await manager.broadcast_to_task(
                     {
@@ -6426,6 +6640,18 @@ async def _handle_chat_message_unserialized(
                     },
                     authorized_task_id,
                 )
+                # Only the durable path needs this: there the rejection ack
+                # is suppressed, so the detail bubble is the sender's only
+                # copy. On the live path finish_delivery_failure already sent
+                # the ack with the same wording, so a bubble would duplicate
+                # it. The origin socket came from the registry and is a
+                # discarding stub when unverifiable, so this is
+                # origin-or-nowhere by construction.
+                if suppress_delivery_ack:
+                    await manager.send_personal_message(
+                        {"type": "error", "message": message, "timestamp": timestamp},
+                        websocket,
+                    )
             else:
                 await manager.send_personal_message(
                     {
@@ -6437,25 +6663,32 @@ async def _handle_chat_message_unserialized(
                 )
         except Exception as e:
             # Other unknown errors, re-raise
-            logger.error(f"Unexpected error in agent execution: {e}")
-            await finish_delivery_failure(str(e))
+            # The branch that withholds the detail logs it, rather than
+            # relying on a caller: the durable dispatcher does record a stack
+            # (task_command_transport.py:1100, logger.exception) but
+            # websocket_chat_endpoint and both public_chat_access.py endpoints
+            # log without exc_info, so the record depends on who called.
+            logger.error("Unexpected error in agent execution: %s", e, exc_info=True)
+            await finish_delivery_failure(client_safe_error_message(e))
             raise
 
     except (ValueError, KeyError, TypeError) as e:
         # Message format error
-        logger.error(f"Message format error: {e}")
-        await finish_delivery_failure(f"Message format error: {str(e)}")
+        log_client_facing_failure(e, "Message format error: %s")
+        message = client_safe_error_message(e)
+        await finish_delivery_failure(message)
         await manager.send_personal_message(
-            {"type": "error", "message": f"Message format error: {str(e)}"}, websocket
+            {"type": "error", "message": message}, websocket
         )
     except (ConnectionError, WebSocketDisconnect) as e:
         # Connection error
-        logger.error(f"Connection error handling chat message: {e}")
+        logger.error("Connection error handling chat message: %s", e)
         raise
     except Exception as e:
         # Other errors, re-raise
-        logger.error(f"Unexpected error handling chat message: {e}")
-        await finish_delivery_failure(str(e))
+        # Redacted below, so the traceback is the only record left.
+        logger.error("Unexpected error handling chat message: %s", e, exc_info=True)
+        await finish_delivery_failure(client_safe_error_message(e))
         raise
 
 
@@ -6564,7 +6797,9 @@ async def handle_execute_task(
         user = message_data.get("user")
         authorized_task_id: int | None = None
         if not user:
-            raise ValueError("User authentication required for task execution")
+            raise ClientVisibleValidationError(
+                "User authentication required for task execution"
+            )
         actor_user_id = int(user.id)
         actor_is_admin = bool(user.is_admin)
 
@@ -6586,7 +6821,9 @@ async def handle_execute_task(
             )
         )
         if request is None:
-            raise Exception(f"Task {task_id} not found or access denied")
+            raise ClientVisibleValidationError(
+                f"Task {task_id} not found or access denied"
+            )
         authorized_task_id = request.task_id
 
         await manager.broadcast_to_task(
@@ -6621,8 +6858,8 @@ async def handle_execute_task(
 
     except (ValueError, KeyError, TypeError) as e:
         # Data validation and format error
-        message = f"Data validation error: {str(e)}"
-        logger.error(f"Data validation error in task execution: {e}")
+        message = client_safe_error_message(e)
+        log_client_facing_failure(e, "Data validation error in task execution: %s")
         timestamp = datetime.now(timezone.utc).isoformat()
         if authorized_task_id is not None:
             error_payload = await _read_task_error_payload_offloop(
@@ -6646,14 +6883,16 @@ async def handle_execute_task(
                 websocket,
             )
     except RuntimeError as e:
-        # Runtime error
+        # Runtime error. The initiating sender keeps the wording (#1479
+        # contract); the task-wide broadcast reaches anonymous subscribers
+        # and gets the fixed string instead.
         message = f"Runtime error: {str(e)}"
-        logger.error(f"Runtime error in task execution: {e}")
+        logger.error("Runtime error in task execution: %s", e, exc_info=True)
         timestamp = datetime.now(timezone.utc).isoformat()
         if authorized_task_id is not None:
             error_payload = await _read_task_error_payload_offloop(
                 authorized_task_id,
-                message,
+                CLIENT_SAFE_TASK_FAILURE,
             )
             await manager.broadcast_to_task(
                 {
@@ -6661,6 +6900,12 @@ async def handle_execute_task(
                     "timestamp": timestamp,
                 },
                 authorized_task_id,
+            )
+            # This handler is invoked with its real ingress socket (it is not
+            # dispatched durably), so the initiating sender keeps the detail.
+            await manager.send_personal_message(
+                {"type": "error", "message": message, "timestamp": timestamp},
+                websocket,
             )
         else:
             await manager.send_personal_message(
@@ -6672,8 +6917,9 @@ async def handle_execute_task(
                 websocket,
             )
     except Exception as e:
-        # Other unknown errors, re-raise
-        logger.error(f"Unexpected error in task execution: {e}")
+        # Re-raised, but the callers do not own the stack: the chat endpoint
+        # logs without exc_info and the public endpoints swallow entirely.
+        logger.error("Unexpected error in task execution: %s", e, exc_info=True)
         raise
 
 
@@ -7377,7 +7623,10 @@ async def handle_intervention(
         await manager.broadcast_to_task(
             {
                 "type": "intervention_processed",
-                "message": f"Manual intervention processed: {intervention_data['action']}",
+                # The action is client-supplied and reaches every connection on
+                # the task, so it travels as a structured field only.
+                "message": "Manual intervention processed",
+                "action": intervention_data["action"],
                 "intervention_id": intervention_data["step_id"],
                 "timestamp": datetime.now(
                     timezone.utc
@@ -7388,19 +7637,20 @@ async def handle_intervention(
 
     except (ValueError, KeyError, TypeError) as e:
         # Data validation error
-        logger.error(f"Data validation error in intervention: {e}")
+        log_client_facing_failure(e, "Data validation error in intervention: %s")
         await manager.send_personal_message(
-            {"type": "error", "message": f"Data validation error: {str(e)}"}, websocket
+            {"type": "error", "message": client_safe_error_message(e)}, websocket
         )
     except RuntimeError as e:
         # Runtime error
-        logger.error(f"Runtime error in intervention: {e}")
+        logger.error("Runtime error in intervention: %s", e, exc_info=True)
         await manager.send_personal_message(
             {"type": "error", "message": f"Runtime error: {str(e)}"}, websocket
         )
     except Exception as e:
-        # Other errors, re-raise
-        logger.error(f"Unexpected error in intervention: {e}")
+        # Re-raised, but the callers do not own the stack: the chat endpoint
+        # logs without exc_info and the public endpoints swallow entirely.
+        logger.error("Unexpected error in intervention: %s", e, exc_info=True)
         raise
 
 
@@ -7417,8 +7667,12 @@ async def handle_pause_task(
             command_id=_client_message_id(message_data.get("command_id")),
         )
     except (PermissionError, ValueError) as exc:
+        log_client_facing_failure(
+            exc, "Pause command rejected for task %s: %s", task_id
+        )
         await manager.send_personal_message(
-            {"type": "error", "message": str(exc)}, websocket
+            {"type": "error", "message": client_safe_error_message(exc)},
+            websocket,
         )
         return
     assert enqueued is not None
@@ -7440,6 +7694,11 @@ async def handle_pause_task(
         },
         websocket,
     )
+    if enqueued.created:
+        # Only the creating ingress owns the origin; a payload-matching
+        # duplicate must never bind (see handle_chat_message). Registered
+        # before dispatch so local execution cannot outrun the binding.
+        _command_origins.register(enqueued.client_command_id, websocket, task_id)
     await dispatch_task_command_promptly(
         execute_durable_task_command,
         command_db_id=enqueued.command_id,
@@ -7644,20 +7903,24 @@ async def _handle_pause_task_unserialized(
     except (ValueError, KeyError, TypeError) as e:
         # Data validation error
         message_data["_durable_command_error"] = str(e)
-        logger.error(f"Data validation error pausing task {task_id}: {e}")
+        logger.error(
+            "Data validation error pausing task %s: %s", task_id, e, exc_info=True
+        )
         await manager.send_personal_message(
-            {"type": "error", "message": f"Data validation error: {str(e)}"}, websocket
+            {"type": "error", "message": client_safe_error_message(e)}, websocket
         )
     except RuntimeError as e:
         # Runtime error
-        logger.error(f"Runtime error pausing task {task_id}: {e}")
+        # No traceback: this branch passes the text through to the client
+        # unredacted (#1479), so nothing is being withheld from the log.
+        logger.error("Runtime error pausing task %s: %s", task_id, e)
         await manager.send_personal_message(
             {"type": "error", "message": f"Runtime error: {str(e)}"}, websocket
         )
         raise
     except Exception as e:
         # Other errors, re-raise
-        logger.error(f"Unexpected error pausing task {task_id}: {e}")
+        logger.error("Unexpected error pausing task %s: %s", task_id, e)
         raise
 
 
@@ -7674,8 +7937,12 @@ async def handle_resume_task(
             command_id=_client_message_id(message_data.get("command_id")),
         )
     except (PermissionError, ValueError) as exc:
+        log_client_facing_failure(
+            exc, "Resume command rejected for task %s: %s", task_id
+        )
         await manager.send_personal_message(
-            {"type": "error", "message": str(exc)}, websocket
+            {"type": "error", "message": client_safe_error_message(exc)},
+            websocket,
         )
         return
     assert enqueued is not None
@@ -7697,6 +7964,11 @@ async def handle_resume_task(
         },
         websocket,
     )
+    if enqueued.created:
+        # Only the creating ingress owns the origin; a payload-matching
+        # duplicate must never bind (see handle_chat_message). Registered
+        # before dispatch so local execution cannot outrun the binding.
+        _command_origins.register(enqueued.client_command_id, websocket, task_id)
     await dispatch_task_command_promptly(
         execute_durable_task_command,
         command_db_id=enqueued.command_id,
@@ -8033,20 +8305,24 @@ async def _handle_resume_task_unserialized(
     except (ValueError, KeyError, TypeError) as e:
         # Data validation error
         message_data["_durable_command_error"] = str(e)
-        logger.error(f"Data validation error resuming task {task_id}: {e}")
+        logger.error(
+            "Data validation error resuming task %s: %s", task_id, e, exc_info=True
+        )
         await manager.send_personal_message(
-            {"type": "error", "message": f"Data validation error: {str(e)}"}, websocket
+            {"type": "error", "message": client_safe_error_message(e)}, websocket
         )
     except RuntimeError as e:
         # Runtime error
-        logger.error(f"Runtime error resuming task {task_id}: {e}")
+        # No traceback: this branch passes the text through to the client
+        # unredacted (#1479), so nothing is being withheld from the log.
+        logger.error("Runtime error resuming task %s: %s", task_id, e)
         await manager.send_personal_message(
             {"type": "error", "message": f"Runtime error: {str(e)}"}, websocket
         )
         raise
     except Exception as e:
         # Other errors, re-raise
-        logger.error(f"Unexpected error resuming task {task_id}: {e}")
+        logger.error("Unexpected error resuming task %s: %s", task_id, e)
         raise
 
 
@@ -8081,20 +8357,16 @@ async def _execute_durable_task_command(
 ) -> dict[str, Any] | None:
     """Apply one DB-claimed command using the existing transport adapters.
 
-    The handler is independent of the originating connection. If the socket is
-    still connected, personal validation errors go there; after a crash or on a
-    different worker they are discarded while task-level state/error events are
-    still broadcast normally.
+    Personal replies go only to the registered origin socket, verified to
+    still be connected to this task. Origin is never inferred from task
+    membership, actor id, or connection order: after a crash, a handoff to a
+    different worker, or a disconnect, personal detail is discarded while
+    task-level state/error events are still broadcast normally.
     """
 
-    connections = manager.connections_for_task(command.task_id)
-    # Broadcast-only subscribers (e.g. the v1 SSE sink) never issued this
-    # command and must not be mistaken for the originating socket, so they
-    # are skipped when picking the target for a personal reply.
-    websocket: Any = next(
-        (c for c in connections if not getattr(c, "is_broadcast_only", False)),
-        _DiscardingCommandWebSocket(),
-    )
+    websocket: Any = _command_origins.resolve(command.command_id, command.task_id)
+    if websocket is None:
+        websocket = _DiscardingCommandWebSocket()
     message_data = dict(command.payload)
     message_data.update(
         {
@@ -8125,7 +8397,7 @@ async def _execute_durable_task_command(
     } and await run_db_io_cancellation_safe(
         lambda: task_has_live_foreign_runner(command.task_id)
     ):
-        raise TaskCommandDeferred(
+        raise ClientVisibleTaskCommandDeferred(
             f"{command.kind.value.title()} command {command.command_id} is waiting "
             "for the active task lease owner"
         )
@@ -8135,7 +8407,7 @@ async def _execute_durable_task_command(
             websocket, command.task_id, message_data
         )
         if message_data.get("_commit_outcome_unknown") == command.command_id:
-            raise TaskCommandDeferred(
+            raise ClientVisibleTaskCommandDeferred(
                 f"Message {command.command_id} has an unknown commit outcome"
             )
         if message_data.get("_registered_turn_handoff") == command.command_id:
@@ -8151,7 +8423,7 @@ async def _execute_durable_task_command(
             )
         )
         if delivery_status == DELIVERY_PENDING:
-            raise TaskCommandDeferred(
+            raise ClientVisibleTaskCommandDeferred(
                 f"Message {command.command_id} is waiting for runtime injection"
             )
         if delivery_status == DELIVERY_FAILED:
@@ -8225,7 +8497,11 @@ async def _broadcast_terminal_command_error(
     await manager.broadcast_to_task(
         {
             "type": "agent_error",
-            "message": (f"Task command {command.kind.value} failed: {error}"),
+            # A blessed constructor rather than an f-string at the call
+            # site: the guard cannot see inside an interpolation. The kind
+            # also travels as a structured field for consumers that want it.
+            "message": client_safe_task_command_failure(command.kind, error),
+            "command_kind": command.kind.value,
             "task_id": command.task_id,
             "command_id": command.command_id,
             "timestamp": datetime.now(timezone.utc).timestamp(),
@@ -8240,19 +8516,25 @@ async def execute_durable_task_command(
     """Apply one command and expose only terminal transport failures to clients."""
 
     try:
-        return await _execute_durable_task_command(command)
+        result = await _execute_durable_task_command(command)
     except TaskCommandDeferred as exc:
         if command.defer_count + 1 >= MAX_COMMAND_DEFERS:
+            _command_origins.discard_command(command.command_id, command.task_id)
             await _broadcast_terminal_command_error(command, exc)
+        # A deferral that will retry keeps its origin entry.
         raise
     except TaskCommandRejected:
         # Rejections come from handlers that already expose their durable
         # domain-level outcome. The dispatcher makes them terminal immediately.
+        _command_origins.discard_command(command.command_id, command.task_id)
         raise
     except Exception as exc:
         if command.failure_count + 1 >= MAX_COMMAND_FAILURES:
+            _command_origins.discard_command(command.command_id, command.task_id)
             await _broadcast_terminal_command_error(command, exc)
         raise
+    _command_origins.discard_command(command.command_id, command.task_id)
+    return result
 
 
 def _load_command_message_delivery_status(
@@ -8725,8 +9007,10 @@ clarification questions as plain assistant text.
                 logger.warning(f"Failed to send task_completed: {e}")
 
     except Exception as e:
-        logger.error(f"Error handling builder chat: {e}", exc_info=True)
-        await websocket.send_text(json.dumps({"type": "error", "message": str(e)}))
+        logger.error("Error handling builder chat: %s", e, exc_info=True)
+        await websocket.send_text(
+            json.dumps({"type": "error", "message": client_safe_error_message(e)})
+        )
 
 
 @ws_router.websocket("/ws/build/preview")
@@ -8809,7 +9093,9 @@ async def websocket_build_preview_endpoint(
                     json.dumps(
                         {
                             "type": "error",
-                            "message": f"Unknown message type: {message_type}",
+                            # Not echoed back: matches the main loop at the
+                            # "Unknown message type" site above.
+                            "message": "Unknown message type",
                         }
                     )
                 )

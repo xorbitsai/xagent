@@ -53,7 +53,9 @@ def get_drive_service() -> Any:
 
 def _resolve_spreadsheet_id(spreadsheet_id: str) -> str:
     """Accept either a bare spreadsheet id or a full Google Sheets URL."""
-    return resolve_id_from_url(spreadsheet_id, _SPREADSHEET_URL_ID_PATTERN)
+    return resolve_id_from_url(
+        spreadsheet_id, _SPREADSHEET_URL_ID_PATTERN, "spreadsheet_id"
+    )
 
 
 @mcp.tool()

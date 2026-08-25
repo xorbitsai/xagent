@@ -1981,7 +1981,7 @@ def test_websocket_enqueue_returns_none_when_the_task_vanishes_mid_enqueue(
     assert result is None
 
 
-def test_websocket_enqueue_reraises_missing_task_when_recovery_is_not_allowed(
+def test_websocket_enqueue_rejects_missing_task_with_client_visible_wording(
     db_session,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1996,7 +1996,11 @@ def test_websocket_enqueue_reraises_missing_task_when_recovery_is_not_allowed(
 
     monkeypatch.setattr(websocket_api, "enqueue_task_command", raise_missing)
 
-    with pytest.raises(TaskCommandTaskMissing):
+    # The rejection is re-raised as ClientVisibleValidationError at this
+    # boundary (still a ValueError, so pause/resume reject it the same way)
+    # so the redaction chokepoint keeps "not found" wording on this race
+    # instead of flattening it to the generic string (#1514 round 5).
+    with pytest.raises(ValueError) as raised:
         websocket_api._enqueue_websocket_task_command_sync(
             task_id=task_id,
             actor_user_id=int(user.id),
@@ -2006,6 +2010,8 @@ def test_websocket_enqueue_reraises_missing_task_when_recovery_is_not_allowed(
             payload={"type": "pause_task"},
             allow_missing_task=False,
         )
+    assert isinstance(raised.value, websocket_api.ClientVisibleValidationError)
+    assert str(raised.value) == f"Task {task_id} not found"
 
 
 def test_task_foreign_key_violation_is_reported_as_a_missing_task(

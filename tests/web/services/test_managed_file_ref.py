@@ -581,3 +581,127 @@ def test_adopt_existing_object_refreshes_same_size_checksum_mismatch_from_local_
     assert storage.stat_calls == [record.storage_key]
     assert storage.put_calls == [(local_path, record.storage_key)]
     assert record.checksum == sha256(b"new-data").hexdigest()
+
+
+def test_the_wrap_keeps_the_storage_key_out_of_its_own_message(tmp_path):
+    """``str(exc)`` is the value that escapes; it must not carry the key.
+
+    The key's scope segments encode the owning user's id, and ``str(exc)`` on
+    these classes reaches places the raise site does not control: a bare
+    ``raise`` from a WebSocket fault arm carries it into a task-wide broadcast
+    and a persisted command row, and broad ``except RuntimeError`` arms
+    interpolate it into client-facing text (#1497). The invariant therefore
+    has to hold at the exception, not at each egress.
+    """
+    source = tmp_path / "uploads" / "leak-probe.txt"
+    source.parent.mkdir()
+    source.write_text("leak probe", encoding="utf-8")
+    record = _record(source, file_size=source.stat().st_size)
+
+    with pytest.raises(DurableStorageOperationError) as raised:
+        ManagedFileRef(record, storage=FailingStorage()).sync_to_durable()
+
+    fault = raised.value
+    assert fault.storage_key, "the wrap must carry the key on the attribute"
+    assert fault.storage_key not in str(fault)
+    assert "users/" not in str(fault)
+
+
+def test_no_wrap_site_interpolates_into_the_message():
+    """Every construction of these classes, not just the one driven above.
+
+    A new wrap site that puts the key back into the message would reopen the
+    leak at every ``str(exc)`` egress at once, and no runtime test can drive a
+    site that does not exist yet. Parsing the module is what closes that gap.
+
+    It also asserts ``storage_key=`` is present at every site: the invariant
+    is the key off the message *and* on the attribute, and mypy enforcing the
+    required keyword elsewhere is not a reason to leave the second half
+    unpinned here.
+
+    The message must be a string literal or a bare name (a module constant
+    like ``FILE_INTEGRITY_REUPLOAD_MESSAGE``) -- a whitelist, because the
+    first version of this test blacklisted f-strings only, and ``"..." + key``,
+    ``"%s" % key``, and ``"{}".format(key)`` all walked past it. The second
+    version read only the positional slot, so ``message=...`` slipped past as
+    a keyword; it is looked up in both places now, and a ``**`` unpacking --
+    which no static check can see through -- fails outright rather than being
+    skipped. Calls are matched by bare name and by attribute
+    (``module.DurableStorageOperationError(...)``), with the guarded name set
+    derived from the class hierarchy so a future subclass is covered without
+    editing this test. What the whitelist still cannot see: a name bound to
+    dynamically built text one statement earlier, or a construction hidden
+    behind an alias -- which is what the exact count below turns into a
+    failure instead of a silent skip.
+    """
+    import ast
+
+    from xagent.web.services import managed_file_ref
+
+    def _hierarchy_names(cls: type) -> set[str]:
+        names = {cls.__name__}
+        for sub in cls.__subclasses__():
+            names |= _hierarchy_names(sub)
+        return names
+
+    guarded = _hierarchy_names(DurableStorageOperationError)
+
+    tree = ast.parse(Path(managed_file_ref.__file__).read_text(encoding="utf-8"))
+    checked = 0
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        callee = node.func
+        callee_name = (
+            callee.id
+            if isinstance(callee, ast.Name)
+            else callee.attr
+            if isinstance(callee, ast.Attribute)
+            else None
+        )
+        if callee_name not in guarded:
+            continue
+        assert not any(kw.arg is None for kw in node.keywords), (
+            f"managed_file_ref.py:{node.lineno} constructs via ** unpacking, "
+            "which this check cannot see through; spell the arguments out so "
+            "the message stays statically checkable"
+        )
+        # The invariant has two halves: the key is off the message AND on the
+        # attribute. mypy enforces the required keyword, but pin it here too so
+        # a site that regressed to a message-only construction fails on this
+        # assertion rather than on a type-check that runs elsewhere. storage_key
+        # is keyword-only, so it can only appear as a keyword.
+        assert any(kw.arg == "storage_key" for kw in node.keywords), (
+            f"managed_file_ref.py:{node.lineno} constructs "
+            f"{callee_name} without storage_key=; the key must ride the "
+            "attribute, not just be absent from the message"
+        )
+        if node.args:
+            message = node.args[0]
+        else:
+            message = next(
+                (kw.value for kw in node.keywords if kw.arg == "message"), None
+            )
+        if message is None:
+            continue
+        checked += 1
+        is_literal = isinstance(message, ast.Constant) and isinstance(
+            message.value, str
+        )
+        assert is_literal or isinstance(message, ast.Name), (
+            f"managed_file_ref.py:{node.lineno} builds the message dynamically "
+            f"({ast.unparse(message)!r}); it must be a string literal or a "
+            "module constant -- the identifier belongs in storage_key= so "
+            "str(exc) stays safe"
+        )
+    # The count is part of the contract: consolidating constructions into a
+    # helper would leave only the helper's own body visible to this walk while
+    # every real call site goes dark, and an aliased construction is invisible
+    # to the name match -- both would silently shrink coverage. A changed count
+    # means a construction was added, removed, or hidden: update it
+    # deliberately and give the new site its coverage story.
+    assert checked == 8, (
+        f"expected 8 constructions (7 wraps + the integrity raise), found "
+        f"{checked} -- a construction was added, removed, aliased, or moved "
+        "behind a helper; update this count deliberately"
+    )

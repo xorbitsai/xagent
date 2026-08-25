@@ -9,7 +9,6 @@ from xagent.core.model.chat.basic.router import RouterLLM
 from xagent.core.model.chat.types import ChunkType, StreamChunk
 
 _THINKING_TOOL_CHOICE_ERROR = "Thinking mode does not support this tool_choice"
-_DISABLE_DOWNSTREAM_THINKING = {"type": "disabled", "enable": False}
 
 
 class _RejectThinkingToolChoiceLLM:
@@ -198,98 +197,6 @@ async def test_router_dispatches_chosen_slug_through_downstream_resolver():
     assert seen["slug"] == "anthropic/claude-opus-4.8"
     assert result.model_name == "anthropic/claude-opus-4.8"
     assert result._downstream == "DOWNSTREAM_LLM"
-
-
-async def test_router_retries_chat_without_thinking_for_tool_choice_error():
-    downstream = _RejectThinkingToolChoiceLLM()
-    selected: list[str] = []
-
-    llm = RouterLLM(model_name="auto", downstream_resolver=lambda _s: downstream)
-
-    async def fake_select(prompt: str) -> str:
-        selected.append(prompt)
-        return "deepseek/deepseek-v4-flash"
-
-    llm._select_model = fake_select  # type: ignore[assignment]
-
-    result = await llm.chat(
-        [{"role": "user", "content": "hi"}],
-        tool_choice="required",
-        thinking={"type": "disabled", "enable": False},
-    )
-
-    assert result == "ok"
-    assert selected == ["hi"]
-    assert len(downstream.chat_calls) == 2
-    assert downstream.chat_calls[0]["tool_choice"] == "required"
-    assert downstream.chat_calls[0]["thinking"] == {
-        "type": "disabled",
-        "enable": False,
-    }
-    assert downstream.chat_calls[1]["tool_choice"] == "required"
-    assert downstream.chat_calls[1]["thinking"] == _DISABLE_DOWNSTREAM_THINKING
-    assert "extra_body" not in downstream.chat_calls[1]
-
-
-async def test_router_retries_stream_without_thinking_for_tool_choice_error():
-    downstream = _RejectThinkingToolChoiceLLM()
-    selected: list[str] = []
-
-    llm = RouterLLM(model_name="auto", downstream_resolver=lambda _s: downstream)
-
-    async def fake_select(prompt: str) -> str:
-        selected.append(prompt)
-        return "deepseek/deepseek-v4-flash"
-
-    llm._select_model = fake_select  # type: ignore[assignment]
-
-    chunks = [
-        chunk
-        async for chunk in llm.stream_chat(
-            [{"role": "user", "content": "hi"}],
-            tool_choice="required",
-            thinking={"type": "disabled", "enable": False},
-        )
-    ]
-
-    assert [chunk.delta for chunk in chunks] == ["ok"]
-    assert selected == ["hi"]
-    assert len(downstream.stream_calls) == 2
-    assert downstream.stream_calls[0]["tool_choice"] == "required"
-    assert downstream.stream_calls[0]["thinking"] == {
-        "type": "disabled",
-        "enable": False,
-    }
-    assert downstream.stream_calls[1]["tool_choice"] == "required"
-    assert downstream.stream_calls[1]["thinking"] == _DISABLE_DOWNSTREAM_THINKING
-    assert "extra_body" not in downstream.stream_calls[1]
-
-
-async def test_router_retries_stream_without_explicit_thinking_for_tool_choice_error():
-    downstream = _RejectThinkingToolChoiceLLM()
-
-    llm = RouterLLM(model_name="auto", downstream_resolver=lambda _s: downstream)
-
-    async def fake_select(_prompt: str) -> str:
-        return "deepseek/deepseek-v4-flash"
-
-    llm._select_model = fake_select  # type: ignore[assignment]
-
-    chunks = [
-        chunk
-        async for chunk in llm.stream_chat(
-            [{"role": "user", "content": "hi"}],
-            tool_choice="required",
-        )
-    ]
-
-    assert [chunk.delta for chunk in chunks] == ["ok"]
-    assert len(downstream.stream_calls) == 2
-    assert downstream.stream_calls[0]["tool_choice"] == "required"
-    assert downstream.stream_calls[0]["thinking"] is None
-    assert downstream.stream_calls[1]["tool_choice"] == "required"
-    assert downstream.stream_calls[1]["thinking"] == _DISABLE_DOWNSTREAM_THINKING
-    assert "extra_body" not in downstream.stream_calls[1]
 
 
 async def test_router_does_not_retry_unrelated_errors():

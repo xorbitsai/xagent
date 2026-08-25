@@ -1261,8 +1261,12 @@ def compensate_registered_uploads_sync(
 
     if unresolved:
         failed_ids = ", ".join(claim.file_id for claim in unresolved)
+        # No single key: this is a batch compensation failure. The file ids in
+        # the message are #1642's scope, alongside widening the purity scan to
+        # this module.
         raise DurableStorageOperationError(
-            f"Failed to compensate durable uploads: {failed_ids}"
+            f"Failed to compensate durable uploads: {failed_ids}",
+            storage_key=None,
         )
 
 

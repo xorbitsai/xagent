@@ -18,7 +18,7 @@ def require_clean_identifier(value: str, field_name: str) -> str:
     into a URL path, use url_path_id instead - encoding (not just rejecting
     whitespace) is what actually closes path/query injection.
     """
-    if not value or value.strip() != value:
+    if not isinstance(value, str) or not value or value.strip() != value:
         raise ValueError(
             f"{field_name} must be a non-empty id with no surrounding whitespace"
         )
@@ -143,9 +143,16 @@ def clamp_offset(offset: int) -> int:
     return max(0, int(offset))
 
 
-def resolve_id_from_url(value: str, pattern: re.Pattern[str]) -> str:
+def resolve_id_from_url(value: str, pattern: re.Pattern[str], field_name: str) -> str:
     """Return the id captured by ``pattern`` when ``value`` is a matching URL,
-    otherwise the stripped value itself."""
+    otherwise the stripped value itself.
+
+    Guards against a non-string value the same way require_clean_identifier
+    does: ``pattern.search()``/``.strip()`` would otherwise raise a raw
+    TypeError/AttributeError instead of a clean, actionable ValueError.
+    """
+    if not isinstance(value, str):
+        raise ValueError(f"{field_name} must be a string")
     match = pattern.search(value)
     if match:
         return match.group(1)

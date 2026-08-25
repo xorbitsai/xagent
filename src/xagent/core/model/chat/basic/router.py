@@ -32,7 +32,7 @@ import inspect
 import logging
 import os
 import threading
-from typing import Any, AsyncIterator, Callable, List, Optional, cast
+from typing import Any, AsyncIterator, Callable, List, Optional
 
 from ....context_ref import CONTEXT_REFS_KEY, normalize_context_references
 from ....model import ChatModelConfig
@@ -45,9 +45,6 @@ logger = logging.getLogger(__name__)
 
 _DEFAULT_ROUTER_ABILITIES = ["chat", "tool_calling"]
 _UNROUTED_ROUTER_ABILITIES = {"vision", "thinking_mode"}
-# Normalized intents translated into OpenRouter's reasoning/thinking request body.
-_DISABLE_DOWNSTREAM_THINKING = {"type": "disabled", "enable": False}
-_ENABLE_DOWNSTREAM_THINKING = {"type": "enabled", "enable": True}
 _CONTENT_PART_MODALITIES = {
     "audio": "audio",
     "audio_url": "audio",
@@ -71,98 +68,6 @@ _MODALITY_ABILITIES = {
 
 class RouterModalityRoutingError(RuntimeError):
     """The installed router cannot enforce required input modalities."""
-
-
-def _should_retry_with_thinking(
-    exc: Exception,
-    *,
-    thinking: dict[str, Any] | None,
-) -> bool:
-    # This is the primary stop condition after a retry swaps in enabled thinking;
-    # retry-action tracking remains defense in depth for the shared retry loop.
-    if isinstance(thinking, dict) and (
-        thinking.get("type") == "enabled" or thinking.get("enable") is True
-    ):
-        return False
-
-    # OpenRouter currently exposes this provider constraint only through an
-    # untyped 400 response. Retry the same selected model once with reasoning
-    # enabled instead of repeating the rejected payload or rerouting.
-    # Replace string matching with typed provider errors when available.
-    exc_msg = str(exc).lower()
-    return "reasoning is mandatory" in exc_msg and "cannot be disabled" in exc_msg
-
-
-def _should_retry_without_thinking(
-    exc: Exception,
-    *,
-    thinking: dict[str, Any] | None,
-    tool_choice: str | dict[str, Any] | None,
-) -> bool:
-    # Deliberate OpenRouter/DeepSeek compatibility bridge: the provider returns
-    # an OpenAI-compatible 400 without a typed error for this thinking/tool_choice
-    # conflict. Replace this with provider-owned typed exceptions once the
-    # follow-up tracking issue lands.
-    exc_msg = str(exc).lower()
-    return (
-        (thinking is None or isinstance(thinking, dict))
-        and tool_choice is not None
-        and "thinking" in exc_msg
-        and "tool_choice" in exc_msg
-    )
-
-
-def _should_retry_with_relaxed_tool_choice(
-    exc: Exception,
-    *,
-    tools: list[dict[str, Any]] | None,
-    tool_choice: str | dict[str, Any] | None,
-) -> bool:
-    if not tools or tool_choice in (None, "auto", "none"):
-        return False
-
-    # Deliberate OpenRouter compatibility bridge: official provider routing can
-    # reject strict tool_choice values before selecting an endpoint. This
-    # degrades forced tool use to "auto" instead of failing the whole agent run.
-    # Replace string matching with typed provider errors when available.
-    exc_msg = str(exc).lower()
-    return "no endpoints found" in exc_msg and "tool_choice" in exc_msg
-
-
-def _next_retry_state(
-    exc: Exception,
-    *,
-    tools: list[dict[str, Any]] | None,
-    thinking: dict[str, Any] | None,
-    tool_choice: str | dict[str, Any] | None,
-) -> tuple[str | dict[str, Any] | None, dict[str, Any] | None, str, str] | None:
-    if _should_retry_with_thinking(exc, thinking=thinking):
-        return (
-            tool_choice,
-            _ENABLE_DOWNSTREAM_THINKING,
-            "selected model requires reasoning; retrying with thinking enabled",
-            "enable_thinking",
-        )
-
-    if _should_retry_without_thinking(exc, thinking=thinking, tool_choice=tool_choice):
-        return (
-            tool_choice,
-            _DISABLE_DOWNSTREAM_THINKING,
-            "selected model rejected thinking with tool_choice; retrying without thinking",
-            "disable_thinking",
-        )
-
-    if _should_retry_with_relaxed_tool_choice(
-        exc, tools=tools, tool_choice=tool_choice
-    ):
-        return (
-            "auto",
-            thinking,
-            "selected OpenRouter endpoint rejected tool_choice; retrying with tool_choice=auto",
-            "relax_tool_choice",
-        )
-
-    return None
 
 
 class _NullStore:
@@ -291,57 +196,6 @@ class RouterLLM(BaseLLM):
     def supports_thinking_mode(self) -> bool:
         return "thinking_mode" in self._abilities
 
-    async def _run_non_streaming_with_provider_retry(
-        self,
-        method: Callable[..., Any],
-        messages: list[dict[str, Any]],
-        *,
-        temperature: float | None,
-        max_tokens: int | None,
-        tools: list[dict[str, Any]] | None,
-        tool_choice: str | dict[str, Any] | None,
-        response_format: dict[str, Any] | None,
-        thinking: dict[str, Any] | None,
-        output_config: dict[str, Any] | None,
-        kwargs: dict[str, Any],
-    ) -> str | dict[str, Any]:
-        current_tool_choice = tool_choice
-        current_thinking = thinking
-        attempted_retry_actions: set[str] = set()
-
-        while True:
-            try:
-                result = await method(
-                    messages,
-                    temperature=temperature,
-                    max_tokens=max_tokens,
-                    tools=tools,
-                    tool_choice=current_tool_choice,
-                    response_format=response_format,
-                    thinking=current_thinking,
-                    output_config=output_config,
-                    **kwargs,
-                )
-                return cast(str | dict[str, Any], result)
-            except Exception as exc:  # noqa: BLE001 - inspect a provider compatibility error.
-                retry_state = _next_retry_state(
-                    exc,
-                    tools=tools,
-                    thinking=current_thinking,
-                    tool_choice=current_tool_choice,
-                )
-                if retry_state is None:
-                    raise
-
-                next_tool_choice, next_thinking, log_message, action_key = retry_state
-                if action_key in attempted_retry_actions:
-                    raise
-
-                attempted_retry_actions.add(action_key)
-                logger.info(log_message)
-                current_tool_choice = next_tool_choice
-                current_thinking = next_thinking
-
     async def chat(
         self,
         messages: list[dict[str, str]],
@@ -418,63 +272,6 @@ class RouterLLM(BaseLLM):
         ):
             yield chunk
 
-    async def _run_streaming_with_provider_retry(
-        self,
-        llm: BaseLLM,
-        messages: list[dict[str, Any]],
-        *,
-        temperature: float | None,
-        max_tokens: int | None,
-        tools: list[dict[str, Any]] | None,
-        tool_choice: str | dict[str, Any] | None,
-        response_format: dict[str, Any] | None,
-        thinking: dict[str, Any] | None,
-        output_config: dict[str, Any] | None,
-        kwargs: dict[str, Any],
-    ) -> AsyncIterator[StreamChunk]:
-        has_yielded = False
-        current_tool_choice = tool_choice
-        current_thinking = thinking
-        attempted_retry_actions: set[str] = set()
-
-        while True:
-            try:
-                async for chunk in llm.stream_chat(
-                    messages,
-                    temperature=temperature,
-                    max_tokens=max_tokens,
-                    tools=tools,
-                    tool_choice=current_tool_choice,
-                    response_format=response_format,
-                    thinking=current_thinking,
-                    output_config=output_config,
-                    **kwargs,
-                ):
-                    has_yielded = True
-                    yield chunk
-                return
-            except Exception as exc:  # noqa: BLE001 - inspect a provider compatibility error.
-                if has_yielded:
-                    raise
-
-                retry_state = _next_retry_state(
-                    exc,
-                    tools=tools,
-                    thinking=current_thinking,
-                    tool_choice=current_tool_choice,
-                )
-                if retry_state is None:
-                    raise
-
-                next_tool_choice, next_thinking, log_message, action_key = retry_state
-                if action_key in attempted_retry_actions:
-                    raise
-
-                attempted_retry_actions.add(action_key)
-                logger.info(log_message)
-                current_tool_choice = next_tool_choice
-                current_thinking = next_thinking
-
     # ---- Routing ------------------------------------------------------------
     async def prepare_for_call(
         self,
@@ -484,9 +281,18 @@ class RouterLLM(BaseLLM):
     ) -> BaseLLM:
         """Resolve one xrouter decision into a reusable per-call LLM.
 
-        The returned wrapper keeps RouterLLM's compatibility retries without
-        routing a second time, and carries the selected model's context window
-        from xrouter's model profile catalog.
+        The returned wrapper dispatches directly to the selected downstream
+        model without routing a second time, and carries the selected model's
+        context window from xrouter's model profile catalog. Both resolver
+        branches in ``_resolve_route`` currently build an ``OpenRouterLLM``
+        client for the chosen slug (the injected ``_downstream_resolver`` in
+        practice, and the ``create_base_llm`` fallback always, since it is
+        given ``model_provider="openrouter"``), so provider-compat retries (a
+        rejected tool_choice, a thinking/tool_choice conflict, a model that
+        mandates reasoning) are that client's own responsibility today, not
+        this router's. ``_downstream_resolver`` is typed as
+        ``Callable[[str], BaseLLM]``, not ``OpenRouterLLM``, so this is a
+        statement about current call sites, not a type-level guarantee.
 
         ``preferred_input_modalities`` supplied by the caller (task runtime
         extensions) is *advisory*: a router that cannot honour it degrades by
@@ -805,8 +611,7 @@ class _ResolvedRouterLLM(BaseLLM):
         output_config: dict[str, Any] | None = None,
         **kwargs: Any,
     ) -> str | dict[str, Any]:
-        return await self._router._run_non_streaming_with_provider_retry(
-            self._downstream.chat,
+        return await self._downstream.chat(
             messages,
             temperature=temperature,
             max_tokens=max_tokens,
@@ -815,7 +620,7 @@ class _ResolvedRouterLLM(BaseLLM):
             response_format=response_format,
             thinking=thinking,
             output_config=output_config,
-            kwargs=kwargs,
+            **kwargs,
         )
 
     async def vision_chat(
@@ -830,8 +635,7 @@ class _ResolvedRouterLLM(BaseLLM):
         output_config: dict[str, Any] | None = None,
         **kwargs: Any,
     ) -> str | dict[str, Any]:
-        return await self._router._run_non_streaming_with_provider_retry(
-            self._downstream.vision_chat,
+        return await self._downstream.vision_chat(
             messages,
             temperature=temperature,
             max_tokens=max_tokens,
@@ -840,7 +644,7 @@ class _ResolvedRouterLLM(BaseLLM):
             response_format=response_format,
             thinking=thinking,
             output_config=output_config,
-            kwargs=kwargs,
+            **kwargs,
         )
 
     async def stream_chat(
@@ -855,8 +659,7 @@ class _ResolvedRouterLLM(BaseLLM):
         output_config: dict[str, Any] | None = None,
         **kwargs: Any,
     ) -> AsyncIterator[StreamChunk]:
-        async for chunk in self._router._run_streaming_with_provider_retry(
-            self._downstream,
+        async for chunk in self._downstream.stream_chat(
             messages,
             temperature=temperature,
             max_tokens=max_tokens,
@@ -865,6 +668,6 @@ class _ResolvedRouterLLM(BaseLLM):
             response_format=response_format,
             thinking=thinking,
             output_config=output_config,
-            kwargs=kwargs,
+            **kwargs,
         ):
             yield chunk

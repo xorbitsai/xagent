@@ -8,6 +8,7 @@ import pytest
 
 from xagent.core.model.chat.basic import openrouter as openrouter_module
 from xagent.core.model.chat.basic.base import BaseLLM
+from xagent.core.model.chat.basic.openai import OpenAILLM
 from xagent.core.model.chat.basic.openrouter import OpenRouterLLM
 from xagent.core.model.chat.error import retry_on
 from xagent.core.model.chat.exceptions import (
@@ -1144,3 +1145,830 @@ async def test_structured_output_retry_disables_openrouter_reasoning(
     second_call = mock_client.chat.completions.create.call_args_list[1].kwargs
     assert second_call["extra_body"]["reasoning"] == {"enabled": False}
     assert second_call["extra_body"]["thinking"] == {"type": "disabled"}
+
+
+# ==========================================================================
+# Provider-compatibility retries owned by the client (direct-slug entrypoints)
+# ==========================================================================
+
+_MANDATORY_REASONING_ERROR = (
+    "Reasoning is mandatory for this endpoint and cannot be disabled."
+)
+_THINKING_TOOL_CHOICE_ERROR = "Thinking mode does not support this tool_choice"
+_OPENROUTER_TOOL_CHOICE_ERROR = (
+    "No endpoints found that support the provided 'tool_choice' value."
+)
+
+
+def _two_tool_schema() -> list[dict]:
+    return [
+        _single_tool_schema("answer")[0],
+        _single_tool_schema("skip")[0],
+    ]
+
+
+@pytest.mark.asyncio
+async def test_openrouter_direct_relaxes_tool_choice_on_endpoint_404(
+    mock_chat_completion, mocker
+):
+    """A direct (non-auto) OpenRouter slug retries a rejected tool_choice itself."""
+    mock_client = mocker.AsyncMock()
+    mock_client.chat.completions.create.side_effect = [
+        RuntimeError(_OPENROUTER_TOOL_CHOICE_ERROR),
+        mock_chat_completion,
+    ]
+    mocker.patch(
+        "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+        return_value=mock_client,
+    )
+    llm = OpenRouterLLM(model_name="z-ai/glm-5.2", api_key="test-key")
+
+    result = await llm.chat(
+        [{"role": "user", "content": "score?"}],
+        tools=_two_tool_schema(),
+        tool_choice="required",
+    )
+
+    assert result["content"] == "Hello World"
+    assert mock_client.chat.completions.create.await_count == 2
+    second_call = mock_client.chat.completions.create.call_args_list[1].kwargs
+    assert second_call["tool_choice"] == "auto"
+
+
+def _bad_request_error(message: str) -> openai.BadRequestError:
+    return openai.BadRequestError(
+        f"Error code: 400 - {{'error': {{'message': '{message}'}}}}",
+        response=httpx.Response(
+            400,
+            request=httpx.Request(
+                "POST", "https://openrouter.ai/api/v1/chat/completions"
+            ),
+        ),
+        body={"error": {"message": message, "code": 400}},
+    )
+
+
+@pytest.mark.asyncio
+async def test_openrouter_direct_relaxes_tool_choice_after_bare_bad_request_error(
+    mock_chat_completion, mocker
+):
+    """A bare ``openai.BadRequestError`` must still reach the compat retry loop.
+
+    ``OpenAILLM.chat`` normally converts every ``openai.BadRequestError`` into
+    a ``RuntimeError`` before returning, but its response_format pop-and-retry
+    path (openai.py's ``except openai.BadRequestError`` block) re-issues the
+    request from inside that except clause: if the retried call also raises
+    ``openai.BadRequestError``, that second error is not wrapped by anything
+    and escapes as a bare SDK exception. The compat retry loop must catch it
+    the same way it catches the RuntimeError case, not just replay-fail.
+    """
+    mock_client = mocker.AsyncMock()
+    mock_client.chat.completions.create.side_effect = [
+        _bad_request_error(
+            "the model does not support response_format for this request"
+        ),
+        _bad_request_error(_OPENROUTER_TOOL_CHOICE_ERROR),
+        mock_chat_completion,
+    ]
+    mocker.patch(
+        "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+        return_value=mock_client,
+    )
+    llm = OpenRouterLLM(model_name="z-ai/glm-5.2", api_key="test-key")
+
+    result = await llm.chat(
+        [{"role": "user", "content": "score?"}],
+        tools=_two_tool_schema(),
+        tool_choice="required",
+        response_format={"type": "json_object"},
+    )
+
+    assert result["content"] == "Hello World"
+    assert mock_client.chat.completions.create.await_count == 3
+    final_call = mock_client.chat.completions.create.call_args_list[2].kwargs
+    assert final_call["tool_choice"] == "auto"
+
+
+@pytest.mark.asyncio
+async def test_openrouter_vision_relaxes_tool_choice_after_bare_bad_request_error(
+    mock_chat_completion, mocker
+):
+    """The vision path recovers from the bare BadRequestError escape too.
+
+    ``vision_chat`` is the entrypoint with a live response_format producer in
+    this repository, so the escape guarded here is reachable in production:
+    ``OpenAILLM.vision_chat``'s pop-and-retry resend sits inside its own
+    ``except openai.BadRequestError`` block and a second failure escapes
+    unwrapped, exactly like ``chat``'s.
+    """
+    mock_client = mocker.AsyncMock()
+    mock_client.chat.completions.create.side_effect = [
+        _bad_request_error(
+            "the model does not support response_format for this request"
+        ),
+        _bad_request_error(_OPENROUTER_TOOL_CHOICE_ERROR),
+        mock_chat_completion,
+    ]
+    mocker.patch(
+        "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+        return_value=mock_client,
+    )
+    llm = OpenRouterLLM(
+        model_name="z-ai/glm-5.2",
+        api_key="test-key",
+        abilities=["chat", "tool_calling", "vision"],
+    )
+
+    await llm.vision_chat(
+        [{"role": "user", "content": "score?"}],
+        tools=_two_tool_schema(),
+        tool_choice="required",
+        response_format={"type": "json_object"},
+    )
+
+    assert mock_client.chat.completions.create.await_count == 3
+    final_call = mock_client.chat.completions.create.call_args_list[2].kwargs
+    assert final_call["tool_choice"] == "auto"
+
+
+@pytest.mark.asyncio
+async def test_openrouter_direct_does_not_repeat_mandatory_reasoning_retry(mocker):
+    """Each compat action fires at most once per call, even across a 3-error run."""
+    mock_client = mocker.AsyncMock()
+    mock_client.chat.completions.create.side_effect = [
+        RuntimeError(_MANDATORY_REASONING_ERROR),
+        RuntimeError(_THINKING_TOOL_CHOICE_ERROR),
+        RuntimeError(_MANDATORY_REASONING_ERROR),
+    ]
+    mocker.patch(
+        "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+        return_value=mock_client,
+    )
+    llm = OpenRouterLLM(model_name="z-ai/glm-5.2", api_key="test-key")
+
+    with pytest.raises(RuntimeError, match="Reasoning is mandatory"):
+        await llm.chat(
+            [{"role": "user", "content": "score?"}],
+            tools=_two_tool_schema(),
+            tool_choice="required",
+            thinking={"type": "disabled", "enable": False},
+        )
+
+    assert mock_client.chat.completions.create.await_count == 3
+    thinking_values = [
+        call.kwargs["extra_body"].get("thinking")
+        for call in mock_client.chat.completions.create.call_args_list
+    ]
+    assert thinking_values == [
+        {"type": "disabled"},
+        {"type": "enabled"},
+        {"type": "disabled"},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_openrouter_direct_chains_thinking_and_tool_choice_retries(mocker):
+    """A thinking-conflict 400 followed by a tool_choice 404 chains two adjustments."""
+    mock_client = mocker.AsyncMock()
+    mock_client.chat.completions.create.side_effect = [
+        RuntimeError(_THINKING_TOOL_CHOICE_ERROR),
+        RuntimeError(_OPENROUTER_TOOL_CHOICE_ERROR),
+        SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(
+                        content="ok", tool_calls=None, reasoning_content=None
+                    )
+                )
+            ],
+            usage=None,
+            model_dump=lambda: {"id": "openrouter-chain"},
+        ),
+    ]
+    mocker.patch(
+        "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+        return_value=mock_client,
+    )
+    llm = OpenRouterLLM(model_name="z-ai/glm-5.2", api_key="test-key")
+
+    result = await llm.chat(
+        [{"role": "user", "content": "score?"}],
+        tools=_two_tool_schema(),
+        tool_choice="required",
+        thinking={"type": "enabled", "enable": True},
+    )
+
+    assert result["content"] == "ok"
+    tool_choices = [
+        call.kwargs["tool_choice"]
+        for call in mock_client.chat.completions.create.call_args_list
+    ]
+    assert tool_choices == ["required", "required", "auto"]
+
+
+@pytest.mark.asyncio
+async def test_openrouter_stream_relaxes_tool_choice_before_first_chunk(mocker):
+    """Streaming retries the same compat rules while nothing has been yielded yet."""
+    calls: list[dict] = []
+
+    async def rejects_tool_choice():
+        if False:
+            yield None
+        raise RuntimeError(_OPENROUTER_TOOL_CHOICE_ERROR)
+
+    async def succeeds():
+        yield StreamChunk(type=ChunkType.TOKEN, content="ok", delta="ok")
+
+    def fake_stream(*_args, **kwargs):
+        calls.append(kwargs)
+        return rejects_tool_choice() if len(calls) == 1 else succeeds()
+
+    llm = OpenRouterLLM(model_name="z-ai/glm-5.2", api_key="test-key")
+    mocker.patch.object(llm, "_stream_chat_inner", side_effect=fake_stream)
+
+    chunks = [
+        chunk
+        async for chunk in llm.stream_chat(
+            [{"role": "user", "content": "score?"}],
+            tools=_two_tool_schema(),
+            tool_choice="required",
+        )
+    ]
+
+    assert [chunk.delta for chunk in chunks] == ["ok"]
+    assert len(calls) == 2
+    assert [call["tool_choice"] for call in calls] == ["required", "auto"]
+
+
+@pytest.mark.asyncio
+async def test_openrouter_stream_error_after_first_chunk_not_retried(mocker):
+    """Once a chunk has actually reached the caller, a later error is never retried."""
+    attempts = 0
+
+    async def yields_then_fails():
+        nonlocal attempts
+        attempts += 1
+        yield StreamChunk(type=ChunkType.TOKEN, content="partial", delta="partial")
+        raise RuntimeError(_OPENROUTER_TOOL_CHOICE_ERROR)
+
+    def fake_stream(*_args, **kwargs):
+        del kwargs
+        return yields_then_fails()
+
+    llm = OpenRouterLLM(model_name="z-ai/glm-5.2", api_key="test-key")
+    mocker.patch.object(llm, "_stream_chat_inner", side_effect=fake_stream)
+
+    received = []
+    with pytest.raises(RuntimeError, match="No endpoints found"):
+        async for chunk in llm.stream_chat(
+            [{"role": "user", "content": "score?"}],
+            tools=_two_tool_schema(),
+            tool_choice="required",
+        ):
+            received.append(chunk)
+
+    assert [chunk.delta for chunk in received] == ["partial"]
+    assert attempts == 1
+
+
+@pytest.mark.asyncio
+async def test_openrouter_compat_retry_does_not_catch_llm_retryable_error(mocker):
+    """A retryable protocol error is re-raised even when its text matches a rule.
+
+    The error message deliberately matches the relaxed-tool_choice predicate
+    and the call carries tools with tool_choice="required": without the
+    LLMRetryableError guard the compat retry would swallow the error and
+    replay the request, so the single-call assertion pins the guard itself.
+    """
+    protocol_error = LLMToolProtocolError(
+        provider="deepseek",
+        code="malformed_tool_arguments",
+        message=("No endpoints found that support the provided 'tool_choice' value."),
+    )
+    llm = OpenRouterLLM(model_name="z-ai/glm-5.2", api_key="test-key")
+    prefix_retry_mock = mocker.patch.object(
+        llm, "_chat_with_prefix_retry", side_effect=protocol_error
+    )
+
+    with pytest.raises(LLMToolProtocolError, match="No endpoints found"):
+        await llm.chat(
+            [{"role": "user", "content": "score?"}],
+            tools=_two_tool_schema(),
+            tool_choice="required",
+        )
+
+    assert prefix_retry_mock.call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_openrouter_compat_retry_skips_retryable_error_hidden_in_cause(mocker):
+    """Ordering contract: retry_on() wins over compat-rule text matching.
+
+    A plain RuntimeError whose ``__cause__`` is an ``openai.RateLimitError``
+    is not an ``LLMRetryableError`` instance, so the existing
+    ``except LLMRetryableError: raise`` guard does not catch it — only
+    ``retry_on()``'s ``__cause__`` inspection recognizes it as retryable. The
+    error text is deliberately built to also match the relaxed-tool_choice
+    compat rule ("no endpoints found" / "tool_choice"), so without checking
+    retry_on() first the compat loop would treat this retryable error as an
+    OpenRouter compatibility quirk and replay the request instead of leaving
+    it for the shared LLM retry wrapper.
+    """
+    cause = openai.RateLimitError("rate limited", response=mocker.Mock(), body=None)
+    try:
+        raise RuntimeError(_OPENROUTER_TOOL_CHOICE_ERROR) from cause
+    except RuntimeError as exc:
+        wrapped_rate_limit_error = exc
+
+    llm = OpenRouterLLM(model_name="z-ai/glm-5.2", api_key="test-key")
+    prefix_retry_mock = mocker.patch.object(
+        llm, "_chat_with_prefix_retry", side_effect=wrapped_rate_limit_error
+    )
+
+    with pytest.raises(RuntimeError, match="No endpoints found"):
+        await llm.chat(
+            [{"role": "user", "content": "score?"}],
+            tools=_two_tool_schema(),
+            tool_choice="required",
+        )
+
+    assert prefix_retry_mock.call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_openrouter_direct_thinking_retry_changes_rendered_extra_body(mocker):
+    """A thinking-rule retry (rules 1/2) must change what is actually sent."""
+    mock_client = mocker.AsyncMock()
+    mock_client.chat.completions.create.side_effect = [
+        RuntimeError(_MANDATORY_REASONING_ERROR),
+        SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(
+                        content="ok", tool_calls=None, reasoning_content=None
+                    )
+                )
+            ],
+            usage=None,
+            model_dump=lambda: {"id": "openrouter-thinking"},
+        ),
+    ]
+    mocker.patch(
+        "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+        return_value=mock_client,
+    )
+    llm = OpenRouterLLM(model_name="z-ai/glm-5.2", api_key="test-key")
+
+    await llm.chat(
+        [{"role": "user", "content": "score?"}],
+        thinking={"type": "disabled", "enable": False},
+    )
+
+    extra_bodies = [
+        call.kwargs["extra_body"]
+        for call in mock_client.chat.completions.create.call_args_list
+    ]
+    assert extra_bodies[0] != extra_bodies[1]
+    assert extra_bodies[0]["thinking"] == {"type": "disabled"}
+    assert extra_bodies[1]["thinking"] == {"type": "enabled"}
+
+
+_DISABLE_THINKING_MATCHING_EXTRA_BODY = {
+    "reasoning": {"enabled": False},
+    "thinking": {"type": "disabled"},
+}
+
+
+@pytest.mark.asyncio
+async def test_openrouter_direct_thinking_rule_skipped_when_render_unchanged(
+    mocker, monkeypatch
+):
+    """A disable-thinking match that renders no real change is a no-op.
+
+    The caller already sends ``extra_body`` with thinking disabled, so
+    replaying with ``_DISABLE_DOWNSTREAM_THINKING`` would produce a
+    byte-identical request. The no-op check inside ``_next_compat_adjustment``
+    only catches this when ``render()`` starts from the caller's actual
+    extra_body instead of a synthetic empty one, so with the fix the rule is
+    skipped and the error surfaces after exactly one call.
+    """
+    monkeypatch.setenv("XAGENT_OPENROUTER_OFFICIAL_PROVIDERS_ONLY", "false")
+    mock_client = mocker.AsyncMock()
+    mock_client.chat.completions.create.side_effect = RuntimeError(
+        _THINKING_TOOL_CHOICE_ERROR
+    )
+    mocker.patch(
+        "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+        return_value=mock_client,
+    )
+    llm = OpenRouterLLM(model_name="z-ai/glm-5.2", api_key="test-key")
+
+    with pytest.raises(RuntimeError, match="Thinking mode does not support"):
+        await llm.chat(
+            [{"role": "user", "content": "score?"}],
+            tool_choice="required",
+            thinking=None,
+            extra_body=dict(_DISABLE_THINKING_MATCHING_EXTRA_BODY),
+        )
+
+    assert mock_client.chat.completions.create.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_openrouter_stream_thinking_rule_skipped_when_render_unchanged(
+    mocker, monkeypatch
+):
+    """Streaming counterpart of the no-op disable-thinking skip above."""
+    monkeypatch.setenv("XAGENT_OPENROUTER_OFFICIAL_PROVIDERS_ONLY", "false")
+    calls = 0
+
+    async def rejects():
+        if False:
+            yield None
+        raise RuntimeError(_THINKING_TOOL_CHOICE_ERROR)
+
+    def fake_inner(*_args, **kwargs):
+        nonlocal calls
+        del kwargs
+        calls += 1
+        return rejects()
+
+    llm = OpenRouterLLM(model_name="z-ai/glm-5.2", api_key="test-key")
+    mocker.patch.object(llm, "_stream_chat_inner", side_effect=fake_inner)
+
+    with pytest.raises(RuntimeError, match="Thinking mode does not support"):
+        async for _chunk in llm.stream_chat(
+            [{"role": "user", "content": "score?"}],
+            tool_choice="required",
+            thinking=None,
+            extra_body=dict(_DISABLE_THINKING_MATCHING_EXTRA_BODY),
+        ):
+            pass
+
+    assert calls == 1
+
+
+@pytest.mark.asyncio
+async def test_openrouter_vision_chat_retries_mandatory_reasoning(mocker):
+    """vision_chat shares the same compat retry as chat, with no prefix retry.
+
+    The message carries a real multimodal content list (text + image_url) so
+    this exercises the actual vision dispatch, not just a plain-text payload
+    that happens to go through vision_chat. The spies pin both directions of
+    the fork: OpenAILLM.vision_chat must be the method that actually issues
+    the request, and OpenRouterLLM.chat / _chat_with_prefix_retry (the
+    DeepSeek prefix-retry path) must never run for a vision call. Rewiring
+    vision_chat to super().chat(...) turns this red via the vision_chat spy
+    dropping to zero (super() bypasses the OpenRouterLLM.chat spy), while
+    rewiring it to self.chat(...) is caught by the chat and prefix-retry
+    spies — together the spies discriminate both dispatch mistakes.
+    """
+    success_response = SimpleNamespace(
+        choices=[
+            SimpleNamespace(
+                message=SimpleNamespace(
+                    content="Hello World", tool_calls=None, reasoning_content=None
+                )
+            )
+        ],
+        usage=None,
+        model_dump=lambda: {"id": "openrouter-vision"},
+    )
+    mock_client = mocker.AsyncMock()
+    mock_client.chat.completions.create.side_effect = [
+        RuntimeError(_MANDATORY_REASONING_ERROR),
+        success_response,
+    ]
+    mocker.patch(
+        "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+        return_value=mock_client,
+    )
+    llm = OpenRouterLLM(
+        model_name="z-ai/glm-5.2",
+        api_key="test-key",
+        abilities=["chat", "tool_calling", "vision"],
+    )
+    vision_chat_spy = mocker.spy(OpenAILLM, "vision_chat")
+    chat_spy = mocker.spy(OpenRouterLLM, "chat")
+    prefix_retry_spy = mocker.spy(llm, "_chat_with_prefix_retry")
+
+    result = await llm.vision_chat(
+        [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "describe this image"},
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": "https://example.com/cat.png"},
+                    },
+                ],
+            }
+        ],
+        thinking={"type": "disabled", "enable": False},
+    )
+
+    assert result["content"] == "Hello World"
+    assert mock_client.chat.completions.create.await_count == 2
+    second_call = mock_client.chat.completions.create.call_args_list[1].kwargs
+    assert second_call["extra_body"]["thinking"] == {"type": "enabled"}
+    assert vision_chat_spy.call_count == 2
+    assert chat_spy.call_count == 0
+    assert prefix_retry_spy.call_count == 0
+    for call in mock_client.chat.completions.create.call_args_list:
+        assert "sanitized_out" not in call.kwargs
+
+
+@pytest.mark.asyncio
+async def test_openrouter_deepseek_no_op_thinking_retry_falls_through_to_next_rule(
+    mocker,
+):
+    """A no-op disable-thinking match is skipped so a real fix (enable) still fires."""
+    combined_error = (
+        "Reasoning is mandatory for this endpoint and cannot be disabled, "
+        "and thinking conflicts with tool_choice here."
+    )
+    success_response = SimpleNamespace(
+        choices=[
+            SimpleNamespace(
+                message=SimpleNamespace(
+                    content="ok", tool_calls=None, reasoning_content=None
+                )
+            )
+        ],
+        usage=None,
+        model_dump=lambda: {"id": "openrouter-noop"},
+    )
+    mock_client = mocker.AsyncMock()
+    mock_client.chat.completions.create.side_effect = [
+        RuntimeError(combined_error),
+        success_response,
+    ]
+    mocker.patch(
+        "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+        return_value=mock_client,
+    )
+    llm = OpenRouterLLM(
+        model_name="deepseek/deepseek-v4-flash",
+        api_key="test-key",
+    )
+
+    # deepseek's default (thinking=None) already renders as disabled, so the
+    # "disable thinking" rule (2) would be a no-op against this error; the
+    # aggregator must fall through to rule 1 (enable thinking) instead of
+    # wasting the retry budget replaying an unchanged request.
+    result = await llm.chat(
+        [{"role": "user", "content": "score?"}],
+        tools=_two_tool_schema(),
+        tool_choice="required",
+    )
+
+    assert result["content"] == "ok"
+    assert mock_client.chat.completions.create.await_count == 2
+    second_call = mock_client.chat.completions.create.call_args_list[1].kwargs
+    assert second_call["extra_body"]["thinking"] == {"type": "enabled"}
+
+
+# ==========================================================================
+# Client-layer equivalents of the RouterLLM-level retry tests that used to
+# live in tests/core/model/test_router_provider_config.py (moved here because
+# RouterLLM no longer retries on its own; see router.py).
+# ==========================================================================
+
+
+@pytest.mark.asyncio
+async def test_openrouter_direct_disables_thinking_for_tool_choice_conflict(mocker):
+    """chat: a thinking/tool_choice 400 retries once with thinking disabled.
+
+    Starting from an already-enabled thinking value keeps the disable
+    adjustment a real change (not a no-op), isolating this single rule.
+    """
+    calls: list[dict] = []
+
+    async def fake_inner(messages, **kwargs):
+        del messages
+        calls.append(kwargs)
+        if len(calls) == 1:
+            raise RuntimeError(_THINKING_TOOL_CHOICE_ERROR)
+        return "ok"
+
+    llm = OpenRouterLLM(model_name="z-ai/glm-5.2", api_key="test-key")
+    mocker.patch.object(llm, "_chat_with_prefix_retry", side_effect=fake_inner)
+
+    result = await llm.chat(
+        [{"role": "user", "content": "score?"}],
+        tool_choice="required",
+        thinking={"type": "enabled", "enable": True},
+    )
+
+    assert result == "ok"
+    assert len(calls) == 2
+    assert calls[0]["tool_choice"] == "required"
+    assert calls[0]["thinking"] == {"type": "enabled", "enable": True}
+    assert calls[1]["tool_choice"] == "required"
+    assert calls[1]["thinking"] == openrouter_module._DISABLE_DOWNSTREAM_THINKING
+
+
+@pytest.mark.asyncio
+async def test_openrouter_stream_disables_thinking_for_tool_choice_conflict(mocker):
+    """stream_chat: same rule as above, exercised on the streaming entrypoint."""
+    calls: list[dict] = []
+
+    async def rejects(**_kwargs):
+        if False:
+            yield None
+        raise RuntimeError(_THINKING_TOOL_CHOICE_ERROR)
+
+    async def succeeds(**_kwargs):
+        yield StreamChunk(type=ChunkType.TOKEN, content="ok", delta="ok")
+
+    def fake_inner(messages, **kwargs):
+        del messages
+        calls.append(kwargs)
+        return rejects() if len(calls) == 1 else succeeds()
+
+    llm = OpenRouterLLM(model_name="z-ai/glm-5.2", api_key="test-key")
+    mocker.patch.object(llm, "_stream_chat_inner", side_effect=fake_inner)
+
+    chunks = [
+        chunk
+        async for chunk in llm.stream_chat(
+            [{"role": "user", "content": "score?"}],
+            tool_choice="required",
+            thinking={"type": "enabled", "enable": True},
+        )
+    ]
+
+    assert [chunk.delta for chunk in chunks] == ["ok"]
+    assert len(calls) == 2
+    assert calls[0]["tool_choice"] == "required"
+    assert calls[0]["thinking"] == {"type": "enabled", "enable": True}
+    assert calls[1]["tool_choice"] == "required"
+    assert calls[1]["thinking"] == openrouter_module._DISABLE_DOWNSTREAM_THINKING
+
+
+@pytest.mark.asyncio
+async def test_openrouter_stream_disables_thinking_when_unspecified_non_deepseek(
+    mocker,
+):
+    """stream_chat: an unspecified (None) thinking value still gets a real
+    disable retry for a non-DeepSeek model.
+
+    DeepSeek's None default already renders as disabled (see the no-op test
+    below), so this covers the case where starting from None is a genuine
+    adjustment: any non-DeepSeek slug, where an unset thinking value renders
+    as an empty extra_body rather than an explicit disabled one.
+    """
+    calls: list[dict] = []
+
+    async def rejects(**_kwargs):
+        if False:
+            yield None
+        raise RuntimeError(_THINKING_TOOL_CHOICE_ERROR)
+
+    async def succeeds(**_kwargs):
+        yield StreamChunk(type=ChunkType.TOKEN, content="ok", delta="ok")
+
+    def fake_inner(messages, **kwargs):
+        del messages
+        calls.append(kwargs)
+        return rejects() if len(calls) == 1 else succeeds()
+
+    llm = OpenRouterLLM(model_name="z-ai/glm-5.2", api_key="test-key")
+    mocker.patch.object(llm, "_stream_chat_inner", side_effect=fake_inner)
+
+    chunks = [
+        chunk
+        async for chunk in llm.stream_chat(
+            [{"role": "user", "content": "score?"}],
+            tool_choice="required",
+        )
+    ]
+
+    assert [chunk.delta for chunk in chunks] == ["ok"]
+    assert len(calls) == 2
+    assert calls[0]["thinking"] is None
+    assert calls[1]["tool_choice"] == "required"
+    assert calls[1]["thinking"] == openrouter_module._DISABLE_DOWNSTREAM_THINKING
+
+
+@pytest.mark.asyncio
+async def test_openrouter_stream_thinking_retry_changes_rendered_extra_body(mocker):
+    """stream_chat: same rule as the chat-path test, exercised on streaming.
+
+    A mandatory-reasoning 400 (rule 3) retries once with thinking enabled,
+    and the retried request's ``extra_body`` must actually reflect that
+    change, not just the ``thinking`` kwarg passed to the inner call.
+
+    The retry's success is mocked as an empty stream (the same convention
+    ``test_openrouter_deepseek_stream_retries_prefix_error_before_first_chunk``
+    uses): the raw OpenAI SDK chunk shape this mock would otherwise need to
+    produce is unrelated to what this test is pinning, which is the request
+    actually sent on retry.
+    """
+
+    async def empty_stream():
+        if False:
+            yield None
+
+    mock_client = mocker.AsyncMock()
+    mock_client.chat.completions.create.side_effect = [
+        RuntimeError(_MANDATORY_REASONING_ERROR),
+        empty_stream(),
+    ]
+    mocker.patch(
+        "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+        return_value=mock_client,
+    )
+    llm = OpenRouterLLM(model_name="z-ai/glm-5.2", api_key="test-key")
+
+    chunks = [
+        chunk
+        async for chunk in llm.stream_chat(
+            [{"role": "user", "content": "score?"}],
+            thinking={"type": "disabled", "enable": False},
+        )
+    ]
+
+    assert chunks == []
+    assert mock_client.chat.completions.create.await_count == 2
+    extra_bodies = [
+        call.kwargs["extra_body"]
+        for call in mock_client.chat.completions.create.call_args_list
+    ]
+    assert extra_bodies[0] != extra_bodies[1]
+    assert extra_bodies[0]["thinking"] == {"type": "disabled"}
+    assert extra_bodies[1]["thinking"] == {"type": "enabled"}
+    for call in mock_client.chat.completions.create.call_args_list:
+        assert "sanitized_out" not in call.kwargs
+
+
+@pytest.mark.asyncio
+async def test_openrouter_stream_does_not_repeat_mandatory_reasoning_retry(mocker):
+    """stream_chat: each compat action fires at most once per call, even
+    across a 3-error run, mirroring the chat-path budget guarantee.
+    """
+    mock_client = mocker.AsyncMock()
+    mock_client.chat.completions.create.side_effect = [
+        RuntimeError(_MANDATORY_REASONING_ERROR),
+        RuntimeError(_THINKING_TOOL_CHOICE_ERROR),
+        RuntimeError(_MANDATORY_REASONING_ERROR),
+    ]
+    mocker.patch(
+        "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+        return_value=mock_client,
+    )
+    llm = OpenRouterLLM(model_name="z-ai/glm-5.2", api_key="test-key")
+
+    with pytest.raises(RuntimeError, match="Reasoning is mandatory"):
+        async for _chunk in llm.stream_chat(
+            [{"role": "user", "content": "score?"}],
+            tools=_two_tool_schema(),
+            tool_choice="required",
+            thinking={"type": "disabled", "enable": False},
+        ):
+            pass
+
+    assert mock_client.chat.completions.create.await_count == 3
+    thinking_values = [
+        call.kwargs["extra_body"].get("thinking")
+        for call in mock_client.chat.completions.create.call_args_list
+    ]
+    assert thinking_values == [
+        {"type": "disabled"},
+        {"type": "enabled"},
+        {"type": "disabled"},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_openrouter_deepseek_stream_no_op_thinking_default_propagates(mocker):
+    """stream_chat: DeepSeek's unspecified (None) thinking already renders
+    disabled, so a thinking/tool_choice 400 is a no-op for rule 2; with no
+    other rule matching this text, the error surfaces after exactly one call
+    instead of wasting a retry replaying an unchanged request.
+    """
+    calls = 0
+
+    async def rejects():
+        if False:
+            yield None
+        raise RuntimeError(_THINKING_TOOL_CHOICE_ERROR)
+
+    def fake_inner(*_args, **kwargs):
+        nonlocal calls
+        del kwargs
+        calls += 1
+        return rejects()
+
+    llm = OpenRouterLLM(model_name="deepseek/deepseek-v4-flash", api_key="test-key")
+    mocker.patch.object(llm, "_stream_chat_inner", side_effect=fake_inner)
+
+    with pytest.raises(RuntimeError, match="Thinking mode does not support"):
+        async for _chunk in llm.stream_chat(
+            [{"role": "user", "content": "score?"}],
+            tool_choice="required",
+        ):
+            pass
+
+    assert calls == 1

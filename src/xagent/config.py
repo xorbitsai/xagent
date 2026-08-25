@@ -2809,9 +2809,10 @@ def get_max_trace_payload_bytes() -> int:
     """Max byte size for individual trace payload fields (e.g. data.messages,
     data.response) before truncation.
 
-    Applies to the LLM I/O audit trace added in fix/llm-trace-coverage. A
-    long DAG task hitting all 9 audit sites can otherwise write multi-MB
-    rows into trace_events.
+    Applies to the LLM I/O audit trace: a long DAG task hitting all 9 audit
+    sites can otherwise write multi-MB rows into trace_events. Also bounds
+    the rendered size of every trace category's console log line, not only
+    LLM audit events.
 
     Priority:
         1. XAGENT_MAX_TRACE_PAYLOAD_BYTES env var

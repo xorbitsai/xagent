@@ -588,7 +588,14 @@ async def store_uploaded_files(
             )
         completed = True
     except DurableStorageOperationError as exc:
-        logger.warning("Durable storage unavailable during upload: %s", exc)
+        # The wrap carries the key on the exception rather than in its message
+        # (see DurableStorageOperationError), so render it explicitly -- this
+        # line is what operators grep during an outage and must not lose it.
+        logger.warning(
+            "Durable storage unavailable during upload: %s; storage_key=%s",
+            exc,
+            exc.storage_key,
+        )
         raise _durable_storage_unavailable() from exc
     finally:
         if not completed:

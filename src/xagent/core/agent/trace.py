@@ -6,7 +6,7 @@ import logging
 from abc import ABC, abstractmethod
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Any, Callable, Dict, List, Optional, cast
+from typing import Any, Callable, Dict, List, Optional, Set, cast
 from uuid import uuid4
 
 from ..utils.security import redact_sensitive_text
@@ -594,10 +594,14 @@ def normalize_llm_trace_payload(
     return out
 
 
-# Bound on recursion depth inside `_trim_subtree`. LLM payloads we care
-# about (messages[*].content, tool_calls) nest at most 4-5 levels; 50 is
-# well above that and well below Python's default 1000-frame limit, so a
-# pathological payload can't blow the stack via this helper.
+# Bound on recursion depth for both walks that share it: `_trim_subtree`
+# (per-leaf budget, LLM payloads) and `_shrink_node` (shared budget,
+# console log line). LLM payloads nest at most 4-5 levels
+# (messages[*].content, tool_calls); checkpoint snapshots handed to the
+# console renderer nest deeper (snapshot.context.messages[*].context_refs[*]),
+# which is why one bound covers both. 50 is well above both profiles and
+# well below Python's default 1000-frame limit, so a pathological payload
+# can't blow the stack via either helper.
 _MAX_TRACE_DEPTH = 50
 
 
@@ -879,31 +883,307 @@ class BaseTraceHandler(TraceHandler):
         pass
 
 
+_LOG_BUDGET_SPENT = "...[truncated: log budget exhausted]"
+_LOG_OMITTED_KEYS_KEY = "__omitted_keys__"
+
+# Stands in for a container that is already on the current walk path.
+# ``repr`` marks a back-reference with ``{...}``; this walk rebuilds
+# containers by hand, so it needs a marker of its own.
+_LOG_CYCLE_MARKER = "...[cyclic reference]"
+
+# Budget held back from every container so the ``__omitted_keys__`` /
+# ``...[N more items]`` marker that closes a truncated container still fits
+# inside the caller's byte bound. The markers are written after the budget
+# is spent, so without this reserve the shrunk copy overshoots by one
+# marker per ancestor level and the overshoot lands in
+# ``_render_event_data_for_log``'s hard byte cut, which slices mid-value
+# instead of on a container boundary.
+_LOG_CONTAINER_SLACK = 256
+
+# Fit passes for a string leaf that has to be truncated. The slice is taken
+# in raw bytes but charged in rendered bytes, and ``repr`` escaping expands
+# a raw byte by at most 4x (ASCII control chars render as ``\xNN``).
+# Scaling the slice down by the measured expansion ratio converges within
+# three passes when escapes are spread roughly evenly through the string
+# (0 of 7,200 random escape-heavy payloads needed more). A string whose
+# escapes are concentrated in a long run at its head overstates the
+# expansion of the tail, which can take five or six passes to converge;
+# after three the leaf may still overshoot, and the final hard cut in
+# ``_render_event_data_for_log`` bounds the output.
+_LOG_TRUNCATE_FIT_PASSES = 3
+
+
+def _rendered_width(text: str) -> int:
+    """UTF-8 byte width of ``text`` as it will appear in the rendered log."""
+    return len(text.encode("utf-8", errors="replace"))
+
+
+def _leaf_text(value: Any, depth: int) -> str:
+    """The exact text a leaf contributes to the rendered log line.
+
+    ``_render_event_data_for_log`` renders the whole payload with a single
+    ``f"{...}"``, so a leaf that *is* the payload goes through ``str()`` --
+    a bare string keeps neither quotes nor escapes. Every deeper leaf is
+    rendered by its container's ``repr()``, which adds the quotes and turns
+    a newline into two characters. Charging the wrong one of these is what
+    made a wide scalar container over-truncate and an escape-heavy string
+    container overshoot.
+    """
+    return f"{value}" if depth == 0 else repr(value)
+
+
+def _leaf_width(value: Any, depth: int) -> int:
+    """Rendered byte width of a leaf sitting at ``depth``."""
+    return _rendered_width(_leaf_text(value, depth))
+
+
+def _shrink_within_budget(value: Any, budget: int) -> Any:
+    """Copy ``value`` while spending a single shared byte budget.
+
+    ``truncate_for_trace`` gives every leaf its own slice of the budget,
+    so its result still grows with the number of leaves: a payload with a
+    few thousand message entries stays in the hundreds of kilobytes even
+    after per-leaf trimming. Here the budget is shared across the whole
+    walk instead — once it is spent, the remaining keys and list items are
+    replaced by a short marker — so the copy has a bounded node count and
+    therefore a bounded rendered length.
+
+    Containers are rebuilt with their keys and order intact and leaves are
+    reused as-is, and every node is charged what it actually renders as, so
+    a payload whose rendered width leaves ``_LOG_CONTAINER_SLACK`` bytes of
+    the budget unspent renders exactly as the original would. The reserve
+    is what the omission markers are written out of; a payload that fills
+    the budget to within that reserve loses its last few entries to a
+    marker instead.
+
+    Cycles are not expanded: a container that points back at one of its own
+    ancestors becomes ``_LOG_CYCLE_MARKER``. The same acyclic subtree
+    referenced from two places is still rendered in both.
+
+    Args:
+        value: Original event payload.
+        budget: Total byte budget for the whole subtree; must be > 0.
+
+    Returns:
+        The original value or a bounded copy of it.
+    """
+    # Capped at 1/8 of the budget so a small configured budget (e.g.
+    # XAGENT_MAX_TRACE_PAYLOAD_BYTES=200) doesn't have most of its bytes
+    # eaten by the reserve before any payload data gets a chance to render.
+    # At the default 50,000 this is a no-op: min(256, 6,250) is 256.
+    slack = min(_LOG_CONTAINER_SLACK, max(0, budget // 8))
+    return _shrink_node(value, [budget], 0, set(), slack)
+
+
+def _shrink_string_leaf(
+    value: str, remaining: List[int], depth: int, slack: int
+) -> str:
+    """Charge a string leaf its rendered width, truncating it if it doesn't fit.
+
+    The leaf is charged what it renders as, ``repr`` escaping included, so a
+    container of escape-heavy strings -- tracebacks, code snippets -- stays
+    within the budget when escapes are spread through the string; a long
+    escape run concentrated at the head can defeat the refit loop and falls
+    to the final hard cut (see ``_LOG_TRUNCATE_FIT_PASSES``). A nested leaf
+    leaves ``slack``
+    bytes behind for its ancestors' omission markers; a top-level leaf is
+    the whole log line, so nothing can follow it and it may spend
+    everything.
+    """
+    spendable = remaining[0] if depth == 0 else remaining[0] - slack
+    width = _leaf_width(value, depth)
+    if width <= spendable:
+        remaining[0] -= width
+        return value
+
+    # The slice is taken in raw bytes but charged in rendered bytes, so
+    # measure the marked result and scale the slice down until it fits.
+    # Slicing on a byte boundary and decoding with errors="ignore" drops an
+    # incomplete trailing multi-byte char, so the reported char count stays
+    # accurate.
+    encoded = value.encode("utf-8", errors="replace")
+    marker_slack = min(30, max(8, spendable // 4))
+    allowance = max(0, spendable - marker_slack)
+    # The slice can never usefully exceed the string's own byte length --
+    # without this cap, a string shorter than ``allowance`` (rendered width
+    # inflated past the budget by repr escaping alone) starts the fit loop
+    # with a slice that cuts nothing, wasting a pass on a no-op and, worse,
+    # tacking a "...[truncated 0 chars]" marker onto the untouched string.
+    cut = min(allowance, len(encoded))
+    marked = ""
+    for _ in range(_LOG_TRUNCATE_FIT_PASSES):
+        head = encoded[:cut].decode("utf-8", errors="ignore")
+        marked = f"{head}...[truncated {len(value) - len(head)} chars]"
+        marked_width = _leaf_width(marked, depth)
+        if marked_width <= spendable or cut == 0:
+            break
+        cut = min(len(encoded), max(0, (cut * allowance) // marked_width))
+    remaining[0] -= _leaf_width(marked, depth)
+    return marked
+
+
+def _shrink_node(
+    value: Any,
+    remaining: List[int],
+    depth: int,
+    seen: Set[int],
+    slack: int,
+) -> Any:
+    """Recursive worker for :func:`_shrink_within_budget`.
+
+    ``remaining`` is a single-element list used as a mutable counter so
+    every branch of the walk draws from the same budget. ``seen`` holds the
+    ids of the containers on the path from the root to here -- ids go in on
+    the way down and come out on the way up -- so a back-reference is
+    replaced by a marker while a shared acyclic subtree is still rendered
+    at each of its positions. ``slack`` is the budget held back for the
+    omission markers.
+    """
+    # Unreachable through the current call graph: the top-level call from
+    # _shrink_within_budget only runs when _render_event_data_for_log has
+    # already rejected max_bytes <= 0, so the root starts with
+    # remaining[0] > 0; and every recursive call from the dict/list
+    # branches below only fires after checking remaining[0] - cost > slack
+    # (slack >= 0) and then deducting cost, so remaining[0] is still > 0
+    # at the callee's entry. Kept as a guard for a future direct caller of
+    # _shrink_within_budget that passes a non-positive budget.
+    if remaining[0] <= 0:
+        return _LOG_BUDGET_SPENT
+    if depth >= _MAX_TRACE_DEPTH:
+        too_deep = f"...[truncated: depth exceeds {_MAX_TRACE_DEPTH}]"
+        remaining[0] -= _leaf_width(too_deep, depth)
+        return too_deep
+
+    if isinstance(value, str):
+        return _shrink_string_leaf(value, remaining, depth, slack)
+
+    if isinstance(value, dict):
+        node_id = id(value)
+        if node_id in seen:
+            remaining[0] -= _leaf_width(_LOG_CYCLE_MARKER, depth)
+            return _LOG_CYCLE_MARKER
+        seen.add(node_id)
+        shrunk: Dict[Any, Any] = {}
+        remaining[0] -= 2  # rendered braces
+        for key, item in value.items():
+            key_cost = _rendered_width(f"{key!r}: , ")
+            # A key is charged in full and can't be truncated, so decide
+            # before spending: stopping here instead of after keeps the copy
+            # inside the budget even when one key is wider than what's left.
+            if remaining[0] - key_cost <= slack:
+                # Don't clobber a real payload key that happens to carry the
+                # sentinel's name -- the omission count is worth less than
+                # the data it would overwrite.
+                if _LOG_OMITTED_KEYS_KEY not in shrunk:
+                    shrunk[_LOG_OMITTED_KEYS_KEY] = (
+                        f"{len(value) - len(shrunk)} more keys"
+                    )
+                break
+            remaining[0] -= key_cost
+            shrunk[key] = _shrink_node(item, remaining, depth + 1, seen, slack)
+        seen.discard(node_id)
+        return shrunk
+
+    if isinstance(value, list):
+        node_id = id(value)
+        if node_id in seen:
+            remaining[0] -= _leaf_width(_LOG_CYCLE_MARKER, depth)
+            return _LOG_CYCLE_MARKER
+        seen.add(node_id)
+        items: List[Any] = []
+        remaining[0] -= 2  # rendered brackets
+        for item in value:
+            if remaining[0] - 2 <= slack:
+                items.append(f"...[{len(value) - len(items)} more items]")
+                break
+            remaining[0] -= 2  # rendered separator
+            items.append(_shrink_node(item, remaining, depth + 1, seen, slack))
+        seen.discard(node_id)
+        return items
+
+    # Numbers, bools, None and anything else: reused as-is and charged what
+    # they render as, so a wide container of scalars spends the budget at
+    # the rate the log line actually grows. A single leaf whose repr is
+    # wider than the whole budget is still left alone here and caught by the
+    # final string cap in ``_render_event_data_for_log``.
+    remaining[0] -= _leaf_width(value, depth)
+    return value
+
+
+def _render_event_data_for_log(data: Any, max_bytes: Optional[int] = None) -> str:
+    """Render ``event.data`` into a size-bounded string for console logging.
+
+    This is the log-rendering sink only. Trace payloads are not capped per
+    category at the tracer boundary (only LLM events go through
+    ``normalize_llm_trace_payload``), and checkpoint events carry a full
+    execution snapshot, so interpolating ``event.data`` straight into a log
+    line produces multi-megabyte lines on long-context tasks.
+
+    Persistence paths must keep the full payload — truncating a durable
+    checkpoint record would break task recovery — so the bound lives here,
+    at the point where the string is built, and nowhere else.
+
+    Args:
+        data: The event payload to render.
+        max_bytes: Byte bound for the rendered string. A value of 0 or
+            less disables truncation. When ``None``, reads
+            ``XAGENT_MAX_TRACE_PAYLOAD_BYTES`` (default 50_000; that path
+            accepts 0 to disable but rejects negatives, falling back to
+            the default).
+
+    Returns:
+        A string no longer than ``max_bytes`` plus a truncation marker.
+    """
+    if max_bytes is None:
+        # Local import to avoid circular dependency at module load
+        from ...config import get_max_trace_payload_bytes
+
+        max_bytes = get_max_trace_payload_bytes()
+
+    if max_bytes <= 0:
+        return f"{data}"
+
+    rendered = f"{_shrink_within_budget(data, max_bytes)}"
+    encoded = rendered.encode("utf-8", errors="replace")
+    if len(encoded) <= max_bytes:
+        return rendered
+    # Slice on a byte boundary and drop an incomplete trailing multi-byte
+    # char, matching the string-leaf truncation above.
+    head = encoded[:max_bytes].decode("utf-8", errors="ignore")
+    return f"{head}...[truncated {len(rendered) - len(head)} chars]"
+
+
 class ConsoleTraceHandler(BaseTraceHandler):
-    """Trace handler that logs events to console with clear scope information."""
+    """Trace handler that logs events to console with clear scope information.
+
+    Payloads are rendered through ``_render_event_data_for_log`` so a large
+    event (a checkpoint snapshot, for instance) cannot turn into a
+    multi-megabyte log line. This handler is observational only; the
+    persistence handlers keep the untrimmed payload.
+    """
 
     async def _handle_task_event(self, event: TraceEvent) -> None:
         """Handle task-level events."""
         logger.info(
-            f"[TASK] {event.event_type.action.value.upper()} {event.event_type.category.value.upper()} - Task {event.task_id} - {event.data}"
+            f"[TASK] {event.event_type.action.value.upper()} {event.event_type.category.value.upper()} - Task {event.task_id} - {_render_event_data_for_log(event.data)}"
         )
 
     async def _handle_step_event(self, event: TraceEvent) -> None:
         """Handle step-level events."""
         logger.info(
-            f"[STEP] {event.event_type.action.value.upper()} {event.event_type.category.value.upper()} - Step {event.step_id} - {event.data}"
+            f"[STEP] {event.event_type.action.value.upper()} {event.event_type.category.value.upper()} - Step {event.step_id} - {_render_event_data_for_log(event.data)}"
         )
 
     async def _handle_action_event(self, event: TraceEvent) -> None:
         """Handle action-level events."""
         logger.info(
-            f"[ACTION] {event.event_type.action.value.upper()} {event.event_type.category.value.upper()} - Step {event.step_id} - {event.data}"
+            f"[ACTION] {event.event_type.action.value.upper()} {event.event_type.category.value.upper()} - Step {event.step_id} - {_render_event_data_for_log(event.data)}"
         )
 
     async def _handle_system_event(self, event: TraceEvent) -> None:
         """Handle system-level events."""
         logger.info(
-            f"[SYSTEM] {event.event_type.action.value.upper()} {event.event_type.category.value.upper()} - {event.data}"
+            f"[SYSTEM] {event.event_type.action.value.upper()} {event.event_type.category.value.upper()} - {_render_event_data_for_log(event.data)}"
         )
 
 

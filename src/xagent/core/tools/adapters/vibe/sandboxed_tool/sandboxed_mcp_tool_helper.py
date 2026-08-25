@@ -21,6 +21,7 @@ from .sandboxed_tool_wrapper import (
     SANDBOX_BASE_DEPENDENCIES,
     SANDBOX_SRC_ROOT,
     SandboxDependencyManager,
+    _SandboxLeaseProviderLike,
     create_sandboxed_tool,
     resolve_primary_sandbox,
 )
@@ -85,7 +86,7 @@ def _serialize_connection(connection: Connection) -> str:
 
 
 async def list_tools_in_sandbox(
-    sandbox: Sandbox,
+    sandbox: Sandbox | _SandboxLeaseProviderLike,
     connection: Connection,
     *,
     timeout_seconds: int = _MCP_SANDBOX_TIMEOUT_SECONDS,
@@ -160,7 +161,7 @@ async def list_tools_in_sandbox(
 
 async def load_sandboxed_mcp_tools(
     connection: Connection,
-    sandbox: Sandbox,
+    sandbox: Sandbox | _SandboxLeaseProviderLike,
     tool_builder: Callable[[MCPTool], AbstractBaseTool],
 ) -> SandboxedMCPLoadResult:
     """Load MCP tool metadata in sandbox and wrap built tools for sandboxed calls."""

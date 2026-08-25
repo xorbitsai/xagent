@@ -5,18 +5,21 @@ Sandbox-vs-SandboxLeaseProvider unwrap logic, not real sandbox execution.
 """
 
 import json
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
 import pytest
 
+from xagent.core.tools.adapters.vibe.python_executor import PythonExecutorToolForBasic
 from xagent.core.tools.adapters.vibe.sandboxed_tool.sandboxed_mcp_tool_helper import (
     list_tools_in_sandbox,
     load_sandboxed_mcp_tools,
 )
 from xagent.core.tools.adapters.vibe.sandboxed_tool.sandboxed_tool_wrapper import (
     SandboxDependencyManager,
+    create_sandboxed_tool,
     resolve_primary_sandbox,
 )
+from xagent.sandbox.base import Sandbox
 
 
 @pytest.fixture(autouse=True)
@@ -38,7 +41,13 @@ def _make_exec_result(exit_code: int = 0, stderr: str = "") -> MagicMock:
 
 
 def _make_plain_sandbox(tool_names: list[str]) -> MagicMock:
-    sandbox = MagicMock()
+    # spec=Sandbox matters, not just style: an unspecced MagicMock
+    # auto-vivifies *any* attribute you touch, including `.primary_sandbox`
+    # -- which made resolve_primary_sandbox's `hasattr(value,
+    # "primary_sandbox")` check misclassify this plain-sandbox double as a
+    # lease provider (a real Sandbox never has that attribute; only the
+    # spec-less mock pretended to). See _has_primary_sandbox's docstring.
+    sandbox = MagicMock(spec=Sandbox)
     sandbox.name = "mock_sandbox"
     sandbox.exec = AsyncMock(return_value=_make_exec_result())
     sandbox.read_file = AsyncMock(
@@ -89,8 +98,14 @@ async def test_list_tools_in_sandbox_unwraps_lease_provider():
     tools = await list_tools_in_sandbox(lease_provider, connection)
 
     assert [t.name for t in tools] == ["xero_tool"]
-    primary_sandbox.exec.assert_awaited()
     primary_sandbox.read_file.assert_awaited()
+    # Pin the cleanup call to its actual args (not just "was exec awaited
+    # at all", which the earlier runner-script exec call already
+    # satisfies): a regression that sent cleanup to a different receiver,
+    # or dropped the result-file arg, would otherwise pass silently --
+    # list_tools_in_sandbox's `except Exception: pass` around cleanup
+    # means nothing else would surface it either.
+    primary_sandbox.exec.assert_any_await("rm", "-f", ANY)
 
 
 @pytest.mark.asyncio
@@ -129,3 +144,22 @@ async def test_load_sandboxed_mcp_tools_passes_original_provider_not_primary():
 def test_resolve_primary_sandbox_rejects_none():
     with pytest.raises(ValueError, match="sandbox cannot be None"):
         resolve_primary_sandbox(None)
+
+
+@pytest.mark.asyncio
+async def test_create_sandboxed_tool_stores_lease_provider_not_primary():
+    """Complements test_load_sandboxed_mcp_tools_passes_original_provider_not_primary:
+    that test only checks create_sandboxed_tool's *call args* through a mock, so it
+    can't catch a regression inside SandboxedToolWrapper's own __init__ that started
+    resolving to the primary sandbox before storing it. Construct a real wrapper (no
+    mocking of create_sandboxed_tool itself) and inspect what it actually kept."""
+    primary_sandbox = _make_plain_sandbox(["xero_tool"])
+    lease_provider = _FakeSandboxLeaseProvider(primary_sandbox)
+
+    wrapper = await create_sandboxed_tool(
+        tool=PythonExecutorToolForBasic(None),
+        sandbox=lease_provider,
+    )
+
+    assert wrapper._sandbox is lease_provider
+    assert wrapper._sandbox is not primary_sandbox

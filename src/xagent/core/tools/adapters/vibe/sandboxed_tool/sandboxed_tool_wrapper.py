@@ -108,6 +108,28 @@ def _is_sandbox_lease_provider(
     return callable(getattr(type(value), "lease", None))
 
 
+def _has_primary_sandbox(value: Any) -> TypeGuard[_SandboxLeaseProviderLike]:
+    """Return whether an object exposes ``.primary_sandbox``.
+
+    A separate, narrower check from _is_sandbox_lease_provider: this is
+    the one attribute resolve_primary_sandbox actually dereferences, and
+    checking for it directly (rather than reusing the lease-only check)
+    keeps this sound for resolve_primary_sandbox's own contract without
+    touching _is_sandbox_lease_provider's existing, battle-tested
+    definition that _lease_sandbox()/FakeLeaseProvider-style test doubles
+    depend on (see that function's docstring for why it can't require
+    ``.primary_sandbox`` too).
+
+    Sound for the two real production shapes (a concrete Sandbox subclass
+    never has this attribute; SandboxLeaseProvider always does), but an
+    unspecced ``MagicMock()`` auto-vivifies *any* attribute access,
+    including this one -- a mock meant to stand in for a plain Sandbox
+    must be built with ``spec=Sandbox`` or it will misclassify as a lease
+    provider here.
+    """
+    return hasattr(value, "primary_sandbox")
+
+
 def resolve_primary_sandbox(sandbox: "Sandbox | _SandboxLeaseProviderLike") -> Sandbox:
     """Unwrap a SandboxLeaseProvider to its primary Sandbox, if given one.
 
@@ -116,10 +138,19 @@ def resolve_primary_sandbox(sandbox: "Sandbox | _SandboxLeaseProviderLike") -> S
     use this instead of re-deriving the same ``.primary_sandbox`` check --
     a SandboxLeaseProvider has no ``.exec``/``.read_file``/``.name`` of its
     own, so operating on it directly raises AttributeError.
+
+    Checks ``isinstance(sandbox, Sandbox)`` first, before the ``.primary_sandbox``
+    duck-type check: a concrete Sandbox is never misclassified this way
+    regardless of what attributes it happens to expose, which matters
+    because SandboxLeaseProvider is not a Sandbox subclass and vice versa
+    -- the two shapes don't otherwise overlap in production, but nothing
+    stops an untyped test double from claiming to be either.
     """
     if sandbox is None:
         raise ValueError("sandbox cannot be None")
-    if _is_sandbox_lease_provider(sandbox):
+    if isinstance(sandbox, Sandbox):
+        return sandbox
+    if _has_primary_sandbox(sandbox):
         return sandbox.primary_sandbox
     return cast(Sandbox, sandbox)
 
@@ -659,14 +690,16 @@ class SandboxedToolWrapper(AbstractBaseTool):
 
 async def create_sandboxed_tool(
     tool: AbstractBaseTool,
-    sandbox: Sandbox,
+    sandbox: "Sandbox | _SandboxLeaseProviderLike",
 ) -> SandboxedToolWrapper:
     """
     Create sandboxed tool instance
 
     Args:
         tool: Tool to wrap
-        sandbox: Created sandbox instance
+        sandbox: Created sandbox instance, or a lease provider -- retained
+            as-is (never resolved to its primary here) so each per-call
+            invocation can still take its own worker-slot lease
 
     Returns:
         Sandboxed tool wrapper

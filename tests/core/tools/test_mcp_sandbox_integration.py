@@ -18,6 +18,7 @@ from xagent.core.tools.adapters.vibe.sandboxed_tool.sandboxed_tool_wrapper impor
     SANDBOX_BASE_DEPENDENCIES,
 )
 from xagent.core.tools.core.mcp.sessions import Connection
+from xagent.sandbox.base import Sandbox
 
 
 class TestShouldSandboxMcpConnection:
@@ -43,7 +44,10 @@ class TestListToolsInSandbox:
 
     @pytest.mark.asyncio
     async def test_requirements_preserve_mcp_without_reinstalling_uv(self):
-        sandbox = AsyncMock()
+        # spec=Sandbox: an unspecced AsyncMock auto-vivifies any attribute,
+        # including `.primary_sandbox`, which makes resolve_primary_sandbox
+        # mistake this plain-sandbox double for a SandboxLeaseProvider.
+        sandbox = AsyncMock(spec=Sandbox)
         sandbox.exec.side_effect = [
             MagicMock(exit_code=0, stderr="", error_message=None),
             MagicMock(exit_code=0),
@@ -64,7 +68,7 @@ class TestListToolsInSandbox:
 
     @pytest.mark.asyncio
     async def test_reads_result_file_and_builds_tools(self):
-        sandbox = AsyncMock()
+        sandbox = AsyncMock(spec=Sandbox)
         sandbox.name = "test-sandbox"
 
         json_payload = '[{"name":"echo","description":"Echo","inputSchema":{"type":"object","properties":{}}}]'

@@ -765,9 +765,10 @@ class ToolFactory:
             if workspace is not None:
                 from .sandboxed_tool.sandboxed_tool_wrapper import (
                     create_workspace_in_sandbox,
+                    resolve_primary_sandbox,
                 )
 
-                setup_sandbox = getattr(sandbox, "primary_sandbox", sandbox)
+                setup_sandbox = resolve_primary_sandbox(sandbox)
                 await create_workspace_in_sandbox(setup_sandbox, workspace)
             tools = await ToolFactory._wrap_sandbox_tools(tools, sandbox)
 

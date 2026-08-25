@@ -12,7 +12,7 @@ import logging
 import os
 import uuid
 from pathlib import Path
-from typing import Any, Mapping, Optional, Type, cast
+from typing import Any, Mapping, Optional, Protocol, Type, TypeGuard, cast
 
 import cloudpickle  # type: ignore[import-untyped]
 from pydantic import BaseModel
@@ -61,12 +61,28 @@ class _StaticSandboxLease:
         return None
 
 
-def _is_sandbox_lease_provider(value: Any) -> bool:
+class _SandboxLeaseProviderLike(Protocol):
+    """Structural shape of a SandboxLeaseProvider (src/xagent/web/sandbox_manager.py).
+
+    A Protocol rather than an import of that class: this module lives under
+    core/ and must not depend on web/. Declaring the shape here lets
+    resolve_primary_sandbox's signature express what it actually accepts
+    instead of ``Any``.
+    """
+
+    primary_sandbox: Sandbox
+
+    def lease(self, *, concurrency_safe: bool) -> Any: ...
+
+
+def _is_sandbox_lease_provider(
+    value: Any,
+) -> TypeGuard[_SandboxLeaseProviderLike]:
     """Return whether an object is a real sandbox lease provider."""
     return callable(getattr(type(value), "lease", None))
 
 
-def resolve_primary_sandbox(sandbox: Any) -> Sandbox:
+def resolve_primary_sandbox(sandbox: "Sandbox | _SandboxLeaseProviderLike") -> Sandbox:
     """Unwrap a SandboxLeaseProvider to its primary Sandbox, if given one.
 
     For one-shot/setup-style operations (dependency install, MCP tool
@@ -77,10 +93,9 @@ def resolve_primary_sandbox(sandbox: Any) -> Sandbox:
     """
     if sandbox is None:
         raise ValueError("sandbox cannot be None")
-    resolved = (
-        sandbox.primary_sandbox if _is_sandbox_lease_provider(sandbox) else sandbox
-    )
-    return cast(Sandbox, resolved)
+    if _is_sandbox_lease_provider(sandbox):
+        return sandbox.primary_sandbox
+    return cast(Sandbox, sandbox)
 
 
 class SandboxDependencyManager:

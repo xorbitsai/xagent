@@ -5,12 +5,13 @@ Sandbox-vs-SandboxLeaseProvider unwrap logic, not real sandbox execution.
 """
 
 import json
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from xagent.core.tools.adapters.vibe.sandboxed_tool.sandboxed_mcp_tool_helper import (
     list_tools_in_sandbox,
+    load_sandboxed_mcp_tools,
 )
 from xagent.core.tools.adapters.vibe.sandboxed_tool.sandboxed_tool_wrapper import (
     SandboxDependencyManager,
@@ -90,6 +91,39 @@ async def test_list_tools_in_sandbox_unwraps_lease_provider():
     assert [t.name for t in tools] == ["xero_tool"]
     primary_sandbox.exec.assert_awaited()
     primary_sandbox.read_file.assert_awaited()
+
+
+@pytest.mark.asyncio
+async def test_load_sandboxed_mcp_tools_passes_original_provider_not_primary():
+    """list_tools_in_sandbox resolves the primary sandbox internally for its
+    one-shot metadata call, but load_sandboxed_mcp_tools must still hand
+    create_sandboxed_tool the *original* provider -- not that resolved
+    primary -- so each wrapped tool keeps per-call worker-slot leasing. A
+    future refactor that started passing the primary everywhere would break
+    concurrency isolation for real tool calls while leaving this untested."""
+    primary_sandbox = _make_plain_sandbox(["xero_tool"])
+    lease_provider = _FakeSandboxLeaseProvider(primary_sandbox)
+    connection = {
+        "transport": "stdio",
+        "command": "npx",
+        "args": ["-y", "@xeroapi/xero-mcp-server@latest"],
+    }
+    fake_wrapped_tool = MagicMock()
+
+    with patch(
+        "xagent.core.tools.adapters.vibe.sandboxed_tool.sandboxed_mcp_tool_helper."
+        "create_sandboxed_tool",
+        new=AsyncMock(return_value=fake_wrapped_tool),
+    ) as mock_create:
+        result = await load_sandboxed_mcp_tools(
+            connection, lease_provider, lambda mcp_tool: MagicMock()
+        )
+
+    assert result.tools == (fake_wrapped_tool,)
+    mock_create.assert_awaited_once()
+    _called_tool, called_sandbox = mock_create.await_args.args
+    assert called_sandbox is lease_provider
+    assert called_sandbox is not primary_sandbox
 
 
 def test_resolve_primary_sandbox_rejects_none():

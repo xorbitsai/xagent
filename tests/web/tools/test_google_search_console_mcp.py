@@ -237,6 +237,10 @@ def test_list_sites_degenerate_trim_reports_true_count_not_zero(monkeypatch):
     assert result["site_count"] == 1
     assert result["truncated"] is True
     assert len(json.dumps(result)) < max_output_length
+    # list_sites has no page size/offset to retry with, unlike
+    # query_search_analytics — the hint must say so honestly rather than
+    # suggesting a retry that can't actually help.
+    assert "no page size/offset" in result["hint"]
 
 
 def test_list_sites_filters_out_entries_without_site_url(monkeypatch):
@@ -440,6 +444,7 @@ def test_list_sitemaps_degenerate_trim_reports_true_count_not_zero(monkeypatch):
     assert result["sitemap_count"] == 1
     assert result["truncated"] is True
     assert len(response) < max_output_length
+    assert "no page size/offset" in result["hint"]
 
 
 def test_list_sitemaps_treats_non_list_sitemap_field_as_empty(monkeypatch, caplog):

@@ -130,6 +130,26 @@ def _row_trim_hint(safe_row_count: int) -> str:
     )
 
 
+def _no_pagination_trim_hint(noun: str) -> Callable[[int], str]:
+    """Build the truncated_hint for list_sites/list_sitemaps: unlike
+    query_search_analytics, neither underlying Google API takes a
+    page size or offset — it always returns every entry in one response —
+    so there is no smaller-request retry that would help. The caller needs
+    to know the dropped entries are genuinely unreachable through this
+    tool, not just that they should ask again differently.
+    """
+
+    def _hint(shown_count: int) -> str:
+        return (
+            f"response truncated for output size; only {shown_count} of the "
+            f"real {noun} count could be included, and this API has no "
+            f"page size/offset to request a smaller batch — the remaining "
+            f"{noun} are not retrievable through this tool"
+        )
+
+    return _hint
+
+
 def _error(message: str) -> str:
     return json.dumps({"status": "error", "message": message}, ensure_ascii=False)
 
@@ -292,7 +312,12 @@ def google_search_console_list_sites() -> str:
             for entry in site_entries
             if isinstance(entry, dict) and entry.get("siteUrl")
         ]
-        return _success_with_trimmed_list("sites", sites, "site_count")
+        return _success_with_trimmed_list(
+            "sites",
+            sites,
+            "site_count",
+            truncated_hint=_no_pagination_trim_hint("sites"),
+        )
     except Exception as e:
         logger.error(f"Error listing Google Search Console sites: {e}")
         return _error(str(e))
@@ -324,7 +349,12 @@ def google_search_console_list_sitemaps(site_url: str) -> str:
                     f"as empty"
                 )
             sitemaps = []
-        return _success_with_trimmed_list("sitemaps", sitemaps, "sitemap_count")
+        return _success_with_trimmed_list(
+            "sitemaps",
+            sitemaps,
+            "sitemap_count",
+            truncated_hint=_no_pagination_trim_hint("sitemaps"),
+        )
     except Exception as e:
         logger.error(f"Error listing sitemaps for {site_url!r}: {e}")
         return _error(str(e))

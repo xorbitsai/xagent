@@ -1282,6 +1282,7 @@ async def test_execution_adapter_forwards_outbound_messages() -> None:
 @pytest.mark.asyncio
 async def test_execution_adapter_rejects_outbound_control_calls_when_disabled() -> None:
     sent_messages: list[dict[str, Any]] = []
+    work_tool = FakeTool()
     llm = FakeLLM(
         [
             {
@@ -1298,7 +1299,14 @@ async def test_execution_adapter_rejects_outbound_control_calls_when_disabled() 
                                 }
                             ),
                         },
-                    }
+                    },
+                    {
+                        "id": "call-work",
+                        "function": {
+                            "name": "noop",
+                            "arguments": json.dumps({"value": "must-not-run"}),
+                        },
+                    },
                 ]
             },
             {
@@ -1325,6 +1333,7 @@ async def test_execution_adapter_rejects_outbound_control_calls_when_disabled() 
             name="noninteractive",
             pattern="single_call",
             llm=llm,
+            tools=[work_tool],
             outbound_message_handler=sent_messages.append,
             skills_enabled=False,
             user_interaction_enabled=False,
@@ -1336,12 +1345,20 @@ async def test_execution_adapter_rejects_outbound_control_calls_when_disabled() 
     assert result["success"] is True
     assert result["output"] == "done"
     assert sent_messages == []
+    assert work_tool.calls == []
     assert [schema["function"]["name"] for schema in llm.calls[0]["tools"]] == [
-        "final_answer"
+        "noop",
+        "final_answer",
     ]
     assert [schema["function"]["name"] for schema in llm.calls[1]["tools"]] == [
         "final_answer"
     ]
+    cancelled_work = next(
+        message
+        for message in llm.calls[1]["messages"]
+        if message.get("role") == "tool" and message.get("tool_call_id") == "call-work"
+    )
+    assert "cancelled" in cancelled_work["content"]
 
 
 def test_execution_adapter_uses_last_assistant_message_when_output_missing() -> None:

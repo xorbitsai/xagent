@@ -1904,6 +1904,17 @@ class ReActPattern(AgentPattern):
                 result={"success": False, "error": error},
                 tool_call_id=tool_call.get("id"),
             )
+            remaining = [
+                pending
+                for pending in self.pending_tool_calls
+                if pending is not tool_call
+            ]
+            self.pending_tool_calls = [tool_call]
+            self._cancel_tool_calls(
+                remaining,
+                context,
+                reason=f"Discarded because control tool '{name}' is disabled.",
+            )
             self.force_final_answer_next = True
             return None
 

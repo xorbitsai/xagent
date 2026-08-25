@@ -561,13 +561,18 @@ def test_request_requiring_membership_passes_through_on_success(monkeypatch):
 
 
 def test_request_requiring_membership_reraises_unrelated_errors(monkeypatch):
+    """channel_not_found isn't in the default not_a_member_codes (only
+    conversations.replies/reactions.* need the wider set) — this must raise
+    the raw _SlackAPIError, not get rewritten into the actionable
+    _SlackNotAMemberError, so a widening regression can't hide behind a
+    substring match on the (still-present) error code."""
     monkeypatch.setattr(
         slack.requests,
         "request",
         Mock(return_value=MockResponse({"ok": False, "error": "channel_not_found"})),
     )
 
-    with pytest.raises(RuntimeError, match="channel_not_found"):
+    with pytest.raises(slack._SlackAPIError, match="channel_not_found"):
         slack._request_requiring_membership(
             "GET", "conversations.history", params={"channel": "C0123456789"}
         )
@@ -813,6 +818,27 @@ def test_get_channel_history_reports_actionable_error_when_not_a_member(monkeypa
     assert result["status"] == "error"
     assert "slack_join_channel" in result["message"]
     assert mock_request.call_count == 1
+
+
+def test_get_channel_history_does_not_treat_channel_not_found_as_actionable(
+    monkeypatch,
+):
+    """conversations.history documents not_in_channel distinctly from
+    channel_not_found (unlike conversations.replies/reactions.*), so a
+    genuine channel_not_found here must stay a plain error — widening the
+    default code set to match the replies/reactions endpoints would make a
+    truly-missing channel get misreported as a membership problem."""
+    monkeypatch.setattr(
+        slack.requests,
+        "request",
+        Mock(return_value=MockResponse({"ok": False, "error": "channel_not_found"})),
+    )
+
+    result = json.loads(slack.slack_get_channel_history("C0123456789"))
+
+    assert result["status"] == "error"
+    assert "slack_join_channel" not in result["message"]
+    assert "channel_not_found" in result["message"]
 
 
 # ---------------------------------------------------------------------------

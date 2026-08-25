@@ -217,6 +217,29 @@ def test_upgrade_preserves_customized_description(tmp_path):
         assert scopes == migration.CURRENT_SCOPES
 
 
+def test_downgrade_preserves_customized_description(tmp_path):
+    """Mirrors test_downgrade_preserves_customized_provider_default_scopes:
+    an operator customization made after upgrade() must survive downgrade()
+    too, not just upgrade()."""
+    engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
+    migration = _load_migration_module()
+    with engine.begin() as connection:
+        _create_table(
+            connection, migration.PREVIOUS_SCOPES, migration.PREVIOUS_DESCRIPTION
+        )
+        with patch.object(migration, "op", _operations(connection)):
+            migration.upgrade()
+            connection.execute(
+                text(
+                    "UPDATE public_mcp_apps SET description = :d WHERE app_id = 'slack'"
+                ),
+                {"d": "A custom description"},
+            )
+            migration.downgrade()
+        description, _ = _row(connection)
+        assert description == "A custom description"
+
+
 def test_upgrade_updates_provider_default_scopes(tmp_path):
     engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
     migration = _load_migration_module()

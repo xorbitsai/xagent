@@ -295,10 +295,13 @@ def test_downgrade_does_not_touch_user_oauth(tmp_path):
 
 
 def test_migration_fields_match_registry():
-    """This migration's CURRENT_SCOPES is a historical snapshot, not the
-    app's final scope set — 20260825_add_slack_channels_join_scope layers
-    another scope on top of it, so only a subset check (every scope this
-    migration granted is still present) holds going forward."""
+    """This migration's CURRENT_SCOPES and CURRENT_DESCRIPTION are historical
+    snapshots, not the app's final values — 20260825_add_slack_channels_join_scope
+    layers another scope and description update on top of them, so only a
+    subset check on scopes (every scope this migration granted is still
+    present) holds going forward; the live description is no longer this
+    migration's CURRENT_DESCRIPTION but 20260825's (see that migration's own
+    test_migration_fields_match_registry for the exact-match check)."""
     from xagent.web.builtin_mcp_registry import get_builtin_public_mcp_app_rows
 
     migration = _load_migration_module()
@@ -306,7 +309,6 @@ def test_migration_fields_match_registry():
         r for r in get_builtin_public_mcp_app_rows() if r["app_id"] == "slack"
     )
     assert set(migration.CURRENT_SCOPES) <= set(registry_row["oauth_scopes"])
-    assert migration.CURRENT_DESCRIPTION == registry_row["description"]
 
 
 # ---------------------------------------------------------------------------

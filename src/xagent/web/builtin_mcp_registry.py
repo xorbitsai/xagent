@@ -679,7 +679,7 @@ def get_builtin_public_mcp_app_rows() -> list[dict[str, Any]]:
         {
             "app_id": "slack",
             "name": "Slack",
-            "description": "Connect to Slack to search and read channel, thread, and DM history, post messages and replies, react to messages, and upload files, e.g. incident summaries and recommended fixes.",
+            "description": "Connect to Slack to search and read channel, thread, and DM history, post messages and replies, react to messages, upload files, and (with your approval) join public channels, e.g. incident summaries and recommended fixes.",
             "icon": "https://www.google.com/s2/favicons?domain=slack.com&sz=128",
             "transport": "oauth",
             "provider_name": "slack",

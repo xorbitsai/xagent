@@ -170,6 +170,31 @@ def _resolve_allowed_file_path(file_path: str) -> Path:
     )
 
 
+class _SlackAPIError(RuntimeError):
+    """Raised by _request for any non-ok Slack response.
+
+    Carries Slack's raw error code as structured state (`.code`) so callers
+    can branch on it directly instead of parsing the rendered message
+    string — str(e) still equals the code, so every existing `except
+    Exception as e: ... str(e)` call site is unaffected.
+    """
+
+    def __init__(self, code: str) -> None:
+        self.code = code
+        super().__init__(code)
+
+
+class _SlackNotAMemberError(RuntimeError):
+    """Raised by _request_requiring_membership once a not-a-member-style
+    failure has been translated into an actionable, user-facing message.
+
+    Distinct from _SlackAPIError so a caller that needs to tell "this is the
+    actionable one" apart from any other failure (see slack_search_messages,
+    where a later transient error must not mask an earlier actionable one)
+    can use isinstance() instead of substring-matching the rendered text.
+    """
+
+
 def _request(
     method: str,
     path: str,
@@ -211,8 +236,22 @@ def _request(
     response.raise_for_status()
     payload: dict[str, Any] = response.json()
     if not payload.get("ok"):
-        raise RuntimeError(payload.get("error") or "Unknown Slack API error")
+        raise _SlackAPIError(payload.get("error") or "Unknown Slack API error")
     return payload
+
+
+# Slack documents "not_in_channel" for conversations.history/replies,
+# chat.postMessage, and files.completeUploadExternal, but conversations.replies
+# and reactions.add/remove do NOT document it — they document
+# "channel_not_found" instead, which is ambiguous (bad id vs. a real channel
+# hidden from a non-member caller). Only conversations.replies and
+# reactions.* need this widened set: by the time either is called here,
+# _resolve_channel_id has already confirmed the channel exists via
+# conversations.list, so a channel_not_found from these specific endpoints is
+# far more likely "the bot isn't a member and Slack is hiding it" than "this
+# channel doesn't exist".
+_HIDDEN_FROM_NON_MEMBER_CODES = frozenset({"not_in_channel", "channel_not_found"})
+_DEFAULT_NOT_A_MEMBER_CODES = frozenset({"not_in_channel"})
 
 
 def _request_requiring_membership(
@@ -221,6 +260,7 @@ def _request_requiring_membership(
     *,
     params: dict[str, Any] | None = None,
     json_data: dict[str, Any] | None = None,
+    not_a_member_codes: frozenset[str] = _DEFAULT_NOT_A_MEMBER_CODES,
 ) -> dict[str, Any]:
     """Call a Slack endpoint that requires the bot to already be a channel
     member, and raise an actionable error if it isn't yet.
@@ -233,6 +273,10 @@ def _request_requiring_membership(
     can still hit this for a private channel/DM, so slack_post_message uses
     this too.
 
+    not_a_member_codes: which Slack error code(s) this specific endpoint
+    actually uses to signal "not a member" — see _HIDDEN_FROM_NON_MEMBER_CODES
+    above for the two call sites that need the wider set.
+
     This deliberately does NOT join the channel on the caller's behalf:
     joining changes the channel's member list, which is visible to everyone
     in it, so the calling agent should check with the user first and only
@@ -241,15 +285,17 @@ def _request_requiring_membership(
     """
     try:
         return _request(method, path, params=params, json_data=json_data)
-    except RuntimeError as e:
-        if str(e) != "not_in_channel":
+    except _SlackAPIError as e:
+        if e.code not in not_a_member_codes:
             raise
-        raise RuntimeError(
-            "not_in_channel: the bot is not a member of this channel yet. "
-            "Ask the user whether to add the bot to this channel; if they "
-            "agree, call slack_join_channel (only works for a public "
-            "channel) — for a private channel or DM, a member needs to run "
-            "`/invite @<this app's bot name>` instead."
+        raise _SlackNotAMemberError(
+            f"{e.code}: the bot cannot access this channel — either it "
+            "isn't a member, or (for a private channel) the channel itself "
+            "is hidden from non-members. Ask the user whether to add the "
+            "bot to this channel; if they agree, call slack_join_channel "
+            "(only works for a public channel) — for a private channel or "
+            "DM, a member needs to run `/invite @<this app's bot name>` "
+            "instead."
         ) from None
 
 
@@ -272,8 +318,27 @@ def slack_join_channel(channel: str) -> str:
     """
     try:
         channel_id = _resolve_channel_id(channel)
-        _request("POST", "conversations.join", json_data={"channel": channel_id})
-        return _success(channel=channel_id)
+        try:
+            result = _request(
+                "POST", "conversations.join", json_data={"channel": channel_id}
+            )
+        except _SlackAPIError as e:
+            if e.code != "missing_scope":
+                raise
+            raise RuntimeError(
+                "missing_scope: this connector's Slack connection hasn't "
+                "been re-authorized with the channels:join permission yet "
+                "— ask the user to reconnect the Slack connector, then "
+                "retry."
+            ) from None
+        # conversations.join succeeds (with warning="already_in_channel")
+        # even when the bot already had membership, so this distinguishes
+        # a fresh join from a no-op re-join rather than reporting both
+        # identically.
+        already_member = "already_in_channel" in (
+            result.get("response_metadata") or {}
+        ).get("warnings", [])
+        return _success(channel=channel_id, already_member=already_member)
     except Exception as e:
         logger.error(f"Error joining Slack channel {channel}: {e}")
         return _error(str(e))
@@ -375,6 +440,10 @@ def slack_post_message(channel: str, text: str, thread_ts: str = "") -> str:
     thread_ts: optional parent message "ts" (from slack_get_channel_history,
     slack_search_messages, or a prior slack_post_message result) to reply
     inside that thread instead of posting to the channel's main timeline.
+    This connector's chat:write.public scope already lets the bot post into
+    any public channel without joining it first — no user confirmation is
+    needed for that case. A private channel or DM the bot isn't in still
+    fails with not_in_channel; ask a member to `/invite` the bot there.
     """
     try:
         json_data: dict[str, Any] = {
@@ -485,7 +554,10 @@ def slack_get_thread_replies(
         if cursor:
             params["cursor"] = cursor
         result = _request_requiring_membership(
-            "GET", "conversations.replies", params=params
+            "GET",
+            "conversations.replies",
+            params=params,
+            not_a_member_codes=_HIDDEN_FROM_NON_MEMBER_CODES,
         )
         messages = [
             {
@@ -641,7 +713,8 @@ def slack_search_messages(
         threaded_parents: list[dict[str, Any]] = []
         scanned = 0
         cursor: str | None = None
-        history_pages_scanned = 0
+        history_pagination_error: str | None = None
+        history_pagination_error_is_actionable = False
 
         for _ in range(MAX_PAGES):
             params: dict[str, Any] = {
@@ -655,20 +728,22 @@ def slack_search_messages(
                     "GET", "conversations.history", params=params
                 )
             except Exception as page_exc:
-                if not history_pages_scanned:
+                if cursor is None:
                     raise
                 # Mirrors slack_list_channels/slack_list_direct_messages: a
                 # mid-pagination failure must not discard the matches
-                # already found on earlier pages.
+                # already found on earlier pages. Unlike those two, this
+                # doesn't return immediately either — any threaded parents
+                # already collected from earlier pages still get scanned
+                # below instead of being silently dropped.
                 logger.warning(
                     f"Slack search history pagination stopped early: {page_exc}"
                 )
-                return _success(
-                    matches=matches[:max_matches],
-                    truncated=True,
-                    error=str(page_exc),
+                history_pagination_error = str(page_exc)
+                history_pagination_error_is_actionable = isinstance(
+                    page_exc, _SlackNotAMemberError
                 )
-            history_pages_scanned += 1
+                break
             for m in result.get("messages") or []:
                 scanned += 1
                 text = str(m.get("text") or "")
@@ -684,7 +759,8 @@ def slack_search_messages(
                 break
 
         threads_scanned = 0
-        thread_fetch_error: str | None = None
+        thread_fetch_error = history_pagination_error
+        thread_fetch_error_is_actionable = history_pagination_error_is_actionable
         thread_replies_truncated = False
         if include_thread_replies:
             for parent in threaded_parents:
@@ -703,6 +779,7 @@ def slack_search_messages(
                         "GET",
                         "conversations.replies",
                         params={"channel": channel_id, "ts": thread_ts, "limit": 200},
+                        not_a_member_codes=_HIDDEN_FROM_NON_MEMBER_CODES,
                     )
                 except Exception as thread_exc:
                     logger.warning(
@@ -712,18 +789,19 @@ def slack_search_messages(
                     # gap distinct from threads never attempted at all
                     # (below) — it must still flag truncated even though
                     # threads_scanned already counts the attempt for budget
-                    # purposes. The message is kept so it reaches the
-                    # caller instead of being visible only in this log line;
-                    # an actionable "call slack_join_channel" message always
-                    # wins over a later transient one (rate limit, etc.) so a
-                    # membership problem is never masked by an unrelated
-                    # failure on a different thread.
-                    error_text = str(thread_exc)
+                    # purposes. An actionable "call slack_join_channel"
+                    # message (identified structurally via isinstance, not
+                    # by searching the rendered text) always wins over a
+                    # later transient one (rate limit, etc.) or over the
+                    # history-pagination failure above, so a membership
+                    # problem is never masked by an unrelated failure
+                    # elsewhere in this same call.
+                    is_actionable = isinstance(thread_exc, _SlackNotAMemberError)
                     if thread_fetch_error is None or (
-                        "slack_join_channel" in error_text
-                        and "slack_join_channel" not in thread_fetch_error
+                        is_actionable and not thread_fetch_error_is_actionable
                     ):
-                        thread_fetch_error = error_text
+                        thread_fetch_error = str(thread_exc)
+                        thread_fetch_error_is_actionable = is_actionable
                     continue
                 # A thread with over 200 replies is only partially scanned —
                 # has_more/next_cursor are not followed, so a match in the
@@ -789,6 +867,7 @@ def _set_reaction(action: str, channel: str, timestamp: str, emoji_name: str) ->
             "POST",
             f"reactions.{action}",
             json_data={"channel": channel_id, "timestamp": timestamp, "name": name},
+            not_a_member_codes=_HIDDEN_FROM_NON_MEMBER_CODES,
         )
         return _success(channel=channel_id, timestamp=timestamp, emoji_name=name)
     except Exception as e:

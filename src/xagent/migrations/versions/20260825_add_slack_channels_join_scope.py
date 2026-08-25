@@ -7,13 +7,10 @@ Create Date: 2026-08-25
 """
 
 import json
-import logging
 from typing import Sequence, Union
 
 import sqlalchemy as sa
 from alembic import op
-
-logger = logging.getLogger(__name__)
 
 revision: str = "20260825_add_slack_channels_join_scope"
 down_revision: Union[str, None] = "a3b70c638cc3"
@@ -24,6 +21,7 @@ depends_on: Union[str, Sequence[str], None] = None
 PUBLIC_MCP_APPS_TABLE = sa.table(
     "public_mcp_apps",
     sa.column("app_id", sa.String),
+    sa.column("description", sa.Text),
     sa.column("oauth_scopes", sa.JSON),
 )
 
@@ -31,13 +29,6 @@ OAUTH_PROVIDERS_TABLE = sa.table(
     "oauth_providers",
     sa.column("provider_name", sa.String),
     sa.column("default_scopes", sa.JSON),
-)
-
-USER_OAUTH_TABLE = sa.table(
-    "user_oauth",
-    sa.column("provider", sa.String),
-    sa.column("access_token", sa.String),
-    sa.column("refresh_token", sa.String),
 )
 
 APP_ID = "slack"
@@ -72,6 +63,18 @@ CURRENT_SCOPES = [
     "reactions:write",
     "files:write",
 ]
+
+PREVIOUS_DESCRIPTION = (
+    "Connect to Slack to search and read channel, thread, and DM history, "
+    "post messages and replies, react to messages, and upload files, e.g. "
+    "incident summaries and recommended fixes."
+)
+CURRENT_DESCRIPTION = (
+    "Connect to Slack to search and read channel, thread, and DM history, "
+    "post messages and replies, react to messages, upload files, and (with "
+    "your approval) join public channels, e.g. incident summaries and "
+    "recommended fixes."
+)
 
 
 def _columns_present(
@@ -148,76 +151,51 @@ def _set_slack_provider_default_scopes_if_unchanged(
     )
 
 
-def _slack_channels_join_scope_already_present(bind: sa.engine.Connection) -> bool:
-    """Whether channels:join is already in the persisted scopes.
+def _set_slack_description_if_unchanged(
+    bind: sa.engine.Connection, expected_current: str, new_value: str
+) -> None:
+    """Refresh the stale default description, without clobbering a customization.
 
-    Guards upgrade() against wiping already-reconnected grants a second
-    time on a re-run against an already-current DB (a direct module
-    invocation, an ops retry, or a stamp+reapply) — without this,
-    _invalidate_existing_slack_grants would fire unconditionally on every
-    call, even when this migration's own scope change was already applied.
+    Mirrors 20260812's equivalent guard: description isn't in admin_mcp's
+    _BUILTIN_PROTECTED_FIELDS, so an operator can legitimately have edited
+    it via the admin PATCH endpoint. Only overwrite when the persisted
+    value still equals the last-known canonical description.
     """
-    if not _columns_present(bind, "public_mcp_apps", {"app_id", "oauth_scopes"}):
-        return False
-
-    current = bind.execute(
-        sa.select(PUBLIC_MCP_APPS_TABLE.c.oauth_scopes).where(
-            PUBLIC_MCP_APPS_TABLE.c.app_id == APP_ID
-        )
-    ).scalar()
-    if isinstance(current, str):
-        try:
-            current = json.loads(current)
-        except (TypeError, ValueError):
-            current = None
-    return bool(current) and "channels:join" in current
-
-
-def _invalidate_existing_slack_grants(bind: sa.engine.Connection) -> None:
-    """Force reconnection so the user has a chance to grant channels:join.
-
-    Same rationale as 20260812's equivalent function: an existing bot-token
-    connection would keep showing "Connected" and only fail at call time with
-    a raw Slack missing_scope error the first time the user agrees to add the
-    bot to a public channel via slack_join_channel.
-    """
-    if not _columns_present(bind, "user_oauth", {"provider", "access_token"}):
+    if not _columns_present(bind, "public_mcp_apps", {"app_id", "description"}):
         return
 
-    values: dict[str, object] = {"access_token": ""}
-    if _columns_present(bind, "user_oauth", {"refresh_token"}):
-        values["refresh_token"] = None
-
-    result = bind.execute(
-        sa.update(USER_OAUTH_TABLE)
-        .where(USER_OAUTH_TABLE.c.provider == APP_ID)
-        .values(**values)
-    )
-    if result.rowcount:
-        logger.warning(
-            "Disconnected %d existing Slack grant(s) for the new "
-            "channels:join scope. Affected users must reconnect the Slack "
-            "connector.",
-            result.rowcount,
+    bind.execute(
+        sa.update(PUBLIC_MCP_APPS_TABLE)
+        .where(
+            PUBLIC_MCP_APPS_TABLE.c.app_id == APP_ID,
+            PUBLIC_MCP_APPS_TABLE.c.description == expected_current,
         )
+        .values(description=new_value)
+    )
 
 
 def upgrade() -> None:
     bind = op.get_bind()
-    already_current = _slack_channels_join_scope_already_present(bind)
     _set_slack_scopes(bind, CURRENT_SCOPES)
     _set_slack_provider_default_scopes_if_unchanged(
         bind, PREVIOUS_SCOPES, CURRENT_SCOPES
     )
-    if not already_current:
-        _invalidate_existing_slack_grants(bind)
+    _set_slack_description_if_unchanged(bind, PREVIOUS_DESCRIPTION, CURRENT_DESCRIPTION)
+    # Deliberately does NOT force-disconnect existing Slack grants: Slack
+    # doesn't retroactively grant a newly-requested scope to an
+    # already-issued token, but it also doesn't revoke or break what that
+    # token could already do — an existing connection keeps working for
+    # every tool it already supported. Only the brand-new
+    # slack_join_channel tool needs channels:join, and it surfaces a clear
+    # "reconnect" message on missing_scope (see slack.py) rather than this
+    # migration forcing every existing user to reconnect just to unlock one
+    # new, optional tool.
 
 
 def downgrade() -> None:
-    # The cleared access tokens are gone for good (that's the point — force a
-    # reconnect); there is nothing meaningful to restore for user_oauth here.
     bind = op.get_bind()
     _set_slack_scopes(bind, PREVIOUS_SCOPES)
     _set_slack_provider_default_scopes_if_unchanged(
         bind, CURRENT_SCOPES, PREVIOUS_SCOPES
     )
+    _set_slack_description_if_unchanged(bind, CURRENT_DESCRIPTION, PREVIOUS_DESCRIPTION)

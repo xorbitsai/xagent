@@ -88,7 +88,7 @@ def test_upgrade_is_idempotent(tmp_path):
         assert rows == 1
 
 
-def test_seed_row_matches_registry(tmp_path):
+def test_seed_row_matches_registry():
     """The migration snapshot and the runtime registry must define the same
     google-search-console row (the migration is a frozen copy; this catches
     drift)."""
@@ -103,6 +103,54 @@ def test_seed_row_matches_registry(tmp_path):
     assert migration.ROW == registry_row
 
 
+def test_app_id_does_not_collide_with_other_builtin_apps():
+    """A duplicate app_id across the registry would violate the DB's UNIQUE
+    constraint at seed time for whichever migration runs second; catch it
+    directly here instead of relying on that indirect signal."""
+    from xagent.web.builtin_mcp_registry import get_builtin_public_mcp_app_rows
+
+    app_ids = [row["app_id"] for row in get_builtin_public_mcp_app_rows()]
+    assert app_ids.count("google-search-console") == 1
+
+
+def test_upgrade_inserts_only_columns_present_on_older_schema(tmp_path):
+    """A pre-existing deployment's public_mcp_apps table may predate a
+    column ROW defines (e.g. before is_visible_in_connector was added).
+    upgrade() must insert only the columns that actually exist rather than
+    failing or inserting into a nonexistent column."""
+    engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
+    migration = _load_migration_module()
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                """
+                CREATE TABLE public_mcp_apps (
+                    id INTEGER PRIMARY KEY,
+                    app_id VARCHAR(100) NOT NULL UNIQUE,
+                    name VARCHAR(200) NOT NULL,
+                    description TEXT,
+                    icon VARCHAR(1000),
+                    transport VARCHAR(50) NOT NULL DEFAULT 'oauth',
+                    provider_name VARCHAR(50),
+                    category VARCHAR(100),
+                    launch_config JSON
+                )
+                """
+            )
+        )
+        with patch.object(migration, "op", _operations(connection)):
+            migration.upgrade()
+        assert "google-search-console" in _app_ids(connection)
+        row = connection.execute(
+            text(
+                "SELECT category, launch_config FROM public_mcp_apps"
+                " WHERE app_id='google-search-console'"
+            )
+        ).first()
+        assert row[0] == "Analytics"
+        assert "xagent.web.tools.mcp.google_search_console" in str(row[1])
+
+
 def test_downgrade_removes_google_search_console(tmp_path):
     engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
     migration = _load_migration_module()
@@ -111,6 +159,16 @@ def test_downgrade_removes_google_search_console(tmp_path):
         with patch.object(migration, "op", _operations(connection)):
             migration.upgrade()
             migration.downgrade()
+        assert "google-search-console" not in _app_ids(connection)
+
+
+def test_downgrade_is_a_no_op_when_row_already_absent(tmp_path):
+    engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
+    migration = _load_migration_module()
+    with engine.begin() as connection:
+        _create_table(connection)
+        with patch.object(migration, "op", _operations(connection)):
+            migration.downgrade()  # never upgraded; row was never inserted
         assert "google-search-console" not in _app_ids(connection)
 
 

@@ -24,6 +24,11 @@ DEFAULT_TIMEOUT_SECONDS = 30
 
 VALID_DIMENSIONS = {"query", "page", "country", "device", "date", "searchAppearance"}
 VALID_SEARCH_TYPES = {"web", "image", "video", "news", "discover", "googleNews"}
+# Google does not disclose search terms for Discover/Google News surfaces,
+# so the Search Analytics API rejects the "query" dimension for these two
+# search types with a 400. Checked locally so the calling LLM gets an
+# actionable message instead of an upstream API error.
+_SEARCH_TYPES_WITHOUT_QUERY_DIMENSION = {"discover", "googleNews"}
 _DATE_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2}\Z")
 
 # The Search Analytics API itself allows rowLimit up to 25000. That's capped
@@ -226,7 +231,9 @@ def google_search_console_query_search_analytics(
     start_date, end_date: YYYY-MM-DD (inclusive). Search Console data is
       typically delayed 1-3 days, so end_date should not be today.
     dimensions: any of "query", "page", "country", "device", "date",
-      "searchAppearance". Omit for a single aggregate row.
+      "searchAppearance". Omit for a single aggregate row. "query" is not
+      available when search_type is "discover" or "googleNews" (Google
+      doesn't disclose search terms for those surfaces).
     search_type: one of "web", "image", "video", "news", "discover",
       "googleNews" (default "web").
     dimension_filter_groups: raw Search Analytics API filter groups, e.g.
@@ -256,6 +263,15 @@ def google_search_console_query_search_analytics(
             if invalid:
                 raise ValueError(
                     f"invalid dimensions {invalid}; must be from {sorted(VALID_DIMENSIONS)}"
+                )
+            if (
+                "query" in dimensions
+                and search_type in _SEARCH_TYPES_WITHOUT_QUERY_DIMENSION
+            ):
+                raise ValueError(
+                    f'the "query" dimension is not available for '
+                    f"search_type={search_type!r} (Google does not disclose "
+                    f"search terms for Discover/Google News surfaces)"
                 )
 
         body: dict[str, Any] = {

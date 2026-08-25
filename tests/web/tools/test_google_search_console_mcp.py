@@ -11,7 +11,15 @@ from xagent.web.tools.mcp import google_search_console
 class MockResponse:
     def __init__(self, json_data=None, text="", status_code=200):
         self._json_data = json_data if json_data is not None else {}
-        self.text = text or (json.dumps(self._json_data) if json_data else "")
+        # `is not None`, not truthiness: json_data={} is a genuine "empty
+        # but present" JSON body ("{}", 2 bytes) and must serialize
+        # differently from omitting json_data entirely (no body at all) —
+        # a plain `if json_data` treats both the same, which lets tests
+        # that pass json_data={} accidentally skip _request's
+        # response.json() parsing path via the empty-content shortcut.
+        self.text = text or (
+            json.dumps(self._json_data) if json_data is not None else ""
+        )
         self.status_code = status_code
         self.content = self.text.encode()
 
@@ -255,6 +263,56 @@ def test_list_sites_returns_error_payload_on_failure(monkeypatch):
     assert "insufficient permissions" in result["message"]
 
 
+def test_list_sites_rejects_expired_token(monkeypatch):
+    monkeypatch.setattr(
+        google_search_console.requests,
+        "request",
+        Mock(
+            return_value=MockResponse(
+                status_code=401,
+                json_data={"error": {"message": "Request had invalid credentials."}},
+            )
+        ),
+    )
+
+    result = json.loads(google_search_console.google_search_console_list_sites())
+
+    assert result["status"] == "error"
+    assert "invalid credentials" in result["message"]
+
+
+def test_list_sites_rejects_non_dict_top_level_response(monkeypatch):
+    """A malformed API response whose top level is a list/string rather than
+    a dict must not raise an unhandled AttributeError out of _require_dict_result's
+    caller; it surfaces as a normal error envelope."""
+    monkeypatch.setattr(
+        google_search_console.requests,
+        "request",
+        Mock(return_value=MockResponse(json_data=["unexpected", "list"])),
+    )
+
+    result = json.loads(google_search_console.google_search_console_list_sites())
+
+    assert result["status"] == "error"
+    assert "Unexpected response format" in result["message"]
+
+
+def test_list_sites_wraps_missing_token_into_error_envelope(monkeypatch):
+    """An end-to-end check that a missing GOOGLE_ACCESS_TOKEN is wrapped into
+    the tool's normal {"status": "error"} envelope rather than propagating
+    as a raw exception — _headers() itself is unit-tested directly
+    elsewhere, but no test previously drove that failure through a tool."""
+    monkeypatch.delenv("GOOGLE_ACCESS_TOKEN")
+    mock_request = Mock()
+    monkeypatch.setattr(google_search_console.requests, "request", mock_request)
+
+    result = json.loads(google_search_console.google_search_console_list_sites())
+
+    assert result["status"] == "error"
+    assert "GOOGLE_ACCESS_TOKEN" in result["message"]
+    mock_request.assert_not_called()
+
+
 def test_list_sitemaps_returns_sitemap_list(monkeypatch):
     mock_request = Mock(
         return_value=MockResponse(
@@ -292,6 +350,45 @@ def test_list_sitemaps_treats_non_list_sitemap_field_as_empty(monkeypatch):
 
     assert result["status"] == "success"
     assert result["sitemaps"] == []
+
+
+def test_list_sitemaps_returns_error_payload_on_failure(monkeypatch):
+    monkeypatch.setattr(
+        google_search_console.requests,
+        "request",
+        Mock(
+            return_value=MockResponse(
+                status_code=404,
+                json_data={"error": {"message": "site not found"}},
+            )
+        ),
+    )
+
+    result = json.loads(
+        google_search_console.google_search_console_list_sitemaps(
+            "https://example.com/"
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "site not found" in result["message"]
+
+
+def test_list_sitemaps_rejects_non_dict_top_level_response(monkeypatch):
+    monkeypatch.setattr(
+        google_search_console.requests,
+        "request",
+        Mock(return_value=MockResponse(json_data=["unexpected", "list"])),
+    )
+
+    result = json.loads(
+        google_search_console.google_search_console_list_sitemaps(
+            "https://example.com/"
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "Unexpected response format" in result["message"]
 
 
 def test_query_search_analytics_builds_body_and_returns_rows(monkeypatch):
@@ -373,6 +470,21 @@ def test_query_search_analytics_passes_through_filter_groups_and_search_type(
     assert body["startRow"] == 100
 
 
+def test_query_search_analytics_omits_dimensions_and_filter_groups_when_unset(
+    monkeypatch,
+):
+    mock_request = Mock(return_value=MockResponse(json_data={}))
+    monkeypatch.setattr(google_search_console.requests, "request", mock_request)
+
+    google_search_console.google_search_console_query_search_analytics(
+        "https://example.com/", start_date="2026-07-01", end_date="2026-07-28"
+    )
+
+    body = mock_request.call_args.kwargs["json"]
+    assert "dimensions" not in body
+    assert "dimensionFilterGroups" not in body
+
+
 def test_query_search_analytics_rejects_invalid_date(monkeypatch):
     mock_request = Mock()
     monkeypatch.setattr(google_search_console.requests, "request", mock_request)
@@ -385,6 +497,21 @@ def test_query_search_analytics_rejects_invalid_date(monkeypatch):
 
     assert result["status"] == "error"
     assert "start_date" in result["message"]
+    mock_request.assert_not_called()
+
+
+def test_query_search_analytics_rejects_invalid_end_date(monkeypatch):
+    mock_request = Mock()
+    monkeypatch.setattr(google_search_console.requests, "request", mock_request)
+
+    result = json.loads(
+        google_search_console.google_search_console_query_search_analytics(
+            "https://example.com/", start_date="2026-07-01", end_date="not-a-date"
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "end_date" in result["message"]
     mock_request.assert_not_called()
 
 
@@ -454,6 +581,50 @@ def test_query_search_analytics_rejects_invalid_dimensions(monkeypatch):
     assert result["status"] == "error"
     assert "bogus" in result["message"]
     mock_request.assert_not_called()
+
+
+@pytest.mark.parametrize("search_type", ["discover", "googleNews"])
+def test_query_search_analytics_rejects_query_dimension_for_discover_and_news(
+    monkeypatch, search_type
+):
+    mock_request = Mock()
+    monkeypatch.setattr(google_search_console.requests, "request", mock_request)
+
+    result = json.loads(
+        google_search_console.google_search_console_query_search_analytics(
+            "https://example.com/",
+            start_date="2026-07-01",
+            end_date="2026-07-28",
+            dimensions=["query"],
+            search_type=search_type,
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "query" in result["message"]
+    mock_request.assert_not_called()
+
+
+def test_query_search_analytics_allows_query_dimension_for_web_search_type(
+    monkeypatch,
+):
+    """The discover/googleNews restriction must not over-reject "query" for
+    other search types."""
+    mock_request = Mock(return_value=MockResponse(json_data={}))
+    monkeypatch.setattr(google_search_console.requests, "request", mock_request)
+
+    result = json.loads(
+        google_search_console.google_search_console_query_search_analytics(
+            "https://example.com/",
+            start_date="2026-07-01",
+            end_date="2026-07-28",
+            dimensions=["query"],
+            search_type="web",
+        )
+    )
+
+    assert result["status"] == "success"
+    mock_request.assert_called_once()
 
 
 def test_query_search_analytics_rejects_zero_row_limit(monkeypatch):
@@ -638,6 +809,45 @@ def test_query_search_analytics_returns_error_payload_on_api_failure(monkeypatch
     assert "bad request" in result["message"]
 
 
+def test_query_search_analytics_rejects_expired_token(monkeypatch):
+    monkeypatch.setattr(
+        google_search_console.requests,
+        "request",
+        Mock(
+            return_value=MockResponse(
+                status_code=401,
+                json_data={"error": {"message": "Request had invalid credentials."}},
+            )
+        ),
+    )
+
+    result = json.loads(
+        google_search_console.google_search_console_query_search_analytics(
+            "https://example.com/", start_date="2026-07-01", end_date="2026-07-28"
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "invalid credentials" in result["message"]
+
+
+def test_query_search_analytics_rejects_non_dict_top_level_response(monkeypatch):
+    monkeypatch.setattr(
+        google_search_console.requests,
+        "request",
+        Mock(return_value=MockResponse(json_data=["unexpected", "list"])),
+    )
+
+    result = json.loads(
+        google_search_console.google_search_console_query_search_analytics(
+            "https://example.com/", start_date="2026-07-01", end_date="2026-07-28"
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "Unexpected response format" in result["message"]
+
+
 def test_inspect_url_returns_inspection_result(monkeypatch):
     mock_request = Mock(
         return_value=MockResponse(
@@ -737,3 +947,20 @@ def test_inspect_url_returns_error_payload_on_api_failure(monkeypatch):
 
     assert result["status"] == "error"
     assert "URL not found" in result["message"]
+
+
+def test_inspect_url_rejects_non_dict_top_level_response(monkeypatch):
+    monkeypatch.setattr(
+        google_search_console.requests,
+        "request",
+        Mock(return_value=MockResponse(json_data=["unexpected", "list"])),
+    )
+
+    result = json.loads(
+        google_search_console.google_search_console_inspect_url(
+            "https://example.com/", "https://example.com/page"
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "Unexpected response format" in result["message"]

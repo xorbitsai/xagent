@@ -1,5 +1,6 @@
 """Test authentication API functionality"""
 
+import asyncio
 import os
 import tempfile
 import threading
@@ -16,6 +17,7 @@ from sqlalchemy.orm import sessionmaker
 from xagent.web.api import auth as auth_api
 from xagent.web.api import chat as chat_api
 from xagent.web.api.auth import RefreshTokenResponse, auth_router, hash_password
+from xagent.web.models import database as database_module
 from xagent.web.models.database import Base, configure_db, get_db, get_engine
 from xagent.web.models.user import User
 
@@ -112,17 +114,29 @@ def test_db():
     # above, so without this it raises "Session Local is not initialized"
     # instead of touching this test's own database. configure_db binds
     # the engine/session factory without re-running migrations or
-    # create_all, which this fixture already did above.
+    # create_all, which this fixture already did above. Save/restore the
+    # prior globals in finally, matching test_task_interaction_close.py's
+    # db_without_interaction_table fixture - otherwise this rebinding
+    # leaks into whichever test runs next in the same process (e.g. under
+    # pytest-xdist, an order-dependent flake: a later test file that
+    # expects its own database, or none configured yet, would instead
+    # silently see this now-deleted per-test sqlite file).
+    previous_engine = database_module._engine
+    previous_session_local = database_module._SessionLocal
     configure_db(db_url=test_db_url)
 
-    yield
-
-    # Cleanup
-    Base.metadata.drop_all(bind=test_engine)
     try:
-        os.unlink(test_db_path)
-    except OSError:
-        pass
+        yield
+    finally:
+        database_module._engine = previous_engine
+        database_module._SessionLocal = previous_session_local
+
+        # Cleanup
+        Base.metadata.drop_all(bind=test_engine)
+        try:
+            os.unlink(test_db_path)
+        except OSError:
+            pass
 
 
 @pytest.fixture(scope="function")
@@ -628,13 +642,19 @@ class TestAuthAPI:
         # worker session actually uses.
         merge_engine = get_engine()
         event.listen(merge_engine, "before_cursor_execute", _record_thread)
+        # `db` is bound to this file's own engine, not `merge_engine` -
+        # release_db_connection_if_clean's own rollback (if any) must not
+        # be mistaken for the merge's SQL by the assertions below.
+        request_db = TestingSessionLocal()
         try:
             response = await auth_api.update_current_user_preferences(
                 request=auth_api.UpdatePreferencesRequest(voice="warm"),
+                db=request_db,
                 user=user,
             )
         finally:
             event.remove(merge_engine, "before_cursor_execute", _record_thread)
+            request_db.close()
 
         assert response.success is True
         assert response.user is not None
@@ -646,6 +666,78 @@ class TestAuthAPI:
             "transaction (or the post-commit reload expire_on_commit "
             "forces) leaked back onto the event loop"
         )
+
+    @pytest.mark.asyncio
+    async def test_update_current_user_preferences_cancellation_drains_merge_worker(
+        self, test_db, test_user_data, monkeypatch
+    ):
+        """A cancelled/disconnected request must not abandon
+        _merge_user_preferences_locked's worker thread while it still
+        holds the row lock and an open Session on it -
+        run_db_io_cancellation_safe's whole contract (see its own and
+        _merge_user_preferences_locked's docstrings) is that the worker
+        is drained to completion before the caller's cancellation is
+        allowed to propagate. Mirrors
+        test_task_command_transport.py's
+        test_dispatch_cancellation_drains_inflight_completion_worker for
+        the same drain-before-cancel contract."""
+        setup_first_admin()
+        register_response = client.post("/api/auth/register", json=test_user_data)
+        assert register_response.status_code == 200
+
+        lookup_db = TestingSessionLocal()
+        try:
+            user = (
+                lookup_db.query(User)
+                .filter(User.username == test_user_data["username"])
+                .one()
+            )
+        finally:
+            lookup_db.close()
+
+        merge_started = threading.Event()
+        allow_merge = threading.Event()
+        merge_completed = threading.Event()
+        original_normalize = auth_api._normalized_preferences
+
+        def blocking_normalize(worker_user):
+            merge_started.set()
+            assert allow_merge.wait(timeout=2)
+            result = original_normalize(worker_user)
+            merge_completed.set()
+            return result
+
+        monkeypatch.setattr(auth_api, "_normalized_preferences", blocking_normalize)
+
+        request_db = TestingSessionLocal()
+        request_task = asyncio.create_task(
+            auth_api.update_current_user_preferences(
+                request=auth_api.UpdatePreferencesRequest(voice="warm"),
+                db=request_db,
+                user=user,
+            )
+        )
+        try:
+            await asyncio.wait_for(asyncio.to_thread(merge_started.wait, 2), timeout=2)
+            request_task.cancel()
+            await asyncio.sleep(0.02)
+            assert not request_task.done()
+        finally:
+            allow_merge.set()
+            request_db.close()
+
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(request_task, timeout=2)
+        assert merge_completed.is_set()
+
+        # Drained, not abandoned: the merge that was already in flight
+        # when cancelled must still have committed.
+        verify_db = TestingSessionLocal()
+        try:
+            stored = verify_db.query(User).filter(User.id == user.id).one()
+            assert stored.preferences["voice"] == "warm"
+        finally:
+            verify_db.close()
 
     def test_update_current_user_email(self, test_db, test_user_data):
         setup_first_admin()

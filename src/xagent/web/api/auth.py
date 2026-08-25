@@ -34,7 +34,7 @@ from ..auth_config import (
     REFRESH_TOKEN_EXPIRE_DAYS,
 )
 from ..auth_dependencies import get_current_user
-from ..models.database import get_db, get_session_local
+from ..models.database import get_db, get_session_local, release_db_connection_if_clean
 from ..models.system_setting import SystemSetting
 from ..models.user import User
 from ..models.user_oauth import UserOAuth
@@ -1431,6 +1431,7 @@ def _merge_user_preferences_locked(
 @auth_router.patch("/me/preferences", response_model=UpdatePreferencesResponse)
 async def update_current_user_preferences(
     request: UpdatePreferencesRequest,
+    db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ) -> UpdatePreferencesResponse:
     """Merge the given fields into the current user's stored preferences.
@@ -1444,6 +1445,17 @@ async def update_current_user_preferences(
             message="Preferences updated successfully",
             user=serialize_auth_user(user),
         )
+
+    # `db` is declared only to release it here, not to do any work with it
+    # directly: FastAPI's per-request dependency caching means this is the
+    # same (read-only, since get_current_user only did a SELECT) session
+    # get_current_user already used, and _merge_user_preferences_locked
+    # is about to open a second, independent session and block on a real
+    # row lock - without this, that session would sit idle-in-transaction,
+    # holding a pool slot, for the whole lock wait (issue #889, same
+    # pattern already used before chat.py's sandbox startup and
+    # workforce_creator.py's ReAct builder call).
+    release_db_connection_if_clean(db)
 
     user_id = int(user.id)
     serialized_user = await run_db_io_cancellation_safe(

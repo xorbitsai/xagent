@@ -35,6 +35,14 @@ MAX_WORKFORCE_BUILDER_WORKERS = 32
 MAX_WORKFORCE_BUILDER_EXISTING_AGENTS = 200
 MAX_WORKFORCE_BUILDER_AGENT_RESULTS = 50
 WORKFORCE_BUILDER_MAX_ITERATIONS = 48
+# Shared by the language- and voice-scoping instructions in
+# workforce_prompt_builder_system_prompt/build_workforce_prompt_plan below,
+# so the two policies enumerate the same persisted-configuration fields
+# from one place instead of two hand-copied string literals drifting apart.
+_WORKFORCE_BUILDER_PERSISTED_FIELDS = (
+    "Workforce and agent names, descriptions, instructions, aliases, and "
+    "assignment text"
+)
 
 
 class WorkforcePromptBuilderError(RuntimeError):
@@ -556,9 +564,9 @@ all created agents and the Workforce in one transaction only after successful
 finalization. A tool error must be corrected with another tool call; never claim
 success when finalization did not happen.
 
-All persisted user-facing prose passed to tools, including Workforce and agent names,
-descriptions, instructions, aliases, and assignments, must follow the user's request
-language. English tool names, schemas, and tool results do not authorize changing it.
+All persisted user-facing prose passed to tools, including {_WORKFORCE_BUILDER_PERSISTED_FIELDS},
+must follow the user's request language. English tool names, schemas, and tool
+results do not authorize changing it.
 {output_language_policy()}
 {response_language_rules(subject="current user request")}
 """
@@ -598,10 +606,9 @@ async def build_workforce_prompt_plan(
         system_prompt = (
             f"{system_prompt}\n\n"
             "The OUTPUT VOICE above governs only your final natural-language "
-            "reply to the user. Agent names, descriptions, instructions, "
-            "aliases, and assignment text passed to "
-            "create_agent/create_workforce are persisted configuration, not "
-            "conversation - write them in plain, neutral language "
+            f"reply to the user. {_WORKFORCE_BUILDER_PERSISTED_FIELDS} passed "
+            "to create_agent/create_workforce are persisted configuration, "
+            "not conversation - write them in plain, neutral language "
             "regardless of that tone."
         )
     service = AgentService(

@@ -207,3 +207,71 @@ async def test_invalidate_does_not_serialize_behind_several_concurrent_builds() 
     for release in release_builds:
         release.set()
     await asyncio.wait_for(asyncio.gather(*build_tasks), timeout=2)
+
+
+@pytest.mark.asyncio
+async def test_invalidate_bounds_the_wait_for_a_lock_with_a_queued_second_builder() -> (
+    None
+):
+    """asyncio.Lock is FIFO-fair: a second get_agent_for_task call already
+    queued behind an in-flight build for the SAME task_id can leave
+    locked() False for a moment right after the first build releases,
+    while the queued waiter hasn't resumed and re-locked it yet. A plain
+    `async with lock` here would still queue fairly behind that second
+    waiter and block for its own (also multi-second) build duration -
+    exactly the stall this method exists to avoid. The bound on
+    lock.acquire() itself must catch this even though locked() didn't."""
+    manager = AgentServiceManager()
+    manager._agent_owner_ids[1] = 7
+    lock = asyncio.Lock()
+    manager._agent_build_locks[1] = lock
+
+    first_started = asyncio.Event()
+    release_first = asyncio.Event()
+    second_started = asyncio.Event()
+    release_second = asyncio.Event()
+
+    async def first_build() -> None:
+        async with lock:
+            first_started.set()
+            await release_first.wait()
+
+    async def second_build() -> None:
+        async with lock:
+            second_started.set()
+            await release_second.wait()
+
+    first_task = asyncio.create_task(first_build())
+    await asyncio.wait_for(first_started.wait(), timeout=2)
+
+    second_task = asyncio.create_task(second_build())
+    # Let second_build actually reach and queue on lock.acquire() while
+    # the first build still holds it - accessing the private _waiters
+    # queue is the only way to confirm this deterministically rather
+    # than guessing a sleep duration.
+    for _ in range(1000):
+        if lock._waiters:
+            break
+        await asyncio.sleep(0)
+    assert lock._waiters, "second_build never queued behind the held lock"
+
+    release_first.set()
+    # Step just far enough for first_build to actually release the lock
+    # (locked() turns False) without over-stepping into second_build's
+    # own resumption - landing in the narrow window locked() alone can't
+    # see: released, but the queued waiter hasn't re-locked it yet.
+    for _ in range(1000):
+        if not lock.locked():
+            break
+        await asyncio.sleep(0)
+    assert not lock.locked(), "first_build never released"
+
+    # Race invalidation's bounded acquire against second_build's own
+    # resumption. Whichever wins the immediate handoff, invalidation
+    # must return within its own short bound - not block until
+    # release_second is set below, which would mean it queued fairly
+    # behind second_build instead of deferring.
+    await asyncio.wait_for(manager.invalidate_cached_agents_for_owner(7), timeout=1)
+
+    release_second.set()
+    await asyncio.wait_for(asyncio.gather(first_task, second_task), timeout=2)

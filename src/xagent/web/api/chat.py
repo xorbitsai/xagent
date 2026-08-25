@@ -1257,6 +1257,14 @@ async def _load_task_setup_snapshot_for_agent(
     )
 
 
+# invalidate_cached_agents_for_owner's bound on acquiring a per-task build
+# lock it finds merely locked()-false-but-FIFO-queued (see that method's
+# docstring) - short enough to never reintroduce the multi-second stall a
+# genuinely busy lock would cause, long enough to cover ordinary event-loop
+# scheduling jitter for a waiter that's about to resume.
+_INVALIDATION_LOCK_ACQUIRE_TIMEOUT = 0.05
+
+
 class AgentServiceManager:
     """Manage AgentService instances for different tasks"""
 
@@ -2219,6 +2227,21 @@ class AgentServiceManager:
             and (user is None or user.id is None or int(user.id) != runtime_user_id)
         ):
             runtime_user = db.query(User).filter(User.id == runtime_user_id).first()
+        # Detach immediately, whatever the source (the passthrough `user`
+        # default above, or the fresh query just above): the very next
+        # statement below can release `db` (resolve_execution_scope via
+        # _run_agent_runtime_db_io, whose first action is
+        # release_db_connection_if_clean - see _run_agent_runtime_caller_
+        # session), which unconditionally expires every object loaded
+        # through it. A live User surviving past that point would turn
+        # a later attribute read (e.g. voice_from_runtime_user) into an
+        # implicit reload on the event loop - detaching here, before the
+        # first release-triggering call in this function, is the only
+        # place that's actually early enough; detaching later, inside a
+        # failure branch after such a call already ran, is too late to
+        # help (the row is already expired by then).
+        if isinstance(runtime_user, User):
+            runtime_user = detach_runtime_user_fields(runtime_user)
 
         # One turn resolves once. Orchestrated execute/resume callers pass the
         # resolved value explicitly, including ``None`` for an intentionally
@@ -2592,12 +2615,6 @@ class AgentServiceManager:
                     task_fast_llm = None
                     task_vision_llm = None
                     task_compact_llm = None
-                    # Same detach as the except block below: the snapshot
-                    # never landed, so a live ORM User from the earlier
-                    # owner-mismatch fallback can still be in
-                    # `runtime_user` here too.
-                    if isinstance(runtime_user, User):
-                        runtime_user = detach_runtime_user_fields(runtime_user)
             except (
                 HTTPException,
                 TaskOwnerMismatchError,
@@ -2618,17 +2635,6 @@ class AgentServiceManager:
                 task_fast_llm = None
                 task_vision_llm = None
                 task_compact_llm = None
-                # The richer snapshot load above (which would have
-                # replaced `runtime_user` with a detached RuntimeUserFields
-                # at line ~2501) failed before reaching that assignment,
-                # so a live ORM User from the earlier owner-mismatch
-                # fallback can still be sitting in `runtime_user` here.
-                # Detach it now, while the row is still attached and
-                # unexpired - past this point (release_db_connection_if_
-                # clean's rollback) a live User's attributes would force
-                # an implicit reload on the event loop instead.
-                if isinstance(runtime_user, User):
-                    runtime_user = detach_runtime_user_fields(runtime_user)
             llm_info = "database LLM configuration"
 
             try:
@@ -3001,16 +3007,29 @@ class AgentServiceManager:
           for a same-moment pop to invalidate, and would then overwrite
           this eviction with the stale-voice result the instant it
           finishes. Checking the same per-task lock's locked() before
-          deciding this task's fate detects that race without blocking on
-          it: a build already in flight (sandbox startup, remote MCP
-          init - multi-second work) would otherwise serialize every one
-          of this owner's *other* concurrent tasks' invalidation behind
-          it with no timeout, turning one voice PATCH into a
-          multi-second stall. A busy lock instead defers this task's
-          eviction, the same tolerance-for-eventual-consistency already
-          used for an in-flight execution above - a later trigger
-          (another preference change, a scope/owner mismatch) still
-          catches the stale-voice result once the build finishes.
+          deciding this task's fate detects the common case of that race
+          without blocking on it: a build already in flight (sandbox
+          startup, remote MCP init - multi-second work) would otherwise
+          serialize every one of this owner's *other* concurrent tasks'
+          invalidation behind it with no timeout, turning one voice PATCH
+          into a multi-second stall. locked() alone isn't quite enough,
+          though: asyncio.Lock is FIFO-fair, so a second get_agent_for_task
+          call already queued behind an in-flight build for the *same*
+          task_id can leave locked() briefly False the instant the first
+          build releases, while acquire() still queues behind that second
+          waiter rather than taking the fast path - an unbounded `async
+          with lock` here would then block for that waiter's own build
+          duration too. Bounding the acquire itself with a short timeout
+          closes that gap without reintroducing the original stall: on a
+          genuinely free lock the acquire is immediate (well under the
+          bound); on a busy one - contended or merely FIFO-queued - it
+          defers, same as the locked() check catches directly. A busy/
+          timed-out lock defers this task's eviction, the same tolerance-
+          for-eventual-consistency already used for an in-flight execution
+          above - a later voice PATCH from the same user, or an unrelated
+          eviction (task removal, owner/scope change), still catches the
+          stale-voice result once the build finishes; absent either of
+          those, it persists for the cached instance's remaining lifetime.
 
         Mirrors the scope-fingerprint-mismatch eviction above: the
         workspace is deliberately NOT cleaned up here (same owner, same
@@ -3037,7 +3056,17 @@ class AgentServiceManager:
             if lock is None:
                 lock = asyncio.Lock()
                 self._agent_build_locks[task_id] = lock
-            async with lock:
+            try:
+                # Bounded, not `async with lock:` - see docstring's FIFO-
+                # fairness note. A free lock acquires immediately, well
+                # under this bound; only a contended/queued one times out.
+                await asyncio.wait_for(
+                    lock.acquire(), timeout=_INVALIDATION_LOCK_ACQUIRE_TIMEOUT
+                )
+            except TimeoutError:
+                deferred_task_ids.append(task_id)
+                continue
+            try:
                 agent = self._agents.get(task_id)
                 if agent is not None:
                     status = agent.get_execution_status(str(task_id))
@@ -3053,6 +3082,8 @@ class AgentServiceManager:
                 self._agent_scope_fingerprints.pop(task_id, None)
                 self._agent_evicted_scope_fingerprints.pop(task_id, None)
                 evicted_task_ids.append(task_id)
+            finally:
+                lock.release()
         if evicted_task_ids:
             logger.info(
                 "Invalidated %d cached AgentService(s) for user %s after a "

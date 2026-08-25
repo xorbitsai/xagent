@@ -12,6 +12,19 @@ import pytest
 from xagent.core.tools.adapters.vibe.sandboxed_tool.sandboxed_mcp_tool_helper import (
     list_tools_in_sandbox,
 )
+from xagent.core.tools.adapters.vibe.sandboxed_tool.sandboxed_tool_wrapper import (
+    SandboxDependencyManager,
+)
+
+
+@pytest.fixture(autouse=True)
+def _reset_dependency_manager():
+    """SandboxDependencyManager tracks installed requirements in a class-level
+    dict, shared process-wide -- reset it so one test's mock sandbox can't be
+    mistaken for "already installed" state left behind by another."""
+    SandboxDependencyManager.reset()
+    yield
+    SandboxDependencyManager.reset()
 
 
 def _make_exec_result(exit_code: int = 0, stderr: str = "") -> MagicMock:

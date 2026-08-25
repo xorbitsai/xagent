@@ -129,6 +129,46 @@ class ReusedExecutionAdapter:
         return {"success": True}
 
 
+def test_execution_adapter_can_disable_skills_and_preserve_internal_metadata() -> None:
+    adapter = AgentExecutionAdapter(
+        AgentExecutionConfig(
+            name="builtin:internal_worker",
+            pattern="single_call",
+            llm=FakeLLM([]),
+            skills_enabled=False,
+            user_interaction_enabled=False,
+            execution_metadata={
+                "agent_type": "builtin",
+                "builtin_agent_name": "internal_worker",
+            },
+        )
+    )
+
+    runner, execution_type = adapter._build_runner()
+    metadata = adapter._execution_metadata(execution_type=execution_type)
+    normalized = adapter._normalize_result(
+        result={"success": True, "output": "ok"},
+        execution_type=execution_type,
+        execution_id="run-1",
+    )
+
+    assert runner.agent.skill_manager is None
+    assert runner.agent.allowed_skills is None
+    assert [
+        schema["function"]["name"]
+        for schema in runner.agent.patterns[0]._builtin_tool_schemas()
+    ] == ["final_answer"]
+    assert runner.agent.metadata == {
+        "agent_type": "builtin",
+        "builtin_agent_name": "internal_worker",
+        "pattern": "single_call",
+    }
+    assert metadata["agent_type"] == "builtin"
+    assert metadata["builtin_agent_name"] == "internal_worker"
+    assert normalized["metadata"]["agent_type"] == "builtin"
+    assert normalized["metadata"]["builtin_agent_name"] == "internal_worker"
+
+
 def test_execution_metadata_carries_runtime_modality_preferences() -> None:
     adapter = AgentExecutionAdapter(
         AgentExecutionConfig(
@@ -1237,6 +1277,71 @@ async def test_execution_adapter_forwards_outbound_messages() -> None:
     assert outbound_message["expect_response"] is False
     assert outbound_message["visible"] is True
     assert outbound_message["step_id"] == outbound_message["metadata"]["step_id"]
+
+
+@pytest.mark.asyncio
+async def test_execution_adapter_rejects_outbound_control_calls_when_disabled() -> None:
+    sent_messages: list[dict[str, Any]] = []
+    llm = FakeLLM(
+        [
+            {
+                "tool_calls": [
+                    {
+                        "id": "call-message",
+                        "function": {
+                            "name": "send_message",
+                            "arguments": json.dumps(
+                                {
+                                    "message": "Should stay internal",
+                                    "message_type": "progress",
+                                    "expect_response": False,
+                                }
+                            ),
+                        },
+                    }
+                ]
+            },
+            {
+                "tool_calls": [
+                    {
+                        "id": "call-final",
+                        "function": {
+                            "name": "final_answer",
+                            "arguments": json.dumps(
+                                {
+                                    "response_language": "en",
+                                    "answer": "done",
+                                    "outcome": "completed",
+                                }
+                            ),
+                        },
+                    }
+                ]
+            },
+        ]
+    )
+    adapter = AgentExecutionAdapter(
+        AgentExecutionConfig(
+            name="noninteractive",
+            pattern="single_call",
+            llm=llm,
+            outbound_message_handler=sent_messages.append,
+            skills_enabled=False,
+            user_interaction_enabled=False,
+        )
+    )
+
+    result = await adapter.execute(task="Stay internal", task_id="internal-exec")
+
+    assert result["success"] is True
+    assert result["output"] == "done"
+    assert sent_messages == []
+    assert [schema["function"]["name"] for schema in llm.calls[0]["tools"]] == [
+        "final_answer"
+    ]
+    assert [schema["function"]["name"] for schema in llm.calls[1]["tools"]] == [
+        "final_answer"
+    ]
 
 
 def test_execution_adapter_uses_last_assistant_message_when_output_missing() -> None:

@@ -208,6 +208,7 @@ class ReActPattern(AgentPattern):
         ),
         tool_parallel_enabled: bool = False,
         tool_max_concurrency: int = 3,
+        user_interaction_enabled: bool = True,
     ) -> None:
         self.llm = llm
         self.max_iterations = max_iterations
@@ -219,6 +220,7 @@ class ReActPattern(AgentPattern):
         # batch bounded by ``tool_max_concurrency``.
         self.tool_parallel_enabled = tool_parallel_enabled
         self.tool_max_concurrency = max(1, int(tool_max_concurrency))
+        self.user_interaction_enabled = user_interaction_enabled
         self.repeated_tool_decision_after_consecutive_tool_calls = (
             repeated_tool_decision_after_consecutive_tool_calls
         )
@@ -1697,7 +1699,7 @@ class ReActPattern(AgentPattern):
     def _builtin_tool_schemas(
         self, *, can_lookup_output_files: bool = False
     ) -> list[dict[str, Any]]:
-        return [
+        schemas = [
             {
                 "type": "function",
                 "function": {
@@ -1849,6 +1851,9 @@ class ReActPattern(AgentPattern):
                 },
             },
         ]
+        if not self.user_interaction_enabled:
+            return schemas[:1]
+        return schemas
 
     def _tool_schemas_with_builtin_controls(
         self,
@@ -1883,6 +1888,24 @@ class ReActPattern(AgentPattern):
     ) -> dict[str, Any] | None:
         name = tool_call["name"]
         args = tool_call.get("args", {})
+
+        if not self.user_interaction_enabled and name in {
+            "send_message",
+            "ask_user_question",
+        }:
+            error = f"Control tool '{name}' is disabled for this execution."
+            self._record_tool_call(
+                tool_call,
+                status="failed",
+                error=error,
+            )
+            context.add_tool_result(
+                tool_name=name,
+                result={"success": False, "error": error},
+                tool_call_id=tool_call.get("id"),
+            )
+            self.force_final_answer_next = True
+            return None
 
         if name == "final_answer":
             answer = self._final_answer_text(args)

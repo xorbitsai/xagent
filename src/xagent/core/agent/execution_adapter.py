@@ -56,7 +56,10 @@ class AgentExecutionConfig:
     skill_manager: Any | None = None
     skill_scope_context: Any | None = None
     allowed_skills: list[str] | None = None
+    skills_enabled: bool = True
+    user_interaction_enabled: bool = True
     preferred_input_modalities: tuple[str, ...] = ()
+    execution_metadata: dict[str, Any] = field(default_factory=dict)
 
 
 class AgentExecutionAdapter:
@@ -240,6 +243,7 @@ class AgentExecutionAdapter:
         include_request_context: bool = False,
     ) -> dict[str, Any]:
         metadata: dict[str, Any] = {
+            **self.config.execution_metadata,
             "execution_type": execution_type,
             "pattern": self.config.pattern,
         }
@@ -257,8 +261,10 @@ class AgentExecutionAdapter:
 
     def _build_runner(self) -> tuple[AgentRunner, str]:
         pattern, execution_type = self._build_pattern()
-        skill_manager = self.config.skill_manager
-        if skill_manager is None:
+        skill_manager = (
+            self.config.skill_manager if self.config.skills_enabled else None
+        )
+        if self.config.skills_enabled and skill_manager is None:
             from ...skills.utils import create_skill_manager
 
             skill_manager = create_skill_manager(
@@ -271,7 +277,10 @@ class AgentExecutionAdapter:
             llm=self.config.llm,
             compact_llm=self.config.compact_llm,
             system_prompt=self.config.system_prompt,
-            metadata={"pattern": self.config.pattern},
+            metadata={
+                **self.config.execution_metadata,
+                "pattern": self.config.pattern,
+            },
             memory_store=self.config.memory_store,
             memory_similarity_threshold=self.config.memory_similarity_threshold,
             skill_manager=skill_manager,
@@ -295,6 +304,7 @@ class AgentExecutionAdapter:
                 DAGPattern(
                     LLMPlanGenerator(),
                     max_concurrency=self.config.dag_max_concurrency,
+                    user_interaction_enabled=self.config.user_interaction_enabled,
                 ),
                 "agent_dag",
             )
@@ -305,10 +315,12 @@ class AgentExecutionAdapter:
                         max_iterations=self.config.react_max_iterations,
                         tool_parallel_enabled=self.config.tool_parallel_enabled,
                         tool_max_concurrency=self.config.tool_max_concurrency,
+                        user_interaction_enabled=(self.config.user_interaction_enabled),
                     ),
                     dag_pattern=DAGPattern(
                         LLMPlanGenerator(),
                         max_concurrency=self.config.dag_max_concurrency,
+                        user_interaction_enabled=(self.config.user_interaction_enabled),
                     ),
                 ),
                 "agent_auto",
@@ -320,6 +332,7 @@ class AgentExecutionAdapter:
                     finalize_after_tool_result=True,
                     tool_parallel_enabled=self.config.tool_parallel_enabled,
                     tool_max_concurrency=self.config.tool_max_concurrency,
+                    user_interaction_enabled=self.config.user_interaction_enabled,
                 ),
                 "agent_single_call",
             )
@@ -328,6 +341,7 @@ class AgentExecutionAdapter:
                 max_iterations=self.config.react_max_iterations,
                 tool_parallel_enabled=self.config.tool_parallel_enabled,
                 tool_max_concurrency=self.config.tool_max_concurrency,
+                user_interaction_enabled=self.config.user_interaction_enabled,
             ),
             "agent_react",
         )
@@ -414,6 +428,7 @@ class AgentExecutionAdapter:
             "success": result.get("success", False),
             "error": result.get("error"),
             "metadata": {
+                **self.config.execution_metadata,
                 "agent_name": self.config.name,
                 "execution_type": execution_type,
                 "pattern": self.config.pattern,

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import Any, cast
+
 import pytest
 
 from xagent.core.agent.builtin import (
@@ -41,3 +43,8 @@ def test_registry_rejects_duplicate_names_even_across_versions() -> None:
 def test_registry_require_fails_for_unknown_agent() -> None:
     with pytest.raises(BuiltinAgentNotFoundError, match="not registered"):
         BuiltinAgentRegistry().require("missing")
+
+
+def test_registry_rejects_non_spec_entries() -> None:
+    with pytest.raises(BuiltinAgentRegistrationError, match="BuiltinAgentSpec"):
+        BuiltinAgentRegistry().register(cast(Any, object()))

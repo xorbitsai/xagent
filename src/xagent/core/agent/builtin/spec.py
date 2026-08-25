@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
+from types import MappingProxyType
 from typing import Any, Literal, TypeAlias
 
 from ...tools.adapters.vibe import Tool
@@ -16,12 +17,16 @@ BuiltinAgentPattern: TypeAlias = Literal[
     "auto",
 ]
 
-_BUILTIN_EXECUTION_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
+_BUILTIN_EXECUTION_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
 
 
 @dataclass(frozen=True, slots=True)
 class BuiltinAgentRunContext:
-    """Execution-scoped dependencies available to built-in agent factories."""
+    """Execution-scoped dependencies available to built-in agent factories.
+
+    Identity and request inputs are immutable; ``artifacts`` is the deliberate
+    mutable output channel shared with execution-scoped tool builders.
+    """
 
     execution_id: str
     request_context: Mapping[str, Any] = field(default_factory=dict)
@@ -33,8 +38,13 @@ class BuiltinAgentRunContext:
         if not _BUILTIN_EXECUTION_ID_RE.fullmatch(self.execution_id):
             raise ValueError(
                 "Built-in agent execution_id must contain only letters, digits, "
-                "dots, colons, underscores, or hyphens"
+                "dots, underscores, or hyphens"
             )
+        object.__setattr__(
+            self,
+            "request_context",
+            MappingProxyType(dict(self.request_context)),
+        )
 
 
 BuiltinToolBuilderResult: TypeAlias = Sequence[Tool] | Awaitable[Sequence[Tool]]

@@ -57,6 +57,7 @@ class AgentExecutionConfig:
     skill_manager: Any | None = None
     skill_scope_context: Any | None = None
     allowed_skills: list[str] | None = None
+    # Capability gate: False overrides an explicitly supplied manager/list.
     skills_enabled: bool = True
     user_interaction_enabled: bool = True
     preferred_input_modalities: tuple[str, ...] = ()

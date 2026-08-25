@@ -8,7 +8,10 @@ from typing import Any, TypeAlias, cast
 
 from ...model.chat.basic.base import BaseLLM
 from ...tools.adapters.vibe import Tool
-from ...tools.adapters.vibe.base import ToolCategory
+from ...tools.adapters.vibe.base import (
+    AGENT_CONFIG_UNASSIGNABLE_CATEGORIES,
+    ToolCategory,
+)
 from ..service import AgentService
 from .registry import BUILTIN_AGENT_REGISTRY, BuiltinAgentRegistry
 from .spec import BuiltinAgentRunContext, BuiltinAgentSpec
@@ -18,6 +21,10 @@ BuiltinModelResolver: TypeAlias = Callable[
     [str, BuiltinAgentRunContext], BuiltinModelResolverResult
 ]
 BuiltinServiceFactory: TypeAlias = Callable[..., AgentService]
+_BUILTIN_ALLOWED_TOOL_CATEGORIES = (
+    frozenset(category.value for category in ToolCategory)
+    - AGENT_CONFIG_UNASSIGNABLE_CATEGORIES
+)
 
 
 class BuiltinAgentModelUnavailableError(RuntimeError):
@@ -58,6 +65,13 @@ class BuiltinAgentExecutor:
             raise ValueError("Built-in agent task must not be empty")
 
         spec = self._registry.require(name)
+        if spec.workspace_enabled and (
+            workspace_base_dir is None or not workspace_base_dir.strip()
+        ):
+            raise BuiltinAgentCapabilityError(
+                f"Built-in agent '{spec.name}' must be given an explicit "
+                "workspace_base_dir when workspace access is enabled"
+            )
         run_context = BuiltinAgentRunContext(
             execution_id=execution_id,
             request_context=dict(request_context or {}),
@@ -76,7 +90,7 @@ class BuiltinAgentExecutor:
         }
         service_kwargs: dict[str, Any] = {
             "name": f"builtin:{spec.name}",
-            "id": f"builtin:{spec.name}:{execution_id}",
+            "id": f"builtin--{spec.name}--{execution_id}",
             "task_id": execution_id,
             "pattern": spec.pattern,
             "llm": model,
@@ -147,7 +161,8 @@ class BuiltinAgentExecutor:
             metadata = getattr(tool, "metadata", None)
             category = getattr(metadata, "category", None)
             category_value = getattr(category, "value", category)
-            if category_value == ToolCategory.AGENT.value:
+            if category_value not in _BUILTIN_ALLOWED_TOOL_CATEGORIES:
                 raise BuiltinAgentCapabilityError(
-                    f"Built-in agent '{spec.name}' cannot use agent delegation tools"
+                    f"Built-in agent '{spec.name}' cannot use tools without an "
+                    f"explicit assignable category (got {category_value!r})"
                 )

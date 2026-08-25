@@ -58,6 +58,21 @@ class AgentCategoryTool:
     )
 
 
+class OtherCategoryTool:
+    metadata = ToolMetadata(
+        name="uncategorized",
+        description="Tool without an assignable category.",
+    )
+
+
+class BasicCategoryTool:
+    metadata = ToolMetadata(
+        name="basic",
+        description="A normal built-in tool.",
+        category=ToolCategory.BASIC,
+    )
+
+
 def _registry(**overrides: Any) -> BuiltinAgentRegistry:
     values: dict[str, Any] = {
         "name": "internal_worker",
@@ -95,7 +110,7 @@ async def test_executor_builds_a_least_privilege_agent_and_stamps_metadata() -> 
     assert service_factory.service is not None
     init = service_factory.service.init_kwargs
     assert init["name"] == "builtin:internal_worker"
-    assert init["id"] == "builtin:internal_worker:run-1"
+    assert init["id"] == "builtin--internal_worker--run-1"
     assert init["pattern"] == "single_call"
     assert init["llm"] is model
     assert init["tools"] == []
@@ -125,7 +140,7 @@ async def test_executor_builds_a_least_privilege_agent_and_stamps_metadata() -> 
 
 @pytest.mark.asyncio
 async def test_executor_supports_execution_scoped_async_tool_builders() -> None:
-    tool = object()
+    tool = BasicCategoryTool()
     builder_execution_ids: list[str] = []
 
     async def build_tools(context: Any) -> list[Any]:
@@ -174,19 +189,63 @@ async def test_executor_fails_before_service_creation_when_model_is_unavailable(
 
 
 @pytest.mark.asyncio
-async def test_executor_rejects_agent_delegation_tools() -> None:
+@pytest.mark.parametrize(
+    "tool",
+    [AgentCategoryTool(), OtherCategoryTool(), object()],
+)
+async def test_executor_rejects_tools_without_an_assignable_category(
+    tool: Any,
+) -> None:
     executor = BuiltinAgentExecutor(
-        registry=_registry(build_tools=lambda _context: [AgentCategoryTool()]),
+        registry=_registry(build_tools=lambda _context: [tool]),
         model_resolver=cast(Any, lambda _role, _context: FakeLLM()),
         service_factory=cast(Any, RecordingServiceFactory()),
     )
 
-    with pytest.raises(BuiltinAgentCapabilityError, match="delegation"):
+    with pytest.raises(BuiltinAgentCapabilityError, match="assignable category"):
         await executor.execute(
             "internal_worker",
             task="Perform internal work",
             execution_id="run-delegation",
         )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("missing_root", [None, "", " "])
+async def test_executor_requires_an_explicit_root_for_workspace_access(
+    tmp_path: Any,
+    missing_root: str | None,
+) -> None:
+    service_factory = RecordingServiceFactory()
+    executor = BuiltinAgentExecutor(
+        registry=_registry(workspace_enabled=True),
+        model_resolver=cast(Any, lambda _role, _context: FakeLLM()),
+        service_factory=cast(Any, service_factory),
+    )
+
+    with pytest.raises(BuiltinAgentCapabilityError, match="workspace_base_dir"):
+        await executor.execute(
+            "internal_worker",
+            task="Perform internal work",
+            execution_id="run-workspace",
+            workspace_base_dir=missing_root,
+        )
+    assert service_factory.service is None
+
+    await executor.execute(
+        "internal_worker",
+        task="Perform internal work",
+        execution_id="run-workspace",
+        workspace_base_dir=str(tmp_path),
+    )
+
+    assert service_factory.service is not None
+    assert service_factory.service.init_kwargs["enable_workspace"] is True
+    assert service_factory.service.init_kwargs["workspace_base_dir"] == str(tmp_path)
+    assert (
+        service_factory.service.init_kwargs["id"]
+        == "builtin--internal_worker--run-workspace"
+    )
 
 
 @pytest.mark.asyncio

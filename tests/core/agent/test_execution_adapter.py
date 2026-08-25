@@ -10,7 +10,7 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
-from xagent.core.agent import AgentExecutionAdapter, AgentExecutionConfig
+from xagent.core.agent import AgentExecutionAdapter, AgentExecutionConfig, ReActPattern
 from xagent.core.agent.execution_adapter import INTERRUPTED_USER_MESSAGE
 from xagent.core.agent.result import NO_OUTPUT_PLACEHOLDER
 from xagent.core.agent.service import AgentService
@@ -1421,6 +1421,88 @@ async def test_execution_adapter_rejects_outbound_control_calls_when_disabled(
     }
     assert cancelled_work_ids == {"call-work-before", "call-work-after"}
     assert "call ask_user_question" not in llm.calls[0]["messages"][0]["content"]
+
+
+@pytest.mark.asyncio
+async def test_disabled_control_prescan_runs_when_control_is_first(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cancelled_batches: list[list[str]] = []
+    original_cancel = ReActPattern._cancel_tool_calls
+
+    def record_cancelled_batch(
+        self: ReActPattern,
+        tool_calls: list[dict[str, Any]],
+        *args: Any,
+        **kwargs: Any,
+    ) -> None:
+        cancelled_batches.append([str(call.get("id")) for call in tool_calls])
+        original_cancel(self, tool_calls, *args, **kwargs)
+
+    monkeypatch.setattr(ReActPattern, "_cancel_tool_calls", record_cancelled_batch)
+    work_tool = FakeTool()
+    llm = FakeLLM(
+        [
+            {
+                "tool_calls": [
+                    {
+                        "id": "call-control",
+                        "function": {
+                            "name": "send_message",
+                            "arguments": json.dumps(
+                                {
+                                    "message": "Do not send",
+                                    "message_type": "progress",
+                                    "expect_response": False,
+                                }
+                            ),
+                        },
+                    },
+                    {
+                        "id": "call-work-after",
+                        "function": {
+                            "name": "noop",
+                            "arguments": json.dumps({"value": "must-not-run"}),
+                        },
+                    },
+                ]
+            },
+            {
+                "tool_calls": [
+                    {
+                        "id": "call-final",
+                        "function": {
+                            "name": "final_answer",
+                            "arguments": json.dumps(
+                                {
+                                    "response_language": "en",
+                                    "answer": "done",
+                                    "outcome": "completed",
+                                }
+                            ),
+                        },
+                    }
+                ]
+            },
+        ]
+    )
+    adapter = AgentExecutionAdapter(
+        AgentExecutionConfig(
+            name="noninteractive",
+            pattern="single_call",
+            llm=llm,
+            tools=[work_tool],
+            skills_enabled=False,
+            user_interaction_enabled=False,
+        )
+    )
+
+    result = await adapter.execute(task="Stay internal", task_id="internal-exec")
+
+    assert result["success"] is True
+    assert work_tool.calls == []
+    assert cancelled_batches[0] == []
+    assert ["call-work-after"] in cancelled_batches
 
 
 def test_execution_adapter_uses_last_assistant_message_when_output_missing() -> None:

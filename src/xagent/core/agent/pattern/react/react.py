@@ -2508,7 +2508,7 @@ class ReActPattern(AgentPattern):
                 ),
                 None,
             )
-            if disabled_index:
+            if disabled_index is not None:
                 preceding = self.pending_tool_calls[:disabled_index]
                 disabled_name = self.pending_tool_calls[disabled_index].get("name")
                 self.pending_tool_calls = self.pending_tool_calls[disabled_index:]

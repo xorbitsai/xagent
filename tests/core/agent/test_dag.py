@@ -31,6 +31,7 @@ from xagent.core.agent.language import (
     OUTPUT_LANGUAGE_SOURCE_PLAN,
 )
 from xagent.core.agent.pattern.base import RequiredToolCallError
+from xagent.core.agent.pattern.dag import dag as dag_module
 from xagent.core.agent.pattern.dag.dag import _DAGStepRuntime
 from xagent.core.agent.pattern.dag.plan_generator import (
     PLAN_GENERATION_REQUIRED_TOOL_MESSAGE,
@@ -451,6 +452,34 @@ def test_dag_waiting_response_preserves_active_step_state() -> None:
         "forwarded_from_root": True,
         "dag_step_id": "confirm",
     }
+
+
+@pytest.mark.asyncio
+async def test_dag_forwards_disabled_interaction_policy_to_each_step(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed_policies: list[bool] = []
+    original_react_pattern = dag_module.ReActPattern
+
+    class RecordingReActPattern(original_react_pattern):
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            observed_policies.append(kwargs["user_interaction_enabled"])
+            super().__init__(*args, **kwargs)
+
+    monkeypatch.setattr(dag_module, "ReActPattern", RecordingReActPattern)
+    pattern = DAGPattern(
+        lambda **_: build_plan(PlanStep(id="answer", task="Answer")),
+        user_interaction_enabled=False,
+    )
+
+    result = await pattern.run(
+        context=ExecutionContext(execution_id="dag-no-interaction"),
+        tools=[],
+        llm=SequenceLLM([{"content": "done", "done": True}]),
+    )
+
+    assert result["success"] is True
+    assert observed_policies == [False]
 
 
 async def run_invalid_plan(plan: ExecutionPlan) -> dict[str, Any]:

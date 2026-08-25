@@ -583,8 +583,27 @@ async def build_workforce_prompt_plan(
     execution_id = f"workforce-prompt-builder-{uuid4().hex}"
     # builder_response below is a free-text assistant reply persisted into
     # the conversation - the same "every agent this user talks to" sink
-    # apply_output_voice's other callers cover.
-    system_prompt = apply_output_voice(workforce_prompt_builder_system_prompt(), voice)
+    # apply_output_voice's other callers cover. But this same system
+    # prompt also governs create_agent/create_workforce tool-call
+    # arguments (names, descriptions, instructions, aliases, assignment
+    # text) that get persisted as configuration, not shown to the user as
+    # conversation - a blanket tone instruction would let e.g. "concise"
+    # start trimming those fields too. Scope it explicitly to the final
+    # reply, mirroring how this same prompt already scopes its language
+    # policy to exempt "English tool names, schemas, and tool results"
+    # above.
+    base_system_prompt = workforce_prompt_builder_system_prompt()
+    system_prompt = apply_output_voice(base_system_prompt, voice)
+    if system_prompt != base_system_prompt:
+        system_prompt = (
+            f"{system_prompt}\n\n"
+            "The OUTPUT VOICE above governs only your final natural-language "
+            "reply to the user. Agent names, descriptions, instructions, "
+            "aliases, and assignment text passed to "
+            "create_agent/create_workforce are persisted configuration, not "
+            "conversation - write them in plain, neutral language "
+            "regardless of that tone."
+        )
     service = AgentService(
         name="Workforce Prompt Builder",
         id=execution_id,

@@ -15,7 +15,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
-from xagent.web.api.auth import _lock_user_row_for_preferences_update
+from xagent.web.api import auth as auth_api
 from xagent.web.models.database import Base, get_engine, get_session_local, init_db
 from xagent.web.models.user import User
 
@@ -53,17 +53,29 @@ def test_concurrent_disjoint_field_updates_both_survive(postgres_user) -> None:
     """Two sessions PATCHing disjoint fields must not lose either one:
     the second session's lock acquisition blocks until the first
     commits, then it merges on top of the first's already-persisted
-    change rather than a stale read."""
+    change rather than a stale read.
+
+    The second side calls _merge_user_preferences_locked directly - the
+    actual function the PATCH endpoint runs through
+    run_db_io_cancellation_safe - rather than hand-rolling an equivalent
+    lock+read+merge+commit sequence, so a regression in that function's
+    own ordering (e.g. reading before the lock, or moving the fetch
+    off the locked session) fails this test instead of leaving it green
+    against a mirror that no longer matches production."""
     SessionLocal, user_id = postgres_user
 
     first_locked = threading.Event()
     release_first = threading.Event()
     first_committed = threading.Event()
-    second_locked = threading.Event()
+    second_returned = threading.Event()
 
     def run_first_update() -> None:
+        # Hand-rolled, not the production function: this side only needs
+        # to hold the row lock open on a controlled schedule, to prove
+        # the second call - which does go through the real production
+        # path below - actually blocks behind it.
         with SessionLocal() as db:
-            _lock_user_row_for_preferences_update(db, user_id)
+            auth_api._lock_user_row_for_preferences_update(db, user_id)
             first_locked.set()
             assert release_first.wait(timeout=10)
             user = db.get(User, user_id)
@@ -75,27 +87,25 @@ def test_concurrent_disjoint_field_updates_both_survive(postgres_user) -> None:
 
     def run_second_update() -> None:
         assert first_locked.wait(timeout=10)
-        with SessionLocal() as db:
-            _lock_user_row_for_preferences_update(db, user_id)
-            second_locked.set()
-            user = db.get(User, user_id)
-            preferences = dict(user.preferences or {})
-            preferences["voice"] = "warm"
-            user.preferences = preferences
-            db.commit()
+        result = auth_api._merge_user_preferences_locked(user_id, {"voice": "warm"})
+        assert result is not None
+        second_returned.set()
 
     with ThreadPoolExecutor(max_workers=2) as executor:
         first = executor.submit(run_first_update)
         assert first_locked.wait(timeout=10)
         second = executor.submit(run_second_update)
-        # The second session's lock attempt must block behind the first
-        # session's still-open transaction.
-        assert not second_locked.wait(timeout=0.2)
+        # The second call's lock attempt must block behind the first
+        # session's still-open transaction - the whole call can't return
+        # (lock, fetch, merge, and commit are all fast once acquired)
+        # until the first session releases the lock.
+        assert not second_returned.wait(timeout=0.2)
         release_first.set()
         first.result(timeout=10)
         second.result(timeout=10)
 
     assert first_committed.is_set()
+    assert second_returned.is_set()
     with SessionLocal() as db:
         user = db.get(User, user_id)
         assert user.preferences == {

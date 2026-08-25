@@ -34,13 +34,14 @@ from ..auth_config import (
     REFRESH_TOKEN_EXPIRE_DAYS,
 )
 from ..auth_dependencies import get_current_user
-from ..models.database import get_db
+from ..models.database import get_db, get_session_local
 from ..models.system_setting import SystemSetting
 from ..models.user import User
 from ..models.user_oauth import UserOAuth
 from ..oauth_provider_quirks import requires_json_accept_header
 from ..services import gmail_provisioning
 from ..services.auth_email import send_password_reset_email
+from ..services.db_runtime import run_db_io_cancellation_safe
 from ..services.user_oauth import delete_scoped_user_oauth_accounts
 from ..utils.graphql_errors import graphql_errors_message, truncate_error_text
 
@@ -1362,11 +1363,11 @@ def _lock_user_row_for_preferences_update(db: Session, user_id: int) -> bool:
     blocks here instead of reading stale data and silently dropping the
     first request's disjoint fields on its own commit.
 
-    Returns ``False`` when the user no longer exists (deleted between
-    ``get_current_user`` loading it and this call), the same contract the
+    Returns ``False`` when the user no longer exists (deleted between the
+    caller resolving the id and this call), the same contract the
     mirrored helper uses - letting the caller turn that into a clean 404
-    instead of an unhandled ``ObjectDeletedError`` from a subsequent
-    ``db.refresh()``."""
+    instead of an unhandled ``ObjectDeletedError`` from the subsequent
+    fetch."""
     if db.get_bind().dialect.name == "sqlite":
         db.execute(
             text("UPDATE users SET id = id WHERE id = :user_id"),
@@ -1379,10 +1380,57 @@ def _lock_user_row_for_preferences_update(db: Session, user_id: int) -> bool:
     )
 
 
+def _merge_user_preferences_locked(
+    user_id: int, updates: Dict[str, Any]
+) -> Dict[str, Any] | None:
+    """Entirely self-contained: opens and closes its own Session and never
+    touches a request-scoped `user`/`db`. This is required, not just
+    tidy: the lock wait this is built around is a real, potentially slow
+    blocking DB call under contention, so the endpoint runs this whole
+    operation through run_db_io_cancellation_safe - if the request is
+    cancelled (client disconnect, timeout) while this worker is
+    mid-transaction, FastAPI can tear down the request's own Session
+    concurrently, and run_db_io_cancellation_safe's contract is exactly
+    "operation must create/use/close its own Session and return only
+    detached data" so that race can't happen (see db_runtime.py's
+    docstring on it; this mirrors admin_users.py's
+    _delete_user_rows_sync).
+
+    Returns the serialized response payload (not the ORM object), built
+    BEFORE commit: Session.commit() defaults to expire_on_commit=True, so
+    any attribute access after commit would force a fresh SELECT - itself
+    a race, since the lock is released the instant commit() returns and a
+    concurrent delete could land in that gap. The preferences merge is
+    already reflected in the in-memory object the moment it's set, so
+    nothing here needs a post-commit read at all.
+
+    Returns ``None`` if the user no longer exists (deleted between the
+    caller resolving ``user_id`` and this call)."""
+    session_factory = get_session_local()
+    worker_db = session_factory()
+    try:
+        if not _lock_user_row_for_preferences_update(worker_db, user_id):
+            return None
+        # Loaded fresh, under the lock, in this operation's own session -
+        # not whatever `User` row the caller may have loaded earlier,
+        # which could be stale (a concurrent PATCH may have committed its
+        # own merge while this request was waiting on the lock).
+        worker_user = worker_db.get(User, user_id)
+        if worker_user is None:
+            return None
+        current_preferences = _normalized_preferences(worker_user)
+        current_preferences.update(updates)
+        setattr(worker_user, "preferences", current_preferences)
+        payload = serialize_auth_user(worker_user)
+        worker_db.commit()
+        return payload
+    finally:
+        worker_db.close()
+
+
 @auth_router.patch("/me/preferences", response_model=UpdatePreferencesResponse)
 async def update_current_user_preferences(
     request: UpdatePreferencesRequest,
-    db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ) -> UpdatePreferencesResponse:
     """Merge the given fields into the current user's stored preferences.
@@ -1397,47 +1445,12 @@ async def update_current_user_preferences(
             user=serialize_auth_user(user),
         )
 
-    def _merge_preferences_sync() -> tuple[int, Dict[str, Any]] | None:
-        """The lock wait this is built around is a real, potentially
-        slow blocking DB call under contention - run the whole
-        lock -> refresh -> merge -> commit transaction in a worker
-        thread so it never blocks the event loop for unrelated
-        requests/WebSockets on this worker, matching this file's own
-        asyncio.to_thread convention for synchronous DB work (see
-        login's _update_user_sync). `db`/`user` are only touched here
-        and, sequentially after this awaited call returns, by the
-        caller - never concurrently from two threads at once.
-
-        Returns the serialized response payload (not the ORM object):
-        Session.commit() defaults to expire_on_commit=True, so any
-        attribute access on `user` after this function returns would
-        otherwise trigger an implicit reload - a blocking SELECT that
-        would land back on the event loop instead of this thread. Read
-        everything the caller needs here, while still off-loop."""
-        if not _lock_user_row_for_preferences_update(db, int(user.id)):
-            # Deleted concurrently (e.g. account deletion) between
-            # get_current_user loading this row and the lock attempt.
-            return None
-        # Re-read after acquiring the lock: a concurrent PATCH may
-        # have committed its own merge while this request was
-        # waiting on it, and `user` was loaded before that lock was
-        # taken. Once acquired, the lock (FOR UPDATE, or SQLite's
-        # write lock via the no-op update) also rules out a
-        # concurrent deletion for the rest of this transaction, so a
-        # trailing refresh to pick that case up is unnecessary - the
-        # response is serialized from the in-memory `user` object
-        # this same merge already updated.
-        db.refresh(user)
-        current_preferences = _normalized_preferences(user)
-        current_preferences.update(updates)
-        setattr(user, "preferences", current_preferences)
-        db.commit()
-        return int(user.id), serialize_auth_user(user)
-
-    merged = await asyncio.to_thread(_merge_preferences_sync)
-    if merged is None:
+    user_id = int(user.id)
+    serialized_user = await run_db_io_cancellation_safe(
+        lambda: _merge_user_preferences_locked(user_id, updates)
+    )
+    if serialized_user is None:
         raise HTTPException(status_code=404, detail="User not found")
-    user_id, serialized_user = merged
 
     if "voice" in updates:
         # A cached AgentService bakes voice into its system prompt at

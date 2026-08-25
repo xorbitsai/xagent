@@ -16,7 +16,7 @@ from sqlalchemy.orm import sessionmaker
 from xagent.web.api import auth as auth_api
 from xagent.web.api import chat as chat_api
 from xagent.web.api.auth import RefreshTokenResponse, auth_router, hash_password
-from xagent.web.models.database import Base, get_db
+from xagent.web.models.database import Base, configure_db, get_db, get_engine
 from xagent.web.models.user import User
 
 # Create temporary directory for database
@@ -94,9 +94,8 @@ def test_db():
     import uuid
 
     test_db_path = os.path.join(temp_dir, f"test_{uuid.uuid4().hex}.db")
-    test_engine = create_engine(
-        f"sqlite:///{test_db_path}", connect_args={"check_same_thread": False}
-    )
+    test_db_url = f"sqlite:///{test_db_path}"
+    test_engine = create_engine(test_db_url, connect_args={"check_same_thread": False})
 
     # Create all tables
     Base.metadata.create_all(bind=test_engine)
@@ -105,6 +104,16 @@ def test_db():
     global engine, TestingSessionLocal
     engine = test_engine
     TestingSessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+
+    # Also point the app's global session factory at the same file:
+    # update_current_user_preferences opens its own Session via
+    # get_session_local() (see _merge_user_preferences_locked) rather
+    # than the request-scoped `db` from Depends(get_db)/TestingSessionLocal
+    # above, so without this it raises "Session Local is not initialized"
+    # instead of touching this test's own database. configure_db binds
+    # the engine/session factory without re-running migrations or
+    # create_all, which this fixture already did above.
+    configure_db(db_url=test_db_url)
 
     yield
 
@@ -600,24 +609,32 @@ class TestAuthAPI:
             user = (
                 db.query(User).filter(User.username == test_user_data["username"]).one()
             )
-
-            event_loop_thread_id = threading.get_ident()
-            executed_thread_ids: list[int] = []
-
-            def _record_thread(*_args: object, **_kwargs: object) -> None:
-                executed_thread_ids.append(threading.get_ident())
-
-            event.listen(engine, "before_cursor_execute", _record_thread)
-            try:
-                response = await auth_api.update_current_user_preferences(
-                    request=auth_api.UpdatePreferencesRequest(voice="warm"),
-                    db=db,
-                    user=user,
-                )
-            finally:
-                event.remove(engine, "before_cursor_execute", _record_thread)
         finally:
             db.close()
+
+        event_loop_thread_id = threading.get_ident()
+        executed_thread_ids: list[int] = []
+
+        def _record_thread(*_args: object, **_kwargs: object) -> None:
+            executed_thread_ids.append(threading.get_ident())
+
+        # _merge_user_preferences_locked opens its own Session via
+        # get_session_local() (see its own docstring for why), which is
+        # bound to a different engine object than this file's own
+        # TestingSessionLocal/`engine` - the `configure_db` call the
+        # `test_db` fixture makes points both at the same underlying
+        # sqlite file, but they're separate SQLAlchemy Engine instances,
+        # so the listener has to attach to the one the endpoint's own
+        # worker session actually uses.
+        merge_engine = get_engine()
+        event.listen(merge_engine, "before_cursor_execute", _record_thread)
+        try:
+            response = await auth_api.update_current_user_preferences(
+                request=auth_api.UpdatePreferencesRequest(voice="warm"),
+                user=user,
+            )
+        finally:
+            event.remove(merge_engine, "before_cursor_execute", _record_thread)
 
         assert response.success is True
         assert response.user is not None

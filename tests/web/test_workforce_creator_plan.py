@@ -398,6 +398,15 @@ async def test_build_workforce_prompt_plan_applies_voice_to_system_prompt(
         workforce_prompt_builder_system_prompt() + "\n\n## OUTPUT VOICE\n"
     )
     assert "Empathetic and reassuring" in system_prompt
+    # The OUTPUT VOICE section also governs create_agent/create_workforce
+    # tool-call arguments in this same system prompt, which get persisted
+    # as configuration - it must be explicitly scoped to the final reply
+    # only, or a tone like "concise" could start trimming agent
+    # names/descriptions/instructions too.
+    assert "persisted configuration, not" in system_prompt
+    assert system_prompt.index("## OUTPUT VOICE") < system_prompt.index(
+        "persisted configuration, not"
+    )
 
 
 @pytest.mark.asyncio

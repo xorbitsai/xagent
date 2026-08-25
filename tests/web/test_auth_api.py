@@ -4,7 +4,7 @@ import asyncio
 import os
 import tempfile
 import threading
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 from urllib.parse import parse_qs, urlparse
 
 import pytest
@@ -484,6 +484,25 @@ class TestAuthAPI:
         )
         assert response.status_code == 422
 
+    def test_update_current_user_preferences_rejects_a_lax_boolean_for_onboarded(
+        self, test_db, test_user_data
+    ):
+        """StrictBool, matching this file's StrictInt/StrictStr convention
+        elsewhere - "true"/1/etc. must not silently coerce."""
+        setup_first_admin()
+        register_response = client.post("/api/auth/register", json=test_user_data)
+        assert register_response.status_code == 200
+        token = login_and_get_token(
+            test_user_data["username"], test_user_data["password"]
+        )
+
+        response = client.patch(
+            "/api/auth/me/preferences",
+            json={"onboarded": "true"},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert response.status_code == 422
+
     def test_update_current_user_preferences_accepts_fields_at_their_bounds(
         self, test_db, test_user_data
     ):
@@ -626,7 +645,10 @@ class TestAuthAPI:
         self, test_db, test_user_data
     ):
         """null is the merge-style PATCH's clear signal, distinct from
-        (and still allowed alongside) the blank-string rejection above."""
+        (and still allowed alongside) the blank-string rejection above.
+        Clearing deletes the key entirely rather than storing a literal
+        `{"department": null}` entry - otherwise every future read would
+        replay that stale explicit-null forever."""
         setup_first_admin()
         register_response = client.post("/api/auth/register", json=test_user_data)
         assert register_response.status_code == 200
@@ -647,7 +669,9 @@ class TestAuthAPI:
             headers={"Authorization": f"Bearer {token}"},
         )
         assert response.status_code == 200, response.text
-        assert response.json()["user"]["preferences"]["department"] is None
+        preferences = response.json()["user"]["preferences"]
+        assert preferences.get("department") is None
+        assert "department" not in preferences
 
     def test_update_current_user_preferences_with_empty_body_is_a_no_op(
         self, test_db, test_user_data
@@ -685,6 +709,7 @@ class TestAuthAPI:
         user_id = register_response.json()["user"]["id"]
 
         mock_manager = MagicMock()
+        mock_manager.invalidate_cached_agents_for_owner = AsyncMock()
         monkeypatch.setattr(chat_api, "get_agent_manager", lambda: mock_manager)
 
         response = client.patch(
@@ -763,6 +788,24 @@ class TestAuthAPI:
             "/api/auth/me/preferences", json={"voice": "warm"}, headers=headers
         )
         assert response.status_code == 404, response.text
+
+    def test_merge_user_preferences_locked_returns_none_when_user_vanishes_after_lock(
+        self, test_db, monkeypatch
+    ):
+        """A second, narrower race than the lock-helper-returns-False case
+        above: the lock helper can report success for a row that's since
+        been deleted (lock acquired, then a concurrent delete lands before
+        the fetch). worker_db.get(User, user_id) is None must be its own
+        clean None result, not an unhandled crash - exercised directly
+        since reaching it through the endpoint would need an actual
+        concurrent delete mid-request."""
+        monkeypatch.setattr(
+            auth_api, "_lock_user_row_for_preferences_update", lambda db, user_id: True
+        )
+
+        result = auth_api._merge_user_preferences_locked(999999, {"voice": "warm"})
+
+        assert result is None
 
     @pytest.mark.asyncio
     async def test_update_current_user_preferences_keeps_all_sql_off_the_event_loop(
@@ -1071,6 +1114,7 @@ class TestAuthAPI:
         monkeypatch.setattr(auth_api, "_merge_user_preferences_locked", delayed_merge)
 
         mock_manager = MagicMock()
+        mock_manager.invalidate_cached_agents_for_owner = AsyncMock()
         monkeypatch.setattr(chat_api, "get_agent_manager", lambda: mock_manager)
 
         merge_engine = get_engine()

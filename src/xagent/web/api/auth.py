@@ -20,12 +20,21 @@ os.environ["OAUTHLIB_RELAX_TOKEN_SCOPE"] = "1"
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from fastapi.responses import HTMLResponse, RedirectResponse
 from jose import JWTError, jwt
-from pydantic import BaseModel, ConfigDict, Field, StrictInt, StrictStr, field_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    StrictBool,
+    StrictInt,
+    StrictStr,
+    field_validator,
+)
 from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from ...config import get_app_base_url, get_password_reset_expire_minutes
+from ...core.agent.voice_policy import VALID_VOICES as _CORE_VALID_VOICES
 from ..auth_config import (
     ACCESS_TOKEN_EXPIRE_MINUTES,
     JWT_ALGORITHM,
@@ -650,8 +659,11 @@ class UpdateEmailResponse(BaseModel):
 
 # The 5 voice options the onboarding "Launch" step offers - each agent's
 # system prompt gets a short instruction derived from whichever one the
-# user picked (see apply_user_voice in api/agents.py).
-VALID_USER_VOICES = {"professional", "friendly", "concise", "warm", "playful"}
+# user picked (see apply_user_voice in api/agents.py). Re-exported from
+# core.agent.voice_policy (the canonical source, not redeclared here) so
+# this and _VOICE_INSTRUCTIONS there can never drift into two
+# independently-maintained copies of the same 5-string set.
+VALID_USER_VOICES = _CORE_VALID_VOICES
 
 # Onboarding's "About you"/"Goals" steps are short free-text labels and a
 # handful of goal picks, not open-ended documents - these mirror the
@@ -677,7 +689,7 @@ class UpdatePreferencesRequest(BaseModel):
     # key is a 422, not a lost write the client believes succeeded.
     model_config = ConfigDict(extra="forbid")
 
-    onboarded: Optional[bool] = None
+    onboarded: Optional[StrictBool] = None
     department: Optional[str] = Field(
         default=None, max_length=PREFERENCES_TEXT_FIELD_MAX_LENGTH
     )
@@ -1456,7 +1468,16 @@ def _merge_user_preferences_locked(
         if worker_user is None:
             return None
         current_preferences = _normalized_preferences(worker_user)
-        current_preferences.update(updates)
+        for key, value in updates.items():
+            # An explicit `null` is this endpoint's only clear-a-field
+            # signal (see UpdatePreferencesRequest's blank-string
+            # rejection) - storing a literal `{key: None}` entry instead
+            # of deleting the key would have every future read replay a
+            # stale explicit-null forever.
+            if value is None:
+                current_preferences.pop(key, None)
+            else:
+                current_preferences[key] = value
         setattr(worker_user, "preferences", current_preferences)
         payload = serialize_auth_user(worker_user)
         worker_db.commit()
@@ -1501,8 +1522,19 @@ async def update_current_user_preferences(
     # row lock - without this, that session would sit idle-in-transaction,
     # holding a pool slot, for the whole lock wait (issue #889, same
     # pattern already used before chat.py's sandbox startup and
-    # workforce_creator.py's ReAct builder call).
-    release_db_connection_if_clean(db)
+    # workforce_creator.py's ReAct builder call). A read-only session
+    # should always release cleanly; treating a failure as a hard error
+    # (mirroring workforce_creator.py's own release_db_connection_if_clean
+    # call) surfaces that as a signal instead of silently holding the
+    # connection through the lock wait anyway.
+    if not release_db_connection_if_clean(db):
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "code": "preferences_update_unavailable",
+                "message": "Could not release the database before updating preferences.",
+            },
+        )
 
     # run_db_io_cancellation_safe's own contract discards a settled result
     # in favor of re-raising the caller's deferred cancellation (see its
@@ -1530,7 +1562,7 @@ async def update_current_user_preferences(
             # old (or now-cleared) voice until incidental eviction/rebuild.
             from .chat import get_agent_manager
 
-            get_agent_manager().invalidate_cached_agents_for_owner(user_id)
+            await get_agent_manager().invalidate_cached_agents_for_owner(user_id)
 
         return UpdatePreferencesResponse(
             success=True,

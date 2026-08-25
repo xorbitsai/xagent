@@ -555,6 +555,11 @@ class TestAgentServiceManagerReconstruction:
             mock_get_memory.return_value = MagicMock()
             mock_tool_factory.create_all_tools = AsyncMock(return_value=[])
             mock_agent_service_class.return_value = MagicMock()
+            # No execution has run on this cached instance, so invalidation
+            # below must not treat it as in-flight and defer eviction.
+            mock_agent_service_class.return_value.get_execution_status.return_value = (
+                None
+            )
 
             await _turn("professional")
             prompt_a = mock_agent_service_class.call_args.kwargs["system_prompt"]
@@ -569,7 +574,7 @@ class TestAgentServiceManagerReconstruction:
             # Voice PATCH professional -> warm: invalidate (as the PATCH
             # endpoint does), then the next turn on the same task rebuilds
             # with the new voice.
-            agent_manager.invalidate_cached_agents_for_owner(7)
+            await agent_manager.invalidate_cached_agents_for_owner(7)
             await _turn("warm")
             prompt_b = mock_agent_service_class.call_args.kwargs["system_prompt"]
             assert "Empathetic and reassuring" in prompt_b
@@ -577,7 +582,7 @@ class TestAgentServiceManagerReconstruction:
 
             # Voice PATCH warm -> cleared (None): invalidate, next turn has
             # no OUTPUT VOICE section at all.
-            agent_manager.invalidate_cached_agents_for_owner(7)
+            await agent_manager.invalidate_cached_agents_for_owner(7)
             await _turn(None)
             prompt_c = mock_agent_service_class.call_args.kwargs["system_prompt"]
             assert "## OUTPUT VOICE" not in prompt_c

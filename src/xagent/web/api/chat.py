@@ -2951,8 +2951,9 @@ class AgentServiceManager:
             )
             agent.invalidate_tools()
 
-    def invalidate_cached_agents_for_owner(self, owner_user_id: int) -> None:
-        """Evict every cached AgentService owned by ``owner_user_id``.
+    async def invalidate_cached_agents_for_owner(self, owner_user_id: int) -> None:
+        """Evict every cached AgentService owned by ``owner_user_id`` that
+        is not currently mid-execution.
 
         A cached AgentService bakes its system prompt in at construction
         time (``AgentService.__init__`` -> ``self._base_system_prompt``)
@@ -2962,30 +2963,80 @@ class AgentServiceManager:
         Call this right after committing a voice change so the next turn
         on each affected task rebuilds from a fresh snapshot instead.
 
+        Two races this must not create, both found by review on the first
+        version of this method:
+
+        - Popping a task's AgentService while it has an in-flight
+          execution orphans that execution - the next live-control call
+          (stop/interrupt/message) builds a *new* AgentService with an
+          empty execution registry, disconnected from the real run
+          (get_agent_for_task/_get_agent_for_task_unlocked). Guarded by
+          checking get_execution_status before evicting: is_running or
+          is_resumable (paused/waiting-for-user, which still holds the
+          slot for a resume) means this task's eviction is deferred, not
+          forced - the same tolerance for eventual (not immediate) cache
+          consistency already accepted for the cross-process case tracked
+          in issue #1639.
+        - Racing a concurrent build (get_agent_for_task, guarded by
+          _agent_build_locks) is not just "which one goes first": a build
+          already past its old-voice prompt construction has nothing left
+          for a same-moment pop to invalidate, and would then overwrite
+          this eviction with the stale-voice result the instant it
+          finishes. Taking the same per-task lock before deciding this
+          task's fate serializes against that build - either this method
+          runs first and a subsequent build reads the now-committed voice
+          from a fresh row, or the build runs first and this method still
+          gets to evict its (stale) result once the lock is free.
+
         Mirrors the scope-fingerprint-mismatch eviction above: the
         workspace is deliberately NOT cleaned up here (same owner, same
         on-disk data must survive the rebuild) - only the manager's cache
-        bookkeeping is cleared.
+        bookkeeping is cleared, and only for tasks actually evicted.
         """
         stale_task_ids = [
             task_id
             for task_id, cached_owner_id in self._agent_owner_ids.items()
             if cached_owner_id == owner_user_id
         ]
+        evicted_task_ids: List[int] = []
+        deferred_task_ids: List[int] = []
         for task_id in stale_task_ids:
-            self._agents.pop(task_id, None)
-            self._agent_owner_ids.pop(task_id, None)
-            self._agent_sandbox_keys.pop(task_id, None)
-            self._agent_sandbox_providers.pop(task_id, None)
-            self._agent_scope_fingerprints.pop(task_id, None)
-            self._agent_evicted_scope_fingerprints.pop(task_id, None)
-        if stale_task_ids:
+            lock = self._agent_build_locks.get(task_id)
+            if lock is None:
+                lock = asyncio.Lock()
+                self._agent_build_locks[task_id] = lock
+            async with lock:
+                agent = self._agents.get(task_id)
+                if agent is not None:
+                    status = agent.get_execution_status(str(task_id))
+                    if status is not None and (
+                        status.get("is_running") or status.get("is_resumable")
+                    ):
+                        deferred_task_ids.append(task_id)
+                        continue
+                self._agents.pop(task_id, None)
+                self._agent_owner_ids.pop(task_id, None)
+                self._agent_sandbox_keys.pop(task_id, None)
+                self._agent_sandbox_providers.pop(task_id, None)
+                self._agent_scope_fingerprints.pop(task_id, None)
+                self._agent_evicted_scope_fingerprints.pop(task_id, None)
+                evicted_task_ids.append(task_id)
+        if evicted_task_ids:
             logger.info(
                 "Invalidated %d cached AgentService(s) for user %s after a "
                 "preference change: %s",
-                len(stale_task_ids),
+                len(evicted_task_ids),
                 owner_user_id,
-                stale_task_ids,
+                evicted_task_ids,
+            )
+        if deferred_task_ids:
+            logger.info(
+                "Deferred cache invalidation for %d in-flight task(s) for "
+                "user %s after a preference change - will pick up the new "
+                "preferences on a later eviction/rebuild: %s",
+                len(deferred_task_ids),
+                owner_user_id,
+                deferred_task_ids,
             )
 
     def remove_agent(self, task_id: int, user_id: Optional[int] = None) -> None:

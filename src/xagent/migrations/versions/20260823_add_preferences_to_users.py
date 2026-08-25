@@ -1,7 +1,7 @@
 """add preferences to users table
 
 Revision ID: 20260823_add_preferences_to_users
-Revises: a3b70c638cc3
+Revises: 20260824_seed_google_search_console_mcp_app
 Create Date: 2026-08-23 00:00:00.000000
 
 """

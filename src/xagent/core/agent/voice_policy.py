@@ -60,12 +60,33 @@ if set(_VOICE_INSTRUCTIONS) != VALID_VOICES:
     )
 
 
+_SCOPE_CAVEAT = (
+    "This governs only your final natural-language reply to the user. "
+    "Arguments passed to any tool call - including but not limited to "
+    "agent/workforce names, descriptions, instructions, aliases, or any "
+    "other value that gets persisted as configuration rather than shown "
+    "to the user as conversation - are not conversation and must stay in "
+    "plain, neutral language regardless of this tone."
+)
+
+
 def apply_output_voice(
     system_prompt: Optional[str], voice: Optional[str]
 ) -> Optional[str]:
     """Append the given output voice as a `## OUTPUT VOICE` section, so
     every agent this user talks to - directly, or as a delegated
     ``AgentTool`` child - writes in the tone they picked.
+
+    Always paired with a caveat scoping that tone to the final reply,
+    not to tool-call arguments: some callers (the Workforce Prompt
+    Builder, Builder Chat, a delegated child with agent-management tools
+    enabled) run one continuous LLM conversation that also emits
+    create_agent/update_agent/create_workforce tool calls whose
+    arguments get persisted verbatim as configuration - without this,
+    a tone like "concise" would start trimming those fields too.
+    Baked in here, once, rather than left to each caller to remember
+    (a caveat added independently at two call sites, and missing from a
+    third that could reach the same tools, is what caused this).
 
     A no-op when voice is None/empty, doesn't match a known option (e.g.
     an older/unrecognized value), or isn't even a string - the persisted
@@ -77,7 +98,7 @@ def apply_output_voice(
     if not instruction:
         return system_prompt
 
-    voice_prompt = f"\n\n## OUTPUT VOICE\n{instruction}"
+    voice_prompt = f"\n\n## OUTPUT VOICE\n{instruction}\n\n{_SCOPE_CAVEAT}"
     if system_prompt:
         return system_prompt + voice_prompt
     return voice_prompt.lstrip("\n")

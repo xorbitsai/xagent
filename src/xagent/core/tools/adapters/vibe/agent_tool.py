@@ -2757,7 +2757,7 @@ async def create_agent_tools(config: "WebToolConfig") -> list[AbstractBaseTool]:
             file_operation_access_version=(config.get_workspace_config() or {}).get(
                 FILE_OPERATION_ACCESS_VERSION_KEY
             ),
-            voice=config.get_voice() if hasattr(config, "get_voice") else None,
+            voice=config.get_voice(),
         )
         records_getter = getattr(config, "get_published_agent_tool_records", None)
         records = records_getter() if callable(records_getter) else None

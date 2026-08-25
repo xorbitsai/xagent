@@ -16,6 +16,7 @@ from concurrent.futures import ThreadPoolExecutor
 import pytest
 
 from xagent.web.api import auth as auth_api
+from xagent.web.models import database as database_module
 from xagent.web.models.database import Base, get_engine, get_session_local, init_db
 from xagent.web.models.user import User
 
@@ -28,6 +29,11 @@ def postgres_user():
     url = os.getenv("XAGENT_TEST_POSTGRES_URL")
     if not url:
         pytest.skip("XAGENT_TEST_POSTGRES_URL is not set")
+    # init_db rebinds the module-global engine/session factory - save and
+    # restore in finally, matching test_auth_api.py's test_db fixture,
+    # or this leaks into whichever test runs next in the same process.
+    previous_engine = database_module._engine
+    previous_session_local = database_module._SessionLocal
     init_db(db_url=url)
     engine = get_engine()
     Base.metadata.drop_all(bind=engine)
@@ -47,6 +53,8 @@ def postgres_user():
         yield SessionLocal, user_id
     finally:
         Base.metadata.drop_all(bind=engine)
+        database_module._engine = previous_engine
+        database_module._SessionLocal = previous_session_local
 
 
 def test_concurrent_disjoint_field_updates_both_survive(postgres_user) -> None:

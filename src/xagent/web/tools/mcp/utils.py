@@ -18,7 +18,7 @@ def require_clean_identifier(value: str, field_name: str) -> str:
     into a URL path, use url_path_id instead - encoding (not just rejecting
     whitespace) is what actually closes path/query injection.
     """
-    if not value or value.strip() != value:
+    if not isinstance(value, str) or not value or value.strip() != value:
         raise ValueError(
             f"{field_name} must be a non-empty id with no surrounding whitespace"
         )

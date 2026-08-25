@@ -12,6 +12,14 @@ def test_require_clean_identifier_rejects_empty_and_whitespace():
     assert utils.require_clean_identifier("001xx", "record_id") == "001xx"
 
 
+def test_require_clean_identifier_rejects_non_string():
+    """A truthy non-str (e.g. an int) previously slipped past `not value`
+    and crashed on `.strip()` with a raw AttributeError instead of a clean
+    ValueError."""
+    with pytest.raises(ValueError, match="record_id"):
+        utils.require_clean_identifier(12345, "record_id")
+
+
 def test_url_path_id_percent_encodes_reserved_characters():
     # A literal ".." blocklist misses "/" and "?", which redirect the
     # request to a different endpoint or inject query params without ever

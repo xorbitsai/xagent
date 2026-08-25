@@ -88,6 +88,35 @@ def test_upgrade_is_idempotent(tmp_path):
         assert rows == 1
 
 
+def test_upgrade_leaves_existing_differently_populated_row_untouched(tmp_path):
+    """The presence-only guard (`if APP_ID in existing: return`) must never
+    reach the insert path once a row exists — verify with a row whose data
+    actually differs from ROW, not just an identical re-seed."""
+    engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
+    migration = _load_migration_module()
+    with engine.begin() as connection:
+        _create_table(connection)
+        connection.execute(
+            text(
+                "INSERT INTO public_mcp_apps (app_id, name, transport,"
+                " provider_name, category, is_visible_in_connector)"
+                " VALUES ('google-search-console', 'Customized Name', 'oauth',"
+                " 'google', 'Marketing', 0)"
+            )
+        )
+        with patch.object(migration, "op", _operations(connection)):
+            migration.upgrade()
+        row = connection.execute(
+            text(
+                "SELECT name, category, is_visible_in_connector"
+                " FROM public_mcp_apps WHERE app_id='google-search-console'"
+            )
+        ).first()
+        assert row[0] == "Customized Name"
+        assert row[1] == "Marketing"
+        assert row[2] == 0
+
+
 def test_seed_row_matches_registry():
     """The migration snapshot and the runtime registry must define the same
     google-search-console row (the migration is a frozen copy; this catches
@@ -170,6 +199,25 @@ def test_downgrade_removes_google_search_console(tmp_path):
             migration.upgrade()
             migration.downgrade()
         assert "google-search-console" not in _app_ids(connection)
+
+
+def test_downgrade_only_removes_this_app_not_unrelated_rows(tmp_path):
+    """A DELETE missing its WHERE clause (table-wide instead of scoped to
+    this app_id) would not be caught by a test with only one seeded row."""
+    engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
+    migration = _load_migration_module()
+    with engine.begin() as connection:
+        _create_table(connection)
+        connection.execute(
+            text(
+                "INSERT INTO public_mcp_apps (app_id, name, transport)"
+                " VALUES ('unrelated-app', 'Unrelated', 'oauth')"
+            )
+        )
+        with patch.object(migration, "op", _operations(connection)):
+            migration.upgrade()
+            migration.downgrade()
+        assert _app_ids(connection) == {"unrelated-app"}
 
 
 def test_downgrade_is_a_no_op_when_row_already_absent(tmp_path):

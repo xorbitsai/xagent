@@ -165,6 +165,20 @@ def test_request_raises_runtime_error_on_non_json_success_body(monkeypatch):
         )
 
 
+def test_request_returns_empty_dict_for_204_response(monkeypatch):
+    monkeypatch.setattr(
+        google_search_console.requests,
+        "request",
+        Mock(return_value=MockResponse(status_code=204, text="")),
+    )
+
+    result = google_search_console._request(
+        "DELETE", f"{google_search_console.WEBMASTERS_API_BASE_URL}/sites"
+    )
+
+    assert result == {}
+
+
 def test_list_sites_projects_site_entries(monkeypatch):
     monkeypatch.setattr(
         google_search_console.requests,
@@ -194,6 +208,32 @@ def test_list_sites_projects_site_entries(monkeypatch):
         {"site_url": "https://example.com/", "permission_level": "siteOwner"},
         {"site_url": "sc-domain:example.com", "permission_level": "siteFullUser"},
     ]
+    assert result["site_count"] == 2
+    assert result["truncated"] is False
+
+
+def test_list_sites_degenerate_trim_reports_true_count_not_zero(monkeypatch):
+    """A single oversized site entry that still exceeds the output budget
+    after trimming to an empty list must not read as "you have no sites" —
+    site_count stays pinned to the real pre-trim count."""
+    max_output_length = get_tool_max_output_length()
+    oversized_site = {
+        "siteUrl": "https://example.com/" + "x" * (max_output_length + 1000),
+        "permissionLevel": "siteOwner",
+    }
+    monkeypatch.setattr(
+        google_search_console.requests,
+        "request",
+        Mock(return_value=MockResponse(json_data={"siteEntry": [oversized_site]})),
+    )
+
+    result = json.loads(google_search_console.google_search_console_list_sites())
+
+    assert result["status"] == "success"
+    assert result["sites"] == []
+    assert result["site_count"] == 1
+    assert result["truncated"] is True
+    assert len(json.dumps(result)) < max_output_length
 
 
 def test_list_sites_filters_out_entries_without_site_url(monkeypatch):
@@ -369,7 +409,34 @@ def test_list_sitemaps_returns_sitemap_list(monkeypatch):
 
     assert result["status"] == "success"
     assert result["sitemaps"][0]["path"] == "https://example.com/sitemap.xml"
+    assert result["sitemap_count"] == 1
     assert "https%3A%2F%2Fexample.com%2F" in mock_request.call_args.kwargs["url"]
+
+
+def test_list_sitemaps_degenerate_trim_reports_true_count_not_zero(monkeypatch):
+    """A single oversized sitemap entry that still exceeds the output
+    budget after trimming to an empty list must not read as "you have no
+    sitemaps" — sitemap_count stays pinned to the real pre-trim count."""
+    max_output_length = get_tool_max_output_length()
+    oversized_sitemap = {
+        "path": "https://example.com/sitemap.xml?" + "x" * (max_output_length + 1000)
+    }
+    monkeypatch.setattr(
+        google_search_console.requests,
+        "request",
+        Mock(return_value=MockResponse(json_data={"sitemap": [oversized_sitemap]})),
+    )
+
+    result = json.loads(
+        google_search_console.google_search_console_list_sitemaps(
+            "https://example.com/"
+        )
+    )
+
+    assert result["status"] == "success"
+    assert result["sitemaps"] == []
+    assert result["sitemap_count"] == 1
+    assert result["truncated"] is True
 
 
 def test_list_sitemaps_treats_non_list_sitemap_field_as_empty(monkeypatch, caplog):
@@ -810,6 +877,102 @@ def test_query_search_analytics_tolerates_malformed_filter_groups(
     )
 
     assert result["status"] == "success"
+    # A regression that silently dropped the malformed groups instead of
+    # forwarding them (e.g. to let Google's own validation reject them)
+    # would pass a status-only assertion undetected.
+    assert mock_request.call_args.kwargs["json"]["dimensionFilterGroups"] == (
+        malformed_filter_groups
+    )
+
+
+def test_query_search_analytics_rejects_non_list_dimensions(monkeypatch):
+    mock_request = Mock()
+    monkeypatch.setattr(google_search_console.requests, "request", mock_request)
+
+    result = json.loads(
+        google_search_console.google_search_console_query_search_analytics(
+            "https://example.com/",
+            start_date="2026-07-01",
+            end_date="2026-07-28",
+            dimensions="query",
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "dimensions" in result["message"]
+    mock_request.assert_not_called()
+
+
+def test_query_search_analytics_rejects_non_list_dimension_filter_groups(monkeypatch):
+    mock_request = Mock()
+    monkeypatch.setattr(google_search_console.requests, "request", mock_request)
+
+    result = json.loads(
+        google_search_console.google_search_console_query_search_analytics(
+            "https://example.com/",
+            start_date="2026-07-01",
+            end_date="2026-07-28",
+            dimension_filter_groups={"filters": []},
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "dimension_filter_groups" in result["message"]
+    mock_request.assert_not_called()
+
+
+def test_query_search_analytics_rejects_search_appearance_combined_with_other_dimensions(
+    monkeypatch,
+):
+    mock_request = Mock()
+    monkeypatch.setattr(google_search_console.requests, "request", mock_request)
+
+    result = json.loads(
+        google_search_console.google_search_console_query_search_analytics(
+            "https://example.com/",
+            start_date="2026-07-01",
+            end_date="2026-07-28",
+            dimensions=["searchAppearance", "query"],
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "searchAppearance" in result["message"]
+    mock_request.assert_not_called()
+
+
+def test_query_search_analytics_allows_search_appearance_alone(monkeypatch):
+    mock_request = Mock(return_value=MockResponse(json_data={}))
+    monkeypatch.setattr(google_search_console.requests, "request", mock_request)
+
+    result = json.loads(
+        google_search_console.google_search_console_query_search_analytics(
+            "https://example.com/",
+            start_date="2026-07-01",
+            end_date="2026-07-28",
+            dimensions=["searchAppearance"],
+        )
+    )
+
+    assert result["status"] == "success"
+    mock_request.assert_called_once()
+
+
+def test_query_search_analytics_accepts_minimum_row_limit(monkeypatch):
+    mock_request = Mock(return_value=MockResponse(json_data={}))
+    monkeypatch.setattr(google_search_console.requests, "request", mock_request)
+
+    result = json.loads(
+        google_search_console.google_search_console_query_search_analytics(
+            "https://example.com/",
+            start_date="2026-07-01",
+            end_date="2026-07-28",
+            row_limit=1,
+        )
+    )
+
+    assert result["status"] == "success"
+    assert mock_request.call_args.kwargs["json"]["rowLimit"] == 1
 
 
 def test_query_search_analytics_rejects_zero_row_limit(monkeypatch):
@@ -903,6 +1066,9 @@ def test_query_search_analytics_trims_rows_and_flags_truncated_when_over_budget(
     # trimming into thinking it already reached the last page.
     assert result["row_count"] == google_search_console.QUERY_MAX_ROW_LIMIT
     assert result["row_count"] != len(result["rows"])
+    # A truncated response must carry a caller-visible next step, not just
+    # a server-side log line.
+    assert "smaller row_limit" in result["hint"]
 
 
 def test_query_search_analytics_trims_to_empty_when_single_row_exceeds_budget(
@@ -1109,6 +1275,25 @@ def test_inspect_url_rejects_surrounding_whitespace(monkeypatch):
 
     assert result["status"] == "error"
     assert "inspection_url" in result["message"]
+    mock_request.assert_not_called()
+
+
+def test_inspect_url_rejects_non_string_site_url(monkeypatch):
+    """inspect_url validates site_url/inspection_url via
+    require_clean_identifier directly (not _encoded_site_url, which would
+    incorrectly percent-encode a JSON-body value) — a non-string must still
+    raise a clean ValueError, not a raw AttributeError from .strip()."""
+    mock_request = Mock()
+    monkeypatch.setattr(google_search_console.requests, "request", mock_request)
+
+    result = json.loads(
+        google_search_console.google_search_console_inspect_url(
+            12345, "https://example.com/page"
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "site_url" in result["message"]
     mock_request.assert_not_called()
 
 

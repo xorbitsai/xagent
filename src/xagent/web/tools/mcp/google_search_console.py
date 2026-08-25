@@ -9,7 +9,12 @@ import requests
 from mcp.server.fastmcp import FastMCP
 
 from ....config import get_tool_max_output_length
-from .utils import require_clean_identifier, setup_proxy_env, url_path_id
+from .utils import (
+    require_clean_identifier,
+    setup_proxy_env,
+    success_with_capped_dict,
+    url_path_id,
+)
 
 logger = logging.getLogger("google-search-console-mcp")
 
@@ -43,25 +48,55 @@ def _success(**payload: Any) -> str:
     return json.dumps({"status": "success", **payload}, ensure_ascii=False)
 
 
-def _success_with_trimmed_list(field_name: str, items: list[Any]) -> str:
-    """Build a {"status": "success", field_name: items, "truncated": ...}
-    payload, halving items until the serialized response fits the
-    platform's output limit.
+def _success_with_trimmed_list(
+    field_name: str,
+    items: list[Any],
+    count_field_name: str,
+    *,
+    truncated_hint: str | None = None,
+) -> str:
+    """Build a {"status": "success", field_name: items, count_field_name:
+    <pre-trim count>, "truncated": ...} payload, halving items until the
+    serialized response fits the platform's output limit.
 
     list_sites and list_sitemaps both call APIs with no pageToken/offset
     parameter — Google returns every site or every submitted sitemap in
     one response — so unlike query_search_analytics (which can be paged
     with start_row), there's no way to ask for a smaller page up front.
-    Truncating after the fact, the same way query_search_analytics already
-    guards its own oversized responses, is the only option for a property
-    with an unusually large site or sitemap count.
+    Truncating after the fact is the only option for a property with an
+    unusually large site or sitemap count.
+
+    count_field_name is pinned to the count *before* any trimming and
+    never recomputed from the (possibly shrunk) items list: for
+    query_search_analytics this is the row_count pagination signal callers
+    check against row_limit, and conflating it with the post-trim count
+    would make a caller stop paging early and silently miss rows, with no
+    way to resume since the dropped rows already consumed part of that
+    request's offset window. For list_sites/list_sitemaps it means a fully
+    trimmed (empty) list still reports how many entries actually exist,
+    rather than reading as "you have none."
+
+    truncated_hint, if given, is included as "hint" only once trimming
+    actually happens — a caller-visible next step (e.g. "retry with a
+    smaller row_limit") instead of a signal only visible in server logs.
     """
     max_output_length = get_tool_max_output_length()
     original_count = len(items)
-    response = _success(**{field_name: items, "truncated": False})
+
+    def _build(truncated: bool) -> str:
+        payload: dict[str, Any] = {
+            field_name: items,
+            count_field_name: original_count,
+            "truncated": truncated,
+        }
+        if truncated and truncated_hint:
+            payload["hint"] = truncated_hint
+        return _success(**payload)
+
+    response = _build(False)
     while len(response) > max_output_length and items:
         items = items[: len(items) // 2]
-        response = _success(**{field_name: items, "truncated": True})
+        response = _build(True)
     if len(items) < original_count:
         logger.warning(
             f"Google Search Console {field_name} response trimmed from "
@@ -174,11 +209,12 @@ def _dimension_filter_groups_reference_query(
     dimension_filter_groups: list[dict[str, Any]],
 ) -> bool:
     """Whether any filter inside dimension_filter_groups filters on the
-    "query" dimension. Tolerates a malformed/unexpected shape (a non-dict
-    group, a non-list "filters", a non-dict filter entry) by treating it as
-    not referencing "query" rather than raising — this check runs before
-    the request body is built, and a shape the caller got wrong here will
-    still surface as a clear upstream 400 once sent."""
+    "query" dimension. The caller has already validated that
+    dimension_filter_groups itself is a list; this tolerates a malformed
+    shape *within* that list (a non-dict group, a non-list "filters", a
+    non-dict filter entry) by treating it as not referencing "query" rather
+    than raising — such a shape will still surface as a clear upstream 400
+    once the request is sent."""
     for group in dimension_filter_groups:
         if not isinstance(group, dict):
             continue
@@ -232,7 +268,7 @@ def google_search_console_list_sites() -> str:
             for entry in site_entries
             if isinstance(entry, dict) and entry.get("siteUrl")
         ]
-        return _success_with_trimmed_list("sites", sites)
+        return _success_with_trimmed_list("sites", sites, "site_count")
     except Exception as e:
         logger.error(f"Error listing Google Search Console sites: {e}")
         return _error(str(e))
@@ -264,7 +300,7 @@ def google_search_console_list_sitemaps(site_url: str) -> str:
                     f"as empty"
                 )
             sitemaps = []
-        return _success_with_trimmed_list("sitemaps", sitemaps)
+        return _success_with_trimmed_list("sitemaps", sitemaps, "sitemap_count")
     except Exception as e:
         logger.error(f"Error listing sitemaps for {site_url!r}: {e}")
         return _error(str(e))
@@ -288,18 +324,19 @@ def google_search_console_query_search_analytics(
     site_url: a value from google_search_console_list_sites.
     start_date, end_date: YYYY-MM-DD (inclusive). Search Console data is
       typically delayed 1-3 days, so end_date should not be today.
-    dimensions: any of "query", "page", "country", "device", "date",
-      "searchAppearance". Omit for a single aggregate row. "query" is not
-      available (as a dimension or as a dimension_filter_groups filter)
-      when search_type is "discover" or "googleNews" (Google doesn't
-      disclose search terms for those surfaces) — "position" values on
-      rows from those two surfaces are also not meaningful ranking data,
-      per Google's own documentation.
+    dimensions: a list of any of "query", "page", "country", "device",
+      "date", "searchAppearance". Omit for a single aggregate row.
+      "searchAppearance" cannot be combined with any other dimension.
+      "query" is not available (as a dimension or as a
+      dimension_filter_groups filter) when search_type is "discover" or
+      "googleNews" (Google doesn't disclose search terms for those
+      surfaces) — "position" values on rows from those two surfaces are
+      also not meaningful ranking data, per Google's own documentation.
     search_type: one of "web", "image", "video", "news", "discover",
       "googleNews" (default "web").
-    dimension_filter_groups: raw Search Analytics API filter groups, e.g.
-      [{"filters": [{"dimension": "country", "operator": "equals",
-      "expression": "usa"}]}]. Optional.
+    dimension_filter_groups: a list of raw Search Analytics API filter
+      groups, e.g. [{"filters": [{"dimension": "country", "operator":
+      "equals", "expression": "usa"}]}]. Optional.
     row_limit: max rows to return (default 100, max 1000 — keeps a wide
       query's serialized response under the MCP output size limit).
     start_row: row offset for paging — if row_count equals row_limit, call
@@ -308,7 +345,9 @@ def google_search_console_query_search_analytics(
       not a total match count — Google's own API docs note it isn't
       guaranteed to return literally every matching row even once you've
       fully paginated. It stays accurate even when "rows" is shortened
-      below for output-size reasons — see "truncated".
+      below for output-size reasons — see "truncated" and "hint" (present
+      only when truncated); a caller that hits this can retry the same
+      start_row with a smaller row_limit to recover the missing rows.
     """
     try:
         encoded_site_url = _encoded_site_url(site_url)
@@ -322,11 +361,22 @@ def google_search_console_query_search_analytics(
             raise ValueError(f"row_limit must be between 1 and {QUERY_MAX_ROW_LIMIT}")
         if start_row < 0:
             raise ValueError("start_row must be >= 0")
+        if dimensions is not None and not isinstance(dimensions, list):
+            raise ValueError("dimensions must be a list of strings")
+        if dimension_filter_groups is not None and not isinstance(
+            dimension_filter_groups, list
+        ):
+            raise ValueError("dimension_filter_groups must be a list of filter groups")
         if dimensions:
             invalid = sorted(set(dimensions) - VALID_DIMENSIONS, key=str)
             if invalid:
                 raise ValueError(
                     f"invalid dimensions {invalid}; must be from {sorted(VALID_DIMENSIONS)}"
+                )
+            if "searchAppearance" in dimensions and len(dimensions) > 1:
+                raise ValueError(
+                    '"searchAppearance" cannot be combined with other dimensions '
+                    "in the same request"
                 )
         if search_type in _SEARCH_TYPES_WITHOUT_QUERY_DIMENSION:
             # Google rejects "query" for these two surfaces whether it's
@@ -377,31 +427,19 @@ def google_search_console_query_search_analytics(
 
         # row_limit bounds row *count*, not bytes: several "query"/"page"
         # dimension values (often full URLs) at once can still cross the
-        # platform's output truncation threshold. Halve the returned rows
-        # until the serialized response fits, mirroring
-        # google_analytics_run_report's trimming approach.
-        #
-        # row_count is pinned to the pre-trim count and never recomputed
-        # from the (possibly shrunk) "rows" list: it's the pagination
-        # signal the docstring tells callers to check against row_limit,
-        # and trimming rows for output-size reasons must not be confused
-        # with "this page had fewer matches than row_limit" — that would
-        # make a caller stop paging early and silently miss rows, with no
-        # way to resume since the dropped rows already consumed part of
-        # this request's offset window.
-        max_output_length = get_tool_max_output_length()
-        original_row_count = len(rows)
-        response = _success(rows=rows, row_count=original_row_count, truncated=False)
-        while len(response) > max_output_length and rows:
-            rows = rows[: len(rows) // 2]
-            response = _success(rows=rows, row_count=original_row_count, truncated=True)
-        if len(rows) < original_row_count:
-            logger.warning(
-                f"Google Search Console query_search_analytics response trimmed "
-                f"from {original_row_count} to {len(rows)} rows to stay under "
-                f"the {max_output_length}-char output limit"
-            )
-        return response
+        # platform's output truncation threshold. _success_with_trimmed_list
+        # halves "rows" until the response fits while pinning row_count to
+        # the pre-trim count (see its docstring) and attaching a retry hint.
+        return _success_with_trimmed_list(
+            "rows",
+            rows,
+            "row_count",
+            truncated_hint=(
+                "response truncated for output size; retry this same "
+                "start_row with a smaller row_limit to recover the missing "
+                "rows"
+            ),
+        )
     except Exception as e:
         logger.error(f"Error querying search analytics for {site_url!r}: {e}")
         return _error(str(e))
@@ -446,7 +484,7 @@ def google_search_console_inspect_url(
                     f"({type(inspection_result).__name__}); treating as empty"
                 )
             inspection_result = {}
-        return _success(inspection_result=inspection_result)
+        return success_with_capped_dict("inspection_result", inspection_result)
     except Exception as e:
         logger.error(f"Error inspecting URL {inspection_url!r}: {e}")
         return _error(str(e))

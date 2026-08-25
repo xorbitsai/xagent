@@ -66,6 +66,21 @@ def _is_sandbox_lease_provider(value: Any) -> bool:
     return callable(getattr(type(value), "lease", None))
 
 
+def resolve_primary_sandbox(sandbox: Any) -> Sandbox:
+    """Unwrap a SandboxLeaseProvider to its primary Sandbox, if given one.
+
+    For one-shot/setup-style operations (dependency install, MCP tool
+    listing) that don't need per-call worker-slot leasing, callers should
+    use this instead of re-deriving the same ``.primary_sandbox`` check --
+    a SandboxLeaseProvider has no ``.exec``/``.read_file``/``.name`` of its
+    own, so operating on it directly raises AttributeError.
+    """
+    resolved = (
+        sandbox.primary_sandbox if _is_sandbox_lease_provider(sandbox) else sandbox
+    )
+    return cast(Sandbox, resolved)
+
+
 class SandboxDependencyManager:
     """Track incremental dependency installation per sandbox."""
 
@@ -330,11 +345,7 @@ class SandboxedToolWrapper(AbstractBaseTool):
     async def _ensure_dependencies(self, sandbox: Sandbox | None = None) -> None:
         """Ensure dependencies are installed in the sandbox."""
         if sandbox is None:
-            sandbox = (
-                self._sandbox.primary_sandbox
-                if _is_sandbox_lease_provider(self._sandbox)
-                else self._sandbox
-            )
+            sandbox = resolve_primary_sandbox(self._sandbox)
         await SandboxDependencyManager.ensure_requirements(sandbox, self._requirements)
 
     def _resolve_execution_spec(self) -> tuple[dict[str, str], Any]:

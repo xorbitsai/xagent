@@ -22,6 +22,7 @@ from .sandboxed_tool_wrapper import (
     SANDBOX_SRC_ROOT,
     SandboxDependencyManager,
     create_sandboxed_tool,
+    resolve_primary_sandbox,
 )
 
 logger = logging.getLogger(__name__)
@@ -93,14 +94,19 @@ async def list_tools_in_sandbox(
     result_file = f"/tmp/xagent_mcp_tools_{uuid.uuid4().hex}.json"
     connection_b64 = _serialize_connection(connection)
 
+    # `sandbox` may be a SandboxLeaseProvider (no exec/read_file/name of its
+    # own) rather than a real Sandbox -- unwrap to the primary sandbox, since
+    # this one-shot metadata call doesn't need per-call worker leasing.
+    target_sandbox = resolve_primary_sandbox(sandbox)
+
     await SandboxDependencyManager.ensure_requirements(
-        sandbox, _SANDBOX_MCP_DEPENDENCIES
+        target_sandbox, _SANDBOX_MCP_DEPENDENCIES
     )
 
     try:
         try:
             result = await asyncio.wait_for(
-                sandbox.exec(
+                target_sandbox.exec(
                     "python",
                     _MCP_RUNNER_PATH,
                     "--connection-b64",
@@ -121,7 +127,7 @@ async def list_tools_in_sandbox(
             raise RuntimeError(f"Sandbox MCP list_tools failed: {error_msg}")
 
         try:
-            output = await sandbox.read_file(result_file)
+            output = await target_sandbox.read_file(result_file)
         except FileNotFoundError:
             logger.warning("MCP list_tools result file not found: %s", result_file)
             return []
@@ -147,7 +153,7 @@ async def list_tools_in_sandbox(
         return [MCPTool.model_validate(item) for item in tool_data]
     finally:
         try:
-            await sandbox.exec("rm", "-f", result_file)
+            await target_sandbox.exec("rm", "-f", result_file)
         except Exception:
             pass
 

@@ -2235,11 +2235,14 @@ class AgentServiceManager:
         # session), which unconditionally expires every object loaded
         # through it. A live User surviving past that point would turn
         # a later attribute read (e.g. voice_from_runtime_user) into an
-        # implicit reload on the event loop - detaching here, before the
-        # first release-triggering call in this function, is the only
-        # place that's actually early enough; detaching later, inside a
-        # failure branch after such a call already ran, is too late to
-        # help (the row is already expired by then).
+        # implicit reload on the event loop - detaching here is the
+        # first point where it's possible: no session-releasing call ran
+        # between `runtime_user` being resolved above and here (an
+        # earlier one, for the cache-miss snapshot load, only runs
+        # before `runtime_user` exists at all, and re-checks out a fresh
+        # connection for the query above regardless). Detaching later,
+        # inside a failure branch after a release already ran, is too
+        # late to help (the row is already expired by then).
         if isinstance(runtime_user, User):
             runtime_user = detach_runtime_user_fields(runtime_user)
 

@@ -1,3 +1,5 @@
+import re
+
 import pytest
 import requests
 
@@ -69,6 +71,35 @@ def test_clamp_limit_boundaries(limit, expected):
 )
 def test_clamp_offset_boundaries(offset, expected):
     assert utils.clamp_offset(offset) == expected
+
+
+_TEST_URL_ID_PATTERN = re.compile(r"/d/([a-zA-Z0-9_-]+)")
+
+
+def test_resolve_id_from_url_extracts_id_from_matching_url():
+    assert (
+        utils.resolve_id_from_url(
+            "https://docs.google.com/document/d/abc123/edit",
+            _TEST_URL_ID_PATTERN,
+            "document_id",
+        )
+        == "abc123"
+    )
+
+
+def test_resolve_id_from_url_passes_through_bare_id():
+    assert (
+        utils.resolve_id_from_url(" abc123 ", _TEST_URL_ID_PATTERN, "document_id")
+        == "abc123"
+    )
+
+
+def test_resolve_id_from_url_rejects_non_string():
+    """Mirrors require_clean_identifier's fix: pattern.search() would
+    otherwise raise a raw TypeError on a non-string value instead of a
+    clean ValueError."""
+    with pytest.raises(ValueError, match="document_id"):
+        utils.resolve_id_from_url(12345, _TEST_URL_ID_PATTERN, "document_id")
 
 
 def test_url_path_id_output_survives_requests_url_normalization():

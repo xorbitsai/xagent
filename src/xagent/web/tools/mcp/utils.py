@@ -143,9 +143,16 @@ def clamp_offset(offset: int) -> int:
     return max(0, int(offset))
 
 
-def resolve_id_from_url(value: str, pattern: re.Pattern[str]) -> str:
+def resolve_id_from_url(value: str, pattern: re.Pattern[str], field_name: str) -> str:
     """Return the id captured by ``pattern`` when ``value`` is a matching URL,
-    otherwise the stripped value itself."""
+    otherwise the stripped value itself.
+
+    Guards against a non-string value the same way require_clean_identifier
+    does: ``pattern.search()``/``.strip()`` would otherwise raise a raw
+    TypeError/AttributeError instead of a clean, actionable ValueError.
+    """
+    if not isinstance(value, str):
+        raise ValueError(f"{field_name} must be a string")
     match = pattern.search(value)
     if match:
         return match.group(1)

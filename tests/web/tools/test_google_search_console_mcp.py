@@ -70,9 +70,12 @@ def test_encoded_site_url_rejects_empty():
 
 @pytest.mark.parametrize("bad_value", [None, 123, ["https://example.com/"]])
 def test_encoded_site_url_rejects_non_string(bad_value):
-    """The isinstance guard is this function's own logic, not something
-    url_path_id/require_clean_identifier provides — .strip() would raise a
-    raw AttributeError on a non-string value without it."""
+    """_encoded_site_url's own isinstance check fires first and produces the
+    more actionable, format-specific message; require_clean_identifier (via
+    url_path_id, reached if this local check were ever removed) now also
+    guards against a non-string value with its own isinstance check, so
+    either layer alone would prevent the raw AttributeError .strip() used
+    to raise on a non-string value."""
     with pytest.raises(ValueError, match="site_url"):
         google_search_console._encoded_site_url(bad_value)
 
@@ -427,16 +430,16 @@ def test_list_sitemaps_degenerate_trim_reports_true_count_not_zero(monkeypatch):
         Mock(return_value=MockResponse(json_data={"sitemap": [oversized_sitemap]})),
     )
 
-    result = json.loads(
-        google_search_console.google_search_console_list_sitemaps(
-            "https://example.com/"
-        )
+    response = google_search_console.google_search_console_list_sitemaps(
+        "https://example.com/"
     )
+    result = json.loads(response)
 
     assert result["status"] == "success"
     assert result["sitemaps"] == []
     assert result["sitemap_count"] == 1
     assert result["truncated"] is True
+    assert len(response) < max_output_length
 
 
 def test_list_sitemaps_treats_non_list_sitemap_field_as_empty(monkeypatch, caplog):
@@ -1067,8 +1070,10 @@ def test_query_search_analytics_trims_rows_and_flags_truncated_when_over_budget(
     assert result["row_count"] == google_search_console.QUERY_MAX_ROW_LIMIT
     assert result["row_count"] != len(result["rows"])
     # A truncated response must carry a caller-visible next step, not just
-    # a server-side log line.
+    # a server-side log line — and a concrete number, not just "try
+    # smaller", so the caller isn't left guessing.
     assert "smaller row_limit" in result["hint"]
+    assert str(len(result["rows"])) in result["hint"]
 
 
 def test_query_search_analytics_trims_to_empty_when_single_row_exceeds_budget(
@@ -1094,6 +1099,9 @@ def test_query_search_analytics_trims_to_empty_when_single_row_exceeds_budget(
     # Even trimmed to zero rows, row_count still reports the actual match
     # count (1), not len(rows) (0) — the pagination signal.
     assert result["row_count"] == 1
+    # A zero-row-fit hint must not suggest an invalid row_limit=0; it
+    # explicitly steers the caller toward narrowing the query instead.
+    assert "narrow the query" in result["hint"]
 
 
 def test_query_search_analytics_treats_non_list_rows_as_empty(monkeypatch, caplog):

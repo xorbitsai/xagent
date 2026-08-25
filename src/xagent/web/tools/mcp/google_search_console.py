@@ -3,7 +3,7 @@ import json
 import logging
 import os
 import re
-from typing import Any
+from typing import Any, Callable
 
 import requests
 from mcp.server.fastmcp import FastMCP
@@ -53,7 +53,7 @@ def _success_with_trimmed_list(
     items: list[Any],
     count_field_name: str,
     *,
-    truncated_hint: str | None = None,
+    truncated_hint: Callable[[int], str] | None = None,
 ) -> str:
     """Build a {"status": "success", field_name: items, count_field_name:
     <pre-trim count>, "truncated": ...} payload, halving items until the
@@ -76,9 +76,11 @@ def _success_with_trimmed_list(
     trimmed (empty) list still reports how many entries actually exist,
     rather than reading as "you have none."
 
-    truncated_hint, if given, is included as "hint" only once trimming
-    actually happens — a caller-visible next step (e.g. "retry with a
-    smaller row_limit") instead of a signal only visible in server logs.
+    truncated_hint, if given, is called with the *final* (post-trim) item
+    count and its return value is included as "hint" only once trimming
+    actually happens — a caller-visible, count-specific next step (e.g.
+    "N rows fit; retry with row_limit=N") instead of a vague "try smaller"
+    signal only visible in server logs.
     """
     max_output_length = get_tool_max_output_length()
     original_count = len(items)
@@ -90,7 +92,7 @@ def _success_with_trimmed_list(
             "truncated": truncated,
         }
         if truncated and truncated_hint:
-            payload["hint"] = truncated_hint
+            payload["hint"] = truncated_hint(len(items))
         return _success(**payload)
 
     response = _build(False)
@@ -104,6 +106,28 @@ def _success_with_trimmed_list(
             f"{max_output_length}-char output limit"
         )
     return response
+
+
+def _row_trim_hint(safe_row_count: int) -> str:
+    """Build query_search_analytics' truncated_hint from the final,
+    post-trim row count. Approximate, not exact: re-requesting with
+    row_limit=safe_row_count may return a different-sized page (a
+    different set of rows can serialize to a different size), so this is a
+    starting point for the caller to converge on, not a guarantee.
+    """
+    if safe_row_count > 0:
+        return (
+            f"response truncated for output size; approximately "
+            f"{safe_row_count} row(s) fit at this start_row — retry with a "
+            f"smaller row_limit (try {safe_row_count} or less) to reduce "
+            f"truncation"
+        )
+    return (
+        "response truncated for output size; even a single row exceeds the "
+        "limit at this start_row — narrow the query (fewer dimensions, or "
+        "add dimension_filter_groups) rather than retrying with a smaller "
+        "row_limit"
+    )
 
 
 def _error(message: str) -> str:
@@ -431,14 +455,7 @@ def google_search_console_query_search_analytics(
         # halves "rows" until the response fits while pinning row_count to
         # the pre-trim count (see its docstring) and attaching a retry hint.
         return _success_with_trimmed_list(
-            "rows",
-            rows,
-            "row_count",
-            truncated_hint=(
-                "response truncated for output size; retry this same "
-                "start_row with a smaller row_limit to recover the missing "
-                "rows"
-            ),
+            "rows", rows, "row_count", truncated_hint=_row_trim_hint
         )
     except Exception as e:
         logger.error(f"Error querying search analytics for {site_url!r}: {e}")

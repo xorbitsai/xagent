@@ -1446,6 +1446,16 @@ async def update_current_user_preferences(
             user=serialize_auth_user(user),
         )
 
+    # Read before releasing `db` below: Session.rollback() unconditionally
+    # expires every object loaded through that session, `user` included
+    # (unlike expire_on_commit, this isn't conditional on a session
+    # setting), so touching `user.id` after release would force an
+    # implicit reload - reacquiring the very connection just released,
+    # synchronously on the event loop, defeating the point of releasing
+    # it at all, and raising ObjectDeletedError outright if the row was
+    # deleted concurrently in the meantime.
+    user_id = int(user.id)
+
     # `db` is declared only to release it here, not to do any work with it
     # directly: FastAPI's per-request dependency caching means this is the
     # same (read-only, since get_current_user only did a SELECT) session
@@ -1456,8 +1466,6 @@ async def update_current_user_preferences(
     # pattern already used before chat.py's sandbox startup and
     # workforce_creator.py's ReAct builder call).
     release_db_connection_if_clean(db)
-
-    user_id = int(user.id)
     serialized_user = await run_db_io_cancellation_safe(
         lambda: _merge_user_preferences_locked(user_id, updates)
     )

@@ -618,14 +618,6 @@ class TestAuthAPI:
         register_response = client.post("/api/auth/register", json=test_user_data)
         assert register_response.status_code == 200
 
-        db = TestingSessionLocal()
-        try:
-            user = (
-                db.query(User).filter(User.username == test_user_data["username"]).one()
-            )
-        finally:
-            db.close()
-
         event_loop_thread_id = threading.get_ident()
         executed_thread_ids: list[int] = []
 
@@ -642,11 +634,20 @@ class TestAuthAPI:
         # worker session actually uses.
         merge_engine = get_engine()
         event.listen(merge_engine, "before_cursor_execute", _record_thread)
-        # `db` is bound to this file's own engine, not `merge_engine` -
-        # release_db_connection_if_clean's own rollback (if any) must not
-        # be mistaken for the merge's SQL by the assertions below.
+        # `user` and `db` share one Session here, mirroring FastAPI's own
+        # per-request dependency caching (get_current_user's `user` and
+        # this endpoint's own `db` parameter resolve to the same cached
+        # instance in production) - giving them separate sessions, as an
+        # earlier version of this test did, can't reproduce a bug where
+        # release_db_connection_if_clean(db) expires `user` out from
+        # under the caller.
         request_db = TestingSessionLocal()
         try:
+            user = (
+                request_db.query(User)
+                .filter(User.username == test_user_data["username"])
+                .one()
+            )
             response = await auth_api.update_current_user_preferences(
                 request=auth_api.UpdatePreferencesRequest(voice="warm"),
                 db=request_db,
@@ -668,6 +669,67 @@ class TestAuthAPI:
         )
 
     @pytest.mark.asyncio
+    async def test_update_current_user_preferences_reads_user_id_before_releasing_db(
+        self, test_db, test_user_data
+    ):
+        """release_db_connection_if_clean(db) rolls back `db` when it is
+        clean, and Session.rollback() unconditionally expires every
+        object that session loaded - `user` included, since
+        get_current_user's `user` and this endpoint's own `db` resolve
+        to the same cached Session in production (FastAPI's per-request
+        dependency caching; see the SQL-off-the-event-loop test above
+        for why this test gives them the same Session too). Touching
+        `user.id` after that release would force an implicit reload
+        SELECT - reacquiring the very connection just released,
+        synchronously on this thread, defeating the point of releasing
+        it at all, and raising ObjectDeletedError outright had the row
+        been deleted meanwhile. Asserts no query at all runs on this
+        session's connection after its rollback."""
+        setup_first_admin()
+        register_response = client.post("/api/auth/register", json=test_user_data)
+        assert register_response.status_code == 200
+
+        released = threading.Event()
+        queries_after_release: list[str] = []
+
+        def _on_rollback(_conn):
+            released.set()
+
+        def _on_cursor_execute(_conn, _cursor, statement, *_args, **_kwargs):
+            if released.is_set():
+                queries_after_release.append(statement)
+
+        event.listen(engine, "rollback", _on_rollback)
+        event.listen(engine, "before_cursor_execute", _on_cursor_execute)
+        request_db = TestingSessionLocal()
+        try:
+            user = (
+                request_db.query(User)
+                .filter(User.username == test_user_data["username"])
+                .one()
+            )
+            response = await auth_api.update_current_user_preferences(
+                request=auth_api.UpdatePreferencesRequest(voice="warm"),
+                db=request_db,
+                user=user,
+            )
+        finally:
+            event.remove(engine, "rollback", _on_rollback)
+            event.remove(engine, "before_cursor_execute", _on_cursor_execute)
+            request_db.close()
+
+        assert response.success is True
+        assert released.is_set(), (
+            "expected release_db_connection_if_clean to roll back this clean session"
+        )
+        assert not queries_after_release, (
+            "a query executed on the request session after it was "
+            "released - user_id must be read from `user` strictly "
+            "before releasing `db`, since the rollback expires it: "
+            f"{queries_after_release}"
+        )
+
+    @pytest.mark.asyncio
     async def test_update_current_user_preferences_builds_response_before_commit(
         self, test_db, test_user_data
     ):
@@ -686,14 +748,6 @@ class TestAuthAPI:
         register_response = client.post("/api/auth/register", json=test_user_data)
         assert register_response.status_code == 200
 
-        db = TestingSessionLocal()
-        try:
-            user = (
-                db.query(User).filter(User.username == test_user_data["username"]).one()
-            )
-        finally:
-            db.close()
-
         committed = threading.Event()
         queries_after_commit: list[str] = []
 
@@ -707,8 +761,16 @@ class TestAuthAPI:
         merge_engine = get_engine()
         event.listen(merge_engine, "commit", _on_commit)
         event.listen(merge_engine, "before_cursor_execute", _on_cursor_execute)
+        # `user` and `db` share one Session, mirroring FastAPI's own
+        # per-request dependency caching - see the sibling SQL-off-the-
+        # event-loop test above for why.
         request_db = TestingSessionLocal()
         try:
+            user = (
+                request_db.query(User)
+                .filter(User.username == test_user_data["username"])
+                .one()
+            )
             response = await auth_api.update_current_user_preferences(
                 request=auth_api.UpdatePreferencesRequest(voice="warm"),
                 db=request_db,
@@ -746,16 +808,6 @@ class TestAuthAPI:
         register_response = client.post("/api/auth/register", json=test_user_data)
         assert register_response.status_code == 200
 
-        lookup_db = TestingSessionLocal()
-        try:
-            user = (
-                lookup_db.query(User)
-                .filter(User.username == test_user_data["username"])
-                .one()
-            )
-        finally:
-            lookup_db.close()
-
         merge_started = threading.Event()
         allow_merge = threading.Event()
         merge_completed = threading.Event()
@@ -770,7 +822,19 @@ class TestAuthAPI:
 
         monkeypatch.setattr(auth_api, "_normalized_preferences", blocking_normalize)
 
+        # `user` and `db` share one Session, mirroring FastAPI's own
+        # per-request dependency caching - see the SQL-off-the-event-loop
+        # test above for why.
         request_db = TestingSessionLocal()
+        user = (
+            request_db.query(User)
+            .filter(User.username == test_user_data["username"])
+            .one()
+        )
+        # Read before release_db_connection_if_clean's rollback expires
+        # `user` (see update_current_user_preferences's own comment on
+        # this) and before request_db.close() below detaches it outright.
+        user_id = int(user.id)
         request_task = asyncio.create_task(
             auth_api.update_current_user_preferences(
                 request=auth_api.UpdatePreferencesRequest(voice="warm"),
@@ -795,7 +859,7 @@ class TestAuthAPI:
         # when cancelled must still have committed.
         verify_db = TestingSessionLocal()
         try:
-            stored = verify_db.query(User).filter(User.id == user.id).one()
+            stored = verify_db.query(User).filter(User.id == user_id).one()
             assert stored.preferences["voice"] == "warm"
         finally:
             verify_db.close()

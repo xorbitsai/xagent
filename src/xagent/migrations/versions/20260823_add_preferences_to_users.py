@@ -25,24 +25,84 @@ down_revision: Union[str, None] = "a3b70c638cc3"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
+TABLE = "users"
+COLUMN = "preferences"
+
+# The schema of the *visible* users relation. version_table_schema names only
+# the Alembic version table, and current_schema() is merely the first entry on
+# search_path, so neither identifies the relation an unqualified reference
+# actually resolves to. Ask PostgreSQL which one it resolves.
+POSTGRES_VISIBLE_TABLE_SCHEMA_SQL = sa.text(
+    """
+    SELECT ns.nspname
+    FROM pg_catalog.pg_class AS cls
+    JOIN pg_catalog.pg_namespace AS ns ON ns.oid = cls.relnamespace
+    WHERE cls.oid = pg_catalog.to_regclass(:table_name)
+    """
+)
+
+
+def _target_schema() -> str | None:
+    """The schema holding the users relation this migration operates on."""
+    bind = op.get_bind()
+    if bind.dialect.name == "postgresql":
+        resolved = bind.execute(
+            POSTGRES_VISIBLE_TABLE_SCHEMA_SQL, {"table_name": TABLE}
+        ).scalar()
+        if resolved:
+            return str(resolved)
+    schema = op.get_context().version_table_schema
+    return str(schema) if schema else None
+
+
+def _online_columns(schema: str | None) -> set[str]:
+    inspector = sa.inspect(op.get_bind())
+    if TABLE not in inspector.get_table_names(schema=schema):
+        return set()
+    return {str(item["name"]) for item in inspector.get_columns(TABLE, schema=schema)}
+
+
+def _online_table_exists(schema: str | None) -> bool:
+    return TABLE in sa.inspect(op.get_bind()).get_table_names(schema=schema)
+
 
 def upgrade() -> None:
-    inspector = sa.inspect(op.get_bind())
+    context = op.get_context()
 
-    if "users" not in inspector.get_table_names():
+    # Offline (--sql) generation has a MockConnection, so reflection is
+    # unavailable. Emit the unconditional DDL instead of inspecting (the
+    # 20260808/20260726 shape, not the inspector-only shape this migration
+    # used before - the latter raises under --sql on both dialects).
+    if context.as_sql:
+        op.add_column(TABLE, sa.Column(COLUMN, sa.JSON(), nullable=True))
         return
 
-    existing_columns = {col["name"] for col in inspector.get_columns("users")}
-    if "preferences" not in existing_columns:
-        op.add_column("users", sa.Column("preferences", sa.JSON(), nullable=True))
+    # Address the same relation the catalog lookup inspects, so reflection and
+    # DDL can never diverge onto different schemas.
+    schema = _target_schema()
+
+    if not _online_table_exists(schema):
+        return
+
+    if COLUMN not in _online_columns(schema):
+        op.add_column(
+            TABLE,
+            sa.Column(COLUMN, sa.JSON(), nullable=True),
+            schema=schema,
+        )
 
 
 def downgrade() -> None:
-    inspector = sa.inspect(op.get_bind())
+    context = op.get_context()
 
-    if "users" not in inspector.get_table_names():
+    if context.as_sql:
+        op.drop_column(TABLE, COLUMN)
         return
 
-    existing_columns = {col["name"] for col in inspector.get_columns("users")}
-    if "preferences" in existing_columns:
-        op.drop_column("users", "preferences")
+    schema = _target_schema()
+
+    if not _online_table_exists(schema):
+        return
+
+    if COLUMN in _online_columns(schema):
+        op.drop_column(TABLE, COLUMN, schema=schema)

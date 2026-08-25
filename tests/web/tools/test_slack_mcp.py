@@ -65,8 +65,23 @@ def test_request_raises_on_slack_ok_false(monkeypatch):
         Mock(return_value=MockResponse({"ok": False, "error": "invalid_auth"})),
     )
 
-    with pytest.raises(RuntimeError, match="invalid_auth"):
+    with pytest.raises(slack._SlackAPIError, match="invalid_auth"):
         slack._request("GET", "auth.test")
+
+
+def test_request_translates_missing_scope_for_every_endpoint(monkeypatch):
+    """missing_scope means the same thing everywhere Slack can return it, so
+    _request translates it once at the lowest level rather than leaving
+    every individual tool to leak the bare code."""
+    monkeypatch.setattr(
+        slack.requests,
+        "request",
+        Mock(return_value=MockResponse({"ok": False, "error": "missing_scope"})),
+    )
+
+    with pytest.raises(slack._SlackMissingScopeError, match="reconnect") as exc_info:
+        slack._request("GET", "auth.test")
+    assert isinstance(exc_info.value, slack._SlackActionableError)
 
 
 def test_request_raises_generic_message_when_error_field_absent(monkeypatch):
@@ -334,6 +349,10 @@ def test_list_channels_returns_partial_results_when_filter_matched_nothing_yet(
 
 
 def test_list_channels_returns_error_payload_when_first_page_fails(monkeypatch):
+    """missing_scope is translated into an actionable reconnect message by
+    _request itself, so this reaches slack_list_channels — a tool that
+    isn't wrapped by _request_requiring_membership at all — the same way
+    it reaches every other tool in this file."""
     monkeypatch.setattr(
         slack.requests,
         "request",
@@ -344,6 +363,7 @@ def test_list_channels_returns_error_payload_when_first_page_fails(monkeypatch):
 
     assert result["status"] == "error"
     assert "missing_scope" in result["message"]
+    assert "reconnect" in result["message"]
 
 
 def test_list_channels_tolerates_missing_channels_key(monkeypatch):
@@ -1648,6 +1668,46 @@ def test_search_messages_history_page_failure_still_scans_collected_threads(
     ]
     assert result["truncated"] is True
     assert result["error"] == "ratelimited"
+
+
+def test_search_messages_skips_thread_scan_after_channel_wide_membership_error(
+    monkeypatch,
+):
+    """Unlike a transient history-page failure (which still scans
+    already-collected threads, per the test above), a not-a-member failure
+    is a channel-wide bot state — every conversations.replies call for this
+    same channel would fail identically, so the thread loop must not even
+    attempt them."""
+    mock_request = Mock(
+        side_effect=[
+            MockResponse(
+                {
+                    "ok": True,
+                    "messages": [
+                        {
+                            "ts": "1.1",
+                            "user": "U1",
+                            "text": "kickoff",
+                            "thread_ts": "1.1",
+                            "reply_count": 1,
+                        }
+                    ],
+                    "response_metadata": {"next_cursor": "page-2"},
+                }
+            ),
+            MockResponse({"ok": False, "error": "not_in_channel"}),
+        ]
+    )
+    monkeypatch.setattr(slack.requests, "request", mock_request)
+
+    result = json.loads(slack.slack_search_messages("C0123456789", "deploy"))
+
+    assert result["status"] == "success"
+    assert result["truncated"] is True
+    assert "slack_join_channel" in result["error"]
+    # Exactly 2 calls: the failing page-2 history call, then nothing else —
+    # no conversations.replies attempt for the threaded parent from page 1.
+    assert mock_request.call_count == 2
 
 
 def test_search_messages_history_page_failure_preserves_partial_matches(monkeypatch):

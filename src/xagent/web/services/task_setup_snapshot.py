@@ -77,11 +77,35 @@ class RuntimeUserFields:
 
     id: int
     is_admin: bool
-    # Onboarding "Launch" step voice choice, or None if unset/unrecognized -
-    # already reduced from the raw preferences JSON here so nothing
-    # downstream needs to touch that column again (see apply_user_voice
-    # in api/agents.py).
+    # Onboarding "Launch" step voice choice, verbatim from the raw
+    # preferences JSON (not validated against VALID_VOICES here - an
+    # unrecognized value is stored as-is and only becomes an inert no-op
+    # later, inside apply_output_voice's own isinstance/lookup guard in
+    # api/agents.py), or None if the key is unset.
     voice: Optional[str] = None
+
+
+def detach_runtime_user_fields(user: User) -> RuntimeUserFields:
+    """Reduce a live ORM ``User`` row to the primitives ``RuntimeUserFields``
+    needs, read now while the row is still attached and unexpired.
+
+    A caller holding a live ``User`` past the point its Session's
+    connection gets released (``release_db_connection_if_clean``'s
+    rollback unconditionally expires every object that Session loaded)
+    would otherwise force an implicit reload on the next attribute
+    access - synchronously, on the event loop, in the same window this
+    whole snapshot mechanism exists to keep query-free. Call this as
+    soon as a live ``User`` is in hand instead of holding onto it."""
+    preferences = user.preferences
+    return RuntimeUserFields(
+        id=int(user.id),
+        is_admin=bool(user.is_admin),
+        voice=(
+            cast(dict, preferences).get("voice")
+            if isinstance(preferences, dict)
+            else None
+        ),
+    )
 
 
 @dataclass(frozen=True)

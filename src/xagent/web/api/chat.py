@@ -138,6 +138,7 @@ from ..services.task_setup_snapshot import (
     RuntimeUserFields,
     TaskOwnerMismatchError,
     TaskSetupSnapshot,
+    detach_runtime_user_fields,
     load_task_setup_snapshot_sync,
 )
 from ..services.workforce_runtime import (
@@ -2591,6 +2592,12 @@ class AgentServiceManager:
                     task_fast_llm = None
                     task_vision_llm = None
                     task_compact_llm = None
+                    # Same detach as the except block below: the snapshot
+                    # never landed, so a live ORM User from the earlier
+                    # owner-mismatch fallback can still be in
+                    # `runtime_user` here too.
+                    if isinstance(runtime_user, User):
+                        runtime_user = detach_runtime_user_fields(runtime_user)
             except (
                 HTTPException,
                 TaskOwnerMismatchError,
@@ -2611,6 +2618,17 @@ class AgentServiceManager:
                 task_fast_llm = None
                 task_vision_llm = None
                 task_compact_llm = None
+                # The richer snapshot load above (which would have
+                # replaced `runtime_user` with a detached RuntimeUserFields
+                # at line ~2501) failed before reaching that assignment,
+                # so a live ORM User from the earlier owner-mismatch
+                # fallback can still be sitting in `runtime_user` here.
+                # Detach it now, while the row is still attached and
+                # unexpired - past this point (release_db_connection_if_
+                # clean's rollback) a live User's attributes would force
+                # an implicit reload on the event loop instead.
+                if isinstance(runtime_user, User):
+                    runtime_user = detach_runtime_user_fields(runtime_user)
             llm_info = "database LLM configuration"
 
             try:
@@ -2982,11 +3000,17 @@ class AgentServiceManager:
           already past its old-voice prompt construction has nothing left
           for a same-moment pop to invalidate, and would then overwrite
           this eviction with the stale-voice result the instant it
-          finishes. Taking the same per-task lock before deciding this
-          task's fate serializes against that build - either this method
-          runs first and a subsequent build reads the now-committed voice
-          from a fresh row, or the build runs first and this method still
-          gets to evict its (stale) result once the lock is free.
+          finishes. Checking the same per-task lock's locked() before
+          deciding this task's fate detects that race without blocking on
+          it: a build already in flight (sandbox startup, remote MCP
+          init - multi-second work) would otherwise serialize every one
+          of this owner's *other* concurrent tasks' invalidation behind
+          it with no timeout, turning one voice PATCH into a
+          multi-second stall. A busy lock instead defers this task's
+          eviction, the same tolerance-for-eventual-consistency already
+          used for an in-flight execution above - a later trigger
+          (another preference change, a scope/owner mismatch) still
+          catches the stale-voice result once the build finishes.
 
         Mirrors the scope-fingerprint-mismatch eviction above: the
         workspace is deliberately NOT cleaned up here (same owner, same
@@ -3002,6 +3026,14 @@ class AgentServiceManager:
         deferred_task_ids: List[int] = []
         for task_id in stale_task_ids:
             lock = self._agent_build_locks.get(task_id)
+            # A lock already held means a build is in flight for this
+            # task - defer rather than block on it (see docstring); only
+            # ever create a fresh lock (never contended, so never blocks)
+            # for the case where invalidation reaches a task_id no build
+            # has touched yet.
+            if lock is not None and lock.locked():
+                deferred_task_ids.append(task_id)
+                continue
             if lock is None:
                 lock = asyncio.Lock()
                 self._agent_build_locks[task_id] = lock

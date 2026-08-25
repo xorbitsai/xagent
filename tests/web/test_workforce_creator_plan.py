@@ -618,10 +618,10 @@ async def test_generation_resolves_voice_from_the_user_row(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """generate_workforce_creation_plan must resolve voice from the live
-    `user` row and thread it into build_workforce_prompt_plan - this is
-    the actual wiring under test in G11 (the two build_workforce_prompt_plan
-    tests above only exercise that function directly with an explicit
-    voice= kwarg, not this caller's own resolution step)."""
+    `user` row and thread it into build_workforce_prompt_plan - the two
+    build_workforce_prompt_plan tests above only exercise that function
+    directly with an explicit voice= kwarg, not this caller's own
+    resolution step, which is what's under test here."""
     llm = FakeLLM([])
     captured_voice: list[str | None] = []
 

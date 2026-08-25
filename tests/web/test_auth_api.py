@@ -641,6 +641,35 @@ class TestAuthAPI:
         )
         assert response.status_code == 422
 
+    def test_update_current_user_preferences_strips_surrounding_whitespace(
+        self, test_db, test_user_data
+    ):
+        """The blank-rejection validators check `.strip()` but must also
+        persist the stripped value, not the original - otherwise a
+        non-blank-but-padded value like "  Sales  " passes validation
+        and is stored with its whitespace intact."""
+        setup_first_admin()
+        register_response = client.post("/api/auth/register", json=test_user_data)
+        assert register_response.status_code == 200
+        token = login_and_get_token(
+            test_user_data["username"], test_user_data["password"]
+        )
+
+        response = client.patch(
+            "/api/auth/me/preferences",
+            json={
+                "department": "  Sales  ",
+                "industry": "  Retail  ",
+                "goals": ["  Ship the launch  "],
+            },
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert response.status_code == 200, response.text
+        preferences = response.json()["user"]["preferences"]
+        assert preferences["department"] == "Sales"
+        assert preferences["industry"] == "Retail"
+        assert preferences["goals"] == ["Ship the launch"]
+
     def test_update_current_user_preferences_clears_a_field_with_null(
         self, test_db, test_user_data
     ):
@@ -788,6 +817,60 @@ class TestAuthAPI:
             "/api/auth/me/preferences", json={"voice": "warm"}, headers=headers
         )
         assert response.status_code == 404, response.text
+
+    def test_update_current_user_preferences_returns_503_when_release_fails(
+        self, test_db, test_user_data, monkeypatch
+    ):
+        """release_db_connection_if_clean returning False (mirroring
+        workforce_creator.py's own hard-error convention for this same
+        helper) must surface as a 503, not silently continue holding
+        the connection through the lock wait."""
+        setup_first_admin()
+        register_response = client.post("/api/auth/register", json=test_user_data)
+        assert register_response.status_code == 200
+        token = login_and_get_token(
+            test_user_data["username"], test_user_data["password"]
+        )
+        headers = {"Authorization": f"Bearer {token}"}
+
+        monkeypatch.setattr(
+            auth_api, "release_db_connection_if_clean", lambda db: False
+        )
+
+        response = client.patch(
+            "/api/auth/me/preferences", json={"voice": "warm"}, headers=headers
+        )
+        assert response.status_code == 503, response.text
+        assert response.json()["detail"]["code"] == "preferences_update_unavailable"
+
+    def test_lock_user_row_exercises_the_real_sqlite_no_op_update_branch(
+        self, test_db, test_user_data
+    ):
+        """The 404 test above monkeypatches this function away entirely -
+        this one calls the real implementation directly against a real
+        SQLite session, so the no-op-UPDATE-then-existence-check branch
+        itself (not just its assumed contract) is exercised: it must
+        return True for a row that exists, and False for a user_id with
+        no matching row, without raising on either the UPDATE or the
+        follow-up SELECT."""
+        setup_first_admin()
+        register_response = client.post("/api/auth/register", json=test_user_data)
+        assert register_response.status_code == 200
+        user_id = register_response.json()["user"]["id"]
+
+        db = TestingSessionLocal()
+        try:
+            assert auth_api._lock_user_row_for_preferences_update(db, user_id) is True
+            db.commit()
+
+            nonexistent_user_id = user_id + 999999
+            assert (
+                auth_api._lock_user_row_for_preferences_update(db, nonexistent_user_id)
+                is False
+            )
+            db.commit()
+        finally:
+            db.close()
 
     def test_merge_user_preferences_locked_returns_none_when_user_vanishes_after_lock(
         self, test_db, monkeypatch

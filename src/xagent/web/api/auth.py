@@ -715,16 +715,22 @@ class UpdatePreferencesRequest(BaseModel):
     @field_validator("department", "industry")
     @classmethod
     def _reject_blank_text(cls, value: Optional[str]) -> Optional[str]:
-        if value is not None and not value.strip():
+        if value is None:
+            return value
+        stripped = value.strip()
+        if not stripped:
             raise ValueError("must not be blank")
-        return value
+        return stripped
 
     @field_validator("goals")
     @classmethod
     def _reject_blank_goals(cls, value: Optional[List[str]]) -> Optional[List[str]]:
-        if value is not None and any(not item.strip() for item in value):
+        if value is None:
+            return value
+        stripped_goals = [item.strip() for item in value]
+        if any(not item for item in stripped_goals):
             raise ValueError("goal must not be blank")
-        return value
+        return stripped_goals
 
 
 class UpdatePreferencesResponse(BaseModel):
@@ -1473,7 +1479,12 @@ def _merge_user_preferences_locked(
             # signal (see UpdatePreferencesRequest's blank-string
             # rejection) - storing a literal `{key: None}` entry instead
             # of deleting the key would have every future read replay a
-            # stale explicit-null forever.
+            # stale explicit-null forever. Note this doesn't apply to
+            # `goals: []`: an empty list is itself a valid value (not a
+            # clear signal) and is stored as-is, so `null` and `[]` are
+            # two different representations of "no goals" that can
+            # coexist - harmless today since nothing branches on the
+            # distinction, but worth knowing if that ever changes.
             if value is None:
                 current_preferences.pop(key, None)
             else:

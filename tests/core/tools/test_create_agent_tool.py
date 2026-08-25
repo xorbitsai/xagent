@@ -510,8 +510,8 @@ class TestCreateAgentTool:
         preference the top-level agent does (see
         core.agent.voice_policy.apply_output_voice) - before this fix,
         AgentTool had no ``voice`` at all, so a worker agent's own output
-        (visibly forwarded/traced to the user, per PR #1612 review N4)
-        stayed in the default tone regardless of what the user picked."""
+        (visibly forwarded/traced to the user) stayed in the default
+        tone regardless of what the user picked."""
         db, db_path, SessionLocal = _create_session()
         try:
             user = User(username="voice-worker-owner", password_hash="x")

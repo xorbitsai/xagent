@@ -127,12 +127,17 @@ async def test_invalidate_evicts_a_task_with_a_completed_execution() -> None:
 
 
 @pytest.mark.asyncio
-async def test_invalidate_waits_for_an_in_flight_build_before_deciding() -> None:
+async def test_invalidate_defers_rather_than_blocks_on_an_in_flight_build() -> None:
     """get_agent_for_task holds _agent_build_locks[task_id] for the
-    duration of a build. A same-moment invalidation must wait its turn on
-    that same lock rather than deciding this task's fate against
-    not-yet-cached state - otherwise a build that read the old voice
-    could overwrite this eviction's result the instant it finishes."""
+    duration of a build (sandbox startup, remote MCP init - multi-second
+    work). A same-moment invalidation must not block waiting its turn on
+    that lock: with several of an owner's tasks mid-build at once, that
+    would serialize a single preference-change PATCH behind all of them
+    with no timeout. It must defer this task_id instead - the same
+    tolerance already used for an in-flight execution - and return
+    promptly; a later trigger (another preference change, a scope/owner
+    mismatch) still catches the stale-voice result once the build
+    finishes and gets cached."""
     manager = AgentServiceManager()
     manager._agent_owner_ids[1] = 7
     build_lock = asyncio.Lock()
@@ -153,17 +158,52 @@ async def test_invalidate_waits_for_an_in_flight_build_before_deciding() -> None
     build_task = asyncio.create_task(fake_build())
     await asyncio.wait_for(build_started.wait(), timeout=2)
 
-    invalidate_task = asyncio.create_task(manager.invalidate_cached_agents_for_owner(7))
-    await asyncio.sleep(0.02)
-    # The build still holds the lock, so invalidation must not have
-    # decided anything yet - task 1 isn't cached at all mid-build.
-    assert not invalidate_task.done()
+    # Invalidation must return promptly - not block on the build's lock -
+    # even though the build hasn't finished yet.
+    await asyncio.wait_for(manager.invalidate_cached_agents_for_owner(7), timeout=1)
     assert 1 not in manager._agents
 
     release_build.set()
     await asyncio.wait_for(build_task, timeout=2)
-    await asyncio.wait_for(invalidate_task, timeout=2)
 
-    # Invalidation ran after the build published its stale-voice result
-    # and correctly evicted it.
-    assert 1 not in manager._agents
+    # The build's (stale-voice) result is cached now that it's finished -
+    # this same invalidation call already returned and did not evict it,
+    # by design; a later invalidation call is what would catch it.
+    assert 1 in manager._agents
+
+
+@pytest.mark.asyncio
+async def test_invalidate_does_not_serialize_behind_several_concurrent_builds() -> None:
+    """Regression for the exact reported failure mode: a user with
+    several tasks mid-build at once must not have a single preferences
+    PATCH's cache invalidation block behind all of them, one after
+    another, with no timeout."""
+    manager = AgentServiceManager()
+    build_locks = {}
+    release_builds = []
+    build_tasks = []
+    for task_id in (1, 2, 3):
+        manager._agent_owner_ids[task_id] = 7
+        lock = asyncio.Lock()
+        build_locks[task_id] = lock
+        manager._agent_build_locks[task_id] = lock
+        started = asyncio.Event()
+        release = asyncio.Event()
+        release_builds.append(release)
+
+        async def fake_build(lock=lock, started=started, release=release) -> None:
+            async with lock:
+                started.set()
+                await release.wait()
+
+        build_tasks.append(asyncio.create_task(fake_build()))
+        await asyncio.wait_for(started.wait(), timeout=2)
+
+    # All three builds are still in flight (none released). Invalidation
+    # must still return well within a single build's own timeout budget,
+    # not accumulate a wait per task.
+    await asyncio.wait_for(manager.invalidate_cached_agents_for_owner(7), timeout=1)
+
+    for release in release_builds:
+        release.set()
+    await asyncio.wait_for(asyncio.gather(*build_tasks), timeout=2)

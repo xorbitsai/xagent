@@ -1,12 +1,11 @@
 """Unit tests for apply_output_voice's own contract.
 
 Tested here, once, rather than only indirectly through every call site:
-review found the scoping caveat below had been added independently at
-two call sites and was missing from a third that could reach the same
-create_agent/update_agent-style tools (PR #1612's M3 finding) - baking
-it into apply_output_voice itself means every current and future caller
-gets it for free, and this is the one place that actually needs to prove
-it's always present.
+the scoping caveat below had been added independently at two call sites
+and was missing from a third that could reach the same
+create_agent/update_agent-style tools - baking it into apply_output_voice
+itself means every current and future caller gets it for free, and this
+is the one place that actually needs to prove it's always present.
 """
 
 from xagent.core.agent.voice_policy import VALID_VOICES, apply_output_voice

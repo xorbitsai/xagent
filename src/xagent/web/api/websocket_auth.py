@@ -24,10 +24,11 @@ class WebSocketPrincipal:
     is_admin: bool
     guest_id: str | None = None
     widget_entity_key: str | None = None
-    # Onboarding "Launch" step voice choice, or None if unset/unrecognized -
-    # already reduced from the raw preferences JSON here so nothing
-    # downstream needs to touch that column again (see apply_user_voice
-    # in api/agents.py).
+    # Onboarding "Launch" step voice choice, verbatim from the raw
+    # preferences JSON (not validated against VALID_VOICES here - an
+    # unrecognized value is stored as-is and only becomes an inert no-op
+    # later, inside apply_output_voice's own isinstance/lookup guard in
+    # api/agents.py), or None if the key is unset.
     voice: str | None = None
 
 

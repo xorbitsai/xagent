@@ -68,6 +68,15 @@ def test_encoded_site_url_rejects_empty():
         google_search_console._encoded_site_url("")
 
 
+@pytest.mark.parametrize("bad_value", [None, 123, ["https://example.com/"]])
+def test_encoded_site_url_rejects_non_string(bad_value):
+    """The isinstance guard is this function's own logic, not something
+    url_path_id/require_clean_identifier provides — .strip() would raise a
+    raw AttributeError on a non-string value without it."""
+    with pytest.raises(ValueError, match="site_url"):
+        google_search_console._encoded_site_url(bad_value)
+
+
 @pytest.mark.parametrize("bad_value", [".", ".."])
 def test_encoded_site_url_rejects_dot_segments(bad_value):
     """ "." and ".." survive quote() unchanged (unreserved per RFC 3986), and
@@ -263,6 +272,33 @@ def test_list_sites_returns_error_payload_on_failure(monkeypatch):
     assert "insufficient permissions" in result["message"]
 
 
+def test_list_sites_trims_response_when_over_output_budget(monkeypatch):
+    """list_sites has no pageToken/offset to request a smaller page up
+    front (Google returns every site in one response), so an unusually
+    large account must be handled the same way query_search_analytics
+    guards its own oversized responses: truncate after the fact."""
+    max_output_length = get_tool_max_output_length()
+    site_entries = [
+        {
+            "siteUrl": f"https://example-{i}.com/".ljust(80, "x"),
+            "permissionLevel": "siteOwner",
+        }
+        for i in range(2000)
+    ]
+    mock_request = Mock(
+        return_value=MockResponse(json_data={"siteEntry": site_entries})
+    )
+    monkeypatch.setattr(google_search_console.requests, "request", mock_request)
+
+    response = google_search_console.google_search_console_list_sites()
+
+    result = json.loads(response)
+    assert result["status"] == "success"
+    assert result["truncated"] is True
+    assert len(result["sites"]) < len(site_entries)
+    assert len(response) < max_output_length
+
+
 def test_list_sites_rejects_expired_token(monkeypatch):
     monkeypatch.setattr(
         google_search_console.requests,
@@ -336,20 +372,43 @@ def test_list_sitemaps_returns_sitemap_list(monkeypatch):
     assert "https%3A%2F%2Fexample.com%2F" in mock_request.call_args.kwargs["url"]
 
 
-def test_list_sitemaps_treats_non_list_sitemap_field_as_empty(monkeypatch):
+def test_list_sitemaps_treats_non_list_sitemap_field_as_empty(monkeypatch, caplog):
     """A malformed API response where "sitemap" isn't a list must not
-    crash or leak the raw value; it degrades to an empty list."""
+    crash or leak the raw value; it degrades to an empty list and logs the
+    anomaly, matching the warning the other three tools log for the same
+    class of malformed-field failure."""
     mock_request = Mock(return_value=MockResponse(json_data={"sitemap": "not-a-list"}))
     monkeypatch.setattr(google_search_console.requests, "request", mock_request)
 
-    result = json.loads(
-        google_search_console.google_search_console_list_sitemaps(
-            "https://example.com/"
+    with caplog.at_level("WARNING", logger=google_search_console.logger.name):
+        result = json.loads(
+            google_search_console.google_search_console_list_sitemaps(
+                "https://example.com/"
+            )
         )
-    )
 
     assert result["status"] == "success"
     assert result["sitemaps"] == []
+    assert "non-list 'sitemap'" in caplog.text
+
+
+def test_list_sitemaps_omits_warning_when_sitemap_key_missing(monkeypatch, caplog):
+    """A genuinely absent "sitemap" key (a site with no sitemaps) should not
+    log the malformed-response warning — only a present-but-wrong-type
+    value should."""
+    mock_request = Mock(return_value=MockResponse(json_data={}))
+    monkeypatch.setattr(google_search_console.requests, "request", mock_request)
+
+    with caplog.at_level("WARNING", logger=google_search_console.logger.name):
+        result = json.loads(
+            google_search_console.google_search_console_list_sitemaps(
+                "https://example.com/"
+            )
+        )
+
+    assert result["status"] == "success"
+    assert result["sitemaps"] == []
+    assert "non-list 'sitemap'" not in caplog.text
 
 
 def test_list_sitemaps_returns_error_payload_on_failure(monkeypatch):
@@ -372,6 +431,35 @@ def test_list_sitemaps_returns_error_payload_on_failure(monkeypatch):
 
     assert result["status"] == "error"
     assert "site not found" in result["message"]
+
+
+def test_list_sitemaps_trims_response_when_over_output_budget(monkeypatch):
+    """Same as list_sites: the Sitemaps API has no pageToken/offset, so a
+    property with an unusually large submitted-sitemap count (common for
+    sitemap-index setups) must be truncated after the fact rather than
+    failing the call outright."""
+    max_output_length = get_tool_max_output_length()
+    sitemap_entries = [
+        {
+            "path": f"https://example.com/sitemap-{i}.xml".ljust(80, "x"),
+            "isPending": False,
+        }
+        for i in range(2000)
+    ]
+    mock_request = Mock(
+        return_value=MockResponse(json_data={"sitemap": sitemap_entries})
+    )
+    monkeypatch.setattr(google_search_console.requests, "request", mock_request)
+
+    response = google_search_console.google_search_console_list_sitemaps(
+        "https://example.com/"
+    )
+
+    result = json.loads(response)
+    assert result["status"] == "success"
+    assert result["truncated"] is True
+    assert len(result["sitemaps"]) < len(sitemap_entries)
+    assert len(response) < max_output_length
 
 
 def test_list_sitemaps_rejects_non_dict_top_level_response(monkeypatch):

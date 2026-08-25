@@ -43,6 +43,34 @@ def _success(**payload: Any) -> str:
     return json.dumps({"status": "success", **payload}, ensure_ascii=False)
 
 
+def _success_with_trimmed_list(field_name: str, items: list[Any]) -> str:
+    """Build a {"status": "success", field_name: items, "truncated": ...}
+    payload, halving items until the serialized response fits the
+    platform's output limit.
+
+    list_sites and list_sitemaps both call APIs with no pageToken/offset
+    parameter — Google returns every site or every submitted sitemap in
+    one response — so unlike query_search_analytics (which can be paged
+    with start_row), there's no way to ask for a smaller page up front.
+    Truncating after the fact, the same way query_search_analytics already
+    guards its own oversized responses, is the only option for a property
+    with an unusually large site or sitemap count.
+    """
+    max_output_length = get_tool_max_output_length()
+    original_count = len(items)
+    response = _success(**{field_name: items, "truncated": False})
+    while len(response) > max_output_length and items:
+        items = items[: len(items) // 2]
+        response = _success(**{field_name: items, "truncated": True})
+    if len(items) < original_count:
+        logger.warning(
+            f"Google Search Console {field_name} response trimmed from "
+            f"{original_count} to {len(items)} items to stay under the "
+            f"{max_output_length}-char output limit"
+        )
+    return response
+
+
 def _error(message: str) -> str:
     return json.dumps({"status": "error", "message": message}, ensure_ascii=False)
 
@@ -204,7 +232,7 @@ def google_search_console_list_sites() -> str:
             for entry in site_entries
             if isinstance(entry, dict) and entry.get("siteUrl")
         ]
-        return _success(sites=sites)
+        return _success_with_trimmed_list("sites", sites)
     except Exception as e:
         logger.error(f"Error listing Google Search Console sites: {e}")
         return _error(str(e))
@@ -229,8 +257,14 @@ def google_search_console_list_sitemaps(site_url: str) -> str:
         )
         sitemaps = result.get("sitemap")
         if not isinstance(sitemaps, list):
+            if sitemaps is not None:
+                logger.warning(
+                    f"Google Search Console list_sitemaps returned a non-list "
+                    f"'sitemap' field ({type(sitemaps).__name__}); treating "
+                    f"as empty"
+                )
             sitemaps = []
-        return _success(sitemaps=sitemaps)
+        return _success_with_trimmed_list("sitemaps", sitemaps)
     except Exception as e:
         logger.error(f"Error listing sitemaps for {site_url!r}: {e}")
         return _error(str(e))

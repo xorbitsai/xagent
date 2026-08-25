@@ -41,7 +41,7 @@ from ..models.user_oauth import UserOAuth
 from ..oauth_provider_quirks import requires_json_accept_header
 from ..services import gmail_provisioning
 from ..services.auth_email import send_password_reset_email
-from ..services.db_runtime import await_task_settlement
+from ..services.db_runtime import await_task_settlement, propagate_deferred_cancellation
 from ..services.user_oauth import delete_scoped_user_oauth_accounts
 from ..utils.graphql_errors import graphql_errors_message, truncate_error_text
 
@@ -694,6 +694,24 @@ class UpdatePreferencesRequest(BaseModel):
     def _validate_voice(cls, value: Optional[str]) -> Optional[str]:
         if value is not None and value not in VALID_USER_VOICES:
             raise ValueError(f"voice must be one of {sorted(VALID_USER_VOICES)}")
+        return value
+
+    # A blank string is meaningless stored data, not a "clear this field"
+    # signal - a merge-style PATCH already has one for that (send `null`
+    # for the key, same as tokens_must_not_be_blank rejects a blank
+    # access/refresh token above rather than treating it as "no token").
+    @field_validator("department", "industry")
+    @classmethod
+    def _reject_blank_text(cls, value: Optional[str]) -> Optional[str]:
+        if value is not None and not value.strip():
+            raise ValueError("must not be blank")
+        return value
+
+    @field_validator("goals")
+    @classmethod
+    def _reject_blank_goals(cls, value: Optional[List[str]]) -> Optional[List[str]]:
+        if value is not None and any(not item.strip() for item in value):
+            raise ValueError("goal must not be blank")
         return value
 
 
@@ -1486,7 +1504,24 @@ async def update_current_user_preferences(
     # workforce_creator.py's ReAct builder call).
     release_db_connection_if_clean(db)
 
-    def _invalidate_voice_cache_if_needed() -> None:
+    # run_db_io_cancellation_safe's own contract discards a settled result
+    # in favor of re-raising the caller's deferred cancellation (see its
+    # docstring), which would otherwise skip the cache invalidation below
+    # entirely - the merge already committed by the time that cancellation
+    # is observed, so the cache must still be invalidated before this
+    # function lets that cancellation propagate. propagate_deferred_
+    # cancellation (the same helper task_command_transport.py's heartbeat
+    # settlement uses) makes that ordering safe even if invalidation
+    # itself raises, or 404s below: cancellation always wins over a
+    # later exception or return, never the reverse.
+    worker = asyncio.get_running_loop().create_task(
+        asyncio.to_thread(_merge_user_preferences_locked, user_id, updates)
+    )
+    serialized_user, cancellation = await await_task_settlement(worker)
+    with propagate_deferred_cancellation(cancellation):
+        if serialized_user is None:
+            raise HTTPException(status_code=404, detail="User not found")
+
         if "voice" in updates:
             # A cached AgentService bakes voice into its system prompt at
             # construction time and won't re-check preferences on later
@@ -1497,31 +1532,11 @@ async def update_current_user_preferences(
 
             get_agent_manager().invalidate_cached_agents_for_owner(user_id)
 
-    # run_db_io_cancellation_safe's own contract discards a settled result
-    # in favor of re-raising the caller's deferred cancellation (see its
-    # docstring), which would otherwise skip the cache invalidation below
-    # entirely - the merge already committed by the time that cancellation
-    # is observed, so the cache must still be invalidated before this
-    # function lets that cancellation propagate.
-    worker = asyncio.get_running_loop().create_task(
-        asyncio.to_thread(_merge_user_preferences_locked, user_id, updates)
-    )
-    serialized_user, cancellation = await await_task_settlement(worker)
-    if cancellation is not None:
-        if serialized_user is not None:
-            _invalidate_voice_cache_if_needed()
-        raise cancellation
-
-    if serialized_user is None:
-        raise HTTPException(status_code=404, detail="User not found")
-
-    _invalidate_voice_cache_if_needed()
-
-    return UpdatePreferencesResponse(
-        success=True,
-        message="Preferences updated successfully",
-        user=serialized_user,
-    )
+        return UpdatePreferencesResponse(
+            success=True,
+            message="Preferences updated successfully",
+            user=serialized_user,
+        )
 
 
 @auth_router.post("/refresh", response_model=RefreshTokenResponse)

@@ -578,6 +578,77 @@ class TestAuthAPI:
         )
         assert response.status_code == 422
 
+    def test_update_current_user_preferences_rejects_blank_department_and_industry(
+        self, test_db, test_user_data
+    ):
+        """A blank string is meaningless stored data, not a signal to
+        clear the field - null already does that for a merge-style PATCH
+        (see the no-op-body test above)."""
+        setup_first_admin()
+        register_response = client.post("/api/auth/register", json=test_user_data)
+        assert register_response.status_code == 200
+        token = login_and_get_token(
+            test_user_data["username"], test_user_data["password"]
+        )
+
+        response = client.patch(
+            "/api/auth/me/preferences",
+            json={"department": "   "},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert response.status_code == 422
+
+        response = client.patch(
+            "/api/auth/me/preferences",
+            json={"industry": ""},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert response.status_code == 422
+
+    def test_update_current_user_preferences_rejects_a_blank_goal(
+        self, test_db, test_user_data
+    ):
+        setup_first_admin()
+        register_response = client.post("/api/auth/register", json=test_user_data)
+        assert register_response.status_code == 200
+        token = login_and_get_token(
+            test_user_data["username"], test_user_data["password"]
+        )
+
+        response = client.patch(
+            "/api/auth/me/preferences",
+            json={"goals": ["Ship the launch", "   "]},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert response.status_code == 422
+
+    def test_update_current_user_preferences_clears_a_field_with_null(
+        self, test_db, test_user_data
+    ):
+        """null is the merge-style PATCH's clear signal, distinct from
+        (and still allowed alongside) the blank-string rejection above."""
+        setup_first_admin()
+        register_response = client.post("/api/auth/register", json=test_user_data)
+        assert register_response.status_code == 200
+        token = login_and_get_token(
+            test_user_data["username"], test_user_data["password"]
+        )
+
+        response = client.patch(
+            "/api/auth/me/preferences",
+            json={"department": "Sales"},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert response.status_code == 200, response.text
+
+        response = client.patch(
+            "/api/auth/me/preferences",
+            json={"department": None},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert response.status_code == 200, response.text
+        assert response.json()["user"]["preferences"]["department"] is None
+
     def test_update_current_user_preferences_with_empty_body_is_a_no_op(
         self, test_db, test_user_data
     ):

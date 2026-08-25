@@ -428,6 +428,12 @@ async def test_handle_builder_chat_applies_voice_preference() -> None:
     system_prompt = execution_context["system_prompt"]
     assert "\n\n## OUTPUT VOICE\n" in system_prompt
     assert "As short as possible" in system_prompt
+    # The voice tone must not bleed into create_agent/update_agent's
+    # persisted name/description/instructions arguments - only the final
+    # reply, mirroring the equivalent scoping already required of the
+    # Workforce Prompt Builder's identically-shaped system prompt.
+    assert "persisted configuration" in system_prompt
+    assert "create_agent/update_agent" in system_prompt
 
 
 @pytest.mark.asyncio

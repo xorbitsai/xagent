@@ -8463,7 +8463,27 @@ Builder chat tools available in this runtime:
 Use native `ask_user_question` for structured user input. Do not ask required
 clarification questions as plain assistant text.
 """
+        # create_agent/update_agent persist name/description/instructions
+        # as configuration, not conversation - a blanket tone instruction
+        # would let e.g. "concise" start trimming those fields too, the
+        # same leak already scoped out of the Workforce Prompt Builder's
+        # equivalent system prompt (see build_workforce_prompt_plan).
+        # create_agent/update_agent persist name/description/instructions
+        # as configuration, not conversation - a blanket tone instruction
+        # would let e.g. "concise" start trimming those fields too, the
+        # same leak already scoped out of the Workforce Prompt Builder's
+        # equivalent system prompt (see build_workforce_prompt_plan).
+        base_builder_chat_prompt = system_prompt
         system_prompt = apply_user_voice(system_prompt, voice_from_runtime_user(user))
+        if system_prompt != base_builder_chat_prompt:
+            system_prompt = (
+                f"{system_prompt}\n\n"
+                "The OUTPUT VOICE above governs only your final natural-language "
+                "reply to the user. Agent name, description, and instructions "
+                "passed to create_agent/update_agent are persisted configuration, "
+                "not conversation - write them in plain, neutral language "
+                "regardless of that tone."
+            )
 
         async def send_builder_outbound_message(payload: Dict[str, Any]) -> None:
             """Bridge agent agent-to-user messages to the builder chat socket."""

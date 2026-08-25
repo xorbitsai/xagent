@@ -4646,6 +4646,58 @@ async def test_react_pattern_skips_store_memory_tool_in_single_call_mode() -> No
 
 
 @pytest.mark.asyncio
+async def test_tool_result_user_interaction_fails_closed_when_disabled() -> None:
+    class WaitingTool:
+        metadata = SimpleNamespace(
+            name="approval_gate",
+            description="Request approval.",
+        )
+
+        def args_type(self) -> type[BaseModel]:
+            return CalculatorArgs
+
+        async def run_json_async(self, args: dict[str, Any]) -> dict[str, Any]:
+            return {
+                "success": False,
+                "status": "waiting_for_user",
+                "message": "Approve this action?",
+            }
+
+    pattern = ReActPattern(max_iterations=2, user_interaction_enabled=False)
+    runtime = PatternRuntime(execution_id="unattended-task")
+    context = ExecutionContext(execution_id="unattended-task")
+    context.add_user_message("Run unattended.")
+
+    result = await pattern.run(
+        context=context,
+        tools=[WaitingTool()],
+        llm=FakeLLM(
+            [
+                {
+                    "tool_calls": [
+                        {
+                            "id": "wait-call",
+                            "function": {
+                                "name": "approval_gate",
+                                "arguments": '{"expression":"2+2"}',
+                            },
+                        }
+                    ]
+                }
+            ]
+        ),
+        runtime=runtime,
+    )
+
+    assert result["success"] is False
+    assert result["status"] == "failed"
+    assert "interaction is disabled" in result["error"]
+    assert runtime.outbound_messages == []
+    assert pattern.status == "failed"
+    assert pattern.waiting_for_user_request is None
+
+
+@pytest.mark.asyncio
 async def test_tool_result_can_pause_and_resume_with_user_response() -> None:
     class ResumableTool:
         def __init__(self) -> None:

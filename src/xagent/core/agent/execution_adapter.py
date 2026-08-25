@@ -35,6 +35,7 @@ class AgentExecutionConfig:
     tracer: Any | None = None
     system_prompt: str | None = None
     workspace_base_dir: str = "workspace"
+    workspace_enabled: bool = True
     allowed_external_dirs: list[str] | None = None
     scope_segments: tuple[str, ...] = ()
     current_task_id: str | None = None
@@ -284,7 +285,9 @@ class AgentExecutionAdapter:
             memory_store=self.config.memory_store,
             memory_similarity_threshold=self.config.memory_similarity_threshold,
             skill_manager=skill_manager,
-            allowed_skills=self.config.allowed_skills,
+            allowed_skills=(
+                self.config.allowed_skills if self.config.skills_enabled else None
+            ),
         )
         return (
             AgentRunner(
@@ -292,6 +295,7 @@ class AgentExecutionAdapter:
                 tracer=self.config.tracer,
                 callbacks=[TraceEventCallback()],
                 workspace_base_dir=self.config.workspace_base_dir,
+                workspace_enabled=self.config.workspace_enabled,
                 scope_segments=self.config.scope_segments,
                 outbound_message_handler=self.config.outbound_message_handler,
             ),
@@ -315,12 +319,12 @@ class AgentExecutionAdapter:
                         max_iterations=self.config.react_max_iterations,
                         tool_parallel_enabled=self.config.tool_parallel_enabled,
                         tool_max_concurrency=self.config.tool_max_concurrency,
-                        user_interaction_enabled=(self.config.user_interaction_enabled),
+                        user_interaction_enabled=self.config.user_interaction_enabled,
                     ),
                     dag_pattern=DAGPattern(
                         LLMPlanGenerator(),
                         max_concurrency=self.config.dag_max_concurrency,
-                        user_interaction_enabled=(self.config.user_interaction_enabled),
+                        user_interaction_enabled=self.config.user_interaction_enabled,
                     ),
                 ),
                 "agent_auto",

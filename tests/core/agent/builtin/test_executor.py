@@ -106,7 +106,7 @@ async def test_executor_builds_a_least_privilege_agent_and_stamps_metadata() -> 
     assert init["memory_enabled"] is False
     assert init["skills_enabled"] is False
     assert init["user_interaction_enabled"] is False
-    assert init["agent_type"] == "builtin"
+    assert "agent_type" not in init
 
     execute = service_factory.service.execute_kwargs
     assert execute is not None
@@ -190,7 +190,9 @@ async def test_executor_rejects_agent_delegation_tools() -> None:
 
 
 @pytest.mark.asyncio
-async def test_executor_runs_through_real_agent_service_without_default_tools() -> None:
+async def test_executor_runs_through_real_agent_service_without_default_tools(
+    tmp_path: Any,
+) -> None:
     model = FakeLLM(["work complete"])
     executor = BuiltinAgentExecutor(
         registry=_registry(),
@@ -201,6 +203,7 @@ async def test_executor_runs_through_real_agent_service_without_default_tools() 
         "internal_worker",
         task="Perform internal work",
         execution_id="run-real-service",
+        workspace_base_dir=str(tmp_path),
     )
 
     assert result["success"] is True
@@ -211,3 +214,4 @@ async def test_executor_runs_through_real_agent_service_without_default_tools() 
         tool["function"]["name"] for tool in model.calls[0].get("tools") or []
     }
     assert tool_names == {"final_answer"}
+    assert not any(path.name.startswith("builtin:") for path in tmp_path.iterdir())

@@ -169,6 +169,31 @@ def test_execution_adapter_can_disable_skills_and_preserve_internal_metadata() -
     assert normalized["metadata"]["builtin_agent_name"] == "internal_worker"
 
 
+@pytest.mark.parametrize("pattern_name", ["dag_plan_execute", "auto"])
+def test_execution_adapter_propagates_interaction_policy_to_nested_patterns(
+    pattern_name: str,
+) -> None:
+    adapter = AgentExecutionAdapter(
+        AgentExecutionConfig(
+            name="builtin:nested_worker",
+            pattern=pattern_name,
+            llm=FakeLLM([]),
+            skills_enabled=False,
+            user_interaction_enabled=False,
+        )
+    )
+
+    runner, _ = adapter._build_runner()
+    pattern = runner.agent.patterns[0]
+
+    assert runner.agent.skill_manager is None
+    if pattern_name == "dag_plan_execute":
+        assert pattern.user_interaction_enabled is False
+    else:
+        assert pattern.react_pattern.user_interaction_enabled is False
+        assert pattern.dag_pattern.user_interaction_enabled is False
+
+
 def test_execution_metadata_carries_runtime_modality_preferences() -> None:
     adapter = AgentExecutionAdapter(
         AgentExecutionConfig(
@@ -915,6 +940,10 @@ async def test_agent_service_refreshes_compact_llm_on_reused_execution_adapter()
             recovered_skill_context=None,
             memory_store=None,
             allowed_skills=None,
+            skills_enabled=True,
+            workspace_enabled=True,
+            user_interaction_enabled=True,
+            execution_metadata={"old": True},
         )
     )
     service = AgentService(
@@ -925,6 +954,10 @@ async def test_agent_service_refreshes_compact_llm_on_reused_execution_adapter()
         compact_llm=cast(Any, initial_compact_llm),
         tools=[],
         tool_config=None,
+        enable_workspace=False,
+        skills_enabled=False,
+        user_interaction_enabled=False,
+        execution_metadata={"agent_type": "builtin"},
     )
     service._execution_adapter = cast(Any, adapter)
 
@@ -939,6 +972,10 @@ async def test_agent_service_refreshes_compact_llm_on_reused_execution_adapter()
     assert adapter.config.current_task_id == "task-compact-refresh"
     assert adapter.config.llm is updated_llm
     assert adapter.config.compact_llm is updated_compact_llm
+    assert adapter.config.skills_enabled is False
+    assert adapter.config.workspace_enabled is False
+    assert adapter.config.user_interaction_enabled is False
+    assert adapter.config.execution_metadata == {"agent_type": "builtin"}
 
 
 @pytest.mark.asyncio
@@ -1280,7 +1317,30 @@ async def test_execution_adapter_forwards_outbound_messages() -> None:
 
 
 @pytest.mark.asyncio
-async def test_execution_adapter_rejects_outbound_control_calls_when_disabled() -> None:
+@pytest.mark.parametrize(
+    ("control_name", "control_args"),
+    [
+        (
+            "send_message",
+            {
+                "message": "Should stay internal",
+                "message_type": "progress",
+                "expect_response": False,
+            },
+        ),
+        (
+            "ask_user_question",
+            {
+                "message": "Should stay internal",
+                "interactions": [],
+            },
+        ),
+    ],
+)
+async def test_execution_adapter_rejects_outbound_control_calls_when_disabled(
+    control_name: str,
+    control_args: dict[str, Any],
+) -> None:
     sent_messages: list[dict[str, Any]] = []
     work_tool = FakeTool()
     llm = FakeLLM(
@@ -1288,20 +1348,21 @@ async def test_execution_adapter_rejects_outbound_control_calls_when_disabled() 
             {
                 "tool_calls": [
                     {
-                        "id": "call-message",
+                        "id": "call-work-before",
                         "function": {
-                            "name": "send_message",
-                            "arguments": json.dumps(
-                                {
-                                    "message": "Should stay internal",
-                                    "message_type": "progress",
-                                    "expect_response": False,
-                                }
-                            ),
+                            "name": "noop",
+                            "arguments": json.dumps({"value": "must-not-run"}),
                         },
                     },
                     {
-                        "id": "call-work",
+                        "id": "call-control",
+                        "function": {
+                            "name": control_name,
+                            "arguments": json.dumps(control_args),
+                        },
+                    },
+                    {
+                        "id": "call-work-after",
                         "function": {
                             "name": "noop",
                             "arguments": json.dumps({"value": "must-not-run"}),
@@ -1353,12 +1414,13 @@ async def test_execution_adapter_rejects_outbound_control_calls_when_disabled() 
     assert [schema["function"]["name"] for schema in llm.calls[1]["tools"]] == [
         "final_answer"
     ]
-    cancelled_work = next(
-        message
+    cancelled_work_ids = {
+        message.get("tool_call_id")
         for message in llm.calls[1]["messages"]
-        if message.get("role") == "tool" and message.get("tool_call_id") == "call-work"
-    )
-    assert "cancelled" in cancelled_work["content"]
+        if message.get("role") == "tool" and "cancelled" in message["content"]
+    }
+    assert cancelled_work_ids == {"call-work-before", "call-work-after"}
+    assert "call ask_user_question" not in llm.calls[0]["messages"][0]["content"]
 
 
 def test_execution_adapter_uses_last_assistant_message_when_output_missing() -> None:

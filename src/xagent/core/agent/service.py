@@ -506,13 +506,16 @@ class AgentService:
             )
             self._execution_adapter.config.allowed_skills = self.allowed_skills
             self._execution_adapter.config.skills_enabled = self.skills_enabled
+            self._execution_adapter.config.workspace_enabled = self.enable_workspace
             self._execution_adapter.config.user_interaction_enabled = (
                 self.user_interaction_enabled
             )
             self._execution_adapter.config.skill_scope_context = (
                 self.skill_scope_context
             )
-            self._execution_adapter.config.execution_metadata = self.execution_metadata
+            self._execution_adapter.config.execution_metadata = dict(
+                self.execution_metadata
+            )
             self._execution_adapter.config.system_prompt = self.system_prompt
             self._execution_adapter.config.preferred_input_modalities = (
                 self.preferred_input_modalities
@@ -553,6 +556,7 @@ class AgentService:
                 tracer=tracer,
                 system_prompt=self.system_prompt,
                 workspace_base_dir=self.workspace_base_dir,
+                workspace_enabled=self.enable_workspace,
                 allowed_external_dirs=self.allowed_external_dirs,
                 scope_segments=self.scope_segments,
                 current_task_id=self._current_task_id,
@@ -570,7 +574,7 @@ class AgentService:
                 skills_enabled=self.skills_enabled,
                 user_interaction_enabled=self.user_interaction_enabled,
                 preferred_input_modalities=self.preferred_input_modalities,
-                execution_metadata=self.execution_metadata,
+                execution_metadata=dict(self.execution_metadata),
             )
         )
 

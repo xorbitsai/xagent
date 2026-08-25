@@ -16,6 +16,8 @@ BuiltinAgentPattern: TypeAlias = Literal[
     "auto",
 ]
 
+_BUILTIN_EXECUTION_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
+
 
 @dataclass(frozen=True, slots=True)
 class BuiltinAgentRunContext:
@@ -28,8 +30,11 @@ class BuiltinAgentRunContext:
     artifacts: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
-        if not self.execution_id.strip():
-            raise ValueError("Built-in agent execution_id must not be empty")
+        if not _BUILTIN_EXECUTION_ID_RE.fullmatch(self.execution_id):
+            raise ValueError(
+                "Built-in agent execution_id must contain only letters, digits, "
+                "dots, colons, underscores, or hyphens"
+            )
 
 
 BuiltinToolBuilderResult: TypeAlias = Sequence[Tool] | Awaitable[Sequence[Tool]]

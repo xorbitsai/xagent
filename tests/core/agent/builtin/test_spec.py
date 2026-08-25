@@ -44,6 +44,9 @@ def test_builtin_agent_spec_rejects_invalid_identity_and_runtime_fields(
         _spec(**{field: value})
 
 
-def test_builtin_agent_run_context_requires_execution_id() -> None:
+@pytest.mark.parametrize("execution_id", [" ", "../escape", "nested/path"])
+def test_builtin_agent_run_context_rejects_unsafe_execution_id(
+    execution_id: str,
+) -> None:
     with pytest.raises(ValueError, match="execution_id"):
-        BuiltinAgentRunContext(execution_id=" ")
+        BuiltinAgentRunContext(execution_id=execution_id)

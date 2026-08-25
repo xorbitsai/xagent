@@ -93,6 +93,7 @@ DEFAULT_REPEATED_TOOL_DECISION_CONSECUTIVE_TOOL_CALLS = 4
 DEFAULT_REPEATED_TOOL_DECISION_CONSECUTIVE_WORK_TOOL_CALLS = 10
 REACT_DECISION_TOOL_NAME = "react_decision"
 REACT_DECISION_FINAL_ANSWER = "final_answer"
+USER_INTERACTION_CONTROL_TOOL_NAMES = CONTROL_TOOL_NAMES - {REACT_DECISION_FINAL_ANSWER}
 REACT_DECISION_TOOL_CALL = "tool_call"
 UNGROUPED_TOOL_DECISION_CATEGORIES = frozenset({"basic", "other"})
 REACT_RESPONSE_LANGUAGE_DESCRIPTION = (
@@ -846,6 +847,15 @@ class ReActPattern(AgentPattern):
                 .isoformat()
             )
             clock_zone_label = clock_zone.key if clock_zone is not None else "UTC"
+            missing_information_instruction = (
+                "If a tool needs missing information from the user, call "
+                "ask_user_question; do not ask the question as plain assistant "
+                "text. "
+                if self.user_interaction_enabled
+                else "If missing user information prevents completion, do not ask "
+                "the user or attempt an unavailable interaction tool; finish with "
+                "outcome=blocked and explain what is missing. "
+            )
             instruction = (
                 "Use available tools when the user asks you to generate, compute, run, "
                 "execute, inspect, read, write, or otherwise produce a concrete result "
@@ -854,9 +864,9 @@ class ReActPattern(AgentPattern):
                 "tool work. When the current task is complete, call the final_answer "
                 "tool exactly once instead of calling another work tool or returning "
                 "plain assistant text. Do not write assistant text in the same "
-                "response as a work tool call; call the tool directly. If a tool "
-                "needs missing information from the user, call ask_user_question; do "
-                "not ask the question as plain assistant text. If the latest user "
+                "response as a work tool call; call the tool directly. "
+                f"{missing_information_instruction}"
+                "If the latest user "
                 "message explicitly asks you to call a named available tool, call "
                 "that tool instead of paraphrasing the request. If a tool "
                 "fails, retry with a corrected call when possible; "
@@ -1699,7 +1709,7 @@ class ReActPattern(AgentPattern):
     def _builtin_tool_schemas(
         self, *, can_lookup_output_files: bool = False
     ) -> list[dict[str, Any]]:
-        schemas = [
+        schemas: list[dict[str, Any]] = [
             {
                 "type": "function",
                 "function": {
@@ -1852,7 +1862,12 @@ class ReActPattern(AgentPattern):
             },
         ]
         if not self.user_interaction_enabled:
-            return schemas[:1]
+            return [
+                schema
+                for schema in schemas
+                if schema.get("function", {}).get("name")
+                not in USER_INTERACTION_CONTROL_TOOL_NAMES
+            ]
         return schemas
 
     def _tool_schemas_with_builtin_controls(
@@ -1889,19 +1904,27 @@ class ReActPattern(AgentPattern):
         name = tool_call["name"]
         args = tool_call.get("args", {})
 
-        if not self.user_interaction_enabled and name in {
-            "send_message",
-            "ask_user_question",
-        }:
+        if (
+            not self.user_interaction_enabled
+            and name in USER_INTERACTION_CONTROL_TOOL_NAMES
+        ):
             error = f"Control tool '{name}' is disabled for this execution."
+            logger.warning(
+                "ReAct rejected disabled user-interaction control tool. "
+                "tool=%s tool_call_id=%s",
+                name,
+                tool_call.get("id"),
+            )
+            failure = {"success": False, "status": "error", "error": error}
             self._record_tool_call(
                 tool_call,
                 status="failed",
+                result=failure,
                 error=error,
             )
             context.add_tool_result(
                 tool_name=name,
-                result={"success": False, "error": error},
+                result=failure,
                 tool_call_id=tool_call.get("id"),
             )
             remaining = [
@@ -1915,6 +1938,7 @@ class ReActPattern(AgentPattern):
                 context,
                 reason=f"Discarded because control tool '{name}' is disabled.",
             )
+            self.status = "thinking"
             self.force_final_answer_next = True
             return None
 
@@ -2257,6 +2281,27 @@ class ReActPattern(AgentPattern):
     ) -> dict[str, Any]:
         """Publish tool-originated questions and checkpoint the suspended run."""
 
+        if not self.user_interaction_enabled:
+            tool_names = sorted(
+                {
+                    str(tool_call.get("name") or "unknown")
+                    for tool_call, _ in waiting_pairs
+                }
+            )
+            error = (
+                "Tool-requested user interaction is disabled for this execution: "
+                + ", ".join(tool_names)
+            )
+            logger.warning("ReAct rejected tool-requested user interaction: %s", error)
+            self.status = "failed"
+            self.waiting_for_user_request = None
+            return {
+                "success": False,
+                "status": "failed",
+                "error": error,
+                "context": context,
+            }
+
         requests: list[dict[str, Any]] = []
         interactions: list[dict[str, Any]] = []
         used_fields: set[str] = set()
@@ -2454,6 +2499,27 @@ class ReActPattern(AgentPattern):
         llm: Any,
         runtime: PatternRuntime,
     ) -> dict[str, Any] | None:
+        if not self.user_interaction_enabled:
+            disabled_index = next(
+                (
+                    index
+                    for index, pending in enumerate(self.pending_tool_calls)
+                    if pending.get("name") in USER_INTERACTION_CONTROL_TOOL_NAMES
+                ),
+                None,
+            )
+            if disabled_index:
+                preceding = self.pending_tool_calls[:disabled_index]
+                disabled_name = self.pending_tool_calls[disabled_index].get("name")
+                self.pending_tool_calls = self.pending_tool_calls[disabled_index:]
+                self._cancel_tool_calls(
+                    preceding,
+                    context,
+                    reason=(
+                        "Discarded because the response also called disabled "
+                        f"control tool '{disabled_name}'."
+                    ),
+                )
         successful_tool_result = False
         while self.pending_tool_calls:
             interrupted = await self._interrupt_if_requested(

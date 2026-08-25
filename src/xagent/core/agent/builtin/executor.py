@@ -91,7 +91,6 @@ class BuiltinAgentExecutor:
             "skills_enabled": spec.skills_enabled,
             "user_interaction_enabled": False,
             "execution_metadata": metadata,
-            "agent_type": "builtin",
         }
         if workspace_base_dir is not None:
             service_kwargs["workspace_base_dir"] = workspace_base_dir

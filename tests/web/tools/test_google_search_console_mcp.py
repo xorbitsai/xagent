@@ -627,6 +627,103 @@ def test_query_search_analytics_allows_query_dimension_for_web_search_type(
     mock_request.assert_called_once()
 
 
+@pytest.mark.parametrize("search_type", ["discover", "googleNews"])
+def test_query_search_analytics_rejects_query_filter_for_discover_and_news(
+    monkeypatch, search_type
+):
+    """The restriction on "query" for discover/googleNews must also cover
+    dimension_filter_groups, not just the dimensions list — Google's API
+    rejects "query" from either path for these two surfaces."""
+    mock_request = Mock()
+    monkeypatch.setattr(google_search_console.requests, "request", mock_request)
+
+    result = json.loads(
+        google_search_console.google_search_console_query_search_analytics(
+            "https://example.com/",
+            start_date="2026-07-01",
+            end_date="2026-07-28",
+            search_type=search_type,
+            dimension_filter_groups=[
+                {
+                    "filters": [
+                        {
+                            "dimension": "query",
+                            "operator": "equals",
+                            "expression": "foo",
+                        }
+                    ]
+                }
+            ],
+        )
+    )
+
+    assert result["status"] == "error"
+    assert "query" in result["message"]
+    mock_request.assert_not_called()
+
+
+def test_query_search_analytics_allows_non_query_filter_for_discover(monkeypatch):
+    """The dimension_filter_groups check must not over-reject a filter on a
+    dimension other than "query"."""
+    mock_request = Mock(return_value=MockResponse(json_data={}))
+    monkeypatch.setattr(google_search_console.requests, "request", mock_request)
+
+    result = json.loads(
+        google_search_console.google_search_console_query_search_analytics(
+            "https://example.com/",
+            start_date="2026-07-01",
+            end_date="2026-07-28",
+            search_type="discover",
+            dimension_filter_groups=[
+                {
+                    "filters": [
+                        {
+                            "dimension": "country",
+                            "operator": "equals",
+                            "expression": "usa",
+                        }
+                    ]
+                }
+            ],
+        )
+    )
+
+    assert result["status"] == "success"
+    mock_request.assert_called_once()
+
+
+@pytest.mark.parametrize(
+    "malformed_filter_groups",
+    [
+        ["not-a-dict"],
+        [{"filters": "not-a-list"}],
+        [{"filters": ["not-a-dict"]}],
+        [{}],
+    ],
+)
+def test_query_search_analytics_tolerates_malformed_filter_groups(
+    monkeypatch, malformed_filter_groups
+):
+    """A malformed dimension_filter_groups shape must not crash the local
+    query-dimension check; it degrades to "doesn't reference query" and
+    lets the request proceed (any real problem still surfaces as an
+    upstream 400)."""
+    mock_request = Mock(return_value=MockResponse(json_data={}))
+    monkeypatch.setattr(google_search_console.requests, "request", mock_request)
+
+    result = json.loads(
+        google_search_console.google_search_console_query_search_analytics(
+            "https://example.com/",
+            start_date="2026-07-01",
+            end_date="2026-07-28",
+            search_type="discover",
+            dimension_filter_groups=malformed_filter_groups,
+        )
+    )
+
+    assert result["status"] == "success"
+
+
 def test_query_search_analytics_rejects_zero_row_limit(monkeypatch):
     mock_request = Mock()
     monkeypatch.setattr(google_search_console.requests, "request", mock_request)

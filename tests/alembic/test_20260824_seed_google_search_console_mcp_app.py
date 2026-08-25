@@ -115,9 +115,17 @@ def test_app_id_does_not_collide_with_other_builtin_apps():
 
 def test_upgrade_inserts_only_columns_present_on_older_schema(tmp_path):
     """A pre-existing deployment's public_mcp_apps table may predate a
-    column ROW defines (e.g. before is_visible_in_connector was added).
-    upgrade() must insert only the columns that actually exist rather than
-    failing or inserting into a nonexistent column."""
+    column ROW defines. upgrade() must insert only the columns that
+    actually exist rather than failing or inserting into a nonexistent
+    column.
+
+    This fixture mirrors the table's actual migration history rather than
+    an arbitrary subset: oauth_scopes was added at table creation
+    (f1427c3a7261, 2026-04-21) while is_visible_in_connector was added over
+    a month later (20260519_add_connector_visibility_to_public_mcp_apps) —
+    so a real pre-2026-05-19 deployment has oauth_scopes but not
+    is_visible_in_connector, never the other way around.
+    """
     engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
     migration = _load_migration_module()
     with engine.begin() as connection:
@@ -133,6 +141,7 @@ def test_upgrade_inserts_only_columns_present_on_older_schema(tmp_path):
                     transport VARCHAR(50) NOT NULL DEFAULT 'oauth',
                     provider_name VARCHAR(50),
                     category VARCHAR(100),
+                    oauth_scopes JSON,
                     launch_config JSON
                 )
                 """
@@ -143,12 +152,13 @@ def test_upgrade_inserts_only_columns_present_on_older_schema(tmp_path):
         assert "google-search-console" in _app_ids(connection)
         row = connection.execute(
             text(
-                "SELECT category, launch_config FROM public_mcp_apps"
+                "SELECT category, oauth_scopes, launch_config FROM public_mcp_apps"
                 " WHERE app_id='google-search-console'"
             )
         ).first()
         assert row[0] == "Analytics"
-        assert "xagent.web.tools.mcp.google_search_console" in str(row[1])
+        assert "webmasters.readonly" in str(row[1])
+        assert "xagent.web.tools.mcp.google_search_console" in str(row[2])
 
 
 def test_downgrade_removes_google_search_console(tmp_path):

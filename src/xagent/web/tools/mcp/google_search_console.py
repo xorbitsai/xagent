@@ -142,6 +142,30 @@ def _encoded_site_url(site_url: str) -> str:
     return url_path_id(site_url, "site_url")
 
 
+def _dimension_filter_groups_reference_query(
+    dimension_filter_groups: list[dict[str, Any]],
+) -> bool:
+    """Whether any filter inside dimension_filter_groups filters on the
+    "query" dimension. Tolerates a malformed/unexpected shape (a non-dict
+    group, a non-list "filters", a non-dict filter entry) by treating it as
+    not referencing "query" rather than raising — this check runs before
+    the request body is built, and a shape the caller got wrong here will
+    still surface as a clear upstream 400 once sent."""
+    for group in dimension_filter_groups:
+        if not isinstance(group, dict):
+            continue
+        filters = group.get("filters")
+        if not isinstance(filters, list):
+            continue
+        for filter_entry in filters:
+            if (
+                isinstance(filter_entry, dict)
+                and filter_entry.get("dimension") == "query"
+            ):
+                return True
+    return False
+
+
 def _validate_date(label: str, value: str) -> None:
     if not isinstance(value, str) or not _DATE_PATTERN.match(value):
         raise ValueError(f"{label} must be a date string in YYYY-MM-DD format")
@@ -232,8 +256,11 @@ def google_search_console_query_search_analytics(
       typically delayed 1-3 days, so end_date should not be today.
     dimensions: any of "query", "page", "country", "device", "date",
       "searchAppearance". Omit for a single aggregate row. "query" is not
-      available when search_type is "discover" or "googleNews" (Google
-      doesn't disclose search terms for those surfaces).
+      available (as a dimension or as a dimension_filter_groups filter)
+      when search_type is "discover" or "googleNews" (Google doesn't
+      disclose search terms for those surfaces) — "position" values on
+      rows from those two surfaces are also not meaningful ranking data,
+      per Google's own documentation.
     search_type: one of "web", "image", "video", "news", "discover",
       "googleNews" (default "web").
     dimension_filter_groups: raw Search Analytics API filter groups, e.g.
@@ -242,9 +269,12 @@ def google_search_console_query_search_analytics(
     row_limit: max rows to return (default 100, max 1000 — keeps a wide
       query's serialized response under the MCP output size limit).
     start_row: row offset for paging — if row_count equals row_limit, call
-      again with start_row += row_limit to fetch more (row_count reflects
-      how many rows this query actually matched, independent of whether
-      "rows" was shortened below — see "truncated").
+      again with start_row += row_limit to fetch more. row_count is the
+      number of rows this single response returned (capped at row_limit),
+      not a total match count — Google's own API docs note it isn't
+      guaranteed to return literally every matching row even once you've
+      fully paginated. It stays accurate even when "rows" is shortened
+      below for output-size reasons — see "truncated".
     """
     try:
         encoded_site_url = _encoded_site_url(site_url)
@@ -264,14 +294,22 @@ def google_search_console_query_search_analytics(
                 raise ValueError(
                     f"invalid dimensions {invalid}; must be from {sorted(VALID_DIMENSIONS)}"
                 )
-            if (
-                "query" in dimensions
-                and search_type in _SEARCH_TYPES_WITHOUT_QUERY_DIMENSION
-            ):
+        if search_type in _SEARCH_TYPES_WITHOUT_QUERY_DIMENSION:
+            # Google rejects "query" for these two surfaces whether it's
+            # requested as a grouping dimension or as a filter condition —
+            # both reach the same API restriction, so both must be checked
+            # here rather than just the dimensions list.
+            uses_query = bool(dimensions and "query" in dimensions) or (
+                dimension_filter_groups is not None
+                and _dimension_filter_groups_reference_query(dimension_filter_groups)
+            )
+            if uses_query:
                 raise ValueError(
                     f'the "query" dimension is not available for '
                     f"search_type={search_type!r} (Google does not disclose "
-                    f"search terms for Discover/Google News surfaces)"
+                    f"search terms for Discover/Google News surfaces), whether "
+                    f"requested as a dimension or filtered on via "
+                    f"dimension_filter_groups"
                 )
 
         body: dict[str, Any] = {

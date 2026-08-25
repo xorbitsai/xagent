@@ -35,10 +35,11 @@ MAX_WORKFORCE_BUILDER_WORKERS = 32
 MAX_WORKFORCE_BUILDER_EXISTING_AGENTS = 200
 MAX_WORKFORCE_BUILDER_AGENT_RESULTS = 50
 WORKFORCE_BUILDER_MAX_ITERATIONS = 48
-# Shared by the language- and voice-scoping instructions in
-# workforce_prompt_builder_system_prompt/build_workforce_prompt_plan below,
-# so the two policies enumerate the same persisted-configuration fields
-# from one place instead of two hand-copied string literals drifting apart.
+# Named list of the persisted-configuration fields the language-scoping
+# instruction in workforce_prompt_builder_system_prompt (below) exempts
+# from the request language policy. Voice-scoping used to enumerate the
+# same list a second time here; that's now handled once, centrally, by
+# apply_output_voice's own caveat instead.
 _WORKFORCE_BUILDER_PERSISTED_FIELDS = (
     "Workforce and agent names, descriptions, instructions, aliases, and "
     "assignment text"

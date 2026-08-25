@@ -75,6 +75,8 @@ def resolve_primary_sandbox(sandbox: Any) -> Sandbox:
     a SandboxLeaseProvider has no ``.exec``/``.read_file``/``.name`` of its
     own, so operating on it directly raises AttributeError.
     """
+    if sandbox is None:
+        raise ValueError("sandbox cannot be None")
     resolved = (
         sandbox.primary_sandbox if _is_sandbox_lease_provider(sandbox) else sandbox
     )

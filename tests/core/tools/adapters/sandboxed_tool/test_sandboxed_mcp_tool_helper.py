@@ -14,6 +14,7 @@ from xagent.core.tools.adapters.vibe.sandboxed_tool.sandboxed_mcp_tool_helper im
 )
 from xagent.core.tools.adapters.vibe.sandboxed_tool.sandboxed_tool_wrapper import (
     SandboxDependencyManager,
+    resolve_primary_sandbox,
 )
 
 
@@ -37,6 +38,7 @@ def _make_exec_result(exit_code: int = 0, stderr: str = "") -> MagicMock:
 
 def _make_plain_sandbox(tool_names: list[str]) -> MagicMock:
     sandbox = MagicMock()
+    sandbox.name = "mock_sandbox"
     sandbox.exec = AsyncMock(return_value=_make_exec_result())
     sandbox.read_file = AsyncMock(
         return_value=json.dumps(
@@ -88,3 +90,8 @@ async def test_list_tools_in_sandbox_unwraps_lease_provider():
     assert [t.name for t in tools] == ["xero_tool"]
     primary_sandbox.exec.assert_awaited()
     primary_sandbox.read_file.assert_awaited()
+
+
+def test_resolve_primary_sandbox_rejects_none():
+    with pytest.raises(ValueError, match="sandbox cannot be None"):
+        resolve_primary_sandbox(None)

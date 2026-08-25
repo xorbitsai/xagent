@@ -36,10 +36,15 @@ def test_builtin_agent_spec_is_immutable() -> None:
         setattr(spec, "name", "replacement")
 
 
+def test_builtin_agent_name_accepts_the_bounded_maximum() -> None:
+    assert _spec(name="a" * 64).name == "a" * 64
+
+
 @pytest.mark.parametrize(
     ("field", "value"),
     [
         ("name", "Internal Worker"),
+        ("name", "a" * 65),
         ("version", " "),
         ("system_prompt", ""),
         ("model_role", " "),

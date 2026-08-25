@@ -21,10 +21,12 @@ BuiltinModelResolver: TypeAlias = Callable[
     [str, BuiltinAgentRunContext], BuiltinModelResolverResult
 ]
 BuiltinServiceFactory: TypeAlias = Callable[..., AgentService]
-_BUILTIN_ALLOWED_TOOL_CATEGORIES = (
-    frozenset(category.value for category in ToolCategory)
-    - AGENT_CONFIG_UNASSIGNABLE_CATEGORIES
+_BUILTIN_ALLOWED_TOOL_CATEGORIES = frozenset(
+    category
+    for category in ToolCategory
+    if category.value not in AGENT_CONFIG_UNASSIGNABLE_CATEGORIES
 )
+_BUILTIN_REQUEST_CONTEXT_KEY = "builtin_request_context"
 
 
 class BuiltinAgentModelUnavailableError(RuntimeError):
@@ -110,11 +112,11 @@ class BuiltinAgentExecutor:
             service_kwargs["workspace_base_dir"] = workspace_base_dir
 
         service = self._service_factory(**service_kwargs)
-        execution_context = dict(run_context.request_context)
-        execution_context["builtin_agent"] = dict(metadata)
         result = await service.execute_task(
             task,
-            context=execution_context,
+            context={
+                _BUILTIN_REQUEST_CONTEXT_KEY: dict(run_context.request_context),
+            },
             task_id=execution_id,
         )
         result_metadata = result.get("metadata")
@@ -138,6 +140,12 @@ class BuiltinAgentExecutor:
                 f"No model is available for built-in agent '{spec.name}' "
                 f"with role '{spec.model_role}'"
             )
+        if not callable(getattr(resolved, "chat", None)):
+            raise BuiltinAgentModelUnavailableError(
+                f"Model resolver for built-in agent '{spec.name}' returned an "
+                f"invalid model for role '{spec.model_role}': expected a callable "
+                "chat method"
+            )
         return cast(BaseLLM, resolved)
 
     async def _build_tools(
@@ -160,9 +168,11 @@ class BuiltinAgentExecutor:
         for tool in tools:
             metadata = getattr(tool, "metadata", None)
             category = getattr(metadata, "category", None)
-            category_value = getattr(category, "value", category)
-            if category_value not in _BUILTIN_ALLOWED_TOOL_CATEGORIES:
+            if (
+                not isinstance(category, ToolCategory)
+                or category not in _BUILTIN_ALLOWED_TOOL_CATEGORIES
+            ):
                 raise BuiltinAgentCapabilityError(
                     f"Built-in agent '{spec.name}' cannot use tools without an "
-                    f"explicit assignable category (got {category_value!r})"
+                    f"explicit assignable category (got {category!r})"
                 )

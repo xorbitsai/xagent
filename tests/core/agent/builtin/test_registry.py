@@ -41,8 +41,11 @@ def test_registry_rejects_duplicate_names_even_across_versions() -> None:
 
 
 def test_registry_require_fails_for_unknown_agent() -> None:
+    registry = BuiltinAgentRegistry()
+
+    assert registry.get("missing") is None
     with pytest.raises(BuiltinAgentNotFoundError, match="not registered"):
-        BuiltinAgentRegistry().require("missing")
+        registry.require("missing")
 
 
 def test_registry_rejects_non_spec_entries() -> None:

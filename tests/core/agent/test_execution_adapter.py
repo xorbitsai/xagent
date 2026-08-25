@@ -135,6 +135,7 @@ def test_execution_adapter_can_disable_skills_and_preserve_internal_metadata() -
             name="builtin:internal_worker",
             pattern="single_call",
             llm=FakeLLM([]),
+            allowed_skills=["must-not-load"],
             skills_enabled=False,
             user_interaction_enabled=False,
             execution_metadata={

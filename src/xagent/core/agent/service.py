@@ -35,7 +35,15 @@ _UNSET = object()
 
 
 class AgentService:
-    """Service facade that executes tasks through agent only."""
+    """Service facade that executes tasks through agent only.
+
+    Capability controls are deny-capable overrides: ``enable_default_tools``
+    controls automatic tool construction, ``skills_enabled=False`` suppresses
+    supplied skill managers and allowlists, and ``user_interaction_enabled=False``
+    blocks outbound user-facing control calls and waits. ``execution_metadata``
+    is trusted internal metadata copied into runner and result records; untrusted
+    request data belongs in the separate task context passed to ``execute_task``.
+    """
 
     def __init__(
         self,

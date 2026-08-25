@@ -6,7 +6,7 @@ import re
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from types import MappingProxyType
-from typing import Any, Literal, TypeAlias
+from typing import Any, Literal, TypeAlias, get_args
 
 from ...tools.adapters.vibe import Tool
 
@@ -24,7 +24,8 @@ _BUILTIN_EXECUTION_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
 class BuiltinAgentRunContext:
     """Execution-scoped dependencies available to built-in agent factories.
 
-    Identity and request inputs are immutable; ``artifacts`` is the deliberate
+    Identity and the top-level request mapping are immutable. Nested request
+    values remain trusted, code-owned inputs; ``artifacts`` is the deliberate
     mutable output channel shared with execution-scoped tool builders.
     """
 
@@ -52,8 +53,8 @@ BuiltinToolBuilder: TypeAlias = Callable[
     [BuiltinAgentRunContext], BuiltinToolBuilderResult
 ]
 
-_BUILTIN_AGENT_NAME_RE = re.compile(r"^[a-z][a-z0-9_-]*$")
-_SUPPORTED_PATTERNS = frozenset({"single_call", "react", "dag_plan_execute", "auto"})
+_BUILTIN_AGENT_NAME_RE = re.compile(r"^[a-z][a-z0-9_-]{0,63}$")
+_SUPPORTED_PATTERNS = frozenset(get_args(BuiltinAgentPattern))
 
 
 @dataclass(frozen=True, slots=True)
@@ -62,6 +63,10 @@ class BuiltinAgentSpec:
 
     Built-in agents are deliberately separate from database-backed agents and
     Agent Builder. Their capabilities are opt-in and disabled by default.
+    ``version`` is an opaque deployment/metadata label; the registry supports
+    one live specification per name, regardless of version. ``build_tools`` is
+    called once per execution and must return execution-owned stateful tools,
+    rather than sharing them between overlapping runs.
     """
 
     name: str
@@ -76,7 +81,7 @@ class BuiltinAgentSpec:
 
     def __post_init__(self) -> None:
         if not _BUILTIN_AGENT_NAME_RE.fullmatch(self.name):
-            raise ValueError("Built-in agent name must match ^[a-z][a-z0-9_-]*$")
+            raise ValueError("Built-in agent name must match ^[a-z][a-z0-9_-]{0,63}$")
         if not self.version.strip():
             raise ValueError("Built-in agent version must not be empty")
         if not self.system_prompt.strip():

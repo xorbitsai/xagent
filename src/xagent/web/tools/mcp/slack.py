@@ -215,6 +215,70 @@ def _request(
     return payload
 
 
+def _request_requiring_membership(
+    method: str,
+    path: str,
+    *,
+    params: dict[str, Any] | None = None,
+    json_data: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Call a Slack endpoint that requires the bot to already be a channel
+    member, and raise an actionable error if it isn't yet.
+
+    This covers conversations.history/replies (regardless of which
+    *:history scopes are granted), reactions.add/remove, and
+    files.completeUploadExternal — none of them work for a channel the bot
+    hasn't joined. chat.postMessage is the one exception for a *public*
+    channel (chat:write.public lets a bot post there without joining), but
+    can still hit this for a private channel/DM, so slack_post_message uses
+    this too.
+
+    This deliberately does NOT join the channel on the caller's behalf:
+    joining changes the channel's member list, which is visible to everyone
+    in it, so the calling agent should check with the user first and only
+    then call slack_join_channel — never silently, just because a call
+    failed.
+    """
+    try:
+        return _request(method, path, params=params, json_data=json_data)
+    except RuntimeError as e:
+        if str(e) != "not_in_channel":
+            raise
+        raise RuntimeError(
+            "not_in_channel: the bot is not a member of this channel yet. "
+            "Ask the user whether to add the bot to this channel; if they "
+            "agree, call slack_join_channel (only works for a public "
+            "channel) — for a private channel or DM, a member needs to run "
+            "`/invite @<this app's bot name>` instead."
+        ) from None
+
+
+@mcp.tool()
+def slack_join_channel(channel: str) -> str:
+    """
+    Add the bot to a public channel so it can read, post, react, and upload
+    files there.
+
+    Only call this after the user has explicitly confirmed they want the
+    bot added to this specific channel — joining changes the channel's
+    member list, which is visible to everyone in it, so it should never
+    happen silently just because another Slack tool call failed with
+    "not_in_channel".
+    channel: a channel id, or a channel name (with or without "#").
+    This only works for a public channel: Slack does not let a bot join a
+    private channel or DM on its own (conversations.join fails with
+    method_not_supported_for_channel_type there) — for those, ask a member
+    to run `/invite @<this app's bot name>` instead.
+    """
+    try:
+        channel_id = _resolve_channel_id(channel)
+        _request("POST", "conversations.join", json_data={"channel": channel_id})
+        return _success(channel=channel_id)
+    except Exception as e:
+        logger.error(f"Error joining Slack channel {channel}: {e}")
+        return _error(str(e))
+
+
 @mcp.tool()
 def slack_list_channels(
     exclude_archived: bool = True,
@@ -319,7 +383,9 @@ def slack_post_message(channel: str, text: str, thread_ts: str = "") -> str:
         }
         if thread_ts:
             json_data["thread_ts"] = thread_ts
-        result = _request("POST", "chat.postMessage", json_data=json_data)
+        result = _request_requiring_membership(
+            "POST", "chat.postMessage", json_data=json_data
+        )
         return _success(channel=result.get("channel"), ts=result.get("ts"))
     except Exception as e:
         logger.error(f"Error posting Slack message to {channel}: {e}")
@@ -349,6 +415,11 @@ def slack_get_channel_history(
     Each message includes its "ts" (needed for slack_get_thread_replies,
     slack_add_reaction, and replying via slack_post_message's thread_ts) and,
     when it starts a thread, "thread_ts" and "reply_count".
+    If the bot isn't a member of the channel yet, you'll get an actionable
+    error instead of an empty/opaque failure: check with the user before
+    calling slack_join_channel to add the bot (only works for a public
+    channel), or ask a member to `/invite` the bot for a private channel or
+    DM.
     """
     try:
         channel_id = _resolve_channel_id(channel)
@@ -362,7 +433,9 @@ def slack_get_channel_history(
             params["latest"] = latest
         if cursor:
             params["cursor"] = cursor
-        result = _request("GET", "conversations.history", params=params)
+        result = _request_requiring_membership(
+            "GET", "conversations.history", params=params
+        )
         messages = [
             {
                 "ts": m.get("ts"),
@@ -396,6 +469,11 @@ def slack_get_thread_replies(
     thread_ts: the parent message's "ts".
     cursor: pass the next_cursor from a previous call's response to fetch
     the next page of replies.
+    If the bot isn't a member of the channel yet, you'll get an actionable
+    error instead of an empty/opaque failure: check with the user before
+    calling slack_join_channel to add the bot (only works for a public
+    channel), or ask a member to `/invite` the bot for a private channel or
+    DM.
     """
     try:
         channel_id = _resolve_channel_id(channel)
@@ -406,7 +484,9 @@ def slack_get_thread_replies(
         }
         if cursor:
             params["cursor"] = cursor
-        result = _request("GET", "conversations.replies", params=params)
+        result = _request_requiring_membership(
+            "GET", "conversations.replies", params=params
+        )
         messages = [
             {
                 "ts": m.get("ts"),
@@ -532,7 +612,11 @@ def slack_search_messages(
     """
     Search a channel, private channel, or DM's recent history (and, by
     default, its threads' replies) for messages containing `query`
-    (case-insensitive substring match).
+    (case-insensitive substring match). If the bot isn't a member of the
+    channel yet, you'll get an actionable error instead of an empty/opaque
+    failure: check with the user before calling slack_join_channel to add
+    the bot (only works for a public channel), or ask a member to `/invite`
+    the bot for a private channel or DM.
     limit: max matching messages to return (default 50, capped at 1000).
     scan_limit: max messages to scan from the conversation's history to look
     for matches in (default 200, capped at 1000) — distinct from `limit`,
@@ -557,6 +641,7 @@ def slack_search_messages(
         threaded_parents: list[dict[str, Any]] = []
         scanned = 0
         cursor: str | None = None
+        history_pages_scanned = 0
 
         for _ in range(MAX_PAGES):
             params: dict[str, Any] = {
@@ -565,7 +650,25 @@ def slack_search_messages(
             }
             if cursor:
                 params["cursor"] = cursor
-            result = _request("GET", "conversations.history", params=params)
+            try:
+                result = _request_requiring_membership(
+                    "GET", "conversations.history", params=params
+                )
+            except Exception as page_exc:
+                if not history_pages_scanned:
+                    raise
+                # Mirrors slack_list_channels/slack_list_direct_messages: a
+                # mid-pagination failure must not discard the matches
+                # already found on earlier pages.
+                logger.warning(
+                    f"Slack search history pagination stopped early: {page_exc}"
+                )
+                return _success(
+                    matches=matches[:max_matches],
+                    truncated=True,
+                    error=str(page_exc),
+                )
+            history_pages_scanned += 1
             for m in result.get("messages") or []:
                 scanned += 1
                 text = str(m.get("text") or "")
@@ -581,7 +684,7 @@ def slack_search_messages(
                 break
 
         threads_scanned = 0
-        thread_fetch_failed = False
+        thread_fetch_error: str | None = None
         thread_replies_truncated = False
         if include_thread_replies:
             for parent in threaded_parents:
@@ -596,7 +699,7 @@ def slack_search_messages(
                 # total wall time.
                 threads_scanned += 1
                 try:
-                    replies_result = _request(
+                    replies_result = _request_requiring_membership(
                         "GET",
                         "conversations.replies",
                         params={"channel": channel_id, "ts": thread_ts, "limit": 200},
@@ -609,8 +712,18 @@ def slack_search_messages(
                     # gap distinct from threads never attempted at all
                     # (below) — it must still flag truncated even though
                     # threads_scanned already counts the attempt for budget
-                    # purposes.
-                    thread_fetch_failed = True
+                    # purposes. The message is kept so it reaches the
+                    # caller instead of being visible only in this log line;
+                    # an actionable "call slack_join_channel" message always
+                    # wins over a later transient one (rate limit, etc.) so a
+                    # membership problem is never masked by an unrelated
+                    # failure on a different thread.
+                    error_text = str(thread_exc)
+                    if thread_fetch_error is None or (
+                        "slack_join_channel" in error_text
+                        and "slack_join_channel" not in thread_fetch_error
+                    ):
+                        thread_fetch_error = error_text
                     continue
                 # A thread with over 200 replies is only partially scanned —
                 # has_more/next_cursor are not followed, so a match in the
@@ -648,13 +761,19 @@ def slack_search_messages(
             or (
                 include_thread_replies
                 and (
-                    thread_fetch_failed
+                    thread_fetch_error is not None
                     or thread_replies_truncated
                     or len(threaded_parents) > threads_scanned
                 )
             )
         )
-        return _success(matches=matches[:max_matches], truncated=truncated)
+        result_fields: dict[str, Any] = {
+            "matches": matches[:max_matches],
+            "truncated": truncated,
+        }
+        if thread_fetch_error is not None:
+            result_fields["error"] = thread_fetch_error
+        return _success(**result_fields)
     except Exception as e:
         logger.error(f"Error searching Slack messages in {channel}: {e}")
         return _error(str(e))
@@ -666,7 +785,7 @@ def _set_reaction(action: str, channel: str, timestamp: str, emoji_name: str) ->
     name = emoji_name.strip().strip(":")
     try:
         channel_id = _resolve_channel_id(channel)
-        _request(
+        _request_requiring_membership(
             "POST",
             f"reactions.{action}",
             json_data={"channel": channel_id, "timestamp": timestamp, "name": name},
@@ -781,7 +900,7 @@ def slack_upload_file(
         if thread_ts:
             complete_payload["thread_ts"] = thread_ts
 
-        complete_result = _request(
+        complete_result = _request_requiring_membership(
             "POST", "files.completeUploadExternal", json_data=complete_payload
         )
         uploaded = (complete_result.get("files") or [{}])[0]

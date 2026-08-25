@@ -55,13 +55,15 @@ APP_ID = "slack"
 # by 20260720_seed_docs_slides_hubspot.py's own HubSpot row when its scopes
 # were later expanded in 20260810_add_hubspot_marketing_scopes.py. Existing
 # databases are unaffected (this migration only inserts when the row is
-# absent); the follow-up 20260812_add_slack_history_reactions_files_scopes
-# migration is what actually upgrades an already-seeded row.
+# absent); the follow-up 20260812_add_slack_history_reactions_files_scopes and
+# 20260825_add_slack_channels_join_scope migrations are what actually upgrade
+# an already-seeded row.
 SLACK_SCOPES = [
     "chat:write",
     "chat:write.public",
     "channels:read",
     "channels:history",
+    "channels:join",
     "groups:read",
     "groups:history",
     "im:read",

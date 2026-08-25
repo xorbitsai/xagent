@@ -90,16 +90,22 @@ def _is_sandbox_lease_provider(
 ) -> TypeGuard[_SandboxLeaseProviderLike]:
     """Return whether an object is a real sandbox lease provider.
 
-    Checks both members _SandboxLeaseProviderLike declares -- a callable
-    ``lease`` and a ``primary_sandbox`` attribute -- so the TypeGuard is
-    sound: a value that passes this can't have a callable ``.lease`` for
-    an unrelated reason while lacking ``.primary_sandbox``, which would
-    otherwise type-check as safe and then raise AttributeError one level
-    into resolve_primary_sandbox.
+    Checks only for a callable ``lease`` -- the one thing _lease_sandbox()
+    actually needs to decide whether to call `.lease(...)` or wrap a plain
+    Sandbox. This makes the TypeGuard not fully sound (a `.lease`-only
+    object narrows to _SandboxLeaseProviderLike here even without
+    `.primary_sandbox`): tightening it to also require `.primary_sandbox`
+    was tried and reverted -- it broke
+    tests/core/tools/adapters/sandboxed_tool/test_sandboxed_tool_lease_provider.py's
+    FakeLeaseProvider, a legitimate lease-provider double that only
+    implements `.lease()` and names its own bookkeeping attribute
+    ``primary``, not ``primary_sandbox``. resolve_primary_sandbox is the
+    only caller that needs `.primary_sandbox` to actually exist, and in
+    production it's only ever given the real SandboxLeaseProvider (which
+    always has it) or a plain Sandbox (which this check correctly rejects
+    -- no callable `.lease` on the class).
     """
-    return callable(getattr(type(value), "lease", None)) and hasattr(
-        value, "primary_sandbox"
-    )
+    return callable(getattr(type(value), "lease", None))
 
 
 def resolve_primary_sandbox(sandbox: "Sandbox | _SandboxLeaseProviderLike") -> Sandbox:

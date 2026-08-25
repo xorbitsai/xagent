@@ -12,7 +12,16 @@ import logging
 import os
 import uuid
 from pathlib import Path
-from typing import Any, Mapping, Optional, Protocol, Type, TypeGuard, cast
+from typing import (
+    Any,
+    Mapping,
+    Optional,
+    Protocol,
+    Type,
+    TypeGuard,
+    cast,
+    runtime_checkable,
+)
 
 import cloudpickle  # type: ignore[import-untyped]
 from pydantic import BaseModel
@@ -61,6 +70,7 @@ class _StaticSandboxLease:
         return None
 
 
+@runtime_checkable
 class _SandboxLeaseProviderLike(Protocol):
     """Structural shape of a SandboxLeaseProvider (src/xagent/web/sandbox_manager.py).
 
@@ -78,8 +88,18 @@ class _SandboxLeaseProviderLike(Protocol):
 def _is_sandbox_lease_provider(
     value: Any,
 ) -> TypeGuard[_SandboxLeaseProviderLike]:
-    """Return whether an object is a real sandbox lease provider."""
-    return callable(getattr(type(value), "lease", None))
+    """Return whether an object is a real sandbox lease provider.
+
+    Checks both members _SandboxLeaseProviderLike declares -- a callable
+    ``lease`` and a ``primary_sandbox`` attribute -- so the TypeGuard is
+    sound: a value that passes this can't have a callable ``.lease`` for
+    an unrelated reason while lacking ``.primary_sandbox``, which would
+    otherwise type-check as safe and then raise AttributeError one level
+    into resolve_primary_sandbox.
+    """
+    return callable(getattr(type(value), "lease", None)) and hasattr(
+        value, "primary_sandbox"
+    )
 
 
 def resolve_primary_sandbox(sandbox: "Sandbox | _SandboxLeaseProviderLike") -> Sandbox:

@@ -7,6 +7,7 @@ startup to add user_id fields to existing LanceDB tables.
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import sys
 import tempfile
@@ -1253,7 +1254,7 @@ async def test_start_temp_file_cleanup_task_wires_stop_event(
         return 0
 
     monkeypatch.setattr(
-        "xagent.web.api.kb.cleanup_orphaned_temp_files",
+        "xagent.web.services.storage_maintenance.cleanup_orphaned_temp_files",
         _fake_cleanup_orphaned_temp_files,
     )
 
@@ -1410,7 +1411,8 @@ async def test_failed_startup_leaves_no_unsignaled_temp_file_cleanup(
         return 0
 
     monkeypatch.setattr(
-        "xagent.web.api.kb.cleanup_orphaned_temp_files", _blocking_cleanup
+        "xagent.web.services.storage_maintenance.cleanup_orphaned_temp_files",
+        _blocking_cleanup,
     )
 
     real_start = web_app_module.start_temp_file_cleanup_task
@@ -1743,3 +1745,79 @@ async def test_startup_event_skips_sandbox_readiness_when_manager_is_none(
         await asyncio.gather(*created_tasks)
 
     assert readiness_called["value"] is False
+
+
+@pytest.mark.asyncio
+async def test_startup_reports_a_still_unwinding_previous_cleanup(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """A retained generation that is already stop-signalled is not "running".
+
+    A shutdown whose bounded wait expires deliberately keeps the pending task
+    and its already-set stop event, so the next startup on the same app object
+    hits the re-entrancy guard. Scheduling a second walk there is still wrong,
+    but reporting a live sweep is a lie: that generation is unwinding and this
+    startup gets none. Only reachable when one app object runs lifespan twice
+    (the test suite's module-level app), never in a deployment that exits
+    after shutdown.
+    """
+    import importlib
+
+    web_app_module = importlib.import_module("xagent.web.app")
+    app = web_app_module.app
+
+    monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
+    app.state.temp_file_cleanup_task = None
+    app.state.temp_file_cleanup_stop = None
+
+    unwind = threading.Event()
+    sweeps_started: list[threading.Event] = []
+
+    def _stalled_cleanup(*, stop_event=None) -> int:
+        sweeps_started.append(stop_event)
+        unwind.wait(timeout=5)
+        return 0
+
+    monkeypatch.setattr(
+        "xagent.web.services.storage_maintenance.cleanup_orphaned_temp_files",
+        _stalled_cleanup,
+    )
+
+    try:
+        first = web_app_module.start_temp_file_cleanup_task(app)
+        assert first is not None
+        first_stop = app.state.temp_file_cleanup_stop
+
+        # A shutdown whose bounded wait expired: signalled, but still pending.
+        first_stop.set()
+        assert not first.done()
+
+        # A handler on the module logger rather than caplog: this app configures
+        # root logging on import, which displaces caplog's own root handler.
+        records: list[logging.LogRecord] = []
+
+        class _Collect(logging.Handler):
+            def emit(self, record: logging.LogRecord) -> None:
+                records.append(record)
+
+        collector = _Collect()
+        web_app_module.logger.addHandler(collector)
+        try:
+            second = web_app_module.start_temp_file_cleanup_task(app)
+        finally:
+            web_app_module.logger.removeHandler(collector)
+
+        assert second is first
+        assert app.state.temp_file_cleanup_stop is first_stop
+        assert [
+            r for r in records if r.levelno == logging.WARNING and "unwinding" in r.msg
+        ]
+        assert not [r for r in records if "Scheduled background" in r.msg]
+    finally:
+        unwind.set()
+        await first
+        app.state.temp_file_cleanup_task = None
+        app.state.temp_file_cleanup_stop = None
+
+    # The guard held: exactly one sweep ran, using the first generation's flag.
+    assert sweeps_started == [first_stop]

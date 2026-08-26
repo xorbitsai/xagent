@@ -1,9 +1,11 @@
+import logging
 import os
 import threading
 import time
 from pathlib import Path
 
-from xagent.web.api.kb import (
+import xagent.web.services.storage_maintenance as sweep_module
+from xagent.web.services.storage_maintenance import (
     _TEMP_CLEANUP_STOP_CHECK_ENTRIES,
     cleanup_orphaned_temp_files,
 )
@@ -191,8 +193,6 @@ def test_cleanup_skips_directory_that_fails_to_open(tmp_path, monkeypatch):
     _write_aged(tmp_path / "good" / "keep.tmp-replace", age=old)
     (tmp_path / "bad").mkdir()
 
-    import xagent.web.api.kb as kb_module
-
     real_scandir = os.scandir
 
     def _flaky_scandir(path, *args, **kwargs):
@@ -200,7 +200,7 @@ def test_cleanup_skips_directory_that_fails_to_open(tmp_path, monkeypatch):
             raise OSError("stale handle")
         return real_scandir(path, *args, **kwargs)
 
-    monkeypatch.setattr(kb_module.os, "scandir", _flaky_scandir)
+    monkeypatch.setattr(sweep_module.os, "scandir", _flaky_scandir)
 
     removed = cleanup_orphaned_temp_files(upload_dir=tmp_path)
 
@@ -213,8 +213,6 @@ def test_cleanup_tolerates_error_mid_iteration(tmp_path, monkeypatch):
     # must skip that directory, not abort the whole sweep.
     old = ORPHAN_AGE_SECONDS + 600
     _write_aged(tmp_path / "root_orphan.tmp-replace", age=old)
-
-    import xagent.web.api.kb as kb_module
 
     real_scandir = os.scandir
 
@@ -243,7 +241,7 @@ def test_cleanup_tolerates_error_mid_iteration(tmp_path, monkeypatch):
     def _wrapped_scandir(path, *args, **kwargs):
         return _RaiseAtEnd(real_scandir(path, *args, **kwargs))
 
-    monkeypatch.setattr(kb_module.os, "scandir", _wrapped_scandir)
+    monkeypatch.setattr(sweep_module.os, "scandir", _wrapped_scandir)
 
     removed = cleanup_orphaned_temp_files(upload_dir=tmp_path)
 
@@ -258,8 +256,6 @@ def test_cleanup_tolerates_unlink_failure_and_keeps_sweeping(tmp_path, monkeypat
     _write_aged(tmp_path / "boom.tmp-replace", age=old)
     _write_aged(tmp_path / "ok.tmp-replace", age=old)
 
-    import xagent.web.api.kb as kb_module
-
     real_unlink = os.unlink
 
     def _selective_unlink(path, *args, **kwargs):
@@ -267,7 +263,7 @@ def test_cleanup_tolerates_unlink_failure_and_keeps_sweeping(tmp_path, monkeypat
             raise OSError("permission denied")
         return real_unlink(path, *args, **kwargs)
 
-    monkeypatch.setattr(kb_module.os, "unlink", _selective_unlink)
+    monkeypatch.setattr(sweep_module.os, "unlink", _selective_unlink)
 
     removed = cleanup_orphaned_temp_files(upload_dir=tmp_path)
 
@@ -318,8 +314,6 @@ def test_cleanup_never_unlinks_while_its_directory_scan_is_open(
     Bookkeeping is scoped to paths under tmp_path so the pass-through wrappers
     stay inert for any other os.scandir/os.unlink caller in the process.
     """
-    import xagent.web.api.kb as kb_module
-
     old = ORPHAN_AGE_SECONDS + 600
     # Several matches in one directory: the case where a mid-scan unlink could
     # perturb the iteration and drop siblings.
@@ -343,8 +337,8 @@ def test_cleanup_never_unlinks_while_its_directory_scan_is_open(
             unlinks_with_open_scan.append(str(path))
         return real_unlink(path, *args, **kwargs)
 
-    monkeypatch.setattr(kb_module.os, "scandir", _tracked_scandir)
-    monkeypatch.setattr(kb_module.os, "unlink", _tracked_unlink)
+    monkeypatch.setattr(sweep_module.os, "scandir", _tracked_scandir)
+    monkeypatch.setattr(sweep_module.os, "unlink", _tracked_unlink)
 
     removed = cleanup_orphaned_temp_files(upload_dir=tmp_path)
 
@@ -362,10 +356,6 @@ def test_completed_sweep_is_not_reported_as_truncated(tmp_path, monkeypatch, cap
     sweep as truncated and tell operators to expect leftover orphans that do
     not exist, so the walk must track "stopped early" as it goes instead.
     """
-    import logging
-
-    import xagent.web.api.kb as kb_module
-
     # A dedicated single-directory root: the walk must have nothing left on its
     # stack when the flag is set, so that "flag set but tree fully walked" is
     # the only state under test. (A shared conftest fixture seeds tmp_path
@@ -384,9 +374,11 @@ def test_completed_sweep_is_not_reported_as_truncated(tmp_path, monkeypatch, cap
         stop.set()
         return result
 
-    monkeypatch.setattr(kb_module.os, "unlink", _unlink_then_signal_shutdown)
+    monkeypatch.setattr(sweep_module.os, "unlink", _unlink_then_signal_shutdown)
 
-    with caplog.at_level(logging.INFO, logger="xagent.web.api.kb"):
+    with caplog.at_level(
+        logging.INFO, logger="xagent.web.services.storage_maintenance"
+    ):
         removed = cleanup_orphaned_temp_files(upload_dir=root, stop_event=stop)
 
     assert removed == 1
@@ -425,8 +417,6 @@ def test_cleanup_stops_mid_deletion_on_a_directory_with_many_victims(
     bounded by the same chunk size as the scan, so it stops after at most one
     chunk instead of draining the whole list.
     """
-    import logging
-
     # A dedicated root: a shared conftest fixture seeds tmp_path itself with a
     # lancedb/ subdirectory, which would consume a poll and shift the counts
     # this test pins.
@@ -443,7 +433,9 @@ def test_cleanup_stops_mid_deletion_on_a_directory_with_many_victims(
     # deletion phase's own check, one chunk in.
     stop = _StopAfterNPolls(2)
 
-    with caplog.at_level(logging.INFO, logger="xagent.web.api.kb"):
+    with caplog.at_level(
+        logging.INFO, logger="xagent.web.services.storage_maintenance"
+    ):
         removed = cleanup_orphaned_temp_files(upload_dir=root, stop_event=stop)
 
     assert removed == _TEMP_CLEANUP_STOP_CHECK_ENTRIES
@@ -519,3 +511,129 @@ def test_cleanup_walks_an_uploads_root_that_is_itself_a_symlink(tmp_path: Path):
 
     assert removed == 1
     assert not (real_root / "old.tmp-replace").exists()
+
+
+class _EntryDouble:
+    """os.DirEntry stand-in whose is_dir/is_file/stat probe can be made to raise.
+
+    Each probe is a separate branch in the walker's shared OSError handler, and
+    a real filesystem cannot be coaxed into failing one probe but not the next.
+    """
+
+    def __init__(self, path: Path, *, raises_on: str) -> None:
+        self.path = str(path)
+        self.name = path.name
+        self._raises_on = raises_on
+
+    def _probe(self, which: str) -> None:
+        if which == self._raises_on:
+            raise OSError(f"{which} failed")
+
+    def is_dir(self, *, follow_symlinks: bool = True) -> bool:
+        self._probe("is_dir")
+        return Path(self.path).is_dir()
+
+    def is_file(self, *, follow_symlinks: bool = True) -> bool:
+        self._probe("is_file")
+        return Path(self.path).is_file()
+
+    def stat(self, *, follow_symlinks: bool = True):
+        self._probe("stat")
+        return os.stat(self.path)
+
+
+def _scandir_yielding_double(monkeypatch, *, directory: Path, double: _EntryDouble):
+    """Make scandir(directory) substitute `double` for the real entry it shadows."""
+    real_scandir = os.scandir
+
+    class _WithDouble:
+        def __init__(self, inner) -> None:
+            self._inner = inner
+            self._pending = [double]
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_exc) -> bool:
+            self._inner.close()
+            return False
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            if self._pending:
+                return self._pending.pop()
+            entry = next(self._inner)
+            while entry.path == double.path:
+                entry = next(self._inner)
+            return entry
+
+    def _scandir(path, *args, **kwargs):
+        inner = real_scandir(path, *args, **kwargs)
+        if Path(path) == directory:
+            return _WithDouble(inner)
+        return inner
+
+    monkeypatch.setattr(sweep_module.os, "scandir", _scandir)
+
+
+def test_cleanup_warns_and_isolates_a_failed_directory_probe(
+    tmp_path: Path, monkeypatch, caplog
+):
+    """A failing is_dir() drops a whole subtree, so it must not log as a candidate.
+
+    is_dir/is_file/stat once shared one handler, so an unreadable directory was
+    reported as a skipped "temp-file candidate" at DEBUG -- invisible at INFO,
+    and describing the wrong thing: what was lost is every orphan beneath it.
+    """
+    old = ORPHAN_AGE_SECONDS + 600
+    subtree = tmp_path / "unreadable"
+    _write_aged(subtree / "nested.tmp-replace", age=old)
+    _write_aged(tmp_path / "sibling.tmp-replace", age=old)
+
+    _scandir_yielding_double(
+        monkeypatch,
+        directory=tmp_path,
+        double=_EntryDouble(subtree, raises_on="is_dir"),
+    )
+
+    with caplog.at_level(
+        logging.DEBUG, logger="xagent.web.services.storage_maintenance"
+    ):
+        removed = cleanup_orphaned_temp_files(upload_dir=tmp_path)
+
+    assert removed == 1
+    assert not (tmp_path / "sibling.tmp-replace").exists()
+    assert (subtree / "nested.tmp-replace").exists()
+
+    probe_records = [r for r in caplog.records if str(subtree) in r.getMessage()]
+    assert [r.levelno for r in probe_records] == [logging.WARNING]
+    assert "candidate" not in probe_records[0].getMessage()
+
+
+def test_cleanup_isolates_a_failed_stat_probe(tmp_path: Path, monkeypatch, caplog):
+    """A candidate whose stat() fails is skipped without disturbing its siblings."""
+    old = ORPHAN_AGE_SECONDS + 600
+    unstattable = tmp_path / "unstattable.ab12cd.tmp"
+    _write_aged(unstattable, age=old)
+    _write_aged(tmp_path / "sibling.tmp-replace", age=old)
+
+    _scandir_yielding_double(
+        monkeypatch,
+        directory=tmp_path,
+        double=_EntryDouble(unstattable, raises_on="stat"),
+    )
+
+    with caplog.at_level(
+        logging.DEBUG, logger="xagent.web.services.storage_maintenance"
+    ):
+        removed = cleanup_orphaned_temp_files(upload_dir=tmp_path)
+
+    assert removed == 1
+    assert unstattable.exists()
+    assert not (tmp_path / "sibling.tmp-replace").exists()
+
+    stat_records = [r for r in caplog.records if str(unstattable) in r.getMessage()]
+    assert [r.levelno for r in stat_records] == [logging.DEBUG]
+    assert "temp-file candidate" in stat_records[0].getMessage()

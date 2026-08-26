@@ -659,11 +659,19 @@ def start_temp_file_cleanup_task(
         getattr(app_instance.state, "temp_file_cleanup_task", None),
     )
     if existing_cleanup_task is not None and not existing_cleanup_task.done():
-        # WHY: keeps a re-entrant startup from orphaning an in-flight walk and
-        # discarding its only stop handle.
-        logger.debug(
-            "Orphaned temp-file cleanup already running; not scheduling another"
-        )
+        # WHY: never schedule a second concurrent walk -- it would orphan the
+        # in-flight one and discard its only stop handle. An already-signalled
+        # generation is unwinding, not sweeping, so say so instead of "running".
+        existing_stop = getattr(app_instance.state, "temp_file_cleanup_stop", None)
+        if existing_stop is not None and existing_stop.is_set():
+            logger.warning(
+                "Previous orphaned temp-file cleanup is still unwinding after a "
+                "shutdown signal; this startup gets no sweep"
+            )
+        else:
+            logger.debug(
+                "Orphaned temp-file cleanup already running; not scheduling another"
+            )
         return existing_cleanup_task
 
     if os.getenv("PYTEST_CURRENT_TEST"):
@@ -675,7 +683,7 @@ def start_temp_file_cleanup_task(
     app_instance.state.temp_file_cleanup_stop = temp_file_cleanup_stop
 
     async def run_temp_file_cleanup_background() -> None:
-        from .api.kb import cleanup_orphaned_temp_files
+        from .services.storage_maintenance import cleanup_orphaned_temp_files
 
         started = time.monotonic()
         logger.info("Background orphaned temp-file cleanup started")
@@ -708,7 +716,7 @@ def start_temp_file_cleanup_task(
 
     task = asyncio.create_task(run_temp_file_cleanup_background())
     app_instance.state.temp_file_cleanup_task = task
-    logger.info("Started background orphaned temp-file cleanup task")
+    logger.info("Scheduled background orphaned temp-file cleanup")
     return task
 
 

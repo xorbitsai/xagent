@@ -310,21 +310,27 @@ def _request(
 #
 # One dict entry per path, keyed by Slack API path, rather than a shared
 # frozenset a new call site has to remember to join: a new membership-gated
-# endpoint declares its own documented code set exactly once here, instead
-# of an author having to correctly guess which of several separate
-# constants it belongs in — the wrong guess here is exactly how
-# conversations.info was first classified (left off this table entirely,
-# on the mistaken assumption that its non-member error was no_permission
-# rather than channel_not_found like its siblings below).
-_NOT_A_MEMBER_CODES_BY_PATH: dict[str, frozenset[str]] = {
-    path: frozenset({"not_in_channel", "no_permission", "channel_not_found"})
-    for path in (
+# endpoint is registered here exactly once, instead of an author having to
+# correctly guess which of several separate constants it belongs in — the
+# wrong guess here is exactly how conversations.info was first classified
+# (left off this table entirely, on the mistaken assumption that its
+# non-member error was no_permission rather than channel_not_found like its
+# siblings below). All four paths happen to share the same documented code
+# set today (none of them document not_in_channel), so this table doesn't
+# yet need per-path variation — but the shape is what a future endpoint
+# with a genuinely different set would extend, not a boolean flag.
+_ALSO_OVERLOADS_CHANNEL_NOT_FOUND = frozenset(
+    {"not_in_channel", "no_permission", "channel_not_found"}
+)
+_NOT_A_MEMBER_CODES_BY_PATH: dict[str, frozenset[str]] = dict.fromkeys(
+    (
         "conversations.replies",
         "conversations.info",
         "reactions.add",
         "reactions.remove",
-    )
-}
+    ),
+    _ALSO_OVERLOADS_CHANNEL_NOT_FOUND,
+)
 _DEFAULT_NOT_A_MEMBER_CODES = frozenset({"not_in_channel", "no_permission"})
 # channel_not_found and no_permission are BOTH overloaded by Slack for
 # reasons unrelated to channel membership too (see the module comment
@@ -457,23 +463,20 @@ def slack_join_channel(channel: str) -> str:
             in ((result.get("response_metadata") or {}).get("warnings") or [])
         )
         return _success(channel=channel_id, already_member=already_member)
-    except _SlackAPIError as e:
+    except Exception as e:
         # _resolve_channel_id passes exclude_archived: "false" (a channel
         # *name* has to resolve to an archived channel too, so a caller
         # gets a clear reason instead of a silent "not found"), which means
         # a name can resolve cleanly here and then fail conversations.join
-        # with this exact code — worth a clear message instead of the bare
+        # with is_archived — worth a clear message instead of the bare
         # code, since nothing about resolving the name signaled the problem.
-        if e.code == "is_archived":
+        if isinstance(e, _SlackAPIError) and e.code == "is_archived":
             logger.error(f"Cannot join archived Slack channel {channel}")
             return _error(
                 f"is_archived: channel '{channel}' has been archived and can't "
                 "be joined — ask a workspace admin to unarchive it first if "
                 "the bot still needs access."
             )
-        logger.error(f"Error joining Slack channel {channel}: {e}")
-        return _error(str(e))
-    except Exception as e:
         logger.error(f"Error joining Slack channel {channel}: {e}")
         return _error(str(e))
 
@@ -1056,6 +1059,11 @@ def slack_add_reaction(channel: str, timestamp: str, emoji_name: str) -> str:
     slack_get_thread_replies, slack_search_messages, or slack_post_message).
     emoji_name: the emoji short name, with or without colons (e.g.
     "thumbsup" or ":thumbsup:").
+    If the bot isn't a member of the channel yet, you'll get an actionable
+    error instead of an empty/opaque failure: check with the user before
+    calling slack_join_channel to add the bot (only works for a public
+    channel), or ask a member to `/invite` the bot for a private channel or
+    DM.
     """
     return _set_reaction("add", channel, timestamp, emoji_name)
 
@@ -1064,7 +1072,8 @@ def slack_add_reaction(channel: str, timestamp: str, emoji_name: str) -> str:
 def slack_remove_reaction(channel: str, timestamp: str, emoji_name: str) -> str:
     """
     Remove an emoji reaction the bot previously added from a message.
-    Same arguments as slack_add_reaction.
+    Same arguments as slack_add_reaction, including the same actionable
+    not-a-member error if the bot hasn't joined the channel yet.
     """
     return _set_reaction("remove", channel, timestamp, emoji_name)
 

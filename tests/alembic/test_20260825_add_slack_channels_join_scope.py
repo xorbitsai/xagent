@@ -290,10 +290,15 @@ def test_upgrade_updates_provider_default_scopes(tmp_path):
             migration.upgrade()
         # Set comparison, not list equality: the merge appends this
         # migration's delta rather than reproducing CURRENT_SCOPES's exact
-        # order, and scope order has no OAuth significance.
-        assert set(_provider_default_scopes(connection, "slack")) == set(
-            migration.CURRENT_SCOPES
-        )
+        # order, and scope order has no OAuth significance. The length
+        # check alongside it is what actually catches a duplicate scope
+        # sneaking into the merge on this first run -- set() alone would
+        # silently accept e.g. channels:join written twice, and that
+        # specific regression is otherwise only caught by the separate
+        # idempotent-*re-run* test, not this first-run one.
+        scopes = _provider_default_scopes(connection, "slack")
+        assert len(scopes) == len(migration.CURRENT_SCOPES)
+        assert set(scopes) == set(migration.CURRENT_SCOPES)
         # A different provider row must be untouched.
         assert _provider_default_scopes(connection, "hubspot") == ["oauth"]
 

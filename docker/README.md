@@ -570,26 +570,23 @@ docker compose exec -T postgres psql -U xagent xagent < backup.sql
 
 ### PostgreSQL major version upgrade (16 to 17)
 
-The bundled `postgres` service defaults to `postgres:17-bookworm`. PostgreSQL never upgrades a data directory across major versions: a v17 server refuses to open a directory initialized by v16, exits with `FATAL: database files are incompatible with server`, and — under `restart: unless-stopped` — restart-loops as `unhealthy`, which blocks `backend`, `worker`, and `scheduler` because they wait for `service_healthy`.
+The bundled `postgres` service defaults to `postgres:17-bookworm`. PostgreSQL never upgrades a data directory across major versions: a v17 server refuses to open a v16 directory, exits with `FATAL: database files are incompatible with server`, and restart-loops as `unhealthy`, which blocks `backend`, `worker`, and `scheduler`. It does not modify the directory, so pinning `POSTGRES_IMAGE_TAG="16-bookworm"` restores service at any point.
 
-Nothing is written to the old directory when this happens, so the situation is recoverable by pinning the previous tag with `POSTGRES_IMAGE_TAG`. The migration itself still has to be performed deliberately.
+The steps below are the standard major-version path — dump under v16, initialize a fresh v17 cluster, restore. **This is a general method, not a procedure tuned to your deployment: use the backup and verification process you already trust for this database, and rehearse it against a copy first.** Release-level context is the dated entry in [`docs/deployment.md`](../docs/deployment.md).
 
-The outline below is the standard PostgreSQL major-version path: dump under v16, initialize a fresh v17 cluster, restore. It is a general method, not a procedure that fits every deployment. Data size, uptime requirements, extensions, and what "verified" means for your data are yours to decide — **use the backup and verification process you already trust for this database, and rehearse the whole thing against a copy before running it on production.** The commands here illustrate each phase; they are not a substitute for that.
+> **Data loss warning:** `docker compose down -v` and removing the live `<project>_postgres_data` volume destroy the database irreversibly. Neither is an upgrade step. Removing the separate `_pg16_backup` copy created in step 4 is expected.
 
-The release-level rollout context for this change — impact, prerequisites, and rollback — is the dated entry in [`docs/deployment.md`](../docs/deployment.md).
+> **Sandbox overlays:** keep the `-f docker/docker-compose.sandbox.*.yml` arguments on every Compose command below, or `backend`, `worker`, and `scheduler` come back without the overlay.
 
-> **Data loss warning:** `docker compose down -v`, removing the live `<project>_postgres_data` volume, and any other form of "recreating the volume" destroy the database irreversibly. None of them is an upgrade step. Removing the separate `_pg16_backup` copy that step 5 creates is a different thing, and is expected.
-
-> **Sandbox overlays:** a deployment started with `-f docker/docker-compose.sandbox.*.yml` must keep those `-f` arguments on every Compose command below. A bare `docker compose up -d` recreates `backend`, `worker`, and `scheduler` without the overlay and silently returns the deployment to non-sandboxed operation.
-
-Throughout, `PGVOL` is the Compose-prefixed volume name and `BACKUP` is the dump path. Find the volume with `docker volume ls | grep postgres_data`; for the default project name it is `xagent_postgres_data`. Keep the dump outside the checkout — it carries password hashes, OAuth tokens, and encrypted provider credentials.
+Set up. `PGVOL` is the Compose-prefixed volume name — find it with `docker volume ls | grep postgres_data`. Keep `BACKUP` outside the checkout; the dump carries password hashes, OAuth tokens, and encrypted provider credentials.
 
 ```bash
 PGVOL=xagent_postgres_data
 BACKUP="$HOME/xagent-pg16-backup.sql"
+unset POSTGRES_IMAGE_TAG   # Compose prefers a shell value over .env
 ```
 
-**1. Pin the current major version and confirm the deployment is healthy before changing anything.** Compose reads `POSTGRES_IMAGE_TAG` from the shell environment in preference to `.env`, so an exported value silently overrides every edit below — `unset POSTGRES_IMAGE_TAG` first if one is set.
+**1. Pin v16 and confirm the deployment is healthy.**
 
 ```bash
 printf '\nPOSTGRES_IMAGE_TAG="16-bookworm"\n' >> .env
@@ -597,38 +594,31 @@ docker compose up -d postgres
 docker compose exec postgres psql -U xagent -d xagent -tAc 'SHOW server_version'
 ```
 
-**2. Stop every writer, leaving `postgres` running.** `nginx` and `frontend` keep serving and will return errors for the whole window; stop them too if user-visible errors are unacceptable.
+**2. Stop the writers**, leaving `postgres` running. `nginx` and `frontend` keep serving errors for the whole window; stop them too if that is unacceptable.
 
 ```bash
 docker compose stop backend worker scheduler
 ```
 
-**3. Back up.** Run your own backup process here; the dump below is the minimum, not the whole of it. Check the result before continuing — an interrupted `pg_dump` still leaves a plausible-looking file — and record whatever you intend to compare against after the restore.
+**3. Back up and record what you will compare against.** An interrupted `pg_dump` still leaves a plausible-looking file, so check the result.
 
 ```bash
 docker compose exec -T postgres pg_dump -U xagent -d xagent > "$BACKUP"
-grep -q 'PostgreSQL database dump complete' "$BACKUP" \
-  && echo "backup complete" \
-  || echo "BACKUP INCOMPLETE - do not proceed"
+grep -q 'PostgreSQL database dump complete' "$BACKUP" && echo OK || echo 'INCOMPLETE - do not proceed'
 docker compose exec -T postgres psql -U xagent -d xagent -tAc 'SELECT version_num FROM alembic_version'
 ```
 
-**4. Stop the stack, keeping the volumes.** Do not pass `-v`. The longer stop timeout lets Postgres finish its shutdown checkpoint, so step 5 copies a cleanly-closed directory rather than a crash-consistent one.
+**4. Stop the stack and copy the v16 volume**, so rollback never depends on the dump alone. No `-v`; `-t 60` lets Postgres finish its shutdown checkpoint. The destination must be a fresh volume, because `cp -a` merges rather than mirrors.
 
 ```bash
 docker compose down -t 60
-```
-
-**5. Copy the v16 volume so rollback never depends on the dump alone.** The destination has to be a clean volume: `cp -a` merges rather than mirrors, so a copy left behind by an earlier attempt must be removed rather than copied into.
-
-```bash
 docker volume rm "${PGVOL}_pg16_backup" 2>/dev/null   # absent on a first attempt
 docker volume create "${PGVOL}_pg16_backup"
 docker run --rm -v "$PGVOL":/from:ro -v "${PGVOL}_pg16_backup":/to alpine sh -c 'cp -a /from/. /to/'
 docker run --rm -v "${PGVOL}_pg16_backup":/d alpine cat /d/pgdata/PG_VERSION   # expect: 16
 ```
 
-**6. Remove the v16 data directory from the live volume.** The guard keeps the destructive command from running unless the dump completed and the volume copy really is v16.
+**5. Remove the v16 data directory from the live volume.** The guard blocks the destructive command unless the dump completed and the copy really is v16.
 
 ```bash
 if grep -q 'PostgreSQL database dump complete' "$BACKUP" \
@@ -639,26 +629,23 @@ else
 fi
 ```
 
-**Then delete the `POSTGRES_IMAGE_TAG` line added in step 1 from `.env`** so the v17 default applies again, and start `postgres`, which initializes a fresh cluster. `pg_isready` needs `-h 127.0.0.1`: while the official image initializes a cluster it runs a temporary server on the Unix socket only, and a socket-based check reports that one as ready.
+**6. Delete the `POSTGRES_IMAGE_TAG` line from `.env`** and start `postgres`, which initializes a fresh v17 cluster. `pg_isready` needs `-h 127.0.0.1`: during initialization the image runs a temporary server on the Unix socket only, which a socket check reports as ready.
 
 ```bash
 docker compose up -d postgres
 docker compose exec postgres pg_isready -h 127.0.0.1 -U xagent -d xagent
 ```
 
-**7. Restore and verify.** `ON_ERROR_STOP=1` makes a partial restore fail loudly instead of leaving a half-populated database.
+**7. Restore and verify.** `ON_ERROR_STOP=1` fails loudly instead of leaving a half-populated database.
 
 ```bash
 docker compose exec -T postgres psql -U xagent -d xagent -v ON_ERROR_STOP=1 < "$BACKUP"
-docker compose exec -T postgres psql -U xagent -d xagent -tAc 'SHOW server_version'
-docker compose exec -T postgres psql -U xagent -d xagent -tAc 'SELECT version_num FROM alembic_version'
-```
-
-The reported version must be 17.x and `alembic_version` must match what step 3 recorded. Those two only establish that the schema arrived; what proves the *data* arrived is specific to your deployment, so run the checks that matter for it — row counts on the tables you care about, spot checks against recent records, an application smoke test. `pg_dump` does not carry optimizer statistics across, so rebuild them before the writers return:
-
-```bash
+docker compose exec -T postgres psql -U xagent -d xagent -tAc 'SHOW server_version'                        # expect: 17.x
+docker compose exec -T postgres psql -U xagent -d xagent -tAc 'SELECT version_num FROM alembic_version'    # expect: the step 3 value
 docker compose exec -T postgres vacuumdb -U xagent --all --analyze-in-stages
 ```
+
+Those two queries establish only that the schema arrived. Run whatever proves the *data* arrived for your deployment — row counts on the tables you care about, spot checks against recent records, an application smoke test. `vacuumdb` rebuilds the optimizer statistics that `pg_dump` does not carry across.
 
 **8. Bring the writers back, only after your verification passes.**
 
@@ -666,7 +653,7 @@ docker compose exec -T postgres vacuumdb -U xagent --all --analyze-in-stages
 docker compose up -d
 ```
 
-**Rollback — valid only until step 8 restarts the writers.** Until that point nothing has written to the v16 copy from step 5, so it is still a complete picture of the database. Confirm it exists and really is v16 *before* removing anything: `docker run -v` creates a named volume that does not exist, so an unchecked copy-back from a missing volume restores nothing over a directory it has already deleted.
+**Rollback — valid only until step 8 restarts the writers.** Until then nothing has written to the v16 copy from step 4. Confirm it exists and really is v16 *before* removing anything: `docker run -v` creates a named volume that does not exist, so an unchecked copy-back from a missing volume restores nothing over a directory it has already deleted.
 
 ```bash
 docker compose down -t 60
@@ -681,9 +668,7 @@ else
 fi
 ```
 
-Once v17 has accepted writes, that copy is stale and copying it back discards everything written since the cutover. From that point recovery means taking a fresh v17 backup and reconciling the two, not a copy-back.
-
-Keep `${PGVOL}_pg16_backup` while you are still deciding whether the upgrade held, then remove it with `docker volume rm "${PGVOL}_pg16_backup"`.
+After v17 accepts writes the copy is stale, and copying it back discards everything written since the cutover; recovery from that point means a fresh v17 backup plus reconciliation. Keep the copy while you are still deciding whether the upgrade held, then remove it with `docker volume rm "${PGVOL}_pg16_backup"`.
 
 ## Troubleshooting
 

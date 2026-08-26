@@ -21,6 +21,7 @@ from xagent.core.tools.adapters.vibe.sandboxed_tool.sandboxed_tool_wrapper impor
     SandboxDependencyManager,
     SandboxedToolWrapper,
 )
+from xagent.sandbox.base import Sandbox
 
 
 @dataclass
@@ -32,8 +33,14 @@ class FakeExecResult:
 
 
 def _make_sandbox(name: str = "sandbox-1") -> MagicMock:
-    """Create a mock Sandbox with async methods."""
-    sb = MagicMock()
+    """Create a mock Sandbox with async methods.
+
+    spec=Sandbox so isinstance(sb, Sandbox) holds -- an unspecced
+    MagicMock auto-vivifies any attribute touched, including
+    `.primary_sandbox`, which would make resolve_primary_sandbox mistake
+    this plain-sandbox double for a SandboxLeaseProvider.
+    """
+    sb = MagicMock(spec=Sandbox)
     sb.name = name
     sb.write_file = AsyncMock()
     sb.exec = AsyncMock(return_value=FakeExecResult(exit_code=0))

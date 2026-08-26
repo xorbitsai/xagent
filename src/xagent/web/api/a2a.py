@@ -62,6 +62,7 @@ from ..services.task_execution_controller import (
     task_execution_controller,
 )
 from ..services.task_interaction_close import (
+    active_interaction_id_sync,
     clear_interaction_marker_if_unpaired,
     close_legacy_resume_interaction,
 )
@@ -322,8 +323,16 @@ RESUME_INPUT_FENCE_UPDATE_COLUMNS = frozenset({"input", "output", "error_message
 def _update_a2a_resume_input_sync(
     task_lease: TaskLease,
     text: str,
+    interaction_id: int | None,
 ) -> bool:
-    """Persist A2A input only while the exact prelease remains current."""
+    """Persist A2A input only while the exact prelease remains current.
+
+    ``interaction_id`` is the active interaction row the caller observed
+    before injecting the message, passed in rather than read here: this
+    function's session does not open until after the injection has already
+    committed. See ``task_interaction_close``'s module docstring for why
+    the read has to precede the injection.
+    """
 
     SessionLocal = get_session_local()
     with SessionLocal() as db:
@@ -369,7 +378,10 @@ def _update_a2a_resume_input_sync(
         assert task_lease.run_id is not None
         if interaction_requests_table_exists(db):
             close_legacy_resume_interaction(
-                db, task_id=task_lease.task_id, run_id=task_lease.run_id
+                db,
+                task_id=task_lease.task_id,
+                run_id=task_lease.run_id,
+                interaction_id=interaction_id,
             )
         db.commit()
         return True
@@ -452,6 +464,29 @@ async def _resume_input_required_a2a_task(
         )
 
     try:
+        # Read before the injection below, not inside
+        # _update_a2a_resume_input_sync, whose session opens only afterwards.
+        # See task_interaction_close's module docstring for why.
+        #
+        # This site's turn id is deterministic (f"a2a:{task_id}:{message_id}"
+        # below), so a retried A2A message replays the same turn:
+        # AgentRunner.inject_user_message short-circuits a repeated turn id
+        # by returning the existing context without persisting anything, and
+        # reports the same truthy `posted` a first attempt does. On such a
+        # replay the id read here is not the question the replayed message
+        # answered but whatever the resumed agent has asked since, and the
+        # close would retire a live question. Nothing can be retired today:
+        # the only INSERT into task_interaction_requests is
+        # stage_interaction_request (task_interaction_staging.py), which has
+        # no caller in src/ and is held at none by
+        # tests/web/services/test_interaction_staging_production_gate.py, so
+        # this read returns None on every call. Closing the window is a
+        # precondition on the change that wires the first production writer,
+        # stated once at the online WebSocket injection site (websocket.py)
+        # and binding here identically.
+        active_interaction_id = await run_db_io_cancellation_safe(
+            lambda: active_interaction_id_sync(task_id)
+        )
 
         async def inject_user_message() -> tuple[Any, bool]:
             from .chat import get_agent_manager
@@ -495,7 +530,9 @@ async def _resume_input_required_a2a_task(
             )
 
         updated = await run_db_io_cancellation_safe(
-            lambda: _update_a2a_resume_input_sync(task_lease, text)
+            lambda: _update_a2a_resume_input_sync(
+                task_lease, text, active_interaction_id
+            )
         )
         if not updated:
             raise TaskLeaseLostError(

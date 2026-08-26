@@ -31,18 +31,30 @@ claims (blocking a concurrent purge, not blocking a concurrent KEY SHARE
 stager) -- every case here runs one session against one fixture at a
 time. The lock-ordering guard is therefore statement-order-in-source-code
 evidence only, not lock-behavior evidence.
+
+The marker column travels with that grid and is asserted here too: the
+clear's own NOT EXISTS subquery is rendered by the dialect, so "the
+marker survives while a live row remains, and goes once none does" is
+not something the SQLite run can settle for PostgreSQL. What stays
+SQLite-only is the composition with a failing pre-injection read
+(test_task_interaction_close.py's
+test_close_keeps_the_marker_when_the_pre_injection_read_failed) --
+that one exercises Python control flow around the same two statements
+and has no dialect content.
 """
 
 from __future__ import annotations
 
 import os
 import uuid
+from datetime import datetime, timedelta, timezone
 
 import pytest
 import sqlalchemy as sa
 from sqlalchemy.orm import sessionmaker
 
 from tests.web.services.task_interaction_schema_shared import (
+    anchor_event_id,
     make_row,
     make_trace_event,
     row_state,
@@ -53,6 +65,10 @@ from tests.web.services.task_interaction_schema_shared import (
 from xagent.web.models.database import Base
 from xagent.web.models.task_interaction import TaskInteractionRequest
 from xagent.web.services.task_interaction_close import close_legacy_resume_interaction
+from xagent.web.services.task_interaction_staging import (
+    InteractionAnchor,
+    stage_interaction_request,
+)
 
 pytestmark = pytest.mark.postgresql
 
@@ -97,7 +113,9 @@ def test_close_retires_the_active_row_for_its_own_run(db) -> None:
     task_id = seed_task_with_run(db, run_id="run-a", marker=1)
     row_id = seed_active_row(db, task_id=task_id, run_id="run-a")
 
-    rowcount = close_legacy_resume_interaction(db, task_id=task_id, run_id="run-a")
+    rowcount = close_legacy_resume_interaction(
+        db, task_id=task_id, run_id="run-a", interaction_id=row_id
+    )
     db.commit()
 
     assert rowcount == 1
@@ -126,7 +144,9 @@ def test_close_is_a_no_op_replaying_an_already_terminated_row(db) -> None:
     row_id = int(row.id)
     original_terminal_reason = row.terminal_reason
 
-    rowcount = close_legacy_resume_interaction(db, task_id=task_id, run_id="run-a")
+    rowcount = close_legacy_resume_interaction(
+        db, task_id=task_id, run_id="run-a", interaction_id=row_id
+    )
     db.commit()
 
     assert rowcount == 0
@@ -136,11 +156,20 @@ def test_close_is_a_no_op_replaying_an_already_terminated_row(db) -> None:
     assert task_marker(db, task_id) is None
 
 
-def test_close_is_a_no_op_with_no_interaction_rows_at_all(db) -> None:
-    """Today's 100% case: the table has no production writer yet."""
-    task_id = seed_task_with_run(db, run_id="run-a", marker=None)
+@pytest.mark.parametrize("seeded_marker", [None, 1])
+def test_close_is_a_no_op_with_no_interaction_rows_at_all(
+    db, seeded_marker: int | None
+) -> None:
+    """No interaction row was ever staged for this run -- today's 100%
+    case, since the table has no production writer yet. The condition on
+    the clear is "no active row remains", not "the close matched
+    something", so the marker is zeroed the same way whether it started
+    unset or set."""
+    task_id = seed_task_with_run(db, run_id="run-a", marker=seeded_marker)
 
-    rowcount = close_legacy_resume_interaction(db, task_id=task_id, run_id="run-a")
+    rowcount = close_legacy_resume_interaction(
+        db, task_id=task_id, run_id="run-a", interaction_id=None
+    )
     db.commit()
 
     assert rowcount == 0
@@ -151,7 +180,9 @@ def test_close_does_not_touch_a_different_runs_active_row(db) -> None:
     task_id = seed_task_with_run(db, run_id="run-a", marker=1)
     orphan_row_id = seed_active_row(db, task_id=task_id, run_id="run-b")
 
-    rowcount = close_legacy_resume_interaction(db, task_id=task_id, run_id="run-a")
+    rowcount = close_legacy_resume_interaction(
+        db, task_id=task_id, run_id="run-a", interaction_id=orphan_row_id
+    )
     db.commit()
 
     assert rowcount == 0
@@ -179,8 +210,128 @@ def test_close_does_not_overwrite_a_row_already_recycled_by_another_terminal_rea
     db.refresh(row)
     row_id = int(row.id)
 
-    rowcount = close_legacy_resume_interaction(db, task_id=task_id, run_id="run-a")
+    rowcount = close_legacy_resume_interaction(
+        db, task_id=task_id, run_id="run-a", interaction_id=row_id
+    )
     db.commit()
 
     assert rowcount == 0
     assert row_state(db, row_id).terminal_reason == "run_superseded"
+
+
+def _stage_a_replacement_question_the_way_a_resumed_agent_would(
+    db, *, task_id: int, run_id: str
+) -> tuple[int, int]:
+    """Put a second question on the same run into the active slot, the way
+    a resumed agent's own ``stage_interaction_request`` call does.
+
+    ``uq_task_interaction_active_slot`` allows one active row per task, so
+    the first question's deadline is moved into the past first, standing
+    in for the time that elapses while a resumed agent works. The second
+    call then takes ``_reclaim_stale_slot_stmt``'s expired-row branch on
+    its own. Returns ``(first_id, second_id)``.
+    """
+    now = datetime.now(timezone.utc)
+    anchor_id = make_trace_event(db, task_id=task_id)
+    first = stage_interaction_request(
+        db,
+        task_id=task_id,
+        run_id=run_id,
+        anchor=InteractionAnchor(
+            trace_event_id=anchor_id,
+            resume_event_id=anchor_event_id(db, anchor_id),
+            resume_execution_id="resume-exec-1",
+            resume_run_partition=run_id,
+        ),
+        kind="clarification",
+        protocol_version=1,
+        origin="internal",
+        request_payload={"prompt": "q1"},
+        request_idempotency_key="q1",
+        expires_at=now + timedelta(minutes=15),
+        now=now,
+    )
+    db.commit()
+
+    # Both columns move together: ck_task_interaction_requests_expiry_
+    # after_creation requires expires_at > created_at.
+    staged_at = now - timedelta(hours=2)
+    db.execute(
+        sa.update(TaskInteractionRequest)
+        .where(TaskInteractionRequest.id == first.staged_db_id)
+        .values(created_at=staged_at, expires_at=staged_at + timedelta(minutes=15))
+    )
+    db.commit()
+
+    later = datetime.now(timezone.utc)
+    second = stage_interaction_request(
+        db,
+        task_id=task_id,
+        run_id=run_id,
+        anchor=InteractionAnchor(
+            trace_event_id=anchor_id,
+            resume_event_id=anchor_event_id(db, anchor_id),
+            resume_execution_id="resume-exec-1",
+            resume_run_partition=run_id,
+        ),
+        kind="clarification",
+        protocol_version=1,
+        origin="internal",
+        request_payload={"prompt": "q2"},
+        request_idempotency_key="q2",
+        expires_at=later + timedelta(minutes=15),
+        now=later,
+    )
+    db.commit()
+    assert second.created is True
+    return int(first.staged_db_id), int(second.staged_db_id)
+
+
+def test_close_leaves_a_question_staged_after_the_injection_alone(db) -> None:
+    """The window this close is keyed against, on the production backend.
+    Injecting the user message is what resumes the agent, so between the
+    observation and the close the resumed agent can ask something new;
+    retiring that as "answered via legacy resume" would discard a question
+    nobody ever saw."""
+
+    task_id = seed_task_with_run(db, run_id="run-a", marker=1)
+    observed_id, staged_after_injection_id = (
+        _stage_a_replacement_question_the_way_a_resumed_agent_would(
+            db, task_id=task_id, run_id="run-a"
+        )
+    )
+
+    rowcount = close_legacy_resume_interaction(
+        db, task_id=task_id, run_id="run-a", interaction_id=observed_id
+    )
+    db.commit()
+
+    assert rowcount == 0
+    survivor = row_state(db, staged_after_injection_id)
+    assert survivor.status == "active"
+    assert survivor.terminal_reason is None
+    assert row_state(db, observed_id).status == "terminated"
+    assert task_marker(db, task_id) == 1
+
+
+def test_close_keeps_the_marker_when_no_row_was_observed_but_one_is_active(
+    db,
+) -> None:
+    """interaction_id=None renders as ``id IS NULL``, never true of a
+    primary key, so the close matches nothing -- and here the marker stays,
+    because the row the pre-injection read failed to name is still active.
+    Identical to the SQLite result, confirmed here because both the ``IS
+    NULL`` rendering and the NOT EXISTS subquery are the dialect's, not
+    this module's."""
+
+    task_id = seed_task_with_run(db, run_id="run-a", marker=1)
+    row_id = seed_active_row(db, task_id=task_id, run_id="run-a")
+
+    rowcount = close_legacy_resume_interaction(
+        db, task_id=task_id, run_id="run-a", interaction_id=None
+    )
+    db.commit()
+
+    assert rowcount == 0
+    assert row_state(db, row_id).status == "active"
+    assert task_marker(db, task_id) == 1

@@ -361,16 +361,10 @@ class TestDeploymentAuthorizationIdentityDomain:
     An unfoldable scope-derived candidate fails the build unless the
     deployment named the same mount point: an operator who names a path
     takes responsibility for it regardless of whether some Actor's scope
-    also happens to derive it. "The same mount point" is
-    ``canonical_sandbox_path`` -- the identity ``SandboxMountIntent`` itself
-    uses -- not the configured spelling. That distinction is load-bearing
-    because ``XAGENT_EXTERNAL_UPLOAD_DIRS`` takes raw operator strings and
-    absolutizing them leaves ``..`` segments and a leading ``//`` in place:
-    matching on the absolutized spelling instead would reject the Actor
-    whose scope collides with a differently-spelled deployment entry while
-    a sibling Actor -- whose own scope path never touches that entry --
-    still gets it as a stable extra mount, which is exactly the per-Actor
-    intent divergence this module exists to prevent.
+    also happens to derive it. "The same mount point" is its physical backend
+    identity, not the configured spelling. This keeps workspace tools and the
+    container target aligned, and makes ordinary aliases authorize exactly the
+    same directory as their target.
 
     Parametrized over spellings rather than asserted once: the verdict for
     one mount point must not depend on how it was typed. Only spellings that
@@ -426,14 +420,10 @@ class TestDeploymentAuthorizationIdentityDomain:
         assert binding_a.mount_intent.mount_root == str(ca_root)
         assert binding_a.mount_intent.extra_mounts == (str(ca_root / "actor7"),)
 
-    def test_a_symlink_alias_of_the_path_does_not_authorize_it(
+    def test_a_symlink_alias_of_the_path_authorizes_the_same_physical_dir(
         self, _uploads_dir, tmp_path, monkeypatch
     ):
-        """The other edge of the same domain: the identity is lexical, so an
-        operator entry that merely *resolves* to the escaping path is a
-        different bind point and authorizes nothing. Naming an alias grants
-        the alias its own mount; the scope path itself still fails closed.
-        """
+        """Aliases and their targets intentionally share mount identity."""
         ca_root = self._escaping_actor7_tree(_uploads_dir, tmp_path)
         alias = ca_root / "aliased-kb"
         alias.symlink_to(ca_root / "actor7", target_is_directory=True)
@@ -441,8 +431,11 @@ class TestDeploymentAuthorizationIdentityDomain:
             workspace_binding, "get_external_upload_dirs", lambda: [alias]
         )
 
-        with pytest.raises(SandboxMountEscapeError):
-            build_chat_workspace_binding(OWNER_ID, self._ca_scope("actor7"))
+        binding_a = build_chat_workspace_binding(OWNER_ID, self._ca_scope("actor7"))
+        binding_b = build_chat_workspace_binding(OWNER_ID, self._ca_scope("actor9"))
+
+        assert binding_a.mount_intent == binding_b.mount_intent
+        assert binding_a.mount_intent.extra_mounts == (str(alias),)
 
     def test_ancestor_spelled_non_canonically_still_absorbs_the_mount_root(
         self, _uploads_dir, monkeypatch
@@ -469,24 +462,10 @@ class TestDeploymentAuthorizationIdentityDomain:
         assert binding.mount_intent.mount_root == str(user_root)
         assert binding.mount_intent.extra_mounts == ()
 
-    def test_ancestor_spelled_through_a_symlink_and_dotdot_folds_identically(
+    def test_symlink_and_dotdot_is_rejected_as_ambiguous(
         self, _uploads_dir, tmp_path, monkeypatch
     ):
-        """The two normalizations must not disagree on one mount point.
-
-        ``..`` after a symlink is where lexical and resolved normalization
-        part ways: ``<root>/link/..`` is lexically ``<root>``, while resolving
-        the raw spelling lands wherever ``link`` points. Folding has to judge
-        the path that will actually be mounted -- the canonical one -- so
-        this spelling of an ancestor must absorb the mount root exactly as
-        the plain spelling does, down to the runtime spec's mount list. Both
-        directions matter: it is the covering side here, and the same domain
-        split decides the escape rejection above.
-        """
-        # Nested one level down, so that resolving ``link/..`` lands on a
-        # directory that is not an ancestor of the mount root either -- the
-        # resolved view then contradicts the lexical one instead of agreeing
-        # with it by accident.
+        """Desired-spec cleanup must not change the mounted directory."""
         outside = tmp_path.parent / f"{tmp_path.name}-outside-root" / "nested"
         outside.mkdir(parents=True)
         user_root = scoped_user_root(_uploads_dir, OWNER_ID, ())
@@ -504,10 +483,8 @@ class TestDeploymentAuthorizationIdentityDomain:
             lambda: [Path(f"{user_root}/link/..")],
         )
 
-        binding = build_chat_workspace_binding(OWNER_ID, scope)
-
-        assert binding.mount_intent.mount_root == str(user_root)
-        assert binding.mount_intent.extra_mounts == ()
+        with pytest.raises(SandboxContractError, match="ambiguous"):
+            build_chat_workspace_binding(OWNER_ID, scope)
 
 
 class TestInternalScopedRow:
@@ -705,13 +682,12 @@ class TestExternalDirBoundary:
 
 
 class TestBackendPathDomain:
-    """Folding candidates are normalized, and symlink-checked, first.
+    """Folding candidates use stable physical backend identities.
 
     ``SandboxMountIntent`` compares paths lexically and rejects relative
     ones outright, so the builder owns both halves of that precondition:
-    raw configuration spellings become absolute, canonical backend-domain
-    paths, and a candidate whose lexical position disagrees with where it
-    actually resolves is never folded away.
+    raw configuration spellings become absolute, symlink-resolved,
+    canonical backend-domain paths before classification.
     """
 
     def test_relative_external_dir_is_absolutized(
@@ -751,14 +727,7 @@ class TestBackendPathDomain:
     def test_uploads_dir_spelled_through_a_symlink_prepares_the_bound_root(
         self, tmp_path, monkeypatch
     ):
-        """The mkdir target must be the directory that gets bind-mounted.
-
-        ``prepare_root`` is the pre-fold root, deeper than the folded mount
-        root but the same path domain: the mount intent canonicalizes what it
-        binds, so an uploads dir spelled ``<base>/link/..`` binds ``<base>``
-        while a raw-spelled preparation target would create the tree under
-        ``link``'s target instead, leaving the real mount source empty.
-        """
+        """A lexical cleanup that changes identity is rejected."""
         base = tmp_path / "base"
         base.mkdir()
         outside = tmp_path / "outside" / "nested"
@@ -769,17 +738,13 @@ class TestBackendPathDomain:
         )
         monkeypatch.setattr(workspace_binding, "get_external_upload_dirs", lambda: [])
 
-        binding = build_chat_workspace_binding(OWNER_ID, None)
-
-        assert binding.prepare_root == binding.mount_intent.mount_root
-        assert binding.prepare_root == str(base / f"user_{OWNER_ID}")
+        with pytest.raises(SandboxContractError, match="ambiguous"):
+            build_chat_workspace_binding(OWNER_ID, None)
 
     def test_symlink_escaping_the_root_keeps_its_own_mount(
         self, _uploads_dir, tmp_path, monkeypatch
     ):
-        """A candidate lexically under the mount root but resolving outside
-        it is exposed by nothing once the root is bind-mounted, so folding
-        it away would silently drop the mount."""
+        """An operator-named target keeps its lexical, translatable bind."""
         outside = tmp_path.parent / f"{tmp_path.name}-outside-kb"
         outside.mkdir()
         user_root = scoped_user_root(_uploads_dir, OWNER_ID, ())
@@ -815,12 +780,10 @@ class TestBackendPathDomain:
         assert binding.mount_intent.mount_root == str(user_root)
         assert binding.mount_intent.extra_mounts == ()
 
-    def test_symlink_only_resolving_to_an_ancestor_is_not_promoted(
+    def test_symlink_resolving_to_an_ancestor_is_promoted_physically(
         self, _uploads_dir, tmp_path, monkeypatch
     ):
-        """The covering direction needs the same veto: mounting a link that
-        merely *resolves* to an ancestor does not expose the mount root at
-        the mount root's own path, so it must not absorb it."""
+        """An alias of an ancestor names that same physical mount root."""
         alias = tmp_path.parent / f"{tmp_path.name}-alias"
         alias.symlink_to(_uploads_dir, target_is_directory=True)
         user_root = scoped_user_root(_uploads_dir, OWNER_ID, ())
@@ -831,5 +794,5 @@ class TestBackendPathDomain:
 
         binding = build_chat_workspace_binding(OWNER_ID, None)
 
-        assert binding.mount_intent.mount_root == str(user_root)
-        assert binding.mount_intent.extra_mounts == (str(alias),)
+        assert binding.mount_intent.mount_root == str(alias)
+        assert binding.mount_intent.extra_mounts == ()

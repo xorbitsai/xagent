@@ -207,6 +207,94 @@ async def test_readiness_allows_non_conflicting_external_dir(tmp_path: Path):
         await check_sandbox_static_readiness(_ProbeStub(True))
 
 
+@pytest.mark.parametrize("reverse_order", [False, True])
+@pytest.mark.asyncio
+async def test_readiness_dedupes_external_aliases_by_physical_identity(
+    tmp_path: Path,
+    reverse_order: bool,
+):
+    """Equivalent aliases produce one stable external volume in either order."""
+    backend_storage_root = tmp_path / "backend" / ".xagent"
+    backend_storage_root.mkdir(parents=True)
+    physical_dir = backend_storage_root / "real-kb"
+    physical_dir.mkdir()
+    alias_a = backend_storage_root / "alias-a"
+    alias_b = backend_storage_root / "alias-b"
+    alias_a.symlink_to(physical_dir, target_is_directory=True)
+    alias_b.symlink_to(physical_dir, target_is_directory=True)
+    aliases = [alias_a, alias_b]
+    if reverse_order:
+        aliases.reverse()
+
+    captured: list[tuple[tuple[str, str, str], ...]] = []
+    with (
+        patch.dict(
+            "os.environ",
+            {
+                "XAGENT_EXTERNAL_UPLOAD_DIRS": ",".join(str(path) for path in aliases),
+                "XAGENT_STORAGE_ROOT": str(backend_storage_root),
+                "XAGENT_UPLOADS_DIR": str(backend_storage_root / "uploads"),
+                "XAGENT_SANDBOX_HOST_STORAGE_ROOT": "/docker-host/storage",
+            },
+            clear=True,
+        ),
+        patch(
+            "xagent.web.sandbox_manager.build_code_mount_volumes",
+            return_value=[],
+        ),
+        patch(
+            "xagent.web.sandbox_manager._check_no_conflicting_readiness_volumes",
+            side_effect=lambda volumes: captured.append(tuple(volumes)),
+        ),
+    ):
+        await check_sandbox_static_readiness(_ProbeStub(True))
+
+    assert captured == [
+        (
+            (
+                "/docker-host/storage/alias-a",
+                str(physical_dir),
+                "rw",
+            ),
+        )
+    ]
+
+
+@pytest.mark.asyncio
+async def test_readiness_keeps_real_conflict_after_external_alias_dedupe(
+    tmp_path: Path,
+):
+    """Physical dedupe must not hide conflicts with explicit host volumes."""
+    backend_storage_root = tmp_path / "backend" / ".xagent"
+    backend_storage_root.mkdir(parents=True)
+    physical_dir = backend_storage_root / "real-kb"
+    physical_dir.mkdir()
+    alias_a = backend_storage_root / "alias-a"
+    alias_b = backend_storage_root / "alias-b"
+    alias_a.symlink_to(physical_dir, target_is_directory=True)
+    alias_b.symlink_to(physical_dir, target_is_directory=True)
+
+    with (
+        patch.dict(
+            "os.environ",
+            {
+                "SANDBOX_VOLUMES": "/docker-host/storage/alias-a:/different-guest:ro",
+                "XAGENT_EXTERNAL_UPLOAD_DIRS": f"{alias_b},{alias_a}",
+                "XAGENT_STORAGE_ROOT": str(backend_storage_root),
+                "XAGENT_UPLOADS_DIR": str(backend_storage_root / "uploads"),
+                "XAGENT_SANDBOX_HOST_STORAGE_ROOT": "/docker-host/storage",
+            },
+            clear=True,
+        ),
+        patch(
+            "xagent.web.sandbox_manager.build_code_mount_volumes",
+            return_value=[],
+        ),
+    ):
+        with pytest.raises(SandboxRuntimeConflictError):
+            await check_sandbox_static_readiness(_ProbeStub(True))
+
+
 @pytest.mark.asyncio
 async def test_readiness_absolutizes_relative_external_dir(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch

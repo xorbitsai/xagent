@@ -2759,6 +2759,9 @@ def _refresh_existing_file_if_changed(
         except DurableObjectMissingError:
             return None
         except Exception as exc:  # noqa: BLE001
+            # ``exc_info`` because this fault is swallowed -- the caller only
+            # sees ``None`` -- so this line is its only record, and ``error=%s``
+            # alone drops the exception class and the cause chain (#1467).
             logger.warning(
                 "Failed to restore durable web-ingestion file before refresh: "
                 "url=%s, file_id=%s, context=%s, error=%s",
@@ -2766,6 +2769,7 @@ def _refresh_existing_file_if_changed(
                 existing_record.file_id,
                 context,
                 exc,
+                exc_info=exc,
             )
             return None
 

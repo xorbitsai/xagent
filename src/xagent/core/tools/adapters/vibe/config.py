@@ -448,6 +448,15 @@ class BaseToolConfig(ABC):
         """Get active agent delegation call stack for recursion prevention."""
         return []
 
+    def get_voice(self) -> Optional[str]:
+        """The already-resolved onboarding output-voice preference (see
+        core.agent.voice_policy.apply_output_voice), or None. Threaded into
+        a delegated AgentTool's own system prompt and into any further
+        tool set it builds for a grandchild delegation, so a task's chosen
+        voice reaches every agent this user talks to - not just the
+        top-level one - without core importing a web route module."""
+        return None
+
     def get_excluded_agent_id(self) -> Optional[int]:
         """Get agent ID to exclude from agent tools."""
         return None

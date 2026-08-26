@@ -5,8 +5,10 @@ Replaces the two-name gate this file's predecessor enforced, keeping both
 names under watch. The predecessor named its retirement condition as "the
 change that routes the existing resume coordinator through this module's
 compatibility seam" -- the change meant to give ``respond()`` its first
-production caller. That compatibility seam has since landed: ``websocket.py``
-now imports ``_active_native_row_criteria`` from this module. It does not,
+production caller. That compatibility seam has since landed: it reads
+through ``task_interaction_close.active_interaction_id_sync``, which
+imports ``_active_native_row_criteria`` from this module (``websocket.py``
+itself no longer imports it directly). It does not,
 though, give ``respond()`` a caller -- the seam only reads that filter
 predicate, it never calls ``respond()`` -- so this gate's retirement
 condition is still open. Zero production code anywhere in this package

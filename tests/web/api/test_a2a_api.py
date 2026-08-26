@@ -849,7 +849,9 @@ def test_update_a2a_resume_input_rolls_back_the_interaction_close_with_the_fence
     stale_lease = TaskLease(
         task_id=task_id, runner_id="a-different-runner", run_id="run-atomicity"
     )
-    updated = a2a_api._update_a2a_resume_input_sync(stale_lease, "attempted text")
+    updated = a2a_api._update_a2a_resume_input_sync(
+        stale_lease, "attempted text", row_id
+    )
 
     assert updated is False
     db = _direct_db_session()
@@ -949,6 +951,103 @@ def test_message_send_closes_the_legacy_resume_interaction_row_on_successful_inj
         assert refreshed.interaction_protocol_version is None
     finally:
         db.close()
+
+
+# A fabricated id, not the seeded row's -- test_message_send_reads_the_
+# interaction_row_before_injecting hands this to the close instead of the
+# real row id, so a site that re-read the row at close time would hand the
+# close the real id and fail there instead.
+_OBSERVED_INTERACTION_ID = 4321
+
+
+def test_message_send_reads_the_interaction_row_before_injecting() -> None:
+    """The close is keyed on the row observed *before* the injection,
+    and only the ordering makes that true -- see task_interaction_close's
+    module docstring. Moving the read after the injection leaves the whole
+    change doing nothing while the row-level assertions in the test above
+    stay green. The observed value is a fabricated id, not the seeded row's,
+    so a site that re-read the row at close time would hand the close the
+    real id and fail here."""
+
+    agent_id, full_key = _create_published_agent_with_key()
+    db = _direct_db_session()
+    try:
+        owner_id = int(db.query(Agent).filter(Agent.id == agent_id).one().user_id)
+        task = Task(
+            user_id=owner_id,
+            title="legacy resume close ordering",
+            status=TaskStatus.PAUSED,
+            control_state=TaskControlState.PAUSED.value,
+            run_id="run-close-order",
+            agent_id=agent_id,
+            source="a2a",
+            is_visible=False,
+            agent_config={"a2a_context_id": "ctx-close-order"},
+            interaction_protocol_version=1,
+        )
+        db.add(task)
+        db.commit()
+        db.refresh(task)
+        task_id = int(task.id)
+        # Kept real and distinct from _OBSERVED_INTERACTION_ID: a site that
+        # re-read the row at close time (instead of using the id observed
+        # before injection) would hand the close this real id and fail the
+        # assertion below.
+        _seed_active_interaction_row(
+            db,
+            task_id=task_id,
+            run_id="run-close-order",
+            idempotency_key="close-order-q1",
+        )
+    finally:
+        db.close()
+
+    order: list[str] = []
+
+    def record_read(_task_id: int) -> int:
+        order.append("read")
+        return _OBSERVED_INTERACTION_ID
+
+    async def record_injection(*_args: object, **_kwargs: object) -> bool:
+        order.append("inject")
+        return True
+
+    agent_service = MagicMock()
+    agent_service.post_user_message = AsyncMock(side_effect=record_injection)
+    agent_manager = MagicMock()
+    agent_manager.get_agent_for_task = AsyncMock(return_value=agent_service)
+    with (
+        patch("xagent.web.api.chat.get_agent_manager", return_value=agent_manager),
+        patch("xagent.web.api.a2a._schedule_waiting_a2a_resume"),
+        patch("xagent.web.api.a2a.TaskTurnOrchestrator.begin_turn", new=AsyncMock()),
+        patch(
+            "xagent.web.api.a2a.active_interaction_id_sync",
+            side_effect=record_read,
+        ),
+        patch(
+            "xagent.web.api.a2a.close_legacy_resume_interaction", return_value=1
+        ) as close_mock,
+    ):
+        response = client.post(
+            f"/api/a2a/agents/{agent_id}/message:send",
+            headers=_bearer(full_key),
+            json={
+                "message": {
+                    "messageId": "msg-close-order",
+                    "taskId": task_id,
+                    "role": "ROLE_USER",
+                    "parts": [{"text": "answered via legacy resume"}],
+                },
+                "configuration": {"returnImmediately": True},
+            },
+        )
+
+    assert response.status_code == 200, response.text
+    assert order == ["read", "inject"]
+    close_mock.assert_called_once()
+    assert close_mock.call_args.kwargs["task_id"] == task_id
+    assert close_mock.call_args.kwargs["run_id"] == "run-close-order"
+    assert close_mock.call_args.kwargs["interaction_id"] == _OBSERVED_INTERACTION_ID
 
 
 @pytest.mark.asyncio

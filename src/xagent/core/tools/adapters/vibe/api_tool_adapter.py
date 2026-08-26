@@ -11,7 +11,6 @@ from pydantic import BaseModel, Field, model_validator
 
 from ....utils.encryption import decrypt_value
 from ...core.api_tool import call_api
-from .agent_tool_names import MAX_AGENT_TOOL_NAME_LENGTH
 from .base import AbstractBaseTool, ToolCategory, ToolVisibility
 from .connector_runtime import (
     MISSING_RUNTIME_VALUE,
@@ -26,6 +25,7 @@ from .connector_runtime import (
     is_runtime_header_scalar,
     runtime_bindings_from_config,
 )
+from .tool_naming_limits import MAX_AGENT_TOOL_NAME_LENGTH
 
 logger = logging.getLogger(__name__)
 
@@ -151,8 +151,8 @@ class CustomApiTool(AbstractBaseTool):
         # `_call` (the part that signals "this is an API call") survives
         # instead of being cut off by a blind truncation of the whole
         # string. `MAX_AGENT_TOOL_NAME_LENGTH` is this repo's own record of
-        # that provider limit (agent_tool_names.py), shared here rather than
-        # redeclared so the two adapters can't drift apart on the number.
+        # that provider limit (tool_naming_limits.py), shared here rather
+        # than redeclared so the two adapters can't drift apart on the number.
         budget = MAX_AGENT_TOOL_NAME_LENGTH - len(prefix) - len(suffix)
         if len(sanitized_name) > budget:
             # `name` is a free-form, DB-unique string with no server

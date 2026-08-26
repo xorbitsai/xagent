@@ -15,6 +15,7 @@ from ...core.agent.language import (
 )
 from ...core.agent.result import extract_assistant_message
 from ...core.agent.service import AgentService
+from ...core.agent.voice_policy import apply_output_voice
 from ...core.model.chat.basic.base import BaseLLM
 from ...core.tools.adapters.vibe.agent_tool import (
     ListAvailableSkillsTool,
@@ -34,6 +35,15 @@ MAX_WORKFORCE_BUILDER_WORKERS = 32
 MAX_WORKFORCE_BUILDER_EXISTING_AGENTS = 200
 MAX_WORKFORCE_BUILDER_AGENT_RESULTS = 50
 WORKFORCE_BUILDER_MAX_ITERATIONS = 48
+# Named list of the persisted-configuration fields the language-scoping
+# instruction in workforce_prompt_builder_system_prompt (below) exempts
+# from the request language policy. Voice-scoping used to enumerate the
+# same list a second time here; that's now handled once, centrally, by
+# apply_output_voice's own caveat instead.
+_WORKFORCE_BUILDER_PERSISTED_FIELDS = (
+    "Workforce and agent names, descriptions, instructions, aliases, and "
+    "assignment text"
+)
 
 
 class WorkforcePromptBuilderError(RuntimeError):
@@ -555,9 +565,9 @@ all created agents and the Workforce in one transaction only after successful
 finalization. A tool error must be corrected with another tool call; never claim
 success when finalization did not happen.
 
-All persisted user-facing prose passed to tools, including Workforce and agent names,
-descriptions, instructions, aliases, and assignments, must follow the user's request
-language. English tool names, schemas, and tool results do not authorize changing it.
+All persisted user-facing prose passed to tools, including {_WORKFORCE_BUILDER_PERSISTED_FIELDS},
+must follow the user's request language. English tool names, schemas, and tool
+results do not authorize changing it.
 {output_language_policy()}
 {response_language_rules(subject="current user request")}
 """
@@ -569,6 +579,7 @@ async def build_workforce_prompt_plan(
     llm: BaseLLM,
     available_agents: Sequence[Mapping[str, Any]],
     compact_llm: BaseLLM | None = None,
+    voice: str | None = None,
 ) -> dict[str, Any]:
     """Run the ReAct builder and return its validated in-memory plan."""
 
@@ -579,6 +590,9 @@ async def build_workforce_prompt_plan(
 
     state = WorkforcePromptBuilderState.from_agents(available_agents)
     execution_id = f"workforce-prompt-builder-{uuid4().hex}"
+    # apply_output_voice's own scoping caveat covers create_agent/
+    # create_workforce's persisted arguments here - see its docstring.
+    system_prompt = apply_output_voice(workforce_prompt_builder_system_prompt(), voice)
     service = AgentService(
         name="Workforce Prompt Builder",
         id=execution_id,
@@ -593,7 +607,7 @@ async def build_workforce_prompt_plan(
             ListAvailableSkillsTool(),
             ListToolCategoriesTool(),
         ],
-        system_prompt=workforce_prompt_builder_system_prompt(),
+        system_prompt=system_prompt,
         memory_enabled=False,
         enable_workspace=False,
         react_max_iterations=WORKFORCE_BUILDER_MAX_ITERATIONS,

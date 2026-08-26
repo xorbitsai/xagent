@@ -76,7 +76,11 @@ from ...services.hot_path_cache import (
     task_snapshot_key,
     task_steps_key,
 )
-from ...services.managed_file_ref import DurableStorageOperationError
+from ...services.managed_file_ref import (
+    DurableObjectIntegrityError,
+    DurableStorageOperationError,
+    log_durable_storage_fault,
+)
 from ...services.task_interaction_read import get_pending_interaction_question
 from ...services.task_orchestrator import (
     TaskTurnError,
@@ -179,11 +183,7 @@ async def upload_task_files(
         # stable {"error": {"code": ...}} shape. 503 (durable storage) stays 503 so
         # callers can retry; 413 (too large) stays 413; other client errors -> 400.
         if exc.status_code == 503:
-            raise V1ApiError(
-                V1ErrorCode.INTERNAL_ERROR,
-                503,
-                message="File storage is temporarily unavailable.",
-            ) from exc
+            _raise_v1_storage_unavailable(exc)
         if 400 <= exc.status_code < 500:
             raise V1ApiError(
                 V1ErrorCode.INVALID_INPUT,
@@ -228,13 +228,29 @@ def _resolve_turn_files_or_400(
             db=db,
             task_id=task_id,
         )
+    except DurableObjectIntegrityError as exc:
+        # Precedes the parent arm: permanent corruption, already logged at
+        # ERROR with both checksums where it is raised. The envelope is left
+        # as-is deliberately -- reclassifying it for the SDK is a compatibility
+        # change, not a logging one -- but it must not also emit a
+        # transient-outage warning.
+        _raise_v1_storage_unavailable(exc)
     except DurableStorageOperationError as exc:
         # Transient storage fault, not a client error -- 503 so SDK can retry.
-        raise V1ApiError(
-            V1ErrorCode.INTERNAL_ERROR,
-            503,
-            message="File storage is temporarily unavailable.",
-        ) from exc
+        # The V1ApiError envelope reaches the client without a traceback, so
+        # this log line is the only record of the provider fault (#1467).
+        # ``task_id`` is None on the create path -- one of this function's two
+        # callers, not an edge case -- so the owner and the requested ids carry
+        # the identification there.
+        log_durable_storage_fault(
+            logger,
+            "turn attachment resolution",
+            exc,
+            task_id=task_id,
+            owner_user_id=owner_user_id,
+            file_ids=",".join(file_ids),
+        )
+        _raise_v1_storage_unavailable(exc)
     if missing:
         raise V1ApiError(
             V1ErrorCode.INVALID_INPUT,
@@ -259,6 +275,22 @@ def _turn_payload(content: str, file_infos: list[dict[str, Any]]) -> TaskTurnPay
         attachments=normalize_attachments_for_persistence(file_infos) or None,
         file_ids=tuple(str(info["file_id"]) for info in file_infos),
     )
+
+
+def _raise_v1_storage_unavailable(exc: Exception) -> NoReturn:
+    """The retryable-503 envelope every durable-fault arm in this module answers with.
+
+    One helper rather than the envelope inline at each arm, matching this
+    module's other ``_raise_v1_*`` helpers. It always chains ``from exc``: the
+    ``v1_api_error_handler`` does not render ``exc_info`` today, so no arm loses
+    anything by chaining, and an arm that dropped the cause would lose it
+    silently the day that boundary starts logging one (#1521).
+    """
+    raise V1ApiError(
+        V1ErrorCode.INTERNAL_ERROR,
+        503,
+        message="File storage is temporarily unavailable.",
+    ) from exc
 
 
 def _raise_v1_file_binding_error(exc: TaskTurnFileBindingError) -> NoReturn:

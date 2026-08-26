@@ -177,6 +177,16 @@ def temp_dir():
 
 
 @pytest.fixture(autouse=True, scope="function")
+def isolate_path_config_caches() -> Iterator[None]:
+    """Reset cwd-pinned config paths so test order cannot change results."""
+    from xagent.config import _reset_path_config_caches_for_tests
+
+    _reset_path_config_caches_for_tests()
+    yield
+    _reset_path_config_caches_for_tests()
+
+
+@pytest.fixture(autouse=True, scope="function")
 def isolate_rag_storage(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     """Isolate per-test RAG/KB storage paths and reset global storage state.
 

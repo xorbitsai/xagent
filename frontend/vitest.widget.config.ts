@@ -10,6 +10,7 @@ const widgetConfig = mergeConfig(baseConfig, defineConfig({
         "src/app/widget/chat/[[]token[]]/page-client.tsx",
         "src/components/chat/ChatInput.tsx",
         "src/components/chat/ChatMessage.tsx",
+        "src/components/chat/clarification-form.tsx",
         "src/components/chat/TraceEventRenderer.tsx",
         "src/components/file/file-preview-content.tsx",
         "src/components/file/file-viewer.tsx",
@@ -88,6 +89,9 @@ const widgetConfig = mergeConfig(baseConfig, defineConfig({
         "src/components/pages/oidc-callback.tsx": { statements: 75, branches: 45, functions: 95, lines: 75 },
         "src/components/chat/ChatInput.tsx": { statements: 60, branches: 60, functions: 40, lines: 60 },
         "src/components/chat/ChatMessage.tsx": { statements: 50, branches: 50, functions: 40, lines: 50 },
+        "src/components/chat/clarification-form.tsx": {
+          statements: 76, branches: 68, functions: 62, lines: 76,
+        },
         "src/components/chat/TraceEventRenderer.tsx": {
           statements: 80, branches: 75, functions: 75, lines: 80,
         },

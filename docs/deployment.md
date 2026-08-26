@@ -200,3 +200,61 @@ Because this release cannot create actor-owned rows, the downgrade remains avail
 SQLite can commit each schema operation separately during a batch-table rebuild. If a downgrade fails, do not retry against the changed database. For a disposable local database, delete and recreate it through normal application startup. Otherwise, restore the verified backup. Make sure that `alembic current` reports the owner-aware revision before you retry the downgrade.
 
 The migration refuses the downgrade if a non-null owner row exists. If a caller created such a row, disable that caller. Revoke and remove the credential with an approved procedure. Then retry the downgrade.
+
+## 2026-08-26 — PostgreSQL 17 default for the bundled Compose database
+
+### Deployment impact
+
+The bundled `postgres` service in `docker-compose.yml` now defaults to `postgres:17-bookworm`, aligning self-hosted deployments with the PostgreSQL 17 major that production runs and CI validates against. There is no Alembic revision, no schema change, and no application-code change. This is a data-directory migration only.
+
+PostgreSQL never upgrades a data directory across major versions. A `postgres_data` volume initialized by PostgreSQL 16 does not open under a PostgreSQL 17 server: the server exits with `FATAL: database files are incompatible with server` without modifying the directory, restart-loops as `unhealthy`, and `backend`, `worker`, and `scheduler` never start because they wait for `service_healthy`. The v16 data stays intact, so pinning the previous tag restores service. Treat an unplanned upgrade of an existing v16 deployment as a full outage until that happens or the migration below completes.
+
+Fresh installations are unaffected, because they initialize directly under v17. So are deployments whose `DATABASE_URL` points at an external or managed PostgreSQL, because the bundled service is not in their path.
+
+### Prerequisites and configuration
+
+`POSTGRES_IMAGE_TAG` is new in this release. It sets the tag of the bundled `postgres` image, defaults to `17-bookworm`, and is documented in `example.env`. Set it to `16-bookworm` to keep an existing v16 volume running until it is migrated.
+
+Before migrating, confirm the deployment uses the bundled `postgres` service rather than an external database, and identify the Compose-prefixed volume name with `docker volume ls | grep postgres_data`. Reserve a maintenance window: the database is unavailable from the point writers stop until verification passes, and `nginx` and `frontend` keep serving errors to users for that whole window.
+
+Never run `docker compose down -v` or remove the live `postgres_data` volume. Both destroy the database irreversibly and neither is an upgrade step. Removing the separate `_pg16_backup` copy that the runbook creates is a different operation and is expected.
+
+The runbook is a general method, not a procedure tuned to any one deployment. Use the backup and verification process you already trust for this database, and rehearse the migration against a copy before running it on production.
+
+### Deployment and migration steps
+
+The executable commands are the [PostgreSQL major version upgrade (16 to 17)](../docker/README.md#postgresql-major-version-upgrade-16-to-17) runbook in `docker/README.md`; each numbered step below is one runbook step, in order. A deployment that uses a sandbox runtime overlay must keep its `-f` overlay arguments on every Compose command, or `backend`, `worker`, and `scheduler` come back without the overlay.
+
+1. Pin `POSTGRES_IMAGE_TAG` to `16-bookworm` and confirm the deployment is healthy on v16.
+2. Stop `backend`, `worker`, and `scheduler`, leaving `postgres` running.
+3. Run your backup process, verify its result, and record the values you will compare after the restore.
+4. Stop the stack without `-v` and copy the v16 volume to a separate volume, so rollback never depends on the dump alone.
+5. Remove the v16 data directory from the live volume, guarded on the dump being complete and the copy being v16.
+6. Unpin `POSTGRES_IMAGE_TAG` and start `postgres` on v17, which initializes a fresh cluster.
+7. Restore the dump with `ON_ERROR_STOP=1`, then run the verification below.
+8. Start the remaining services only after verification passes.
+
+Keep the v16 volume copy while you are still deciding whether the upgrade held, then remove it with `docker volume rm`.
+
+### Verification and monitoring
+
+After the restore, `SHOW server_version` must report a 17.x version, and `SELECT version_num FROM alembic_version` must equal the value recorded in step 3. The second check is schema-only: a restore that stopped early does not change that value.
+
+Those two establish that the schema arrived. What proves the data arrived depends on the deployment, so run the checks that matter for yours — row counts on the tables you care about, spot checks against recent records, an application smoke test.
+
+Then run `vacuumdb --all --analyze-in-stages` inside the `postgres` container. `pg_dump` does not carry optimizer statistics across a restore, and a restored cluster plans queries badly until they exist.
+
+Before starting the writers, confirm that `docker compose ps` reports `postgres` as `healthy` and that `docker compose logs postgres` shows a startup with no `FATAL` line.
+
+### Rollback
+
+Valid only until step 8 restarts the writers. Until that point a v17 server has never opened the volume copy taken in step 4, so it is still a complete picture of the database and rollback restores it directly instead of replaying the dump.
+
+1. Stop the stack without `-v`.
+2. Confirm the preserved v16 volume exists and reports `PG_VERSION` 16, before removing anything. Docker creates a named volume that does not exist, so an unchecked copy-back from a missing volume restores nothing over a directory it has already deleted.
+3. Remove the data directory from the live volume and copy the preserved v16 volume back over it.
+4. Pin `POSTGRES_IMAGE_TAG` to `16-bookworm`, start the stack, and confirm that `SHOW server_version` reports a 16.x version.
+
+Roll back rather than repair in place when verification fails after a partial restore under v17. A cluster left half-populated by an interrupted restore is not a state to diagnose during an outage. If the v16 volume copy is unavailable, restore the verified dump from step 3 onto a v16 cluster initialized from `16-bookworm`.
+
+After v17 accepts writes the volume copy is stale, and restoring it discards everything written since the cutover. Recovery from that point means taking a fresh v17 backup and reconciling the two, not a copy-back.

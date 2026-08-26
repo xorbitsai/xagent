@@ -121,8 +121,10 @@ async def _create_knowledge_base_from_file_impl(
         from .....web.models.database import get_db
         from .....web.models.uploaded_file import UploadedFile
         from .....web.services.managed_file_ref import (
+            DurableObjectIntegrityError,
             DurableStorageOperationError,
             ensure_uploaded_file_local_path,
+            log_durable_storage_fault,
         )
         from ...core.RAG_tools.core.schemas import (
             DEFAULT_EMBEDDING_MODEL_ID,
@@ -187,9 +189,35 @@ async def _create_knowledge_base_from_file_impl(
         for record in file_records:
             try:
                 source_path = ensure_uploaded_file_local_path(record)
-            except DurableStorageOperationError as exc:
+            except DurableObjectIntegrityError:
+                # Must precede the parent arm below, which this subclasses. A
+                # checksum mismatch is permanent corruption, already recorded
+                # at ERROR with both checksums by ``_raise_integrity_error``.
+                # Routing it through the durable-fault logger would add a
+                # "Durable storage unavailable" WARNING on top, which reads as
+                # a transient outage and can trip the alerts that watch for one
+                # -- burying the corruption diagnosis under a wrong one.
                 errors.append(
-                    f"Failed to restore {record.filename} from durable storage: {exc}"
+                    f"Stored copy of {record.filename} failed its integrity "
+                    "check and must be re-uploaded"
+                )
+                continue
+            except DurableStorageOperationError as exc:
+                log_durable_storage_fault(
+                    logger,
+                    "knowledge-base file restore",
+                    exc,
+                    file_id=record.file_id,
+                )
+                # Deliberately does NOT interpolate ``exc``. This string is
+                # joined into the tool result, so it reaches the model and the
+                # conversation transcript, and the provider detail belongs in
+                # the log line above, which is server-side only. (Since #1643
+                # the storage key is on ``storage_key`` rather than in the
+                # message, so it is the provider text -- not the key -- that
+                # interpolating would expose here.)
+                errors.append(
+                    f"Failed to restore {record.filename} from durable storage"
                 )
                 continue
             if not source_path.exists():
@@ -211,10 +239,18 @@ async def _create_knowledge_base_from_file_impl(
             try:
                 request_context = copy_context()
                 result = await loop.run_in_executor(None, request_context.run, func)
-            except Exception as exc:
-                errors.append(
-                    f"Failed to ingest {record.filename} due to unexpected error: {exc}"
-                )
+            except Exception:
+                # Deliberately does NOT interpolate the exception, for the same
+                # reason as the durable arm above: this string is joined into the
+                # tool result, so it reaches the model and the conversation
+                # transcript. ``HashComputationError`` wraps an OSError whose
+                # message embeds the absolute upload path, and
+                # ``DocumentValidationError`` renders "Source path does not
+                # exist: <path>" -- both under users/<user_id>/uploads/..., so
+                # both carry the owning user's id. The filename is the only part
+                # the model needs; the traceback below keeps everything else,
+                # server-side.
+                errors.append(f"Failed to ingest {record.filename}")
                 logger.exception(
                     "Unexpected error ingesting file %s",
                     record.filename,

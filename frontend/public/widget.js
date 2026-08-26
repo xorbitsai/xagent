@@ -209,6 +209,24 @@
   var iconColor = scriptTag.getAttribute('data-icon-color') || '#fff';
   var panelBgColor = scriptTag.getAttribute('data-panel-bg-color') || '#fff';
 
+  // Read by use-websocket.ts off the iframe URL, where it outranks the browser
+  // zone. Optional: absent means the iframe URL is unchanged.
+  var embedTimezone = (scriptTag.getAttribute('data-timezone') || '').trim();
+
+  function withTimezone(url) {
+    if (!embedTimezone) return url;
+    var encoded;
+    try {
+      // A lone UTF-16 surrogate survives trim() and makes encodeURIComponent
+      // throw; the override must degrade to the browser/UTC path, never abort
+      // iframe setup.
+      encoded = encodeURIComponent(embedTimezone);
+    } catch {
+      return url;
+    }
+    return url + (url.indexOf('?') === -1 ? '?' : '&') + 'timezone=' + encoded;
+  }
+
   // Styles
   var style = document.createElement('style');
   style.innerHTML = `
@@ -358,7 +376,7 @@
           if (ticket) {
             url += '&embed_ticket=' + encodeURIComponent(ticket);
           }
-          iframe.src = url;
+          iframe.src = withTimezone(url);
         }
 
         // Request a short-lived embed ticket from the top-level page. This fetch
@@ -489,7 +507,7 @@
 
     function attach(iframe) {
       state.iframe = iframe;
-      iframe.src = host + '/widget/chat/session';
+      iframe.src = withTimezone(host + '/widget/chat/session');
       window.addEventListener('message', onMessage);
       window.addEventListener('pageshow', onPageShow);
       window.addEventListener('pagehide', onPageHide);

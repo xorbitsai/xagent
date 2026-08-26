@@ -53,6 +53,17 @@ async def generate_workforce_creation_plan(
     user: User,
     prompt: str,
 ) -> dict[str, Any]:
+    # Resolved from the live `user` row before release_db_connection_if_clean
+    # below expires it - see apply_output_voice's docstring for why this
+    # can't be re-derived from `user` after that point. The Workforce
+    # Prompt Builder's final answer is a free-text assistant reply
+    # persisted into the conversation (see build_workforce_prompt_plan's
+    # builder_response), the same "every agent this user talks to" shape
+    # that Builder chat and task chat already apply this to.
+    from ..api.agents import voice_from_runtime_user
+
+    voice = voice_from_runtime_user(user)
+
     normalized_prompt = normalize_text(prompt, "prompt", required=True)
     agents = list_accessible_published_agents(
         db,
@@ -98,6 +109,7 @@ async def generate_workforce_creation_plan(
             llm=llm,
             compact_llm=compact_llm,
             available_agents=available_agents,
+            voice=voice,
         )
     except WorkforcePromptBuilderUnavailableError as exc:
         logger.exception("ReAct Workforce builder runtime is unavailable")

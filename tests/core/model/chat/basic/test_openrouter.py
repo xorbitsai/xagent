@@ -1209,18 +1209,16 @@ def _bad_request_error(message: str) -> openai.BadRequestError:
 
 
 @pytest.mark.asyncio
-async def test_openrouter_direct_relaxes_tool_choice_after_bare_bad_request_error(
+async def test_openrouter_direct_relaxes_tool_choice_after_wrapped_resend_failure(
     mock_chat_completion, mocker
 ):
-    """A bare ``openai.BadRequestError`` must still reach the compat retry loop.
+    """The compat retry recovers when the response_format resend also 400s.
 
-    ``OpenAILLM.chat`` normally converts every ``openai.BadRequestError`` into
-    a ``RuntimeError`` before returning, but its response_format pop-and-retry
-    path (openai.py's ``except openai.BadRequestError`` block) re-issues the
-    request from inside that except clause: if the retried call also raises
-    ``openai.BadRequestError``, that second error is not wrapped by anything
-    and escapes as a bare SDK exception. The compat retry loop must catch it
-    the same way it catches the RuntimeError case, not just replay-fail.
+    ``OpenAILLM.chat`` converts every ``openai.BadRequestError`` into a
+    ``RuntimeError``, including a failure of its response_format pop-and-retry
+    resend, so the compat loop sees the wrapped form here. The loop's catch
+    tuple still includes the bare SDK exception as defense in depth for any
+    future base-client path that leaks one unwrapped.
     """
     mock_client = mocker.AsyncMock()
     mock_client.chat.completions.create.side_effect = [
@@ -1250,16 +1248,22 @@ async def test_openrouter_direct_relaxes_tool_choice_after_bare_bad_request_erro
 
 
 @pytest.mark.asyncio
-async def test_openrouter_vision_relaxes_tool_choice_after_bare_bad_request_error(
+async def test_openrouter_vision_relaxes_tool_choice_after_wrapped_resend_failure(
     mock_chat_completion, mocker
 ):
-    """The vision path recovers from the bare BadRequestError escape too.
+    """The vision path recovers when the response_format resend also 400s.
 
     ``vision_chat`` is the entrypoint with a live response_format producer in
-    this repository, so the escape guarded here is reachable in production:
-    ``OpenAILLM.vision_chat``'s pop-and-retry resend sits inside its own
-    ``except openai.BadRequestError`` block and a second failure escapes
-    unwrapped, exactly like ``chat``'s.
+    this repository, so this recovery is reachable in production. A failed
+    resend arrives here wrapped as ``RuntimeError`` by the base client; the
+    compat loop's catch tuple keeps the bare SDK exception as defense in
+    depth. The value asserted below reaches the caller from the THIRD
+    upstream call, which succeeds on its first attempt after the compat loop
+    relaxed ``tool_choice`` -- it does not come through a successful resend.
+    So this pins that ``vision_chat``'s processed result survives the
+    OpenRouter compat loop; the successful-resend return itself is pinned
+    directly by ``test_vision_chat_response_format_retry_success_returns_result``
+    in ``tests/core/model/chat/basic/test_openai.py``.
     """
     mock_client = mocker.AsyncMock()
     mock_client.chat.completions.create.side_effect = [
@@ -1279,16 +1283,52 @@ async def test_openrouter_vision_relaxes_tool_choice_after_bare_bad_request_erro
         abilities=["chat", "tool_calling", "vision"],
     )
 
-    await llm.vision_chat(
+    result = await llm.vision_chat(
         [{"role": "user", "content": "score?"}],
         tools=_two_tool_schema(),
         tool_choice="required",
         response_format={"type": "json_object"},
     )
 
+    assert result["type"] == "text"
+    assert result["content"] == "Hello World"
     assert mock_client.chat.completions.create.await_count == 3
     final_call = mock_client.chat.completions.create.call_args_list[2].kwargs
     assert final_call["tool_choice"] == "auto"
+
+
+@pytest.mark.asyncio
+async def test_openrouter_compat_loop_catches_bare_sdk_bad_request(mocker):
+    """A bare ``openai.BadRequestError`` reaching the compat loop is handled.
+
+    The base client wraps provider 4xx failures into ``RuntimeError`` on
+    every known path, so this pin drives the loop directly: the inner call
+    raises the bare SDK error once, and the loop must treat it as a compat
+    adjustment opportunity rather than let it escape. This is the only test
+    that fails when ``openai.BadRequestError`` is removed from
+    ``_COMPAT_RETRYABLE_ERRORS``. The streaming compat loop in
+    ``_run_stream_chat_with_compat_retry`` consumes the same tuple but has
+    no equivalent bare-error stub coverage yet.
+    """
+    llm = OpenRouterLLM(model_name="z-ai/glm-5.2", api_key="test-key")
+    prefix_retry_mock = mocker.patch.object(
+        llm,
+        "_chat_with_prefix_retry",
+        side_effect=[
+            _bad_request_error(_OPENROUTER_TOOL_CHOICE_ERROR),
+            {"type": "text", "content": "Hello World", "tool_calls": None},
+        ],
+    )
+
+    result = await llm.chat(
+        [{"role": "user", "content": "score?"}],
+        tools=_two_tool_schema(),
+        tool_choice="required",
+    )
+
+    assert result["content"] == "Hello World"
+    assert prefix_retry_mock.call_count == 2
+    assert prefix_retry_mock.call_args_list[1].kwargs["tool_choice"] == "auto"
 
 
 @pytest.mark.asyncio

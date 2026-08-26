@@ -12,9 +12,29 @@ flag never changes observable results, only latency:
   including failures.
 - I3 (ledger order): ``tool_ledger`` insertion order matches input order after a
   batch, because the consecutive-count walks read it in reverse insertion order.
-- I4 (control short-circuit): a control tool (final_answer / send_message /
-  ask_user_question) owns its segment and ends the turn's tool execution; later
-  tool calls in the same turn do not run.
+- I4 (control segment): a control tool (final_answer / send_message /
+  ask_user_question) owns its segment and never shares a concurrent batch.
+  What happens to the rest of the batch depends on the control result:
+    * final_answer with answer text finalizes the run and clears the queue;
+    * final_answer with an empty answer is rejected instead - the call gets a
+      failure result, every sibling still queued is cancelled with a result of
+      its own, and the next turn is forced back to final_answer;
+    * ask_user_question, and send_message with expect_response=True, suspend
+      for the user and discard the rest of the plan;
+    * send_message with expect_response=False returns "message_sent" and
+      execution continues with the next segment.
+  So every branch except the last ends the turn's tool execution. The reject,
+  suspend, and message branches settle every queued sibling with a result of
+  its own; the finalize branch does not - it clears the queue without
+  cancelling siblings, which is exactly why the strip removes a bundled
+  final_answer before the batch is recorded.
+
+  A batch that arrives here from a fresh LLM response carries no final_answer
+  alongside a work tool: response normalization removes it first, because its
+  answer text was written before those tools ran. That holds for fresh
+  responses only - pending_tool_calls restored from a checkpoint are replayed
+  without re-normalization, so a batch written by an earlier build can still
+  reach this loop carrying one, and takes the branches above unchanged.
 - I5 (interrupt / resume): an interrupt during a concurrent batch preserves
   calls that already completed and leaves only interrupted calls pending. A
   cancelled call may still have committed externally before cancellation was
@@ -48,6 +68,7 @@ from ....file_ref import (
 )
 from ....model.chat.exceptions import LLMToolProtocolError
 from ....model.chat.tool_protocol import get_tool_protocol_error
+from ....tools.adapters.vibe.interaction_types import INTERACTION_TYPES
 from ....tools.user_interaction import (
     tool_result_waits_for_user,
     user_interaction_resume_callable,
@@ -93,8 +114,14 @@ DEFAULT_REPEATED_TOOL_DECISION_CONSECUTIVE_TOOL_CALLS = 4
 DEFAULT_REPEATED_TOOL_DECISION_CONSECUTIVE_WORK_TOOL_CALLS = 10
 REACT_DECISION_TOOL_NAME = "react_decision"
 REACT_DECISION_FINAL_ANSWER = "final_answer"
+USER_INTERACTION_CONTROL_TOOL_NAMES = CONTROL_TOOL_NAMES - {REACT_DECISION_FINAL_ANSWER}
 REACT_DECISION_TOOL_CALL = "tool_call"
 UNGROUPED_TOOL_DECISION_CATEGORIES = frozenset({"basic", "other"})
+# Bounds for the final_answer-strip warning's tool-name list. Tool names come
+# straight from the model, so the log line is shaped like the rest of this
+# module's untrusted-input logging: bounded length, escaped, never raw.
+STRIP_LOG_MAX_TOOL_NAMES = 8
+STRIP_LOG_MAX_TOOL_NAME_CHARS = 64
 REACT_RESPONSE_LANGUAGE_DESCRIPTION = (
     "Target natural language for user-facing prose in this ReAct response, "
     "for example English, Simplified Chinese, Traditional Chinese, or Spanish. "
@@ -208,6 +235,7 @@ class ReActPattern(AgentPattern):
         ),
         tool_parallel_enabled: bool = False,
         tool_max_concurrency: int = 3,
+        user_interaction_enabled: bool = True,
     ) -> None:
         self.llm = llm
         self.max_iterations = max_iterations
@@ -219,6 +247,7 @@ class ReActPattern(AgentPattern):
         # batch bounded by ``tool_max_concurrency``.
         self.tool_parallel_enabled = tool_parallel_enabled
         self.tool_max_concurrency = max(1, int(tool_max_concurrency))
+        self.user_interaction_enabled = user_interaction_enabled
         self.repeated_tool_decision_after_consecutive_tool_calls = (
             repeated_tool_decision_after_consecutive_tool_calls
         )
@@ -673,6 +702,30 @@ class ReActPattern(AgentPattern):
                             self._empty_final_answer_call(normalized) is not None
                         ),
                     )
+            original_tool_calls = normalized.get("tool_calls") or []
+            kept_tool_calls, stripped_final_answers = (
+                self._strip_final_answer_bundled_with_work_tools(original_tool_calls)
+            )
+            if stripped_final_answers:
+                logger.warning(
+                    "ReAct discarding %d final_answer call(s) bundled with work "
+                    "tools; the answer text predates their results. "
+                    "iteration=%s model=%s batch_size=%d tools=[%s]",
+                    len(stripped_final_answers),
+                    iteration,
+                    llm_metadata.get("selected_model"),
+                    len(original_tool_calls),
+                    self._tool_names_for_log(original_tool_calls),
+                )
+                normalized["tool_calls"] = kept_tool_calls
+                if answer_streamer is not None:
+                    # The discarded text may already be streaming to the UI.
+                    # Nothing downstream closes that stream once the batch no
+                    # longer carries a final_answer, so close it here.
+                    await answer_streamer.fail(
+                        "discarded an answer that arrived together with tool "
+                        "calls; answering again once the tools have run"
+                    )
             if force_final_answer_now and not normalized.get("tool_calls"):
                 normalized["done"] = True
 
@@ -837,8 +890,21 @@ class ReActPattern(AgentPattern):
             can_lookup_output_files = (
                 WORKSPACE_OUTPUT_FILES_TOOL_NAME in active_tool_names
             )
+            clock_zone = context.clock_zone()
             current_date = (
-                context.created_at.astimezone(timezone.utc).date().isoformat()
+                context.created_at.astimezone(clock_zone or timezone.utc)
+                .date()
+                .isoformat()
+            )
+            clock_zone_label = clock_zone.key if clock_zone is not None else "UTC"
+            missing_information_instruction = (
+                "If a tool needs missing information from the user, call "
+                "ask_user_question; do not ask the question as plain assistant "
+                "text. "
+                if self.user_interaction_enabled
+                else "If missing user information prevents completion, do not ask "
+                "the user or attempt an unavailable interaction tool; finish with "
+                "outcome=blocked and explain what is missing. "
             )
             instruction = (
                 "Use available tools when the user asks you to generate, compute, run, "
@@ -847,10 +913,12 @@ class ReActPattern(AgentPattern):
                 "final answer on the latest tool result instead of repeating the same "
                 "tool work. When the current task is complete, call the final_answer "
                 "tool exactly once instead of calling another work tool or returning "
-                "plain assistant text. Do not write assistant text in the same "
-                "response as a work tool call; call the tool directly. If a tool "
-                "needs missing information from the user, call ask_user_question; do "
-                "not ask the question as plain assistant text. If the latest user "
+                "plain assistant text. Never put final_answer in the same response "
+                "as any other tool call: run the work tools first, then answer on a "
+                "later turn from their results. Do not write assistant text in the "
+                "same response as a work tool call; call the tool directly. "
+                f"{missing_information_instruction}"
+                "If the latest user "
                 "message explicitly asks you to call a named available tool, call "
                 "that tool instead of paraphrasing the request. If a tool "
                 "fails, retry with a corrected call when possible; "
@@ -863,7 +931,7 @@ class ReActPattern(AgentPattern):
                 "When writing any final user-facing response, including plain "
                 "assistant text: "
                 f"{final_deliverable_file_reference_instructions(can_lookup=can_lookup_output_files, include_heading=False)}\n\n"
-                f"Current date (UTC): {current_date}. "
+                f"Current date ({clock_zone_label}): {current_date}. "
                 "For recent, latest, current, or time-sensitive requests, use this "
                 "date when forming search queries and judging source relevance. Only call "
                 "tools that are present in the current tool schema for this LLM call; "
@@ -1062,6 +1130,15 @@ class ReActPattern(AgentPattern):
                 continue
             if force_final_answer and tool_call.get("name") != "final_answer":
                 return True
+        if self._batch_carries_work_tool(tool_calls):
+            # A final_answer sharing the batch with a work tool is removed by
+            # _strip_final_answer_bundled_with_work_tools before the batch is
+            # recorded, so its answer field never reaches the user and cannot
+            # be a reason to discard the whole response. Discarding here would
+            # take the work calls with it - the exact behavior this guard is
+            # not allowed to reintroduce. The empty-answer repair owns
+            # responses whose only calls are control tools.
+            return False
         return self._empty_final_answer_call(normalized) is not None
 
     def _empty_final_answer_call(
@@ -1084,6 +1161,85 @@ class ReActPattern(AgentPattern):
             if not self._final_answer_text(tool_call.get("args")).strip():
                 return tool_call
         return None
+
+    def _batch_carries_work_tool(self, tool_calls: list[dict[str, Any]]) -> bool:
+        """Whether a tool-call batch contains at least one non-control tool.
+
+        The single predicate for "this batch does real work", shared by the
+        final_answer strip and the empty-answer guard so the two cannot
+        disagree about which batches the strip owns.
+        """
+
+        control_tool_names = self._control_tool_names()
+        return any(
+            isinstance(tool_call, dict)
+            and tool_call.get("name") not in control_tool_names
+            for tool_call in tool_calls
+        )
+
+    def _strip_final_answer_bundled_with_work_tools(
+        self,
+        tool_calls: list[dict[str, Any]],
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        """Split a batch that mixes ``final_answer`` with real work tools.
+
+        Returns ``(kept, removed)``. A ``final_answer`` sharing a response with
+        a work tool was written before that tool ran, so its text cannot
+        describe the result it claims to summarize. Dropping it lets the work
+        tools execute and the next iteration answer from real results.
+
+        Must run before the batch reaches ``add_assistant_message``. A
+        ``final_answer`` recorded in the message history never receives a tool
+        result, and ``ExecutionContext._sanitize_tool_message_pairs`` then drops
+        the whole assistant block together with the work-tool results the model
+        needs on the next turn.
+
+        Control-only batches are returned unchanged. ``send_message`` with
+        ``expect_response=False`` continues the turn by design, and a batch
+        with no work tool carries no result the answer could be missing.
+        """
+
+        if not self._batch_carries_work_tool(tool_calls):
+            return tool_calls, []
+        kept: list[dict[str, Any]] = []
+        removed: list[dict[str, Any]] = []
+        for tool_call in tool_calls:
+            if isinstance(tool_call, dict) and tool_call.get("name") == "final_answer":
+                removed.append(tool_call)
+            else:
+                kept.append(tool_call)
+        return kept, removed
+
+    def _tool_names_for_log(self, tool_calls: list[dict[str, Any]]) -> str:
+        """Render a batch's tool names for a log line, bounded and escaped.
+
+        Names are model-controlled strings with no length or character limit of
+        their own, so they are truncated and ``repr``-escaped before reaching
+        the log: a newline inside a name would otherwise split the record.
+        Order is preserved and duplicates are kept - a batch calling the same
+        tool three times is the fact worth reading. Non-mapping entries are
+        rendered as a placeholder instead of raising, matching the
+        ``isinstance(tool_call, dict)`` defense in ``_batch_carries_work_tool``
+        and ``_strip_final_answer_bundled_with_work_tools``: this method must
+        not be the one place in the strip path that crashes the run on a
+        malformed batch it is only trying to log. That branch is
+        defense-in-depth: ``_normalize_tool_calls`` currently emits only dict
+        entries with non-empty names, so no production input reaches it today.
+        """
+
+        names = [
+            repr(
+                (
+                    str(tool_call.get("name"))
+                    if isinstance(tool_call, dict)
+                    else f"<non-mapping tool_call: {type(tool_call).__name__}>"
+                )[:STRIP_LOG_MAX_TOOL_NAME_CHARS]
+            )
+            for tool_call in tool_calls[:STRIP_LOG_MAX_TOOL_NAMES]
+        ]
+        overflow = len(tool_calls) - len(names)
+        rendered = ", ".join(names)
+        return f"{rendered} (+{overflow} more)" if overflow > 0 else rendered
 
     def _final_answer_text(self, args: Any) -> str:
         """Coerce a ``final_answer`` argument payload into its answer text.
@@ -1693,7 +1849,7 @@ class ReActPattern(AgentPattern):
     def _builtin_tool_schemas(
         self, *, can_lookup_output_files: bool = False
     ) -> list[dict[str, Any]]:
-        return [
+        schemas: list[dict[str, Any]] = [
             {
                 "type": "function",
                 "function": {
@@ -1706,9 +1862,12 @@ class ReActPattern(AgentPattern):
                         "unfinished, or outcome=blocked when no further progress is "
                         "possible without user input or an external state change. "
                         "Never mark an answer completed when it admits work is "
-                        "unfinished. Do not call additional tools after this. Set "
-                        "response_language to the target output language for this "
-                        "answer. "
+                        "unfinished. Call this tool alone: never place it in the "
+                        "same response as any other tool call, and do not call "
+                        "additional tools after it. An answer written in the same "
+                        "response as a tool call cannot describe that tool's "
+                        "result. Set response_language to the target output "
+                        "language for this answer. "
                         f"{final_answer_language_rule()}"
                     ),
                     "parameters": {
@@ -1796,15 +1955,7 @@ class ReActPattern(AgentPattern):
                                     "properties": {
                                         "type": {
                                             "type": "string",
-                                            "enum": [
-                                                "select_one",
-                                                "select_multiple",
-                                                "text_input",
-                                                "file_upload",
-                                                "confirm",
-                                                "number_input",
-                                                "action_cards",
-                                            ],
+                                            "enum": list(INTERACTION_TYPES),
                                         },
                                         "field": {"type": "string"},
                                         "label": {"type": "string"},
@@ -1845,6 +1996,14 @@ class ReActPattern(AgentPattern):
                 },
             },
         ]
+        if not self.user_interaction_enabled:
+            return [
+                schema
+                for schema in schemas
+                if schema.get("function", {}).get("name")
+                not in USER_INTERACTION_CONTROL_TOOL_NAMES
+            ]
+        return schemas
 
     def _tool_schemas_with_builtin_controls(
         self,
@@ -1879,6 +2038,44 @@ class ReActPattern(AgentPattern):
     ) -> dict[str, Any] | None:
         name = tool_call["name"]
         args = tool_call.get("args", {})
+
+        if (
+            not self.user_interaction_enabled
+            and name in USER_INTERACTION_CONTROL_TOOL_NAMES
+        ):
+            error = f"Control tool '{name}' is disabled for this execution."
+            logger.warning(
+                "ReAct rejected disabled user-interaction control tool. "
+                "tool=%s tool_call_id=%s",
+                name,
+                tool_call.get("id"),
+            )
+            failure = {"success": False, "status": "error", "error": error}
+            self._record_tool_call(
+                tool_call,
+                status="failed",
+                result=failure,
+                error=error,
+            )
+            context.add_tool_result(
+                tool_name=name,
+                result=failure,
+                tool_call_id=tool_call.get("id"),
+            )
+            remaining = [
+                pending
+                for pending in self.pending_tool_calls
+                if pending is not tool_call
+            ]
+            self.pending_tool_calls = [tool_call]
+            self._cancel_tool_calls(
+                remaining,
+                context,
+                reason=f"Discarded because control tool '{name}' is disabled.",
+            )
+            self.status = "thinking"
+            self.force_final_answer_next = True
+            return None
 
         if name == "final_answer":
             answer = self._final_answer_text(args)
@@ -2033,9 +2230,14 @@ class ReActPattern(AgentPattern):
     ) -> None:
         """Refuse to finalize on an empty ``final_answer`` and re-request one.
 
-        ``_response_requires_tool_protocol_retry`` catches this on the turn the
-        model produces it, so this guard covers the paths that reach the handler
-        without passing through response normalization — most importantly a
+        For a batch whose only calls are control tools,
+        ``_response_requires_tool_protocol_retry`` still catches this on the
+        turn the model produces it, discarding the whole response before it is
+        recorded. For a batch that also carries a work tool, the fresh path
+        strips the ``final_answer`` call regardless of whether its answer is
+        empty, so the work tool runs and this handler never sees that batch
+        either. This guard is left covering the one path that reaches the
+        handler without passing through response normalization at all — a
         checkpoint resume that restores ``pending_tool_calls`` verbatim.
 
         Returning ``None`` keeps the run in the loop; ``force_final_answer_next``
@@ -2044,13 +2246,15 @@ class ReActPattern(AgentPattern):
 
         Two deliberate differences from the fresh-turn path.
 
-        Sibling calls still pending are discarded, matching the fresh path's
-        whole-response rejection for the order that matters: a resumed
-        ``[final_answer(""), work_tool]`` batch would otherwise execute a
-        side-effecting tool that the fresh path never runs. The match is not
-        exact in the reverse order - in ``[work_tool, final_answer("")]`` the
-        work tool has already executed by the time this runs, and nothing here
-        undoes it.
+        Sibling calls still pending are discarded regardless of order, because
+        by the time a resume reaches this point the assistant envelope for the
+        batch is already recorded in history (see
+        ``_ensure_pending_tool_call_envelope``), so an undiscarded sibling
+        would be left queued with no result of its own. This diverges from the
+        fresh path, which now runs the work tool instead of discarding it: the
+        fresh path can still drop ``final_answer`` before anything is
+        recorded, while a resumed batch can only cancel calls that are already
+        committed to history.
 
         And the next turn is forced to ``final_answer`` alone, where the fresh
         path restores the full tool set. That bounds the run: a second empty
@@ -2218,6 +2422,27 @@ class ReActPattern(AgentPattern):
         runtime: PatternRuntime,
     ) -> dict[str, Any]:
         """Publish tool-originated questions and checkpoint the suspended run."""
+
+        if not self.user_interaction_enabled:
+            tool_names = sorted(
+                {
+                    str(tool_call.get("name") or "unknown")
+                    for tool_call, _ in waiting_pairs
+                }
+            )
+            error = (
+                "Tool-requested user interaction is disabled for this execution: "
+                + ", ".join(tool_names)
+            )
+            logger.warning("ReAct rejected tool-requested user interaction: %s", error)
+            self.status = "failed"
+            self.waiting_for_user_request = None
+            return {
+                "success": False,
+                "status": "failed",
+                "error": error,
+                "context": context,
+            }
 
         requests: list[dict[str, Any]] = []
         interactions: list[dict[str, Any]] = []
@@ -2416,6 +2641,27 @@ class ReActPattern(AgentPattern):
         llm: Any,
         runtime: PatternRuntime,
     ) -> dict[str, Any] | None:
+        if not self.user_interaction_enabled:
+            disabled_index = next(
+                (
+                    index
+                    for index, pending in enumerate(self.pending_tool_calls)
+                    if pending.get("name") in USER_INTERACTION_CONTROL_TOOL_NAMES
+                ),
+                None,
+            )
+            if disabled_index is not None:
+                preceding = self.pending_tool_calls[:disabled_index]
+                disabled_name = self.pending_tool_calls[disabled_index].get("name")
+                self.pending_tool_calls = self.pending_tool_calls[disabled_index:]
+                self._cancel_tool_calls(
+                    preceding,
+                    context,
+                    reason=(
+                        "Discarded because the response also called disabled "
+                        f"control tool '{disabled_name}'."
+                    ),
+                )
         successful_tool_result = False
         while self.pending_tool_calls:
             interrupted = await self._interrupt_if_requested(

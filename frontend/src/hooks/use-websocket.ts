@@ -54,16 +54,42 @@ export type MessageDeliveryDisposition = "not_sent" | "rejected" | "outcome_unkn
 export class MessageDeliveryError extends Error {
   readonly disposition: MessageDeliveryDisposition
   readonly retryWithNewId: boolean
+  /**
+   * Whether `message` explains the failure in terms the sender can act on —
+   * the server's rejection text. The remaining messages describe connection
+   * plumbing ("the connection changed before delivery") and are diagnostics:
+   * callers show their own localized string for those rather than putting
+   * internal English in front of a visitor.
+   */
+  readonly userFacing: boolean
 
   constructor(
     message: string,
     disposition: MessageDeliveryDisposition,
     retryWithNewId = false,
+    userFacing = false,
   ) {
     super(message)
     this.name = "MessageDeliveryError"
     this.disposition = disposition
     this.retryWithNewId = retryWithNewId
+    this.userFacing = userFacing
+  }
+}
+
+const resolveReportedTimezone = (): string | undefined => {
+  if (typeof window !== "undefined") {
+    // widget.js copies data-timezone onto the iframe URL; an embedder that knows
+    // its user's business zone outranks the machine zone.
+    const declared = new URLSearchParams(window.location.search).get("timezone")?.trim()
+    if (declared) return declared
+  }
+  try {
+    // Defensive: neither a throwing Intl nor an empty resolved zone may block
+    // the send. The caller's truthiness check drops "".
+    return Intl.DateTimeFormat().resolvedOptions().timeZone
+  } catch {
+    return undefined
   }
 }
 
@@ -71,7 +97,8 @@ const deliveryError = (
   message: string,
   disposition: MessageDeliveryDisposition,
   retryWithNewId = false,
-) => new MessageDeliveryError(message, disposition, retryWithNewId)
+  userFacing = false,
+) => new MessageDeliveryError(message, disposition, retryWithNewId, userFacing)
 
 export type WebSocketCredentialOwner =
   | {
@@ -319,6 +346,11 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
   const tokenRef = useRef(token !== undefined ? token : authToken)
   const pendingDeliveriesRef = useRef(new Map<string, PendingDelivery>())
   const preparationsRef = useRef(new Map<string, MessagePreparationClaim>())
+  // Keyed by the logical client_message_id, not by physical send. The durable
+  // transport compares the whole payload, so a same-id retry that re-resolved
+  // the zone would be rejected as different content while the first command may
+  // still be executing. Cleared on either terminal ack below.
+  const attemptTimezonesRef = useRef(new Map<string, string | undefined>())
   const recentMessagesRef = useRef<RecentMessage[]>([])
   const callbacksRef = useRef<WebSocketCallbacks>({
     onConnectionClose,
@@ -875,6 +907,14 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
             ) {
               clearTimeout(pending.timeout)
               pendingDeliveriesRef.current.delete(clientMessageId)
+              if (
+                data.type === 'message_accepted'
+                || data.rejection_outcome === "not_accepted"
+              ) {
+                // Terminal for this id: accepted, or rejected without a
+                // same-id retry. An unknown outcome keeps the binding.
+                attemptTimezonesRef.current.delete(clientMessageId)
+              }
               if (data.type === 'message_accepted') {
                 pending.resolve({
                   client_message_id: clientMessageId,
@@ -887,8 +927,24 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
                     ? "rejected"
                     : "outcome_unknown",
                   data.retry_with_new_id === true,
+                  typeof data.message === "string" && data.message.trim() !== "",
                 ))
               }
+            } else if (
+              typeof clientMessageId === 'string'
+              && !pending
+              && !preparationsRef.current.has(clientMessageId)
+              && (
+                data.type === 'message_accepted'
+                || data.rejection_outcome === "not_accepted"
+              )
+            ) {
+              // Terminal ack that arrived after the 30s timeout already dropped
+              // the pending entry. isCurrentOwner (top of onmessage) fences stale
+              // sockets, and no same-id retry is in flight, so the binding can
+              // never be reused; release it. outcome_unknown is excluded so a
+              // still-allowed same-id retry keeps its first attempt's zone.
+              attemptTimezonesRef.current.delete(clientMessageId)
             }
             return
           }
@@ -1164,10 +1220,15 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
     preparationsRef.current.set(clientMessageId, claim)
 
     try {
+      if (!attemptTimezonesRef.current.has(clientMessageId)) {
+        attemptTimezonesRef.current.set(clientMessageId, resolveReportedTimezone())
+      }
+      const reportedTimezone = attemptTimezonesRef.current.get(clientMessageId)
       const messageData: Record<string, unknown> = {
         type: 'chat',
         message,
         client_message_id: clientMessageId,
+        ...(reportedTimezone ? { context: { timezone: reportedTimezone } } : {}),
         ...(connection.chatTaskIdMode === "required" ? { task_id: currentTaskId } : {}),
       }
 
@@ -1283,6 +1344,9 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
         ) {
           clearTimeout(pending.timeout)
           pendingDeliveriesRef.current.delete(clientMessageId)
+          // Nothing reached the server, so a same-id retry may re-resolve the
+          // zone freely; drop the binding rather than leak it.
+          attemptTimezonesRef.current.delete(clientMessageId)
           pending.reject(deliveryError(
             error instanceof Error ? error.message : String(error),
             "not_sent",
@@ -1313,6 +1377,15 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
 
       return delivery
     } catch (error) {
+      // Pre-send failures never reached the server; free the attempt binding so
+      // abandoned drafts do not accumulate. An outcome-unknown send cannot land
+      // here (it settles through the delivery promise), so retryable bindings
+      // are untouched.
+      const disposition =
+        error instanceof MessageDeliveryError ? error.disposition : "not_sent"
+      if (disposition !== "outcome_unknown") {
+        attemptTimezonesRef.current.delete(clientMessageId)
+      }
       if (error instanceof MessageDeliveryError) throw error
       throw deliveryError(
         error instanceof Error ? error.message : String(error),

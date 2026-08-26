@@ -62,6 +62,7 @@ from xagent.web.services.task_command_transport import COMMAND_ID_PATTERN
 from xagent.web.services.task_interaction_service import (
     materialize_compatibility_view,
     parse_v1_request_payload,
+    validate_v1_write_payload,
 )
 from xagent.web.services.task_interaction_staging import (
     InteractionAnchor,
@@ -360,6 +361,75 @@ def test_cross_run_anchor_mismatch_still_resolves_as_publishable() -> None:
 # ---------------------------------------------------------------------------
 # Payload construction and parsing
 # ---------------------------------------------------------------------------
+
+
+# This builder and task_interaction_service's write-side rules are two
+# halves of one contract with no shared type to enforce it: everything this
+# builder produces is offered to the write path, so a payload it can build
+# that those rules reject is a clarification that can never be published.
+# The rows below are the shapes it actually produces, fed through the real
+# parser and the real rules rather than through a hand-written mirror.
+@pytest.mark.parametrize(
+    "make_draft",
+    [
+        pytest.param(
+            lambda: _draft(),
+            id="send_message_draft_carries_no_interactions",
+        ),
+        pytest.param(
+            lambda: _draft(
+                source="ask_user_question",
+                interactions=(
+                    {
+                        "type": "select_one",
+                        "field": "colour",
+                        "label": "Colour",
+                        "options": [{"label": "Red", "value": "red"}],
+                    },
+                    {"type": "text_input", "field": "why", "label": "Why?"},
+                ),
+            ),
+            id="ask_user_question_draft_carries_a_form",
+        ),
+        pytest.param(
+            lambda: _draft(
+                source="ask_user_question",
+                interactions=tuple(
+                    {
+                        "type": "text_input",
+                        "field": f"field_{index}",
+                        "label": "x" * 512,
+                    }
+                    for index in range(400)
+                ),
+            ),
+            id="oversized_form_is_dropped_to_an_empty_list",
+        ),
+    ],
+)
+def test_the_clarification_payload_builder_satisfies_the_write_side_rules(
+    make_draft: Any,
+) -> None:
+    payload = build_clarification_payload(make_draft())
+    validate_v1_write_payload(parse_v1_request_payload(payload))
+
+
+def test_an_oversized_clarification_form_really_is_dropped_to_an_empty_list() -> None:
+    """The row above named "oversized" only proves something if the builder
+    actually took its drop branch. Pin that here rather than trusting the
+    row's id."""
+
+    payload = build_clarification_payload(
+        _draft(
+            source="ask_user_question",
+            interactions=tuple(
+                {"type": "text_input", "field": f"field_{index}", "label": "x" * 512}
+                for index in range(400)
+            ),
+        )
+    )
+    assert payload["interactions"] == []
+    assert payload["interactions_dropped"] is True
 
 
 def test_payload_round_trip_matches_the_legacy_reader_shape_for_a_send_message_draft(

@@ -20,18 +20,18 @@ logger = logging.getLogger(__name__)
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 _DEEPSEEK_FUNCTION_PREFIX_ERROR = "function call should not be used with prefix"
 
-# OpenAILLM.chat/vision_chat normally convert every openai.BadRequestError
-# into a RuntimeError before returning. Their response_format pop-and-retry
-# path is an exception, though: it re-issues the request from inside its own
-# ``except openai.BadRequestError`` block, and if that retried call also fails
-# with a BadRequestError, nothing wraps the second failure -- it escapes as a
-# bare SDK exception. (stream_chat is not affected: its resend sits in a
-# nested try, so the outer handler still wraps a second failure; the streaming
-# loop catches the tuple for symmetry and defense.) openai.BadRequestError's
-# MRO does not include RuntimeError, so the compat retry loops below must
-# catch both explicitly to keep covering that case. The historical
-# implementation caught bare ``Exception`` here; this tuple is the precise,
-# intentionally narrowed replacement.
+# OpenAILLM.chat/vision_chat/stream_chat convert every openai.BadRequestError
+# into a RuntimeError before returning, including the response_format
+# pop-and-retry resend (its second failure is re-raised inside the outer
+# try and wrapped like any other provider failure). openai.BadRequestError
+# stays in this tuple as defense in depth: its MRO does not include
+# RuntimeError, so if any base-client path ever leaks the bare SDK
+# exception again, the compat retry loops below keep covering it instead
+# of letting the call hard-fail. The historical implementation caught bare
+# ``Exception`` here; this tuple is the precise, intentionally narrowed
+# replacement.
+# No production path currently produces a bare ``openai.BadRequestError``
+# here; the only coverage is a stub test that patches an internal method.
 _COMPAT_RETRYABLE_ERRORS = (RuntimeError, openai.BadRequestError)
 
 # Pinning to these provider slugs via `only` + `allow_fallbacks: False` routes
@@ -503,13 +503,12 @@ class OpenRouterLLM(OpenAILLM):
         adjustment opportunity. A single ``call`` invocation may itself issue
         one additional upstream request through the response_format
         pop-and-retry path shared by ``OpenAILLM.chat`` and ``vision_chat``,
-        but the two behave differently on a successful resend: ``chat``'s
-        branch returns the processed result of the resent call, or lets that
-        second call's failure propagate uncaught; ``vision_chat``'s
-        same-named branch does neither on a successful resend -- it falls
-        out of the ``except`` block with no ``return`` statement, so the
-        call implicitly yields ``None`` instead of the resent response
-        (tracked by #1650). No caller in this repository currently passes
+        and the two behave identically: a successful resend flows through
+        the method's normal response processing and is returned, while a
+        resend that fails again is wrapped into ``RuntimeError`` by the
+        outer handler like every other failure path, so no bare
+        ``openai.BadRequestError`` reaches this loop from either
+        entrypoint. No caller in this repository currently passes
         ``response_format`` into ``chat``; the one caller that does supply
         it in this repository (``vision_tool.py``) calls ``vision_chat``.
 

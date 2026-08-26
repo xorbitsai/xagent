@@ -18,6 +18,7 @@ from starlette.types import ASGIApp, Receive, Scope, Send
 from ..config import (
     get_agent_runtime,
     get_background_job_sweep_interval_seconds,
+    get_external_upload_dirs,
     get_file_storage_startup_sync_enabled,
     get_gmail_watch_enabled,
     get_gmail_watch_renewal_interval_seconds,
@@ -148,6 +149,10 @@ def _startup_phase(name: str) -> Iterator[None]:
 # Ensure web, uploads directory exists before configuring static files
 uploads_dir = get_uploads_dir()
 uploads_dir.mkdir(parents=True, exist_ok=True)
+# Validate deployment-owned external roots independently of whether a sandbox
+# backend is enabled or supports runtime-spec readiness. Otherwise an ambiguous
+# path can pass health checks and fail only when the first task reads it.
+get_external_upload_dirs()
 
 
 # FastAPI app creation here

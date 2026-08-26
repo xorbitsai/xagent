@@ -4,7 +4,7 @@ import os
 from datetime import timedelta
 from pathlib import Path
 from types import ModuleType
-from typing import Any, Dict, NamedTuple, Optional, Tuple, cast
+from typing import Any, Dict, NamedTuple, NoReturn, Optional, Tuple, cast
 from urllib.parse import quote
 from uuid import uuid4
 
@@ -37,7 +37,7 @@ from ...config import (
     get_uploads_dir,
 )
 from ...core.execution_scope import resolve_execution_scope
-from ...core.file_storage import get_user_file_storage
+from ...core.file_storage import get_user_file_storage, normalize_storage_key
 from ...core.tools.adapters.vibe.file_tool import read_file
 from ...core.tools.core.file_analysis import collect_pptx_slide_blocks
 from ...core.utils.svg import rasterize_svg_bytes
@@ -70,11 +70,13 @@ from ..services.db_runtime import (
 from ..services.kb_file_service import aggregate_uploaded_file_statuses
 from ..services.managed_file_ref import (
     FILE_INTEGRITY_REUPLOAD_MESSAGE,
+    NAMESPACE_AUTHORITY_ERRORS,
     DurableObjectIntegrityError,
     DurableObjectMissingError,
     DurableStorageOperationError,
     ManagedFileRef,
     guess_media_type,
+    log_durable_storage_fault,
 )
 from ..services.uploaded_file_store import (
     LocalUploadRegistration,
@@ -113,11 +115,33 @@ logger = logging.getLogger(__name__)
 file_router = APIRouter(prefix="/api/files", tags=["files"])
 
 
-def _durable_storage_unavailable() -> HTTPException:
-    return HTTPException(
+def _raise_durable_storage_unavailable(
+    exc: Exception, operation: str, **fields: object
+) -> NoReturn:
+    """Log the durable-storage fault, then raise the retryable 503.
+
+    ``NoReturn`` rather than a factory returning the exception: logging and
+    raising are one step, so the type forbids a caller that logs without
+    raising (a phantom fault in the log) or raises without logging (the cause
+    lost, which is the bug #1467 was filed for). The 503 body is deliberately
+    detail-free, which is what makes the log the only record.
+
+    The 503 body carries no detail from ``exc``. The storage key rides on the
+    exception's ``storage_key`` attribute rather than its message (#1643), so
+    the log line renders it as a field while ``str(exc)`` stays safe wherever
+    it escapes. Pass request identifiers as ``fields``, and keep ``operation``
+    a bounded label so it stays aggregatable.
+
+    ``exc`` is ``Exception``, not ``BaseException``, so mypy rejects a caller
+    that hands over an ``asyncio.CancelledError`` or ``KeyboardInterrupt``:
+    a cancelled request has not shown the object store to be unwell, and 503
+    would tell the client to retry something deliberately stopped.
+    """
+    log_durable_storage_fault(logger, operation, exc, **fields)
+    raise HTTPException(
         status_code=503,
         detail="Durable storage is temporarily unavailable",
-    )
+    ) from exc
 
 
 def _file_integrity_failed() -> HTTPException:
@@ -305,7 +329,9 @@ def _durable_redirect_response(
     except DurableObjectIntegrityError as exc:
         raise _file_integrity_failed() from exc
     except DurableStorageOperationError as exc:
-        raise _durable_storage_unavailable() from exc
+        _raise_durable_storage_unavailable(
+            exc, "signed durable redirect", file_id=file_ref.record.file_id
+        )
 
     if not signed_url:
         return None
@@ -588,15 +614,13 @@ async def store_uploaded_files(
             )
         completed = True
     except DurableStorageOperationError as exc:
-        # The wrap carries the key on the exception rather than in its message
-        # (see DurableStorageOperationError), so render it explicitly -- this
-        # line is what operators grep during an outage and must not lose it.
-        logger.warning(
-            "Durable storage unavailable during upload: %s; storage_key=%s",
-            exc,
-            exc.storage_key,
+        # No single ``file_id``: this is a batch registration, and any of the
+        # files in it may be the one that failed. Tenant and task still
+        # correlate a 503 burst to who and what was affected, which is the
+        # question asked first during an outage.
+        _raise_durable_storage_unavailable(
+            exc, "upload", user_id=user_id, task_id=parsed_task_id
         )
-        raise _durable_storage_unavailable() from exc
     finally:
         if not completed:
 
@@ -626,6 +650,21 @@ async def store_uploaded_files(
                 await drain_async_task_cancellation_safe(cleanup_task)
             except asyncio.CancelledError:
                 raise
+            except DurableStorageOperationError as exc:
+                # The double fault: the upload already failed against durable
+                # storage, and compensating against the same backend failed
+                # too -- the shape of the incident this reporting exists for.
+                # The generic arm below would log it, but without the fields
+                # that let a burst be aggregated, so it is named here instead.
+                # It stays swallowed: best-effort cleanup inside the
+                # ``finally`` of a request that is already failing.
+                log_durable_storage_fault(
+                    logger,
+                    "upload compensation",
+                    exc,
+                    user_id=user_id,
+                    task_id=parsed_task_id,
+                )
             except Exception:
                 logger.exception("Failed to compensate cancelled/failed upload")
 
@@ -1467,7 +1506,7 @@ async def download_file(
                     },
                 )
             except DurableStorageOperationError as exc:
-                raise _durable_storage_unavailable() from exc
+                _raise_durable_storage_unavailable(exc, "download", file_id=file_id)
     else:
         # For legacy files without records, check ownership
         if owner_user_id != _user_id_value(user) and not _is_admin_user(user):
@@ -1776,7 +1815,7 @@ async def preview_file(
             except DurableObjectIntegrityError as exc:
                 raise _file_integrity_failed() from exc
             except DurableStorageOperationError as exc:
-                raise _durable_storage_unavailable() from exc
+                _raise_durable_storage_unavailable(exc, "preview", file_id=file_id)
             except DurableObjectMissingError:
                 materialized_path = file_ref.local_path
                 _ensure_under_uploads(materialized_path, owner_user_id)
@@ -1865,7 +1904,7 @@ async def preview_pptx_as_pdf(
             except DurableObjectIntegrityError as exc:
                 raise _file_integrity_failed() from exc
             except DurableStorageOperationError as exc:
-                raise _durable_storage_unavailable() from exc
+                _raise_durable_storage_unavailable(exc, "pptx preview", file_id=file_id)
             except DurableObjectMissingError:
                 # Durable record points at nothing; fall back to whatever
                 # is on disk (or 404 below if it's gone too).
@@ -1957,7 +1996,9 @@ async def public_download_file(
             except DurableObjectIntegrityError as exc:
                 raise _file_integrity_failed() from exc
             except DurableStorageOperationError as exc:
-                raise _durable_storage_unavailable() from exc
+                _raise_durable_storage_unavailable(
+                    exc, "public download", file_id=file_id
+                )
             except DurableObjectMissingError:
                 target_path = file_ref.local_path
         else:
@@ -2023,7 +2064,9 @@ async def public_preview_file(
             except DurableObjectIntegrityError as exc:
                 raise _file_integrity_failed() from exc
             except DurableStorageOperationError as exc:
-                raise _durable_storage_unavailable() from exc
+                _raise_durable_storage_unavailable(
+                    exc, "public preview", file_id=file_id
+                )
             except DurableObjectMissingError:
                 target_path = file_ref.local_path
                 _ensure_under_uploads(target_path, owner_user_id)
@@ -2067,7 +2110,16 @@ async def public_preview_file(
             except DurableObjectIntegrityError as exc:
                 raise _file_integrity_failed() from exc
             except DurableStorageOperationError as exc:
-                raise _durable_storage_unavailable() from exc
+                # ``asset_record`` is a different row from the route's
+                # ``file_id``: the base record is the document, this is the
+                # preview asset registered under it, and it is the asset's
+                # restore that failed. Logging the route parameter here named an
+                # object that is fine.
+                _raise_durable_storage_unavailable(
+                    exc,
+                    "public preview task asset",
+                    file_id=asset_record.file_id,
+                )
             except DurableObjectMissingError:
                 target_path = asset_ref.local_path
             _ensure_under_uploads(target_path, owner_user_id)
@@ -2132,16 +2184,30 @@ async def delete_file(
         storage_key = str(file_record.storage_key or "")
         storage_status = str(file_record.storage_status or "")
         if storage_key and storage_status == "available":
+            # Validate the persisted key *before* the try. A malformed one
+            # (null byte, empty, ``.``/``..`` segment -- rejected even in
+            # tolerant mode) is permanent, and no retry clears it, which is
+            # the half of #1473 about ``ValueError``. Doing it here rather
+            # than catching ``ValueError`` around the call is what keeps a
+            # *backend* ``ValueError`` -- ``fs.exists``/``fs.rm`` raise it
+            # too -- on the retryable path below where it belongs.
+            normalize_storage_key(storage_key, strict=False)
             try:
                 get_user_file_storage(_file_user_id_value(file_record)).delete(
                     storage_key
                 )
+            except NAMESPACE_AUTHORITY_ERRORS:
+                # A containment violation is permanent too, and has its own
+                # handler in web/app.py -- consistent with every other site in
+                # this file.
+                raise
             except Exception as exc:
-                logger.warning(
-                    "Failed to clean up durable file before deleting row: %s",
-                    storage_key,
+                _raise_durable_storage_unavailable(
+                    exc,
+                    "durable cleanup before row delete",
+                    file_id=file_id,
+                    storage_key=storage_key,
                 )
-                raise _durable_storage_unavailable() from exc
 
         db.delete(file_record)
         db.commit()

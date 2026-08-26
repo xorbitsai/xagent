@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import replace
+from datetime import datetime, timezone
 
 import pytest
 
@@ -20,6 +21,7 @@ from xagent.core.agent.context.enrichment import (
     _lookup_relevant_memories_with_context,
     enrich_context_with_memory,
 )
+from xagent.core.agent.context.execution import CLOCK_TIMEZONE_METADATA_KEY
 from xagent.core.agent.language import (
     OUTPUT_LANGUAGE_METADATA_KEY,
     detect_prose_script_mismatch,
@@ -1712,3 +1714,94 @@ def test_system_context_renders_memory_persistence_guidance() -> None:
     assert "Memory persistence:" in with_flag
     assert "store_memory" in with_flag
     assert "update_memory" in with_flag
+
+
+def _clock_context(timezone_name: str | None) -> ExecutionContext:
+    """Context frozen at the ShiftCare incident instant: 2026-08-24 22:03:37 UTC
+    was already 2026-08-25 in Melbourne."""
+    context = ExecutionContext(
+        created_at=datetime(2026, 8, 24, 22, 3, 37, tzinfo=timezone.utc)
+    )
+    if timezone_name is not None:
+        context.metadata[CLOCK_TIMEZONE_METADATA_KEY] = timezone_name
+    context.add_user_message("how many shifts do we have on tomorrow?")
+    return context
+
+
+UTC_ONLY_CLOCK_LINE = (
+    "Current date and time: 2026-08-24 22:03:37 UTC. Use this as the reference "
+    "for relative dates such as today, recent, latest, yesterday, and tomorrow."
+)
+
+
+def test_clock_line_is_byte_identical_to_utc_wording_without_a_timezone() -> None:
+    assert _clock_context(None)._current_time_context() == UTC_ONLY_CLOCK_LINE
+
+
+def test_clock_line_leads_with_local_date_for_a_caller_timezone() -> None:
+    line = _clock_context("Australia/Melbourne")._current_time_context()
+
+    assert line.startswith(
+        "Current date and time: 2026-08-25 08:03:37 "
+        "(Australia/Melbourne, UTC+10:00), which is 2026-08-24 22:03:37 UTC."
+    )
+    # The wrong answer in production came from the model reading 08-24 as today.
+    assert not line.startswith("Current date and time: 2026-08-24")
+
+
+def test_clock_line_renders_a_half_hour_offset() -> None:
+    assert "(Asia/Kolkata, UTC+05:30)" in (
+        _clock_context("Asia/Kolkata")._current_time_context()
+    )
+
+
+def test_clock_line_follows_daylight_saving_for_the_same_zone() -> None:
+    winter = _clock_context("Australia/Melbourne")._current_time_context()
+    summer = ExecutionContext(
+        created_at=datetime(2026, 12, 24, 22, 3, 37, tzinfo=timezone.utc),
+        metadata={CLOCK_TIMEZONE_METADATA_KEY: "Australia/Melbourne"},
+    )._current_time_context()
+
+    assert "UTC+10:00" in winter
+    assert "UTC+11:00" in summer
+    assert "2026-12-25 09:03:37" in summer
+
+
+def test_clock_line_renders_a_negative_offset() -> None:
+    assert "(America/New_York, UTC-04:00)" in (
+        _clock_context("America/New_York")._current_time_context()
+    )
+
+
+@pytest.mark.parametrize(
+    "supplied",
+    [
+        "Not/AZone",
+        "",
+        "   ",
+        "Australia/Melbourne\x00",
+        42,
+        None,
+        "A" * 5000,
+        "../../../etc/passwd",
+        "/etc/passwd",
+        "Australia/../../etc/hosts",
+    ],
+)
+def test_unusable_timezone_degrades_to_utc_wording(supplied: object) -> None:
+    context = _clock_context(None)
+    context.metadata[CLOCK_TIMEZONE_METADATA_KEY] = supplied
+
+    assert context.clock_zone() is None
+    assert context._current_time_context() == UTC_ONLY_CLOCK_LINE
+
+
+def test_clock_timezone_survives_serialization_and_child_contexts() -> None:
+    context = _clock_context("Australia/Melbourne")
+
+    restored = ExecutionContext.from_dict(context.to_dict())
+    assert restored.clock_zone() is not None
+    assert restored.clock_zone().key == "Australia/Melbourne"
+
+    child = context.create_child_context(task="sub-task")
+    assert child.clock_zone().key == "Australia/Melbourne"

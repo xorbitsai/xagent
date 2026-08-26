@@ -151,6 +151,7 @@ from ..services.task_execution_controller import (
     task_execution_controller,
 )
 from ..services.task_interaction_close import (
+    active_interaction_id_sync,
     clear_interaction_marker_if_unpaired,
     close_legacy_resume_interaction_sync,
 )
@@ -3387,11 +3388,21 @@ async def execute_resume_background(
             # apply inside a nested closure.
             assert lease.run_id is not None
             close_run_id = lease.run_id
+            # Read by the online handler before this message was injected,
+            # and carried here rather than read now for the opposite reason
+            # to the one it looks like: the injection is not still to come,
+            # it is the post_user_message call above and has already
+            # committed by this line. Injecting is what resumes the agent,
+            # so a read here could name a question the resumed agent has
+            # staged since, not the one the message answered. Bound to a
+            # plain local before the lambda below, like close_run_id above.
+            close_interaction_id = pending_user_message.get("interaction_id")
             try:
                 await run_db_io_cancellation_safe(
                     lambda: close_legacy_resume_interaction_sync(
-                        task_id,
-                        close_run_id,
+                        task_id=task_id,
+                        run_id=close_run_id,
+                        interaction_id=close_interaction_id,
                     )
                 )
             except Exception:
@@ -6156,6 +6167,18 @@ async def _handle_chat_message_unserialized(
                         return
                     delivery_claimed = True
 
+                    # Read before the injection below and before the posted
+                    # fork, so both branches carry the same observation --
+                    # see task_interaction_close's module docstring for why
+                    # it has to precede the injection. The two branches are
+                    # mutually exclusive: posted true closes below with this
+                    # local, posted false hands the same value to
+                    # execute_resume_background through pending_user_message,
+                    # so one observation only ever serves one close.
+                    active_interaction_id = await run_db_io_cancellation_safe(
+                        lambda: active_interaction_id_sync(task_id)
+                    )
+
                     posted = False
                     if live_task_lease is not None:
                         with bind_task_lease_context(live_task_lease):
@@ -6228,6 +6251,12 @@ async def _handle_chat_message_unserialized(
                                     "display_message": display_user_message,
                                     "files": display_file_refs,
                                     "turn_id": turn_id,
+                                    # The pre-injection observation, carried
+                                    # rather than re-read: the deferred path
+                                    # injects later still, so a read there
+                                    # would be even further past the point
+                                    # where the answered row is identifiable.
+                                    "interaction_id": active_interaction_id,
                                 }
                             ),
                             delivery_turn_id=turn_id,
@@ -6266,17 +6295,46 @@ async def _handle_chat_message_unserialized(
                                 turn_id,
                                 exc_info=True,
                             )
-                        # `posted` is true, meaning a message with this
-                        # turn id is in a live checkpoint -- written by this
-                        # call, or already present from an earlier attempt
-                        # with the same turn id, which short-circuits without
-                        # persisting anything new (see
-                        # AgentRunner.inject_user_message) -- instead of
-                        # going through the native interaction
-                        # protocol's answer path, so any question this run
-                        # had open under that protocol is answered by other
-                        # means now. Retire it and clear the task's
-                        # marker in the same short transaction. The run fence
+                        # `posted` is true, meaning a message with this turn
+                        # id is in a live checkpoint. Retire the interaction
+                        # row observed before the injection and clear the
+                        # task's marker in the same short transaction: the
+                        # message went in outside the native interaction
+                        # protocol's answer path, so a question this run had
+                        # open under that protocol was answered by other
+                        # means.
+                        #
+                        # That reading holds for a first attempt and not for
+                        # a replay, and `posted` cannot tell the two apart.
+                        # AgentRunner.inject_user_message short-circuits a
+                        # repeated turn id by returning the existing context
+                        # without persisting anything, which reaches here as
+                        # the same `True`. On a replay the id read just above
+                        # is not the question the replayed message answered
+                        # -- that one was retired by the first attempt -- but
+                        # whatever the resumed agent has asked since, and
+                        # retiring it discards a live question nobody
+                        # answered. This close call is live production code --
+                        # it runs on every websocket chat message that
+                        # reaches a running task -- so what makes the window
+                        # harmless today is not that the code is dormant. It
+                        # is that there is nothing for it to retire: the only
+                        # INSERT into task_interaction_requests is
+                        # stage_interaction_request
+                        # (task_interaction_staging.py), which has no caller
+                        # in src/ and is held at none by
+                        # tests/web/services/test_interaction_staging_production_gate.py.
+                        # The pre-injection read therefore returns None on
+                        # every call, and the close matches zero rows. The
+                        # change that wires the first production writer has
+                        # to close this window before that writer ships:
+                        # the runner has to report whether it persisted a
+                        # new message or replayed an existing turn, and this
+                        # site has to skip the close on the replay answer.
+                        # The A2A injection site (a2a.py) carries the same
+                        # window and the same precondition.
+                        #
+                        # The run fence
                         # is live_task_lease.run_id, not task_run_id: posted
                         # being true only happens by way of the
                         # live_task_lease is not None branch above, which is
@@ -6288,11 +6346,13 @@ async def _handle_chat_message_unserialized(
                         assert live_task_lease is not None
                         assert live_task_lease.run_id is not None
                         close_run_id = live_task_lease.run_id
+                        close_interaction_id = active_interaction_id
                         try:
                             await run_db_io_cancellation_safe(
                                 lambda: close_legacy_resume_interaction_sync(
-                                    task_id,
-                                    close_run_id,
+                                    task_id=task_id,
+                                    run_id=close_run_id,
+                                    interaction_id=close_interaction_id,
                                 )
                             )
                         except Exception:
@@ -7975,93 +8035,6 @@ async def handle_resume_task(
     )
 
 
-def _active_native_interaction_id_sync(task_id: int) -> int | None:
-    """The id of this task's active native interaction row, scoped to the
-    task's current run, or ``None`` if there is none.
-
-    Uses the identical four-field predicate
-    (``task_interaction_service._active_native_row_criteria``) every reader
-    of "this task's one live row" keys off: status, active_slot, and a join
-    against ``Task.run_id``. That predicate has three call sites in this
-    tree -- ``task_interaction_service``'s own ``list_active`` and
-    ``_active_native_row`` (the latter is how
-    ``materialize_compatibility_view`` reads the row), plus this seam. The
-    answer fence is a fourth, future caller: it does not exist here yet and
-    lands with ``respond()``. All of them must keep changing together, or
-    the read surface, this resume seam, and the fence once it arrives would
-    disagree about which row -- if any -- is "the" live one for a given
-    task. An active row anchored to a run the task has since moved past is
-    invisible here for the same reason it is invisible to the other
-    readers: ``_reclaim_stale_slot_stmt``
-    (``task_interaction_staging.py``) recycles it on the next question, so
-    it carries no obligation for this seam either.
-
-    Gated on ``interaction_requests_table_exists`` for the same reason
-    ``materialize_compatibility_view`` gates on it: a deployment can run
-    this code before the migration that creates
-    ``task_interaction_requests`` has been applied, and this seam must
-    survive that window rather than raising.
-
-    Uses ``get_optional_session_local`` rather than ``get_session_local``,
-    and wraps the read in a broad ``except Exception`` -- the same
-    fail-open shape ``_resolve_read_direction_anchor``
-    (``task_interaction_service.py``) already uses for its own read against
-    this same kind of infrastructure. Every production entry point into
-    this handler runs after ``configure_db()``/``init_db()`` against one
-    database for the life of the process, so neither branch is expected to
-    ever fire there. Both exist for this handler's test callers, which
-    mock the rest of the resume path precisely to avoid needing a database
-    at all, and which do not each get an isolated process: a session
-    factory some other test left installed as the process-global default
-    can point at a since-removed temporary database file by the time an
-    unrelated test reaches this call. Either way, "cannot determine
-    whether there is an active row" is treated as "assume there is not" --
-    refusing every resume because this one read failed would be a worse
-    failure mode than the one legacy-resume window this seam closes.
-    """
-
-    from ..models.database import get_optional_session_local
-    from ..models.task import Task
-    from ..models.task_interaction import TaskInteractionRequest
-    from ..services.task_interaction_schema import interaction_requests_table_exists
-    from ..services.task_interaction_service import _active_native_row_criteria
-
-    SessionLocal = get_optional_session_local()
-    if SessionLocal is None:
-        return None
-    try:
-        db = SessionLocal()
-    except Exception:
-        logger.warning(
-            "resume interaction seam: could not open a session for task_id=%s",
-            task_id,
-            exc_info=True,
-        )
-        return None
-    try:
-        if not interaction_requests_table_exists(db):
-            return None
-        row = (
-            db.query(TaskInteractionRequest.id)
-            .join(Task, Task.id == TaskInteractionRequest.task_id)
-            .filter(
-                TaskInteractionRequest.task_id == task_id,
-                *_active_native_row_criteria(),
-            )
-            .first()
-        )
-        return int(row[0]) if row is not None else None
-    except Exception:
-        logger.warning(
-            "resume interaction seam: active-row lookup failed for task_id=%s",
-            task_id,
-            exc_info=True,
-        )
-        return None
-    finally:
-        db.close()
-
-
 async def _handle_resume_task_unserialized(
     websocket: WebSocket, task_id: int, message_data: dict
 ) -> None:
@@ -8152,7 +8125,12 @@ async def _handle_resume_task_unserialized(
         # continuation respond() staged, refuse rather than let either path
         # append to or replan around an unanswered question. This runs
         # before agent_service is built (below) so a refused request never
-        # pays for constructing one.
+        # pays for constructing one. Gated on tasks.interaction_protocol_
+        # version first, though: under a NULL marker the read below returns
+        # None regardless of whether an active row exists, so this refusal
+        # never fires for that state -- deliberately, matching what the
+        # read surface would show for the same task (see
+        # active_interaction_id_sync's own docstring).
         #
         # Residual window, named here rather than closed here: this lookup
         # opens and closes its own session, and no lock spans it and either
@@ -8160,8 +8138,12 @@ async def _handle_resume_task_unserialized(
         # between this read and the transition. Nothing can drive that
         # change until respond()'s finalizer exists, and that finalizer --
         # not this seam -- is what must own the window when it lands.
+        #
+        # The read itself is task_interaction_close.active_interaction_id_sync
+        # -- the same reader the three legacy-resume injection sites use, so
+        # this gate and the close cannot disagree about which row is live.
         active_interaction_id = await run_db_io_cancellation_safe(
-            lambda: _active_native_interaction_id_sync(task_id)
+            lambda: active_interaction_id_sync(task_id)
         )
         if active_interaction_id is not None:
             receipt_interaction_id = message_data.get("interaction_id")
@@ -8640,6 +8622,7 @@ async def handle_builder_chat(
     from ...core.memory.in_memory import InMemoryMemoryStore
     from ...skills.utils import create_skill_manager
     from ..services.builder_chat_runtime import load_builder_chat_runtime_inputs
+    from .agents import apply_user_voice, voice_from_runtime_user
 
     user_id = int(user.id)
     is_admin = bool(user.is_admin)
@@ -8723,7 +8706,9 @@ async def handle_builder_chat(
 
         # Build system prompt with runtime state only. The behavioral workflow comes
         # from the forced agent-builder skill context below.
-        system_prompt = f"""You are the runtime wrapper for the Xagent builder chat.
+        system_prompt: Optional[
+            str
+        ] = f"""You are the runtime wrapper for the Xagent builder chat.
 Follow the selected `agent-builder` skill as the authoritative workflow.
 
 Current Agent Configuration:
@@ -8742,6 +8727,10 @@ Builder chat tools available in this runtime:
 Use native `ask_user_question` for structured user input. Do not ask required
 clarification questions as plain assistant text.
 """
+        # apply_user_voice's own scoping caveat covers create_agent/
+        # update_agent's persisted name/description/instructions here -
+        # see apply_output_voice's docstring.
+        system_prompt = apply_user_voice(system_prompt, voice_from_runtime_user(user))
 
         async def send_builder_outbound_message(payload: Dict[str, Any]) -> None:
             """Bridge agent agent-to-user messages to the builder chat socket."""

@@ -10,7 +10,7 @@ import os
 import re
 import secrets
 from datetime import datetime, timedelta, timezone
-from typing import Annotated, Any, Dict, Literal, Optional, cast
+from typing import Annotated, Any, Dict, List, Literal, Optional, cast
 
 import requests
 
@@ -20,11 +20,21 @@ os.environ["OAUTHLIB_RELAX_TOKEN_SCOPE"] = "1"
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from fastapi.responses import HTMLResponse, RedirectResponse
 from jose import JWTError, jwt
-from pydantic import BaseModel, Field, StrictInt, StrictStr, field_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    StrictBool,
+    StrictInt,
+    StrictStr,
+    field_validator,
+)
+from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from ...config import get_app_base_url, get_password_reset_expire_minutes
+from ...core.agent.voice_policy import VALID_VOICES as _CORE_VALID_VOICES
 from ..auth_config import (
     ACCESS_TOKEN_EXPIRE_MINUTES,
     JWT_ALGORITHM,
@@ -33,13 +43,14 @@ from ..auth_config import (
     REFRESH_TOKEN_EXPIRE_DAYS,
 )
 from ..auth_dependencies import get_current_user
-from ..models.database import get_db
+from ..models.database import get_db, get_session_local, release_db_connection_if_clean
 from ..models.system_setting import SystemSetting
 from ..models.user import User
 from ..models.user_oauth import UserOAuth
 from ..oauth_provider_quirks import requires_json_accept_header
 from ..services import gmail_provisioning
 from ..services.auth_email import send_password_reset_email
+from ..services.db_runtime import await_task_settlement, propagate_deferred_cancellation
 from ..services.user_oauth import delete_scoped_user_oauth_accounts
 from ..utils.graphql_errors import graphql_errors_message, truncate_error_text
 
@@ -646,6 +657,88 @@ class UpdateEmailResponse(BaseModel):
     user: Optional[Dict[str, Any]] = None
 
 
+# The 5 voice options the onboarding "Launch" step offers - each agent's
+# system prompt gets a short instruction derived from whichever one the
+# user picked (see apply_user_voice in api/agents.py). Re-exported from
+# core.agent.voice_policy (the canonical source, not redeclared here) so
+# this and _VOICE_INSTRUCTIONS there can never drift into two
+# independently-maintained copies of the same 5-string set.
+VALID_USER_VOICES = _CORE_VALID_VOICES
+
+# Onboarding's "About you"/"Goals" steps are short free-text labels and a
+# handful of goal picks, not open-ended documents - these mirror the
+# max_length this codebase already puts on comparably-scoped free-text
+# fields (e.g. agents.py's/custom_api.py's name/description Fields).
+# Without a bound, the full preferences JSON is replayed through every
+# login/`/me`/email-update/token-validation/PATCH response, so an
+# unbounded field lets a user inflate all of those response bodies.
+PREFERENCES_TEXT_FIELD_MAX_LENGTH = 200
+PREFERENCES_GOALS_MAX_ITEMS = 20
+
+
+class UpdatePreferencesRequest(BaseModel):
+    """Partial update for the current user's onboarding/voice preferences.
+    Only fields actually present in the request body are merged into the
+    stored dict (see exclude_unset=True below) - onboarding writes these
+    incrementally, one step at a time, not all at once."""
+
+    # Pydantic's default (extra="ignore") would validate a typo'd key
+    # (e.g. "voce") to an empty, all-unset model: model_dump(exclude_unset=True)
+    # then returns {}, so the PATCH silently skips persistence and cache
+    # invalidation while still reporting success - forbid so a typo/unknown
+    # key is a 422, not a lost write the client believes succeeded.
+    model_config = ConfigDict(extra="forbid")
+
+    onboarded: Optional[StrictBool] = None
+    department: Optional[str] = Field(
+        default=None, max_length=PREFERENCES_TEXT_FIELD_MAX_LENGTH
+    )
+    industry: Optional[str] = Field(
+        default=None, max_length=PREFERENCES_TEXT_FIELD_MAX_LENGTH
+    )
+    voice: Optional[str] = None
+    goals: Optional[
+        List[Annotated[str, Field(max_length=PREFERENCES_TEXT_FIELD_MAX_LENGTH)]]
+    ] = Field(default=None, max_length=PREFERENCES_GOALS_MAX_ITEMS)
+
+    @field_validator("voice")
+    @classmethod
+    def _validate_voice(cls, value: Optional[str]) -> Optional[str]:
+        if value is not None and value not in VALID_USER_VOICES:
+            raise ValueError(f"voice must be one of {sorted(VALID_USER_VOICES)}")
+        return value
+
+    # A blank string is meaningless stored data, not a "clear this field"
+    # signal - a merge-style PATCH already has one for that (send `null`
+    # for the key, same as tokens_must_not_be_blank rejects a blank
+    # access/refresh token above rather than treating it as "no token").
+    @field_validator("department", "industry")
+    @classmethod
+    def _reject_blank_text(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return value
+        stripped = value.strip()
+        if not stripped:
+            raise ValueError("must not be blank")
+        return stripped
+
+    @field_validator("goals")
+    @classmethod
+    def _reject_blank_goals(cls, value: Optional[List[str]]) -> Optional[List[str]]:
+        if value is None:
+            return value
+        stripped_goals = [item.strip() for item in value]
+        if any(not item for item in stripped_goals):
+            raise ValueError("goal must not be blank")
+        return stripped_goals
+
+
+class UpdatePreferencesResponse(BaseModel):
+    success: bool
+    message: str
+    user: Optional[Dict[str, Any]] = None
+
+
 class RefreshTokenRequest(BaseModel):
     """Refresh token request model"""
 
@@ -937,12 +1030,24 @@ def validate_email_for_login_namespace(
     return None
 
 
+def _normalized_preferences(user: User) -> Dict[str, Any]:
+    """The user's stored preferences as a plain dict, tolerating a NULL or
+    malformed value. ``preferences`` has no nested-type constraint (same
+    reasoning as apply_output_voice's isinstance guard on the ``voice``
+    value it holds), so a corrupted/hand-edited row could store a non-dict
+    JSON value here - ``dict(value or {})`` would raise on any of those
+    instead of degrading to an empty dict."""
+    preferences = cast(Any, user.preferences)
+    return dict(preferences) if isinstance(preferences, dict) else {}
+
+
 def serialize_auth_user(user: User, include_login_time: bool = False) -> Dict[str, Any]:
     payload: Dict[str, Any] = {
         "id": user.id,
         "username": user.username,
         "email": user.email,
         "is_admin": bool(cast(Any, user.is_admin)),
+        "preferences": _normalized_preferences(user),
     }
     if include_login_time:
         payload["loginTime"] = datetime.now(timezone.utc).timestamp()
@@ -1298,6 +1403,199 @@ async def update_current_user_email(
         message="Email updated successfully",
         user=serialize_auth_user(user),
     )
+
+
+def _lock_user_row_for_preferences_update(db: Session, user_id: int) -> bool:
+    """Serialize concurrent preferences PATCHes for one user, in every
+    database - mirrors acquire_runtime_key_transition_fence's dual-dialect
+    pattern (services/api_keys.py). PostgreSQL/MySQL take a row-level
+    ``FOR UPDATE`` lock; SQLite ignores that clause, so a no-op write grabs
+    its write lock instead. Held until this transaction commits, so a
+    second concurrent PATCH's read-modify-write of the same JSON column
+    blocks here instead of reading stale data and silently dropping the
+    first request's disjoint fields on its own commit.
+
+    Returns ``False`` when the user no longer exists (deleted between the
+    caller resolving the id and this call), the same contract the
+    mirrored helper uses - letting the caller turn that into a clean 404
+    instead of an unhandled ``ObjectDeletedError`` from the subsequent
+    fetch."""
+    if db.get_bind().dialect.name == "sqlite":
+        db.execute(
+            text("UPDATE users SET id = id WHERE id = :user_id"),
+            {"user_id": user_id},
+        )
+        return db.query(User.id).filter(User.id == user_id).first() is not None
+    return (
+        db.query(User.id).filter(User.id == user_id).with_for_update().first()
+        is not None
+    )
+
+
+def _merge_user_preferences_locked(
+    user_id: int, updates: Dict[str, Any]
+) -> Dict[str, Any] | None:
+    """Entirely self-contained: opens and closes its own Session and never
+    touches a request-scoped `user`/`db`. This is required, not just
+    tidy: the lock wait this is built around is a real, potentially slow
+    blocking DB call under contention, so the endpoint runs this whole
+    operation through asyncio.to_thread and drains it via
+    await_task_settlement (the same primitive run_db_io_cancellation_safe
+    wraps, called directly here so the endpoint can still invalidate the
+    voice cache off a settled-but-cancelled result before that
+    cancellation propagates) - if the request is cancelled (client
+    disconnect, timeout) while this worker is mid-transaction, FastAPI
+    can tear down the request's own Session concurrently, and the
+    contract is exactly "operation must create/use/close its own Session
+    and return only detached data" so that race can't happen (see
+    db_runtime.py's docstring on it; this mirrors admin_users.py's
+    _delete_user_rows_sync).
+
+    Returns the serialized response payload (not the ORM object), built
+    BEFORE commit: Session.commit() defaults to expire_on_commit=True, so
+    any attribute access after commit would force a fresh SELECT - itself
+    a race, since the lock is released the instant commit() returns and a
+    concurrent delete could land in that gap. The preferences merge is
+    already reflected in the in-memory object the moment it's set, so
+    nothing here needs a post-commit read at all.
+
+    Returns ``None`` if the user no longer exists (deleted between the
+    caller resolving ``user_id`` and this call)."""
+    session_factory = get_session_local()
+    worker_db = session_factory()
+    try:
+        if not _lock_user_row_for_preferences_update(worker_db, user_id):
+            return None
+        # Loaded fresh, under the lock, in this operation's own session -
+        # not whatever `User` row the caller may have loaded earlier,
+        # which could be stale (a concurrent PATCH may have committed its
+        # own merge while this request was waiting on the lock).
+        worker_user = worker_db.get(User, user_id)
+        if worker_user is None:
+            return None
+        current_preferences = _normalized_preferences(worker_user)
+        for key, value in updates.items():
+            # An explicit `null` is this endpoint's only clear-a-field
+            # signal (see UpdatePreferencesRequest's blank-string
+            # rejection) - storing a literal `{key: None}` entry instead
+            # of deleting the key would have every future read replay a
+            # stale explicit-null forever. Note this doesn't apply to
+            # `goals: []`: an empty list is itself a valid value (not a
+            # clear signal) and is stored as-is, so `null` and `[]` are
+            # two different representations of "no goals" that can
+            # coexist - harmless today since nothing branches on the
+            # distinction, but worth knowing if that ever changes.
+            if value is None:
+                current_preferences.pop(key, None)
+            else:
+                current_preferences[key] = value
+        setattr(worker_user, "preferences", current_preferences)
+        payload = serialize_auth_user(worker_user)
+        worker_db.commit()
+        return payload
+    finally:
+        worker_db.close()
+
+
+@auth_router.patch("/me/preferences", response_model=UpdatePreferencesResponse)
+async def update_current_user_preferences(
+    request: UpdatePreferencesRequest,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> UpdatePreferencesResponse:
+    """Merge the given fields into the current user's stored preferences.
+    Each onboarding step (About you, Goals, Launch) calls this with only
+    its own fields - a merge, not a replace, so an earlier step's answer
+    survives a later step's PATCH."""
+    updates = request.model_dump(exclude_unset=True)
+    if not updates:
+        return UpdatePreferencesResponse(
+            success=True,
+            message="Preferences updated successfully",
+            user=serialize_auth_user(user),
+        )
+
+    # Read before releasing `db` below: Session.rollback() unconditionally
+    # expires every object loaded through that session, `user` included
+    # (unlike expire_on_commit, this isn't conditional on a session
+    # setting), so touching `user.id` after release would force an
+    # implicit reload - reacquiring the very connection just released,
+    # synchronously on the event loop, defeating the point of releasing
+    # it at all, and raising ObjectDeletedError outright if the row was
+    # deleted concurrently in the meantime.
+    user_id = int(user.id)
+
+    # `db` is declared only to release it here, not to do any work with it
+    # directly: FastAPI's per-request dependency caching means this is the
+    # same (read-only, since get_current_user only did a SELECT) session
+    # get_current_user already used, and _merge_user_preferences_locked
+    # is about to open a second, independent session and block on a real
+    # row lock - without this, that session would sit idle-in-transaction,
+    # holding a pool slot, for the whole lock wait (issue #889, same
+    # pattern already used before chat.py's sandbox startup and
+    # workforce_creator.py's ReAct builder call). A read-only session
+    # should always release cleanly; treating a failure as a hard error
+    # (mirroring workforce_creator.py's own release_db_connection_if_clean
+    # call) surfaces that as a signal instead of silently holding the
+    # connection through the lock wait anyway.
+    if not release_db_connection_if_clean(db):
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "code": "preferences_update_unavailable",
+                "message": "Could not release the database before updating preferences.",
+            },
+        )
+
+    # run_db_io_cancellation_safe's own contract discards a settled result
+    # in favor of re-raising the caller's deferred cancellation (see its
+    # docstring), which would otherwise skip the cache invalidation below
+    # entirely - the merge already committed by the time that cancellation
+    # is observed, so the cache must still be invalidated before this
+    # function lets that cancellation propagate. propagate_deferred_
+    # cancellation (the same helper task_command_transport.py's heartbeat
+    # settlement uses) makes that ordering safe even if invalidation
+    # itself raises, or 404s below: cancellation always wins over a
+    # later exception or return, never the reverse.
+    worker = asyncio.get_running_loop().create_task(
+        asyncio.to_thread(_merge_user_preferences_locked, user_id, updates)
+    )
+    serialized_user, cancellation = await await_task_settlement(worker)
+    with propagate_deferred_cancellation(cancellation):
+        if serialized_user is None:
+            raise HTTPException(status_code=404, detail="User not found")
+
+        if "voice" in updates:
+            # A cached AgentService bakes voice into its system prompt at
+            # construction time and won't re-check preferences on later
+            # turns (see invalidate_cached_agents_for_owner's docstring),
+            # so an already-warm task would otherwise keep speaking in the
+            # old (or now-cleared) voice until incidental eviction/rebuild.
+            #
+            # The merge above already committed - this is best-effort
+            # follow-up, not part of "did the write succeed." An
+            # unguarded raise here would turn a successful PATCH into a
+            # client-visible 500 for a write that already happened,
+            # mirroring the exact bug _run_post_commit_oauth_side_effects
+            # (issue #1150) exists to prevent; same fix, same reasoning.
+            from .chat import get_agent_manager
+
+            try:
+                await get_agent_manager().invalidate_cached_agents_for_owner(user_id)
+            except Exception:
+                logger.warning(
+                    "Voice cache invalidation failed for user %s after a "
+                    "successful preferences write; a warm task may keep "
+                    "speaking in the old voice until incidental eviction",
+                    user_id,
+                    exc_info=True,
+                )
+
+        return UpdatePreferencesResponse(
+            success=True,
+            message="Preferences updated successfully",
+            user=serialized_user,
+        )
 
 
 @auth_router.post("/refresh", response_model=RefreshTokenResponse)

@@ -357,6 +357,15 @@ def test_live_db_path_unchanged():
     cfg.close()  # must not raise; caller owns the request session
 
 
+def test_get_voice_defaults_to_none_when_not_passed():
+    """Every construction site that doesn't have a resolved voice in hand
+    (or predates the voice feature) omits the parameter - get_voice() must
+    degrade to the same no-op apply_output_voice already treats as
+    "no voice", not raise or silently return something else."""
+    cfg = WebToolConfig(db=None, request=None)
+    assert cfg.get_voice() is None
+
+
 @pytest.mark.asyncio
 async def test_create_default_tools_uses_worker_session_factory_without_live_db(
     monkeypatch,

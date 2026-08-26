@@ -110,11 +110,21 @@ from .task_lease_service import (
 
 logger = logging.getLogger(__name__)
 
-# Deployment policy, not an invariant: this only bounds how long an
+# The TTL the publication path actually uses: a published row's
+# ``expires_at`` is this added to the moment the round is resolved.
+# Deployment policy, not an invariant -- it only bounds how long an
 # unanswered row sits before a reclaim job retires it. The read surface
 # does not consult ``expires_at`` at all, so a longer-lived row is still
 # shown to whoever is waiting on it; widen or narrow this once real
 # publication volume gives a basis for the number, not before.
+#
+# Distinct from ``_MIN_INTERACTION_TTL_SECONDS`` /
+# ``_MAX_INTERACTION_TTL_SECONDS`` (``task_interaction_service.py``),
+# which are not a TTL at all but the interval a caller's own
+# ``ttl_seconds`` override has to fall inside. The two are deliberately
+# not unified -- one is the value this path publishes with, the other the
+# range a caller may ask for. The only relationship that has to hold
+# between them is that this value falls inside that range.
 CLARIFICATION_REQUEST_TTL = timedelta(hours=24)
 
 # The character domain a payload's free-text leaves may contain, kept

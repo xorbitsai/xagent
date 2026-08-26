@@ -1283,6 +1283,11 @@ class WebToolConfig(BaseToolConfig):
         connector_team_id: Optional[int] = None,
         agent_creator_user_id: Optional[int] = None,
         declared_knowledge_bases: Optional[List[str]] = None,
+        # Appended after every pre-existing parameter (not inserted
+        # alongside its closest siblings above) so a caller still using
+        # positional arguments for anything after agent_call_stack keeps
+        # binding the same values it always did.
+        voice: Optional[str] = None,
     ):
         # ``tool_selection_spec`` accepts :class:`ToolSelectionSpec` from
         # the tools adapter package; typed as ``Any`` here to avoid an
@@ -1380,6 +1385,10 @@ class WebToolConfig(BaseToolConfig):
         self._parent_task_id = parent_task_id
         self._parent_tracer = parent_tracer
         self._agent_call_stack = list(agent_call_stack or [])
+        # Already-resolved onboarding output-voice preference (see
+        # get_voice's docstring on BaseToolConfig for why this threads into
+        # delegated AgentTool children).
+        self._voice = voice
         self._excluded_agent_id: Optional[int] = None
 
         # Cache user object for hook queries.
@@ -2101,6 +2110,10 @@ class WebToolConfig(BaseToolConfig):
     def get_agent_call_stack(self) -> List[int]:
         """Get active agent delegation call stack for recursion prevention."""
         return self._agent_call_stack
+
+    def get_voice(self) -> Optional[str]:
+        """See BaseToolConfig.get_voice's docstring."""
+        return self._voice
 
     def get_user_tool_overrides(self) -> dict:
         """Return per-user tool overrides from the registered hook.

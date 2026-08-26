@@ -418,10 +418,11 @@ def _sa_update_targets(tree: ast.AST) -> list[str]:
 
 def test_close_module_issues_exactly_the_expected_update_statements() -> None:
     """The whole module issues exactly three UPDATE statements: the close
-    (task_interaction_requests), its paired unconditional clear (tasks),
-    and the compensation paths' shared NOT-EXISTS-guarded clear (tasks).
-    A fourth statement, or one against an unexpected table, means either a
-    duplicated write path or a table this design never named."""
+    (task_interaction_requests), its paired clear (tasks), and the
+    compensation paths' clear (tasks) -- both clears guarded by the same
+    NOT EXISTS clause. A fourth statement, or one against an unexpected
+    table, means either a duplicated write path or a table this design
+    never named."""
     targets = _sa_update_targets(ast.parse(_source(task_interaction_close)))
     assert targets == ["TaskInteractionRequest", "Task", "Task"], targets
 

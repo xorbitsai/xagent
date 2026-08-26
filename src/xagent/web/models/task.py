@@ -197,12 +197,14 @@ class Task(Base):  # type: ignore
     # finalizers will write it (1 when a row was staged, NULL when staging
     # degraded) and have no writer yet. The four legacy-resume injection
     # sites (the two WebSocket sites, the A2A resume-input path, and the
-    # v1 reply resume-input path) clear it back to NULL unconditionally,
-    # paired with retiring the row they answered; that writer already
-    # exists in task_interaction_close.py
+    # v1 reply resume-input path) retire the row they answered and clear
+    # this column back to NULL in the same transaction, the clear
+    # conditioned on no active row for that run remaining afterwards;
+    # that writer already exists in task_interaction_close.py
     # (close_legacy_resume_interaction). The three resume-abandonment
-    # paths clear it back to NULL only when it no longer names any active
-    # row; that writer also already exists in task_interaction_close.py
+    # paths have no row to retire and only reconcile the column, under
+    # the same condition; that writer also already exists in
+    # task_interaction_close.py
     # (clear_interaction_marker_if_unpaired), called from the A2A prelease
     # restore (a2a.py), the WebSocket lease restore (websocket.py), and
     # the v1 reply prelease restore (task_reply.py), all
@@ -226,6 +228,14 @@ class Task(Base):  # type: ignore
     # worker-owned short session of its own rather than a request-scoped
     # one, but it resolves and loads the same Task row before asking, so
     # the same free-attribute-access argument applies to it unchanged.
+    # ``task_interaction_close.active_interaction_id_sync`` reads this same
+    # marker too, ahead of the interaction-table query it guards, but it is
+    # not one of the four above: it never holds a loaded Task row, so it
+    # pays for its own single-column primary-key query rather than getting
+    # the check for free. That is the trade against the alternative it
+    # replaced -- an uncached catalog inspection plus a two-table join --
+    # not a violation of the free-access argument above, which is about the
+    # read surface specifically.
     # While every waiting task predates the native protocol (and during
     # any rollback), the marker is NULL for all of them and the
     # interaction table receives zero queries from the read path.

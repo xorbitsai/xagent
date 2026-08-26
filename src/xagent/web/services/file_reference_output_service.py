@@ -5,6 +5,8 @@ from __future__ import annotations
 import logging
 import re
 from collections import defaultdict
+from collections.abc import Callable, Iterator
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -107,6 +109,10 @@ logger = logging.getLogger(__name__)
 # future change piping reconciled text into one of them should update it
 # to match this pattern (or route through a shared parsing helper) rather
 # than silently mis-parsing a title clause as part of the id/label.
+# ``iter_markdown_file_references`` /
+# ``replace_markdown_file_references`` below are that shared helper: a
+# consumer needing to read or rewrite this format goes through them, so
+# there is one pattern to keep correct rather than one per consumer.
 _MARKDOWN_FILE_REFERENCE_RE = re.compile(
     r"(?P<image>!)?\[(?P<label>(?>[^\]]*))\]\("
     r"(?P<target>(?>file:[^)\s]+))"
@@ -131,6 +137,222 @@ def _parsed_title(match: re.Match[str]) -> str | None:
     if stitle is not None:
         return stitle
     return match.group("ptitle")
+
+
+@dataclass(frozen=True)
+class MarkdownFileReference:
+    """One parsed ``[label](file:id ["title"])`` reference.
+
+    The public, structured view of a single ``_MARKDOWN_FILE_REFERENCE_RE``
+    match, so a consumer outside this module can read a reference's parts
+    without owning a second copy of the grammar. ``file_id`` is already
+    through ``parse_file_id_ref``, so a real ``file:///path`` URI never
+    reaches a consumer as a handle.
+
+    ``span`` indexes the *original* string, which is what makes a
+    replacement-by-span rewrite possible; ``text`` is the matched substring,
+    so a consumer that decides to leave a reference alone can put back
+    exactly what was written.
+
+    **Caller-facing contract details that are easy to get wrong:**
+
+    * ``label`` can be the empty string -- ``[](file:id)`` is a well-formed
+      match. Every existing consumer in this repo substitutes something
+      (``label or "image"``, ``label or "file"``); a caller that renders it
+      bare gets an empty link text.
+    * ``file_id`` is percent-*decoded* (``parse_file_id_ref`` runs
+      ``unquote``), so it is not necessarily a literal substring of
+      ``content``: ``[a](file:a%20b)`` yields ``file_id="a b"``. A caller
+      re-emitting a target MUST go through ``build_file_id_ref`` to
+      re-encode it -- ``f"file:{reference.file_id}"`` can produce a target
+      that no longer matches this module's own regex.
+    * ``title`` is raw: backslash escapes inside it are not decoded.
+    * ``junk`` is the reference's trailing unparsable prose -- see below.
+      A caller that rewrites a reference without consulting it will delete
+      that prose from the output.
+    """
+
+    file_id: str
+    label: str
+    title: str | None
+    is_image: bool
+    span: tuple[int, int]
+    text: str
+    # Trailing content inside the parens that parsed as neither destination
+    # nor title -- ``[the docs](file:id for more details)`` yields
+    # ``" for more details"``.
+    #
+    # Exposed because a caller cannot otherwise tell this case apart from an
+    # ordinary untitled reference (``title`` is ``None`` either way), and the
+    # difference decides whether rewriting is lossless. The regex matched
+    # that text as link syntax, but it is ordinary prose the model wrote:
+    # replacing the whole match discards it permanently. That is the
+    # destructive-loss class issue #1202 asked this module to eliminate, and
+    # ``reconcile_assistant_file_references`` guards it by falling back to
+    # ``match.group(0)`` whenever a reference carrying non-blank junk turns
+    # out to be unrecoverable.
+    #
+    # This function cannot make that call itself: whether a reference is
+    # recoverable depends on the caller's own lookup (the sibling has the
+    # database; this has a callback). So the decision is handed over rather
+    # than guessed -- see ``replace_markdown_file_references``, which
+    # defaults to preserving.
+    junk: str = ""
+
+
+def iter_markdown_file_references(content: str) -> Iterator[MarkdownFileReference]:
+    """Every internal ``file:`` reference in ``content``, in order.
+
+    The reading half of this module's canonical parser. The comment above
+    ``_MARKDOWN_FILE_REFERENCE_RE`` asks a consumer that needs to match this
+    format to route through a shared helper rather than fork the pattern;
+    until now there was no such helper, so the only options were forking it
+    or importing a private constant. A fork drifts silently -- a title-blind
+    copy reads a title clause as part of the id, and a copy without the
+    ``junk`` alternative fails to match shapes this one recovers -- and the
+    drift only shows up as a mangled reference in somebody's transcript.
+
+    See ``MarkdownFileReference`` for the contract details a caller has to
+    handle: an empty ``label``, a percent-decoded ``file_id``, and ``junk``.
+
+    Targets that are not internal handles are skipped rather than yielded
+    with an empty id: whether a ``file:`` target is a handle at all is
+    ``parse_file_id_ref``'s decision, and a consumer should not have to
+    re-make it.
+
+    Content with no ``file:`` substring is skipped without running the regex.
+    That is correctness-preserving (every match contains the literal), and it
+    is here for cost: the pattern's atomic label group makes ``finditer``
+    explore bracket-run candidates, and ``"[" * 100000 + "]"`` measures at
+    ~1.5s without the precheck and is instant with it.
+
+    It is a common-case optimisation, **not** a defence against adversarial
+    input: one ``file:`` anywhere in the content passes the precheck and the
+    same pathological cost returns (``"file:" + "[" * 100000 + "]"`` measures
+    ~2s either way). Hardening that would mean changing the pattern, which
+    this addition deliberately does not touch.
+
+    Deliberately *not* guarded on ``isinstance(content, str)``, unlike
+    ``reconcile_assistant_file_references``: a non-string must still raise --
+    once iterated. This is a generator, so no body runs until the first
+    ``next()``; an unconsumed ``iter_markdown_file_references(None)`` raises
+    nothing. Returning early instead would turn bad input into an empty
+    iteration a caller cannot tell apart from "no references".
+
+    The precheck is therefore ordered *after* a ``str``-only operation, not
+    before one. ``"file:" not in content`` is true for a ``list``/``tuple``/
+    ``set``/``dict`` of strings as readily as for text, so testing it first
+    would swallow exactly the bad input this contract promises to reject --
+    ``finditer`` used to raise on those and must keep doing so.
+    """
+    if not isinstance(content, str):
+        raise TypeError(f"content must be a str, got {type(content).__name__}")
+    if "file:" not in content:
+        return
+    for match in _MARKDOWN_FILE_REFERENCE_RE.finditer(content):
+        reference = _reference_from_match(match)
+        if reference is not None:
+            yield reference
+
+
+def _reference_from_match(match: re.Match[str]) -> MarkdownFileReference | None:
+    """One match as a reference, or ``None`` if its target is not a handle.
+
+    Shared by both public entry points so they cannot disagree about what a
+    reference is, or about which matches are skipped.
+    """
+    file_id = parse_file_id_ref(match.group("target"))
+    if not file_id:
+        return None
+    return MarkdownFileReference(
+        file_id=file_id,
+        label=match.group("label"),
+        title=_parsed_title(match),
+        is_image=bool(match.group("image")),
+        span=match.span(),
+        text=match.group(0),
+        junk=match.group("junk") or "",
+    )
+
+
+def replace_markdown_file_references(
+    content: str,
+    replace: Callable[[MarkdownFileReference], str],
+    *,
+    rewrite_junk_references: bool = False,
+) -> str:
+    """Rewrite every internal ``file:`` reference through ``replace``.
+
+    The writing half, for a consumer whose job is to *remove* the ``file:``
+    scheme rather than canonicalize it -- a chat channel whose client cannot
+    resolve the handle, say. ``reconcile_assistant_file_references`` does not
+    serve that consumer: it is the function that puts canonical ``file:``
+    links *into* content.
+
+    Non-handle targets are left exactly as written, for the same reason they
+    are skipped by ``iter_markdown_file_references``.
+
+    **A reference carrying non-blank junk is left untouched by default.**
+    ``[the docs](file:id for more details)`` matches because the regex's
+    ``junk`` alternative accepts trailing unparsable content, but that
+    content is ordinary prose the model wrote, not link syntax -- rewriting
+    the whole match deletes a fragment of the user's sentence. That is the
+    destructive-content-loss class issue #1202 closed on the reconcile path,
+    and defaulting to "rewrite" here would reopen it for every consumer that
+    did not know to ask.
+
+    ``reconcile_assistant_file_references`` makes this call conditionally:
+    junk is discardable when the id *resolves* to a record, and preserved
+    when the reference is unrecoverable. This function cannot decide that
+    itself -- recoverability lives in the caller's lookup, not here -- so the
+    conservative half is the default and ``rewrite_junk_references=True``
+    opts into the other. A caller that opts in should consult
+    ``MarkdownFileReference.junk`` and re-emit the prose it is about to
+    consume; returning ``reference.text`` from ``replace`` is the equivalent
+    of leaving one such reference alone case by case.
+
+    Substitution runs through ``re.sub``, so the output is built in one pass
+    and a replacement's length cannot disturb a later reference's position.
+    ``re.sub`` calls the callback in *forward* order, once per match.
+
+    ``replace`` must return a ``str``. A callback that returns ``None`` -- an
+    accidentally missing ``return`` is the realistic way this happens --
+    raises ``TypeError`` here rather than being honoured: ``re.sub`` treats a
+    ``None`` replacement as the empty string and would *silently delete*
+    every reference it was handed, which is the same destructive-content-loss
+    outcome the junk guard above exists to prevent. A callback that *raises*
+    is left alone: the exception propagates and ``content`` is unmutated,
+    because ``re.sub`` builds the result separately.
+    """
+
+    def _substitute(match: re.Match[str]) -> str:
+        reference = _reference_from_match(match)
+        if reference is None:
+            # Not an internal handle. Put back exactly what was written --
+            # deciding that is ``parse_file_id_ref``'s job, not this one's.
+            return match.group(0)
+        if reference.junk.strip() and not rewrite_junk_references:
+            return match.group(0)
+        replacement = replace(reference)
+        if not isinstance(replacement, str):
+            raise TypeError(
+                "replace must return a str; got "
+                f"{type(replacement).__name__} for file reference "
+                f"{reference.file_id!r}"
+            )
+        return replacement
+
+    if not isinstance(content, str):
+        # See ``iter_markdown_file_references``: the type rejection has to
+        # precede the containment test, which a container of strings passes.
+        raise TypeError(f"content must be a str, got {type(content).__name__}")
+    if "file:" not in content:
+        # Same short-circuit and the same reasoning as
+        # ``iter_markdown_file_references``. Returning ``content`` is exact:
+        # with no ``file:`` there is no match, so ``sub`` would return it
+        # unchanged anyway.
+        return content
+    return _MARKDOWN_FILE_REFERENCE_RE.sub(_substitute, content)
 
 
 # ``artifact_type_for_filename`` only knows image/video/office extensions

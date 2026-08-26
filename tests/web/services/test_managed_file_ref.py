@@ -705,3 +705,167 @@ def test_no_wrap_site_interpolates_into_the_message():
         f"{checked} -- a construction was added, removed, aliased, or moved "
         "behind a helper; update this count deliberately"
     )
+
+
+class _SentinelProviderFault(RuntimeError):
+    """The provider error a wrap must keep reachable through ``__cause__``."""
+
+
+_REMOTE_CHECKSUM = sha256(b"durable bytes").hexdigest()
+
+
+class _ProviderFaultStorage:
+    """Raise ``fault`` from one named backend call; let the others succeed.
+
+    Only the call under test may fail. If everything raised, a site could pass
+    by wrapping some *earlier* call's fault, which is the opposite of what these
+    cases pin down.
+
+    ``materialize`` and ``signed_url`` raise on their success path because no
+    case reaches them successfully; a path change that starts calling one shows
+    up as a failure instead of passing on a fault nobody meant to test.
+    """
+
+    def __init__(
+        self,
+        fault: Exception,
+        failing: str,
+        *,
+        remote_checksum: str = _REMOTE_CHECKSUM,
+        remote_size: int = 0,
+    ):
+        self.fault = fault
+        self.failing = failing
+        self.remote_checksum = remote_checksum
+        self.remote_size = remote_size
+
+    def _maybe_fail(self, name: str) -> None:
+        if name == self.failing:
+            raise self.fault
+
+    def _stored(self, key: str) -> StoredObject:
+        return StoredObject(
+            backend="s3",
+            key=key,
+            uri=f"s3://bucket/{key}",
+            size=self.remote_size,
+            checksum=self.remote_checksum,
+            etag="etag",
+        )
+
+    def copy_to_path(self, key, target_path):
+        self._maybe_fail("copy_to_path")
+        Path(target_path).write_bytes(b"durable bytes")
+
+    def materialize(self, key, filename=None):
+        self._maybe_fail("materialize")
+        raise AssertionError("unreachable in these cases")
+
+    def put_file(self, source, key, content_type=None):
+        self._maybe_fail("put_file")
+        return self._stored(key)
+
+    def signed_url(self, key, *, expires, content_type=None, content_disposition=None):
+        self._maybe_fail("signed_url")
+        raise AssertionError("unreachable in these cases")
+
+    def content_hash(self, key):
+        self._maybe_fail("content_hash")
+        return self.remote_checksum
+
+    def stat(self, key):
+        self._maybe_fail("stat")
+        return self._stored(key)
+
+
+def _durable_record(tmp_path, *, local_bytes: bytes | None, **overrides):
+    local_path = tmp_path / "uploads" / "payload.txt"
+    local_path.parent.mkdir(parents=True, exist_ok=True)
+    if local_bytes is not None:
+        local_path.write_bytes(local_bytes)
+    return _record(
+        local_path,
+        storage_backend="s3",
+        storage_key="users/7/uploads/file-123/payload.txt",
+        storage_status="available",
+        **overrides,
+    )
+
+
+def _drive_ensure_local(tmp_path, storage):
+    ref = ManagedFileRef(_durable_record(tmp_path, local_bytes=None), storage=storage)
+    return ref.ensure_local
+
+
+def _drive_materialize(tmp_path, storage):
+    ref = ManagedFileRef(_durable_record(tmp_path, local_bytes=None), storage=storage)
+    return ref.materialize
+
+
+def _drive_signed_access_url(tmp_path, storage):
+    # The signing call is reached only past the checksum gate, so the DB
+    # checksum has to agree with what ``content_hash`` reports.
+    record = _durable_record(tmp_path, local_bytes=None, checksum=_REMOTE_CHECKSUM)
+    ref = ManagedFileRef(record, storage=storage)
+    return lambda: ref.signed_access_url(expires=60)
+
+
+def _drive_sync_to_durable(tmp_path, storage):
+    ref = ManagedFileRef(
+        _durable_record(tmp_path, local_bytes=b"local bytes"), storage=storage
+    )
+    return ref.sync_to_durable
+
+
+def _drive_adopt(tmp_path, storage):
+    """Both ``adopt_existing_object`` wraps, selected by which call fails.
+
+    With no local copy, failing ``stat`` hits the metadata wrap directly; letting
+    ``stat`` succeed while reporting no checksum falls through to the second
+    ``content_hash`` lookup, which is wrapped separately a few lines further on.
+    """
+    record = _durable_record(tmp_path, local_bytes=None)
+    ref = ManagedFileRef(record, storage=storage)
+    return lambda: ref.adopt_existing_object(record.storage_key)
+
+
+@pytest.mark.parametrize(
+    ("failing", "expected_message", "driver", "storage_kwargs"),
+    [
+        ("copy_to_path", "restore durable object", _drive_ensure_local, {}),
+        ("materialize", "materialize durable object", _drive_materialize, {}),
+        ("signed_url", "sign durable object URL", _drive_signed_access_url, {}),
+        ("put_file", "write durable object", _drive_sync_to_durable, {}),
+        ("stat", "inspect durable object metadata", _drive_adopt, {}),
+        (
+            "content_hash",
+            "inspect durable object metadata",
+            _drive_adopt,
+            {"remote_checksum": ""},
+        ),
+    ],
+)
+def test_every_wrap_keeps_the_provider_fault_as_its_cause(
+    tmp_path, failing, expected_message, driver, storage_kwargs
+):
+    """``from exc`` at each real wrap site, asserted on a real raise.
+
+    The fault-logging suite builds its wraps by assigning ``__cause__`` on a
+    hand-made exception, so it proves what the logger does with a chain that is
+    already there -- not that these sites still produce one. Dropping ``from
+    exc`` at any wrap below would leave every assertion over there passing while
+    #1467 silently reopened: the provider class, the HTTP status and throttle vs.
+    timeout vs. rejected credentials live in ``__cause__`` and nowhere else.
+
+    Each case fails exactly one backend call and asserts the wrap raised for
+    *that* call carries *that* fault instance -- identity, not just type, so a
+    wrap re-raising some other error cannot pass.
+    """
+    fault = _SentinelProviderFault("SlowDown: reduce your request rate")
+    storage = _ProviderFaultStorage(fault, failing, **storage_kwargs)
+
+    with pytest.raises(DurableStorageOperationError) as raised:
+        driver(tmp_path, storage)()
+
+    assert expected_message in str(raised.value)
+    assert raised.value.__cause__ is fault

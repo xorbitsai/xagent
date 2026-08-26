@@ -9,6 +9,7 @@ import {
 } from "@testing-library/react"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 import type { McpApp } from "@/contexts/mcp-apps-context"
+import { resolveTranslation } from "@/i18n/translations"
 
 const appContextMock = vi.hoisted(() => ({
   dispatch: vi.fn(),
@@ -31,10 +32,20 @@ vi.mock("@/contexts/app-context-chat", () => ({
   },
 }))
 
+// `translate` is a mutable box so a test can swap the active locale's `t` and
+// rerender, the way I18nProvider does - it changes its context value without
+// remounting consumers. `identity` is kept beside it as the single definition
+// the file-wide reset below restores.
+const i18nMock = vi.hoisted(() => {
+  const identity = (key: string, vars?: Record<string, string | number>) =>
+    vars ? `${key}:${JSON.stringify(vars)}` : key
+  return { identity, translate: identity }
+})
+
 vi.mock("@/contexts/i18n-context", () => ({
   useI18n: () => ({
     t: (key: string, vars?: Record<string, string | number>) =>
-      vars ? `${key}:${JSON.stringify(vars)}` : key,
+      i18nMock.translate(key, vars),
   }),
 }))
 
@@ -54,6 +65,12 @@ vi.mock("@/contexts/auth-context", () => ({
 }))
 
 import { ClarificationForm } from "./clarification-form"
+
+// Every describe in this file gets the identity translate back, so a locale
+// swapped by one test cannot leak into a suite added below it.
+beforeEach(() => {
+  i18nMock.translate = i18nMock.identity
+})
 
 describe("ClarificationForm Session file capability", () => {
   beforeEach(() => {
@@ -386,5 +403,260 @@ describe("ClarificationForm connect_apps interaction", () => {
     expect(screen.queryByText(CONNECT_APPS_INTERACTION.label)).not.toBeInTheDocument()
     // An ordinary field's own persisted label is untouched by this.
     expect(screen.getByText("Note:")).toBeInTheDocument()
+  })
+})
+
+describe("ClarificationForm delivery failures", () => {
+  beforeEach(() => {
+    appContextMock.dispatch.mockReset()
+    appContextMock.filesDisabled = false
+    appContextMock.providerAvailable = true
+    appContextMock.sendMessage.mockReset()
+    toastErrorMock.mockReset()
+  })
+
+  afterEach(() => {
+    cleanup()
+  })
+
+  const deliveryError = (
+    message: string,
+    disposition: string,
+    userFacing = false,
+  ) => Object.assign(new Error(message), { disposition, userFacing })
+
+  const submitAnswer = async (onSend: ReturnType<typeof vi.fn>) => {
+    render(
+      <ClarificationForm
+        interactions={[{ type: "text_input" as const, field: "city", label: "City" }]}
+        onSend={onSend}
+      />,
+    )
+    fireEvent.change(screen.getByRole("textbox"), { target: { value: "Beijing" } })
+    fireEvent.click(
+      screen.getByRole("button", { name: "chatPage.clarification.submit" }),
+    )
+  }
+
+  it("surfaces the backend rejection reason instead of the generic toast", async () => {
+    const onSend = vi.fn().mockRejectedValue(deliveryError(
+      "A previous guidance message is still being applied. Please wait for it to finish.",
+      "rejected",
+      true,
+    ))
+
+    await submitAnswer(onSend)
+
+    await waitFor(() => {
+      expect(toastErrorMock).toHaveBeenCalledWith(
+        "A previous guidance message is still being applied. Please wait for it to finish.",
+        { description: "chatPage.clarification.sendNotSent" },
+      )
+    })
+    const alert = await screen.findByRole("alert")
+    expect(alert).toHaveTextContent(
+      "A previous guidance message is still being applied.",
+    )
+    // The hint lives in the alert too, not only in the toast - without this
+    // the inline hint could be deleted with every test still green.
+    expect(alert).toHaveTextContent("chatPage.clarification.sendNotSent")
+  })
+
+  it("keeps the form submittable after a failure that never reached the agent", async () => {
+    const onSend = vi.fn().mockRejectedValue(
+      deliveryError("Durable storage is temporarily unavailable", "not_sent", true),
+    )
+
+    await submitAnswer(onSend)
+
+    await waitFor(() => expect(toastErrorMock).toHaveBeenCalledWith(
+      "Durable storage is temporarily unavailable",
+      { description: "chatPage.clarification.sendNotSent" },
+    ))
+    const submit = screen.getByRole("button", {
+      name: "chatPage.clarification.submit",
+    })
+    expect(submit).toBeEnabled()
+    expect(screen.getByRole("textbox")).toHaveValue("Beijing")
+  })
+
+  it("warns before a resubmit when the delivery outcome is unknown", async () => {
+    // No resubmit guard exists in this component (a retry mints a fresh
+    // client message id today), so the copy must warn - not promise safety.
+    const onSend = vi.fn().mockRejectedValue(deliveryError(
+      "The task is busy applying an earlier answer.",
+      "outcome_unknown",
+      true,
+    ))
+
+    await submitAnswer(onSend)
+
+    await waitFor(() => {
+      expect(toastErrorMock).toHaveBeenCalledWith(
+        "The task is busy applying an earlier answer.",
+        { description: "chatPage.clarification.sendOutcomeUnknown" },
+      )
+    })
+    // Advisory only: the button stays enabled, exactly as it does today.
+    expect(screen.getByRole("button", {
+      name: "chatPage.clarification.submit",
+    })).toBeEnabled()
+    expect(screen.getByRole("alert")).toHaveTextContent(
+      "chatPage.clarification.sendOutcomeUnknown",
+    )
+  })
+
+  it("keeps connection plumbing diagnostics away from the visitor", async () => {
+    const onSend = vi.fn().mockRejectedValue(deliveryError(
+      "Message not sent: the connection changed before delivery.",
+      "not_sent",
+    ))
+
+    await submitAnswer(onSend)
+
+    await waitFor(() => {
+      expect(toastErrorMock).toHaveBeenCalledWith(
+        "chatPage.clarification.sendError",
+        { description: "chatPage.clarification.sendNotSent" },
+      )
+    })
+    expect(await screen.findByRole("alert")).not.toHaveTextContent(
+      "the connection changed before delivery",
+    )
+  })
+
+  it("falls back to the generic string when the failure carries no reason", async () => {
+    const onSend = vi.fn().mockRejectedValue(new Error("   "))
+
+    await submitAnswer(onSend)
+
+    await waitFor(() => {
+      expect(toastErrorMock).toHaveBeenCalledWith(
+        "chatPage.clarification.sendError",
+        undefined,
+      )
+    })
+  })
+
+  it("clears the failure once the visitor edits an answer", async () => {
+    const onSend = vi.fn().mockRejectedValue(
+      deliveryError("Durable storage is temporarily unavailable", "not_sent", true),
+    )
+
+    await submitAnswer(onSend)
+
+    await screen.findByRole("alert")
+    fireEvent.change(screen.getByRole("textbox"), { target: { value: "Shanghai" } })
+    await waitFor(() => expect(screen.queryByRole("alert")).toBeNull())
+  })
+
+  it("reads the reason off a failure that is not an Error instance", async () => {
+    // `onSend` belongs to arbitrary builder callbacks (#1485), so a rejection
+    // carrying the contract's fields need not be an `Error` subclass - the
+    // disposition is probed structurally and the reason has to match.
+    const onSend = vi.fn().mockRejectedValue({
+      message: "A previous guidance message is still being applied.",
+      disposition: "rejected",
+      userFacing: true,
+    })
+
+    await submitAnswer(onSend)
+
+    await waitFor(() => {
+      expect(toastErrorMock).toHaveBeenCalledWith(
+        "A previous guidance message is still being applied.",
+        { description: "chatPage.clarification.sendNotSent" },
+      )
+    })
+  })
+
+  it("re-renders the visible failure in the new locale", async () => {
+    // I18nProvider swaps its context value on a locale change without
+    // remounting consumers, so an alert holding pre-translated strings would
+    // keep showing the previous language until it is cleared.
+    const onSend = vi.fn().mockRejectedValue(
+      deliveryError("Durable storage is temporarily unavailable", "not_sent", true),
+    )
+    const interactions = [{ type: "text_input" as const, field: "city", label: "City" }]
+    const { rerender } = render(
+      <ClarificationForm interactions={interactions} onSend={onSend} />,
+    )
+    fireEvent.change(screen.getByRole("textbox"), { target: { value: "Beijing" } })
+    fireEvent.click(
+      screen.getByRole("button", { name: "chatPage.clarification.submit" }),
+    )
+    const alert = await screen.findByRole("alert")
+    expect(alert).toHaveTextContent("chatPage.clarification.sendNotSent")
+
+    i18nMock.translate = (key: string) => `zh:${key}`
+    rerender(<ClarificationForm interactions={interactions} onSend={onSend} />)
+
+    expect(screen.getByRole("alert")).toHaveTextContent(
+      "zh:chatPage.clarification.sendNotSent",
+    )
+    // The backend's own reason is not ours to translate - it passes through.
+    expect(screen.getByRole("alert")).toHaveTextContent(
+      "Durable storage is temporarily unavailable",
+    )
+  })
+
+  it("re-renders the generic fallback message in the new locale", async () => {
+    const onSend = vi.fn().mockRejectedValue(new Error("   "))
+    const interactions = [{ type: "text_input" as const, field: "city", label: "City" }]
+    const { rerender } = render(
+      <ClarificationForm interactions={interactions} onSend={onSend} />,
+    )
+    fireEvent.change(screen.getByRole("textbox"), { target: { value: "Beijing" } })
+    fireEvent.click(
+      screen.getByRole("button", { name: "chatPage.clarification.submit" }),
+    )
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "chatPage.clarification.sendError",
+    )
+
+    i18nMock.translate = (key: string) => `zh:${key}`
+    rerender(<ClarificationForm interactions={interactions} onSend={onSend} />)
+
+    expect(screen.getByRole("alert")).toHaveTextContent(
+      "zh:chatPage.clarification.sendError",
+    )
+  })
+
+  it("uses hint keys that resolve in both locale trees", () => {
+    // The component tests stub t() as identity, so they pin the key strings
+    // only against themselves. This binds them to the real trees: a typo'd
+    // key would fall back to itself instead of a translated sentence.
+    for (const key of [
+      "chatPage.clarification.sendNotSent",
+      "chatPage.clarification.sendOutcomeUnknown",
+    ] as const) {
+      expect(resolveTranslation("en", key)).not.toBe(key)
+      expect(resolveTranslation("zh", key)).not.toBe(key)
+    }
+  })
+
+  it("clears a previous round's failure when the form is asked again", async () => {
+    // The live turn render path keeps one component instance across
+    // clarification rounds, so a stale round-1 alert would sit on top of
+    // round 2's question.
+    appContextMock.sendMessage.mockRejectedValue(deliveryError(
+      "Durable storage is temporarily unavailable",
+      "not_sent",
+      true,
+    ))
+    const interactions = [{ type: "text_input" as const, field: "city", label: "City" }]
+    const { rerender } = render(
+      <ClarificationForm interactions={interactions} active />,
+    )
+    fireEvent.change(screen.getByRole("textbox"), { target: { value: "Beijing" } })
+    fireEvent.click(
+      screen.getByRole("button", { name: "chatPage.clarification.submit" }),
+    )
+    await screen.findByRole("alert")
+
+    rerender(<ClarificationForm interactions={interactions} active={false} />)
+    rerender(<ClarificationForm interactions={interactions} active />)
+
+    expect(screen.queryByRole("alert")).toBeNull()
   })
 })

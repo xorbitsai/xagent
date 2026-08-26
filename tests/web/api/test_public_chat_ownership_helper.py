@@ -405,6 +405,62 @@ def test_identity_string_for_user_principal() -> None:
     assert principal.identity_string() == "user:42"
 
 
+# responder_identity is the one column this table's audit trail can rely on
+# staying populated, and its only database-side check is "non-empty". Every
+# row below used to render into a non-empty string that passes that check
+# and names nobody.
+@pytest.mark.parametrize(
+    "principal",
+    [
+        pytest.param(
+            InteractionPrincipal(
+                kind="user", user_id=None, is_admin=False, auth_mode=None
+            ),
+            id="user_without_a_user_id",
+        ),
+        pytest.param(
+            InteractionPrincipal(
+                kind="user", user_id=None, is_admin=True, auth_mode=None
+            ),
+            id="admin_without_a_user_id",
+        ),
+        pytest.param(
+            InteractionPrincipal(
+                kind="guest",
+                user_id=7,
+                is_admin=False,
+                auth_mode="widget",
+                widget_agent_id=1,
+                guest_id=None,
+            ),
+            id="guest_without_a_guest_id",
+        ),
+        pytest.param(
+            InteractionPrincipal(
+                kind="guest",
+                user_id=7,
+                is_admin=False,
+                auth_mode="widget",
+                widget_agent_id=1,
+                guest_id="",
+            ),
+            id="guest_with_an_empty_guest_id",
+        ),
+        pytest.param(
+            InteractionPrincipal(
+                kind="robot", user_id=7, is_admin=False, auth_mode=None
+            ),
+            id="unrecognized_kind",
+        ),
+    ],
+)
+def test_identity_string_refuses_a_principal_it_cannot_name(
+    principal: InteractionPrincipal,
+) -> None:
+    with pytest.raises(ValueError):
+        principal.identity_string()
+
+
 # ---------------------------------------------------------------------------
 # public_chat_identity_matches: the message-selection slice used by Phase 2
 # ---------------------------------------------------------------------------

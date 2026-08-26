@@ -981,9 +981,13 @@ def stage_interaction_request(
     call's pre-read and its own INSERT. Under REPEATABLE READ or
     SERIALIZABLE the re-read reuses this transaction's original snapshot,
     does not see that row, and classifies a legitimate replay as
-    ``InteractionSlotTaken`` -- measured on PostgreSQL 16 at both levels.
-    That is a degradation, not a corruption: ``InteractionSlotTaken`` is
-    swallowed, so the caller's turn survives and the question is lost.
+    ``InteractionSlotTaken`` at both levels: a query in such a
+    transaction sees a snapshot as of the start of the transaction's
+    first non-transaction-control statement rather than of the current
+    statement, so the re-read cannot see a row committed after that
+    point. That is a degradation, not a corruption:
+    ``InteractionSlotTaken`` is swallowed, so the caller's turn survives
+    and the question is lost.
     READ COMMITTED is PostgreSQL's default and this codebase sets no
     ``isolation_level`` on its engine. Both halves of that are asserted,
     not assumed: one test reads the server's effective

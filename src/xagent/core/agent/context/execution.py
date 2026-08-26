@@ -3,10 +3,11 @@ from __future__ import annotations
 import json
 from collections import Counter
 from dataclasses import dataclass, field, replace
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from enum import Enum
 from typing import Any
 from uuid import uuid4
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from ...context_ref import (
     CONTEXT_REFS_KEY,
@@ -60,6 +61,10 @@ COMPACT_DROPPED_TOOL_NAME_MAX_CHARS = 64
 # nothing a dropped observation held.
 NON_EVIDENCE_TOOL_NAMES = CONTROL_TOOL_NAMES | {LOAD_SKILL_TOOL_NAME}
 COMPACT_DROPPED_TOOL_NOTICE_MAX_NAMES = 20
+
+# Wire name: request_context keys reach metadata verbatim, so renaming this
+# breaks the clients that populate it.
+CLOCK_TIMEZONE_METADATA_KEY = "timezone"
 
 
 def _utcnow() -> datetime:
@@ -441,10 +446,41 @@ class ExecutionContext:
                 messages.insert(0, {"role": "system", "content": system_content})
         return messages
 
+    def clock_zone(self) -> ZoneInfo | None:
+        """The end user's timezone, or None when none was supplied or the name
+        is unusable. The value is caller-controlled, so an unparsable name
+        degrades to the UTC wording instead of failing the run."""
+        name = self.metadata.get(CLOCK_TIMEZONE_METADATA_KEY)
+        if not isinstance(name, str) or not name.strip():
+            return None
+        try:
+            return ZoneInfo(name.strip())
+        except (ZoneInfoNotFoundError, ValueError, OSError, TypeError, KeyError):
+            # OSError is an over-long name, ValueError a path-shaped one; both
+            # are reachable because the name comes from the client.
+            return None
+
+    def _current_clock_text(self) -> str:
+        utc_stamp = self.created_at.astimezone(timezone.utc).strftime(
+            "%Y-%m-%d %H:%M:%S UTC"
+        )
+        zone = self.clock_zone()
+        if zone is None:
+            return utc_stamp
+        local = self.created_at.astimezone(zone)
+        offset = local.utcoffset() or timedelta(0)
+        sign = "-" if offset < timedelta(0) else "+"
+        hours, remainder = divmod(abs(offset), timedelta(hours=1))
+        minutes = remainder // timedelta(minutes=1)
+        return (
+            f"{local.strftime('%Y-%m-%d %H:%M:%S')} "
+            f"({zone.key}, UTC{sign}{hours:02d}:{minutes:02d}), "
+            f"which is {utc_stamp}"
+        )
+
     def _current_time_context(self) -> str:
         return (
-            "Current date and time: "
-            f"{self.created_at.astimezone(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}. "
+            f"Current date and time: {self._current_clock_text()}. "
             "Use this as the reference for relative dates such as today, recent, "
             "latest, yesterday, and tomorrow."
         )

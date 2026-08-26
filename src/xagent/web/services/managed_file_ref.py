@@ -5,6 +5,7 @@ import binascii
 import hashlib
 import logging
 import mimetypes
+import re
 import tempfile
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -47,6 +48,119 @@ class DurableObjectMissingError(FileNotFoundError):
     """Raised when a registered file has no local copy or durable object."""
 
 
+# Field values are rendered into a plain-text ``key=value`` line, so a value
+# must stay one token: whitespace in it would let a client-supplied string put
+# what reads as further fields on the same record (CWE-117). Quoting is not
+# enough -- it only protects consumers that honour quotes, and the deployed
+# logs are read by whitespace tokenizers -- so whitespace is escaped instead.
+# Some of these values are client-supplied (``/v1/*`` renders the request's
+# ``files`` list, an unvalidated ``list[str]``), so a caller cannot be relied
+# on to have checked.
+_LOG_VALUE_TRANSLATION = str.maketrans({"\n": "\\n", "\r": "\\r", "\t": "\\t"})
+_LOG_VALUE_WHITESPACE = re.compile(r"\s")
+
+# Long enough for a UUID list of realistic size, short enough that one field
+# cannot crowd out the rest of the line.
+_MAX_LOG_VALUE_LENGTH = 256
+
+# The stable prefix every durable-fault line starts with, and the anchor the
+# operational note tells alerts to key on. Public because tests assert on its
+# *absence* to prove an integrity fault was not reported as an outage, and an
+# inlined copy there would pass vacuously once this text changed.
+DURABLE_FAULT_LOG_PREFIX = "Durable storage unavailable during"
+
+
+def _escape_whitespace(match: re.Match[str]) -> str:
+    """Render one whitespace character as an unambiguous escape."""
+    code = ord(match.group())
+    return f"\\x{code:02x}" if code <= 0xFF else f"\\u{code:04x}"
+
+
+def _sanitize_log_value(value: object) -> str:
+    """Flatten a field value to one bounded, single-token string.
+
+    Callers filter ``None`` out before rendering; a ``None`` field is dropped
+    from the line entirely (whether it should render instead is #1642).
+
+    The escape character goes first so the result stays decodable: ``\\\\``
+    is a literal backslash, ``\\n`` a newline, ``\\x20`` a space. What this
+    does not do is make the whole *record* unforgeable -- ``exc_info`` text is
+    rendered verbatim by the formatter (#1516), and ESC is not whitespace so it
+    still passes through (#1519).
+    """
+    text = str(value).replace("\\", "\\\\")
+    text = text.translate(_LOG_VALUE_TRANSLATION)
+    text = _LOG_VALUE_WHITESPACE.sub(_escape_whitespace, text)
+    if len(text) > _MAX_LOG_VALUE_LENGTH:
+        return f"{text[:_MAX_LOG_VALUE_LENGTH]}...[truncated]"
+    return text
+
+
+def log_durable_storage_fault(
+    target_logger: logging.Logger,
+    operation: str,
+    exc: Exception,
+    **fields: object,
+) -> None:
+    """Record a durable-storage fault with its full cause chain.
+
+    The single implementation for every site that reports a durable-storage
+    fault *as such*. That is narrower than every consumer of the class: it is
+    a ``RuntimeError``, so broad ``except Exception``/``except RuntimeError``
+    arms (chat.py, kb.py, core/workspace.py) absorb it without naming it, and
+    each keeps its own ``exc_info`` instead of the fields rendered here.
+
+    The provider class, HTTP status, and throttle-vs-timeout-vs-credentials
+    distinction live only in ``__cause__``, and none of the envelopes these
+    faults become -- ``HTTPException``, the ``/v1/*`` body, a tool result --
+    carries a traceback, so ``exc_info`` is what gets them into a log (#1467).
+
+    ``target_logger`` is the caller's, so a line stays attributed to the
+    endpoint or tool that produced it. ``operation`` must be a bounded label,
+    a small fixed set of values, so it stays aggregatable; per-request
+    identifiers belong in ``fields``.
+
+    Fields are rendered as ``key=value`` *in the message*, not via ``extra=``:
+    the deployed formatter (``web/logging_config.py``) renders only
+    ``%(message)s``, so anything passed as ``extra`` is invisible in exactly
+    the logs an incident is read from. Values are escaped and bounded because
+    some are client-supplied; that bounds the fields, not the whole record,
+    whose ``exc_info`` text the formatter still renders verbatim (#1516).
+    """
+    # One record per fault instance: a wrap can cross several arms that each
+    # legitimately report it, and the mark is what makes them safe to write
+    # independently. Only this module's wraps are marked, and the attribute is
+    # declared on the class, so neither the read nor the write needs a guard.
+    if isinstance(exc, DurableStorageOperationError):
+        if exc._durable_fault_logged:
+            return
+        # The key rides on the exception, not in its message (#1643), so it
+        # reaches this line from every site -- including ones that never pass
+        # it as a field -- while ``str(exc)`` stays safe wherever it escapes.
+        # An explicit field wins, so a caller can still name a different key.
+        if exc.storage_key and "storage_key" not in fields:
+            fields = {**fields, "storage_key": exc.storage_key}
+
+    rendered = "".join(
+        f" {name}={_sanitize_log_value(value)}"
+        for name, value in fields.items()
+        if value is not None
+    )
+    # The prefix stays a literal in the template, not an argument: this repo
+    # reads ``record.msg`` as the event's identity, and ``"%s %s%s"`` identifies
+    # nothing. ``DURABLE_FAULT_LOG_PREFIX`` is the same text for callers and
+    # tests to match on, pinned against this line by
+    # ``test_the_exported_prefix_is_the_one_the_helper_emits``.
+    target_logger.warning(
+        "Durable storage unavailable during %s%s", operation, rendered, exc_info=exc
+    )
+    # Marked only after the record is emitted: if emission raised, the fault
+    # would stay unmarked for a later arm to report, instead of being
+    # permanently recorded as logged by an attempt that never wrote.
+    if isinstance(exc, DurableStorageOperationError):
+        exc._durable_fault_logged = True
+
+
 class DurableStorageOperationError(RuntimeError):
     """Raised when durable object storage is unavailable for an operation.
 
@@ -64,17 +178,22 @@ class DurableStorageOperationError(RuntimeError):
     carries other identifiers (it has no storage key) in its own message
     (#1642).
 
-    What this costs, stated so it is not overread: the one log line that
-    renders ``str(exc)`` today (the upload warning in ``web/api/files.py``)
-    is updated to render the attribute alongside it. Other absorbers of
-    ``str(exc)`` -- the KB ingestion tool's error text, the WebSocket
-    ``except RuntimeError`` arm -- lose the key from their output until they
-    read the attribute, which is #1515's scope.
+    ``log_durable_storage_fault`` renders the attribute as a field, so every
+    line that reports the fault *as such* still carries the key. The broad
+    absorbers that render ``str(e)`` -- chat.py, kb.py, core/workspace.py --
+    lose it from their lines until they read the attribute, which is #1515's
+    scope.
 
     ``storage_key`` is required (still nullable) so an omission is a type
     error at the call site rather than a silently ``None`` attribute --
     pass ``storage_key=None`` only where there genuinely is no key yet.
     """
+
+    # Set by ``log_durable_storage_fault`` so one fault yields one record even
+    # when several arms legitimately report it. Declared here rather than
+    # attached dynamically so it is typed, discoverable, and always present to
+    # read -- the reason that function needs no guard around the mark.
+    _durable_fault_logged: bool = False
 
     def __init__(self, message: str, *, storage_key: str | None) -> None:
         super().__init__(message)
@@ -103,7 +222,7 @@ class DurableObjectIntegrityError(DurableStorageOperationError):
 # once, at the application boundary (see the handlers registered in
 # ``web/app.py``), instead of being reported as an outage an operator would
 # retry.
-_NAMESPACE_AUTHORITY_ERRORS: tuple[type[BaseException], ...] = (
+NAMESPACE_AUTHORITY_ERRORS: tuple[type[BaseException], ...] = (
     StorageKeyScopeError,
     ExecutionScopeAuthorityError,
     ExecutionScopeResolverContractError,
@@ -401,7 +520,7 @@ class ManagedFileRef:
         except DurableObjectIntegrityError:
             temp_path.unlink(missing_ok=True)
             raise
-        except _NAMESPACE_AUTHORITY_ERRORS:
+        except NAMESPACE_AUTHORITY_ERRORS:
             temp_path.unlink(missing_ok=True)
             raise
         except Exception as exc:
@@ -432,7 +551,7 @@ class ManagedFileRef:
                 last_integrity_error = exc
                 if materialized_path is not None:
                     materialized_path.unlink(missing_ok=True)
-            except _NAMESPACE_AUTHORITY_ERRORS:
+            except NAMESPACE_AUTHORITY_ERRORS:
                 raise
             except Exception as exc:
                 raise DurableStorageOperationError(
@@ -468,7 +587,7 @@ class ManagedFileRef:
                 content_type=content_type,
                 content_disposition=content_disposition,
             )
-        except _NAMESPACE_AUTHORITY_ERRORS:
+        except NAMESPACE_AUTHORITY_ERRORS:
             raise
         except Exception as exc:
             raise DurableStorageOperationError(
@@ -520,7 +639,7 @@ class ManagedFileRef:
                 resolved_key,
                 mime_type or getattr(self.record, "mime_type", None),
             )
-        except _NAMESPACE_AUTHORITY_ERRORS:
+        except NAMESPACE_AUTHORITY_ERRORS:
             raise
         except Exception as exc:
             raise DurableStorageOperationError(
@@ -540,7 +659,7 @@ class ManagedFileRef:
             stored_object = self._bound_storage().stat(expected_key)
         except FileNotFoundError:
             return "missing"
-        except _NAMESPACE_AUTHORITY_ERRORS:
+        except NAMESPACE_AUTHORITY_ERRORS:
             raise
         except Exception as exc:
             raise DurableStorageOperationError(
@@ -562,7 +681,7 @@ class ManagedFileRef:
             if not checksum:
                 try:
                     checksum = self._bound_storage().content_hash(expected_key)
-                except _NAMESPACE_AUTHORITY_ERRORS:
+                except NAMESPACE_AUTHORITY_ERRORS:
                     # The rule holds at every site in this module, not only
                     # where a downstream call happens to raise the same class
                     # again: relying on that would make this a silent swallow
@@ -585,7 +704,7 @@ class ManagedFileRef:
         if not checksum:
             try:
                 checksum = self._bound_storage().content_hash(expected_key)
-            except _NAMESPACE_AUTHORITY_ERRORS:
+            except NAMESPACE_AUTHORITY_ERRORS:
                 raise
             except Exception as exc:
                 raise DurableStorageOperationError(
@@ -645,18 +764,24 @@ class ManagedFileRef:
 
         try:
             actual_checksum = self._bound_storage().content_hash(self.storage_key)
-        except _NAMESPACE_AUTHORITY_ERRORS:
+        except NAMESPACE_AUTHORITY_ERRORS:
             # A permanent authority fault must not be reported as "checksum
             # unavailable", which reads as a transient reason to fall back to
             # backend-mediated access.
             raise
         except Exception as exc:
+            # ``exc_info`` for the same reason as everywhere else on this
+            # path: this fault is swallowed -- the caller only sees ``False``
+            # and silently falls back to backend-mediated delivery -- so this
+            # line is the only record of it, and ``error=%s`` alone drops the
+            # exception class and the cause chain (#1467).
             logger.warning(
                 "Falling back to backend-mediated durable access because content "
                 "hash is unavailable: file_id=%s storage_key=%s error=%s",
                 getattr(self.record, "file_id", None),
                 self.storage_key,
                 exc,
+                exc_info=exc,
             )
             return False
 

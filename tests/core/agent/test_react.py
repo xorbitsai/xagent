@@ -5,6 +5,7 @@ import inspect
 import json
 import logging
 import re
+from datetime import datetime, timezone
 from types import SimpleNamespace
 from typing import Any
 
@@ -20,6 +21,7 @@ from xagent.core.agent import (
     ToolCallInterrupted,
     ToolCallRecord,
 )
+from xagent.core.agent.context.execution import CLOCK_TIMEZONE_METADATA_KEY
 from xagent.core.agent.result import tool_result_succeeded
 from xagent.core.file_ref import WORKSPACE_OUTPUT_FILES_TOOL_NAME
 from xagent.core.model.chat.basic.router import RouterLLM
@@ -327,6 +329,12 @@ class FakeLLM:
     async def chat(self, **kwargs: Any) -> Any:
         self.calls.append(kwargs)
         return self.responses.pop(0)
+
+
+class FakeNamedLLM(FakeLLM):
+    """FakeLLM carrying a ``model_name``, for tests that assert on it in logs."""
+
+    model_name = "fake-model"
 
 
 class StreamingFinalAnswerLLM:
@@ -695,29 +703,116 @@ class StreamingFinalAnswerToolLLM:
 
 
 class StreamingMixedFinalAnswerAndToolLLM:
+    """First call bundles final_answer with a work tool; the retry answers for real."""
+
+    def __init__(self) -> None:
+        self.stream_calls: list[dict[str, Any]] = []
+
     async def chat(self, **kwargs: Any) -> Any:
         raise AssertionError("streaming mixed tool path should not call chat()")
 
     async def stream_chat(self, **kwargs: Any) -> Any:
+        self.stream_calls.append(kwargs)
+        if len(self.stream_calls) == 1:
+            yield StreamChunk(
+                type=ChunkType.TOOL_CALL,
+                tool_calls=[
+                    {
+                        "index": 0,
+                        "id": "call_final",
+                        "function": {
+                            "name": "final_answer",
+                            "arguments": '{"answer":"Candidate"}',
+                        },
+                    },
+                    {
+                        "index": 1,
+                        "id": "call_calc",
+                        "function": {
+                            "name": "calculator",
+                            "arguments": '{"expression":"2+2"}',
+                        },
+                    },
+                ],
+            )
+            yield StreamChunk(type=ChunkType.END)
+            return
         yield StreamChunk(
             type=ChunkType.TOOL_CALL,
             tool_calls=[
                 {
-                    "index": 0,
-                    "id": "call_final",
+                    "id": "call_final_2",
                     "function": {
                         "name": "final_answer",
-                        "arguments": '{"answer":"Candidate"}',
+                        "arguments": '{"answer":"4"}',
                     },
-                },
+                }
+            ],
+        )
+        yield StreamChunk(type=ChunkType.END)
+
+
+class StreamingAnswerThenWorkToolLLM:
+    """Streams a final_answer candidate before the batch also names a work tool.
+
+    Exercises the case where the answer streamer has already emitted content
+    by the time the work tool's name shows up in a later chunk of the same
+    response, so the strip point is the only place left to close the stream.
+    """
+
+    def __init__(self) -> None:
+        self.stream_calls: list[dict[str, Any]] = []
+
+    async def chat(self, **kwargs: Any) -> Any:
+        raise AssertionError("streaming answer-then-tool path should not call chat()")
+
+    async def stream_chat(self, **kwargs: Any) -> Any:
+        self.stream_calls.append(kwargs)
+        if len(self.stream_calls) == 1:
+            prefix = '{"answer":"'
+            for arguments in [
+                prefix + "Looking",
+                prefix + "Looking that up now.",
+                prefix + 'Looking that up now."}',
+            ]:
+                yield StreamChunk(
+                    type=ChunkType.TOOL_CALL,
+                    tool_calls=[
+                        {
+                            "index": 0,
+                            "id": "call_final",
+                            "function": {
+                                "name": "final_answer",
+                                "arguments": arguments,
+                            },
+                        }
+                    ],
+                )
+            yield StreamChunk(
+                type=ChunkType.TOOL_CALL,
+                tool_calls=[
+                    {
+                        "index": 1,
+                        "id": "call_calc",
+                        "function": {
+                            "name": "calculator",
+                            "arguments": '{"expression":"2+2"}',
+                        },
+                    }
+                ],
+            )
+            yield StreamChunk(type=ChunkType.END)
+            return
+        yield StreamChunk(
+            type=ChunkType.TOOL_CALL,
+            tool_calls=[
                 {
-                    "index": 1,
-                    "id": "call_calc",
+                    "id": "call_final_2",
                     "function": {
-                        "name": "calculator",
-                        "arguments": '{"expression":"2+2"}',
+                        "name": "final_answer",
+                        "arguments": '{"answer":"4"}',
                     },
-                },
+                }
             ],
         )
         yield StreamChunk(type=ChunkType.END)
@@ -1585,24 +1680,811 @@ async def test_react_pattern_streams_final_answer_control_tool() -> None:
 
 
 @pytest.mark.asyncio
-async def test_react_pattern_does_not_stream_mixed_final_answer_candidate() -> None:
+async def test_react_strips_final_answer_bundled_before_work_tool() -> None:
+    """I-2: a final_answer bundled before a work tool is stripped too - the
+    work tool is no longer silently discarded, and the candidate answer text
+    is never streamed to the frontend."""
+
     llm = StreamingMixedFinalAnswerAndToolLLM()
-    pattern = ReActPattern(max_iterations=1)
+    pattern = ReActPattern(max_iterations=3)
     context = ExecutionContext(system_prompt="You are helpful.", execution_id="task-1")
     context.add_user_message("Calculate 2+2")
     outbound = OutboundCollector()
     runtime = PatternRuntime(execution_id="task-1", outbound_message_handler=outbound)
+    tool = FakeTool()
 
     result = await pattern.run(
         context=context,
-        tools=[FakeTool()],
+        tools=[tool],
         llm=llm,
         runtime=runtime,
     )
 
     assert result["success"] is True
-    assert result["response"] == "Candidate"
-    assert outbound.events == []
+    assert result["response"] == "4"
+    assert tool.calls == [{"expression": "2+2"}]
+    assert not any(
+        event.get("content") == "Candidate" or event.get("delta") == "Candidate"
+        for event in outbound.events
+    )
+
+
+@pytest.mark.asyncio
+async def test_react_strips_final_answer_bundled_after_work_tool(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """I-1/I-3/I-5: a final_answer bundled after a work tool is stripped, the
+    work tool executes and its result reaches the next turn, and the strip is
+    logged once with the model name and the pre-strip tool list, bounded and
+    escaped."""
+
+    llm = FakeNamedLLM(
+        responses=[
+            {
+                "tool_calls": [
+                    {
+                        "id": "call_calc",
+                        "function": {
+                            "name": "calculator",
+                            "arguments": '{"expression":"2+2"}',
+                        },
+                    },
+                    {
+                        "id": "call_final",
+                        "function": {
+                            "name": "final_answer",
+                            "arguments": '{"answer":"Looking that up now."}',
+                        },
+                    },
+                ],
+            },
+            {
+                "tool_calls": [
+                    {
+                        "id": "call_final_2",
+                        "function": {
+                            "name": "final_answer",
+                            "arguments": '{"answer":"4"}',
+                        },
+                    }
+                ],
+            },
+        ]
+    )
+    tool = FakeTool()
+    pattern = ReActPattern(max_iterations=3)
+    context = ExecutionContext(system_prompt="You are helpful.", execution_id="task-1")
+    context.add_user_message("Calculate 2+2")
+    runtime = PatternRuntime(execution_id="task-1")
+
+    with caplog.at_level(
+        logging.WARNING, logger="xagent.core.agent.pattern.react.react"
+    ):
+        result = await pattern.run(
+            context=context,
+            tools=[tool],
+            llm=llm,
+            runtime=runtime,
+        )
+
+    assert result["success"] is True
+    assert result["response"] == "4"
+    assert tool.calls == [{"expression": "2+2"}]
+
+    # I-3: the stripped final_answer leaves no trace in the assistant
+    # message, the tool-result messages, or the ledger.
+    assistant_messages = context.get_messages_by_role("assistant")
+    first_turn_tool_names = [
+        call["function"]["name"] for call in (assistant_messages[0].tool_calls or [])
+    ]
+    assert first_turn_tool_names == ["calculator"]
+    tool_result_ids = {
+        message.tool_call_id for message in context.get_messages_by_role("tool")
+    }
+    assert "call_final" not in tool_result_ids
+    assert "call_final" not in pattern.tool_ledger
+
+    # Regression-only guard, not a mutation-effective assertion on its own:
+    # no orphaned tool_call may ever appear in history.
+    assistant_tool_call_ids = {
+        call["id"]
+        for message in assistant_messages
+        for call in (message.tool_calls or [])
+    }
+    assert assistant_tool_call_ids == tool_result_ids
+
+    all_content = json.dumps(
+        [message.content for message in context.messages], default=str
+    )
+    assert "Looking that up now." not in all_content
+
+    assert len(llm.calls) == 2
+    assert llm.calls[1]["messages"][-1]["role"] == "tool"
+
+    messages = [record.getMessage() for record in caplog.records]
+    assert len(messages) == 1
+    assert "final_answer" in messages[0]
+    assert "calculator" in messages[0]
+    assert "fake-model" in messages[0]
+
+    # I-5 (bound): the tool-name list in the warning is capped, escaped, and
+    # never exposes an unbounded or unescaped model-controlled string.
+    caplog.clear()
+    long_name = "x" * 200 + "\n" + "y"
+    overflow_tool_calls = [
+        {"id": "call_long", "function": {"name": long_name, "arguments": "{}"}},
+        *(
+            {
+                "id": f"call_work_{index}",
+                "function": {"name": f"work_tool_{index}", "arguments": "{}"},
+            }
+            for index in range(10)
+        ),
+        {
+            "id": "call_overflow_final",
+            "function": {
+                "name": "final_answer",
+                "arguments": '{"answer":"Looking that up now."}',
+            },
+        },
+    ]
+    overflow_llm = FakeNamedLLM(responses=[{"tool_calls": overflow_tool_calls}])
+    overflow_pattern = ReActPattern(max_iterations=1)
+    overflow_context = ExecutionContext(
+        system_prompt="You are helpful.", execution_id="task-2"
+    )
+    overflow_context.add_user_message("Run many tools")
+    overflow_runtime = PatternRuntime(execution_id="task-2")
+
+    with caplog.at_level(
+        logging.WARNING, logger="xagent.core.agent.pattern.react.react"
+    ):
+        await overflow_pattern.run(
+            context=overflow_context,
+            tools=[],
+            llm=overflow_llm,
+            runtime=overflow_runtime,
+        )
+
+    overflow_messages = [record.getMessage() for record in caplog.records]
+    assert len(overflow_messages) == 1
+    overflow_message = overflow_messages[0]
+    assert "(+4 more)" in overflow_message
+    assert "\n" not in overflow_message
+    assert ("x" * 64) in overflow_message
+    assert ("x" * 65) not in overflow_message
+
+
+def test_tool_names_for_log_tolerates_non_mapping_entries() -> None:
+    """Matches the isinstance(dict) defense in _batch_carries_work_tool and
+    _strip_final_answer_bundled_with_work_tools: a non-mapping batch entry
+    must render a placeholder instead of crashing the log line it appears
+    in."""
+
+    pattern = ReActPattern()
+
+    rendered = pattern._tool_names_for_log(
+        [
+            {"id": "call_1", "name": "calculator"},
+            "not-a-tool-call",
+            None,
+        ]
+    )
+
+    assert "calculator" in rendered
+    assert "non-mapping tool_call: str" in rendered
+    assert "non-mapping tool_call: NoneType" in rendered
+
+
+@pytest.mark.asyncio
+async def test_react_strips_every_final_answer_in_a_mixed_batch() -> None:
+    """I-4: every final_answer in a batch is stripped, not only the first."""
+
+    llm = FakeLLM(
+        responses=[
+            {
+                "tool_calls": [
+                    {
+                        "id": "call_final_a",
+                        "function": {
+                            "name": "final_answer",
+                            "arguments": '{"answer":"A"}',
+                        },
+                    },
+                    {
+                        "id": "call_calc",
+                        "function": {
+                            "name": "calculator",
+                            "arguments": '{"expression":"2+2"}',
+                        },
+                    },
+                    {
+                        "id": "call_final_b",
+                        "function": {
+                            "name": "final_answer",
+                            "arguments": '{"answer":"B"}',
+                        },
+                    },
+                ],
+            },
+            {
+                "tool_calls": [
+                    {
+                        "id": "call_final_2",
+                        "function": {
+                            "name": "final_answer",
+                            "arguments": '{"answer":"4"}',
+                        },
+                    }
+                ],
+            },
+        ]
+    )
+    tool = FakeTool()
+    pattern = ReActPattern(max_iterations=3)
+    context = ExecutionContext(system_prompt="You are helpful.", execution_id="task-1")
+    context.add_user_message("Calculate 2+2")
+    runtime = PatternRuntime(execution_id="task-1")
+
+    result = await pattern.run(
+        context=context,
+        tools=[tool],
+        llm=llm,
+        runtime=runtime,
+    )
+
+    assert result["response"] not in {"A", "B"}
+    assert result["response"] == "4"
+    assistant_messages = context.get_messages_by_role("assistant")
+    first_turn_tool_calls = assistant_messages[0].tool_calls or []
+    assert len(first_turn_tool_calls) == 1
+    assert first_turn_tool_calls[0]["function"]["name"] == "calculator"
+
+
+@pytest.mark.asyncio
+async def test_react_closes_open_answer_stream_when_bundled_final_answer_is_stripped() -> (
+    None
+):
+    """I-6: an answer stream already open when the batch turns out to bundle
+    a work tool is closed explicitly instead of left open forever, and it is
+    never closed as though the candidate text were the real final answer."""
+
+    llm = StreamingAnswerThenWorkToolLLM()
+    pattern = ReActPattern(max_iterations=3)
+    context = ExecutionContext(system_prompt="You are helpful.", execution_id="task-1")
+    context.add_user_message("Calculate 2+2")
+    outbound = OutboundCollector()
+    runtime = PatternRuntime(execution_id="task-1", outbound_message_handler=outbound)
+    tool = FakeTool()
+
+    result = await pattern.run(
+        context=context,
+        tools=[tool],
+        llm=llm,
+        runtime=runtime,
+    )
+
+    assert result["success"] is True
+    assert result["response"] == "4"
+    assert tool.calls == [{"expression": "2+2"}]
+
+    started_id = next(
+        event["message_id"]
+        for event in outbound.events
+        if event["type"] == "final_answer_start"
+    )
+    first_stream_events = []
+    for event in outbound.events:
+        if event.get("message_id") != started_id:
+            continue
+        first_stream_events.append(event)
+        if event["type"] == "final_answer_error":
+            break
+
+    assert [event["type"] for event in first_stream_events] == [
+        "final_answer_start",
+        "final_answer_delta",
+        "final_answer_delta",
+        "final_answer_error",
+    ]
+    assert not any(
+        event["type"] == "final_answer_end"
+        and event.get("content") == "Looking that up now."
+        for event in outbound.events
+    )
+    assert outbound.events[-1]["type"] == "final_answer_end"
+    assert outbound.events[-1]["content"] == "4"
+
+
+@pytest.mark.asyncio
+async def test_react_keeps_send_message_bundled_with_work_tool(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Guards against a future change that widens the strip from final_answer
+    to every control tool. This test stays green if the strip is removed
+    entirely - it pins behavior that must not change, not behavior this fix
+    introduces."""
+
+    llm = FakeLLM(
+        responses=[
+            {
+                "tool_calls": [
+                    {
+                        "id": "call_message",
+                        "function": {
+                            "name": "send_message",
+                            "arguments": (
+                                '{"message":"Still working",'
+                                '"message_type":"progress","expect_response":false}'
+                            ),
+                        },
+                    },
+                    {
+                        "id": "call_calc",
+                        "function": {
+                            "name": "calculator",
+                            "arguments": '{"expression":"2+2"}',
+                        },
+                    },
+                ],
+            },
+            {
+                "tool_calls": [
+                    {
+                        "id": "call_final",
+                        "function": {
+                            "name": "final_answer",
+                            "arguments": '{"answer":"4"}',
+                        },
+                    }
+                ],
+            },
+        ]
+    )
+    tool = FakeTool()
+    pattern = ReActPattern(max_iterations=3)
+    context = ExecutionContext(system_prompt="You are helpful.", execution_id="task-1")
+    context.add_user_message("Calculate 2+2")
+    runtime = PatternRuntime(execution_id="task-1")
+
+    with caplog.at_level(
+        logging.WARNING, logger="xagent.core.agent.pattern.react.react"
+    ):
+        result = await pattern.run(
+            context=context,
+            tools=[tool],
+            llm=llm,
+            runtime=runtime,
+        )
+
+    assert result["success"] is True
+    assert result["response"] == "4"
+    assert tool.calls == [{"expression": "2+2"}]
+    assert len(runtime.outbound_messages) == 1
+    assert runtime.outbound_messages[0]["message"] == "Still working"
+    assert caplog.records == []
+
+
+@pytest.mark.asyncio
+async def test_react_keeps_control_only_final_answer_batch(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Same guard shape as the send_message case: a batch of control tools
+    only has no result the answer could be missing, so the strip must not
+    touch it. Green with or without the strip."""
+
+    llm = FakeLLM(
+        responses=[
+            {
+                "tool_calls": [
+                    {
+                        "id": "call_message",
+                        "function": {
+                            "name": "send_message",
+                            "arguments": (
+                                '{"message":"Still working",'
+                                '"message_type":"progress","expect_response":false}'
+                            ),
+                        },
+                    },
+                    {
+                        "id": "call_final",
+                        "function": {
+                            "name": "final_answer",
+                            "arguments": '{"answer":"Done."}',
+                        },
+                    },
+                ],
+            },
+        ]
+    )
+    pattern = ReActPattern(max_iterations=1)
+    context = ExecutionContext(system_prompt="You are helpful.", execution_id="task-1")
+    context.add_user_message("Do the thing")
+    runtime = PatternRuntime(execution_id="task-1")
+
+    with caplog.at_level(
+        logging.WARNING, logger="xagent.core.agent.pattern.react.react"
+    ):
+        result = await pattern.run(
+            context=context,
+            tools=[],
+            llm=llm,
+            runtime=runtime,
+        )
+
+    assert result["success"] is True
+    assert result["response"] == "Done."
+    assert caplog.records == []
+
+
+@pytest.mark.asyncio
+async def test_react_forced_final_answer_recovers_full_tool_set_after_mixed_batch(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """I-9a: guards the forced-final-answer turn's existing recovery path.
+    This test stays green if the strip is removed entirely - it pins
+    behavior that must not change, not behavior this fix introduces."""
+
+    llm = FakeLLM(
+        responses=[
+            {
+                "tool_calls": [
+                    {
+                        "id": "call_calc_1",
+                        "function": {
+                            "name": "calculator",
+                            "arguments": '{"expression":"2+2"}',
+                        },
+                    },
+                    {
+                        "id": "call_final_1",
+                        "function": {
+                            "name": "final_answer",
+                            "arguments": '{"answer":"Looking that up now."}',
+                        },
+                    },
+                ],
+            },
+            {
+                "tool_calls": [
+                    {
+                        "id": "call_calc_2",
+                        "function": {
+                            "name": "calculator",
+                            "arguments": '{"expression":"2+2"}',
+                        },
+                    }
+                ],
+            },
+            {
+                "tool_calls": [
+                    {
+                        "id": "call_final_2",
+                        "function": {
+                            "name": "final_answer",
+                            "arguments": '{"answer":"4"}',
+                        },
+                    }
+                ],
+            },
+        ]
+    )
+    tool = FakeTool()
+    pattern = ReActPattern(max_iterations=3)
+    pattern.force_final_answer_next = True
+    context = ExecutionContext(system_prompt="You are helpful.", execution_id="task-1")
+    context.add_user_message("Calculate 2+2")
+    runtime = PatternRuntime(execution_id="task-1")
+
+    with caplog.at_level(
+        logging.WARNING, logger="xagent.core.agent.pattern.react.react"
+    ):
+        result = await pattern.run(
+            context=context,
+            tools=[tool],
+            llm=llm,
+            runtime=runtime,
+        )
+
+    assert result["success"] is True
+    assert result["response"] == "4"
+    second_call_tool_names = {
+        schema["function"]["name"] for schema in llm.calls[1]["tools"]
+    }
+    assert "calculator" in second_call_tool_names
+    assert pattern.force_final_answer_next is False
+    assert tool.calls == [{"expression": "2+2"}]
+    assert caplog.records == []
+
+
+@pytest.mark.asyncio
+async def test_react_forced_final_answer_fails_when_recovery_retry_bundles_again(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """I-9b: anchor test - pins the strip's position, not its existence.
+    Deleting the strip helper entirely leaves this green. Moving the strip
+    call to run ahead of either tool-protocol-retry guard check instead of
+    after both turns it red: on the first guard, because the strip fires and
+    logs before that response is discarded wholesale for an unrelated reason,
+    leaving a stray "discarding" warning behind; on the second (retry) guard,
+    because stripping the retried batch's final_answer erases the very
+    mixed-call shape that guard exists to reject, so the run no longer fails
+    at all - it runs the retried calculator and needs a third response the
+    fixture never provides."""
+
+    llm = FakeLLM(
+        responses=[
+            {
+                "tool_calls": [
+                    {
+                        "id": "call_calc_1",
+                        "function": {
+                            "name": "calculator",
+                            "arguments": '{"expression":"2+2"}',
+                        },
+                    },
+                    {
+                        "id": "call_final_1",
+                        "function": {
+                            "name": "final_answer",
+                            "arguments": '{"answer":"Looking that up now."}',
+                        },
+                    },
+                ],
+            },
+            {
+                "tool_calls": [
+                    {
+                        "id": "call_calc_2",
+                        "function": {
+                            "name": "calculator",
+                            "arguments": '{"expression":"2+2"}',
+                        },
+                    },
+                    {
+                        "id": "call_final_2",
+                        "function": {
+                            "name": "final_answer",
+                            "arguments": '{"answer":"Looking that up now."}',
+                        },
+                    },
+                ],
+            },
+        ]
+    )
+    tool = FakeTool()
+    pattern = ReActPattern(max_iterations=3)
+    pattern.force_final_answer_next = True
+    context = ExecutionContext(system_prompt="You are helpful.", execution_id="task-1")
+    context.add_user_message("Calculate 2+2")
+    runtime = PatternRuntime(execution_id="task-1")
+
+    with caplog.at_level(
+        logging.WARNING, logger="xagent.core.agent.pattern.react.react"
+    ):
+        result = await pattern.run(
+            context=context,
+            tools=[tool],
+            llm=llm,
+            runtime=runtime,
+        )
+
+    assert result["success"] is False
+    assert result["status"] == "invalid_tool_protocol"
+    assert tool.calls == []
+    # The run fails through the existing invalid-protocol path, which logs
+    # its own unrelated warning; only the strip's warning must be absent.
+    assert not any("discarding" in record.getMessage() for record in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_react_strips_empty_final_answer_from_a_retried_batch_when_not_reforcing() -> (
+    None
+):
+    """Guards the retry recheck's accepted behavior change: a retried batch
+    that is neither a forced turn nor itself rejecting mixed control calls
+    (reject_mixed_control_calls=False from a provider protocol error on the
+    first response, force_final_answer=False because this was never a forced
+    turn) now lets a bundled empty final_answer strip and the work tool run,
+    instead of hard-failing as "invalid tool protocol after retry". The
+    first response's provider-level protocol error is what puts the run on
+    the retry path at all; the retried response is the one carrying the
+    mixed batch this test is pinning."""
+
+    llm = FakeLLM(
+        responses=[
+            tool_protocol_error_response(
+                ToolProtocolViolation(
+                    provider="deepseek",
+                    code="serialized_tool_call_content",
+                    message="Invalid provider tool protocol.",
+                )
+            ),
+            {
+                "tool_calls": [
+                    {
+                        "id": "call_work",
+                        "function": {
+                            "name": "calculator",
+                            "arguments": '{"expression":"2+2"}',
+                        },
+                    },
+                    {
+                        "id": "call_final",
+                        "function": {
+                            "name": "final_answer",
+                            "arguments": '{"answer":""}',
+                        },
+                    },
+                ],
+            },
+            {
+                "tool_calls": [
+                    {
+                        "id": "call_final_2",
+                        "function": {
+                            "name": "final_answer",
+                            "arguments": '{"answer":"4"}',
+                        },
+                    }
+                ],
+            },
+        ]
+    )
+    tool = FakeTool()
+    pattern = ReActPattern(max_iterations=3)
+    context = ExecutionContext(system_prompt="You are helpful.", execution_id="task-1")
+    context.add_user_message("Calculate 2+2")
+    runtime = PatternRuntime(execution_id="task-1")
+
+    result = await pattern.run(
+        context=context,
+        tools=[tool],
+        llm=llm,
+        runtime=runtime,
+    )
+
+    assert result["success"] is True
+    assert result["response"] == "4"
+    assert tool.calls == [{"expression": "2+2"}]
+    assert len(llm.calls) == 3
+
+
+@pytest.mark.asyncio
+async def test_react_strips_empty_final_answer_bundled_with_work_tool(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """I-11: an empty-answer final_answer bundled with a work tool is
+    stripped like any other bundled final_answer, instead of discarding the
+    whole response the way a control-only empty answer does."""
+
+    llm = FakeLLM(
+        responses=[
+            {
+                "tool_calls": [
+                    {
+                        "id": "call_calc",
+                        "function": {
+                            "name": "calculator",
+                            "arguments": '{"expression":"2+2"}',
+                        },
+                    },
+                    {
+                        "id": "call_final",
+                        "function": {
+                            "name": "final_answer",
+                            "arguments": '{"answer":""}',
+                        },
+                    },
+                ],
+            },
+            {
+                "tool_calls": [
+                    {
+                        "id": "call_final_2",
+                        "function": {
+                            "name": "final_answer",
+                            "arguments": '{"answer":"4"}',
+                        },
+                    }
+                ],
+            },
+        ]
+    )
+    tool = FakeTool()
+    pattern = ReActPattern(max_iterations=3)
+    context = ExecutionContext(system_prompt="You are helpful.", execution_id="task-1")
+    context.add_user_message("Calculate 2+2")
+    runtime = PatternRuntime(execution_id="task-1")
+
+    with caplog.at_level(
+        logging.WARNING, logger="xagent.core.agent.pattern.react.react"
+    ):
+        result = await pattern.run(
+            context=context,
+            tools=[tool],
+            llm=llm,
+            runtime=runtime,
+        )
+
+    assert result["success"] is True
+    assert result["response"] == "4"
+    assert tool.calls == [{"expression": "2+2"}]
+    assert len(llm.calls) == 2
+
+    messages = [record.getMessage() for record in caplog.records]
+    assert not any("carried no answer text" in message for message in messages)
+    assert any(
+        "final_answer" in message and "calculator" in message for message in messages
+    )
+
+
+@pytest.mark.asyncio
+async def test_react_pauses_for_user_after_stripping_bundled_final_answer() -> None:
+    """I-12: a batch that turns out to need user input after the bundled
+    final_answer is stripped still pauses cleanly, with the unexecuted work
+    tool cancelled rather than silently dropped."""
+
+    llm = FakeLLM(
+        responses=[
+            {
+                "tool_calls": [
+                    {
+                        "id": "call_final",
+                        "function": {
+                            "name": "final_answer",
+                            "arguments": '{"answer":"Done."}',
+                        },
+                    },
+                    {
+                        "id": "call_ask",
+                        "function": {
+                            "name": "ask_user_question",
+                            "arguments": '{"message":"Which one?"}',
+                        },
+                    },
+                    {
+                        "id": "call_calc",
+                        "function": {
+                            "name": "calculator",
+                            "arguments": '{"expression":"2+2"}',
+                        },
+                    },
+                ],
+            },
+        ]
+    )
+    tool = FakeTool()
+    pattern = ReActPattern(max_iterations=1)
+    context = ExecutionContext(system_prompt="You are helpful.", execution_id="task-1")
+    context.add_user_message("Calculate 2+2 then ask me something")
+    runtime = PatternRuntime(execution_id="task-1")
+
+    result = await pattern.run(
+        context=context,
+        tools=[tool],
+        llm=llm,
+        runtime=runtime,
+    )
+
+    assert result["status"] == "waiting_for_user"
+    assert tool.calls == []
+    assert "call_final" not in pattern.tool_ledger
+    assert pattern.tool_ledger["call_calc"].status == "cancelled"
+    assert pattern.tool_ledger["call_ask"].status == "completed"
+
+    assistant_messages = context.get_messages_by_role("assistant")
+    assistant_tool_call_ids = {
+        call["id"]
+        for message in assistant_messages
+        for call in (message.tool_calls or [])
+    }
+    tool_result_ids = {
+        message.tool_call_id for message in context.get_messages_by_role("tool")
+    }
+    assert assistant_tool_call_ids == {"call_ask", "call_calc"}
+    assert assistant_tool_call_ids <= tool_result_ids
 
 
 @pytest.mark.asyncio
@@ -3110,6 +3992,10 @@ async def test_react_pattern_reserves_control_tool_names_in_schema() -> None:
     )
     assert "tool names mentioned in memory" in system_prompt
     assert "call the final_answer tool exactly once" in system_prompt
+    assert (
+        "Never put final_answer in the same response as any other tool call"
+        in system_prompt
+    )
     final_answer_schema = next(
         schema
         for schema in llm.calls[0]["tools"]
@@ -3118,6 +4004,10 @@ async def test_react_pattern_reserves_control_tool_names_in_schema() -> None:
     assert (
         "same natural language as the current user request"
         in final_answer_schema["description"]
+    )
+    assert (
+        "Call this tool alone: never place it in the same response as any "
+        "other tool call" in final_answer_schema["description"]
     )
     assert "response_language" in final_answer_schema["parameters"]["required"]
     assert "outcome" in final_answer_schema["parameters"]["required"]
@@ -3138,6 +4028,78 @@ async def test_react_pattern_reserves_control_tool_names_in_schema() -> None:
     assert "## FINAL DELIVERABLE FILE REFERENCES" not in answer_schema["description"]
     assert "exact markdown_link" in answer_schema["description"]
     assert "get_workspace_output_files" not in answer_schema["description"]
+
+
+def test_interaction_type_list_has_one_source() -> None:
+    from xagent.core.tools.adapters.vibe.ask_user_tool import InteractionArg
+    from xagent.core.tools.adapters.vibe.interaction_types import INTERACTION_TYPES
+    from xagent.web.services.task_interaction_service import _V1_INTERACTION_TYPES
+
+    assert INTERACTION_TYPES == (
+        "select_one",
+        "select_multiple",
+        "text_input",
+        "file_upload",
+        "confirm",
+        "number_input",
+        "action_cards",
+    )
+    assert InteractionArg.model_fields["type"].description == (
+        "Type of interaction: select_one, select_multiple, text_input, "
+        "file_upload, confirm, number_input, action_cards"
+    )
+    assert frozenset(INTERACTION_TYPES) == _V1_INTERACTION_TYPES
+
+
+async def test_react_pattern_ask_user_question_schema_derives_its_type_enum_from_one_source() -> (
+    None
+):
+    """The ask_user_question tool's ``interactions[].type`` enum is built
+    from ``interaction_types.INTERACTION_TYPES`` rather than a copy written
+    out in this schema; a name added or reordered there must show up here
+    unchanged."""
+
+    from xagent.core.tools.adapters.vibe.interaction_types import INTERACTION_TYPES
+
+    llm = FakeLLM(responses=[{"content": "No tools needed."}])
+    pattern = ReActPattern(max_iterations=1)
+    context = ExecutionContext()
+    context.add_user_message("Say hi")
+
+    result = await pattern.run(
+        context=context,
+        tools=[FakeAskUserTool()],
+        llm=llm,
+    )
+
+    assert result["success"] is True
+    ask_user_schema = next(
+        schema
+        for schema in llm.calls[0]["tools"]
+        if schema["function"]["name"] == "ask_user_question"
+    )["function"]
+    type_enum = ask_user_schema["parameters"]["properties"]["interactions"]["items"][
+        "properties"
+    ]["type"]["enum"]
+    assert type_enum == list(INTERACTION_TYPES)
+
+
+def test_react_module_pulls_in_no_web_modules() -> None:
+    """react.py must not depend on xagent.web. The interaction type list it
+    reads lives in an import-free module for exactly this reason -- putting
+    it beside InteractionArg in ask_user_tool pulls the tool-registration
+    chain and 61 xagent.web modules into every import of this pattern."""
+    import subprocess
+    import sys
+
+    probe = (
+        "import sys; import xagent.core.agent.pattern.react.react; "
+        "print(len([m for m in sys.modules if m.startswith('xagent.web')]))"
+    )
+    out = subprocess.run(
+        [sys.executable, "-c", probe], capture_output=True, text=True, check=True
+    )
+    assert out.stdout.strip() == "0"
 
 
 def test_react_final_answer_lookup_instruction_tracks_active_workspace_tool() -> None:
@@ -3204,6 +4166,11 @@ async def test_react_pattern_can_finish_with_final_answer_tool() -> None:
 async def test_react_pattern_final_answer_clears_trailing_pending_before_checkpoint() -> (
     None
 ):
+    # The trailing call is another control tool (send_message), not a work
+    # tool: a work tool here would instead be stripped from the batch before
+    # final_answer ever reaches this point (see the strip tests above), which
+    # would defeat what this test is pinning - that a control result of
+    # "completed" clears whatever is still queued behind it.
     llm = FakeLLM(
         responses=[
             {
@@ -3216,10 +4183,13 @@ async def test_react_pattern_final_answer_clears_trailing_pending_before_checkpo
                         },
                     },
                     {
-                        "id": "call_calc",
+                        "id": "call_message",
                         "function": {
-                            "name": "calculator",
-                            "arguments": '{"expression":"9+1"}',
+                            "name": "send_message",
+                            "arguments": (
+                                '{"message":"Still working",'
+                                '"message_type":"progress","expect_response":false}'
+                            ),
                         },
                     },
                 ],
@@ -4644,6 +5614,58 @@ async def test_react_pattern_skips_store_memory_tool_in_single_call_mode() -> No
 
 
 @pytest.mark.asyncio
+async def test_tool_result_user_interaction_fails_closed_when_disabled() -> None:
+    class WaitingTool:
+        metadata = SimpleNamespace(
+            name="approval_gate",
+            description="Request approval.",
+        )
+
+        def args_type(self) -> type[BaseModel]:
+            return CalculatorArgs
+
+        async def run_json_async(self, args: dict[str, Any]) -> dict[str, Any]:
+            return {
+                "success": False,
+                "status": "waiting_for_user",
+                "message": "Approve this action?",
+            }
+
+    pattern = ReActPattern(max_iterations=2, user_interaction_enabled=False)
+    runtime = PatternRuntime(execution_id="unattended-task")
+    context = ExecutionContext(execution_id="unattended-task")
+    context.add_user_message("Run unattended.")
+
+    result = await pattern.run(
+        context=context,
+        tools=[WaitingTool()],
+        llm=FakeLLM(
+            [
+                {
+                    "tool_calls": [
+                        {
+                            "id": "wait-call",
+                            "function": {
+                                "name": "approval_gate",
+                                "arguments": '{"expression":"2+2"}',
+                            },
+                        }
+                    ]
+                }
+            ]
+        ),
+        runtime=runtime,
+    )
+
+    assert result["success"] is False
+    assert result["status"] == "failed"
+    assert "interaction is disabled" in result["error"]
+    assert runtime.outbound_messages == []
+    assert pattern.status == "failed"
+    assert pattern.waiting_for_user_request is None
+
+
+@pytest.mark.asyncio
 async def test_tool_result_can_pause_and_resume_with_user_response() -> None:
     class ResumableTool:
         def __init__(self) -> None:
@@ -5295,8 +6317,10 @@ async def test_react_retries_final_answer_that_omits_the_answer_field() -> None:
 
 
 @pytest.mark.asyncio
-async def test_react_discards_empty_final_answer_with_trailing_work_call() -> None:
-    """Discard the invalid response so retry feedback survives sanitization."""
+async def test_react_strips_empty_final_answer_with_trailing_work_call() -> None:
+    """An empty-answer final_answer bundled with a work tool is stripped like
+    any other bundled final_answer: the work tool executes instead of being
+    discarded along with the empty answer (I-11, streaming path)."""
 
     llm = StreamingEmptyFinalAnswerLLM(trailing_work_tool=True)
     pattern, context, runtime, _outbound, _tracer = _react_empty_final_answer_fixture()
@@ -5311,12 +6335,8 @@ async def test_react_discards_empty_final_answer_with_trailing_work_call() -> No
 
     assert result["success"] is True
     assert result["response"] == "The result is 4."
-    assert tool.calls == []
+    assert tool.calls == [{"expression": "2+2"}]
     assert len(llm.stream_calls) == 2
-    assert (
-        "previous response called final_answer with an empty answer"
-        in (llm.stream_calls[1]["messages"][0]["content"])
-    )
 
     assistant_tool_call_ids = {
         tool_call["id"]
@@ -5326,7 +6346,8 @@ async def test_react_discards_empty_final_answer_with_trailing_work_call() -> No
     tool_result_ids = {
         message.tool_call_id for message in context.messages if message.role == "tool"
     }
-    assert assistant_tool_call_ids == {"call_final_1"}
+    assert "call_final_0" not in assistant_tool_call_ids
+    assert "call_final_0" not in pattern.tool_ledger
     assert assistant_tool_call_ids <= tool_result_ids
 
 
@@ -5528,12 +6549,14 @@ def test_empty_final_answer_call_detects_blank_answers() -> None:
 
 @pytest.mark.asyncio
 async def test_react_discards_rest_of_resumed_batch_after_empty_final_answer() -> None:
-    """A rejected resume batch must not run work the fresh path would discard.
+    """A rejected resume batch cancels its still-pending sibling calls.
 
-    The fresh-turn path throws away the whole offending response, so a
-    ``[final_answer(""), work_tool]`` batch never executes the work tool. A
-    resumed batch has to match, or a pre-fix checkpoint replays a side effect
-    that the same model output would never have produced on a live turn.
+    On resume the whole batch's assistant envelope is already recorded in
+    history before execution starts, so every queued call must end with a
+    result row; the only safe outcome for siblings behind a rejected empty
+    ``final_answer`` is cancellation. A fresh-turn ``[final_answer(""),
+    work_tool]`` batch instead strips the ``final_answer`` before anything
+    is recorded and runs the work tool, so the two paths diverge on purpose.
     """
 
     llm = StreamingEmptyFinalAnswerLLM()
@@ -5721,9 +6744,11 @@ async def test_react_resumed_empty_final_answer_abandons_after_forced_retry() ->
 async def test_react_resumed_reverse_batch_order_cannot_undo_an_executed_tool() -> None:
     """Pins the documented limit of the resume guard's batch discard.
 
-    In ``[work_tool, final_answer("")]`` the work tool has already executed by
-    the time the rejection runs, so the match with the fresh path's
-    whole-response rejection is exact only when the empty answer comes first.
+    In ``[work_tool, final_answer("")]`` restored onto ``pending_tool_calls``,
+    the work tool has already executed by the time the rejection runs, so
+    discarding the rest of the batch cannot reach back and undo it - the
+    resume guard can only cancel calls still queued, never ones already
+    committed.
     """
 
     llm = StreamingEmptyFinalAnswerLLM()
@@ -6131,3 +7156,49 @@ async def test_blank_streaming_arguments_flow_from_adapter_into_react(mocker) ->
     assert result["success"] is True
     assert result["response"] == "gpt-4o"
     assert tool.calls == [{}]
+
+
+def _react_clock_prompt(timezone_name: str | None) -> str:
+    context = ExecutionContext(
+        created_at=datetime(2026, 8, 24, 22, 3, 37, tzinfo=timezone.utc)
+    )
+    if timezone_name is not None:
+        context.metadata[CLOCK_TIMEZONE_METADATA_KEY] = timezone_name
+    context.add_user_message("how many shifts do we have on tomorrow?")
+
+    messages = ReActPattern()._messages_for_llm(context, has_tools=True)
+    return messages[0]["content"]
+
+
+# Verbatim pre-PR sentence, so a change to any part of the fallback instruction
+# fails rather than only a change to its "Current date" prefix.
+UTC_DATE_INSTRUCTION = (
+    "Current date (UTC): 2026-08-24. "
+    "For recent, latest, current, or time-sensitive requests, use this "
+    "date when forming search queries and judging source relevance."
+)
+
+
+def _date_instruction(prompt: str) -> str:
+    start = prompt.index("Current date (")
+    end = prompt.index("source relevance.", start) + len("source relevance.")
+    return prompt[start:end]
+
+
+def test_tool_call_date_line_keeps_utc_wording_without_a_timezone() -> None:
+    assert _date_instruction(_react_clock_prompt(None)) == UTC_DATE_INSTRUCTION
+
+
+def test_tool_call_date_line_uses_the_caller_timezone() -> None:
+    prompt = _react_clock_prompt("Australia/Melbourne")
+
+    assert _date_instruction(prompt) == UTC_DATE_INSTRUCTION.replace(
+        "Current date (UTC): 2026-08-24. ",
+        "Current date (Australia/Melbourne): 2026-08-25. ",
+    )
+    # The UTC date is what produced the wrong "tomorrow" in production.
+    assert "Current date (UTC)" not in prompt
+
+
+def test_tool_call_date_line_degrades_to_utc_for_an_unusable_timezone() -> None:
+    assert _date_instruction(_react_clock_prompt("Not/AZone")) == UTC_DATE_INSTRUCTION

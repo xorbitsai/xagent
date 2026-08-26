@@ -1361,7 +1361,13 @@ class TaskWorkspace:
                 if should_close:
                     db.close()
         except Exception as e:
-            logger.warning(f"Failed to resolve file_id from database: {e}")
+            # ``exc_info`` because this fault is swallowed -- the caller only
+            # sees ``None`` -- so this is its only record. A durable-storage
+            # fault arrives here from ``materialize()`` carrying just the
+            # storage key; its cause lives in ``__cause__`` (#1467).
+            logger.warning(
+                f"Failed to resolve file_id from database: {e}", exc_info=True
+            )
             return None
 
     def _file_operation_path_in_authorized_storage(self, path: Path) -> bool:

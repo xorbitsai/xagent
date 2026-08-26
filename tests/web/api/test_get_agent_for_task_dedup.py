@@ -224,3 +224,92 @@ async def test_existing_task_with_agent_dedups_task_and_agent_queries() -> None:
     )
     assert counter.calls_by_model[User] == 0
     snapshot_loader.assert_called_once_with(42, None)
+
+
+@pytest.mark.asyncio
+async def test_owner_mismatch_reload_failure_detaches_the_live_owner_row() -> None:
+    """Regression: a cached task whose owner mismatches gets evicted and
+    rebuilt. Runtime identity is first resolved onto a live ORM `User`
+    (the owner row, queried directly on the request session) as a
+    fallback ahead of the richer snapshot load that would normally
+    replace it with a detached RuntimeUserFields. If that richer load
+    fails - anything other than HTTPException/TaskOwnerMismatchError/
+    _AgentRuntimeSessionBoundaryError - the live `User` must not survive
+    past this point: release_db_connection_if_clean's rollback expires
+    every object the request session loaded, and any later attribute
+    read (e.g. voice_from_runtime_user's `.preferences` access in
+    create_default_tools) would otherwise force an implicit reload on
+    the event loop instead of using the detached snapshot this whole
+    mechanism exists to provide."""
+    manager = AgentServiceManager()
+    acting_user = _make_user()  # id=1
+    owner_row = User(id=2, username="owner", password_hash="hash", is_admin=False)
+    task = _make_task(status=TaskStatus.PENDING)
+    task.user_id = 2
+
+    # A cached entry for a DIFFERENT owner (id=1) is what triggers the
+    # owner-mismatch eviction once the real owner (id=2) resolves below -
+    # the eviction is what skips the *first* snapshot load, which is
+    # only attempted up front for a task not already cached.
+    manager._agents[42] = MagicMock()
+    manager._agent_owner_ids[42] = 1
+
+    def query_side_effect(model):
+        result = MagicMock()
+        result.filter = MagicMock(return_value=result)
+        if model is Task.user_id:
+            result.first = MagicMock(return_value=(2,))
+        elif model is User:
+            result.first = MagicMock(return_value=owner_row)
+        else:
+            result.first = MagicMock(return_value=None)
+        return result
+
+    db = MagicMock()
+    db.query = MagicMock(side_effect=query_side_effect)
+
+    captured_tool_kwargs: dict[str, Any] = {}
+
+    async def fake_create_default_tools(*_args, **kwargs):
+        captured_tool_kwargs.update(kwargs)
+        return ([], MagicMock())
+
+    with (
+        patch(
+            "xagent.web.api.chat.load_task_setup_snapshot_sync",
+            side_effect=RuntimeError("snapshot load failed"),
+        ),
+        patch.object(manager, "_load_persisted_conversation_history"),
+        patch("xagent.web.api.chat.create_task_tracer", return_value=MagicMock()),
+        patch(
+            "xagent.web.api.chat.create_default_tools",
+            new=fake_create_default_tools,
+        ),
+        patch("xagent.web.sandbox_manager.get_sandbox_manager", return_value=None),
+        patch("xagent.web.api.chat.AgentService"),
+        patch(
+            "xagent.web.api.chat.resolve_execution_scope",
+            return_value=None,
+        ),
+    ):
+        try:
+            await manager.get_agent_for_task(task_id=42, db=db, user=acting_user)
+        except Exception:
+            # The assertion below only needs create_default_tools to have
+            # already been called with the runtime identity this test
+            # verifies; a later stub raising doesn't invalidate that.
+            pass
+
+    assert "user" in captured_tool_kwargs, (
+        "create_default_tools was never called - the owner-mismatch "
+        "eviction and reload-failure path this test targets wasn't "
+        "reached; fix the test setup, not the assertion below."
+    )
+    assert not isinstance(captured_tool_kwargs["user"], User), (
+        "a live ORM User reached create_default_tools after the richer "
+        "snapshot load failed - it must be detached to RuntimeUserFields "
+        "first, or a later attribute read forces an implicit reload once "
+        "the request session's connection is released"
+    )
+    assert isinstance(captured_tool_kwargs["user"], RuntimeUserFields)
+    assert captured_tool_kwargs["user"].id == 2

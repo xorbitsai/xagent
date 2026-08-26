@@ -1599,10 +1599,30 @@ class UploadsDirConfigurationError(Exception):
     """
 
 
+class ExternalUploadsDirConfigurationError(Exception):
+    """A configured external upload directory has two physical meanings."""
+
+
 # First absolutized reading of each cwd-dependent uploads root, kept so the
 # root cannot move mid-process (see _require_unambiguous_uploads_dir). Keyed by
 # the configured spelling, so changing the configuration still takes effect.
 _pinned_relative_uploads_roots: dict[str, Path] = {}
+
+# External upload dirs feed both the chat allowlist and sandbox mount building
+# through separate calls. Pin cwd-dependent spellings on first use so a later
+# process-wide chdir cannot make those consumers name different directories.
+_pinned_relative_external_upload_dirs: dict[str, Path] = {}
+
+
+def _reset_path_config_caches_for_tests() -> None:
+    """Clear cwd-dependent path pins between tests.
+
+    Production code deliberately keeps these values for the process lifetime;
+    tests need an explicit reset boundary so their result cannot depend on
+    which working directory an earlier test pinned for the same spelling.
+    """
+    _pinned_relative_uploads_roots.clear()
+    _pinned_relative_external_upload_dirs.clear()
 
 
 def _require_unambiguous_uploads_dir(uploads_dir: Path) -> Path:
@@ -1611,20 +1631,20 @@ def _require_unambiguous_uploads_dir(uploads_dir: Path) -> Path:
     Paths under the uploads root reach consumers that normalize differently,
     and both normalizations are load-bearing:
 
-    - lexical (``canonical_sandbox_path``) is what sandbox mount identity and
-      desired-vs-observed spec comparison must use, because a path that keeps
-      ``..`` can never byte-match what a container backend reports;
+    - lexical (``canonical_sandbox_path``) is still used by generic sandbox
+      configuration identities and must not preserve ``..`` segments that a
+      backend will report differently;
     - physical (``realpath``) is what ``TaskWorkspace``, the upload writers
       and ``files.py``'s containment checks use, because files have to be
       found.
 
     They agree on every spelling but one: a symlink followed by ``..``, where
     the lexical form discards the symlink the physical form follows. That
-    configuration makes one logical directory two real ones, so an uploaded
-    file can land where the sandbox never mounted and agent tools cannot see
-    it. Rejecting the input is what lets each consumer keep its own
-    normalization: none has to defend against this, and a new consumer cannot
-    reintroduce it by picking the "wrong" one.
+    configuration gives one logical directory two readings. Workspace mount
+    producers retain both readings -- the lexical one for Docker-host path
+    translation and the physical one for file identity -- so rejecting this
+    ambiguous spelling at the shared configuration boundary prevents those
+    two load-bearing views from naming different directories.
 
     An ordinary symlink is untouched -- following one is not a disagreement,
     both spellings still name a single directory.
@@ -1998,7 +2018,11 @@ def get_external_upload_dirs() -> list[Path]:
     """Get external upload directories from environment variable.
 
     The XAGENT_EXTERNAL_UPLOAD_DIRS environment variable should contain
-    a comma-separated list of directory paths.
+    a comma-separated list of directory paths. Environment variables and
+    ``~`` are expanded and relative paths are pinned to their first observed
+    working directory. The returned path deliberately preserves its symlink
+    spelling: Docker sibling-mode translation needs that backend-relative
+    spelling, while file-access consumers resolve it in their own domain.
 
     Example: /path/to/uploads1,/path/to/uploads2
 
@@ -2015,13 +2039,33 @@ def get_external_upload_dirs() -> list[Path]:
     for dir_path in env_dirs.split(","):
         dir_path = dir_path.strip()
         if dir_path:
-            path = Path(dir_path)
-            if path.is_dir():
-                result.append(path)
+            expanded = Path(os.path.expandvars(dir_path)).expanduser()
+            if expanded.is_absolute():
+                absolute = expanded
+            else:
+                absolute = _pinned_relative_external_upload_dirs.setdefault(
+                    dir_path, Path.cwd() / expanded
+                )
+            from .sandbox.base import canonical_sandbox_path
+
+            canonical = Path(canonical_sandbox_path(str(absolute)))
+            physical_configured = os.path.realpath(absolute)
+            physical_canonical = os.path.realpath(canonical)
+            if physical_configured != physical_canonical:
+                raise ExternalUploadsDirConfigurationError(
+                    f"External upload directory {dir_path!r} names two different "
+                    "directories depending on normalization: lexically it is "
+                    f"{str(canonical)!r}, resolving to {physical_canonical!r}, "
+                    "while resolving the configured spelling directly gives "
+                    f"{physical_configured!r}. A '..' segment after a symlink "
+                    "does that; configure the directory you actually mean."
+                )
+            if canonical.is_dir():
+                result.append(canonical)
             else:
                 logger.warning(
                     "External upload directory does not exist or is not a directory: %r",
-                    path,
+                    canonical,
                 )
 
     return result

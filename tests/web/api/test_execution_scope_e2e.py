@@ -209,7 +209,7 @@ async def test_scoped_build_applies_the_scope_to_every_subsystem() -> None:
     lifecycle key, the sandbox mount intent, the workspace base dir, the
     carried segments, and the cache fingerprint — in the same build.
 
-    SCOPE_A does not set ``isolate_external_dirs``, so the CA-physical mount
+    SCOPE_A does not set ``isolate_external_dirs``, so the CA mount
     intent folds to the unscoped user root (build_chat_workspace_binding's
     covering-absorbs-root rule): the container family still narrows via
     ``sandbox_key_suffix``, but the Actor-logical workspace base dir (below)

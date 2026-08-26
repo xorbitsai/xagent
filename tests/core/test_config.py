@@ -113,6 +113,7 @@ from xagent.config import (
     WEB_CRAWL_TLS_IMPERSONATE,
     WEB_DIR,
     WEB_SEARCH_PROVIDER,
+    ExternalUploadsDirConfigurationError,
     format_file_size,
     get_agent_pattern_for_execution_mode,
     get_agent_runtime,
@@ -1208,6 +1209,47 @@ class TestGetExternalUploadDirs:
             assert len(result) == 2
             assert dir1 in result
             assert dir2 in result
+
+    def test_expands_environment_tilde_and_preserves_symlink_spelling(
+        self, tmp_path, monkeypatch
+    ):
+        physical = tmp_path / "physical" / "uploads"
+        physical.mkdir(parents=True)
+        alias = tmp_path / "alias"
+        alias.symlink_to(physical, target_is_directory=True)
+        monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.setenv("EXTERNAL_NAME", "alias")
+        monkeypatch.setenv(EXTERNAL_UPLOAD_DIRS, "~/$EXTERNAL_NAME")
+
+        assert get_external_upload_dirs() == [alias]
+
+    def test_rejects_symlink_followed_by_dotdot(self, tmp_path, monkeypatch):
+        base = tmp_path / "base"
+        outside = tmp_path / "outside" / "nested"
+        base.mkdir()
+        outside.mkdir(parents=True)
+        (base / "link").symlink_to(outside, target_is_directory=True)
+        monkeypatch.setenv(EXTERNAL_UPLOAD_DIRS, str(base / "link" / ".."))
+
+        with pytest.raises(ExternalUploadsDirConfigurationError, match="two different"):
+            get_external_upload_dirs()
+
+    def test_relative_dir_is_pinned_to_first_working_directory(
+        self, tmp_path, monkeypatch
+    ):
+        first_cwd = tmp_path / "first"
+        second_cwd = tmp_path / "second"
+        external = first_cwd / "relative-external"
+        external.mkdir(parents=True)
+        second_cwd.mkdir()
+        relative_spelling = "relative-external"
+        monkeypatch.setenv(EXTERNAL_UPLOAD_DIRS, relative_spelling)
+
+        monkeypatch.chdir(first_cwd)
+        assert get_external_upload_dirs() == [external]
+
+        monkeypatch.chdir(second_cwd)
+        assert get_external_upload_dirs() == [external]
 
 
 class TestGetExternalSkillsDirs:

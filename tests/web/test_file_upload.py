@@ -1,5 +1,6 @@
 """Test file upload API functionality - Fixed for multi-tenant architecture"""
 
+import logging
 import os
 import tempfile
 from pathlib import Path
@@ -19,6 +20,7 @@ from xagent.web.models import database as database_module
 from xagent.web.models.database import Base, get_db
 from xagent.web.models.uploaded_file import UploadedFile
 from xagent.web.models.user import User
+from xagent.web.services.managed_file_ref import DURABLE_FAULT_LOG_PREFIX
 
 
 @pytest.fixture(scope="function")
@@ -1510,7 +1512,7 @@ class TestFileManagement:
         assert unrelated_cache.exists()
 
     def test_delete_file_keeps_record_when_durable_cleanup_fails(
-        self, client, test_db, temp_uploads_dir, auth_headers, monkeypatch
+        self, client, test_db, temp_uploads_dir, auth_headers, monkeypatch, caplog
     ):
         """Durable cleanup failure should not orphan the object by deleting the row."""
         from xagent.core.file_storage.storage import FsspecFileStorage
@@ -1549,10 +1551,194 @@ class TestFileManagement:
 
         monkeypatch.setattr(FsspecFileStorage, "delete", fail_target_delete)
 
-        response = client.delete(f"/api/files/{file_id}", headers=auth_headers)
+        with caplog.at_level(logging.WARNING, logger="xagent.web.api.files"):
+            response = client.delete(f"/api/files/{file_id}", headers=auth_headers)
 
         assert response.status_code == 503
         assert local_path.exists()
+
+        # End-to-end on the message this endpoint actually composes (#1467).
+        # Asserting through the request rather than by calling the helper with a
+        # hand-built label is the point: a drift in what the endpoint passes --
+        # a wrong variable, a dropped field -- would otherwise be invisible.
+        fault_lines = [
+            logging.Formatter("%(message)s").format(entry)
+            for entry in caplog.records
+            if entry.name == "xagent.web.api.files"
+            and entry.levelno == logging.WARNING
+            and "durable cleanup before row delete" in entry.getMessage()
+        ]
+        assert len(fault_lines) == 1, caplog.records
+        rendered = fault_lines[0]
+        assert f"file_id={file_id}" in rendered
+        assert f"storage_key={storage_key}" in rendered
+        # The cause chain, not just its str(), so the provider class survives.
+        assert "RuntimeError" in rendered
+        assert "simulated durable delete failure" in rendered
+        # The 503 body stays detail-free: the key must not reach the client.
+        assert storage_key not in response.text
+        db = next(test_app.dependency_overrides[get_db]())
+        try:
+            assert (
+                db.query(UploadedFile).filter(UploadedFile.file_id == file_id).first()
+                is not None
+            )
+        finally:
+            db.close()
+
+    def test_delete_file_malformed_key_is_not_reported_as_an_outage(
+        self, client, test_db, temp_uploads_dir, auth_headers, caplog
+    ):
+        """The other half of #1473: a structurally-invalid persisted key.
+
+        ``ScopedFileStorage.delete`` normalizes the key even in tolerant mode,
+        and ``normalize_storage_key`` raises ``ValueError`` for a ``..`` path
+        segment (also a null byte or an empty key). That is data-level
+        corruption in the row itself -- no retry can clear it -- so the
+        cleanup arm must let it propagate rather than fold it into the
+        retryable 503 with a transient-outage warning, which is exactly the
+        failure #1473 describes: the row becomes undeletable through the API
+        while the client is told to retry forever.
+        """
+        admin_user, test_app = test_db
+        upload_response = client.post(
+            "/api/files/upload",
+            files={"file": ("malformed-key.txt", b"malformed key", "text/plain")},
+            data={"task_type": "general"},
+            headers=auth_headers,
+        )
+        assert upload_response.status_code == 200
+        file_id = upload_response.json()["file_id"]
+
+        # Corrupt the persisted key the way a bad migration or adopt would:
+        # structurally invalid, not merely out of scope.
+        db = next(test_app.dependency_overrides[get_db]())
+        try:
+            record = (
+                db.query(UploadedFile).filter(UploadedFile.file_id == file_id).one()
+            )
+            record.storage_key = f"users/{admin_user.id}/uploads/../{file_id}"
+            db.commit()
+        finally:
+            db.close()
+
+        with caplog.at_level(logging.WARNING, logger="xagent.web.api.files"):
+            with pytest.raises(ValueError, match="Invalid storage key"):
+                client.delete(f"/api/files/{file_id}", headers=auth_headers)
+
+        # No outage warning: the fault is permanent, not a durable outage.
+        assert not [
+            entry
+            for entry in caplog.records
+            if entry.name == "xagent.web.api.files"
+            and DURABLE_FAULT_LOG_PREFIX in entry.getMessage()
+        ], "a malformed persisted key was reported as a durable-storage outage"
+        # The row survives, same as any failed cleanup.
+        db = next(test_app.dependency_overrides[get_db]())
+        try:
+            assert (
+                db.query(UploadedFile).filter(UploadedFile.file_id == file_id).first()
+                is not None
+            )
+        finally:
+            db.close()
+
+    def test_delete_file_backend_value_error_is_still_a_retryable_outage(
+        self, client, test_db, temp_uploads_dir, auth_headers, monkeypatch, caplog
+    ):
+        """A ValueError from the backend is an outage, not a malformed key.
+
+        ``ScopedFileStorage.delete`` normalizes and then calls ``fs.exists`` /
+        ``fs.rm``, and those raise ``ValueError`` for their own reasons. The
+        malformed-key half of #1473 must not swallow that case: catching
+        ``ValueError`` around the whole call made every backend one permanent,
+        bypassing both the durable-outage log and the retryable 503. The key
+        is validated before the call now, so only the normalization boundary
+        is permanent.
+        """
+        from xagent.core.file_storage.storage import FsspecFileStorage
+
+        _, test_app = test_db
+        upload_response = client.post(
+            "/api/files/upload",
+            files={"file": ("backend-value-error.txt", b"payload", "text/plain")},
+            data={"task_type": "general"},
+            headers=auth_headers,
+        )
+        assert upload_response.status_code == 200
+        file_id = upload_response.json()["file_id"]
+
+        def backend_value_error(self, key):
+            raise ValueError("backend rejected the request")
+
+        monkeypatch.setattr(FsspecFileStorage, "delete", backend_value_error)
+
+        with caplog.at_level(logging.WARNING, logger="xagent.web.api.files"):
+            response = client.delete(f"/api/files/{file_id}", headers=auth_headers)
+
+        # Retryable, not the permanent 500 a malformed key produces.
+        assert response.status_code == 503, response.text
+        # And it is reported as a durable-storage fault, with its cause.
+        fault_lines = [
+            entry.getMessage()
+            for entry in caplog.records
+            if entry.name == "xagent.web.api.files"
+            and DURABLE_FAULT_LOG_PREFIX in entry.getMessage()
+        ]
+        assert len(fault_lines) == 1, caplog.records
+        assert "durable cleanup before row delete" in fault_lines[0]
+
+    def test_delete_file_scope_violation_is_not_reported_as_an_outage(
+        self, client, test_db, temp_uploads_dir, auth_headers, monkeypatch, caplog
+    ):
+        """A containment violation is a permanent authority fault, not a 503.
+
+        ``ScopedFileStorage.delete`` raises ``StorageKeyScopeError`` before it
+        reaches the backend when the key falls outside the bound prefix. The
+        cleanup arm must let it propagate -- retrying cannot clear an
+        authority fault, and the outage warning would point an operator at the
+        wrong subsystem. This was #1473.
+
+        This fixture's app is a bare router with no application-level
+        handlers, so "propagate" here means the exception escapes the
+        endpoint. In production it reaches the dedicated handler registered in
+        ``web/app.py`` (a permanent 500 with a fixed body), whose contract is
+        pinned by ``test_storage_namespace_authority_handler.py``.
+        """
+        from xagent.core.file_storage.scoped import (
+            ScopedFileStorage,
+            StorageKeyScopeError,
+        )
+
+        admin_user, test_app = test_db
+        upload_response = client.post(
+            "/api/files/upload",
+            files={"file": ("scope-violation.txt", b"scope violation", "text/plain")},
+            data={"task_type": "general"},
+            headers=auth_headers,
+        )
+        assert upload_response.status_code == 200
+        file_id = upload_response.json()["file_id"]
+
+        def scope_violating_delete(self, key):
+            raise StorageKeyScopeError(
+                f"Storage key '{key}' is outside the bound prefix"
+            )
+
+        monkeypatch.setattr(ScopedFileStorage, "delete", scope_violating_delete)
+
+        with caplog.at_level(logging.WARNING, logger="xagent.web.api.files"):
+            with pytest.raises(StorageKeyScopeError):
+                client.delete(f"/api/files/{file_id}", headers=auth_headers)
+
+        # No outage warning: the fault is not a durable-storage outage.
+        assert not [
+            entry
+            for entry in caplog.records
+            if entry.name == "xagent.web.api.files"
+            and DURABLE_FAULT_LOG_PREFIX in entry.getMessage()
+        ], "a scope violation was reported as a durable-storage outage"
+        # The row survives, same as any failed cleanup.
         db = next(test_app.dependency_overrides[get_db]())
         try:
             assert (

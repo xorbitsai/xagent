@@ -35,7 +35,15 @@ _UNSET = object()
 
 
 class AgentService:
-    """Service facade that executes tasks through agent only."""
+    """Service facade that executes tasks through agent only.
+
+    Capability controls are deny-capable overrides: ``enable_default_tools``
+    controls automatic tool construction, ``skills_enabled=False`` suppresses
+    supplied skill managers and allowlists, and ``user_interaction_enabled=False``
+    blocks outbound user-facing control calls and waits. ``execution_metadata``
+    is trusted internal metadata copied into runner and result records; untrusted
+    request data belongs in the separate task context passed to ``execute_task``.
+    """
 
     def __init__(
         self,
@@ -65,6 +73,10 @@ class AgentService:
         preferred_input_modalities: tuple[str, ...] | list[str] | None = None,
         tools_initialized: bool | None = None,
         react_max_iterations: int = 200,
+        enable_default_tools: bool = True,
+        skills_enabled: bool = True,
+        user_interaction_enabled: bool = True,
+        execution_metadata: dict[str, Any] | None = None,
         **agent_kwargs: Any,
     ) -> None:
         self.name = name
@@ -86,6 +98,10 @@ class AgentService:
         self.memory_similarity_threshold = memory_similarity_threshold
         self.memory_enabled = memory_enabled
         self.react_max_iterations = max(1, int(react_max_iterations))
+        self.enable_default_tools = enable_default_tools
+        self.skills_enabled = skills_enabled
+        self.user_interaction_enabled = user_interaction_enabled
+        self.execution_metadata = dict(execution_metadata or {})
         if tools is not None and tool_config is not None:
             handoff_factory_runtime = getattr(
                 tool_config, "handoff_factory_runtime", None
@@ -191,7 +207,7 @@ class AgentService:
         elif self.enable_workspace:
             self._setup_workspace()
 
-        if not self.tools and not self.tool_config:
+        if self.enable_default_tools and not self.tools and not self.tool_config:
             self.tool_config = self._create_default_tool_config()
             self.allowed_skills = self._get_allowed_skills_from_config(self.tool_config)
 
@@ -497,8 +513,16 @@ class AgentService:
                 self.memory if self.memory_enabled else None
             )
             self._execution_adapter.config.allowed_skills = self.allowed_skills
+            self._execution_adapter.config.skills_enabled = self.skills_enabled
+            self._execution_adapter.config.workspace_enabled = self.enable_workspace
+            self._execution_adapter.config.user_interaction_enabled = (
+                self.user_interaction_enabled
+            )
             self._execution_adapter.config.skill_scope_context = (
                 self.skill_scope_context
+            )
+            self._execution_adapter.config.execution_metadata = dict(
+                self.execution_metadata
             )
             self._execution_adapter.config.system_prompt = self.system_prompt
             self._execution_adapter.config.preferred_input_modalities = (
@@ -540,6 +564,7 @@ class AgentService:
                 tracer=tracer,
                 system_prompt=self.system_prompt,
                 workspace_base_dir=self.workspace_base_dir,
+                workspace_enabled=self.enable_workspace,
                 allowed_external_dirs=self.allowed_external_dirs,
                 scope_segments=self.scope_segments,
                 current_task_id=self._current_task_id,
@@ -554,7 +579,10 @@ class AgentService:
                 memory_similarity_threshold=self.memory_similarity_threshold,
                 skill_scope_context=self.skill_scope_context,
                 allowed_skills=self.allowed_skills,
+                skills_enabled=self.skills_enabled,
+                user_interaction_enabled=self.user_interaction_enabled,
                 preferred_input_modalities=self.preferred_input_modalities,
+                execution_metadata=dict(self.execution_metadata),
             )
         )
 

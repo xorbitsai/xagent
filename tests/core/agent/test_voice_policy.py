@@ -8,7 +8,25 @@ itself means every current and future caller gets it for free, and this
 is the one place that actually needs to prove it's always present.
 """
 
-from xagent.core.agent.voice_policy import VALID_VOICES, apply_output_voice
+from xagent.core.agent.voice_policy import (
+    VALID_VOICES,
+    apply_output_voice,
+    voice_from_preferences,
+)
+
+
+def test_voice_from_preferences_reads_the_stored_value():
+    assert voice_from_preferences({"voice": "warm", "department": "Sales"}) == "warm"
+
+
+def test_voice_from_preferences_tolerates_none_and_malformed_values():
+    """The preferences column has no nested-type constraint - a
+    corrupted/hand-edited row, or one that predates this migration
+    entirely, must degrade to None rather than raise."""
+    assert voice_from_preferences(None) is None
+    assert voice_from_preferences({}) is None
+    assert voice_from_preferences("warm") is None
+    assert voice_from_preferences(["warm"]) is None
 
 
 def test_apply_output_voice_is_a_noop_without_a_voice():

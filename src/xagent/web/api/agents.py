@@ -18,7 +18,7 @@ from ...core.agent.language import (
 )
 from ...core.agent.service import AgentService
 from ...core.agent.voice_policy import _VOICE_INSTRUCTIONS as _core_voice_instructions
-from ...core.agent.voice_policy import apply_output_voice
+from ...core.agent.voice_policy import apply_output_voice, voice_from_preferences
 from ...core.memory.in_memory import InMemoryMemoryStore
 from ...core.tools.core.document_search import find_missing_knowledge_bases
 from ...core.tracing import create_agent_tracer
@@ -364,10 +364,7 @@ def voice_from_runtime_user(
     voice = getattr(runtime_user, "voice", None)
     if voice is not None:
         return cast(Optional[str], voice)
-    preferences = getattr(runtime_user, "preferences", None)
-    if isinstance(preferences, dict):
-        return preferences.get("voice")
-    return None
+    return voice_from_preferences(getattr(runtime_user, "preferences", None))
 
 
 # ===== Helper Functions =====

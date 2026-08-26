@@ -442,9 +442,40 @@ class TestAuthAPI:
             "onboarded": True,
         }
 
+    def test_update_current_user_preferences_from_a_null_row(
+        self, test_db, test_user_data
+    ):
+        """The model's ``default=dict`` only applies to new ORM inserts -
+        every user row that existed before this migration landed has a
+        genuine SQL NULL, not ``{}``, and nothing in this test file's own
+        registration flow exercises that state. Force it directly."""
+        setup_first_admin()
+        register_response = client.post("/api/auth/register", json=test_user_data)
+        assert register_response.status_code == 200
+        user_id = register_response.json()["user"]["id"]
+        token = login_and_get_token(
+            test_user_data["username"], test_user_data["password"]
+        )
+        headers = {"Authorization": f"Bearer {token}"}
+
+        db = TestingSessionLocal()
+        try:
+            db.query(User).filter(User.id == user_id).update({"preferences": None})
+            db.commit()
+        finally:
+            db.close()
+
+        response = client.patch(
+            "/api/auth/me/preferences",
+            json={"voice": "friendly"},
+            headers=headers,
+        )
+        assert response.status_code == 200, response.text
+        assert response.json()["user"]["preferences"] == {"voice": "friendly"}
+
         # Persisted, not just echoed back - confirm a fresh /me sees it too.
         me = client.get("/api/auth/me", headers=headers)
-        assert me.json()["user"]["preferences"]["onboarded"] is True
+        assert me.json()["user"]["preferences"] == {"voice": "friendly"}
 
     def test_update_current_user_preferences_rejects_unknown_voice(
         self, test_db, test_user_data
@@ -753,6 +784,38 @@ class TestAuthAPI:
         assert response.status_code == 200, response.text
         mock_manager.invalidate_cached_agents_for_owner.assert_called_once_with(user_id)
 
+    def test_update_current_user_preferences_survives_a_failed_cache_invalidation(
+        self, test_db, test_user_data, monkeypatch
+    ):
+        """The merge already committed by the time invalidation runs -
+        a raise here must not turn a successful write into a client-visible
+        500, mirroring _run_post_commit_oauth_side_effects's same guard for
+        the identical "committed, best-effort follow-up" shape."""
+        setup_first_admin()
+        register_response = client.post("/api/auth/register", json=test_user_data)
+        assert register_response.status_code == 200
+        token = login_and_get_token(
+            test_user_data["username"], test_user_data["password"]
+        )
+        headers = {"Authorization": f"Bearer {token}"}
+
+        mock_manager = MagicMock()
+        mock_manager.invalidate_cached_agents_for_owner = AsyncMock(
+            side_effect=RuntimeError("cache backend unavailable")
+        )
+        monkeypatch.setattr(chat_api, "get_agent_manager", lambda: mock_manager)
+
+        response = client.patch(
+            "/api/auth/me/preferences", json={"voice": "warm"}, headers=headers
+        )
+        assert response.status_code == 200, response.text
+        assert response.json()["user"]["preferences"]["voice"] == "warm"
+        mock_manager.invalidate_cached_agents_for_owner.assert_called_once()
+
+        # Persisted, not just echoed back despite the failed invalidation.
+        me = client.get("/api/auth/me", headers=headers)
+        assert me.json()["user"]["preferences"]["voice"] == "warm"
+
     def test_serialize_auth_user_tolerates_malformed_non_dict_preferences(
         self, test_db, test_user_data
     ):
@@ -871,6 +934,71 @@ class TestAuthAPI:
             db.commit()
         finally:
             db.close()
+
+    def test_lock_user_row_actually_blocks_a_second_sqlite_writer(
+        self, test_db, test_user_data
+    ):
+        """The no-op UPDATE's write lock isn't just assumed to serialize
+        two concurrent merges - WAL mode plus apply_sqlite_concurrency_
+        pragmas' busy_timeout make it plausible by design, but that was
+        never itself exercised. Two real threads, two real connections
+        to the same on-disk file (get_engine(), not this file's own
+        TestingSessionLocal, since only get_engine() has the pragmas
+        applied): the second's call must not return until the first
+        releases its lock, proven with an Event, not a timing guess."""
+        setup_first_admin()
+        register_response = client.post("/api/auth/register", json=test_user_data)
+        assert register_response.status_code == 200
+        user_id = register_response.json()["user"]["id"]
+
+        SessionForLock = sessionmaker(bind=get_engine())
+        holder_acquired = threading.Event()
+        release_holder = threading.Event()
+        second_acquired = threading.Event()
+        errors: list[BaseException] = []
+
+        def hold_the_lock() -> None:
+            db = SessionForLock()
+            try:
+                auth_api._lock_user_row_for_preferences_update(db, user_id)
+                holder_acquired.set()
+                assert release_holder.wait(timeout=5)
+            except BaseException as exc:  # noqa: BLE001
+                errors.append(exc)
+            finally:
+                db.commit()
+                db.close()
+
+        def acquire_second() -> None:
+            assert holder_acquired.wait(timeout=5)
+            db = SessionForLock()
+            try:
+                auth_api._lock_user_row_for_preferences_update(db, user_id)
+                second_acquired.set()
+            except BaseException as exc:  # noqa: BLE001
+                errors.append(exc)
+            finally:
+                db.commit()
+                db.close()
+
+        holder_thread = threading.Thread(target=hold_the_lock)
+        second_thread = threading.Thread(target=acquire_second)
+        holder_thread.start()
+        assert holder_acquired.wait(timeout=5)
+        second_thread.start()
+
+        # The second thread is now blocked inside SQLite's busy-timeout
+        # wait for the row lock the first thread holds - it must not have
+        # finished yet.
+        assert not second_acquired.wait(timeout=0.2)
+
+        release_holder.set()
+        holder_thread.join(timeout=5)
+        second_thread.join(timeout=5)
+        assert not errors, errors
+        assert second_acquired.is_set(), (
+            "the second writer never acquired the lock after the first released it"
+        )
 
     def test_merge_user_preferences_locked_returns_none_when_user_vanishes_after_lock(
         self, test_db, monkeypatch

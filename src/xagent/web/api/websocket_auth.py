@@ -9,6 +9,7 @@ from fastapi import WebSocket
 from fastapi.responses import JSONResponse
 from starlette.websockets import WebSocketState
 
+from ...core.agent.voice_policy import voice_from_preferences
 from ..auth_dependencies import get_user_from_websocket_token
 from ..models.database import get_session_local
 from ..services.db_runtime import run_db_io_cancellation_safe
@@ -80,8 +81,7 @@ def _load_websocket_principal_sync(token: str) -> WebSocketPrincipal | None:
         user = get_user_from_websocket_token(token, db)
         if user is None or user.id is None:
             return None
-        preferences = getattr(user, "preferences", None)
-        voice = preferences.get("voice") if isinstance(preferences, dict) else None
+        voice = voice_from_preferences(getattr(user, "preferences", None))
         return WebSocketPrincipal(
             id=int(user.id), is_admin=bool(user.is_admin), voice=voice
         )

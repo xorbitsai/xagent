@@ -37,6 +37,14 @@ class User(Base):  # type: ignore
     # into this dict, not replaces it) - see update_current_user_preferences
     # in api/auth.py. `voice` feeds apply_user_voice's system-prompt
     # injection in api/agents.py.
+    #
+    # Any writer of this column MUST go through api/auth.py's
+    # _merge_user_preferences_locked (which takes the row lock
+    # _lock_user_row_for_preferences_update acquires) - it is the only
+    # thing preventing a lost-update race between two concurrent merges.
+    # There is no structural enforcement of this; a future direct write
+    # (an admin endpoint, a seed script, a provisioning path) can silently
+    # bypass it.
     preferences = Column(JSON, nullable=True, default=dict)
 
     # Relationships

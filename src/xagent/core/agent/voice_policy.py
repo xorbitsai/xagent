@@ -60,6 +60,21 @@ if set(_VOICE_INSTRUCTIONS) != VALID_VOICES:
     )
 
 
+def voice_from_preferences(preferences: object) -> Optional[str]:
+    """Extract the raw ``voice`` entry from a user's ``preferences`` JSON
+    blob, tolerating ``None`` or a malformed non-dict value the same way
+    every other reader of this column already does - the column has no
+    nested-type constraint, so a corrupted/hand-edited row could hold
+    anything here. Returns the raw stored value unvalidated (may be an
+    unrecognized string, or - if the column itself was corrupted - even a
+    non-string); callers that apply it to a prompt go through
+    ``apply_output_voice``, whose own ``isinstance``/lookup guard is what
+    makes an invalid value degrade to a no-op rather than raise."""
+    if isinstance(preferences, dict):
+        return preferences.get("voice")
+    return None
+
+
 _SCOPE_CAVEAT = (
     "This governs only your final natural-language reply to the user. "
     "Arguments passed to any tool call - including but not limited to "

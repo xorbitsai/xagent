@@ -36,6 +36,7 @@ from typing import TYPE_CHECKING, Any, Optional, cast
 
 from sqlalchemy.orm import Session
 
+from ...core.agent.voice_policy import voice_from_preferences
 from ...core.model.chat.basic.base import BaseLLM
 from ..models.database import get_session_local
 from ..models.task import DAGExecution, Task, TraceEvent
@@ -96,15 +97,10 @@ def detach_runtime_user_fields(user: User) -> RuntimeUserFields:
     access - synchronously, on the event loop, in the same window this
     whole snapshot mechanism exists to keep query-free. Call this as
     soon as a live ``User`` is in hand instead of holding onto it."""
-    preferences = user.preferences
     return RuntimeUserFields(
         id=int(user.id),
         is_admin=bool(user.is_admin),
-        voice=(
-            cast(dict, preferences).get("voice")
-            if isinstance(preferences, dict)
-            else None
-        ),
+        voice=voice_from_preferences(user.preferences),
     )
 
 
@@ -309,11 +305,7 @@ def load_task_setup_snapshot_sync(
             RuntimeUserFields(
                 id=int(runtime_user_row[0]),
                 is_admin=bool(runtime_user_row[1]),
-                voice=(
-                    cast(dict, runtime_user_row[2] or {}).get("voice")
-                    if isinstance(runtime_user_row[2], dict)
-                    else None
-                ),
+                voice=voice_from_preferences(runtime_user_row[2]),
             )
             if runtime_user_row is not None
             else None

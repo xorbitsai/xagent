@@ -226,6 +226,17 @@ async def test_invalidate_bounds_the_wait_for_a_lock_with_a_queued_second_builde
     lock = asyncio.Lock()
     manager._agent_build_locks[1] = lock
 
+    # This test depends on asyncio.Lock's private _waiters attribute
+    # (confirmed structurally identical - None until contended, then a
+    # deque of Futures - across CPython 3.11-3.13, this repo's supported
+    # range) to deterministically detect the queued-waiter window rather
+    # than guessing a sleep duration. Fail with a clear message, not a
+    # buried AttributeError, if a future interpreter changes the shape.
+    assert hasattr(lock, "_waiters"), (
+        "asyncio.Lock no longer exposes _waiters on this Python version - "
+        "this test's queued-waiter detection needs a new approach"
+    )
+
     first_started = asyncio.Event()
     release_first = asyncio.Event()
     second_started = asyncio.Event()

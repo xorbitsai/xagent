@@ -1571,9 +1571,25 @@ async def update_current_user_preferences(
             # turns (see invalidate_cached_agents_for_owner's docstring),
             # so an already-warm task would otherwise keep speaking in the
             # old (or now-cleared) voice until incidental eviction/rebuild.
+            #
+            # The merge above already committed - this is best-effort
+            # follow-up, not part of "did the write succeed." An
+            # unguarded raise here would turn a successful PATCH into a
+            # client-visible 500 for a write that already happened,
+            # mirroring the exact bug _run_post_commit_oauth_side_effects
+            # (issue #1150) exists to prevent; same fix, same reasoning.
             from .chat import get_agent_manager
 
-            await get_agent_manager().invalidate_cached_agents_for_owner(user_id)
+            try:
+                await get_agent_manager().invalidate_cached_agents_for_owner(user_id)
+            except Exception:
+                logger.warning(
+                    "Voice cache invalidation failed for user %s after a "
+                    "successful preferences write; a warm task may keep "
+                    "speaking in the old voice until incidental eviction",
+                    user_id,
+                    exc_info=True,
+                )
 
         return UpdatePreferencesResponse(
             success=True,

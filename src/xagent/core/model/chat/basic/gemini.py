@@ -574,7 +574,9 @@ class GeminiLLM(BaseLLM):
 
             response = await self._client.aio.models.generate_content(**api_params)
 
-            # Extract token usage
+            # Extract token usage; snapshot it as an OpenAI-style payload so
+            # the result envelopes below can carry a top-level ``usage`` stamp.
+            usage_payload: Optional[Dict[str, Any]] = None
             if hasattr(response, "usage_metadata") and response.usage_metadata:
                 usage_metadata = response.usage_metadata
                 input_tokens = getattr(usage_metadata, "prompt_token_count", 0)
@@ -584,6 +586,10 @@ class GeminiLLM(BaseLLM):
                 )
 
                 if input_tokens > 0 or output_tokens > 0:
+                    usage_payload = {
+                        "prompt_tokens": input_tokens,
+                        "completion_tokens": output_tokens,
+                    }
                     add_token_usage(
                         input_tokens=input_tokens,
                         output_tokens=output_tokens,
@@ -638,10 +644,13 @@ class GeminiLLM(BaseLLM):
                     text_parts.append(part.text)
 
             if tool_calls:
-                return {
+                tool_result: Dict[str, Any] = {
                     "type": "tool_call",
                     "tool_calls": tool_calls,
                 }
+                if usage_payload is not None:
+                    tool_result["usage"] = usage_payload
+                return tool_result
 
             content = "".join(text_parts).strip()
 
@@ -650,7 +659,10 @@ class GeminiLLM(BaseLLM):
                     "LLM returned empty content and no tool calls"
                 )
 
-            return content
+            text_result: Dict[str, Any] = {"type": "text", "content": content}
+            if usage_payload is not None:
+                text_result["usage"] = usage_payload
+            return text_result
 
         except Exception as e:
             logger.error("Gemini SDK API error: %s", redact_sensitive_text(str(e)))

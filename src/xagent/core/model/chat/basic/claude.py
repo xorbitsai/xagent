@@ -531,7 +531,8 @@ class ClaudeLLM(BaseLLM):
             **kwargs: Additional parameters to pass to the Anthropic API
 
         Returns:
-            - If normal text reply: return string
+            - If normal text reply: return dict with type "text" and content
+              (plus a top-level "usage" payload when the provider reported one)
             - If tool call triggered: return dict with type "tool_call" and tool_calls list
 
         Raises:
@@ -656,11 +657,17 @@ class ClaudeLLM(BaseLLM):
             # Make the API call
             response = await self._client.messages.create(**completion_params)
 
-            # Record token usage
+            # Record token usage; snapshot it as an OpenAI-style payload so the
+            # result envelopes below can carry a top-level ``usage`` stamp.
+            usage_payload: Optional[Dict[str, Any]] = None
             if hasattr(response, "usage"):
                 usage = response.usage
                 input_tokens, cache_read, cache_write = _anthropic_input_usage(usage)
                 output_tokens = getattr(usage, "output_tokens", 0)
+                usage_payload = {
+                    "prompt_tokens": input_tokens,
+                    "completion_tokens": output_tokens,
+                }
                 add_token_usage(
                     input_tokens=input_tokens,
                     output_tokens=output_tokens,
@@ -691,13 +698,16 @@ class ClaudeLLM(BaseLLM):
                         )
 
                 if tool_calls:
-                    return {
+                    result: Dict[str, Any] = {
                         "type": "tool_call",
                         "tool_calls": tool_calls,
                         "raw": response.model_dump()
                         if hasattr(response, "model_dump")
                         else str(response),
                     }
+                    if usage_payload is not None:
+                        result["usage"] = usage_payload
+                    return result
 
             # Extract text content
             text_content = []
@@ -706,6 +716,12 @@ class ClaudeLLM(BaseLLM):
                     text_content.append(block.text)
 
             content = "".join(text_content).strip()
+
+            def _text_result(text: str) -> Dict[str, Any]:
+                result: Dict[str, Any] = {"type": "text", "content": text}
+                if usage_payload is not None:
+                    result["usage"] = usage_payload
+                return result
 
             if not content:
                 # Empty response should trigger retry
@@ -716,10 +732,12 @@ class ClaudeLLM(BaseLLM):
                 try:
                     # Try to repair the JSON first
                     repaired_content = repair_loads(content, logging=False)
-                    # If repair succeeded, return the repaired JSON as string
-                    # to maintain consistency with normal text response
+                    # If repair succeeded, return the repaired JSON as the text
+                    # envelope's content, consistent with normal text responses
                     logger.info("JSON repair succeeded, returning repaired content")
-                    return json.dumps(repaired_content, ensure_ascii=False)
+                    return _text_result(
+                        json.dumps(repaired_content, ensure_ascii=False)
+                    )
                 except Exception as repair_error:
                     # JSON repair failed - raise retryable error to trigger retry
                     logger.warning(
@@ -736,9 +754,9 @@ class ClaudeLLM(BaseLLM):
                     # When using json_schema, the response is already validated JSON
                     # Return as-is since it's guaranteed to be valid
                     logger.info("Returning JSON schema validated response")
-                    return content
+                    return _text_result(content)
 
-            return content
+            return _text_result(content)
 
         except Exception as e:
             logger.error(f"Claude API error: {str(e)}")
@@ -1197,7 +1215,8 @@ class ClaudeLLM(BaseLLM):
             **kwargs: Additional parameters to pass to the Claude API
 
         Returns:
-            - If normal text reply: return string
+            - If normal text reply: return dict with type "text" and content
+              (plus a top-level "usage" payload when the provider reported one)
             - If tool call triggered: return dict with type "tool_call" and tool_calls list
 
         Raises:

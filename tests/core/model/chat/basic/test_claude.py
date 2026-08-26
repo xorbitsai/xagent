@@ -163,9 +163,10 @@ class TestClaudeLLM:
 
         response = await llm.chat(messages)
 
-        # Verify response is a non-empty string
-        assert isinstance(response, str)
-        assert response == "Hello World"
+        # Verify response is a text envelope carrying the usage stamp
+        assert response["type"] == "text"
+        assert response["content"] == "Hello World"
+        assert response["usage"] == {"prompt_tokens": 10, "completion_tokens": 5}
         print(f"Basic chat response: {response}")
 
         # Verify the API was called with correct parameters
@@ -235,6 +236,8 @@ class TestClaudeLLM:
         assert isinstance(response, dict)
         assert response.get("type") == "tool_call"
         assert "tool_calls" in response
+        # The usage stamp rides on tool_call envelopes too.
+        assert response["usage"] == {"prompt_tokens": 20, "completion_tokens": 10}
 
         tool_calls = response["tool_calls"]
         assert len(tool_calls) > 0
@@ -387,8 +390,8 @@ class TestClaudeLLM:
             messages = [{"role": "user", "content": "Say 'test'"}]
             response = await ctx_llm.chat(messages)
 
-            assert isinstance(response, str)
-            assert response == "test"
+            assert response["type"] == "text"
+            assert response["content"] == "test"
             print(f"Context manager response: {response}")
 
         # Verify the client was properly closed
@@ -466,8 +469,8 @@ class TestClaudeLLM:
             max_tokens=50,  # Limit response length
         )
 
-        assert isinstance(response, str)
-        assert response == "Test response"
+        assert response["type"] == "text"
+        assert response["content"] == "Test response"
         print(f"Custom parameters response: {response}")
 
         # Verify custom parameters were passed
@@ -565,7 +568,7 @@ class TestClaudeLLM:
             messages, thinking={"type": "enabled", "budget_tokens": 20480}
         )
 
-        assert isinstance(response, str)
+        assert response["type"] == "text"
 
         # Verify thinking mode was passed
         call_args = mock_client.messages.create.call_args
@@ -604,7 +607,7 @@ class TestClaudeLLM:
         # Test with thinking mode explicitly disabled
         response = await llm.chat(messages, thinking={"type": "disabled"})
 
-        assert isinstance(response, str)
+        assert response["type"] == "text"
 
         # Verify thinking mode was set to disabled
         call_args = mock_client.messages.create.call_args
@@ -654,8 +657,8 @@ class TestClaudeLLM:
 
         response = await llm.vision_chat(messages)
 
-        assert isinstance(response, str)
-        assert response == "I see an image"
+        assert response["type"] == "text"
+        assert response["content"] == "I see an image"
         print(f"Vision chat response: {response}")
 
     @pytest.mark.asyncio
@@ -1012,10 +1015,10 @@ class TestClaudeLLM:
 
         response = await llm.chat(messages, output_config=output_config)
 
-        assert isinstance(response, str)
-        # Verify the response contains the expected JSON
-        assert "joke" in response
-        assert "punchline" in response
+        assert response["type"] == "text"
+        # Verify the response content contains the expected JSON
+        assert "joke" in response["content"]
+        assert "punchline" in response["content"]
 
         # Verify the API was called with output_config
         mock_client.messages.create.assert_called_once()

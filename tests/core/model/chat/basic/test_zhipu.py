@@ -70,7 +70,8 @@ class TestZhipuLLM:
 
         result = await zhipu_llm.chat([{"role": "user", "content": "Hello"}])
 
-        assert result == "Hello, world!"
+        assert result["type"] == "text"
+        assert result["content"] == "Hello, world!"
 
     @pytest.mark.asyncio
     async def test_none_content_response(self, zhipu_llm, mock_zhipu_client):
@@ -134,6 +135,8 @@ class TestZhipuLLM:
 
         mock_response = MagicMock()
         mock_response.choices = [mock_choice]
+        mock_response.usage.prompt_tokens = 12
+        mock_response.usage.completion_tokens = 4
 
         mock_zhipu_client.chat.completions.create.return_value = mock_response
 
@@ -158,6 +161,8 @@ class TestZhipuLLM:
         assert result["type"] == "tool_call"
         assert len(result["tool_calls"]) == 1
         assert result["tool_calls"][0]["function"]["name"] == "calculator"
+        # The usage stamp rides on tool_call envelopes too.
+        assert result["usage"] == {"prompt_tokens": 12, "completion_tokens": 4}
 
     @pytest.mark.asyncio
     async def test_stream_chat_yields_tool_call_argument_deltas(
@@ -292,7 +297,8 @@ class TestZhipuLLM:
         assert "thinking" in call_args.kwargs
         assert call_args.kwargs["thinking"]["type"] == "disabled"
 
-        assert result == "Response with thinking disabled"
+        assert result["type"] == "text"
+        assert result["content"] == "Response with thinking disabled"
 
     @pytest.mark.asyncio
     async def test_empty_string_api_key_fallback(self, monkeypatch):

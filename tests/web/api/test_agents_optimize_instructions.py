@@ -80,3 +80,40 @@ async def test_optimize_instructions_falls_back_on_wrong_language_output(
     )
 
     assert result == {"optimized_instructions": draft}
+
+
+@pytest.mark.asyncio
+async def test_optimize_instructions_rejects_tool_call_envelope(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#1714: a tool_call envelope from the LLM must surface as an explicit
+    500, never a 200 carrying the envelope's repr as "optimized" text."""
+
+    class _ToolCallLLM:
+        async def chat(self, **kwargs: Any) -> dict[str, Any]:
+            return {
+                "type": "tool_call",
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "read_file", "arguments": "{}"},
+                    }
+                ],
+            }
+
+    monkeypatch.setattr(
+        agents_api,
+        "UserAwareModelStorage",
+        lambda db: _FakeModelStorage(_ToolCallLLM()),  # type: ignore[arg-type]
+    )
+
+    with pytest.raises(agents_api.HTTPException) as exc_info:
+        await agents_api.optimize_instructions(
+            agents_api.OptimizeInstructionsRequest(instructions="请用中文回答。"),
+            SimpleNamespace(id=7),
+            object(),
+        )
+
+    assert exc_info.value.status_code == 500
+    assert "no usable text content" in exc_info.value.detail

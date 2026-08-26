@@ -227,6 +227,48 @@
     return url + (url.indexOf('?') === -1 ? '?' : '&') + 'timezone=' + encoded;
   }
 
+  // Panel width: resizable via the left-edge drag handle, persisted across
+  // reloads. Inline width is only ever applied above MOBILE_BREAKPOINT --
+  // below it the CSS media query owns sizing, and inline width would win
+  // over that media query by specificity if left in place.
+  var WIDTH_STORAGE_KEY = 'xagent_widget_width';
+  var DEFAULT_PANEL_WIDTH = 380;
+  var MIN_PANEL_WIDTH = 320;
+  var MAX_PANEL_WIDTH = 720;
+  var MOBILE_BREAKPOINT = 480;
+  var HORIZONTAL_VIEWPORT_MARGIN = 40;
+
+  function isMobileViewport() {
+    return window.innerWidth <= MOBILE_BREAKPOINT;
+  }
+
+  function clampPanelWidth(width) {
+    var viewportMax = window.innerWidth - HORIZONTAL_VIEWPORT_MARGIN;
+    return Math.min(Math.max(width, MIN_PANEL_WIDTH), Math.min(MAX_PANEL_WIDTH, viewportMax));
+  }
+
+  function readStoredWidth() {
+    var raw;
+    try {
+      raw = localStorage.getItem(WIDTH_STORAGE_KEY);
+    } catch (e) {
+      return DEFAULT_PANEL_WIDTH;
+    }
+    var parsed = raw ? parseInt(raw, 10) : NaN;
+    return isNaN(parsed) ? DEFAULT_PANEL_WIDTH : parsed;
+  }
+
+  function persistWidth(width) {
+    try {
+      localStorage.setItem(WIDTH_STORAGE_KEY, String(width));
+    } catch (e) {
+      // Storage can be unavailable (private browsing, quota); resizing still
+      // works for the session, it just won't survive a reload.
+    }
+  }
+
+  var panelWidth = clampPanelWidth(readStoredWidth());
+
   // Styles
   var style = document.createElement('style');
   style.innerHTML = `
@@ -297,10 +339,30 @@
       background: transparent;
     }
 
-    @media (max-width: 480px) {
+    .xagent-widget-resize-handle {
+      position: absolute;
+      top: 0;
+      left: 0;
+      bottom: 0;
+      width: 6px;
+      cursor: ew-resize;
+      z-index: 2;
+      touch-action: none;
+    }
+
+    .xagent-widget-resize-handle:hover,
+    .xagent-widget-resize-handle:active {
+      background: rgba(0, 0, 0, 0.15);
+    }
+
+    @media (max-width: ${MOBILE_BREAKPOINT}px) {
       .xagent-widget-panel {
-        width: calc(100vw - 40px);
+        width: calc(100vw - ${HORIZONTAL_VIEWPORT_MARGIN}px);
         height: calc(100vh - 120px);
+      }
+
+      .xagent-widget-resize-handle {
+        display: none;
       }
     }
   `;
@@ -318,6 +380,60 @@
   var iframe = document.createElement('iframe');
   iframe.className = 'xagent-widget-iframe';
   panel.appendChild(iframe);
+
+  // Left-edge resize handle
+  var resizeHandle = document.createElement('div');
+  resizeHandle.className = 'xagent-widget-resize-handle';
+  panel.appendChild(resizeHandle);
+
+  function applyPanelWidth() {
+    panel.style.width = isMobileViewport() ? '' : panelWidth + 'px';
+  }
+  applyPanelWidth();
+  window.addEventListener('resize', function () {
+    panelWidth = clampPanelWidth(panelWidth);
+    applyPanelWidth();
+  });
+
+  var dragState = null;
+
+  resizeHandle.addEventListener('pointerdown', function (event) {
+    // Ignore a second simultaneous pointer (e.g. a touchscreen device) so it
+    // can't hijack dragState mid-drag and strand the first pointer's cleanup.
+    if (isMobileViewport() || dragState) return;
+    dragState = {
+      pointerId: event.pointerId,
+      startX: event.clientX,
+      startWidth: panel.getBoundingClientRect().width
+    };
+    resizeHandle.setPointerCapture(event.pointerId);
+    document.body.style.userSelect = 'none';
+    event.preventDefault();
+  });
+
+  resizeHandle.addEventListener('pointermove', function (event) {
+    if (!dragState || event.pointerId !== dragState.pointerId) return;
+    // Panel is right-anchored, so dragging the left edge left (clientX
+    // decreasing) should grow the panel.
+    var delta = dragState.startX - event.clientX;
+    panelWidth = clampPanelWidth(dragState.startWidth + delta);
+    panel.style.width = panelWidth + 'px';
+  });
+
+  function endDrag(event) {
+    if (!dragState || (event && event.pointerId !== dragState.pointerId)) return;
+    dragState = null;
+    document.body.style.userSelect = '';
+    persistWidth(panelWidth);
+  }
+  resizeHandle.addEventListener('pointerup', endDrag);
+  resizeHandle.addEventListener('pointercancel', endDrag);
+  // A drag released off-window (e.g. Alt+Tab away mid-drag) never delivers
+  // pointerup/pointercancel to the handle, which would otherwise strand
+  // userSelect: 'none' on the host page indefinitely.
+  window.addEventListener('blur', function () {
+    endDrag(null);
+  });
 
   // FAB
   var fab = document.createElement('button');

@@ -266,18 +266,18 @@ describe("widget bootstrap", () => {
       expect(document.body.style.userSelect).toBe("none")
       expect(widgetIframe().style.pointerEvents).toBe("none")
 
-      // getBoundingClientRect().width is always 0 in jsdom, so startWidth is
-      // 0 and the resulting width is driven entirely by clientX delta.
-      firePointerEvent(handle(), "pointermove", { pointerId: 7, clientX: 250 })
-      expect(panel().style.width).toBe("320px") // clamped to MIN_PANEL_WIDTH
+      // startWidth is read from computed style, which reflects the panel's
+      // width at drag start (380px, the default applied on load).
+      firePointerEvent(handle(), "pointermove", { pointerId: 7, clientX: 400 })
+      expect(panel().style.width).toBe("320px") // 380 - 100 = 280, clamped to MIN_PANEL_WIDTH
 
-      firePointerEvent(handle(), "pointermove", { pointerId: 7, clientX: -50 })
-      expect(panel().style.width).toBe("350px") // within bounds, no clamping
+      firePointerEvent(handle(), "pointermove", { pointerId: 7, clientX: 180 })
+      expect(panel().style.width).toBe("500px") // 380 + 120 = 500, within bounds
 
-      firePointerEvent(handle(), "pointerup", { pointerId: 7, clientX: -50 })
+      firePointerEvent(handle(), "pointerup", { pointerId: 7, clientX: 180 })
       expect(document.body.style.userSelect).toBe("text")
       expect(widgetIframe().style.pointerEvents).toBe("")
-      expect(localStorage.getItem("xagent_widget_width")).toBe("350")
+      expect(localStorage.getItem("xagent_widget_width")).toBe("500")
     })
 
     it("ends the drag on pointercancel", () => {
@@ -302,11 +302,11 @@ describe("widget bootstrap", () => {
       expect(document.body.style.userSelect).toBe("none") // pointer 1's drag is still active
 
       firePointerEvent(handle(), "pointermove", { pointerId: 1, clientX: 250 })
-      expect(panel().style.width).toBe("320px")
+      expect(panel().style.width).toBe("430px") // 380 + 50, from pointer 1's own startWidth
 
       firePointerEvent(handle(), "pointerup", { pointerId: 1, clientX: 250 })
       expect(document.body.style.userSelect).toBe("")
-      expect(localStorage.getItem("xagent_widget_width")).toBe("320")
+      expect(localStorage.getItem("xagent_widget_width")).toBe("430")
     })
 
     it("cleans up an interrupted drag on window blur", () => {
@@ -331,6 +331,52 @@ describe("widget bootstrap", () => {
       firePointerEvent(handle(), "pointerdown", { pointerId: 4, clientX: 300 })
       expect(() => firePointerEvent(handle(), "pointerup", { pointerId: 4, clientX: 300 }))
         .not.toThrow()
+    })
+
+    it("falls back to the default width if computed style is unreadable", () => {
+      runWidget({ "data-widget-key": "widget-secret" })
+      vi.spyOn(window, "getComputedStyle").mockReturnValue({ width: "auto" } as CSSStyleDeclaration)
+
+      firePointerEvent(handle(), "pointerdown", { pointerId: 5, clientX: 300 })
+      firePointerEvent(handle(), "pointermove", { pointerId: 5, clientX: 250 })
+
+      expect(panel().style.width).toBe("430px") // DEFAULT_PANEL_WIDTH (380) + 50
+    })
+
+    it("stops reacting to window resize once the panel leaves the DOM", () => {
+      const removeSpy = vi.spyOn(window, "removeEventListener")
+      localStorage.setItem("xagent_widget_width", "600")
+      runWidget({ "data-widget-key": "widget-secret" })
+      const panelEl = panel()
+      expect(panelEl.style.width).toBe("600px")
+
+      document.querySelector(".xagent-widget-container")?.remove()
+
+      // Below the mobile breakpoint would normally clear the inline width;
+      // an unchanged value proves the listener self-removed instead of
+      // reapplying the clamp to a detached panel.
+      setInnerWidth(400)
+      window.dispatchEvent(new Event("resize"))
+
+      expect(panelEl.style.width).toBe("600px")
+      expect(removeSpy).toHaveBeenCalledWith("resize", expect.any(Function))
+    })
+
+    it("stops reacting to window blur once the panel leaves the DOM", () => {
+      const removeSpy = vi.spyOn(window, "removeEventListener")
+      runWidget({ "data-widget-key": "widget-secret" })
+
+      firePointerEvent(handle(), "pointerdown", { pointerId: 9, clientX: 300 })
+      expect(document.body.style.userSelect).toBe("none")
+
+      document.querySelector(".xagent-widget-container")?.remove()
+      window.dispatchEvent(new Event("blur"))
+
+      // userSelect is still stuck at the drag's 'none': endDrag never ran,
+      // proving the (now-detached) panel's blur listener self-removed
+      // instead of firing.
+      expect(document.body.style.userSelect).toBe("none")
+      expect(removeSpy).toHaveBeenCalledWith("blur", expect.any(Function))
     })
   })
 })

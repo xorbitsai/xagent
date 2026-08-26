@@ -309,6 +309,10 @@
     }
 
     .xagent-widget-panel {
+      /* Pin the box model so the resize drag's width math (which reads
+         computed CSS width) can't drift from the host page's own
+         box-sizing default. */
+      box-sizing: border-box;
       position: absolute;
       bottom: calc(${buttonSize} + 20px);
       right: 0;
@@ -393,7 +397,17 @@
     panel.style.width = isMobileViewport() ? '' : clampPanelWidth(panelWidth) + 'px';
   }
   applyPanelWidth();
-  window.addEventListener('resize', applyPanelWidth);
+  // Self-unsubscribes once the panel leaves the DOM (e.g. a host SPA removing
+  // the widget without a full page reload) -- otherwise this window-level
+  // listener is a GC root keeping the whole closure, panel included, alive
+  // indefinitely.
+  window.addEventListener('resize', function onWindowResize() {
+    if (!panel.isConnected) {
+      window.removeEventListener('resize', onWindowResize);
+      return;
+    }
+    applyPanelWidth();
+  });
 
   var dragState = null;
 
@@ -404,7 +418,12 @@
     dragState = {
       pointerId: event.pointerId,
       startX: event.clientX,
-      startWidth: panel.getBoundingClientRect().width,
+      // getBoundingClientRect().width is always border-box regardless of
+      // box-sizing, but panel.style.width sets content-box width unless
+      // box-sizing: border-box is in effect -- computed style avoids that
+      // mismatch (a jump by the border width on every drag start) even if
+      // something on the host page ends up overriding our own box-sizing rule.
+      startWidth: parseInt(window.getComputedStyle(panel).width, 10) || DEFAULT_PANEL_WIDTH,
       originalUserSelect: document.body.style.userSelect
     };
     // Older browsers without Pointer Capture still get a working drag via
@@ -439,8 +458,13 @@
   resizeHandle.addEventListener('pointercancel', endDrag);
   // A drag released off-window (e.g. Alt+Tab away mid-drag) never delivers
   // pointerup/pointercancel to the handle, which would otherwise strand
-  // userSelect: 'none' on the host page indefinitely.
-  window.addEventListener('blur', function () {
+  // userSelect: 'none' on the host page indefinitely. Self-unsubscribes once
+  // the panel leaves the DOM, for the same reason as the resize listener above.
+  window.addEventListener('blur', function onWindowBlur() {
+    if (!panel.isConnected) {
+      window.removeEventListener('blur', onWindowBlur);
+      return;
+    }
     endDrag(null);
   });
 

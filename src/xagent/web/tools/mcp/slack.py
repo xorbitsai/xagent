@@ -319,8 +319,14 @@ def _request(
 # set today (none of them document not_in_channel), so this table doesn't
 # yet need per-path variation — but the shape is what a future endpoint
 # with a genuinely different set would extend, not a boolean flag.
-_ALSO_OVERLOADS_CHANNEL_NOT_FOUND = frozenset(
-    {"not_in_channel", "no_permission", "channel_not_found"}
+_DEFAULT_NOT_A_MEMBER_CODES = frozenset({"not_in_channel", "no_permission"})
+# Derived from _DEFAULT_NOT_A_MEMBER_CODES rather than re-listing both its
+# members: the two are meant to always differ by exactly channel_not_found,
+# and writing this one out as its own literal (as an earlier version of
+# this table did) is exactly the kind of drift that would go unnoticed if
+# a future change ever adds a third default code.
+_ALSO_OVERLOADS_CHANNEL_NOT_FOUND = _DEFAULT_NOT_A_MEMBER_CODES | frozenset(
+    {"channel_not_found"}
 )
 _NOT_A_MEMBER_CODES_BY_PATH: dict[str, frozenset[str]] = dict.fromkeys(
     (
@@ -331,7 +337,6 @@ _NOT_A_MEMBER_CODES_BY_PATH: dict[str, frozenset[str]] = dict.fromkeys(
     ),
     _ALSO_OVERLOADS_CHANNEL_NOT_FOUND,
 )
-_DEFAULT_NOT_A_MEMBER_CODES = frozenset({"not_in_channel", "no_permission"})
 # channel_not_found and no_permission are BOTH overloaded by Slack for
 # reasons unrelated to channel membership too (see the module comment
 # above) — once membership is independently proven, neither can still mean

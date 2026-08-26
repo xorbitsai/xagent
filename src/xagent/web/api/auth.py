@@ -47,7 +47,11 @@ from ..models.database import get_db, get_session_local, release_db_connection_i
 from ..models.system_setting import SystemSetting
 from ..models.user import User
 from ..models.user_oauth import UserOAuth
-from ..oauth_provider_quirks import requires_json_accept_header
+from ..oauth_provider_quirks import (
+    matches_provider_family,
+    requires_json_accept_header,
+    requires_pkce,
+)
 from ..services import gmail_provisioning
 from ..services.auth_email import send_password_reset_email
 from ..services.db_runtime import await_task_settlement, propagate_deferred_cancellation
@@ -155,21 +159,19 @@ def _is_salesforce_provider(provider: str) -> bool:
     workaround is an admin hand-creating a second provider row (e.g.
     "salesforce-sandbox") pointing at test.salesforce.com, since the
     provider-row model has no per-user sandbox toggle. Every Salesforce-only
-    code path -- PKCE, the instance_url presence guard, and the
+    code path below -- the instance_url presence guard and the
     provider_user_id identity backfill -- must use this same predicate; an
-    exact match on any one of them would silently grant that row the
-    capability while skipping its safeguard.
+    exact match on either would silently grant that row the capability while
+    skipping its safeguard.
 
-    Anchored to a "-" separator, not a bare prefix: `oauth_providers.name` is
-    admin-settable via POST/PUT /admin/mcp/providers, so a bare
-    `.startswith("salesforce")` would also match an unrelated custom
-    provider an admin happened to name e.g. "salesforcelite" -- routing it
-    through PKCE and the instance_url-required guard it has no reason to
-    satisfy. Requiring "salesforce" or "salesforce-<anything>" keeps the
-    sandbox row matched without widening the blast radius that far.
+    PKCE is gated separately, by requires_pkce() (oauth_provider_quirks.py):
+    that predicate also covers Employment Hero, so it is no longer
+    Salesforce-only and must not be conflated with this one. Both share the
+    same underlying family-match algorithm (matches_provider_family below),
+    just applied to a different provider set -- see that function's
+    docstring for the "-"-anchored-prefix reasoning this predicate relies on.
     """
-    lowered = provider.lower()
-    return lowered == "salesforce" or lowered.startswith("salesforce-")
+    return matches_provider_family(provider, "salesforce")
 
 
 def _resolve_oauth_secret(
@@ -1792,19 +1794,20 @@ def generic_oauth_login(
     # Newer Salesforce orgs enforce PKCE on this authorization-code grant at
     # the org level, with no per-app way to disable it (Setup > External
     # Client Apps > Security > "Require Proof Key for Code Exchange" is
-    # locked once an org has it on). The verifier rides inside this signed,
-    # short-lived state token rather than a new DB row, to avoid a schema
-    # change for one provider -- but `state` itself goes out as a URL query
-    # param on the redirect to Salesforce and back, so it lands in browser
-    # history/Referer headers/proxy logs. HS256 signing alone doesn't hide
-    # the payload (it's base64, not encrypted), so the verifier is encrypted
-    # here before being embedded, and decrypted back out in the callback
-    # below. The token exchange still requires the server-held client_secret
-    # regardless, so this is defense-in-depth on top of that, not the only
-    # thing standing between an interceptor and a token.
-    code_verifier = (
-        secrets.token_urlsafe(64) if _is_salesforce_provider(provider) else None
-    )
+    # locked once an org has it on); Employment Hero mandates it for every
+    # app from 2026-09-14. requires_pkce() (oauth_provider_quirks.py) is the
+    # shared predicate for this provider family, not just _is_salesforce_
+    # provider, since it's no longer Salesforce-only. The verifier rides
+    # inside this signed, short-lived state token rather than a new DB row,
+    # to avoid a schema change for this -- but `state` itself goes out as a
+    # URL query param on the redirect to the provider and back, so it lands
+    # in browser history/Referer headers/proxy logs. HS256 signing alone
+    # doesn't hide the payload (it's base64, not encrypted), so the verifier
+    # is encrypted here before being embedded, and decrypted back out in the
+    # callback below. The token exchange still requires the server-held
+    # client_secret regardless, so this is defense-in-depth on top of that,
+    # not the only thing standing between an interceptor and a token.
+    code_verifier = secrets.token_urlsafe(64) if requires_pkce(provider) else None
     if code_verifier:
         from ...core.utils.encryption import encrypt_value
 
@@ -1814,19 +1817,22 @@ def generic_oauth_login(
             # get_cipher() raises this when ENCRYPTION_KEY is unset outside
             # development -- every other provider's login route never calls
             # encrypt_value at all, so this misconfiguration is otherwise
-            # invisible until the first Salesforce connect attempt. Not
-            # routed through _oauth_provider_config_error: that helper's
-            # "Missing X for provider Y" phrasing is written for a
-            # provider-prefixed env var (e.g. SALESFORCE_CLIENT_ID) and
-            # would misleadingly suggest a SALESFORCE_ENCRYPTION_KEY-style
-            # variable exists, when ENCRYPTION_KEY is a single global
-            # setting unrelated to any one provider.
+            # invisible until the first PKCE-gated connect attempt (now
+            # Salesforce or Employment Hero, per requires_pkce() -- the
+            # provider name is interpolated below rather than hardcoded, so
+            # this stays accurate as that set grows). Not routed through
+            # _oauth_provider_config_error: that helper's "Missing X for
+            # provider Y" phrasing is written for a provider-prefixed env var
+            # (e.g. SALESFORCE_CLIENT_ID) and would misleadingly suggest a
+            # SALESFORCE_ENCRYPTION_KEY-style variable exists, when
+            # ENCRYPTION_KEY is a single global setting unrelated to any one
+            # provider.
             return HTMLResponse(
                 content=(
                     "<h1>Error: Server misconfigured</h1>"
                     "<p>The ENCRYPTION_KEY environment variable is not set. "
-                    "This is required to connect Salesforce; set it and "
-                    "restart the backend.</p>"
+                    f"This is required to connect {html.escape(provider)}; set "
+                    "it and restart the backend.</p>"
                 ),
                 status_code=500,
             )

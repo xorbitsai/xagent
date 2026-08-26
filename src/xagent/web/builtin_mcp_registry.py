@@ -316,6 +316,36 @@ def get_builtin_oauth_provider_rows() -> list[dict[str, Any]]:
                 "read:me",
             ],
         },
+        {
+            "provider_name": "employment-hero",
+            "name": "Employment Hero",
+            "client_id": os.environ.get("EMPLOYMENT_HERO_CLIENT_ID", ""),
+            "client_secret": os.environ.get("EMPLOYMENT_HERO_CLIENT_SECRET", ""),
+            "auth_url": "https://oauth.employmenthero.com/oauth2/authorize",
+            "token_url": "https://oauth.employmenthero.com/oauth2/token",
+            "redirect_uri": os.environ.get("EMPLOYMENT_HERO_REDIRECT_URI", ""),
+            # Employment Hero has no OIDC-style "me"/identity endpoint — its
+            # closest resource, GET /api/v1/organisations, returns a *list*
+            # of organisations the token can access rather than a single
+            # object with an id/email shape this callback's flat
+            # user_id_path/email_path lookup could use. Left empty, same
+            # tradeoff as salesforce/linear's rows above: generic_oauth_
+            # callback's `if userinfo_url and access_token:` guard skips the
+            # lookup, so UserOAuth.email/provider_user_id stay NULL for
+            # every grant — is_connected still works from access_token
+            # alone, and an agent calls employment_hero_list_organisations
+            # to discover the organisation_id every other tool needs anyway.
+            "userinfo_url": "",
+            "user_id_path": "id",
+            "email_path": "email",
+            # Employment Hero has no separate identity-only scope (unlike
+            # google/zoom/github above) — every scope here is a functional
+            # read permission this connector's tools actually call, so they
+            # live entirely on the app row's oauth_scopes below and are
+            # merged in at authorize time by _merge_oauth_scopes, same
+            # no-default-scopes convention as intercom's row above.
+            "default_scopes": [],
+        },
     ]
 
 
@@ -1058,6 +1088,36 @@ def get_builtin_public_mcp_app_rows() -> list[dict[str, Any]]:
                 "command": "python",
                 "args": ["-m", "xagent.web.tools.mcp.stripe"],
                 "required_env": ["STRIPE_API_KEY"],
+            },
+        },
+        {
+            "app_id": "employment-hero",
+            "name": "Employment Hero",
+            "description": "Connect to Employment Hero to look up organisations, employees, teams, and timesheet entries.",
+            "icon": "https://www.google.com/s2/favicons?domain=employmenthero.com&sz=128",
+            "transport": "oauth",
+            "provider_name": "employment-hero",
+            # No existing sidebar category filter (connect-mcp-dialog.tsx)
+            # fits an HR/payroll connector -- reusing "Operations" (currently
+            # only aws, an infra-monitoring connector) would be the same
+            # mismatch the salesforce/notion comments above call out on
+            # other rows, not something to repeat. Like storage/development/
+            # productivity elsewhere in this file, this category has no
+            # dedicated sidebar button; the connector still surfaces under
+            # "All".
+            "category": "HR",
+            "oauth_scopes": [
+                "organisations:list",
+                "employees:list",
+                "employees:show",
+                "teams:list",
+                "timesheet_entries:list",
+            ],
+            "is_visible_in_connector": True,
+            "launch_config": {
+                "command": "python",
+                "args": ["-m", "xagent.web.tools.mcp.employment_hero"],
+                "env_mapping": {"EMPLOYMENT_HERO_ACCESS_TOKEN": "access_token"},
             },
         },
     ]

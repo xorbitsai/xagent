@@ -29,6 +29,7 @@ from xagent.web.api.auth import (
 from xagent.web.models.database import Base
 from xagent.web.models.public_mcp import PublicMCPApp
 from xagent.web.models.user import User
+from xagent.web.oauth_provider_quirks import requires_pkce
 
 # ---------- helpers ---------------------------------------------------------
 
@@ -269,6 +270,73 @@ def test_salesforce_sandbox_provider_includes_pkce_code_challenge(db_session):
 
     assert qs.get("code_challenge_method") == ["S256"]
     assert "code_challenge" in qs
+
+
+def test_employment_hero_provider_includes_pkce_code_challenge(db_session):
+    """Employment Hero mandates PKCE on this grant for every app from
+    2026-09-14, with no per-app opt-out -- requires_pkce()
+    (oauth_provider_quirks.py) covers this provider the same way it covers
+    salesforce above, so the authorize redirect must carry a code_challenge
+    too."""
+    db, user = db_session
+    token = _token_for(user)
+
+    provider = _provider(
+        auth_url="https://oauth.employmenthero.com/oauth2/authorize",
+        default_scopes=[],
+        redirect_uri="https://app.example.com/cb",
+    )
+
+    resp = generic_oauth_login(
+        provider="employment-hero",
+        token=token,
+        app_id=None,
+        redirect=None,
+        db=db,
+        db_provider=provider,
+    )
+    qs = parse_qs(urlparse(_location(resp)).query)
+
+    assert qs.get("code_challenge_method") == ["S256"]
+    assert "code_challenge" in qs
+
+    state_payload = verify_token(qs["state"][0])
+    encrypted_verifier = state_payload["code_verifier"]
+    decrypted_verifier = decrypt_value(encrypted_verifier)
+    assert encrypted_verifier != decrypted_verifier
+    assert _is_encrypted(encrypted_verifier)
+
+    expected_challenge = (
+        base64.urlsafe_b64encode(
+            hashlib.sha256(decrypted_verifier.encode("ascii")).digest()
+        )
+        .decode("ascii")
+        .rstrip("=")
+    )
+    assert qs["code_challenge"][0] == expected_challenge
+
+
+@pytest.mark.parametrize(
+    "provider,expected",
+    [
+        ("salesforce", True),
+        ("salesforce-sandbox", True),
+        ("employment-hero", True),
+        ("EMPLOYMENT-HERO", True),
+        ("employment-hero-sandbox", True),
+        ("employment-herolite", False),
+        ("employment-hero2", False),
+        ("hubspot", False),
+        ("", False),
+    ],
+)
+def test_requires_pkce_matches_gated_provider_families(provider, expected):
+    """requires_pkce() is the shared predicate generic_oauth_login's PKCE
+    gate actually calls -- covering it directly (not just indirectly through
+    the redirect-URL assertions above) pins the provider-family membership
+    list itself, the same anchored-prefix reasoning
+    _is_salesforce_provider's own test documents."""
+    assert requires_pkce(provider) is expected
 
 
 def test_salesforce_login_returns_clear_error_when_encryption_key_missing(

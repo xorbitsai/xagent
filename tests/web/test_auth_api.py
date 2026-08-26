@@ -987,14 +987,23 @@ class TestAuthAPI:
         assert holder_acquired.wait(timeout=5)
         second_thread.start()
 
-        # The second thread is now blocked inside SQLite's busy-timeout
-        # wait for the row lock the first thread holds - it must not have
-        # finished yet.
-        assert not second_acquired.wait(timeout=0.2)
-
-        release_holder.set()
-        holder_thread.join(timeout=5)
-        second_thread.join(timeout=5)
+        try:
+            # The second thread is now blocked inside SQLite's busy-timeout
+            # wait for the row lock the first thread holds - it must not
+            # have finished yet.
+            assert not second_acquired.wait(timeout=0.2)
+        finally:
+            # Release and join even when the assertion above fails - a
+            # regression that actually breaks the lock (what this test
+            # exists to catch) would otherwise leave holder_thread running
+            # with an open write-lock transaction for its own 5s timeout,
+            # which can then make the test_db fixture's teardown
+            # (Base.metadata.drop_all, needing that same lock) race and
+            # raise its own confusing "database is locked" error on top
+            # of the real AssertionError.
+            release_holder.set()
+            holder_thread.join(timeout=5)
+            second_thread.join(timeout=5)
         assert not errors, errors
         assert second_acquired.is_set(), (
             "the second writer never acquired the lock after the first released it"

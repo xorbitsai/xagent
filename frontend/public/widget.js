@@ -267,7 +267,11 @@
     }
   }
 
-  var panelWidth = clampPanelWidth(readStoredWidth());
+  // Raw preferred width, deliberately NOT clamped here: applyPanelWidth below
+  // clamps only for rendering, without writing the clamped value back here,
+  // so a viewport narrower than the stored preference at load never
+  // overwrites it (e.g. via a later, otherwise-unmoved drag release).
+  var panelWidth = readStoredWidth();
 
   // Styles
   var style = document.createElement('style');
@@ -426,14 +430,18 @@
       startWidth: parseInt(window.getComputedStyle(panel).width, 10) || DEFAULT_PANEL_WIDTH,
       originalUserSelect: document.body.style.userSelect
     };
-    // Older browsers without Pointer Capture still get a working drag via
-    // iframe.style.pointerEvents below; this call is a nice-to-have.
+    // pointermove/pointerup are bound only to this 6px handle, so once the
+    // cursor leaves it the drag lives entirely on this capture -- it has
+    // near-universal support in browsers this widget runs in, but guard the
+    // call anyway since it's not essential to starting the drag itself.
     try {
       resizeHandle.setPointerCapture(event.pointerId);
     } catch (e) {}
     document.body.style.userSelect = 'none';
-    // The iframe would otherwise intercept pointer events once the cursor
-    // moves over it mid-drag, stalling the resize.
+    // Without this, the iframe (a sibling of the handle, not an ancestor)
+    // would intercept pointer events once the cursor moves over it mid-drag;
+    // disabling its pointer-events lets those events fall through to the
+    // captured handle instead of stalling on the iframe.
     iframe.style.pointerEvents = 'none';
     event.preventDefault();
   });
@@ -456,16 +464,19 @@
   }
   resizeHandle.addEventListener('pointerup', endDrag);
   resizeHandle.addEventListener('pointercancel', endDrag);
-  // A drag released off-window (e.g. Alt+Tab away mid-drag) never delivers
-  // pointerup/pointercancel to the handle, which would otherwise strand
-  // userSelect: 'none' on the host page indefinitely. Self-unsubscribes once
-  // the panel leaves the DOM, for the same reason as the resize listener above.
+  // A drag released off-window (e.g. Alt+Tab away mid-drag, or a host SPA
+  // removing the widget mid-drag) never delivers pointerup/pointercancel to
+  // the handle, which would otherwise strand userSelect: 'none' on the host
+  // page indefinitely -- including past the panel's own removal, since that
+  // removal doesn't touch document.body. So endDrag must run unconditionally
+  // here, before the isConnected self-unsubscribe (added for the same reason
+  // as the resize listener above): unlike that listener, this one has a
+  // cleanup obligation that self-unsubscribing must not skip.
   window.addEventListener('blur', function onWindowBlur() {
+    endDrag(null);
     if (!panel.isConnected) {
       window.removeEventListener('blur', onWindowBlur);
-      return;
     }
-    endDrag(null);
   });
 
   // FAB

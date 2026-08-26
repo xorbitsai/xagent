@@ -236,6 +236,25 @@ describe("widget bootstrap", () => {
       expect(panel().style.width).toBe("600px")
     })
 
+    it("does not corrupt a stored preference wider than the load-time viewport", () => {
+      localStorage.setItem("xagent_widget_width", "700")
+      setInnerWidth(600) // viewportMax = 560, so the initial render clamps the display
+      runWidget({ "data-widget-key": "widget-secret" })
+      expect(panel().style.width).toBe("560px")
+
+      // A click-and-release with no movement must not persist the render
+      // clamp over the raw stored preference.
+      firePointerEvent(handle(), "pointerdown", { pointerId: 6, clientX: 300 })
+      firePointerEvent(handle(), "pointerup", { pointerId: 6, clientX: 300 })
+      expect(localStorage.getItem("xagent_widget_width")).toBe("700")
+
+      // Widening the viewport back must recover the full preference, not the
+      // narrower value that was ever rendered.
+      setInnerWidth(1024)
+      window.dispatchEvent(new Event("resize"))
+      expect(panel().style.width).toBe("700px")
+    })
+
     it("hides the inline width below the mobile breakpoint and restores it above", () => {
       runWidget({ "data-widget-key": "widget-secret" })
 
@@ -362,9 +381,10 @@ describe("widget bootstrap", () => {
       expect(removeSpy).toHaveBeenCalledWith("resize", expect.any(Function))
     })
 
-    it("stops reacting to window blur once the panel leaves the DOM", () => {
+    it("still cleans up an interrupted drag on blur after the panel leaves the DOM", () => {
       const removeSpy = vi.spyOn(window, "removeEventListener")
       runWidget({ "data-widget-key": "widget-secret" })
+      document.body.style.userSelect = "text"
 
       firePointerEvent(handle(), "pointerdown", { pointerId: 9, clientX: 300 })
       expect(document.body.style.userSelect).toBe("none")
@@ -372,11 +392,17 @@ describe("widget bootstrap", () => {
       document.querySelector(".xagent-widget-container")?.remove()
       window.dispatchEvent(new Event("blur"))
 
-      // userSelect is still stuck at the drag's 'none': endDrag never ran,
-      // proving the (now-detached) panel's blur listener self-removed
-      // instead of firing.
-      expect(document.body.style.userSelect).toBe("none")
+      // The drag's cleanup obligation (restoring the host page's userSelect)
+      // must run even though the panel is no longer connected -- unlike the
+      // resize listener, self-unsubscribing here must not skip it.
+      expect(document.body.style.userSelect).toBe("text")
       expect(removeSpy).toHaveBeenCalledWith("blur", expect.any(Function))
+
+      // And the listener is now actually gone: a second blur is a no-op,
+      // not just a repeat no-drag-active early return.
+      document.body.style.userSelect = "text"
+      window.dispatchEvent(new Event("blur"))
+      expect(document.body.style.userSelect).toBe("text")
     })
   })
 })

@@ -84,6 +84,30 @@ def test_request_translates_missing_scope_for_every_endpoint(monkeypatch):
     assert isinstance(exc_info.value, slack._SlackActionableError)
 
 
+def test_request_surfaces_needed_scope_when_slack_provides_it(monkeypatch):
+    """When Slack's missing_scope response names the specific scope it
+    needed, that must reach the message — an operator reading logs
+    shouldn't have to guess which of this connector's many scopes is
+    missing."""
+    monkeypatch.setattr(
+        slack.requests,
+        "request",
+        Mock(
+            return_value=MockResponse(
+                {
+                    "ok": False,
+                    "error": "missing_scope",
+                    "needed": "channels:join",
+                    "provided": "chat:write,channels:read",
+                }
+            )
+        ),
+    )
+
+    with pytest.raises(slack._SlackMissingScopeError, match="needed: channels:join"):
+        slack._request("GET", "auth.test")
+
+
 def test_request_raises_generic_message_when_error_field_absent(monkeypatch):
     monkeypatch.setattr(
         slack.requests,
@@ -641,15 +665,15 @@ def test_request_requiring_membership_treats_no_permission_as_actionable(monkeyp
 
 
 @pytest.mark.parametrize(
-    ("caller", "kwargs"),
+    "caller",
     [
-        (lambda: slack.slack_get_channel_history("C0123456789"), {}),
-        (lambda: slack.slack_get_thread_replies("C0123456789", "1.1"), {}),
-        (lambda: slack.slack_post_message("C0123456789", "hi"), {}),
+        lambda: slack.slack_get_channel_history("C0123456789"),
+        lambda: slack.slack_get_thread_replies("C0123456789", "1.1"),
+        lambda: slack.slack_post_message("C0123456789", "hi"),
     ],
 )
 def test_no_permission_reports_actionable_error_across_read_and_write_tools(
-    monkeypatch, caller, kwargs
+    monkeypatch, caller
 ):
     monkeypatch.setattr(
         slack.requests,
@@ -903,6 +927,32 @@ def test_join_channel_reports_error_for_private_channel_by_name(monkeypatch):
     assert "method_not_supported_for_channel_type" in result["message"]
 
 
+def test_join_channel_reports_actionable_error_for_archived_channel(monkeypatch):
+    """_resolve_channel_id passes exclude_archived: "false", so a channel
+    *name* can resolve cleanly to an archived channel's id and only then
+    fail conversations.join with is_archived — that must get a clear
+    "channel is archived" message, not the bare Slack code, since nothing
+    about the successful name resolution signaled the problem."""
+    mock_request = Mock(
+        side_effect=[
+            MockResponse(
+                {
+                    "ok": True,
+                    "channels": [{"id": "C0123456789", "name": "old-incident"}],
+                }
+            ),
+            MockResponse({"ok": False, "error": "is_archived"}),
+        ]
+    )
+    monkeypatch.setattr(slack.requests, "request", mock_request)
+
+    result = json.loads(slack.slack_join_channel("old-incident"))
+
+    assert result["status"] == "error"
+    assert "is_archived" in result["message"]
+    assert "archived" in result["message"]
+
+
 def test_join_channel_reports_actionable_error_for_missing_scope(monkeypatch):
     """A user who hasn't reconnected the Slack app since channels:join was
     added would hit missing_scope here — the error must tell them to
@@ -1075,6 +1125,10 @@ def test_get_thread_replies_reports_error_payload(monkeypatch):
 
     assert result["status"] == "error"
     assert "thread_not_found" in result["message"]
+    # Pins that a non-membership code on this endpoint stays a plain error
+    # — would still pass if thread_not_found were ever wrongly added to the
+    # not-a-member code set.
+    assert "slack_join_channel" not in result["message"]
 
 
 def test_get_thread_replies_reports_actionable_error_when_not_a_member(monkeypatch):
@@ -1156,33 +1210,48 @@ def test_get_channel_info_returns_topic_and_metadata(monkeypatch):
 
 
 def test_get_channel_info_reports_error_payload(monkeypatch):
-    """channel_not_found for conversations.info genuinely means a bad/
-    deleted channel id (unlike conversations.replies/reactions.*, which
-    overload it for membership too) — Slack documents no_permission, not
-    channel_not_found, for the non-member case (see the test below), so
-    this must stay a plain, non-actionable error."""
+    """A plain, non-membership Slack error must stay a plain error, not get
+    swept into the actionable not-a-member path."""
     monkeypatch.setattr(
         slack.requests,
         "request",
-        Mock(return_value=MockResponse({"ok": False, "error": "channel_not_found"})),
+        Mock(return_value=MockResponse({"ok": False, "error": "invalid_arguments"})),
     )
 
     result = json.loads(slack.slack_get_channel_info("C0123456789"))
 
     assert result["status"] == "error"
-    assert "channel_not_found" in result["message"]
+    assert "invalid_arguments" in result["message"]
     assert "slack_join_channel" not in result["message"]
 
 
 def test_get_channel_info_reports_actionable_error_when_not_a_member(monkeypatch):
-    """conversations.info documents no_permission (not channel_not_found)
-    for a caller that isn't a member of a private channel — this must get
-    the same actionable message every other membership-gated tool in this
-    file gives, not a bare Slack error code."""
+    """no_permission is documented identically across every endpoint this
+    connector wraps, including conversations.info — this must get the same
+    actionable message every other membership-gated tool in this file
+    gives, not a bare Slack error code."""
     monkeypatch.setattr(
         slack.requests,
         "request",
         Mock(return_value=MockResponse({"ok": False, "error": "no_permission"})),
+    )
+
+    result = json.loads(slack.slack_get_channel_info("C0123456789"))
+
+    assert result["status"] == "error"
+    assert "slack_join_channel" in result["message"]
+
+
+def test_get_channel_info_treats_channel_not_found_as_actionable(monkeypatch):
+    """conversations.info does not document not_in_channel — like
+    conversations.replies/reactions.*, it documents channel_not_found
+    instead for the non-member case (Slack hides a private channel/DM's
+    info entirely from a caller that isn't in it), so this must get the
+    same actionable message, not a bare passthrough error."""
+    monkeypatch.setattr(
+        slack.requests,
+        "request",
+        Mock(return_value=MockResponse({"ok": False, "error": "channel_not_found"})),
     )
 
     result = json.loads(slack.slack_get_channel_info("C0123456789"))
@@ -1786,7 +1855,7 @@ def test_search_messages_thread_channel_not_found_is_not_actionable_once_members
     monkeypatch,
 ):
     """channel_not_found from conversations.replies is ambiguous in
-    general (see _PATHS_HIDING_CHANNEL_FROM_NON_MEMBERS's module comment),
+    general (see _NOT_A_MEMBER_CODES_BY_PATH's module comment),
     but inside slack_search_messages the conversations.history call just
     above always succeeds for this same channel_id first — which proves
     membership — before the thread loop ever runs. A later channel_not_found

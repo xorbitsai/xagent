@@ -204,7 +204,7 @@ class _SlackMissingScopeError(_SlackActionableError):
     """Raised by _request whenever Slack reports "missing_scope".
 
     Unlike not-a-member codes (which vary by endpoint — see
-    _PATHS_HIDING_CHANNEL_FROM_NON_MEMBERS below), missing_scope means the
+    _NOT_A_MEMBER_CODES_BY_PATH below), missing_scope means the
     same thing everywhere Slack can return it: the stored token predates a
     scope this call needs. Translating it once here, at the lowest level
     every Slack call goes through, means every tool in this file gets the
@@ -262,10 +262,18 @@ def _request(
     if not payload.get("ok"):
         code = payload.get("error") or "Unknown Slack API error"
         if code == "missing_scope":
+            # Slack's response for this error can carry "needed" (the
+            # specific scope this call required) alongside the bare code —
+            # surfaced here (not dropped) so an operator reading logs can
+            # tell which scope is missing without guessing, which matters
+            # more now that this connector's scope set grows across
+            # successive migrations.
+            needed = payload.get("needed")
+            detail = f" (needed: {needed})" if needed else ""
             raise _SlackMissingScopeError(
-                "missing_scope: this connector's Slack connection is "
-                "missing a permission this action needs. Ask the user to "
-                "reconnect the Slack connector so it can request the "
+                f"missing_scope{detail}: this connector's Slack connection "
+                "is missing a permission this action needs. Ask the user "
+                "to reconnect the Slack connector so it can request the "
                 "updated permissions, then retry."
             ) from None
         raise _SlackAPIError(code)
@@ -273,24 +281,26 @@ def _request(
 
 
 # "no_permission" is documented identically across every endpoint this
-# connector wraps (conversations.history/replies, chat.postMessage,
+# connector wraps (conversations.history/replies/info, chat.postMessage,
 # reactions.add/remove, files.completeUploadExternal) as "The workspace
 # token used in this request does not have the permissions necessary...
 # Make sure your app is a member of the conversation" — a second, endpoint-
-# independent way Slack signals "not a member", distinct from not_in_channel.
+# independent way Slack signals "not a member", distinct from not_in_channel,
+# and present regardless of which of the two documentation shapes below an
+# endpoint falls into.
 #
 # Slack documents "not_in_channel" for conversations.history, chat.postMessage,
-# and files.completeUploadExternal, but conversations.replies and
-# reactions.add/remove do NOT document it — they document "channel_not_found"
-# instead, which is ambiguous: it can mean a bad/deleted channel id just as
-# easily as a real channel hidden from a non-member caller. When the caller
-# passed a channel *name*, _resolve_channel_id already confirmed the channel
-# exists via conversations.list, which makes "hidden from a non-member" the
-# likelier explanation — but when the caller passed a channel id directly,
-# _resolve_channel_id short-circuits without checking it's real, so
-# channel_not_found here could still genuinely mean "no such channel". The
-# raised message below is worded to cover both rather than asserting the
-# membership explanation outright.
+# and files.completeUploadExternal, but conversations.replies, conversations.info,
+# and reactions.add/remove do NOT document it — each of those four instead
+# documents "channel_not_found", which is ambiguous: it can mean a bad/deleted
+# channel id just as easily as a real channel hidden from a non-member caller.
+# When the caller passed a channel *name*, _resolve_channel_id already
+# confirmed the channel exists via conversations.list, which makes "hidden
+# from a non-member" the likelier explanation — but when the caller passed a
+# channel id directly, _resolve_channel_id short-circuits without checking
+# it's real, so channel_not_found here could still genuinely mean "no such
+# channel". The raised message below is worded to cover both rather than
+# asserting the membership explanation outright.
 #
 # channel_not_found is deliberately NOT added for chat.postMessage: Slack's
 # own docs say a DM target returns channel_not_found specifically when the
@@ -298,31 +308,32 @@ def _request(
 # only joins *channels*) cannot fix, so treating it as the same "go call
 # slack_join_channel" actionable error would be actively misleading.
 #
-# Keyed by Slack API path rather than left as a parameter each call site has
-# to remember to pass: a lookup here is the one place a future endpoint's
-# "which code does Slack actually use" needs to be recorded, rather than
-# risking a new call site quietly falling back to the too-narrow default the
-# same way this exact set of endpoints originally did.
-_PATHS_HIDING_CHANNEL_FROM_NON_MEMBERS = frozenset(
-    {"conversations.replies", "reactions.add", "reactions.remove"}
-)
-# not_in_channel is unambiguous per Slack's own docs: if Slack returns it,
-# the bot genuinely isn't a member, full stop — proven membership earlier
-# in the same call doesn't change that (the bot could always have been
-# removed mid-call), so this is never excluded by membership_already_proven
-# below.
-_UNAMBIGUOUS_NOT_A_MEMBER_CODES = frozenset({"not_in_channel"})
+# One dict entry per path, keyed by Slack API path, rather than a shared
+# frozenset a new call site has to remember to join: a new membership-gated
+# endpoint declares its own documented code set exactly once here, instead
+# of an author having to correctly guess which of several separate
+# constants it belongs in — the wrong guess here is exactly how
+# conversations.info was first classified (left off this table entirely,
+# on the mistaken assumption that its non-member error was no_permission
+# rather than channel_not_found like its siblings below).
+_NOT_A_MEMBER_CODES_BY_PATH: dict[str, frozenset[str]] = {
+    path: frozenset({"not_in_channel", "no_permission", "channel_not_found"})
+    for path in (
+        "conversations.replies",
+        "conversations.info",
+        "reactions.add",
+        "reactions.remove",
+    )
+}
+_DEFAULT_NOT_A_MEMBER_CODES = frozenset({"not_in_channel", "no_permission"})
 # channel_not_found and no_permission are BOTH overloaded by Slack for
 # reasons unrelated to channel membership too (see the module comment
-# below) — once membership is independently proven, neither can still mean
+# above) — once membership is independently proven, neither can still mean
 # "not a member", so membership_already_proven excludes both, not just one.
+# not_in_channel is never excluded: it's unambiguous per Slack's own docs
+# regardless of prior proof (the bot could always have been removed
+# mid-call).
 _AMBIGUOUS_NOT_A_MEMBER_CODES = frozenset({"channel_not_found", "no_permission"})
-_DEFAULT_NOT_A_MEMBER_CODES = _UNAMBIGUOUS_NOT_A_MEMBER_CODES | frozenset(
-    {"no_permission"}
-)
-_HIDDEN_FROM_NON_MEMBER_CODES = _DEFAULT_NOT_A_MEMBER_CODES | frozenset(
-    {"channel_not_found"}
-)
 
 
 def _request_requiring_membership(
@@ -336,7 +347,7 @@ def _request_requiring_membership(
     """Call a Slack endpoint that requires the bot to already be a channel
     member, and raise an actionable error if it isn't yet.
 
-    This covers conversations.history/replies (regardless of which
+    This covers conversations.history/replies/info (regardless of which
     *:history scopes are granted), reactions.add/remove, and
     files.completeUploadExternal — none of them work for a channel the bot
     hasn't joined. chat.postMessage is the one exception for a *public*
@@ -345,12 +356,12 @@ def _request_requiring_membership(
     this too.
 
     Which error code signals "not a member" is derived from `path` via
-    _PATHS_HIDING_CHANNEL_FROM_NON_MEMBERS above, rather than taken as a
-    parameter — see that constant's comment for why.
+    _NOT_A_MEMBER_CODES_BY_PATH above, rather than taken as a parameter —
+    see that constant's comment for why.
 
     membership_already_proven defaults to False (the ambiguous hedge
-    described on _PATHS_HIDING_CHANNEL_FROM_NON_MEMBERS above applies as
-    normal), but a caller that already confirmed membership on this same
+    described on _NOT_A_MEMBER_CODES_BY_PATH above applies as normal), but
+    a caller that already confirmed membership on this same
     channel earlier in the same call — e.g. slack_search_messages, which
     only reaches its conversations.replies call after conversations.history
     already succeeded for the same channel_id — must pass True: a later
@@ -369,10 +380,8 @@ def _request_requiring_membership(
     then call slack_join_channel — never silently, just because a call
     failed.
     """
-    not_a_member_codes = (
-        _HIDDEN_FROM_NON_MEMBER_CODES
-        if path in _PATHS_HIDING_CHANNEL_FROM_NON_MEMBERS
-        else _DEFAULT_NOT_A_MEMBER_CODES
+    not_a_member_codes = _NOT_A_MEMBER_CODES_BY_PATH.get(
+        path, _DEFAULT_NOT_A_MEMBER_CODES
     )
     if membership_already_proven:
         not_a_member_codes = not_a_member_codes - _AMBIGUOUS_NOT_A_MEMBER_CODES
@@ -448,6 +457,22 @@ def slack_join_channel(channel: str) -> str:
             in ((result.get("response_metadata") or {}).get("warnings") or [])
         )
         return _success(channel=channel_id, already_member=already_member)
+    except _SlackAPIError as e:
+        # _resolve_channel_id passes exclude_archived: "false" (a channel
+        # *name* has to resolve to an archived channel too, so a caller
+        # gets a clear reason instead of a silent "not found"), which means
+        # a name can resolve cleanly here and then fail conversations.join
+        # with this exact code — worth a clear message instead of the bare
+        # code, since nothing about resolving the name signaled the problem.
+        if e.code == "is_archived":
+            logger.error(f"Cannot join archived Slack channel {channel}")
+            return _error(
+                f"is_archived: channel '{channel}' has been archived and can't "
+                "be joined — ask a workspace admin to unarchive it first if "
+                "the bot still needs access."
+            )
+        logger.error(f"Error joining Slack channel {channel}: {e}")
+        return _error(str(e))
     except Exception as e:
         logger.error(f"Error joining Slack channel {channel}: {e}")
         return _error(str(e))
@@ -701,11 +726,6 @@ def slack_get_channel_info(channel: str) -> str:
     """
     try:
         channel_id = _resolve_channel_id(channel)
-        # conversations.info documents no_permission (not channel_not_found)
-        # for a non-member caller — channel_not_found there genuinely means
-        # a bad/deleted id, so this doesn't need
-        # _PATHS_HIDING_CHANNEL_FROM_NON_MEMBERS's widening, just the
-        # default not-a-member codes.
         result = _request_requiring_membership(
             "GET", "conversations.info", params={"channel": channel_id}
         )
@@ -1070,6 +1090,13 @@ def slack_upload_file(
     channel: the target channel/DM id or name.
     thread_ts: optional parent message "ts" to post the file as a thread
     reply instead of into the channel's main timeline.
+    If this fails after telling you to call slack_join_channel (not a
+    member yet) or reconnect (missing scope), the file may already be
+    staged in Slack's storage from the upload steps that ran before the
+    failing one — retrying after fixing the cause re-uploads it rather than
+    reusing that staged copy, which leaves the earlier one orphaned. Not a
+    problem for the channel (nothing unwanted gets posted), just wasted
+    storage.
     """
     try:
         local_path = _resolve_allowed_file_path(file_path)

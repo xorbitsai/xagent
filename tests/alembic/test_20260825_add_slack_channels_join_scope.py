@@ -209,6 +209,40 @@ def test_upgrade_without_table_is_a_noop(tmp_path):
             migration.upgrade()  # must not raise when the table doesn't exist
 
 
+def test_downgrade_without_table_is_a_noop(tmp_path):
+    engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
+    migration = _load_migration_module()
+    with engine.begin() as connection:
+        with patch.object(migration, "op", _operations(connection)):
+            migration.downgrade()  # must not raise when the table doesn't exist
+
+
+def test_upgrade_without_oauth_scopes_or_description_columns_is_a_noop(tmp_path):
+    """public_mcp_apps can exist without the oauth_scopes/description
+    columns this migration writes (an older schema, or a reduced admin
+    deployment) -- _columns_present's guard must make both writes a
+    no-op, not a crash on columns that aren't there, mirroring the
+    equivalent oauth_providers case covered above."""
+    engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
+    migration = _load_migration_module()
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                """
+                CREATE TABLE public_mcp_apps (
+                    id INTEGER PRIMARY KEY,
+                    app_id VARCHAR(100) NOT NULL UNIQUE
+                )
+                """
+            )
+        )
+        connection.execute(
+            text("INSERT INTO public_mcp_apps (app_id) VALUES ('slack')")
+        )
+        with patch.object(migration, "op", _operations(connection)):
+            migration.upgrade()  # must not raise despite the missing columns
+
+
 def test_upgrade_preserves_customized_description(tmp_path):
     engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
     migration = _load_migration_module()
@@ -476,6 +510,27 @@ def test_downgrade_merges_into_a_row_with_null_default_scopes(tmp_path):
         assert (
             _provider_default_scopes(connection, "slack") == migration.PREVIOUS_SCOPES
         )
+
+
+def test_upgrade_merges_into_a_row_with_explicit_empty_default_scopes(tmp_path):
+    """An explicit, already-stored [] is an operator customization (e.g.
+    deliberately cleared via the admin PATCH endpoint) -- unlike a NULL
+    column, it must take the delta-merge branch (result: exactly
+    ["channels:join"]), not the full-set-seed branch (result: the entire
+    CURRENT_SCOPES list), preserving the current is None vs. current == []
+    distinction the code draws at the `if current is None:` check. No
+    existing test pins this: a future refactor to a falsy check
+    (`if not current:`) would silently merge the two branches, seeding the
+    full canonical set here instead of just the delta, and nothing else in
+    this file would catch it."""
+    engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
+    migration = _load_migration_module()
+    with engine.begin() as connection:
+        _create_table(connection, migration.PREVIOUS_SCOPES)
+        _create_oauth_providers_table(connection, [])
+        with patch.object(migration, "op", _operations(connection)):
+            migration.upgrade()
+        assert _provider_default_scopes(connection, "slack") == ["channels:join"]
 
 
 def test_upgrade_preserves_unparsable_default_scopes_without_overwriting(tmp_path):

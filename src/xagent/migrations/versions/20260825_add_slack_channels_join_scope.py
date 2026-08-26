@@ -74,8 +74,8 @@ PREVIOUS_DESCRIPTION = (
 )
 CURRENT_DESCRIPTION = (
     "Connect to Slack to search and read channel, thread, and DM history, "
-    "post messages and replies, react to messages, upload files, and (with "
-    "your approval) join public channels, e.g. incident summaries and "
+    "post messages and replies, react to messages, upload files, and join "
+    "public channels when asked to, e.g. incident summaries and "
     "recommended fixes."
 )
 

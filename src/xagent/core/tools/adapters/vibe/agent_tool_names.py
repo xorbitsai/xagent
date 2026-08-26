@@ -4,6 +4,8 @@ import re
 import unicodedata
 from typing import Any
 
+from .tool_naming_limits import MAX_AGENT_TOOL_NAME_LENGTH
+
 try:
     # This module is transitively imported by mcp_adapter.py, which
     # sandboxed tool execution (tool_runner.py's _load_tool_class) also
@@ -21,7 +23,6 @@ AGENT_TOOL_NAME_PREFIX = "agent_"
 LEGACY_AGENT_TOOL_NAME_PREFIX = "call_agent_"
 WORKFORCE_AGENT_TOOL_NAME_PREFIX = "worker_"
 AGENT_TOOL_NAME_ID_SEPARATOR = "__a"
-MAX_AGENT_TOOL_NAME_LENGTH = 64
 
 
 def _normalize_agent_id(agent_id: Any) -> int:

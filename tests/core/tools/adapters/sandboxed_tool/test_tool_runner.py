@@ -3,6 +3,9 @@
 import argparse
 import base64
 import json
+import subprocess
+import sys
+import textwrap
 from typing import Any, Mapping
 from unittest.mock import patch
 
@@ -83,6 +86,66 @@ class TestLoadToolClass:
         """Non-existent module should raise ModuleNotFoundError."""
         with pytest.raises(ModuleNotFoundError):
             _load_tool_class("no.such.module:Cls")
+
+    def test_mcp_tool_adapter_loads_without_pypinyin(self):
+        """Regression test for the reported sandbox failure (PR #1710).
+
+        A reduced sandbox never installs pypinyin (only mcp/pydantic/
+        cloudpickle -- see SANDBOX_BASE_DEPENDENCIES), yet every
+        sandboxed MCP tool call must still import mcp_adapter:
+        MCPToolAdapter through this exact function, because
+        mcp_adapter.py transitively imports agent_tool_names.py for an
+        unrelated constant that agent_tool_names.py used to require
+        pypinyin just to define. Runs in a subprocess -- rather than
+        monkeypatching sys.modules/builtins.__import__ in-process -- so
+        blocking "pypinyin" at the import-system level can't be
+        undone by pypinyin already sitting in sys.modules from an
+        earlier test in this same process, and so this exercises the
+        real, unmodified import machinery tool_runner.py itself runs
+        under in a sandbox.
+        """
+        script = textwrap.dedent(
+            """
+            import sys
+
+            class _BlockPypinyin:
+                def find_spec(self, name, path=None, target=None):
+                    if name == "pypinyin" or name.startswith("pypinyin."):
+                        raise ModuleNotFoundError(f"No module named {name!r}")
+                    return None
+
+            sys.meta_path.insert(0, _BlockPypinyin())
+
+            from xagent.core.tools.adapters.vibe.sandboxed_tool.tool_runner import (
+                _load_tool_class,
+            )
+
+            cls = _load_tool_class(
+                "xagent.core.tools.adapters.vibe.mcp_adapter:MCPToolAdapter"
+            )
+            assert cls.__name__ == "MCPToolAdapter"
+
+            from xagent.core.tools.adapters.vibe import agent_tool_names
+
+            assert agent_tool_names.lazy_pinyin is None
+
+            ascii_name = agent_tool_names.gen_workforce_agent_tool_name(
+                1, "ASCII Name"
+            )
+            assert ascii_name.isascii()
+            assert agent_tool_names.parse_agent_tool_id(ascii_name) == 1
+
+            print("REGRESSION_TEST_OK")
+            """
+        )
+        result = subprocess.run(
+            [sys.executable, "-c", script],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        assert result.returncode == 0, result.stderr
+        assert "REGRESSION_TEST_OK" in result.stdout
 
 
 class TestLoadExecutionSpec:

@@ -13,7 +13,6 @@ from pydantic import BaseModel, ConfigDict
 from pydantic.alias_generators import to_camel
 
 from xagent.core.tools.adapters.vibe import mcp_adapter as mcp_adapter_module
-from xagent.core.tools.adapters.vibe.agent_tool_names import MAX_AGENT_TOOL_NAME_LENGTH
 from xagent.core.tools.adapters.vibe.mcp_adapter import (
     MCPFailurePhase,
     MCPServerLoadFailure,
@@ -22,6 +21,9 @@ from xagent.core.tools.adapters.vibe.mcp_adapter import (
     _exception_indicates_http_401,
     _mcp_return_value_as_string,
     load_mcp_tools_as_agent_tools,
+)
+from xagent.core.tools.adapters.vibe.tool_naming_limits import (
+    MAX_AGENT_TOOL_NAME_LENGTH,
 )
 
 

@@ -3,10 +3,12 @@ from unittest.mock import patch
 
 import pytest
 
-from xagent.core.tools.adapters.vibe.agent_tool_names import MAX_AGENT_TOOL_NAME_LENGTH
 from xagent.core.tools.adapters.vibe.api_tool_adapter import (
     CustomApiTool,
     create_custom_api_tools,
+)
+from xagent.core.tools.adapters.vibe.tool_naming_limits import (
+    MAX_AGENT_TOOL_NAME_LENGTH,
 )
 
 

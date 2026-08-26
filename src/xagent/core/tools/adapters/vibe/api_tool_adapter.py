@@ -11,7 +11,6 @@ from pydantic import BaseModel, Field, model_validator
 
 from ....utils.encryption import decrypt_value
 from ...core.api_tool import call_api
-from .agent_tool_names import MAX_AGENT_TOOL_NAME_LENGTH
 from .base import AbstractBaseTool, ToolCategory, ToolVisibility
 from .connector_runtime import (
     MISSING_RUNTIME_VALUE,
@@ -26,6 +25,7 @@ from .connector_runtime import (
     is_runtime_header_scalar,
     runtime_bindings_from_config,
 )
+from .tool_naming_limits import MAX_AGENT_TOOL_NAME_LENGTH
 
 logger = logging.getLogger(__name__)
 

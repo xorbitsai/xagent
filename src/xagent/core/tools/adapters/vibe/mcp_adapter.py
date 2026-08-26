@@ -24,7 +24,6 @@ from ..... import config as _root_config
 from .....sandbox.base import Sandbox
 from ...core.mcp.sessions import Connection, create_session
 from ...core.mcp.tools import load_mcp_tools
-from .agent_tool_names import MAX_AGENT_TOOL_NAME_LENGTH
 from .base import AbstractBaseTool, ToolVisibility
 from .connector_runtime import (
     ERROR_DELEGATED_AUTHORIZATION_FAILED,
@@ -41,6 +40,7 @@ from .sandboxed_tool.sandboxed_mcp_tool_helper import (
     load_sandboxed_mcp_tools,
     should_sandbox_mcp_connection,
 )
+from .tool_naming_limits import MAX_AGENT_TOOL_NAME_LENGTH
 
 
 class MCPFailurePhase(str, Enum):

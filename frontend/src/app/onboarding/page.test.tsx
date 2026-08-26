@@ -144,6 +144,15 @@ describe("OnboardingPage", () => {
     expect(continueButton).not.toBeDisabled()
   })
 
+  // Matches PREFERENCES_TEXT_FIELD_MAX_LENGTH in src/xagent/web/api/auth.py -
+  // a defensive client-side cap flagged by PR review.
+  it("caps the free-text industry field at 200 characters", async () => {
+    await goToWelcomeThenBusiness()
+    fireEvent.click(screen.getByText("Other"))
+
+    expect(screen.getByPlaceholderText("e.g. Property management")).toHaveAttribute("maxLength", "200")
+  })
+
   it("reorders goals to bring the selected work type's goals first", async () => {
     await goToWelcomeThenBusiness()
     fireEvent.click(screen.getByText("Sales"))
@@ -210,6 +219,29 @@ describe("OnboardingPage", () => {
     })
 
     expect(routerPush).toHaveBeenCalledWith("/task")
+  })
+
+  // Flagged by PR review (xorbitsai/xagent#1617): persistAndLeave had no
+  // double-click guard, unlike handleLaunch's launchingRef - a fast second
+  // click before the first PATCH resolved would fire two concurrent saves.
+  it("ignores a second click on Skip setup while the first save is still in flight", async () => {
+    let resolveSave!: (v: { ok: boolean }) => void
+    updateUserPreferencesMock.mockReturnValue(new Promise((resolve) => { resolveSave = resolve }))
+
+    render(<OnboardingPage />)
+    await waitFor(() => expect(screen.getByText(/Welcome to Xagent/)).toBeInTheDocument())
+
+    const skipButton = screen.getByText("Skip setup")
+    fireEvent.click(skipButton)
+    fireEvent.click(skipButton)
+    fireEvent.click(skipButton)
+
+    expect(updateUserPreferencesMock).toHaveBeenCalledTimes(1)
+    expect(skipButton.closest("button")).toBeDisabled()
+
+    await act(async () => {
+      resolveSave({ ok: true })
+    })
   })
 
   // Flagged by PR review (xorbitsai/xagent#1617): persistAndLeave awaited the

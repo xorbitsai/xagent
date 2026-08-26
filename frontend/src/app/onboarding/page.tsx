@@ -212,6 +212,12 @@ export default function OnboardingPage() {
   // one here either. Bailing out via the goals step after already selecting
   // a couple of goals must not silently discard them.
   const persistAndLeave = async (destination: string) => {
+    // Reuses the same launching/launchingRef guard as handleLaunch below -
+    // a double-click on any exit button before the PATCH resolves would
+    // otherwise fire two concurrent saves.
+    if (launchingRef.current) return;
+    launchingRef.current = true;
+    setLaunching(true);
     // Awaited, not fire-and-forget: AuthGuard's onboarding-redirect check runs
     // a GET as soon as `destination` mounts, and that GET winning the race
     // against this PATCH would read the old onboarded:false and bounce the
@@ -226,10 +232,14 @@ export default function OnboardingPage() {
     // Don't navigate on a failed save either: onboarded would stay false
     // server-side, and AuthGuard would just bounce the user right back here.
     if (!saved.ok) {
-      toast.error(t("onboarding.done.saveFailed"));
+      if (isMountedRef.current) {
+        toast.error(t("onboarding.done.saveFailed"));
+        launchingRef.current = false;
+        setLaunching(false);
+      }
       return;
     }
-    router.push(destination);
+    if (isMountedRef.current) router.push(destination);
   };
 
   const handleLaunch = async () => {
@@ -294,7 +304,7 @@ export default function OnboardingPage() {
       </div>
 
       <header className="ob-top">
-        <button type="button" onClick={() => persistAndLeave("/task")} className="ob-exit">
+        <button type="button" disabled={launching} onClick={() => persistAndLeave("/task")} className="ob-exit">
           {t("onboarding.skip")}
         </button>
         {/* eslint-disable-next-line @next/next/no-img-element -- fixed 26px brand mark, not a candidate for next/image */}
@@ -384,6 +394,10 @@ export default function OnboardingPage() {
                     value={industry}
                     onChange={(event) => setIndustry(event.target.value)}
                     placeholder={t("onboarding.business.industryPlaceholder")}
+                    // Matches PREFERENCES_TEXT_FIELD_MAX_LENGTH in
+                    // src/xagent/web/api/auth.py - a defensive client-side
+                    // cap, not a replacement for the backend's own validation.
+                    maxLength={200}
                     className="ob-input"
                   />
                 </div>
@@ -437,7 +451,7 @@ export default function OnboardingPage() {
                   {t("onboarding.continue")}
                 </button>
               </div>
-              <button type="button" onClick={() => persistAndLeave("/templates")} className="ob-skip">
+              <button type="button" disabled={launching} onClick={() => persistAndLeave("/templates")} className="ob-skip">
                 {t("onboarding.goals.skip")}
               </button>
             </>
@@ -643,7 +657,7 @@ export default function OnboardingPage() {
                       {!launching && <ArrowRight className="h-4 w-4" />}
                     </button>
                   </div>
-                  <button type="button" onClick={() => persistAndLeave("/templates")} className="ob-skip">
+                  <button type="button" disabled={launching} onClick={() => persistAndLeave("/templates")} className="ob-skip">
                     {t("onboarding.done.skip")}
                   </button>
                 </>

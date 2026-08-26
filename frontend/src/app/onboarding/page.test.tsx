@@ -321,6 +321,29 @@ describe("OnboardingPage", () => {
     expect(screen.getByText("Continue").closest("button")).not.toBeDisabled()
   })
 
+  // Pins a self-review finding: if EVERY recommended template for the
+  // selected goals fails to load or has no persona (not just one of them),
+  // the team step must fall back to the same 3 defaults it uses when no
+  // goals were picked at all, rather than showing zero cards with Continue
+  // stuck disabled and no explanation.
+  it("falls back to the 3 default agents when every recommended template is unavailable", async () => {
+    await goToWelcomeThenBusiness()
+    fireEvent.click(screen.getByText("Marketing"))
+    fireEvent.click(screen.getByText("Continue"))
+
+    await waitFor(() => expect(screen.getByText(/take off your plate/)).toBeInTheDocument())
+    // "docs" -> general-doc-summarizer-action-extractor, which isn't in the
+    // fetched TEMPLATES fixture at all.
+    fireEvent.click(screen.getByText("Summarise long documents"))
+    fireEvent.click(screen.getByText("Continue"))
+
+    await waitFor(() => expect(screen.getByText(/Meet your AI team/)).toBeInTheDocument())
+    expect(screen.getByText("Maya")).toBeInTheDocument()
+    expect(screen.getByText("Ellie")).toBeInTheDocument()
+    expect(screen.getByText("Kevin")).toBeInTheDocument()
+    expect(screen.getByText("Continue").closest("button")).not.toBeDisabled()
+  })
+
   // Flagged by PR review (xorbitsai/xagent#1617): the templates fetch used to
   // set templatesLoading:false in a finally block regardless of outcome,
   // contradicting its own comment that failure should stay in a loading
@@ -343,7 +366,7 @@ describe("OnboardingPage", () => {
     expect(screen.getByText("Continue").closest("button")).toBeDisabled()
   })
 
-  it("the goals step's 'not sure yet' link persists onboarded:true (without goals/voice) and exits to /templates", async () => {
+  it("the goals step's 'not sure yet' link persists onboarded:true and the current voice, with no goals selected yet", async () => {
     await goToWelcomeThenBusiness()
     fireEvent.click(screen.getByText("Other"))
     fireEvent.change(screen.getByPlaceholderText("e.g. Property management"), {
@@ -355,11 +378,33 @@ describe("OnboardingPage", () => {
     fireEvent.click(screen.getByText("Not sure yet — show me everyone"))
 
     expect(updateUserPreferencesMock).toHaveBeenCalledWith(
-      expect.objectContaining({ onboarded: true, department: "other", industry: "Something" })
+      expect.objectContaining({
+        onboarded: true,
+        department: "other",
+        industry: "Something",
+        voice: "professional",
+      })
     )
     const call = updateUserPreferencesMock.mock.calls.at(-1)![0]
     expect(call).not.toHaveProperty("goals")
-    expect(call).not.toHaveProperty("voice")
     await waitFor(() => expect(routerPush).toHaveBeenCalledWith("/templates"))
+  })
+
+  // Pins a bug found in self-review: the reference UI's finish() persists
+  // whatever's been picked so far on EVERY exit path, unconditionally - this
+  // page used to special-case the goals-step skip to drop goals/voice,
+  // silently losing any selections already made before the user bailed out.
+  it("does not discard already-selected goals when leaving via the goals step's 'not sure yet' link", async () => {
+    await goToWelcomeThenBusiness()
+    fireEvent.click(screen.getByText("Marketing"))
+    fireEvent.click(screen.getByText("Continue"))
+
+    await waitFor(() => expect(screen.getByText(/take off your plate/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Post on social media"))
+    fireEvent.click(screen.getByText("Not sure yet — show me everyone"))
+
+    expect(updateUserPreferencesMock).toHaveBeenCalledWith(
+      expect.objectContaining({ onboarded: true, goals: ["social"] })
+    )
   })
 })

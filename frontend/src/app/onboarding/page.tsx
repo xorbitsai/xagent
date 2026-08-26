@@ -16,6 +16,7 @@ import { hireAgentFromTemplate } from "@/lib/hire-agent";
 import { PersonaAvatar } from "@/components/templates/persona-avatar";
 import {
   ONBOARDING_DEFAULT_VOICE,
+  ONBOARDING_FALLBACK_TEMPLATE_IDS,
   ONBOARDING_GOALS,
   ONBOARDING_VOICES,
   ONBOARDING_WORK,
@@ -121,6 +122,10 @@ export default function OnboardingPage() {
 
   useEffect(() => {
     let cancelled = false;
+    // A locale change mid-flow re-runs this effect (it's a dep below) - reset
+    // to loading rather than leaving the previous locale's templates/team
+    // step displayed with no indication a refetch is even happening.
+    setTemplatesLoading(true);
     (async () => {
       try {
         const response = await apiRequest(`${getApiUrl()}/api/templates/?lang=${locale}`);
@@ -155,10 +160,20 @@ export default function OnboardingPage() {
   // step from ever landing on a recommendation with nothing to render, which
   // would otherwise leave "Continue" enabled with an empty grid and a blank
   // (persona-less) Done step with no way to finish other than Back/Skip.
+  // While templates are still loading, templateById is empty so this is
+  // naturally [] too - no separate loading branch needed, and isTeamValid
+  // (below) doesn't need its own !templatesLoading check as a result.
   const validRecommended = useMemo(() => {
-    if (templatesLoading) return recommended;
-    return recommended.filter((r) => templateById.get(r.templateId)?.persona);
-  }, [recommended, templatesLoading, templateById]);
+    const filtered = recommended.filter((r) => templateById.get(r.templateId)?.persona);
+    if (filtered.length > 0) return filtered;
+    // Every recommendation for the selected goals failed to load or has no
+    // persona (or nothing has loaded yet) - fall back to the same 3 defaults
+    // recommendedTemplates() uses when no goals were picked at all, so a
+    // template-catalog gap can't leave this step with zero cards to show.
+    return ONBOARDING_FALLBACK_TEMPLATE_IDS.map((templateId) => ({ templateId, goalId: null })).filter(
+      (r) => templateById.get(r.templateId)?.persona
+    );
+  }, [recommended, templateById]);
 
   // Keep the selected agent valid as the recommendation list changes -
   // default to the first recommendation whenever the current pick falls
@@ -176,11 +191,7 @@ export default function OnboardingPage() {
 
   const isBusinessValid = work !== "" && (work !== "other" || industry.trim() !== "");
   const isGoalsValid = goals.length > 0;
-  // Also gated on !templatesLoading: agentTemplateId can get set from the
-  // static catalog (validRecommended falls back to the unfiltered list
-  // while loading) before templates actually resolve, and Continue must
-  // not go live off of a pick nothing has confirmed exists yet.
-  const isTeamValid = agentTemplateId !== "" && !templatesLoading;
+  const isTeamValid = agentTemplateId !== "";
 
   const goTo = (index: number) => {
     const clamped = Math.max(0, Math.min(STEP_ORDER.length - 1, index));
@@ -194,7 +205,13 @@ export default function OnboardingPage() {
     setGoals((prev) => (prev.includes(id) ? prev.filter((g) => g !== id) : [...prev, id]));
   };
 
-  const persistAndLeave = async (destination: string, includeAll: boolean) => {
+  // Matches the reference UI's finish() exactly: every exit path (header
+  // "Skip setup", the goals step's "Not sure yet", the done step's "Take me
+  // to the catalogue") persists whatever's been picked so far, unconditionally
+  // - there is no partial-vs-full distinction there, and there shouldn't be
+  // one here either. Bailing out via the goals step after already selecting
+  // a couple of goals must not silently discard them.
+  const persistAndLeave = async (destination: string) => {
     // Awaited, not fire-and-forget: AuthGuard's onboarding-redirect check runs
     // a GET as soon as `destination` mounts, and that GET winning the race
     // against this PATCH would read the old onboarded:false and bounce the
@@ -203,8 +220,8 @@ export default function OnboardingPage() {
       onboarded: true,
       ...(work ? { department: work } : {}),
       ...(work === "other" && industry.trim() ? { industry: industry.trim() } : {}),
-      ...(includeAll && goals.length ? { goals } : {}),
-      ...(includeAll ? { voice } : {}),
+      ...(goals.length ? { goals } : {}),
+      voice,
     });
     // Don't navigate on a failed save either: onboarded would stay false
     // server-side, and AuthGuard would just bounce the user right back here.
@@ -277,7 +294,7 @@ export default function OnboardingPage() {
       </div>
 
       <header className="ob-top">
-        <button type="button" onClick={() => persistAndLeave("/task", false)} className="ob-exit">
+        <button type="button" onClick={() => persistAndLeave("/task")} className="ob-exit">
           {t("onboarding.skip")}
         </button>
         {/* eslint-disable-next-line @next/next/no-img-element -- fixed 26px brand mark, not a candidate for next/image */}
@@ -420,7 +437,7 @@ export default function OnboardingPage() {
                   {t("onboarding.continue")}
                 </button>
               </div>
-              <button type="button" onClick={() => persistAndLeave("/templates", false)} className="ob-skip">
+              <button type="button" onClick={() => persistAndLeave("/templates")} className="ob-skip">
                 {t("onboarding.goals.skip")}
               </button>
             </>
@@ -626,7 +643,7 @@ export default function OnboardingPage() {
                       {!launching && <ArrowRight className="h-4 w-4" />}
                     </button>
                   </div>
-                  <button type="button" onClick={() => persistAndLeave("/templates", true)} className="ob-skip">
+                  <button type="button" onClick={() => persistAndLeave("/templates")} className="ob-skip">
                     {t("onboarding.done.skip")}
                   </button>
                 </>

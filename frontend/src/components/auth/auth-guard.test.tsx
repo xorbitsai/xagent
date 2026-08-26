@@ -138,4 +138,24 @@ describe("AuthGuard onboarding redirect", () => {
 
     expect(fetchUserPreferencesMock).not.toHaveBeenCalled()
   })
+
+  // Pins a self-review finding: the "checked once" ref used to latch true
+  // BEFORE the async check resolved. If a navigation cancelled that check
+  // in flight, the ref stayed latched forever and no later route ever got
+  // checked again in that tab. The ref must only latch once a check
+  // actually completes, so a cancelled check can be retried on the next one.
+  it("retries the check on the next route if navigation cancels it before the fetch resolves", async () => {
+    fetchUserPreferencesMock
+      .mockImplementationOnce(() => new Promise(() => {})) // never resolves - simulates an in-flight, then-cancelled check
+      .mockResolvedValueOnce({ onboarded: true })
+
+    const { rerender } = render(<AuthGuard><div data-testid="children" /></AuthGuard>)
+    await waitFor(() => expect(fetchUserPreferencesMock).toHaveBeenCalledTimes(1))
+
+    // Navigate to a different authenticated route before the first check resolves.
+    route.pathname = "/dashboard"
+    rerender(<AuthGuard><div data-testid="children" /></AuthGuard>)
+
+    await waitFor(() => expect(fetchUserPreferencesMock).toHaveBeenCalledTimes(2))
+  })
 })

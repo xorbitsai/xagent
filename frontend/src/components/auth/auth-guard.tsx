@@ -42,16 +42,23 @@ export function AuthGuard({ children }: AuthGuardProps) {
   // navigation), not on every route change - a stale read only matters until
   // the user next completes or skips onboarding, at which point every exit
   // path there PATCHes onboarded:true before leaving, so this won't loop.
+  //
+  // The ref only latches once the check actually finishes (not before the
+  // await) - if a dependency changes and cancels this run first (e.g. the
+  // user navigates again while the GET is still in flight), `active` goes
+  // false and the ref is left untouched, so the next run (with the new
+  // deps) retries instead of the check being silently disarmed forever.
   const checkedOnboardingRef = useRef(false)
   useEffect(() => {
     if (!mounted || isAuthPage || pathname === ONBOARDING_PATH) return
     if (isLoading || !isAuthenticated || checkedOnboardingRef.current) return
-    checkedOnboardingRef.current = true
 
     let active = true
     void (async () => {
       const preferences = await fetchUserPreferences()
-      if (active && !preferences.onboarded) {
+      if (!active) return
+      checkedOnboardingRef.current = true
+      if (!preferences.onboarded) {
         router.push(ONBOARDING_PATH)
       }
     })()

@@ -6,7 +6,7 @@ import { isAuthPublicPath } from "@/lib/auth-pages"
 import { useRouter, usePathname } from "next/navigation"
 import { useI18n } from "@/contexts/i18n-context"
 import { getBrandingFromEnv } from "@/lib/branding"
-import { fetchUserPreferences } from "@/lib/user-preferences"
+import { consumeOnboardingSaveEscapeFlag, fetchUserPreferences } from "@/lib/user-preferences"
 
 const ONBOARDING_PATH = "/onboarding"
 
@@ -41,7 +41,8 @@ export function AuthGuard({ children }: AuthGuardProps) {
   // Checked once per app load (this component doesn't remount on client-side
   // navigation), not on every route change - a stale read only matters until
   // the user next completes or skips onboarding, at which point every exit
-  // path there PATCHes onboarded:true before leaving, so this won't loop.
+  // path there PATCHes onboarded:true before leaving (or, on a save that
+  // keeps failing, sets the escape flag consumed below), so this won't loop.
   //
   // The ref only latches once the check actually finishes (not before the
   // await) - if a dependency changes and cancels this run first (e.g. the
@@ -63,6 +64,11 @@ export function AuthGuard({ children }: AuthGuardProps) {
       if (preferences === null) return
       checkedOnboardingRef.current = true
       if (!preferences.onboarded) {
+        // The onboarding page's own escape hatch (giving up and leaving
+        // after repeated save failures) sets this right before navigating
+        // here - honoring it once, and still latching the ref above, is
+        // what stops that escape from just bouncing the user right back.
+        if (consumeOnboardingSaveEscapeFlag()) return
         router.push(ONBOARDING_PATH)
       }
     })()

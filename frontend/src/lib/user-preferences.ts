@@ -57,3 +57,39 @@ export async function updateUserPreferences(
     return { ok: false };
   }
 }
+
+const SAVE_ESCAPE_KEY = "xagent-onboarding-save-escape";
+
+/** Called by the onboarding page right before it gives up and navigates away
+ * despite a failed preferences save (see MAX_SAVE_FAILURES_BEFORE_ESCAPE in
+ * page.tsx). Without this, AuthGuard's own onboarding-redirect check on the
+ * destination route would see the still-`onboarded:false` preferences and
+ * immediately bounce the user right back into onboarding - defeating the
+ * whole point of the escape hatch (in the worst case, an infinite bounce
+ * loop between the destination and /onboarding, each one resetting the
+ * failure counter on remount). sessionStorage (not a ref/module variable)
+ * because the check that needs to see this runs in AuthGuard, a different
+ * component the onboarding page has no direct handle on. */
+export function markOnboardingSaveEscaped(): void {
+  try {
+    window.sessionStorage.setItem(SAVE_ESCAPE_KEY, "1");
+  } catch {
+    // Storage unavailable (private mode, disabled) - AuthGuard just won't
+    // see the flag and will redirect as it did before this existed; no
+    // worse than the pre-existing behavior.
+  }
+}
+
+/** Reads and clears the flag set by markOnboardingSaveEscaped() - one-shot,
+ * so only the very next onboarding check is suppressed, not every future
+ * one for the rest of the tab's session (the caller is expected to also
+ * latch its own "already checked" state alongside consuming this). */
+export function consumeOnboardingSaveEscapeFlag(): boolean {
+  try {
+    if (window.sessionStorage.getItem(SAVE_ESCAPE_KEY) !== "1") return false;
+    window.sessionStorage.removeItem(SAVE_ESCAPE_KEY);
+    return true;
+  } catch {
+    return false;
+  }
+}

@@ -6,7 +6,12 @@ vi.mock("@/lib/api-wrapper", () => ({
   apiRequest: apiRequestMock,
 }))
 
-import { fetchUserPreferences, updateUserPreferences } from "./user-preferences"
+import {
+  consumeOnboardingSaveEscapeFlag,
+  fetchUserPreferences,
+  markOnboardingSaveEscaped,
+  updateUserPreferences,
+} from "./user-preferences"
 
 describe("fetchUserPreferences", () => {
   beforeEach(() => {
@@ -78,5 +83,43 @@ describe("updateUserPreferences", () => {
     apiRequestMock.mockRejectedValue(new Error("network down"))
 
     expect(await updateUserPreferences({ onboarded: true })).toEqual({ ok: false })
+  })
+})
+
+// Coordinates persistAndLeave's give-up-after-repeated-failures escape hatch
+// with AuthGuard's independent onboarding check - without this, escaping a
+// failed save just gets immediately bounced back (see full-feature
+// self-review finding on the onboarding-flow PR).
+describe("markOnboardingSaveEscaped / consumeOnboardingSaveEscapeFlag", () => {
+  beforeEach(() => {
+    window.sessionStorage.clear()
+  })
+
+  it("consume returns false when nothing was marked", () => {
+    expect(consumeOnboardingSaveEscapeFlag()).toBe(false)
+  })
+
+  it("consume returns true once after marking, then false again (one-shot)", () => {
+    markOnboardingSaveEscaped()
+
+    expect(consumeOnboardingSaveEscapeFlag()).toBe(true)
+    expect(consumeOnboardingSaveEscapeFlag()).toBe(false)
+  })
+
+  it("does not throw when sessionStorage is unavailable", () => {
+    const original = window.sessionStorage
+    Object.defineProperty(window, "sessionStorage", {
+      configurable: true,
+      get() {
+        throw new Error("storage disabled")
+      },
+    })
+
+    try {
+      expect(() => markOnboardingSaveEscaped()).not.toThrow()
+      expect(consumeOnboardingSaveEscapeFlag()).toBe(false)
+    } finally {
+      Object.defineProperty(window, "sessionStorage", { configurable: true, value: original })
+    }
   })
 })

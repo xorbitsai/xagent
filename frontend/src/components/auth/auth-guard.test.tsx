@@ -8,6 +8,7 @@ const route = vi.hoisted(() => ({ pathname: "/" as string | null }))
 const authState = vi.hoisted(() => ({ isAuthenticated: false, isLoading: true }))
 const routerPush = vi.hoisted(() => vi.fn())
 const fetchUserPreferencesMock = vi.hoisted(() => vi.fn())
+const consumeOnboardingSaveEscapeFlagMock = vi.hoisted(() => vi.fn(() => false))
 
 vi.mock("next/navigation", () => ({
   usePathname: () => route.pathname,
@@ -16,6 +17,7 @@ vi.mock("next/navigation", () => ({
 
 vi.mock("@/lib/user-preferences", () => ({
   fetchUserPreferences: fetchUserPreferencesMock,
+  consumeOnboardingSaveEscapeFlag: consumeOnboardingSaveEscapeFlagMock,
 }))
 
 vi.mock("@/contexts/auth-context", () => ({
@@ -101,6 +103,8 @@ describe("AuthGuard onboarding redirect", () => {
     authState.isLoading = false
     routerPush.mockClear()
     fetchUserPreferencesMock.mockReset()
+    consumeOnboardingSaveEscapeFlagMock.mockReset()
+    consumeOnboardingSaveEscapeFlagMock.mockReturnValue(false)
   })
 
   afterEach(cleanup)
@@ -120,6 +124,28 @@ describe("AuthGuard onboarding redirect", () => {
 
     await waitFor(() => expect(fetchUserPreferencesMock).toHaveBeenCalled())
     expect(routerPush).not.toHaveBeenCalledWith("/onboarding")
+  })
+
+  // Pins a full-feature self-review finding: without this, the onboarding
+  // page's own "give up after repeated save failures" escape hatch gets
+  // immediately defeated by this exact check bouncing the user right back
+  // (sometimes as a loop) since onboarded genuinely never got persisted.
+  it("does not redirect when the onboarding page's save-escape flag is set, and still latches as checked", async () => {
+    fetchUserPreferencesMock.mockResolvedValue({})
+    consumeOnboardingSaveEscapeFlagMock.mockReturnValue(true)
+
+    const { rerender } = render(<AuthGuard><div data-testid="children" /></AuthGuard>)
+
+    await waitFor(() => expect(fetchUserPreferencesMock).toHaveBeenCalledTimes(1))
+    expect(routerPush).not.toHaveBeenCalledWith("/onboarding")
+
+    // The ref must have latched (as "checked") even though the redirect was
+    // suppressed - otherwise the very next navigation re-triggers the same
+    // check and, since the flag is one-shot and already consumed, redirects
+    // anyway, defeating the whole point of the escape hatch.
+    route.pathname = "/dashboard"
+    rerender(<AuthGuard><div data-testid="children" /></AuthGuard>)
+    expect(fetchUserPreferencesMock).toHaveBeenCalledTimes(1)
   })
 
   // Pins a PR review finding: fetchUserPreferences returns null (not {}) on

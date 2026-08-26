@@ -11,7 +11,7 @@ import { apiRequest } from "@/lib/api-wrapper";
 import { getApiUrl } from "@/lib/utils";
 import { cn } from "@/lib/utils";
 import { getBrandingFromEnv } from "@/lib/branding";
-import { updateUserPreferences } from "@/lib/user-preferences";
+import { markOnboardingSaveEscaped, updateUserPreferences } from "@/lib/user-preferences";
 import { hireAgentFromTemplate } from "@/lib/hire-agent";
 import { PersonaAvatar } from "@/components/templates/persona-avatar";
 import {
@@ -31,26 +31,26 @@ import type { TranslationKey } from "@/i18n/translations";
 
 const branding = getBrandingFromEnv();
 
-// Sidebar groups - "My team" deliberately spans both the team-pick and
-// voice-pick steps (matching the reference UI exactly), not one group per
-// step; only "Launch" is its own single-step group.
-const GROUP_KEYS: TranslationKey[] = [
-  "onboarding.rail.aboutYou",
-  "onboarding.rail.goals",
-  "onboarding.rail.myTeam",
-  "onboarding.rail.launch",
-];
-
 type StepId = "welcome" | "business" | "goals" | "team" | "voice" | "done";
-const STEP_GROUP: Record<StepId, number> = {
-  welcome: 0,
-  business: 0,
-  goals: 1,
-  team: 2,
-  voice: 2,
-  done: 3,
-};
-const STEP_ORDER: StepId[] = ["welcome", "business", "goals", "team", "voice", "done"];
+
+// Single source of truth for the rail's grouping - "My team" deliberately
+// spans both the team-pick and voice-pick steps (matching the reference UI
+// exactly), not one group per step; only "Launch" is its own single-step
+// group. STEP_ORDER/STEP_GROUP/GROUP_KEYS all used to be separately authored
+// literals that had to be hand-kept in sync; deriving them here instead
+// makes that desync structurally impossible.
+const STEP_GROUPS: { key: TranslationKey; steps: StepId[] }[] = [
+  { key: "onboarding.rail.aboutYou", steps: ["welcome", "business"] },
+  { key: "onboarding.rail.goals", steps: ["goals"] },
+  { key: "onboarding.rail.myTeam", steps: ["team", "voice"] },
+  { key: "onboarding.rail.launch", steps: ["done"] },
+];
+const GROUP_KEYS: TranslationKey[] = STEP_GROUPS.map((g) => g.key);
+const STEP_ORDER: StepId[] = STEP_GROUPS.flatMap((g) => g.steps);
+const STEP_GROUP: Record<StepId, number> = STEP_GROUPS.reduce((acc, group, groupIndex) => {
+  for (const step of group.steps) acc[step] = groupIndex;
+  return acc;
+}, {} as Record<StepId, number>);
 
 // persistAndLeave gives up and navigates anyway after this many consecutive
 // failures saving to the SAME destination, rather than trapping the user on
@@ -262,6 +262,13 @@ export default function OnboardingPage() {
       // didn't land; they'll just be asked again next session instead of
       // being stuck this one.
       if (failureCount < MAX_SAVE_FAILURES_BEFORE_ESCAPE) return;
+      // Escaping despite the failure only works if AuthGuard's own
+      // onboarding check on `destination` doesn't immediately see
+      // onboarded:false and bounce the user right back (self-review found
+      // this happens for real: sometimes as a bounce loop, sometimes it
+      // silently means the escape never actually reaches its destination).
+      // This flag tells that check to stand down once.
+      markOnboardingSaveEscaped();
     } else {
       saveFailureCountByDestRef.current[destination] = 0;
     }
@@ -533,6 +540,7 @@ export default function OnboardingPage() {
                         key={template.id}
                         type="button"
                         aria-pressed={selected}
+                        disabled={launching}
                         onClick={() => setAgentTemplateId(template.id)}
                         className="ob-tm"
                       >

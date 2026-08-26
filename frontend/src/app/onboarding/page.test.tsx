@@ -10,6 +10,7 @@ const apiRequestMock = vi.hoisted(() => vi.fn())
 const updateUserPreferencesMock = vi.hoisted(() => vi.fn())
 const hireAgentFromTemplateMock = vi.hoisted(() => vi.fn())
 const toastErrorMock = vi.hoisted(() => vi.fn())
+const markOnboardingSaveEscapedMock = vi.hoisted(() => vi.fn())
 
 vi.mock("next/navigation", () => ({
   useRouter: () => ({ push: routerPush }),
@@ -38,6 +39,7 @@ vi.mock("@/lib/api-wrapper", () => ({
 vi.mock("@/lib/user-preferences", () => ({
   updateUserPreferences: updateUserPreferencesMock,
   fetchUserPreferences: vi.fn(),
+  markOnboardingSaveEscaped: markOnboardingSaveEscapedMock,
 }))
 
 vi.mock("@/lib/hire-agent", () => ({
@@ -112,6 +114,7 @@ describe("OnboardingPage", () => {
     hireAgentFromTemplateMock.mockReset()
     hireAgentFromTemplateMock.mockResolvedValue({ taskId: 42 })
     toastErrorMock.mockReset()
+    markOnboardingSaveEscapedMock.mockReset()
   })
 
   afterEach(cleanup)
@@ -581,6 +584,11 @@ describe("OnboardingPage", () => {
       fireEvent.click(screen.getByText("Skip setup"))
     })
     expect(routerPush).toHaveBeenCalledWith("/task")
+    // Full-feature self-review finding: without telling AuthGuard about
+    // this, its own onboarding check on "/task" would see onboarded still
+    // false and immediately bounce the user right back, defeating the
+    // point of escaping at all.
+    expect(markOnboardingSaveEscapedMock).toHaveBeenCalledTimes(1)
   })
 
   // Pins a self-review finding: the failure count is per-destination, not

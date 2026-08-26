@@ -1,7 +1,7 @@
 """add Slack channels:join OAuth scope
 
 Revision ID: 20260825_add_slack_channels_join_scope
-Revises: 20260824_seed_google_search_console_mcp_app
+Revises: 20260823_add_preferences_to_users
 Create Date: 2026-08-25
 
 """
@@ -16,7 +16,11 @@ from alembic import op
 logger = logging.getLogger(__name__)
 
 revision: str = "20260825_add_slack_channels_join_scope"
-down_revision: Union[str, None] = "20260824_seed_google_search_console_mcp_app"
+# Repointed from 20260824_seed_google_search_console_mcp_app: a sibling
+# branch (20260823_add_preferences_to_users) landed on main first with the
+# same parent, creating two heads -- same situation as that earlier
+# repoint, one link further down the chain.
+down_revision: Union[str, None] = "20260823_add_preferences_to_users"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 

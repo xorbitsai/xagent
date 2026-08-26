@@ -1294,6 +1294,12 @@ async def test_failed_startup_leaves_no_unsignaled_temp_file_cleanup(
     must be no cleanup task that is both unfinished and unsignaled. Scheduling
     the sweep only after every failure-prone startup step satisfies it, and so
     would signalling the flag on the way out.
+
+    The invariant alone is weak here -- today it holds because the sweep is
+    never reached, so ``task is None`` satisfies it -- so this also pins the
+    reason: the induced failure must land *before* the scheduling point. That
+    is the regression worth catching, because moving the scheduling earlier is
+    what would leave a walk running with no way to stop it.
     """
     import importlib
 
@@ -1341,8 +1347,9 @@ async def test_failed_startup_leaves_no_unsignaled_temp_file_cleanup(
     # the failure path under test to be reachable at all.
     monkeypatch.setenv("LANCEDB_AUTO_MIGRATE", "true")
     # The same genuine SANDBOX_VOLUMES/code-mount conflict as
-    # test_startup_event_raises_on_readiness_conflict_with_probe_true: startup
-    # fails *after* the point where the sweep is scheduled today.
+    # test_startup_event_raises_on_readiness_conflict_with_probe_true. Static
+    # readiness runs well before the sweep is scheduled, so this failure lands
+    # ahead of every position the sweep must not be scheduled at.
     monkeypatch.setenv("SANDBOX_VOLUMES", "/foo:/guest1:ro")
     monkeypatch.setattr(
         "xagent.web.sandbox_manager.build_code_mount_volumes",
@@ -1416,6 +1423,7 @@ async def test_failed_startup_leaves_no_unsignaled_temp_file_cleanup(
     )
 
     real_start = web_app_module.start_temp_file_cleanup_task
+    scheduling_reached = []
 
     def _start_ungated(app_instance):
         # Exercise the REAL wrapper, whose own PYTEST_CURRENT_TEST gate would
@@ -1423,6 +1431,7 @@ async def test_failed_startup_leaves_no_unsignaled_temp_file_cleanup(
         # this call keeps the five unrelated gates in startup_event (trigger
         # dispatcher, lease/upload recovery, orphan GC, metadata rebuild) in
         # force, so the failure path is the only thing this test un-gates.
+        scheduling_reached.append(app_instance)
         saved = os.environ.pop("PYTEST_CURRENT_TEST", None)
         try:
             return real_start(app_instance)
@@ -1451,6 +1460,11 @@ async def test_failed_startup_leaves_no_unsignaled_temp_file_cleanup(
     try:
         with pytest.raises(SandboxRuntimeConflictError):
             await web_app_module.startup_event()
+
+        # WHY: pins the reason the invariant below holds -- the raising step
+        # comes first, so the sweep was never scheduled. Without this, moving
+        # the scheduling earlier could still satisfy it and pass on luck.
+        assert scheduling_reached == []
 
         task = getattr(app.state, "temp_file_cleanup_task", None)
         stop = getattr(app.state, "temp_file_cleanup_stop", None)
@@ -1820,4 +1834,123 @@ async def test_startup_reports_a_still_unwinding_previous_cleanup(
         app.state.temp_file_cleanup_stop = None
 
     # The guard held: exactly one sweep ran, using the first generation's flag.
+    assert sweeps_started == [first_stop]
+
+
+@pytest.mark.asyncio
+async def test_background_cleanup_logs_a_failing_sweep_with_its_traceback(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """A sweep that raises must be reported with its traceback, not swallowed.
+
+    The walk runs unattended in an executor thread: nothing awaits the task
+    for a result and no request path sees the exception, so this WARNING is
+    the failure's only surface. Without it a sweep that never cleans anything
+    looks exactly like one with nothing to clean.
+    """
+    import importlib
+
+    web_app_module = importlib.import_module("xagent.web.app")
+    app = web_app_module.app
+
+    monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
+    app.state.temp_file_cleanup_task = None
+    app.state.temp_file_cleanup_stop = None
+
+    def _failing_cleanup(*, stop_event=None) -> int:
+        raise OSError("uploads root vanished mid-sweep")
+
+    monkeypatch.setattr(
+        "xagent.web.services.storage_maintenance.cleanup_orphaned_temp_files",
+        _failing_cleanup,
+    )
+
+    records: list[logging.LogRecord] = []
+
+    class _Collect(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            records.append(record)
+
+    collector = _Collect()
+    web_app_module.logger.addHandler(collector)
+    try:
+        task = web_app_module.start_temp_file_cleanup_task(app)
+        assert task is not None
+        await task
+        # Nothing retrieves this task's result in production, so a failure
+        # left on it would surface only as an "exception was never retrieved"
+        # warning at interpreter exit -- long after the sweep mattered.
+        assert task.exception() is None
+    finally:
+        web_app_module.logger.removeHandler(collector)
+        app.state.temp_file_cleanup_task = None
+        app.state.temp_file_cleanup_stop = None
+
+    failures = [
+        r
+        for r in records
+        if r.levelno == logging.WARNING and "cleanup failed" in r.getMessage()
+    ]
+    assert len(failures) == 1
+    assert failures[0].exc_info is not None
+    assert "uploads root vanished mid-sweep" in logging.Formatter().formatException(
+        failures[0].exc_info
+    )
+
+
+@pytest.mark.asyncio
+async def test_startup_reuses_a_live_unsignaled_cleanup_generation(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """A live, unsignalled sweep is handed back, not joined by a second walk.
+
+    Sibling of the still-unwinding case above: same guard, opposite state.
+    Two concurrent walks over one tree would race each other's unlinks, and
+    the newer generation's stop event would overwrite the older one's on
+    app.state -- orphaning the only handle that can stop the walk in flight.
+    """
+    import importlib
+
+    web_app_module = importlib.import_module("xagent.web.app")
+    app = web_app_module.app
+
+    monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
+    app.state.temp_file_cleanup_task = None
+    app.state.temp_file_cleanup_stop = None
+
+    release = threading.Event()
+    sweeps_started: list[threading.Event] = []
+
+    def _stalled_cleanup(*, stop_event=None) -> int:
+        sweeps_started.append(stop_event)
+        release.wait(timeout=5)
+        return 0
+
+    monkeypatch.setattr(
+        "xagent.web.services.storage_maintenance.cleanup_orphaned_temp_files",
+        _stalled_cleanup,
+    )
+
+    try:
+        first = web_app_module.start_temp_file_cleanup_task(app)
+        assert first is not None
+        first_stop = app.state.temp_file_cleanup_stop
+
+        # Still sweeping and never signalled -- unlike the unwinding sibling.
+        assert not first.done()
+        assert not first_stop.is_set()
+
+        second = web_app_module.start_temp_file_cleanup_task(app)
+
+        assert second is first
+        assert app.state.temp_file_cleanup_task is first
+        assert app.state.temp_file_cleanup_stop is first_stop
+        assert not first_stop.is_set()
+    finally:
+        release.set()
+        await first
+        app.state.temp_file_cleanup_task = None
+        app.state.temp_file_cleanup_stop = None
+
+    # The guard held: one walk, still holding the flag shutdown would set.
     assert sweeps_started == [first_stop]

@@ -1857,20 +1857,20 @@ async def shutdown_event() -> None:
     #
     # Use asyncio.wait rather than asyncio.wait_for: wait_for's cancellation only
     # kills the awaiting coroutine, not the executor thread doing the real work,
-    # so cancelling early has no benefit -- only the risk of losing the
-    # completion/failure log to an uncaught CancelledError. If the walk is still
-    # running once this bounded wait elapses, the process's own asyncio.run()
-    # teardown will join (or cancel) the outstanding task regardless.
+    # so cancelling early buys nothing. It also keeps the walk collectable after
+    # this wait -- on the timeout branch the completion/failure log is lost
+    # either way, since asyncio.run()'s teardown cancels the pending task and
+    # CancelledError is a BaseException the coroutine's handler does not catch.
     if hasattr(app.state, "temp_file_cleanup_task"):
-        task = app.state.temp_file_cleanup_task
-        if task and not task.done():
+        cleanup_task = app.state.temp_file_cleanup_task
+        if cleanup_task and not cleanup_task.done():
             timeout = get_temp_file_cleanup_shutdown_timeout_seconds()
-            done, _pending = await asyncio.wait({task}, timeout=timeout)
+            done, _pending = await asyncio.wait({cleanup_task}, timeout=timeout)
             if not done:
                 logger.warning(
                     "Orphaned temp-file cleanup still running %ss after stop "
                     "signal; the executor thread will unwind at its next "
-                    "directory boundary",
+                    "stop-check boundary",
                     timeout,
                 )
         # WHY: only release the handles once the task is actually finished.
@@ -1878,7 +1878,7 @@ async def shutdown_event() -> None:
         # stop handle and let a re-entrant startup schedule a second concurrent
         # sweep over the same tree -- exactly what the guard in
         # start_temp_file_cleanup_task exists to prevent.
-        if task is None or task.done():
+        if cleanup_task is None or cleanup_task.done():
             app.state.temp_file_cleanup_task = None
             app.state.temp_file_cleanup_stop = None
 

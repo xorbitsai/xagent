@@ -6,6 +6,7 @@ from pathlib import Path
 
 import xagent.web.services.storage_maintenance as sweep_module
 from xagent.web.services.storage_maintenance import (
+    _TEMP_CLEANUP_DELETION_STOP_CHECK_ENTRIES,
     _TEMP_CLEANUP_STOP_CHECK_ENTRIES,
     cleanup_orphaned_temp_files,
 )
@@ -200,6 +201,9 @@ def test_cleanup_skips_directory_that_fails_to_open(tmp_path, monkeypatch):
             raise OSError("stale handle")
         return real_scandir(path, *args, **kwargs)
 
+    # WARN: sweep_module.os *is* the global os module, so this and the sibling
+    # patches below swap os.scandir/os.unlink process-wide until monkeypatch
+    # undoes them -- hence each one delegates to the real function off-path.
     monkeypatch.setattr(sweep_module.os, "scandir", _flaky_scandir)
 
     removed = cleanup_orphaned_temp_files(upload_dir=tmp_path)
@@ -413,24 +417,27 @@ def test_cleanup_stops_mid_deletion_on_a_directory_with_many_victims(
     to run every queued unlink unconditionally. A directory holding many aged
     temp files (an agent workspace's ``temp``/``output``, where unlink latency
     on network storage is tens of milliseconds) could therefore outlive both
-    the shutdown grace period and the executor join. The deletion phase is
-    bounded by the same chunk size as the scan, so it stops after at most one
-    chunk instead of draining the whole list.
+    the shutdown grace period and the executor join.
+
+    The deletion phase gets its own, smaller chunk than the scan: at the
+    unlink latency the module's comment cites, one scan-sized chunk of
+    deletions would consume the whole default shutdown grace period.
     """
     # A dedicated root: a shared conftest fixture seeds tmp_path itself with a
     # lancedb/ subdirectory, which would consume a poll and shift the counts
     # this test pins.
     root = tmp_path / "uploads"
     root.mkdir()
-    leftover = 100
-    total = _TEMP_CLEANUP_STOP_CHECK_ENTRIES + leftover
+    # One scan chunk plus a remainder, so the scan polls exactly once and the
+    # deletion phase starts with more victims queued than it may drain.
+    total = _TEMP_CLEANUP_STOP_CHECK_ENTRIES + 100
     for i in range(total):
         _write_aged(root / f"v{i:04d}.ab12cd.tmp", age=ORPHAN_AGE_SECONDS + 600)
 
     # Poll 1 is the per-directory check and poll 2 the scan's per-entry check
     # at entry _TEMP_CLEANUP_STOP_CHECK_ENTRIES -- both must be unset so the
     # walk reaches the deletion phase with a full chunk queued. Poll 3 is the
-    # deletion phase's own check, one chunk in.
+    # deletion phase's own check, one deletion chunk in.
     stop = _StopAfterNPolls(2)
 
     with caplog.at_level(
@@ -438,8 +445,9 @@ def test_cleanup_stops_mid_deletion_on_a_directory_with_many_victims(
     ):
         removed = cleanup_orphaned_temp_files(upload_dir=root, stop_event=stop)
 
-    assert removed == _TEMP_CLEANUP_STOP_CHECK_ENTRIES
-    assert len(list(root.iterdir())) == leftover
+    assert _TEMP_CLEANUP_DELETION_STOP_CHECK_ENTRIES < _TEMP_CLEANUP_STOP_CHECK_ENTRIES
+    assert removed == _TEMP_CLEANUP_DELETION_STOP_CHECK_ENTRIES
+    assert len(list(root.iterdir())) == total - removed
     assert "was not fully walked" in caplog.text
 
 

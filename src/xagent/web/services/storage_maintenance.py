@@ -18,8 +18,13 @@ logger = logging.getLogger(__name__)
 # WHY: a single very large flat directory must still be interruptible within
 # the shutdown grace period, not only at directory boundaries -- checking
 # every entry would add per-entry overhead for no benefit at typical sizes.
-# The same chunk size bounds that directory's deletion phase below.
 _TEMP_CLEANUP_STOP_CHECK_ENTRIES = 500
+
+# WHY: smaller than the scan's chunk, because a step here is an unlink -- tens
+# of milliseconds on network storage -- so a scan-sized chunk would spend the
+# whole 10s default shutdown grace period. Still chunked, not per-victim, so a
+# stop does not discard a typical directory's few victims.
+_TEMP_CLEANUP_DELETION_STOP_CHECK_ENTRIES = 50
 
 
 class _StopSignal(Protocol):
@@ -40,13 +45,18 @@ def cleanup_orphaned_temp_files(
     """Clean up orphaned temporary files from interrupted atomic replacements.
 
     Removes files matching patterns like:
-    - *.tmp-replace (old pattern)
-    - .*.tmp (new NamedTemporaryFile pattern)
+    - *.tmp-replace (old pattern; no producer remains in src/, kept to reclaim
+      files left behind by deployments that predate its removal)
+    - NamedTemporaryFile temps ending in .tmp, with or without a leading dot --
+      producers spell the prefix both ways
 
     Deleting a temp whose writer stalled past the age threshold is possible,
     but bounded: every producer of these names is create-temp -> write ->
     atomic replace, so the worst case is that writer's replace failing, never
-    a partial file at the target. A producer that writes in place voids this.
+    a partial file at the target. An in-place writer would void this, and one
+    exists (web/api/files.py reserves uploads with open(..., "xb")) -- what
+    keeps it out of reach is the upload extension allowlist, which admits
+    neither .tmp nor .tmp-replace.
 
     Args:
         upload_dir: Base uploads directory to clean. If None, uses default uploads dir.
@@ -172,7 +182,10 @@ def cleanup_orphaned_temp_files(
                         continue
                     if not entry.is_file(follow_symlinks=False):
                         continue
-                    if now - entry.stat().st_mtime <= 3600:  # 1 hour
+                    # Older than 1 hour. WHY lstat: a following stat() would
+                    # read the target's mtime if the entry were swapped for a
+                    # symlink after is_file(), judging age by another file.
+                    if now - entry.stat(follow_symlinks=False).st_mtime <= 3600:
                         continue
                 except OSError as e:
                     # The entry vanished mid-scan (e.g. a concurrent replace);
@@ -184,14 +197,12 @@ def cleanup_orphaned_temp_files(
         for victims_seen, victim in enumerate(victims):
             # WHY: an unpolled deletion phase can outlive both the shutdown grace
             # period and asyncio.run()'s executor join -- one directory can hold
-            # many aged temp files (an agent workspace's temp/output) and unlink
-            # latency on network storage is tens of milliseconds. Chunked rather
-            # than per-victim so a stop mid-deletion does not discard a typical
-            # directory's few victims, which nothing reclaims until next startup.
+            # many aged temp files (an agent workspace's temp/output). See the
+            # deletion chunk size above for why it is not the scan's.
             if (
                 stop_event is not None
                 and victims_seen
-                and victims_seen % _TEMP_CLEANUP_STOP_CHECK_ENTRIES == 0
+                and victims_seen % _TEMP_CLEANUP_DELETION_STOP_CHECK_ENTRIES == 0
                 and stop_event.is_set()
             ):
                 stopped_early = True

@@ -1,10 +1,11 @@
 import json
 import re
+import sys
 from contextlib import asynccontextmanager
 from dataclasses import FrozenInstanceError
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 import httpx
 import pytest
@@ -540,6 +541,27 @@ def test_resolver_challenge_uses_all_www_authenticate_header_values():
 )
 def test_resolver_challenge_rejects_non_refreshable_evidence(exc):
     assert mcp_adapter_module._resolver_invalid_token_challenge(exc) is None
+
+
+def test_resolver_401_evidence_degrades_when_mcp_oauth_unimportable():
+    """_resolver_401_evidence lazily imports xagent.web.services.mcp_oauth,
+    which needs sqlalchemy (directly, and transitively through
+    xagent.web.services.__init__'s other eager imports). That's fine on
+    the backend host, but this function runs inside MCPToolAdapter.
+    run_json_async -- the exact class/method tool_runner.py reconstructs
+    and calls for every sandboxed npx/uvx MCP tool call (see PR #1710) --
+    and the sandbox never installs sqlalchemy. A 401 from a sandboxed
+    OAuth-protected connector (e.g. Xero, once its access token expires
+    mid-session) must fail the same clean "authorization failed" way an
+    unparsable challenge already does, not crash with
+    ModuleNotFoundError."""
+    exc = _http_status_error(authenticate=['Bearer error="invalid_token"'])
+
+    with patch.dict(sys.modules, {"xagent.web.services.mcp_oauth": None}):
+        challenge, response_ids = mcp_adapter_module._resolver_401_evidence(exc)
+
+    assert challenge is None
+    assert len(response_ids) == 1
 
 
 def test_mcp_return_value_as_string_keeps_malformed_scalar_content_together():

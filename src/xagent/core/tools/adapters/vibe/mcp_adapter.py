@@ -158,14 +158,24 @@ def _strict_http_401_responses(
 
 
 def _resolver_401_evidence(exc: BaseException) -> tuple[Any | None, frozenset[int]]:
-    # Lazy import keeps the core adapter independent from the web layer at import time.
-    from .....web.services.mcp_oauth import parse_www_authenticate_bearer
+    try:
+        # Lazy import keeps the core adapter independent from the web layer
+        # at import time -- and, since this runs inside MCPToolAdapter.
+        # run_json_async, which tool_runner.py reconstructs and calls for
+        # every sandboxed npx/uvx MCP tool call, from crashing with
+        # ModuleNotFoundError on a 401 (mcp_oauth.py needs sqlalchemy,
+        # which the sandbox never installs) instead of just skipping the
+        # refresh attempt the same way an unparsable challenge already
+        # does below.
+        from .....web.services.mcp_oauth import parse_www_authenticate_bearer
+    except ImportError:
+        parse_www_authenticate_bearer = None  # type: ignore[assignment]
 
     challenge = None
     response_ids: set[int] = set()
     for response in _strict_http_401_responses(exc):
         response_ids.add(id(response))
-        if challenge is not None:
+        if challenge is not None or parse_www_authenticate_bearer is None:
             continue
         candidate = parse_www_authenticate_bearer(
             response.headers.get_list("WWW-Authenticate")
@@ -447,8 +457,8 @@ class MCPToolAdapter(AbstractBaseTool):
         # Same failure mode as the character check above -- an over-long
         # name is rejected by the same providers, just on length instead of
         # charset. `MAX_AGENT_TOOL_NAME_LENGTH` is this repo's own record of
-        # that provider limit (agent_tool_names.py), shared here rather than
-        # redeclared so the two adapters can't drift apart on the number.
+        # that provider limit (tool_naming_limits.py), shared here rather
+        # than redeclared so the two adapters can't drift apart on the number.
         #
         # The tool name -- not the prefix -- is the only part that tells
         # two tools on the *same* server apart, so truncating from the end

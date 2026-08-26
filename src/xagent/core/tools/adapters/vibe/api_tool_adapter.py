@@ -151,8 +151,8 @@ class CustomApiTool(AbstractBaseTool):
         # `_call` (the part that signals "this is an API call") survives
         # instead of being cut off by a blind truncation of the whole
         # string. `MAX_AGENT_TOOL_NAME_LENGTH` is this repo's own record of
-        # that provider limit (agent_tool_names.py), shared here rather than
-        # redeclared so the two adapters can't drift apart on the number.
+        # that provider limit (tool_naming_limits.py), shared here rather
+        # than redeclared so the two adapters can't drift apart on the number.
         budget = MAX_AGENT_TOOL_NAME_LENGTH - len(prefix) - len(suffix)
         if len(sanitized_name) > budget:
             # `name` is a free-form, DB-unique string with no server

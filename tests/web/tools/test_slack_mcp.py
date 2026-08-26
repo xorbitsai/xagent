@@ -84,11 +84,13 @@ def test_request_translates_missing_scope_for_every_endpoint(monkeypatch):
     assert isinstance(exc_info.value, slack._SlackActionableError)
 
 
-def test_request_surfaces_needed_scope_when_slack_provides_it(monkeypatch):
+def test_request_surfaces_needed_and_provided_scopes_when_slack_provides_them(
+    monkeypatch,
+):
     """When Slack's missing_scope response names the specific scope it
-    needed, that must reach the message — an operator reading logs
-    shouldn't have to guess which of this connector's many scopes is
-    missing."""
+    needed and what the token already had, both must reach the message —
+    an operator reading logs shouldn't have to guess which of this
+    connector's many scopes is missing, or what the token has instead."""
     monkeypatch.setattr(
         slack.requests,
         "request",
@@ -104,7 +106,34 @@ def test_request_surfaces_needed_scope_when_slack_provides_it(monkeypatch):
         ),
     )
 
-    with pytest.raises(slack._SlackMissingScopeError, match="needed: channels:join"):
+    with pytest.raises(
+        slack._SlackMissingScopeError,
+        match=r"needed: channels:join, provided: chat:write,channels:read",
+    ):
+        slack._request("GET", "auth.test")
+
+
+def test_request_surfaces_needed_scope_without_provided(monkeypatch):
+    """Slack may omit "provided" even when "needed" is present -- the
+    detail must still render correctly with just one of the two."""
+    monkeypatch.setattr(
+        slack.requests,
+        "request",
+        Mock(
+            return_value=MockResponse(
+                {
+                    "ok": False,
+                    "error": "missing_scope",
+                    "needed": "channels:join",
+                }
+            )
+        ),
+    )
+
+    with pytest.raises(
+        slack._SlackMissingScopeError,
+        match=r"^missing_scope \(needed: channels:join\):",
+    ):
         slack._request("GET", "auth.test")
 
 
@@ -951,6 +980,25 @@ def test_join_channel_reports_actionable_error_for_archived_channel(monkeypatch)
     assert result["status"] == "error"
     assert "is_archived" in result["message"]
     assert "archived" in result["message"]
+
+
+def test_join_channel_reports_actionable_error_for_unknown_channel_id(monkeypatch):
+    """A raw channel id short-circuits _resolve_channel_id with no
+    existence check (unlike a name, which is confirmed real via
+    conversations.list) — conversations.join then fails with
+    channel_not_found, which must get a clear "doesn't exist" message
+    rather than the bare Slack code."""
+    monkeypatch.setattr(
+        slack.requests,
+        "request",
+        Mock(return_value=MockResponse({"ok": False, "error": "channel_not_found"})),
+    )
+
+    result = json.loads(slack.slack_join_channel("C0000000000"))
+
+    assert result["status"] == "error"
+    assert "channel_not_found" in result["message"]
+    assert "doesn't resolve" in result["message"]
 
 
 def test_join_channel_reports_actionable_error_for_missing_scope(monkeypatch):

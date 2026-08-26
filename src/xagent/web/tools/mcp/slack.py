@@ -263,13 +263,20 @@ def _request(
         code = payload.get("error") or "Unknown Slack API error"
         if code == "missing_scope":
             # Slack's response for this error can carry "needed" (the
-            # specific scope this call required) alongside the bare code —
-            # surfaced here (not dropped) so an operator reading logs can
-            # tell which scope is missing without guessing, which matters
-            # more now that this connector's scope set grows across
-            # successive migrations.
+            # specific scope this call required) and "provided" (what the
+            # token actually has) alongside the bare code — both surfaced
+            # here (not dropped) so an operator reading logs can tell which
+            # scope is missing, and what the token already has, without
+            # guessing, which matters more now that this connector's scope
+            # set grows across successive migrations.
             needed = payload.get("needed")
-            detail = f" (needed: {needed})" if needed else ""
+            provided = payload.get("provided")
+            detail_parts = []
+            if needed:
+                detail_parts.append(f"needed: {needed}")
+            if provided:
+                detail_parts.append(f"provided: {provided}")
+            detail = f" ({', '.join(detail_parts)})" if detail_parts else ""
             raise _SlackMissingScopeError(
                 f"missing_scope{detail}: this connector's Slack connection "
                 "is missing a permission this action needs. Ask the user "
@@ -481,6 +488,21 @@ def slack_join_channel(channel: str) -> str:
                 f"is_archived: channel '{channel}' has been archived and can't "
                 "be joined — ask a workspace admin to unarchive it first if "
                 "the bot still needs access."
+            )
+        if isinstance(e, _SlackAPIError) and e.code == "channel_not_found":
+            # Only reachable for a raw id: _resolve_channel_id already
+            # confirmed a channel *name* exists via conversations.list, so
+            # a channel_not_found here means the caller passed an id that
+            # doesn't resolve to a real channel — conversations.join
+            # documents this code for exactly that case (unlike
+            # conversations.replies/reactions.*, there's no "hidden from a
+            # non-member" ambiguity to hedge: joining doesn't require
+            # membership in the first place).
+            logger.error(f"Cannot join unknown Slack channel {channel}")
+            return _error(
+                f"channel_not_found: '{channel}' doesn't resolve to a real "
+                "Slack channel — double check the id, or pass a channel "
+                "name so it can be looked up instead."
             )
         logger.error(f"Error joining Slack channel {channel}: {e}")
         return _error(str(e))

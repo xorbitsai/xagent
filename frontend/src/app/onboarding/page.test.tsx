@@ -542,10 +542,31 @@ describe("OnboardingPage", () => {
     expect(screen.queryByText(/Meet your AI team/)).not.toBeInTheDocument()
   })
 
+  // Pins a self-review finding: a rail link (e.g. "About you", reachable
+  // from every later step) could still jump the user elsewhere while a
+  // header "Skip setup" save was in flight, racing that save's own
+  // eventual router.push - every other button was already guarded.
+  it("disables rail navigation links while a save is in flight", async () => {
+    let resolveSave!: (v: { ok: boolean }) => void
+    updateUserPreferencesMock.mockReturnValue(new Promise((resolve) => { resolveSave = resolve }))
+
+    await goToWelcomeThenBusiness()
+    fireEvent.click(screen.getByText("Marketing"))
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/take off your plate/)).toBeInTheDocument())
+
+    fireEvent.click(screen.getByText("Skip setup"))
+    expect(screen.getByText("About you").closest("button")).toBeDisabled()
+
+    await act(async () => {
+      resolveSave({ ok: true })
+    })
+  })
+
   // Pins a PR review finding: persistAndLeave used to block navigation
   // forever on a failed save, trapping the user on this full-screen page
   // (with no other nav) if the backend kept rejecting it.
-  it("navigates away anyway after 2 consecutive save failures on the same exit action, instead of trapping the user", async () => {
+  it("navigates away anyway after 2 consecutive save failures to the same destination, instead of trapping the user", async () => {
     updateUserPreferencesMock.mockResolvedValue({ ok: false })
 
     render(<OnboardingPage />)
@@ -560,5 +581,64 @@ describe("OnboardingPage", () => {
       fireEvent.click(screen.getByText("Skip setup"))
     })
     expect(routerPush).toHaveBeenCalledWith("/task")
+  })
+
+  // Pins a self-review finding: the failure count is per-destination, not
+  // one global tally - a failure on one exit action must not spend down a
+  // DIFFERENT destination's own first-attempt retry-in-place chance.
+  it("does not let a failure on one destination's exit count toward a different destination's first attempt", async () => {
+    updateUserPreferencesMock.mockResolvedValue({ ok: false })
+
+    await goToWelcomeThenBusiness()
+    fireEvent.click(screen.getByText("Marketing"))
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/take off your plate/)).toBeInTheDocument())
+
+    // First failure via header "Skip setup" -> /task.
+    await act(async () => {
+      fireEvent.click(screen.getByText("Skip setup"))
+    })
+    expect(routerPush).not.toHaveBeenCalled()
+
+    // First-ever attempt via the goals step's own skip -> /templates: must
+    // still get its own retry-in-place chance, not be force-navigated
+    // immediately just because /task's counter is already at 1.
+    await act(async () => {
+      fireEvent.click(screen.getByText("Not sure yet — show me everyone"))
+    })
+    expect(routerPush).not.toHaveBeenCalled()
+  })
+
+  // Pins a test-coverage gap flagged in self-review: the "N other matches"
+  // subtitle must not claim a count before templates have actually loaded.
+  it("does not claim 'other matches waiting' before templates have finished loading", async () => {
+    let resolveTemplates!: () => void
+    apiRequestMock.mockReturnValue(
+      new Promise((resolve) => {
+        resolveTemplates = () => resolve({ ok: true, json: async () => TEMPLATES })
+      })
+    )
+
+    await goToWelcomeThenBusiness()
+    fireEvent.click(screen.getByText("Marketing"))
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/take off your plate/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Post on social media"))
+    fireEvent.click(screen.getByText("Keep my inbox under control"))
+    fireEvent.click(screen.getByText("Write up my meetings"))
+    fireEvent.click(screen.getByText("Continue"))
+
+    await waitFor(() => expect(screen.getByText(/Meet your AI team/)).toBeInTheDocument())
+    // 3 goals picked, templates still loading - must not yet claim any
+    // goals are "waiting in Templates" (validRecommended is unresolved, not
+    // confirmed short by 0).
+    expect(screen.queryByText(/waiting in Templates/)).not.toBeInTheDocument()
+
+    await act(async () => {
+      resolveTemplates()
+    })
+    // All 3 goals map to the 3 fetched templates, so once loaded there's
+    // nothing extra waiting either - this only pins the *during-load* state
+    // above, not a specific post-load count.
   })
 })

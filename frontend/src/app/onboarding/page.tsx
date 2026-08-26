@@ -52,6 +52,14 @@ const STEP_GROUP: Record<StepId, number> = {
 };
 const STEP_ORDER: StepId[] = ["welcome", "business", "goals", "team", "voice", "done"];
 
+// persistAndLeave gives up and navigates anyway after this many consecutive
+// failures saving to the SAME destination, rather than trapping the user on
+// this full-screen page forever. 2 (not 1): a single transient blip
+// shouldn't skip the "retry once in place" step entirely; not higher, since
+// this is the only page in the app with no other navigation affordance if
+// the backend really is down.
+const MAX_SAVE_FAILURES_BEFORE_ESCAPE = 2;
+
 // The category ring/dot colors below are the reference UI's fixed literal
 // values (onboarding.html's [data-cat] rules), not the app's theme tokens -
 // this whole page is a one-off bespoke screen matched pixel-for-pixel against
@@ -111,8 +119,14 @@ export default function OnboardingPage() {
   const [launching, setLaunching] = useState(false);
   const launchingRef = useRef(false);
   const isMountedRef = useRef(true);
-  // Consecutive persistAndLeave save failures - see the escape hatch there.
-  const saveFailureCountRef = useRef(0);
+  // Consecutive persistAndLeave save failures, keyed by destination - see the
+  // escape hatch there. Per-destination (not one global count): "/task" and
+  // "/templates" represent genuinely different user intents, and a failure
+  // on one shouldn't spend down the other's own first-attempt retry-in-place
+  // chance. header Skip -> "/task"; goals-step and done-step skip both ->
+  // "/templates", which is intentional (both mean the same "leave to browse
+  // templates" exit, just from different steps).
+  const saveFailureCountByDestRef = useRef<Record<string, number>>({});
 
   useEffect(() => {
     isMountedRef.current = true;
@@ -231,23 +245,25 @@ export default function OnboardingPage() {
       voice,
     });
     if (!saved.ok) {
-      saveFailureCountRef.current += 1;
+      const failureCount = (saveFailureCountByDestRef.current[destination] ?? 0) + 1;
+      saveFailureCountByDestRef.current[destination] = failureCount;
       if (isMountedRef.current) {
         toast.error(t("onboarding.done.saveFailed"));
         launchingRef.current = false;
         setLaunching(false);
       }
-      // Don't navigate on the FIRST failure: onboarded would stay false
-      // server-side, and AuthGuard would just bounce the user right back
-      // here - retrying in place is the better first response. But this is
-      // the only full-screen page in the app with no other nav affordance,
-      // so a save that keeps failing (backend down, a persistent 422) must
-      // not trap the user here forever with zero way out - let them through
-      // after a couple of tries even though the save didn't land; they'll
-      // just be asked again next session instead of being stuck this one.
-      if (saveFailureCountRef.current < 2) return;
+      // Don't navigate on the FIRST failure to this destination: onboarded
+      // would stay false server-side, and AuthGuard would just bounce the
+      // user right back here - retrying in place is the better first
+      // response. But this is the only full-screen page in the app with no
+      // other nav affordance, so a save that keeps failing (backend down, a
+      // persistent 422) must not trap the user here forever with zero way
+      // out - let them through after a couple of tries even though the save
+      // didn't land; they'll just be asked again next session instead of
+      // being stuck this one.
+      if (failureCount < MAX_SAVE_FAILURES_BEFORE_ESCAPE) return;
     } else {
-      saveFailureCountRef.current = 0;
+      saveFailureCountByDestRef.current[destination] = 0;
     }
     if (isMountedRef.current) router.push(destination);
   };
@@ -338,7 +354,7 @@ export default function OnboardingPage() {
             <button
               key={key}
               type="button"
-              disabled={!canGo}
+              disabled={!canGo || launching}
               onClick={() => {
                 const targetStep =
                   lastVisitedInGroupRef.current[groupIndex] ??

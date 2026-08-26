@@ -171,7 +171,9 @@ def _resolve_allowed_file_path(file_path: str) -> Path:
 
 
 class _SlackAPIError(RuntimeError):
-    """Raised by _request for any non-ok Slack response.
+    """Raised by _request for a non-ok Slack response, except
+    "missing_scope" — that one is always _SlackMissingScopeError instead
+    (see its own docstring for why), so it never carries a `.code` here.
 
     Carries Slack's raw error code as structured state (`.code`) so callers
     can branch on it directly instead of parsing the rendered message
@@ -316,6 +318,7 @@ def _request_requiring_membership(
     *,
     params: dict[str, Any] | None = None,
     json_data: dict[str, Any] | None = None,
+    channel_not_found_means_not_a_member: bool = True,
 ) -> dict[str, Any]:
     """Call a Slack endpoint that requires the bot to already be a channel
     member, and raise an actionable error if it isn't yet.
@@ -332,6 +335,18 @@ def _request_requiring_membership(
     _PATHS_HIDING_CHANNEL_FROM_NON_MEMBERS above, rather than taken as a
     parameter — see that constant's comment for why.
 
+    channel_not_found_means_not_a_member defaults to True (the ambiguous
+    hedge described on _PATHS_HIDING_CHANNEL_FROM_NON_MEMBERS above), but a
+    caller that already proved membership on this same channel earlier in
+    the same call — e.g. slack_search_messages, which only reaches its
+    conversations.replies call after conversations.history already
+    succeeded for the same channel_id — must pass False: a later
+    channel_not_found there cannot mean "not a member" (that was just
+    disproven), so treating it as such would abort the scan with impossible
+    advice ("ask the user to add a bot that's already in the channel")
+    instead of the real cause (the thread was deleted, or the channel was
+    archived mid-scan).
+
     This deliberately does NOT join the channel on the caller's behalf:
     joining changes the channel's member list, which is visible to everyone
     in it, so the calling agent should check with the user first and only
@@ -343,6 +358,8 @@ def _request_requiring_membership(
         if path in _PATHS_HIDING_CHANNEL_FROM_NON_MEMBERS
         else _DEFAULT_NOT_A_MEMBER_CODES
     )
+    if not channel_not_found_means_not_a_member:
+        not_a_member_codes = not_a_member_codes - {"channel_not_found"}
     try:
         return _request(method, path, params=params, json_data=json_data)
     except _SlackAPIError as e:
@@ -406,9 +423,13 @@ def slack_join_channel(channel: str) -> str:
         # conversations.join succeeds (with warning="already_in_channel")
         # even when the bot already had membership, so this distinguishes
         # a fresh join from a no-op re-join rather than reporting both
-        # identically.
-        already_member = "already_in_channel" in (
-            (result.get("response_metadata") or {}).get("warnings") or []
+        # identically. Slack documents this signal in both the top-level
+        # "warning" string and response_metadata.warnings — checked here
+        # regardless of which one a given response actually populates,
+        # rather than relying on just one of the two.
+        already_member = result.get("warning") == "already_in_channel" or (
+            "already_in_channel"
+            in ((result.get("response_metadata") or {}).get("warnings") or [])
         )
         return _success(channel=channel_id, already_member=already_member)
     except Exception as e:
@@ -877,6 +898,11 @@ def slack_search_messages(
                         "GET",
                         "conversations.replies",
                         params={"channel": channel_id, "ts": thread_ts, "limit": 200},
+                        # The conversations.history call above already
+                        # succeeded for this same channel_id, which proves
+                        # membership — a channel_not_found here can't mean
+                        # "not a member" (see the parameter's docstring).
+                        channel_not_found_means_not_a_member=False,
                     )
                 except Exception as thread_exc:
                     logger.warning(
@@ -945,13 +971,11 @@ def slack_search_messages(
                 )
             )
         )
-        result_fields: dict[str, Any] = {
-            "matches": matches[:max_matches],
-            "truncated": truncated,
-        }
-        if scan_error is not None:
-            result_fields["error"] = str(scan_error)
-        return _success(**result_fields)
+        return _success(
+            matches=matches[:max_matches],
+            truncated=truncated,
+            **({"error": str(scan_error)} if scan_error is not None else {}),
+        )
     except Exception as e:
         logger.error(f"Error searching Slack messages in {channel}: {e}")
         return _error(str(e))

@@ -139,6 +139,10 @@ def test_upgrade_adds_channels_join_scope_and_description(tmp_path):
 
 
 def test_upgrade_is_idempotent(tmp_path):
+    """Re-run as two genuinely separate migration runs (each its own
+    transaction), not two calls stacked inside one uncommitted transaction —
+    the latter wouldn't exercise re-running against already-persisted state,
+    which is what idempotency is actually about."""
     engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
     migration = _load_migration_module()
     with engine.begin() as connection:
@@ -147,6 +151,8 @@ def test_upgrade_is_idempotent(tmp_path):
         )
         with patch.object(migration, "op", _operations(connection)):
             migration.upgrade()
+    with engine.begin() as connection:
+        with patch.object(migration, "op", _operations(connection)):
             migration.upgrade()
         assert _scopes(connection) == migration.CURRENT_SCOPES
 
@@ -281,6 +287,44 @@ def test_upgrade_without_oauth_providers_table_is_a_noop(tmp_path):
             migration.upgrade()  # must not raise when oauth_providers is missing
 
 
+def test_downgrade_without_oauth_providers_table_is_a_noop(tmp_path):
+    engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
+    migration = _load_migration_module()
+    with engine.begin() as connection:
+        _create_table(
+            connection, migration.CURRENT_SCOPES, migration.CURRENT_DESCRIPTION
+        )
+        with patch.object(migration, "op", _operations(connection)):
+            migration.downgrade()  # must not raise when oauth_providers is missing
+
+
+def test_upgrade_without_default_scopes_column_on_oauth_providers_is_a_noop(
+    tmp_path,
+):
+    """oauth_providers can exist without a default_scopes column (an older
+    schema, or a reduced admin deployment) -- _columns_present's guard must
+    make this a no-op, not a crash on a column that isn't there."""
+    engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
+    migration = _load_migration_module()
+    with engine.begin() as connection:
+        _create_table(connection, migration.PREVIOUS_SCOPES)
+        connection.execute(
+            text(
+                """
+                CREATE TABLE oauth_providers (
+                    id INTEGER PRIMARY KEY,
+                    provider_name VARCHAR(50) NOT NULL UNIQUE
+                )
+                """
+            )
+        )
+        connection.execute(
+            text("INSERT INTO oauth_providers (provider_name) VALUES ('slack')")
+        )
+        with patch.object(migration, "op", _operations(connection)):
+            migration.upgrade()  # must not raise despite the missing column
+
+
 def test_upgrade_merges_channels_join_into_customized_provider_default_scopes(
     tmp_path,
 ):
@@ -365,9 +409,11 @@ def test_upgrade_updates_provider_default_scopes_when_no_row_exists(tmp_path):
 def test_upgrade_merges_into_a_row_with_null_default_scopes(tmp_path):
     """A "slack" row can exist with default_scopes literally NULL (the
     column is nullable, and the admin PATCH endpoint's schema allows
-    clearing it) -- that must be treated as an empty list to merge into,
-    not mistaken for "no row exists" and skipped forever the same way the
-    old skip-based guard would have blocked it indefinitely."""
+    clearing it) -- that has no informative starting value to merge a delta
+    into, so upgrade must seed the full CURRENT_SCOPES set (mirroring
+    20260812's equivalent None-handling), not write only this migration's
+    own ["channels:join"] delta and leave every other scope missing from
+    the app-id-less authorize path."""
     engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
     migration = _load_migration_module()
     with engine.begin() as connection:
@@ -391,7 +437,87 @@ def test_upgrade_merges_into_a_row_with_null_default_scopes(tmp_path):
         )
         with patch.object(migration, "op", _operations(connection)):
             migration.upgrade()
-        assert _provider_default_scopes(connection, "slack") == ["channels:join"]
+        assert set(_provider_default_scopes(connection, "slack")) == set(
+            migration.CURRENT_SCOPES
+        )
+
+
+def test_downgrade_merges_into_a_row_with_null_default_scopes(tmp_path):
+    """Symmetric with the upgrade case above: a NULL default_scopes row has
+    no delta to remove channels:join from either, so downgrade must seed
+    the full PREVIOUS_SCOPES set rather than leaving an empty list."""
+    engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
+    migration = _load_migration_module()
+    with engine.begin() as connection:
+        _create_table(connection, migration.CURRENT_SCOPES)
+        connection.execute(
+            text(
+                """
+                CREATE TABLE oauth_providers (
+                    id INTEGER PRIMARY KEY,
+                    provider_name VARCHAR(50) NOT NULL UNIQUE,
+                    default_scopes JSON
+                )
+                """
+            )
+        )
+        connection.execute(
+            text(
+                "INSERT INTO oauth_providers (provider_name, default_scopes) "
+                "VALUES ('slack', NULL)"
+            )
+        )
+        with patch.object(migration, "op", _operations(connection)):
+            migration.downgrade()
+        assert set(_provider_default_scopes(connection, "slack")) == set(
+            migration.PREVIOUS_SCOPES
+        )
+
+
+def test_upgrade_preserves_unparsable_default_scopes_without_overwriting(tmp_path):
+    """default_scopes can hold a JSON string that isn't itself a scope list
+    (e.g. double-encoded, or written by something other than this
+    migration's own list writes) -- SQLAlchemy's JSON column type happily
+    deserializes the column's outer JSON into that Python str, but this
+    function's own json.loads(current) on the str value then fails. That
+    must leave the row untouched rather than coercing to an empty list and
+    overwriting it — either a delta-merge or a full write from that empty
+    list would silently discard whatever was actually stored, taking away
+    the operator's only chance to notice and fix it. (A raw, non-JSON-at-all
+    string can't be used here: SQLAlchemy's own row deserializer raises
+    before this function's code ever runs, which is exercised by the
+    coverage this test's docstring intentionally does not claim.)"""
+    engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
+    migration = _load_migration_module()
+    with engine.begin() as connection:
+        _create_table(connection, migration.PREVIOUS_SCOPES)
+        connection.execute(
+            text(
+                """
+                CREATE TABLE oauth_providers (
+                    id INTEGER PRIMARY KEY,
+                    provider_name VARCHAR(50) NOT NULL UNIQUE,
+                    default_scopes JSON
+                )
+                """
+            )
+        )
+        connection.execute(
+            text(
+                "INSERT INTO oauth_providers (provider_name, default_scopes) "
+                "VALUES ('slack', :scopes)"
+            ),
+            {"scopes": json.dumps("not-a-scope-list")},
+        )
+        with patch.object(migration, "op", _operations(connection)):
+            migration.upgrade()  # must not raise
+        raw = connection.execute(
+            text(
+                "SELECT default_scopes FROM oauth_providers "
+                "WHERE provider_name = 'slack'"
+            )
+        ).scalar()
+        assert json.loads(raw) == "not-a-scope-list"
 
 
 def test_upgrade_merges_into_a_customization_committed_before_this_migration_runs(
@@ -424,8 +550,10 @@ def test_upgrade_merges_into_a_customization_committed_before_this_migration_run
 
 
 def test_merge_provider_default_scopes_is_idempotent(tmp_path):
-    """Re-running the merge (e.g. upgrade() invoked twice) must not
-    duplicate channels:join or otherwise change an already-merged list."""
+    """Re-run as two genuinely separate migration runs (each its own
+    transaction, not two upgrade() calls stacked inside one uncommitted
+    transaction) must not duplicate channels:join or otherwise change an
+    already-merged list."""
     engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
     migration = _load_migration_module()
     with engine.begin() as connection:
@@ -433,6 +561,8 @@ def test_merge_provider_default_scopes_is_idempotent(tmp_path):
         _create_oauth_providers_table(connection, migration.PREVIOUS_SCOPES)
         with patch.object(migration, "op", _operations(connection)):
             migration.upgrade()
+    with engine.begin() as connection:
+        with patch.object(migration, "op", _operations(connection)):
             migration.upgrade()
         scopes = _provider_default_scopes(connection, "slack")
         assert scopes.count("channels:join") == 1

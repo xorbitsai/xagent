@@ -136,6 +136,16 @@ def _set_slack_provider_default_scopes_if_unchanged(
 
     No other app_id shares provider_name "slack" today, so this update
     cannot affect an unrelated app's authorize request.
+
+    Known accepted gap: 20260801_seed_slack_mcp_app.py's seed now bakes in
+    scopes this migration hasn't granted yet (backdated for
+    20260825_add_slack_channels_join_scope's channels:join), so a fresh
+    install's row never equals `expected_current` and this guard always
+    skips its own write. Harmless today only because the seeded value is
+    already a superset of what this migration would have written — see
+    that migration's own docstring, which does a true delta-merge instead
+    of this skip-if-changed shape precisely to avoid this failure mode for
+    scopes added after it.
     """
     if not _columns_present(
         bind, "oauth_providers", {"provider_name", "default_scopes"}

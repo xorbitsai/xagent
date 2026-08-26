@@ -804,10 +804,41 @@ def test_join_channel_resolves_bare_name(monkeypatch):
     assert join_call.kwargs["json"] == {"channel": "C1"}
 
 
-def test_join_channel_reports_already_member_on_repeat_join(monkeypatch):
+def test_join_channel_reports_already_member_via_response_metadata_warnings(
+    monkeypatch,
+):
     """conversations.join succeeds even when the bot already had membership
     (flagged via response_metadata.warnings) — the caller must be able to
-    tell that apart from a fresh join."""
+    tell that apart from a fresh join. Sets only response_metadata.warnings
+    (no top-level "warning") so this actually exercises that field alone —
+    see the sibling test below for the top-level field."""
+    monkeypatch.setattr(
+        slack.requests,
+        "request",
+        Mock(
+            return_value=MockResponse(
+                {
+                    "ok": True,
+                    "response_metadata": {"warnings": ["already_in_channel"]},
+                }
+            )
+        ),
+    )
+
+    result = json.loads(slack.slack_join_channel("C0123456789"))
+
+    assert result == {
+        "status": "success",
+        "channel": "C0123456789",
+        "already_member": True,
+    }
+
+
+def test_join_channel_reports_already_member_via_top_level_warning(monkeypatch):
+    """Slack can also carry the already-in-channel signal in a top-level
+    "warning" string rather than response_metadata.warnings — a real
+    response that only sets this field must still be recognized, not just
+    one that happens to set both."""
     monkeypatch.setattr(
         slack.requests,
         "request",
@@ -816,7 +847,6 @@ def test_join_channel_reports_already_member_on_repeat_join(monkeypatch):
                 {
                     "ok": True,
                     "warning": "already_in_channel",
-                    "response_metadata": {"warnings": ["already_in_channel"]},
                 }
             )
         ),
@@ -1692,7 +1722,15 @@ def test_search_messages_surfaces_actionable_thread_join_failure(monkeypatch):
     """A thread-replies fetch that fails because the bot isn't a member of
     the channel must not be reduced to `truncated: true` with no
     explanation — the actionable message from _request_requiring_membership has to
-    reach the caller, not just a server-side log line."""
+    reach the caller, not just a server-side log line.
+
+    Uses not_in_channel rather than channel_not_found: the history call
+    just above already succeeded for this channel_id, which proves
+    membership, so channel_not_found from conversations.replies is no
+    longer actionable here (see
+    test_search_messages_thread_channel_not_found_is_not_actionable_once_membership_proven)
+    — not_in_channel exercises the same "actionable failure reaches the
+    caller" behavior without relying on that now-fixed misclassification."""
     mock_request = Mock(
         side_effect=[
             MockResponse(
@@ -1709,7 +1747,7 @@ def test_search_messages_surfaces_actionable_thread_join_failure(monkeypatch):
                     ],
                 }
             ),
-            MockResponse({"ok": False, "error": "channel_not_found"}),
+            MockResponse({"ok": False, "error": "not_in_channel"}),
         ]
     )
     monkeypatch.setattr(slack.requests, "request", mock_request)
@@ -1721,16 +1759,71 @@ def test_search_messages_surfaces_actionable_thread_join_failure(monkeypatch):
     assert "slack_join_channel" in result["error"]
 
 
+def test_search_messages_thread_channel_not_found_is_not_actionable_once_membership_proven(
+    monkeypatch,
+):
+    """channel_not_found from conversations.replies is ambiguous in
+    general (see _PATHS_HIDING_CHANNEL_FROM_NON_MEMBERS's module comment),
+    but inside slack_search_messages the conversations.history call just
+    above always succeeds for this same channel_id first — which proves
+    membership — before the thread loop ever runs. A later channel_not_found
+    there therefore cannot mean "not a member"; it must stay a plain,
+    non-actionable error (most likely the thread was deleted, or the
+    channel was archived mid-scan), and — unlike a genuine actionable
+    failure — must not stop the scan: the next collected thread still gets
+    attempted."""
+    mock_request = Mock(
+        side_effect=[
+            MockResponse(
+                {
+                    "ok": True,
+                    "messages": [
+                        {
+                            "ts": "1.1",
+                            "user": "U1",
+                            "text": "kickoff",
+                            "thread_ts": "1.1",
+                            "reply_count": 1,
+                        },
+                        {
+                            "ts": "1.2",
+                            "user": "U1",
+                            "text": "the deploy failed",
+                            "thread_ts": "1.2",
+                            "reply_count": 1,
+                        },
+                    ],
+                }
+            ),
+            MockResponse({"ok": False, "error": "channel_not_found"}),
+            MockResponse({"ok": True, "messages": [{"ts": "1.2", "user": "U1"}]}),
+        ]
+    )
+    monkeypatch.setattr(slack.requests, "request", mock_request)
+
+    result = json.loads(slack.slack_search_messages("C0123456789", "deploy"))
+
+    assert result["status"] == "success"
+    assert "slack_join_channel" not in result.get("error", "")
+    assert "channel_not_found" in result["error"]
+    # 1 history call + both thread attempts — the loop must not stop after
+    # the first thread's channel_not_found, since it isn't actionable here.
+    assert mock_request.call_count == 3
+
+
 def test_search_messages_actionable_thread_error_survives_a_later_unrelated_one(
     monkeypatch,
 ):
-    """An actionable channel_not_found/slack_join_channel failure on one
-    thread must not be masked by an earlier, less useful failure (e.g. a
-    rate limit) on a different thread in the same search — the actionable
-    guidance has to win even though it wasn't the first failure seen.
+    """An actionable missing_scope/reconnect failure on one thread must not
+    be masked by an earlier, less useful failure (e.g. a rate limit) on a
+    different thread in the same search — the actionable guidance has to
+    win even though it wasn't the first failure seen.
     (Ordered transient-then-actionable deliberately: the reverse order is
     covered by test_search_messages_stops_thread_scan_after_channel_wide_membership_failure,
-    which also asserts the scan stops there instead of continuing.)"""
+    which also asserts the scan stops there instead of continuing. Uses
+    missing_scope rather than channel_not_found so this test's intent —
+    actionable-wins-over-earlier-transient — doesn't depend on the
+    proven-membership channel_not_found case covered separately above.)"""
     mock_request = Mock(
         side_effect=[
             MockResponse(
@@ -1755,7 +1848,7 @@ def test_search_messages_actionable_thread_error_survives_a_later_unrelated_one(
                 }
             ),
             MockResponse({"ok": False, "error": "ratelimited"}),
-            MockResponse({"ok": False, "error": "channel_not_found"}),
+            MockResponse({"ok": False, "error": "missing_scope"}),
         ]
     )
     monkeypatch.setattr(slack.requests, "request", mock_request)
@@ -1764,7 +1857,7 @@ def test_search_messages_actionable_thread_error_survives_a_later_unrelated_one(
 
     assert result["status"] == "success"
     assert result["truncated"] is True
-    assert "slack_join_channel" in result["error"]
+    assert "reconnect" in result["error"]
     assert mock_request.call_count == 3
 
 
@@ -1775,7 +1868,10 @@ def test_search_messages_stops_thread_scan_after_channel_wide_membership_failure
     state, not specific to that thread — every remaining threaded parent
     would fail identically, so the scan must stop there instead of
     repeating the same doomed conversations.replies call for each of the
-    (here, 3) collected threads."""
+    (here, 3) collected threads.
+
+    Uses not_in_channel rather than channel_not_found — see
+    test_search_messages_surfaces_actionable_thread_join_failure for why."""
     mock_request = Mock(
         side_effect=[
             MockResponse(
@@ -1793,7 +1889,7 @@ def test_search_messages_stops_thread_scan_after_channel_wide_membership_failure
                     ],
                 }
             ),
-            MockResponse({"ok": False, "error": "channel_not_found"}),
+            MockResponse({"ok": False, "error": "not_in_channel"}),
         ]
     )
     monkeypatch.setattr(slack.requests, "request", mock_request)

@@ -7,10 +7,13 @@ Create Date: 2026-08-25
 """
 
 import json
+import logging
 from typing import Sequence, Union
 
 import sqlalchemy as sa
 from alembic import op
+
+logger = logging.getLogger(__name__)
 
 revision: str = "20260825_add_slack_channels_join_scope"
 down_revision: Union[str, None] = "20260824_seed_google_search_console_mcp_app"
@@ -117,7 +120,10 @@ def _set_slack_scopes(bind: sa.engine.Connection, scopes: list[str]) -> None:
 
 
 def _merge_slack_provider_default_scopes(
-    bind: sa.engine.Connection, add_scopes: list[str], remove_scopes: list[str]
+    bind: sa.engine.Connection,
+    add_scopes: list[str],
+    remove_scopes: list[str],
+    full_scopes_if_null: list[str],
 ) -> None:
     """Add/remove this migration's own scope delta from
     oauth_providers.default_scopes for provider "slack", preserving any
@@ -140,6 +146,25 @@ def _merge_slack_provider_default_scopes(
     ["channels:join"], not the full CURRENT_SCOPES/PREVIOUS_SCOPES list) —
     so an operator's unrelated custom scope is never touched either
     direction.
+
+    full_scopes_if_null is written instead of the delta specifically when
+    default_scopes is column-NULL (never populated) — mirroring
+    20260812_add_slack_history_reactions_files_scopes.py's
+    _set_slack_provider_default_scopes_if_unchanged, which writes its own
+    full new_value in that same case. A NULL row has no informative
+    starting value to merge a delta into: writing only ["channels:join"]
+    there would silently drop every other scope this connector needs from
+    the app-id-less authorize path. This does NOT apply to a row that is
+    an explicit, already-stored empty list ([]) rather than NULL — that is
+    an operator customization (deliberately cleared via the admin PATCH
+    endpoint) like any other, and gets the same delta-merge treatment as
+    a non-empty customization.
+
+    A default_scopes value that is a string Slack/JSON can't parse is left
+    untouched (logged, not overwritten) rather than coerced to an empty
+    list and then clobbered by a merge or a full write — either would
+    silently discard whatever was actually stored, taking away the
+    operator's ability to inspect what went wrong.
 
     Locks the row for the rest of this migration's transaction on
     PostgreSQL (SELECT ... FOR UPDATE) so a customization committed via
@@ -164,24 +189,33 @@ def _merge_slack_provider_default_scopes(
     if row is None:
         # No "slack" provider row at all -- nothing to merge into.
         return
-    # Distinct from the no-row case above: a row can exist with
-    # default_scopes literally NULL (the column is nullable, and the admin
-    # PATCH endpoint's OAuthProviderUpdate schema allows clearing it) --
-    # that must still be merged into (treated as an empty scope list), not
-    # mistaken for "no row" and skipped forever.
-    current = row[0]
-    if isinstance(current, str):
-        try:
-            current = json.loads(current)
-        except (TypeError, ValueError):
-            current = []
-    current_list = list(current) if isinstance(current, list) else []
 
-    remove = set(remove_scopes)
-    new_scopes = [scope for scope in current_list if scope not in remove]
-    for scope in add_scopes:
-        if scope not in new_scopes:
-            new_scopes.append(scope)
+    current = row[0]
+    if current is None:
+        # Column-NULL, never populated -- there is no delta to merge into,
+        # so seed the full canonical set for this migration direction
+        # instead of leaving the row with only this migration's own scope.
+        current_list: list[str] = []
+        new_scopes = list(full_scopes_if_null)
+    else:
+        if isinstance(current, str):
+            try:
+                current = json.loads(current)
+            except (TypeError, ValueError):
+                logger.warning(
+                    "oauth_providers.default_scopes for provider %r is "
+                    "not valid JSON (%r) -- leaving it untouched rather "
+                    "than overwriting unparsable data.",
+                    PROVIDER_NAME,
+                    current,
+                )
+                return
+        current_list = list(current) if isinstance(current, list) else []
+        remove = set(remove_scopes)
+        new_scopes = [scope for scope in current_list if scope not in remove]
+        for scope in add_scopes:
+            if scope not in new_scopes:
+                new_scopes.append(scope)
 
     if new_scopes == current_list:
         return
@@ -223,7 +257,10 @@ def upgrade() -> None:
     bind = op.get_bind()
     _set_slack_scopes(bind, CURRENT_SCOPES)
     _merge_slack_provider_default_scopes(
-        bind, add_scopes=_ADDED_SCOPES, remove_scopes=[]
+        bind,
+        add_scopes=_ADDED_SCOPES,
+        remove_scopes=[],
+        full_scopes_if_null=CURRENT_SCOPES,
     )
     _set_slack_description_if_unchanged(bind, PREVIOUS_DESCRIPTION, CURRENT_DESCRIPTION)
     # Deliberately does NOT force-disconnect existing Slack grants: Slack
@@ -241,6 +278,9 @@ def downgrade() -> None:
     bind = op.get_bind()
     _set_slack_scopes(bind, PREVIOUS_SCOPES)
     _merge_slack_provider_default_scopes(
-        bind, add_scopes=[], remove_scopes=_ADDED_SCOPES
+        bind,
+        add_scopes=[],
+        remove_scopes=_ADDED_SCOPES,
+        full_scopes_if_null=PREVIOUS_SCOPES,
     )
     _set_slack_description_if_unchanged(bind, CURRENT_DESCRIPTION, PREVIOUS_DESCRIPTION)

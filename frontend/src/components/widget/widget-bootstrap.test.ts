@@ -212,6 +212,12 @@ describe("widget bootstrap", () => {
       expect(panel().style.width).toBe("380px")
     })
 
+    it("falls back to the default width for an out-of-range stored value", () => {
+      localStorage.setItem("xagent_widget_width", "99999")
+      runWidget({ "data-widget-key": "widget-secret" })
+      expect(panel().style.width).toBe("380px")
+    })
+
     it("falls back to the default width when reading storage throws", () => {
       const realGetItem = window.localStorage.getItem.bind(window.localStorage)
       vi.spyOn(window.localStorage, "getItem").mockImplementation((key) => {
@@ -253,6 +259,43 @@ describe("widget bootstrap", () => {
       setInnerWidth(1024)
       window.dispatchEvent(new Event("resize"))
       expect(panel().style.width).toBe("700px")
+    })
+
+    it("does not lose a wider preference to a drag that never escapes the viewport ceiling", () => {
+      localStorage.setItem("xagent_widget_width", "700")
+      setInnerWidth(600) // viewportMax = 560
+      runWidget({ "data-widget-key": "widget-secret" })
+      expect(panel().style.width).toBe("560px")
+
+      // A 1px nudge attempting to widen further is fully absorbed by the
+      // ceiling -- the rendered width never actually changes, unlike a true
+      // zero-movement release.
+      firePointerEvent(handle(), "pointerdown", { pointerId: 11, clientX: 300 })
+      firePointerEvent(handle(), "pointermove", { pointerId: 11, clientX: 299 })
+      expect(panel().style.width).toBe("560px")
+      firePointerEvent(handle(), "pointerup", { pointerId: 11, clientX: 299 })
+
+      // The 700px preference must survive this drag, not get silently
+      // replaced by the 560px ceiling it never actually moved past.
+      expect(localStorage.getItem("xagent_widget_width")).toBe("700")
+      setInnerWidth(1024)
+      window.dispatchEvent(new Event("resize"))
+      expect(panel().style.width).toBe("700px")
+    })
+
+    it("does adopt a genuinely smaller width when a drag visibly shrinks past the ceiling", () => {
+      localStorage.setItem("xagent_widget_width", "700")
+      setInnerWidth(600) // viewportMax = 560
+      runWidget({ "data-widget-key": "widget-secret" })
+
+      // Drag right (shrink) past the ceiling: a real, visible size change,
+      // as opposed to the previous test's absorbed widening attempt.
+      firePointerEvent(handle(), "pointerdown", { pointerId: 12, clientX: 300 })
+      firePointerEvent(handle(), "pointermove", { pointerId: 12, clientX: 350 })
+      expect(panel().style.width).toBe("510px") // 560 - 50, a real shrink
+      firePointerEvent(handle(), "pointerup", { pointerId: 12, clientX: 350 })
+
+      expect(localStorage.getItem("xagent_widget_width")).toBe("510")
     })
 
     it("hides the inline width below the mobile breakpoint and restores it above", () => {
@@ -341,6 +384,20 @@ describe("widget bootstrap", () => {
       expect(localStorage.getItem("xagent_widget_width")).toBe("380")
     })
 
+    it("does not restore userSelect if the host page changed it since drag start", () => {
+      runWidget({ "data-widget-key": "widget-secret" })
+
+      firePointerEvent(handle(), "pointerdown", { pointerId: 13, clientX: 300 })
+      expect(document.body.style.userSelect).toBe("none")
+
+      // Host page sets its own value mid-drag, e.g. while rebuilding its own UI.
+      document.body.style.userSelect = "all"
+
+      firePointerEvent(handle(), "pointerup", { pointerId: 13, clientX: 300 })
+      // Must NOT be clobbered back to the pre-drag snapshot.
+      expect(document.body.style.userSelect).toBe("all")
+    })
+
     it("does not throw when persisting the width fails", () => {
       runWidget({ "data-widget-key": "widget-secret" })
       vi.spyOn(window.localStorage, "setItem").mockImplementation(() => {
@@ -362,47 +419,63 @@ describe("widget bootstrap", () => {
       expect(panel().style.width).toBe("430px") // DEFAULT_PANEL_WIDTH (380) + 50
     })
 
-    it("stops reacting to window resize once the panel leaves the DOM", () => {
-      const removeSpy = vi.spyOn(window, "removeEventListener")
-      localStorage.setItem("xagent_widget_width", "600")
-      runWidget({ "data-widget-key": "widget-secret" })
-      const panelEl = panel()
-      expect(panelEl.style.width).toBe("600px")
-
-      document.querySelector(".xagent-widget-container")?.remove()
-
-      // Below the mobile breakpoint would normally clear the inline width;
-      // an unchanged value proves the listener self-removed instead of
-      // reapplying the clamp to a detached panel.
-      setInnerWidth(400)
-      window.dispatchEvent(new Event("resize"))
-
-      expect(panelEl.style.width).toBe("600px")
-      expect(removeSpy).toHaveBeenCalledWith("resize", expect.any(Function))
-    })
-
-    it("still cleans up an interrupted drag on blur after the panel leaves the DOM", () => {
-      const removeSpy = vi.spyOn(window, "removeEventListener")
+    it("tears down cleanup immediately on DOM removal, even mid-drag, without waiting for blur", async () => {
       runWidget({ "data-widget-key": "widget-secret" })
       document.body.style.userSelect = "text"
 
-      firePointerEvent(handle(), "pointerdown", { pointerId: 9, clientX: 300 })
+      firePointerEvent(handle(), "pointerdown", { pointerId: 14, clientX: 300 })
       expect(document.body.style.userSelect).toBe("none")
 
       document.querySelector(".xagent-widget-container")?.remove()
-      window.dispatchEvent(new Event("blur"))
+      // The teardown observer's callback fires as a microtask.
+      await Promise.resolve()
 
-      // The drag's cleanup obligation (restoring the host page's userSelect)
-      // must run even though the panel is no longer connected -- unlike the
-      // resize listener, self-unsubscribing here must not skip it.
+      // Cleanup already ran on removal itself -- no blur or resize needed.
       expect(document.body.style.userSelect).toBe("text")
-      expect(removeSpy).toHaveBeenCalledWith("blur", expect.any(Function))
+    })
 
-      // And the listener is now actually gone: a second blur is a no-op,
-      // not just a repeat no-drag-active early return.
+    it("skips persisting the width for a drag interrupted by DOM removal", async () => {
+      runWidget({ "data-widget-key": "widget-secret" })
+
+      firePointerEvent(handle(), "pointerdown", { pointerId: 15, clientX: 300 })
+      firePointerEvent(handle(), "pointermove", { pointerId: 15, clientX: 200 }) // mid-drag, unconfirmed
+      expect(panel().style.width).not.toBe("380px")
+
+      document.querySelector(".xagent-widget-container")?.remove()
+      await Promise.resolve()
+
+      // The unconfirmed mid-drag width must not have been written to
+      // storage -- nothing was ever persisted in this test at all.
+      expect(localStorage.getItem("xagent_widget_width")).toBeNull()
+    })
+
+    it("stops reacting to window/document listeners once the panel leaves the DOM", async () => {
+      const winRemoveSpy = vi.spyOn(window, "removeEventListener")
+      const docRemoveSpy = vi.spyOn(document, "removeEventListener")
+      runWidget({ "data-widget-key": "widget-secret" })
+      const detachedHandle = handle()
+
+      document.querySelector(".xagent-widget-container")?.remove()
+      await Promise.resolve()
+
+      expect(winRemoveSpy).toHaveBeenCalledWith("resize", expect.any(Function))
+      expect(winRemoveSpy).toHaveBeenCalledWith("blur", expect.any(Function))
+      expect(docRemoveSpy).toHaveBeenCalledWith("pointermove", expect.any(Function))
+      expect(docRemoveSpy).toHaveBeenCalledWith("pointerup", expect.any(Function))
+      expect(docRemoveSpy).toHaveBeenCalledWith("pointercancel", expect.any(Function))
+
+      // Functional proof, not just a spy check that could pass even if the
+      // handler removed were the wrong one: pointerdown is bound directly to
+      // the handle element itself (not torn down, since it isn't a GC-root
+      // concern), so a fresh drag still starts even though the panel is
+      // detached -- but with the blur listener actually gone, nothing
+      // restores userSelect afterward.
       document.body.style.userSelect = "text"
+      firePointerEvent(detachedHandle, "pointerdown", { pointerId: 16, clientX: 300 })
+      expect(document.body.style.userSelect).toBe("none")
+
       window.dispatchEvent(new Event("blur"))
-      expect(document.body.style.userSelect).toBe("text")
+      expect(document.body.style.userSelect).toBe("none")
     })
   })
 })

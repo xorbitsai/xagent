@@ -1809,6 +1809,43 @@ def test_search_messages_stops_thread_scan_after_channel_wide_membership_failure
     assert mock_request.call_count == 2
 
 
+def test_search_messages_stops_thread_scan_after_missing_scope_failure(monkeypatch):
+    """missing_scope is connection-wide, not even channel-specific — it's at
+    least as certain to recur on every remaining thread as a not-a-member
+    failure is, so the scan must stop there too. Exercises the shared
+    _SlackActionableError base (not a hardcoded _SlackNotAMemberError
+    check), since _SlackMissingScopeError is a sibling subclass, not that
+    one specifically."""
+    mock_request = Mock(
+        side_effect=[
+            MockResponse(
+                {
+                    "ok": True,
+                    "messages": [
+                        {
+                            "ts": f"1.{i}",
+                            "user": "U1",
+                            "text": "kickoff",
+                            "thread_ts": f"1.{i}",
+                            "reply_count": 1,
+                        }
+                        for i in range(3)
+                    ],
+                }
+            ),
+            MockResponse({"ok": False, "error": "missing_scope"}),
+        ]
+    )
+    monkeypatch.setattr(slack.requests, "request", mock_request)
+
+    result = json.loads(slack.slack_search_messages("C0123456789", "deploy"))
+
+    assert result["status"] == "success"
+    assert result["truncated"] is True
+    assert "reconnect" in result["error"]
+    assert mock_request.call_count == 2
+
+
 def test_search_messages_history_page_failure_still_scans_collected_threads(
     monkeypatch,
 ):

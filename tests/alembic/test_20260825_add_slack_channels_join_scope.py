@@ -296,10 +296,17 @@ def test_upgrade_merges_channels_join_into_customized_provider_default_scopes(
         _create_oauth_providers_table(connection, ["chat:write", "custom:scope"])
         with patch.object(migration, "op", _operations(connection)):
             migration.upgrade()
-        scopes = _provider_default_scopes(connection, "slack")
-        assert "custom:scope" in scopes
-        assert "chat:write" in scopes
-        assert "channels:join" in scopes
+        # Exact set, not just "these are present": a regression that merged
+        # in the whole CURRENT_SCOPES list (e.g. add_scopes=CURRENT_SCOPES
+        # instead of the delta _ADDED_SCOPES) would still contain
+        # "chat:write"/"channels:join" and pass a presence-only check, but
+        # would also pollute the row with channels:read/groups:read/etc.
+        # that were never part of this customization.
+        assert set(_provider_default_scopes(connection, "slack")) == {
+            "chat:write",
+            "custom:scope",
+            "channels:join",
+        }
         # The app-facing oauth_scopes column is unaffected by this guard —
         # it always updates (see _set_slack_scopes's own docstring).
         assert _scopes(connection) == migration.CURRENT_SCOPES
@@ -321,10 +328,15 @@ def test_downgrade_removes_channels_join_but_preserves_other_customization(tmp_p
                 {"s": json.dumps(["chat:write", "custom:scope", "channels:join"])},
             )
             migration.downgrade()
-        scopes = _provider_default_scopes(connection, "slack")
-        assert "custom:scope" in scopes
-        assert "chat:write" in scopes
-        assert "channels:join" not in scopes
+        # Exact set: the row was overwritten to exactly these 3 scopes
+        # right before downgrade() ran, so removal must strip exactly
+        # channels:join and nothing else — not the whole
+        # PREVIOUS_SCOPES-to-CURRENT_SCOPES delta by accident, and must
+        # not touch the unrelated customization either.
+        assert set(_provider_default_scopes(connection, "slack")) == {
+            "chat:write",
+            "custom:scope",
+        }
 
 
 def test_upgrade_updates_provider_default_scopes_when_no_row_exists(tmp_path):
@@ -350,6 +362,38 @@ def test_upgrade_updates_provider_default_scopes_when_no_row_exists(tmp_path):
         assert _provider_default_scopes(connection, "slack") is None
 
 
+def test_upgrade_merges_into_a_row_with_null_default_scopes(tmp_path):
+    """A "slack" row can exist with default_scopes literally NULL (the
+    column is nullable, and the admin PATCH endpoint's schema allows
+    clearing it) -- that must be treated as an empty list to merge into,
+    not mistaken for "no row exists" and skipped forever the same way the
+    old skip-based guard would have blocked it indefinitely."""
+    engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
+    migration = _load_migration_module()
+    with engine.begin() as connection:
+        _create_table(connection, migration.PREVIOUS_SCOPES)
+        connection.execute(
+            text(
+                """
+                CREATE TABLE oauth_providers (
+                    id INTEGER PRIMARY KEY,
+                    provider_name VARCHAR(50) NOT NULL UNIQUE,
+                    default_scopes JSON
+                )
+                """
+            )
+        )
+        connection.execute(
+            text(
+                "INSERT INTO oauth_providers (provider_name, default_scopes) "
+                "VALUES ('slack', NULL)"
+            )
+        )
+        with patch.object(migration, "op", _operations(connection)):
+            migration.upgrade()
+        assert _provider_default_scopes(connection, "slack") == ["channels:join"]
+
+
 def test_upgrade_merges_into_a_customization_committed_before_this_migration_runs(
     tmp_path,
 ):
@@ -372,9 +416,11 @@ def test_upgrade_merges_into_a_customization_committed_before_this_migration_run
                 {"s": json.dumps([*migration.PREVIOUS_SCOPES, "custom:scope"])},
             )
             migration.upgrade()
-        scopes = _provider_default_scopes(connection, "slack")
-        assert "custom:scope" in scopes
-        assert "channels:join" in scopes
+        # Exact set: must add exactly channels:join on top of the
+        # pre-existing customization, not the whole CURRENT_SCOPES list.
+        assert set(_provider_default_scopes(connection, "slack")) == set(
+            migration.PREVIOUS_SCOPES
+        ) | {"custom:scope", "channels:join"}
 
 
 def test_merge_provider_default_scopes_is_idempotent(tmp_path):
@@ -408,3 +454,33 @@ def test_migration_fields_match_registry():
         r for r in get_builtin_oauth_provider_rows() if r["provider_name"] == "slack"
     )
     assert migration.CURRENT_SCOPES == registry_provider["default_scopes"]
+
+
+def test_previous_fields_match_prior_migrations_current_fields():
+    """This migration's PREVIOUS_SCOPES/PREVIOUS_DESCRIPTION are hand-copied
+    from 20260812_add_slack_history_reactions_files_scopes's CURRENT_SCOPES/
+    CURRENT_DESCRIPTION, not derived from it -- nothing else checks that copy
+    stays correct. 20260812's own test file used to assert its CURRENT_*
+    fields exactly match the live registry, which transitively caught this
+    file's PREVIOUS_* going stale too; this PR loosened that assertion to a
+    subset check (and dropped the description check outright) since 20260825
+    now layers changes on top of the registry's final values. Without this
+    test, a future edit to either migration's constants that breaks the
+    handoff would pass every existing test while permanently breaking
+    _set_slack_description_if_unchanged's `WHERE description ==
+    expected_current` guard on any real database that already ran
+    20260812 -- the description would never get updated by this migration."""
+    prior_migration_file = (
+        Path(__file__).parent.parent.parent
+        / "src/xagent/migrations/versions/20260812_add_slack_history_reactions_files_scopes.py"
+    )
+    spec = importlib.util.spec_from_file_location(
+        "add_slack_history_reactions_files_scopes_migration", prior_migration_file
+    )
+    prior_migration = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(prior_migration)
+
+    migration = _load_migration_module()
+    assert migration.PREVIOUS_SCOPES == prior_migration.CURRENT_SCOPES
+    assert migration.PREVIOUS_DESCRIPTION == prior_migration.CURRENT_DESCRIPTION

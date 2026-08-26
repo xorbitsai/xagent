@@ -160,10 +160,16 @@ def _merge_slack_provider_default_scopes(
     if bind.dialect.name == "postgresql":
         select_stmt = select_stmt.with_for_update()
 
-    current = bind.execute(select_stmt).scalar()
-    if current is None:
+    row = bind.execute(select_stmt).first()
+    if row is None:
         # No "slack" provider row at all -- nothing to merge into.
         return
+    # Distinct from the no-row case above: a row can exist with
+    # default_scopes literally NULL (the column is nullable, and the admin
+    # PATCH endpoint's OAuthProviderUpdate schema allows clearing it) --
+    # that must still be merged into (treated as an empty scope list), not
+    # mistaken for "no row" and skipped forever.
+    current = row[0]
     if isinstance(current, str):
         try:
             current = json.loads(current)

@@ -356,9 +356,17 @@ def _request_requiring_membership(
                 "is hidden entirely from non-members), though this can "
                 "also mean the channel id doesn't exist"
             )
+        elif e.code == "no_permission":
+            # Documented as membership for every endpoint this connector
+            # wraps (see the module comment above), but Slack also reuses
+            # this same code more broadly for other workspace-level
+            # permission restrictions the bot can't fix by joining — a
+            # slightly softer hedge than not_in_channel's, short of
+            # channel_not_found's full uncertainty.
+            cause = "most likely because the bot isn't a member of it"
         else:
-            # not_in_channel / no_permission are both unambiguous per
-            # Slack's own docs — no need to hedge.
+            # not_in_channel is unambiguous per Slack's own docs — no need
+            # to hedge.
             cause = "because the bot isn't a member of it"
         raise _SlackNotAMemberError(
             f"{e.code}: the bot cannot access this channel — {cause}. If "
@@ -843,12 +851,16 @@ def slack_search_messages(
 
         threads_scanned = 0
         thread_replies_truncated = False
-        # A not-a-member error from the history scan is a channel-wide bot
-        # state, not specific to whichever page hit it — every
+        # An actionable error from the history scan (not a member, missing
+        # scope) describes a channel-wide or connection-wide bot state, not
+        # something specific to whichever page hit it — every
         # conversations.replies call below would fail the exact same way,
         # so skip the (up to MAX_SEARCH_THREADS) doomed calls entirely
-        # rather than re-discovering the same failure per thread.
-        if include_thread_replies and not isinstance(scan_error, _SlackNotAMemberError):
+        # rather than re-discovering the same failure per thread. Checked
+        # on the common _SlackActionableError base, not one specific
+        # subclass, so this covers missing_scope the same way it covers
+        # not-a-member.
+        if include_thread_replies and not isinstance(scan_error, _SlackActionableError):
             for parent in threaded_parents:
                 if threads_scanned >= MAX_SEARCH_THREADS or len(matches) >= max_matches:
                     break
@@ -880,11 +892,12 @@ def slack_search_messages(
                     # above, so a membership problem is never masked by an
                     # unrelated failure elsewhere in this same call.
                     scan_error = _prefer_actionable_error(scan_error, thread_exc)
-                    if isinstance(thread_exc, _SlackNotAMemberError):
+                    if isinstance(thread_exc, _SlackActionableError):
                         # Discovered mid-loop rather than up front (the
                         # earlier history scan succeeded, so the guard
-                        # above this loop didn't catch it) — but it's still
-                        # a channel-wide bot state, not specific to this
+                        # above this loop didn't catch it) — but not a
+                        # member / missing scope are both channel-wide or
+                        # connection-wide bot states, not specific to this
                         # thread, so every remaining parent would fail
                         # identically. Stop instead of repeating the same
                         # doomed call up to MAX_SEARCH_THREADS times.

@@ -145,4 +145,192 @@ describe("widget bootstrap", () => {
       "https://chat.example/widget/chat/legacy-token?guest_id=guest-fixed",
     )
   })
+
+  describe("panel resize", () => {
+    let originalInnerWidth: number
+
+    beforeEach(() => {
+      originalInnerWidth = window.innerWidth
+      // innerHTML resets don't touch inline styles on body itself, and it's
+      // shared across every test in this file.
+      document.body.style.userSelect = ""
+      fetchMock.mockResolvedValue(new Response(JSON.stringify({
+        ticket: "ticket/one",
+        agent_id: 17,
+      }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      }))
+    })
+
+    afterEach(() => {
+      setInnerWidth(originalInnerWidth)
+    })
+
+    function setInnerWidth(value: number) {
+      Object.defineProperty(window, "innerWidth", { configurable: true, value })
+    }
+
+    function panel() {
+      return document.querySelector<HTMLDivElement>(".xagent-widget-panel")!
+    }
+
+    function handle() {
+      return document.querySelector<HTMLDivElement>(".xagent-widget-resize-handle")!
+    }
+
+    function widgetIframe() {
+      return document.querySelector<HTMLIFrameElement>(".xagent-widget-iframe")!
+    }
+
+    function firePointerEvent(
+      target: EventTarget,
+      type: string,
+      init: { pointerId: number; clientX: number },
+    ) {
+      // jsdom has no PointerEvent constructor; a plain Event with the fields
+      // the widget reads is enough since addEventListener matches by type.
+      const event = new MouseEvent(type, { bubbles: true, cancelable: true, clientX: init.clientX })
+      Object.defineProperty(event, "pointerId", { value: init.pointerId })
+      target.dispatchEvent(event)
+    }
+
+    it("applies the default width on a fresh visit", () => {
+      runWidget({ "data-widget-key": "widget-secret" })
+      expect(panel().style.width).toBe("380px")
+    })
+
+    it("applies a persisted width from localStorage", () => {
+      localStorage.setItem("xagent_widget_width", "500")
+      runWidget({ "data-widget-key": "widget-secret" })
+      expect(panel().style.width).toBe("500px")
+    })
+
+    it("falls back to the default width for a corrupt stored value", () => {
+      localStorage.setItem("xagent_widget_width", "not-a-number")
+      runWidget({ "data-widget-key": "widget-secret" })
+      expect(panel().style.width).toBe("380px")
+    })
+
+    it("falls back to the default width when reading storage throws", () => {
+      const realGetItem = window.localStorage.getItem.bind(window.localStorage)
+      vi.spyOn(window.localStorage, "getItem").mockImplementation((key) => {
+        if (key === "xagent_widget_width") throw new Error("blocked")
+        return realGetItem(key)
+      })
+      runWidget({ "data-widget-key": "widget-secret" })
+      expect(panel().style.width).toBe("380px")
+    })
+
+    it("re-clamps to the viewport on resize without losing the stored preference", () => {
+      localStorage.setItem("xagent_widget_width", "600")
+      runWidget({ "data-widget-key": "widget-secret" })
+      expect(panel().style.width).toBe("600px")
+
+      setInnerWidth(500)
+      window.dispatchEvent(new Event("resize"))
+      expect(panel().style.width).toBe("460px")
+
+      setInnerWidth(1024)
+      window.dispatchEvent(new Event("resize"))
+      expect(panel().style.width).toBe("600px")
+    })
+
+    it("hides the inline width below the mobile breakpoint and restores it above", () => {
+      runWidget({ "data-widget-key": "widget-secret" })
+
+      setInnerWidth(400)
+      window.dispatchEvent(new Event("resize"))
+      expect(panel().style.width).toBe("")
+
+      setInnerWidth(1024)
+      window.dispatchEvent(new Event("resize"))
+      expect(panel().style.width).toBe("380px")
+    })
+
+    it("ignores a drag start below the mobile breakpoint", () => {
+      setInnerWidth(400)
+      runWidget({ "data-widget-key": "widget-secret" })
+
+      firePointerEvent(handle(), "pointerdown", { pointerId: 1, clientX: 100 })
+
+      expect(document.body.style.userSelect).toBe("")
+      expect(widgetIframe().style.pointerEvents).toBe("")
+    })
+
+    it("resizes the panel while dragging and persists the final width on release", () => {
+      runWidget({ "data-widget-key": "widget-secret" })
+      document.body.style.userSelect = "text"
+
+      firePointerEvent(handle(), "pointerdown", { pointerId: 7, clientX: 300 })
+      expect(document.body.style.userSelect).toBe("none")
+      expect(widgetIframe().style.pointerEvents).toBe("none")
+
+      // getBoundingClientRect().width is always 0 in jsdom, so startWidth is
+      // 0 and the resulting width is driven entirely by clientX delta.
+      firePointerEvent(handle(), "pointermove", { pointerId: 7, clientX: 250 })
+      expect(panel().style.width).toBe("320px") // clamped to MIN_PANEL_WIDTH
+
+      firePointerEvent(handle(), "pointermove", { pointerId: 7, clientX: -50 })
+      expect(panel().style.width).toBe("350px") // within bounds, no clamping
+
+      firePointerEvent(handle(), "pointerup", { pointerId: 7, clientX: -50 })
+      expect(document.body.style.userSelect).toBe("text")
+      expect(widgetIframe().style.pointerEvents).toBe("")
+      expect(localStorage.getItem("xagent_widget_width")).toBe("350")
+    })
+
+    it("ends the drag on pointercancel", () => {
+      runWidget({ "data-widget-key": "widget-secret" })
+
+      firePointerEvent(handle(), "pointerdown", { pointerId: 2, clientX: 300 })
+      firePointerEvent(handle(), "pointercancel", { pointerId: 2, clientX: 300 })
+
+      expect(document.body.style.userSelect).toBe("")
+      expect(widgetIframe().style.pointerEvents).toBe("")
+    })
+
+    it("ignores a second concurrent pointer without disrupting the first pointer's drag", () => {
+      runWidget({ "data-widget-key": "widget-secret" })
+
+      firePointerEvent(handle(), "pointerdown", { pointerId: 1, clientX: 300 })
+      firePointerEvent(handle(), "pointerdown", { pointerId: 2, clientX: 100 })
+      firePointerEvent(handle(), "pointermove", { pointerId: 2, clientX: 0 })
+      expect(panel().style.width).toBe("380px") // untouched: pointer 2 was never tracked
+
+      firePointerEvent(handle(), "pointerup", { pointerId: 2, clientX: 0 })
+      expect(document.body.style.userSelect).toBe("none") // pointer 1's drag is still active
+
+      firePointerEvent(handle(), "pointermove", { pointerId: 1, clientX: 250 })
+      expect(panel().style.width).toBe("320px")
+
+      firePointerEvent(handle(), "pointerup", { pointerId: 1, clientX: 250 })
+      expect(document.body.style.userSelect).toBe("")
+      expect(localStorage.getItem("xagent_widget_width")).toBe("320")
+    })
+
+    it("cleans up an interrupted drag on window blur", () => {
+      runWidget({ "data-widget-key": "widget-secret" })
+
+      firePointerEvent(handle(), "pointerdown", { pointerId: 3, clientX: 300 })
+      expect(document.body.style.userSelect).toBe("none")
+
+      window.dispatchEvent(new Event("blur"))
+
+      expect(document.body.style.userSelect).toBe("")
+      expect(widgetIframe().style.pointerEvents).toBe("")
+      expect(localStorage.getItem("xagent_widget_width")).toBe("380")
+    })
+
+    it("does not throw when persisting the width fails", () => {
+      runWidget({ "data-widget-key": "widget-secret" })
+      vi.spyOn(window.localStorage, "setItem").mockImplementation(() => {
+        throw new Error("quota exceeded")
+      })
+
+      firePointerEvent(handle(), "pointerdown", { pointerId: 4, clientX: 300 })
+      expect(() => firePointerEvent(handle(), "pointerup", { pointerId: 4, clientX: 300 }))
+        .not.toThrow()
+    })
+  })
 })

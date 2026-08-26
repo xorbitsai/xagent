@@ -386,14 +386,14 @@
   resizeHandle.className = 'xagent-widget-resize-handle';
   panel.appendChild(resizeHandle);
 
+  // Clamp on render rather than mutating panelWidth here: a temporary narrow
+  // viewport (a shrunk window, a rotated device) must not permanently shrink
+  // the user's stored preference once the viewport widens again.
   function applyPanelWidth() {
-    panel.style.width = isMobileViewport() ? '' : panelWidth + 'px';
+    panel.style.width = isMobileViewport() ? '' : clampPanelWidth(panelWidth) + 'px';
   }
   applyPanelWidth();
-  window.addEventListener('resize', function () {
-    panelWidth = clampPanelWidth(panelWidth);
-    applyPanelWidth();
-  });
+  window.addEventListener('resize', applyPanelWidth);
 
   var dragState = null;
 
@@ -404,10 +404,18 @@
     dragState = {
       pointerId: event.pointerId,
       startX: event.clientX,
-      startWidth: panel.getBoundingClientRect().width
+      startWidth: panel.getBoundingClientRect().width,
+      originalUserSelect: document.body.style.userSelect
     };
-    resizeHandle.setPointerCapture(event.pointerId);
+    // Older browsers without Pointer Capture still get a working drag via
+    // iframe.style.pointerEvents below; this call is a nice-to-have.
+    try {
+      resizeHandle.setPointerCapture(event.pointerId);
+    } catch (e) {}
     document.body.style.userSelect = 'none';
+    // The iframe would otherwise intercept pointer events once the cursor
+    // moves over it mid-drag, stalling the resize.
+    iframe.style.pointerEvents = 'none';
     event.preventDefault();
   });
 
@@ -422,8 +430,9 @@
 
   function endDrag(event) {
     if (!dragState || (event && event.pointerId !== dragState.pointerId)) return;
+    document.body.style.userSelect = dragState.originalUserSelect;
+    iframe.style.pointerEvents = '';
     dragState = null;
-    document.body.style.userSelect = '';
     persistWidth(panelWidth);
   }
   resizeHandle.addEventListener('pointerup', endDrag);

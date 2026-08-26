@@ -248,7 +248,12 @@ def test_upgrade_updates_provider_default_scopes(tmp_path):
         _create_oauth_providers_table(connection, migration.PREVIOUS_SCOPES)
         with patch.object(migration, "op", _operations(connection)):
             migration.upgrade()
-        assert _provider_default_scopes(connection, "slack") == migration.CURRENT_SCOPES
+        # Set comparison, not list equality: the merge appends this
+        # migration's delta rather than reproducing CURRENT_SCOPES's exact
+        # order, and scope order has no OAuth significance.
+        assert set(_provider_default_scopes(connection, "slack")) == set(
+            migration.CURRENT_SCOPES
+        )
         # A different provider row must be untouched.
         assert _provider_default_scopes(connection, "hubspot") == ["oauth"]
 
@@ -276,7 +281,14 @@ def test_upgrade_without_oauth_providers_table_is_a_noop(tmp_path):
             migration.upgrade()  # must not raise when oauth_providers is missing
 
 
-def test_upgrade_preserves_customized_provider_default_scopes(tmp_path):
+def test_upgrade_merges_channels_join_into_customized_provider_default_scopes(
+    tmp_path,
+):
+    """The old "skip unless it exactly equals PREVIOUS_SCOPES" guard
+    permanently dropped channels:join from the app-id-less authorize path
+    for any workspace that had ever customized this column — merging by
+    delta instead must add channels:join while still preserving the
+    customization, not silently keep the list frozen forever."""
     engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
     migration = _load_migration_module()
     with engine.begin() as connection:
@@ -284,16 +296,16 @@ def test_upgrade_preserves_customized_provider_default_scopes(tmp_path):
         _create_oauth_providers_table(connection, ["chat:write", "custom:scope"])
         with patch.object(migration, "op", _operations(connection)):
             migration.upgrade()
-        assert _provider_default_scopes(connection, "slack") == [
-            "chat:write",
-            "custom:scope",
-        ]
+        scopes = _provider_default_scopes(connection, "slack")
+        assert "custom:scope" in scopes
+        assert "chat:write" in scopes
+        assert "channels:join" in scopes
         # The app-facing oauth_scopes column is unaffected by this guard —
         # it always updates (see _set_slack_scopes's own docstring).
         assert _scopes(connection) == migration.CURRENT_SCOPES
 
 
-def test_downgrade_preserves_customized_provider_default_scopes(tmp_path):
+def test_downgrade_removes_channels_join_but_preserves_other_customization(tmp_path):
     engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
     migration = _load_migration_module()
     with engine.begin() as connection:
@@ -306,19 +318,18 @@ def test_downgrade_preserves_customized_provider_default_scopes(tmp_path):
                     "UPDATE oauth_providers SET default_scopes = :s "
                     "WHERE provider_name = 'slack'"
                 ),
-                {"s": json.dumps(["chat:write", "custom:scope"])},
+                {"s": json.dumps(["chat:write", "custom:scope", "channels:join"])},
             )
             migration.downgrade()
-        assert _provider_default_scopes(connection, "slack") == [
-            "chat:write",
-            "custom:scope",
-        ]
+        scopes = _provider_default_scopes(connection, "slack")
+        assert "custom:scope" in scopes
+        assert "chat:write" in scopes
+        assert "channels:join" not in scopes
 
 
 def test_upgrade_updates_provider_default_scopes_when_no_row_exists(tmp_path):
-    """No 'slack' provider row is not a customization to protect — the
-    if-unchanged guard must not turn a previously-unconditional no-op into a
-    silent skip once a row is later created some other way."""
+    """No 'slack' provider row means there's nothing to merge into — must
+    not raise, and must not fabricate a row."""
     engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
     migration = _load_migration_module()
     with engine.begin() as connection:
@@ -337,6 +348,48 @@ def test_upgrade_updates_provider_default_scopes_when_no_row_exists(tmp_path):
         with patch.object(migration, "op", _operations(connection)):
             migration.upgrade()  # must not raise with no matching row
         assert _provider_default_scopes(connection, "slack") is None
+
+
+def test_upgrade_merges_into_a_customization_committed_before_this_migration_runs(
+    tmp_path,
+):
+    """Regression coverage for the race this guard is meant to survive: an
+    admin customization already committed to the row before upgrade() ever
+    reads it must not be lost, and channels:join must still be added on top
+    of it — exercising the same merge path a customization landing between
+    a naive SELECT and UPDATE would need to survive."""
+    engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
+    migration = _load_migration_module()
+    with engine.begin() as connection:
+        _create_table(connection, migration.PREVIOUS_SCOPES)
+        _create_oauth_providers_table(connection, migration.PREVIOUS_SCOPES)
+        with patch.object(migration, "op", _operations(connection)):
+            connection.execute(
+                text(
+                    "UPDATE oauth_providers SET default_scopes = :s "
+                    "WHERE provider_name = 'slack'"
+                ),
+                {"s": json.dumps([*migration.PREVIOUS_SCOPES, "custom:scope"])},
+            )
+            migration.upgrade()
+        scopes = _provider_default_scopes(connection, "slack")
+        assert "custom:scope" in scopes
+        assert "channels:join" in scopes
+
+
+def test_merge_provider_default_scopes_is_idempotent(tmp_path):
+    """Re-running the merge (e.g. upgrade() invoked twice) must not
+    duplicate channels:join or otherwise change an already-merged list."""
+    engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
+    migration = _load_migration_module()
+    with engine.begin() as connection:
+        _create_table(connection, migration.PREVIOUS_SCOPES)
+        _create_oauth_providers_table(connection, migration.PREVIOUS_SCOPES)
+        with patch.object(migration, "op", _operations(connection)):
+            migration.upgrade()
+            migration.upgrade()
+        scopes = _provider_default_scopes(connection, "slack")
+        assert scopes.count("channels:join") == 1
 
 
 def test_migration_fields_match_registry():

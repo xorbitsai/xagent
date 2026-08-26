@@ -116,38 +116,74 @@ def _set_slack_scopes(bind: sa.engine.Connection, scopes: list[str]) -> None:
     )
 
 
-def _set_slack_provider_default_scopes_if_unchanged(
-    bind: sa.engine.Connection, expected_current: list[str], new_value: list[str]
+def _merge_slack_provider_default_scopes(
+    bind: sa.engine.Connection, add_scopes: list[str], remove_scopes: list[str]
 ) -> None:
-    """Keep oauth_providers.default_scopes for provider "slack" in sync too,
-    without clobbering an operator customization.
+    """Add/remove this migration's own scope delta from
+    oauth_providers.default_scopes for provider "slack", preserving any
+    operator customization instead of skipping the update entirely
+    whenever the persisted value isn't an exact historical snapshot.
 
-    Mirrors 20260812's equivalent guard — see that migration for the full
-    rationale on why this column (unlike oauth_scopes) drives live behavior
-    for the app-id-less authorize path.
+    The prior "skip unless it still equals PREVIOUS_SCOPES exactly" shape
+    (mirrored from 20260812's equivalent guard) has a real bug: once an
+    operator adds even one custom scope here, every later migration that
+    only compares against its own PREVIOUS_SCOPES permanently no-ops
+    forever, silently dropping any newly-required scope (channels:join,
+    here) from the app-id-less authorize path (GET /api/auth/{provider}/
+    login with no app_id) — see api/auth.py's _merge_oauth_scopes for why
+    that path reads this column directly rather than unioning in the app's
+    own (always-current) oauth_scopes. Merging by delta instead means a
+    customization survives, and the scope this migration actually owns
+    still gets added regardless of what else is in the list.
+
+    add_scopes/remove_scopes are this migration's own delta (e.g.
+    ["channels:join"], not the full CURRENT_SCOPES/PREVIOUS_SCOPES list) —
+    so an operator's unrelated custom scope is never touched either
+    direction.
+
+    Locks the row for the rest of this migration's transaction on
+    PostgreSQL (SELECT ... FOR UPDATE) so a customization committed via
+    the admin PATCH endpoint between this read and the write below can't
+    be silently clobbered. SQLite has no real concurrent-writer scenario
+    for a migration run and doesn't support FOR UPDATE, so it's skipped
+    there (also consistent with SQLite migrations here assuming
+    non-transactional DDL).
     """
     if not _columns_present(
         bind, "oauth_providers", {"provider_name", "default_scopes"}
     ):
         return
 
-    current = bind.execute(
-        sa.select(OAUTH_PROVIDERS_TABLE.c.default_scopes).where(
-            OAUTH_PROVIDERS_TABLE.c.provider_name == PROVIDER_NAME
-        )
-    ).scalar()
+    select_stmt = sa.select(OAUTH_PROVIDERS_TABLE.c.default_scopes).where(
+        OAUTH_PROVIDERS_TABLE.c.provider_name == PROVIDER_NAME
+    )
+    if bind.dialect.name == "postgresql":
+        select_stmt = select_stmt.with_for_update()
+
+    current = bind.execute(select_stmt).scalar()
+    if current is None:
+        # No "slack" provider row at all -- nothing to merge into.
+        return
     if isinstance(current, str):
         try:
             current = json.loads(current)
         except (TypeError, ValueError):
-            pass
-    if current is not None and current != expected_current:
+            current = []
+    current_list = list(current) if isinstance(current, list) else []
+
+    remove = set(remove_scopes)
+    new_scopes = [scope for scope in current_list if scope not in remove]
+    for scope in add_scopes:
+        if scope not in new_scopes:
+            new_scopes.append(scope)
+
+    if new_scopes == current_list:
         return
 
     bind.execute(
         sa.update(OAUTH_PROVIDERS_TABLE)
         .where(OAUTH_PROVIDERS_TABLE.c.provider_name == PROVIDER_NAME)
-        .values(default_scopes=new_value)
+        .values(default_scopes=new_scopes)
     )
 
 
@@ -174,11 +210,14 @@ def _set_slack_description_if_unchanged(
     )
 
 
+_ADDED_SCOPES = [scope for scope in CURRENT_SCOPES if scope not in PREVIOUS_SCOPES]
+
+
 def upgrade() -> None:
     bind = op.get_bind()
     _set_slack_scopes(bind, CURRENT_SCOPES)
-    _set_slack_provider_default_scopes_if_unchanged(
-        bind, PREVIOUS_SCOPES, CURRENT_SCOPES
+    _merge_slack_provider_default_scopes(
+        bind, add_scopes=_ADDED_SCOPES, remove_scopes=[]
     )
     _set_slack_description_if_unchanged(bind, PREVIOUS_DESCRIPTION, CURRENT_DESCRIPTION)
     # Deliberately does NOT force-disconnect existing Slack grants: Slack
@@ -195,7 +234,7 @@ def upgrade() -> None:
 def downgrade() -> None:
     bind = op.get_bind()
     _set_slack_scopes(bind, PREVIOUS_SCOPES)
-    _set_slack_provider_default_scopes_if_unchanged(
-        bind, CURRENT_SCOPES, PREVIOUS_SCOPES
+    _merge_slack_provider_default_scopes(
+        bind, add_scopes=[], remove_scopes=_ADDED_SCOPES
     )
     _set_slack_description_if_unchanged(bind, CURRENT_DESCRIPTION, PREVIOUS_DESCRIPTION)

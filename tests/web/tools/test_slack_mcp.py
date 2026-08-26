@@ -621,9 +621,150 @@ def test_request_requiring_membership_raises_actionable_error_without_auto_joini
     assert mock_request.call_count == 1
 
 
+def test_request_requiring_membership_treats_no_permission_as_actionable(monkeypatch):
+    """no_permission is documented identically across every endpoint this
+    wrapper covers as "make sure your app is a member of the conversation"
+    (verified against Slack's own API reference for conversations.history,
+    conversations.replies, chat.postMessage, reactions.add/remove, and
+    files.completeUploadExternal) — it must be actionable everywhere, not
+    just the endpoints that happen to also document not_in_channel."""
+    monkeypatch.setattr(
+        slack.requests,
+        "request",
+        Mock(return_value=MockResponse({"ok": False, "error": "no_permission"})),
+    )
+
+    with pytest.raises(RuntimeError, match="slack_join_channel"):
+        slack._request_requiring_membership(
+            "GET", "conversations.history", params={"channel": "C0123456789"}
+        )
+
+
+@pytest.mark.parametrize(
+    ("caller", "kwargs"),
+    [
+        (lambda: slack.slack_get_channel_history("C0123456789"), {}),
+        (lambda: slack.slack_get_thread_replies("C0123456789", "1.1"), {}),
+        (lambda: slack.slack_post_message("C0123456789", "hi"), {}),
+    ],
+)
+def test_no_permission_reports_actionable_error_across_read_and_write_tools(
+    monkeypatch, caller, kwargs
+):
+    monkeypatch.setattr(
+        slack.requests,
+        "request",
+        Mock(return_value=MockResponse({"ok": False, "error": "no_permission"})),
+    )
+
+    result = json.loads(caller())
+
+    assert result["status"] == "error"
+    assert "slack_join_channel" in result["message"]
+
+
+def test_add_reaction_reports_actionable_error_for_no_permission(monkeypatch):
+    monkeypatch.setattr(
+        slack.requests,
+        "request",
+        Mock(return_value=MockResponse({"ok": False, "error": "no_permission"})),
+    )
+
+    result = json.loads(slack.slack_add_reaction("C0123456789", "1.1", "thumbsup"))
+
+    assert result["status"] == "error"
+    assert "slack_join_channel" in result["message"]
+
+
+def test_upload_file_reports_actionable_error_for_no_permission(tmp_path, monkeypatch):
+    local_file = tmp_path / "report.txt"
+    local_file.write_text("incident report")
+    monkeypatch.setenv("XAGENT_SLACK_FILE_ALLOWED_DIRS", str(tmp_path))
+    mock_request = Mock(
+        side_effect=[
+            MockResponse(
+                {
+                    "ok": True,
+                    "upload_url": "https://files.slack.com/upload/v1/abc",
+                    "file_id": "F123",
+                }
+            ),
+            MockResponse({"ok": False, "error": "no_permission"}),
+        ]
+    )
+    monkeypatch.setattr(slack.requests, "request", mock_request)
+    monkeypatch.setattr(
+        slack.requests, "post", Mock(return_value=MockResponse({}, status_code=200))
+    )
+
+    result = json.loads(slack.slack_upload_file("C0123456789", str(local_file)))
+
+    assert result["status"] == "error"
+    assert "slack_join_channel" in result["message"]
+
+
+def test_request_requiring_membership_hedges_channel_not_found_for_invalid_raw_id(
+    monkeypatch,
+):
+    """channel_not_found for conversations.replies/reactions.* is genuinely
+    ambiguous when the caller passed a raw channel id directly:
+    _resolve_channel_id never validates a syntactically-valid id via
+    conversations.list (only names go through that lookup), so this could
+    be a real not-a-member case or simply a wrong/deleted id. The message
+    must not assert the membership explanation as fact."""
+    monkeypatch.setattr(
+        slack.requests,
+        "request",
+        Mock(return_value=MockResponse({"ok": False, "error": "channel_not_found"})),
+    )
+
+    result = json.loads(slack.slack_add_reaction("C0000000009", "1.1", "thumbsup"))
+
+    assert result["status"] == "error"
+    assert "doesn't exist" in result["message"]
+    assert "slack_join_channel" in result["message"]
+
+
+def test_post_message_does_not_treat_dm_channel_not_found_as_actionable(monkeypatch):
+    """Unlike conversations.replies/reactions.*, chat.postMessage's
+    channel_not_found is NOT widened to actionable: Slack's own docs say a
+    DM target returns exactly this code when the app lacks permission to
+    open that DM — a case slack_join_channel (which only joins channels,
+    never DMs) cannot fix, so treating it as "go call slack_join_channel"
+    would be actively misleading."""
+    monkeypatch.setattr(
+        slack.requests,
+        "request",
+        Mock(return_value=MockResponse({"ok": False, "error": "channel_not_found"})),
+    )
+
+    result = json.loads(slack.slack_post_message("U0123456789", "hi"))
+
+    assert result["status"] == "error"
+    assert "slack_join_channel" not in result["message"]
+    assert "channel_not_found" in result["message"]
+
+
 # ---------------------------------------------------------------------------
 # slack_join_channel
 # ---------------------------------------------------------------------------
+
+
+async def test_join_channel_is_discoverable_via_mcp_list_tools():
+    """Every direct-call test below exercises the Python function, not the
+    MCP registration — a regression in the @mcp.tool() decorator, the
+    exposed tool name, or the generated input schema could leave those
+    tests green while an agent can't discover or correctly invoke this
+    tool at all."""
+    tools = await slack.mcp.list_tools()
+    tool = next(t for t in tools if t.name == "slack_join_channel")
+
+    assert tool.inputSchema["required"] == ["channel"]
+    assert tool.inputSchema["properties"]["channel"]["type"] == "string"
+    # The docstring is what the calling agent actually reads to decide
+    # whether it's safe to call this tool without asking first — confirm
+    # the real one made it through registration, not an empty/stub one.
+    assert "explicitly confirmed" in (tool.description or "")
 
 
 def test_join_channel_sends_expected_payload(monkeypatch):
@@ -1583,10 +1724,13 @@ def test_search_messages_surfaces_actionable_thread_join_failure(monkeypatch):
 def test_search_messages_actionable_thread_error_survives_a_later_unrelated_one(
     monkeypatch,
 ):
-    """An actionable not_in_channel/slack_join_channel failure on one thread
-    must not be masked by a later, less useful failure (e.g. a rate limit)
-    on a different thread in the same search — the actionable guidance has
-    to win regardless of which thread hits it first."""
+    """An actionable channel_not_found/slack_join_channel failure on one
+    thread must not be masked by an earlier, less useful failure (e.g. a
+    rate limit) on a different thread in the same search — the actionable
+    guidance has to win even though it wasn't the first failure seen.
+    (Ordered transient-then-actionable deliberately: the reverse order is
+    covered by test_search_messages_stops_thread_scan_after_channel_wide_membership_failure,
+    which also asserts the scan stops there instead of continuing.)"""
     mock_request = Mock(
         side_effect=[
             MockResponse(
@@ -1610,8 +1754,8 @@ def test_search_messages_actionable_thread_error_survives_a_later_unrelated_one(
                     ],
                 }
             ),
-            MockResponse({"ok": False, "error": "channel_not_found"}),
             MockResponse({"ok": False, "error": "ratelimited"}),
+            MockResponse({"ok": False, "error": "channel_not_found"}),
         ]
     )
     monkeypatch.setattr(slack.requests, "request", mock_request)
@@ -1621,6 +1765,48 @@ def test_search_messages_actionable_thread_error_survives_a_later_unrelated_one(
     assert result["status"] == "success"
     assert result["truncated"] is True
     assert "slack_join_channel" in result["error"]
+    assert mock_request.call_count == 3
+
+
+def test_search_messages_stops_thread_scan_after_channel_wide_membership_failure(
+    monkeypatch,
+):
+    """A not-a-member failure discovered on one thread is a channel-wide bot
+    state, not specific to that thread — every remaining threaded parent
+    would fail identically, so the scan must stop there instead of
+    repeating the same doomed conversations.replies call for each of the
+    (here, 3) collected threads."""
+    mock_request = Mock(
+        side_effect=[
+            MockResponse(
+                {
+                    "ok": True,
+                    "messages": [
+                        {
+                            "ts": f"1.{i}",
+                            "user": "U1",
+                            "text": "kickoff",
+                            "thread_ts": f"1.{i}",
+                            "reply_count": 1,
+                        }
+                        for i in range(3)
+                    ],
+                }
+            ),
+            MockResponse({"ok": False, "error": "channel_not_found"}),
+        ]
+    )
+    monkeypatch.setattr(slack.requests, "request", mock_request)
+
+    result = json.loads(slack.slack_search_messages("C0123456789", "deploy"))
+
+    assert result["status"] == "success"
+    assert result["truncated"] is True
+    assert "slack_join_channel" in result["error"]
+    # 1 history call + exactly 1 thread attempt — the other 2 collected
+    # threaded parents must never be attempted once the first one reveals
+    # a channel-wide membership problem.
+    assert mock_request.call_count == 2
 
 
 def test_search_messages_history_page_failure_still_scans_collected_threads(

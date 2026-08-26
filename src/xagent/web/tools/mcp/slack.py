@@ -270,6 +270,13 @@ def _request(
     return payload
 
 
+# "no_permission" is documented identically across every endpoint this
+# connector wraps (conversations.history/replies, chat.postMessage,
+# reactions.add/remove, files.completeUploadExternal) as "The workspace
+# token used in this request does not have the permissions necessary...
+# Make sure your app is a member of the conversation" — a second, endpoint-
+# independent way Slack signals "not a member", distinct from not_in_channel.
+#
 # Slack documents "not_in_channel" for conversations.history, chat.postMessage,
 # and files.completeUploadExternal, but conversations.replies and
 # reactions.add/remove do NOT document it — they document "channel_not_found"
@@ -283,6 +290,12 @@ def _request(
 # raised message below is worded to cover both rather than asserting the
 # membership explanation outright.
 #
+# channel_not_found is deliberately NOT added for chat.postMessage: Slack's
+# own docs say a DM target returns channel_not_found specifically when the
+# app lacks permission to open that DM — a case slack_join_channel (which
+# only joins *channels*) cannot fix, so treating it as the same "go call
+# slack_join_channel" actionable error would be actively misleading.
+#
 # Keyed by Slack API path rather than left as a parameter each call site has
 # to remember to pass: a lookup here is the one place a future endpoint's
 # "which code does Slack actually use" needs to be recorded, rather than
@@ -291,7 +304,7 @@ def _request(
 _PATHS_HIDING_CHANNEL_FROM_NON_MEMBERS = frozenset(
     {"conversations.replies", "reactions.add", "reactions.remove"}
 )
-_DEFAULT_NOT_A_MEMBER_CODES = frozenset({"not_in_channel"})
+_DEFAULT_NOT_A_MEMBER_CODES = frozenset({"not_in_channel", "no_permission"})
 _HIDDEN_FROM_NON_MEMBER_CODES = _DEFAULT_NOT_A_MEMBER_CODES | frozenset(
     {"channel_not_found"}
 )
@@ -335,15 +348,25 @@ def _request_requiring_membership(
     except _SlackAPIError as e:
         if e.code not in not_a_member_codes:
             raise
+        if e.code == "channel_not_found":
+            # Genuinely ambiguous (see the module comment above) — don't
+            # assert the membership explanation as fact.
+            cause = (
+                "most likely because it isn't a member (a private channel "
+                "is hidden entirely from non-members), though this can "
+                "also mean the channel id doesn't exist"
+            )
+        else:
+            # not_in_channel / no_permission are both unambiguous per
+            # Slack's own docs — no need to hedge.
+            cause = "because the bot isn't a member of it"
         raise _SlackNotAMemberError(
-            f"{e.code}: the bot cannot access this channel — most likely "
-            "because it isn't a member (a private channel is hidden "
-            "entirely from non-members), though this can also mean the "
-            "channel id doesn't exist. If the channel is genuinely there: "
-            "ask the user whether to add the bot to it; if they agree, "
-            "call slack_join_channel (only works for a public channel) — "
-            "for a private channel or DM, a member needs to run `/invite "
-            "@<this app's bot name>` instead."
+            f"{e.code}: the bot cannot access this channel — {cause}. If "
+            "the channel is genuinely there: ask the user whether to add "
+            "the bot to it; if they agree, call slack_join_channel (only "
+            "works for a public channel) — for a private channel or DM, "
+            "a member needs to run `/invite @<this app's bot name>` "
+            "instead."
         ) from None
 
 
@@ -857,6 +880,15 @@ def slack_search_messages(
                     # above, so a membership problem is never masked by an
                     # unrelated failure elsewhere in this same call.
                     scan_error = _prefer_actionable_error(scan_error, thread_exc)
+                    if isinstance(thread_exc, _SlackNotAMemberError):
+                        # Discovered mid-loop rather than up front (the
+                        # earlier history scan succeeded, so the guard
+                        # above this loop didn't catch it) — but it's still
+                        # a channel-wide bot state, not specific to this
+                        # thread, so every remaining parent would fail
+                        # identically. Stop instead of repeating the same
+                        # doomed call up to MAX_SEARCH_THREADS times.
+                        break
                     continue
                 # A thread with over 200 replies is only partially scanned —
                 # has_more/next_cursor are not followed, so a match in the

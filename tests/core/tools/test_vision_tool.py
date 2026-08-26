@@ -2379,3 +2379,56 @@ class TestDrawBoundingBoxes:
             finally:
                 if os.path.exists(temp_image_path):
                     os.unlink(temp_image_path)
+
+
+class TestVisionToolChatEnvelope:
+    """Regression tests for the chat-envelope contract (#520/#1714 class).
+
+    Adapters now return ``{"type": "text", "content": ...}`` envelopes from
+    ``vision_chat``; the tool must read ``content``, never repr the envelope.
+    """
+
+    @pytest.mark.asyncio
+    async def test_understand_images_unwraps_text_envelope(self) -> None:
+        model = Mock(spec=BaseLLM)
+        model.vision_chat = AsyncMock(
+            return_value={
+                "type": "text",
+                "content": "A cat sitting on a keyboard.",
+                "usage": {"prompt_tokens": 12, "completion_tokens": 4},
+            }
+        )
+        model.has_ability = Mock(return_value=True)
+
+        result = await VisionTool(model).understand_images(
+            "data:image/jpeg;base64,ZmFrZV9pbWFnZV9kYXRh",
+            "What is in this image?",
+        )
+
+        assert result.success is True
+        assert result.answer == "A cat sitting on a keyboard."
+        assert "'type': 'text'" not in result.answer
+
+    @pytest.mark.asyncio
+    async def test_detect_objects_parses_text_envelope_content(self) -> None:
+        model = Mock(spec=BaseLLM)
+        model.vision_chat = AsyncMock(
+            return_value={
+                "type": "text",
+                "content": (
+                    '{"detections": [{"class": "person", "confidence": 0.95, '
+                    '"bbox": [0.1, 0.1, 0.6, 0.8]}]}'
+                ),
+                "usage": {"prompt_tokens": 12, "completion_tokens": 4},
+            }
+        )
+        model.has_ability = Mock(return_value=True)
+
+        result = await VisionTool(model).detect_objects(
+            "data:image/jpeg;base64,ZmFrZV9pbWFnZV9kYXRh",
+            task="Find all objects in the image",
+        )
+
+        assert result.success is True
+        assert len(result.detections) == 1
+        assert result.detections[0]["class"] == "person"

@@ -42,6 +42,7 @@ from xagent.core.model.chat.token_context import get_token_usage, reset_token_us
 
 PROMPT_TOKENS = 10
 COMPLETION_TOKENS = 5
+CACHED_TOKENS = 6
 COMPACT_SUMMARY = "summarized tool result"
 
 
@@ -539,10 +540,59 @@ class TestResolveUsagePayload:
                 },
                 (7, 4),
             ),
+            # Zhipu tool_call fallback shape: raw is a plain stringified
+            # response -- fail open, never raise or probe the string.
+            (
+                {
+                    "type": "tool_call",
+                    "tool_calls": [],
+                    "raw": "ChatCompletion(choices=[...])",
+                },
+                None,
+            ),
+            # Top-level usage_metadata (legacy Gemini-style attribute shape
+            # preserved as-is on the response): the original key order applies.
+            (
+                {
+                    "type": "text",
+                    "content": "x",
+                    "usage_metadata": {
+                        "prompt_token_count": 8,
+                        "candidates_token_count": 3,
+                    },
+                },
+                (8, 3),
+            ),
+            # Usage present but all-zero: not a measurement, fail open.
+            (
+                {
+                    "type": "text",
+                    "content": "x",
+                    "usage": {"prompt_tokens": 0, "completion_tokens": 0},
+                },
+                None,
+            ),
+            # All-zero usage in raw behaves the same one level down.
+            (
+                {
+                    "type": "text",
+                    "content": "x",
+                    "raw": {"usage": {"prompt_tokens": 0, "completion_tokens": 0}},
+                },
+                None,
+            ),
         ],
     )
     def test_extract_token_usage_shapes(self, response: Any, expected: Any) -> None:
         assert self.runtime._extract_token_usage(response) == expected
+
+    def test_extract_cached_tokens_fails_open_on_string_raw(self) -> None:
+        response = {
+            "type": "tool_call",
+            "tool_calls": [],
+            "raw": "ChatCompletion(choices=[...])",
+        }
+        assert self.runtime._extract_cached_tokens(response) == 0
 
     def test_extract_cached_tokens_reads_raw_usage(self) -> None:
         response = {
@@ -639,3 +689,297 @@ class TestUnwrapChatText:
     def test_unrecognized_shape_raises_no_text_content(self) -> None:
         with pytest.raises(LLMNoTextContentError):
             unwrap_chat_text(42)
+
+
+@pytest.mark.asyncio
+async def test_openai_compact_cached_tokens_flow_to_trace_event(mocker) -> None:
+    """End-to-end cache loop: a real CompletionUsage carrying
+    ``prompt_tokens_details.cached_tokens`` must surface as
+    ``cached_input_tokens`` on the compact trace event -- the stamp alone is
+    not enough, the extractor must read it back."""
+    from openai.types.completion_usage import PromptTokensDetails
+
+    reset_token_usage()
+    llm = OpenAILLM(model_name="gpt-4o-mini", api_key="test-key")
+    completion = _openai_completion(COMPACT_SUMMARY)
+    completion.usage = CompletionUsage(
+        prompt_tokens=PROMPT_TOKENS,
+        completion_tokens=COMPLETION_TOKENS,
+        total_tokens=PROMPT_TOKENS + COMPLETION_TOKENS,
+        prompt_tokens_details=PromptTokensDetails(cached_tokens=CACHED_TOKENS),
+    )
+    mock_client = mocker.AsyncMock()
+    mock_client.chat.completions.create.return_value = completion
+    mocker.patch(
+        "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+        return_value=mock_client,
+    )
+
+    tracer, context = await _run_compact_with(llm)
+
+    compact_end = next(
+        event
+        for event in tracer.events
+        if event["event_type"] == "action_end_llm"
+        and event["data"].get("purpose") == "context_compaction"
+    )
+    assert compact_end["data"]["cached_input_tokens"] == CACHED_TOKENS
+    assert compact_end["data"]["input_tokens"] == PROMPT_TOKENS
+    assert context.get_total_token_usage()["total"] == (
+        PROMPT_TOKENS + COMPLETION_TOKENS
+    )
+
+
+class TestVisionChatUsageStamp:
+    """``vision_chat`` envelopes carry the same top-level usage stamp as
+    ``chat()`` -- image inputs account tokens identically (#520)."""
+
+    @pytest.mark.asyncio
+    async def test_openai_vision_chat_stamps_top_level_usage(self, mocker) -> None:
+        llm = OpenAILLM(
+            model_name="gpt-4o-mini",
+            api_key="test-key",
+            abilities=["chat", "vision"],
+        )
+        mock_client = mocker.AsyncMock()
+        mock_client.chat.completions.create.return_value = _openai_completion(
+            "A diagram on a whiteboard."
+        )
+        mocker.patch(
+            "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+            return_value=mock_client,
+        )
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "Describe this image."},
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": "data:image/jpeg;base64,ZmFrZV9pbWFnZV9kYXRh"
+                        },
+                    },
+                ],
+            }
+        ]
+
+        response = await llm.vision_chat(messages)
+
+        assert response["type"] == "text"
+        assert response["content"] == "A diagram on a whiteboard."
+        assert response["usage"]["prompt_tokens"] == PROMPT_TOKENS
+        assert response["usage"]["completion_tokens"] == COMPLETION_TOKENS
+
+    @pytest.mark.asyncio
+    async def test_zhipu_vision_chat_stamps_usage_with_cached_tokens(self) -> None:
+        llm = ZhipuLLM(model_name="glm-4.5v", api_key="test-key")
+        response = _zhipu_response("A flowchart with three boxes.")
+        response.usage.prompt_tokens_details = SimpleNamespace(
+            cached_tokens=CACHED_TOKENS
+        )
+        llm._client = SimpleNamespace(
+            chat=SimpleNamespace(
+                completions=SimpleNamespace(create=lambda **kwargs: response)
+            )
+        )
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "Describe this image."},
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": "data:image/jpeg;base64,ZmFrZV9pbWFnZV9kYXRh"
+                        },
+                    },
+                ],
+            }
+        ]
+
+        result = await llm.vision_chat(messages=messages)
+
+        assert result["type"] == "text"
+        assert result["content"] == "A flowchart with three boxes."
+        assert result["usage"] == {
+            "prompt_tokens": PROMPT_TOKENS,
+            "completion_tokens": COMPLETION_TOKENS,
+            "cached_input_tokens": CACHED_TOKENS,
+        }
+
+
+@pytest.mark.asyncio
+async def test_openai_reasoning_truncation_branch_stamps_usage(mocker) -> None:
+    """The reasoning-content early return (content empty, finish_reason
+    "length") is a separate result-construction branch; its envelope must
+    carry the stamp too."""
+    llm = OpenAILLM(model_name="gpt-4o-mini", api_key="test-key")
+    completion = ChatCompletion(
+        id="compact-contract-reasoning",
+        choices=[
+            Choice(
+                finish_reason="length",
+                index=0,
+                message=ChatCompletionMessage(
+                    content="",
+                    role="assistant",
+                    tool_calls=None,
+                    reasoning_content="partial reasoning trace",  # type: ignore[call-arg]
+                ),
+            )
+        ],
+        created=1234567890,
+        model="gpt-4o-mini",
+        object="chat.completion",
+        usage=CompletionUsage(
+            prompt_tokens=PROMPT_TOKENS,
+            completion_tokens=COMPLETION_TOKENS,
+            total_tokens=PROMPT_TOKENS + COMPLETION_TOKENS,
+        ),
+    )
+    mock_client = mocker.AsyncMock()
+    mock_client.chat.completions.create.return_value = completion
+    mocker.patch(
+        "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+        return_value=mock_client,
+    )
+
+    response = await llm.chat([{"role": "user", "content": "hi"}])
+
+    assert response["type"] == "text"
+    assert response["content"] == "partial reasoning trace"
+    assert response["usage"]["prompt_tokens"] == PROMPT_TOKENS
+    assert response["usage"]["completion_tokens"] == COMPLETION_TOKENS
+
+
+@pytest.mark.asyncio
+async def test_compact_usage_survives_checkpoint_roundtrip(mocker) -> None:
+    """Invariant I5: usage recorded during compaction must survive
+    ``to_dict``/``from_dict`` unchanged -- checkpoints are how executions
+    resume, and a lossy roundtrip would silently drop billed tokens."""
+    reset_token_usage()
+    llm = OpenAILLM(model_name="gpt-4o-mini", api_key="test-key")
+    mock_client = mocker.AsyncMock()
+    mock_client.chat.completions.create.return_value = _openai_completion(
+        COMPACT_SUMMARY
+    )
+    mocker.patch(
+        "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+        return_value=mock_client,
+    )
+
+    _, context = await _run_compact_with(llm)
+
+    expected = {
+        "total": PROMPT_TOKENS + COMPLETION_TOKENS,
+        "input": PROMPT_TOKENS,
+        "output": COMPLETION_TOKENS,
+        "call_count": 1,
+    }
+    assert context.get_total_token_usage() == expected
+
+    restored = ExecutionContext.from_dict(context.to_dict())
+
+    assert restored.get_total_token_usage() == expected
+
+
+@pytest.mark.asyncio
+async def test_compact_estimate_reflects_current_messages_not_stale_record(
+    mocker,
+) -> None:
+    """Invariant I4 + the implicit ordering contract in
+    ``PatternRuntime.compact_context_if_needed``: ``on_llm_end`` (which calls
+    ``record_llm_usage``) runs *before* ``compact_with_llm_response`` rewrites
+    ``context.messages``. If someone swaps them, the record's
+    ``prompt_message_count``/``prompt_content_chars`` describe the *rewritten*
+    message list, the staleness check in ``_get_total_tokens`` then passes,
+    and ``estimate_context_tokens`` silently reports the compact call's
+    prompt tokens (~10) instead of estimating the summary text (~hundreds).
+    """
+    reset_token_usage()
+    llm = OpenAILLM(model_name="gpt-4o-mini", api_key="test-key")
+    mock_client = mocker.AsyncMock()
+    mock_client.chat.completions.create.return_value = _openai_completion(
+        COMPACT_SUMMARY
+    )
+    mocker.patch(
+        "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+        return_value=mock_client,
+    )
+
+    tracer = TraceEventRecorder()
+    context = ExecutionContext(execution_id="compact-estimate-contract")
+    context.compact_config.threshold = 1
+    context.add_user_message("current request")
+    context.add_assistant_message(
+        "",
+        tool_calls=[
+            {"id": "call-1", "type": "function", "function": {"name": "read_file"}}
+        ],
+    )
+    # Large enough that the summary is genuinely smaller than the original.
+    context.add_tool_result("read_file", {"output": "x" * 4000}, tool_call_id="call-1")
+    estimate_before = context.estimate_context_tokens()
+    message_count_before = len(context.messages)
+
+    result = await ReActPattern(max_iterations=1).run(
+        context=context,
+        tools=[],
+        llm=FakeLLM([{"content": "done"}]),
+        compact_llm=llm,
+        runtime=PatternRuntime(tracer=tracer),
+    )
+
+    assert result["success"] is True
+    # Compaction really shrank the message list.
+    compact_end = next(
+        event for event in tracer.events if event["event_type"] == "action_end_compact"
+    )
+    assert compact_end["data"]["original_count"] == message_count_before
+    assert compact_end["data"]["final_count"] < message_count_before
+
+    # The post-compaction estimate is a live estimate of the current
+    # messages: smaller than before, positive, and far above the compact
+    # call's own prompt-token count (which a swapped record would leak).
+    estimate_after = context.estimate_context_tokens()
+    assert 0 < estimate_after < estimate_before
+    assert estimate_after > 3 * PROMPT_TOKENS
+
+
+@pytest.mark.asyncio
+async def test_compact_dependency_falls_back_when_compact_llm_returns_empty_content() -> (
+    None
+):
+    """#1714 empty-content path: an empty text envelope now raises
+    ``LLMEmptyContentError`` from ``unwrap_chat_text``; compaction must fail
+    explicitly and engage the truncation fallback, with no residue of the
+    envelope in the rebuilt context."""
+    empty_envelope = {"type": "text", "content": ""}
+    compact_llm = FakeLLM([empty_envelope, empty_envelope])
+    builder = ContextBuilder(
+        llm=FakeLLM([]), compact_threshold=1, compact_llm=compact_llm
+    )
+    dep_result = StepExecutionResult(
+        step_id="dep-1",
+        messages=[
+            {"role": "user", "content": "u" * 100},
+            {"role": "assistant", "content": "a" * 100},
+        ],
+        final_result={},
+        agent_name="dep-agent",
+    )
+
+    messages = await builder.build_context_for_step(
+        step_name="target",
+        step_description="do something with the dependency output",
+        dependencies=["dep-1"],
+        dependency_results={"dep-1": dep_result},
+    )
+
+    # Both compaction levels consulted the compact model and both fell back.
+    assert len(compact_llm.calls) == 2
+    rendered = json.dumps(messages, ensure_ascii=False)
+    assert "'content': ''" not in rendered
+    # The explicit truncation fallback keeps real history rather than a repr.
+    assert any("a" * 100 in m["content"] for m in messages)

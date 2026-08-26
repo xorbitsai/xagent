@@ -117,3 +117,32 @@ async def test_optimize_instructions_rejects_tool_call_envelope(
 
     assert exc_info.value.status_code == 500
     assert "no usable text content" in exc_info.value.detail
+
+
+@pytest.mark.asyncio
+async def test_optimize_instructions_rejects_empty_content_envelope(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An empty text envelope raises ``LLMEmptyContentError`` from
+    ``unwrap_chat_text`` and must surface as an explicit 500, not a 200 with
+    an empty "optimization"."""
+
+    class _EmptyContentLLM:
+        async def chat(self, **kwargs: Any) -> dict[str, Any]:
+            return {"type": "text", "content": ""}
+
+    monkeypatch.setattr(
+        agents_api,
+        "UserAwareModelStorage",
+        lambda db: _FakeModelStorage(_EmptyContentLLM()),  # type: ignore[arg-type]
+    )
+
+    with pytest.raises(agents_api.HTTPException) as exc_info:
+        await agents_api.optimize_instructions(
+            agents_api.OptimizeInstructionsRequest(instructions="请用中文回答。"),
+            SimpleNamespace(id=7),
+            object(),
+        )
+
+    assert exc_info.value.status_code == 500
+    assert "empty" in exc_info.value.detail

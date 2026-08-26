@@ -668,6 +668,12 @@ class ClaudeLLM(BaseLLM):
                     "prompt_tokens": input_tokens,
                     "completion_tokens": output_tokens,
                 }
+                # Only stamp cache metrics when non-zero so a default 0 never
+                # shadows fallback fields in downstream extraction.
+                if cache_read > 0:
+                    usage_payload["cached_input_tokens"] = cache_read
+                if cache_write > 0:
+                    usage_payload["cache_write_input_tokens"] = cache_write
                 add_token_usage(
                     input_tokens=input_tokens,
                     output_tokens=output_tokens,

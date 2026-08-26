@@ -177,6 +177,43 @@ class TestClaudeLLM:
         assert call_args.kwargs["temperature"] == 0.7
 
     @pytest.mark.asyncio
+    async def test_usage_stamp_includes_cache_metrics(self, llm, mocker):
+        """Cache read/write tokens ride the usage stamp so PatternRuntime's
+        _extract_cached_tokens sees prompt-cache hits on non-streaming calls."""
+        mock_client = mocker.AsyncMock()
+
+        mock_text_block = mocker.Mock()
+        mock_text_block.type = "text"
+        mock_text_block.text = "Cached"
+
+        mock_usage = mocker.Mock()
+        mock_usage.input_tokens = 10
+        mock_usage.output_tokens = 5
+        mock_usage.cache_read_input_tokens = 4
+        mock_usage.cache_creation_input_tokens = 2
+
+        mock_response = mocker.Mock()
+        mock_response.stop_reason = "stop"
+        mock_response.content = [mock_text_block]
+        mock_response.usage = mock_usage
+
+        mock_client.messages.create.return_value = mock_response
+        mocker.patch(
+            "xagent.core.model.chat.basic.claude.AsyncAnthropic",
+            return_value=mock_client,
+        )
+
+        response = await llm.chat([{"role": "user", "content": "hi"}])
+
+        # _anthropic_input_usage re-adds cache tokens into the input total.
+        assert response["usage"] == {
+            "prompt_tokens": 16,
+            "completion_tokens": 5,
+            "cached_input_tokens": 4,
+            "cache_write_input_tokens": 2,
+        }
+
+    @pytest.mark.asyncio
     async def test_tool_calling(self, llm, mocker):
         """Test tool calling functionality."""
         # Setup mock

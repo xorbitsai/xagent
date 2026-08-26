@@ -259,17 +259,20 @@ class ZhipuLLM(BaseLLM):
                 output_tokens = getattr(usage, "completion_tokens", 0) or getattr(
                     usage, "output_tokens", 0
                 )
+                cached_tokens = extract_cached_input_tokens(usage)
                 usage_payload = {
                     "prompt_tokens": input_tokens,
                     "completion_tokens": output_tokens,
                 }
+                if cached_tokens > 0:
+                    usage_payload["cached_input_tokens"] = cached_tokens
                 add_token_usage(
                     input_tokens=input_tokens,
                     output_tokens=output_tokens,
                     model=self._model_name,
                     model_id=self.model_id,
                     call_type="chat",
-                    cached_input_tokens=extract_cached_input_tokens(usage),
+                    cached_input_tokens=cached_tokens,
                 )
 
             # Extract the choice
@@ -916,17 +919,20 @@ class ZhipuLLM(BaseLLM):
                 output_tokens = getattr(usage, "completion_tokens", 0) or getattr(
                     usage, "output_tokens", 0
                 )
+                cached_tokens = extract_cached_input_tokens(usage)
                 usage_payload = {
                     "prompt_tokens": input_tokens,
                     "completion_tokens": output_tokens,
                 }
+                if cached_tokens > 0:
+                    usage_payload["cached_input_tokens"] = cached_tokens
                 add_token_usage(
                     input_tokens=input_tokens,
                     output_tokens=output_tokens,
                     model=self._model_name,
                     model_id=self.model_id,
                     call_type="vision_chat",
-                    cached_input_tokens=extract_cached_input_tokens(usage),
+                    cached_input_tokens=cached_tokens,
                 )
 
             # Extract the choice

@@ -137,6 +137,10 @@ class TestZhipuLLM:
         mock_response.choices = [mock_choice]
         mock_response.usage.prompt_tokens = 12
         mock_response.usage.completion_tokens = 4
+        # Declare "no cache" explicitly: MagicMock auto-attrs would otherwise
+        # coerce to phantom cache tokens (int(MagicMock()) == 1).
+        mock_response.usage.prompt_cache_hit_tokens = 0
+        mock_response.usage.prompt_tokens_details = None
 
         mock_zhipu_client.chat.completions.create.return_value = mock_response
 

@@ -5,7 +5,7 @@ import logging
 import re
 from typing import Any, Dict, List
 
-from ...model.chat.exceptions import LLMNoTextContentError
+from ...model.chat.exceptions import LLMEmptyContentError, LLMNoTextContentError
 
 logger = logging.getLogger(__name__)
 
@@ -25,15 +25,20 @@ def unwrap_chat_text(response: Any) -> str:
         a dict envelope carrying a usable non-empty string.
 
     Raises:
+        LLMEmptyContentError: The envelope carries string content that is
+            empty or whitespace-only (same transient class the adapters raise
+            for an empty generation).
         LLMNoTextContentError: The response is a tool_call envelope, carries
-            empty/non-string content, or has an unrecognized shape.
+            non-string content, or has an unrecognized shape.
     """
     if isinstance(response, str):
         return response
     if isinstance(response, dict):
         content = response.get("content")
-        if isinstance(content, str) and content.strip():
-            return content
+        if isinstance(content, str):
+            if content.strip():
+                return content
+            raise LLMEmptyContentError("Chat response content is empty")
         raise LLMNoTextContentError(
             "Chat response has no usable text content "
             f"(type={response.get('type')!r}, keys={sorted(response.keys())})"

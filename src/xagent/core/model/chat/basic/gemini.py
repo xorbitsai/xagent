@@ -590,6 +590,10 @@ class GeminiLLM(BaseLLM):
                         "prompt_tokens": input_tokens,
                         "completion_tokens": output_tokens,
                     }
+                    # Guard the comparison: real SDKs report int/None here,
+                    # but token accounting must never raise out of chat().
+                    if isinstance(cached_tokens, (int, float)) and cached_tokens > 0:
+                        usage_payload["cached_input_tokens"] = cached_tokens
                     add_token_usage(
                         input_tokens=input_tokens,
                         output_tokens=output_tokens,

@@ -29,10 +29,15 @@ from openai.types.completion_usage import CompletionUsage
 
 from xagent.core.agent import ExecutionContext, PatternRuntime, ReActPattern
 from xagent.core.agent.utils.context_builder import ContextBuilder, StepExecutionResult
+from xagent.core.agent.utils.llm_utils import unwrap_chat_text
 from xagent.core.model.chat.basic.deepseek import DeepSeekLLM
 from xagent.core.model.chat.basic.gemini import GeminiLLM
 from xagent.core.model.chat.basic.openai import OpenAILLM
 from xagent.core.model.chat.basic.zhipu import ZhipuLLM
+from xagent.core.model.chat.exceptions import (
+    LLMEmptyContentError,
+    LLMNoTextContentError,
+)
 from xagent.core.model.chat.token_context import get_token_usage, reset_token_usage
 
 PROMPT_TOKENS = 10
@@ -553,3 +558,84 @@ class TestResolveUsagePayload:
         }
         assert self.runtime._extract_cached_tokens(response) == 6
         assert self.runtime._extract_cached_tokens("plain string") == 0
+
+
+class TestUsageStampCachedTokens:
+    """The stamp must carry cache metrics so ``_extract_cached_tokens`` sees
+    prompt-cache hits on non-streaming calls (review findings on PR #1787).
+    Cached keys are stamped only when non-zero, so a default 0 never shadows
+    fallback fields downstream."""
+
+    @pytest.mark.asyncio
+    async def test_zhipu_chat_stamp_includes_cached_tokens(self) -> None:
+        reset_token_usage()
+        llm = ZhipuLLM(model_name="glm-4.5", api_key="test-key")
+        response = _zhipu_response("cached reply")
+        response.usage.prompt_tokens_details = SimpleNamespace(cached_tokens=4)
+        llm._client = SimpleNamespace(
+            chat=SimpleNamespace(
+                completions=SimpleNamespace(create=lambda **kwargs: response)
+            )
+        )
+
+        result = await llm.chat(messages=[{"role": "user", "content": "hi"}])
+
+        assert result["usage"]["cached_input_tokens"] == 4
+
+    @pytest.mark.asyncio
+    async def test_zhipu_chat_stamp_omits_zero_cached_tokens(self) -> None:
+        reset_token_usage()
+        llm = ZhipuLLM(model_name="glm-4.5", api_key="test-key")
+        llm._client = SimpleNamespace(
+            chat=SimpleNamespace(
+                completions=SimpleNamespace(
+                    create=lambda **kwargs: _zhipu_response("plain reply")
+                )
+            )
+        )
+
+        result = await llm.chat(messages=[{"role": "user", "content": "hi"}])
+
+        assert "cached_input_tokens" not in result["usage"]
+
+    @pytest.mark.asyncio
+    async def test_gemini_chat_stamp_includes_cached_tokens(self) -> None:
+        reset_token_usage()
+        llm = GeminiLLM(model_name="gemini-2.5-flash", api_key="test-key")
+        response = _gemini_response("cached reply")
+        response.usage_metadata.cached_content_token_count = 4
+        llm._client = SimpleNamespace(
+            aio=SimpleNamespace(
+                models=SimpleNamespace(
+                    generate_content=AsyncMock(return_value=response)
+                )
+            )
+        )
+
+        result = await llm.chat(messages=[{"role": "user", "content": "hi"}])
+
+        assert result["usage"]["cached_input_tokens"] == 4
+
+
+class TestUnwrapChatText:
+    """``unwrap_chat_text`` distinguishes "no text shape" from "empty text"
+    so retry/fallback semantics stay aligned with the adapters' own classes."""
+
+    def test_plain_string_passthrough(self) -> None:
+        assert unwrap_chat_text("hello") == "hello"
+
+    def test_envelope_content(self) -> None:
+        assert unwrap_chat_text({"type": "text", "content": "hi"}) == "hi"
+
+    @pytest.mark.parametrize("content", ["", "   \n\t"])
+    def test_empty_envelope_content_raises_empty_content(self, content: str) -> None:
+        with pytest.raises(LLMEmptyContentError):
+            unwrap_chat_text({"type": "text", "content": content})
+
+    def test_tool_call_envelope_raises_no_text_content(self) -> None:
+        with pytest.raises(LLMNoTextContentError):
+            unwrap_chat_text({"type": "tool_call", "tool_calls": []})
+
+    def test_unrecognized_shape_raises_no_text_content(self) -> None:
+        with pytest.raises(LLMNoTextContentError):
+            unwrap_chat_text(42)

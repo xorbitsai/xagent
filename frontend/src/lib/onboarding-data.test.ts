@@ -56,7 +56,10 @@ describe("recommendedTemplates", () => {
   it("caps at 3 recommendations even when more goals are selected", () => {
     const manyGoalIds = ONBOARDING_GOALS.slice(0, 6).map((g) => g.id)
     const result = recommendedTemplates(manyGoalIds)
-    expect(result.length).toBeLessThanOrEqual(3)
+    // Asserts the exact first 3 (in ONBOARDING_GOALS' own declared order),
+    // not just an upper bound - toBeLessThanOrEqual(3) would also pass for
+    // an empty array, silently missing a regression that dropped everything.
+    expect(result).toEqual(ONBOARDING_GOALS.slice(0, 3).map((g) => ({ templateId: g.templateId, goalId: g.id })))
   })
 
   it("ignores unknown goal ids", () => {
@@ -83,5 +86,11 @@ describe("joinWithAnd", () => {
     expect(joinWithAnd(["LinkedIn", "Facebook Pages", "Instagram", "Google Drive"])).toBe(
       "LinkedIn, Facebook Pages, Instagram and Google Drive"
     )
+  })
+
+  // Pins a PR review finding: the connector word must be localizable, not a
+  // hardcoded English "and" leaking into otherwise-translated copy.
+  it("uses a caller-supplied localized connector word instead of hardcoding English", () => {
+    expect(joinWithAnd(["Gmail", "Outlook"], "和")).toBe("Gmail 和 Outlook")
   })
 })

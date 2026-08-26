@@ -57,6 +57,10 @@ export function AuthGuard({ children }: AuthGuardProps) {
     void (async () => {
       const preferences = await fetchUserPreferences()
       if (!active) return
+      // null means the fetch itself failed - "unknown," not "confirmed not
+      // onboarded." Leave the ref unlatched so the next navigation retries
+      // instead of redirecting an already-onboarded user on a transient error.
+      if (preferences === null) return
       checkedOnboardingRef.current = true
       if (!preferences.onboarded) {
         router.push(ONBOARDING_PATH)

@@ -290,6 +290,74 @@ describe("OnboardingPage", () => {
     expect(routerPush).toHaveBeenCalledWith("/task/42")
   })
 
+  // Pins a PR review test-coverage gap: handleLaunch's already-hired
+  // shortcut (skip hireAgentFromTemplate, go straight to the existing agent)
+  // was never exercised.
+  it("skips hireAgentFromTemplate and goes straight to the agent when it's already hired", async () => {
+    apiRequestMock.mockResolvedValue({
+      ok: true,
+      json: async () => [{ ...TEMPLATES[0], hired: true, hired_agent_id: 99 }, TEMPLATES[1], TEMPLATES[2]],
+    })
+
+    await goToWelcomeThenBusiness()
+    fireEvent.click(screen.getByText("Marketing"))
+    fireEvent.click(screen.getByText("Continue"))
+
+    await waitFor(() => expect(screen.getByText(/take off your plate/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Post on social media"))
+    fireEvent.click(screen.getByText("Continue"))
+
+    await waitFor(() => expect(screen.getByText(/Meet your AI team/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Continue"))
+
+    await waitFor(() => expect(screen.getByText(/How should/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Continue"))
+
+    await waitFor(() => expect(screen.getByText("You're all set.")).toBeInTheDocument())
+
+    await act(async () => {
+      fireEvent.click(screen.getByText("Start with Maya"))
+    })
+
+    await waitFor(() => expect(routerPush).toHaveBeenCalledWith("/agent/99"))
+    expect(hireAgentFromTemplateMock).not.toHaveBeenCalled()
+  })
+
+  // Pins a PR review test-coverage gap: only the thrown/rejected variant of
+  // a templates-fetch failure was tested - a non-throwing !response.ok, and
+  // a 200 response whose body isn't an array, are separate code paths.
+  it("stays on the loading spinner when the templates fetch resolves with a non-ok response (not a thrown error)", async () => {
+    apiRequestMock.mockResolvedValue({ ok: false })
+
+    await goToWelcomeThenBusiness()
+    fireEvent.click(screen.getByText("Marketing"))
+    fireEvent.click(screen.getByText("Continue"))
+
+    await waitFor(() => expect(screen.getByText(/take off your plate/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Post on social media"))
+    fireEvent.click(screen.getByText("Continue"))
+
+    await waitFor(() => expect(screen.getByText(/Meet your AI team/)).toBeInTheDocument())
+    expect(document.querySelector(".animate-spin, [class*='spin']")).toBeTruthy()
+    expect(screen.getByText("Continue").closest("button")).toBeDisabled()
+  })
+
+  it("stays on the loading spinner when the templates fetch resolves ok with a non-array body", async () => {
+    apiRequestMock.mockResolvedValue({ ok: true, json: async () => ({ not: "an array" }) })
+
+    await goToWelcomeThenBusiness()
+    fireEvent.click(screen.getByText("Marketing"))
+    fireEvent.click(screen.getByText("Continue"))
+
+    await waitFor(() => expect(screen.getByText(/take off your plate/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Post on social media"))
+    fireEvent.click(screen.getByText("Continue"))
+
+    await waitFor(() => expect(screen.getByText(/Meet your AI team/)).toBeInTheDocument())
+    expect(document.querySelector(".animate-spin, [class*='spin']")).toBeTruthy()
+    expect(screen.getByText("Continue").closest("button")).toBeDisabled()
+  })
+
   it("fetches templates for the current locale, not an unlocalized default", async () => {
     render(<OnboardingPage />)
     await waitFor(() => expect(apiRequestMock).toHaveBeenCalled())
@@ -438,5 +506,59 @@ describe("OnboardingPage", () => {
     expect(updateUserPreferencesMock).toHaveBeenCalledWith(
       expect.objectContaining({ onboarded: true, goals: ["social"] })
     )
+  })
+
+  // Pins a PR review finding: the rail's "About you"/"My team" links always
+  // jumped to the FIRST step of their (multi-step) group via findIndex,
+  // never the step the user actually last visited in it.
+  it("returns to the last-visited step in a group when clicking its rail link, not always the first step", async () => {
+    await goToWelcomeThenBusiness()
+    fireEvent.click(screen.getByText("Marketing"))
+    fireEvent.click(screen.getByText("Continue"))
+
+    await waitFor(() => expect(screen.getByText(/take off your plate/)).toBeInTheDocument())
+    // "About you" (group 0) spans welcome+business - business was the last
+    // step actually visited there, so clicking it from a later step must
+    // return to business ("What does your team do?"), not the welcome splash.
+    fireEvent.click(screen.getByText("About you"))
+    expect(screen.getByText(/What does/)).toBeInTheDocument()
+    expect(screen.queryByText(/Welcome to Xagent/)).not.toBeInTheDocument()
+
+    // Drive through to voice, so "My team" (group 2) becomes reachable from
+    // "done" with voice as its last-visited step.
+    fireEvent.click(screen.getByText("Marketing"))
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/take off your plate/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Post on social media"))
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/Meet your AI team/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/How should/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText("You're all set.")).toBeInTheDocument())
+
+    fireEvent.click(screen.getByText("My team"))
+    expect(screen.getByText(/How should/)).toBeInTheDocument()
+    expect(screen.queryByText(/Meet your AI team/)).not.toBeInTheDocument()
+  })
+
+  // Pins a PR review finding: persistAndLeave used to block navigation
+  // forever on a failed save, trapping the user on this full-screen page
+  // (with no other nav) if the backend kept rejecting it.
+  it("navigates away anyway after 2 consecutive save failures on the same exit action, instead of trapping the user", async () => {
+    updateUserPreferencesMock.mockResolvedValue({ ok: false })
+
+    render(<OnboardingPage />)
+    await waitFor(() => expect(screen.getByText(/Welcome to Xagent/)).toBeInTheDocument())
+
+    await act(async () => {
+      fireEvent.click(screen.getByText("Skip setup"))
+    })
+    expect(routerPush).not.toHaveBeenCalled()
+
+    await act(async () => {
+      fireEvent.click(screen.getByText("Skip setup"))
+    })
+    expect(routerPush).toHaveBeenCalledWith("/task")
   })
 })

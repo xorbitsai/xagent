@@ -1699,6 +1699,7 @@ const zh = {
       writingInPrefix: "写作风格：",
       writingInSuffix: "",
       willConnectPrefix: "会在合适的时候请求连接",
+      willConnectAnd: "和",
       willConnectSuffix: "",
       noAccounts: "开始使用无需连接任何账号",
       start: "开始与 {name} 对话",

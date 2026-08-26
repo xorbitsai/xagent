@@ -56,18 +56,13 @@ const STEP_ORDER: StepId[] = ["welcome", "business", "goals", "team", "voice", "
 // values (onboarding.html's [data-cat] rules), not the app's theme tokens -
 // this whole page is a one-off bespoke screen matched pixel-for-pixel against
 // that reference, same reasoning as the .ob-* styles further down.
-const CATEGORY_RING: Record<string, string> = {
-  Marketing: "rgba(192,57,159,.18)",
-  Support: "rgba(37,54,224,.18)",
-  Operations: "rgba(200,138,20,.20)",
-  Sales: "rgba(34,160,91,.20)",
+const CATEGORY_STYLE: Record<string, { ring: string; dot: string }> = {
+  Marketing: { ring: "rgba(192,57,159,.18)", dot: "#C0399F" },
+  Support: { ring: "rgba(37,54,224,.18)", dot: "#2536E0" },
+  Operations: { ring: "rgba(200,138,20,.20)", dot: "#C88A14" },
+  Sales: { ring: "rgba(34,160,91,.20)", dot: "#22A05B" },
 };
-const CATEGORY_DOT: Record<string, string> = {
-  Marketing: "#C0399F",
-  Support: "#2536E0",
-  Operations: "#C88A14",
-  Sales: "#22A05B",
-};
+const DEFAULT_CATEGORY_STYLE = { ring: "rgba(37,54,224,.10)", dot: "#8A8A94" };
 
 function Orb({ small }: { small?: boolean }) {
   return <div aria-hidden="true" className={cn("ob-orb", small && "sm")} />;
@@ -98,8 +93,12 @@ export default function OnboardingPage() {
   const { t, locale } = useI18n();
 
   const [stepIndex, setStepIndex] = useState(0);
-  const [furthest, setFurthest] = useState(0);
   const step = STEP_ORDER[stepIndex];
+  // Which step within each rail group was last visited, so jumping back to
+  // an already-passed group (e.g. "About you" from a later step) returns to
+  // where the user actually was in it, not always that group's first step -
+  // "About you" spans welcome+business, "My team" spans team+voice.
+  const lastVisitedInGroupRef = useRef<Record<number, number>>({});
 
   const [work, setWork] = useState<OnboardingWorkId | "">("");
   const [industry, setIndustry] = useState("");
@@ -112,6 +111,8 @@ export default function OnboardingPage() {
   const [launching, setLaunching] = useState(false);
   const launchingRef = useRef(false);
   const isMountedRef = useRef(true);
+  // Consecutive persistAndLeave save failures - see the escape hatch there.
+  const saveFailureCountRef = useRef(0);
 
   useEffect(() => {
     isMountedRef.current = true;
@@ -196,7 +197,7 @@ export default function OnboardingPage() {
   const goTo = (index: number) => {
     const clamped = Math.max(0, Math.min(STEP_ORDER.length - 1, index));
     setStepIndex(clamped);
-    setFurthest((prev) => Math.max(prev, clamped));
+    lastVisitedInGroupRef.current[STEP_GROUP[STEP_ORDER[clamped]]] = clamped;
   };
   const next = () => goTo(stepIndex + 1);
   const back = () => goTo(stepIndex - 1);
@@ -229,15 +230,24 @@ export default function OnboardingPage() {
       ...(goals.length ? { goals } : {}),
       voice,
     });
-    // Don't navigate on a failed save either: onboarded would stay false
-    // server-side, and AuthGuard would just bounce the user right back here.
     if (!saved.ok) {
+      saveFailureCountRef.current += 1;
       if (isMountedRef.current) {
         toast.error(t("onboarding.done.saveFailed"));
         launchingRef.current = false;
         setLaunching(false);
       }
-      return;
+      // Don't navigate on the FIRST failure: onboarded would stay false
+      // server-side, and AuthGuard would just bounce the user right back
+      // here - retrying in place is the better first response. But this is
+      // the only full-screen page in the app with no other nav affordance,
+      // so a save that keeps failing (backend down, a persistent 422) must
+      // not trap the user here forever with zero way out - let them through
+      // after a couple of tries even though the save didn't land; they'll
+      // just be asked again next session instead of being stuck this one.
+      if (saveFailureCountRef.current < 2) return;
+    } else {
+      saveFailureCountRef.current = 0;
     }
     if (isMountedRef.current) router.push(destination);
   };
@@ -319,14 +329,20 @@ export default function OnboardingPage() {
         {GROUP_KEYS.map((key, groupIndex) => {
           const isNow = STEP_GROUP[step] === groupIndex;
           const isDone = STEP_GROUP[step] > groupIndex;
-          const canGo = groupIndex < STEP_GROUP[step] && groupIndex <= STEP_GROUP[STEP_ORDER[furthest]];
+          // Navigation is strictly linear (next() only ever advances by one
+          // step), so an earlier group being reachable at all already means
+          // every step in it was visited - no separate "how far has the user
+          // gotten" tracking needed here.
+          const canGo = groupIndex < STEP_GROUP[step];
           return (
             <button
               key={key}
               type="button"
               disabled={!canGo}
               onClick={() => {
-                const targetStep = STEP_ORDER.findIndex((s) => STEP_GROUP[s] === groupIndex);
+                const targetStep =
+                  lastVisitedInGroupRef.current[groupIndex] ??
+                  STEP_ORDER.findIndex((s) => STEP_GROUP[s] === groupIndex);
                 if (targetStep >= 0) goTo(targetStep);
               }}
               className={cn("ob-rl", isNow && "is-now", isDone && "is-done", canGo && "can-go")}
@@ -352,7 +368,7 @@ export default function OnboardingPage() {
               </h1>
               <p className="ob-sub">{t("onboarding.welcome.subtitle")}</p>
               <div className="ob-cta">
-                <button type="button" onClick={next} className="ob-btn-next">
+                <button type="button" disabled={launching} onClick={next} className="ob-btn-next">
                   {t("onboarding.welcome.cta")}
                   <ArrowRight className="h-4 w-4" />
                 </button>
@@ -403,10 +419,10 @@ export default function OnboardingPage() {
                 </div>
               )}
               <div className="ob-cta">
-                <button type="button" onClick={back} className="ob-btn-back">
+                <button type="button" disabled={launching} onClick={back} className="ob-btn-back">
                   {t("common.back")}
                 </button>
-                <button type="button" disabled={!isBusinessValid} onClick={next} className="ob-btn-next">
+                <button type="button" disabled={!isBusinessValid || launching} onClick={next} className="ob-btn-next">
                   {t("onboarding.continue")}
                 </button>
               </div>
@@ -444,10 +460,10 @@ export default function OnboardingPage() {
                 })}
               </div>
               <div className="ob-cta">
-                <button type="button" onClick={back} className="ob-btn-back">
+                <button type="button" disabled={launching} onClick={back} className="ob-btn-back">
                   {t("common.back")}
                 </button>
-                <button type="button" disabled={!isGoalsValid} onClick={next} className="ob-btn-next">
+                <button type="button" disabled={!isGoalsValid || launching} onClick={next} className="ob-btn-next">
                   {t("onboarding.continue")}
                 </button>
               </div>
@@ -464,8 +480,12 @@ export default function OnboardingPage() {
               <p className="ob-sub">
                 {goals.length === 0
                   ? t("onboarding.team.subtitleNoGoals")
-                  : `${t("onboarding.team.subtitleBase")}${
-                      goals.length - validRecommended.length > 0
+                  : // Gated on !templatesLoading like the grid below it: while
+                    // still loading, validRecommended is always [] (nothing has
+                    // resolved yet), which would otherwise claim every goal has
+                    // an "other match waiting" before we actually know that.
+                    `${t("onboarding.team.subtitleBase")}${
+                      !templatesLoading && goals.length - validRecommended.length > 0
                         ? ` ${t(
                             goals.length - validRecommended.length === 1
                               ? "onboarding.team.subtitleExtraOne"
@@ -491,8 +511,7 @@ export default function OnboardingPage() {
                     if (!template || !template.persona) return null;
                     const goal = ONBOARDING_GOALS.find((g) => g.id === rec.goalId);
                     const selected = agentTemplateId === template.id;
-                    const ring = CATEGORY_RING[template.category] ?? "rgba(37,54,224,.10)";
-                    const dot = CATEGORY_DOT[template.category] ?? "#8A8A94";
+                    const { ring, dot } = CATEGORY_STYLE[template.category] ?? DEFAULT_CATEGORY_STYLE;
                     return (
                       <button
                         key={template.id}
@@ -532,10 +551,10 @@ export default function OnboardingPage() {
                 </div>
               )}
               <div className="ob-cta">
-                <button type="button" onClick={back} className="ob-btn-back">
+                <button type="button" disabled={launching} onClick={back} className="ob-btn-back">
                   {t("common.back")}
                 </button>
-                <button type="button" disabled={!isTeamValid} onClick={next} className="ob-btn-next">
+                <button type="button" disabled={!isTeamValid || launching} onClick={next} className="ob-btn-next">
                   {t("onboarding.continue")}
                 </button>
               </div>
@@ -568,10 +587,10 @@ export default function OnboardingPage() {
                 );
               })()}
               <div className="ob-cta">
-                <button type="button" onClick={back} className="ob-btn-back">
+                <button type="button" disabled={launching} onClick={back} className="ob-btn-back">
                   {t("common.back")}
                 </button>
-                <button type="button" onClick={next} className="ob-btn-next">
+                <button type="button" disabled={launching} onClick={next} className="ob-btn-next">
                   {t("onboarding.continue")}
                 </button>
               </div>
@@ -588,7 +607,7 @@ export default function OnboardingPage() {
               const jobCount = goals.length || 3;
               const voiceOption = ONBOARDING_VOICES.find((v) => v.id === voice) ?? ONBOARDING_VOICES[0];
               const appNames = (selected.connections || []).map((c) => c.name).filter(Boolean);
-              const ring = CATEGORY_RING[selected.category] ?? "rgba(37,54,224,.10)";
+              const { ring } = CATEGORY_STYLE[selected.category] ?? DEFAULT_CATEGORY_STYLE;
 
               return (
                 <>
@@ -638,7 +657,8 @@ export default function OnboardingPage() {
                         />
                         {appNames.length ? (
                           <span>
-                            {t("onboarding.done.willConnectPrefix")} <b>{joinWithAnd(appNames)}</b>{" "}
+                            {t("onboarding.done.willConnectPrefix")}{" "}
+                            <b>{joinWithAnd(appNames, t("onboarding.done.willConnectAnd"))}</b>{" "}
                             {t("onboarding.done.willConnectSuffix")}
                           </span>
                         ) : (
@@ -649,7 +669,7 @@ export default function OnboardingPage() {
                   </div>
 
                   <div className="ob-cta">
-                    <button type="button" onClick={back} className="ob-btn-back">
+                    <button type="button" disabled={launching} onClick={back} className="ob-btn-back">
                       {t("common.back")}
                     </button>
                     <button type="button" disabled={launching} onClick={handleLaunch} className="ob-btn-next">

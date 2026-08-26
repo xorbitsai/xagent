@@ -131,9 +131,13 @@ export function recommendedTemplates(selectedGoalIds: string[]): RecommendedTemp
 }
 
 /** "Gmail and Outlook", not "Gmail, Outlook" - the agent is talking, not
- * printing a CSV. Matches onboarding.html's andList exactly. */
-export function joinWithAnd(items: string[]): string {
+ * printing a CSV. Matches onboarding.html's andList exactly for English
+ * (no Oxford comma - Intl.ListFormat's "long" style adds one, which would
+ * drift from the pixel/copy-matched reference). `and` is a caller-supplied,
+ * already-localized connector word so this doesn't hardcode English into
+ * otherwise-translated copy. */
+export function joinWithAnd(items: string[], and = "and"): string {
   if (items.length === 0) return "";
   if (items.length === 1) return items[0];
-  return `${items.slice(0, -1).join(", ")} and ${items[items.length - 1]}`;
+  return `${items.slice(0, -1).join(", ")} ${and} ${items[items.length - 1]}`;
 }

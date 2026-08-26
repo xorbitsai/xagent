@@ -122,6 +122,31 @@ describe("AuthGuard onboarding redirect", () => {
     expect(routerPush).not.toHaveBeenCalledWith("/onboarding")
   })
 
+  // Pins a PR review finding: fetchUserPreferences returns null (not {}) on
+  // a failed/unreachable GET - that's "unknown," not "confirmed not
+  // onboarded," so it must not redirect an already-onboarded user into the
+  // wizard just because a transient error hit this one GET.
+  it("does not redirect when the preferences fetch fails (returns null)", async () => {
+    fetchUserPreferencesMock.mockResolvedValue(null)
+
+    render(<AuthGuard><div data-testid="children" /></AuthGuard>)
+
+    await waitFor(() => expect(fetchUserPreferencesMock).toHaveBeenCalledTimes(1))
+    expect(routerPush).not.toHaveBeenCalledWith("/onboarding")
+  })
+
+  it("retries on the next route after a failed (null) check, since a failure must not latch the ref", async () => {
+    fetchUserPreferencesMock.mockResolvedValue(null)
+
+    const { rerender } = render(<AuthGuard><div data-testid="children" /></AuthGuard>)
+    await waitFor(() => expect(fetchUserPreferencesMock).toHaveBeenCalledTimes(1))
+
+    route.pathname = "/dashboard"
+    rerender(<AuthGuard><div data-testid="children" /></AuthGuard>)
+
+    await waitFor(() => expect(fetchUserPreferencesMock).toHaveBeenCalledTimes(2))
+  })
+
   it("does not check preferences at all while already on the onboarding page", () => {
     route.pathname = "/onboarding"
 

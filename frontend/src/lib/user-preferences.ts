@@ -20,18 +20,23 @@ export interface UserPreferences {
  * deliberately not threaded through the cached auth-context session
  * (AuthCacheUser carries only id/username/email/is_admin), since only the
  * onboarding-redirect check and the onboarding page itself need this, not
- * every authenticated page render. Returns `{}` (never onboarded) on any
- * failure - a transient error here must not force a fresh login into a
- * redirect loop. */
-export async function fetchUserPreferences(): Promise<UserPreferences> {
+ * every authenticated page render.
+ *
+ * Returns `null` (not `{}`) when the fetch fails or the response isn't ok -
+ * that's "unknown," not "confirmed not onboarded," and callers must not
+ * treat the two the same. Conflating them used to mean a transient error
+ * (deploy, brief backend blip) redirected an already-onboarded, active user
+ * into the onboarding wizard - the exact "forced redirect loop" this was
+ * meant to prevent, just triggered by an error instead of a stale read. */
+export async function fetchUserPreferences(): Promise<UserPreferences | null> {
   try {
     const response = await apiRequest(`${getApiUrl()}/api/auth/me`);
-    if (!response.ok) return {};
+    if (!response.ok) return null;
     const body = await response.json();
     const preferences = body?.user?.preferences;
     return preferences && typeof preferences === "object" ? preferences : {};
   } catch {
-    return {};
+    return null;
   }
 }
 

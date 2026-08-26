@@ -32,13 +32,16 @@ describe("fetchUserPreferences", () => {
     expect(result).toEqual({ onboarded: true, voice: "warm" })
   })
 
-  it("returns {} when the response is not ok", async () => {
+  // Pins a PR review finding: a failed/unreachable GET is "unknown," not
+  // "confirmed not onboarded" - returning {} for both used to make a
+  // transient error redirect an already-onboarded user into the wizard.
+  it("returns null (not {}) when the response is not ok", async () => {
     apiRequestMock.mockResolvedValue({ ok: false })
 
-    expect(await fetchUserPreferences()).toEqual({})
+    expect(await fetchUserPreferences()).toBeNull()
   })
 
-  it("returns {} when user.preferences is missing or not an object", async () => {
+  it("returns {} (a real, successful answer) when user.preferences is missing or not an object", async () => {
     apiRequestMock.mockResolvedValue({
       ok: true,
       json: async () => ({ success: true, message: "ok", user: { id: 1, username: "a", email: "a@b.com", is_admin: false } }),
@@ -47,10 +50,10 @@ describe("fetchUserPreferences", () => {
     expect(await fetchUserPreferences()).toEqual({})
   })
 
-  it("returns {} when the request throws", async () => {
+  it("returns null (not {}) when the request throws", async () => {
     apiRequestMock.mockRejectedValue(new Error("network down"))
 
-    expect(await fetchUserPreferences()).toEqual({})
+    expect(await fetchUserPreferences()).toBeNull()
   })
 })
 

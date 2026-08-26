@@ -371,17 +371,84 @@ describe("widget bootstrap", () => {
       expect(localStorage.getItem("xagent_widget_width")).toBe("430")
     })
 
-    it("cleans up an interrupted drag on window blur", () => {
+    it("cancels (without persisting) an interrupted drag on window blur", () => {
       runWidget({ "data-widget-key": "widget-secret" })
 
       firePointerEvent(handle(), "pointerdown", { pointerId: 3, clientX: 300 })
-      expect(document.body.style.userSelect).toBe("none")
+      firePointerEvent(handle(), "pointermove", { pointerId: 3, clientX: 250 }) // mid-drag, unconfirmed
+      expect(document.body.style.cursor).toBe("ew-resize")
 
       window.dispatchEvent(new Event("blur"))
 
       expect(document.body.style.userSelect).toBe("")
+      expect(document.body.style.cursor).toBe("")
       expect(widgetIframe().style.pointerEvents).toBe("")
-      expect(localStorage.getItem("xagent_widget_width")).toBe("380")
+      // A blur interruption is not the user confirming a width via release --
+      // nothing was ever persisted in this test.
+      expect(localStorage.getItem("xagent_widget_width")).toBeNull()
+
+      // The cancelled drag is really over: further movement on the same
+      // pointer does nothing, regardless of where it goes.
+      firePointerEvent(handle(), "pointermove", { pointerId: 3, clientX: 100 })
+      expect(panel().style.width).toBe("430px") // unchanged from the last real move (380 + 50)
+    })
+
+    it("ignores a blur caused by focus moving into the widget's own iframe", () => {
+      runWidget({ "data-widget-key": "widget-secret" })
+      vi.spyOn(document, "hasFocus").mockReturnValue(true)
+
+      firePointerEvent(handle(), "pointerdown", { pointerId: 17, clientX: 300 })
+      expect(document.body.style.userSelect).toBe("none")
+
+      window.dispatchEvent(new Event("blur"))
+
+      // document.hasFocus() still true means the window itself never lost
+      // focus -- this blur doesn't interrupt the drag.
+      expect(document.body.style.userSelect).toBe("none")
+
+      firePointerEvent(handle(), "pointerup", { pointerId: 17, clientX: 300 })
+      expect(document.body.style.userSelect).toBe("")
+    })
+
+    it("cancels (without persisting) an active drag on window resize", () => {
+      runWidget({ "data-widget-key": "widget-secret" })
+
+      firePointerEvent(handle(), "pointerdown", { pointerId: 18, clientX: 300 })
+      firePointerEvent(handle(), "pointermove", { pointerId: 18, clientX: 250 }) // mid-drag, unconfirmed
+      expect(document.body.style.userSelect).toBe("none")
+
+      // A viewport change invalidates this drag's frozen startX/startWidth --
+      // rather than let the next pointermove misread it as a shrink, the
+      // drag is cancelled outright.
+      window.dispatchEvent(new Event("resize"))
+
+      expect(document.body.style.userSelect).toBe("")
+      expect(widgetIframe().style.pointerEvents).toBe("")
+      expect(localStorage.getItem("xagent_widget_width")).toBeNull()
+
+      firePointerEvent(handle(), "pointermove", { pointerId: 18, clientX: 100 })
+      expect(panel().style.width).toBe("430px") // unchanged from the last real move (380 + 50): the drag is over
+    })
+
+    it("keeps a wider preference across a drag that shrinks past the ceiling and returns to it", () => {
+      localStorage.setItem("xagent_widget_width", "700")
+      setInnerWidth(600) // viewportMax = 560
+      runWidget({ "data-widget-key": "widget-secret" })
+      expect(panel().style.width).toBe("560px")
+
+      firePointerEvent(handle(), "pointerdown", { pointerId: 19, clientX: 300 })
+      // Genuinely shrink past the ceiling first...
+      firePointerEvent(handle(), "pointermove", { pointerId: 19, clientX: 350 })
+      expect(panel().style.width).toBe("510px")
+      // ...then drag back up to exactly the ceiling value. Since this drag
+      // already demonstrated a real shrink, this is now a deliberate choice
+      // of 560, not an unmoved starting position -- it must NOT snap back to
+      // the untouched 700px preference.
+      firePointerEvent(handle(), "pointermove", { pointerId: 19, clientX: 300 })
+      expect(panel().style.width).toBe("560px")
+      firePointerEvent(handle(), "pointerup", { pointerId: 19, clientX: 300 })
+
+      expect(localStorage.getItem("xagent_widget_width")).toBe("560")
     })
 
     it("does not restore userSelect if the host page changed it since drag start", () => {
@@ -449,6 +516,26 @@ describe("widget bootstrap", () => {
       expect(localStorage.getItem("xagent_widget_width")).toBeNull()
     })
 
+    it("never starts a new drag if the same panel node is later re-inserted into the DOM", async () => {
+      runWidget({ "data-widget-key": "widget-secret" })
+      const container = document.querySelector(".xagent-widget-container")!
+      const detachedHandle = handle()
+
+      container.remove()
+      await Promise.resolve() // teardown observer fires and disconnects
+
+      // Re-inserting the SAME node (e.g. a host SPA's portal/keep-alive
+      // remounting it) flips isConnected back to true without re-arming the
+      // (already-disconnected) observer or any removed listener.
+      document.body.appendChild(container)
+      expect(container.isConnected).toBe(true)
+
+      document.body.style.userSelect = "text"
+      firePointerEvent(detachedHandle, "pointerdown", { pointerId: 20, clientX: 300 })
+      // The torndown flag blocks this permanently, regardless of isConnected.
+      expect(document.body.style.userSelect).toBe("text")
+    })
+
     it("stops reacting to window/document listeners once the panel leaves the DOM", async () => {
       const winRemoveSpy = vi.spyOn(window, "removeEventListener")
       const docRemoveSpy = vi.spyOn(document, "removeEventListener")
@@ -465,17 +552,17 @@ describe("widget bootstrap", () => {
       expect(docRemoveSpy).toHaveBeenCalledWith("pointercancel", expect.any(Function))
 
       // Functional proof, not just a spy check that could pass even if the
-      // handler removed were the wrong one: pointerdown is bound directly to
-      // the handle element itself (not torn down, since it isn't a GC-root
-      // concern), so a fresh drag still starts even though the panel is
-      // detached -- but with the blur listener actually gone, nothing
-      // restores userSelect afterward.
+      // handler removed were the wrong one: the torndown flag permanently
+      // blocks pointerdown on this instance's handle -- covering a host SPA
+      // re-inserting this same panel node later, which flips
+      // panel.isConnected back to true without re-arming anything -- so a
+      // fresh drag never starts and userSelect is never touched at all.
       document.body.style.userSelect = "text"
       firePointerEvent(detachedHandle, "pointerdown", { pointerId: 16, clientX: 300 })
-      expect(document.body.style.userSelect).toBe("none")
+      expect(document.body.style.userSelect).toBe("text")
 
       window.dispatchEvent(new Event("blur"))
-      expect(document.body.style.userSelect).toBe("none")
+      expect(document.body.style.userSelect).toBe("text")
     })
   })
 })

@@ -212,6 +212,24 @@ describe("OnboardingPage", () => {
     expect(routerPush).toHaveBeenCalledWith("/task")
   })
 
+  // Flagged by PR review (xorbitsai/xagent#1617): persistAndLeave awaited the
+  // save but never checked its result - a failed PATCH still navigated away,
+  // and AuthGuard would immediately bounce the user back since onboarded
+  // never actually got persisted server-side.
+  it("does not navigate and shows an error toast when the Skip setup save fails", async () => {
+    updateUserPreferencesMock.mockResolvedValue({ ok: false })
+
+    render(<OnboardingPage />)
+    await waitFor(() => expect(screen.getByText(/Welcome to Xagent/)).toBeInTheDocument())
+
+    await act(async () => {
+      fireEvent.click(screen.getByText("Skip setup"))
+    })
+
+    expect(toastErrorMock).toHaveBeenCalledWith("Couldn't save your setup — please try again.")
+    expect(routerPush).not.toHaveBeenCalled()
+  })
+
   it("hires the selected agent and navigates to /task/{taskId} on launch", async () => {
     await goToWelcomeThenBusiness()
     fireEvent.click(screen.getByText("Marketing"))
@@ -301,6 +319,28 @@ describe("OnboardingPage", () => {
     expect(screen.queryByText("Maya")).not.toBeInTheDocument()
     expect(screen.getByText("Ellie")).toBeInTheDocument()
     expect(screen.getByText("Continue").closest("button")).not.toBeDisabled()
+  })
+
+  // Flagged by PR review (xorbitsai/xagent#1617): the templates fetch used to
+  // set templatesLoading:false in a finally block regardless of outcome,
+  // contradicting its own comment that failure should stay in a loading
+  // state rather than show a broken, empty card grid. Also pins that
+  // Continue can't go live off of a still-loading, unconfirmed pick.
+  it("stays on the loading spinner (Continue disabled) when the templates fetch fails, instead of showing an empty grid", async () => {
+    apiRequestMock.mockRejectedValue(new Error("network down"))
+
+    await goToWelcomeThenBusiness()
+    fireEvent.click(screen.getByText("Marketing"))
+    fireEvent.click(screen.getByText("Continue"))
+
+    await waitFor(() => expect(screen.getByText(/take off your plate/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Post on social media"))
+    fireEvent.click(screen.getByText("Continue"))
+
+    await waitFor(() => expect(screen.getByText(/Meet your AI team/)).toBeInTheDocument())
+    expect(document.querySelector(".animate-spin, [class*='spin']")).toBeTruthy()
+    expect(screen.queryByText("Maya")).not.toBeInTheDocument()
+    expect(screen.getByText("Continue").closest("button")).toBeDisabled()
   })
 
   it("the goals step's 'not sure yet' link persists onboarded:true (without goals/voice) and exits to /templates", async () => {

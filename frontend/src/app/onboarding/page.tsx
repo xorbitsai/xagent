@@ -125,12 +125,15 @@ export default function OnboardingPage() {
         const response = await apiRequest(`${getApiUrl()}/api/templates/?lang=${locale}`);
         if (cancelled || !response.ok) return;
         const data = await response.json();
-        if (!cancelled && Array.isArray(data)) setTemplates(data);
+        if (!cancelled && Array.isArray(data)) {
+          setTemplates(data);
+          setTemplatesLoading(false);
+        }
       } catch {
-        // The team step falls back to a loading state indefinitely rather
-        // than a broken card list - see templatesLoading below.
-      } finally {
-        if (!cancelled) setTemplatesLoading(false);
+        // Deliberately leave templatesLoading true on failure - the team
+        // step falls back to a loading state indefinitely rather than a
+        // broken, un-populated card list with no way to tell it apart from
+        // "there really are no recommendations" (see templatesLoading below).
       }
     })();
     return () => {
@@ -172,7 +175,11 @@ export default function OnboardingPage() {
 
   const isBusinessValid = work !== "" && (work !== "other" || industry.trim() !== "");
   const isGoalsValid = goals.length > 0;
-  const isTeamValid = agentTemplateId !== "";
+  // Also gated on !templatesLoading: agentTemplateId can get set from the
+  // static catalog (validRecommended falls back to the unfiltered list
+  // while loading) before templates actually resolve, and Continue must
+  // not go live off of a pick nothing has confirmed exists yet.
+  const isTeamValid = agentTemplateId !== "" && !templatesLoading;
 
   const goTo = (index: number) => {
     const clamped = Math.max(0, Math.min(STEP_ORDER.length - 1, index));
@@ -191,13 +198,19 @@ export default function OnboardingPage() {
     // a GET as soon as `destination` mounts, and that GET winning the race
     // against this PATCH would read the old onboarded:false and bounce the
     // user straight back into onboarding right after they left it.
-    await updateUserPreferences({
+    const saved = await updateUserPreferences({
       onboarded: true,
       ...(work ? { department: work } : {}),
       ...(work === "other" && industry.trim() ? { industry: industry.trim() } : {}),
       ...(includeAll && goals.length ? { goals } : {}),
       ...(includeAll ? { voice } : {}),
     });
+    // Don't navigate on a failed save either: onboarded would stay false
+    // server-side, and AuthGuard would just bounce the user right back here.
+    if (!saved.ok) {
+      toast.error(t("onboarding.done.saveFailed"));
+      return;
+    }
     router.push(destination);
   };
 

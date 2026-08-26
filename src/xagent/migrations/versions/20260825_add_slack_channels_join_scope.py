@@ -160,11 +160,15 @@ def _merge_slack_provider_default_scopes(
     endpoint) like any other, and gets the same delta-merge treatment as
     a non-empty customization.
 
-    A default_scopes value that is a string Slack/JSON can't parse is left
-    untouched (logged, not overwritten) rather than coerced to an empty
-    list and then clobbered by a merge or a full write — either would
-    silently discard whatever was actually stored, taking away the
-    operator's ability to inspect what went wrong.
+    A default_scopes value that isn't usable as a scope list -- a string
+    that fails to parse as JSON, or JSON that parses to something other
+    than a list (an object, a bare number/bool) -- is left untouched
+    (logged, not overwritten) rather than coerced to an empty list and
+    then clobbered by a merge or a full write. Either would silently
+    discard whatever was actually stored, taking away the operator's
+    ability to inspect what went wrong; this is the same failure mode a
+    prior version of this function only guarded for the "unparsable
+    string" shape, missing the "parses fine but isn't a list" one.
 
     Locks the row for the rest of this migration's transaction on
     PostgreSQL (SELECT ... FOR UPDATE) so a customization committed via
@@ -210,7 +214,21 @@ def _merge_slack_provider_default_scopes(
                     current,
                 )
                 return
-        current_list = list(current) if isinstance(current, list) else []
+        if not isinstance(current, list):
+            # Not a scope list at all (e.g. a JSON object or a bare
+            # number/bool) -- coercing this to [] and merging would
+            # overwrite it with just this migration's own delta, the same
+            # data-loss failure mode as the malformed-JSON case just above,
+            # only for a value that *did* parse successfully.
+            logger.warning(
+                "oauth_providers.default_scopes for provider %r is not a "
+                "scope list (%r) -- leaving it untouched rather than "
+                "treating it as empty and overwriting it.",
+                PROVIDER_NAME,
+                current,
+            )
+            return
+        current_list = current
         remove = set(remove_scopes)
         new_scopes = [scope for scope in current_list if scope not in remove]
         for scope in add_scopes:

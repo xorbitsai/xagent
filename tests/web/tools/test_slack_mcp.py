@@ -1156,6 +1156,11 @@ def test_get_channel_info_returns_topic_and_metadata(monkeypatch):
 
 
 def test_get_channel_info_reports_error_payload(monkeypatch):
+    """channel_not_found for conversations.info genuinely means a bad/
+    deleted channel id (unlike conversations.replies/reactions.*, which
+    overload it for membership too) — Slack documents no_permission, not
+    channel_not_found, for the non-member case (see the test below), so
+    this must stay a plain, non-actionable error."""
     monkeypatch.setattr(
         slack.requests,
         "request",
@@ -1166,6 +1171,24 @@ def test_get_channel_info_reports_error_payload(monkeypatch):
 
     assert result["status"] == "error"
     assert "channel_not_found" in result["message"]
+    assert "slack_join_channel" not in result["message"]
+
+
+def test_get_channel_info_reports_actionable_error_when_not_a_member(monkeypatch):
+    """conversations.info documents no_permission (not channel_not_found)
+    for a caller that isn't a member of a private channel — this must get
+    the same actionable message every other membership-gated tool in this
+    file gives, not a bare Slack error code."""
+    monkeypatch.setattr(
+        slack.requests,
+        "request",
+        Mock(return_value=MockResponse({"ok": False, "error": "no_permission"})),
+    )
+
+    result = json.loads(slack.slack_get_channel_info("C0123456789"))
+
+    assert result["status"] == "error"
+    assert "slack_join_channel" in result["message"]
 
 
 # ---------------------------------------------------------------------------
@@ -1808,6 +1831,55 @@ def test_search_messages_thread_channel_not_found_is_not_actionable_once_members
     assert "channel_not_found" in result["error"]
     # 1 history call + both thread attempts — the loop must not stop after
     # the first thread's channel_not_found, since it isn't actionable here.
+    assert mock_request.call_count == 3
+
+
+def test_search_messages_thread_no_permission_is_not_actionable_once_membership_proven(
+    monkeypatch,
+):
+    """no_permission is overloaded by Slack the same way channel_not_found
+    is (see the module comment on _AMBIGUOUS_NOT_A_MEMBER_CODES) — once the
+    conversations.history call just above already proved membership on
+    this same channel_id, a later no_permission on conversations.replies
+    can no longer mean "not a member" either, and must get the same
+    non-actionable, scan-continues treatment as channel_not_found does in
+    the sibling test above."""
+    mock_request = Mock(
+        side_effect=[
+            MockResponse(
+                {
+                    "ok": True,
+                    "messages": [
+                        {
+                            "ts": "1.1",
+                            "user": "U1",
+                            "text": "kickoff",
+                            "thread_ts": "1.1",
+                            "reply_count": 1,
+                        },
+                        {
+                            "ts": "1.2",
+                            "user": "U1",
+                            "text": "the deploy failed",
+                            "thread_ts": "1.2",
+                            "reply_count": 1,
+                        },
+                    ],
+                }
+            ),
+            MockResponse({"ok": False, "error": "no_permission"}),
+            MockResponse({"ok": True, "messages": [{"ts": "1.2", "user": "U1"}]}),
+        ]
+    )
+    monkeypatch.setattr(slack.requests, "request", mock_request)
+
+    result = json.loads(slack.slack_search_messages("C0123456789", "deploy"))
+
+    assert result["status"] == "success"
+    assert "slack_join_channel" not in result.get("error", "")
+    assert "no_permission" in result["error"]
+    # 1 history call + both thread attempts — the loop must not stop after
+    # the first thread's no_permission, since it isn't actionable here.
     assert mock_request.call_count == 3
 
 

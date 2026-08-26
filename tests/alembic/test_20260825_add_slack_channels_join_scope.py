@@ -437,9 +437,12 @@ def test_upgrade_merges_into_a_row_with_null_default_scopes(tmp_path):
         )
         with patch.object(migration, "op", _operations(connection)):
             migration.upgrade()
-        assert set(_provider_default_scopes(connection, "slack")) == set(
-            migration.CURRENT_SCOPES
-        )
+        # Exact list, not just set equality: this branch does
+        # `list(full_scopes_if_null)`, a verbatim order-preserving copy, so
+        # an exact comparison is strictly stronger and just as easy to
+        # write — it also catches an accidental reorder/dedup that a set
+        # comparison would silently let through.
+        assert _provider_default_scopes(connection, "slack") == migration.CURRENT_SCOPES
 
 
 def test_downgrade_merges_into_a_row_with_null_default_scopes(tmp_path):
@@ -469,8 +472,9 @@ def test_downgrade_merges_into_a_row_with_null_default_scopes(tmp_path):
         )
         with patch.object(migration, "op", _operations(connection)):
             migration.downgrade()
-        assert set(_provider_default_scopes(connection, "slack")) == set(
-            migration.PREVIOUS_SCOPES
+        # Exact list -- see the upgrade counterpart's comment above.
+        assert (
+            _provider_default_scopes(connection, "slack") == migration.PREVIOUS_SCOPES
         )
 
 
@@ -518,6 +522,47 @@ def test_upgrade_preserves_unparsable_default_scopes_without_overwriting(tmp_pat
             )
         ).scalar()
         assert json.loads(raw) == "not-a-scope-list"
+
+
+def test_upgrade_preserves_default_scopes_that_decode_to_a_non_list_value(tmp_path):
+    """default_scopes can hold JSON that parses successfully but isn't a
+    list at all (a JSON object here) -- the malformed-JSON-string branch
+    above only guards the "fails to parse" case; a value that parses fine
+    but isn't a list must get the same warn-and-skip treatment, not
+    silently fall through to being treated as an empty list and then
+    overwritten with just ["channels:join"], discarding whatever was
+    actually stored."""
+    engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
+    migration = _load_migration_module()
+    with engine.begin() as connection:
+        _create_table(connection, migration.PREVIOUS_SCOPES)
+        connection.execute(
+            text(
+                """
+                CREATE TABLE oauth_providers (
+                    id INTEGER PRIMARY KEY,
+                    provider_name VARCHAR(50) NOT NULL UNIQUE,
+                    default_scopes JSON
+                )
+                """
+            )
+        )
+        connection.execute(
+            text(
+                "INSERT INTO oauth_providers (provider_name, default_scopes) "
+                "VALUES ('slack', :scopes)"
+            ),
+            {"scopes": json.dumps({"unexpectedly": "an object"})},
+        )
+        with patch.object(migration, "op", _operations(connection)):
+            migration.upgrade()  # must not raise
+        raw = connection.execute(
+            text(
+                "SELECT default_scopes FROM oauth_providers "
+                "WHERE provider_name = 'slack'"
+            )
+        ).scalar()
+        assert json.loads(raw) == {"unexpectedly": "an object"}
 
 
 def test_upgrade_merges_into_a_customization_committed_before_this_migration_runs(
@@ -614,3 +659,49 @@ def test_previous_fields_match_prior_migrations_current_fields():
     migration = _load_migration_module()
     assert migration.PREVIOUS_SCOPES == prior_migration.CURRENT_SCOPES
     assert migration.PREVIOUS_DESCRIPTION == prior_migration.CURRENT_DESCRIPTION
+
+
+def test_upgrade_after_actually_running_20260812_upgrade(tmp_path):
+    """Every other test in this file constructs 20260825's starting fixture
+    directly (e.g. _create_oauth_providers_table(connection,
+    migration.PREVIOUS_SCOPES)) rather than by running
+    20260812_add_slack_history_reactions_files_scopes's real upgrade()
+    first -- so a regression in what 20260812 actually leaves in the row
+    (as opposed to what its constants claim) would pass every other test
+    here. This runs the real two-migration sequence a fresh, or
+    partially-migrated, database goes through."""
+    prior_migration_file = (
+        Path(__file__).parent.parent.parent
+        / "src/xagent/migrations/versions/20260812_add_slack_history_reactions_files_scopes.py"
+    )
+    spec = importlib.util.spec_from_file_location(
+        "add_slack_history_reactions_files_scopes_migration", prior_migration_file
+    )
+    prior_migration = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(prior_migration)
+
+    migration = _load_migration_module()
+    engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
+    with engine.begin() as connection:
+        _create_table(
+            connection,
+            prior_migration.PREVIOUS_SCOPES,
+            prior_migration.PREVIOUS_DESCRIPTION,
+        )
+        _create_oauth_providers_table(connection, prior_migration.PREVIOUS_SCOPES)
+        with patch.object(prior_migration, "op", _operations(connection)):
+            prior_migration.upgrade()
+        with patch.object(migration, "op", _operations(connection)):
+            migration.upgrade()
+
+        # oauth_scopes always gets overwritten unconditionally with the
+        # literal CURRENT_SCOPES list (see _set_slack_scopes's docstring),
+        # so this is exact-list-safe.
+        assert _scopes(connection) == migration.CURRENT_SCOPES
+        # Set, not list, equality for default_scopes: the delta-merge
+        # appends channels:join at the end rather than reproducing
+        # CURRENT_SCOPES's exact (inserted-in-the-middle) order.
+        assert set(_provider_default_scopes(connection, "slack")) == set(
+            migration.CURRENT_SCOPES
+        )

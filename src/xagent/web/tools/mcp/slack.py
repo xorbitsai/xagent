@@ -306,7 +306,20 @@ def _request(
 _PATHS_HIDING_CHANNEL_FROM_NON_MEMBERS = frozenset(
     {"conversations.replies", "reactions.add", "reactions.remove"}
 )
-_DEFAULT_NOT_A_MEMBER_CODES = frozenset({"not_in_channel", "no_permission"})
+# not_in_channel is unambiguous per Slack's own docs: if Slack returns it,
+# the bot genuinely isn't a member, full stop — proven membership earlier
+# in the same call doesn't change that (the bot could always have been
+# removed mid-call), so this is never excluded by membership_already_proven
+# below.
+_UNAMBIGUOUS_NOT_A_MEMBER_CODES = frozenset({"not_in_channel"})
+# channel_not_found and no_permission are BOTH overloaded by Slack for
+# reasons unrelated to channel membership too (see the module comment
+# below) — once membership is independently proven, neither can still mean
+# "not a member", so membership_already_proven excludes both, not just one.
+_AMBIGUOUS_NOT_A_MEMBER_CODES = frozenset({"channel_not_found", "no_permission"})
+_DEFAULT_NOT_A_MEMBER_CODES = _UNAMBIGUOUS_NOT_A_MEMBER_CODES | frozenset(
+    {"no_permission"}
+)
 _HIDDEN_FROM_NON_MEMBER_CODES = _DEFAULT_NOT_A_MEMBER_CODES | frozenset(
     {"channel_not_found"}
 )
@@ -318,7 +331,7 @@ def _request_requiring_membership(
     *,
     params: dict[str, Any] | None = None,
     json_data: dict[str, Any] | None = None,
-    channel_not_found_means_not_a_member: bool = True,
+    membership_already_proven: bool = False,
 ) -> dict[str, Any]:
     """Call a Slack endpoint that requires the bot to already be a channel
     member, and raise an actionable error if it isn't yet.
@@ -335,17 +348,20 @@ def _request_requiring_membership(
     _PATHS_HIDING_CHANNEL_FROM_NON_MEMBERS above, rather than taken as a
     parameter — see that constant's comment for why.
 
-    channel_not_found_means_not_a_member defaults to True (the ambiguous
-    hedge described on _PATHS_HIDING_CHANNEL_FROM_NON_MEMBERS above), but a
-    caller that already proved membership on this same channel earlier in
-    the same call — e.g. slack_search_messages, which only reaches its
-    conversations.replies call after conversations.history already
-    succeeded for the same channel_id — must pass False: a later
-    channel_not_found there cannot mean "not a member" (that was just
-    disproven), so treating it as such would abort the scan with impossible
-    advice ("ask the user to add a bot that's already in the channel")
-    instead of the real cause (the thread was deleted, or the channel was
-    archived mid-scan).
+    membership_already_proven defaults to False (the ambiguous hedge
+    described on _PATHS_HIDING_CHANNEL_FROM_NON_MEMBERS above applies as
+    normal), but a caller that already confirmed membership on this same
+    channel earlier in the same call — e.g. slack_search_messages, which
+    only reaches its conversations.replies call after conversations.history
+    already succeeded for the same channel_id — must pass True: a later
+    channel_not_found or no_permission there cannot mean "not a member"
+    (that was just disproven for both, since Slack overloads both codes the
+    same way — see _AMBIGUOUS_NOT_A_MEMBER_CODES above), so treating either
+    as such would abort the scan with impossible advice ("ask the user to
+    add a bot that's already in the channel") instead of the real cause
+    (e.g. the thread was deleted, or the channel was archived mid-scan, or
+    some other workspace-level permission restriction). not_in_channel is
+    never excluded this way, since it's unambiguous regardless.
 
     This deliberately does NOT join the channel on the caller's behalf:
     joining changes the channel's member list, which is visible to everyone
@@ -358,8 +374,8 @@ def _request_requiring_membership(
         if path in _PATHS_HIDING_CHANNEL_FROM_NON_MEMBERS
         else _DEFAULT_NOT_A_MEMBER_CODES
     )
-    if not channel_not_found_means_not_a_member:
-        not_a_member_codes = not_a_member_codes - {"channel_not_found"}
+    if membership_already_proven:
+        not_a_member_codes = not_a_member_codes - _AMBIGUOUS_NOT_A_MEMBER_CODES
     try:
         return _request(method, path, params=params, json_data=json_data)
     except _SlackAPIError as e:
@@ -677,10 +693,22 @@ def slack_get_channel_info(channel: str) -> str:
     """
     Get metadata for a channel, private channel, or DM — including its
     topic, purpose, member count, and archived/private flags.
+    If the bot isn't a member of the channel yet, you'll get an actionable
+    error instead of an empty/opaque failure: check with the user before
+    calling slack_join_channel to add the bot (only works for a public
+    channel), or ask a member to `/invite` the bot for a private channel or
+    DM.
     """
     try:
         channel_id = _resolve_channel_id(channel)
-        result = _request("GET", "conversations.info", params={"channel": channel_id})
+        # conversations.info documents no_permission (not channel_not_found)
+        # for a non-member caller — channel_not_found there genuinely means
+        # a bad/deleted id, so this doesn't need
+        # _PATHS_HIDING_CHANNEL_FROM_NON_MEMBERS's widening, just the
+        # default not-a-member codes.
+        result = _request_requiring_membership(
+            "GET", "conversations.info", params={"channel": channel_id}
+        )
         info = result.get("channel") or {}
         return _success(
             id=info.get("id"),
@@ -900,9 +928,8 @@ def slack_search_messages(
                         params={"channel": channel_id, "ts": thread_ts, "limit": 200},
                         # The conversations.history call above already
                         # succeeded for this same channel_id, which proves
-                        # membership — a channel_not_found here can't mean
-                        # "not a member" (see the parameter's docstring).
-                        channel_not_found_means_not_a_member=False,
+                        # membership — see the parameter's docstring.
+                        membership_already_proven=True,
                     )
                 except Exception as thread_exc:
                     logger.warning(

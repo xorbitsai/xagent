@@ -35,11 +35,28 @@ OLD_SCOPES = ("https://www.googleapis.com/auth/calendar",)
 NEW_SCOPES = ("https://www.googleapis.com/auth/calendar.events",)
 
 
+def _columns_present(
+    bind: sa.engine.Connection, table_name: str, required_columns: set[str]
+) -> bool:
+    """Whether ``table_name`` exists and has all of ``required_columns``.
+
+    Shared by upgrade() and downgrade(): this migration must be a no-op (not
+    an error) against a database mid-way through a schema this old, or an
+    admin's reduced-schema table, rather than assume a table shape that
+    matches only the current model.
+    """
+    inspector = sa.inspect(bind)
+    if table_name not in set(inspector.get_table_names()):
+        return False
+    columns = {column["name"] for column in inspector.get_columns(table_name)}
+    return required_columns.issubset(columns)
+
+
 def _offline_scopes_literal(scopes: Sequence[str], dialect_name: str):
     # Match the online sa.JSON binding contract (none_as_null=False) used
     # elsewhere in this migration set: values are stored as JSON, not as a
     # bare SQL string literal, on every supported dialect.
-    serialized_literal = op.inline_literal(json.dumps(scopes, sort_keys=True))
+    serialized_literal = op.inline_literal(json.dumps(scopes))
     if dialect_name == "postgresql":
         return sa.cast(serialized_literal, sa.JSON())
     return serialized_literal
@@ -61,12 +78,7 @@ def upgrade() -> None:
         return
 
     bind = op.get_bind()
-    inspector = sa.inspect(bind)
-    if "public_mcp_apps" not in inspector.get_table_names():
-        return
-
-    columns = {column["name"] for column in inspector.get_columns("public_mcp_apps")}
-    if not {"app_id", "oauth_scopes"}.issubset(columns):
+    if not _columns_present(bind, "public_mcp_apps", {"app_id", "oauth_scopes"}):
         return
 
     bind.execute(
@@ -92,12 +104,7 @@ def downgrade() -> None:
         return
 
     bind = op.get_bind()
-    inspector = sa.inspect(bind)
-    if "public_mcp_apps" not in inspector.get_table_names():
-        return
-
-    columns = {column["name"] for column in inspector.get_columns("public_mcp_apps")}
-    if not {"app_id", "oauth_scopes"}.issubset(columns):
+    if not _columns_present(bind, "public_mcp_apps", {"app_id", "oauth_scopes"}):
         return
 
     bind.execute(

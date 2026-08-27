@@ -233,7 +233,12 @@ def test_offline_postgresql_downgrade_emits_literal_update_only_sql() -> None:
     assert sql.count("UPDATE public_mcp_apps SET") == 1
     assert "oauth_scopes=" in sql
     assert "public_mcp_apps.app_id = 'google-calendar'" in sql
+    # "auth/calendar" alone is a substring of both OLD_SCOPES and NEW_SCOPES
+    # ("auth/calendar.events"), so it can't distinguish which one was
+    # emitted; assert the narrower scope is absent to catch a swapped
+    # OLD_SCOPES/NEW_SCOPES argument in _downgrade_offline().
     assert "auth/calendar" in sql
+    assert "calendar.events" not in sql
     assert "INSERT INTO public_mcp_apps" not in sql
     assert "DELETE FROM public_mcp_apps" not in sql
     assert "%(" not in sql

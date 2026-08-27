@@ -889,7 +889,6 @@ async def test_auto_pattern_clears_stale_output_language_before_routing() -> Non
 async def test_auto_pattern_streams_direct_final_answer_as_tool_args_arrive() -> None:
     prefix = (
         '{"action":"final_answer","reason":"simple",'
-        '"response_language":"English",'
         '"requires_current_or_external_facts":false,'
         '"existing_context_sufficient":true,'
         '"evidence_basis":"current conversation",'
@@ -1364,11 +1363,8 @@ async def test_auto_pattern_plan_execute_decision_delegates_to_dag() -> None:
         "evidence_basis": "current conversation",
         "missing_verification": "",
     }
-    assert context.metadata[OUTPUT_LANGUAGE_METADATA_KEY] == "English"
-    assert (
-        context.metadata[OUTPUT_LANGUAGE_SOURCE_METADATA_KEY]
-        == OUTPUT_LANGUAGE_SOURCE_PLAN
-    )
+    assert OUTPUT_LANGUAGE_METADATA_KEY not in context.metadata
+    assert OUTPUT_LANGUAGE_SOURCE_METADATA_KEY not in context.metadata
     assert pattern.selected_pattern == "plan_execute"
     assert pattern.dag_state is not None
     assert runtime.last_checkpoint is not None
@@ -2252,3 +2248,40 @@ async def test_stale_memory_language_does_not_reach_child_as_hard_policy() -> No
     assert "Output language policy:" not in child_system
     assert "Summarize the quarterly revenue trend in one paragraph." in child_system
     assert response_language_rules() in child_system
+
+
+@pytest.mark.asyncio
+async def test_direct_final_answer_allows_an_explicit_target_language() -> None:
+    request = "Reply in French: what is the capital of Italy?"
+    llm = FakeLLM(
+        [
+            decision_tool_response(
+                "final_answer",
+                "Simple factual reply.",
+                answer="La capitale de l'Italie est Rome.",
+            )
+        ]
+    )
+    pattern = AutoPattern()
+    context = ExecutionContext(execution_id="auto-explicit-target-language")
+    context.add_user_message(request)
+
+    result = await pattern.run(
+        context=context, tools=[], llm=llm, runtime=PatternRuntime()
+    )
+
+    assert result["success"] is True
+    assert result["output"] == "La capitale de l'Italie est Rome."
+    assert OUTPUT_LANGUAGE_METADATA_KEY not in context.metadata
+    target_rule = (
+        "If the current user request explicitly asks to translate, rewrite, or "
+        "answer in another language, use that requested target language."
+    )
+    tool_schema = llm.calls[0]["tools"][0]["function"]
+    assert target_rule in tool_schema["description"]
+    assert (
+        target_rule in tool_schema["parameters"]["properties"]["answer"]["description"]
+    )
+    system_content = context.get_messages_for_llm()[0]["content"]
+    assert request in system_content
+    assert target_rule in system_content

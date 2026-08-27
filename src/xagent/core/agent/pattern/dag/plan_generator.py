@@ -405,13 +405,9 @@ class LLMPlanGenerator(PlanGenerator):
                     exc,
                 )
                 continue
-            expected_language, language_source = self._language_authority(
-                request.context
-            )
-            has_external_authority = bool(expected_language) and (
-                language_source != OUTPUT_LANGUAGE_SOURCE_PLAN
-            )
-            if attempt + 1 < MAX_PLAN_TOOL_CALL_ATTEMPTS and not has_external_authority:
+            if attempt + 1 < MAX_PLAN_TOOL_CALL_ATTEMPTS and not (
+                self._has_external_language_authority(request.context)
+            ):
                 reminder = self._request_language_reminder(request.context, plan)
                 if reminder is not None:
                     retry_feedback = reminder
@@ -421,7 +417,6 @@ class LLMPlanGenerator(PlanGenerator):
                         request.execution_id,
                     )
                     continue
-            self._apply_response_language(request.context, plan_arguments)
             return self._filter_suggested_tools(
                 plan=plan,
                 available_tool_names=request.available_tool_names,
@@ -617,6 +612,29 @@ class LLMPlanGenerator(PlanGenerator):
         return language, source
 
     @staticmethod
+    def _has_external_language_authority(context: Any) -> bool:
+        """Whether the output language came from outside the agent.
+
+        An API caller's request_context is the only writer that leaves this key
+        without a source label.
+        """
+        language, source = LLMPlanGenerator._language_authority(context)
+        return bool(language) and not source
+
+    @staticmethod
+    def _step_prose(step: PlanStep) -> str:
+        return "\n".join(
+            value
+            for value in (
+                step.task,
+                step.description or "",
+                step.termination_condition or "",
+                step.completion_evidence or "",
+            )
+            if value
+        )
+
+    @staticmethod
     def _validate_plan_language(
         *,
         context: Any,
@@ -647,18 +665,8 @@ class LLMPlanGenerator(PlanGenerator):
             )
 
         for step in plan.steps:
-            prose = "\n".join(
-                value
-                for value in (
-                    step.task,
-                    step.description or "",
-                    step.termination_condition or "",
-                    step.completion_evidence or "",
-                )
-                if value
-            )
             mismatch = detect_response_language_script_mismatch(
-                response_language, prose
+                response_language, LLMPlanGenerator._step_prose(step)
             )
             if mismatch is not None:
                 raise PlanLanguageMismatchError(
@@ -678,17 +686,9 @@ class LLMPlanGenerator(PlanGenerator):
         """
         request = latest_user_text(context) or ""
         for step in plan.steps:
-            prose = "\n".join(
-                value
-                for value in (
-                    step.task,
-                    step.description or "",
-                    step.termination_condition or "",
-                    step.completion_evidence or "",
-                )
-                if value
+            mismatch = detect_prose_script_mismatch(
+                request, LLMPlanGenerator._step_prose(step)
             )
-            mismatch = detect_prose_script_mismatch(request, prose)
             if mismatch is None:
                 continue
             return (
@@ -702,24 +702,6 @@ class LLMPlanGenerator(PlanGenerator):
                 "and return the same plan language."
             )
         return None
-
-    @staticmethod
-    def _apply_response_language(context: Any, plan_arguments: dict[str, Any]) -> None:
-        response_language = normalize_response_language_label(
-            str(plan_arguments.get("response_language") or "")
-        )
-        if not response_language:
-            return
-        metadata = getattr(context, "metadata", None)
-        if not isinstance(metadata, dict):
-            return
-        _, language_source = LLMPlanGenerator._language_authority(context)
-        if (
-            not metadata.get(OUTPUT_LANGUAGE_METADATA_KEY)
-            or language_source == OUTPUT_LANGUAGE_SOURCE_PLAN
-        ):
-            metadata[OUTPUT_LANGUAGE_METADATA_KEY] = response_language
-            metadata[OUTPUT_LANGUAGE_SOURCE_METADATA_KEY] = OUTPUT_LANGUAGE_SOURCE_PLAN
 
     def _required_tool_call_retry_feedback(self, tool_name: str) -> str:
         return (

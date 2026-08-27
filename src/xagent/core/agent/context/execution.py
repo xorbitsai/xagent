@@ -496,6 +496,10 @@ class ExecutionContext:
                 continue
             if message.metadata.get("response_to_waiting_for_user"):
                 continue
+            # A DAG child context copies the root messages and then appends step
+            # scaffolding; only the root request may anchor the response language.
+            if message.metadata.get("dag_step_id"):
+                continue
             content = str(message.content or "").strip()
             if content:
                 return content
@@ -583,6 +587,14 @@ class ExecutionContext:
                 "provided in the latest DAG step instruction message.\n\n"
                 f"{step_language_rules}"
             )
+            if current_task:
+                parts.append(
+                    "Current user request, quoted for response language only:\n"
+                    f"{current_task}\n\n"
+                    "This request is not the executable goal for this step; use it "
+                    "only to decide the natural language of user-facing prose.\n\n"
+                    f"{response_language_rules()}"
+                )
         memory_context = self.metadata.get(MEMORY_CONTEXT_METADATA_KEY)
         if memory_context:
             parts.append(

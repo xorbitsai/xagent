@@ -7,6 +7,8 @@ from typing import Any, Literal
 OUTPUT_LANGUAGE_METADATA_KEY = "output_language"
 OUTPUT_LANGUAGE_SOURCE_METADATA_KEY = "output_language_source"
 OUTPUT_LANGUAGE_SOURCE_PLAN = "dag_plan"
+# Written by AutoPattern before the answering model owned the response language.
+_LEGACY_OUTPUT_LANGUAGE_SOURCE_ROUTER = "auto_router"
 
 _ALLOWED_RESPONSE_LANGUAGE_LABELS = frozenset(
     {
@@ -318,6 +320,50 @@ def detect_prose_script_mismatch(
     return mismatch
 
 
+def clear_router_owned_output_language(checkpoint_payload: Any) -> None:
+    """Drop agent-chosen output languages from a restored checkpoint payload.
+
+    Every ``metadata`` dict in the payload is visited, so serialized child
+    contexts inside a pattern state are migrated too. A resume skips the router
+    decision that used to clear this key, so a pre-upgrade label would otherwise
+    survive as a hard instruction.
+    """
+    if isinstance(checkpoint_payload, list):
+        for item in checkpoint_payload:
+            clear_router_owned_output_language(item)
+        return
+    if not isinstance(checkpoint_payload, dict):
+        return
+    for key, value in checkpoint_payload.items():
+        if key == "metadata" and isinstance(value, dict):
+            _clear_router_owned_metadata_language(value)
+        clear_router_owned_output_language(value)
+
+
+def _clear_router_owned_metadata_language(metadata: dict[str, Any]) -> None:
+    label = normalize_response_language_label(
+        str(metadata.get(OUTPUT_LANGUAGE_METADATA_KEY) or "")
+    )
+    source = str(metadata.get(OUTPUT_LANGUAGE_SOURCE_METADATA_KEY) or "")
+    # An unlabelled value either predates the source key or came from the API
+    # caller; only request_context can prove the latter, so it is re-read below.
+    router_owned = source == _LEGACY_OUTPUT_LANGUAGE_SOURCE_ROUTER or (
+        bool(label) and not source and metadata.get("pattern") != "dag_plan_execute"
+    )
+    if not router_owned:
+        return
+    metadata.pop(OUTPUT_LANGUAGE_METADATA_KEY, None)
+    metadata.pop(OUTPUT_LANGUAGE_SOURCE_METADATA_KEY, None)
+    request_context = metadata.get("request_context")
+    if not isinstance(request_context, dict):
+        return
+    external = normalize_response_language_label(
+        str(request_context.get(OUTPUT_LANGUAGE_METADATA_KEY) or "")
+    )
+    if external:
+        metadata[OUTPUT_LANGUAGE_METADATA_KEY] = external
+
+
 def output_language_policy(response_language: str | None = None) -> str:
     """Return a compact policy for downstream language preservation."""
     language = normalize_response_language_label(response_language)
@@ -408,9 +454,11 @@ def final_answer_language_rule(*, subject: str = "current user request") -> str:
     return (
         "The final answer must use the same natural language as the "
         f"{subject}, even if tool results, source documents, retrieved memories, "
-        "examples, or earlier turns are written in another language. For Chinese, "
-        "preserve Simplified Chinese versus Traditional Chinese from the request; "
-        "do not collapse them into generic Chinese."
+        "examples, or earlier turns are written in another language. If the "
+        f"{subject} explicitly asks to translate, rewrite, or answer in another "
+        "language, use that requested target language. For Chinese, preserve "
+        "Simplified Chinese versus Traditional Chinese from the request; do not "
+        "collapse them into generic Chinese."
     )
 
 

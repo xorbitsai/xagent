@@ -11,7 +11,7 @@ import { apiRequest } from "@/lib/api-wrapper";
 import { getApiUrl } from "@/lib/utils";
 import { cn } from "@/lib/utils";
 import { getBrandingFromEnv } from "@/lib/branding";
-import { markOnboardingSaveEscaped, updateUserPreferences } from "@/lib/user-preferences";
+import { markOnboardingSaveEscaped, updateUserPreferences, type UserPreferences } from "@/lib/user-preferences";
 import { hireAgentFromTemplate } from "@/lib/hire-agent";
 import { PersonaAvatar } from "@/components/templates/persona-avatar";
 import {
@@ -26,7 +26,7 @@ import {
   type OnboardingVoiceId,
   type OnboardingWorkId,
 } from "@/lib/onboarding-data";
-import type { Template } from "@/types/template";
+import type { Template, TemplateDetail } from "@/types/template";
 import type { TranslationKey } from "@/i18n/translations";
 
 const branding = getBrandingFromEnv();
@@ -179,15 +179,19 @@ export default function OnboardingPage() {
   // naturally [] too - no separate loading branch needed, and isTeamValid
   // (below) doesn't need its own !templatesLoading check as a result.
   const validRecommended = useMemo(() => {
+    // Filter for persona-availability BEFORE capping at 3 (not after) - a
+    // 4th-ranked match with a real persona should fill a slot vacated by a
+    // top-3 match that turns out to have none, not lose out to the cap
+    // being applied on the unfiltered list first.
     const filtered = recommended.filter((r) => templateById.get(r.templateId)?.persona);
-    if (filtered.length > 0) return filtered;
+    if (filtered.length > 0) return filtered.slice(0, 3);
     // Every recommendation for the selected goals failed to load or has no
     // persona (or nothing has loaded yet) - fall back to the same 3 defaults
     // recommendedTemplates() uses when no goals were picked at all, so a
     // template-catalog gap can't leave this step with zero cards to show.
-    return ONBOARDING_FALLBACK_TEMPLATE_IDS.map((templateId) => ({ templateId, goalId: null })).filter(
-      (r) => templateById.get(r.templateId)?.persona
-    );
+    return ONBOARDING_FALLBACK_TEMPLATE_IDS.map((templateId) => ({ templateId, goalId: null }))
+      .filter((r) => templateById.get(r.templateId)?.persona)
+      .slice(0, 3);
   }, [recommended, templateById]);
 
   // Keep the selected agent valid as the recommendation list changes -
@@ -207,6 +211,13 @@ export default function OnboardingPage() {
   const isBusinessValid = work !== "" && (work !== "other" || industry.trim() !== "");
   const isGoalsValid = goals.length > 0;
   const isTeamValid = agentTemplateId !== "";
+  // "professional" is a real, legitimate voice choice, not an empty
+  // placeholder - so unlike goals (empty array = clearly untouched), the
+  // default value alone can't distinguish "user picked this" from "user
+  // never got here." Only include it once the voice step has actually been
+  // reached, so e.g. the header Skip (reachable from any step at any time)
+  // can't persist a policy the user never saw.
+  const hasReachedVoice = stepIndex >= STEP_ORDER.indexOf("voice");
 
   const goTo = (index: number) => {
     const clamped = Math.max(0, Math.min(STEP_ORDER.length - 1, index));
@@ -219,6 +230,17 @@ export default function OnboardingPage() {
   const toggleGoal = (id: string) => {
     setGoals((prev) => (prev.includes(id) ? prev.filter((g) => g !== id) : [...prev, id]));
   };
+
+  // Shared by persistAndLeave and handleLaunch - these used to independently
+  // hand-build the same PATCH payload and had already drifted (goals was
+  // conditional in one, unconditional in the other) before this existed.
+  const buildPreferencesPayload = (): UserPreferences => ({
+    onboarded: true,
+    ...(work ? { department: work } : {}),
+    ...(work === "other" && industry.trim() ? { industry: industry.trim() } : {}),
+    ...(goals.length ? { goals } : {}),
+    ...(hasReachedVoice ? { voice } : {}),
+  });
 
   // Matches the reference UI's finish() exactly: every exit path (header
   // "Skip setup", the goals step's "Not sure yet", the done step's "Take me
@@ -237,13 +259,7 @@ export default function OnboardingPage() {
     // a GET as soon as `destination` mounts, and that GET winning the race
     // against this PATCH would read the old onboarded:false and bounce the
     // user straight back into onboarding right after they left it.
-    const saved = await updateUserPreferences({
-      onboarded: true,
-      ...(work ? { department: work } : {}),
-      ...(work === "other" && industry.trim() ? { industry: industry.trim() } : {}),
-      ...(goals.length ? { goals } : {}),
-      voice,
-    });
+    const saved = await updateUserPreferences(buildPreferencesPayload());
     if (!saved.ok) {
       const failureCount = (saveFailureCountByDestRef.current[destination] ?? 0) + 1;
       saveFailureCountByDestRef.current[destination] = failureCount;
@@ -272,7 +288,10 @@ export default function OnboardingPage() {
     } else {
       saveFailureCountByDestRef.current[destination] = 0;
     }
-    if (isMountedRef.current) router.push(destination);
+    // replace, not push: leaving a /onboarding entry in history means a
+    // single Back press would return the user to a stale, reset-to-step-0
+    // wizard even though they've just finished with it (or escaped it).
+    if (isMountedRef.current) router.replace(destination);
   };
 
   const handleLaunch = async () => {
@@ -282,13 +301,7 @@ export default function OnboardingPage() {
     launchingRef.current = true;
     setLaunching(true);
     try {
-      const saved = await updateUserPreferences({
-        onboarded: true,
-        ...(work ? { department: work } : {}),
-        ...(work === "other" && industry.trim() ? { industry: industry.trim() } : {}),
-        goals,
-        voice,
-      });
+      const saved = await updateUserPreferences(buildPreferencesPayload());
       // Don't proceed to hire on a failed save: onboarded would never be
       // persisted, yet the user would land on the agent's task page believing
       // setup is done - only to be bounced back into onboarding next session.
@@ -302,9 +315,34 @@ export default function OnboardingPage() {
       }
 
       if (selected.hired && selected.hired_agent_id) {
-        if (isMountedRef.current) router.push(`/agent/${selected.hired_agent_id}`);
+        if (isMountedRef.current) router.replace(`/agent/${selected.hired_agent_id}`);
         return;
       }
+
+      // `selected.hired` was fetched once on mount and never revalidated, so
+      // hiring the same template from another tab/session mid-wizard would
+      // still see hired: false here. Mirrors the identical re-check in
+      // templates/[id]/page-client.tsx: hireAgentFromTemplate's resolve step
+      // is idempotent (reuses the agent), but task/create always mints a new
+      // task, so without this a race would seed a second opening message
+      // onto an agent the user already has a real conversation with. Best
+      // effort only: if the recheck itself fails, fall through to hiring
+      // normally rather than blocking the action on it.
+      try {
+        const freshCheck = await apiRequest(
+          `${getApiUrl()}/api/templates/${encodeURIComponent(selected.id)}?lang=${locale}`
+        );
+        if (freshCheck.ok) {
+          const freshTemplate = (await freshCheck.json()) as TemplateDetail;
+          if (freshTemplate.hired && freshTemplate.hired_agent_id) {
+            if (isMountedRef.current) router.replace(`/agent/${freshTemplate.hired_agent_id}`);
+            return;
+          }
+        }
+      } catch {
+        // Fall through - see the best-effort note above.
+      }
+      if (!isMountedRef.current) return;
 
       const result = await hireAgentFromTemplate({
         templateId: selected.id,
@@ -317,7 +355,7 @@ export default function OnboardingPage() {
         connections: selected.connections,
       });
       if (!isMountedRef.current) return;
-      router.push(`/task/${result.taskId}`);
+      router.replace(`/task/${result.taskId}`);
     } catch {
       if (!isMountedRef.current) return;
       toast.error(
@@ -515,12 +553,15 @@ export default function OnboardingPage() {
                               : "onboarding.team.subtitleExtraMany",
                             { count: goals.length - validRecommended.length }
                           )}`
-                        : "."
+                        : t("onboarding.team.subtitleEnd")
                     }`}
               </p>
               {templatesLoading ? (
                 <div style={{ marginTop: 40, display: "flex", justifyContent: "center" }}>
-                  <div className="h-8 w-8 animate-spin rounded-full border-2 border-[#E7E7EC] border-t-[#2536E0]" />
+                  <div
+                    data-testid="onboarding-team-loading"
+                    className="h-8 w-8 animate-spin rounded-full border-2 border-[#E7E7EC] border-t-[#2536E0]"
+                  />
                 </div>
               ) : (
                 <div
@@ -682,7 +723,13 @@ export default function OnboardingPage() {
                         {appNames.length ? (
                           <span>
                             {t("onboarding.done.willConnectPrefix")}{" "}
-                            <b>{joinWithAnd(appNames, t("onboarding.done.willConnectAnd"))}</b>{" "}
+                            <b>
+                              {joinWithAnd(
+                                appNames,
+                                t("onboarding.done.willConnectAnd"),
+                                t("onboarding.done.willConnectSeparator")
+                              )}
+                            </b>{" "}
                             {t("onboarding.done.willConnectSuffix")}
                           </span>
                         ) : (

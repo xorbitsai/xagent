@@ -59,6 +59,13 @@ export async function updateUserPreferences(
 }
 
 const SAVE_ESCAPE_KEY = "xagent-onboarding-save-escape";
+// Must be consumed by the very next onboarding check after being set - see
+// the caller in auth-guard.tsx for why that's now guaranteed structurally,
+// not just by convention. This TTL is defense-in-depth on top of that, not
+// the primary mechanism: a stale/leftover value (a caller that changes in
+// the future and stops consuming it promptly, a corrupted value) expires
+// instead of silently suppressing some unrelated future redirect forever.
+const SAVE_ESCAPE_TTL_MS = 30_000;
 
 /** Called by the onboarding page right before it gives up and navigates away
  * despite a failed preferences save (see MAX_SAVE_FAILURES_BEFORE_ESCAPE in
@@ -72,7 +79,7 @@ const SAVE_ESCAPE_KEY = "xagent-onboarding-save-escape";
  * component the onboarding page has no direct handle on. */
 export function markOnboardingSaveEscaped(): void {
   try {
-    window.sessionStorage.setItem(SAVE_ESCAPE_KEY, "1");
+    window.sessionStorage.setItem(SAVE_ESCAPE_KEY, String(Date.now()));
   } catch {
     // Storage unavailable (private mode, disabled) - AuthGuard just won't
     // see the flag and will redirect as it did before this existed; no
@@ -80,15 +87,16 @@ export function markOnboardingSaveEscaped(): void {
   }
 }
 
-/** Reads and clears the flag set by markOnboardingSaveEscaped() - one-shot,
- * so only the very next onboarding check is suppressed, not every future
- * one for the rest of the tab's session (the caller is expected to also
- * latch its own "already checked" state alongside consuming this). */
+/** Reads and clears the flag set by markOnboardingSaveEscaped() - always
+ * removed on read (one-shot; a stale or corrupt value must not linger
+ * either), and only honored within SAVE_ESCAPE_TTL_MS of being set. */
 export function consumeOnboardingSaveEscapeFlag(): boolean {
   try {
-    if (window.sessionStorage.getItem(SAVE_ESCAPE_KEY) !== "1") return false;
+    const raw = window.sessionStorage.getItem(SAVE_ESCAPE_KEY);
     window.sessionStorage.removeItem(SAVE_ESCAPE_KEY);
-    return true;
+    if (!raw) return false;
+    const setAt = Number(raw);
+    return Number.isFinite(setAt) && Date.now() - setAt < SAVE_ESCAPE_TTL_MS;
   } catch {
     return false;
   }

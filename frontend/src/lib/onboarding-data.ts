@@ -110,9 +110,14 @@ export interface RecommendedTemplate {
 
 /** Which templates to show on the My team step, and why - a recommendation
  * that cannot explain itself is just a default with better manners.
- * Deduplicates (one card per template even if multiple goals point to it),
- * preserves ONBOARDING_GOALS' own order (not selection order), and caps at
- * 3 - three faces, not twelve, mirrors onboarding.html's recommended(). */
+ * Deduplicates (one card per template even if multiple goals point to it)
+ * and preserves ONBOARDING_GOALS' own order (not selection order).
+ *
+ * Deliberately NOT capped at 3 here - the caller (page.tsx's
+ * validRecommended) filters this down to templates that actually loaded
+ * with a persona first, THEN caps at 3. Capping here, before that filter,
+ * used to mean a 4th-ranked match with a real persona could never fill a
+ * slot vacated by a top-3 match that turned out to have none. */
 export function recommendedTemplates(selectedGoalIds: string[]): RecommendedTemplate[] {
   const picked = ONBOARDING_GOALS.filter((goal) => selectedGoalIds.includes(goal.id));
   const seen = new Set<string>();
@@ -127,17 +132,18 @@ export function recommendedTemplates(selectedGoalIds: string[]): RecommendedTemp
       out.push({ templateId, goalId: null });
     }
   }
-  return out.slice(0, 3);
+  return out;
 }
 
 /** "Gmail and Outlook", not "Gmail, Outlook" - the agent is talking, not
  * printing a CSV. Matches onboarding.html's andList exactly for English
  * (no Oxford comma - Intl.ListFormat's "long" style adds one, which would
- * drift from the pixel/copy-matched reference). `and` is a caller-supplied,
- * already-localized connector word so this doesn't hardcode English into
- * otherwise-translated copy. */
-export function joinWithAnd(items: string[], and = "and"): string {
+ * drift from the pixel/copy-matched reference). `and` and `separator` are
+ * caller-supplied, already-localized strings so this doesn't hardcode
+ * English/Western punctuation (", ") into otherwise-translated copy - e.g.
+ * Chinese conventionally uses "、" between list items, not a Latin comma. */
+export function joinWithAnd(items: string[], and = "and", separator = ", "): string {
   if (items.length === 0) return "";
   if (items.length === 1) return items[0];
-  return `${items.slice(0, -1).join(", ")} ${and} ${items[items.length - 1]}`;
+  return `${items.slice(0, -1).join(separator)} ${and} ${items[items.length - 1]}`;
 }

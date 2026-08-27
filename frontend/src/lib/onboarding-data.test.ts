@@ -53,13 +53,15 @@ describe("recommendedTemplates", () => {
     )
   })
 
-  it("caps at 3 recommendations even when more goals are selected", () => {
+  // Pins a PR review finding: capping at 3 here (before the caller filters
+  // by persona-availability) meant a 4th-ranked match with a real persona
+  // could never fill a slot vacated by a top-3 match that had none. The cap
+  // now belongs to the caller (page.tsx's validRecommended), applied AFTER
+  // that filter - this function returns every match, uncapped.
+  it("does not cap the result - returns every distinct match, leaving capping to the caller", () => {
     const manyGoalIds = ONBOARDING_GOALS.slice(0, 6).map((g) => g.id)
     const result = recommendedTemplates(manyGoalIds)
-    // Asserts the exact first 3 (in ONBOARDING_GOALS' own declared order),
-    // not just an upper bound - toBeLessThanOrEqual(3) would also pass for
-    // an empty array, silently missing a regression that dropped everything.
-    expect(result).toEqual(ONBOARDING_GOALS.slice(0, 3).map((g) => ({ templateId: g.templateId, goalId: g.id })))
+    expect(result).toEqual(ONBOARDING_GOALS.slice(0, 6).map((g) => ({ templateId: g.templateId, goalId: g.id })))
   })
 
   it("ignores unknown goal ids", () => {
@@ -85,6 +87,15 @@ describe("joinWithAnd", () => {
   it("joins 3+ items with commas and a trailing 'and'", () => {
     expect(joinWithAnd(["LinkedIn", "Facebook Pages", "Instagram", "Google Drive"])).toBe(
       "LinkedIn, Facebook Pages, Instagram and Google Drive"
+    )
+  })
+
+  // Pins a PR review finding: the ", " separator was hardcoded Western
+  // punctuation, same class of bug as the "and" word before it was
+  // localized - Chinese conventionally uses "、" between list items.
+  it("uses a caller-supplied separator instead of a hardcoded comma", () => {
+    expect(joinWithAnd(["LinkedIn", "Facebook Pages", "Instagram"], "和", "、")).toBe(
+      "LinkedIn、Facebook Pages 和 Instagram"
     )
   })
 

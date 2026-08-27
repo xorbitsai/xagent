@@ -1659,6 +1659,7 @@ const zh = {
     team: {
       title: "认识一下你的 AI 团队。",
       subtitleBase: "根据你选的内容匹配。选一个开始吧",
+      subtitleEnd: "。",
       subtitleExtraOne: "——还有一个匹配项在模板库中等着你。",
       subtitleExtraMany: "——还有 {count} 个匹配项在模板库中等着你。",
       subtitleNoGoals: "选一个开始吧——剩下的可以随时雇佣。",
@@ -1700,6 +1701,7 @@ const zh = {
       writingInSuffix: "",
       willConnectPrefix: "会在合适的时候请求连接",
       willConnectAnd: "和",
+      willConnectSeparator: "、",
       willConnectSuffix: "",
       noAccounts: "开始使用无需连接任何账号",
       start: "开始与 {name} 对话",

@@ -2,13 +2,11 @@
 
 import React, { useEffect, useRef, useState } from "react"
 import { useAuth } from "@/contexts/auth-context"
-import { isAuthPublicPath } from "@/lib/auth-pages"
+import { isAuthPublicPath, ONBOARDING_PATH } from "@/lib/auth-pages"
 import { useRouter, usePathname } from "next/navigation"
 import { useI18n } from "@/contexts/i18n-context"
 import { getBrandingFromEnv } from "@/lib/branding"
 import { consumeOnboardingSaveEscapeFlag, fetchUserPreferences } from "@/lib/user-preferences"
-
-const ONBOARDING_PATH = "/onboarding"
 
 const branding = getBrandingFromEnv()
 
@@ -52,6 +50,23 @@ export function AuthGuard({ children }: AuthGuardProps) {
   const checkedOnboardingRef = useRef(false)
   useEffect(() => {
     if (!mounted || isAuthPage || pathname === ONBOARDING_PATH) return
+
+    // Consumed unconditionally, AHEAD of the "already checked" guard below -
+    // a previous version of this fix checked the flag only inside the async
+    // check itself, which the ref guard skips entirely once a check has
+    // already run this app-load (the common case: the user usually reached
+    // /onboarding via an earlier check on some OTHER page that already
+    // latched this ref). That left the flag unconsumed on the escape it was
+    // meant for, and let it linger to wrongly suppress some unrelated LATER
+    // onboarding check instead - a real regression an earlier round shipped.
+    // Reading it first, before any early return, guarantees it's consumed
+    // the very next time this effect runs after being set, regardless of
+    // which branch would otherwise apply.
+    if (consumeOnboardingSaveEscapeFlag()) {
+      checkedOnboardingRef.current = true
+      return
+    }
+
     if (isLoading || !isAuthenticated || checkedOnboardingRef.current) return
 
     let active = true
@@ -64,12 +79,11 @@ export function AuthGuard({ children }: AuthGuardProps) {
       if (preferences === null) return
       checkedOnboardingRef.current = true
       if (!preferences.onboarded) {
-        // The onboarding page's own escape hatch (giving up and leaving
-        // after repeated save failures) sets this right before navigating
-        // here - honoring it once, and still latching the ref above, is
-        // what stops that escape from just bouncing the user right back.
-        if (consumeOnboardingSaveEscapeFlag()) return
-        router.push(ONBOARDING_PATH)
+        // replace, not push: a `push` here leaves the pre-redirect page in
+        // history, so a single Back press returns the user there with the
+        // ref already latched - no re-check ever fires again this session,
+        // permanently bypassing onboarding with no error condition required.
+        router.replace(ONBOARDING_PATH)
       }
     })()
     return () => {

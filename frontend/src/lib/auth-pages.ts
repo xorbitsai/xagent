@@ -40,12 +40,18 @@ export function isAuthPublicPath(pathname: string | null): boolean {
   return AUTH_PUBLIC_PATHS.includes(pathname as (typeof AUTH_PUBLIC_PATHS)[number])
 }
 
+/** The single source of truth for the onboarding route path - both
+ * auth-guard.tsx's redirect target and CHROMELESS_AUTHENTICATED_PATHS below
+ * derive from this, instead of each independently hardcoding "/onboarding"
+ * and risking a silent divergence if the route is ever renamed. */
+export const ONBOARDING_PATH = "/onboarding"
+
 /** Paths that render full-screen with no sidebar/app chrome, but - unlike
  * AUTH_PUBLIC_PATHS - still require a real authenticated session (AuthGuard
  * still runs its login redirect for them). Kept separate from
  * isAuthPublicPath so a page here is never accidentally treated as not
  * requiring login. */
-export const CHROMELESS_AUTHENTICATED_PATHS = ["/onboarding"] as const
+export const CHROMELESS_AUTHENTICATED_PATHS = [ONBOARDING_PATH] as const
 
 export function isChromelessAuthenticatedPath(pathname: string | null): boolean {
   if (!pathname) {

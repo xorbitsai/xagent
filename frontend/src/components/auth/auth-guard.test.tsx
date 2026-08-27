@@ -7,12 +7,13 @@ import { resolveTranslation, type TranslationKey } from "@/i18n/translations"
 const route = vi.hoisted(() => ({ pathname: "/" as string | null }))
 const authState = vi.hoisted(() => ({ isAuthenticated: false, isLoading: true }))
 const routerPush = vi.hoisted(() => vi.fn())
+const routerReplace = vi.hoisted(() => vi.fn())
 const fetchUserPreferencesMock = vi.hoisted(() => vi.fn())
 const consumeOnboardingSaveEscapeFlagMock = vi.hoisted(() => vi.fn(() => false))
 
 vi.mock("next/navigation", () => ({
   usePathname: () => route.pathname,
-  useRouter: () => ({ push: routerPush }),
+  useRouter: () => ({ push: routerPush, replace: routerReplace }),
 }))
 
 vi.mock("@/lib/user-preferences", () => ({
@@ -102,6 +103,7 @@ describe("AuthGuard onboarding redirect", () => {
     authState.isAuthenticated = true
     authState.isLoading = false
     routerPush.mockClear()
+    routerReplace.mockClear()
     fetchUserPreferencesMock.mockReset()
     consumeOnboardingSaveEscapeFlagMock.mockReset()
     consumeOnboardingSaveEscapeFlagMock.mockReturnValue(false)
@@ -109,12 +111,17 @@ describe("AuthGuard onboarding redirect", () => {
 
   afterEach(cleanup)
 
-  it("redirects an authenticated but unonboarded user to /onboarding", async () => {
+  // replace, not push: a `push` here leaves the pre-redirect page in
+  // history, so a single Back press would return the user there with the
+  // ref already latched - permanently bypassing onboarding with no error
+  // condition required (a PR review finding).
+  it("redirects an authenticated but unonboarded user to /onboarding via replace", async () => {
     fetchUserPreferencesMock.mockResolvedValue({})
 
     render(<AuthGuard><div data-testid="children" /></AuthGuard>)
 
-    await waitFor(() => expect(routerPush).toHaveBeenCalledWith("/onboarding"))
+    await waitFor(() => expect(routerReplace).toHaveBeenCalledWith("/onboarding"))
+    expect(routerPush).not.toHaveBeenCalledWith("/onboarding")
   })
 
   it("does not redirect a user whose preferences already have onboarded: true", async () => {
@@ -123,29 +130,36 @@ describe("AuthGuard onboarding redirect", () => {
     render(<AuthGuard><div data-testid="children" /></AuthGuard>)
 
     await waitFor(() => expect(fetchUserPreferencesMock).toHaveBeenCalled())
-    expect(routerPush).not.toHaveBeenCalledWith("/onboarding")
+    expect(routerReplace).not.toHaveBeenCalledWith("/onboarding")
   })
 
-  // Pins a full-feature self-review finding: without this, the onboarding
-  // page's own "give up after repeated save failures" escape hatch gets
-  // immediately defeated by this exact check bouncing the user right back
-  // (sometimes as a loop) since onboarded genuinely never got persisted.
-  it("does not redirect when the onboarding page's save-escape flag is set, and still latches as checked", async () => {
-    fetchUserPreferencesMock.mockResolvedValue({})
+  // Pins a PR review finding (regression in this mechanism's first version):
+  // the flag used to be checked only inside the async preferences check,
+  // which the "already checked" ref guard skips entirely once a check has
+  // already run this app-load - the common case, since the user usually
+  // reached /onboarding via an earlier check on another page that already
+  // latched the ref. That left the flag unconsumed on the very escape it
+  // was meant for, letting it linger to wrongly suppress some unrelated
+  // LATER onboarding check instead. It's now consumed synchronously, ahead
+  // of that guard, so this must not even call fetchUserPreferences at all -
+  // there is nothing left to check once the escape is honored.
+  it("does not redirect (and skips the preferences check entirely) when the onboarding page's save-escape flag is set, and still latches as checked", async () => {
     consumeOnboardingSaveEscapeFlagMock.mockReturnValue(true)
 
     const { rerender } = render(<AuthGuard><div data-testid="children" /></AuthGuard>)
 
-    await waitFor(() => expect(fetchUserPreferencesMock).toHaveBeenCalledTimes(1))
-    expect(routerPush).not.toHaveBeenCalledWith("/onboarding")
+    expect(consumeOnboardingSaveEscapeFlagMock).toHaveBeenCalledTimes(1)
+    expect(fetchUserPreferencesMock).not.toHaveBeenCalled()
+    expect(routerReplace).not.toHaveBeenCalledWith("/onboarding")
 
-    // The ref must have latched (as "checked") even though the redirect was
-    // suppressed - otherwise the very next navigation re-triggers the same
-    // check and, since the flag is one-shot and already consumed, redirects
+    // The ref must have latched (as "checked") even though the check was
+    // skipped - otherwise the very next navigation re-triggers a real check
+    // and, since the flag is one-shot and already consumed, redirects
     // anyway, defeating the whole point of the escape hatch.
+    consumeOnboardingSaveEscapeFlagMock.mockReturnValue(false)
     route.pathname = "/dashboard"
     rerender(<AuthGuard><div data-testid="children" /></AuthGuard>)
-    expect(fetchUserPreferencesMock).toHaveBeenCalledTimes(1)
+    expect(fetchUserPreferencesMock).not.toHaveBeenCalled()
   })
 
   // Pins a PR review finding: fetchUserPreferences returns null (not {}) on
@@ -158,7 +172,7 @@ describe("AuthGuard onboarding redirect", () => {
     render(<AuthGuard><div data-testid="children" /></AuthGuard>)
 
     await waitFor(() => expect(fetchUserPreferencesMock).toHaveBeenCalledTimes(1))
-    expect(routerPush).not.toHaveBeenCalledWith("/onboarding")
+    expect(routerReplace).not.toHaveBeenCalledWith("/onboarding")
   })
 
   it("retries on the next route after a failed (null) check, since a failure must not latch the ref", async () => {

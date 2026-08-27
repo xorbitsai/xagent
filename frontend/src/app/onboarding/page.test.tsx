@@ -5,6 +5,7 @@ import { resolveTranslation, type TranslationKey } from "@/i18n/translations"
 import OnboardingPage from "./page"
 
 const routerPush = vi.hoisted(() => vi.fn())
+const routerReplace = vi.hoisted(() => vi.fn())
 const authUser = vi.hoisted(() => ({ username: "Shulei" as string | undefined }))
 const apiRequestMock = vi.hoisted(() => vi.fn())
 const updateUserPreferencesMock = vi.hoisted(() => vi.fn())
@@ -13,7 +14,7 @@ const toastErrorMock = vi.hoisted(() => vi.fn())
 const markOnboardingSaveEscapedMock = vi.hoisted(() => vi.fn())
 
 vi.mock("next/navigation", () => ({
-  useRouter: () => ({ push: routerPush }),
+  useRouter: () => ({ push: routerPush, replace: routerReplace }),
 }))
 
 vi.mock("sonner", () => ({
@@ -106,6 +107,7 @@ async function goToWelcomeThenBusiness() {
 describe("OnboardingPage", () => {
   beforeEach(() => {
     routerPush.mockClear()
+    routerReplace.mockClear()
     authUser.username = "Shulei"
     apiRequestMock.mockReset()
     apiRequestMock.mockResolvedValue({ ok: true, json: async () => TEMPLATES })
@@ -215,13 +217,13 @@ describe("OnboardingPage", () => {
 
     expect(updateUserPreferencesMock).toHaveBeenCalledWith(expect.objectContaining({ onboarded: true }))
     // The save is still pending - navigation must not have happened yet.
-    expect(routerPush).not.toHaveBeenCalled()
+    expect(routerReplace).not.toHaveBeenCalled()
 
     await act(async () => {
       resolveSave({ ok: true })
     })
 
-    expect(routerPush).toHaveBeenCalledWith("/task")
+    expect(routerReplace).toHaveBeenCalledWith("/task")
   })
 
   // Flagged by PR review (xorbitsai/xagent#1617): persistAndLeave had no
@@ -262,7 +264,7 @@ describe("OnboardingPage", () => {
     })
 
     expect(toastErrorMock).toHaveBeenCalledWith("Couldn't save your setup — please try again.")
-    expect(routerPush).not.toHaveBeenCalled()
+    expect(routerReplace).not.toHaveBeenCalled()
   })
 
   it("hires the selected agent and navigates to /task/{taskId} on launch", async () => {
@@ -290,7 +292,43 @@ describe("OnboardingPage", () => {
     expect(hireAgentFromTemplateMock.mock.calls[0][0]).toEqual(
       expect.objectContaining({ templateId: "marketing-social-media-content-manager" })
     )
-    expect(routerPush).toHaveBeenCalledWith("/task/42")
+    expect(routerReplace).toHaveBeenCalledWith("/task/42")
+  })
+
+  // Pins a PR review finding: mount-time `selected.hired` can go stale if
+  // the same template gets hired from another tab/session mid-wizard.
+  // handleLaunch must re-check right before hiring, mirroring the identical
+  // guard in templates/[id]/page-client.tsx, instead of seeding a second
+  // opening message onto an agent the user already has a real conversation with.
+  it("re-checks hired status right before hiring and redirects to the existing agent if another session hired it meanwhile", async () => {
+    apiRequestMock.mockImplementation((url: string) => {
+      if (url.includes("/api/templates/marketing-social-media-content-manager")) {
+        return Promise.resolve({
+          ok: true,
+          json: async () => ({ ...TEMPLATES[0], hired: true, hired_agent_id: 77 }),
+        })
+      }
+      return Promise.resolve({ ok: true, json: async () => TEMPLATES })
+    })
+
+    await goToWelcomeThenBusiness()
+    fireEvent.click(screen.getByText("Marketing"))
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/take off your plate/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Post on social media"))
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/Meet your AI team/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/How should/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText("You're all set.")).toBeInTheDocument())
+
+    await act(async () => {
+      fireEvent.click(screen.getByText("Start with Maya"))
+    })
+
+    await waitFor(() => expect(routerReplace).toHaveBeenCalledWith("/agent/77"))
+    expect(hireAgentFromTemplateMock).not.toHaveBeenCalled()
   })
 
   // Pins a PR review test-coverage gap: handleLaunch's already-hired
@@ -322,7 +360,7 @@ describe("OnboardingPage", () => {
       fireEvent.click(screen.getByText("Start with Maya"))
     })
 
-    await waitFor(() => expect(routerPush).toHaveBeenCalledWith("/agent/99"))
+    await waitFor(() => expect(routerReplace).toHaveBeenCalledWith("/agent/99"))
     expect(hireAgentFromTemplateMock).not.toHaveBeenCalled()
   })
 
@@ -341,7 +379,7 @@ describe("OnboardingPage", () => {
     fireEvent.click(screen.getByText("Continue"))
 
     await waitFor(() => expect(screen.getByText(/Meet your AI team/)).toBeInTheDocument())
-    expect(document.querySelector(".animate-spin, [class*='spin']")).toBeTruthy()
+    expect(screen.getByTestId("onboarding-team-loading")).toBeInTheDocument()
     expect(screen.getByText("Continue").closest("button")).toBeDisabled()
   })
 
@@ -357,7 +395,7 @@ describe("OnboardingPage", () => {
     fireEvent.click(screen.getByText("Continue"))
 
     await waitFor(() => expect(screen.getByText(/Meet your AI team/)).toBeInTheDocument())
-    expect(document.querySelector(".animate-spin, [class*='spin']")).toBeTruthy()
+    expect(screen.getByTestId("onboarding-team-loading")).toBeInTheDocument()
     expect(screen.getByText("Continue").closest("button")).toBeDisabled()
   })
 
@@ -395,7 +433,7 @@ describe("OnboardingPage", () => {
 
     await waitFor(() => expect(toastErrorMock).toHaveBeenCalledWith("Couldn't save your setup — please try again."))
     expect(hireAgentFromTemplateMock).not.toHaveBeenCalled()
-    expect(routerPush).not.toHaveBeenCalledWith(expect.stringContaining("/task/"))
+    expect(routerReplace).not.toHaveBeenCalledWith(expect.stringContaining("/task/"))
   })
 
   // Pins C2: a recommended templateId that never loaded (or has no persona)
@@ -447,6 +485,55 @@ describe("OnboardingPage", () => {
     expect(screen.getByText("Continue").closest("button")).not.toBeDisabled()
   })
 
+  // Flagged by PR review (xorbitsai/xagent#1617): the 3-card cap used to be
+  // applied before filtering for persona-availability, so a 4th-ranked
+  // match with a real persona could never fill a slot vacated by a top-3
+  // match that turned out to have none - the user saw fewer cards than
+  // their own goal selections actually supported.
+  it("promotes a 4th-ranked match to fill a slot when a top-3 match has no persona", async () => {
+    apiRequestMock.mockResolvedValue({
+      ok: true,
+      json: async () => [
+        TEMPLATES[0], // social -> Maya, has persona
+        TEMPLATES[1], // inbox -> Ellie, has persona
+        { ...TEMPLATES[2], persona: null }, // meetings -> Kevin, NO persona this time
+        {
+          id: "support-ai-chatbot-agent",
+          name: "Chatbot",
+          category: "Support",
+          description: "Answers customer questions.",
+          features: [],
+          persona: { name: "Nora", role: "Support Chatbot", intro: "Hi", kickoff_questions: [] },
+          connections: [],
+          setup_time: "5 min",
+          tags: [],
+          author: "xagent",
+          version: "1.0",
+          views: 0,
+          likes: 0,
+          used_count: 0,
+        },
+      ],
+    })
+
+    await goToWelcomeThenBusiness()
+    fireEvent.click(screen.getByText("Marketing"))
+    fireEvent.click(screen.getByText("Continue"))
+
+    await waitFor(() => expect(screen.getByText(/take off your plate/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Post on social media")) // social
+    fireEvent.click(screen.getByText("Keep my inbox under control")) // inbox
+    fireEvent.click(screen.getByText("Write up my meetings")) // meetings - no persona
+    fireEvent.click(screen.getByText("Answer customer questions")) // support - 4th ranked, has persona
+    fireEvent.click(screen.getByText("Continue"))
+
+    await waitFor(() => expect(screen.getByText(/Meet your AI team/)).toBeInTheDocument())
+    expect(screen.getByText("Maya")).toBeInTheDocument()
+    expect(screen.getByText("Ellie")).toBeInTheDocument()
+    expect(screen.getByText("Nora")).toBeInTheDocument()
+    expect(screen.queryByText("Kevin")).not.toBeInTheDocument()
+  })
+
   // Flagged by PR review (xorbitsai/xagent#1617): the templates fetch used to
   // set templatesLoading:false in a finally block regardless of outcome,
   // contradicting its own comment that failure should stay in a loading
@@ -464,12 +551,16 @@ describe("OnboardingPage", () => {
     fireEvent.click(screen.getByText("Continue"))
 
     await waitFor(() => expect(screen.getByText(/Meet your AI team/)).toBeInTheDocument())
-    expect(document.querySelector(".animate-spin, [class*='spin']")).toBeTruthy()
+    expect(screen.getByTestId("onboarding-team-loading")).toBeInTheDocument()
     expect(screen.queryByText("Maya")).not.toBeInTheDocument()
     expect(screen.getByText("Continue").closest("button")).toBeDisabled()
   })
 
-  it("the goals step's 'not sure yet' link persists onboarded:true and the current voice, with no goals selected yet", async () => {
+  // Pins a PR review finding: "professional" is a real, legitimate voice
+  // choice, not an empty placeholder like goals' [] - so unlike goals,
+  // voice must not be sent at all until the voice step has actually been
+  // reached. The goals step's skip is reachable well before that.
+  it("the goals step's 'not sure yet' link persists onboarded:true but not voice, since the voice step was never reached", async () => {
     await goToWelcomeThenBusiness()
     fireEvent.click(screen.getByText("Other"))
     fireEvent.change(screen.getByPlaceholderText("e.g. Property management"), {
@@ -485,12 +576,34 @@ describe("OnboardingPage", () => {
         onboarded: true,
         department: "other",
         industry: "Something",
-        voice: "professional",
       })
     )
     const call = updateUserPreferencesMock.mock.calls.at(-1)![0]
     expect(call).not.toHaveProperty("goals")
-    await waitFor(() => expect(routerPush).toHaveBeenCalledWith("/templates"))
+    expect(call).not.toHaveProperty("voice")
+    await waitFor(() => expect(routerReplace).toHaveBeenCalledWith("/templates"))
+  })
+
+  // Pins the same PR review finding from the other direction: once the
+  // voice step HAS been reached (even via the header Skip, not just a
+  // completed flow), the choice made there must be persisted.
+  it("persists voice on the header Skip once the voice step has actually been visited", async () => {
+    await goToWelcomeThenBusiness()
+    fireEvent.click(screen.getByText("Marketing"))
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/take off your plate/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Post on social media"))
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/Meet your AI team/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/How should/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Playful"))
+
+    fireEvent.click(screen.getByText("Skip setup"))
+
+    expect(updateUserPreferencesMock).toHaveBeenCalledWith(
+      expect.objectContaining({ onboarded: true, voice: "playful" })
+    )
   })
 
   // Pins a bug found in self-review: the reference UI's finish() persists
@@ -578,12 +691,12 @@ describe("OnboardingPage", () => {
     await act(async () => {
       fireEvent.click(screen.getByText("Skip setup"))
     })
-    expect(routerPush).not.toHaveBeenCalled()
+    expect(routerReplace).not.toHaveBeenCalled()
 
     await act(async () => {
       fireEvent.click(screen.getByText("Skip setup"))
     })
-    expect(routerPush).toHaveBeenCalledWith("/task")
+    expect(routerReplace).toHaveBeenCalledWith("/task")
     // Full-feature self-review finding: without telling AuthGuard about
     // this, its own onboarding check on "/task" would see onboarded still
     // false and immediately bounce the user right back, defeating the
@@ -606,7 +719,7 @@ describe("OnboardingPage", () => {
     await act(async () => {
       fireEvent.click(screen.getByText("Skip setup"))
     })
-    expect(routerPush).not.toHaveBeenCalled()
+    expect(routerReplace).not.toHaveBeenCalled()
 
     // First-ever attempt via the goals step's own skip -> /templates: must
     // still get its own retry-in-place chance, not be force-navigated
@@ -614,7 +727,7 @@ describe("OnboardingPage", () => {
     await act(async () => {
       fireEvent.click(screen.getByText("Not sure yet — show me everyone"))
     })
-    expect(routerPush).not.toHaveBeenCalled()
+    expect(routerReplace).not.toHaveBeenCalled()
   })
 
   // Pins a test-coverage gap flagged in self-review: the "N other matches"

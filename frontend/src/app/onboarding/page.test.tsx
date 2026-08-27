@@ -136,6 +136,25 @@ describe("OnboardingPage", () => {
     expect(screen.getAllByText("there").length).toBeGreaterThan(0)
   })
 
+  // Pins a gap found in full-feature self-review: each step swaps the
+  // entire JSX subtree (only one `step === "..."` branch is ever mounted),
+  // so the browser drops focus to <body> on every transition with nothing
+  // to tell a keyboard/screen-reader user a new step even loaded. The new
+  // step's heading must receive focus so it's announced and Tab resumes
+  // from there instead of the very top of the page.
+  it("moves focus to the new step's heading after advancing to the next step", async () => {
+    render(<OnboardingPage />)
+    await waitFor(() => expect(screen.getByText(/Welcome to Xagent/)).toBeInTheDocument())
+    expect(document.activeElement).toBe(screen.getByRole("heading", { level: 1 }))
+
+    fireEvent.click(screen.getByText("Let's go"))
+
+    await waitFor(() =>
+      expect(screen.getByRole("heading", { level: 1 })).toHaveTextContent("What doesyour team do?")
+    )
+    expect(document.activeElement).toBe(screen.getByRole("heading", { level: 1 }))
+  })
+
   it("requires an industry value before Continue is enabled when 'Other' is picked", async () => {
     await goToWelcomeThenBusiness()
     fireEvent.click(screen.getByText("Other"))
@@ -299,6 +318,28 @@ describe("OnboardingPage", () => {
 
     expect(toastErrorMock).toHaveBeenCalledWith("Couldn't save your setup — please try again.")
     expect(routerReplace).not.toHaveBeenCalled()
+  })
+
+  // Pins a finding from full-feature self-review: PersonaAvatar's own doc
+  // comment explains `decorative` exists exactly for a picker button that
+  // renders the name right next to the avatar - without it, a screen reader
+  // announces the name twice ("Maya Maya...") since the avatar's fallback
+  // initial and the visible name text are both inside the same interactive
+  // <button aria-pressed>. The done-step's avatar reuse is inside a plain,
+  // non-interactive div, so it doesn't need this - only the team-step picker did.
+  it("hides the team card's persona avatar from the accessibility tree so its name isn't announced twice", async () => {
+    render(<OnboardingPage />)
+    await waitFor(() => expect(screen.getByText(/Welcome to Xagent/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Let's go"))
+    fireEvent.click(screen.getByText("Marketing"))
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/take off your plate/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Post on social media"))
+    fireEvent.click(screen.getByText("Continue"))
+
+    await waitFor(() => expect(screen.getByText("Maya")).toBeInTheDocument())
+    const card = screen.getByText("Maya").closest("button")!
+    expect(card.querySelector('[aria-hidden="true"]')).toHaveTextContent("M")
   })
 
   it("hires the selected agent and navigates to /task/{taskId} on launch", async () => {

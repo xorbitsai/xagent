@@ -146,6 +146,10 @@
 }
 .ob-acct b {
   font-weight: 550;
+  max-width: 140px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 .ob-exit {
   position: absolute;
@@ -628,7 +632,7 @@
 }
 .ob-sum-li {
   display: grid;
-  grid-template-columns: 18px 1fr;
+  grid-template-columns: 18px minmax(0, 1fr);
   gap: 11px;
   align-items: start;
   font-size: 13.5px;
@@ -637,6 +641,7 @@
 .ob-sum-li b {
   font-weight: 600;
   color: hsl(var(--foreground));
+  overflow-wrap: break-word;
 }
 
 @media (max-width: 1180px) {

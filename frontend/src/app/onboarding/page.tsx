@@ -235,6 +235,17 @@ export default function OnboardingPage() {
   // in the other direction (persisting a choice never made).
   const hasReachedVoiceRef = useRef(false);
 
+  // Step transitions swap the entire JSX subtree (only one `step === "..."`
+  // branch is ever mounted), so the browser drops focus to <body> on every
+  // step change - a keyboard/screen-reader user gets no indication a new
+  // step even loaded and has to Tab from the very top of the page each time.
+  // Attached to whichever step's <h1> is currently mounted (only one is at
+  // once), moved there on every step change below.
+  const stepHeadingRef = useRef<HTMLHeadingElement>(null);
+  useEffect(() => {
+    stepHeadingRef.current?.focus();
+  }, [step]);
+
   const goTo = (index: number) => {
     const clamped = Math.max(0, Math.min(STEP_ORDER.length - 1, index));
     setStepIndex(clamped);
@@ -455,6 +466,7 @@ export default function OnboardingPage() {
               key={key}
               type="button"
               disabled={!canGo || launching}
+              aria-current={isNow ? "step" : undefined}
               onClick={() => {
                 const targetStep =
                   lastVisitedInGroupRef.current[groupIndex] ??
@@ -477,7 +489,7 @@ export default function OnboardingPage() {
           {step === "welcome" && (
             <>
               <Orb />
-              <h1>
+              <h1 ref={stepHeadingRef} tabIndex={-1}>
                 {t("onboarding.welcome.titlePrefix")}
                 <br />
                 <em>{firstName}</em>.
@@ -495,7 +507,7 @@ export default function OnboardingPage() {
           {step === "business" && (
             <>
               <Orb small />
-              <h1>
+              <h1 ref={stepHeadingRef} tabIndex={-1}>
                 {t("onboarding.business.titleLine1")}
                 <br />
                 {t("onboarding.business.titleLine2")}
@@ -548,7 +560,7 @@ export default function OnboardingPage() {
           {step === "goals" && (
             <>
               <Orb small />
-              <h1>
+              <h1 ref={stepHeadingRef} tabIndex={-1}>
                 {t("onboarding.goals.titleLine1")}
                 <br />
                 {t("onboarding.goals.titleLine2")}
@@ -592,7 +604,7 @@ export default function OnboardingPage() {
           {step === "team" && (
             <>
               <Orb small />
-              <h1>{t("onboarding.team.title")}</h1>
+              <h1 ref={stepHeadingRef} tabIndex={-1}>{t("onboarding.team.title")}</h1>
               <p className="ob-sub">
                 {goals.length === 0
                   ? t("onboarding.team.subtitleNoGoals")
@@ -615,7 +627,7 @@ export default function OnboardingPage() {
                 <div style={{ marginTop: 40, display: "flex", justifyContent: "center" }}>
                   <div
                     data-testid="onboarding-team-loading"
-                    className="h-8 w-8 animate-spin rounded-full border-2 border-[#E7E7EC] border-t-[#2536E0]"
+                    className="h-8 w-8 animate-spin rounded-full border-2 border-[hsl(var(--border))] border-t-[hsl(var(--primary))]"
                   />
                 </div>
               ) : (
@@ -650,6 +662,7 @@ export default function OnboardingPage() {
                           sizeClassName="h-[84px] w-[84px]"
                           textClassName="text-[33px]"
                           className="ob-tm-av"
+                          decorative
                           style={{
                             boxShadow: `0 0 0 1px hsl(var(--border)), 0 0 0 5px hsl(var(--card)), 0 0 0 6px ${ring}`,
                           }}
@@ -686,7 +699,7 @@ export default function OnboardingPage() {
           {step === "voice" && (
             <>
               <Orb small />
-              <h1>
+              <h1 ref={stepHeadingRef} tabIndex={-1}>
                 {t("onboarding.voice.titleLine1")}
                 <br />
                 {t("onboarding.voice.titleLine2")}
@@ -734,7 +747,7 @@ export default function OnboardingPage() {
               return (
                 <>
                   <Orb />
-                  <h1>{t("onboarding.done.title")}</h1>
+                  <h1 ref={stepHeadingRef} tabIndex={-1}>{t("onboarding.done.title")}</h1>
                   <p className="ob-sub">{t("onboarding.done.subtitle", { name: persona.name })}</p>
 
                   <div className="ob-sum">

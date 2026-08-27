@@ -209,46 +209,6 @@
   var iconColor = scriptTag.getAttribute('data-icon-color') || '#fff';
   var panelBgColor = scriptTag.getAttribute('data-panel-bg-color') || '#fff';
 
-  // Two widgets embedded on the same host page (different agents/grants)
-  // must not collide on one shared preference -- without this, the last one
-  // to persist a value silently restores *both* instances to it on the next
-  // load. Guest mode has a stable, non-secret identifier available for this
-  // (the widget key, or the deprecated token); session mode's grant is
-  // single-use and genuinely encrypted (not merely signed), so there is no
-  // stable client-visible identifier to derive one from under the current
-  // protocol -- those instances still share one namespace until that's
-  // addressed separately (would need a new, non-rotating instance id shipped
-  // server-side alongside the grant).
-  var instanceStorageKeySuffix = scriptTag.getAttribute('data-widget-key')
-    || scriptTag.getAttribute('data-token')
-    || '';
-  function namespacedStorageKey(base) {
-    return instanceStorageKeySuffix ? base + ':' + instanceStorageKeySuffix : base;
-  }
-
-  // Closed state: persisted across reloads so a visitor who left the panel
-  // open sees it reopen on their next page load. Absent/unparsable storage
-  // defaults to closed (today's baseline: closed until the FAB is clicked),
-  // so a first-time visitor never sees an unsolicited popup.
-  var CLOSED_STORAGE_KEY = namespacedStorageKey('xagent_widget_closed');
-
-  function readStoredClosed() {
-    try {
-      return localStorage.getItem(CLOSED_STORAGE_KEY) !== 'false';
-    } catch (e) {
-      return true;
-    }
-  }
-
-  function persistClosed(closed) {
-    try {
-      localStorage.setItem(CLOSED_STORAGE_KEY, String(closed));
-    } catch (e) {
-      // Storage can be unavailable (private browsing, quota); the toggle
-      // still works for the session, it just won't survive a reload.
-    }
-  }
-
   // Read by use-websocket.ts off the iframe URL, where it outranks the browser
   // zone. Optional: absent means the iframe URL is unchanged.
   var embedTimezone = (scriptTag.getAttribute('data-timezone') || '').trim();
@@ -271,12 +231,6 @@
   // reloads. Inline width is only ever applied above MOBILE_BREAKPOINT --
   // below it the CSS media query owns sizing, and inline width would win
   // over that media query by specificity if left in place.
-  // Not namespaced like CLOSED_STORAGE_KEY below, despite the identical
-  // multi-instance collision risk: doing so consistently would mean
-  // rewriting ~25 hardcoded key-literal assertions in widget-bootstrap.test.ts
-  // (PR #1742, untouched by this PR) for a key this PR didn't introduce.
-  // Left as a known, flagged gap alongside CLOSED_STORAGE_KEY's own
-  // session-mode limitation above, for a follow-up covering both together.
   var WIDTH_STORAGE_KEY = 'xagent_widget_width';
   var DEFAULT_PANEL_WIDTH = 380;
   var MIN_PANEL_WIDTH = 320;
@@ -680,20 +634,16 @@
 
   var isOpen = false;
 
-  function openPanel(skipPersist) {
+  function openPanel() {
     isOpen = true;
     panel.classList.add('open');
     fab.innerHTML = closeIcon;
-    if (!skipPersist) {
-      persistClosed(false);
-    }
   }
 
   function closePanel() {
     isOpen = false;
     panel.classList.remove('open');
     fab.innerHTML = chatIcon;
-    persistClosed(true);
   }
 
   fab.onclick = function () {
@@ -720,43 +670,21 @@
   // <html>'s own childList changes when body itself is swapped out.
   panelRemovalObserver.observe(document.documentElement, { childList: true, subtree: true });
 
-  // The header's close control, and guest mode's post-authentication ready
-  // signal (see maybeAutoOpen below), live inside the iframe's React app and
-  // have no direct handle to panel/fab, so they signal intent back here over
+  // The header's close control lives inside the iframe's React app and has
+  // no direct handle to panel/fab, so it signals intent back here over
   // postMessage instead. Named (not inline) so panelRemovalObserver can
   // remove it below, matching every other listener's teardown in this file
   // -- otherwise a host SPA that removes the widget without a full page
-  // reload leaves this listener retaining the closure indefinitely, and a
-  // stray message arriving afterward would still mutate a detached panel
-  // and corrupt the next load's auto-open decision in localStorage.
+  // reload leaves this listener retaining the closure indefinitely.
   function onChromeMessage(event) {
     if (torndown || event.origin !== host || !iframe.contentWindow || event.source !== iframe.contentWindow) return;
     var data = event.data;
     if (!data || data.xagent !== true || data.v !== 1) return;
     if (data.type === 'widget_close') {
       closePanel();
-    } else if (data.type === 'widget_ready') {
-      maybeAutoOpen();
     }
   }
   window.addEventListener('message', onChromeMessage);
-
-  // Called once the visitor's session is confirmed fully usable, not called
-  // unconditionally here: guest mode's iframe.src being set only means the
-  // *embed ticket* exchange (parent-side, this file) succeeded -- the child
-  // then redeems that ticket for a real session via its own /api/widget/auth
-  // call, which can independently fail (a live allowlist re-check, a rate
-  // limit, a network error, a malformed response). Auto-opening ahead of
-  // that would show a returning visitor the auth-error screen, every reload.
-  // Guest mode instead calls this from onChromeMessage above, once the child
-  // posts back widget_ready after its own auth succeeds. Session mode's
-  // grant exchange *is* the complete handshake (no separate child-side auth
-  // call follows it), so it calls this immediately on that success.
-  function maybeAutoOpen() {
-    if (!readStoredClosed()) {
-      openPanel(true);
-    }
-  }
 
   mode.attach(iframe);
 
@@ -1211,14 +1139,6 @@
           return;
         }
         applySession(payload);
-        // Gated to the initial exchange, not every reconnect: this is the
-        // first point session mode actually knows the grant is usable (a
-        // returning visitor whose grant has since expired or been consumed
-        // reaches recordFailure below instead, never auto-opening onto the
-        // degraded/terminal screen -- same reasoning as guest mode's
-        // ticket-fetch-success gate on maybeAutoOpen). A later reconnect
-        // succeeding shouldn't re-open a panel the visitor has since closed.
-        if (phase === 'exchange') maybeAutoOpen();
         flush();
         return;
       }

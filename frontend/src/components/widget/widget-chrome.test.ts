@@ -8,10 +8,6 @@ const widgetScript = readFileSync(widgetScriptPath, "utf8")
 const widgetScriptUrl = pathToFileURL(widgetScriptPath).href
 
 const HOST = "https://chat.example"
-// Namespaced by data-widget-key (this file's default runWidget() attribute)
-// so two different agents' widgets embedded on one host page don't collide
-// on one shared open/closed preference.
-const CLOSED_KEY = "xagent_widget_closed:widget-secret"
 
 function runWidget(attributes: Record<string, string> = { "data-widget-key": "widget-secret" }) {
   const script = document.createElement("script")
@@ -72,137 +68,30 @@ describe("widget close chrome", () => {
     vi.restoreAllMocks()
   })
 
-  it("starts closed with no persisted preference for a first-time visitor", () => {
+  it("starts closed for a first-time visitor", () => {
     runWidget()
 
     expect(panelEl()).not.toHaveClass("open")
-    expect(localStorage.getItem(CLOSED_KEY)).toBeNull()
   })
 
-  it("keeps two different agents' widgets on one host page from colliding on one shared preference", () => {
-    // A fresh Response per call: mockResolvedValue would hand out the same
-    // instance to both widgets, and a fetch body can only be read once.
-    fetchMock.mockImplementation(() => Promise.resolve(new Response(
-      JSON.stringify({ ticket: "t", agent_id: 1 }),
-      { status: 200, headers: { "Content-Type": "application/json" } },
-    )))
-
-    runWidget({ "data-widget-key": "widget-secret" })
-    runWidget({ "data-widget-key": "other-widget-secret" })
-
-    const fabs = document.querySelectorAll<HTMLButtonElement>(".xagent-widget-fab")
-    const panels = document.querySelectorAll(".xagent-widget-panel")
-    expect(fabs).toHaveLength(2)
-
-    fabs[0].click()
-
-    expect(panels[0]).toHaveClass("open")
-    expect(panels[1]).not.toHaveClass("open")
-    expect(localStorage.getItem(CLOSED_KEY)).toBe("false")
-    expect(localStorage.getItem("xagent_widget_closed:other-widget-secret")).toBeNull()
-  })
-
-  it("opens on FAB click and persists the open (not-closed) preference", () => {
+  it("opens on FAB click", () => {
     runWidget()
 
     fabEl()?.click()
 
     expect(panelEl()).toHaveClass("open")
-    expect(localStorage.getItem(CLOSED_KEY)).toBe("false")
   })
 
-  it("closes on a second FAB click and persists the closed preference", () => {
+  it("closes on a second FAB click", () => {
     runWidget()
 
     fabEl()?.click()
     fabEl()?.click()
 
     expect(panelEl()).not.toHaveClass("open")
-    expect(localStorage.getItem(CLOSED_KEY)).toBe("true")
   })
 
-  it("does not auto-open on the embed ticket resolving alone -- only once the child confirms widget_ready", async () => {
-    // The ticket exchange succeeding only means the *parent's* half of
-    // authentication worked; the child still has to redeem that ticket via
-    // its own /api/widget/auth call, which can independently fail. Setting
-    // iframe.src is not itself proof the visitor will see a working chat.
-    localStorage.setItem(CLOSED_KEY, "false")
-
-    runWidget()
-
-    await vi.waitFor(() => {
-      expect(iframeEl()?.getAttribute("src")).not.toBeNull()
-    })
-    expect(panelEl()).not.toHaveClass("open")
-  })
-
-  it("reopens once the child posts widget_ready, for a visitor who last left it open", async () => {
-    localStorage.setItem(CLOSED_KEY, "false")
-
-    runWidget()
-    await vi.waitFor(() => {
-      expect(iframeEl()?.getAttribute("src")).not.toBeNull()
-    })
-    fromIframe("widget_ready")
-
-    expect(panelEl()).toHaveClass("open")
-  })
-
-  it("does not re-persist the preference when auto-restoring on widget_ready", async () => {
-    localStorage.setItem(CLOSED_KEY, "false")
-    const setItemSpy = vi.spyOn(localStorage, "setItem")
-
-    runWidget()
-    await vi.waitFor(() => {
-      expect(iframeEl()?.getAttribute("src")).not.toBeNull()
-    })
-    fromIframe("widget_ready")
-
-    expect(panelEl()).toHaveClass("open")
-    expect(setItemSpy).not.toHaveBeenCalledWith(CLOSED_KEY, expect.anything())
-    setItemSpy.mockRestore()
-  })
-
-  it("stays closed on load once the visitor has closed it before, even once widget_ready arrives", async () => {
-    localStorage.setItem(CLOSED_KEY, "true")
-
-    runWidget()
-    await vi.waitFor(() => {
-      expect(iframeEl()?.getAttribute("src")).not.toBeNull()
-    })
-    fromIframe("widget_ready")
-
-    expect(panelEl()).not.toHaveClass("open")
-  })
-
-  it("does not auto-open when the embed-ticket request fails, even for a visitor who left it open", async () => {
-    // A stale allowlist, a rate limit, or a network error all resolve this
-    // fetch chain without ever setting iframe.src (see createGuestMode) --
-    // auto-opening ahead of that would show a blank panel on every reload.
-    fetchMock.mockReset()
-    fetchMock.mockResolvedValueOnce(new Response("forbidden", { status: 403 }))
-    localStorage.setItem(CLOSED_KEY, "false")
-    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => undefined)
-
-    runWidget()
-
-    await vi.waitFor(() => {
-      expect(errorSpy).toHaveBeenCalledWith(expect.stringContaining("embed authorization failed"))
-    })
-    expect(panelEl()).not.toHaveClass("open")
-    expect(iframeEl()?.getAttribute("src")).toBeNull()
-    errorSpy.mockRestore()
-  })
-
-  it("stays closed on load once the visitor has closed it before", () => {
-    localStorage.setItem(CLOSED_KEY, "true")
-
-    runWidget()
-
-    expect(panelEl()).not.toHaveClass("open")
-  })
-
-  it("closes the panel and persists closed when the iframe posts widget_close", () => {
+  it("closes the panel when the iframe posts widget_close", () => {
     runWidget()
     fabEl()?.click()
     expect(panelEl()).toHaveClass("open")
@@ -210,7 +99,6 @@ describe("widget close chrome", () => {
     fromIframe("widget_close")
 
     expect(panelEl()).not.toHaveClass("open")
-    expect(localStorage.getItem(CLOSED_KEY)).toBe("true")
   })
 
   it("stops reacting to widget_close once the widget is torn down (removed from the DOM)", async () => {
@@ -219,17 +107,18 @@ describe("widget close chrome", () => {
     // wired into the file's established torndown-flag/teardown-observer
     // pattern that every other listener here uses. A stray message arriving
     // after removal (a host SPA swap, not a full page reload) would
-    // otherwise still mutate a detached panel and corrupt the next load's
-    // auto-open decision in storage.
+    // otherwise still mutate a detached panel.
     runWidget()
     fabEl()?.click()
     expect(panelEl()).toHaveClass("open")
-    expect(localStorage.getItem(CLOSED_KEY)).toBe("false")
-    // Captured before removal: jsdom may null out a detached iframe's own
+    // Both captured before removal: querying by class after the container is
+    // detached returns null (the element still exists, just outside the
+    // document), and jsdom may separately null out a detached iframe's own
     // contentWindow, which would make the pre-existing origin/source check
     // reject the message on its own -- this proves the *teardown* path
     // specifically, independent of that check, by keeping the source a
     // match regardless.
+    const capturedPanel = panelEl()
     const capturedSource = iframeEl()?.contentWindow as Window
 
     document.querySelector(".xagent-widget-container")?.remove()
@@ -243,8 +132,8 @@ describe("widget close chrome", () => {
     }))
 
     // Unchanged from the open-click above: a stray post-teardown widget_close
-    // must not have run closePanel() and re-persisted it as closed.
-    expect(localStorage.getItem(CLOSED_KEY)).toBe("false")
+    // must not have run closePanel().
+    expect(capturedPanel).toHaveClass("open")
   })
 
   it("ignores an unrecognized chrome message type", () => {
@@ -326,53 +215,5 @@ describe("widget close chrome", () => {
 
     expect(panelEl()).toHaveClass("open")
     contentWindowGetter.mockRestore()
-  })
-
-  it("falls back to closed when reading the persisted preference throws", async () => {
-    // Scoped to this one key: a blanket throw would also hit the pre-existing,
-    // unrelated xagent_guest_id lookup earlier in the same bootstrap and blow
-    // up before ever reaching readStoredClosed().
-    const realGetItem = localStorage.getItem.bind(localStorage)
-    const getItemSpy = vi.spyOn(localStorage, "getItem").mockImplementation((key) => {
-      if (key === CLOSED_KEY) throw new Error("blocked")
-      return realGetItem(key)
-    })
-    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => undefined)
-
-    runWidget()
-
-    await vi.waitFor(() => {
-      expect(iframeEl()?.getAttribute("src")).not.toBeNull()
-    })
-    expect(panelEl()).not.toHaveClass("open")
-    // "panel stays closed" alone doesn't distinguish a graceful fallback from
-    // readStoredClosed() throwing and the exception just happening to be
-    // swallowed one level up, by the embed-ticket fetch chain's own catch --
-    // which logs this different message. Assert it's never reached.
-    expect(errorSpy).not.toHaveBeenCalledWith(
-      expect.stringContaining("embed authorization request failed"),
-    )
-    getItemSpy.mockRestore()
-    errorSpy.mockRestore()
-  })
-
-  it("does not surface an uncaught error when persisting the preference is blocked", () => {
-    // A synchronous throw inside a native onclick handler doesn't propagate
-    // back through .click() in jsdom (matches real browser behavior) --
-    // expect(() => ...).not.toThrow() can't observe it either way. The
-    // window "error" event is how jsdom actually surfaces it.
-    runWidget()
-    const setItemSpy = vi.spyOn(localStorage, "setItem").mockImplementation(() => {
-      throw new Error("blocked")
-    })
-    const onError = vi.fn()
-    window.addEventListener("error", onError)
-
-    fabEl()?.click()
-
-    expect(onError).not.toHaveBeenCalled()
-    expect(panelEl()).toHaveClass("open")
-    window.removeEventListener("error", onError)
-    setItemSpy.mockRestore()
   })
 })

@@ -33,16 +33,6 @@ function iframeEl(): HTMLIFrameElement | null {
   return document.querySelector<HTMLIFrameElement>(".xagent-widget-iframe")
 }
 
-function panelEl(): Element | null {
-  return document.querySelector(".xagent-widget-panel")
-}
-
-function fabEl(): HTMLButtonElement | null {
-  return document.querySelector<HTMLButtonElement>(".xagent-widget-fab")
-}
-
-const CLOSED_KEY = "xagent_widget_closed"
-
 function spyOnIframePostMessage(frame = iframeEl()) {
   if (!frame?.contentWindow) throw new Error("iframe not mounted")
   return vi.spyOn(frame.contentWindow, "postMessage")
@@ -311,62 +301,6 @@ describe("widget session mode", () => {
     await vi.waitFor(() => {
       expect(response.bodyUsed).toBe(true)
     })
-  })
-
-  it("auto-opens once the initial grant exchange succeeds, for a visitor who last left it open", async () => {
-    localStorage.setItem(CLOSED_KEY, "false")
-    fetchMock.mockResolvedValueOnce(jsonResponse(200, exchangeBody()))
-
-    runWidget({ "data-encrypted-context": GRANT })
-
-    // Session mode sets iframe.src synchronously and unconditionally --
-    // unlike guest mode, that alone doesn't mean the grant is usable, so
-    // this has to wait for the exchange itself to resolve.
-    await vi.waitFor(() => {
-      expect(panelEl()).toHaveClass("open")
-    })
-  })
-
-  it("does not auto-open when the initial grant exchange fails, even for a visitor who left it open", async () => {
-    // A returning visitor's grant can have expired, been consumed, or the
-    // exchange can just fail -- auto-opening ahead of that would show the
-    // degraded/terminal screen unprompted, on every reload.
-    localStorage.setItem(CLOSED_KEY, "false")
-    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => undefined)
-    fetchMock.mockResolvedValueOnce(errorResponse(401, "grant_expired"))
-
-    runWidget({ "data-encrypted-context": GRANT })
-
-    await vi.waitFor(() => expect(errorSpy).toHaveBeenCalledWith(
-      expect.stringContaining("[grant_expired]"),
-    ))
-    expect(panelEl()).not.toHaveClass("open")
-  })
-
-  it("does not re-open a panel the visitor has since closed when a later reconnect succeeds", async () => {
-    localStorage.setItem(CLOSED_KEY, "false")
-    fetchMock
-      .mockResolvedValueOnce(jsonResponse(200, exchangeBody()))
-      .mockResolvedValueOnce(jsonResponse(200, exchangeBody({
-        session_token: "st_second",
-        reconnect_token: "rt_second",
-      })))
-    runWidget({ "data-encrypted-context": GRANT })
-    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1))
-    await flushAsync()
-    // The initial exchange auto-opened it (per the test above); confirm that
-    // before the visitor closes it themselves, so a later false-negative here
-    // can't be mistaken for this test's own point.
-    expect(panelEl()).toHaveClass("open")
-
-    fabEl()?.click()
-    expect(panelEl()).not.toHaveClass("open")
-
-    fromIframe("reconnect_request", { reason: "ws_closed" })
-    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2))
-    await flushAsync()
-
-    expect(panelEl()).not.toHaveClass("open")
   })
 
   it("sends the opaque grant value verbatim after checking that it is not blank", () => {

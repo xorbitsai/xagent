@@ -18,7 +18,8 @@ const postCloseToParent = () => {
 }
 
 const iconButtonClassName =
-  "p-2 rounded-md text-muted-foreground hover:text-foreground hover:bg-muted/50 transition-colors"
+  "p-2 rounded-md text-muted-foreground hover:text-foreground hover:bg-muted/50 transition-colors "
+  + "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
 
 interface WidgetChromeControlsProps {
   // Undefined hides the "..." menu entirely -- it would otherwise open onto
@@ -104,7 +105,7 @@ export function WidgetChromeControls({ newConversation }: WidgetChromeControlsPr
                 role="menuitem"
                 onClick={handleNewConversation}
                 disabled={newConversation.disabled}
-                className="flex w-full items-center gap-2 whitespace-nowrap px-3 py-2 text-left text-sm hover:bg-muted/50 transition-colors disabled:pointer-events-none disabled:opacity-50"
+                className="flex w-full items-center gap-2 whitespace-nowrap px-3 py-2 text-left text-sm hover:bg-muted/50 transition-colors disabled:pointer-events-none disabled:opacity-50 focus-visible:bg-muted/50 focus-visible:outline-none"
               >
                 <MessageSquarePlus className="w-4 h-4 shrink-0" />
                 {newConversation.label}

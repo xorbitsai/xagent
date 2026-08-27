@@ -30,6 +30,7 @@ const widgetConfig = mergeConfig(baseConfig, defineConfig({
         "src/lib/api-wrapper.ts",
         "src/lib/auth-cache.ts",
         "src/lib/files-disabled-presentation.ts",
+        "src/lib/widget-parent-message.ts",
         "src/contexts/presentation-capabilities.tsx",
         "src/app/settings/page.tsx",
         "src/components/layout/sidebar.tsx",
@@ -66,6 +67,9 @@ const widgetConfig = mergeConfig(baseConfig, defineConfig({
         },
         "src/components/widget/widget-chrome-controls.tsx": {
           statements: 95, branches: 90, functions: 95, lines: 95,
+        },
+        "src/lib/widget-parent-message.ts": {
+          statements: 100, branches: 100, functions: 100, lines: 100,
         },
         "src/lib/files-disabled-presentation.ts": {
           statements: 85, branches: 80, functions: 90, lines: 85,

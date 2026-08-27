@@ -8,7 +8,10 @@ const widgetScript = readFileSync(widgetScriptPath, "utf8")
 const widgetScriptUrl = pathToFileURL(widgetScriptPath).href
 
 const HOST = "https://chat.example"
-const CLOSED_KEY = "xagent_widget_closed"
+// Namespaced by data-widget-key (this file's default runWidget() attribute)
+// so two different agents' widgets embedded on one host page don't collide
+// on one shared open/closed preference.
+const CLOSED_KEY = "xagent_widget_closed:widget-secret"
 
 function runWidget(attributes: Record<string, string> = { "data-widget-key": "widget-secret" }) {
   const script = document.createElement("script")
@@ -76,6 +79,29 @@ describe("widget close chrome", () => {
     expect(localStorage.getItem(CLOSED_KEY)).toBeNull()
   })
 
+  it("keeps two different agents' widgets on one host page from colliding on one shared preference", () => {
+    // A fresh Response per call: mockResolvedValue would hand out the same
+    // instance to both widgets, and a fetch body can only be read once.
+    fetchMock.mockImplementation(() => Promise.resolve(new Response(
+      JSON.stringify({ ticket: "t", agent_id: 1 }),
+      { status: 200, headers: { "Content-Type": "application/json" } },
+    )))
+
+    runWidget({ "data-widget-key": "widget-secret" })
+    runWidget({ "data-widget-key": "other-widget-secret" })
+
+    const fabs = document.querySelectorAll<HTMLButtonElement>(".xagent-widget-fab")
+    const panels = document.querySelectorAll(".xagent-widget-panel")
+    expect(fabs).toHaveLength(2)
+
+    fabs[0].click()
+
+    expect(panels[0]).toHaveClass("open")
+    expect(panels[1]).not.toHaveClass("open")
+    expect(localStorage.getItem(CLOSED_KEY)).toBe("false")
+    expect(localStorage.getItem("xagent_widget_closed:other-widget-secret")).toBeNull()
+  })
+
   it("opens on FAB click and persists the open (not-closed) preference", () => {
     runWidget()
 
@@ -95,29 +121,58 @@ describe("widget close chrome", () => {
     expect(localStorage.getItem(CLOSED_KEY)).toBe("true")
   })
 
-  it("reopens automatically once the embed ticket resolves, for a visitor who last left it open", async () => {
+  it("does not auto-open on the embed ticket resolving alone -- only once the child confirms widget_ready", async () => {
+    // The ticket exchange succeeding only means the *parent's* half of
+    // authentication worked; the child still has to redeem that ticket via
+    // its own /api/widget/auth call, which can independently fail. Setting
+    // iframe.src is not itself proof the visitor will see a working chat.
     localStorage.setItem(CLOSED_KEY, "false")
 
     runWidget()
 
-    // Guest mode's auto-open is deferred to iframe.src actually being set,
-    // which only happens after this fetch's promise chain resolves.
     await vi.waitFor(() => {
-      expect(panelEl()).toHaveClass("open")
+      expect(iframeEl()?.getAttribute("src")).not.toBeNull()
     })
+    expect(panelEl()).not.toHaveClass("open")
   })
 
-  it("does not re-persist the preference when auto-restoring on load", async () => {
+  it("reopens once the child posts widget_ready, for a visitor who last left it open", async () => {
+    localStorage.setItem(CLOSED_KEY, "false")
+
+    runWidget()
+    await vi.waitFor(() => {
+      expect(iframeEl()?.getAttribute("src")).not.toBeNull()
+    })
+    fromIframe("widget_ready")
+
+    expect(panelEl()).toHaveClass("open")
+  })
+
+  it("does not re-persist the preference when auto-restoring on widget_ready", async () => {
     localStorage.setItem(CLOSED_KEY, "false")
     const setItemSpy = vi.spyOn(localStorage, "setItem")
 
     runWidget()
-
     await vi.waitFor(() => {
-      expect(panelEl()).toHaveClass("open")
+      expect(iframeEl()?.getAttribute("src")).not.toBeNull()
     })
+    fromIframe("widget_ready")
+
+    expect(panelEl()).toHaveClass("open")
     expect(setItemSpy).not.toHaveBeenCalledWith(CLOSED_KEY, expect.anything())
     setItemSpy.mockRestore()
+  })
+
+  it("stays closed on load once the visitor has closed it before, even once widget_ready arrives", async () => {
+    localStorage.setItem(CLOSED_KEY, "true")
+
+    runWidget()
+    await vi.waitFor(() => {
+      expect(iframeEl()?.getAttribute("src")).not.toBeNull()
+    })
+    fromIframe("widget_ready")
+
+    expect(panelEl()).not.toHaveClass("open")
   })
 
   it("does not auto-open when the embed-ticket request fails, even for a visitor who left it open", async () => {

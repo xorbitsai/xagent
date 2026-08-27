@@ -3,19 +3,7 @@
 import React, { useEffect, useRef, useState } from "react"
 import { Loader2, MessageSquarePlus, MoreHorizontal, X } from "lucide-react"
 import { useI18n } from "@/contexts/i18n-context"
-
-// The host page's widget.js owns panel visibility; it has no direct handle
-// into this iframe's React tree, so close intent is signalled back over
-// postMessage instead. The host is an arbitrary third-party origin from in
-// here, so targetOrigin can't be pinned tighter than "*" -- this carries no
-// sensitive payload, unlike the parent -> iframe session protocol.
-const postCloseToParent = () => {
-  // A direct (non-embedded) visit to this page has window.parent === window;
-  // posting there would just send the widget its own message right back.
-  if (window.parent !== window) {
-    window.parent.postMessage({ xagent: true, v: 1, type: "widget_close" }, "*")
-  }
-}
+import { postToParentWidget } from "@/lib/widget-parent-message"
 
 const iconButtonClassName =
   "p-2 rounded-md text-muted-foreground hover:text-foreground hover:bg-muted/50 transition-colors "
@@ -84,7 +72,7 @@ export function WidgetChromeControls({ newConversation }: WidgetChromeControlsPr
 
   const handleClose = () => {
     setIsMenuOpen(false)
-    postCloseToParent()
+    postToParentWidget("widget_close")
   }
 
   return (

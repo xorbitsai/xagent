@@ -11,6 +11,7 @@ import { usePublicFileAccessPolicy } from "@/contexts/file-access-context"
 import { useI18n } from "@/contexts/i18n-context"
 import { uploadPublicChatFile } from "@/lib/public-chat-file-upload"
 import { normalizeTaskStatus } from "@/lib/task-status"
+import { postToParentWidget } from "@/lib/widget-parent-message"
 import {
   getApiUrl,
 } from "@/lib/utils"
@@ -595,6 +596,14 @@ export function PublicAgentChatPage({
         persistShareAuth(authData)
         setAuthResult(authData)
         setErrorMessage(null)
+        // Tells widget.js it's now safe to auto-restore the panel to open:
+        // the embed-ticket exchange it saw succeed only got this far, not
+        // all the way through this call's own auth check. A share page has
+        // no parent widget.js panel to signal (postToParentWidget no-ops
+        // there anyway), so this is effectively widget-mode only.
+        if (authMode === "widget") {
+          postToParentWidget("widget_ready")
+        }
       } catch (error) {
         console.error(error)
         setErrorMessage((error as Error).message || t("widgetChat.messages.error_init"))

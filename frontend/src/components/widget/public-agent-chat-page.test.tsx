@@ -397,12 +397,13 @@ describe("PublicAgentChatPage", () => {
 
     expect(await screen.findByRole("button", { name: "start:Support Agent" })).toBeInTheDocument()
     expect(fetchMock).toHaveBeenCalledTimes(1)
-    // No conversation yet — nothing to end.
+    // No conversation yet — nothing to end, so the "..." menu (which would
+    // only ever hold the new-conversation action) doesn't render either.
     expect(screen.queryByRole("button", { name: "widgetChat.newConversation" })).toBeNull()
-    // The embedded widget's minimize/close controls render even with no
-    // active conversation — they toggle the host panel, not the chat itself.
+    expect(screen.queryByRole("button", { name: "widgetChat.moreOptions" })).toBeNull()
+    // The close control still renders — it toggles the host panel, not the
+    // chat itself, so it's independent of whether a conversation exists.
     expect(screen.getByRole("button", { name: "widgetChat.close" })).toBeInTheDocument()
-    expect(screen.getByRole("button", { name: "widgetChat.moreOptions" })).toBeInTheDocument()
   })
 
   it("ends the conversation and returns to the start screen", async () => {
@@ -413,7 +414,8 @@ describe("PublicAgentChatPage", () => {
     renderWidgetPage()
 
     await screen.findByTestId("conversation-panel")
-    fireEvent.click(screen.getByRole("button", { name: "widgetChat.newConversation" }))
+    fireEvent.click(screen.getByRole("button", { name: "widgetChat.moreOptions" }))
+    fireEvent.click(screen.getByRole("menuitem", { name: "widgetChat.newConversation" }))
 
     // The persisted id is dropped, so a reload cannot resurrect the old task,
     // and the next message goes through the fresh-task path in handleSend.
@@ -434,7 +436,8 @@ describe("PublicAgentChatPage", () => {
     renderWidgetPage()
 
     await screen.findByTestId("conversation-panel")
-    fireEvent.click(screen.getByRole("button", { name: "widgetChat.newConversation" }))
+    fireEvent.click(screen.getByRole("button", { name: "widgetChat.moreOptions" }))
+    fireEvent.click(screen.getByRole("menuitem", { name: "widgetChat.newConversation" }))
 
     expect(app.dispatch).toHaveBeenCalledWith({ type: "SET_PROCESSING", payload: false })
     expect(app.dispatch).toHaveBeenCalledWith({ type: "SET_CURRENT_TASK", payload: null })

@@ -247,7 +247,8 @@ describe("SessionAgentChatPage", () => {
     render(<SessionAgentChatPage />)
 
     expect(screen.getByRole("alert")).toHaveTextContent("widgetSession.reloadRequired")
-    expect(screen.getByRole("button", {
+    fireEvent.click(screen.getByRole("button", { name: "widgetChat.moreOptions" }))
+    expect(screen.getByRole("menuitem", {
       name: "widgetSession.startNewConversation",
     })).toBeDisabled()
     expect(app.startProps).toBeNull()
@@ -263,7 +264,8 @@ describe("SessionAgentChatPage", () => {
     app.state.taskId = 92
     app.startNewConversation.mockRejectedValueOnce(new Error("timeout"))
     const { rerender } = render(<SessionAgentChatPage />)
-    fireEvent.click(screen.getByRole("button", { name: "widgetSession.startNewConversation" }))
+    fireEvent.click(screen.getByRole("button", { name: "widgetChat.moreOptions" }))
+    fireEvent.click(screen.getByRole("menuitem", { name: "widgetSession.startNewConversation" }))
     await screen.findByText("widgetSession.resetFailed")
 
     app.sessionConversationState = "reload_required"
@@ -303,11 +305,13 @@ describe("SessionAgentChatPage", () => {
       { mode: "balanced" },
       [],
     )
-    expect(screen.queryByRole("button", {
+    expect(screen.queryByRole("menuitem", {
       name: "widgetSession.startNewConversation",
     })).not.toBeInTheDocument()
+    // No conversation yet — nothing to reset, so the "..." menu (which would
+    // only ever hold the new-conversation action) doesn't render either.
+    expect(screen.queryByRole("button", { name: "widgetChat.moreOptions" })).toBeNull()
     expect(screen.getByRole("button", { name: "widgetChat.close" })).toBeInTheDocument()
-    expect(screen.getByRole("button", { name: "widgetChat.moreOptions" })).toBeInTheDocument()
   })
 
   it("renders the conversation with files disabled and gates reset on pending work", () => {
@@ -326,14 +330,15 @@ describe("SessionAgentChatPage", () => {
       showTaskFiles: false,
       showTaskActions: false,
     }))
-    const reset = screen.getByRole("button", {
+    fireEvent.click(screen.getByRole("button", { name: "widgetChat.moreOptions" }))
+    const reset = screen.getByRole("menuitem", {
       name: "widgetSession.startNewConversation",
     })
     expect(reset).toBeDisabled()
 
     app.isMessageDeliveryPending = false
     rerender(<SessionAgentChatPage />)
-    fireEvent.click(screen.getByRole("button", {
+    fireEvent.click(screen.getByRole("menuitem", {
       name: "widgetSession.startNewConversation",
     }))
     expect(app.startNewConversation).toHaveBeenCalledTimes(1)

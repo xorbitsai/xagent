@@ -9,9 +9,11 @@ vi.mock("@/contexts/i18n-context", () => ({
 
 describe("WidgetChromeControls", () => {
   const postMessageSpy = vi.fn()
+  const onNewConversation = vi.fn()
 
   beforeEach(() => {
     postMessageSpy.mockReset()
+    onNewConversation.mockReset()
     vi.stubGlobal("parent", { postMessage: postMessageSpy })
   })
 
@@ -20,10 +22,16 @@ describe("WidgetChromeControls", () => {
     vi.unstubAllGlobals()
   })
 
-  it("renders a close button and a collapsed menu trigger", () => {
+  it("renders only the close button when there is no new-conversation action", () => {
     render(<WidgetChromeControls />)
 
     expect(screen.getByRole("button", { name: "widgetChat.close" })).toBeInTheDocument()
+    expect(screen.queryByRole("button", { name: "widgetChat.moreOptions" })).toBeNull()
+  })
+
+  it("renders a collapsed menu trigger when a new-conversation action is given", () => {
+    render(<WidgetChromeControls newConversation={{ label: "Start over", onClick: onNewConversation }} />)
+
     const menuTrigger = screen.getByRole("button", { name: "widgetChat.moreOptions" })
     expect(menuTrigger).toHaveAttribute("aria-expanded", "false")
     expect(screen.queryByRole("menu")).toBeNull()
@@ -40,23 +48,33 @@ describe("WidgetChromeControls", () => {
     )
   })
 
-  it("opens the menu on trigger click and posts widget_minimize, closing the menu", () => {
-    render(<WidgetChromeControls />)
+  it("opens the menu on trigger click, shows the given label, and calls onClick then closes the menu", () => {
+    render(<WidgetChromeControls newConversation={{ label: "Start over", onClick: onNewConversation }} />)
 
     fireEvent.click(screen.getByRole("button", { name: "widgetChat.moreOptions" }))
-    expect(screen.getByRole("menu")).toBeInTheDocument()
+    const item = screen.getByRole("menuitem", { name: "Start over" })
+    expect(item).toBeInTheDocument()
 
-    fireEvent.click(screen.getByRole("menuitem", { name: "widgetChat.minimize" }))
+    fireEvent.click(item)
 
-    expect(postMessageSpy).toHaveBeenCalledWith(
-      { xagent: true, v: 1, type: "widget_minimize" },
-      "*",
-    )
+    expect(onNewConversation).toHaveBeenCalledTimes(1)
     expect(screen.queryByRole("menu")).toBeNull()
   })
 
+  it("disables the new-conversation menu item when told to", () => {
+    render(
+      <WidgetChromeControls
+        newConversation={{ label: "Resetting...", onClick: onNewConversation, disabled: true }}
+      />,
+    )
+
+    fireEvent.click(screen.getByRole("button", { name: "widgetChat.moreOptions" }))
+
+    expect(screen.getByRole("menuitem", { name: "Resetting..." })).toBeDisabled()
+  })
+
   it("closes the menu on Escape", () => {
-    render(<WidgetChromeControls />)
+    render(<WidgetChromeControls newConversation={{ label: "Start over", onClick: onNewConversation }} />)
 
     fireEvent.click(screen.getByRole("button", { name: "widgetChat.moreOptions" }))
     expect(screen.getByRole("menu")).toBeInTheDocument()
@@ -69,7 +87,7 @@ describe("WidgetChromeControls", () => {
   it("closes the menu when the iframe window loses focus", () => {
     // e.g. the host page's own FAB, entirely outside this document, hiding
     // the panel -- neither the pointerdown nor the Escape listener fires.
-    render(<WidgetChromeControls />)
+    render(<WidgetChromeControls newConversation={{ label: "Start over", onClick: onNewConversation }} />)
 
     fireEvent.click(screen.getByRole("button", { name: "widgetChat.moreOptions" }))
     expect(screen.getByRole("menu")).toBeInTheDocument()
@@ -83,7 +101,7 @@ describe("WidgetChromeControls", () => {
     render(
       <div>
         <div data-testid="outside">outside</div>
-        <WidgetChromeControls />
+        <WidgetChromeControls newConversation={{ label: "Start over", onClick: onNewConversation }} />
       </div>,
     )
 

@@ -396,23 +396,29 @@ function PublicConversationContent({
               <p className="text-xs text-destructive">{createTaskError}</p>
             )}
           </div>
-          {(state.taskId || authMode === "widget") && (
-            <div className="ml-auto flex items-center gap-1">
-              {state.taskId && (
-                <button
-                  type="button"
-                  onClick={handleNewConversation}
-                  title={t("widgetChat.newConversation")}
-                  aria-label={t("widgetChat.newConversation")}
-                  className="p-2 rounded-md text-muted-foreground hover:text-foreground hover:bg-muted/50 transition-colors"
-                >
-                  <MessageSquarePlus className="w-4 h-4" />
-                </button>
-              )}
-              {/* The embedded widget is the only mode a host page can hide;
-                  a standalone share link has no parent to signal. */}
-              {authMode === "widget" && <WidgetChromeControls />}
-            </div>
+          {/* A standalone share link has no parent widget.js to signal, so
+              it keeps its own visible reset button instead of the "..."
+              menu -- the embedded widget is the only mode that can be
+              hidden from a host page. */}
+          {authMode === "share" ? (
+            state.taskId && (
+              <button
+                type="button"
+                onClick={handleNewConversation}
+                title={t("widgetChat.newConversation")}
+                aria-label={t("widgetChat.newConversation")}
+                className="ml-auto p-2 rounded-md text-muted-foreground hover:text-foreground hover:bg-muted/50 transition-colors"
+              >
+                <MessageSquarePlus className="w-4 h-4" />
+              </button>
+            )
+          ) : (
+            <WidgetChromeControls
+              newConversation={state.taskId ? {
+                label: t("widgetChat.newConversation"),
+                onClick: handleNewConversation,
+              } : undefined}
+            />
           )}
         </div>
       </div>

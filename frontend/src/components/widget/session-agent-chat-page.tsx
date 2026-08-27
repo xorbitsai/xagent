@@ -4,7 +4,6 @@ import React, { useCallback, useMemo, useState } from "react"
 import { Loader2 } from "lucide-react"
 import { ChatStartScreen } from "@/components/chat/ChatStartScreen"
 import { TaskConversationPanel } from "@/components/task/task-conversation-panel"
-import { Button } from "@/components/ui/button"
 import { WidgetChromeControls } from "@/components/widget/widget-chrome-controls"
 import {
   AppProvider,
@@ -156,22 +155,15 @@ function SessionConversationContent({
                 : t("widgetChat.status.connecting")}
             </p>
           </div>
-          <div className="ml-auto flex items-center gap-1">
-            {hasEstablishedConversation ? (
-              <Button
-                type="button"
-                variant="outline"
-                size="sm"
-                disabled={resetDisabled}
-                onClick={() => void handleStartNewConversation()}
-              >
-                {isConversationResetPending
-                  ? t("widgetSession.resetting")
-                  : t("widgetSession.startNewConversation")}
-              </Button>
-            ) : null}
-            <WidgetChromeControls />
-          </div>
+          <WidgetChromeControls
+            newConversation={hasEstablishedConversation ? {
+              label: isConversationResetPending
+                ? t("widgetSession.resetting")
+                : t("widgetSession.startNewConversation"),
+              onClick: () => void handleStartNewConversation(),
+              disabled: resetDisabled,
+            } : undefined}
+          />
         </div>
         {isAbsoluteExpiryWarningVisible ? (
           <p

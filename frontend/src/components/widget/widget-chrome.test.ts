@@ -8,7 +8,7 @@ const widgetScript = readFileSync(widgetScriptPath, "utf8")
 const widgetScriptUrl = pathToFileURL(widgetScriptPath).href
 
 const HOST = "https://chat.example"
-const MINIMIZED_KEY = "xagent_widget_minimized"
+const CLOSED_KEY = "xagent_widget_closed"
 
 function runWidget(attributes: Record<string, string> = { "data-widget-key": "widget-secret" }) {
   const script = document.createElement("script")
@@ -41,7 +41,7 @@ function fromIframe(type: string) {
   }))
 }
 
-describe("widget minimize/close chrome", () => {
+describe("widget close chrome", () => {
   let currentScriptDescriptor: PropertyDescriptor | undefined
   const fetchMock = vi.fn()
 
@@ -73,45 +73,45 @@ describe("widget minimize/close chrome", () => {
     runWidget()
 
     expect(panelEl()).not.toHaveClass("open")
-    expect(localStorage.getItem(MINIMIZED_KEY)).toBeNull()
+    expect(localStorage.getItem(CLOSED_KEY)).toBeNull()
   })
 
-  it("opens on FAB click and persists the open (non-minimized) preference", () => {
+  it("opens on FAB click and persists the open (not-closed) preference", () => {
     runWidget()
 
     fabEl()?.click()
 
     expect(panelEl()).toHaveClass("open")
-    expect(localStorage.getItem(MINIMIZED_KEY)).toBe("false")
+    expect(localStorage.getItem(CLOSED_KEY)).toBe("false")
   })
 
-  it("closes on a second FAB click and persists the minimized preference", () => {
+  it("closes on a second FAB click and persists the closed preference", () => {
     runWidget()
 
     fabEl()?.click()
     fabEl()?.click()
 
     expect(panelEl()).not.toHaveClass("open")
-    expect(localStorage.getItem(MINIMIZED_KEY)).toBe("true")
+    expect(localStorage.getItem(CLOSED_KEY)).toBe("true")
   })
 
   it("reopens automatically on load when the visitor last left it open", () => {
-    localStorage.setItem(MINIMIZED_KEY, "false")
+    localStorage.setItem(CLOSED_KEY, "false")
 
     runWidget()
 
     expect(panelEl()).toHaveClass("open")
   })
 
-  it("stays closed on load once the visitor has minimized it before", () => {
-    localStorage.setItem(MINIMIZED_KEY, "true")
+  it("stays closed on load once the visitor has closed it before", () => {
+    localStorage.setItem(CLOSED_KEY, "true")
 
     runWidget()
 
     expect(panelEl()).not.toHaveClass("open")
   })
 
-  it("closes the panel and persists minimized when the iframe posts widget_close", () => {
+  it("closes the panel and persists closed when the iframe posts widget_close", () => {
     runWidget()
     fabEl()?.click()
     expect(panelEl()).toHaveClass("open")
@@ -119,16 +119,16 @@ describe("widget minimize/close chrome", () => {
     fromIframe("widget_close")
 
     expect(panelEl()).not.toHaveClass("open")
-    expect(localStorage.getItem(MINIMIZED_KEY)).toBe("true")
+    expect(localStorage.getItem(CLOSED_KEY)).toBe("true")
   })
 
-  it("closes the panel when the iframe posts widget_minimize", () => {
+  it("ignores an unrecognized chrome message type", () => {
     runWidget()
     fabEl()?.click()
 
     fromIframe("widget_minimize")
 
-    expect(panelEl()).not.toHaveClass("open")
+    expect(panelEl()).toHaveClass("open")
   })
 
   it("ignores a chrome message from a different origin", () => {
@@ -170,7 +170,7 @@ describe("widget minimize/close chrome", () => {
     expect(panelEl()).toHaveClass("open")
   })
 
-  it("falls back to minimized when reading the persisted preference throws", () => {
+  it("falls back to closed when reading the persisted preference throws", () => {
     const getItemSpy = vi.spyOn(Storage.prototype, "getItem").mockImplementation(() => {
       throw new Error("blocked")
     })

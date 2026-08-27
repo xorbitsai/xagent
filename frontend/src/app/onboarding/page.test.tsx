@@ -249,6 +249,40 @@ describe("OnboardingPage", () => {
     })
   })
 
+  // Pins a bug found in full-feature self-review: the save-escape flag used
+  // to be marked unconditionally on the 2nd consecutive failure, even though
+  // the matching navigation right after it is gated on isMountedRef - an
+  // unmount between the two (e.g. a forced re-auth redirect elsewhere) left
+  // the flag live in sessionStorage with no navigation to consume it,
+  // wrongly suppressing AuthGuard's next check on wherever the user actually
+  // landed. The flag must only be marked alongside a navigation that's
+  // actually about to happen.
+  it("does not mark the save-escape flag if the component unmounts before the 2nd failure's navigation would fire", async () => {
+    updateUserPreferencesMock.mockResolvedValueOnce({ ok: false })
+    let resolveSecondSave!: (v: { ok: boolean }) => void
+    updateUserPreferencesMock.mockReturnValueOnce(
+      new Promise((resolve) => { resolveSecondSave = resolve })
+    )
+
+    const { unmount } = render(<OnboardingPage />)
+    await waitFor(() => expect(screen.getByText(/Welcome to Xagent/)).toBeInTheDocument())
+
+    await act(async () => {
+      fireEvent.click(screen.getByText("Skip setup"))
+    })
+    expect(routerReplace).not.toHaveBeenCalled()
+
+    fireEvent.click(screen.getByText("Skip setup"))
+    unmount()
+
+    await act(async () => {
+      resolveSecondSave({ ok: false })
+    })
+
+    expect(markOnboardingSaveEscapedMock).not.toHaveBeenCalled()
+    expect(routerReplace).not.toHaveBeenCalled()
+  })
+
   // Flagged by PR review (xorbitsai/xagent#1617): persistAndLeave awaited the
   // save but never checked its result - a failed PATCH still navigated away,
   // and AuthGuard would immediately bounce the user back since onboarded
@@ -292,6 +326,75 @@ describe("OnboardingPage", () => {
     expect(hireAgentFromTemplateMock.mock.calls[0][0]).toEqual(
       expect.objectContaining({ templateId: "marketing-social-media-content-manager" })
     )
+    expect(routerReplace).toHaveBeenCalledWith("/task/42")
+  })
+
+  // Pins a test-coverage gap found in full-feature self-review: handleLaunch
+  // has the same launchingRef double-click guard as persistAndLeave, but
+  // every existing test awaits each click to full completion before firing
+  // the next one - a fast double-click on the primary CTA before its PATCH
+  // resolves was never actually exercised.
+  it("ignores a second click on 'Start with X' while the first save is still in flight", async () => {
+    let resolveSave!: (v: { ok: boolean }) => void
+    updateUserPreferencesMock.mockReturnValue(new Promise((resolve) => { resolveSave = resolve }))
+
+    await goToWelcomeThenBusiness()
+    fireEvent.click(screen.getByText("Marketing"))
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/take off your plate/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Post on social media"))
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/Meet your AI team/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/How should/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText("You're all set.")).toBeInTheDocument())
+
+    const startButton = screen.getByText("Start with Maya")
+    fireEvent.click(startButton)
+    fireEvent.click(startButton)
+    fireEvent.click(startButton)
+
+    expect(updateUserPreferencesMock).toHaveBeenCalledTimes(1)
+
+    await act(async () => {
+      resolveSave({ ok: true })
+    })
+
+    expect(hireAgentFromTemplateMock).toHaveBeenCalledTimes(1)
+  })
+
+  // Pins a test-coverage gap found in full-feature self-review: handleLaunch's
+  // outer catch (hireAgentFromTemplate itself rejecting, after a successful
+  // save and freshness re-check) had zero coverage - a broken retry here
+  // would strand a first-time user on the page with no way to proceed.
+  it("shows an error toast and resets launching state so the user can retry when hireAgentFromTemplate fails", async () => {
+    hireAgentFromTemplateMock.mockRejectedValueOnce(new Error("network down"))
+
+    await goToWelcomeThenBusiness()
+    fireEvent.click(screen.getByText("Marketing"))
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/take off your plate/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Post on social media"))
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/Meet your AI team/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/How should/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText("You're all set.")).toBeInTheDocument())
+
+    await act(async () => {
+      fireEvent.click(screen.getByText("Start with Maya"))
+    })
+
+    expect(toastErrorMock).toHaveBeenCalledWith("Couldn't hire Maya. Please try again.")
+    expect(routerReplace).not.toHaveBeenCalledWith(expect.stringContaining("/task/"))
+    expect(screen.getByText("Start with Maya").closest("button")).not.toBeDisabled()
+
+    // Retrying must actually work - launchingRef/setLaunching were reset.
+    await act(async () => {
+      fireEvent.click(screen.getByText("Start with Maya"))
+    })
     expect(routerReplace).toHaveBeenCalledWith("/task/42")
   })
 

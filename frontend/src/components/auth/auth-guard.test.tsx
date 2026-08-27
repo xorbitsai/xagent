@@ -133,6 +133,24 @@ describe("AuthGuard onboarding redirect", () => {
     expect(routerReplace).not.toHaveBeenCalledWith("/onboarding")
   })
 
+  // Pins the core behavior checkedOnboardingRef exists to implement, found
+  // untested in full-feature self-review: every other latch scenario (the
+  // escape flag, a cancelled in-flight check) is pinned, but not the plain
+  // "checked once per app load" happy path itself. A regression that never
+  // latches on a successful check would silently re-fetch preferences on
+  // every single route change for every user, forever.
+  it("does not re-check preferences on a later route once a check has successfully completed", async () => {
+    fetchUserPreferencesMock.mockResolvedValue({ onboarded: true })
+
+    const { rerender } = render(<AuthGuard><div data-testid="children" /></AuthGuard>)
+    await waitFor(() => expect(fetchUserPreferencesMock).toHaveBeenCalledTimes(1))
+
+    route.pathname = "/dashboard"
+    rerender(<AuthGuard><div data-testid="children" /></AuthGuard>)
+
+    expect(fetchUserPreferencesMock).toHaveBeenCalledTimes(1)
+  })
+
   // Pins a PR review finding (regression in this mechanism's first version):
   // the flag used to be checked only inside the async preferences check,
   // which the "already checked" ref guard skips entirely once a check has

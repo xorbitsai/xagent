@@ -511,9 +511,6 @@
   display: grid;
   place-items: center;
 }
-.ob-tm .ob-tm-av {
-  background: linear-gradient(150deg, #eef0fe, #e4e7fc 55%, #dce0fa);
-}
 .ob-tm-name {
   margin-top: 15px;
   font-size: 17px;

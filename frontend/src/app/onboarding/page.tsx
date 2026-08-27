@@ -14,6 +14,7 @@ import { getBrandingFromEnv } from "@/lib/branding";
 import { markOnboardingSaveEscaped, updateUserPreferences, type UserPreferences } from "@/lib/user-preferences";
 import { hireAgentFromTemplate } from "@/lib/hire-agent";
 import { PersonaAvatar } from "@/components/templates/persona-avatar";
+import { categoryLabel } from "@/lib/template-categories";
 import {
   ONBOARDING_DEFAULT_VOICE,
   ONBOARDING_FALLBACK_TEMPLATE_IDS,
@@ -276,6 +277,14 @@ export default function OnboardingPage() {
     // against this PATCH would read the old onboarded:false and bounce the
     // user straight back into onboarding right after they left it.
     const saved = await updateUserPreferences(buildPreferencesPayload());
+    // Set only right before the navigation below actually fires (guarded by
+    // the same isMountedRef check), not unconditionally here - self-review
+    // found that marking it regardless of mount state leaves it dangling in
+    // sessionStorage, live, if the component unmounts for an unrelated
+    // reason (e.g. a forced re-auth navigation) between this failure and the
+    // replace() below: the flag would then wrongly stand down AuthGuard's
+    // very next check on wherever the user actually lands instead.
+    let shouldMarkSaveEscape = false;
     if (!saved.ok) {
       const failureCount = (saveFailureCountByDestRef.current[destination] ?? 0) + 1;
       saveFailureCountByDestRef.current[destination] = failureCount;
@@ -300,14 +309,17 @@ export default function OnboardingPage() {
       // this happens for real: sometimes as a bounce loop, sometimes it
       // silently means the escape never actually reaches its destination).
       // This flag tells that check to stand down once.
-      markOnboardingSaveEscaped();
+      shouldMarkSaveEscape = true;
     } else {
       saveFailureCountByDestRef.current[destination] = 0;
     }
     // replace, not push: leaving a /onboarding entry in history means a
     // single Back press would return the user to a stale, reset-to-step-0
     // wizard even though they've just finished with it (or escaped it).
-    if (isMountedRef.current) router.replace(destination);
+    if (isMountedRef.current) {
+      if (shouldMarkSaveEscape) markOnboardingSaveEscaped();
+      router.replace(destination);
+    }
   };
 
   const handleLaunch = async () => {
@@ -646,7 +658,7 @@ export default function OnboardingPage() {
                         <div className="ob-tm-role">{template.persona.role}</div>
                         <span className="ob-tm-cat">
                           <i style={{ background: dot }} />
-                          {template.category}
+                          {categoryLabel(t, template.category)}
                         </span>
                         <p className="ob-tm-desc">{template.description}</p>
                         {goal && (

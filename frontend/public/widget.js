@@ -326,7 +326,7 @@
       position: absolute;
       bottom: calc(${buttonSize} + 20px);
       right: 0;
-      width: 380px;
+      width: ${DEFAULT_PANEL_WIDTH}px;
       height: 600px;
       max-height: calc(100vh - 100px);
       background: ${panelBgColor};
@@ -367,6 +367,15 @@
     .xagent-widget-resize-handle:hover,
     .xagent-widget-resize-handle:active {
       background: rgba(0, 0, 0, 0.15);
+    }
+
+    /* visibility transitions to a closed panel keep it hit-testable for the
+       duration of the transition (per spec, as long as either end of the
+       transition is 'visible') -- without this, the handle stays draggable
+       and cursor-hinting during that window even though the panel is
+       already fading out. */
+    .xagent-widget-panel:not(.open) .xagent-widget-resize-handle {
+      display: none;
     }
 
     @media (max-width: ${MOBILE_BREAKPOINT}px) {
@@ -433,22 +442,19 @@
       // box-sizing: border-box is in effect -- computed style avoids that
       // mismatch (a jump by the border width on every drag start) even if
       // something on the host page ends up overriding our own box-sizing rule.
-      // This is the *rendered* width, which is <= the user's raw preference
-      // whenever the viewport is currently clamping it down (previewWidth
-      // below) -- pointermove needs both to avoid re-corrupting the
-      // preference on a drag that never escapes that clamp.
       startWidth: parseInt(window.getComputedStyle(panel).width, 10) || DEFAULT_PANEL_WIDTH,
       // The drag's live candidate. panelWidth itself is never written until
-      // a real release commits it (see endDrag) -- cancelling a drag (blur,
-      // a mid-drag viewport change, pointercancel, DOM removal) then needs
-      // no rollback of anything, since the committed preference was never
-      // touched in the first place.
-      previewWidth: panelWidth,
-      // Sticky for the rest of this drag: once the user visibly shrinks past
-      // the starting render, later pointermove events adopt the live value
-      // outright (see onPointerMove) instead of continuing to protect a
-      // preference the user has already demonstrated they're moving away from.
-      shrunkPastStart: false,
+      // a real release commits it (see finishDrag) -- cancelling a drag
+      // (blur, a mid-drag viewport change, pointercancel, DOM removal) then
+      // needs no rollback of anything, since the committed preference was
+      // never touched in the first place.
+      lastWidth: null,
+      // Whether this drag ever visibly rendered a width other than
+      // startWidth -- a release with this still false is a no-op (a plain
+      // click, or a drag fully absorbed by the viewport ceiling) and must
+      // leave the existing preference alone rather than re-commit whatever
+      // startWidth happened to be.
+      moved: false,
       originalCursor: document.body.style.cursor,
       originalUserSelect: document.body.style.userSelect
     };
@@ -476,15 +482,15 @@
     var delta = dragState.startX - event.clientX;
     var candidate = clampPanelWidth(dragState.startWidth + delta);
     panel.style.width = candidate + 'px';
-    if (candidate < dragState.startWidth) dragState.shrunkPastStart = true;
-    // If the drag started already pinned to the viewport ceiling (the raw
-    // preference is wider than what currently fits) and never visibly shrinks
-    // past that ceiling, keep the wider preference intact instead of silently
-    // replacing it with the ceiling value -- once the user does demonstrate a
-    // real shrink, adopt the live value for the rest of the drag, including a
-    // later move back up to exactly the ceiling (that's now a real choice,
-    // not an unmoved starting position).
-    dragState.previewWidth = dragState.shrunkPastStart ? candidate : Math.max(candidate, dragState.previewWidth);
+    dragState.lastWidth = candidate;
+    // A drag that started already pinned to the viewport ceiling (the raw
+    // preference is wider than what currently fits) and never visibly moves
+    // the render away from that ceiling hasn't expressed a new choice --
+    // leave the existing preference alone rather than re-committing the
+    // ceiling value on release. Always tracking the *latest* candidate here
+    // (not a running min/max across the drag) is what makes an overshoot
+    // that gets corrected back commit the corrected value, not the peak.
+    if (candidate !== dragState.startWidth) dragState.moved = true;
   }
 
   function restoreDragSideEffects() {
@@ -509,40 +515,42 @@
     } catch (e) {}
   }
 
-  function endDrag(event) {
+  // A real release (pointerup/pointercancel... see below) commits whatever
+  // was last rendered; any other way a drag ends only cancels. Both share
+  // this one path so the guard, cleanup, and re-render can't drift apart
+  // between the two the way they did across earlier rounds.
+  function finishDrag(commit, event) {
     if (!dragState || (event && event.pointerId !== dragState.pointerId)) return;
     restoreDragSideEffects();
-    // Skip committing once the panel has left the DOM: this same cleanup
-    // runs from the teardown observer below on removal, by which point any
-    // width here reflects a stale, no-longer-visible instance rather than a
-    // choice the user can still see or reconsider.
-    if (panel.isConnected) {
-      panelWidth = dragState.previewWidth;
+    // dragState.moved false means this release never actually rendered a
+    // different width (a plain click, or a drag fully absorbed by the
+    // viewport ceiling) -- leave the existing preference untouched rather
+    // than re-committing startWidth as if it were a real choice. Skip
+    // committing entirely once the panel has left the DOM: any width here
+    // reflects a stale, no-longer-visible instance rather than a choice the
+    // user can still see or reconsider.
+    if (commit && dragState.moved && panel.isConnected) {
+      panelWidth = dragState.lastWidth;
       persistWidth(panelWidth);
     }
     dragState = null;
+    applyPanelWidth();
+  }
+  function endDrag(event) {
+    finishDrag(true, event);
+  }
+  // Cancels rather than commits: window blur, a viewport change invalidating
+  // this drag's frozen geometry, DOM removal, and pointercancel (an
+  // involuntary interruption -- a touch gesture reinterpreted as a scroll,
+  // an OS-level interrupt, capture lost to another element -- rather than
+  // the user confirming a release) are none of them the user releasing the
+  // handle, so none of them persist a width.
+  function cancelDrag(event) {
+    finishDrag(false, event);
   }
   document.addEventListener('pointermove', onPointerMove);
   document.addEventListener('pointerup', endDrag);
-  // pointercancel is an involuntary interruption (a touch gesture
-  // reinterpreted as a scroll, an OS-level interrupt, capture lost to
-  // another element) rather than the user confirming a release, so it goes
-  // through cancelDrag (below) like blur/resize, not endDrag.
   document.addEventListener('pointercancel', cancelDrag);
-
-  // Cancels rather than commits: an interruption -- window blur, a viewport
-  // change invalidating this drag's frozen geometry, pointercancel, DOM
-  // removal -- is not the user confirming a width via release, so it must
-  // not persist one. Unlike endDrag, this never touches the committed
-  // panelWidth at all (only dragState.previewWidth, which is simply
-  // discarded) -- so there's nothing to roll back, and no risk of an
-  // abandoned draft surviving to be picked up by a later, unrelated drag.
-  function cancelDrag(event) {
-    if (!dragState || (event && event.pointerId !== dragState.pointerId)) return;
-    restoreDragSideEffects();
-    dragState = null;
-    applyPanelWidth();
-  }
 
   function onWindowBlur() {
     // Focus moving into this widget's own iframe (e.g. the chat composer
@@ -587,6 +595,11 @@
     document.removeEventListener('pointerup', endDrag);
     document.removeEventListener('pointercancel', cancelDrag);
     cancelDrag();
+    // Belt-and-suspenders for a host SPA that re-inserts this same node
+    // later (torndown permanently blocks a new drag regardless, but without
+    // this the handle would still show its ew-resize cursor and hover
+    // highlight, looking interactive while doing nothing).
+    resizeHandle.style.display = 'none';
   });
 
   // FAB
@@ -621,7 +634,11 @@
   // container directly, or wiping a wrapper it added around container)
   // would otherwise mutate a node this observer never inspects, and the
   // callback would simply never fire.
-  panelRemovalObserver.observe(document.body, { childList: true, subtree: true });
+  // documentElement, not body: a host framework that replaces <body> wholesale
+  // on navigation (e.g. Turbo Drive, htmx boosted navigation) never mutates
+  // the childList of the *old* body node that still holds container -- only
+  // <html>'s own childList changes when body itself is swapped out.
+  panelRemovalObserver.observe(document.documentElement, { childList: true, subtree: true });
 
   mode.attach(iframe);
 
@@ -790,7 +807,10 @@
       window.addEventListener('pageshow', onPageShow);
       window.addEventListener('pagehide', onPageHide);
       state.observer = new MutationObserver(onDomMutation);
-      state.observer.observe(document.body, { childList: true, subtree: true });
+      // documentElement, not body: see panelRemovalObserver's identical
+      // reasoning above -- a full <body> replacement never mutates the old
+      // body's own childList.
+      state.observer.observe(document.documentElement, { childList: true, subtree: true });
       runLoadFlow();
     }
 

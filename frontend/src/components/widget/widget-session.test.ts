@@ -270,15 +270,17 @@ describe("widget session mode", () => {
     expect(iframeEl()?.src).toBe(`${HOST}/widget/chat/session`)
     // Two MutationObservers now exist in session mode: the widget's own
     // panel-removal teardown (armed before mode.attach runs) and this
-    // controller's iframe-connectivity one, both on document.body with the
-    // same options -- so "was called with these args" alone no longer pins
-    // this controller's own observer specifically. Assert every observe()
-    // call has the expected target/options, so a regression in either one
-    // (e.g. this controller's own observer losing `subtree`) still fails
-    // here instead of being masked by the other happening to be correct.
+    // controller's iframe-connectivity one, both on document.documentElement
+    // with the same options -- so "was called with these args" alone no
+    // longer pins this controller's own observer specifically. Assert every
+    // observe() call has the expected target/options, so a regression in
+    // either one (e.g. this controller's own observer losing `subtree`, or
+    // reverting to document.body -- which misses a host framework replacing
+    // <body> wholesale on navigation) still fails here instead of being
+    // masked by the other happening to be correct.
     expect(observeSpy).toHaveBeenCalledTimes(2)
     observeSpy.mock.calls.forEach(([target, options]) => {
-      expect(target).toBe(document.body)
+      expect(target).toBe(document.documentElement)
       expect(options).toEqual({ childList: true, subtree: true })
     })
     expect(fetchMock).toHaveBeenCalledTimes(1)

@@ -191,6 +191,24 @@ describe("ChatMessage Session file capability", () => {
     ).not.toBeInTheDocument()
   })
 
+  it("keeps a Hire-flow seeded kickoff message intact instead of overwriting it, since its connect_apps interaction is not the active pause", () => {
+    render(
+      <ChatMessage
+        role="assistant"
+        content="Hi, I'm your new marketing agent. Before we start, connect the apps below."
+        interactions={[{ type: "connect_apps", field: "connect_apps", apps: ["Gmail", "Slack"] }]}
+        interactionsActive={false}
+      />,
+    )
+
+    expect(
+      screen.getByText("Hi, I'm your new marketing agent. Before we start, connect the apps below."),
+    ).toBeInTheDocument()
+    expect(
+      screen.queryByText("chatPage.clarification.connectApps.needAccess"),
+    ).not.toBeInTheDocument()
+  })
+
   it("renders Computer use context on a user message", () => {
     render(
       <ChatMessage

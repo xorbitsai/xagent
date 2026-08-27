@@ -455,8 +455,17 @@ export function ChatMessage({
   // locale-awareness to draw on there, so re-render it from live i18n data
   // instead, the same way ClarificationForm already re-resolves this
   // interaction type's label instead of trusting the persisted one.
+  //
+  // Gated on interactionsActive, not just the interaction shape: the Hire
+  // flow seeds a connect_apps interaction alongside a persona's real
+  // intro/kickoff message (hire-agent.ts's buildConnectAppsInteraction,
+  // persisted via seed_assistant_message/seed_interactions in chat.py) that
+  // never puts the task into waiting_for_user - task-conversation-panel.tsx
+  // only sets interactionsActive true for the one message that is actually
+  // the live, unanswered pause, so a seeded kickoff message's real content
+  // is left alone here.
   const connectAppsOnlyApps =
-    !isUser && interactions && interactions.length > 0 &&
+    !isUser && interactionsActive && interactions && interactions.length > 0 &&
     interactions.every((interaction) => interaction?.type === "connect_apps")
       ? Array.from(
           new Set(

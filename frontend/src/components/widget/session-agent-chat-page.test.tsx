@@ -305,11 +305,11 @@ describe("SessionAgentChatPage", () => {
       { mode: "balanced" },
       [],
     )
-    expect(screen.queryByRole("menuitem", {
-      name: "widgetSession.startNewConversation",
-    })).not.toBeInTheDocument()
     // No conversation yet — nothing to reset, so the "..." menu (which would
-    // only ever hold the new-conversation action) doesn't render either.
+    // only ever hold the new-conversation action) doesn't render either. (Not
+    // asserting the menuitem itself is absent here: the menu was never
+    // opened, so that check can't fail regardless of whether this logic
+    // works — the trigger's own absence, below, is what actually proves it.)
     expect(screen.queryByRole("button", { name: "widgetChat.moreOptions" })).toBeNull()
     expect(screen.getByRole("button", { name: "widgetChat.close" })).toBeInTheDocument()
   })
@@ -342,6 +342,27 @@ describe("SessionAgentChatPage", () => {
       name: "widgetSession.startNewConversation",
     }))
     expect(app.startNewConversation).toHaveBeenCalledTimes(1)
+  })
+
+  it("keeps the reset visibly pending on the trigger after the menu auto-closes on click", () => {
+    // The menuitem click that starts the reset also closes the menu (normal
+    // menu UX), so the "Resetting..." label is only reachable here if the
+    // trigger itself carries the pending state too.
+    setBridge("active", activeSession())
+    app.state.taskId = 71
+    app.isConnected = true
+
+    const { rerender } = render(<SessionAgentChatPage />)
+    const trigger = screen.getByRole("button", { name: "widgetChat.moreOptions" })
+    fireEvent.click(trigger)
+    fireEvent.click(screen.getByRole("menuitem", { name: "widgetSession.startNewConversation" }))
+    expect(screen.queryByRole("menu")).toBeNull()
+
+    app.isConversationResetPending = true
+    rerender(<SessionAgentChatPage />)
+
+    expect(trigger).toBeDisabled()
+    expect(screen.queryByRole("menu")).toBeNull()
   })
 
   it("shows connecting and the non-blocking absolute-expiry warning", () => {

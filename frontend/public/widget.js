@@ -700,16 +700,25 @@
   // no direct handle to panel/fab, so it signals intent back here over
   // postMessage instead.
   window.addEventListener('message', function (event) {
-    if (event.origin !== host || event.source !== iframe.contentWindow) return;
+    if (event.origin !== host || !iframe.contentWindow || event.source !== iframe.contentWindow) return;
     var data = event.data;
-    if (!data || data.xagent !== true) return;
+    if (!data || data.xagent !== true || data.v !== 1) return;
     if (data.type === 'widget_close') {
       closePanel();
     }
   });
 
-  if (!readStoredClosed()) {
-    openPanel(true);
+  // Deferred to the moment each mode actually starts loading the iframe (see
+  // call sites below), not called unconditionally here: guest mode's iframe
+  // src is only set after a successful embed-ticket exchange, and auto-
+  // opening ahead of that would show a returning visitor a blank panel --
+  // every reload -- on any auth failure (stale allowlist, rate limit,
+  // network error). Session mode sets its iframe src synchronously and
+  // unconditionally, so it calls this immediately.
+  function maybeAutoOpen() {
+    if (!readStoredClosed()) {
+      openPanel(true);
+    }
   }
 
   mode.attach(iframe);
@@ -744,6 +753,7 @@
             url += '&embed_ticket=' + encodeURIComponent(ticket);
           }
           iframe.src = withTimezone(url);
+          maybeAutoOpen();
         }
 
         // Request a short-lived embed ticket from the top-level page. This fetch
@@ -875,6 +885,7 @@
     function attach(iframe) {
       state.iframe = iframe;
       iframe.src = withTimezone(host + '/widget/chat/session');
+      maybeAutoOpen();
       window.addEventListener('message', onMessage);
       window.addEventListener('pageshow', onPageShow);
       window.addEventListener('pagehide', onPageHide);

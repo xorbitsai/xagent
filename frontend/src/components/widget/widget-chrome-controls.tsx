@@ -1,7 +1,7 @@
 "use client"
 
 import React, { useEffect, useRef, useState } from "react"
-import { MessageSquarePlus, MoreHorizontal, X } from "lucide-react"
+import { Loader2, MessageSquarePlus, MoreHorizontal, X } from "lucide-react"
 import { useI18n } from "@/contexts/i18n-context"
 
 // The host page's widget.js owns panel visibility; it has no direct handle
@@ -19,6 +19,7 @@ const postCloseToParent = () => {
 
 const iconButtonClassName =
   "p-2 rounded-md text-muted-foreground hover:text-foreground hover:bg-muted/50 transition-colors "
+  + "disabled:pointer-events-none disabled:opacity-50 "
   + "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
 
 interface WidgetChromeControlsProps {
@@ -30,6 +31,12 @@ interface WidgetChromeControlsProps {
     label: string
     onClick: () => void
     disabled?: boolean
+    // The menu closes as soon as an item is clicked (standard menu UX), so a
+    // pending round-trip (e.g. Session mode's reset) would otherwise show no
+    // feedback at all unless the visitor happens to reopen the menu during
+    // it. Surfaced as a spinner on the trigger itself instead, which stays
+    // visible with the menu closed.
+    pending?: boolean
   }
 }
 
@@ -87,13 +94,18 @@ export function WidgetChromeControls({ newConversation }: WidgetChromeControlsPr
           <button
             type="button"
             onClick={() => setIsMenuOpen((open) => !open)}
+            disabled={newConversation.pending}
             title={t("widgetChat.moreOptions")}
             aria-label={t("widgetChat.moreOptions")}
             aria-haspopup="menu"
             aria-expanded={isMenuOpen}
             className={iconButtonClassName}
           >
-            <MoreHorizontal className="w-4 h-4" />
+            {newConversation.pending ? (
+              <Loader2 className="w-4 h-4 animate-spin" />
+            ) : (
+              <MoreHorizontal className="w-4 h-4" />
+            )}
           </button>
           {isMenuOpen ? (
             <div

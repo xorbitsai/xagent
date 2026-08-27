@@ -49,12 +49,17 @@ describe("WidgetChromeControls", () => {
   })
 
   it("does not post a message when the page is visited directly (window.parent === window)", () => {
+    // window.parent === window here means the guard's else-branch calls the
+    // real window.postMessage, not the postMessageSpy stub above -- spy on
+    // the real one directly so a missing guard would actually be caught.
     vi.stubGlobal("parent", window)
+    const realPostMessageSpy = vi.spyOn(window, "postMessage")
 
     render(<WidgetChromeControls />)
     fireEvent.click(screen.getByRole("button", { name: "widgetChat.close" }))
 
-    expect(postMessageSpy).not.toHaveBeenCalled()
+    expect(realPostMessageSpy).not.toHaveBeenCalled()
+    realPostMessageSpy.mockRestore()
   })
 
   it("opens the menu on trigger click, shows the given label, and calls onClick then closes the menu", () => {
@@ -80,6 +85,36 @@ describe("WidgetChromeControls", () => {
     fireEvent.click(screen.getByRole("button", { name: "widgetChat.moreOptions" }))
 
     expect(screen.getByRole("menuitem", { name: "Resetting..." })).toBeDisabled()
+  })
+
+  it("keeps a pending action visible on the trigger after the menu closes on click", () => {
+    // The menu closes immediately on menuitem click (standard menu UX), so a
+    // slow round-trip needs feedback that survives that -- the trigger itself
+    // switches to a spinner rather than depending on the visitor reopening
+    // the (by-then pending) menu to see anything changed.
+    const { rerender } = render(
+      <WidgetChromeControls
+        newConversation={{ label: "Start over", onClick: onNewConversation }}
+      />,
+    )
+    const trigger = screen.getByRole("button", { name: "widgetChat.moreOptions" })
+    fireEvent.click(trigger)
+    fireEvent.click(screen.getByRole("menuitem", { name: "Start over" }))
+    expect(screen.queryByRole("menu")).toBeNull()
+
+    rerender(
+      <WidgetChromeControls
+        newConversation={{
+          label: "Resetting...",
+          onClick: onNewConversation,
+          disabled: true,
+          pending: true,
+        }}
+      />,
+    )
+
+    expect(trigger).toBeDisabled()
+    expect(screen.queryByRole("menu")).toBeNull()
   })
 
   it("closes the menu on Escape", () => {

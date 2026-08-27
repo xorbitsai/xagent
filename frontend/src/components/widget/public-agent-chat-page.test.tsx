@@ -615,9 +615,12 @@ describe("PublicAgentChatPage", () => {
     // A share visitor already has the full page; unlike the embedded widget
     // iframe, an in-tab navigation away from it is ordinary browser behavior.
     expect(app.provider?.transport?.capabilities?.linksOpenInNewTab).toBe("disabled")
-    // A share link has no parent widget.js panel to signal minimize/close to.
+    // A share link has no parent widget.js panel to signal close to. (The
+    // "..." trigger's absence isn't asserted here -- it would also be absent
+    // in widget mode at this same taskless start screen, so it wouldn't
+    // prove anything about the share/widget exclusion specifically; that's
+    // covered instead once there's an active share conversation, below.)
     expect(screen.queryByRole("button", { name: "widgetChat.close" })).toBeNull()
-    expect(screen.queryByRole("button", { name: "widgetChat.moreOptions" })).toBeNull()
   })
 
   it("reuses a persisted, unexpired share token without re-authing", async () => {
@@ -706,6 +709,11 @@ describe("PublicAgentChatPage", () => {
     expect(fetchMock).not.toHaveBeenCalled()
     // Hiding the trace is scoped to the widget (#1041); share links keep it.
     expect(panel).toHaveAttribute("data-show-process-view", "true")
+    // The share/widget exclusion only means something once there's an active
+    // conversation -- in widget mode this same state renders the "..." menu
+    // (see the standalone-newConversation share button asserted below).
+    expect(screen.queryByRole("button", { name: "widgetChat.moreOptions" })).toBeNull()
+    expect(screen.getByRole("button", { name: "widgetChat.newConversation" })).toBeInTheDocument()
   })
 
   it("ends a share conversation and returns to the start screen", async () => {

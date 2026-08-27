@@ -162,6 +162,7 @@ function SessionConversationContent({
                 : t("widgetSession.startNewConversation"),
               onClick: () => void handleStartNewConversation(),
               disabled: resetDisabled,
+              pending: isConversationResetPending,
             } : undefined}
           />
         </div>

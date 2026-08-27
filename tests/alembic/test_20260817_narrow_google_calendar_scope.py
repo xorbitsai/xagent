@@ -222,4 +222,4 @@ def test_revision_metadata() -> None:
     migration = _load_migration_module()
 
     assert migration.revision == "20260817_narrow_google_calendar_scope"
-    assert migration.down_revision == "20260725_add_uploaded_file_recovery_index"
+    assert migration.down_revision == "20260825_add_slack_channels_join_scope"

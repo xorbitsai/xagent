@@ -707,6 +707,30 @@ describe("widget bootstrap", () => {
       expect(panel().style.width).toBe("") // still unaffected: the drag is over
     })
 
+    it("does not cancel an active drag on a resize event that leaves the viewport width unchanged", () => {
+      // Mobile browsers fire a bare `resize` event when the on-screen
+      // keyboard opens/closes (innerHeight changes, innerWidth doesn't) --
+      // startX/startWidth depend only on innerWidth, so this must not abort
+      // an in-progress drag the way the genuine-width-change test above does.
+      runWidget({ "data-widget-key": "widget-secret" })
+      openPanel()
+
+      firePointerEvent(handle(), "pointerdown", { pointerId: 26, clientX: 300 })
+      firePointerEvent(handle(), "pointermove", { pointerId: 26, clientX: 250 })
+      expect(panel().style.width).toBe("430px")
+      expect(document.body.style.userSelect).toBe("none")
+
+      window.dispatchEvent(new Event("resize")) // innerWidth unchanged
+
+      expect(document.body.style.userSelect).toBe("none") // drag still active
+      expect(panel().style.width).toBe("430px")
+
+      firePointerEvent(handle(), "pointermove", { pointerId: 26, clientX: 200 })
+      expect(panel().style.width).toBe("480px")
+      firePointerEvent(handle(), "pointerup", { pointerId: 26, clientX: 200 })
+      expect(localStorage.getItem("xagent_widget_width")).toBe("480")
+    })
+
     it("keeps a wider preference across a drag that shrinks past the ceiling and returns to it", () => {
       localStorage.setItem("xagent_widget_width", "700")
       setInnerWidth(600) // viewportMax = 560

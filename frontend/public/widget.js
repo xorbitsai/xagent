@@ -570,9 +570,23 @@
   }
   window.addEventListener('blur', onWindowBlur);
 
+  var lastViewportWidth = window.innerWidth;
   function onWindowResize() {
+    var currentViewportWidth = window.innerWidth;
+    var widthChanged = currentViewportWidth !== lastViewportWidth;
+    lastViewportWidth = currentViewportWidth;
+    // Only a horizontal change affects anything here -- isMobileViewport()/
+    // clampPanelWidth() and a drag's frozen startX/startWidth anchors all
+    // depend solely on innerWidth. A resize event with an unchanged
+    // innerWidth (e.g. a mobile on-screen keyboard opening, which only moves
+    // innerHeight) must be a complete no-op: applyPanelWidth() would just
+    // re-render the same value when idle, but during an active drag it would
+    // clobber the live preview (it always renders from the last *committed*
+    // width, not dragState's in-progress one) without actually cancelling
+    // the drag -- worse than doing nothing.
+    if (!widthChanged) return;
     applyPanelWidth();
-    // A viewport change mid-drag invalidates this drag's frozen startX/
+    // A genuine width change mid-drag invalidates this drag's frozen startX/
     // startWidth anchors -- rather than let a later pointermove misread the
     // viewport's own movement as the user shrinking the panel (and persist
     // that on release), end the drag cleanly here. The user can just grab

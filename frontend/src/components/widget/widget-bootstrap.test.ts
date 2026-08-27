@@ -183,6 +183,14 @@ describe("widget bootstrap", () => {
       return document.querySelector<HTMLDivElement>(".xagent-widget-resize-handle")!
     }
 
+    function openPanel() {
+      // The handle is only draggable while the panel carries the 'open'
+      // class (see the pointerdown guard in widget.js) -- click the FAB,
+      // the same real-world path a user takes, rather than poking the class
+      // directly.
+      document.querySelector<HTMLButtonElement>(".xagent-widget-fab")!.click()
+    }
+
     function widgetIframe() {
       return document.querySelector<HTMLIFrameElement>(".xagent-widget-iframe")!
     }
@@ -236,6 +244,22 @@ describe("widget bootstrap", () => {
       expect(panel().style.width).toBe("380px")
     })
 
+    it("accepts a stored value at exactly the minimum boundary", () => {
+      // readStoredWidth rejects strictly below MIN_PANEL_WIDTH (320) -- pin
+      // that the boundary value itself is accepted, not folded into the
+      // rejected range by an off-by-one.
+      localStorage.setItem("xagent_widget_width", "320")
+      runWidget({ "data-widget-key": "widget-secret" })
+      expect(panel().style.width).toBe("320px")
+    })
+
+    it("accepts a stored value at exactly the maximum boundary", () => {
+      // Same as above for the upper MAX_PANEL_WIDTH (720) boundary.
+      localStorage.setItem("xagent_widget_width", "720")
+      runWidget({ "data-widget-key": "widget-secret" })
+      expect(panel().style.width).toBe("720px")
+    })
+
     it("falls back to the default width when reading storage throws", () => {
       const realGetItem = window.localStorage.getItem.bind(window.localStorage)
       vi.spyOn(window.localStorage, "getItem").mockImplementation((key) => {
@@ -244,6 +268,38 @@ describe("widget bootstrap", () => {
       })
       runWidget({ "data-widget-key": "widget-secret" })
       expect(panel().style.width).toBe("380px")
+    })
+
+    it("round-trips a dragged width through storage into a fresh load", () => {
+      // Every other persistence test either seeds storage directly or checks
+      // it after a drag -- neither proves a value a drag itself wrote is
+      // actually what the *next* page load reads back. Simulate that next
+      // load by tearing down this instance's DOM and re-running the
+      // bootstrap script, the same way a real page refresh would.
+      // The describe-level mock resolves every call with the same Response
+      // instance, whose body a single fetch already consumes -- this test
+      // fetches twice (once per runWidget), so it needs a fresh Response per
+      // call instead.
+      fetchMock.mockImplementation(() => Promise.resolve(new Response(JSON.stringify({
+        ticket: "ticket/one",
+        agent_id: 17,
+      }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      })))
+      runWidget({ "data-widget-key": "widget-secret" })
+      openPanel()
+
+      firePointerEvent(handle(), "pointerdown", { pointerId: 10, clientX: 300 })
+      firePointerEvent(handle(), "pointermove", { pointerId: 10, clientX: 200 })
+      expect(panel().style.width).toBe("480px")
+      firePointerEvent(handle(), "pointerup", { pointerId: 10, clientX: 200 })
+      expect(localStorage.getItem("xagent_widget_width")).toBe("480")
+
+      document.head.innerHTML = ""
+      document.body.innerHTML = ""
+      runWidget({ "data-widget-key": "widget-secret" })
+      expect(panel().style.width).toBe("480px")
     })
 
     it("re-clamps to the viewport on resize without losing the stored preference", () => {
@@ -268,6 +324,7 @@ describe("widget bootstrap", () => {
 
       // A click-and-release with no movement must not persist the render
       // clamp over the raw stored preference.
+      openPanel()
       firePointerEvent(handle(), "pointerdown", { pointerId: 6, clientX: 300 })
       firePointerEvent(handle(), "pointerup", { pointerId: 6, clientX: 300 })
       expect(localStorage.getItem("xagent_widget_width")).toBe("700")
@@ -288,6 +345,7 @@ describe("widget bootstrap", () => {
       // A 1px nudge attempting to widen further is fully absorbed by the
       // ceiling -- the rendered width never actually changes, unlike a true
       // zero-movement release.
+      openPanel()
       firePointerEvent(handle(), "pointerdown", { pointerId: 11, clientX: 300 })
       firePointerEvent(handle(), "pointermove", { pointerId: 11, clientX: 299 })
       expect(panel().style.width).toBe("560px")
@@ -308,6 +366,7 @@ describe("widget bootstrap", () => {
 
       // Drag right (shrink) past the ceiling: a real, visible size change,
       // as opposed to the previous test's absorbed widening attempt.
+      openPanel()
       firePointerEvent(handle(), "pointerdown", { pointerId: 12, clientX: 300 })
       firePointerEvent(handle(), "pointermove", { pointerId: 12, clientX: 350 })
       expect(panel().style.width).toBe("510px") // 560 - 50, a real shrink
@@ -342,10 +401,27 @@ describe("widget bootstrap", () => {
       expect(mobileBlock).toMatch(/\.xagent-widget-resize-handle\s*{[^}]*display:\s*none/)
     })
 
+    it("declares the closed-panel rule that hides the resize handle without JS", () => {
+      // Same rationale as the mobile-rule test above: the JS-level
+      // panel.classList.contains('open') check in the pointerdown guard is
+      // defense in depth, not the primary mechanism -- this stylesheet rule
+      // is what actually keeps the handle un-hit-testable while the panel is
+      // closed on a real page.
+      runWidget({ "data-widget-key": "widget-secret" })
+      const css = document.head.querySelector("style")!.textContent!
+
+      expect(css).toMatch(
+        /\.xagent-widget-panel:not\(\.open\)\s*\.xagent-widget-resize-handle\s*{[^}]*display:\s*none/,
+      )
+    })
+
     it("ignores a drag start below the mobile breakpoint", () => {
       setInnerWidth(400)
       runWidget({ "data-widget-key": "widget-secret" })
+      openPanel()
 
+      // Isolate the mobile-viewport guard specifically: with the panel open,
+      // only isMobileViewport() can be blocking this pointerdown.
       firePointerEvent(handle(), "pointerdown", { pointerId: 1, clientX: 100 })
 
       expect(document.body.style.userSelect).toBe("")
@@ -374,6 +450,7 @@ describe("widget bootstrap", () => {
 
     it("resizes the panel while dragging and persists the final width on release", () => {
       runWidget({ "data-widget-key": "widget-secret" })
+      openPanel()
       document.body.style.userSelect = "text"
 
       firePointerEvent(handle(), "pointerdown", { pointerId: 7, clientX: 300 })
@@ -394,12 +471,29 @@ describe("widget bootstrap", () => {
       expect(localStorage.getItem("xagent_widget_width")).toBe("500")
     })
 
+    it("clamps a drag to the static MAX_PANEL_WIDTH, not just the viewport ceiling", () => {
+      // The other ceiling-clamp tests all clamp against a narrowed viewport
+      // (viewportMax below 720) -- this one keeps the default wide viewport
+      // (viewportMax = 984) so the static 720px cap itself is what stops the
+      // drag, not window width.
+      runWidget({ "data-widget-key": "widget-secret" })
+      openPanel()
+
+      firePointerEvent(handle(), "pointerdown", { pointerId: 9, clientX: 300 })
+      firePointerEvent(handle(), "pointermove", { pointerId: 9, clientX: -100 }) // 380 + 400 = 780, capped to 720
+      expect(panel().style.width).toBe("720px")
+
+      firePointerEvent(handle(), "pointerup", { pointerId: 9, clientX: -100 })
+      expect(localStorage.getItem("xagent_widget_width")).toBe("720")
+    })
+
     it("commits the width the drag actually ends at, not the widest point it passed through", () => {
       // A very ordinary gesture: overshoot while dragging, then correct back
       // -- while still wider than the start, i.e. never triggering the old
       // "shrunk past the ceiling" escape hatch. The committed width must
       // match what's actually rendered when the pointer is released.
       runWidget({ "data-widget-key": "widget-secret" })
+      openPanel()
 
       firePointerEvent(handle(), "pointerdown", { pointerId: 8, clientX: 300 })
       firePointerEvent(handle(), "pointermove", { pointerId: 8, clientX: 180 }) // overshoot to 500px
@@ -422,6 +516,7 @@ describe("widget bootstrap", () => {
       // dispatching where an event would actually land if capture were
       // unavailable and the cursor were, say, over the iframe.
       runWidget({ "data-widget-key": "widget-secret" })
+      openPanel()
 
       firePointerEvent(handle(), "pointerdown", { pointerId: 27, clientX: 300 })
       firePointerEvent(document, "pointermove", { pointerId: 27, clientX: 200 })
@@ -439,6 +534,7 @@ describe("widget bootstrap", () => {
       // observe the call (production code already guards the call in a
       // try/catch for exactly this kind of absence).
       runWidget({ "data-widget-key": "widget-secret" })
+      openPanel()
       const releaseSpy = vi.fn()
       handle().releasePointerCapture = releaseSpy
 
@@ -454,6 +550,7 @@ describe("widget bootstrap", () => {
       // confirming a release -- it must not persist wherever the drag had
       // gotten to.
       runWidget({ "data-widget-key": "widget-secret" })
+      openPanel()
 
       firePointerEvent(handle(), "pointerdown", { pointerId: 2, clientX: 300 })
       firePointerEvent(handle(), "pointermove", { pointerId: 2, clientX: 250 }) // mid-drag, unconfirmed
@@ -473,6 +570,7 @@ describe("widget bootstrap", () => {
       // the module's current width, and an unrelated zero-movement drag
       // later on would commit it via a normal release.
       runWidget({ "data-widget-key": "widget-secret" })
+      openPanel()
 
       firePointerEvent(handle(), "pointerdown", { pointerId: 21, clientX: 300 })
       firePointerEvent(handle(), "pointermove", { pointerId: 21, clientX: 250 }) // -> 430px, abandoned below
@@ -490,6 +588,7 @@ describe("widget bootstrap", () => {
 
     it("restores the host page's own cursor rather than clearing it", () => {
       runWidget({ "data-widget-key": "widget-secret" })
+      openPanel()
       document.body.style.cursor = "help"
 
       firePointerEvent(handle(), "pointerdown", { pointerId: 23, clientX: 300 })
@@ -501,7 +600,10 @@ describe("widget bootstrap", () => {
 
     it("ignores a non-primary pointer button", () => {
       runWidget({ "data-widget-key": "widget-secret" })
+      openPanel()
 
+      // Isolate the button guard: with the panel open, only a non-primary
+      // button can be blocking this pointerdown.
       firePointerEvent(handle(), "pointerdown", { pointerId: 24, clientX: 300, button: 2 })
 
       expect(document.body.style.userSelect).toBe("")
@@ -517,6 +619,7 @@ describe("widget bootstrap", () => {
 
     it("ignores a second concurrent pointer without disrupting the first pointer's drag", () => {
       runWidget({ "data-widget-key": "widget-secret" })
+      openPanel()
 
       firePointerEvent(handle(), "pointerdown", { pointerId: 1, clientX: 300 })
       firePointerEvent(handle(), "pointerdown", { pointerId: 2, clientX: 100 })
@@ -536,6 +639,7 @@ describe("widget bootstrap", () => {
 
     it("cancels (without persisting) an interrupted drag on window blur", () => {
       runWidget({ "data-widget-key": "widget-secret" })
+      openPanel()
 
       firePointerEvent(handle(), "pointerdown", { pointerId: 3, clientX: 300 })
       firePointerEvent(handle(), "pointermove", { pointerId: 3, clientX: 250 }) // mid-drag, unconfirmed
@@ -560,6 +664,7 @@ describe("widget bootstrap", () => {
 
     it("ignores a blur caused by focus moving into the widget's own iframe", () => {
       runWidget({ "data-widget-key": "widget-secret" })
+      openPanel()
       vi.spyOn(document, "hasFocus").mockReturnValue(true)
 
       firePointerEvent(handle(), "pointerdown", { pointerId: 17, clientX: 300 })
@@ -577,6 +682,7 @@ describe("widget bootstrap", () => {
 
     it("cancels an active drag on a genuine viewport change and re-renders for the new viewport", () => {
       runWidget({ "data-widget-key": "widget-secret" })
+      openPanel()
 
       firePointerEvent(handle(), "pointerdown", { pointerId: 18, clientX: 300 })
       firePointerEvent(handle(), "pointermove", { pointerId: 18, clientX: 100 }) // -> 580px, abandoned below
@@ -605,6 +711,7 @@ describe("widget bootstrap", () => {
       localStorage.setItem("xagent_widget_width", "700")
       setInnerWidth(600) // viewportMax = 560
       runWidget({ "data-widget-key": "widget-secret" })
+      openPanel()
       expect(panel().style.width).toBe("560px")
 
       firePointerEvent(handle(), "pointerdown", { pointerId: 19, clientX: 300 })
@@ -624,6 +731,7 @@ describe("widget bootstrap", () => {
 
     it("does not restore userSelect if the host page changed it since drag start", () => {
       runWidget({ "data-widget-key": "widget-secret" })
+      openPanel()
 
       firePointerEvent(handle(), "pointerdown", { pointerId: 13, clientX: 300 })
       expect(document.body.style.userSelect).toBe("none")
@@ -641,6 +749,7 @@ describe("widget bootstrap", () => {
       // has two symmetric checks and this one had no dedicated negative-space
       // coverage of its own.
       runWidget({ "data-widget-key": "widget-secret" })
+      openPanel()
 
       firePointerEvent(handle(), "pointerdown", { pointerId: 14, clientX: 300 })
       expect(document.body.style.cursor).toBe("ew-resize")
@@ -653,6 +762,7 @@ describe("widget bootstrap", () => {
 
     it("does not throw when persisting the width fails", () => {
       runWidget({ "data-widget-key": "widget-secret" })
+      openPanel()
       vi.spyOn(window.localStorage, "setItem").mockImplementation(() => {
         throw new Error("quota exceeded")
       })
@@ -664,6 +774,7 @@ describe("widget bootstrap", () => {
 
     it("falls back to the default width if computed style is unreadable", () => {
       runWidget({ "data-widget-key": "widget-secret" })
+      openPanel()
       vi.spyOn(window, "getComputedStyle").mockReturnValue({ width: "auto" } as CSSStyleDeclaration)
 
       firePointerEvent(handle(), "pointerdown", { pointerId: 5, clientX: 300 })
@@ -674,6 +785,7 @@ describe("widget bootstrap", () => {
 
     it("tears down cleanup immediately on DOM removal, even mid-drag, without waiting for blur", async () => {
       runWidget({ "data-widget-key": "widget-secret" })
+      openPanel()
       document.body.style.userSelect = "text"
 
       firePointerEvent(handle(), "pointerdown", { pointerId: 14, clientX: 300 })
@@ -689,6 +801,7 @@ describe("widget bootstrap", () => {
 
     it("skips persisting the width for a drag interrupted by DOM removal", async () => {
       runWidget({ "data-widget-key": "widget-secret" })
+      openPanel()
 
       firePointerEvent(handle(), "pointerdown", { pointerId: 15, clientX: 300 })
       firePointerEvent(handle(), "pointermove", { pointerId: 15, clientX: 200 }) // mid-drag, unconfirmed
@@ -711,6 +824,7 @@ describe("widget bootstrap", () => {
       // only shows up as a *subtree* mutation of document.body -- this is
       // the one scenario that actually distinguishes the two.
       runWidget({ "data-widget-key": "widget-secret" })
+      openPanel()
       document.body.style.userSelect = "text"
 
       firePointerEvent(handle(), "pointerdown", { pointerId: 25, clientX: 300 })
@@ -724,6 +838,7 @@ describe("widget bootstrap", () => {
 
     it("never starts a new drag if the same panel node is later re-inserted into the DOM", async () => {
       runWidget({ "data-widget-key": "widget-secret" })
+      openPanel()
       const container = document.querySelector(".xagent-widget-container")!
       const detachedHandle = handle()
 
@@ -738,7 +853,9 @@ describe("widget bootstrap", () => {
 
       document.body.style.userSelect = "text"
       firePointerEvent(detachedHandle, "pointerdown", { pointerId: 20, clientX: 300 })
-      // The torndown flag blocks this permanently, regardless of isConnected.
+      // The torndown flag blocks this permanently, regardless of isConnected
+      // -- the panel was opened above, so the open-state guard can't be
+      // masking this as the actual reason.
       expect(document.body.style.userSelect).toBe("text")
     })
 
@@ -750,6 +867,7 @@ describe("widget bootstrap", () => {
       const winRemoveSpy = vi.spyOn(window, "removeEventListener")
       const docRemoveSpy = vi.spyOn(document, "removeEventListener")
       runWidget({ "data-widget-key": "widget-secret" })
+      openPanel()
       const detachedHandle = handle()
       const detachedPanel = panel()
 

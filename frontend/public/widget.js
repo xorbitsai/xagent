@@ -433,7 +433,12 @@
     // way: only a real, explicit non-primary button should block the drag.
     // Ignore a second simultaneous pointer (e.g. a touchscreen device) so it
     // can't hijack dragState mid-drag and strand the first pointer's cleanup.
-    if (torndown || isMobileViewport() || dragState || (event.button || 0) !== 0) return;
+    // The injected stylesheet already hides the handle while the panel is
+    // closed (see .xagent-widget-panel:not(.open) above), but a host page
+    // whose CSP blocks that inline <style> would leave it visually
+    // draggable with no CSS backing it up -- check the open class directly
+    // too, as defense in depth that doesn't depend on the stylesheet loading.
+    if (torndown || isMobileViewport() || dragState || (event.button || 0) !== 0 || !panel.classList.contains('open')) return;
     dragState = {
       pointerId: event.pointerId,
       startX: event.clientX,

@@ -479,10 +479,17 @@ class ExecutionContext:
         )
 
     def _current_time_context(self) -> str:
+        # The stamp is captured once at turn start and held constant for the
+        # whole turn (byte-identical prefix for provider caching, PR #636), so
+        # the wording must not claim it is the current time.
         return (
-            f"Current date and time: {self._current_clock_text()}. "
-            "Use this as the reference for relative dates such as today, recent, "
-            "latest, yesterday, and tomorrow."
+            f"Turn started at: {self._current_clock_text()}. "
+            "Real time keeps advancing while this turn runs, so treat this as "
+            "the start of the turn rather than the exact current time. Use it "
+            "as the reference for relative dates such as today, recent, latest, "
+            "yesterday, and tomorrow. When the answer depends on the actual "
+            "time now, call the get_current_time tool if it is available "
+            "instead of computing from this value."
         )
 
     def _current_user_request_text(self) -> str:

@@ -38,6 +38,7 @@ from tests.web.pool_contention_shared import (
     wait_for_ticks,
 )
 from xagent.core.agent.checkpoint import CHECKPOINT_TYPE
+from xagent.core.tools.adapters.vibe.config import RequiredMCPUnavailableError
 from xagent.core.tools.adapters.vibe.connector_runtime import ConnectorRef
 from xagent.web.models import database as database_module
 from xagent.web.models.agent import Agent
@@ -53,6 +54,9 @@ from xagent.web.models.trigger import (
 from xagent.web.models.user import User
 from xagent.web.models.workforce import Workforce, WorkforceRun
 from xagent.web.services import task_orchestrator as task_orchestrator_module
+from xagent.web.services.assistant_history_safety import (
+    CLIENT_SAFE_FAILURE_MESSAGE_TYPE,
+)
 from xagent.web.services.chat_history_service import (
     DELIVERY_COMPLETED,
     DELIVERY_DISPATCHED,
@@ -2860,11 +2864,77 @@ async def test_schedule_bg_cleanup_handles_missing_payload_turn_id(db_session) -
 
 
 @pytest.mark.asyncio
+async def test_schedule_bg_preserves_public_safe_required_mcp_failure(
+    db_session,
+) -> None:
+    """A typed, curated setup failure remains actionable to the client."""
+    from xagent.web.api.websocket import background_task_manager
+    from xagent.web.api.websocket import manager as ws_manager
+
+    user = _create_user(db_session)
+    task = _create_task(db_session, user.id, status=TaskStatus.RUNNING)
+    task.runner_id = "test-runner"
+    task.run_id = "run-a"
+    db_session.commit()
+    lease = TaskLease(task_id=int(task.id), runner_id="test-runner", run_id="run-a")
+    public_message = "Required MCP servers are unavailable."
+
+    with (
+        patch(
+            "xagent.web.services.task_orchestrator.acquire_task_lease_isolated",
+            return_value=lease,
+        ),
+        patch(
+            "xagent.web.services.task_orchestrator.run_task_lease_heartbeat",
+            new=AsyncMock(),
+        ),
+        patch(
+            "xagent.web.services.task_orchestrator.load_task_setup_snapshot_sync",
+            side_effect=RequiredMCPUnavailableError([]),
+        ),
+        patch.object(background_task_manager, "register_task"),
+        patch.object(ws_manager, "broadcast_to_task", new=AsyncMock()) as broadcast,
+        patch(
+            "xagent.web.services.task_orchestrator._get_agent_manager",
+            return_value=MagicMock(),
+        ),
+    ):
+        await _schedule_bg(
+            task_id=int(task.id),
+            task_owner_user_id=int(user.id),
+            task_source=task.source,
+            payload=TaskTurnPayload("hello"),
+            force_fresh=False,
+            context=None,
+        )
+
+    db_session.expire_all()
+    persisted = db_session.get(Task, int(task.id))
+    assert persisted is not None
+    assert persisted.error_message == public_message
+    assistant = (
+        db_session.query(TaskChatMessage)
+        .filter(
+            TaskChatMessage.task_id == task.id,
+            TaskChatMessage.role == "assistant",
+        )
+        .one()
+    )
+    assert assistant.content == public_message
+    assert assistant.message_type == CLIENT_SAFE_FAILURE_MESSAGE_TYPE
+    broadcast.assert_awaited_once()
+    event = broadcast.await_args.args[0]
+    assert event["message"] == public_message
+    assert event["error"] == public_message
+
+
+@pytest.mark.asyncio
 async def test_schedule_bg_marks_task_failed_when_execute_raises(
     db_session,
 ) -> None:
     """An execution exception is persisted by the one fenced settlement."""
     from xagent.web.api.websocket import background_task_manager
+    from xagent.web.api.websocket import manager as ws_manager
     from xagent.web.services.task_lease_service import TaskLease
 
     user = _create_user(db_session)
@@ -2898,6 +2968,7 @@ async def test_schedule_bg_marks_task_failed_when_execute_raises(
             new=AsyncMock(side_effect=RuntimeError("simulated agent boom")),
         ),
         patch.object(background_task_manager, "register_task"),
+        patch.object(ws_manager, "broadcast_to_task", new=AsyncMock()) as broadcast,
         patch(
             "xagent.web.services.task_orchestrator._get_agent_manager",
             return_value=MagicMock(),
@@ -2920,6 +2991,11 @@ async def test_schedule_bg_marks_task_failed_when_execute_raises(
     assert task.status == TaskStatus.FAILED
     assert task.error_message is not None
     assert "simulated agent boom" in str(task.error_message)
+    broadcast.assert_awaited_once()
+    event = broadcast.await_args.args[0]
+    assert event["message"] == "Task execution failed."
+    assert event["error"] == "Task execution failed."
+    assert "simulated agent boom" not in repr(event)
 
 
 @pytest.mark.asyncio

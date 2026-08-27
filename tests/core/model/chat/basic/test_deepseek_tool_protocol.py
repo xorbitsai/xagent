@@ -9,7 +9,11 @@ from xagent.core.model.chat.basic.deepseek_tool_protocol import (
     adapt_deepseek_stream,
     normalize_deepseek_response,
 )
-from xagent.core.model.chat.tool_protocol import get_tool_protocol_error
+from xagent.core.model.chat.tool_protocol import (
+    ToolProtocolViolation,
+    get_tool_protocol_error,
+    tool_protocol_error_response,
+)
 from xagent.core.model.chat.types import ChunkType, StreamChunk
 
 
@@ -437,6 +441,27 @@ def test_deepseek_codec_bounds_original_argument_diagnostics() -> None:
     assert details["original_arguments_length"] == len(original_arguments)
     assert len(details["original_arguments_preview"]) == 4096
     assert details["original_arguments_truncated"] is True
+
+
+def test_tool_protocol_error_response_never_carries_tool_calls() -> None:
+    """A protocol-error response is never mistaken for a real tool-call turn.
+
+    react.py's guard that saves reasoning provider state only does so
+    ``if tool_calls`` (see react.py's assistant-message save point); this
+    response shape is the reason that guard never fires on a violation --
+    ``tool_calls`` is unconditionally ``[]`` here, regardless of what the
+    violating response actually contained.
+    """
+    violation = ToolProtocolViolation(
+        provider="deepseek",
+        code="malformed_tool_arguments",
+        message="DeepSeek returned malformed arguments.",
+    )
+
+    response = tool_protocol_error_response(violation, raw={"tool_calls": [{"id": 1}]})
+
+    assert response["tool_calls"] == []
+    assert response["type"] == "tool_protocol_error"
 
 
 def test_deepseek_codec_is_inactive_without_requested_tools() -> None:

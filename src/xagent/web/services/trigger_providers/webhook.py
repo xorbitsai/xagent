@@ -125,7 +125,14 @@ class WebhookProvider:
 
         return RegistrationResult(status=TriggerProvisioningStatus.ACTIVE)
 
-    async def unregister(self, db: Session, trigger: AgentTrigger, config: Any) -> None:
+    async def unregister(
+        self,
+        db: Session,
+        trigger: AgentTrigger,
+        config: Any,
+        *,
+        resource_id: str | None = None,
+    ) -> None:
         return None
 
     async def parse_events(

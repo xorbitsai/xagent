@@ -176,11 +176,21 @@ class RouterLLM(BaseLLM):
         # A virtual router cannot advertise one candidate's dynamic abilities.
         # The resolved per-call wrapper derives those from the selected model's
         # profile after xrouter applies any input-modality preferences.
+        configured_abilities = (
+            list(abilities) if abilities else list(_DEFAULT_ROUTER_ABILITIES)
+        )
         self._abilities = [
             ability
-            for ability in (abilities or _DEFAULT_ROUTER_ABILITIES)
+            for ability in configured_abilities
             if ability not in _UNROUTED_ROUTER_ABILITIES
         ]
+        # Kept unfiltered (unlike ``self._abilities`` above) for the
+        # ``_resolve_route`` fallback branch: that branch builds a real
+        # downstream ``OpenRouterLLM`` from a ``ChatModelConfig``, and that
+        # client's own ``vision``/``thinking_mode`` support must reflect what
+        # the user actually configured, not this virtual router's
+        # deliberately-narrowed advertised abilities.
+        self._raw_abilities = configured_abilities
         self._fallback_model = os.getenv("XAGENT_ROUTER_FALLBACK_MODEL") or None
 
     # ---- BaseLLM interface --------------------------------------------------
@@ -373,7 +383,11 @@ class RouterLLM(BaseLLM):
             default_temperature=self.default_temperature,
             default_max_tokens=self.default_max_tokens,
             timeout=self.timeout,
-            abilities=self._abilities,
+            # Unfiltered abilities (see ``self._raw_abilities``): this builds
+            # a real downstream client, not the virtual router itself, so it
+            # must not inherit the router's own vision/thinking_mode
+            # exclusion.
+            abilities=self._raw_abilities,
         )
         return model_id, create_base_llm(config)
 
@@ -589,6 +603,13 @@ class _ResolvedRouterLLM(BaseLLM):
 
     @property
     def supports_thinking_mode(self) -> bool:
+        # Reads the virtual router's own abilities, which always exclude
+        # "thinking_mode" (see ``_UNROUTED_ROUTER_ABILITIES``), so this is
+        # always False even when ``self._downstream`` (the actually resolved
+        # model) does support thinking. No caller in this repository reads
+        # this property today, so the mismatch is latent; if a caller starts
+        # relying on it, read ``self._downstream.supports_thinking_mode``
+        # instead of changing what the router itself reports.
         return self._router.supports_thinking_mode
 
     @property

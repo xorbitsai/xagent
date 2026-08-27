@@ -5,6 +5,7 @@ import { Loader2, MessageSquarePlus } from "lucide-react"
 import { ChatStartScreen } from "@/components/chat/ChatStartScreen"
 import { TaskConversationPanel } from "@/components/task/task-conversation-panel"
 import { AppProvider, useApp, type AppProviderTransportConfig } from "@/contexts/app-context-chat"
+import { resolveReportedTimezone } from "@/hooks/use-websocket"
 import { usePublicFileAccessPolicy } from "@/contexts/file-access-context"
 import { useI18n } from "@/contexts/i18n-context"
 import { uploadPublicChatFile } from "@/lib/public-chat-file-upload"
@@ -262,6 +263,13 @@ function PublicConversationContent({
       const taskPayload: Record<string, string | number | string[]> = {
         title: message,
         description: message,
+      }
+      // Workforce opening turns start inside this request and never reach
+      // sendChatMessage, so the zone has to ride along here or the first
+      // answer is rendered against UTC.
+      const openingTimezone = resolveReportedTimezone()
+      if (openingTimezone) {
+        taskPayload.timezone = openingTimezone
       }
       if (agentId) {
         taskPayload.agent_id = agentId

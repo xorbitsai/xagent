@@ -70,7 +70,7 @@ def test_finalize_managed_result_commits_exact_status_and_transcript(
             status=TaskStatus.COMPLETED,
             assistant_content="completed inline",
             interactions=[{"type": "question", "content": "continue?"}],
-            message_type="assistant_message",
+            message_type="assistant_response",
         )
         is True
     )

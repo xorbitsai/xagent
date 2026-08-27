@@ -227,7 +227,10 @@ def web_task_status_key(task_id: int) -> str:
 
 
 def web_task_history_key(task_id: int) -> str:
-    return f"task:web:history:{task_id}"
+    # The v1 namespace may contain assistant failure events serialized before
+    # historical replay learned to redact ambiguous legacy transcript rows.
+    # Never accept those payloads at the public WebSocket boundary.
+    return f"task:web:history:v2:{task_id}"
 
 
 def agent_list_key(

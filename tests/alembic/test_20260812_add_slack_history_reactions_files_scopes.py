@@ -295,14 +295,20 @@ def test_downgrade_does_not_touch_user_oauth(tmp_path):
 
 
 def test_migration_fields_match_registry():
+    """This migration's CURRENT_SCOPES and CURRENT_DESCRIPTION are historical
+    snapshots, not the app's final values — 20260825_add_slack_channels_join_scope
+    layers another scope and description update on top of them, so only a
+    subset check on scopes (every scope this migration granted is still
+    present) holds going forward; the live description is no longer this
+    migration's CURRENT_DESCRIPTION but 20260825's (see that migration's own
+    test_migration_fields_match_registry for the exact-match check)."""
     from xagent.web.builtin_mcp_registry import get_builtin_public_mcp_app_rows
 
     migration = _load_migration_module()
     registry_row = next(
         r for r in get_builtin_public_mcp_app_rows() if r["app_id"] == "slack"
     )
-    assert migration.CURRENT_SCOPES == registry_row["oauth_scopes"]
-    assert migration.CURRENT_DESCRIPTION == registry_row["description"]
+    assert set(migration.CURRENT_SCOPES) <= set(registry_row["oauth_scopes"])
 
 
 # ---------------------------------------------------------------------------
@@ -404,13 +410,15 @@ def test_upgrade_without_default_scopes_column_is_a_noop(tmp_path):
 
 
 def test_provider_default_scopes_match_registry():
+    """Same historical-snapshot caveat as test_migration_fields_match_registry
+    above — see its docstring."""
     from xagent.web.builtin_mcp_registry import get_builtin_oauth_provider_rows
 
     migration = _load_migration_module()
     registry_provider = next(
         r for r in get_builtin_oauth_provider_rows() if r["provider_name"] == "slack"
     )
-    assert migration.CURRENT_SCOPES == registry_provider["default_scopes"]
+    assert set(migration.CURRENT_SCOPES) <= set(registry_provider["default_scopes"])
 
 
 # ---------------------------------------------------------------------------

@@ -6,6 +6,7 @@ import ast
 import asyncio
 import json
 import logging
+from enum import IntEnum
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Iterator, NamedTuple
@@ -556,6 +557,190 @@ def test_log_level_follows_the_marker_not_the_call_site(
     assert "task 7" in record.getMessage()
 
 
+def test_malformed_curated_failure_remains_a_warning_without_traceback(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    websocket_api.log_client_facing_failure(
+        websocket_api.ClientVisibleValidationError("Authentication required"),
+        "Pause command rejected",
+    )
+
+    (record,) = [r for r in caplog.records if r.name == WEBSOCKET_LOGGER]
+    assert (record.levelno, record.exc_info) == (logging.WARNING, None)
+    assert "malformed client-facing log template" in record.getMessage().lower()
+
+
+@pytest.mark.parametrize(
+    ("template", "args"),
+    [
+        ("Pause command rejected", ()),
+        ("Task %s failed: %s", ()),
+        ("Task %d failed: %s", ()),
+        ("Task %(task_id)s failed: %s", ()),
+        ("%%s", ()),
+    ],
+    ids=[
+        "missing-placeholder",
+        "count-mismatch",
+        "integer-placeholder",
+        "mapping-placeholder",
+        "terminal-escaped-percent-s",
+    ],
+)
+def test_log_helper_rejects_every_malformed_percent_template(
+    caplog: pytest.LogCaptureFixture,
+    template: str,
+    args: tuple[object, ...],
+) -> None:
+    try:
+        raise ValueError("operator detail")
+    except ValueError as error:
+        with caplog.at_level(logging.ERROR, logger=WEBSOCKET_LOGGER):
+            websocket_api.log_client_facing_failure(error, template, *args)
+
+    records = [record for record in caplog.records if record.name == WEBSOCKET_LOGGER]
+    assert len(records) == 1
+    assert records[0].levelno == logging.ERROR
+    assert records[0].exc_info is not None
+    assert records[0].exc_info[0] is ValueError
+    assert "malformed client-facing log template" in records[0].getMessage().lower()
+    assert "operator detail" in records[0].getMessage()
+
+
+def test_log_helper_accepts_int_enum_for_native_integer_placeholder(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    class TaskNumber(IntEnum):
+        FIRST = 7
+
+    with caplog.at_level(logging.ERROR, logger=WEBSOCKET_LOGGER):
+        websocket_api.log_client_facing_failure(
+            ValueError("operator detail"),
+            "Task %d failed: %s",
+            TaskNumber.FIRST,
+        )
+
+    records = [record for record in caplog.records if record.name == WEBSOCKET_LOGGER]
+    assert len(records) == 1
+    assert records[0].getMessage() == "Task 7 failed: operator detail"
+    assert "malformed client-facing log template" not in records[0].getMessage().lower()
+
+
+@pytest.mark.parametrize(
+    ("template", "args", "expected_message"),
+    [
+        ("V=%r: %s", (SimpleNamespace(x="é"),), "V=namespace(x='é'): e"),
+        ("V=%a: %s", (SimpleNamespace(x="é"),), "V=namespace(x='\\xe9'): e"),
+        ("100%%: %s", (), "100%: e"),
+    ],
+)
+def test_log_helper_preserves_native_percent_formatting(
+    caplog: pytest.LogCaptureFixture,
+    template: str,
+    args: tuple[object, ...],
+    expected_message: str,
+) -> None:
+    websocket_api.log_client_facing_failure(ValueError("e"), template, *args)
+
+    (record,) = [r for r in caplog.records if r.name == WEBSOCKET_LOGGER]
+    assert record.getMessage() == expected_message
+
+
+def test_log_helper_does_not_raise_for_unprintable_values(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    class BrokenText:
+        def __str__(self) -> str:
+            raise RuntimeError("broken text")
+
+    class BrokenStr(str):
+        __str__ = BrokenText.__str__
+
+        def __repr__(self) -> str:
+            raise RuntimeError("broken repr")
+
+    class BadFallback(str):
+        def __str__(self) -> str:
+            return self
+
+        def __repr__(self) -> str:
+            raise RuntimeError("bad repr")
+
+    class StatefulText(str):
+        calls = 0
+
+        def __str__(self) -> str:
+            type(self).calls += 1
+            if type(self).calls >= 3:
+                raise RuntimeError("rendered repeatedly")
+            return self
+
+    with caplog.at_level(logging.ERROR, logger=WEBSOCKET_LOGGER):
+        websocket_api.log_client_facing_failure(
+            ValueError(BrokenText()), "Data validation error: %s"
+        )
+        websocket_api.log_client_facing_failure(
+            ValueError("operator detail"), "Task %s failed: %s", BrokenStr("x")
+        )
+        websocket_api.log_client_facing_failure(
+            ValueError("operator detail"), "Malformed template", BadFallback("x")
+        )
+        websocket_api.log_client_facing_failure(
+            ValueError("operator detail"),
+            "Task %s failed: %s",
+            StatefulText("stable"),
+        )
+
+    records = [record for record in caplog.records if record.name == WEBSOCKET_LOGGER]
+    assert len(records) == 4
+    assert "unprintable ValueError" in records[0].getMessage()
+    assert "unprintable BrokenStr" in records[1].getMessage()
+    assert "malformed client-facing log template" in records[2].getMessage().lower()
+    assert "Task stable failed" in records[3].getMessage()
+
+
+def test_client_visible_error_is_a_subclass_only_marker() -> None:
+    """The marker base cannot escape handlers that catch its typed subclasses."""
+    with pytest.raises(TypeError, match="must be subclassed"):
+        websocket_api.ClientVisibleError("bare marker")
+
+    assert str(websocket_api.ClientVisibleValidationError("curated")) == "curated"
+
+
+@pytest.mark.parametrize("message", ["", "   ", "\t\n"])
+def test_empty_client_visible_message_falls_back_to_the_generic_text(
+    message: str,
+) -> None:
+    error = websocket_api.ClientVisibleValidationError(message)
+
+    assert (
+        websocket_api.client_safe_error_message(error)
+        == websocket_api.CLIENT_SAFE_VALIDATION_ERROR
+    )
+
+
+def test_client_visible_message_preserves_non_ascii_text() -> None:
+    message = "请求无效：缺少步骤标识"
+
+    assert (
+        websocket_api.client_safe_error_message(
+            websocket_api.ClientVisibleValidationError(message)
+        )
+        == message
+    )
+
+
+def test_empty_client_visible_outer_error_does_not_expose_its_cause() -> None:
+    cause = RuntimeError(SECRET)
+    error = websocket_api.ClientVisibleValidationError("")
+    error.__cause__ = cause
+
+    rendered = websocket_api.client_safe_error_message(error)
+
+    assert rendered == websocket_api.CLIENT_SAFE_VALIDATION_ERROR
+    assert SECRET not in rendered
+
+
 @pytest.mark.asyncio
 async def test_builder_chat_redacts_through_its_own_socket_sink(
     monkeypatch: pytest.MonkeyPatch,
@@ -890,7 +1075,10 @@ async def test_terminal_command_failure_keeps_context_and_redacts_detail() -> No
     connection_manager = MagicMock()
     connection_manager.broadcast_to_task = AsyncMock()
     command = SimpleNamespace(
-        kind=websocket_api.TaskCommandKind.PAUSE, task_id=7, command_id="cmd-7"
+        kind=websocket_api.TaskCommandKind.PAUSE,
+        task_id=7,
+        command_id="cmd-7",
+        payload={},
     )
     with patch.object(websocket_api, "manager", connection_manager):
         await websocket_api._broadcast_terminal_command_error(

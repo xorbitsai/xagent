@@ -22,6 +22,10 @@ def tool_protocol_error_response(
     *,
     raw: Any = None,
 ) -> dict[str, Any]:
+    # ``tool_calls`` is always ``[]`` here, never the violating call: callers
+    # that only persist reasoning-replay state for tool-call turns (e.g.
+    # react.py's context guard) rely on this response never looking like a
+    # tool-call turn, so a protocol violation is never mistaken for one.
     response: dict[str, Any] = {
         "type": "tool_protocol_error",
         "content": "",

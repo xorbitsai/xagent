@@ -62,8 +62,10 @@ from ..services.tool_credentials import (
     get_sql_connection_map,
     get_user_tool_allowlist,
     get_user_tool_overrides,
+    has_user_tool_overrides_hook,
     has_user_tool_policy_hooks,
     resolve_tool_credential,
+    unresolved_tool_policy_allowlist,
 )
 from ..services.user_oauth import (
     get_scoped_user_oauth_account,
@@ -1250,6 +1252,15 @@ def _load_tool_runtime_policy_snapshot(
 
     from ..models.user import User
 
+    # A registering application enforces authorization through the policy
+    # hooks, so "could not resolve the policy" must not be reported as "no
+    # policy configured". Both branches below reach the hooks not at all, so
+    # the application has nothing to intercept; the loader itself has to fail
+    # closed. Recorded per input and collapsed into a deny-all allowlist after
+    # every input has had its own isolated Session, so an unresolvable
+    # overrides read cannot skip the independent allowlist read.
+    unresolved: set[str] = set()
+
     def load_policy_input(
         input_name: str,
         loader: Callable[[Any, Any], Any],
@@ -1259,11 +1270,21 @@ def _load_tool_runtime_policy_snapshot(
             try:
                 user = db.query(User).filter(User.id == user_id).first()
                 if user is None:
+                    unresolved.add(input_name)
+                    logger.warning(
+                        "Tool policy %s unresolved: user %s could not be reloaded",
+                        input_name,
+                        user_id,
+                    )
                     return default
                 return loader(db, user)
             except Exception as exc:
+                # Pool timeouts keep propagating (the caller retries the turn),
+                # and CancelledError is a BaseException that is deliberately
+                # not caught here.
                 if is_database_pool_timeout(exc):
                     raise
+                unresolved.add(input_name)
                 logger.exception("Failed to get user tool %s", input_name)
                 return default
 
@@ -1280,6 +1301,16 @@ def _load_tool_runtime_policy_snapshot(
         lambda db, user: normalize_tool_allowlist(get_user_tool_allowlist(db, user)),
         None,
     )
+    if unresolved:
+        fail_closed = unresolved_tool_policy_allowlist()
+        if fail_closed is not None:
+            logger.error(
+                "Tool policy unresolved for user %s (%s); denying every tool "
+                "for this turn",
+                user_id,
+                ", ".join(sorted(unresolved)),
+            )
+            tool_allowlist = fail_closed
     return _ToolRuntimePolicySnapshot(
         tool_overrides=tool_overrides,
         tool_allowlist=tool_allowlist,
@@ -1446,6 +1477,13 @@ class WebToolConfig(BaseToolConfig):
         # separate flag tracks whether the hook has been consulted yet.
         self._cached_tool_allowlist: Optional[list] = None
         self._tool_allowlist_cached: bool = False
+        # Names the policy inputs whose read could not be resolved (the hook
+        # never ran). ``get_user_tool_allowlist`` turns a non-empty set into a
+        # deny-all allowlist so the execution layer fails closed instead of
+        # building every tool. Each accessor clears its own entry before
+        # re-reading, so a transient failure cannot latch deny-all onto a config
+        # that is reused across turns.
+        self._unresolved_tool_policy_inputs: set[str] = set()
 
         # Sandbox instance - only store reference, lifecycle managed by upper layer
         self._sandbox: Optional[Any] = sandbox
@@ -2162,21 +2200,80 @@ class WebToolConfig(BaseToolConfig):
         """See BaseToolConfig.get_voice's docstring."""
         return self._voice
 
+    def _note_unresolved_tool_policy(self, input_name: str, reason: str) -> None:
+        """Record that a policy input could not be resolved for this turn.
+
+        The registered hook never ran on these paths, so the application that
+        owns authorization has nothing to intercept and cannot repair the read.
+        ``get_user_tool_allowlist`` converts a recorded input into a deny-all
+        allowlist so the execution layer builds no tools instead of the full
+        default set. Entries live only as long as the cached read that produced
+        them: each accessor drops its own entry before consulting the hook
+        again, so a transient failure denies one turn rather than latching.
+        """
+        if not has_user_tool_policy_hooks():
+            # No application policy to lose: standalone xagent keeps its
+            # unrestricted default rather than denying every tool.
+            return
+        self._unresolved_tool_policy_inputs.add(input_name)
+        # Invalidate any allowlist already cached by an earlier read. The two
+        # inputs are read in either order, so a clean allowlist cached before
+        # this failure would otherwise keep reporting "no filtering" and hand
+        # the turn the full tool set. Re-deriving it applies the denial.
+        if input_name != "allowlist":
+            self._tool_allowlist_cached = False
+            self._cached_tool_allowlist = None
+        logger.error(
+            "Tool policy %s unresolved for user %s (%s); denying every tool "
+            "for this turn",
+            input_name,
+            self._user_id,
+            reason,
+        )
+
     def get_user_tool_overrides(self) -> dict:
         """Return per-user tool overrides from the registered hook.
 
-        Both display layer and execution layer use this as the single
-        source of truth for per-user tool policies.
+        Both display layer and execution layer read per-user tool policy from
+        here, but this is no longer the whole picture: ``{}`` means either "no
+        overrides configured" or "the policy could not be resolved", and the
+        two are not distinguishable from the return value. The fail-closed
+        signal for an unresolved read is carried by
+        :meth:`get_user_tool_allowlist`, so the execution layer must consult
+        both.
         """
+        from ..services.db_runtime import is_database_pool_timeout
+
         if self._cached_tool_overrides is not None:
             return self._cached_tool_overrides
+        # This read supersedes whatever the previous one concluded.
+        self._unresolved_tool_policy_inputs.discard("overrides")
         if self._user is None:
+            # No user to hand the hook: the policy is unresolved, not absent.
+            # The overrides mapping stays a dict (the tool-listing API indexes
+            # it); ``get_user_tool_allowlist`` carries the fail-closed signal.
+            #
+            # Gated on the overrides hook specifically, not on either hook:
+            # with no overrides hook registered ``get_user_tool_overrides``
+            # ignores ``user`` and returns ``{}`` regardless, so a missing user
+            # resolves this input. Recording it would deny an allowlist-only
+            # deployment whose allowlist hook answered successfully.
+            if has_user_tool_overrides_hook():
+                self._note_unresolved_tool_policy("overrides", "no runtime user")
             self._cached_tool_overrides = {}
             return {}
         try:
             self._cached_tool_overrides = get_user_tool_overrides(self.db, self._user)
-        except Exception:
+        except Exception as exc:
+            # A pool checkout timeout is not an unresolved policy: the very next
+            # step needs the same pool, so propagate it for the caller to retry
+            # rather than spending the turn with no tools. Matches
+            # ``_load_tool_runtime_policy_snapshot``. Nothing is cached and no
+            # input is recorded, so the retry re-reads from scratch.
+            if is_database_pool_timeout(exc):
+                raise
             logger.exception("Failed to get user tool overrides")
+            self._note_unresolved_tool_policy("overrides", "hook read failed")
             self._cached_tool_overrides = {}
         return self._cached_tool_overrides
 
@@ -2251,6 +2348,10 @@ class WebToolConfig(BaseToolConfig):
         self._cached_tool_overrides = snapshot.tool_overrides
         self._cached_tool_allowlist = snapshot.tool_allowlist
         self._tool_allowlist_cached = True
+        # The worker resolved the policy itself and already folded any
+        # unresolvable input into ``snapshot.tool_allowlist``; stale entries from
+        # an earlier in-request read must not latch deny-all onto this snapshot.
+        self._unresolved_tool_policy_inputs.clear()
 
     async def prepare_factory_runtime(self) -> None:
         """Prefetch synchronous ToolFactory inputs without blocking its loop.
@@ -2395,6 +2496,10 @@ class WebToolConfig(BaseToolConfig):
                 self._cached_tool_overrides = None
                 self._tool_allowlist_cached = False
                 self._cached_tool_allowlist = None
+                # The accessors below each drop their own entry before
+                # re-reading, so nothing from a previous turn survives; clearing
+                # here keeps that explicit for the in-request branch.
+                self._unresolved_tool_policy_inputs.clear()
                 self.refresh_user_tool_overrides()
                 self.refresh_user_tool_allowlist()
                 return
@@ -2413,6 +2518,10 @@ class WebToolConfig(BaseToolConfig):
         self._cached_tool_overrides = policy_snapshot.tool_overrides
         self._cached_tool_allowlist = policy_snapshot.tool_allowlist
         self._tool_allowlist_cached = True
+        # This snapshot is authoritative for the turn (the loader already
+        # fail-closed any input it could not resolve), so drop entries left by
+        # an earlier read rather than denying every tool for the rest of the run.
+        self._unresolved_tool_policy_inputs.clear()
         self._pending_runtime_policy = policy_snapshot
 
     def refresh_user_tool_overrides(self) -> dict:
@@ -2428,16 +2537,45 @@ class WebToolConfig(BaseToolConfig):
         list means keep only those tool names (execution layer only). The
         allowlist is resolved from the active execution scope by the hook, so
         it can differ per turn even for the same user.
+
+        When a policy hook is registered but a policy input could not be
+        resolved, this returns the empty list ("no tools allowed") rather than
+        ``None``: the hook never ran, so the application enforcing
+        authorization has nothing to intercept, and reporting "no allowlist"
+        would build the globally available tool set. With no hook registered
+        there is no policy to lose and the unrestricted default is kept.
         """
+        from ..services.db_runtime import is_database_pool_timeout
+
         if self._tool_allowlist_cached:
             return self._cached_tool_allowlist
+        # This read supersedes whatever the previous one concluded. The
+        # overrides entry is left alone: an unresolved overrides read in this
+        # same turn must still deny below.
+        self._unresolved_tool_policy_inputs.discard("allowlist")
         try:
+            # ``self._user`` may legitimately be ``None`` here: the allowlist is
+            # resolved from the active execution scope, so the hook is consulted
+            # with whatever user the config holds rather than short-circuited.
             self._cached_tool_allowlist = normalize_tool_allowlist(
                 get_user_tool_allowlist(self.db, self._user)
             )
-        except Exception:
+        except Exception as exc:
+            # See get_user_tool_overrides: a pool timeout propagates for retry
+            # instead of being recorded as an unresolved policy. Left uncached
+            # so the retry re-reads, and no deny-all is applied on the way out.
+            if is_database_pool_timeout(exc):
+                raise
             logger.exception("Failed to get user tool allowlist")
+            self._note_unresolved_tool_policy("allowlist", "hook read failed")
             self._cached_tool_allowlist = None
+        if self._unresolved_tool_policy_inputs:
+            # An unresolved read on either policy input denies every tool
+            # rather than reporting "no allowlist configured", which would
+            # skip the execution layer's positive filter entirely.
+            fail_closed = unresolved_tool_policy_allowlist()
+            if fail_closed is not None:
+                self._cached_tool_allowlist = fail_closed
         self._tool_allowlist_cached = True
         return self._cached_tool_allowlist
 
@@ -2445,6 +2583,10 @@ class WebToolConfig(BaseToolConfig):
         """Reload the positive tool allowlist from the registered hook."""
         # The active execution scope (hence the CA allowlist) can change while
         # an AgentService instance is reused across turns.
+        #
+        # ``get_user_tool_allowlist`` drops only its own unresolved entry before
+        # re-reading, so a fresh allowlist answer lifts the denial it caused
+        # while an unresolved overrides read from the same turn still denies.
         self._tool_allowlist_cached = False
         self._cached_tool_allowlist = None
         return self.get_user_tool_allowlist()

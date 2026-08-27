@@ -1067,7 +1067,7 @@ async def test_react_pattern_runs_tool_call_then_final_answer() -> None:
     assert llm.calls[0]["tools"][0]["function"]["name"] == "calculator"
     system_prompt = llm.calls[0]["messages"][0]["content"]
     assert "latest user message" in system_prompt
-    assert re.search(r"Current date \(UTC\): \d{4}-\d{2}-\d{2}", system_prompt)
+    assert re.search(r"Turn-start date \(UTC\): \d{4}-\d{2}-\d{2}", system_prompt)
     assert "use this date when forming search queries" in system_prompt
     assert "not supported by the conversation" in system_prompt
     assert "available context is insufficient" in system_prompt
@@ -7170,18 +7170,20 @@ def _react_clock_prompt(timezone_name: str | None) -> str:
     return messages[0]["content"]
 
 
-# Verbatim pre-PR sentence, so a change to any part of the fallback instruction
-# fails rather than only a change to its "Current date" prefix.
+# Covers the whole fallback instruction through the get_current_time pointer, so
+# reverting any part of it fails rather than only a change to the prefix.
 UTC_DATE_INSTRUCTION = (
-    "Current date (UTC): 2026-08-24. "
+    "Turn-start date (UTC): 2026-08-24. "
     "For recent, latest, current, or time-sensitive requests, use this "
-    "date when forming search queries and judging source relevance."
+    "date when forming search queries and judging source relevance. If the "
+    "exact current time matters or the turn may have crossed midnight, call "
+    "the get_current_time tool if it is available."
 )
 
 
 def _date_instruction(prompt: str) -> str:
-    start = prompt.index("Current date (")
-    end = prompt.index("source relevance.", start) + len("source relevance.")
+    start = prompt.index("Turn-start date (")
+    end = prompt.index("if it is available.", start) + len("if it is available.")
     return prompt[start:end]
 
 
@@ -7193,11 +7195,11 @@ def test_tool_call_date_line_uses_the_caller_timezone() -> None:
     prompt = _react_clock_prompt("Australia/Melbourne")
 
     assert _date_instruction(prompt) == UTC_DATE_INSTRUCTION.replace(
-        "Current date (UTC): 2026-08-24. ",
-        "Current date (Australia/Melbourne): 2026-08-25. ",
+        "Turn-start date (UTC): 2026-08-24. ",
+        "Turn-start date (Australia/Melbourne): 2026-08-25. ",
     )
     # The UTC date is what produced the wrong "tomorrow" in production.
-    assert "Current date (UTC)" not in prompt
+    assert "Turn-start date (UTC)" not in prompt
 
 
 def test_tool_call_date_line_degrades_to_utc_for_an_unusable_timezone() -> None:

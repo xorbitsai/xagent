@@ -55,13 +55,15 @@ APP_ID = "slack"
 # by 20260720_seed_docs_slides_hubspot.py's own HubSpot row when its scopes
 # were later expanded in 20260810_add_hubspot_marketing_scopes.py. Existing
 # databases are unaffected (this migration only inserts when the row is
-# absent); the follow-up 20260812_add_slack_history_reactions_files_scopes
-# migration is what actually upgrades an already-seeded row.
+# absent); the follow-up 20260812_add_slack_history_reactions_files_scopes and
+# 20260825_add_slack_channels_join_scope migrations are what actually upgrade
+# an already-seeded row.
 SLACK_SCOPES = [
     "chat:write",
     "chat:write.public",
     "channels:read",
     "channels:history",
+    "channels:join",
     "groups:read",
     "groups:history",
     "im:read",
@@ -102,7 +104,7 @@ def _slack_app_row() -> dict[str, object]:
     return {
         "app_id": APP_ID,
         "name": "Slack",
-        "description": "Connect to Slack to search and read channel, thread, and DM history, post messages and replies, react to messages, and upload files, e.g. incident summaries and recommended fixes.",
+        "description": "Connect to Slack to search and read channel, thread, and DM history, post messages and replies, react to messages, upload files, and join public channels when asked to, e.g. incident summaries and recommended fixes.",
         "icon": "https://www.google.com/s2/favicons?domain=slack.com&sz=128",
         "transport": "oauth",
         "provider_name": "slack",

@@ -1007,6 +1007,7 @@ async def _create_workforce_widget_chat_task(
         workforce,
         message=request.description or "",
         selected_file_ids=request.files,
+        timezone=request.timezone,
         source="widget",
         is_visible=False,
         extra_agent_config={
@@ -1172,6 +1173,7 @@ async def _create_workforce_share_chat_task(
         workforce,
         message=request.description or "",
         selected_file_ids=request.files,
+        timezone=request.timezone,
         source="shared_link",
         is_visible=False,
         extra_agent_config={

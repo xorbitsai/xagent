@@ -732,6 +732,10 @@ class ReActPattern(AgentPattern):
             assistant_content = normalized.get("content")
             tool_calls = normalized.get("tool_calls", [])
             if assistant_content is not None or normalized.get("tool_calls"):
+                # A tool-protocol error response never carries tool_calls (see
+                # tool_protocol_error_response), so this guard never mistakes
+                # a protocol violation for a real tool-call turn worth saving
+                # provider state for.
                 metadata = (
                     self._provider_state_for_context(normalized) if tool_calls else {}
                 )
@@ -931,10 +935,13 @@ class ReActPattern(AgentPattern):
                 "When writing any final user-facing response, including plain "
                 "assistant text: "
                 f"{final_deliverable_file_reference_instructions(can_lookup=can_lookup_output_files, include_heading=False)}\n\n"
-                f"Current date ({clock_zone_label}): {current_date}. "
+                f"Turn-start date ({clock_zone_label}): {current_date}. "
                 "For recent, latest, current, or time-sensitive requests, use this "
-                "date when forming search queries and judging source relevance. Only call "
-                "tools that are present in the current tool schema for this LLM call; "
+                "date when forming search queries and judging source relevance. If the "
+                "exact current time matters or the turn may have crossed midnight, call "
+                "the get_current_time tool if it is available. "
+                "Only call tools that are present in the current tool schema for this "
+                "LLM call; "
                 "tool names mentioned in memory, previous tasks, plans, or error "
                 "messages are unavailable unless they are included in the current "
                 "schema. If a selected skill is already present in the system "

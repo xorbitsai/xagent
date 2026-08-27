@@ -8,16 +8,33 @@ from ..error import retry_on
 from ..exceptions import LLMRetryableError, LLMToolProtocolError
 from ..timeout_config import TimeoutConfig
 from ..tool_protocol import TOOL_PROTOCOL_ERROR_KEY, get_tool_protocol_error
-from ..types import StreamChunk
+from ..types import PROVIDER_STATE_METADATA_KEY, StreamChunk
 from .deepseek_tool_protocol import (
+    DEEPSEEK_REASONING_CONTENT_STATE_KEY,
     adapt_deepseek_stream,
+    deepseek_reasoning_provider_state,
+    deepseek_reasoning_provider_state_payload,
     normalize_deepseek_response,
+    reasoning_field_names,
+    restore_deepseek_reasoning_content,
 )
-from .openai import OpenAILLM
+from .openai import OpenAILLM, field_content
 
 logger = logging.getLogger(__name__)
 
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
+
+# OpenRouter's own docs describe both ``reasoning_content`` (the field
+# DeepSeek's own API uses) and a ``reasoning`` alias as valid response
+# fields; which one a given deepseek-authored slug actually sends has not
+# been confirmed against a live response, so both are watched defensively.
+# A third documented field, ``reasoning_details`` (structured blocks), is
+# deliberately not handled: replaying it would need an ordered-array
+# accumulator this client does not have, and the WARNING logged when no
+# known field is captured (see ``_response_provider_state``) is the safety
+# net for that gap. Order here is precedence when a response carries more
+# than one of these fields.
+OPENROUTER_REASONING_FIELDS = (DEEPSEEK_REASONING_CONTENT_STATE_KEY, "reasoning")
 _DEEPSEEK_FUNCTION_PREFIX_ERROR = "function call should not be used with prefix"
 
 # OpenAILLM.chat/vision_chat/stream_chat convert every openai.BadRequestError
@@ -152,6 +169,13 @@ _ACTION_DISABLE_THINKING = "disable_thinking"
 _ACTION_RELAX_TOOL_CHOICE = "relax_tool_choice"
 
 
+def _thinking_requested(thinking: Optional[Dict[str, Any]]) -> bool:
+    """Return whether a request asked for thinking to be enabled."""
+    return isinstance(thinking, dict) and (
+        thinking.get("type") == "enabled" or thinking.get("enable") is True
+    )
+
+
 def _should_retry_with_thinking(
     exc: Exception,
     *,
@@ -159,9 +183,7 @@ def _should_retry_with_thinking(
 ) -> bool:
     # This is the primary stop condition after a retry swaps in enabled thinking;
     # retry-action tracking remains defense in depth for the shared retry loop.
-    if isinstance(thinking, dict) and (
-        thinking.get("type") == "enabled" or thinking.get("enable") is True
-    ):
+    if _thinking_requested(thinking):
         return False
 
     # OpenRouter currently exposes this provider constraint only through an
@@ -316,6 +338,126 @@ class OpenRouterLLM(OpenAILLM):
 
     def _is_official_openrouter_client(self) -> bool:
         return self.base_url.rstrip("/") == OPENROUTER_BASE_URL
+
+    def _prepare_messages_for_request(
+        self,
+        messages: List[Dict[str, Any]],
+        *,
+        thinking: Optional[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        """Replay captured DeepSeek reasoning content, deepseek slugs only.
+
+        Gated on ``_uses_deepseek_tool_protocol`` (the model-name author
+        check), the same gate every other DeepSeek-protocol branch on this
+        class uses -- not on abilities or config, so a non-deepseek slug's
+        request-building path is untouched.
+        """
+        if not self._uses_deepseek_tool_protocol:
+            return messages
+        return restore_deepseek_reasoning_content(messages, model_name=self._model_name)
+
+    def _response_provider_state(
+        self,
+        result: Dict[str, Any],
+        *,
+        thinking: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        if not self._uses_deepseek_tool_protocol:
+            return {}
+        provider_state = deepseek_reasoning_provider_state(
+            result, fields=OPENROUTER_REASONING_FIELDS
+        )
+        if (
+            not provider_state
+            and result.get("tool_calls")
+            and _thinking_requested(thinking)
+        ):
+            # Thinking was requested and the response is a tool call, but
+            # neither known reasoning field spelling was captured. This is
+            # the one silent-failure mode of the whole mechanism (see
+            # OPENROUTER_REASONING_FIELDS): the next request in this tool
+            # chain will 400 with no clue pointing back here, so log which
+            # reasoning-like keys (if any) actually showed up -- key names
+            # only, never their content.
+            logger.warning(
+                "OpenRouter deepseek model %s returned a tool call with "
+                "thinking requested, but no reasoning content was captured "
+                "under any known field spelling %s; observed reasoning-like "
+                "keys: %s",
+                self._model_name,
+                OPENROUTER_REASONING_FIELDS,
+                reasoning_field_names(result),
+            )
+        return provider_state
+
+    def _attach_reasoning_content_to_raw(
+        self,
+        raw_payload: Any,
+        reasoning_content: str,
+        *,
+        has_reasoning_content: bool = False,
+    ) -> Any:
+        raw_payload = super()._attach_reasoning_content_to_raw(
+            raw_payload,
+            reasoning_content,
+            has_reasoning_content=has_reasoning_content,
+        )
+        if (
+            self._uses_deepseek_tool_protocol
+            and has_reasoning_content
+            and isinstance(raw_payload, dict)
+        ):
+            raw_payload[PROVIDER_STATE_METADATA_KEY] = (
+                deepseek_reasoning_provider_state_payload(reasoning_content)
+            )
+        return raw_payload
+
+    def _delta_reasoning_content(self, delta: Any) -> tuple[bool, Any]:
+        """Widen the streaming reasoning-field check for deepseek slugs only.
+
+        Non-deepseek slugs get the base class's single-spelling check
+        unchanged; this only broadens what counts as reasoning content for
+        the protocol this class already special-cases everywhere else.
+        """
+        if not self._uses_deepseek_tool_protocol:
+            return super()._delta_reasoning_content(delta)
+        for field_name in OPENROUTER_REASONING_FIELDS:
+            found, value = field_content(delta, field_name)
+            if found:
+                return True, value
+        return False, None
+
+    def _check_stream_reasoning_capture(
+        self,
+        *,
+        thinking: Optional[Dict[str, Any]],
+        has_tool_calls: bool,
+        has_reasoning_content: bool,
+        observed_field_names: tuple[str, ...],
+    ) -> None:
+        """Streaming counterpart of the WARNING in ``_response_provider_state``.
+
+        Same silent-failure mode, same gate (deepseek slugs only, thinking
+        requested, response ended with tool calls), just checked over the
+        whole stream's outcome instead of one non-streaming response body:
+        if no delta ever carried a recognized reasoning field, the next
+        request in this tool chain will 400 with nothing pointing back here.
+        """
+        if (
+            self._uses_deepseek_tool_protocol
+            and has_tool_calls
+            and _thinking_requested(thinking)
+            and not has_reasoning_content
+        ):
+            logger.warning(
+                "OpenRouter deepseek model %s streamed a tool call with "
+                "thinking requested, but no reasoning content was captured "
+                "under any known field spelling %s across the stream; "
+                "observed reasoning-like keys: %s",
+                self._model_name,
+                OPENROUTER_REASONING_FIELDS,
+                observed_field_names,
+            )
 
     def _deepseek_function_prefix_retry_messages(
         self,
@@ -546,11 +688,15 @@ class OpenRouterLLM(OpenAILLM):
 
         # ``render`` only models extra_body. Thinking also reaches the request
         # through ``_build_request_messages(messages, thinking=...)``, which
-        # ``render`` never sees; that second path is a no-op today only because
-        # this class's MRO resolves to ``OpenAILLM._prepare_messages_for_request``
-        # (ignores ``thinking``), not ``DeepSeekLLM``'s rewrite. If a class on
-        # this MRO ever starts consuming ``thinking`` there, this no-op
-        # comparison must model the message body too, not just extra_body.
+        # ``render`` never sees; that second path is a no-op comparison-wise
+        # not because it ignores ``thinking`` (this class's own
+        # ``_prepare_messages_for_request`` does replay reasoning content) but
+        # because its output depends only on ``messages``, never on
+        # ``thinking``: for one fixed ``messages`` list, any two candidate
+        # thinking values render byte-identical message bodies, so comparing
+        # extra_body alone is still sufficient. If that method ever starts
+        # branching on ``thinking``, this no-op comparison must model the
+        # message body too, not just extra_body.
         def render(candidate_thinking: Optional[Dict[str, Any]]) -> Dict[str, Any]:
             return self._prepare_provider_reasoning_extra_body(
                 extra_body=self._prepare_extra_body(
@@ -903,12 +1049,17 @@ class OpenRouterLLM(OpenAILLM):
         else:
             # DeepSeek-served endpoints can default to thinking mode, and once a
             # response carries reasoning_content they require it to be replayed
-            # verbatim on the next request of a tool-call chain — which this
-            # client does not do (#1537). Keep thinking off unless the caller
-            # asks for it, matching DeepSeekLLM's default. This deliberately
-            # ignores supports_thinking_mode: the blocker is the missing
-            # replay, not model capability, so a declared thinking_mode
-            # ability must not re-enable the failing default before #1537.
+            # verbatim on the next request of a tool-call chain. That replay is
+            # implemented (_prepare_messages_for_request, _response_provider_
+            # state, _attach_reasoning_content_to_raw below), so this is no
+            # longer the reason thinking stays off by default. It stays off
+            # here anyway, matching DeepSeekLLM's own default: turning
+            # thinking on changes token cost and response shape for every
+            # DeepSeek-authored slug on this client, which is a separate call
+            # from closing the replay gap and is left for a change that makes
+            # that call explicitly (#1537). This deliberately ignores
+            # supports_thinking_mode: a declared thinking_mode ability does
+            # not flip this default on its own.
             should_disable = self._uses_deepseek_tool_protocol
             should_enable = False
 

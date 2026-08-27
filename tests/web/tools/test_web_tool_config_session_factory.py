@@ -2445,6 +2445,208 @@ def test_runtime_policy_propagates_later_input_checkout_timeout():
         set_user_tool_allowlist_hook(None)
 
 
+# --------------------------------------------------------------------------- #
+# Fail-closed policy resolution (xagent #1739)
+#
+# The policy hooks are how a registering application enforces authorization. On
+# the two branches below the hook never runs, so the application has nothing to
+# intercept: reporting "no policy configured" would build the globally available
+# tool set and run the turn unrestricted.
+# --------------------------------------------------------------------------- #
+class _UserReloadSession:
+    """Session whose ``User`` reload misbehaves in a configurable way."""
+
+    def __init__(self, mode: str):
+        self._mode = mode
+        self.closed = False
+
+    def connection(self):
+        return object()
+
+    def query(self, *_args, **_kwargs):
+        if self._mode == "raise":
+            raise RuntimeError("user reload failed")
+        if self._mode == "cancel":
+            raise asyncio.CancelledError()
+        return _ListChain([] if self._mode == "missing" else [SimpleNamespace(id=1)])
+
+    def close(self):
+        self.closed = True
+
+
+def _policy_snapshot_for(mode: str, *, overrides=None, allowlist=None):
+    from xagent.web.tools.config import _load_tool_runtime_policy_snapshot
+
+    sessions: list[_UserReloadSession] = []
+
+    def session_factory() -> _UserReloadSession:
+        session = _UserReloadSession(mode)
+        sessions.append(session)
+        return session
+
+    set_user_tool_overrides_hook(overrides or (lambda _db, _user: {}))
+    set_user_tool_allowlist_hook(allowlist or (lambda _db, _user: None))
+    try:
+        return _load_tool_runtime_policy_snapshot(session_factory, 1), sessions
+    finally:
+        set_user_tool_overrides_hook(None)
+        set_user_tool_allowlist_hook(None)
+
+
+@pytest.mark.parametrize("mode", ["raise", "missing"])
+def test_runtime_policy_denies_every_tool_when_user_reload_fails(mode):
+    # ``raise`` is an ordinary loader failure; ``missing`` is a reload that
+    # returns None. Both used to yield overrides={} / allowlist=None, which the
+    # factory reads as "no disable set, no positive filter" — the full tool set.
+    snapshot, sessions = _policy_snapshot_for(
+        mode,
+        # A permissive-looking hook makes the point: even when the policy would
+        # have allowed something, an unresolved read grants nothing.
+        allowlist=lambda _db, _user: ["file", "shell"],
+    )
+
+    assert snapshot.tool_allowlist == []
+    # The overrides mapping stays a dict: the tool-listing API indexes it.
+    assert snapshot.tool_overrides == {}
+    assert all(session.closed for session in sessions)
+
+
+def test_runtime_policy_keeps_a_healthy_read_unrestricted():
+    # The guard above must be conditional, not a blanket deny: a resolvable
+    # policy is passed through untouched. Without this case, an implementation
+    # that denied every turn would satisfy the two tests above.
+    snapshot, _ = _policy_snapshot_for(
+        "ok",
+        overrides=lambda _db, _user: {"file": {"enabled": False}},
+        allowlist=lambda _db, _user: ["shell"],
+    )
+
+    assert snapshot.tool_allowlist == ["shell"]
+    assert snapshot.tool_overrides == {"file": {"enabled": False}}
+
+
+def test_runtime_policy_keeps_a_healthy_read_without_an_allowlist():
+    # "No allowlist configured" is a legitimate resolved answer and must stay
+    # ``None`` (no filtering) rather than collapsing into the deny-all value.
+    snapshot, _ = _policy_snapshot_for("ok")
+
+    assert snapshot.tool_allowlist is None
+    assert snapshot.tool_overrides == {}
+
+
+@pytest.mark.parametrize("mode", ["raise", "missing"])
+def test_runtime_policy_stays_open_without_a_registered_hook(mode):
+    """Standalone xagent must keep its unrestricted default."""
+    from xagent.web.tools.config import _load_tool_runtime_policy_snapshot
+
+    sessions: list[_UserReloadSession] = []
+
+    def session_factory() -> _UserReloadSession:
+        session = _UserReloadSession(mode)
+        sessions.append(session)
+        return session
+
+    set_user_tool_overrides_hook(None)
+    set_user_tool_allowlist_hook(None)
+    snapshot = _load_tool_runtime_policy_snapshot(session_factory, 1)
+
+    # No hook registered means no policy to lose: denying every tool here would
+    # break every deployment that never delegated authorization to a hook.
+    assert snapshot.tool_allowlist is None
+    assert snapshot.tool_overrides == {}
+    assert all(session.closed for session in sessions)
+
+
+def test_runtime_policy_still_propagates_pool_timeouts():
+    """A pool timeout is retried by the caller, not converted to deny-all."""
+    from xagent.web.tools.config import _load_tool_runtime_policy_snapshot
+
+    checkout_timeout = SQLAlchemyTimeoutError("overrides checkout timed out")
+    sessions: list[_PostgresAbortSession] = []
+
+    def session_factory() -> _PostgresAbortSession:
+        session = _PostgresAbortSession(checkout_error=checkout_timeout)
+        sessions.append(session)
+        return session
+
+    set_user_tool_overrides_hook(lambda _db, _user: {})
+    set_user_tool_allowlist_hook(lambda _db, _user: ["file"])
+    try:
+        with pytest.raises(SQLAlchemyTimeoutError) as exc_info:
+            _load_tool_runtime_policy_snapshot(session_factory, 1)
+
+        assert exc_info.value is checkout_timeout
+        assert all(session.closed for session in sessions)
+    finally:
+        set_user_tool_overrides_hook(None)
+        set_user_tool_allowlist_hook(None)
+
+
+def test_runtime_policy_still_propagates_cancellation():
+    """CancelledError is a BaseException and must not be swallowed."""
+    from xagent.web.tools.config import _load_tool_runtime_policy_snapshot
+
+    sessions: list[_UserReloadSession] = []
+
+    def session_factory() -> _UserReloadSession:
+        session = _UserReloadSession("cancel")
+        sessions.append(session)
+        return session
+
+    set_user_tool_overrides_hook(lambda _db, _user: {})
+    set_user_tool_allowlist_hook(lambda _db, _user: ["file"])
+    try:
+        with pytest.raises(asyncio.CancelledError):
+            _load_tool_runtime_policy_snapshot(session_factory, 1)
+
+        assert all(session.closed for session in sessions)
+    finally:
+        set_user_tool_overrides_hook(None)
+        set_user_tool_allowlist_hook(None)
+
+
+def test_runtime_policy_denies_when_only_the_overrides_read_fails():
+    """An unresolved overrides read must not be rescued by a healthy allowlist.
+
+    The two inputs load through independent Sessions, so one can succeed while
+    the other fails. The disable set the hook would have returned is unknown, so
+    the allowlist it did return cannot be trusted to be complete.
+    """
+    from xagent.web.tools.config import _load_tool_runtime_policy_snapshot
+
+    sessions: list[_PostgresAbortSession] = []
+
+    def session_factory() -> _PostgresAbortSession:
+        session = _PostgresAbortSession()
+        sessions.append(session)
+        return session
+
+    def load_overrides(db: _PostgresAbortSession, _user):
+        db.swallow_statement_failure()
+        raise RuntimeError("overrides read failed")
+
+    allowlist_hook_called = False
+
+    def load_allowlist(_db, _user):
+        nonlocal allowlist_hook_called
+        allowlist_hook_called = True
+        return ["file"]
+
+    set_user_tool_overrides_hook(load_overrides)
+    set_user_tool_allowlist_hook(load_allowlist)
+    try:
+        snapshot = _load_tool_runtime_policy_snapshot(session_factory, 1)
+
+        # The independent allowlist read still runs (its own Session is clean)…
+        assert allowlist_hook_called is True
+        # …but the unresolved overrides input still denies the turn.
+        assert snapshot.tool_allowlist == []
+        assert all(session.closed for session in sessions)
+    finally:
+        set_user_tool_overrides_hook(None)
+        set_user_tool_allowlist_hook(None)
+
+
 @pytest.mark.asyncio
 async def test_default_model_prefetch_returns_every_pool_checkout(
     monkeypatch,

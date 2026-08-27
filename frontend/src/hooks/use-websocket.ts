@@ -77,7 +77,7 @@ export class MessageDeliveryError extends Error {
   }
 }
 
-const resolveReportedTimezone = (): string | undefined => {
+export const resolveReportedTimezone = (): string | undefined => {
   if (typeof window !== "undefined") {
     // widget.js copies data-timezone onto the iframe URL; an embedder that knows
     // its user's business zone outranks the machine zone.

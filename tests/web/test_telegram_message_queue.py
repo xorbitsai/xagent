@@ -1482,7 +1482,8 @@ async def test_empty_output_edits_the_loading_message_with_a_placeholder(
             task_status=TaskStatus.COMPLETED,
             transcript_content="",
             interactions=[],
-            message_type="assistant_message",
+            message_type="assistant_response",
+            diagnostic_error=None,
         ),
     )
     bot._extract_message_content = extract_text

@@ -8,12 +8,15 @@ from unittest.mock import MagicMock
 import httpx
 import openai
 import pytest
+from openai.types.chat.chat_completion_chunk import ChoiceDelta
+from pydantic import BaseModel, ConfigDict
 
 from xagent.core.model.chat.basic.base import BaseLLM
 from xagent.core.model.chat.basic.openai import (
     PROVIDER_STATE_METADATA_KEY,
     OpenAILLM,
     _format_openai_error,
+    field_content,
 )
 from xagent.core.model.chat.error import retry_on
 from xagent.core.model.chat.exceptions import LLMEmptyContentError, LLMRetryableError
@@ -50,6 +53,18 @@ def _response_format_bad_request(message: str) -> openai.BadRequestError:
             request=httpx.Request("POST", "https://api.openai.com/v1/chat/completions"),
         ),
         body={"error": {"message": message, "code": 400}},
+    )
+
+
+def _unrelated_bad_request() -> openai.BadRequestError:
+    """A 400 that has nothing to do with response_format."""
+    return openai.BadRequestError(
+        "Error code: 400 - {'error': {'message': 'Unsupported image format'}}",
+        response=httpx.Response(
+            400,
+            request=httpx.Request("POST", "https://api.openai.com/v1/chat/completions"),
+        ),
+        body={"error": {"message": "Unsupported image format", "code": 400}},
     )
 
 
@@ -621,6 +636,96 @@ class TestOpenAILLM:
         call_args = mock_client.chat.completions.create.call_args
         assert call_args.kwargs["temperature"] == 0.0
         assert "max_tokens" not in call_args.kwargs
+
+    @pytest.mark.asyncio
+    async def test_vision_chat_returns_the_response_format_retry_result(
+        self, openai_llm_config, mock_chat_completion, mocker
+    ):
+        """Dropping response_format must not also drop the answer.
+
+        The retry succeeds, so vision_chat has to return that reply's
+        envelope. Returning ``None`` instead reaches the vision tool as an
+        unsupported response shape, turning a successful answer into a
+        detection failure.
+        """
+        mock_client = mocker.AsyncMock()
+        mock_client.chat.completions.create.side_effect = [
+            _response_format_bad_request(
+                "response_format is not supported by this model"
+            ),
+            mock_chat_completion,
+        ]
+        mocker.patch(
+            "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+            return_value=mock_client,
+        )
+
+        llm = OpenAILLM(**openai_llm_config, abilities=["chat", "vision"])
+        response = await llm.vision_chat(
+            [{"role": "user", "content": "Describe this image."}],
+            response_format={"type": "json_object"},
+        )
+
+        assert response == {
+            "type": "text",
+            "content": "Hello World",
+            "raw": mock_chat_completion.model_dump(),
+        }
+        assert mock_client.chat.completions.create.await_count == 2
+        retry_kwargs = mock_client.chat.completions.create.call_args_list[1].kwargs
+        assert "response_format" not in retry_kwargs
+
+    @pytest.mark.asyncio
+    async def test_vision_chat_unrelated_bad_request_is_terminal(
+        self, openai_llm_config, mocker
+    ):
+        """A 400 unrelated to response_format keeps failing with its own message."""
+        mock_client = mocker.AsyncMock()
+        mock_client.chat.completions.create.side_effect = _unrelated_bad_request()
+        mocker.patch(
+            "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+            return_value=mock_client,
+        )
+
+        llm = OpenAILLM(**openai_llm_config, abilities=["chat", "vision"])
+        with pytest.raises(RuntimeError, match="OpenAI bad request"):
+            await llm.vision_chat(
+                [{"role": "user", "content": "Describe this image."}],
+                response_format={"type": "json_object"},
+            )
+
+        assert mock_client.chat.completions.create.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_vision_chat_reports_a_failed_retry_as_a_runtime_error(
+        self, openai_llm_config, mocker
+    ):
+        """A retry that is rejected too surfaces as the documented RuntimeError.
+
+        The method documents ``Raises: RuntimeError``; a raw provider
+        exception escaping from the retry would break that, and would differ
+        from how ``stream_chat`` reports the same double rejection.
+        """
+        mock_client = mocker.AsyncMock()
+        mock_client.chat.completions.create.side_effect = [
+            _response_format_bad_request(
+                "response_format is not supported by this model"
+            ),
+            _unrelated_bad_request(),
+        ]
+        mocker.patch(
+            "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+            return_value=mock_client,
+        )
+
+        llm = OpenAILLM(**openai_llm_config, abilities=["chat", "vision"])
+        with pytest.raises(RuntimeError, match="OpenAI bad request"):
+            await llm.vision_chat(
+                [{"role": "user", "content": "Describe this image."}],
+                response_format={"type": "json_object"},
+            )
+
+        assert mock_client.chat.completions.create.await_count == 2
 
     @pytest.mark.asyncio
     async def test_cleanup(self, openai_llm_config, mock_chat_completion, mocker):
@@ -1584,3 +1689,31 @@ class TestOpenAILLM:
         assert mock_client.chat.completions.create.await_count == 2
         second_call = mock_client.chat.completions.create.call_args_list[1].kwargs
         assert "response_format" not in second_call
+
+
+class TestFieldContent:
+    """``field_content`` must not mistake a pydantic model's declared default
+    for a value the provider actually sent."""
+
+    class _MessageWithDeclaredDefault(BaseModel):
+        model_config = ConfigDict(extra="allow")
+
+        reasoning_content: str = "sdk-default-not-from-provider"
+
+    def test_field_content_ignores_a_declared_default_on_a_pydantic_model(self):
+        message = self._MessageWithDeclaredDefault()
+
+        assert field_content(message, "reasoning_content") == (False, None)
+
+    def test_field_content_reads_a_value_passed_through_model_extra(self):
+        """The real-world path: the OpenAI SDK builds response and delta
+        objects through ``construct()``, which -- unlike a normal pydantic
+        ``__init__`` -- only adds explicitly-declared fields to
+        ``model_fields_set`` and routes every unrecognized field straight to
+        ``model_extra``. ``ChoiceDelta`` doesn't declare ``reasoning_content``,
+        so this is exactly how a provider's reasoning field actually arrives
+        on a streaming delta."""
+        delta = ChoiceDelta.construct(role="assistant", reasoning_content="step 1")
+
+        assert "reasoning_content" not in delta.model_fields_set
+        assert field_content(delta, "reasoning_content") == (True, "step 1")

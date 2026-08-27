@@ -1173,10 +1173,11 @@ class TestWebToolConfigUserOverride:
             set_user_tool_overrides_hook(None)
 
     @pytest.mark.asyncio
-    async def test_create_all_tools_skips_filter_when_no_user_at_all(self):
-        """When neither explicit user nor request.user is set,
-        get_user_tool_overrides() returns {} and ToolFactory filtering is skipped.
-        This is the safe fallback — no user means no per-user policy can apply."""
+    async def test_create_all_tools_denies_every_tool_when_no_user_at_all(self):
+        """When a policy hook is registered but neither explicit user nor
+        request.user is set, the hook never runs. That is "policy unavailable",
+        not "no policy": the turn must get no tools rather than the full set,
+        which would include the very tool the policy disables."""
         from unittest.mock import AsyncMock, MagicMock, patch
 
         from xagent.core.tools.adapters.vibe.factory import ToolFactory
@@ -1195,7 +1196,7 @@ class TestWebToolConfigUserOverride:
                 db=MagicMock(),
                 request=request_without_user,
                 user_id=42,
-                # No explicit user passed — this is the pre-fix bug path
+                # No explicit user passed — the unresolvable-policy path.
                 workspace_config={"base_dir": "/tmp", "task_id": "test"},
             )
 
@@ -1211,13 +1212,46 @@ class TestWebToolConfigUserOverride:
                 result = await ToolFactory.create_all_tools(cfg)
 
             tool_names = [t.name for t in result]
-            # Without explicit user, overrides are {} and filtering is skipped
-            assert "browser_navigate" in tool_names, (
-                "No filtering when no user (existing behavior)"
+            assert "browser_navigate" not in tool_names, (
+                "an unresolved policy must not hand back a tool the policy disables"
             )
-            assert "calculator" in tool_names
+            # Fail closed all the way: an unresolved policy cannot be narrowed
+            # to just the disabled names, because the hook never told us any.
+            assert tool_names == []
         finally:
             set_user_tool_overrides_hook(None)
+
+    @pytest.mark.asyncio
+    async def test_create_all_tools_keeps_every_tool_when_no_hook_registered(self):
+        """Standalone xagent registers no policy hook, so a config without a
+        runtime user has no policy to lose and keeps its unrestricted default."""
+        from unittest.mock import AsyncMock, MagicMock, patch
+
+        from xagent.core.tools.adapters.vibe.factory import ToolFactory
+        from xagent.web.tools.config import WebToolConfig
+
+        request_without_user = MagicMock()
+        del request_without_user.user
+
+        cfg = WebToolConfig(
+            db=MagicMock(),
+            request=request_without_user,
+            user_id=42,
+            workspace_config={"base_dir": "/tmp", "task_id": "test"},
+        )
+
+        tool_browser = MagicMock()
+        tool_browser.name = "browser_navigate"
+        tool_calc = MagicMock()
+        tool_calc.name = "calculator"
+
+        with patch(
+            "xagent.core.tools.adapters.vibe.factory.ToolRegistry.create_registered_tools",
+            AsyncMock(return_value=[tool_browser, tool_calc]),
+        ):
+            result = await ToolFactory.create_all_tools(cfg)
+
+        assert sorted(t.name for t in result) == ["browser_navigate", "calculator"]
 
     @pytest.mark.asyncio
     async def test_create_all_tools_keeps_disabled_when_filter_false(self):

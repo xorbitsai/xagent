@@ -287,6 +287,12 @@ class ClaudeLLM(BaseLLM):
         Returns:
             Tuple of (system_message, list of messages in Anthropic format)
         """
+        # No explicit ``_xagent_``-prefixed key stripping happens here: every
+        # output message below is rebuilt field-by-field (role/content/
+        # tool_use blocks), never a ``dict(msg)`` copy, so an internal
+        # marker like ``_xagent_provider_state`` on the input is never read
+        # and cannot leak into the Anthropic request. Switching any branch
+        # here to copy ``msg`` wholesale would reopen that leak.
         anthropic_messages: List[Dict[str, Any]] = []
         system_message = None
 

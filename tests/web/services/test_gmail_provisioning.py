@@ -31,6 +31,8 @@ from xagent.web.models.user import User
 from xagent.web.models.user_oauth import UserOAuth
 from xagent.web.services import gmail_provisioning
 from xagent.web.services.gmail_provisioning import (
+    GMAIL_ACCOUNT_UNAVAILABLE_ERROR,
+    GMAIL_INVALID_OAUTH_ACCOUNT_BINDING_ERROR,
     GMAIL_PUSH_PUBLISHER,
     GMAIL_WATCH_DISABLED_ERROR,
     ensure_gmail_mailbox_provisioned,
@@ -303,6 +305,773 @@ def _create_gmail_trigger(
     return trigger
 
 
+def test_watch_state_rejects_mismatched_user(db_session: Session) -> None:
+    account_user = _create_user(db_session)
+    state_user = User(
+        username="watch-owner",
+        email="watch-owner@example.com",
+        password_hash="hash",
+        is_admin=False,
+    )
+    db_session.add(state_user)
+    db_session.commit()
+    db_session.refresh(state_user)
+    account = _create_oauth(db_session, account_user)
+    db_session.add(
+        GmailWatchState(
+            user_id=int(state_user.id),
+            oauth_account_id=int(account.id),
+            email=str(account.email),
+            history_id="",
+            topic_name="",
+        )
+    )
+    db_session.commit()
+
+    with pytest.raises(
+        gmail_provisioning.GmailProvisioningError,
+        match="watch and OAuth account users do not match",
+    ):
+        gmail_provisioning._get_or_create_watch_state(
+            db_session,
+            account,
+            str(account.email),
+        )
+
+
+def test_watch_state_adoption_rejects_mismatched_user(
+    db_session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A concurrent insert must not adopt a watch owned by another user."""
+    account_user = _create_user(db_session)
+    state_user = User(
+        username="racing-watch-owner",
+        email="racing-watch-owner@example.com",
+        password_hash="hash",
+        is_admin=False,
+    )
+    db_session.add(state_user)
+    db_session.commit()
+    db_session.refresh(state_user)
+    account = _create_oauth(db_session, account_user)
+    db_session.add(
+        GmailWatchState(
+            user_id=int(state_user.id),
+            oauth_account_id=int(account.id),
+            email=str(account.email),
+            history_id="",
+            topic_name="",
+        )
+    )
+    db_session.commit()
+
+    original_query = db_session.query
+    initial_lookup = True
+
+    class MissingWatchQuery:
+        def filter(self, *_args: object) -> MissingWatchQuery:
+            return self
+
+        def with_for_update(self) -> MissingWatchQuery:
+            return self
+
+        def first(self) -> None:
+            return None
+
+    def race_initial_watch_lookup(*entities: object) -> Any:
+        nonlocal initial_lookup
+        if initial_lookup and entities == (GmailWatchState,):
+            initial_lookup = False
+            return MissingWatchQuery()
+        return original_query(*entities)
+
+    monkeypatch.setattr(db_session, "query", race_initial_watch_lookup)
+
+    with pytest.raises(
+        gmail_provisioning.GmailProvisioningError,
+        match="watch and OAuth account users do not match",
+    ):
+        gmail_provisioning._get_or_create_watch_state(
+            db_session,
+            account,
+            str(account.email),
+        )
+
+
+def test_fresh_session_provisioning_rejects_actor_account(
+    db_session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    user = _create_user(db_session)
+    account = _create_oauth(db_session, user)
+    account.resource_owner_key = "toby:slack:41:UALICE"
+    db_session.commit()
+
+    monkeypatch.setattr(
+        gmail_provisioning,
+        "ensure_gmail_mailbox_provisioned",
+        lambda *_args, **_kwargs: pytest.fail("actor account reached provisioning"),
+    )
+
+    gmail_provisioning._provision_in_fresh_session(int(account.id))
+
+
+def test_fresh_session_provisioning_accepts_ordinary_account(
+    db_session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    user = _create_user(db_session)
+    account = _create_oauth(db_session, user)
+    provisioned: list[int] = []
+
+    monkeypatch.setattr(
+        gmail_provisioning,
+        "ensure_gmail_mailbox_provisioned",
+        lambda _db, oauth_account: provisioned.append(int(oauth_account.id)),
+    )
+
+    gmail_provisioning._provision_in_fresh_session(int(account.id))
+
+    assert provisioned == [int(account.id)]
+
+
+def test_trigger_provisioning_rejects_actor_account(db_session: Session) -> None:
+    user = _create_user(db_session)
+    agent = _create_agent(db_session, user)
+    account = _create_oauth(db_session, user)
+    trigger = _create_gmail_trigger(db_session, user, agent, account)
+    account.resource_owner_key = "toby:slack:41:UALICE"
+    db_session.commit()
+
+    status = gmail_provisioning.provision_gmail_trigger(db_session, trigger)
+
+    assert status == TriggerProvisioningStatus.FAILED.value
+    assert trigger.provisioning_error == "Gmail account is unavailable"
+
+
+def test_trigger_provisioning_resolves_persisted_legacy_mailbox(
+    db_session: Session,
+) -> None:
+    user = _create_user(db_session)
+    agent = _create_agent(db_session, user)
+    account = _create_oauth(db_session, user)
+    trigger = _create_gmail_trigger(db_session, user, agent, account, enabled=False)
+    trigger.config = {"watch_label": "INBOX"}
+    trigger.enabled = True
+    trigger.name = "Re-enabled legacy Gmail inbox"
+    db_session.commit()
+    provisioned_account_ids: list[int] = []
+
+    class CompletedThread:
+        def join(self, _timeout: int | None) -> None:
+            return None
+
+        def is_alive(self) -> bool:
+            return False
+
+    def provision(account_id: int) -> Any:
+        provisioned_account_ids.append(account_id)
+        db_session.add(
+            GmailWatchState(
+                user_id=int(user.id),
+                oauth_account_id=account_id,
+                email=str(account.email),
+                history_id="legacy-history",
+                topic_name="projects/demo-project/topics/legacy",
+                status=TriggerProvisioningStatus.ACTIVE.value,
+                watch_expiration=datetime.now(timezone.utc) + timedelta(hours=1),
+            )
+        )
+        db_session.commit()
+        return CompletedThread()
+
+    status = gmail_provisioning.provision_gmail_trigger(
+        db_session,
+        trigger,
+        run_in_thread=provision,
+    )
+
+    assert status == TriggerProvisioningStatus.ACTIVE.value
+    assert provisioned_account_ids == [int(account.id)]
+    assert trigger.config == {"watch_label": "INBOX"}
+    assert trigger.provisioning_error is None
+
+
+@pytest.mark.parametrize("account_kind", ["actor", "cross-user", "non-gmail"])
+def test_trigger_provisioning_rejects_nonordinary_legacy_mailbox(
+    db_session: Session,
+    account_kind: str,
+) -> None:
+    user = _create_user(db_session)
+    agent = _create_agent(db_session, user)
+    mailbox = "legacy@gmail.example"
+    account_user = user
+    provider = "gmail"
+    owner_key: str | None = None
+    if account_kind == "actor":
+        owner_key = "toby:slack:41:UALICE"
+    elif account_kind == "cross-user":
+        account_user = User(
+            username="other-legacy-owner",
+            email="other-legacy-owner@example.com",
+            password_hash="hash",
+            is_admin=False,
+        )
+        db_session.add(account_user)
+        db_session.commit()
+        db_session.refresh(account_user)
+    else:
+        provider = "google-drive"
+
+    db_session.add_all(
+        [
+            UserOAuth(
+                user_id=int(account_user.id),
+                provider=provider,
+                resource_owner_key=owner_key,
+                access_token="legacy-decoy-token",
+                email=mailbox,
+            ),
+            AgentTrigger(
+                user_id=int(user.id),
+                agent_id=int(agent.id),
+                type=TriggerType.GMAIL.value,
+                name="Legacy Gmail inbox",
+                enabled=True,
+                provider=TriggerType.GMAIL.value,
+                resource_id=mailbox,
+                config={"watch_label": "INBOX"},
+            ),
+        ]
+    )
+    db_session.commit()
+    trigger = db_session.query(AgentTrigger).one()
+
+    def forbidden_run_in_thread(_account_id: int) -> NoReturn:
+        raise AssertionError("invalid legacy account reached provisioning")
+
+    status = gmail_provisioning.provision_gmail_trigger(
+        db_session,
+        trigger,
+        run_in_thread=forbidden_run_in_thread,
+    )
+
+    assert status == TriggerProvisioningStatus.FAILED.value
+    assert trigger.provisioning_error == GMAIL_ACCOUNT_UNAVAILABLE_ERROR
+    assert db_session.query(GmailWatchState).count() == 0
+
+
+def test_trigger_provisioning_rejects_ambiguous_legacy_mailbox(
+    db_session: Session,
+) -> None:
+    user = _create_user(db_session)
+    agent = _create_agent(db_session, user)
+    first = _create_oauth(db_session, user, email="legacy@gmail.example")
+    second = _create_oauth(db_session, user, email="Legacy@Gmail.Example")
+    trigger = _create_gmail_trigger(db_session, user, agent, first)
+    trigger.config = {"watch_label": "INBOX"}
+    db_session.commit()
+
+    def forbidden_run_in_thread(_account_id: int) -> NoReturn:
+        raise AssertionError("ambiguous legacy account reached provisioning")
+
+    status = gmail_provisioning.provision_gmail_trigger(
+        db_session,
+        trigger,
+        run_in_thread=forbidden_run_in_thread,
+    )
+
+    assert int(first.id) != int(second.id)
+    assert status == TriggerProvisioningStatus.FAILED.value
+    assert trigger.provisioning_error == GMAIL_ACCOUNT_UNAVAILABLE_ERROR
+    assert db_session.query(GmailWatchState).count() == 0
+
+
+def test_release_rejects_actor_owned_account(db_session: Session) -> None:
+    user = _create_user(db_session)
+    account = _create_oauth(db_session, user)
+    account.resource_owner_key = "toby:slack:41:UALICE"
+    state = GmailWatchState(
+        user_id=int(user.id),
+        oauth_account_id=int(account.id),
+        email=str(account.email),
+        history_id="history",
+        topic_name="projects/demo/topics/gmail",
+        subscription_name="projects/demo/subscriptions/gmail",
+        status=TriggerProvisioningStatus.ACTIVE.value,
+    )
+    db_session.add_all([account, state])
+    db_session.commit()
+    gmail = FakeGmailService()
+    publisher = FakePublisher()
+    subscriber = FakeSubscriber()
+
+    released = release_gmail_mailbox_if_unused(
+        db_session,
+        int(account.id),
+        service_factory=lambda _db, _account: gmail,
+        publisher_factory=lambda: publisher,
+        subscriber_factory=lambda: subscriber,
+    )
+
+    assert released is False
+    assert gmail.stop_calls == []
+    assert publisher.deleted_topics == []
+    assert subscriber.deleted_subscriptions == []
+    assert db_session.get(GmailWatchState, int(state.id)) is not None
+
+
+def test_watch_state_rejects_owner_change_before_pending_persist(
+    db_session: Session,
+) -> None:
+    user = _create_user(db_session)
+    account = _create_oauth(db_session, user)
+    state = GmailWatchState(
+        user_id=int(user.id),
+        oauth_account_id=int(account.id),
+        email=str(account.email),
+        history_id="history",
+        topic_name="projects/demo/topics/gmail",
+        callback_id="stable-callback",
+        status=TriggerProvisioningStatus.ACTIVE.value,
+    )
+    db_session.add(state)
+    db_session.commit()
+
+    account.resource_owner_key = "toby:slack:41:UALICE"
+    db_session.commit()
+
+    with pytest.raises(
+        gmail_provisioning.GmailProvisioningError,
+        match="ordinary Gmail account not found",
+    ):
+        gmail_provisioning._get_or_create_watch_state(
+            db_session,
+            account,
+            str(account.email),
+        )
+
+    db_session.refresh(state)
+    assert state.status == TriggerProvisioningStatus.ACTIVE.value
+    assert state.callback_id == "stable-callback"
+
+
+def test_provisioning_rejects_owner_change_before_active_persist(
+    db_session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    user = _create_user(db_session)
+    account = _create_oauth(db_session, user)
+    publisher = FakePublisher()
+    subscriber = FakeSubscriber()
+    gmail = FakeGmailService()
+    register_watch = gmail_provisioning._register_gmail_watch
+
+    def become_actor_after_watch(
+        service: Any, topic_path: str
+    ) -> tuple[str, datetime | None]:
+        result = register_watch(service, topic_path)
+        account.resource_owner_key = "toby:slack:41:UALICE"
+        db_session.commit()
+        return result
+
+    monkeypatch.setattr(
+        gmail_provisioning,
+        "_register_gmail_watch",
+        become_actor_after_watch,
+    )
+
+    with pytest.raises(
+        gmail_provisioning.GmailProvisioningError,
+        match="ordinary Gmail ownership changed during provisioning",
+    ):
+        ensure_gmail_mailbox_provisioned(
+            db_session,
+            account,
+            service_factory=lambda _db, _account: gmail,
+            publisher_factory=lambda: publisher,
+            subscriber_factory=lambda: subscriber,
+        )
+
+    state = db_session.query(GmailWatchState).one()
+    assert state.status == TriggerProvisioningStatus.PENDING.value
+    assert gmail.watch_calls != []
+    assert publisher.topics != set()
+    assert subscriber.subscriptions != {}
+
+
+def test_release_rechecks_owner_before_cloud_teardown(db_session: Session) -> None:
+    user = _create_user(db_session)
+    account = _create_oauth(db_session, user)
+    publisher = FakePublisher()
+    subscriber = FakeSubscriber()
+    state = ensure_gmail_mailbox_provisioned(
+        db_session,
+        account,
+        service_factory=lambda _db, _account: FakeGmailService(),
+        publisher_factory=lambda: publisher,
+        subscriber_factory=lambda: subscriber,
+    )
+    gmail = FakeGmailService()
+
+    def become_actor_before_stop(_db: Session, _account: UserOAuth) -> FakeGmailService:
+        account.resource_owner_key = "toby:slack:41:UALICE"
+        db_session.commit()
+        return gmail
+
+    released = release_gmail_mailbox_if_unused(
+        db_session,
+        int(account.id),
+        service_factory=become_actor_before_stop,
+        publisher_factory=lambda: publisher,
+        subscriber_factory=lambda: subscriber,
+    )
+
+    assert released is False
+    assert gmail.stop_calls == []
+    assert publisher.deleted_topics == []
+    assert subscriber.deleted_subscriptions == []
+    assert db_session.get(GmailWatchState, int(state.id)) is not None
+
+
+def test_release_keeps_watch_after_owner_changes_during_teardown(
+    db_session: Session,
+) -> None:
+    user = _create_user(db_session)
+    account = _create_oauth(db_session, user)
+    publisher = FakePublisher()
+    subscriber = FakeSubscriber()
+    state = ensure_gmail_mailbox_provisioned(
+        db_session,
+        account,
+        service_factory=lambda _db, _account: FakeGmailService(),
+        publisher_factory=lambda: publisher,
+        subscriber_factory=lambda: subscriber,
+    )
+
+    class ActorAfterStopUsers(FakeGmailUsers):
+        def stop(self, *, userId: str) -> FakeExecutable:
+            result = super().stop(userId=userId)
+            account.resource_owner_key = "toby:slack:41:UALICE"
+            db_session.commit()
+            return result
+
+    class ActorAfterStopService(FakeGmailService):
+        def users(self) -> ActorAfterStopUsers:
+            return ActorAfterStopUsers(self)
+
+    gmail = ActorAfterStopService()
+    released = release_gmail_mailbox_if_unused(
+        db_session,
+        int(account.id),
+        service_factory=lambda _db, _account: gmail,
+        publisher_factory=lambda: publisher,
+        subscriber_factory=lambda: subscriber,
+    )
+
+    assert released is False
+    assert gmail.stop_calls == [{"userId": "me"}]
+    assert publisher.deleted_topics == []
+    assert subscriber.deleted_subscriptions == []
+    assert db_session.get(GmailWatchState, int(state.id)) is not None
+
+
+def test_disabled_provisioning_does_not_mark_actor_watch_failed(
+    db_session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    user = _create_user(db_session)
+    account = _create_oauth(db_session, user)
+    monkeypatch.setenv("XAGENT_GMAIL_WATCH_ENABLED", "false")
+    get_or_create = gmail_provisioning._get_or_create_watch_state
+
+    def become_actor(*args: Any, **kwargs: Any) -> GmailWatchState:
+        state = get_or_create(*args, **kwargs)
+        account.resource_owner_key = "toby:slack:41:UALICE"
+        db_session.commit()
+        return state
+
+    monkeypatch.setattr(gmail_provisioning, "_get_or_create_watch_state", become_actor)
+
+    with pytest.raises(gmail_provisioning.GmailProvisioningError):
+        ensure_gmail_mailbox_provisioned(db_session, account)
+
+    state = db_session.query(GmailWatchState).one()
+    assert state.status == TriggerProvisioningStatus.PENDING.value
+    assert state.last_error is None
+
+
+def test_failed_provisioning_does_not_mark_actor_watch_failed(
+    db_session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    user = _create_user(db_session)
+    account = _create_oauth(db_session, user)
+
+    def fail_after_owner_change(*_args: Any, **_kwargs: Any) -> None:
+        account.resource_owner_key = "toby:slack:41:UALICE"
+        db_session.commit()
+        raise RuntimeError("topic failed")
+
+    monkeypatch.setattr(gmail_provisioning, "_ensure_topic", fail_after_owner_change)
+
+    with pytest.raises(gmail_provisioning.GmailProvisioningError):
+        ensure_gmail_mailbox_provisioned(
+            db_session,
+            account,
+            service_factory=lambda _db, _account: FakeGmailService(),
+            publisher_factory=lambda: FakePublisher(),
+            subscriber_factory=lambda: FakeSubscriber(),
+        )
+
+    state = db_session.query(GmailWatchState).one()
+    assert state.status == TriggerProvisioningStatus.PENDING.value
+    assert state.last_error is None
+
+
+def test_release_stops_after_subscription_owner_change(db_session: Session) -> None:
+    user = _create_user(db_session)
+    account = _create_oauth(db_session, user)
+    publisher = FakePublisher()
+
+    class ActorAfterSubscription(FakeSubscriber):
+        def delete_subscription(self, *, request: dict[str, Any]) -> None:
+            super().delete_subscription(request=request)
+            account.resource_owner_key = "toby:slack:41:UALICE"
+            db_session.commit()
+
+    subscriber = ActorAfterSubscription()
+    state = ensure_gmail_mailbox_provisioned(
+        db_session,
+        account,
+        service_factory=lambda _db, _account: FakeGmailService(),
+        publisher_factory=lambda: publisher,
+        subscriber_factory=lambda: subscriber,
+    )
+
+    released = release_gmail_mailbox_if_unused(
+        db_session,
+        int(account.id),
+        service_factory=lambda _db, _account: FakeGmailService(),
+        publisher_factory=lambda: publisher,
+        subscriber_factory=lambda: subscriber,
+    )
+
+    assert released is False
+    assert subscriber.deleted_subscriptions != []
+    assert publisher.deleted_topics == []
+    assert db_session.get(GmailWatchState, int(state.id)) is not None
+
+
+def test_trigger_provisioning_rejects_owner_change_after_worker(
+    db_session: Session,
+) -> None:
+    user = _create_user(db_session)
+    agent = _create_agent(db_session, user)
+    account = _create_oauth(db_session, user)
+    trigger = _create_gmail_trigger(db_session, user, agent, account)
+    ensure_gmail_mailbox_provisioned(
+        db_session,
+        account,
+        service_factory=lambda _db, _account: FakeGmailService(),
+        publisher_factory=lambda: FakePublisher(),
+        subscriber_factory=lambda: FakeSubscriber(),
+    )
+
+    class OwnerChangingThread:
+        def join(self, _timeout: int | None) -> None:
+            account.resource_owner_key = "toby:slack:41:UALICE"
+            db_session.commit()
+
+        def is_alive(self) -> bool:
+            return False
+
+    status = gmail_provisioning.provision_gmail_trigger(
+        db_session,
+        trigger,
+        run_in_thread=lambda _account_id: OwnerChangingThread(),  # type: ignore[return-value]
+    )
+
+    assert status == TriggerProvisioningStatus.FAILED.value
+    assert trigger.provisioning_error == "Gmail account is unavailable"
+
+
+def test_sweep_does_not_record_actor_owner_failure(
+    db_session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    user = _create_user(db_session)
+    agent = _create_agent(db_session, user)
+    account = _create_oauth(db_session, user)
+    _create_gmail_trigger(db_session, user, agent, account)
+    state = GmailWatchState(
+        user_id=int(user.id),
+        oauth_account_id=int(account.id),
+        email=str(account.email),
+        history_id="history",
+        topic_name="projects/demo/topics/gmail",
+        status=TriggerProvisioningStatus.FAILED.value,
+        last_error="prior failure",
+    )
+    db_session.add(state)
+    db_session.commit()
+
+    def fail_after_owner_change(*_args: Any, **_kwargs: Any) -> None:
+        account.resource_owner_key = "toby:slack:41:UALICE"
+        db_session.commit()
+        raise gmail_provisioning.GmailProvisioningError("provisioning failed")
+
+    monkeypatch.setattr(
+        gmail_provisioning,
+        "ensure_gmail_mailbox_provisioned",
+        fail_after_owner_change,
+    )
+
+    assert sweep_gmail_provisioning(db_session) == 0
+    db_session.refresh(state)
+    assert state.last_error == "prior failure"
+
+
+def test_renewal_does_not_record_actor_owner_failure(
+    db_session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from xagent.web.services import gmail_triggers
+
+    user = _create_user(db_session)
+    agent = _create_agent(db_session, user)
+    account = _create_oauth(db_session, user)
+    _create_gmail_trigger(db_session, user, agent, account)
+    state = GmailWatchState(
+        user_id=int(user.id),
+        oauth_account_id=int(account.id),
+        email=str(account.email),
+        history_id="history",
+        topic_name="projects/demo/topics/gmail",
+        watch_expiration=datetime.now(timezone.utc) - timedelta(hours=1),
+        last_error="prior renewal error",
+    )
+    db_session.add(state)
+    db_session.commit()
+
+    def fail_after_owner_change(*_args: Any, **_kwargs: Any) -> None:
+        account.resource_owner_key = "toby:slack:41:UALICE"
+        db_session.commit()
+        raise gmail_triggers.GmailTriggerError("renewal failed")
+
+    monkeypatch.setattr(
+        gmail_triggers, "_renew_watch_for_account", fail_after_owner_change
+    )
+
+    assert gmail_triggers.scan_due_gmail_watch_renewals(db_session) == 0
+    db_session.refresh(state)
+    assert state.last_error == "prior renewal error"
+
+
+def test_pending_update_rejects_target_actor_at_write_boundary(
+    db_session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The target account, not an ordinary same-user decoy, authorizes PENDING."""
+    user = _create_user(db_session)
+    target = _create_oauth(db_session, user)
+    _create_oauth(db_session, user, email="decoy@gmail.example")
+    state = GmailWatchState(
+        user_id=int(user.id),
+        oauth_account_id=int(target.id),
+        email=str(target.email),
+        history_id="history",
+        topic_name="projects/demo/topics/target",
+        callback_id="stable-callback",
+        status=TriggerProvisioningStatus.ACTIVE.value,
+    )
+    db_session.add(state)
+    db_session.commit()
+
+    real_execute = db_session.execute
+    changed = False
+
+    def actorize_before_pending(statement: Any, *args: Any, **kwargs: Any) -> Any:
+        nonlocal changed
+        if (
+            not changed
+            and getattr(getattr(statement, "table", None), "name", None)
+            == GmailWatchState.__tablename__
+        ):
+            changed = True
+            db_session.query(UserOAuth).filter(UserOAuth.id == int(target.id)).update(
+                {UserOAuth.resource_owner_key: "toby:slack:41:UALICE"},
+                synchronize_session=False,
+            )
+        return real_execute(statement, *args, **kwargs)
+
+    monkeypatch.setattr(db_session, "execute", actorize_before_pending)
+
+    with pytest.raises(
+        gmail_provisioning.GmailProvisioningError,
+        match="ordinary Gmail account not found",
+    ):
+        gmail_provisioning._get_or_create_watch_state(
+            db_session,
+            target,
+            str(target.email),
+        )
+
+    db_session.expire_all()
+    persisted = db_session.get(GmailWatchState, int(state.id))
+    assert changed is True
+    assert persisted is not None
+    assert persisted.status == TriggerProvisioningStatus.ACTIVE.value
+    assert persisted.callback_id == "stable-callback"
+
+
+def test_pending_create_rejects_target_reassignment_at_write_boundary(
+    db_session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An ordinary same-user decoy cannot authorize a reassigned target."""
+    user = _create_user(db_session)
+    other_user = User(
+        username="other-owner",
+        email="other-owner@example.com",
+        password_hash="hash",
+        is_admin=False,
+    )
+    db_session.add(other_user)
+    db_session.commit()
+    target = _create_oauth(db_session, user)
+    _create_oauth(db_session, user, email="decoy@gmail.example")
+
+    real_execute = db_session.execute
+    changed = False
+
+    def reassign_before_pending(statement: Any, *args: Any, **kwargs: Any) -> Any:
+        nonlocal changed
+        if (
+            not changed
+            and getattr(getattr(statement, "table", None), "name", None)
+            == GmailWatchState.__tablename__
+        ):
+            changed = True
+            db_session.query(UserOAuth).filter(UserOAuth.id == int(target.id)).update(
+                {UserOAuth.user_id: int(other_user.id)},
+                synchronize_session=False,
+            )
+        return real_execute(statement, *args, **kwargs)
+
+    monkeypatch.setattr(db_session, "execute", reassign_before_pending)
+
+    with pytest.raises(
+        gmail_provisioning.GmailProvisioningError,
+        match="ordinary Gmail account not found",
+    ):
+        gmail_provisioning._get_or_create_watch_state(
+            db_session,
+            target,
+            str(target.email),
+        )
+
+    db_session.expire_all()
+    assert changed is True
+    assert (
+        db_session.query(GmailWatchState)
+        .filter(GmailWatchState.oauth_account_id == int(target.id))
+        .count()
+        == 0
+    )
+
+
 def test_provisioning_creates_deterministic_resources_and_active_state(
     db_session: Session,
 ) -> None:
@@ -458,6 +1227,93 @@ def test_sweep_retries_stale_failed_referenced_mailbox(db_session: Session) -> N
     assert refreshed.status == TriggerProvisioningStatus.ACTIVE.value
     assert refreshed.history_id == "hist-retry"
     assert refreshed.last_error is None
+
+
+def test_sweep_isolates_invalid_mailbox_failures(db_session: Session) -> None:
+    user = _create_user(db_session)
+    agent = _create_agent(db_session, user)
+    invalid = _create_oauth(db_session, user, email="")
+    valid = _create_oauth(db_session, user, email="valid@gmail.example")
+    _create_gmail_trigger(db_session, user, agent, invalid)
+    _create_gmail_trigger(db_session, user, agent, valid)
+    for index, account in enumerate((invalid, valid), start=1):
+        db_session.add(
+            GmailWatchState(
+                user_id=int(user.id),
+                oauth_account_id=int(account.id),
+                email=str(account.email or ""),
+                history_id="",
+                topic_name="",
+                status=TriggerProvisioningStatus.FAILED.value,
+                last_error="old failure",
+                updated_at=datetime.now(timezone.utc) - timedelta(minutes=10 - index),
+            )
+        )
+    db_session.commit()
+
+    attempts = sweep_gmail_provisioning(
+        db_session,
+        service_factory=lambda _db, _account: FakeGmailService(),
+        publisher_factory=lambda: FakePublisher(),
+        subscriber_factory=lambda: FakeSubscriber(),
+    )
+
+    states = {
+        int(state.oauth_account_id): state
+        for state in db_session.query(GmailWatchState).all()
+    }
+    assert attempts == 1
+    assert states[int(invalid.id)].status == TriggerProvisioningStatus.FAILED.value
+    assert states[int(invalid.id)].last_error == "Gmail account email is required"
+    assert states[int(valid.id)].status == TriggerProvisioningStatus.ACTIVE.value
+
+
+def test_sweep_filters_actor_rows_before_limit(db_session: Session) -> None:
+    user = _create_user(db_session)
+    agent = _create_agent(db_session, user)
+    actor = UserOAuth(
+        user_id=int(user.id),
+        provider="gmail",
+        access_token="actor-token",
+        email="actor@gmail.example",
+        resource_owner_key="toby:slack:41:UALICE",
+    )
+    db_session.add(actor)
+    db_session.commit()
+    db_session.refresh(actor)
+    ordinary = _create_oauth(db_session, user, email="ordinary@gmail.example")
+    _create_gmail_trigger(db_session, user, agent, actor)
+    _create_gmail_trigger(db_session, user, agent, ordinary)
+    for index, account in enumerate((actor, ordinary), start=1):
+        db_session.add(
+            GmailWatchState(
+                user_id=int(user.id),
+                oauth_account_id=int(account.id),
+                email=str(account.email),
+                history_id="",
+                topic_name="",
+                status=TriggerProvisioningStatus.FAILED.value,
+                last_error="old failure",
+                updated_at=datetime.now(timezone.utc) - timedelta(minutes=10 - index),
+            )
+        )
+    db_session.commit()
+
+    attempts = sweep_gmail_provisioning(
+        db_session,
+        limit=1,
+        service_factory=lambda _db, _account: FakeGmailService(),
+        publisher_factory=lambda: FakePublisher(),
+        subscriber_factory=lambda: FakeSubscriber(),
+    )
+
+    assert attempts == 1
+    state = (
+        db_session.query(GmailWatchState)
+        .filter(GmailWatchState.oauth_account_id == int(ordinary.id))
+        .one()
+    )
+    assert state.status == TriggerProvisioningStatus.ACTIVE.value
 
 
 def test_sweep_matches_duplicate_mailboxes_by_oauth_account_id(
@@ -660,6 +1516,51 @@ def test_unregister_releases_mailbox_only_after_last_enabled_trigger_is_deleted(
     assert subscriber.deleted_subscriptions == [state.subscription_name]
     assert publisher.deleted_topics == [state.topic_name]
     assert db_session.query(GmailWatchState).count() == 0
+
+
+@pytest.mark.parametrize("oauth_account_id", ["malformed", 0, "0"])
+def test_release_fails_closed_for_invalid_same_mailbox_binding(
+    db_session: Session,
+    oauth_account_id: object,
+) -> None:
+    user = _create_user(db_session)
+    agent = _create_agent(db_session, user)
+    account = _create_oauth(db_session, user)
+    trigger = _create_gmail_trigger(db_session, user, agent, account)
+    publisher = FakePublisher()
+    subscriber = FakeSubscriber()
+    gmail = FakeGmailService()
+    state = ensure_gmail_mailbox_provisioned(
+        db_session,
+        account,
+        service_factory=lambda _db, _account: gmail,
+        publisher_factory=lambda: publisher,
+        subscriber_factory=lambda: subscriber,
+    )
+    trigger.config = {
+        "watch_label": "INBOX",
+        "oauth_account_id": oauth_account_id,
+    }
+    db_session.commit()
+
+    assert (
+        release_gmail_mailbox_if_unused(
+            db_session,
+            int(account.id),
+            service_factory=lambda _db, _account: gmail,
+            publisher_factory=lambda: publisher,
+            subscriber_factory=lambda: subscriber,
+        )
+        is False
+    )
+
+    db_session.refresh(trigger)
+    assert trigger.provisioning_status == TriggerProvisioningStatus.FAILED.value
+    assert trigger.provisioning_error == GMAIL_INVALID_OAUTH_ACCOUNT_BINDING_ERROR
+    assert gmail.stop_calls == []
+    assert subscriber.deleted_subscriptions == []
+    assert publisher.deleted_topics == []
+    assert db_session.get(GmailWatchState, int(state.id)) is not None
 
 
 async def test_gmail_provider_register_unregister_offload_sync_sdk_work(
@@ -958,6 +1859,43 @@ def test_reconcile_reports_expired_active_watch_as_failed(
     assert "expired" in str(trigger.provisioning_error)
 
 
+def test_reconcile_rejects_cross_user_bound_watch(
+    db_session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("XAGENT_GMAIL_WATCH_ENABLED", "true")
+    account_user = _create_user(db_session)
+    trigger_user = User(
+        username="cross-user-trigger-owner",
+        email="cross-user-trigger-owner@example.com",
+        password_hash="hash",
+        is_admin=False,
+    )
+    db_session.add(trigger_user)
+    db_session.commit()
+    db_session.refresh(trigger_user)
+    agent = _create_agent(db_session, trigger_user)
+    account = _create_oauth(db_session, account_user)
+    trigger = _create_gmail_trigger(db_session, trigger_user, agent, account)
+    trigger.provisioning_status = TriggerProvisioningStatus.ACTIVE.value
+    db_session.add(
+        GmailWatchState(
+            user_id=int(account_user.id),
+            oauth_account_id=int(account.id),
+            email=str(account.email),
+            history_id="hist-1",
+            topic_name="projects/demo-project/topics/xagent-gmail-abc",
+            status=TriggerProvisioningStatus.ACTIVE.value,
+        )
+    )
+    db_session.commit()
+
+    assert reconcile_gmail_trigger_provisioning(db_session, [trigger]) == 1
+
+    db_session.refresh(trigger)
+    assert trigger.provisioning_status == TriggerProvisioningStatus.FAILED.value
+    assert trigger.provisioning_error == GMAIL_ACCOUNT_UNAVAILABLE_ERROR
+
+
 def test_reconcile_matches_gmail_trigger_by_account_id_when_email_diverges(
     db_session: Session, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1011,8 +1949,7 @@ def test_reconcile_matches_gmail_trigger_by_account_id_when_email_diverges(
 def test_reconcile_legacy_trigger_without_account_binding_matches_by_email(
     db_session: Session,
 ) -> None:
-    """A trigger whose config carries no oauth_account_id (legacy/malformed)
-    still resolves through the (user_id, resource_id-email) fallback key."""
+    """A trigger with no oauth_account_id uses mailbox fallback."""
     user = _create_user(db_session)
     agent = _create_agent(db_session, user)
     account = _create_oauth(db_session, user)
@@ -1040,6 +1977,63 @@ def test_reconcile_legacy_trigger_without_account_binding_matches_by_email(
         status=TriggerProvisioningStatus.ACTIVE.value,
     )
     db_session.add(state)
+    db_session.commit()
+
+    assert reconcile_gmail_trigger_provisioning(db_session, [trigger]) == 1
+    db_session.refresh(trigger)
+    assert trigger.provisioning_status == TriggerProvisioningStatus.ACTIVE.value
+    assert trigger.provisioning_error is None
+
+
+def test_reconcile_legacy_trigger_ignores_actor_watch_with_same_email(
+    db_session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("XAGENT_GMAIL_WATCH_ENABLED", "true")
+    user = _create_user(db_session)
+    agent = _create_agent(db_session, user)
+    ordinary = _create_oauth(db_session, user)
+    actor = UserOAuth(
+        user_id=int(user.id),
+        provider="gmail",
+        resource_owner_key="toby:slack:41:UALICE",
+        access_token="actor-access-token",
+        email=ordinary.email,
+    )
+    trigger = AgentTrigger(
+        user_id=int(user.id),
+        agent_id=int(agent.id),
+        type=TriggerType.GMAIL.value,
+        name="Legacy Gmail inbox",
+        enabled=True,
+        provider=TriggerType.GMAIL.value,
+        resource_id=str(ordinary.email).lower(),
+        config={"watch_label": "INBOX"},
+        provisioning_status=TriggerProvisioningStatus.PENDING.value,
+    )
+    db_session.add_all([actor, trigger])
+    db_session.commit()
+    db_session.refresh(actor)
+    db_session.refresh(trigger)
+    db_session.add_all(
+        [
+            GmailWatchState(
+                user_id=int(user.id),
+                oauth_account_id=int(ordinary.id),
+                email=str(ordinary.email),
+                history_id="ordinary-history",
+                topic_name="projects/demo/topics/ordinary",
+                status=TriggerProvisioningStatus.ACTIVE.value,
+            ),
+            GmailWatchState(
+                user_id=int(user.id),
+                oauth_account_id=int(actor.id),
+                email=str(actor.email),
+                history_id="actor-history",
+                topic_name="projects/demo/topics/actor",
+                status=TriggerProvisioningStatus.ACTIVE.value,
+            ),
+        ]
+    )
     db_session.commit()
 
     assert reconcile_gmail_trigger_provisioning(db_session, [trigger]) == 1
@@ -1225,6 +2219,75 @@ def test_unbind_releases_old_mailbox_while_flag_is_off(
     )
     assert status == TriggerProvisioningStatus.FAILED.value
     assert "disabled" in str(trigger.provisioning_error)
+
+
+def test_release_ignores_other_users_and_actor_trigger_references(
+    db_session: Session,
+) -> None:
+    user = _create_user(db_session)
+    agent = _create_agent(db_session, user)
+    account = _create_oauth(db_session, user, email="shared@gmail.example")
+    ordinary_trigger = _create_gmail_trigger(db_session, user, agent, account)
+    gmail = FakeGmailService()
+    ensure_gmail_mailbox_provisioned(
+        db_session,
+        account,
+        service_factory=lambda _db, _account: gmail,
+        publisher_factory=lambda: FakePublisher(),
+        subscriber_factory=lambda: FakeSubscriber(),
+    )
+    setattr(ordinary_trigger, "enabled", False)
+
+    actor_account = UserOAuth(
+        user_id=int(user.id),
+        provider="gmail",
+        access_token="actor-token",
+        email="shared@gmail.example",
+        resource_owner_key="toby:slack:41:UALICE",
+    )
+    other_user = User(
+        username="other-owner",
+        email="other-owner@example.com",
+        password_hash="hash",
+    )
+    db_session.add_all([actor_account, other_user])
+    db_session.commit()
+    db_session.refresh(actor_account)
+    db_session.refresh(other_user)
+    other_agent = _create_agent(db_session, other_user)
+    other_account = _create_oauth(
+        db_session,
+        other_user,
+        email="shared@gmail.example",
+    )
+    _create_gmail_trigger(db_session, other_user, other_agent, other_account)
+    db_session.add(
+        AgentTrigger(
+            user_id=int(user.id),
+            agent_id=int(agent.id),
+            type=TriggerType.GMAIL.value,
+            name="Actor Gmail inbox",
+            enabled=True,
+            provider=TriggerType.GMAIL.value,
+            resource_id="shared@gmail.example",
+            config={
+                "watch_label": "INBOX",
+                "oauth_account_id": int(actor_account.id),
+            },
+        )
+    )
+    db_session.commit()
+
+    released = release_gmail_mailbox_if_unused(
+        db_session,
+        int(account.id),
+        service_factory=lambda _db, _account: gmail,
+        publisher_factory=lambda: FakePublisher(),
+        subscriber_factory=lambda: FakeSubscriber(),
+    )
+
+    assert released is True
+    assert gmail.stop_calls == [{"userId": "me"}]
 
 
 def test_provision_gmail_trigger_disabled_reports_failed_without_registering(
@@ -1597,6 +2660,95 @@ def test_reconcile_full_scan_pages_candidates_with_bounded_queries(
     assert len(candidate_queries) == expected_page_queries
 
 
+def test_reconcile_prefetches_invalid_bound_accounts_per_page(
+    db_session: Session,
+) -> None:
+    user = _create_user(db_session)
+    agent = _create_agent(db_session, user)
+    ordinary = _create_oauth(db_session, user, email="ordinary@gmail.example")
+    actor = _create_oauth(db_session, user, email="actor@gmail.example")
+    non_gmail = _create_oauth(db_session, user, email="drive@gmail.example")
+    ordinary_trigger = _create_gmail_trigger(db_session, user, agent, ordinary)
+    actor_trigger = _create_gmail_trigger(db_session, user, agent, actor)
+    non_gmail_trigger = _create_gmail_trigger(db_session, user, agent, non_gmail)
+    actor.resource_owner_key = "toby:slack:41:UALICE"
+    non_gmail.provider = "google-drive"
+
+    other_user = User(
+        username="reconcile-other-owner",
+        email="reconcile-other-owner@example.com",
+        password_hash="hash",
+    )
+    db_session.add(other_user)
+    db_session.commit()
+    db_session.refresh(other_user)
+    other_agent = _create_agent(db_session, other_user)
+    cross_user_trigger = _create_gmail_trigger(
+        db_session,
+        other_user,
+        other_agent,
+        ordinary,
+    )
+    db_session.commit()
+
+    account_queries: list[str] = []
+    engine = get_engine()
+
+    def capture_account_query(
+        _connection: Any,
+        _cursor: Any,
+        statement: str,
+        _parameters: Any,
+        _context: Any,
+        _executemany: bool,
+    ) -> None:
+        if "SELECT" in statement.upper() and "FROM user_oauth" in statement:
+            account_queries.append(statement)
+
+    event.listen(engine, "before_cursor_execute", capture_account_query)
+    try:
+        updated = reconcile_gmail_trigger_provisioning(
+            db_session,
+            [
+                ordinary_trigger,
+                actor_trigger,
+                non_gmail_trigger,
+                cross_user_trigger,
+            ],
+        )
+    finally:
+        event.remove(engine, "before_cursor_execute", capture_account_query)
+
+    assert updated == 3
+    assert len(account_queries) == 1
+    assert " IN (" in account_queries[0]
+    for trigger in (actor_trigger, non_gmail_trigger, cross_user_trigger):
+        db_session.refresh(trigger)
+        assert trigger.provisioning_status == TriggerProvisioningStatus.FAILED.value
+        assert trigger.provisioning_error == GMAIL_ACCOUNT_UNAVAILABLE_ERROR
+
+
+@pytest.mark.parametrize("resource_id", [None, "   "])
+def test_reconcile_rejects_legacy_binding_without_mailbox_resource(
+    db_session: Session,
+    resource_id: str | None,
+) -> None:
+    user = _create_user(db_session)
+    agent = _create_agent(db_session, user)
+    account = _create_oauth(db_session, user)
+    trigger = _create_gmail_trigger(db_session, user, agent, account)
+    trigger.config = {"watch_label": "INBOX"}
+    trigger.resource_id = resource_id
+    trigger.provisioning_status = TriggerProvisioningStatus.ACTIVE.value
+    db_session.commit()
+
+    assert reconcile_gmail_trigger_provisioning(db_session, [trigger]) == 1
+
+    db_session.refresh(trigger)
+    assert trigger.provisioning_status == TriggerProvisioningStatus.FAILED.value
+    assert trigger.provisioning_error == "Gmail trigger has no legacy mailbox binding"
+
+
 class ResyncFakeSubscriber(FakeSubscriber):
     """FakeSubscriber that behaves like Pub/Sub for existing subscriptions."""
 
@@ -1763,6 +2915,44 @@ def test_existing_subscription_resyncs_a_stale_oidc_audience(
     assert second.status == TriggerProvisioningStatus.ACTIVE.value
     assert len(subscriber.modify_calls) == 1
     assert subscription["push_config"]["oidc_token"]["audience"] == second.push_audience
+
+
+def test_locked_push_reconcile_revalidates_ordinary_owner(
+    db_session: Session,
+) -> None:
+    user = _create_user(db_session)
+    account = _create_oauth(db_session, user)
+    subscriber = ResyncFakeSubscriber()
+    state = ensure_gmail_mailbox_provisioned(
+        db_session,
+        account,
+        service_factory=lambda _db, _account: FakeGmailService(),
+        publisher_factory=lambda: FakePublisher(),
+        subscriber_factory=lambda: subscriber,
+    )
+    state_row = (
+        int(state.id),
+        int(state.oauth_account_id),
+        str(state.email),
+        str(state.callback_id),
+        str(state.subscription_name),
+        str(state.push_audience),
+    )
+    setattr(account, "resource_owner_key", "toby:slack:41:UALICE")
+    db_session.add(account)
+    db_session.commit()
+
+    outcome = gmail_provisioning._reconcile_gmail_push_endpoint(
+        db_session,
+        state_row=state_row,
+        base_url="https://new-api.example.com",
+        push_service_account="push@example.com",
+        subscriber=subscriber,
+        execute=True,
+    )
+
+    assert outcome == "skipped"
+    assert subscriber.modify_calls == []
 
 
 def test_reconcile_push_endpoint_uses_s2s_base_without_reregistering_watch(
@@ -2189,6 +3379,32 @@ def test_reconcile_push_endpoint_dry_run_does_not_change_cloud_or_database(
     assert subscriber.modify_calls == []
 
 
+@pytest.mark.parametrize("account_kind", ["actor", "non-gmail"])
+def test_reconcile_rejects_nonordinary_bound_account(
+    db_session: Session,
+    monkeypatch: pytest.MonkeyPatch,
+    account_kind: str,
+) -> None:
+    monkeypatch.setenv("XAGENT_GMAIL_WATCH_ENABLED", "true")
+    user = _create_user(db_session)
+    agent = _create_agent(db_session, user)
+    account = _create_oauth(db_session, user)
+    trigger = _create_gmail_trigger(db_session, user, agent, account)
+    trigger.provisioning_status = TriggerProvisioningStatus.ACTIVE.value
+    trigger.resource_id = None
+    if account_kind == "actor":
+        account.resource_owner_key = "toby:slack:41:UALICE"
+    else:
+        account.provider = "google-drive"
+    db_session.commit()
+
+    assert reconcile_gmail_trigger_provisioning(db_session) == 1
+
+    db_session.refresh(trigger)
+    assert trigger.provisioning_status == TriggerProvisioningStatus.FAILED.value
+    assert trigger.provisioning_error == GMAIL_ACCOUNT_UNAVAILABLE_ERROR
+
+
 def test_reconcile_matches_enabled_triggers_by_oauth_account_id(
     db_session: Session, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -2217,8 +3433,68 @@ def test_reconcile_matches_enabled_triggers_by_oauth_account_id(
     assert result.scanned == 1
 
 
-@pytest.mark.parametrize("oauth_account_id", [None, "malformed"])
+def test_reconcile_matches_leading_zero_account_binding(
+    db_session: Session,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    user = _create_user(db_session)
+    agent = _create_agent(db_session, user)
+    account = _create_oauth(db_session, user)
+    trigger = _create_gmail_trigger(db_session, user, agent, account)
+    subscriber = ResyncFakeSubscriber()
+    ensure_gmail_mailbox_provisioned(
+        db_session,
+        account,
+        service_factory=lambda _db, _account: FakeGmailService(),
+        publisher_factory=lambda: FakePublisher(),
+        subscriber_factory=lambda: subscriber,
+    )
+    trigger.config = {
+        "watch_label": "INBOX",
+        "oauth_account_id": f"0{int(account.id)}",
+    }
+    trigger.resource_id = "stale@gmail.example"
+    db_session.commit()
+    monkeypatch.setenv("XAGENT_S2S_API_BASE_URL", "https://sg-origin.cloud.xagent.co")
+
+    result = reconcile_gmail_push_endpoints(
+        db_session,
+        subscriber_factory=lambda: subscriber,
+    )
+
+    assert result.scanned == 1
+
+
 def test_reconcile_legacy_binding_falls_back_to_mailbox_email(
+    db_session: Session,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    user = _create_user(db_session)
+    agent = _create_agent(db_session, user)
+    account = _create_oauth(db_session, user)
+    trigger = _create_gmail_trigger(db_session, user, agent, account)
+    subscriber = ResyncFakeSubscriber()
+    ensure_gmail_mailbox_provisioned(
+        db_session,
+        account,
+        service_factory=lambda _db, _account: FakeGmailService(),
+        publisher_factory=lambda: FakePublisher(),
+        subscriber_factory=lambda: subscriber,
+    )
+    trigger.config = {"watch_label": "INBOX"}
+    db_session.commit()
+    monkeypatch.setenv("XAGENT_S2S_API_BASE_URL", "https://sg-origin.cloud.xagent.co")
+
+    result = reconcile_gmail_push_endpoints(
+        db_session,
+        subscriber_factory=lambda: subscriber,
+    )
+
+    assert result.scanned == 1
+
+
+@pytest.mark.parametrize("oauth_account_id", [None, "malformed", True, 1.5])
+def test_reconcile_rejects_malformed_account_binding(
     db_session: Session,
     monkeypatch: pytest.MonkeyPatch,
     oauth_account_id: object,
@@ -2237,12 +3513,11 @@ def test_reconcile_legacy_binding_falls_back_to_mailbox_email(
     )
     trigger.config = {
         "watch_label": "INBOX",
-        **(
-            {"oauth_account_id": oauth_account_id}
-            if oauth_account_id is not None
-            else {}
-        ),
+        "oauth_account_id": oauth_account_id,
     }
+    trigger.provisioning_status = TriggerProvisioningStatus.ACTIVE.value
+    trigger.provisioning_error = None
+    trigger.resource_id = None
     db_session.commit()
     monkeypatch.setenv("XAGENT_S2S_API_BASE_URL", "https://sg-origin.cloud.xagent.co")
 
@@ -2251,7 +3526,14 @@ def test_reconcile_legacy_binding_falls_back_to_mailbox_email(
         subscriber_factory=lambda: subscriber,
     )
 
-    assert result.scanned == 1
+    assert result.scanned == 0
+    assert reconcile_gmail_trigger_provisioning(db_session) == 1
+    db_session.refresh(trigger)
+    assert trigger.provisioning_status == TriggerProvisioningStatus.FAILED.value
+    assert (
+        trigger.provisioning_error
+        == "Gmail trigger has an invalid OAuth account binding"
+    )
 
 
 def test_reconcile_bounds_gmail_trigger_lookup_to_each_watch_page(
@@ -2413,6 +3695,128 @@ def test_reconcile_reports_watch_deleted_after_its_cloud_update(
     assert result.changed == 0
     assert result.failed == 1
     assert str(state_id) in result.errors[0]
+
+
+def test_reconcile_rechecks_owner_after_cloud_update(
+    db_session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    user = _create_user(db_session)
+    agent = _create_agent(db_session, user)
+    account = _create_oauth(db_session, user)
+    _create_gmail_trigger(db_session, user, agent, account)
+
+    class ActorAfterModifySubscriber(ResyncFakeSubscriber):
+        oauth_account_id: int | None = None
+
+        def modify_push_config(self, *, request: dict[str, Any]) -> None:
+            super().modify_push_config(request=request)
+            assert self.oauth_account_id is not None
+            with get_session_local()() as concurrent_db:
+                concurrent_db.query(UserOAuth).filter(
+                    UserOAuth.id == self.oauth_account_id
+                ).update(
+                    {UserOAuth.resource_owner_key: "toby:slack:41:UALICE"},
+                    synchronize_session=False,
+                )
+                concurrent_db.commit()
+
+    subscriber = ActorAfterModifySubscriber()
+    state = ensure_gmail_mailbox_provisioned(
+        db_session,
+        account,
+        service_factory=lambda _db, _account: FakeGmailService(),
+        publisher_factory=lambda: FakePublisher(),
+        subscriber_factory=lambda: subscriber,
+    )
+    subscriber.oauth_account_id = int(account.id)
+    previous_audience = str(state.push_audience)
+    monkeypatch.setenv("XAGENT_S2S_API_BASE_URL", "https://sg-origin.cloud.xagent.co")
+
+    result = reconcile_gmail_push_endpoints(
+        db_session,
+        execute=True,
+        subscriber_factory=lambda: subscriber,
+    )
+
+    db_session.expire_all()
+    persisted = (
+        db_session.query(GmailWatchState)
+        .filter(GmailWatchState.id == int(state.id))
+        .one()
+    )
+    assert result.scanned == 1
+    assert result.changed == 0
+    assert result.failed == 1
+    assert "changed ownership or disappeared" in result.errors[0]
+    assert persisted.push_audience == previous_audience
+
+
+def test_reconcile_rechecks_target_owner_after_cloud_update(
+    db_session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    user = _create_user(db_session)
+    agent = _create_agent(db_session, user)
+    account = _create_oauth(db_session, user)
+    _create_gmail_trigger(db_session, user, agent, account)
+
+    # The decoy shares the user, so only the target watch/account join can
+    # authorize the guarded update.
+    decoy_account = _create_oauth(
+        db_session,
+        user,
+        email="decoy@gmail.example",
+    )
+
+    class ActorAfterModifySubscriber(ResyncFakeSubscriber):
+        oauth_account_id: int | None = None
+
+        def modify_push_config(self, *, request: dict[str, Any]) -> None:
+            super().modify_push_config(request=request)
+            assert self.oauth_account_id is not None
+            with get_session_local()() as concurrent_db:
+                concurrent_db.query(UserOAuth).filter(
+                    UserOAuth.id == self.oauth_account_id
+                ).update(
+                    {UserOAuth.resource_owner_key: "toby:slack:41:UALICE"},
+                    synchronize_session=False,
+                )
+                concurrent_db.commit()
+
+    subscriber = ActorAfterModifySubscriber()
+    state = ensure_gmail_mailbox_provisioned(
+        db_session,
+        account,
+        service_factory=lambda _db, _account: FakeGmailService(),
+        publisher_factory=lambda: FakePublisher(),
+        subscriber_factory=lambda: subscriber,
+    )
+    ensure_gmail_mailbox_provisioned(
+        db_session,
+        decoy_account,
+        service_factory=lambda _db, _account: FakeGmailService(),
+        publisher_factory=lambda: FakePublisher(),
+        subscriber_factory=lambda: subscriber,
+    )
+    subscriber.oauth_account_id = int(account.id)
+    previous_audience = str(state.push_audience)
+    monkeypatch.setenv("XAGENT_S2S_API_BASE_URL", "https://sg-origin.cloud.xagent.co")
+
+    result = reconcile_gmail_push_endpoints(
+        db_session,
+        execute=True,
+        subscriber_factory=lambda: subscriber,
+    )
+
+    db_session.expire_all()
+    persisted = (
+        db_session.query(GmailWatchState)
+        .filter(GmailWatchState.id == int(state.id))
+        .one()
+    )
+    assert result.scanned == 1
+    assert result.changed == 0
+    assert result.failed == 1
+    assert persisted.push_audience == previous_audience
 
 
 def test_reconciliation_serializes_with_concurrent_provisioning(
@@ -2892,15 +4296,13 @@ def test_postgresql_transition_lock_contends_per_oauth_account(
 
 
 @pytest.mark.postgresql
-def test_release_and_reprovision_contend_on_the_watch_state_lock(
+def test_release_lock_order(
     pg_session: Session,
 ) -> None:
-    """Unregister-of-last-trigger and a concurrent provision serialize.
+    """Release and provisioning use the OAuth-before-watch lock order.
 
-    While release_gmail_mailbox_if_unused holds the watch-state row lock,
-    _get_or_create_watch_state must block instead of updating a row that is
-    about to be deleted (which strands the new trigger at PENDING via
-    StaleDataError on the losing commit).
+    Provisioning waits on the OAuth row while release owns both locks. It
+    cannot update a watch row that release will delete.
     """
     from xagent.web.models.database import get_session_local
 
@@ -2987,6 +4389,295 @@ def test_release_and_reprovision_contend_on_the_watch_state_lock(
     assert rows[0].status == TriggerProvisioningStatus.ACTIVE.value
 
 
+@pytest.mark.postgresql
+def test_release_rechecks_watch_after_service_commit(
+    pg_session: Session,
+) -> None:
+    """A token-refresh commit must not expose a stale release decision."""
+    db = pg_session
+    user = _create_user(db)
+    agent = _create_agent(db, user)
+    account = _create_oauth(db, user)
+    trigger = _create_gmail_trigger(db, user, agent, account, enabled=False)
+    publisher = FakePublisher()
+    subscriber = FakeSubscriber()
+    release_gmail = FakeGmailService()
+    ensure_gmail_mailbox_provisioned(
+        db,
+        account,
+        service_factory=lambda _db, _account: FakeGmailService(),
+        publisher_factory=lambda: publisher,
+        subscriber_factory=lambda: subscriber,
+    )
+    account_id = int(account.id)
+    trigger_id = int(trigger.id)
+
+    service_committed = threading.Event()
+    provision_finished = threading.Event()
+    errors: list[BaseException] = []
+    results: dict[str, Any] = {}
+
+    def committing_service_factory(
+        session: Session,
+        _account: UserOAuth,
+    ) -> FakeGmailService:
+        # Token refresh commits inside build_gmail_service and releases both
+        # row locks before release can call users.stop.
+        session.commit()
+        service_committed.set()
+        assert provision_finished.wait(timeout=30)
+        return release_gmail
+
+    def release() -> None:
+        session = get_session_local()()
+        try:
+            results["released"] = release_gmail_mailbox_if_unused(
+                session,
+                account_id,
+                service_factory=committing_service_factory,
+                publisher_factory=lambda: publisher,
+                subscriber_factory=lambda: subscriber,
+            )
+        except BaseException as exc:  # noqa: BLE001 - asserted below
+            errors.append(exc)
+        finally:
+            session.close()
+
+    def provision() -> None:
+        session = get_session_local()()
+        try:
+            current_trigger = (
+                session.query(AgentTrigger).filter(AgentTrigger.id == trigger_id).one()
+            )
+            current_trigger.enabled = True
+            session.commit()
+            current_account = (
+                session.query(UserOAuth).filter(UserOAuth.id == account_id).one()
+            )
+            state = ensure_gmail_mailbox_provisioned(
+                session,
+                current_account,
+                service_factory=lambda _db, _account: FakeGmailService(
+                    history_id="hist-reprovisioned"
+                ),
+                publisher_factory=lambda: publisher,
+                subscriber_factory=lambda: subscriber,
+            )
+            results["status"] = str(state.status)
+        except BaseException as exc:  # noqa: BLE001 - asserted below
+            errors.append(exc)
+        finally:
+            session.close()
+            provision_finished.set()
+
+    releaser = threading.Thread(target=release)
+    provisioner = threading.Thread(target=provision)
+    try:
+        releaser.start()
+        assert service_committed.wait(timeout=30)
+        provisioner.start()
+        provisioner.join(timeout=30)
+        releaser.join(timeout=30)
+    finally:
+        provision_finished.set()
+        releaser.join(timeout=30)
+        if provisioner.ident is not None:
+            provisioner.join(timeout=30)
+
+    assert not releaser.is_alive() and not provisioner.is_alive()
+    assert errors == []
+    assert results == {
+        "released": False,
+        "status": TriggerProvisioningStatus.ACTIVE.value,
+    }
+    assert release_gmail.stop_calls == []
+    assert publisher.deleted_topics == []
+    assert subscriber.deleted_subscriptions == []
+    db.expire_all()
+    state = (
+        db.query(GmailWatchState)
+        .filter(GmailWatchState.oauth_account_id == account_id)
+        .one()
+    )
+    assert state.status == TriggerProvisioningStatus.ACTIVE.value
+    assert state.history_id == "hist-reprovisioned"
+
+
+@pytest.mark.postgresql
+def test_release_locks_oauth_before_watch_delete(
+    pg_session: Session,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Credential deletion must wait for release's OAuth-before-watch order."""
+    db = pg_session
+    user = _create_user(db)
+    account = _create_oauth(db, user)
+    publisher = FakePublisher()
+    subscriber = FakeSubscriber()
+    gmail = FakeGmailService()
+    ensure_gmail_mailbox_provisioned(
+        db,
+        account,
+        service_factory=lambda _db, _account: gmail,
+        publisher_factory=lambda: publisher,
+        subscriber_factory=lambda: subscriber,
+    )
+    account_id = int(account.id)
+
+    release_reached_reference_check = threading.Event()
+    release_may_continue = threading.Event()
+    release_finished = threading.Event()
+    delete_started = threading.Event()
+    first_delete_attempt_finished = threading.Event()
+    errors: list[BaseException] = []
+    first_delete_error: list[OperationalError] = []
+    results: dict[str, bool] = {}
+    original_references = gmail_provisioning._referenced_gmail_oauth_account_ids
+
+    def pause_reference_check(*args: Any, **kwargs: Any) -> set[int]:
+        release_reached_reference_check.set()
+        assert release_may_continue.wait(timeout=30)
+        return original_references(*args, **kwargs)
+
+    monkeypatch.setattr(
+        gmail_provisioning,
+        "_referenced_gmail_oauth_account_ids",
+        pause_reference_check,
+    )
+
+    def release() -> None:
+        session = get_session_local()()
+        try:
+            results["released"] = release_gmail_mailbox_if_unused(
+                session,
+                account_id,
+                service_factory=lambda _db, _account: gmail,
+                publisher_factory=lambda: publisher,
+                subscriber_factory=lambda: subscriber,
+            )
+        except BaseException as exc:  # noqa: BLE001 - asserted below
+            errors.append(exc)
+        finally:
+            session.close()
+            release_finished.set()
+
+    def delete_account() -> None:
+        session = get_session_local()()
+        try:
+            session.execute(sql_text("SET LOCAL lock_timeout = '500ms'"))
+            delete_started.set()
+            try:
+                locked_account = (
+                    session.query(UserOAuth)
+                    .filter(UserOAuth.id == account_id)
+                    .with_for_update()
+                    .one()
+                )
+                # The old watch-before-OAuth order reaches here and waits for
+                # release, reproducing the inverse lock acquisition shape.
+                assert release_may_continue.wait(timeout=30)
+                session.delete(locked_account)
+                session.commit()
+            except OperationalError as exc:
+                first_delete_error.append(exc)
+                session.rollback()
+            finally:
+                first_delete_attempt_finished.set()
+
+            assert release_finished.wait(timeout=30)
+            session.query(UserOAuth).filter(UserOAuth.id == account_id).delete(
+                synchronize_session=False
+            )
+            session.commit()
+            results["deleted"] = True
+        except BaseException as exc:  # noqa: BLE001 - asserted below
+            errors.append(exc)
+        finally:
+            session.close()
+
+    releaser = threading.Thread(target=release)
+    deleter = threading.Thread(target=delete_account)
+    try:
+        releaser.start()
+        assert release_reached_reference_check.wait(timeout=30)
+
+        deleter.start()
+        assert delete_started.wait(timeout=30)
+        # A delete must time out on the OAuth lock, rather than acquire it
+        # while release holds the watch row and form a W-to-U/U-to-W cycle.
+        assert first_delete_attempt_finished.wait(timeout=2)
+    finally:
+        release_may_continue.set()
+        releaser.join(timeout=30)
+        deleter.join(timeout=30)
+
+    assert not releaser.is_alive() and not deleter.is_alive()
+    assert errors == []
+    assert len(first_delete_error) == 1
+    assert getattr(first_delete_error[0].orig, "pgcode", None) == "55P03"
+    assert results == {"released": True, "deleted": True}
+
+
+@pytest.mark.postgresql
+def test_postgresql_push_reconcile_locks_only_watch_state(
+    pg_session: Session,
+) -> None:
+    """The endpoint transition must not row-lock the joined OAuth account."""
+    db = pg_session
+    user = _create_user(db)
+    account = _create_oauth(db, user)
+    subscriber = ResyncFakeSubscriber()
+    state = ensure_gmail_mailbox_provisioned(
+        db,
+        account,
+        service_factory=lambda _db, _account: FakeGmailService(),
+        publisher_factory=lambda: FakePublisher(),
+        subscriber_factory=lambda: subscriber,
+    )
+    state_row = (
+        int(state.id),
+        int(state.oauth_account_id),
+        str(state.email),
+        str(state.callback_id),
+        str(state.subscription_name),
+        str(state.push_audience),
+    )
+    lock_statements: list[str] = []
+    engine = get_engine()
+
+    def capture_lock_statement(
+        _connection: Any,
+        _cursor: Any,
+        statement: str,
+        _parameters: Any,
+        _context: Any,
+        _executemany: bool,
+    ) -> None:
+        normalized = statement.upper()
+        if (
+            "FROM GMAIL_WATCH_STATES JOIN USER_OAUTH" in normalized
+            and "FOR UPDATE" in normalized
+        ):
+            lock_statements.append(normalized)
+
+    event.listen(engine, "before_cursor_execute", capture_lock_statement)
+    try:
+        outcome = gmail_provisioning._reconcile_gmail_push_endpoint(
+            db,
+            state_row=state_row,
+            base_url="https://new-api.example.com",
+            push_service_account="push@example.com",
+            subscriber=subscriber,
+            execute=True,
+        )
+    finally:
+        event.remove(engine, "before_cursor_execute", capture_lock_statement)
+
+    assert outcome == "changed"
+    assert len(lock_statements) == 1
+    assert "FOR UPDATE OF GMAIL_WATCH_STATES" in lock_statements[0]
+
+
 def test_first_time_creation_race_adopts_winner_row(
     db_session: Session, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -3039,6 +4730,232 @@ def test_first_time_creation_race_adopts_winner_row(
 
 
 @pytest.mark.postgresql
+def test_existing_watch_provision_locks_oauth_before_watch(
+    pg_session: Session,
+) -> None:
+    """Provisioning must wait on OAuth before it can lock an existing watch."""
+    db = pg_session
+    user = _create_user(db)
+    account = _create_oauth(db, user)
+    state = GmailWatchState(
+        user_id=int(user.id),
+        oauth_account_id=int(account.id),
+        email=str(account.email),
+        history_id="history",
+        topic_name="projects/demo/topics/lock-order",
+        callback_id="lock-order-callback",
+        status=TriggerProvisioningStatus.ACTIVE.value,
+    )
+    db.add(state)
+    db.commit()
+
+    account_id = int(account.id)
+    state_id = int(state.id)
+    owner_lock_attempted = threading.Event()
+    errors: list[BaseException] = []
+    watch_lock_errors: list[OperationalError] = []
+    engine = get_engine()
+
+    def note_owner_lock_attempt(
+        _connection: Any,
+        _cursor: Any,
+        statement: str,
+        _parameters: Any,
+        _context: Any,
+        _executemany: bool,
+    ) -> None:
+        if threading.current_thread() is not provisioner:
+            return
+
+        normalized = statement.strip().upper()
+        locks_owner = "FROM USER_OAUTH" in normalized and "FOR UPDATE" in normalized
+        updates_watch = normalized.startswith("UPDATE GMAIL_WATCH_STATES")
+        if locks_owner or updates_watch:
+            owner_lock_attempted.set()
+
+    def provision() -> None:
+        session = get_session_local()()
+        try:
+            oauth_account = session.get(UserOAuth, account_id)
+            assert oauth_account is not None
+            gmail_provisioning._get_or_create_watch_state(
+                session,
+                oauth_account,
+                str(oauth_account.email),
+            )
+        except BaseException as exc:  # noqa: BLE001 - surfaced by the assert below
+            errors.append(exc)
+        finally:
+            session.close()
+
+    provisioner = threading.Thread(target=provision)
+    event.listen(engine, "before_cursor_execute", note_owner_lock_attempt)
+    try:
+        db.execute(sql_text("SET LOCAL lock_timeout = '500ms'"))
+        db.query(UserOAuth).filter(UserOAuth.id == account_id).with_for_update().one()
+
+        provisioner.start()
+        assert owner_lock_attempted.wait(timeout=30)
+        try:
+            db.query(GmailWatchState).filter(
+                GmailWatchState.id == state_id
+            ).with_for_update().one()
+        except OperationalError as exc:
+            watch_lock_errors.append(exc)
+        finally:
+            db.rollback()
+
+        provisioner.join(timeout=30)
+    finally:
+        db.rollback()
+        event.remove(engine, "before_cursor_execute", note_owner_lock_attempt)
+        provisioner.join(timeout=30)
+
+    assert not provisioner.is_alive()
+    assert errors == []
+    assert watch_lock_errors == []
+
+
+@pytest.mark.postgresql
+def test_pending_write_locks_ordinary_oauth_owner_until_commit(
+    pg_session: Session,
+) -> None:
+    """An owner change waits for the guarded PENDING write to commit."""
+    db = pg_session
+    user = _create_user(db)
+    other_user = User(
+        username="other-owner",
+        email="other-owner@example.com",
+        password_hash="hash",
+        is_admin=False,
+    )
+    db.add(other_user)
+    db.commit()
+    db.refresh(other_user)
+    account = _create_oauth(db, user)
+    state = GmailWatchState(
+        user_id=int(user.id),
+        oauth_account_id=int(account.id),
+        email=str(account.email),
+        history_id="history",
+        topic_name="projects/demo/topics/owner",
+        callback_id="stable-callback",
+        status=TriggerProvisioningStatus.ACTIVE.value,
+    )
+    db.add(state)
+    db.commit()
+
+    pending_written = threading.Event()
+    provision_committed = threading.Event()
+    allow_provision_commit = threading.Event()
+    allow_owner_attempt = threading.Event()
+    owner_first_attempt_done = threading.Event()
+    owner_change_committed = threading.Event()
+    errors: list[BaseException] = []
+    first_attempt_errors: list[BaseException] = []
+    account_id = int(account.id)
+    new_owner_id = int(other_user.id)
+    new_owner_key = "toby:slack:41:UALICE"
+    owner_values = {
+        UserOAuth.user_id: new_owner_id,
+        UserOAuth.resource_owner_key: new_owner_key,
+    }
+
+    def provision() -> None:
+        session = get_session_local()()
+        real_commit = session.commit
+
+        def pause_after_pending_write() -> None:
+            pending_written.set()
+            allow_provision_commit.wait(timeout=30)
+            real_commit()
+            provision_committed.set()
+
+        session.commit = pause_after_pending_write  # type: ignore[method-assign]
+        try:
+            oauth_account = session.get(UserOAuth, account_id)
+            assert oauth_account is not None
+            gmail_provisioning._get_or_create_watch_state(
+                session,
+                oauth_account,
+                str(oauth_account.email),
+            )
+        except BaseException as exc:  # noqa: BLE001 - surfaced by the assert below
+            errors.append(exc)
+        finally:
+            session.close()
+
+    def change_owner() -> None:
+        session = get_session_local()()
+        try:
+            assert allow_owner_attempt.wait(timeout=30)
+            session.execute(sql_text("SET LOCAL lock_timeout = '1s'"))
+            try:
+                session.query(UserOAuth).filter(UserOAuth.id == account_id).update(
+                    owner_values,
+                    synchronize_session=False,
+                )
+                session.commit()
+            except OperationalError as exc:
+                # The guarded PENDING DML holds this owner row until commit.
+                first_attempt_errors.append(exc)
+                session.rollback()
+            else:
+                first_attempt_errors.append(
+                    AssertionError("owner update did not time out on the row lock")
+                )
+            finally:
+                owner_first_attempt_done.set()
+
+            assert provision_committed.wait(timeout=30)
+            updated = (
+                session.query(UserOAuth)
+                .filter(UserOAuth.id == account_id)
+                .update(owner_values, synchronize_session=False)
+            )
+            assert updated == 1
+            session.commit()
+            owner_change_committed.set()
+        except BaseException as exc:  # noqa: BLE001 - surfaced by the assert below
+            errors.append(exc)
+        finally:
+            session.close()
+
+    provisioner = threading.Thread(target=provision)
+    owner_changer = threading.Thread(target=change_owner)
+    try:
+        provisioner.start()
+        owner_changer.start()
+        assert pending_written.wait(timeout=30)
+
+        allow_owner_attempt.set()
+        assert owner_first_attempt_done.wait(timeout=10)
+        assert len(first_attempt_errors) == 1
+        first_attempt_error = first_attempt_errors[0]
+        assert isinstance(first_attempt_error, OperationalError)
+        assert getattr(first_attempt_error.orig, "pgcode", None) == "55P03"
+    finally:
+        # Never strand either transaction if an assertion above fails.
+        allow_owner_attempt.set()
+        allow_provision_commit.set()
+        provisioner.join(timeout=30)
+        owner_changer.join(timeout=30)
+
+    assert not provisioner.is_alive() and not owner_changer.is_alive()
+    assert errors == []
+    assert owner_change_committed.is_set()
+
+    db.expire_all()
+    changed_account = db.get(UserOAuth, account_id)
+    changed_state = db.get(GmailWatchState, int(state.id))
+    assert changed_account is not None
+    assert changed_account.user_id == new_owner_id
+    assert changed_account.resource_owner_key == new_owner_key
+    assert changed_state is not None
+    assert changed_state.status == TriggerProvisioningStatus.PENDING.value
+
+
+@pytest.mark.postgresql
 def test_concurrent_first_time_creations_race_on_the_unique_constraint(
     pg_session: Session,
 ) -> None:
@@ -3061,20 +4978,24 @@ def test_concurrent_first_time_creations_race_on_the_unique_constraint(
 
     def do_enable(name: str) -> None:
         session = get_session_local()()
-        real_commit = session.commit
-        insert_commit_pending = True
+        real_execute = session.execute
+        insert_pending = True
 
-        def synchronized_commit() -> None:
-            # Hold the insert commit until both sessions have run the empty
-            # FOR UPDATE select, so both take the insert path; the loser's
-            # adoption retry commit passes straight through.
-            nonlocal insert_commit_pending
-            if insert_commit_pending:
-                insert_commit_pending = False
+        def synchronized_insert(statement: Any, *args: Any, **kwargs: Any) -> Any:
+            # Hold the INSERT ... SELECT until both sessions have passed the
+            # empty FOR UPDATE select. The winner then commits immediately;
+            # the loser gets the unique violation and adopts it.
+            nonlocal insert_pending
+            if (
+                insert_pending
+                and getattr(getattr(statement, "table", None), "name", None)
+                == GmailWatchState.__tablename__
+            ):
+                insert_pending = False
                 both_past_the_empty_select.wait(timeout=30)
-            real_commit()
+            return real_execute(statement, *args, **kwargs)
 
-        session.commit = synchronized_commit  # type: ignore[method-assign]
+        session.execute = synchronized_insert  # type: ignore[method-assign]
         try:
             acct = session.query(UserOAuth).filter(UserOAuth.id == account_id).one()
             state = _get_or_create_watch_state(session, acct, "owner@gmail.example")
@@ -3122,15 +5043,99 @@ def test_gmail_trigger_lookup_resolves_bindings_on_postgresql(
     user = _create_user(db)
     agent = _create_agent(db, user)
     account = _create_oauth(db, user)
-    _create_gmail_trigger(db, user, agent, account)
-    _create_gmail_trigger(db, user, agent, account)
+    first = _create_gmail_trigger(db, user, agent, account)
+    second = _create_gmail_trigger(db, user, agent, account)
+    for trigger in (first, second):
+        trigger.config = {
+            "watch_label": "INBOX",
+            "oauth_account_id": f"0{int(account.id)}",
+        }
+        trigger.resource_id = "stale@gmail.example"
+    db.commit()
 
     referenced = gmail_provisioning._referenced_gmail_oauth_account_ids(
         db,
-        [(int(account.id), str(account.email or ""))],
+        [(int(account.id), int(user.id), str(account.email or ""))],
     )
 
     assert referenced == {int(account.id)}
+
+
+@pytest.mark.postgresql
+def test_reconciliation_filters_invalid_bindings_on_postgresql(
+    pg_session: Session,
+) -> None:
+    db = pg_session
+    user = _create_user(db)
+    other_user = User(
+        username="other-owner",
+        email="other-owner@example.com",
+        password_hash="hash",
+    )
+    db.add(other_user)
+    db.commit()
+    db.refresh(other_user)
+    agent = _create_agent(db, user)
+    ordinary = _create_oauth(db, user)
+    actor = UserOAuth(
+        user_id=int(user.id),
+        provider="gmail",
+        resource_owner_key="toby:slack:41:UALICE",
+        access_token="actor-token",
+        email=ordinary.email,
+    )
+    non_gmail = UserOAuth(
+        user_id=int(user.id),
+        provider="google-drive",
+        access_token="drive-token",
+        email=ordinary.email,
+    )
+    other_account = UserOAuth(
+        user_id=int(other_user.id),
+        provider="gmail",
+        access_token="other-token",
+        email=ordinary.email,
+    )
+    trigger = AgentTrigger(
+        user_id=int(user.id),
+        agent_id=int(agent.id),
+        type=TriggerType.GMAIL.value,
+        name="Legacy Gmail inbox",
+        enabled=True,
+        provider=TriggerType.GMAIL.value,
+        resource_id=str(ordinary.email).lower(),
+        config={"watch_label": "INBOX"},
+        provisioning_status=TriggerProvisioningStatus.PENDING.value,
+    )
+    db.add_all([actor, non_gmail, other_account, trigger])
+    db.commit()
+    for row in (actor, non_gmail, other_account, trigger):
+        db.refresh(row)
+
+    def state(account: UserOAuth, owner: User, status: str) -> GmailWatchState:
+        return GmailWatchState(
+            user_id=int(owner.id),
+            oauth_account_id=int(account.id),
+            email=str(account.email),
+            history_id=f"history-{account.id}",
+            topic_name=f"projects/demo/topics/account-{account.id}",
+            status=status,
+        )
+
+    db.add_all(
+        [
+            state(ordinary, user, TriggerProvisioningStatus.ACTIVE.value),
+            state(actor, user, TriggerProvisioningStatus.FAILED.value),
+            state(non_gmail, user, TriggerProvisioningStatus.FAILED.value),
+            state(other_account, other_user, TriggerProvisioningStatus.FAILED.value),
+        ]
+    )
+    db.commit()
+
+    assert reconcile_gmail_trigger_provisioning(db, [trigger]) == 1
+    db.refresh(trigger)
+    assert trigger.provisioning_status == TriggerProvisioningStatus.ACTIVE.value
+    assert trigger.provisioning_error is None
 
 
 def test_provisioning_requires_account_email(db_session: Session) -> None:

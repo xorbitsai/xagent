@@ -249,7 +249,9 @@ class XinferenceLLM(BaseLLM):
             LLMTimeoutError: If the request times out
         """
         # Sanitize messages
-        sanitized_messages = self._sanitize_unicode_content(messages)
+        sanitized_messages = self._sanitize_unicode_content(
+            self._strip_internal_message_keys(messages)
+        )
 
         # Build generate config
         generate_config = self._build_generate_config(
@@ -476,7 +478,9 @@ class XinferenceLLM(BaseLLM):
             LLMTimeoutError: If timeout occurs
         """
         # Sanitize messages
-        sanitized_messages = self._sanitize_unicode_content(messages)
+        sanitized_messages = self._sanitize_unicode_content(
+            self._strip_internal_message_keys(messages)
+        )
 
         # Build generate config with streaming enabled
         stream_options = dict(kwargs.pop("stream_options", {}) or {})

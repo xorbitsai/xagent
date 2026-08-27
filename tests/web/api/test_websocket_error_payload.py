@@ -76,8 +76,8 @@ def test_terminal_task_error_payload_marks_unowned_task_failed(_test_db):
 
 def test_terminal_task_error_payload_persists_error_chat_message(_test_db):
     """Failures before agent execution (no trace events, e.g. sandbox
-    capacity rejection) must persist the error as an assistant message so
-    a history reload shows the real error instead of a generic bubble."""
+    capacity rejection) persist a client-safe assistant message while the
+    task keeps the diagnostic detail for operators."""
     from xagent.web.models.chat_message import TaskChatMessage
 
     db = _direct_db_session()
@@ -111,7 +111,11 @@ def test_terminal_task_error_payload_persists_error_chat_message(_test_db):
             .all()
         )
         assert len(messages) == 1
-        assert error_text in messages[0].content
+        assert messages[0].message_type == "task_failure"
+        assert messages[0].content == websocket_api.CLIENT_SAFE_TASK_FAILURE
+        persisted_task = db.get(Task, task_id)
+        assert persisted_task is not None
+        assert persisted_task.error_message == error_text
     finally:
         db.close()
 

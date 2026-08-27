@@ -629,7 +629,7 @@ def test_get_messages_for_llm_filters_hidden_and_truncates() -> None:
     result = ctx.get_messages_for_llm(max_tokens=4)
     assert result[0]["role"] == "system"
     assert result[0]["content"].startswith("You are helpful")
-    assert "Current date and time:" in result[0]["content"]
+    assert "Turn started at:" in result[0]["content"]
     # Max tokens = 4 should keep only last assistant message (3 tokens)
     assert len(result) == 2
     assert result[-1]["content"] == "visible-3"
@@ -642,7 +642,7 @@ def test_get_messages_for_llm_injects_time_context_without_system_prompt() -> No
     result = ctx.get_messages_for_llm()
 
     assert result[0]["role"] == "system"
-    assert "Current date and time:" in result[0]["content"]
+    assert "Turn started at:" in result[0]["content"]
     assert "relative dates" in result[0]["content"]
     assert result[1] == {"role": "user", "content": "what happened recently?"}
 
@@ -704,7 +704,7 @@ def test_get_messages_for_llm_coalesces_system_messages() -> None:
     assert [message["role"] for message in result].count("system") == 1
     assert result[0]["role"] == "system"
     assert "Base prompt." in result[0]["content"]
-    assert "Current date and time:" in result[0]["content"]
+    assert "Turn started at:" in result[0]["content"]
     assert "Recovered system context." not in result[0]["content"]
     assert result[1]["role"] == "user"
     assert "Previous system-context message" in result[1]["content"]
@@ -1729,8 +1729,13 @@ def _clock_context(timezone_name: str | None) -> ExecutionContext:
 
 
 UTC_ONLY_CLOCK_LINE = (
-    "Current date and time: 2026-08-24 22:03:37 UTC. Use this as the reference "
-    "for relative dates such as today, recent, latest, yesterday, and tomorrow."
+    "Turn started at: 2026-08-24 22:03:37 UTC. "
+    "Real time keeps advancing while this turn runs, so treat this as "
+    "the start of the turn rather than the exact current time. Use it "
+    "as the reference for relative dates such as today, recent, latest, "
+    "yesterday, and tomorrow. When the answer depends on the actual "
+    "time now, call the get_current_time tool if it is available "
+    "instead of computing from this value."
 )
 
 
@@ -1738,15 +1743,26 @@ def test_clock_line_is_byte_identical_to_utc_wording_without_a_timezone() -> Non
     assert _clock_context(None)._current_time_context() == UTC_ONLY_CLOCK_LINE
 
 
+def test_clock_line_is_honest_about_being_the_turn_start() -> None:
+    # #1676: the stamp is frozen at turn start, so the prompt must not claim it
+    # is the current time, and must point at the current-time tool.
+    line = _clock_context(None)._current_time_context()
+
+    assert line.startswith("Turn started at:")
+    assert "Current date and time" not in line
+    assert "get_current_time" in line
+    assert "keeps advancing" in line
+
+
 def test_clock_line_leads_with_local_date_for_a_caller_timezone() -> None:
     line = _clock_context("Australia/Melbourne")._current_time_context()
 
     assert line.startswith(
-        "Current date and time: 2026-08-25 08:03:37 "
+        "Turn started at: 2026-08-25 08:03:37 "
         "(Australia/Melbourne, UTC+10:00), which is 2026-08-24 22:03:37 UTC."
     )
     # The wrong answer in production came from the model reading 08-24 as today.
-    assert not line.startswith("Current date and time: 2026-08-24")
+    assert not line.startswith("Turn started at: 2026-08-24")
 
 
 def test_clock_line_renders_a_half_hour_offset() -> None:

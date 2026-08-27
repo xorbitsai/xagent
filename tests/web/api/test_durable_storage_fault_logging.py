@@ -8,11 +8,19 @@ record of what actually failed. ``ManagedFileRef`` wraps provider faults into
 log line without ``exc_info`` leaves an operator unable to tell a throttle from
 a timeout from rejected credentials. That is the gap that blocked an incident
 investigation in #1467.
+
+The same helper also renders the *classified* provider fault as ``key=value``
+fields, so a burst of these logs can be aggregated by cause rather than grepped
+as text. Classification itself is unit-tested in
+``tests/core/test_storage_provider_faults.py``; what is pinned here is that the
+fields reach the request paths' log lines, and that ``retryable=False`` in them
+does not change the 503 the client receives.
 """
 
 from __future__ import annotations
 
 import ast
+import errno
 import io
 import logging
 from pathlib import Path
@@ -24,6 +32,7 @@ from fastapi.datastructures import UploadFile
 
 from xagent.core.file_storage.factory import get_unscoped_file_storage
 from xagent.web.api import files as files_api
+from xagent.web.api import websocket as websocket_api
 from xagent.web.api.v1 import tasks as v1_tasks
 from xagent.web.api.v1.errors import V1ApiError
 from xagent.web.models.user import User
@@ -85,6 +94,7 @@ def _stage_under(root: Path, user_id: int):
     return get_upload_path
 
 
+_EIO = errno.EIO
 _FILENAME = "quarterly-report.txt"
 _STORAGE_KEY = f"users/7/uploads/8ac1f2/{_FILENAME}"
 _PROVIDER_MESSAGE = "SlowDown: Please reduce your request rate (status 503)"
@@ -112,6 +122,32 @@ def _wrapped_fault() -> DurableStorageOperationError:
         "Failed to write durable object", storage_key=_STORAGE_KEY
     )
     fault.__cause__ = _ProviderThrottled(_PROVIDER_MESSAGE)
+    return fault
+
+
+def _s3_throttle_fault() -> DurableStorageOperationError:
+    """The incident's real chain: wrap -> s3fs OSError -> botocore ClientError.
+
+    s3fs maps unrecognized codes onto ``OSError(EIO, ...)`` and hangs the
+    original ``ClientError`` off ``__cause__``, so the provider code sits two
+    links below the wrap. Built by hand rather than with botocore so the test
+    does not depend on an optional dependency being importable.
+    """
+
+    class ClientError(Exception):
+        def __init__(self) -> None:
+            super().__init__("An error occurred (SlowDown)")
+            self.response = {
+                "Error": {"Code": "SlowDown", "Message": _PROVIDER_MESSAGE},
+                "ResponseMetadata": {"HTTPStatusCode": 503},
+            }
+
+    translated = OSError(_EIO, _PROVIDER_MESSAGE)
+    translated.__cause__ = ClientError()
+    fault = DurableStorageOperationError(
+        "Failed to write durable object", storage_key=_STORAGE_KEY
+    )
+    fault.__cause__ = translated
     return fault
 
 
@@ -236,16 +272,16 @@ def test_one_wrap_yields_one_record_however_many_arms_report_it(
 
     with caplog.at_level(logging.WARNING, logger=files_api.logger.name):
         log_durable_storage_fault(
-            files_api.logger, "turn preparation", fault, task_id=42
+            files_api.logger, "websocket chat turn preparation", fault, task_id=42
         )
         log_durable_storage_fault(
-            files_api.logger, "endpoint recovery", fault, task_id=42
+            files_api.logger, "websocket chat turn", fault, task_id=42
         )
 
     # The first arm to report wins, which is the innermost -- the one that knows
     # what it was doing. The coarser endpoint label is the one dropped.
     rendered = _sole_warning(caplog, files_api.logger.name)
-    assert "during turn preparation" in rendered
+    assert "during websocket chat turn preparation" in rendered
     _assert_cause_chain_recorded(rendered)
 
 
@@ -425,8 +461,9 @@ _FAULT_SITES = (
 #
 # Several contracts in this file can only be checked against source: which
 # call sites exist, what they bind, which arms come first, and whether a
-# handler re-raises. Each started as its own hand-rolled walk; these are the
-# pieces they share, and the checks themselves stay separate because they
+# handler re-raises. Each of those started as its own hand-rolled walk, and
+# four near-identical parse-and-search blocks were three too many. These are
+# the pieces they share; the checks themselves stay separate because they
 # assert different things.
 
 
@@ -498,6 +535,16 @@ def _exception_name(node: ast.expr) -> str | None:
     return None
 
 
+def _function_named(tree: ast.Module, name: str) -> ast.AST:
+    """The (async) function definition called ``name``, anywhere in ``tree``."""
+    return next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.AsyncFunctionDef, ast.FunctionDef))
+        and node.name == name
+    )
+
+
 def _handler_types(handler: ast.ExceptHandler) -> list[str]:
     """The exception class names an ``except`` arm names, tuple or not."""
     if handler.type is None:
@@ -510,6 +557,17 @@ def _handler_types(handler: ast.ExceptHandler) -> list[str]:
         ]
     name = _exception_name(handler.type)
     return [name] if name is not None else []
+
+
+def _arms_catching(func: ast.AST, exc_name: str) -> list[ast.ExceptHandler]:
+    """Every ``except`` arm under ``func`` that names ``exc_name``, tuple or not."""
+    return [
+        arm
+        for try_node in ast.walk(func)
+        if isinstance(try_node, ast.Try)
+        for arm in try_node.handlers
+        if exc_name in _handler_types(arm)
+    ]
 
 
 def _durable_arm_pairs(tree: ast.Module) -> list[ast.Try]:
@@ -648,6 +706,246 @@ def test_every_fault_site_label_is_bounded_and_reaches_the_log() -> None:
             )
 
 
+@pytest.mark.parametrize(
+    "hostile_type",
+    [None, [], {}, {"nested": 1}, 42, ["chat"]],
+    ids=["missing", "list", "dict", "mapping", "int", "list-of-valid"],
+)
+def test_an_unhashable_or_absent_message_type_still_resolves_to_a_label(
+    hostile_type: object,
+) -> None:
+    """The dispatch lookup must survive a ``type`` the client chose freely.
+
+    ``message_data`` is decoded JSON, so ``type`` can be any JSON value --
+    including an unhashable one. ``dict.get([])`` raises ``TypeError``, inside
+    the endpoint's message loop, which is why the lookup coerces with ``str()``
+    first. A review read that coercion as a ``None``-to-``"None"`` bug; it is
+    not, because no coerced value names a handler, but nothing pinned the
+    property it actually protects.
+    """
+    resolved = websocket_api._DISPATCH_OPERATIONS.get(
+        str(hostile_type), websocket_api._UNKNOWN_DISPATCH_OPERATION
+    )
+
+    assert resolved in set(websocket_api._DISPATCH_OPERATIONS.values()) | {
+        websocket_api._UNKNOWN_DISPATCH_OPERATION
+    }
+    # A client-chosen value never becomes the label itself.
+    assert str(hostile_type) not in resolved
+
+
+def test_no_client_supplied_message_type_can_become_an_operation_label() -> None:
+    """The label must be a literal from the map, never built from the input.
+
+    ``operation`` is rendered into the message and, unlike the fields beside it,
+    is not escaped or bounded (#1520), so the received ``type`` reaching it would
+    reintroduce the injection this PR closed for fields.
+
+    Asserted against the **call site**, not by re-evaluating the lookup: an
+    earlier version of this test called ``_DISPATCH_OPERATIONS.get(hostile, ...)``
+    itself and claimed that pinned the property. It did not -- rewriting the call
+    site to ``f"websocket {message_data.get('type')}"`` would have left it green,
+    which is the exact leak class it claimed to guard.
+    """
+    endpoint = _function_named(_module_ast(websocket_api), "websocket_chat_endpoint")
+
+    assignments = [
+        node
+        for node in ast.walk(endpoint)
+        if isinstance(node, ast.Assign)
+        and any(
+            isinstance(target, ast.Name) and target.id == "dispatching"
+            for target in node.targets
+        )
+    ]
+    assert assignments, "no assignment to `dispatching` -- the label plumbing moved"
+
+    for node in assignments:
+        value = node.value
+        if isinstance(value, ast.Constant):
+            assert isinstance(value.value, str)
+            continue
+        assert isinstance(value, ast.Call) and isinstance(value.func, ast.Attribute), (
+            f"line {node.lineno}: `dispatching` is built by "
+            f"{ast.unparse(value)!r}; it must be a literal or a lookup in "
+            "_DISPATCH_OPERATIONS, never composed from the received type"
+        )
+        assert value.func.attr == "get"
+        assert (
+            isinstance(value.func.value, ast.Name)
+            and value.func.value.id == "_DISPATCH_OPERATIONS"
+        ), f"line {node.lineno}: lookup is not against _DISPATCH_OPERATIONS"
+        fallback = value.args[1] if len(value.args) > 1 else None
+        assert isinstance(fallback, ast.Name) and fallback.id == (
+            "_UNKNOWN_DISPATCH_OPERATION"
+        ), f"line {node.lineno}: unknown types must fall back to a fixed label"
+
+    # And the values a client can select between are bounded literals.
+    labels = set(websocket_api._DISPATCH_OPERATIONS.values())
+    labels.add(websocket_api._UNKNOWN_DISPATCH_OPERATION)
+    for label in labels:
+        assert label == label.strip()
+        assert not any(char in label for char in "\n\r\t")
+        assert len(label) < 64
+
+
+def test_every_dispatched_message_type_has_a_label() -> None:
+    """The map and the dispatch cascade must not drift apart.
+
+    They are two switches on the same value, kept in step by hand: a seventh
+    handler added to the cascade without a label would log its faults as
+    "unknown message type", which is silent and exactly the mislabelling the
+    map was added to fix.
+    """
+    endpoint = _function_named(_module_ast(websocket_api), "websocket_chat_endpoint")
+    dispatched = {
+        comparator.value
+        for node in ast.walk(endpoint)
+        if isinstance(node, ast.Compare)
+        and isinstance(node.left, ast.Call)
+        and isinstance(node.left.func, ast.Attribute)
+        and node.left.func.attr == "get"
+        and [getattr(arg, "value", None) for arg in node.left.args] == ["type"]
+        for comparator in node.comparators
+        if isinstance(comparator, ast.Constant)
+    }
+
+    assert dispatched, "found no dispatch branches -- the parse assumption broke"
+    labelled = set(websocket_api._DISPATCH_OPERATIONS)
+    unlabelled = _SWALLOWED_DISPATCH_TYPES | _INNER_REPORTED_DISPATCH_TYPES
+    assert dispatched == labelled | unlabelled, (
+        "dispatch cascade and label map disagree: "
+        f"{dispatched ^ (labelled | unlabelled)}"
+    )
+    assert not (labelled & unlabelled), (
+        "a type cannot be both labelled and declared unreachable: "
+        f"{labelled & unlabelled}"
+    )
+    assert not (_SWALLOWED_DISPATCH_TYPES & _INNER_REPORTED_DISPATCH_TYPES), (
+        "a type cannot be declared unlabelled for two different reasons -- "
+        "each omission is pinned by its own test, and they disagree about the "
+        "handler's shape: "
+        f"{_SWALLOWED_DISPATCH_TYPES & _INNER_REPORTED_DISPATCH_TYPES}"
+    )
+
+
+# Message types deliberately absent from the label map because their handler
+# swallows the fault before it can reach the endpoint arm. Declared, not
+# assumed: the test below reads the handlers to confirm it.
+_SWALLOWED_DISPATCH_TYPES = {"execute_task", "intervention"}
+
+# Absent for a different reason: every fault arm of the handler that
+# re-raises reports first, and the shared logger marks the instance, so the
+# endpoint-level call is a no-op. Two tests split that claim between them:
+# ``test_one_wrap_yields_one_record_however_many_arms_report_it`` pins the
+# marker, and ``test_chat_is_unlabelled_only_because_its_arms_report_first``
+# pins the report-before-re-raise shape against the handler's own arms.
+_INNER_REPORTED_DISPATCH_TYPES = {"chat"}
+_SWALLOWING_HANDLERS = {
+    "execute_task": "handle_execute_task",
+    "intervention": "handle_intervention",
+}
+
+
+def test_chat_is_unlabelled_only_because_its_arms_report_first() -> None:
+    """The omission above must stay true of the handler, not just of a comment.
+
+    Leaving ``chat`` out of the label map is only correct while every
+    ``DurableStorageOperationError`` arm in ``_handle_chat_message_unserialized``
+    that re-raises calls ``log_durable_storage_fault`` first: the logger marks
+    the instance, so the endpoint-level call stays a no-op. If an arm stops
+    logging before its bare ``raise``, the fault reaches the endpoint arm
+    unmarked and renders under the fallback label "websocket unknown message
+    type" -- a worse mislabel than the dead ``chat`` entry this omission
+    replaced -- and this test is what says the label must come back.
+
+    Scope, stated so it is not overread: this pins the shape of the arms that
+    re-raise. The marker behaviour itself is pinned by
+    ``test_one_wrap_yields_one_record_however_many_arms_report_it``, and neither
+    test proves that every statement of the handler sits inside a durable
+    ``try``.
+    """
+    func = _function_named(
+        _module_ast(websocket_api), "_handle_chat_message_unserialized"
+    )
+    durable_arms = _arms_catching(func, "DurableStorageOperationError")
+    assert durable_arms, (
+        "_handle_chat_message_unserialized no longer has a "
+        "DurableStorageOperationError arm, so a chat fault reaches the endpoint "
+        "arm unreported and 'chat' needs a label in _DISPATCH_OPERATIONS again"
+    )
+
+    for arm in durable_arms:
+        bare_raises = [
+            node
+            for node in ast.walk(arm)
+            if isinstance(node, ast.Raise) and node.exc is None
+        ]
+        if not bare_raises:
+            # A swallowing arm cannot hand the fault onward to the endpoint.
+            continue
+        log_calls = [
+            node
+            for node in ast.walk(arm)
+            if isinstance(node, ast.Call)
+            and (
+                (
+                    isinstance(node.func, ast.Name)
+                    and node.func.id == "log_durable_storage_fault"
+                )
+                or (
+                    isinstance(node.func, ast.Attribute)
+                    and node.func.attr == "log_durable_storage_fault"
+                )
+            )
+        ]
+        assert log_calls and min(c.lineno for c in log_calls) < min(
+            r.lineno for r in bare_raises
+        ), (
+            f"the DurableStorageOperationError arm at line {arm.lineno} re-raises "
+            "without logging first, so the fault reaches the endpoint arm "
+            "unmarked and renders as 'websocket unknown message type' -- either "
+            "restore the log call before the raise or give 'chat' a label in "
+            "_DISPATCH_OPERATIONS"
+        )
+
+
+@pytest.mark.parametrize(
+    ("dispatch_type", "handler"), sorted(_SWALLOWING_HANDLERS.items())
+)
+def test_a_type_is_unlabelled_only_because_its_handler_swallows(
+    dispatch_type: str, handler: str
+) -> None:
+    """The omission above must stay true of the code, not just of a comment.
+
+    Leaving these two out of the label map is only correct while their handlers
+    end in ``except RuntimeError`` without re-raising, because that is what stops
+    a durable fault ever reaching the arm that would use the label. If someone
+    adds a re-raise -- or a durable arm, which is the #1515 work -- the type
+    becomes reachable and needs a label, and this is what says so.
+    """
+    func = _function_named(_module_ast(websocket_api), handler)
+    # ``_arms_catching`` also sees tuple arms (``except (A, RuntimeError)``),
+    # which the hand-rolled predecessor of this walk missed.
+    runtime_arms = _arms_catching(func, "RuntimeError")
+
+    assert runtime_arms, f"{handler} no longer has an except RuntimeError arm"
+    for arm in runtime_arms:
+        reraises = any(
+            isinstance(node, ast.Raise) and node.exc is None for node in ast.walk(arm)
+        )
+        assert not reraises, (
+            f"{handler}'s RuntimeError arm now re-raises, so {dispatch_type!r} "
+            "can reach the endpoint fault arm and needs a label in "
+            "_DISPATCH_OPERATIONS"
+        )
+
+
+# Every module carrying an integrity/parent arm pair. The ordering below is a
+# safety property, not a style rule: ``DurableObjectIntegrityError`` subclasses
+# ``DurableStorageOperationError``, so a parent arm placed first makes the child
+# arm dead and reports permanent corruption as a retryable outage -- loud enough
+# to trip the alerts that watch for one, and burying the real diagnosis.
 # The counts are part of the contract: the walker can only check the pairs it
 # finds, so a deleted integrity arm removes its pair from sight rather than
 # failing the ordering assert. Pinning how many pairs each module carries is
@@ -657,6 +955,7 @@ def test_every_fault_site_label_is_bounded_and_reaches_the_log() -> None:
 # not derived.)
 _MODULES_WITH_DURABLE_ARM_PAIRS = (
     ("web/api/files.py", 7, lambda: files_api),
+    ("web/api/websocket.py", 3, lambda: websocket_api),
     ("web/api/v1/tasks.py", 1, lambda: v1_tasks),
     (
         "core/tools/adapters/vibe/file_ingestion_tool.py",
@@ -671,13 +970,39 @@ _MODULES_WITH_DURABLE_ARM_PAIRS = (
 # ``_raise_durable_storage_unavailable`` wrapper, whose own forwarding call
 # passes its caller's label along as a parameter -- the one site whose label
 # is legitimately not a literal, pinned by the files.py sweep instead.
+# Each direct site by module, label, and the fields it must carry. The fields
+# are part of the contract, not decoration: a label without its correlators
+# cannot be joined to the request that produced it, and a review found the
+# compensation site could have lost or swapped ``user_id``/``task_id`` while
+# a label-only table stayed green.
 _DIRECT_HELPER_SITES = frozenset(
     {
-        ("web/api/files.py", "upload compensation"),
-        ("web/api/v1/tasks.py", "turn attachment resolution"),
+        ("web/api/files.py", "upload compensation", ("user_id", "task_id")),
+        (
+            "web/services/startup_file_storage_sync.py",
+            "startup durable adoption",
+            ("file_id", "storage_key"),
+        ),
+        (
+            "web/services/startup_file_storage_sync.py",
+            "startup durable sync",
+            ("file_id", "storage_key"),
+        ),
+        (
+            "web/api/v1/tasks.py",
+            "turn attachment resolution",
+            ("task_id", "owner_user_id", "file_ids"),
+        ),
+        (
+            "web/api/websocket.py",
+            "websocket chat turn preparation",
+            ("task_id",),
+        ),
+        ("web/api/websocket.py", "websocket agent execution", ("task_id",)),
         (
             "core/tools/adapters/vibe/file_ingestion_tool.py",
             "knowledge-base file restore",
+            ("file_id",),
         ),
     }
 )
@@ -691,6 +1016,11 @@ _BOUNDED_NON_LITERAL_LABELS = {
     # The wrapper forwarding its caller's label; the literals live at its
     # callers, where the files.py sweep above checks them.
     ("web/api/files.py", "operation"),
+    # The endpoint fault arm's dispatch label. Bounded by ``_DISPATCH_OPERATIONS``
+    # being a closed map with a fixed fallback -- a client-supplied ``type``
+    # cannot reach it -- which ``test_no_client_supplied_message_type_can_become
+    # _an_operation_label`` pins at the call site itself.
+    ("web/api/websocket.py", "dispatching"),
 }
 
 
@@ -706,8 +1036,9 @@ def test_every_direct_helper_site_is_declared_with_a_bounded_label() -> None:
     prevent) fails wherever it appears.
     """
     package_root = Path(files_api.__file__).parents[2]
-    found: set[tuple[str, str]] = set()
+    found: set[tuple[str, str, tuple[str, ...]]] = set()
     forwarding: list[str] = []
+    seen_calls: list[str] = []
     for path in _package_modules(package_root):
         module_label = path.relative_to(package_root).as_posix()
         tree = _parse_module_file(path)
@@ -728,7 +1059,20 @@ def test_every_direct_helper_site_is_declared_with_a_bounded_label() -> None:
                     f"{module_label}:{node.lineno} passes **kwargs to the "
                     "helper, so its field names are not checkable here"
                 )
-                found.add((module_label, label_node.value))
+                seen_calls.append(f"{module_label}:{node.lineno}")
+                fields = tuple(str(kw.arg) for kw in node.keywords)
+                # Names alone are not the contract: ``task_id=user_id`` would
+                # declare the right field and render the wrong value. The
+                # binding check is the same one the files.py sweep applies.
+                for keyword in node.keywords:
+                    assert keyword.arg is not None and _binds_a_matching_name(
+                        keyword.arg, keyword.value
+                    ), (
+                        f"{module_label}:{node.lineno} binds {keyword.arg}= to "
+                        f"{ast.unparse(keyword.value)!r}, which never reads "
+                        f"{keyword.arg}"
+                    )
+                found.add((module_label, label_node.value, fields))
             elif (
                 isinstance(label_node, ast.Name)
                 and (module_label, label_node.id) in _BOUNDED_NON_LITERAL_LABELS
@@ -747,8 +1091,15 @@ def test_every_direct_helper_site_is_declared_with_a_bounded_label() -> None:
 
     assert found == set(_DIRECT_HELPER_SITES), (
         f"direct helper sites changed: {found ^ set(_DIRECT_HELPER_SITES)} -- "
-        "declare the new site with its bounded label, or fix a label that "
-        "stopped being a string literal"
+        "declare the new site with its bounded label and the fields it must "
+        "carry, or fix a site whose label or field set drifted"
+    )
+    # An exact count on top of the set comparison: a second call with a label
+    # and fields already declared would collapse into the same set element and
+    # go unnoticed otherwise.
+    assert len(seen_calls) == len(_DIRECT_HELPER_SITES), (
+        f"{len(seen_calls)} direct helper calls but "
+        f"{len(_DIRECT_HELPER_SITES)} declared: {sorted(seen_calls)}"
     )
     assert set(forwarding) == {
         f"{module}:{name}" for module, name in _BOUNDED_NON_LITERAL_LABELS
@@ -756,6 +1107,54 @@ def test_every_direct_helper_site_is_declared_with_a_bounded_label() -> None:
         "the declared bounded-variable labels and the ones actually passed "
         f"disagree: {sorted(forwarding)} vs {sorted(_BOUNDED_NON_LITERAL_LABELS)}"
     )
+
+
+def test_the_inner_durable_arms_still_notify_the_task() -> None:
+    """The arms this change inserts must not drop the notification they intercept.
+
+    ``DurableStorageOperationError`` and ``DurableObjectIntegrityError`` both
+    subclass ``RuntimeError``, so before these arms existed such a fault
+    reached the ``RuntimeError`` arm below them, which acknowledges the sender
+    *and* broadcasts ``CLIENT_SAFE_TASK_FAILURE`` to the task. Answering with
+    the acknowledgement alone would quietly stop notifying that audience --
+    which is why both arms go through ``answer_durable_turn_failure``, and why
+    that helper is the only thing standing between them and the regression.
+
+    Structural, and deliberately labelled as such: the inner agent-execution
+    block has no behavioural harness in this suite (it is one of the pairs
+    #1522 covers), so this pins the routing rather than the frames. It fails
+    if an arm reverts to calling ``finish_delivery_failure`` directly.
+    """
+    func = _function_named(
+        _module_ast(websocket_api), "_handle_chat_message_unserialized"
+    )
+    inner_arms = [
+        arm
+        for arm in _arms_catching(func, "DurableStorageOperationError")
+        + _arms_catching(func, "DurableObjectIntegrityError")
+        # The outer arms re-raise; the inner ones swallow, and only those
+        # inherit the broadcast the RuntimeError arm used to perform.
+        if not any(
+            isinstance(node, ast.Raise) and node.exc is None for node in ast.walk(arm)
+        )
+    ]
+    assert len(inner_arms) == 2, (
+        f"expected the two swallowing durable arms, found {len(inner_arms)} -- "
+        "an arm changed between re-raising and swallowing, which changes "
+        "whether it owes the task a broadcast"
+    )
+    for arm in inner_arms:
+        answered = [
+            node
+            for node in ast.walk(arm)
+            if isinstance(node, ast.Call)
+            and _callee_name(node) == "answer_durable_turn_failure"
+        ]
+        assert answered, (
+            f"the durable arm at line {arm.lineno} answers without "
+            "answer_durable_turn_failure, so the task-wide broadcast the "
+            "RuntimeError arm performs is silently dropped for this fault"
+        )
 
 
 def test_every_module_with_an_arm_pair_is_in_the_table() -> None:
@@ -793,22 +1192,24 @@ def _file_ingestion_tool() -> Any:
 def test_the_integrity_arm_precedes_its_parent_at_every_site(
     label: str, expected: int, loader: Any
 ) -> None:
-    """Checked at all nine pairs, because three of them have no other guard.
+    """Checked at all twelve pairs, because five of them have no other guard.
 
-    Measured, not estimated -- an earlier version of this docstring claimed
-    seven of the nine were unguarded, which was more than twice the truth.
-    Neutralising each integrity arm in turn and running the suite shows six
-    pairs are caught behaviourally: ``_durable_redirect_response``,
-    ``download_file``, ``preview_file`` and the first ``public_preview_file``
-    pair (by the five ``*_checksum_mismatch_asks_user_to_reupload`` tests),
-    plus ``v1/tasks.py`` and ``file_ingestion_tool`` (by the real-path
-    injections in this file and ``test_kb_creation_tools``).
+    Measured, not estimated -- an earlier version of this docstring put the
+    unguarded count at more than twice the truth. Neutralising each integrity
+    arm in turn and running the suite shows seven pairs are caught
+    behaviourally: ``_durable_redirect_response``, ``download_file``,
+    ``preview_file`` and the first ``public_preview_file`` pair (by the five
+    ``*_checksum_mismatch_asks_user_to_reupload`` tests), ``v1/tasks.py`` and
+    ``file_ingestion_tool`` (by the real-path injections in this file and
+    ``test_kb_creation_tools``), and the outer ``websocket.py`` pair (by
+    ``test_a_durable_integrity_fault_is_answered_as_corruption_not_an_outage``).
 
-    The three where a swapped or deleted arm changes behaviour with no
+    The five where a swapped or deleted arm changes behaviour with no
     behavioural test failing are ``preview_pptx_as_pdf``,
-    ``public_download_file``, and the second ``public_preview_file`` pair --
-    the task-asset one. Those are what this check is load-bearing for; giving
-    them real end-to-end coverage is #1522.
+    ``public_download_file``, the second ``public_preview_file`` pair (the
+    task-asset one), and the two remaining ``websocket.py`` pairs -- the inner
+    agent-execution one and the endpoint-level one. Those are what this check
+    is load-bearing for; giving them real end-to-end coverage is #1522.
 
     This does not replace the behavioural tests: it proves ordering, not that
     each arm answers correctly. What it adds is that the one regression which
@@ -933,8 +1334,11 @@ def test_a_field_value_cannot_forge_a_second_field_on_the_same_line(
     # The consumer: split on whitespace, then on the first ``=``. This is what
     # awk, a kv filter, and a grep pipeline all do.
     fields = dict(token.split("=", 1) for token in message_line.split() if "=" in token)
-    assert set(fields) == {"file_ids", "storage_key"}, fields
-    assert "user_id" not in fields and "file_id" not in fields
+    # Not an exact set: the classifier appends its own fields to every line
+    # (``provider_class``, ``retryable``, ...). What must hold is that the
+    # client's value minted none of them.
+    assert "user_id" not in fields and "file_id" not in fields, fields
+    assert "file_ids" in fields and "storage_key" in fields, fields
     # The value survives whole in the one field it belongs to, escaped.
     assert fields["file_ids"].replace("\\x20", " ") == forged
     # Fields the helper renders itself stay untouched and greppable.
@@ -1004,3 +1408,95 @@ def test_an_overlong_field_value_is_truncated(
     # green if it were raised to a value that defeats that. A ceiling rather
     # than an equality, so the number stays tunable within its purpose.
     assert _MAX_LOG_VALUE_LENGTH <= 512
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("_test_db")
+async def test_upload_log_carries_the_classified_provider_fault(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    isolated_upload_storage: Path,
+) -> None:
+    """The fields an operator aggregates on must reach the upload log line.
+
+    This is the burst from #1467: intermittent 503s whose cause could not be
+    named. With the chain classified, one query groups them by
+    ``provider_code`` instead of eyeballing tracebacks.
+    """
+    upload_root = isolated_upload_storage
+    # Side effect only: lays down the admin row the upload is attributed to.
+    _setup_admin()
+    db = _direct_db_session()
+    try:
+        user_id = int(db.query(User.id).filter(User.username == "admin").scalar())
+    finally:
+        db.close()
+    monkeypatch.setattr(
+        files_api, "get_upload_path", _stage_under(upload_root, user_id)
+    )
+
+    def fail_sync(_self: ManagedFileRef, *_args: Any, **_kwargs: Any) -> None:
+        raise _s3_throttle_fault()
+
+    monkeypatch.setattr(ManagedFileRef, "sync_to_durable", fail_sync)
+    upload = UploadFile(
+        filename=_FILENAME,
+        file=io.BytesIO(b"payload"),
+        headers={"content-type": "text/plain"},
+    )
+
+    with caplog.at_level(logging.WARNING, logger=files_api.logger.name):
+        with pytest.raises(HTTPException) as raised:
+            await files_api.store_uploaded_files(
+                upload_items=[upload],
+                task_type="general",
+                task_id=None,
+                folder=None,
+                user_id=user_id,
+                single_file_mode=True,
+            )
+
+    assert raised.value.status_code == 503
+    rendered = _warning_matching(
+        caplog, files_api.logger.name, "Durable storage unavailable during upload"
+    )
+    assert "provider_code=SlowDown" in rendered
+    assert "provider_http_status=503" in rendered
+    assert "retryable=True" in rendered
+    # The traceback still accompanies the fields; they add to it, not replace it.
+    assert _PROVIDER_MESSAGE in rendered
+    assert _STORAGE_KEY in rendered
+
+
+def test_a_permanent_fault_is_labelled_but_still_answered_503(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Classification is diagnostic only -- it must not reroute the status.
+
+    Mapping permanent causes onto a non-retryable status is a deliberate
+    follow-up: it would change the SDK retry contract and the widget error path,
+    so this change stops at naming the cause.
+    """
+
+    class ClientError(Exception):
+        def __init__(self) -> None:
+            super().__init__("An error occurred (InvalidAccessKeyId)")
+            self.response = {
+                "Error": {"Code": "InvalidAccessKeyId"},
+                "ResponseMetadata": {"HTTPStatusCode": 403},
+            }
+
+    fault = DurableStorageOperationError(
+        "Failed to write durable object", storage_key=_STORAGE_KEY
+    )
+    fault.__cause__ = ClientError()
+
+    with caplog.at_level(logging.WARNING, logger=files_api.logger.name):
+        with pytest.raises(HTTPException) as raised:
+            files_api._raise_durable_storage_unavailable(fault, "upload")
+
+    assert raised.value.status_code == 503
+    assert raised.value.detail == _UNAVAILABLE_DETAIL
+    rendered = _sole_warning(caplog, files_api.logger.name)
+    assert "provider_code=InvalidAccessKeyId" in rendered
+    assert "retryable=False" in rendered

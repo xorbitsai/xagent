@@ -464,11 +464,11 @@ async def test_request_context_timezone_reaches_both_prompt_clocks() -> None:
     )
 
     assert (
-        f"Current date and time: {expected_local.strftime('%Y-%m-%d %H:%M:%S')} "
+        f"Turn started at: {expected_local.strftime('%Y-%m-%d %H:%M:%S')} "
         f"(Australia/Melbourne, UTC+" in system_prompt
     )
     assert (
-        f"Current date (Australia/Melbourne): {expected_local.date().isoformat()}. "
+        f"Turn-start date (Australia/Melbourne): {expected_local.date().isoformat()}. "
         in system_prompt
     )
 
@@ -495,8 +495,8 @@ async def test_request_context_without_timezone_keeps_utc_clocks() -> None:
         for message in llm.calls[0]["messages"]
         if message["role"] == "system"
     )
-    assert "Current date (UTC): " in system_prompt
-    assert " UTC. Use this as the reference for relative dates" in system_prompt
+    assert "Turn-start date (UTC): " in system_prompt
+    assert " UTC. Real time keeps advancing" in system_prompt
     assert "which is" not in system_prompt
 
 

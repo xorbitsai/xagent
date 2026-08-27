@@ -4116,7 +4116,7 @@ async def test_dag_dependency_summary_does_not_add_extra_system_message() -> Non
     ]
     assert len(system_messages) == 1
     assert system_messages[0]["content"].startswith("You are a precise planner.")
-    assert "Current date and time:" in system_messages[0]["content"]
+    assert "Turn started at:" in system_messages[0]["content"]
     assert any(
         message["role"] == "user" and "Dependency results" in message["content"]
         for message in child_messages

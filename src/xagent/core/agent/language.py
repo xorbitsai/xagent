@@ -7,7 +7,6 @@ from typing import Any, Literal
 OUTPUT_LANGUAGE_METADATA_KEY = "output_language"
 OUTPUT_LANGUAGE_SOURCE_METADATA_KEY = "output_language_source"
 OUTPUT_LANGUAGE_SOURCE_PLAN = "dag_plan"
-OUTPUT_LANGUAGE_SOURCE_ROUTER = "auto_router"
 
 _ALLOWED_RESPONSE_LANGUAGE_LABELS = frozenset(
     {

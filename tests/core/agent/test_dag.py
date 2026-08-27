@@ -3678,9 +3678,9 @@ async def test_initial_direct_dag_retries_self_consistent_wrong_language() -> No
 
     assert llm.calls == 2
     assert plan.steps[0].task == "研究市场数据并总结所有关键发现"
-    assert (
-        "does not match the latest user request" in llm.seen_messages[1][-1]["content"]
-    )
+    retry_message = llm.seen_messages[1][-1]["content"]
+    assert "script of the latest user request" in retry_message
+    assert "请研究市场数据，并用中文总结所有关键发现和风险。" in retry_message
 
 
 @pytest.mark.asyncio
@@ -4976,3 +4976,42 @@ async def test_dag_pattern_resume_after_replan_keeps_new_active_step(
     }
     assert "step_2" not in resumed["step_results"]
     assert tool.calls == []
+
+
+@pytest.mark.asyncio
+async def test_plan_generator_accepts_implicit_cross_language_request() -> None:
+    generator = LLMPlanGenerator()
+    context = ExecutionContext(execution_id="dag-implicit-cross-language")
+    context.add_user_message(
+        "Rewrite this announcement so our Shanghai colleagues can read it easily."
+    )
+    chinese_plan = plan_tool_response(
+        [
+            {
+                "id": "rewrite",
+                "task": "重写这份公告，使其更易于阅读，并保留原有的关键信息与时间安排",
+                "description": "使用中文输出改写后的完整公告，保留时间与关键信息。",
+                "dependencies": [],
+                "tool_names": [],
+            }
+        ],
+        response_language="Simplified Chinese",
+    )
+    llm = SequenceLLM([chinese_plan, chinese_plan])
+
+    plan = await generator.generate_plan(
+        request=PlanGenerationRequest(
+            context=context,
+            execution_id=context.execution_id,
+            available_tool_names=[],
+        ),
+        llm=llm,
+    )
+
+    assert llm.calls == 2
+    assert plan.steps[0].id == "rewrite"
+    assert context.metadata[OUTPUT_LANGUAGE_METADATA_KEY] == "Simplified Chinese"
+    retry_message = llm.seen_messages[1][-1]["content"]
+    assert "Shanghai colleagues" in retry_message
+    assert "Re-read latest_user_request" in retry_message
+    assert "keep it and return the same plan language" in retry_message

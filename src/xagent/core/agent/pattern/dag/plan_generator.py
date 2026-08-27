@@ -405,6 +405,16 @@ class LLMPlanGenerator(PlanGenerator):
                     exc,
                 )
                 continue
+            if attempt + 1 < MAX_PLAN_TOOL_CALL_ATTEMPTS:
+                reminder = self._request_language_reminder(request.context, plan)
+                if reminder is not None:
+                    retry_feedback = reminder
+                    logger.info(
+                        "LLMPlanGenerator plan language may not match the request; "
+                        "asking the planner to re-check once. execution_id=%s",
+                        request.execution_id,
+                    )
+                    continue
             self._apply_response_language(request.context, plan_arguments)
             return self._filter_suggested_tools(
                 plan=plan,
@@ -653,19 +663,39 @@ class LLMPlanGenerator(PlanGenerator):
                     response_language=response_language,
                 )
 
-            if expected_language and language_source != OUTPUT_LANGUAGE_SOURCE_PLAN:
-                continue
-            request_mismatch = detect_prose_script_mismatch(
-                latest_user_text(context) or "",
-                prose,
-            )
-            if request_mismatch is not None:
-                raise PlanLanguageMismatchError(
-                    f"plan step {step.id!r} has predominantly "
-                    f"{request_mismatch.observed_script}-script user-facing text, "
-                    "which does not match the latest user request.",
-                    response_language="",
+    @staticmethod
+    def _request_language_reminder(context: Any, plan: ExecutionPlan) -> str | None:
+        """Return one retry nudge when plan prose looks off-script for the request.
+
+        Script comparison is a heuristic that misreads legitimate cross-language
+        requests, so it may only ask the planner to re-check, never veto.
+        """
+        request = latest_user_text(context) or ""
+        for step in plan.steps:
+            prose = "\n".join(
+                value
+                for value in (
+                    step.task,
+                    step.description or "",
+                    step.termination_condition or "",
+                    step.completion_evidence or "",
                 )
+                if value
+            )
+            mismatch = detect_prose_script_mismatch(request, prose)
+            if mismatch is None:
+                continue
+            return (
+                f"Plan step {step.id!r} is written in predominantly "
+                f"{mismatch.observed_script} script, which does not match the "
+                "script of the latest user request. Re-read latest_user_request "
+                "above and decide the output language from that request alone, "
+                "including any language change it asks for explicitly or "
+                f"implicitly. Call {LLMPlanGenerator.PLAN_TOOL_NAME} again exactly "
+                "once. If that language is still correct for this request, keep it "
+                "and return the same plan language."
+            )
+        return None
 
     @staticmethod
     def _apply_response_language(context: Any, plan_arguments: dict[str, Any]) -> None:

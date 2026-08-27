@@ -298,10 +298,10 @@ def test_upgrade_and_downgrade_no_op_without_tables(tmp_path):
 
 
 def test_down_revision_matches_current_head():
-    """Pin down_revision to the confirmed true head at the time this
-    connector was added, so a future migration insertion between them
-    would be caught here rather than only surfacing as a confusing
-    multiple-heads error from `alembic heads`."""
+    """Pin down_revision to the confirmed true head as of this branch's
+    last rebase onto upstream/main, so a future migration insertion
+    between them would be caught here rather than only surfacing as a
+    confusing multiple-heads error from `alembic heads`."""
     migration = _load_migration_module()
 
-    assert migration.down_revision == "20260823_add_preferences_to_users"
+    assert migration.down_revision == "20260825_add_slack_channels_join_scope"

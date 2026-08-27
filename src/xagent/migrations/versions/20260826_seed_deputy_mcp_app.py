@@ -1,7 +1,7 @@
 """seed built-in Deputy (OAuth) MCP connector
 
 Revision ID: 20260826_seed_deputy_mcp_app
-Revises: 20260823_add_preferences_to_users
+Revises: 20260825_add_slack_channels_join_scope
 Create Date: 2026-08-26 00:00:00.000000
 
 """
@@ -14,7 +14,7 @@ from alembic import op
 
 # revision identifiers, used by Alembic.
 revision: str = "20260826_seed_deputy_mcp_app"
-down_revision: Union[str, None] = "20260823_add_preferences_to_users"
+down_revision: Union[str, None] = "20260825_add_slack_channels_join_scope"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 

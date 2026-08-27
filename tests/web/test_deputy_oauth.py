@@ -202,6 +202,38 @@ def test_callback_persists_normalized_endpoint_scope_and_identity(
         mock_get.call_args.kwargs["headers"]["Authorization"] == "Bearer deputy-token"
     )
 
+
+def test_callback_scope_filters_empty_entries_in_default_scopes(
+    db_session, monkeypatch
+):
+    """A stray empty-string entry in the provider row's default_scopes
+    (e.g. from an admin edit via PUT /admin/mcp/providers with no
+    element-level validation) must not produce a scope value with a
+    trailing/doubled space -- filtered out, not just joined as-is."""
+    db, user = db_session
+    provider = _deputy_provider()
+    provider.default_scopes = ["longlife_refresh_token", ""]
+    mock_post = Mock(
+        return_value=MockResponse(
+            {
+                "access_token": "deputy-token",
+                "refresh_token": "deputy-refresh",
+                "token_type": "Bearer",
+                "endpoint": "acme.au.deputy.com",
+            }
+        )
+    )
+    mock_get = Mock(return_value=MockResponse({"Id": 42}))
+    monkeypatch.setattr(auth_api.requests, "post", mock_post)
+    monkeypatch.setattr(auth_api.requests, "get", mock_get)
+
+    response = generic_oauth_callback(
+        "deputy", _callback_request(db, user), db, provider
+    )
+
+    assert response.status_code == 200
+    assert mock_post.call_args.kwargs["data"]["scope"] == "longlife_refresh_token"
+
     server = db.query(MCPServer).filter(MCPServer.name == "Deputy").one()
     assert server.transport == "oauth"
     user_mcp = (
@@ -482,6 +514,66 @@ async def test_deputy_refresh_posts_to_stored_instance_url_with_scope_and_redire
     )
     assert kwargs["data"]["grant_type"] == "refresh_token"
     assert kwargs["data"]["refresh_token"] == "old-refresh"
+
+
+@pytest.mark.asyncio
+async def test_deputy_refresh_scope_filters_empty_entries_in_default_scopes(
+    db_session, monkeypatch
+):
+    """See the matching callback-side test's docstring -- same reasoning
+    applies to the refresh leg's scope-building."""
+    db, user = db_session
+    db.add(
+        OAuthProvider(
+            provider_name="deputy",
+            name="Deputy",
+            client_id=encrypt_value("deputy-client-id"),
+            client_secret=encrypt_value("deputy-client-secret"),
+            auth_url="https://once.deputy.com/my/oauth/login",
+            token_url="https://once.deputy.com/my/oauth/access_token",
+            redirect_uri="https://app.example.com/api/auth/deputy/callback",
+            userinfo_url="",
+            user_id_path="",
+            email_path="",
+            default_scopes=["longlife_refresh_token", ""],
+        )
+    )
+    oauth_account = UserOAuth(
+        user_id=user.id,
+        provider="deputy",
+        access_token="old-token",
+        refresh_token="old-refresh",
+        instance_url="https://acme.au.deputy.com",
+        expires_at=datetime.now(timezone.utc) - timedelta(minutes=1),
+        provider_user_id="42",
+    )
+    db.add(oauth_account)
+    db.commit()
+
+    captured_requests = []
+
+    class FakeAsyncClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return None
+
+        async def post(self, url, **kwargs):
+            captured_requests.append((url, kwargs))
+            return MockResponse(
+                {"access_token": "new-token", "token_type": "Bearer"},
+                status_code=200,
+            )
+
+    monkeypatch.setattr(tool_config.httpx, "AsyncClient", FakeAsyncClient)
+
+    assert (
+        await tool_config.refresh_oauth_token_if_needed(db, oauth_account, "deputy")
+        is True
+    )
+
+    assert captured_requests[0][1]["data"]["scope"] == "longlife_refresh_token"
 
 
 @pytest.mark.asyncio

@@ -95,37 +95,34 @@ def _instance_url() -> str:
     instance_url = os.environ.get("DEPUTY_INSTANCE_URL")
     if not instance_url:
         raise ValueError("DEPUTY_INSTANCE_URL environment variable is missing")
+    invalid = ValueError(
+        f"DEPUTY_INSTANCE_URL is not a valid Deputy host: {instance_url!r}"
+    )
     try:
         # urlparse() itself, not just the .port access below, can raise
         # ValueError on malformed input (e.g. an IPv6-literal-like host:
         # urlparse("https://[::1].deputy.com") raises "Invalid IPv6 URL")
-        # -- both calls share this one try/except, and everything needed
-        # below is pulled out as plain strings here (not a `parsed`
-        # reference kept for later), so either failure mode raises this
-        # function's own clear message -- rather than urlparse's cryptic
-        # one (or, for .port, "Port could not be cast to integer value")
-        # escaping uncaught, or mypy having to reason about a ParseResult
-        # that may or may not exist below.
+        # -- both calls share this one try/except and raise the same
+        # `invalid` error, rather than urlparse's cryptic one (or, for
+        # .port, "Port could not be cast to integer value") escaping
+        # uncaught. `parsed` is only ever used below once this block has
+        # completed without raising, so mypy needs no Optional handling
+        # for it.
         parsed = urlparse(instance_url.rstrip("/"))
-        scheme = parsed.scheme
-        # rstrip: a trailing-dot FQDN (e.g. "acme.au.deputy.com.") is a
-        # valid, equivalent hostname that just wouldn't satisfy endswith
-        # below otherwise -- Deputy's own token response never sends one,
-        # but there's no reason to reject it if it ever did.
-        hostname = (parsed.hostname or "").rstrip(".")
         port = f":{parsed.port}" if parsed.port else ""
     except ValueError:
-        scheme = None
-        hostname = ""
-        port = ""
-    if scheme != "https" or not (
+        raise invalid from None
+    # rstrip: a trailing-dot FQDN (e.g. "acme.au.deputy.com.") is a valid,
+    # equivalent hostname that just wouldn't satisfy endswith below
+    # otherwise -- Deputy's own token response never sends one, but
+    # there's no reason to reject it if it ever did.
+    hostname = (parsed.hostname or "").rstrip(".")
+    if parsed.scheme != "https" or not (
         hostname == _INSTANCE_URL_HOST_SUFFIX
         or hostname.endswith(f".{_INSTANCE_URL_HOST_SUFFIX}")
     ):
-        raise ValueError(
-            f"DEPUTY_INSTANCE_URL is not a valid Deputy host: {instance_url!r}"
-        )
-    return f"{scheme}://{hostname}{port}"
+        raise invalid
+    return f"{parsed.scheme}://{hostname}{port}"
 
 
 def _headers() -> dict[str, str]:
@@ -221,11 +218,17 @@ def deputy_list_resource(resource: str) -> str:
     try:
         safe_resource = url_path_id(resource, "resource")
         result = _request("GET", f"/resource/{safe_resource}")
+        if result is None:
+            # A JSON `null` body is a common REST idiom for "no records" (an
+            # ASP.NET-style API serializing a null collection reference
+            # rather than an empty array) -- treated the same as [], not as
+            # an unexpected shape.
+            result = []
         if not isinstance(result, list):
-            # Distinct from "genuinely zero records" (an empty list is a
-            # valid, common response) -- coercing an unexpected shape to []
-            # here would make a malformed/unexpected Deputy response
-            # indistinguishable from a real empty result, unlike
+            # Distinct from "genuinely zero records" (an empty list, or
+            # null, is a valid, common response) -- coercing any OTHER
+            # unexpected shape to [] here would make a malformed Deputy
+            # response indistinguishable from a real empty result, unlike
             # deputy_get_resource/deputy_get_current_user, which both
             # already error on an unexpected shape rather than guessing.
             return _error(f"Deputy returned an unexpected response for {resource}")
@@ -292,6 +295,9 @@ def deputy_query_resource(
         if join:
             body["join"] = join
         result = _request("POST", f"/resource/{safe_resource}/QUERY", json_data=body)
+        if result is None:
+            # See deputy_list_resource's identical null-to-empty-list check.
+            result = []
         if not isinstance(result, list):
             # See deputy_list_resource's identical check: distinct from
             # "genuinely zero records" (a valid, common response).

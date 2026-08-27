@@ -710,8 +710,11 @@ async def refresh_oauth_token_if_needed(
             data["redirect_uri"] = _resolve_oauth_redirect_uri(
                 provider_name, provider_config
             )
-            data["scope"] = " ".join(provider_config.default_scopes or []) or (
-                "longlife_refresh_token"
+            data["scope"] = (
+                " ".join(
+                    scope for scope in provider_config.default_scopes or [] if scope
+                )
+                or "longlife_refresh_token"
             )
             # Deputy's generic once.deputy.com host only serves the initial
             # code exchange -- token renewal must go to the same per-install

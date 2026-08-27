@@ -2161,6 +2161,12 @@ def generic_oauth_callback(
     db_provider: Optional[Any] = None,
 ) -> Any:
     """Handle generic OAuth callback"""
+    # Computed once and reused at every Deputy-specific branch below
+    # (`provider` is this function's own parameter, never reassigned) --
+    # matches tools/config.py's refresh_oauth_token_if_needed's
+    # `normalized_provider` precedent, rather than re-lowering/re-comparing
+    # the same string five separate times across the function.
+    is_deputy = provider.lower() == "deputy"
     if db is None:
         raise RuntimeError("db session is required")
     code = request.query_params.get("code")
@@ -2314,7 +2320,7 @@ def generic_oauth_callback(
         }
         if code_verifier:
             data["code_verifier"] = code_verifier
-        if provider.lower() == "deputy":
+        if is_deputy:
             # Deputy's docs list `scope` as a required body param on the
             # code-exchange request itself, not just the authorize redirect
             # -- without it Deputy still exchanges the code but omits
@@ -2330,8 +2336,9 @@ def generic_oauth_callback(
             # override on the Deputy catalog row (none exists today) would
             # be reflected in the authorize URL but not here. Revisit if
             # one is ever added.
-            data["scope"] = " ".join(db_provider.default_scopes or []) or (
-                "longlife_refresh_token"
+            data["scope"] = (
+                " ".join(scope for scope in db_provider.default_scopes or [] if scope)
+                or "longlife_refresh_token"
             )
         headers = {"Content-Type": "application/x-www-form-urlencoded"}
         if requires_json_accept_header(provider):
@@ -2510,10 +2517,10 @@ def generic_oauth_callback(
 
         deputy_instance_url = (
             _normalize_deputy_endpoint(token_data.get("endpoint"))
-            if provider.lower() == "deputy"
+            if is_deputy
             else None
         )
-        if provider.lower() == "deputy" and not deputy_instance_url:
+        if is_deputy and not deputy_instance_url:
             # Same reasoning as the Salesforce instance_url guard above:
             # every real Deputy token exchange includes a non-empty
             # `endpoint` (Deputy's per-install API host); this connector's
@@ -2613,7 +2620,7 @@ def generic_oauth_callback(
                     "provider_user_id for this grant",
                     type(raw_provider_user_id).__name__,
                 )
-        elif provider.lower() == "deputy":
+        elif is_deputy:
             # Deputy's userinfo_url is deliberately left empty (see the
             # registry row's comment) -- the host itself is per-account, so
             # there is no fixed URL the generic `elif userinfo_url and
@@ -2780,7 +2787,7 @@ def generic_oauth_callback(
             # already the correct, final value: no `if "instance_url" in
             # token_data` guard needed to avoid clobbering anything.
             resolved_instance_url = token_data.get("instance_url")
-            if provider.lower() == "deputy":
+            if is_deputy:
                 # Deputy's equivalent is `endpoint`, not `instance_url`, and
                 # arrives without a scheme -- deputy_instance_url is the
                 # already-guarded, normalized value from above (Deputy

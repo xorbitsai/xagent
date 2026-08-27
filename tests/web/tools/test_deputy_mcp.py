@@ -293,6 +293,31 @@ def test_list_resource_errors_on_non_list_response(monkeypatch):
     assert result["status"] == "error"
 
 
+class _NullJsonResponse:
+    """A response whose body is the literal JSON `null` -- a common REST
+    idiom (e.g. an ASP.NET-style API serializing a null collection
+    reference) for "no records", distinct from an unexpected shape like a
+    dict or string."""
+
+    status_code = 200
+    text = "null"
+    content = b"null"
+
+    def json(self):
+        return None
+
+
+def test_list_resource_treats_null_response_as_empty(monkeypatch):
+    monkeypatch.setattr(
+        deputy.requests, "request", Mock(return_value=_NullJsonResponse())
+    )
+
+    result = json.loads(deputy.deputy_list_resource("Employee"))
+
+    assert result["status"] == "success"
+    assert result["records"] == []
+
+
 def test_list_resource_rejects_surrounding_whitespace_resource_without_raising(
     monkeypatch,
 ):
@@ -464,6 +489,17 @@ def test_query_resource_errors_on_non_list_response(monkeypatch):
     result = json.loads(deputy.deputy_query_resource("Roster"))
 
     assert result["status"] == "error"
+
+
+def test_query_resource_treats_null_response_as_empty(monkeypatch):
+    monkeypatch.setattr(
+        deputy.requests, "request", Mock(return_value=_NullJsonResponse())
+    )
+
+    result = json.loads(deputy.deputy_query_resource("Roster"))
+
+    assert result["status"] == "success"
+    assert result["records"] == []
 
 
 def test_query_resource_rejects_surrounding_whitespace_resource_without_raising(

@@ -526,7 +526,9 @@ export function ConnectAppsField({
                   try {
                     await onContinue();
                   } catch {
-                    setContinued(false);
+                    if (isMountedRef.current) {
+                      setContinued(false);
+                    }
                   }
                 }}
               >

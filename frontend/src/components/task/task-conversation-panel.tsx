@@ -122,60 +122,50 @@ const isWorkforceAgentToolTraceEvent = (event: unknown): boolean => {
   return isAgentDelegationToolName(toolName)
 }
 
-const findWaitingPrompt = (currentTask: any, traceEvents: any[]) => {
+// Combined (not two independent scans): the prompt text and its
+// interactions must come from the SAME pause event, or a plain-text
+// question that happens to follow an older connect_apps-carrying pause in
+// trace history gets its interactions list from that unrelated older event
+// instead of correctly having none.
+export const findWaitingPromptAndInteractions = (
+  currentTask: any,
+  traceEvents: any[]
+): { message: string | null; interactions: any[] | undefined } => {
   if (currentTask?.status !== "waiting_for_user") {
-    return null
+    return { message: null, interactions: undefined }
   }
-  if (currentTask.waitingQuestion) {
-    return currentTask.waitingQuestion
+  if (currentTask.waitingQuestion || currentTask.waitingInteractions?.length) {
+    return {
+      message: currentTask.waitingQuestion || null,
+      interactions: currentTask.waitingInteractions?.length ? currentTask.waitingInteractions : undefined,
+    }
   }
 
   for (let i = traceEvents.length - 1; i >= 0; i--) {
     const event = traceEvents[i]
-    if (event.event_type === "agent_message") {
-      const expectsResponse = event.data?.expect_response === true
+    if (event.event_type === "agent_message" && event.data?.expect_response === true) {
       const message = event.data?.message || event.data?.content
-      if (expectsResponse && typeof message === "string" && message.trim()) {
-        return message
-      }
-    }
-    if (event.event_type === "react_task_end") {
-      const result = event.data?.result
-      if (result?.status === "waiting_for_user" && typeof result.message === "string" && result.message.trim()) {
-        return result.message
-      }
-    }
-  }
-
-  return null
-}
-
-const findWaitingInteractions = (currentTask: any, traceEvents: any[]) => {
-  if (currentTask?.status !== "waiting_for_user") {
-    return undefined
-  }
-  if (currentTask.waitingInteractions?.length) {
-    return currentTask.waitingInteractions
-  }
-
-  for (let i = traceEvents.length - 1; i >= 0; i--) {
-    const event = traceEvents[i]
-    if (event.event_type === "agent_message") {
-      const expectsResponse = event.data?.expect_response === true
       const interactions = event.data?.metadata?.interactions
-      if (expectsResponse && Array.isArray(interactions) && interactions.length > 0) {
-        return interactions
+      if ((typeof message === "string" && message.trim()) || (Array.isArray(interactions) && interactions.length > 0)) {
+        return {
+          message: typeof message === "string" && message.trim() ? message : null,
+          interactions: Array.isArray(interactions) && interactions.length > 0 ? interactions : undefined,
+        }
       }
     }
-    if (event.event_type === "react_task_end") {
-      const interactions = event.data?.result?.interactions
-      if (Array.isArray(interactions) && interactions.length > 0) {
-        return interactions
+    if (event.event_type === "react_task_end" && event.data?.result?.status === "waiting_for_user") {
+      const result = event.data.result
+      const interactions = result?.interactions
+      if ((typeof result.message === "string" && result.message.trim()) || (Array.isArray(interactions) && interactions.length > 0)) {
+        return {
+          message: typeof result.message === "string" && result.message.trim() ? result.message : null,
+          interactions: Array.isArray(interactions) && interactions.length > 0 ? interactions : undefined,
+        }
       }
     }
   }
 
-  return undefined
+  return { message: null, interactions: undefined }
 }
 
 export function TaskConversationPanel({
@@ -465,12 +455,8 @@ export function TaskConversationPanel({
     })
   }, [managerTraceEvents, messageItems])
 
-  const waitingPrompt = useMemo(
-    () => findWaitingPrompt(state.currentTask, managerTraceEvents as any[]),
-    [managerTraceEvents, state.currentTask]
-  )
-  const waitingInteractions = useMemo(
-    () => findWaitingInteractions(state.currentTask, managerTraceEvents as any[]),
+  const { message: waitingPrompt, interactions: waitingInteractions } = useMemo(
+    () => findWaitingPromptAndInteractions(state.currentTask, managerTraceEvents as any[]),
     [managerTraceEvents, state.currentTask]
   )
 

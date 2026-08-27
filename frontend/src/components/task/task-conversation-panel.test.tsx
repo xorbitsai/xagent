@@ -227,7 +227,7 @@ vi.mock("@/components/layout/center-panel", () => ({
   ),
 }))
 
-import { TaskConversationPanel } from "./task-conversation-panel"
+import { TaskConversationPanel, findWaitingPromptAndInteractions } from "./task-conversation-panel"
 
 describe("TaskConversationPanel", () => {
   beforeEach(() => {
@@ -1205,5 +1205,78 @@ describe("TaskConversationPanel", () => {
     for (const message of screen.getAllByTestId("chat-message")) {
       expect(message).toHaveAttribute("data-show-process-view", "true")
     }
+  })
+})
+
+describe("findWaitingPromptAndInteractions", () => {
+  const waitingTask = { status: "waiting_for_user" } as any
+
+  it("returns null/undefined when the task is not waiting_for_user", () => {
+    expect(findWaitingPromptAndInteractions({ status: "running" } as any, [])).toEqual({
+      message: null,
+      interactions: undefined,
+    })
+  })
+
+  it("prefers currentTask's own waitingQuestion/waitingInteractions fields when set", () => {
+    const task = {
+      status: "waiting_for_user",
+      waitingQuestion: "Which dataset?",
+      waitingInteractions: [{ type: "select_one", field: "dataset" }],
+    } as any
+    expect(findWaitingPromptAndInteractions(task, [])).toEqual({
+      message: "Which dataset?",
+      interactions: task.waitingInteractions,
+    })
+  })
+
+  it("pairs the message and interactions from the SAME trace event, not two independently-found events", () => {
+    const traceEvents = [
+      {
+        event_type: "agent_message",
+        data: {
+          expect_response: true,
+          message: "I need access to Gmail to continue.",
+          metadata: {
+            interactions: [{ type: "connect_apps", field: "connect_apps", apps: ["Gmail"] }],
+          },
+        },
+      },
+      {
+        event_type: "agent_message",
+        data: { expect_response: true, message: "Which dataset should I use?" },
+      },
+    ]
+
+    // The most recent qualifying event (the plain question) has no
+    // interactions of its own - it must not inherit the older connect_apps
+    // event's interactions just because that one has some.
+    expect(findWaitingPromptAndInteractions(waitingTask, traceEvents)).toEqual({
+      message: "Which dataset should I use?",
+      interactions: undefined,
+    })
+  })
+
+  it("takes interactions from the most recent event even without a message on it", () => {
+    const traceEvents = [
+      {
+        event_type: "agent_message",
+        data: { expect_response: true, message: "An older question." },
+      },
+      {
+        event_type: "agent_message",
+        data: {
+          expect_response: true,
+          metadata: {
+            interactions: [{ type: "connect_apps", field: "connect_apps", apps: ["Gmail"] }],
+          },
+        },
+      },
+    ]
+
+    expect(findWaitingPromptAndInteractions(waitingTask, traceEvents)).toEqual({
+      message: null,
+      interactions: [{ type: "connect_apps", field: "connect_apps", apps: ["Gmail"] }],
+    })
   })
 })

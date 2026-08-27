@@ -20,7 +20,7 @@ import {
 import { Button } from "@/components/ui/button";
 import { normalizeTimestampMs } from "@/lib/time-utils";
 import { FileChip } from "./FileChip";
-import { ClarificationForm } from "./clarification-form";
+import { ClarificationForm, LIVE_WIDGET_TYPES } from "./clarification-form";
 import { isStoppedTraceProcessStatus, resolveTraceProcessStatus } from "@/lib/trace-process-status";
 import {
   TaskRuntimeMessageMetadataExtension,
@@ -466,7 +466,7 @@ export function ChatMessage({
   // is left alone here.
   const connectAppsOnlyApps =
     !isUser && interactionsActive && interactions && interactions.length > 0 &&
-    interactions.every((interaction) => interaction?.type === "connect_apps")
+    interactions.every((interaction) => LIVE_WIDGET_TYPES.has(interaction?.type))
       ? Array.from(
           new Set(
             interactions.flatMap((interaction) =>

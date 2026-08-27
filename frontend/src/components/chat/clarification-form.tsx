@@ -52,7 +52,7 @@ const isFileActionSelection = (
 // currently produced by any seeder, but nothing in the type system or
 // backend schema rules it out) still renders correctly via renderField's
 // switch below instead of falling through to its "unsupported type" case.
-const LIVE_WIDGET_TYPES = new Set(["connect_apps"])
+export const LIVE_WIDGET_TYPES = new Set(["connect_apps"])
 
 export function ClarificationForm({
   interactions,

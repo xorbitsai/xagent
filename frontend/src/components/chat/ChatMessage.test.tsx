@@ -81,6 +81,7 @@ vi.mock("./clarification-form", () => ({
     clarificationFormMock(props)
     return null
   },
+  LIVE_WIDGET_TYPES: new Set(["connect_apps"]),
 }))
 
 import { ChatMessage } from "./ChatMessage"

@@ -210,7 +210,7 @@ def deputy_get_current_user() -> str:
             return _error("Deputy returned an unexpected response for /me")
         return success_with_capped_dict("user", result)
     except Exception as e:
-        logger.error(f"Error fetching authenticated Deputy user: {e}")
+        logger.error(f"Error fetching authenticated Deputy user: {e}", exc_info=True)
         return _error(str(e))
 
 
@@ -231,7 +231,7 @@ def deputy_list_resource(resource: str) -> str:
         items = result if isinstance(result, list) else []
         return _success_with_capped_list("records", items)
     except Exception as e:
-        logger.error(f"Error listing Deputy resource {resource}: {e}")
+        logger.error(f"Error listing Deputy resource {resource}: {e}", exc_info=True)
         return _error(str(e))
 
 
@@ -251,7 +251,10 @@ def deputy_get_resource(resource: str, resource_id: str) -> str:
             return _error(f"Deputy returned an unexpected response for {resource}")
         return success_with_capped_dict("record", result)
     except Exception as e:
-        logger.error(f"Error fetching Deputy {resource} record {resource_id}: {e}")
+        logger.error(
+            f"Error fetching Deputy {resource} record {resource_id}: {e}",
+            exc_info=True,
+        )
         return _error(str(e))
 
 
@@ -292,7 +295,7 @@ def deputy_query_resource(
         items = result if isinstance(result, list) else []
         return _success_with_capped_list("records", items)
     except Exception as e:
-        logger.error(f"Error querying Deputy resource {resource}: {e}")
+        logger.error(f"Error querying Deputy resource {resource}: {e}", exc_info=True)
         return _error(str(e))
 
 

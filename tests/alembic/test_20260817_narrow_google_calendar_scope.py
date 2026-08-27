@@ -267,8 +267,8 @@ def test_offline_postgresql_downgrade_emits_literal_update_only_sql() -> None:
     # "auth/calendar" alone is a substring of both OLD_SCOPES and NEW_SCOPES
     # ("auth/calendar.events"), so it can't distinguish which one was
     # emitted; assert the narrower scope is absent to catch a swapped
-    # OLD_SCOPES/NEW_SCOPES argument in downgrade()'s _set_calendar_scopes()
-    # call.
+    # OLD_SCOPES/NEW_SCOPES argument in downgrade()'s
+    # _set_calendar_scopes_offline() call.
     assert "auth/calendar" in sql
     assert "calendar.events" not in sql
     assert "INSERT INTO public_mcp_apps" not in sql
@@ -317,6 +317,13 @@ def test_migration_fields_match_registry() -> None:
     )
 
     assert list(migration.NEW_SCOPES) == registry_row["oauth_scopes"]
+    # This file's own OLD_SCOPES/NEW_SCOPES (used throughout the tests above)
+    # are a separate copy of the migration's constants, not a reference to
+    # them -- if the migration's values ever changed without this file's
+    # copy following, every test above would keep passing against a stale
+    # expectation instead of failing loudly.
+    assert list(migration.OLD_SCOPES) == OLD_SCOPES
+    assert list(migration.NEW_SCOPES) == NEW_SCOPES
 
 
 def test_revision_metadata() -> None:

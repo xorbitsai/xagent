@@ -146,16 +146,21 @@ RUN if [ "$INSTALL_CHROME" != "true" ]; then \
 # access behavior of Boxlite" -- src/xagent/sandbox/docker_sandbox.py).
 # A cache keyed to $HOME would have to guess that correctly; one fixed,
 # world-writable path doesn't need to -- verified this actually holds,
-# not just in theory: `umask 0000` below, because the top-level
+# not just in theory: `umask 0022` below, because the top-level
 # NPM_CONFIG_CACHE directory being world-writable does not make npm's
-# own subdirectories/files under it world-writable too (npm creates
+# own subdirectories/files under it world-readable too (npm creates
 # those with root's normal, restrictive umask); without this, a
 # different exec user can list the cache directory but still gets
 # ENOTCACHED trying to actually read a --offline resolution out of it.
 # `--help` exercises resolution without starting Chrome, so this needs
-# no display/GPU setup at build time.
+# no display/GPU setup at build time. umask 0022 (world-readable, not
+# world-writable): the goal is only cross-user *read* access to the
+# warmed cache, so a laxer 0000 would needlessly leave the cache tree
+# writable by any future lower-privileged process with filesystem
+# access inside the container -- an avoidable way to tamper with a
+# package `--prefer-offline` trusts without re-verifying.
 RUN if [ "$INSTALL_CHROME" = "true" ]; then \
-        umask 0000 && npx -y --prefer-offline chrome-devtools-mcp@1.6.0 --help > /dev/null; \
+        umask 0022 && npx -y --prefer-offline chrome-devtools-mcp@1.6.0 --help > /dev/null; \
     fi
 
 ######################## tools dependencies

@@ -207,7 +207,12 @@ describe("SessionAgentChatPage", () => {
   })
 
   it("constructs the exact active Session transport and does not leak credentials", () => {
-    const storageSet = vi.spyOn(Storage.prototype, "setItem")
+    // Same fix as widget-chrome.test.ts: this suite's localStorage is a
+    // LocalStorageMock with its own prototype (vitest.setup.ts), unrelated
+    // to native Storage.prototype -- spying there never intercepted this
+    // component's actual localStorage.setItem calls, so this credential-leak
+    // assertion was vacuous.
+    const storageSet = vi.spyOn(localStorage, "setItem")
     setBridge("active", activeSession())
     app.isConnected = true
 

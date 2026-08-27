@@ -304,4 +304,4 @@ def test_down_revision_matches_current_head():
     confusing multiple-heads error from `alembic heads`."""
     migration = _load_migration_module()
 
-    assert migration.down_revision == "20260825_add_slack_channels_join_scope"
+    assert migration.down_revision == "20260817_narrow_google_calendar_scope"

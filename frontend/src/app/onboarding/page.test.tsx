@@ -436,6 +436,38 @@ describe("OnboardingPage", () => {
     expect(routerReplace).not.toHaveBeenCalledWith(expect.stringContaining("/task/"))
   })
 
+  // Flagged by PR review (xorbitsai/xagent#1617, major finding #4): unlike
+  // every persistAndLeave exit, "Start with X" had no escape hatch at all -
+  // a save that kept failing left the primary CTA permanently unusable.
+  it("proceeds to hire anyway after 2 consecutive save failures on 'Start with X', marking the save-escape flag", async () => {
+    updateUserPreferencesMock.mockResolvedValue({ ok: false })
+
+    await goToWelcomeThenBusiness()
+    fireEvent.click(screen.getByText("Marketing"))
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/take off your plate/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Post on social media"))
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/Meet your AI team/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/How should/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText("You're all set.")).toBeInTheDocument())
+
+    await act(async () => {
+      fireEvent.click(screen.getByText("Start with Maya"))
+    })
+    expect(hireAgentFromTemplateMock).not.toHaveBeenCalled()
+
+    await act(async () => {
+      fireEvent.click(screen.getByText("Start with Maya"))
+    })
+
+    await waitFor(() => expect(hireAgentFromTemplateMock).toHaveBeenCalled())
+    expect(routerReplace).toHaveBeenCalledWith("/task/42")
+    expect(markOnboardingSaveEscapedMock).toHaveBeenCalledTimes(1)
+  })
+
   // Pins C2: a recommended templateId that never loaded (or has no persona)
   // must not leave the team step stuck on an invalid, unrenderable pick.
   it("skips a recommended template that has no persona and falls back to the next valid one", async () => {

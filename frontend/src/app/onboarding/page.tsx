@@ -302,16 +302,30 @@ export default function OnboardingPage() {
     setLaunching(true);
     try {
       const saved = await updateUserPreferences(buildPreferencesPayload());
-      // Don't proceed to hire on a failed save: onboarded would never be
-      // persisted, yet the user would land on the agent's task page believing
-      // setup is done - only to be bounced back into onboarding next session.
       if (!saved.ok) {
-        if (isMountedRef.current) {
-          toast.error(t("onboarding.done.saveFailed"));
-          launchingRef.current = false;
-          setLaunching(false);
+        // Same per-destination escape hatch as persistAndLeave, keyed under
+        // a fixed name since this path's actual destination (an existing
+        // agent vs. a freshly hired one) isn't known until after the save.
+        const failureCount = (saveFailureCountByDestRef.current["launch"] ?? 0) + 1;
+        saveFailureCountByDestRef.current["launch"] = failureCount;
+        if (isMountedRef.current) toast.error(t("onboarding.done.saveFailed"));
+        // Don't proceed to hire on the FIRST failure: onboarded would stay
+        // false server-side, and AuthGuard would just bounce the user right
+        // back here - retrying in place is the better first response. But
+        // "Start with X" is the primary CTA here, and a save that keeps
+        // failing must not leave it permanently unusable (even though the
+        // adjacent "Take me to the catalogue" skip link is still a way out)
+        // - let it through after a couple of tries too, same as every exit.
+        if (failureCount < MAX_SAVE_FAILURES_BEFORE_ESCAPE) {
+          if (isMountedRef.current) {
+            launchingRef.current = false;
+            setLaunching(false);
+          }
+          return;
         }
-        return;
+        markOnboardingSaveEscaped();
+      } else {
+        saveFailureCountByDestRef.current["launch"] = 0;
       }
 
       if (selected.hired && selected.hired_agent_id) {

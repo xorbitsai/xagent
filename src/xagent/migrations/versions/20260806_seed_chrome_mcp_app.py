@@ -64,6 +64,7 @@ ROW = {
             "--isolated",
             "--chrome-arg=--no-sandbox",
             "--chrome-arg=--disable-setuid-sandbox",
+            "--chrome-arg=--disable-dev-shm-usage",
             "--no-usage-statistics",
             "--no-performance-crux",
         ],

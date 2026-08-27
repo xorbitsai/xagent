@@ -368,29 +368,63 @@ def test_chrome_devtools_mcp_pin_matches_across_dockerfiles_and_registry() -> No
     # while still reporting success, not fail loudly -- this pins all three
     # together so a future bump can't drift one file behind the others.
     registry = read_repo_file("src/xagent/web/builtin_mcp_registry.py")
-    pin_match = re.search(r'"chrome-devtools-mcp@([\w.\-]+)"', registry)
-    assert pin_match, "chrome-devtools-mcp pin not found in builtin_mcp_registry.py"
-    pinned_version = pin_match.group(1)
+    # findall, not search: if the registry ever grows a second quoted pin
+    # (e.g. a stale one left in a comment), a single search silently checks
+    # only whichever occurrence comes first -- require there to be exactly
+    # one so a duplicate/ambiguous pin fails loudly instead of passing on
+    # a coin flip of match order.
+    registry_pins = set(re.findall(r'"chrome-devtools-mcp@([\w.\-]+)"', registry))
+    assert registry_pins, "chrome-devtools-mcp pin not found in builtin_mcp_registry.py"
+    assert len(registry_pins) == 1, (
+        f"builtin_mcp_registry.py has ambiguous chrome-devtools-mcp pins: "
+        f"{sorted(registry_pins)} -- expected exactly one"
+    )
+    (pinned_version,) = registry_pins
 
-    # Extracts just the version each Dockerfile's own npx warm-up command
-    # resolves against, rather than requiring an exact-substring match of
-    # the whole npx invocation -- a future edit that legitimately reorders
-    # or adds flags around the same pinned version shouldn't fail this
-    # test, only an actual version mismatch should.
     for dockerfile_path in ("docker/Dockerfile.backend", "docker/Dockerfile.sandbox"):
         dockerfile = read_repo_file(dockerfile_path)
-        dockerfile_match = re.search(
-            r"npx\b[^\n]*\bchrome-devtools-mcp@([\w.\-]+)", dockerfile
+
+        # Extracts just the version each Dockerfile's own npx warm-up
+        # command resolves against, rather than requiring an
+        # exact-substring match of the whole npx invocation -- a future
+        # edit that legitimately reorders or adds flags around the same
+        # pinned version shouldn't fail this test, only an actual version
+        # mismatch should. findall (not search) for the same
+        # duplicate-match reason as the registry side above.
+        dockerfile_pins = set(
+            re.findall(r"npx\b[^\n]*\bchrome-devtools-mcp@([\w.\-]+)", dockerfile)
         )
-        assert dockerfile_match, (
+        assert dockerfile_pins, (
             f"{dockerfile_path} has no npx chrome-devtools-mcp warm-up command"
         )
-        assert dockerfile_match.group(1) == pinned_version, (
+        assert len(dockerfile_pins) == 1, (
+            f"{dockerfile_path} has ambiguous chrome-devtools-mcp npx pins: "
+            f"{sorted(dockerfile_pins)} -- expected exactly one"
+        )
+        (dockerfile_version,) = dockerfile_pins
+        assert dockerfile_version == pinned_version, (
             f"{dockerfile_path} warms the npx cache for "
-            f"chrome-devtools-mcp@{dockerfile_match.group(1)}, but "
+            f"chrome-devtools-mcp@{dockerfile_version}, but "
             f"builtin_mcp_registry.py pins chrome-devtools-mcp@{pinned_version} -- "
             "update the warm-up command to match"
         )
+
+    # A pinned version string surviving unchanged doesn't prove the browser
+    # install itself survived -- guard against the case this PR actually
+    # fixes (chrome-devtools-mcp launched with no Chrome to find) being
+    # silently reintroduced by a future edit that deletes the install
+    # block while leaving the (now-misleading) npx warm-up line intact.
+    sandbox_dockerfile = read_repo_file("docker/Dockerfile.sandbox")
+    assert "ARG INSTALL_CHROME" in sandbox_dockerfile, (
+        "Dockerfile.sandbox is missing its Chrome/Chromium install gate "
+        "(ARG INSTALL_CHROME) -- without it, sandboxed chrome-devtools-mcp "
+        "calls fail with 'Could not find Google Chrome executable'"
+    )
+    assert "/opt/google/chrome/chrome" in sandbox_dockerfile, (
+        "Dockerfile.sandbox is missing the /opt/google/chrome/chrome "
+        "resolver-path existence check -- without it, a broken Chrome/"
+        "Chromium install can silently ship instead of failing the build"
+    )
 
 
 def test_sandbox_uv_install_uses_buildkit_cache() -> None:

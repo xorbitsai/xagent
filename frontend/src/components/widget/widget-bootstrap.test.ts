@@ -154,6 +154,7 @@ describe("widget bootstrap", () => {
       // innerHTML resets don't touch inline styles on body itself, and it's
       // shared across every test in this file.
       document.body.style.userSelect = ""
+      document.body.style.cursor = ""
       fetchMock.mockResolvedValue(new Response(JSON.stringify({
         ticket: "ticket/one",
         agent_id: 17,
@@ -186,11 +187,16 @@ describe("widget bootstrap", () => {
     function firePointerEvent(
       target: EventTarget,
       type: string,
-      init: { pointerId: number; clientX: number },
+      init: { pointerId: number; clientX: number; button?: number },
     ) {
       // jsdom has no PointerEvent constructor; a plain Event with the fields
       // the widget reads is enough since addEventListener matches by type.
-      const event = new MouseEvent(type, { bubbles: true, cancelable: true, clientX: init.clientX })
+      const event = new MouseEvent(type, {
+        bubbles: true,
+        cancelable: true,
+        clientX: init.clientX,
+        button: init.button ?? 0,
+      })
       Object.defineProperty(event, "pointerId", { value: init.pointerId })
       target.dispatchEvent(event)
     }
@@ -310,6 +316,20 @@ describe("widget bootstrap", () => {
       expect(panel().style.width).toBe("380px")
     })
 
+    it("declares the mobile media rule that actually hides the resize handle", () => {
+      // jsdom doesn't evaluate CSS, so the inline-width behavior above can't
+      // prove the stylesheet itself still hides the handle below the
+      // breakpoint -- assert the injected rule text directly, so weakening
+      // or dropping that declaration fails here even though it wouldn't
+      // change any inline style the other tests observe.
+      runWidget({ "data-widget-key": "widget-secret" })
+      const css = document.head.querySelector("style")!.textContent!
+
+      expect(css).toMatch(/@media\s*\(max-width:\s*480px\)/)
+      const mobileBlock = css.slice(css.indexOf("@media"))
+      expect(mobileBlock).toMatch(/\.xagent-widget-resize-handle\s*{[^}]*display:\s*none/)
+    })
+
     it("ignores a drag start below the mobile breakpoint", () => {
       setInnerWidth(400)
       runWidget({ "data-widget-key": "widget-secret" })
@@ -342,11 +362,58 @@ describe("widget bootstrap", () => {
       expect(localStorage.getItem("xagent_widget_width")).toBe("500")
     })
 
-    it("ends the drag on pointercancel", () => {
+    it("cancels rather than commits on pointercancel, reverting the in-progress width", () => {
+      // pointercancel is an involuntary interruption (a touch gesture
+      // reinterpreted as a scroll, an OS-level interrupt), not the user
+      // confirming a release -- it must not persist wherever the drag had
+      // gotten to.
       runWidget({ "data-widget-key": "widget-secret" })
 
       firePointerEvent(handle(), "pointerdown", { pointerId: 2, clientX: 300 })
-      firePointerEvent(handle(), "pointercancel", { pointerId: 2, clientX: 300 })
+      firePointerEvent(handle(), "pointermove", { pointerId: 2, clientX: 250 }) // mid-drag, unconfirmed
+      expect(panel().style.width).toBe("430px")
+
+      firePointerEvent(handle(), "pointercancel", { pointerId: 2, clientX: 250 })
+
+      expect(document.body.style.userSelect).toBe("")
+      expect(widgetIframe().style.pointerEvents).toBe("")
+      expect(panel().style.width).toBe("380px") // reverted, not left at the abandoned 430px
+      expect(localStorage.getItem("xagent_widget_width")).toBeNull()
+    })
+
+    it("does not let a cancelled drag's abandoned width survive to be committed by a later no-op drag", () => {
+      // A drag that gets cancelled must roll panelWidth itself back, not
+      // just skip persisting once -- otherwise the abandoned in-progress
+      // value stays the module's current width, and an unrelated
+      // zero-movement drag later on would commit it via a normal release.
+      runWidget({ "data-widget-key": "widget-secret" })
+
+      firePointerEvent(handle(), "pointerdown", { pointerId: 21, clientX: 300 })
+      firePointerEvent(handle(), "pointermove", { pointerId: 21, clientX: 250 }) // -> 430px, abandoned below
+      window.dispatchEvent(new Event("blur")) // cancels; must revert to 380px, not just skip persisting
+
+      // An unrelated click-and-release with zero movement.
+      firePointerEvent(handle(), "pointerdown", { pointerId: 22, clientX: 300 })
+      firePointerEvent(handle(), "pointerup", { pointerId: 22, clientX: 300 })
+
+      expect(localStorage.getItem("xagent_widget_width")).toBe("380") // not the abandoned 430
+    })
+
+    it("restores the host page's own cursor rather than clearing it", () => {
+      runWidget({ "data-widget-key": "widget-secret" })
+      document.body.style.cursor = "help"
+
+      firePointerEvent(handle(), "pointerdown", { pointerId: 23, clientX: 300 })
+      expect(document.body.style.cursor).toBe("ew-resize")
+
+      firePointerEvent(handle(), "pointerup", { pointerId: 23, clientX: 300 })
+      expect(document.body.style.cursor).toBe("help")
+    })
+
+    it("ignores a non-primary pointer button", () => {
+      runWidget({ "data-widget-key": "widget-secret" })
+
+      firePointerEvent(handle(), "pointerdown", { pointerId: 24, clientX: 300, button: 2 })
 
       expect(document.body.style.userSelect).toBe("")
       expect(widgetIframe().style.pointerEvents).toBe("")
@@ -386,11 +453,13 @@ describe("widget bootstrap", () => {
       // A blur interruption is not the user confirming a width via release --
       // nothing was ever persisted in this test.
       expect(localStorage.getItem("xagent_widget_width")).toBeNull()
+      // Reverted, not left at the abandoned 430px (380 + 50 from the move above).
+      expect(panel().style.width).toBe("380px")
 
       // The cancelled drag is really over: further movement on the same
       // pointer does nothing, regardless of where it goes.
       firePointerEvent(handle(), "pointermove", { pointerId: 3, clientX: 100 })
-      expect(panel().style.width).toBe("430px") // unchanged from the last real move (380 + 50)
+      expect(panel().style.width).toBe("380px")
     })
 
     it("ignores a blur caused by focus moving into the widget's own iframe", () => {
@@ -425,9 +494,11 @@ describe("widget bootstrap", () => {
       expect(document.body.style.userSelect).toBe("")
       expect(widgetIframe().style.pointerEvents).toBe("")
       expect(localStorage.getItem("xagent_widget_width")).toBeNull()
+      // Reverted, not left at the abandoned 430px (380 + 50 from the move above).
+      expect(panel().style.width).toBe("380px")
 
       firePointerEvent(handle(), "pointermove", { pointerId: 18, clientX: 100 })
-      expect(panel().style.width).toBe("430px") // unchanged from the last real move (380 + 50): the drag is over
+      expect(panel().style.width).toBe("380px") // still unaffected: the drag is over
     })
 
     it("keeps a wider preference across a drag that shrinks past the ceiling and returns to it", () => {
@@ -537,19 +608,46 @@ describe("widget bootstrap", () => {
     })
 
     it("stops reacting to window/document listeners once the panel leaves the DOM", async () => {
+      // Spy without mockImplementation so these still call through -- we
+      // want the real listeners attached, just also recorded.
+      const winAddSpy = vi.spyOn(window, "addEventListener")
+      const docAddSpy = vi.spyOn(document, "addEventListener")
       const winRemoveSpy = vi.spyOn(window, "removeEventListener")
       const docRemoveSpy = vi.spyOn(document, "removeEventListener")
       runWidget({ "data-widget-key": "widget-secret" })
       const detachedHandle = handle()
+      const detachedPanel = panel()
+
+      function addedListener(spy: typeof winAddSpy, type: string) {
+        return spy.mock.calls.find(([calledType]) => calledType === type)?.[1]
+      }
+      // Captured before removal so removeEventListener can be checked
+      // against the *exact* function reference that was added -- not just
+      // "any function", which would also pass if the wrong handler (or a
+      // fresh unrelated one) were removed instead.
+      const resizeListener = addedListener(winAddSpy, "resize")
+      const blurListener = addedListener(winAddSpy, "blur")
+      const pointermoveListener = addedListener(docAddSpy, "pointermove")
+      const pointerupListener = addedListener(docAddSpy, "pointerup")
+      const pointercancelListener = addedListener(docAddSpy, "pointercancel")
 
       document.querySelector(".xagent-widget-container")?.remove()
       await Promise.resolve()
 
-      expect(winRemoveSpy).toHaveBeenCalledWith("resize", expect.any(Function))
-      expect(winRemoveSpy).toHaveBeenCalledWith("blur", expect.any(Function))
-      expect(docRemoveSpy).toHaveBeenCalledWith("pointermove", expect.any(Function))
-      expect(docRemoveSpy).toHaveBeenCalledWith("pointerup", expect.any(Function))
-      expect(docRemoveSpy).toHaveBeenCalledWith("pointercancel", expect.any(Function))
+      expect(winRemoveSpy).toHaveBeenCalledWith("resize", resizeListener)
+      expect(winRemoveSpy).toHaveBeenCalledWith("blur", blurListener)
+      expect(docRemoveSpy).toHaveBeenCalledWith("pointermove", pointermoveListener)
+      expect(docRemoveSpy).toHaveBeenCalledWith("pointerup", pointerupListener)
+      expect(docRemoveSpy).toHaveBeenCalledWith("pointercancel", pointercancelListener)
+
+      // Behavioral proof for the resize listener specifically: below the
+      // mobile breakpoint this would normally clear the inline width, so an
+      // unchanged value after dispatch proves the listener is truly gone,
+      // not just idle.
+      const widthBeforeResize = detachedPanel.style.width
+      setInnerWidth(400)
+      window.dispatchEvent(new Event("resize"))
+      expect(detachedPanel.style.width).toBe(widthBeforeResize)
 
       // Functional proof, not just a spy check that could pass even if the
       // handler removed were the wrong one: the torndown flag permanently

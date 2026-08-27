@@ -417,9 +417,12 @@
   var torndown = false;
 
   resizeHandle.addEventListener('pointerdown', function (event) {
+    // event.button is 0 for touch/pen contact and the primary mouse button;
+    // a nonzero value here is a right-click, middle-click, or pen barrel
+    // button, none of which should start a resize.
     // Ignore a second simultaneous pointer (e.g. a touchscreen device) so it
     // can't hijack dragState mid-drag and strand the first pointer's cleanup.
-    if (torndown || isMobileViewport() || dragState) return;
+    if (torndown || isMobileViewport() || dragState || event.button !== 0) return;
     dragState = {
       pointerId: event.pointerId,
       startX: event.clientX,
@@ -439,6 +442,7 @@
       // outright (see onPointerMove) instead of continuing to protect a
       // preference the user has already demonstrated they're moving away from.
       shrunkPastStart: false,
+      originalCursor: document.body.style.cursor,
       originalUserSelect: document.body.style.userSelect
     };
     // Optimization, not the drag's only path: pointermove/pointerup/
@@ -478,13 +482,15 @@
 
   function restoreDragSideEffects() {
     // Only restore if nothing else changed it in the meantime -- a host page
-    // that set its own userSelect after this drag started (e.g. while
+    // that set its own userSelect/cursor after this drag started (e.g. while
     // rebuilding its own UI mid-drag) must not have that value clobbered by
     // a stale snapshot from before it ran.
     if (document.body.style.userSelect === 'none') {
       document.body.style.userSelect = dragState.originalUserSelect;
     }
-    document.body.style.cursor = '';
+    if (document.body.style.cursor === 'ew-resize') {
+      document.body.style.cursor = dragState.originalCursor;
+    }
     iframe.style.pointerEvents = '';
   }
 
@@ -500,16 +506,25 @@
   }
   document.addEventListener('pointermove', onPointerMove);
   document.addEventListener('pointerup', endDrag);
-  document.addEventListener('pointercancel', endDrag);
+  // pointercancel is an involuntary interruption (a touch gesture
+  // reinterpreted as a scroll, an OS-level interrupt, capture lost to
+  // another element) rather than the user confirming a release, so it goes
+  // through cancelDrag (below) like blur/resize, not endDrag.
+  document.addEventListener('pointercancel', cancelDrag);
 
   // Cancels rather than commits: an interruption -- window blur, a viewport
-  // change invalidating this drag's frozen geometry, DOM removal -- is not
-  // the user confirming a width via release, so it must not persist one
-  // (and, for blur/resize, must not go on computing candidates against a
-  // stale dragState.startX/startWidth after this point either).
-  function cancelDrag() {
-    if (!dragState) return;
+  // change invalidating this drag's frozen geometry, pointercancel, DOM
+  // removal -- is not the user confirming a width via release, so it must
+  // not persist one. Also rolls panelWidth and the render back to this
+  // drag's starting point rather than just clearing dragState: otherwise the
+  // abandoned in-progress width survives as the module's current value, and
+  // a later, unrelated zero-movement drag could commit it via
+  // endDrag/persistWidth as if the user had confirmed it.
+  function cancelDrag(event) {
+    if (!dragState || (event && event.pointerId !== dragState.pointerId)) return;
     restoreDragSideEffects();
+    panelWidth = dragState.startPanelWidth;
+    applyPanelWidth();
     dragState = null;
   }
 
@@ -556,10 +571,15 @@
     window.removeEventListener('blur', onWindowBlur);
     document.removeEventListener('pointermove', onPointerMove);
     document.removeEventListener('pointerup', endDrag);
-    document.removeEventListener('pointercancel', endDrag);
+    document.removeEventListener('pointercancel', cancelDrag);
     cancelDrag();
   });
-  panelRemovalObserver.observe(document.body, { childList: true });
+  // subtree: true because "direct child of body" only catches container's
+  // own removal -- a host page reaching further in (removing panel from
+  // container directly, or wiping a wrapper it added around container)
+  // would otherwise mutate a node this observer never inspects, and the
+  // callback would simply never fire.
+  panelRemovalObserver.observe(document.body, { childList: true, subtree: true });
 
   // FAB
   var fab = document.createElement('button');

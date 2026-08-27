@@ -31,11 +31,11 @@ PUBLIC_MCP_APPS_TABLE = sa.table(
 )
 
 APP_ID = "google-calendar"
-OLD_SCOPES = ["https://www.googleapis.com/auth/calendar"]
-NEW_SCOPES = ["https://www.googleapis.com/auth/calendar.events"]
+OLD_SCOPES = ("https://www.googleapis.com/auth/calendar",)
+NEW_SCOPES = ("https://www.googleapis.com/auth/calendar.events",)
 
 
-def _offline_scopes_literal(scopes: list[str], dialect_name: str):
+def _offline_scopes_literal(scopes: Sequence[str], dialect_name: str):
     # Match the online sa.JSON binding contract (none_as_null=False) used
     # elsewhere in this migration set: values are stored as JSON, not as a
     # bare SQL string literal, on every supported dialect.
@@ -76,7 +76,21 @@ def upgrade() -> None:
     )
 
 
+def _downgrade_offline() -> None:
+    dialect_name = op.get_context().dialect.name
+    statement = (
+        sa.update(PUBLIC_MCP_APPS_TABLE)
+        .where(PUBLIC_MCP_APPS_TABLE.c.app_id == op.inline_literal(APP_ID))
+        .values(oauth_scopes=_offline_scopes_literal(OLD_SCOPES, dialect_name))
+    )
+    op.execute(statement)
+
+
 def downgrade() -> None:
+    if op.get_context().as_sql:
+        _downgrade_offline()
+        return
+
     bind = op.get_bind()
     inspector = sa.inspect(bind)
     if "public_mcp_apps" not in inspector.get_table_names():

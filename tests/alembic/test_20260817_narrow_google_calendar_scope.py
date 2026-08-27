@@ -218,6 +218,57 @@ def test_offline_sqlite_upgrade_round_trips_json_scope_value() -> None:
     assert json.loads(stored[0]) == NEW_SCOPES
 
 
+def test_offline_postgresql_downgrade_emits_literal_update_only_sql() -> None:
+    migration = _load_migration_module()
+    output = StringIO()
+    context = MigrationContext.configure(
+        dialect_name="postgresql",
+        opts={"as_sql": True, "output_buffer": output},
+    )
+
+    with Operations.context(context):
+        migration.downgrade()
+
+    sql = output.getvalue()
+    assert sql.count("UPDATE public_mcp_apps SET") == 1
+    assert "oauth_scopes=" in sql
+    assert "public_mcp_apps.app_id = 'google-calendar'" in sql
+    assert "auth/calendar" in sql
+    assert "INSERT INTO public_mcp_apps" not in sql
+    assert "DELETE FROM public_mcp_apps" not in sql
+    assert "%(" not in sql
+
+
+def test_offline_sqlite_downgrade_round_trips_json_scope_value() -> None:
+    migration = _load_migration_module()
+    output = StringIO()
+    context = MigrationContext.configure(
+        dialect_name="sqlite",
+        opts={"as_sql": True, "output_buffer": output},
+    )
+
+    with Operations.context(context):
+        migration.downgrade()
+
+    connection = sqlite3.connect(":memory:")
+    connection.execute(
+        "CREATE TABLE public_mcp_apps (app_id TEXT PRIMARY KEY, oauth_scopes JSON)"
+    )
+    connection.execute(
+        "INSERT INTO public_mcp_apps (app_id, oauth_scopes) VALUES (?, ?)",
+        ("google-calendar", json.dumps(NEW_SCOPES)),
+    )
+    connection.executescript(output.getvalue())
+
+    stored = connection.execute(
+        "SELECT oauth_scopes FROM public_mcp_apps WHERE app_id = 'google-calendar'"
+    ).fetchone()
+    connection.close()
+
+    assert stored is not None
+    assert json.loads(stored[0]) == OLD_SCOPES
+
+
 def test_revision_metadata() -> None:
     migration = _load_migration_module()
 

@@ -405,7 +405,13 @@ class LLMPlanGenerator(PlanGenerator):
                     exc,
                 )
                 continue
-            if attempt + 1 < MAX_PLAN_TOOL_CALL_ATTEMPTS:
+            expected_language, language_source = self._language_authority(
+                request.context
+            )
+            has_external_authority = bool(expected_language) and (
+                language_source != OUTPUT_LANGUAGE_SOURCE_PLAN
+            )
+            if attempt + 1 < MAX_PLAN_TOOL_CALL_ATTEMPTS and not has_external_authority:
                 reminder = self._request_language_reminder(request.context, plan)
                 if reminder is not None:
                     retry_feedback = reminder
@@ -667,8 +673,8 @@ class LLMPlanGenerator(PlanGenerator):
     def _request_language_reminder(context: Any, plan: ExecutionPlan) -> str | None:
         """Return one retry nudge when plan prose looks off-script for the request.
 
-        Script comparison is a heuristic that misreads legitimate cross-language
-        requests, so it may only ask the planner to re-check, never veto.
+        Script comparison cannot tell a biased plan from a request that legitimately
+        asks for another language, so it may only nudge once, never reject a plan.
         """
         request = latest_user_text(context) or ""
         for step in plan.steps:

@@ -762,8 +762,8 @@ class AutoPattern(AgentPattern):
         if llm is None:
             raise RuntimeError("AutoPattern requires an LLM with tool calling support.")
 
-        # A stale plan-scoped language label must not become a hard instruction
-        # for a new request; only an in-flight DAG may keep the one it wrote.
+        # Runs on every fresh routing decision, so a stale plan-scoped label never
+        # becomes a hard instruction; a resumed pattern skips _decide and keeps it.
         self._clear_response_language(context)
         await runtime.compact_context_if_needed(
             context=context,

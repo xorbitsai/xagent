@@ -5015,3 +5015,58 @@ async def test_plan_generator_accepts_implicit_cross_language_request() -> None:
     assert "Shanghai colleagues" in retry_message
     assert "Re-read latest_user_request" in retry_message
     assert "keep it and return the same plan language" in retry_message
+
+
+@pytest.mark.asyncio
+async def test_direct_dag_skips_request_reminder_under_external_authority() -> None:
+    generator = LLMPlanGenerator()
+    context = ExecutionContext(execution_id="dag-external-authority-no-reminder")
+    context.metadata["pattern"] = "auto"
+    context.metadata[OUTPUT_LANGUAGE_METADATA_KEY] = "English"
+    context.add_user_message("请继续处理这个任务。")
+    llm = SequenceLLM(
+        [
+            plan_tool_response(
+                [
+                    {
+                        "id": "continue",
+                        "task": "Continue processing the task in English",
+                        "description": (
+                            "Follow the authoritative language and finish the "
+                            "remaining work."
+                        ),
+                        "dependencies": [],
+                        "tool_names": [],
+                    }
+                ],
+                response_language="English",
+            ),
+            plan_tool_response(
+                [
+                    {
+                        "id": "continue",
+                        "task": "继续处理任务并用中文回答",
+                        "description": "根据请求继续完成任务。",
+                        "dependencies": [],
+                        "tool_names": [],
+                    }
+                ],
+                response_language="Simplified Chinese",
+            ),
+        ]
+    )
+
+    plan = await generator.generate_plan(
+        request=PlanGenerationRequest(
+            context=context,
+            execution_id=context.execution_id,
+            replan=True,
+            previous_plan=ExecutionPlan(steps=[]),
+            available_tool_names=[],
+        ),
+        llm=llm,
+    )
+
+    assert llm.calls == 1
+    assert plan.steps[0].task == "Continue processing the task in English"
+    assert context.metadata[OUTPUT_LANGUAGE_METADATA_KEY] == "English"

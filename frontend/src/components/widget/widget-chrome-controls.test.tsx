@@ -48,6 +48,15 @@ describe("WidgetChromeControls", () => {
     )
   })
 
+  it("does not post a message when the page is visited directly (window.parent === window)", () => {
+    vi.stubGlobal("parent", window)
+
+    render(<WidgetChromeControls />)
+    fireEvent.click(screen.getByRole("button", { name: "widgetChat.close" }))
+
+    expect(postMessageSpy).not.toHaveBeenCalled()
+  })
+
   it("opens the menu on trigger click, shows the given label, and calls onClick then closes the menu", () => {
     render(<WidgetChromeControls newConversation={{ label: "Start over", onClick: onNewConversation }} />)
 
@@ -95,6 +104,25 @@ describe("WidgetChromeControls", () => {
     fireEvent(window, new Event("blur"))
 
     expect(screen.queryByRole("menu")).toBeNull()
+  })
+
+  it("ignores a pointerdown whose target was removed from the DOM during dispatch", () => {
+    // A sibling handler on the target itself can synchronously detach it
+    // before the event finishes bubbling to this component's document
+    // listener; Node.contains() on a now-disconnected node would otherwise
+    // read the same as a genuine outside click and close the menu.
+    render(<WidgetChromeControls newConversation={{ label: "Start over", onClick: onNewConversation }} />)
+
+    fireEvent.click(screen.getByRole("button", { name: "widgetChat.moreOptions" }))
+    expect(screen.getByRole("menu")).toBeInTheDocument()
+
+    const ephemeral = document.createElement("button")
+    document.body.appendChild(ephemeral)
+    ephemeral.addEventListener("pointerdown", () => ephemeral.remove())
+
+    fireEvent.pointerDown(ephemeral)
+
+    expect(screen.getByRole("menu")).toBeInTheDocument()
   })
 
   it("closes the menu on an outside pointer press", () => {

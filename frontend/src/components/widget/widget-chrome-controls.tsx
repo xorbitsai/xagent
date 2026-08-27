@@ -10,7 +10,11 @@ import { useI18n } from "@/contexts/i18n-context"
 // here, so targetOrigin can't be pinned tighter than "*" -- this carries no
 // sensitive payload, unlike the parent -> iframe session protocol.
 const postCloseToParent = () => {
-  window.parent.postMessage({ xagent: true, v: 1, type: "widget_close" }, "*")
+  // A direct (non-embedded) visit to this page has window.parent === window;
+  // posting there would just send the widget its own message right back.
+  if (window.parent !== window) {
+    window.parent.postMessage({ xagent: true, v: 1, type: "widget_close" }, "*")
+  }
 }
 
 const iconButtonClassName =
@@ -37,7 +41,12 @@ export function WidgetChromeControls({ newConversation }: WidgetChromeControlsPr
     if (!isMenuOpen) return
 
     const handlePointerDown = (event: PointerEvent) => {
-      if (menuRef.current && !menuRef.current.contains(event.target as Node)) {
+      const target = event.target as Node | null
+      // A target already detached from the tree (removed by some other
+      // handler earlier in the same dispatch) fails Node.contains() the
+      // same way a genuine outside click would; don't misread that as one.
+      if (target && !target.isConnected) return
+      if (menuRef.current && !menuRef.current.contains(target)) {
         setIsMenuOpen(false)
       }
     }

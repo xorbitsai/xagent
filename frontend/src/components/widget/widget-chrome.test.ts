@@ -103,6 +103,16 @@ describe("widget close chrome", () => {
     expect(panelEl()).toHaveClass("open")
   })
 
+  it("does not re-persist the preference when auto-restoring on load", () => {
+    localStorage.setItem(CLOSED_KEY, "false")
+    const setItemSpy = vi.spyOn(Storage.prototype, "setItem")
+
+    runWidget()
+
+    expect(setItemSpy).not.toHaveBeenCalledWith(CLOSED_KEY, expect.anything())
+    setItemSpy.mockRestore()
+  })
+
   it("stays closed on load once the visitor has closed it before", () => {
     localStorage.setItem(CLOSED_KEY, "true")
 

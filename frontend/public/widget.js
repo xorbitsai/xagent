@@ -656,11 +656,13 @@
 
   var isOpen = false;
 
-  function openPanel() {
+  function openPanel(skipPersist) {
     isOpen = true;
     panel.classList.add('open');
     fab.innerHTML = closeIcon;
-    persistClosed(false);
+    if (!skipPersist) {
+      persistClosed(false);
+    }
   }
 
   function closePanel() {
@@ -707,7 +709,7 @@
   });
 
   if (!readStoredClosed()) {
-    openPanel();
+    openPanel(true);
   }
 
   mode.attach(iframe);

@@ -357,6 +357,29 @@ def test_sandbox_export_is_locked_without_managed_python_downloads() -> None:
     )
 
 
+def test_chrome_devtools_mcp_pin_matches_across_dockerfiles_and_registry() -> None:
+    # builtin_mcp_registry.py is the single source of truth for the version
+    # end users' MCP calls actually run; both Dockerfiles independently warm
+    # an npx cache for "the same" pin so npx resolves offline instead of
+    # hitting the npm registry on every sandboxed/backend-hosted launch (see
+    # Dockerfile.sandbox's INSTALL_CHROME block and its npx warm-up comment).
+    # A version bumped in the registry but missed in either warm-up command
+    # would silently leave that path's cache cold for the *new* version
+    # while still reporting success, not fail loudly -- this pins all three
+    # together so a future bump can't drift one file behind the others.
+    registry = read_repo_file("src/xagent/web/builtin_mcp_registry.py")
+    pin_match = re.search(r'"chrome-devtools-mcp@([\w.\-]+)"', registry)
+    assert pin_match, "chrome-devtools-mcp pin not found in builtin_mcp_registry.py"
+    pinned_spec = f"chrome-devtools-mcp@{pin_match.group(1)}"
+
+    for dockerfile_path in ("docker/Dockerfile.backend", "docker/Dockerfile.sandbox"):
+        dockerfile = read_repo_file(dockerfile_path)
+        assert f"npx -y --prefer-offline {pinned_spec} --help" in dockerfile, (
+            f"{dockerfile_path} does not warm the npx cache for {pinned_spec} -- "
+            "update its warm-up command to match builtin_mcp_registry.py"
+        )
+
+
 def test_sandbox_uv_install_uses_buildkit_cache() -> None:
     dockerfile = read_repo_file("docker/Dockerfile.sandbox")
     runtime_stage = dockerfile.split("FROM node:22-slim AS sandbox\n", maxsplit=1)[1]

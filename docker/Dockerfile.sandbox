@@ -59,6 +59,18 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # intend to enable this connector can drop the image size and the
 # /opt/google/chrome/chrome binary + npx cache with
 # --build-arg INSTALL_CHROME=false.
+#
+# Security posture, matching Dockerfile.backend's (not a new risk this
+# image introduces): DockerSandboxService always creates/execs this
+# container as root regardless of the USER directive later in this file
+# (src/xagent/sandbox/docker_sandbox.py: "Run as root to match the file
+# access behavior of Boxlite"), and the connector's launch_config passes
+# --chrome-arg=--no-sandbox --chrome-arg=--disable-setuid-sandbox, so
+# Chrome parses arbitrary page content as UID 0 with its own process
+# sandbox disabled. Accepted for now only because the connector stays
+# is_visible_in_connector: false until the security review Dockerfile.
+# backend's own comment tracks (root Chrome there too) is done -- do not
+# treat this image as a safer alternative to that one.
 ARG INSTALL_CHROME=true
 # Its default "stable" channel resolution checks exactly
 # /opt/google/chrome/chrome on Linux -- see Dockerfile.backend's block for
@@ -78,6 +90,7 @@ RUN if [ "$INSTALL_CHROME" != "true" ]; then \
                 > /etc/apt/sources.list.d/google-chrome.list \
             && apt-get update \
             && apt-get install -y --no-install-recommends -o Acquire::Retries=5 google-chrome-stable \
+            && apt-get purge -y --auto-remove -o APT::AutoRemove::RecommendsImportant=false curl gnupg \
             && rm -rf /var/lib/apt/lists/* /etc/apt/sources.list.d/google-chrome.list /usr/share/keyrings/google-chrome.gpg; \
         elif [ "$(dpkg --print-architecture)" = "arm64" ]; then \
             apt-get update \
@@ -90,6 +103,27 @@ RUN if [ "$INSTALL_CHROME" != "true" ]; then \
             exit 1; \
         fi; \
         [ -e /opt/google/chrome/chrome ] || { echo "ERROR: the Chrome/Chromium install did not produce /opt/google/chrome/chrome -- update the chrome-devtools-mcp resolver path handling" >&2; exit 1; }; \
+    fi
+
+# Warm the npx cache for the exact version pinned in
+# builtin_mcp_registry.py's launch_config, same rationale as
+# Dockerfile.backend's identical step. Runs as root, matching how it's
+# actually executed at runtime -- NOT as the "sandbox" user this image
+# later declares via USER: DockerSandboxService always creates the
+# container (and execs into it) with `"user": "root"` regardless of the
+# image's own USER directive ("Run as root to match the file access
+# behavior of Boxlite" -- src/xagent/sandbox/docker_sandbox.py), so npx
+# resolves against /root/.npm/_npx at runtime. A cache warmed under
+# /home/sandbox (this file's previous approach) would sit in a HOME
+# that's never actually used and stay permanently cold, silently
+# defeating the whole point of warming it -- `--prefer-offline` still
+# falls back to the network on a cache miss, so a genuinely
+# network-isolated sandbox (SandboxConfig.network_isolated) would then
+# fail to launch the connector at all instead of merely being slower.
+# `--help` exercises resolution without starting Chrome, so this needs
+# no display/GPU setup at build time.
+RUN if [ "$INSTALL_CHROME" = "true" ]; then \
+        npx -y --prefer-offline chrome-devtools-mcp@1.6.0 --help > /dev/null; \
     fi
 
 ######################## tools dependencies
@@ -118,17 +152,5 @@ RUN groupadd --gid 1010 sandbox \
 
 USER sandbox
 WORKDIR /home/sandbox
-
-# Warm the npx cache for the exact version pinned in
-# builtin_mcp_registry.py's launch_config, same rationale as
-# Dockerfile.backend's identical step. Must run as the "sandbox" user, not
-# root: unlike the backend image (root throughout), sandbox.exec() launches
-# npx as this unprivileged user at runtime, and npx resolves against
-# $HOME/.npm/_npx -- a cache warmed under /root would sit in the wrong
-# user's HOME and never be read. `--help` exercises resolution without
-# starting Chrome, so this needs no display/GPU setup at build time.
-RUN if [ "$INSTALL_CHROME" = "true" ]; then \
-        npx -y --prefer-offline chrome-devtools-mcp@1.6.0 --help > /dev/null; \
-    fi
 
 CMD ["bash"]

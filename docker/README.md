@@ -390,7 +390,18 @@ The build stage does not copy `pyproject.toml` or `uv.lock` into the runtime
 image.
 
 Custom `SANDBOX_IMAGE` images used with sandboxed uvx MCP connections must
-provide `uvx` on `PATH`; Xagent no longer installs uv dynamically.
+provide `uvx` on `PATH`; Xagent no longer installs uv dynamically. A custom
+image that wants the built-in Chrome MCP connector (`chrome-devtools-mcp`)
+to work once enabled must also provide `npx` plus a browser resolvable at
+`/opt/google/chrome/chrome` (or an npx cache warmed for the exact pinned
+`chrome-devtools-mcp@` version) — otherwise sandboxed calls to that
+connector fail with "Could not find Google Chrome executable".
+
+**Build args:**
+
+| Arg | Default | Effect |
+|-----|---------|--------|
+| `INSTALL_CHROME` | `true` | Installs Google Chrome (amd64) or Chromium (arm64), symlinked to the same `/opt/google/chrome/chrome` resolver path Dockerfile.backend's copy uses, plus a warmed `npx` cache for the built-in Chrome MCP connector — same effect and same reasoning as Dockerfile.backend's identical arg (see the Backend section's table row above); pass `--build-arg INSTALL_CHROME=false` to skip both for deployments that never enable the connector. **Runs as root, not the `sandbox` user this image later switches to**: `DockerSandboxService` always execs sandboxed commands as root regardless of the image's own `USER` directive, so the npx cache is warmed under `/root`, and the connector's launch config passes `--chrome-arg=--no-sandbox`, matching (not exceeding) the same root-Chrome exposure Dockerfile.backend already carries. |
 
 ```bash
 docker buildx build \

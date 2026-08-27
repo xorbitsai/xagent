@@ -1,4 +1,5 @@
-"""Prompt snippets for preserving user-facing response language."""
+"""Prompt snippets for user-facing response language, plus the
+checkpoint migration that keeps only a caller-provided language label."""
 
 import re
 from dataclasses import dataclass
@@ -7,6 +8,9 @@ from typing import Any, Literal
 OUTPUT_LANGUAGE_METADATA_KEY = "output_language"
 OUTPUT_LANGUAGE_SOURCE_METADATA_KEY = "output_language_source"
 OUTPUT_LANGUAGE_SOURCE_PLAN = "dag_plan"
+REQUEST_CONTEXT_METADATA_KEY = "request_context"
+LANGUAGE_REQUEST_PREVIEW_LIMIT = 1200
+_MIDDLE_TRUNCATION_MARKER = "\n... [middle truncated] ...\n"
 
 _ALLOWED_RESPONSE_LANGUAGE_LABELS = frozenset(
     {
@@ -335,21 +339,48 @@ def reset_output_language_to_request_context(checkpoint_payload: Any) -> None:
         return
     for key, value in checkpoint_payload.items():
         if key == "metadata" and isinstance(value, dict):
-            _reset_metadata_output_language(value)
+            reset_metadata_output_language(value)
         reset_output_language_to_request_context(value)
 
 
-def _reset_metadata_output_language(metadata: dict[str, Any]) -> None:
-    metadata.pop(OUTPUT_LANGUAGE_METADATA_KEY, None)
-    metadata.pop(OUTPUT_LANGUAGE_SOURCE_METADATA_KEY, None)
-    request_context = metadata.get("request_context")
+def request_context_output_language(metadata: Any) -> str:
+    """Return the output language an API caller pinned via ``request_context``.
+
+    The single judgement of "external language authority": every decision point
+    must agree on it, or a caller's label degrades into an internal one.
+    """
+    if not isinstance(metadata, dict):
+        return ""
+    request_context = metadata.get(REQUEST_CONTEXT_METADATA_KEY)
     if not isinstance(request_context, dict):
-        return
-    external = normalize_response_language_label(
+        return ""
+    return normalize_response_language_label(
         str(request_context.get(OUTPUT_LANGUAGE_METADATA_KEY) or "")
     )
+
+
+def reset_metadata_output_language(metadata: dict[str, Any]) -> None:
+    """Drop any derived output language, keeping the caller-provided one."""
+    metadata.pop(OUTPUT_LANGUAGE_METADATA_KEY, None)
+    metadata.pop(OUTPUT_LANGUAGE_SOURCE_METADATA_KEY, None)
+    external = request_context_output_language(metadata)
     if external:
         metadata[OUTPUT_LANGUAGE_METADATA_KEY] = external
+
+
+def truncate_request_preview(
+    request_text: str,
+    *,
+    limit: int = LANGUAGE_REQUEST_PREVIEW_LIMIT,
+) -> str:
+    """Keep both ends of a bounded request so trailing directives survive."""
+    stripped = request_text.strip()
+    if len(stripped) <= limit:
+        return stripped
+    available = limit - len(_MIDDLE_TRUNCATION_MARKER)
+    head_length = available // 2
+    tail_length = available - head_length
+    return stripped[:head_length] + _MIDDLE_TRUNCATION_MARKER + stripped[-tail_length:]
 
 
 def output_language_policy(response_language: str | None = None) -> str:
@@ -431,9 +462,12 @@ def response_language_rules(*, subject: str = "current user request") -> str:
         "to translate, rewrite, or answer in another language, use that requested "
         "target language. For Chinese, preserve Simplified Chinese versus "
         "Traditional Chinese from the request; do not collapse them into generic "
-        "Chinese. Do not let retrieved memories, tool results, source documents, "
-        "examples, or earlier turns change the response language unless "
-        f"the {subject} explicitly asks for that language change."
+        "Chinese. Use that same language for tool arguments that persist "
+        "user-facing prose, such as agent descriptions, agent instructions, "
+        "document text, titles, and summaries. Do not let retrieved memories, "
+        "tool results, source documents, examples, or earlier turns change the "
+        f"response language unless the {subject} explicitly asks for that "
+        "language change."
     )
 
 
@@ -502,12 +536,10 @@ def output_language_directives(
     language decision differs; the decision lives in effective_output_language.
     """
     if section == "root_system_context":
+        # A caller-pinned language is the hard authority; emitting the soft rules
+        # beside it would hand the model a second, competing rule.
         if language:
-            return (
-                f"{response_language_rules()}"
-                "\n\nOutput language policy:\n"
-                f"{output_language_policy(language)}"
-            )
+            return f"Output language policy:\n{output_language_policy(language)}"
         return response_language_rules()
     if section == "dag_step_scope":
         return output_language_policy(language).strip()

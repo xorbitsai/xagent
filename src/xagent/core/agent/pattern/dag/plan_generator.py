@@ -9,7 +9,6 @@ from typing import Any, Callable
 
 from ...context.enrichment import latest_user_text
 from ...language import (
-    OUTPUT_LANGUAGE_METADATA_KEY,
     OUTPUT_LANGUAGE_SOURCE_METADATA_KEY,
     OUTPUT_LANGUAGE_SOURCE_PLAN,
     detect_prose_script_mismatch,
@@ -18,6 +17,8 @@ from ...language import (
     normalize_response_language_label,
     output_language_directives,
     plan_language_rules,
+    request_context_output_language,
+    truncate_request_preview,
 )
 from ..base import (
     RequiredToolCallError,
@@ -29,8 +30,6 @@ from ..base import (
 logger = logging.getLogger(__name__)
 
 MAX_PLAN_TOOL_CALL_ATTEMPTS = 2
-LATEST_USER_REQUEST_PREVIEW_LIMIT = 1200
-_MIDDLE_TRUNCATION_MARKER = "\n... [middle truncated] ...\n"
 PLAN_GENERATION_REQUIRED_TOOL_MESSAGE = (
     "Plan generation failed because the model did not return the required "
     "planning tool call. Please retry."
@@ -559,7 +558,7 @@ class LLMPlanGenerator(PlanGenerator):
         payload = {
             "execution_id": request.execution_id,
             "replan": request.replan,
-            "latest_user_request": self._latest_user_request_preview(latest_request),
+            "latest_user_request": truncate_request_preview(latest_request),
             "output_language_policy": output_language_directives(
                 None
                 if language_source == OUTPUT_LANGUAGE_SOURCE_PLAN
@@ -586,19 +585,6 @@ class LLMPlanGenerator(PlanGenerator):
         return json.dumps(payload, ensure_ascii=False)
 
     @staticmethod
-    def _latest_user_request_preview(request_text: str) -> str:
-        """Keep both ends of a bounded request so trailing directives survive."""
-        stripped = request_text.strip()
-        if len(stripped) <= LATEST_USER_REQUEST_PREVIEW_LIMIT:
-            return stripped
-        available = LATEST_USER_REQUEST_PREVIEW_LIMIT - len(_MIDDLE_TRUNCATION_MARKER)
-        head_length = available // 2
-        tail_length = available - head_length
-        return (
-            stripped[:head_length] + _MIDDLE_TRUNCATION_MARKER + stripped[-tail_length:]
-        )
-
-    @staticmethod
     def _language_authority(context: Any) -> tuple[str, str]:
         """Return language value/source and migrate legacy direct-DAG metadata."""
         metadata = getattr(context, "metadata", None)
@@ -606,20 +592,22 @@ class LLMPlanGenerator(PlanGenerator):
             return "", ""
         language = effective_output_language(context)
         source = str(metadata.get(OUTPUT_LANGUAGE_SOURCE_METADATA_KEY) or "")
-        if language and not source and metadata.get("pattern") == "dag_plan_execute":
+        if (
+            language
+            and not source
+            and metadata.get("pattern") == "dag_plan_execute"
+            and language != request_context_output_language(metadata)
+        ):
             source = OUTPUT_LANGUAGE_SOURCE_PLAN
             metadata[OUTPUT_LANGUAGE_SOURCE_METADATA_KEY] = source
         return language, source
 
     @staticmethod
     def _has_external_language_authority(context: Any) -> bool:
-        """Whether the output language came from outside the agent.
-
-        An API caller's request_context is the only writer that leaves this key
-        without a source label.
-        """
-        language, source = LLMPlanGenerator._language_authority(context)
-        return bool(language) and not source
+        """Whether an API caller pinned the output language via request_context."""
+        language, _ = LLMPlanGenerator._language_authority(context)
+        metadata = getattr(context, "metadata", None)
+        return bool(language) and language == request_context_output_language(metadata)
 
     @staticmethod
     def _step_prose(step: PlanStep) -> str:

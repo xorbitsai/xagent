@@ -29,9 +29,8 @@ from ...context.skill_tool import (
 from ...frame import ExecutionFrame, ExecutionSnapshot, ExecutionStatus
 from ...grounding import grounding_rule
 from ...language import (
-    OUTPUT_LANGUAGE_METADATA_KEY,
-    OUTPUT_LANGUAGE_SOURCE_METADATA_KEY,
     final_answer_language_rule,
+    reset_metadata_output_language,
 )
 from ...runtime import (
     LLMCallInterrupted,
@@ -737,8 +736,7 @@ class AutoPattern(AgentPattern):
     def _clear_response_language(self, context: Any) -> None:
         metadata = self._context_metadata(context)
         if metadata is not None:
-            metadata.pop(OUTPUT_LANGUAGE_METADATA_KEY, None)
-            metadata.pop(OUTPUT_LANGUAGE_SOURCE_METADATA_KEY, None)
+            reset_metadata_output_language(metadata)
 
     def _attach_decision_metadata(self, result: dict[str, Any]) -> None:
         if self.decision is None:
@@ -762,8 +760,8 @@ class AutoPattern(AgentPattern):
         if llm is None:
             raise RuntimeError("AutoPattern requires an LLM with tool calling support.")
 
-        # Runs on every fresh routing decision, so a stale plan-scoped label never
-        # becomes a hard instruction; a resumed pattern skips _decide and keeps it.
+        # Every fresh routing decision drops all derived labels and re-derives the
+        # caller's; a resumed pattern skips _decide, so the runner migration does it.
         self._clear_response_language(context)
         await runtime.compact_context_if_needed(
             context=context,

@@ -689,10 +689,54 @@ def test_get_messages_for_llm_uses_compact_dag_output_language_policy() -> None:
     assert "Current user request:" not in system_content
     assert "DAG step execution scope:" in system_content
     assert "Output language: English" in system_content
-    assert "Current user request, quoted for response language only:" in system_content
-    assert "Create two posters." in system_content
+    # A caller-pinned language is authoritative; the soft request quote would
+    # contradict it.
+    assert "Current user request, quoted for response language only:" not in (
+        system_content
+    )
+    assert "Create two posters." not in system_content
     assert "Only execute the current DAG step" in system_content
     assert [message["role"] for message in result].count("system") == 1
+
+
+def test_dag_step_without_output_language_quotes_the_request_for_language() -> None:
+    ctx = ExecutionContext()
+    ctx.metadata["task"] = "Crée deux affiches."
+    ctx.metadata["dag_step_id"] = "step-1"
+    ctx.metadata["dag_step_name"] = "Extract release notes"
+    ctx.add_user_message("Crée deux affiches.")
+
+    system_content = ctx.get_messages_for_llm()[0]["content"]
+
+    assert "Current user request, quoted for response language only:" in system_content
+    assert "Crée deux affiches." in system_content
+    assert "Response language rules:" in system_content
+    assert "Output language:" not in system_content
+
+
+def test_dag_step_language_quote_is_middle_truncated() -> None:
+    request = "A" * 900 + "TAIL_DIRECTIVE" + "B" * 900 + " Reply in French."
+    ctx = ExecutionContext()
+    ctx.metadata["dag_step_id"] = "step-1"
+    ctx.metadata["dag_step_name"] = "Extract release notes"
+    ctx.add_user_message(request)
+
+    system_content = ctx.get_messages_for_llm()[0]["content"]
+
+    assert request not in system_content
+    assert "middle truncated" in system_content
+    assert "Reply in French." in system_content
+    assert "TAIL_DIRECTIVE" not in system_content
+
+
+def test_root_request_without_output_language_constrains_tool_arguments() -> None:
+    ctx = ExecutionContext()
+    ctx.add_user_message("Crée un agent pour moi.")
+
+    system_content = ctx.get_messages_for_llm()[0]["content"]
+
+    assert "tool arguments that persist user-facing prose" in system_content
+    assert "Output language:" not in system_content
 
 
 def test_get_messages_for_llm_coalesces_system_messages() -> None:

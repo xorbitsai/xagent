@@ -5031,7 +5031,12 @@ async def test_plan_generator_accepts_implicit_cross_language_request() -> None:
 async def test_direct_dag_skips_request_reminder_under_external_authority() -> None:
     generator = LLMPlanGenerator()
     context = ExecutionContext(execution_id="dag-external-authority-no-reminder")
-    context.metadata["pattern"] = "auto"
+    # Shaped like _apply_request_context: the caller's request_context is mirrored
+    # into metadata, and the direct-DAG pattern marker is what F2b degraded.
+    context.metadata["pattern"] = "dag_plan_execute"
+    context.metadata["request_context"] = {
+        OUTPUT_LANGUAGE_METADATA_KEY: "English",
+    }
     context.metadata[OUTPUT_LANGUAGE_METADATA_KEY] = "English"
     context.add_user_message("请继续处理这个任务。")
     llm = SequenceLLM(
@@ -5080,6 +5085,48 @@ async def test_direct_dag_skips_request_reminder_under_external_authority() -> N
     assert llm.calls == 1
     assert plan.steps[0].task == "Continue processing the task in English"
     assert context.metadata[OUTPUT_LANGUAGE_METADATA_KEY] == "English"
+    assert OUTPUT_LANGUAGE_SOURCE_METADATA_KEY not in context.metadata
+
+
+def test_request_context_language_survives_direct_dag_authority_check() -> None:
+    context = ExecutionContext(execution_id="dag-request-context-authority")
+    context.metadata["pattern"] = "dag_plan_execute"
+    context.metadata["request_context"] = {OUTPUT_LANGUAGE_METADATA_KEY: "French"}
+    context.metadata[OUTPUT_LANGUAGE_METADATA_KEY] = "French"
+
+    assert LLMPlanGenerator._has_external_language_authority(context) is True
+    assert OUTPUT_LANGUAGE_SOURCE_METADATA_KEY not in context.metadata
+
+
+def test_unproven_direct_dag_language_is_still_marked_as_plan_scoped() -> None:
+    context = ExecutionContext(execution_id="dag-legacy-authority")
+    context.metadata["pattern"] = "dag_plan_execute"
+    context.metadata[OUTPUT_LANGUAGE_METADATA_KEY] = "French"
+
+    assert LLMPlanGenerator._has_external_language_authority(context) is False
+    assert (
+        context.metadata[OUTPUT_LANGUAGE_SOURCE_METADATA_KEY]
+        == OUTPUT_LANGUAGE_SOURCE_PLAN
+    )
+
+
+def test_step_prose_covers_every_user_facing_plan_field() -> None:
+    step = PlanStep(
+        id="s1",
+        task="TASK_TEXT",
+        description="DESCRIPTION_TEXT",
+        termination_condition="TERMINATION_TEXT",
+        completion_evidence="EVIDENCE_TEXT",
+    )
+
+    prose = LLMPlanGenerator._step_prose(step)
+
+    assert prose.splitlines() == [
+        "TASK_TEXT",
+        "DESCRIPTION_TEXT",
+        "TERMINATION_TEXT",
+        "EVIDENCE_TEXT",
+    ]
 
 
 @pytest.mark.asyncio
@@ -5186,3 +5233,56 @@ async def test_legacy_router_language_is_not_external_authority_for_planning() -
 
     assert llm.calls == 2
     assert "script of the latest user request" in llm.seen_messages[1][-1]["content"]
+
+
+@pytest.mark.asyncio
+async def test_restored_dag_step_instruction_drops_stale_language_policy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    step = PlanStep(id="write", task="Write the summary")
+    pattern = DAGPattern(lambda **_: build_plan(step))
+    pattern.plan = build_plan(step)
+
+    legacy_root = ExecutionContext(execution_id="dag-restored-language-legacy")
+    legacy_root.metadata[OUTPUT_LANGUAGE_METADATA_KEY] = "Simplified Chinese"
+    stale_instruction = pattern._step_instruction(root_context=legacy_root, step=step)
+    assert "Output language: Simplified Chinese" in stale_instruction
+
+    child_context = ExecutionContext(execution_id="dag-restored-language:write")
+    child_context.add_user_message(
+        stale_instruction,
+        metadata={"kind": "dag_step_instruction", "dag_step_id": "write"},
+    )
+    pattern.active_step_contexts = {"write": child_context.to_dict()}
+
+    captured: list[Any] = []
+
+    class CapturingReActPattern:
+        def __init__(self, **kwargs: Any) -> None:
+            del kwargs
+
+        async def run(self, *, context: Any, **kwargs: Any) -> dict[str, Any]:
+            del kwargs
+            captured.append(context)
+            return {"success": True, "status": "completed", "output": "done"}
+
+    monkeypatch.setattr(dag_module, "ReActPattern", CapturingReActPattern)
+
+    root_context = ExecutionContext(execution_id="dag-restored-language")
+    root_context.add_user_message("Summarize the release notes.")
+    await pattern._execute_step_impl(
+        step=step,
+        root_context=root_context,
+        tools=[],
+        llm=object(),
+        runtime=PatternRuntime(execution_id="dag-restored-language"),
+    )
+
+    assert len(captured) == 1
+    instruction = next(
+        message.content
+        for message in captured[0].messages
+        if message.metadata.get("kind") == "dag_step_instruction"
+    )
+    assert "Output language: Simplified Chinese" not in instruction
+    assert "Use the same natural language as the current user request" in instruction

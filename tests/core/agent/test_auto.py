@@ -886,6 +886,27 @@ async def test_auto_pattern_clears_stale_output_language_before_routing() -> Non
 
 
 @pytest.mark.asyncio
+async def test_auto_pattern_keeps_request_context_output_language() -> None:
+    llm = FakeLLM(
+        [decision_tool_response("final_answer", "Greeting only.", answer="hi")]
+    )
+    pattern = AutoPattern()
+    context = ExecutionContext()
+    context.metadata["request_context"] = {OUTPUT_LANGUAGE_METADATA_KEY: "French"}
+    context.metadata[OUTPUT_LANGUAGE_METADATA_KEY] = "French"
+    context.metadata[OUTPUT_LANGUAGE_SOURCE_METADATA_KEY] = OUTPUT_LANGUAGE_SOURCE_PLAN
+    context.add_user_message("hi")
+
+    result = await pattern.run(
+        context=context, tools=[], llm=llm, runtime=PatternRuntime()
+    )
+
+    assert result["success"] is True
+    assert context.metadata[OUTPUT_LANGUAGE_METADATA_KEY] == "French"
+    assert OUTPUT_LANGUAGE_SOURCE_METADATA_KEY not in context.metadata
+
+
+@pytest.mark.asyncio
 async def test_auto_pattern_streams_direct_final_answer_as_tool_args_arrive() -> None:
     prefix = (
         '{"action":"final_answer","reason":"simple",'

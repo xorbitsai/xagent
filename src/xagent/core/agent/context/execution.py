@@ -24,6 +24,8 @@ from ...tools.artifacts import (
 from ..language import (
     effective_output_language,
     output_language_directives,
+    response_language_rules,
+    truncate_request_preview,
 )
 from ..result import CONTROL_TOOL_NAMES, tool_result_succeeded
 from .components import (
@@ -509,9 +511,10 @@ class ExecutionContext:
         parts = [self._current_time_context(), FILE_REF_MODEL_INSTRUCTIONS]
         dag_step_id = self.metadata.get("dag_step_id")
         current_task = self._current_user_request_text()
+        output_language = effective_output_language(self)
         if current_task and not dag_step_id:
             language_directives = output_language_directives(
-                effective_output_language(self), section="root_system_context"
+                output_language, section="root_system_context"
             )
             parts.append(
                 "Current user request:\n"
@@ -550,7 +553,6 @@ class ExecutionContext:
                     "Task input/output examples:\n" + "\n".join(formatted_examples)
                 )
         if dag_step_id:
-            output_language = effective_output_language(self)
             language_policy = output_language_directives(
                 output_language, section="dag_step_scope"
             )
@@ -587,10 +589,10 @@ class ExecutionContext:
                 "provided in the latest DAG step instruction message.\n\n"
                 f"{step_language_rules}"
             )
-            if current_task:
+            if current_task and not output_language:
                 parts.append(
                     "Current user request, quoted for response language only:\n"
-                    f"{current_task}\n\n"
+                    f"{truncate_request_preview(current_task)}\n\n"
                     "This request is not the executable goal for this step; use it "
                     "only to decide the natural language of user-facing prose.\n\n"
                     f"{response_language_rules()}"

@@ -1911,3 +1911,55 @@ async def test_resume_keeps_caller_supplied_output_language(tmp_path: Path) -> N
     assert result["context"].metadata[OUTPUT_LANGUAGE_METADATA_KEY] == "French"
     system_content = result["context"].get_messages_for_llm()[0]["content"]
     assert "Output language: French" in system_content
+
+
+class _StoredContextCheckpointStore:
+    def __init__(self, context: ExecutionContext) -> None:
+        self.payload = {"type": "checkpoint", "context": context.to_dict()}
+
+    async def load_latest_checkpoint(self, execution_id: str) -> dict[str, Any]:
+        del execution_id
+        return self.payload
+
+
+def _cold_start_runner(context: ExecutionContext) -> AgentRunner:
+    return AgentRunner(
+        agent=Agent(name="writer", patterns=[], llm=None),
+        tracer=_StoredContextCheckpointStore(context),
+    )
+
+
+@pytest.mark.asyncio
+async def test_inject_user_message_cold_start_drops_legacy_output_language() -> None:
+    stored = ExecutionContext(execution_id="exec-inject-legacy-language")
+    stored.metadata["pattern"] = "auto"
+    stored.metadata[OUTPUT_LANGUAGE_METADATA_KEY] = "Simplified Chinese"
+    stored.metadata[OUTPUT_LANGUAGE_SOURCE_METADATA_KEY] = "auto_router"
+    stored.add_user_message("Summarize the release notes.")
+
+    context = await _cold_start_runner(stored).inject_user_message(
+        "exec-inject-legacy-language",
+        message="continue",
+    )
+
+    assert context is not None
+    assert OUTPUT_LANGUAGE_METADATA_KEY not in context.metadata
+    assert OUTPUT_LANGUAGE_SOURCE_METADATA_KEY not in context.metadata
+
+
+@pytest.mark.asyncio
+async def test_inject_user_message_cold_start_keeps_caller_output_language() -> None:
+    stored = ExecutionContext(execution_id="exec-inject-caller-language")
+    stored.metadata["request_context"] = {OUTPUT_LANGUAGE_METADATA_KEY: "French"}
+    stored.metadata[OUTPUT_LANGUAGE_METADATA_KEY] = "French"
+    stored.metadata[OUTPUT_LANGUAGE_SOURCE_METADATA_KEY] = "auto_router"
+    stored.add_user_message("Summarize the release notes.")
+
+    context = await _cold_start_runner(stored).inject_user_message(
+        "exec-inject-caller-language",
+        message="continue",
+    )
+
+    assert context is not None
+    assert context.metadata[OUTPUT_LANGUAGE_METADATA_KEY] == "French"
+    assert OUTPUT_LANGUAGE_SOURCE_METADATA_KEY not in context.metadata

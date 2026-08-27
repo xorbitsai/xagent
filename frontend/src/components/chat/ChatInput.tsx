@@ -245,7 +245,8 @@ export function ChatInput({
 
   // Track files for async operations
   const filesRef = useRef(enabledFiles);
-  const uploadAbortControllersRef = useRef<Map<string, AbortController>>(new Map());
+  const uploadAbortControllersRef = useRef<Map<File, AbortController>>(new Map());
+  const uploadQueueRef = useRef<Promise<void>>(Promise.resolve());
 
   useEffect(() => {
     filesRef.current = enabledFiles;
@@ -315,7 +316,7 @@ export function ChatInput({
   const [models, setModels] = useState<ModelRecord[]>([]);
 
   // State to track files currently being uploaded
-  const [uploadingFiles, setUploadingFiles] = useState<Set<string>>(new Set());
+  const [uploadingFiles, setUploadingFiles] = useState<Set<File>>(new Set());
 
   const extractDroppedFiles = (dataTransfer: DataTransfer) => {
     const itemFiles = Array.from(dataTransfer.items || [])
@@ -346,32 +347,33 @@ export function ChatInput({
     setIsDraggingFiles(false);
   }, [filesDisabled]);
 
-  // Helper to upload files immediately
-  const uploadFiles = async (newFiles: File[]) => {
-    if (filesDisabled || newFiles.length === 0) return;
-
-    // Mark as uploading (use name + lastModified as rough unique ID)
-    const fileIds = newFiles.map(f => `${f.name}-${f.lastModified}`);
-    setUploadingFiles(prev => {
-      const next = new Set(prev);
-      fileIds.forEach(id => next.add(id));
-      return next;
-    });
+  const runFileUploads = async (newFiles: File[]) => {
+    if (filesDisabled || newFiles.length === 0) {
+      return;
+    }
 
     const failedFiles = new Set<File>();
     let uploadErrorMessage: string | null = null;
 
-    // Upload files individually to ensure better reliability and progress tracking
-    await Promise.all(newFiles.map(async (file) => {
-      const fileId = `${file.name}-${file.lastModified}`;
-      const controller = new AbortController();
-      uploadAbortControllersRef.current.set(fileId, controller);
+    for (const file of newFiles) {
+      const controller = uploadAbortControllersRef.current.get(file);
+      if (!controller || controller.signal.aborted) {
+        setUploadingFiles(prev => {
+          const next = new Set(prev);
+          next.delete(file);
+          return next;
+        });
+        continue;
+      }
 
       try {
         const currentTaskType = mode || 'task';
 
         if (uploadFile) {
           const result = await uploadFile(file, { taskType: currentTaskType });
+          if (controller.signal.aborted) {
+            continue;
+          }
           if (result && typeof result.file_id === 'string') {
             (file as File & { file_id?: string }).file_id = result.file_id;
           } else {
@@ -380,7 +382,6 @@ export function ChatInput({
         } else {
           const formData = new FormData();
           formData.append('file', file);
-          // Default to task mode if not specified
           formData.append('task_type', currentTaskType);
 
           const response = await apiRequest(`${getUploadApiUrl()}/api/files/upload`, {
@@ -394,7 +395,6 @@ export function ChatInput({
           if (response.ok && isJsonRecord(parsed.data)) {
             const data = parsed.data;
             if (data.success && typeof data.file_id === 'string') {
-              // Attach file_id to the File object
               (file as File & { file_id?: string }).file_id = data.file_id;
             } else {
               failedFiles.add(file);
@@ -416,22 +416,37 @@ export function ChatInput({
           uploadErrorMessage = uploadErrorMessage || (error instanceof Error ? error.message : null);
         }
       } finally {
-        uploadAbortControllersRef.current.delete(fileId);
+        if (uploadAbortControllersRef.current.get(file) === controller) {
+          uploadAbortControllersRef.current.delete(file);
+        }
         setUploadingFiles(prev => {
           const next = new Set(prev);
-          next.delete(fileId);
+          next.delete(file);
           return next;
         });
       }
-    }));
+    }
 
-    // Handle failed files
     if (failedFiles.size > 0) {
       toast.error(uploadErrorMessage || t("files.uploadFailed") || "Failed to upload some files");
       if (onFilesChange) {
         onFilesChange(filesRef.current.filter(f => !failedFiles.has(f)));
       }
     }
+  };
+
+  const uploadFiles = (newFiles: File[]) => {
+    if (filesDisabled || newFiles.length === 0) {
+      return;
+    }
+
+    newFiles.forEach(file => {
+      uploadAbortControllersRef.current.set(file, new AbortController());
+    });
+    setUploadingFiles(prev => new Set([...prev, ...newFiles]));
+
+    const scheduled = uploadQueueRef.current.then(() => runFileUploads(newFiles));
+    uploadQueueRef.current = scheduled.catch(() => undefined);
   };
 
   const appendFiles = (newFiles: File[]) => {
@@ -874,11 +889,10 @@ export function ChatInput({
   const removeFile = (index: number) => {
     const fileToRemove = enabledFiles[index];
     if (fileToRemove) {
-      const fileId = `${fileToRemove.name}-${fileToRemove.lastModified}`;
-      const controller = uploadAbortControllersRef.current.get(fileId);
+      const controller = uploadAbortControllersRef.current.get(fileToRemove);
       if (controller) {
         controller.abort();
-        uploadAbortControllersRef.current.delete(fileId);
+        uploadAbortControllersRef.current.delete(fileToRemove);
       }
     }
     onFilesChange?.(enabledFiles.filter((_, i) => i !== index));
@@ -976,7 +990,7 @@ export function ChatInput({
           {enabledFiles.length > 0 && (
             <div className="flex flex-wrap gap-2 px-4 pt-3">
               {enabledFiles.map((file, index) => {
-                const isUploading = uploadingFiles.has(`${file.name}-${file.lastModified}`);
+                const isUploading = uploadingFiles.has(file);
                 return (
                   <div
                     key={index}

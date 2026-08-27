@@ -20,6 +20,7 @@ const app = vi.hoisted(() => ({
     transport?: AppProviderTransportConfig
   },
   startScreenProps: null as null | {
+    onSend: (message: string, files: File[], config?: Record<string, string>) => Promise<void>
     voiceInputEnabled?: boolean
   },
 }))
@@ -577,6 +578,63 @@ describe("PublicAgentChatPage", () => {
     })
   })
 
+  it("uploads workforce opening attachments serially before creating a task", async () => {
+    let resolveFirst!: (response: Response) => void
+    let resolveSecond!: (response: Response) => void
+    const firstUpload = new Promise<Response>((resolve) => {
+      resolveFirst = resolve
+    })
+    const secondUpload = new Promise<Response>((resolve) => {
+      resolveSecond = resolve
+    })
+    const first = new File(["one"], "one.txt", { type: "text/plain" })
+    const second = new File(["two"], "two.txt", { type: "text/plain" })
+
+    fetchMock
+      .mockResolvedValueOnce(jsonResponse(successfulWorkforceAuth))
+      .mockReturnValueOnce(firstUpload)
+      .mockReturnValueOnce(secondUpload)
+      .mockResolvedValueOnce(jsonResponse(widgetTaskResponse(44, "running")))
+
+    renderWidgetPage({ searchAgentId: null, widgetKey: "widget-secret" })
+
+    await screen.findByRole("button", { name: "start:Support Workforce" })
+    const opening = app.startScreenProps!.onSend(
+      "opening message",
+      [first, second],
+      { mode: "balanced" },
+    )
+
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+    expect(fetchMock.mock.calls[1][0]).toBe(
+      "https://api.example/api/widget/files/upload",
+    )
+    const firstRequest = fetchMock.mock.calls[1][1] as RequestInit
+    expect((firstRequest.body as FormData).get("file")).toBe(first)
+
+    resolveFirst(jsonResponse({ success: true, file_id: "file-1" }))
+
+    await waitFor(() => {
+      expect(fetchMock).toHaveBeenCalledTimes(3)
+    })
+    expect(fetchMock.mock.calls[2][0]).toBe(
+      "https://api.example/api/widget/files/upload",
+    )
+    const secondRequest = fetchMock.mock.calls[2][1] as RequestInit
+    expect((secondRequest.body as FormData).get("file")).toBe(second)
+
+    resolveSecond(jsonResponse({ success: true, file_id: "file-2" }))
+
+    await opening
+    expect(fetchMock).toHaveBeenCalledTimes(4)
+    const taskRequest = fetchMock.mock.calls[3][1] as RequestInit
+    expect(JSON.parse(taskRequest.body as string)).toEqual({
+      title: "opening message",
+      description: "opening message",
+      files: ["file-1", "file-2"],
+    })
+  })
+
   it("authenticates a share link and persists the guest token for reuse", async () => {
     localStorage.clear()
     fetchMock.mockResolvedValueOnce(jsonResponse(successfulAgentAuth))
@@ -737,6 +795,39 @@ describe("PublicAgentChatPage", () => {
     expect(await screen.findByRole("button", { name: "start:Support Agent" })).toBeInTheDocument()
     expect(app.setTaskId).toHaveBeenCalledWith(null, { navigate: false })
     expect(app.setTaskId).not.toHaveBeenCalledWith(99, { navigate: false })
+  })
+
+  it("serializes public transport uploads", async () => {
+    let resolveFirst!: (response: Response) => void
+    const firstResponse = new Promise<Response>((resolve) => {
+      resolveFirst = resolve
+    })
+    const first = new File(["one"], "one.txt", { type: "text/plain" })
+    const second = new File(["two"], "two.txt", { type: "text/plain" })
+
+    fetchMock
+      .mockResolvedValueOnce(jsonResponse(successfulAgentAuth))
+      .mockReturnValueOnce(firstResponse)
+      .mockResolvedValueOnce(jsonResponse({ success: true, file_id: "file-2" }))
+
+    renderWidgetPage({ widgetKey: "widget-secret" })
+
+    await screen.findByRole("button", { name: "start:Support Agent" })
+    const uploaded = app.provider?.transport?.uploadFiles?.(
+      [first, second],
+      { taskId: 42, taskType: "task" },
+    )
+
+    expect(uploaded).toBeDefined()
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+
+    resolveFirst(jsonResponse({ success: true, file_id: "file-1" }))
+
+    await expect(uploaded).resolves.toEqual([
+      expect.objectContaining({ file_id: "file-1" }),
+      expect.objectContaining({ file_id: "file-2" }),
+    ])
+    expect(fetchMock).toHaveBeenCalledTimes(3)
   })
 
   it("clears a stale task when the server denies access for this guest", async () => {

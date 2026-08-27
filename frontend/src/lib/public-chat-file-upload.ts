@@ -21,6 +21,18 @@ interface PublicChatUploadResponse {
   message?: unknown
 }
 
+export async function uploadPublicChatFiles(
+  { files, ...options }: Omit<UploadPublicChatFileOptions, "file"> & { files: File[] },
+): Promise<PublicChatUploadedFile[]> {
+  const uploadedFiles: PublicChatUploadedFile[] = []
+
+  for (const file of files) {
+    uploadedFiles.push(await uploadPublicChatFile({ ...options, file }))
+  }
+
+  return uploadedFiles
+}
+
 export async function uploadPublicChatFile({
   url,
   accessToken,

@@ -43,6 +43,22 @@ def test_headers_include_bearer_token():
     }
 
 
+def test_headers_reject_whitespace_only_token(monkeypatch):
+    monkeypatch.setenv("DEPUTY_ACCESS_TOKEN", "   ")
+
+    with pytest.raises(ValueError, match="DEPUTY_ACCESS_TOKEN"):
+        deputy._headers()
+
+
+def test_headers_strip_surrounding_whitespace(monkeypatch):
+    monkeypatch.setenv("DEPUTY_ACCESS_TOKEN", "  access-token\n")
+
+    assert deputy._headers() == {
+        "Authorization": "Bearer access-token",
+        "Content-Type": "application/json",
+    }
+
+
 # ---------------------------------------------------------------------------
 # _instance_url
 # ---------------------------------------------------------------------------

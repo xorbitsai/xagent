@@ -2631,7 +2631,11 @@ def generic_oauth_callback(
                 # A network-level failure (timeout, connection error) --
                 # distinct from the case above: Deputy never actually
                 # responded, so attributing this to "the provider reported"
-                # would be misleading.
+                # would be misleading. The client only sees str(e) (via the
+                # HTMLResponse below); the full traceback is logged here so
+                # an unexpected failure mode (not just a plain timeout) is
+                # still diagnosable server-side.
+                logger.error("Deputy identity verification failed", exc_info=True)
                 return HTMLResponse(
                     content=(
                         "<h1>Error verifying the connected account</h1>"

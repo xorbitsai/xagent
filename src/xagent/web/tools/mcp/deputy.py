@@ -125,9 +125,14 @@ def _instance_url() -> str:
 
 
 def _headers() -> dict[str, str]:
-    access_token = os.environ.get("DEPUTY_ACCESS_TOKEN")
+    # Stripped, not just a bare os.environ.get(): a stray leading/trailing
+    # newline or space in the injected token (e.g. from a copy-pasted env
+    # value in a manual/local launch_config override) would otherwise
+    # silently produce a malformed Authorization header rather than the
+    # clear "missing" error below.
+    access_token = (os.environ.get("DEPUTY_ACCESS_TOKEN") or "").strip()
     if not access_token:
-        raise ValueError("DEPUTY_ACCESS_TOKEN environment variable is missing")
+        raise ValueError("DEPUTY_ACCESS_TOKEN environment variable is missing or empty")
     return {
         "Authorization": f"Bearer {access_token}",
         "Content-Type": "application/json",

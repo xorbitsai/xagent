@@ -248,7 +248,8 @@ def _evaluate_filter_expression(
     elif operator == FilterOperator.IN:
         result = series.isin(expr.value)
     elif operator == FilterOperator.CONTAINS:
-        result = series.astype(str).str.contains(str(expr.value), na=False, regex=False)
+        text_series = cast(pd.Series[str], series.astype(str))
+        result = text_series.str.contains(str(expr.value), na=False, regex=False)
     else:  # pragma: no cover - FilterOperator currently exhausts these branches
         raise ValueError(f"Unsupported filter operator: {operator}")
     return (non_null & result).fillna(False).astype(bool)

@@ -20,8 +20,8 @@ from typing import (
     Optional,
     Protocol,
     Sequence,
-    TypeAlias,
     Tuple,
+    TypeAlias,
     Union,
     runtime_checkable,
 )

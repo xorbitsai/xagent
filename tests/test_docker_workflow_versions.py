@@ -212,6 +212,27 @@ def test_backend_runtime_keeps_uv_binaries() -> None:
     assert dockerfile.count("COPY --from=uv /uv /uvx /usr/local/bin/") == 2
 
 
+def test_backend_dockerfile_installs_docker_cli_without_the_daemon() -> None:
+    """docker.io ships an engine + containerd + runc that a daemonless
+    container never uses, but /usr/bin/docker must survive the swap:
+    command_policy.py gates the agent shell by path, not by an allowlist.
+    See https://github.com/xorbitsai/xagent/pull/1807
+    """
+
+    dockerfile = read_repo_file("docker/Dockerfile.backend")
+
+    assert "docker-ce-cli" in dockerfile
+    assert "\n    docker.io \\" not in dockerfile
+    # Hardcoding an arch here would break the arm64 image (docker-publish.yml
+    # publishes amd64 + arm64); --no-install-recommends keeps
+    # docker-buildx-plugin/docker-compose-plugin out.
+    assert (
+        "arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/docker.gpg"
+        in dockerfile
+    )
+    assert "--no-install-recommends docker-ce-cli" in dockerfile
+
+
 def test_backend_package_version_is_vcs_based_for_normal_builds() -> None:
     pyproject = read_repo_file("pyproject.toml")
 

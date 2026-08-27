@@ -370,13 +370,26 @@ def test_chrome_devtools_mcp_pin_matches_across_dockerfiles_and_registry() -> No
     registry = read_repo_file("src/xagent/web/builtin_mcp_registry.py")
     pin_match = re.search(r'"chrome-devtools-mcp@([\w.\-]+)"', registry)
     assert pin_match, "chrome-devtools-mcp pin not found in builtin_mcp_registry.py"
-    pinned_spec = f"chrome-devtools-mcp@{pin_match.group(1)}"
+    pinned_version = pin_match.group(1)
 
+    # Extracts just the version each Dockerfile's own npx warm-up command
+    # resolves against, rather than requiring an exact-substring match of
+    # the whole npx invocation -- a future edit that legitimately reorders
+    # or adds flags around the same pinned version shouldn't fail this
+    # test, only an actual version mismatch should.
     for dockerfile_path in ("docker/Dockerfile.backend", "docker/Dockerfile.sandbox"):
         dockerfile = read_repo_file(dockerfile_path)
-        assert f"npx -y --prefer-offline {pinned_spec} --help" in dockerfile, (
-            f"{dockerfile_path} does not warm the npx cache for {pinned_spec} -- "
-            "update its warm-up command to match builtin_mcp_registry.py"
+        dockerfile_match = re.search(
+            r"npx\b[^\n]*\bchrome-devtools-mcp@([\w.\-]+)", dockerfile
+        )
+        assert dockerfile_match, (
+            f"{dockerfile_path} has no npx chrome-devtools-mcp warm-up command"
+        )
+        assert dockerfile_match.group(1) == pinned_version, (
+            f"{dockerfile_path} warms the npx cache for "
+            f"chrome-devtools-mcp@{dockerfile_match.group(1)}, but "
+            f"builtin_mcp_registry.py pins chrome-devtools-mcp@{pinned_version} -- "
+            "update the warm-up command to match"
         )
 
 

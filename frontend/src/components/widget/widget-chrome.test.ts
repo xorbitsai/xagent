@@ -158,6 +158,40 @@ describe("widget close chrome", () => {
     expect(localStorage.getItem(CLOSED_KEY)).toBe("true")
   })
 
+  it("stops reacting to widget_close once the widget is torn down (removed from the DOM)", async () => {
+    // Regression coverage: this listener used to be an inline anonymous
+    // function, structurally impossible to removeEventListener, and wasn't
+    // wired into the file's established torndown-flag/teardown-observer
+    // pattern that every other listener here uses. A stray message arriving
+    // after removal (a host SPA swap, not a full page reload) would
+    // otherwise still mutate a detached panel and corrupt the next load's
+    // auto-open decision in storage.
+    runWidget()
+    fabEl()?.click()
+    expect(panelEl()).toHaveClass("open")
+    expect(localStorage.getItem(CLOSED_KEY)).toBe("false")
+    // Captured before removal: jsdom may null out a detached iframe's own
+    // contentWindow, which would make the pre-existing origin/source check
+    // reject the message on its own -- this proves the *teardown* path
+    // specifically, independent of that check, by keeping the source a
+    // match regardless.
+    const capturedSource = iframeEl()?.contentWindow as Window
+
+    document.querySelector(".xagent-widget-container")?.remove()
+    // The teardown observer's callback fires as a microtask.
+    await Promise.resolve()
+
+    window.dispatchEvent(new MessageEvent("message", {
+      data: { xagent: true, v: 1, type: "widget_close" },
+      origin: HOST,
+      source: capturedSource,
+    }))
+
+    // Unchanged from the open-click above: a stray post-teardown widget_close
+    // must not have run closePanel() and re-persisted it as closed.
+    expect(localStorage.getItem(CLOSED_KEY)).toBe("false")
+  })
+
   it("ignores an unrecognized chrome message type", () => {
     runWidget()
     fabEl()?.click()

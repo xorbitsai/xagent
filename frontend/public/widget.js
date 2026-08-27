@@ -633,6 +633,7 @@
     panelRemovalObserver.disconnect();
     window.removeEventListener('resize', onWindowResize);
     window.removeEventListener('blur', onWindowBlur);
+    window.removeEventListener('message', onChromeMessage);
     document.removeEventListener('pointermove', onPointerMove);
     document.removeEventListener('pointerup', endDrag);
     document.removeEventListener('pointercancel', cancelDrag);
@@ -698,15 +699,21 @@
 
   // The header's close control lives inside the iframe's React app and has
   // no direct handle to panel/fab, so it signals intent back here over
-  // postMessage instead.
-  window.addEventListener('message', function (event) {
-    if (event.origin !== host || !iframe.contentWindow || event.source !== iframe.contentWindow) return;
+  // postMessage instead. Named (not inline) so panelRemovalObserver can
+  // remove it below, matching every other listener's teardown in this file
+  // -- otherwise a host SPA that removes the widget without a full page
+  // reload leaves this listener retaining the closure indefinitely, and a
+  // stray message arriving afterward would still mutate a detached panel
+  // and corrupt the next load's auto-open decision in localStorage.
+  function onChromeMessage(event) {
+    if (torndown || event.origin !== host || !iframe.contentWindow || event.source !== iframe.contentWindow) return;
     var data = event.data;
     if (!data || data.xagent !== true || data.v !== 1) return;
     if (data.type === 'widget_close') {
       closePanel();
     }
-  });
+  }
+  window.addEventListener('message', onChromeMessage);
 
   // Deferred to the moment each mode actually starts loading the iframe (see
   // call sites below), not called unconditionally here: guest mode's iframe
@@ -885,7 +892,6 @@
     function attach(iframe) {
       state.iframe = iframe;
       iframe.src = withTimezone(host + '/widget/chat/session');
-      maybeAutoOpen();
       window.addEventListener('message', onMessage);
       window.addEventListener('pageshow', onPageShow);
       window.addEventListener('pagehide', onPageHide);
@@ -1176,6 +1182,14 @@
           return;
         }
         applySession(payload);
+        // Gated to the initial exchange, not every reconnect: this is the
+        // first point session mode actually knows the grant is usable (a
+        // returning visitor whose grant has since expired or been consumed
+        // reaches recordFailure below instead, never auto-opening onto the
+        // degraded/terminal screen -- same reasoning as guest mode's
+        // ticket-fetch-success gate on maybeAutoOpen). A later reconnect
+        // succeeding shouldn't re-open a panel the visitor has since closed.
+        if (phase === 'exchange') maybeAutoOpen();
         flush();
         return;
       }

@@ -221,16 +221,38 @@ def test_backend_dockerfile_installs_docker_cli_without_the_daemon() -> None:
 
     dockerfile = read_repo_file("docker/Dockerfile.backend")
 
-    assert "docker-ce-cli" in dockerfile
-    assert "\n    docker.io \\" not in dockerfile
+    # `runtime` is FROM runtime-base and copies no apt layer out of the build
+    # stages, so an install that drifted into backend-base would ship an image
+    # with no /usr/bin/docker at all.
+    runtime_base = dockerfile.split(
+        "FROM python:${PYTHON_VERSION}-bookworm AS runtime-base\n", maxsplit=1
+    )[1].split("\nFROM ", maxsplit=1)[0]
+    block = next(
+        chunk for chunk in runtime_base.split("\n\n") if "docker-ce-cli" in chunk
+    )
+    install = "\n".join(line for line in block.splitlines() if not line.startswith("#"))
+
     # Hardcoding an arch here would break the arm64 image (docker-publish.yml
     # publishes amd64 + arm64); --no-install-recommends keeps
     # docker-buildx-plugin/docker-compose-plugin out.
     assert (
         "arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/docker.gpg"
-        in dockerfile
+        in install
     )
-    assert "--no-install-recommends docker-ce-cli" in dockerfile
+    assert "--no-install-recommends docker-ce-cli \\" in install
+    for daemon_package in ("docker.io", "docker-ce ", "containerd", "runc"):
+        assert daemon_package not in install
+
+    # The key and source list must be dropped by the same layer that added
+    # them, or download.docker.com stays resolvable in the running container.
+    assert (
+        "rm -rf /var/lib/apt/lists/* /etc/apt/sources.list.d/docker.list"
+        " /usr/share/keyrings/docker.gpg" in install
+    )
+    # Smoke-tested during the build so a broken swap fails on both published
+    # architectures instead of shipping.
+    assert "test -x /usr/bin/docker \\" in install
+    assert "! command -v dockerd \\" in install
 
 
 def test_backend_package_version_is_vcs_based_for_normal_builds() -> None:

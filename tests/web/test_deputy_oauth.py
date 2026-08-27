@@ -206,13 +206,14 @@ def test_callback_persists_normalized_endpoint_scope_and_identity(
 def test_callback_scope_filters_empty_entries_in_default_scopes(
     db_session, monkeypatch
 ):
-    """A stray empty-string entry in the provider row's default_scopes
-    (e.g. from an admin edit via PUT /admin/mcp/providers with no
-    element-level validation) must not produce a scope value with a
-    trailing/doubled space -- filtered out, not just joined as-is."""
+    """A stray empty or whitespace-only entry in the provider row's
+    default_scopes (e.g. from an admin edit via PUT /admin/mcp/providers
+    with no element-level validation) must not produce a scope value with
+    a leading/trailing/doubled space -- filtered out, not just joined
+    as-is."""
     db, user = db_session
     provider = _deputy_provider()
-    provider.default_scopes = ["longlife_refresh_token", ""]
+    provider.default_scopes = ["longlife_refresh_token", "", "   "]
     mock_post = Mock(
         return_value=MockResponse(
             {
@@ -245,6 +246,59 @@ def test_callback_scope_filters_empty_entries_in_default_scopes(
         .one()
     )
     assert user_mcp.is_active is True
+
+
+def test_callback_reports_error_in_token_data_for_deputy(db_session, monkeypatch):
+    """The generic `"error" in token_data` guard must still fire correctly
+    for Deputy despite the Deputy-specific `data["scope"] = ...` code
+    injected into the outbound request just before this POST -- that
+    injection must not interfere with how the (unrelated) response is
+    handled."""
+    db, user = db_session
+    mock_post = Mock(
+        return_value=MockResponse(
+            {"error": "invalid_client", "error_description": "bad credentials"}
+        )
+    )
+    monkeypatch.setattr(auth_api.requests, "post", mock_post)
+
+    response = generic_oauth_callback(
+        "deputy", _callback_request(db, user), db, _deputy_provider()
+    )
+
+    assert response.status_code == 400
+    assert (
+        db.query(UserOAuth)
+        .filter(UserOAuth.user_id == user.id, UserOAuth.provider == "deputy")
+        .first()
+        is None
+    )
+
+
+def test_callback_rejects_non_2xx_status_for_deputy(db_session, monkeypatch):
+    """A non-2xx response with no explicit "error" key (e.g. a proxy/
+    gateway artifact) must not be trusted as a successful Deputy
+    exchange."""
+    db, user = db_session
+    mock_post = Mock(
+        return_value=MockResponse(
+            {"access_token": "deputy-token", "endpoint": "acme.au.deputy.com"},
+            status_code=502,
+        )
+    )
+    monkeypatch.setattr(auth_api.requests, "post", mock_post)
+
+    response = generic_oauth_callback(
+        "deputy", _callback_request(db, user), db, _deputy_provider()
+    )
+
+    assert response.status_code == 400
+    assert (
+        db.query(UserOAuth)
+        .filter(UserOAuth.user_id == user.id, UserOAuth.provider == "deputy")
+        .first()
+        is None
+    )
 
 
 @pytest.mark.parametrize(
@@ -514,6 +568,12 @@ async def test_deputy_refresh_posts_to_stored_instance_url_with_scope_and_redire
     )
     assert kwargs["data"]["grant_type"] == "refresh_token"
     assert kwargs["data"]["refresh_token"] == "old-refresh"
+    # Deputy relies on httpx's default form-urlencoded Content-Type for a
+    # `data=` body (no `json=` body, no explicit Content-Type/Accept
+    # override, unlike jira/linkedin/github's branches in the same
+    # function) -- locks in that Deputy takes neither of those branches.
+    assert "json" not in kwargs
+    assert kwargs["headers"] == {}
 
 
 @pytest.mark.asyncio
@@ -535,7 +595,7 @@ async def test_deputy_refresh_scope_filters_empty_entries_in_default_scopes(
             userinfo_url="",
             user_id_path="",
             email_path="",
-            default_scopes=["longlife_refresh_token", ""],
+            default_scopes=["longlife_refresh_token", "", "   "],
         )
     )
     oauth_account = UserOAuth(

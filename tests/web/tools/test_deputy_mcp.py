@@ -318,6 +318,22 @@ def test_list_resource_treats_null_response_as_empty(monkeypatch):
     assert result["records"] == []
 
 
+def test_list_resource_treats_204_response_as_empty(monkeypatch):
+    """_request() normalizes a 204/empty-content response to `{}` (needed
+    so deputy_get_resource/deputy_get_current_user treat it as a valid
+    empty dict) -- deputy_list_resource must also recognize that `{}`,
+    not just a literal JSON null, as "no records", not an unexpected
+    shape."""
+    monkeypatch.setattr(
+        deputy.requests, "request", Mock(return_value=MockResponse(status_code=204))
+    )
+
+    result = json.loads(deputy.deputy_list_resource("Employee"))
+
+    assert result["status"] == "success"
+    assert result["records"] == []
+
+
 def test_list_resource_rejects_surrounding_whitespace_resource_without_raising(
     monkeypatch,
 ):
@@ -494,6 +510,19 @@ def test_query_resource_errors_on_non_list_response(monkeypatch):
 def test_query_resource_treats_null_response_as_empty(monkeypatch):
     monkeypatch.setattr(
         deputy.requests, "request", Mock(return_value=_NullJsonResponse())
+    )
+
+    result = json.loads(deputy.deputy_query_resource("Roster"))
+
+    assert result["status"] == "success"
+    assert result["records"] == []
+
+
+def test_query_resource_treats_204_response_as_empty(monkeypatch):
+    """See test_list_resource_treats_204_response_as_empty's docstring --
+    same reasoning applies here."""
+    monkeypatch.setattr(
+        deputy.requests, "request", Mock(return_value=MockResponse(status_code=204))
     )
 
     result = json.loads(deputy.deputy_query_resource("Roster"))

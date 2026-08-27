@@ -707,12 +707,25 @@ async def refresh_oauth_token_if_needed(
             # hardcoded literal, so an admin who edits this provider row's
             # scopes doesn't leave refresh silently still sending the old
             # value.
+            # Resolved from the CURRENT provider row/env var, not whatever
+            # redirect_uri was actually used for this grant's original
+            # authorization -- UserOAuth has no per-grant redirect_uri
+            # column to read instead (no provider in this codebase needs
+            # one; Deputy is the only one requiring redirect_uri on
+            # refresh at all). If an admin changes the Deputy provider's
+            # redirect_uri (or DEPUTY_REDIRECT_URI) after users have
+            # already connected, Deputy may reject those users' next
+            # refresh with a redirect_uri mismatch until they reconnect --
+            # a known limitation, not something this function can resolve
+            # without a schema change.
             data["redirect_uri"] = _resolve_oauth_redirect_uri(
                 provider_name, provider_config
             )
             data["scope"] = (
                 " ".join(
-                    scope for scope in provider_config.default_scopes or [] if scope
+                    stripped
+                    for scope in provider_config.default_scopes or []
+                    if isinstance(scope, str) and (stripped := scope.strip())
                 )
                 or "longlife_refresh_token"
             )

@@ -18,6 +18,15 @@ setup_proxy_env()
 
 mcp = FastMCP("deputy-mcp")
 
+# This connector wraps Deputy's V1 "Resource API" (/api/v1/resource/*),
+# which Deputy's own docs mark as "in maintenance mode -- new integrations
+# should prefer the V2 API" (developer.deputy.com/reference/searchemployee-1
+# and sibling pages). V2 (developer.deputy.com/docs/new-employee-api-beta)
+# only covers Employee management today, with no Roster/Timesheet/Leave
+# equivalent yet -- V1 is the only way to cover this connector's actual
+# scope (rosters, timesheets, leave, and generic resource querying), so
+# this is a deliberate choice, not an oversight. Revisit if V2 gains
+# coverage for the object types this connector needs.
 DEFAULT_TIMEOUT_SECONDS = 30
 # Matches zoom.py's/salesforce.py's convention: an error body that isn't
 # the expected shape (e.g. an HTML gateway error page) must not be
@@ -218,11 +227,18 @@ def deputy_list_resource(resource: str) -> str:
     try:
         safe_resource = url_path_id(resource, "resource")
         result = _request("GET", f"/resource/{safe_resource}")
-        if result is None:
+        if result is None or result == {}:
             # A JSON `null` body is a common REST idiom for "no records" (an
             # ASP.NET-style API serializing a null collection reference
             # rather than an empty array) -- treated the same as [], not as
-            # an unexpected shape.
+            # an unexpected shape. `{}` is included too: _request() itself
+            # normalizes a 204 or empty-content 200 response (Deputy's own
+            # backend already serializes "no records" inconsistently, per
+            # the null case above) to `{}`, not `[]` or `None` -- that
+            # normalization is shared with deputy_get_resource/
+            # deputy_get_current_user, where `{}` is instead a genuinely
+            # valid dict result, so it can't be changed at the source
+            # without breaking those two.
             result = []
         if not isinstance(result, list):
             # Distinct from "genuinely zero records" (an empty list, or
@@ -295,8 +311,10 @@ def deputy_query_resource(
         if join:
             body["join"] = join
         result = _request("POST", f"/resource/{safe_resource}/QUERY", json_data=body)
-        if result is None:
-            # See deputy_list_resource's identical null-to-empty-list check.
+        if result is None or result == {}:
+            # See deputy_list_resource's identical null/empty-to-empty-list
+            # check (also covers _request()'s 204/empty-content -> {}
+            # normalization).
             result = []
         if not isinstance(result, list):
             # See deputy_list_resource's identical check: distinct from

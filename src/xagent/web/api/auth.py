@@ -2337,7 +2337,11 @@ def generic_oauth_callback(
             # be reflected in the authorize URL but not here. Revisit if
             # one is ever added.
             data["scope"] = (
-                " ".join(scope for scope in db_provider.default_scopes or [] if scope)
+                " ".join(
+                    stripped
+                    for scope in db_provider.default_scopes or []
+                    if isinstance(scope, str) and (stripped := scope.strip())
+                )
                 or "longlife_refresh_token"
             )
         headers = {"Content-Type": "application/x-www-form-urlencoded"}

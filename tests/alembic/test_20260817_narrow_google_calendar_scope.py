@@ -267,7 +267,8 @@ def test_offline_postgresql_downgrade_emits_literal_update_only_sql() -> None:
     # "auth/calendar" alone is a substring of both OLD_SCOPES and NEW_SCOPES
     # ("auth/calendar.events"), so it can't distinguish which one was
     # emitted; assert the narrower scope is absent to catch a swapped
-    # OLD_SCOPES/NEW_SCOPES argument in downgrade()'s _apply_scope() call.
+    # OLD_SCOPES/NEW_SCOPES argument in downgrade()'s _set_calendar_scopes()
+    # call.
     assert "auth/calendar" in sql
     assert "calendar.events" not in sql
     assert "INSERT INTO public_mcp_apps" not in sql
@@ -305,7 +306,7 @@ def test_offline_sqlite_downgrade_round_trips_json_scope_value() -> None:
     assert json.loads(stored[0]) == OLD_SCOPES
 
 
-def test_migration_scope_matches_registry() -> None:
+def test_migration_fields_match_registry() -> None:
     from xagent.web.builtin_mcp_registry import get_builtin_public_mcp_app_rows
 
     migration = _load_migration_module()

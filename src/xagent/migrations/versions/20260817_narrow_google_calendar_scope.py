@@ -50,8 +50,9 @@ def _columns_present(
 ) -> bool:
     """Whether ``table_name`` exists and has all of ``required_columns``.
 
-    Shared by upgrade() and downgrade(): this migration must be a no-op (not
-    an error) against a database mid-way through a schema this old, or an
+    Used by _set_calendar_scopes()'s online branch, called from both
+    upgrade() and downgrade(): this migration must be a no-op (not an
+    error) against a database mid-way through a schema this old, or an
     admin's reduced-schema table, rather than assume a table shape that
     matches only the current model.
     """
@@ -71,11 +72,18 @@ def _offline_scopes_literal(scopes: Sequence[str], dialect_name: str) -> object:
     return serialized_literal
 
 
-def _apply_scope(scopes: Sequence[str]) -> None:
-    # oauth_scopes is in admin_mcp's _BUILTIN_PROTECTED_FIELDS, so an
-    # operator can never have customized it via the admin PATCH endpoint --
-    # safe to overwrite unconditionally, with no prior-value check, in both
-    # directions.
+def _set_calendar_scopes(scopes: Sequence[str]) -> None:
+    """Write ``scopes`` to the google-calendar row's oauth_scopes column.
+
+    oauth_scopes is in admin_mcp's _BUILTIN_PROTECTED_FIELDS, so an operator
+    can never have customized it via the admin PATCH endpoint -- safe to
+    overwrite unconditionally, with no prior-value check, in both
+    directions. Handles both the online and offline (``--sql``) paths itself
+    -- unlike the sibling migrations' ``_set_<app>_scopes(bind, scopes)``
+    helpers, this one has no live ``bind`` to take as a parameter until
+    after the as_sql check below, since none of those siblings support
+    offline SQL generation.
+    """
     if op.get_context().as_sql:
         dialect_name = op.get_context().dialect.name
         statement = (
@@ -98,8 +106,8 @@ def _apply_scope(scopes: Sequence[str]) -> None:
 
 
 def upgrade() -> None:
-    _apply_scope(NEW_SCOPES)
+    _set_calendar_scopes(NEW_SCOPES)
 
 
 def downgrade() -> None:
-    _apply_scope(OLD_SCOPES)
+    _set_calendar_scopes(OLD_SCOPES)

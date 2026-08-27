@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 from ....file_ref import final_deliverable_file_reference_instructions
@@ -959,6 +959,11 @@ class DAGPattern(AgentPattern):
                 OUTPUT_LANGUAGE_METADATA_KEY
             ):
                 child_context.metadata[OUTPUT_LANGUAGE_METADATA_KEY] = output_language
+            self._refresh_restored_step_instruction(
+                child_context,
+                root_context=root_context,
+                step=step,
+            )
         else:
             child_context = root_context.create_child_context(
                 metadata={
@@ -1895,6 +1900,27 @@ class DAGPattern(AgentPattern):
         self.planned_user_message_count = len(root_user_messages)
         self.status = "running"
         return True
+
+    def _refresh_restored_step_instruction(
+        self,
+        child_context: Any,
+        *,
+        root_context: Any,
+        step: PlanStep,
+    ) -> None:
+        """Re-emit the instruction message of a checkpoint-restored step.
+
+        The instruction bakes the output language policy into message content,
+        which the metadata-only checkpoint migration cannot reach.
+        """
+        instruction = self._step_instruction(root_context=root_context, step=step)
+        for index, message in enumerate(child_context.messages):
+            metadata = getattr(message, "metadata", None) or {}
+            if (
+                metadata.get("kind") == "dag_step_instruction"
+                and message.content != instruction
+            ):
+                child_context.messages[index] = replace(message, content=instruction)
 
     @staticmethod
     def _refresh_restored_step_runtime_metadata(

@@ -122,6 +122,10 @@ def test_upgrade_skips_when_catalog_table_is_absent() -> None:
         with patch.object(migration, "op", _operations(connection)):
             migration.upgrade()
 
+        # Not just "didn't raise": confirm it truly no-op'd rather than, say,
+        # creating the table it was supposed to find missing.
+        assert sa.inspect(connection).get_table_names() == []
+
 
 def test_upgrade_skips_when_oauth_scopes_column_is_absent() -> None:
     migration = _load_migration_module()
@@ -165,6 +169,33 @@ def test_downgrade_restores_the_full_calendar_scope(tmp_path) -> None:
         scopes = _scopes_by_app_id(connection, table)
 
     assert scopes["google-calendar"] == OLD_SCOPES
+
+
+def test_downgrade_restores_the_full_calendar_scope_without_touching_other_apps(
+    tmp_path,
+) -> None:
+    migration = _load_migration_module()
+    engine = sa.create_engine(f"sqlite:///{tmp_path / 'test.db'}")
+    metadata = sa.MetaData()
+    table = _public_mcp_apps(metadata)
+    metadata.create_all(engine)
+
+    with engine.begin() as connection:
+        connection.execute(
+            sa.insert(table),
+            [
+                {"app_id": "google-calendar", "oauth_scopes": NEW_SCOPES},
+                {"app_id": "gmail", "oauth_scopes": ["gmail-scope"]},
+            ],
+        )
+
+        with patch.object(migration, "op", _operations(connection)):
+            migration.downgrade()
+
+        scopes = _scopes_by_app_id(connection, table)
+
+    assert scopes["google-calendar"] == OLD_SCOPES
+    assert scopes["gmail"] == ["gmail-scope"]
 
 
 def test_offline_postgresql_upgrade_emits_literal_update_only_sql() -> None:
@@ -236,7 +267,7 @@ def test_offline_postgresql_downgrade_emits_literal_update_only_sql() -> None:
     # "auth/calendar" alone is a substring of both OLD_SCOPES and NEW_SCOPES
     # ("auth/calendar.events"), so it can't distinguish which one was
     # emitted; assert the narrower scope is absent to catch a swapped
-    # OLD_SCOPES/NEW_SCOPES argument in _downgrade_offline().
+    # OLD_SCOPES/NEW_SCOPES argument in downgrade()'s _apply_scope() call.
     assert "auth/calendar" in sql
     assert "calendar.events" not in sql
     assert "INSERT INTO public_mcp_apps" not in sql
@@ -272,6 +303,19 @@ def test_offline_sqlite_downgrade_round_trips_json_scope_value() -> None:
 
     assert stored is not None
     assert json.loads(stored[0]) == OLD_SCOPES
+
+
+def test_migration_scope_matches_registry() -> None:
+    from xagent.web.builtin_mcp_registry import get_builtin_public_mcp_app_rows
+
+    migration = _load_migration_module()
+    registry_row = next(
+        row
+        for row in get_builtin_public_mcp_app_rows()
+        if row["app_id"] == "google-calendar"
+    )
+
+    assert list(migration.NEW_SCOPES) == registry_row["oauth_scopes"]
 
 
 def test_revision_metadata() -> None:

@@ -3,8 +3,15 @@
 The Calendar connector's tools (search/create/get/update/delete) only ever
 operate on events, never on calendar list management, so the full
 ``.../auth/calendar`` scope requested more access than the feature set uses.
-This updates the persisted built-in catalog row to match the narrower scope
-now declared in ``builtin_mcp_registry.py``.
+
+For a builtin app, the scope actually requested at authorize time is sourced
+live from ``builtin_mcp_registry.py``, not from this table -- this migration
+only converges the persisted ``public_mcp_apps.oauth_scopes`` row so
+``validate_builtin_public_mcp_apps`` stops reporting drift against that
+registry value on an already-seeded database. It deliberately does not touch
+already-issued ``user_oauth`` grants: narrowing a scope doesn't require
+re-consent for a token that already has the (now broader) old scope to keep
+working, so there's nothing to invalidate.
 
 Revision ID: 20260817_narrow_google_calendar_scope
 Revises: 20260825_add_slack_channels_join_scope
@@ -19,6 +26,8 @@ import sqlalchemy as sa
 from alembic import op
 
 revision: str = "20260817_narrow_google_calendar_scope"
+# This re-cut PR was rebased onto main after 20260825_add_slack_channels_join_scope
+# landed, which is why this (earlier-dated) revision's parent has a later date.
 down_revision: Union[str, None] = "20260825_add_slack_channels_join_scope"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
@@ -31,6 +40,7 @@ PUBLIC_MCP_APPS_TABLE = sa.table(
 )
 
 APP_ID = "google-calendar"
+REQUIRED_COLUMNS = {"app_id", "oauth_scopes"}
 OLD_SCOPES = ("https://www.googleapis.com/auth/calendar",)
 NEW_SCOPES = ("https://www.googleapis.com/auth/calendar.events",)
 
@@ -52,63 +62,44 @@ def _columns_present(
     return required_columns.issubset(columns)
 
 
-def _offline_scopes_literal(scopes: Sequence[str], dialect_name: str):
-    # Match the online sa.JSON binding contract (none_as_null=False) used
-    # elsewhere in this migration set: values are stored as JSON, not as a
-    # bare SQL string literal, on every supported dialect.
+def _offline_scopes_literal(scopes: Sequence[str], dialect_name: str) -> object:
+    # Match the online sa.JSON binding contract: values are stored as JSON,
+    # not as a bare SQL string literal, on every supported dialect.
     serialized_literal = op.inline_literal(json.dumps(scopes))
     if dialect_name == "postgresql":
         return sa.cast(serialized_literal, sa.JSON())
     return serialized_literal
 
 
-def _upgrade_offline() -> None:
-    dialect_name = op.get_context().dialect.name
-    statement = (
+def _apply_scope(scopes: Sequence[str]) -> None:
+    # oauth_scopes is in admin_mcp's _BUILTIN_PROTECTED_FIELDS, so an
+    # operator can never have customized it via the admin PATCH endpoint --
+    # safe to overwrite unconditionally, with no prior-value check, in both
+    # directions.
+    if op.get_context().as_sql:
+        dialect_name = op.get_context().dialect.name
+        statement = (
+            sa.update(PUBLIC_MCP_APPS_TABLE)
+            .where(PUBLIC_MCP_APPS_TABLE.c.app_id == op.inline_literal(APP_ID))
+            .values(oauth_scopes=_offline_scopes_literal(scopes, dialect_name))
+        )
+        op.execute(statement)
+        return
+
+    bind = op.get_bind()
+    if not _columns_present(bind, "public_mcp_apps", REQUIRED_COLUMNS):
+        return
+
+    bind.execute(
         sa.update(PUBLIC_MCP_APPS_TABLE)
-        .where(PUBLIC_MCP_APPS_TABLE.c.app_id == op.inline_literal(APP_ID))
-        .values(oauth_scopes=_offline_scopes_literal(NEW_SCOPES, dialect_name))
+        .where(PUBLIC_MCP_APPS_TABLE.c.app_id == APP_ID)
+        .values(oauth_scopes=scopes)
     )
-    op.execute(statement)
 
 
 def upgrade() -> None:
-    if op.get_context().as_sql:
-        _upgrade_offline()
-        return
-
-    bind = op.get_bind()
-    if not _columns_present(bind, "public_mcp_apps", {"app_id", "oauth_scopes"}):
-        return
-
-    bind.execute(
-        sa.update(PUBLIC_MCP_APPS_TABLE)
-        .where(PUBLIC_MCP_APPS_TABLE.c.app_id == APP_ID)
-        .values(oauth_scopes=NEW_SCOPES)
-    )
-
-
-def _downgrade_offline() -> None:
-    dialect_name = op.get_context().dialect.name
-    statement = (
-        sa.update(PUBLIC_MCP_APPS_TABLE)
-        .where(PUBLIC_MCP_APPS_TABLE.c.app_id == op.inline_literal(APP_ID))
-        .values(oauth_scopes=_offline_scopes_literal(OLD_SCOPES, dialect_name))
-    )
-    op.execute(statement)
+    _apply_scope(NEW_SCOPES)
 
 
 def downgrade() -> None:
-    if op.get_context().as_sql:
-        _downgrade_offline()
-        return
-
-    bind = op.get_bind()
-    if not _columns_present(bind, "public_mcp_apps", {"app_id", "oauth_scopes"}):
-        return
-
-    bind.execute(
-        sa.update(PUBLIC_MCP_APPS_TABLE)
-        .where(PUBLIC_MCP_APPS_TABLE.c.app_id == APP_ID)
-        .values(oauth_scopes=OLD_SCOPES)
-    )
+    _apply_scope(OLD_SCOPES)

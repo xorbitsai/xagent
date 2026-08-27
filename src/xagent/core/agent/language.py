@@ -7,8 +7,6 @@ from typing import Any, Literal
 OUTPUT_LANGUAGE_METADATA_KEY = "output_language"
 OUTPUT_LANGUAGE_SOURCE_METADATA_KEY = "output_language_source"
 OUTPUT_LANGUAGE_SOURCE_PLAN = "dag_plan"
-# Written by AutoPattern before the answering model owned the response language.
-_LEGACY_OUTPUT_LANGUAGE_SOURCE_ROUTER = "auto_router"
 
 _ALLOWED_RESPONSE_LANGUAGE_LABELS = frozenset(
     {
@@ -320,38 +318,28 @@ def detect_prose_script_mismatch(
     return mismatch
 
 
-def clear_router_owned_output_language(checkpoint_payload: Any) -> None:
-    """Drop agent-chosen output languages from a restored checkpoint payload.
+def reset_output_language_to_request_context(checkpoint_payload: Any) -> None:
+    """Keep only the ``output_language`` that ``request_context`` can prove.
 
     Every ``metadata`` dict in the payload is visited, so serialized child
-    contexts inside a pattern state are migrated too. A resume skips the router
-    decision that used to clear this key, so a pre-upgrade label would otherwise
-    survive as a hard instruction.
+    contexts inside a pattern state are migrated too. Any label an internal
+    component derived is dropped regardless of its recorded source: a resume
+    skips the decision that produced it, so it would otherwise survive as a
+    hard instruction the current request never asked for.
     """
     if isinstance(checkpoint_payload, list):
         for item in checkpoint_payload:
-            clear_router_owned_output_language(item)
+            reset_output_language_to_request_context(item)
         return
     if not isinstance(checkpoint_payload, dict):
         return
     for key, value in checkpoint_payload.items():
         if key == "metadata" and isinstance(value, dict):
-            _clear_router_owned_metadata_language(value)
-        clear_router_owned_output_language(value)
+            _reset_metadata_output_language(value)
+        reset_output_language_to_request_context(value)
 
 
-def _clear_router_owned_metadata_language(metadata: dict[str, Any]) -> None:
-    label = normalize_response_language_label(
-        str(metadata.get(OUTPUT_LANGUAGE_METADATA_KEY) or "")
-    )
-    source = str(metadata.get(OUTPUT_LANGUAGE_SOURCE_METADATA_KEY) or "")
-    # An unlabelled value either predates the source key or came from the API
-    # caller; only request_context can prove the latter, so it is re-read below.
-    router_owned = source == _LEGACY_OUTPUT_LANGUAGE_SOURCE_ROUTER or (
-        bool(label) and not source and metadata.get("pattern") != "dag_plan_execute"
-    )
-    if not router_owned:
-        return
+def _reset_metadata_output_language(metadata: dict[str, Any]) -> None:
     metadata.pop(OUTPUT_LANGUAGE_METADATA_KEY, None)
     metadata.pop(OUTPUT_LANGUAGE_SOURCE_METADATA_KEY, None)
     request_context = metadata.get("request_context")

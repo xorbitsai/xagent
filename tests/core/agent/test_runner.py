@@ -1842,6 +1842,48 @@ async def test_resume_drops_legacy_router_output_language(tmp_path: Path) -> Non
 
 
 @pytest.mark.asyncio
+async def test_resume_drops_legacy_plan_output_language(tmp_path: Path) -> None:
+    checkpoint_context = ExecutionContext(execution_id="exec-legacy-plan-language")
+    checkpoint_context.metadata["pattern"] = "dag_plan_execute"
+    checkpoint_context.metadata[OUTPUT_LANGUAGE_METADATA_KEY] = "Simplified Chinese"
+    checkpoint_context.metadata[OUTPUT_LANGUAGE_SOURCE_METADATA_KEY] = "dag_plan"
+    checkpoint_context.add_user_message("Summarize the release notes in one paragraph.")
+    child_context = ExecutionContext(execution_id="exec-legacy-plan-language_child")
+    child_context.metadata[OUTPUT_LANGUAGE_METADATA_KEY] = "Simplified Chinese"
+    child_context.metadata[OUTPUT_LANGUAGE_SOURCE_METADATA_KEY] = "dag_plan"
+    checkpoint = {
+        "context": checkpoint_context.to_dict(),
+        "pattern": "StatefulPattern",
+        "pattern_state": {
+            "output": "restored",
+            "active_step_contexts": {"step_1": child_context.to_dict()},
+        },
+    }
+    pattern = StatefulPattern()
+    runner = AgentRunner(
+        agent=Agent(name="writer", patterns=[pattern]),
+        workspace_manager=FakeWorkspaceManager(tmp_path),
+    )
+
+    result = await runner.run(
+        task=None,
+        execution_id="exec-legacy-plan-language",
+        checkpoint=checkpoint,
+    )
+
+    assert result["success"] is True
+    metadata = result["context"].metadata
+    assert OUTPUT_LANGUAGE_METADATA_KEY not in metadata
+    assert OUTPUT_LANGUAGE_SOURCE_METADATA_KEY not in metadata
+    restored_child = pattern.state["active_step_contexts"]["step_1"]["metadata"]
+    assert OUTPUT_LANGUAGE_METADATA_KEY not in restored_child
+    assert OUTPUT_LANGUAGE_SOURCE_METADATA_KEY not in restored_child
+    system_content = result["context"].get_messages_for_llm()[0]["content"]
+    assert "Output language: Simplified Chinese" not in system_content
+    assert "Summarize the release notes in one paragraph." in system_content
+
+
+@pytest.mark.asyncio
 async def test_resume_keeps_caller_supplied_output_language(tmp_path: Path) -> None:
     checkpoint_context = ExecutionContext(execution_id="exec-caller-language")
     checkpoint_context.metadata["request_context"] = {

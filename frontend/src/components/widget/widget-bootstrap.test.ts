@@ -33,6 +33,12 @@ describe("widget bootstrap", () => {
     currentScriptDescriptor = Object.getOwnPropertyDescriptor(document, "currentScript")
     document.head.innerHTML = ""
     document.body.innerHTML = ""
+    // innerHTML resets don't touch inline styles on body itself, and it's
+    // shared across every test in this file (not just the panel-resize
+    // describe below) -- reset here, not just in a nested beforeEach, so any
+    // test anywhere in the file that touches these can't leak into another.
+    document.body.style.userSelect = ""
+    document.body.style.cursor = ""
     localStorage.setItem("xagent_guest_id", "guest-fixed")
     vi.stubGlobal("fetch", fetchMock)
     fetchMock.mockReset()
@@ -151,10 +157,7 @@ describe("widget bootstrap", () => {
 
     beforeEach(() => {
       originalInnerWidth = window.innerWidth
-      // innerHTML resets don't touch inline styles on body itself, and it's
-      // shared across every test in this file.
-      document.body.style.userSelect = ""
-      document.body.style.cursor = ""
+      // userSelect/cursor are reset in the outer beforeEach above.
       fetchMock.mockResolvedValue(new Response(JSON.stringify({
         ticket: "ticket/one",
         agent_id: 17,
@@ -416,7 +419,14 @@ describe("widget bootstrap", () => {
       firePointerEvent(handle(), "pointerdown", { pointerId: 24, clientX: 300, button: 2 })
 
       expect(document.body.style.userSelect).toBe("")
+      expect(document.body.style.cursor).toBe("")
       expect(widgetIframe().style.pointerEvents).toBe("")
+      // Proves dragState itself was never created, not just that these three
+      // particular side effects happen to be unset: if the button guard were
+      // moved after dragState's assignment, this assertion alone wouldn't
+      // catch it, but a subsequent move actually changing the width would.
+      firePointerEvent(handle(), "pointermove", { pointerId: 24, clientX: 100 })
+      expect(panel().style.width).toBe("380px")
     })
 
     it("ignores a second concurrent pointer without disrupting the first pointer's drag", () => {
@@ -587,6 +597,26 @@ describe("widget bootstrap", () => {
       expect(localStorage.getItem("xagent_widget_width")).toBeNull()
     })
 
+    it("tears down when the panel is removed directly, without container itself leaving the DOM", async () => {
+      // Regression coverage for subtree: true. A remove() on .xagent-widget-
+      // container (used by every other teardown test in this file) is
+      // already a direct childList change on document.body, so it would
+      // pass even with the narrower { childList: true } this diff replaced.
+      // Removing panel out from under container, while container stays put,
+      // only shows up as a *subtree* mutation of document.body -- this is
+      // the one scenario that actually distinguishes the two.
+      runWidget({ "data-widget-key": "widget-secret" })
+      document.body.style.userSelect = "text"
+
+      firePointerEvent(handle(), "pointerdown", { pointerId: 25, clientX: 300 })
+      expect(document.body.style.userSelect).toBe("none")
+
+      panel().remove()
+      await Promise.resolve()
+
+      expect(document.body.style.userSelect).toBe("text")
+    })
+
     it("never starts a new drag if the same panel node is later re-inserted into the DOM", async () => {
       runWidget({ "data-widget-key": "widget-secret" })
       const container = document.querySelector(".xagent-widget-container")!
@@ -619,7 +649,12 @@ describe("widget bootstrap", () => {
       const detachedPanel = panel()
 
       function addedListener(spy: typeof winAddSpy, type: string) {
-        return spy.mock.calls.find(([calledType]) => calledType === type)?.[1]
+        const matches = spy.mock.calls.filter(([calledType]) => calledType === type)
+        // Fail loudly on zero or multiple matches rather than silently
+        // returning undefined (a legal, if useless, arg to
+        // toHaveBeenCalledWith) or picking an arbitrary one of several.
+        expect(matches).toHaveLength(1)
+        return matches[0][1]
       }
       // Captured before removal so removeEventListener can be checked
       // against the *exact* function reference that was added -- not just

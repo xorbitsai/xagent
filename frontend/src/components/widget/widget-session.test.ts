@@ -268,7 +268,19 @@ describe("widget session mode", () => {
     runWidget({ "data-encrypted-context": GRANT })
 
     expect(iframeEl()?.src).toBe(`${HOST}/widget/chat/session`)
-    expect(observeSpy).toHaveBeenCalledWith(document.body, { childList: true, subtree: true })
+    // Two MutationObservers now exist in session mode: the widget's own
+    // panel-removal teardown (armed before mode.attach runs) and this
+    // controller's iframe-connectivity one, both on document.body with the
+    // same options -- so "was called with these args" alone no longer pins
+    // this controller's own observer specifically. Assert every observe()
+    // call has the expected target/options, so a regression in either one
+    // (e.g. this controller's own observer losing `subtree`) still fails
+    // here instead of being masked by the other happening to be correct.
+    expect(observeSpy).toHaveBeenCalledTimes(2)
+    observeSpy.mock.calls.forEach(([target, options]) => {
+      expect(target).toBe(document.body)
+      expect(options).toEqual({ childList: true, subtree: true })
+    })
     expect(fetchMock).toHaveBeenCalledTimes(1)
     expect(fetchMock).toHaveBeenCalledWith(EXCHANGE_URL, expect.objectContaining({
       method: "POST",

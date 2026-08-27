@@ -2001,6 +2001,48 @@ async def test_remote_runtime_connection_exception_retains_safe_unavailable_conf
 
 
 @pytest.mark.asyncio
+async def test_remote_runtime_connection_none_gets_connect_apps_app_name(
+    db_session, monkeypatch
+):
+    """A remote-transport oauth_token_required failure (no resolver hook, no
+    delegated connection, build_mcp_runtime_connection returns connection=None)
+    must still resolve app_info -> app_name, the same as every other
+    failure_code="oauth_token_required" call site in this file."""
+    from xagent.web.services.mcp_runtime import (
+        MCPRuntimeConnectionBuild,
+        mcp_oauth_runtime_diagnostic,
+    )
+
+    db, user = db_session
+    remote_server = _add_remote_server(db, user, name="Remote Records")
+
+    async def connection_is_none(*args, **kwargs):
+        return MCPRuntimeConnectionBuild(
+            connection=None,
+            diagnostic=mcp_oauth_runtime_diagnostic(
+                remote_server,
+                code="authorization_required",
+                message="MCP OAuth runtime requires a valid grant",
+            ),
+        )
+
+    monkeypatch.setattr(
+        "xagent.web.services.mcp_runtime.build_mcp_runtime_connection",
+        connection_is_none,
+    )
+
+    configs = await _tool_config(db, user).get_mcp_server_configs()
+
+    _assert_unavailable_mcp_config(
+        configs[0],
+        remote_server,
+        reason="authorization_required",
+        oauth_token_required=True,
+    )
+    assert configs[0]["config"]["app_name"] == "Remote Records"
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("resolved", "exception_type"),
     [

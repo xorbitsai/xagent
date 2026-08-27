@@ -3386,6 +3386,12 @@ class WebToolConfig(BaseToolConfig):
                 runtime_values=runtime_values,
             )
             resolver, registration_generation = _get_oauth_token_resolver_hook()
+            # None until actually needed: a server whose delegated/static
+            # connection succeeds must not pay for a DB lookup it never uses
+            # (see test_remote_without_hook_skips_resolver_candidate_work).
+            # The `runtime_build.connection is None` fallback below resolves
+            # it lazily on the one path that actually needs it.
+            app_info = None
             remote_providers_to_resolve: list[str] = []
             remote_configured_resource: str | None = None
             remote_hook_token: _ResolvedHookToken | None = None
@@ -3491,6 +3497,9 @@ class WebToolConfig(BaseToolConfig):
                             message=UNAVAILABLE_MCP_CREDENTIAL_MESSAGE,
                             diagnostic=diagnostic,
                             failure_code="oauth_token_required",
+                            app_info=app_info
+                            if app_info is not None
+                            else get_app_for_mcp_server(self.db, server),
                         )
                     transport_config.update(
                         connection_to_transport_config(runtime_build.connection)

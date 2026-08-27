@@ -20,6 +20,7 @@ from typing import (
     Optional,
     Protocol,
     Sequence,
+    TypeAlias,
     Tuple,
     Union,
     runtime_checkable,
@@ -287,6 +288,10 @@ FilterExpression = Union[
     "tuple[FilterExpression, ...]",  # AND combination
     "list[FilterExpression]",  # OR combination
 ]
+
+# API-facing filters may use the legacy dictionary form or the normalized
+# backend-agnostic expression form.
+FilterInput: TypeAlias = Union[Dict[str, Any], FilterExpression]
 
 
 class MetadataStore(ABC):

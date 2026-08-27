@@ -34,6 +34,7 @@ from .operation_compatibility import (
 )
 
 if TYPE_CHECKING:
+    from ..storage.contracts import FilterInput
     from .collection_handle import LanceDBCollectionHandle
     from .coordinator import KBCoordinator
     from .storage_shim import KBStorageShimCompatibilityFacade
@@ -565,7 +566,7 @@ class KBLegacyStepCompatibilityFacade:
         query_vector: List[float],
         *,
         top_k: int = 10,
-        filters: Optional[Dict[str, Any]] = None,
+        filters: Optional[FilterInput] = None,
         readonly: bool = False,
         nprobes: Optional[int] = None,
         refine_factor: Optional[int] = None,
@@ -598,7 +599,7 @@ class KBLegacyStepCompatibilityFacade:
         query_vector: List[float],
         *,
         top_k: int = 10,
-        filters: Optional[Dict[str, Any]] = None,
+        filters: Optional[FilterInput] = None,
         readonly: bool = False,
         nprobes: Optional[int] = None,
         refine_factor: Optional[int] = None,
@@ -634,7 +635,7 @@ class KBLegacyStepCompatibilityFacade:
         query_text: str,
         *,
         top_k: int,
-        filters: Optional[Dict[str, Any]] = None,
+        filters: Optional[FilterInput] = None,
         readonly: bool = False,
         nprobes: Optional[int] = None,
         refine_factor: Optional[int] = None,
@@ -667,7 +668,7 @@ class KBLegacyStepCompatibilityFacade:
         query_text: str,
         *,
         top_k: int,
-        filters: Optional[Dict[str, Any]] = None,
+        filters: Optional[FilterInput] = None,
         readonly: bool = False,
         nprobes: Optional[int] = None,
         refine_factor: Optional[int] = None,
@@ -704,7 +705,7 @@ class KBLegacyStepCompatibilityFacade:
         query_vector: List[float],
         *,
         top_k: int = 10,
-        filters: Optional[Dict[str, Any]] = None,
+        filters: Optional[FilterInput] = None,
         fusion_config: Optional[FusionConfig] = None,
         readonly: bool = False,
         nprobes: Optional[int] = None,

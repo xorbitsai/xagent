@@ -12,6 +12,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pandas as pd
 import pytest
 
+from xagent.core.tools.core.RAG_tools.core.exceptions import DocumentValidationError
 from xagent.core.tools.core.RAG_tools.core.schemas import (
     DenseSearchResponse,
     IndexStatus,
@@ -19,6 +20,10 @@ from xagent.core.tools.core.RAG_tools.core.schemas import (
 )
 from xagent.core.tools.core.RAG_tools.kb.collection_handle import (
     LanceDBCollectionHandle,
+)
+from xagent.core.tools.core.RAG_tools.storage.contracts import (
+    FilterCondition,
+    FilterOperator,
 )
 
 
@@ -134,6 +139,50 @@ async def test_search_dense_async_success():
     assert kwargs["user_id"] == 7 and kwargs["is_admin"] is False
 
 
+@pytest.mark.parametrize(
+    "custom_filter",
+    [
+        FilterCondition("page_number", FilterOperator.GTE, 2),
+        (
+            FilterCondition("page_number", FilterOperator.GTE, 2),
+            FilterCondition("section", FilterOperator.EQ, "intro"),
+        ),
+        [
+            FilterCondition("page_number", FilterOperator.EQ, 1),
+            FilterCondition("page_number", FilterOperator.EQ, 2),
+        ],
+    ],
+)
+def test_search_dense_preserves_prebuilt_filter_expression(custom_filter):
+    handle, _, store, _ = _make_handle()
+    store.create_index.return_value = _index_result()
+    store.search_vectors_by_model.return_value = []
+
+    handle.search_dense("model-x", [0.1], filters=custom_filter)
+
+    filter_expr = store.search_vectors_by_model.call_args.kwargs["filters"]
+    assert isinstance(filter_expr, tuple)
+    assert filter_expr[1] == custom_filter
+
+
+@pytest.mark.asyncio
+async def test_search_dense_async_preserves_or_filter_expression():
+    handle, _, store, _ = _make_handle()
+    store.create_index.return_value = _index_result()
+    store.search_vectors_by_model_async = AsyncMock(return_value=[])
+    custom_filter = [
+        FilterCondition("page_number", FilterOperator.EQ, 1),
+        FilterCondition("page_number", FilterOperator.EQ, 2),
+    ]
+
+    await handle.search_dense_async("model-x", [0.1], filters=custom_filter)
+
+    filter_expr = store.search_vectors_by_model_async.call_args.kwargs["filters"]
+    assert isinstance(filter_expr, tuple)
+    assert isinstance(filter_expr[1], list)
+    assert filter_expr[1] == custom_filter
+
+
 # ---------------------------------------------------------------------------
 # Sparse search tests
 # ---------------------------------------------------------------------------
@@ -174,6 +223,112 @@ def test_search_sparse_fts_hit_scores_normalized():
     assert resp.status == "success"
     assert resp.fts_enabled is True
     assert resp.results[0].score == pytest.approx(0.75)  # 3/(1+3)
+
+
+def test_search_sparse_preserves_or_filter_expression():
+    handle, _, store, _ = _make_handle()
+    table = MagicMock()
+    store.open_embeddings_table.return_value = (table, "embeddings_model-x")
+    store.create_index.return_value = _index_result()
+    store.build_filter_expression.return_value = "filter"
+    table.search.return_value.limit.return_value.where.return_value.to_pandas.return_value = pd.DataFrame(
+        [
+            {
+                "doc_id": "d1",
+                "chunk_id": "c1",
+                "text": "hello",
+                "parse_hash": "h",
+                "created_at": "2026",
+                "metadata": None,
+                "_score": 1.0,
+            }
+        ]
+    )
+    custom_filter = [
+        FilterCondition("page_number", FilterOperator.EQ, 1),
+        FilterCondition("page_number", FilterOperator.EQ, 2),
+    ]
+
+    handle.search_sparse(
+        "model-x", "hello", top_k=3, filters=custom_filter, is_admin=True
+    )
+
+    filter_expr = store.build_filter_expression.call_args.kwargs["filters"]
+    assert isinstance(filter_expr, tuple)
+    assert isinstance(filter_expr[1], list)
+    assert filter_expr[1] == custom_filter
+
+
+def test_substring_fallback_applies_legacy_operator_and_user_scope():
+    handle, _, _, _ = _make_handle()
+    table = MagicMock()
+    batch = MagicMock()
+    batch.to_pandas.return_value = pd.DataFrame(
+        {
+            "collection": ["col1", "col1", "col1"],
+            "doc_id": ["d1", "d2", "d3"],
+            "chunk_id": ["c1", "c2", "c3"],
+            "text": ["needle", "needle", "needle"],
+            "parse_hash": ["h1", "h2", "h3"],
+            "created_at": ["2026", "2026", "2026"],
+            "metadata": [None, None, None],
+            "page_number": [1, 2, 3],
+            "user_id": [7, 7, 8],
+        }
+    )
+    table.to_batches.return_value = [batch]
+
+    results = handle._substring_fallback(
+        table=table,
+        collection="col1",
+        query_text="needle",
+        model_tag="model-x",
+        top_k=5,
+        filters={"page_number": {"operator": "gte", "value": 2}},
+        current_warnings=[],
+        user_id=7,
+        is_admin=False,
+    )
+
+    assert [result.doc_id for result in results] == ["d2"]
+
+
+@pytest.mark.asyncio
+async def test_substring_fallback_async_uses_same_expression_evaluator():
+    handle, _, store, _ = _make_handle()
+    table = MagicMock()
+    store.open_embeddings_table.return_value = (table, "embeddings_model-x")
+    batch = MagicMock()
+    batch.to_pandas.return_value = pd.DataFrame(
+        {
+            "collection": ["col1", "col1"],
+            "doc_id": ["d1", "d2"],
+            "chunk_id": ["c1", "c2"],
+            "text": ["needle", "needle"],
+            "parse_hash": ["h1", "h2"],
+            "created_at": ["2026", "2026"],
+            "metadata": [None, None],
+            "page_number": [1, 2],
+        }
+    )
+
+    async def iter_batches_async(**kwargs):
+        yield batch
+
+    store.iter_batches_async = iter_batches_async
+
+    results = await handle._substring_fallback_async(
+        model_tag="model-x",
+        collection="col1",
+        query_text="needle",
+        top_k=5,
+        filters={"page_number": {"operator": "gte", "value": 2}},
+        current_warnings=[],
+        user_id=7,
+        is_admin=False,
+    )
+
+    assert [result.doc_id for result in results] == ["d2"]
 
 
 # ---------------------------------------------------------------------------
@@ -353,6 +508,14 @@ async def test_search_hybrid_async_capability_unsupported():
     assert resp.status == "failed"
     assert any(w.code == "SEARCH_NOT_SUPPORTED" for w in resp.warnings)
     assert resp.dense_count == 0 and resp.sparse_count == 0
+
+
+@pytest.mark.asyncio
+async def test_search_hybrid_async_validates_inputs_before_fan_out():
+    handle, _, _, _ = _make_handle()
+
+    with pytest.raises(DocumentValidationError):
+        await handle.search_hybrid_async("model-x", "", [0.1], top_k=5)
 
 
 @pytest.mark.asyncio

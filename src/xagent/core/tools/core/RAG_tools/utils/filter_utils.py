@@ -8,7 +8,12 @@ from __future__ import annotations
 
 from typing import Any, Dict, Optional
 
-from ..storage.contracts import FilterCondition, FilterExpression, FilterOperator
+from ..storage.contracts import (
+    FilterCondition,
+    FilterExpression,
+    FilterInput,
+    FilterOperator,
+)
 
 
 def validate_filter_depth(
@@ -44,6 +49,8 @@ def validate_filter_depth(
         elif isinstance(e, list):
             for item in e:
                 _check_depth(item, depth + 1)
+        else:
+            raise TypeError(f"Unsupported filter expression: {type(e).__name__}")
 
     _check_depth(expr)
 
@@ -84,20 +91,27 @@ def parse_legacy_filters(
         "lte": FilterOperator.LTE,
         "in": FilterOperator.IN,
         "contains": FilterOperator.CONTAINS,
+        "is_null": FilterOperator.IS_NULL,
+        "is_not_null": FilterOperator.IS_NOT_NULL,
     }
 
     conditions: list[FilterCondition] = []
     for field, spec in filters.items():
-        if isinstance(spec, dict) and "operator" in spec and "value" in spec:
+        if isinstance(spec, dict) and "operator" in spec:
             op_str = str(spec["operator"]).lower()
             if op_str not in op_map:
                 raise ValueError(
                     f"Unknown filter operator: {op_str}. Supported operators: {sorted(op_map.keys())}"
                 )
+            operator = op_map[op_str]
+            if operator in {FilterOperator.IS_NULL, FilterOperator.IS_NOT_NULL}:
+                value = None
+            elif "value" not in spec:
+                raise ValueError(f"Filter operator '{op_str}' requires a value")
+            else:
+                value = spec["value"]
             conditions.append(
-                FilterCondition(
-                    field=field, operator=op_map[op_str], value=spec["value"]
-                )
+                FilterCondition(field=field, operator=operator, value=value)
             )
         else:
             conditions.append(
@@ -107,3 +121,50 @@ def parse_legacy_filters(
     if len(conditions) == 1:
         return conditions[0]
     return tuple(conditions)
+
+
+def normalize_filter_input(
+    filters: Optional[FilterInput],
+    max_depth: int = 10,
+) -> Optional[FilterExpression]:
+    """Normalize API-facing filters without changing boolean composition.
+
+    Legacy dictionaries are parsed into ``FilterCondition`` objects. Existing
+    expressions are copied recursively so tuple/AND and list/OR semantics remain
+    intact and malformed expression members fail at the boundary.
+    """
+    if filters is None or filters == {}:
+        return None
+
+    def _normalize(expr: FilterExpression) -> FilterExpression:
+        if isinstance(expr, FilterCondition):
+            return expr
+        if isinstance(expr, tuple):
+            if not expr:
+                raise ValueError("AND filter expression cannot be empty")
+            return tuple(_normalize(item) for item in expr)
+        if isinstance(expr, list):
+            if not expr:
+                raise ValueError("OR filter expression cannot be empty")
+            return [_normalize(item) for item in expr]
+        raise TypeError(f"Unsupported filter expression: {type(expr).__name__}")
+
+    normalized = (
+        parse_legacy_filters(filters)
+        if isinstance(filters, dict)
+        else _normalize(filters)
+    )
+    validate_filter_depth(normalized, max_depth=max_depth)
+    return normalized
+
+
+def combine_filter_expressions(
+    *expressions: Optional[FilterExpression],
+) -> Optional[FilterExpression]:
+    """Combine complete filter expressions with AND without flattening them."""
+    present = tuple(expression for expression in expressions if expression is not None)
+    if not present:
+        return None
+    if len(present) == 1:
+        return present[0]
+    return present

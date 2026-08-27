@@ -10,7 +10,9 @@ from typing import List
 from unittest.mock import Mock, patch
 
 import pandas as pd
+import pytest
 
+from xagent.core.tools.core.RAG_tools.core.exceptions import DocumentValidationError
 from xagent.core.tools.core.RAG_tools.core.schemas import (
     SearchFallbackAction,
     SearchResult,
@@ -25,6 +27,34 @@ search_sparse_module = importlib.import_module(
 
 class TestSearchSparse:
     """Test search_sparse main function."""
+
+    @pytest.mark.parametrize(
+        "kwargs",
+        [
+            {"collection": "", "model_tag": "model", "query_text": "query", "top_k": 1},
+            {"collection": "docs", "model_tag": "", "query_text": "query", "top_k": 1},
+            {"collection": "docs", "model_tag": "model", "query_text": "", "top_k": 1},
+            {
+                "collection": "docs",
+                "model_tag": "model",
+                "query_text": "query",
+                "top_k": 0,
+            },
+        ],
+    )
+    def test_search_sparse_validates_public_inputs(self, kwargs: dict) -> None:
+        with pytest.raises(DocumentValidationError):
+            search_sparse_module.search_sparse(**kwargs)
+
+    @pytest.mark.asyncio
+    async def test_search_sparse_async_validates_public_inputs(self) -> None:
+        with pytest.raises(DocumentValidationError):
+            await search_sparse_module.search_sparse_async(
+                collection="docs",
+                model_tag="model",
+                query_text="",
+                top_k=1,
+            )
 
     def test_search_sparse_success_no_filters(self, make_handle, routed_facade) -> None:
         """Test successful sparse search with collection filter only (KB isolation).
@@ -602,6 +632,7 @@ class TestSearchSparse:
             top_k=5,
             filters=None,
             current_warnings=warnings,
+            is_admin=True,
         )
 
         # Verify results were found and warning was added

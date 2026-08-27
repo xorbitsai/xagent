@@ -5,13 +5,19 @@ full-text search results using RRF or linear weighted combination.
 """
 
 import logging
-from typing import TYPE_CHECKING, Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Dict, List, Optional
 
 from ..core.schemas import (
     FusionConfig,
     HybridSearchResponse,
     SearchResult,
 )
+from ..storage.contracts import FilterInput
+from ..utils.validation_utils import (
+    validate_search_common_inputs,
+    validate_search_query_text,
+)
+from ..vector_storage.vector_manager import validate_query_vector
 
 if TYPE_CHECKING:
     from ..kb import KBLegacyStepCompatibilityFacade
@@ -179,7 +185,7 @@ def search_hybrid(
     query_vector: List[float],
     *,
     top_k: int = 10,
-    filters: Optional[Dict[str, Any]] = None,
+    filters: Optional[FilterInput] = None,
     fusion_config: Optional[FusionConfig] = None,
     readonly: bool = False,
     nprobes: Optional[int] = None,
@@ -188,6 +194,9 @@ def search_hybrid(
     is_admin: bool = False,
 ) -> HybridSearchResponse:
     """Performs hybrid search, combining dense and sparse retrieval."""
+    validate_search_common_inputs(collection, model_tag, top_k)
+    validate_search_query_text(query_text)
+    validate_query_vector(query_vector)
     return _get_legacy_step_compatibility_facade().search_hybrid(
         collection=collection,
         model_tag=model_tag,

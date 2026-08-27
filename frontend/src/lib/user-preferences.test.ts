@@ -122,4 +122,40 @@ describe("markOnboardingSaveEscaped / consumeOnboardingSaveEscapeFlag", () => {
       Object.defineProperty(window, "sessionStorage", { configurable: true, value: original })
     }
   })
+
+  // Pins the 30s TTL added as defense-in-depth on top of the ordering fix:
+  // a flag that's somehow still unconsumed after this long (a future caller
+  // that stops consuming it promptly, a tab left open mid-navigation) must
+  // expire rather than silently suppress an unrelated, much later redirect.
+  it("consume returns false once the flag is older than the TTL, and still clears it", () => {
+    vi.useFakeTimers()
+    try {
+      markOnboardingSaveEscaped()
+      vi.advanceTimersByTime(30_001)
+
+      expect(consumeOnboardingSaveEscapeFlag()).toBe(false)
+      expect(window.sessionStorage.getItem("xagent-onboarding-save-escape")).toBeNull()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it("consume still returns true just under the TTL boundary", () => {
+    vi.useFakeTimers()
+    try {
+      markOnboardingSaveEscaped()
+      vi.advanceTimersByTime(29_999)
+
+      expect(consumeOnboardingSaveEscapeFlag()).toBe(true)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it("consume returns false and clears a non-numeric stored value", () => {
+    window.sessionStorage.setItem("xagent-onboarding-save-escape", "not-a-timestamp")
+
+    expect(consumeOnboardingSaveEscapeFlag()).toBe(false)
+    expect(window.sessionStorage.getItem("xagent-onboarding-save-escape")).toBeNull()
+  })
 })

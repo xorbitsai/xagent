@@ -52,18 +52,22 @@ const STEP_GROUP: Record<StepId, number> = STEP_GROUPS.reduce((acc, group, group
   return acc;
 }, {} as Record<StepId, number>);
 
-// persistAndLeave gives up and navigates anyway after this many consecutive
-// failures saving to the SAME destination, rather than trapping the user on
-// this full-screen page forever. 2 (not 1): a single transient blip
-// shouldn't skip the "retry once in place" step entirely; not higher, since
-// this is the only page in the app with no other navigation affordance if
-// the backend really is down.
+// Shared by persistAndLeave's exits AND handleLaunch's "Start with X": both
+// give up and proceed anyway after this many consecutive failures saving to
+// the same bucket, rather than trapping the user on this full-screen page
+// forever. 2 (not 1): a single transient blip shouldn't skip the "retry once
+// in place" step entirely; not higher, since this is the only page in the
+// app with no other navigation affordance if the backend really is down.
 const MAX_SAVE_FAILURES_BEFORE_ESCAPE = 2;
+// handleLaunch's fixed, non-URL bucket in saveFailureCountByDestRef - see
+// the comment on that ref for why it can't use a real destination key.
+const LAUNCH_FAILURE_KEY = "__launch__";
 
 // The category ring/dot colors below are the reference UI's fixed literal
-// values (onboarding.html's [data-cat] rules), not the app's theme tokens -
-// this whole page is a one-off bespoke screen matched pixel-for-pixel against
-// that reference, same reasoning as the .ob-* styles further down.
+// values (onboarding.html's [data-cat] rules), deliberately left un-themed:
+// each color is this category's fixed identity (a small solid dot, a low-alpha
+// ring tint), not text-on-background contrast that shifts per theme - unlike
+// the .ob-* styles further down, which now mostly use theme tokens.
 const CATEGORY_STYLE: Record<string, { ring: string; dot: string }> = {
   Marketing: { ring: "rgba(192,57,159,.18)", dot: "#C0399F" },
   Support: { ring: "rgba(37,54,224,.18)", dot: "#2536E0" },
@@ -119,13 +123,16 @@ export default function OnboardingPage() {
   const [launching, setLaunching] = useState(false);
   const launchingRef = useRef(false);
   const isMountedRef = useRef(true);
-  // Consecutive persistAndLeave save failures, keyed by destination - see the
-  // escape hatch there. Per-destination (not one global count): "/task" and
-  // "/templates" represent genuinely different user intents, and a failure
-  // on one shouldn't spend down the other's own first-attempt retry-in-place
-  // chance. header Skip -> "/task"; goals-step and done-step skip both ->
-  // "/templates", which is intentional (both mean the same "leave to browse
-  // templates" exit, just from different steps).
+  // Consecutive save failures, keyed by "destination" - see the escape
+  // hatches in persistAndLeave/handleLaunch below. Per-destination (not one
+  // global count): "/task" and "/templates" represent genuinely different
+  // user intents, and a failure on one shouldn't spend down the other's own
+  // first-attempt retry-in-place chance. header Skip -> "/task"; goals-step
+  // and done-step skip both -> "/templates", which is intentional (both mean
+  // the same "leave to browse templates" exit, just from different steps).
+  // LAUNCH_FAILURE_KEY is the one non-URL entry: "Start with X" doesn't know
+  // its real destination (an existing agent vs. a freshly hired one) until
+  // after the save succeeds, so it gets its own fixed bucket instead.
   const saveFailureCountByDestRef = useRef<Record<string, number>>({});
 
   useEffect(() => {
@@ -211,18 +218,27 @@ export default function OnboardingPage() {
   const isBusinessValid = work !== "" && (work !== "other" || industry.trim() !== "");
   const isGoalsValid = goals.length > 0;
   const isTeamValid = agentTemplateId !== "";
+
   // "professional" is a real, legitimate voice choice, not an empty
   // placeholder - so unlike goals (empty array = clearly untouched), the
   // default value alone can't distinguish "user picked this" from "user
   // never got here." Only include it once the voice step has actually been
   // reached, so e.g. the header Skip (reachable from any step at any time)
   // can't persist a policy the user never saw.
-  const hasReachedVoice = stepIndex >= STEP_ORDER.indexOf("voice");
+  //
+  // A latch, not a live `stepIndex >= indexOf("voice")` comparison: the
+  // latter briefly looked right but silently DROPPED an already-made choice
+  // the moment the user pressed Back past the voice step - reaching voice,
+  // picking one, going back to team, then hitting the header Skip lost the
+  // pick entirely, the same class of bug this round fixed for goals/voice
+  // in the other direction (persisting a choice never made).
+  const hasReachedVoiceRef = useRef(false);
 
   const goTo = (index: number) => {
     const clamped = Math.max(0, Math.min(STEP_ORDER.length - 1, index));
     setStepIndex(clamped);
     lastVisitedInGroupRef.current[STEP_GROUP[STEP_ORDER[clamped]]] = clamped;
+    if (STEP_ORDER[clamped] === "voice") hasReachedVoiceRef.current = true;
   };
   const next = () => goTo(stepIndex + 1);
   const back = () => goTo(stepIndex - 1);
@@ -239,7 +255,7 @@ export default function OnboardingPage() {
     ...(work ? { department: work } : {}),
     ...(work === "other" && industry.trim() ? { industry: industry.trim() } : {}),
     ...(goals.length ? { goals } : {}),
-    ...(hasReachedVoice ? { voice } : {}),
+    ...(hasReachedVoiceRef.current ? { voice } : {}),
   });
 
   // Matches the reference UI's finish() exactly: every exit path (header
@@ -302,12 +318,18 @@ export default function OnboardingPage() {
     setLaunching(true);
     try {
       const saved = await updateUserPreferences(buildPreferencesPayload());
+      // Set only right before whichever navigation below actually fires, not
+      // here: the freshness re-check and hireAgentFromTemplate are both still
+      // ahead and can throw, and self-review found that marking the flag this
+      // early leaves it dangling in sessionStorage - live, but with nothing
+      // left to navigate and consume it - if either of those throws instead.
+      let shouldMarkSaveEscape = false;
       if (!saved.ok) {
         // Same per-destination escape hatch as persistAndLeave, keyed under
         // a fixed name since this path's actual destination (an existing
         // agent vs. a freshly hired one) isn't known until after the save.
-        const failureCount = (saveFailureCountByDestRef.current["launch"] ?? 0) + 1;
-        saveFailureCountByDestRef.current["launch"] = failureCount;
+        const failureCount = (saveFailureCountByDestRef.current[LAUNCH_FAILURE_KEY] ?? 0) + 1;
+        saveFailureCountByDestRef.current[LAUNCH_FAILURE_KEY] = failureCount;
         if (isMountedRef.current) toast.error(t("onboarding.done.saveFailed"));
         // Don't proceed to hire on the FIRST failure: onboarded would stay
         // false server-side, and AuthGuard would just bounce the user right
@@ -323,13 +345,16 @@ export default function OnboardingPage() {
           }
           return;
         }
-        markOnboardingSaveEscaped();
+        shouldMarkSaveEscape = true;
       } else {
-        saveFailureCountByDestRef.current["launch"] = 0;
+        saveFailureCountByDestRef.current[LAUNCH_FAILURE_KEY] = 0;
       }
 
       if (selected.hired && selected.hired_agent_id) {
-        if (isMountedRef.current) router.replace(`/agent/${selected.hired_agent_id}`);
+        if (isMountedRef.current) {
+          if (shouldMarkSaveEscape) markOnboardingSaveEscaped();
+          router.replace(`/agent/${selected.hired_agent_id}`);
+        }
         return;
       }
 
@@ -349,7 +374,10 @@ export default function OnboardingPage() {
         if (freshCheck.ok) {
           const freshTemplate = (await freshCheck.json()) as TemplateDetail;
           if (freshTemplate.hired && freshTemplate.hired_agent_id) {
-            if (isMountedRef.current) router.replace(`/agent/${freshTemplate.hired_agent_id}`);
+            if (isMountedRef.current) {
+              if (shouldMarkSaveEscape) markOnboardingSaveEscaped();
+              router.replace(`/agent/${freshTemplate.hired_agent_id}`);
+            }
             return;
           }
         }
@@ -369,6 +397,7 @@ export default function OnboardingPage() {
         connections: selected.connections,
       });
       if (!isMountedRef.current) return;
+      if (shouldMarkSaveEscape) markOnboardingSaveEscaped();
       router.replace(`/task/${result.taskId}`);
     } catch {
       if (!isMountedRef.current) return;
@@ -609,7 +638,9 @@ export default function OnboardingPage() {
                           sizeClassName="h-[84px] w-[84px]"
                           textClassName="text-[33px]"
                           className="ob-tm-av"
-                          style={{ boxShadow: `0 0 0 1px #F0F0F4, 0 0 0 5px #fff, 0 0 0 6px ${ring}` }}
+                          style={{
+                            boxShadow: `0 0 0 1px hsl(var(--border)), 0 0 0 5px hsl(var(--card)), 0 0 0 6px ${ring}`,
+                          }}
                         />
                         <div className="ob-tm-name">{template.persona.name}</div>
                         <div className="ob-tm-role">{template.persona.role}</div>
@@ -701,7 +732,9 @@ export default function OnboardingPage() {
                         sizeClassName="h-[62px] w-[62px]"
                         textClassName="text-2xl"
                         className="ob-tm-av"
-                        style={{ boxShadow: `0 0 0 1px #F0F0F4, 0 0 0 4px #fff, 0 0 0 5px ${ring}` }}
+                        style={{
+                          boxShadow: `0 0 0 1px hsl(var(--border)), 0 0 0 4px hsl(var(--card)), 0 0 0 5px ${ring}`,
+                        }}
                       />
                       <div>
                         <div className="ob-sum-nm">{persona.name}</div>

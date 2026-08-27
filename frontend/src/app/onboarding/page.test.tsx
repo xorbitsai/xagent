@@ -638,6 +638,35 @@ describe("OnboardingPage", () => {
     )
   })
 
+  // Pins a bug found in self-review: whether the voice step has been reached
+  // was a LIVE comparison against the current step index, not "has this ever
+  // happened" - so going Back past the voice step after already picking one
+  // silently dropped that choice, the same class of bug as the two tests
+  // above but in the opposite direction (losing a real choice instead of
+  // persisting one never made).
+  it("still persists voice on the header Skip after going Back past the voice step", async () => {
+    await goToWelcomeThenBusiness()
+    fireEvent.click(screen.getByText("Marketing"))
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/take off your plate/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Post on social media"))
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/Meet your AI team/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/How should/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Playful"))
+
+    // Back past voice, to "Meet your AI team".
+    fireEvent.click(screen.getByText("Back"))
+    await waitFor(() => expect(screen.getByText(/Meet your AI team/)).toBeInTheDocument())
+
+    fireEvent.click(screen.getByText("Skip setup"))
+
+    expect(updateUserPreferencesMock).toHaveBeenCalledWith(
+      expect.objectContaining({ onboarded: true, voice: "playful" })
+    )
+  })
+
   // Pins a bug found in self-review: the reference UI's finish() persists
   // whatever's been picked so far on EVERY exit path, unconditionally - this
   // page used to special-case the goals-step skip to drop goals/voice,

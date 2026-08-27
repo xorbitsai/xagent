@@ -4,6 +4,7 @@ import React, { useCallback, useEffect, useMemo, useState } from "react"
 import { Loader2, MessageSquarePlus } from "lucide-react"
 import { ChatStartScreen } from "@/components/chat/ChatStartScreen"
 import { TaskConversationPanel } from "@/components/task/task-conversation-panel"
+import { WidgetChromeControls } from "@/components/widget/widget-chrome-controls"
 import { AppProvider, useApp, type AppProviderTransportConfig } from "@/contexts/app-context-chat"
 import { resolveReportedTimezone } from "@/hooks/use-websocket"
 import { usePublicFileAccessPolicy } from "@/contexts/file-access-context"
@@ -395,16 +396,23 @@ function PublicConversationContent({
               <p className="text-xs text-destructive">{createTaskError}</p>
             )}
           </div>
-          {state.taskId && (
-            <button
-              type="button"
-              onClick={handleNewConversation}
-              title={t("widgetChat.newConversation")}
-              aria-label={t("widgetChat.newConversation")}
-              className="ml-auto p-2 rounded-md text-muted-foreground hover:text-foreground hover:bg-muted/50 transition-colors"
-            >
-              <MessageSquarePlus className="w-4 h-4" />
-            </button>
+          {(state.taskId || authMode === "widget") && (
+            <div className="ml-auto flex items-center gap-1">
+              {state.taskId && (
+                <button
+                  type="button"
+                  onClick={handleNewConversation}
+                  title={t("widgetChat.newConversation")}
+                  aria-label={t("widgetChat.newConversation")}
+                  className="p-2 rounded-md text-muted-foreground hover:text-foreground hover:bg-muted/50 transition-colors"
+                >
+                  <MessageSquarePlus className="w-4 h-4" />
+                </button>
+              )}
+              {/* The embedded widget is the only mode a host page can hide;
+                  a standalone share link has no parent to signal. */}
+              {authMode === "widget" && <WidgetChromeControls />}
+            </div>
           )}
         </div>
       </div>

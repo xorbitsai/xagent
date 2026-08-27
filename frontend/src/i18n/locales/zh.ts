@@ -516,6 +516,9 @@ const zh = {
   widgetChat: {
     title: "AI 助手",
     newConversation: "新建会话",
+    minimize: "最小化",
+    close: "关闭",
+    moreOptions: "更多选项",
     status: {
       initializing: "正在初始化...",
       connecting: "连接中...",

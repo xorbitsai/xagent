@@ -209,6 +209,29 @@
   var iconColor = scriptTag.getAttribute('data-icon-color') || '#fff';
   var panelBgColor = scriptTag.getAttribute('data-panel-bg-color') || '#fff';
 
+  // Minimized state: persisted across reloads so a visitor who left the
+  // panel open sees it reopen on their next page load. Absent/unparsable
+  // storage defaults to minimized (today's baseline: closed until the FAB
+  // is clicked), so a first-time visitor never sees an unsolicited popup.
+  var MINIMIZED_STORAGE_KEY = 'xagent_widget_minimized';
+
+  function readStoredMinimized() {
+    try {
+      return localStorage.getItem(MINIMIZED_STORAGE_KEY) !== 'false';
+    } catch (e) {
+      return true;
+    }
+  }
+
+  function persistMinimized(minimized) {
+    try {
+      localStorage.setItem(MINIMIZED_STORAGE_KEY, String(minimized));
+    } catch (e) {
+      // Storage can be unavailable (private browsing, quota); the toggle
+      // still works for the session, it just won't survive a reload.
+    }
+  }
+
   // Read by use-websocket.ts off the iframe URL, where it outranks the browser
   // zone. Optional: absent means the iframe URL is unchanged.
   var embedTimezone = (scriptTag.getAttribute('data-timezone') || '').trim();
@@ -632,14 +655,26 @@
   fab.innerHTML = chatIcon;
 
   var isOpen = false;
+
+  function openPanel() {
+    isOpen = true;
+    panel.classList.add('open');
+    fab.innerHTML = closeIcon;
+    persistMinimized(false);
+  }
+
+  function closePanel() {
+    isOpen = false;
+    panel.classList.remove('open');
+    fab.innerHTML = chatIcon;
+    persistMinimized(true);
+  }
+
   fab.onclick = function () {
-    isOpen = !isOpen;
     if (isOpen) {
-      panel.classList.add('open');
-      fab.innerHTML = closeIcon;
+      closePanel();
     } else {
-      panel.classList.remove('open');
-      fab.innerHTML = chatIcon;
+      openPanel();
     }
   };
 
@@ -658,6 +693,24 @@
   // the childList of the *old* body node that still holds container -- only
   // <html>'s own childList changes when body itself is swapped out.
   panelRemovalObserver.observe(document.documentElement, { childList: true, subtree: true });
+
+  // The header's minimize/close controls live inside the iframe's React app
+  // and have no direct handle to panel/fab, so they signal intent back here
+  // over postMessage instead. Both currently collapse to the same hide
+  // action; kept as distinct message types since they're two separately
+  // named product controls, even though today's effect is identical.
+  window.addEventListener('message', function (event) {
+    if (event.origin !== host || event.source !== iframe.contentWindow) return;
+    var data = event.data;
+    if (!data || data.xagent !== true) return;
+    if (data.type === 'widget_minimize' || data.type === 'widget_close') {
+      closePanel();
+    }
+  });
+
+  if (!readStoredMinimized()) {
+    openPanel();
+  }
 
   mode.attach(iframe);
 

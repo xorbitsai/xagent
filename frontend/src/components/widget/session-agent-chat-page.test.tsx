@@ -306,6 +306,8 @@ describe("SessionAgentChatPage", () => {
     expect(screen.queryByRole("button", {
       name: "widgetSession.startNewConversation",
     })).not.toBeInTheDocument()
+    expect(screen.getByRole("button", { name: "widgetChat.close" })).toBeInTheDocument()
+    expect(screen.getByRole("button", { name: "widgetChat.moreOptions" })).toBeInTheDocument()
   })
 
   it("renders the conversation with files disabled and gates reset on pending work", () => {

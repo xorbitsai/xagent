@@ -399,6 +399,10 @@ describe("PublicAgentChatPage", () => {
     expect(fetchMock).toHaveBeenCalledTimes(1)
     // No conversation yet — nothing to end.
     expect(screen.queryByRole("button", { name: "widgetChat.newConversation" })).toBeNull()
+    // The embedded widget's minimize/close controls render even with no
+    // active conversation — they toggle the host panel, not the chat itself.
+    expect(screen.getByRole("button", { name: "widgetChat.close" })).toBeInTheDocument()
+    expect(screen.getByRole("button", { name: "widgetChat.moreOptions" })).toBeInTheDocument()
   })
 
   it("ends the conversation and returns to the start screen", async () => {
@@ -608,6 +612,9 @@ describe("PublicAgentChatPage", () => {
     // A share visitor already has the full page; unlike the embedded widget
     // iframe, an in-tab navigation away from it is ordinary browser behavior.
     expect(app.provider?.transport?.capabilities?.linksOpenInNewTab).toBe("disabled")
+    // A share link has no parent widget.js panel to signal minimize/close to.
+    expect(screen.queryByRole("button", { name: "widgetChat.close" })).toBeNull()
+    expect(screen.queryByRole("button", { name: "widgetChat.moreOptions" })).toBeNull()
   })
 
   it("reuses a persisted, unexpired share token without re-authing", async () => {

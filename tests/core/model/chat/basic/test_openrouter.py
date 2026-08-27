@@ -1004,6 +1004,13 @@ def test_openrouter_reasoning_hook_enables_reasoning_payload(monkeypatch):
 def test_openrouter_deepseek_defaults_to_disabled_thinking(
     monkeypatch, model_name, is_streaming, response_format
 ):
+    """The undeclared-ability half of a declared/undeclared contrast pair.
+
+    This model record never declares ``thinking_mode``, so every request
+    shape here keeps the disabled default. See
+    ``test_openrouter_deepseek_declared_thinking_ability_leaves_default_open``
+    for the same shapes with the ability declared.
+    """
     monkeypatch.setenv("XAGENT_OPENROUTER_OFFICIAL_PROVIDERS_ONLY", "false")
     llm = OpenRouterLLM(
         model_name=model_name,
@@ -1025,6 +1032,63 @@ def test_openrouter_deepseek_defaults_to_disabled_thinking(
         "reasoning": {"enabled": False},
         "thinking": {"type": "disabled"},
     }
+
+
+@pytest.mark.parametrize(
+    ("is_streaming", "response_format", "expected_extra"),
+    [
+        (False, None, {}),
+        (
+            False,
+            {"type": "json_object"},
+            {"reasoning": {"enabled": False}, "thinking": {"type": "disabled"}},
+        ),
+        (True, None, {}),
+        (
+            True,
+            {"type": "json_object"},
+            {"reasoning": {"enabled": False}, "thinking": {"type": "disabled"}},
+        ),
+    ],
+)
+@pytest.mark.parametrize(
+    "model_name",
+    [
+        "deepseek/deepseek-v4-flash",
+        "openrouter/deepseek/deepseek-v4-flash",
+    ],
+)
+def test_openrouter_deepseek_declared_thinking_ability_leaves_default_open(
+    monkeypatch, model_name, is_streaming, response_format, expected_extra
+):
+    """The declared-ability half of a declared/undeclared contrast pair.
+
+    A model record that declares ``thinking_mode`` gets nothing sent for an
+    unspecified request, except when the request asks for structured
+    output -- streaming or not -- which stays disabled: that branch is only
+    reached when the caller specified no thinking configuration at all, and
+    the declared ability says the operator wants reasoning, not that they
+    want it mixed into a JSON body. See
+    ``test_openrouter_deepseek_defaults_to_disabled_thinking`` for the same
+    shapes without the ability declared.
+    """
+    monkeypatch.setenv("XAGENT_OPENROUTER_OFFICIAL_PROVIDERS_ONLY", "false")
+    llm = OpenRouterLLM(
+        model_name=model_name,
+        api_key="test-key",
+        abilities=["chat", "tool_calling", "thinking_mode"],
+    )
+
+    extra_body = llm._prepare_provider_reasoning_extra_body(
+        extra_body={"trace_id": "abc"},
+        thinking=None,
+        tools=None,
+        response_format=response_format,
+        output_config=None,
+        is_streaming=is_streaming,
+    )
+
+    assert extra_body == {"trace_id": "abc", **expected_extra}
 
 
 def test_openrouter_deepseek_structured_streaming_disables_thinking(monkeypatch):
@@ -1153,6 +1217,79 @@ async def test_structured_output_retry_disables_openrouter_reasoning(
     second_call = mock_client.chat.completions.create.call_args_list[1].kwargs
     assert second_call["extra_body"]["reasoning"] == {"enabled": False}
     assert second_call["extra_body"]["thinking"] == {"type": "disabled"}
+
+
+@pytest.mark.asyncio
+async def test_openrouter_deepseek_default_thinking_triggers_structured_degrade_resend(
+    mocker, monkeypatch
+):
+    """The structured-output degrade resend above is triggered by the
+    response's own reasoning_content, not by what this call requested -- so
+    it also fires when the caller passes no ``thinking`` at all. The
+    mandatory reasoning-disable for structured output does not depend on
+    whether this call's model record declares the thinking ability either,
+    so the first request already carries the disable payload; the degrade
+    resend exists because this endpoint reasoned anyway, ignoring that
+    payload, and it repeats the same disable ask on the resend.
+    """
+    monkeypatch.setenv("XAGENT_OPENROUTER_OFFICIAL_PROVIDERS_ONLY", "false")
+
+    first_message = SimpleNamespace(
+        content="not json",
+        tool_calls=None,
+        reasoning_content="reasoning here",
+    )
+    second_message = SimpleNamespace(
+        content='{"status": "ok"}',
+        tool_calls=None,
+        reasoning_content=None,
+    )
+    first_response = SimpleNamespace(
+        choices=[SimpleNamespace(message=first_message)],
+        usage=None,
+        model_dump=lambda: {"id": "openrouter-default-first"},
+    )
+    second_response = SimpleNamespace(
+        choices=[SimpleNamespace(message=second_message)],
+        usage=None,
+        model_dump=lambda: {"id": "openrouter-default-second"},
+    )
+
+    mock_client = mocker.AsyncMock()
+    mock_client.chat.completions.create.side_effect = [first_response, second_response]
+    mocker.patch(
+        "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+        return_value=mock_client,
+    )
+
+    llm = OpenRouterLLM(
+        model_name="deepseek/deepseek-v4-flash",
+        api_key="test-key",
+        abilities=["chat", "tool_calling", "thinking_mode"],
+    )
+
+    result = await llm.chat(
+        [{"role": "user", "content": "Return JSON"}],
+        response_format={"type": "json_object"},
+    )
+
+    assert result["content"] == '{"status": "ok"}'
+    assert mock_client.chat.completions.create.await_count == 2
+    disabled = {
+        "reasoning": {"enabled": False},
+        "thinking": {"type": "disabled"},
+    }
+    # The structured-output rule already asked for no reasoning on the way
+    # out; this endpoint reasoned anyway. The degrade resend is the second
+    # line of defence for exactly that, and it repeats the same ask.
+    assert (
+        mock_client.chat.completions.create.call_args_list[0].kwargs["extra_body"]
+        == disabled
+    )
+    assert (
+        mock_client.chat.completions.create.call_args_list[1].kwargs["extra_body"]
+        == disabled
+    )
 
 
 # ==========================================================================
@@ -1777,6 +1914,74 @@ async def test_openrouter_deepseek_no_op_thinking_retry_falls_through_to_next_ru
     assert second_call["extra_body"]["thinking"] == {"type": "enabled"}
 
 
+@pytest.mark.asyncio
+async def test_openrouter_deepseek_declared_thinking_makes_disable_retry_a_real_fix(
+    mocker, monkeypatch
+):
+    """Mirror of the no-op test above: once the model record declares
+    ``thinking_mode``, DeepSeek's unspecified default no longer renders as
+    disabled, so the "disable thinking" rule (2) is a real change against
+    this same combined error and gets to fire instead of being skipped as a
+    no-op.
+
+    The endpoint modelled here is the one the error text describes: it
+    refuses every request that does not ask for reasoning explicitly. So the
+    disable attempt this fallthrough now spends is rejected in turn, and
+    recovery costs three upstream requests -- the unspecified first attempt,
+    the disable attempt, and the enable attempt that finally succeeds.
+    """
+    monkeypatch.setenv("XAGENT_OPENROUTER_OFFICIAL_PROVIDERS_ONLY", "false")
+    combined_error = (
+        "Reasoning is mandatory for this endpoint and cannot be disabled, "
+        "and thinking conflicts with tool_choice here."
+    )
+    success_response = SimpleNamespace(
+        choices=[
+            SimpleNamespace(
+                message=SimpleNamespace(
+                    content="ok", tool_calls=None, reasoning_content=None
+                )
+            )
+        ],
+        usage=None,
+        model_dump=lambda: {"id": "openrouter-declared-noop"},
+    )
+    mock_client = mocker.AsyncMock()
+    mock_client.chat.completions.create.side_effect = [
+        RuntimeError(combined_error),
+        RuntimeError(combined_error),
+        success_response,
+    ]
+    mocker.patch(
+        "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+        return_value=mock_client,
+    )
+    llm = OpenRouterLLM(
+        model_name="deepseek/deepseek-v4-flash",
+        api_key="test-key",
+        abilities=["chat", "tool_calling", "thinking_mode"],
+    )
+
+    result = await llm.chat(
+        [{"role": "user", "content": "score?"}],
+        tools=_two_tool_schema(),
+        tool_choice="required",
+    )
+
+    assert result["content"] == "ok"
+    calls = mock_client.chat.completions.create.call_args_list
+    assert mock_client.chat.completions.create.await_count == 3
+    assert "extra_body" not in calls[0].kwargs
+    assert calls[1].kwargs["extra_body"] == {
+        "reasoning": {"enabled": False},
+        "thinking": {"type": "disabled"},
+    }
+    assert calls[2].kwargs["extra_body"] == {
+        "reasoning": {"enabled": True},
+        "thinking": {"type": "enabled"},
+    }
+
+
 # ==========================================================================
 # Client-layer equivalents of the RouterLLM-level retry tests that used to
 # live in tests/core/model/test_router_provider_config.py (moved here because
@@ -2022,6 +2227,44 @@ async def test_openrouter_deepseek_stream_no_op_thinking_default_propagates(mock
     assert calls == 1
 
 
+@pytest.mark.asyncio
+async def test_openrouter_deepseek_declared_thinking_stream_spends_disable_retry(
+    mocker, monkeypatch
+):
+    """Mirror of the no-op test above: once the model record declares
+    ``thinking_mode``, DeepSeek's unspecified default no longer renders as
+    disabled, so the disable-thinking retry (rule 2) is a real change and
+    actually spends its budget before the request fails for good.
+    """
+    monkeypatch.setenv("XAGENT_OPENROUTER_OFFICIAL_PROVIDERS_ONLY", "false")
+    seen: list = []
+
+    async def rejects():
+        if False:
+            yield None
+        raise RuntimeError(_THINKING_TOOL_CHOICE_ERROR)
+
+    def fake_inner(*_args, **kwargs):
+        seen.append(kwargs.get("thinking"))
+        return rejects()
+
+    llm = OpenRouterLLM(
+        model_name="deepseek/deepseek-v4-flash",
+        api_key="test-key",
+        abilities=["chat", "tool_calling", "thinking_mode"],
+    )
+    mocker.patch.object(llm, "_stream_chat_inner", side_effect=fake_inner)
+
+    with pytest.raises(RuntimeError, match="Thinking mode does not support"):
+        async for _chunk in llm.stream_chat(
+            [{"role": "user", "content": "score?"}],
+            tool_choice="required",
+        ):
+            pass
+
+    assert seen == [None, openrouter_module._DISABLE_DOWNSTREAM_THINKING]
+
+
 # ---------------------------------------------------------------------------
 # DeepSeek reasoning-content replay on OpenRouter (issue #1537).
 #
@@ -2029,9 +2272,11 @@ async def test_openrouter_deepseek_stream_no_op_thinking_default_propagates(mock
 # OpenRouterLLM via ``deepseek_tool_protocol``'s shared functions. The
 # direct-DeepSeek side of that same mechanism keeps its own coverage in
 # test_deepseek.py, and test_openai.py holds the negative case pinning that
-# a plain OpenAI-compatible client captures nothing. Whether thinking should
-# default to enabled for deepseek slugs is a separate question and is not
-# decided by any test here.
+# a plain OpenAI-compatible client captures nothing. Whether a deepseek slug
+# is asked to disable reasoning when the caller says nothing is decided by
+# the model record's declared abilities; the request-payload tests around
+# ``test_openrouter_deepseek_defaults_to_disabled_thinking`` pin both rows
+# of that contrast.
 # ---------------------------------------------------------------------------
 
 
@@ -2155,6 +2400,73 @@ async def test_openrouter_deepseek_captures_reasoning_alias_from_raw(mocker):
     assert result[PROVIDER_STATE_METADATA_KEY] == _deepseek_provider_state(
         "alt-spelling-thinking"
     )
+
+
+@pytest.mark.asyncio
+async def test_openrouter_deepseek_declared_thinking_captures_and_replays_without_request_thinking(
+    mocker,
+):
+    """The path PR-2 opens: a model record that declares ``thinking_mode``
+    gets reasoning captured and replayed across a tool-call chain even when
+    neither request in the chain passes ``thinking`` at all.
+    """
+    first = _openrouter_tool_call_response(
+        reasoning_content="Use the search tool first"
+    )
+    second = SimpleNamespace(
+        choices=[
+            SimpleNamespace(
+                message=SimpleNamespace(
+                    content="done", tool_calls=None, reasoning_content=None
+                )
+            )
+        ],
+        usage=None,
+        model_dump=lambda: {"id": "openrouter-second-turn"},
+    )
+    mock_client = mocker.AsyncMock()
+    mock_client.chat.completions.create.side_effect = [first, second]
+    mocker.patch(
+        "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+        return_value=mock_client,
+    )
+    llm = OpenRouterLLM(
+        model_name="deepseek/deepseek-v4-flash",
+        api_key="test-key",
+        abilities=["chat", "tool_calling", "thinking_mode"],
+    )
+
+    round1 = await llm.chat(
+        [{"role": "user", "content": "Search xagent"}],
+        tools=_single_tool_schema("search"),
+    )
+    assert (
+        "extra_body" not in mock_client.chat.completions.create.call_args_list[0].kwargs
+    )
+    assert round1[PROVIDER_STATE_METADATA_KEY] == _deepseek_provider_state(
+        "Use the search tool first"
+    )
+
+    messages = [
+        {"role": "user", "content": "Search xagent"},
+        {
+            "role": "assistant",
+            "content": "",
+            PROVIDER_STATE_METADATA_KEY: round1[PROVIDER_STATE_METADATA_KEY],
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "search", "arguments": "{}"},
+                }
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call_1", "content": "result"},
+    ]
+    await llm.chat(messages, tools=_single_tool_schema("search"))
+    sent = mock_client.chat.completions.create.call_args_list[1].kwargs["messages"]
+    assert sent[1]["reasoning_content"] == "Use the search tool first"
+    assert PROVIDER_STATE_METADATA_KEY not in sent[1]
 
 
 @pytest.mark.asyncio
@@ -2512,6 +2824,94 @@ async def test_openrouter_deepseek_stream_replays_reasoning_content(mocker):
     call_messages = mock_client.chat.completions.create.call_args.kwargs["messages"]
     assert call_messages[1]["reasoning_content"] == "prior thought"
     assert PROVIDER_STATE_METADATA_KEY not in call_messages[1]
+
+
+@pytest.mark.asyncio
+async def test_openrouter_deepseek_declared_thinking_stream_captures_and_replays_without_request_thinking(
+    mocker,
+):
+    """Streaming counterpart of the non-streaming capture-then-replay test.
+
+    Each half of this round trip is already pinned on its own -- streamed
+    capture, streamed replay, and the declared-ability default. What is only
+    covered here is the composition: one streamed tool-call turn captures
+    reasoning, and the next streamed turn sends it back, with neither call
+    passing ``thinking`` at all.
+    """
+
+    async def first_stream():
+        yield _reasoning_delta_chunk(reasoning_content="Use the search tool first")
+        yield _tool_call_delta_chunk(
+            call_id="call_1",
+            index=0,
+            name="search",
+            arguments='{"query":"xagent"}',
+            finish_reason="tool_calls",
+        )
+
+    async def second_stream():
+        yield _tool_call_delta_chunk(
+            call_id="call_2",
+            index=0,
+            name="search",
+            arguments='{"query":"xagent"}',
+            finish_reason="tool_calls",
+        )
+
+    mock_client = mocker.AsyncMock()
+    mock_client.chat.completions.create.side_effect = [
+        first_stream(),
+        second_stream(),
+    ]
+    mocker.patch(
+        "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+        return_value=mock_client,
+    )
+    llm = OpenRouterLLM(
+        model_name="deepseek/deepseek-v4-flash",
+        api_key="test-key",
+        abilities=["chat", "tool_calling", "thinking_mode"],
+    )
+
+    round1 = [
+        chunk
+        async for chunk in llm.stream_chat(
+            [{"role": "user", "content": "Search xagent"}],
+            tools=_single_tool_schema("search"),
+        )
+    ]
+    assert (
+        "extra_body" not in mock_client.chat.completions.create.call_args_list[0].kwargs
+    )
+    tool_chunks = [chunk for chunk in round1 if chunk.is_tool_call()]
+    assert tool_chunks, "expected at least one tool-call chunk"
+    captured = tool_chunks[-1].raw[PROVIDER_STATE_METADATA_KEY]
+    assert captured == _deepseek_provider_state("Use the search tool first")
+
+    messages = [
+        {"role": "user", "content": "Search xagent"},
+        {
+            "role": "assistant",
+            "content": "",
+            PROVIDER_STATE_METADATA_KEY: captured,
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "search", "arguments": "{}"},
+                }
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call_1", "content": "result"},
+    ]
+    async for _chunk in llm.stream_chat(messages, tools=_single_tool_schema("search")):
+        pass
+
+    second_call = mock_client.chat.completions.create.call_args_list[1].kwargs
+    assert "extra_body" not in second_call
+    sent = second_call["messages"]
+    assert sent[1]["reasoning_content"] == "Use the search tool first"
+    assert PROVIDER_STATE_METADATA_KEY not in sent[1]
 
 
 @pytest.mark.asyncio
@@ -2898,12 +3298,13 @@ async def test_openrouter_deepseek_warns_when_capture_misses_all_known_spellings
 async def test_openrouter_deepseek_no_warning_when_thinking_not_requested(
     mocker, caplog
 ):
-    """The capture-miss WARNING stays silent when thinking was not requested.
+    """The capture-miss WARNING stays silent for a model record that never
+    declared ``thinking_mode``.
 
-    Thinking is off by default for every deepseek slug, so this is the
-    highest-traffic path today. An empty capture there is the expected
-    outcome rather than a sign that the provider renamed its reasoning
-    field, and warning about it would turn the signal into noise.
+    This model record's requests still go out with an explicit disable
+    payload, so an empty reasoning capture here is the expected outcome
+    rather than a sign that the provider renamed its reasoning field, and
+    warning about it would turn the signal into noise.
     """
     import logging
 
@@ -2928,6 +3329,55 @@ async def test_openrouter_deepseek_no_warning_when_thinking_not_requested(
         "no reasoning content was captured" in record.message
         for record in caplog.records
     )
+
+
+@pytest.mark.asyncio
+async def test_openrouter_deepseek_warns_when_declared_thinking_capture_misses(
+    mocker, caplog
+):
+    """The gate this change fixes: a model record that declares
+    ``thinking_mode`` gets nothing sent on an unspecified request, so a
+    tool-call response with no captured reasoning is a real capture miss
+    and must warn, even though the caller never asked for thinking either.
+    """
+    import logging
+
+    response = _openrouter_tool_call_response(
+        reasoning_content="unset",
+        raw_message_extra={
+            "reasoning_details": [{"type": "reasoning.text", "text": "SECRET-THOUGHT"}]
+        },
+    )
+    llm = OpenRouterLLM(
+        model_name="deepseek/deepseek-v4-flash",
+        api_key="test-key",
+        abilities=["chat", "tool_calling", "thinking_mode"],
+    )
+    mock_client = mocker.AsyncMock()
+    mock_client.chat.completions.create.return_value = response
+    mocker.patch(
+        "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+        return_value=mock_client,
+    )
+
+    with caplog.at_level(
+        logging.WARNING, logger="xagent.core.model.chat.basic.openrouter"
+    ):
+        await llm.chat(
+            [{"role": "user", "content": "Search xagent"}],
+            tools=_single_tool_schema("search"),
+        )
+
+    messages = [
+        record.getMessage()
+        for record in caplog.records
+        if "no reasoning content was captured" in record.message
+    ]
+    assert len(messages) == 1
+    assert "reasoning_details" in messages[0]
+    for record in caplog.records:
+        assert "SECRET-THOUGHT" not in record.getMessage()
+        assert "Search xagent" not in record.getMessage()
 
 
 @pytest.mark.asyncio
@@ -3061,16 +3511,78 @@ async def test_openrouter_deepseek_stream_warns_when_capture_misses_all_known_sp
 
 
 @pytest.mark.asyncio
+async def test_openrouter_deepseek_stream_warns_when_declared_thinking_capture_misses(
+    mocker, caplog
+):
+    """Streaming counterpart of
+    ``test_openrouter_deepseek_warns_when_declared_thinking_capture_misses``:
+    a model record that declares ``thinking_mode`` gets nothing sent on an
+    unspecified streaming request either, so a stream that ends with a tool
+    call and no captured reasoning is a real capture miss and must warn.
+    """
+    import logging
+
+    async def stream():
+        chunk = _tool_call_delta_chunk(
+            call_id="call_1",
+            index=0,
+            name="search",
+            arguments='{"query":"xagent"}',
+            finish_reason="tool_calls",
+        )
+        chunk.choices[0].delta.reasoning_details = [
+            {"type": "reasoning.text", "text": "SECRET-THOUGHT"}
+        ]
+        yield chunk
+
+    mock_client = mocker.AsyncMock()
+    mock_client.chat.completions.create.return_value = stream()
+    mocker.patch(
+        "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+        return_value=mock_client,
+    )
+    llm = OpenRouterLLM(
+        model_name="deepseek/deepseek-v4-flash",
+        api_key="test-key",
+        abilities=["chat", "tool_calling", "thinking_mode"],
+    )
+
+    with caplog.at_level(
+        logging.WARNING, logger="xagent.core.model.chat.basic.openrouter"
+    ):
+        chunks = [
+            chunk
+            async for chunk in llm.stream_chat(
+                [{"role": "user", "content": "Search xagent"}],
+                tools=_single_tool_schema("search"),
+            )
+        ]
+
+    assert chunks
+    messages = [
+        record.getMessage()
+        for record in caplog.records
+        if "no reasoning content was captured" in record.message
+    ]
+    assert len(messages) == 1
+    assert "reasoning_details" in messages[0]
+    for record in caplog.records:
+        assert "SECRET-THOUGHT" not in record.getMessage()
+        assert "Search xagent" not in record.getMessage()
+
+
+@pytest.mark.asyncio
 async def test_openrouter_deepseek_stream_no_warning_when_thinking_not_requested(
     mocker, caplog
 ):
-    """The streaming capture-miss WARNING is silent without thinking too.
+    """The streaming capture-miss WARNING stays silent for a model record
+    that never declared ``thinking_mode``.
 
     Same rule as
-    ``test_openrouter_deepseek_no_warning_when_thinking_not_requested``: an
-    empty capture is the expected outcome, not a sign of a renamed provider
-    field, on the path where thinking was never requested -- off by default
-    for every deepseek slug, and the highest-traffic streaming path today.
+    ``test_openrouter_deepseek_no_warning_when_thinking_not_requested``: this
+    model record's requests still go out with an explicit disable payload,
+    so an empty capture here is the expected outcome, not a sign of a
+    renamed provider field.
     """
     import logging
 
@@ -3151,3 +3663,187 @@ async def test_openrouter_non_deepseek_stream_no_capture_warning(mocker, caplog)
         "no reasoning content was captured" in record.message
         for record in caplog.records
     )
+
+
+@pytest.mark.asyncio
+async def test_openrouter_deepseek_structured_non_stream_stays_disabled_and_silent(
+    mocker, caplog
+):
+    """Non-streaming half of the structured-output rule, and of the sentinel
+    agreement the streaming test below pins.
+
+    A structured request disables thinking whatever the transport, and the
+    non-streaming capture sentinel must agree, staying silent about a
+    capture it knows this request could not have produced. The model record
+    declares the ability specifically so this test can tell apart the two
+    things the sentinel could be looking at: if it ignored this call's own
+    ``response_format`` and reused the declared-ability default-open
+    answer, it would treat the missing capture as a real miss and warn.
+    """
+    import logging
+
+    response = _openrouter_tool_call_response(
+        reasoning_content="unset",
+        raw_message_extra={
+            "reasoning_details": [{"type": "reasoning.text", "text": "SECRET-THOUGHT"}]
+        },
+    )
+    mock_client = mocker.AsyncMock()
+    mock_client.chat.completions.create.return_value = response
+    mocker.patch(
+        "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+        return_value=mock_client,
+    )
+    llm = OpenRouterLLM(
+        model_name="deepseek/deepseek-v4-flash",
+        api_key="test-key",
+        abilities=["chat", "tool_calling", "thinking_mode"],
+    )
+
+    with caplog.at_level(
+        logging.WARNING, logger="xagent.core.model.chat.basic.openrouter"
+    ):
+        await llm.chat(
+            [{"role": "user", "content": "Search xagent"}],
+            tools=_single_tool_schema("search"),
+            response_format={"type": "json_object"},
+        )
+
+    assert mock_client.chat.completions.create.call_args.kwargs["extra_body"] == {
+        "reasoning": {"enabled": False},
+        "thinking": {"type": "disabled"},
+    }
+    assert not [
+        record.message
+        for record in caplog.records
+        if "no reasoning content was captured" in record.message
+    ]
+    for record in caplog.records:
+        assert "SECRET-THOUGHT" not in record.getMessage()
+
+
+@pytest.mark.asyncio
+async def test_openrouter_deepseek_structured_stream_stays_disabled_and_silent(
+    mocker, caplog
+):
+    """A structured streaming request still disables thinking unconditionally
+    even for a model record that declares ``thinking_mode`` -- and the
+    streaming capture sentinel must agree, staying silent about a capture it
+    knows this request could not have produced.
+
+    The model record here declares the ability specifically so this test can
+    tell apart the two things the streaming sentinel could be looking at: if
+    it forgot to look at this call's own ``response_format`` and instead
+    reused the declared-ability default-open answer, it would wrongly treat
+    the missing capture as a real miss and warn.
+    """
+    import logging
+
+    async def stream():
+        chunk = _tool_call_delta_chunk(
+            call_id="call_1",
+            index=0,
+            name="search",
+            arguments='{"query":"xagent"}',
+            finish_reason="tool_calls",
+        )
+        chunk.choices[0].delta.reasoning_details = [
+            {"type": "reasoning.text", "text": "SECRET-THOUGHT"}
+        ]
+        yield chunk
+
+    mock_client = mocker.AsyncMock()
+    mock_client.chat.completions.create.return_value = stream()
+    mocker.patch(
+        "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+        return_value=mock_client,
+    )
+    llm = OpenRouterLLM(
+        model_name="deepseek/deepseek-v4-flash",
+        api_key="test-key",
+        abilities=["chat", "tool_calling", "thinking_mode"],
+    )
+
+    with caplog.at_level(
+        logging.WARNING, logger="xagent.core.model.chat.basic.openrouter"
+    ):
+        chunks = [
+            chunk
+            async for chunk in llm.stream_chat(
+                [{"role": "user", "content": "Search xagent"}],
+                tools=_single_tool_schema("search"),
+                response_format={"type": "json_object"},
+            )
+        ]
+
+    assert chunks
+    assert mock_client.chat.completions.create.call_args.kwargs["extra_body"] == {
+        "reasoning": {"enabled": False},
+        "thinking": {"type": "disabled"},
+    }
+    assert not [
+        record.message
+        for record in caplog.records
+        if "no reasoning content was captured" in record.message
+    ]
+
+
+@pytest.mark.asyncio
+async def test_openrouter_deepseek_response_format_resend_stays_silent(mocker, caplog):
+    """The capture sentinel must judge the resent request, not the caller's.
+
+    When the endpoint rejects ``response_format`` with a 400, ``OpenAILLM.chat``
+    drops it and resends -- but reuses the extra_body it already built while
+    ``response_format`` was still set, so the resend still goes out with
+    thinking disabled. The sentinel must recognize that: if it instead looked
+    at the now-cleared ``response_format`` local, it would conclude the resend
+    left thinking open and wrongly warn about a missing capture on this
+    tool-call response.
+    """
+    import logging
+
+    response = _openrouter_tool_call_response(
+        reasoning_content="unset",
+        raw_message_extra={
+            "reasoning_details": [{"type": "reasoning.text", "text": "SECRET-THOUGHT"}]
+        },
+    )
+    mock_client = mocker.AsyncMock()
+    mock_client.chat.completions.create.side_effect = [
+        _bad_request_error(
+            "the model does not support response_format for this request"
+        ),
+        response,
+    ]
+    mocker.patch(
+        "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+        return_value=mock_client,
+    )
+    llm = OpenRouterLLM(
+        model_name="deepseek/deepseek-v4-flash",
+        api_key="test-key",
+        abilities=["chat", "tool_calling", "thinking_mode"],
+    )
+
+    with caplog.at_level(
+        logging.WARNING, logger="xagent.core.model.chat.basic.openrouter"
+    ):
+        await llm.chat(
+            [{"role": "user", "content": "Search xagent"}],
+            tools=_single_tool_schema("search"),
+            response_format={"type": "json_object"},
+        )
+
+    assert mock_client.chat.completions.create.await_count == 2
+    for call in mock_client.chat.completions.create.call_args_list:
+        assert call.kwargs["extra_body"] == {
+            "reasoning": {"enabled": False},
+            "thinking": {"type": "disabled"},
+        }
+    assert not [
+        record.message
+        for record in caplog.records
+        if "no reasoning content was captured" in record.message
+    ]
+    for record in caplog.records:
+        assert "SECRET-THOUGHT" not in record.getMessage()

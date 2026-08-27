@@ -208,7 +208,7 @@ export function ClarificationForm({
           description: typeof opt?.description === "string" ? opt.description : undefined,
           action_type: typeof opt?.action_type === "string" ? opt.action_type : undefined,
         }))
-        .filter((opt: { value: string; label: string }) => opt.value && opt.label)
+        .filter((opt: { value: string; label: string }) => opt.value.trim() !== "" && opt.label.trim() !== "")
       return {
         ...interaction,
         type,

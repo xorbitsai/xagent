@@ -407,7 +407,7 @@ def get_builtin_public_mcp_app_rows() -> list[dict[str, Any]]:
             "transport": "oauth",
             "provider_name": "google",
             "category": "Scheduling",
-            "oauth_scopes": ["https://www.googleapis.com/auth/calendar"],
+            "oauth_scopes": ["https://www.googleapis.com/auth/calendar.events"],
             "is_visible_in_connector": True,
             "launch_config": {
                 "command": "python",

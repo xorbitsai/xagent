@@ -168,8 +168,103 @@ class ToolCallRecord:
         )
 
 
+# Every code point that Python's str.strip() or JavaScript's
+# String.prototype.trim() treats as trimmable: ECMA-262 WhiteSpace (TAB VT FF
+# ZWNBSP + Unicode Zs) and LineTerminator (LF CR LS PS), unioned with the five
+# extra code points CPython's str.strip() treats as whitespace (U+001C-U+001F,
+# U+0085).
+#
+# The table is frozen as a literal instead of derived from CPython's
+# whitespace table for two reasons: (1) this invariant runs in the direction
+# "whatever JavaScript trims, we must also trim", and CPython's whitespace
+# table shifts with the Unicode version bundled in each interpreter release;
+# (2) the normalized value is written back into item["field"], and the
+# frontend's own trim() must be a no-op on the result -- that only holds
+# while this table is a superset of the JavaScript table, which the coverage
+# test in tests/core/agent/test_react.py pins down.
+#
+# Every code point is written as an escape, never a literal: several of them
+# (U+2028/U+2029 in particular) are silently rewritten by some editors and
+# transports when they appear as literal bytes.
+_INTERACTION_TRIM_CHARS = (
+    "\t\n\v\f\r\x1c\x1d\x1e\x1f\x20\x85\xa0"
+    "\u1680\u2000\u2001\u2002\u2003\u2004\u2005"
+    "\u2006\u2007\u2008\u2009\u200a"
+    "\u2028\u2029\u202f\u205f\u3000\ufeff"
+)  # 30 code points
+
+
+def _normalize_interaction_text(value: str) -> str:
+    """Strip every code point either Python or JavaScript treats as trimmable.
+
+    One pass over one union table, deliberately -- not ``value.strip()``
+    followed by a second pass over the JavaScript-only characters.
+
+    One pass is a fixed point by construction: ``str.strip(chars)`` deletes
+    from both ends up to the first character not in ``chars``, so the
+    returned value's first and last characters are, by definition, not in
+    ``chars``; stripping the same ``chars`` again is the identity. That is
+    what lets the caller write the result back into ``item["field"]`` and
+    rely on the frontend's own ``trim()`` being a no-op on it.
+
+    Two passes over two different tables would not be a fixed point: each
+    pass stops at a character its own table does not contain, and that
+    stopping point says nothing about the other table -- e.g. a value
+    starting with U+FEFF then U+001C would have the first pass halt
+    immediately on U+FEFF (Python does not treat it as space), then a second
+    pass over the JavaScript-only characters would remove U+FEFF and halt on
+    U+001C (JavaScript does not trim it), leaving U+001C behind. Do not
+    "optimize" this back into two passes.
+    """
+    return value.strip(_INTERACTION_TRIM_CHARS)
+
+
+def _is_non_blank_str(value: Any) -> bool:
+    """True when value is a string that stays non-empty after
+    _normalize_interaction_text -- the blankness judgment shared by option
+    label/value filtering and field-name fallback. Takes Any (not str) so
+    the isinstance check and the trim happen together, on the same value:
+    calling _normalize_interaction_text directly on a fresh dict.get(...)
+    expression defeats type-narrowing across the two calls.
+    """
+    return isinstance(value, str) and bool(_normalize_interaction_text(value))
+
+
 def _normalize_ask_user_interactions(interactions: Any) -> list[dict[str, Any]]:
-    """Normalize common model variants into the frontend interaction contract."""
+    """Normalize common model variants into the frontend interaction contract.
+
+    A label or value that is blank after ``_normalize_interaction_text`` is
+    treated the same as missing: the option is dropped. A field name that is
+    blank after normalization falls back to ``response_{index}``; a
+    well-formed field name is normalized and written back so the frontend's
+    own ``trim()`` is a no-op on it. Survivors are otherwise kept verbatim --
+    only blankness is judged here, not content.
+
+    The alias chain ``field or id or name`` intentionally keeps its raw
+    truthiness check; it is not normalization-aware. The frontend's own
+    alias chains (clarification-form.tsx, app-context-chat.tsx) make the
+    same raw-truthiness choice, and because this function always writes its
+    result back into ``item["field"]``, the frontend never evaluates its own
+    ``id``/``name`` fallback for a field this function has already resolved
+    -- so this stays consistent with the frontend regardless of which one
+    changes first.
+
+    This function does not deduplicate field names within a single call: it
+    keeps every colliding entry as its own interaction rather than dropping
+    or renaming one. Each one still goes through every other step above --
+    its field is trimmed, its options are filtered, ``actions`` is stripped
+    -- only the name collision itself is left as-is, and a warning is
+    logged. The single-tool call site (``ask_user_question`` in
+    ``_handle_control_tool``) sends the result on as-is. The multi-tool call
+    site (``_pause_for_tool_results``) runs its own deduplication across all
+    tools' interactions after calling this function once per tool.
+
+    The output never carries an ``actions`` key: ``actions`` is a model
+    alias for ``options`` (consumed above whenever ``options`` itself is
+    missing or not a list, and ``actions`` is itself a list), and leaving
+    the raw, unfiltered alias in the output would give the persisted row a
+    second, never-filtered carrier of the same option list.
+    """
 
     if not isinstance(interactions, list):
         return []
@@ -181,16 +276,26 @@ def _normalize_ask_user_interactions(interactions: Any) -> list[dict[str, Any]]:
 
         item = dict(interaction)
         field = item.get("field") or item.get("id") or item.get("name")
-        if not isinstance(field, str) or not field.strip():
-            field = f"response_{index}"
-        item["field"] = field.strip()
+        normalized_field = (
+            _normalize_interaction_text(field) if isinstance(field, str) else ""
+        )
+        item["field"] = normalized_field or f"response_{index}"
 
-        if "options" not in item and isinstance(item.get("actions"), list):
+        # Widened from "options" not in item: an interaction can carry both
+        # a malformed options (present but not a list) and a well-formed
+        # actions alias, and the alias is the only place the real data
+        # lives in that shape -- narrower than "not in item" would leave
+        # the alias unconsumed and drop every option for that interaction
+        # (verified: the malformed-options-plus-actions case loses all its
+        # options under the narrower condition).
+        if not isinstance(item.get("options"), list) and isinstance(
+            item.get("actions"), list
+        ):
             item["options"] = item["actions"]
 
         options = item.get("options")
         if isinstance(options, list):
-            item["options"] = [
+            filtered_options = [
                 {
                     key: value
                     for key, value in {
@@ -203,13 +308,79 @@ def _normalize_ask_user_interactions(interactions: Any) -> list[dict[str, Any]]:
                 }
                 for option in options
                 if isinstance(option, dict)
-                and isinstance(option.get("label"), str)
-                and option.get("label")
-                and isinstance(option.get("value"), str)
-                and option.get("value")
+                and _is_non_blank_str(option.get("label"))
+                and _is_non_blank_str(option.get("value"))
             ]
+            if options and not filtered_options:
+                # All options for this interaction were blank. The
+                # interaction is still emitted (the question still goes
+                # out), so this is the only signal that it happened. This
+                # warning's payload is bounded to integer counts, never the
+                # model-controlled field name -- the same discipline
+                # STRIP_LOG_MAX_TOOL_NAMES above applies to tool names, but
+                # that is this warning's own choice, not a blanket rule for
+                # every log call in this module (several elsewhere put raw
+                # tool names or argument keys straight into the message).
+                logger.warning(
+                    "ask_user_question dropped all %d option(s) for interaction %d",
+                    len(options),
+                    index,
+                    extra={
+                        "dropped": len(options),
+                        "total": len(options),
+                        "interaction_index": index,
+                    },
+                )
+            item["options"] = filtered_options
+        elif "options" in item:
+            # options is present but neither a list nor rescued by the
+            # actions alias above -- a malformed shape this function has
+            # always left untouched, but silently: nothing signaled that
+            # it happened. Same payload discipline as the other two
+            # warnings in this function: bounded, integer-only.
+            logger.warning(
+                "ask_user_question interaction %d has a non-list options value",
+                index,
+                extra={"interaction_index": index},
+            )
+
+        # Leave only one carrier of the option list in the output. Whether
+        # or not the alias branch above used actions to seed options,
+        # item["actions"] itself is never touched by the filter step above
+        # (that step reassigns item["options"] to a new, filtered list and
+        # leaves the actions key exactly as the model gave it) -- so
+        # whatever is left under item["actions"] is always the original,
+        # unfiltered list: either the same content options was seeded
+        # from, pre-filter, or, when options was itself already a list, a
+        # completely unrelated list the filter never saw. Either way,
+        # leaving it in the output gives the persisted row a second,
+        # unfiltered carrier of option data that gets stored verbatim into
+        # task_chat_messages.interactions and replayed unchanged.
+        # Unconditional so this holds regardless of whether options ended
+        # up a list -- must run after the alias branch above, not before:
+        # popping actions first would delete the only place a malformed
+        # options's real data lives before the alias branch can consume it,
+        # dropping every option for that interaction.
+        item.pop("actions", None)
 
         normalized.append(item)
+
+    field_counts: dict[str, int] = {}
+    for item in normalized:
+        field_counts[item["field"]] = field_counts.get(item["field"], 0) + 1
+    colliding_field_count = sum(1 for count in field_counts.values() if count > 1)
+    if colliding_field_count:
+        # Same payload discipline as the other warnings in this function:
+        # integer counts only, never the colliding field name itself.
+        logger.warning(
+            "ask_user_question interactions have %d colliding field name(s) out of %d",
+            colliding_field_count,
+            len(normalized),
+            extra={
+                "colliding_field_count": colliding_field_count,
+                "total": len(normalized),
+            },
+        )
 
     return normalized
 

@@ -9,11 +9,17 @@ import logging
 from enum import IntEnum
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Iterator, NamedTuple
+from typing import Iterator
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from tests.web.api.client_safe_ast_guard import (
+    ALLOWED_RAW_MESSAGES,
+    SAFE_MESSAGE_BUILDERS,
+    _scan,
+)
+from tests.web.api.client_safe_ast_guard import guard_offenders as _guard_offenders
 from xagent.web.api import websocket as websocket_api
 from xagent.web.models.task import Task, TaskStatus
 from xagent.web.models.user import User
@@ -146,247 +152,6 @@ async def test_execute_task_keeps_a_message_written_for_the_sender(
     )
 
 
-FUNCTION_NODES = (ast.FunctionDef, ast.AsyncFunctionDef)
-
-# arg name -> positional index of the client-visible message
-PRODUCERS: dict[str, int | None] = {
-    "finish_delivery_failure": 0,
-    "finish_delivery": 1,
-    "send_message_delivery": None,  # keyword-only
-}
-
-# The one deliberate exception: agent RuntimeError text is passed through to
-# the INITIATING SENDER - the rejection ack and the personal error bubble.
-# Narrowing that wording is the product decision tracked in #1479.
-#
-# The broadcast half of the passthrough is closed (maintainer scope ruling on
-# #1514): the task-wide broadcast reaches every connection under the task_id,
-# anonymous widget and share visitors included, and DurableStorageOperation-
-# Error subclasses RuntimeError with tenant-scope text in its message, so
-# broadcasts carry CLIENT_SAFE_TASK_FAILURE instead - pinned by the two
-# audience-boundary tests at the end of this file. Still #1479: whether the
-# sender copy should also be narrowed when the initiator is an anonymous
-# public connection.
-#
-# Anchored to (enclosing function, expression) rather than to the expression
-# alone, which blessed the string in every function it appeared in. This stops
-# reuse in a *different* function only: `_local_assignments` unions every
-# assignment in the enclosing function regardless of branch, so moving the
-# string between branches of an allowlisted function is NOT caught. #1547.
-ALLOWED_RAW_MESSAGES = {
-    ("_handle_chat_message_unserialized", "f'Runtime error: {str(e)}'"),
-    # The same #1479 flow seen through the closure scope chain: the outer
-    # function's runtime-error string reaches these closures' ``message``
-    # parameter at their call sites. Surfaced when the parameter short-circuit
-    # stopped hiding rebound names; not a new leak.
-    ("finish_delivery", "f'Runtime error: {str(e)}'"),
-    ("finish_delivery_failure", "f'Runtime error: {str(e)}'"),
-    ("handle_execute_task", "f'Runtime error: {str(e)}'"),
-    ("handle_intervention", "f'Runtime error: {str(e)}'"),
-    ("_handle_pause_task_unserialized", "f'Runtime error: {str(e)}'"),
-    ("_handle_resume_task_unserialized", "f'Runtime error: {str(e)}'"),
-}
-
-
-def _parents(tree: ast.Module) -> dict[ast.AST, ast.AST]:
-    parents: dict[ast.AST, ast.AST] = {}
-    for node in ast.walk(tree):
-        for child in ast.iter_child_nodes(node):
-            parents[child] = node
-    return parents
-
-
-def _enclosing_functions(
-    node: ast.AST, parents: dict[ast.AST, ast.AST]
-) -> list[ast.AST]:
-    """Innermost-first chain of functions a node can read locals from."""
-    chain: list[ast.AST] = []
-    current = parents.get(node)
-    while current is not None:
-        if isinstance(current, FUNCTION_NODES):
-            chain.append(current)
-        current = parents.get(current)
-    return chain
-
-
-def _message_expression(node: ast.Call, index: int | None) -> ast.expr | None:
-    for keyword in node.keywords:
-        if keyword.arg == "message":
-            return keyword.value
-    if index is not None and len(node.args) > index:
-        return node.args[index]
-    return None
-
-
-# ``send_text`` takes a serialized payload, so the dict sits one call deeper.
-ERROR_PAYLOAD_SINKS = {"send_personal_message", "broadcast_to_task", "send_text"}
-
-# Both render in the client's conversation, so both are the same disclosure
-# surface. ``agent_error`` was missing until review found a producer using it.
-ERROR_PAYLOAD_TYPES = {"error", "agent_error"}
-
-# The only functions allowed to mint client-visible text from an exception.
-SAFE_MESSAGE_BUILDERS = {
-    "client_safe_error_message",
-    "client_safe_task_command_failure",
-}
-
-
-def _unwrap_serializer(expr: ast.expr) -> ast.expr:
-    """``json.dumps(payload)`` -> ``payload``; anything else unchanged."""
-    if isinstance(expr, ast.Call) and _called_name(expr) == "dumps" and expr.args:
-        return expr.args[0]
-    return expr
-
-
-def _error_payload_message(node: ast.Call) -> ast.expr | None:
-    """The message of an ``{"type": "error", ...}`` payload, if this is one."""
-    if _called_name(node) not in ERROR_PAYLOAD_SINKS:
-        return None
-    for raw in (*node.args, *(kw.value for kw in node.keywords)):
-        argument = _unwrap_serializer(raw)
-        if not isinstance(argument, ast.Dict):
-            continue
-        keys = {
-            key.value: value
-            for key, value in zip(argument.keys, argument.values)
-            if isinstance(key, ast.Constant)
-        }
-        kind = keys.get("type")
-        if isinstance(kind, ast.Constant) and kind.value in ERROR_PAYLOAD_TYPES:
-            return keys.get("message")
-    return None
-
-
-def _called_name(node: ast.Call) -> str | None:
-    if isinstance(node.func, ast.Name):
-        return node.func.id
-    if isinstance(node.func, ast.Attribute):
-        return node.func.attr
-    return None
-
-
-def _is_parameter(scopes: list[ast.AST], name: str) -> bool:
-    """A forwarded parameter is vetted at the wrapper's own call sites."""
-    for scope in scopes:
-        if not isinstance(scope, FUNCTION_NODES):
-            continue
-        arguments = scope.args
-        for argument in (
-            *arguments.posonlyargs,
-            *arguments.args,
-            *arguments.kwonlyargs,
-        ):
-            if argument.arg == name:
-                return True
-    return False
-
-
-def _local_assignments(scopes: list[ast.AST], name: str) -> list[ast.expr]:
-    """Values assigned to `name` inside the given scopes only."""
-    values: list[ast.expr] = []
-    for scope in scopes:
-        for node in ast.walk(scope):
-            if isinstance(node, ast.Assign):
-                for target in node.targets:
-                    if isinstance(target, ast.Name) and target.id == name:
-                        values.append(node.value)
-    return values
-
-
-def _is_client_safe(expr: ast.expr) -> bool:
-    if isinstance(expr, ast.Constant) and isinstance(expr.value, str):
-        return True
-    if isinstance(expr, ast.Call) and isinstance(expr.func, ast.Name):
-        if expr.func.id == "client_safe_error_message":
-            return True
-        if expr.func.id == "client_safe_task_command_failure":
-            # The prefix argument must be attribute access on server state
-            # (``command.kind``), never a literal or a bare name a caller
-            # could point at untrusted text.
-            return bool(expr.args) and isinstance(expr.args[0], ast.Attribute)
-        return False
-    # `_TURN_REJECTION_MESSAGES.get(reason, "<literal>")` - a curated table.
-    if isinstance(expr, ast.Call) and isinstance(expr.func, ast.Attribute):
-        return expr.func.attr == "get" and all(
-            isinstance(arg, ast.Constant) or isinstance(arg, ast.Attribute)
-            for arg in expr.args[1:]
-        )
-    if isinstance(expr, ast.BoolOp):
-        return all(_is_client_safe(value) for value in expr.values)
-    return False
-
-
-class _ScanResult(NamedTuple):
-    offenders: list[str]
-    producers: int
-    error_payloads: int
-    used_allowlist: set[tuple[str, str]]
-
-
-def _scan(tree: ast.Module) -> _ScanResult:
-    """The one copy of the sweep's recognition logic.
-
-    Both the production sweep and the snippet-based regression tests run
-    this same function, so a change to the analysis cannot pass the snippet
-    tests while silently not applying to the real module (or vice versa).
-    """
-    parents = _parents(tree)
-    producers = 0
-    error_payloads = 0
-    offenders: list[str] = []
-    used_allowlist: set[tuple[str, str]] = set()
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.Call):
-            continue
-        name = _called_name(node)
-        is_producer = name in PRODUCERS
-        if is_producer:
-            expr = _message_expression(node, PRODUCERS[name])
-        else:
-            # The error bubble renders in the same conversation as the
-            # rejection ack, so it is the same disclosure surface.
-            expr = _error_payload_message(node)
-            name = f"{name}(error payload)"
-        if expr is None:
-            continue
-        if is_producer:
-            producers += 1
-        else:
-            error_payloads += 1
-        scopes = _enclosing_functions(node, parents)
-        candidates = (
-            _local_assignments(scopes, expr.id)
-            if isinstance(expr, ast.Name)
-            else [expr]
-        )
-        if not candidates:
-            # Only a name nothing rebinds is a genuinely forwarded parameter,
-            # vetted at the wrapper's own call sites. A parameter rebound by a
-            # plain assignment lands in the candidates instead; rebinding via
-            # AnnAssign/AugAssign/walrus/tuple targets is still invisible to
-            # ``_local_assignments`` and tracked in #1547.
-            if isinstance(expr, ast.Name) and _is_parameter(scopes, expr.id):
-                continue
-            offenders.append(f"{name}:{node.lineno} passes an unresolvable name")
-            continue
-        enclosing = next(
-            (scope.name for scope in scopes if isinstance(scope, FUNCTION_NODES)),
-            "<module>",
-        )
-        for candidate in candidates:
-            if _is_client_safe(candidate):
-                continue
-            key = (enclosing, ast.unparse(candidate))
-            if key in ALLOWED_RAW_MESSAGES:
-                used_allowlist.add(key)
-                continue
-            offenders.append(
-                f"{name}:{node.lineno} may send {ast.unparse(candidate)!r}"
-            )
-    return _ScanResult(offenders, producers, error_payloads, used_allowlist)
-
-
 def test_no_delivery_producer_can_bypass_the_client_safe_message() -> None:
     """Exception text may not reach a client through the *recognized* shapes.
 
@@ -414,14 +179,15 @@ def test_no_delivery_producer_can_bypass_the_client_safe_message() -> None:
             f"SAFE_MESSAGE_BUILDERS blesses {builder!r}, which does not exist"
         )
 
-    # Actual counts at the time of writing: 23 producers, 30 error payloads.
-    # These floors sit below that, so a minority of sites can still vanish
-    # silently; tightening them to exact equality is tracked in #1547.
-    assert result.producers >= 21, (
-        f"the producers moved; only {result.producers} matched"
+    # These are deliberate exact baselines. If a producer is added or removed,
+    # inspect the changed site and bump the corresponding count in this test.
+    assert result.producers == 26, (
+        f"expected exactly 26 producers, matched {result.producers}; "
+        "review the changed sites and bump deliberately"
     )
-    assert result.error_payloads >= 21, (
-        f"the error payloads moved; only {result.error_payloads} matched"
+    assert result.error_payloads == 35, (
+        f"expected exactly 35 error payloads, matched {result.error_payloads}; "
+        "review the changed sites and bump deliberately"
     )
     # Every allowlist entry must be earned by a live call site: a stale entry
     # is a standing exemption nothing uses, and an unused closure entry is
@@ -920,11 +686,6 @@ async def leak(websocket):
 # dependency is written down rather than left implicit.
 
 
-def _guard_offenders(source: str) -> list[str]:
-    """Run the one sweep implementation over an arbitrary module source."""
-    return _scan(ast.parse(source)).offenders
-
-
 @pytest.mark.xfail(
     strict=True,
     reason="Known guard blind spots, all tracked in #1497. When one is closed "
@@ -1025,6 +786,78 @@ async def outer(websocket, message):
 """,
         id="nested-shadow",
     ),
+    pytest.param(
+        """
+async def leak(websocket, message):
+    try:
+        pass
+    except Exception as e:
+        message: str = str(e)
+        await send_message_delivery(
+            websocket,
+            client_message_id="c",
+            turn_id="t",
+            accepted=False,
+            message=message,
+            rejection_outcome="not_accepted",
+        )
+""",
+        id="annotated-rebind",
+    ),
+    pytest.param(
+        """
+async def leak(websocket, message):
+    try:
+        pass
+    except Exception as e:
+        message += str(e)
+        await send_message_delivery(
+            websocket,
+            client_message_id="c",
+            turn_id="t",
+            accepted=False,
+            message=message,
+            rejection_outcome="not_accepted",
+        )
+""",
+        id="augmented-rebind",
+    ),
+    pytest.param(
+        """
+async def leak(websocket, message):
+    try:
+        pass
+    except Exception as e:
+        (message := str(e))
+        await send_message_delivery(
+            websocket,
+            client_message_id="c",
+            turn_id="t",
+            accepted=False,
+            message=message,
+            rejection_outcome="not_accepted",
+        )
+""",
+        id="walrus-rebind",
+    ),
+    pytest.param(
+        """
+async def leak(websocket, message):
+    try:
+        pass
+    except Exception as e:
+        message, ignored = str(e), None
+        await send_message_delivery(
+            websocket,
+            client_message_id="c",
+            turn_id="t",
+            accepted=False,
+            message=message,
+            rejection_outcome="not_accepted",
+        )
+""",
+        id="tuple-rebind",
+    ),
 ]
 
 
@@ -1055,12 +888,760 @@ async def forward(websocket, message):
     assert not _guard_offenders(source)
 
 
+def test_allowlist_is_scoped_to_the_runtime_error_handler() -> None:
+    source = """
+async def handle_intervention(websocket):
+    try:
+        pass
+    except ValueError as e:
+        await manager.send_personal_message(
+            {"type": "error", "message": f"Runtime error: {str(e)}"},
+            websocket,
+        )
+"""
+
+    assert _guard_offenders(source), "a validation branch cannot reuse the carve-out"
+
+
+def test_allowlist_cannot_flow_from_runtime_into_a_validation_handler() -> None:
+    source = """
+async def handle_intervention(websocket):
+    try:
+        pass
+    except RuntimeError as e:
+        message = f"Runtime error: {str(e)}"
+
+    try:
+        pass
+    except ValueError:
+        await manager.send_personal_message(
+            {"type": "error", "message": message},
+            websocket,
+        )
+"""
+
+    assert _guard_offenders(source), "the carve-out cannot cross except handlers"
+
+
+def test_allowlist_cannot_flow_into_a_nested_runtime_error_handler() -> None:
+    source = """
+async def handle_intervention(websocket):
+    try: first_operation()
+    except RuntimeError as e:
+        message = f"Runtime error: {str(e)}"
+        try: second_operation()
+        except RuntimeError as other:
+            await manager.send_personal_message({"type": "error", "message": message})
+"""
+
+    assert _guard_offenders(source), "a nested handler cannot borrow the carve-out"
+
+
+def test_conditional_allowlisted_assignment_keeps_the_incoming_parameter() -> None:
+    source = """
+async def handle_intervention(websocket, message, flag):
+    try:
+        pass
+    except RuntimeError as e:
+        if flag:
+            message = f"Runtime error: {str(e)}"
+        await manager.send_personal_message(
+            {"type": "error", "message": message},
+            websocket,
+        )
+"""
+
+    assert _guard_offenders(source), "the false branch still forwards raw input"
+
+
+def test_conditional_assignment_keeps_the_outer_local_definition() -> None:
+    source = """
+async def handle_intervention(websocket, error, flag):
+    message = str(error)
+    try: pass
+    except RuntimeError as e:
+        if flag: message = f"Runtime error: {str(e)}"
+        else:
+            await manager.send_personal_message({"type": "error", "message": message})
+"""
+
+    assert _guard_offenders(source), "the else branch still uses the outer local"
+
+
+def test_allowlisted_assignment_after_sink_cannot_rewrite_history() -> None:
+    source = """
+async def handle_intervention(websocket, message):
+    try:
+        pass
+    except RuntimeError as e:
+        await manager.send_personal_message(
+            {"type": "error", "message": message},
+            websocket,
+        )
+        message = f"Runtime error: {str(e)}"
+"""
+
+    assert _guard_offenders(source), "a later binding cannot sanitize an earlier send"
+
+
+@pytest.mark.parametrize(
+    "loop_header",
+    ["for item in items:", "async for item in items:", "while items:"],
+    ids=["for", "async-for", "while"],
+)
+def test_loop_backedge_rebinding_reaches_an_earlier_sink(loop_header: str) -> None:
+    source = f"""
+async def leak(items, error):
+    message = "safe"
+    {loop_header}
+        await send_message_delivery(message=message)
+        message = str(error)
+"""
+
+    assert _guard_offenders(source), "the next iteration sends the rebound value"
+
+
+def test_loop_backedge_binding_is_unavailable_on_the_first_iteration() -> None:
+    source = """
+async def leak(items, message):
+    for item in items:
+        await send_message_delivery(message=message)
+        message = "safe"
+"""
+
+    assert _guard_offenders(source), "the first iteration still sends the input"
+
+
+def test_while_backedge_rebinding_reaches_the_next_condition() -> None:
+    source = """
+async def leak(error):
+    message = "safe"
+    while await send_message_delivery(message=message):
+        message = str(error)
+"""
+
+    assert _guard_offenders(source), "the next condition sees the rebound value"
+
+
+def test_while_condition_rebinding_reaches_the_next_condition() -> None:
+    source = """
+async def leak(error):
+    message = "safe"
+    while (await send_message_delivery(message=message)) or (message := str(error)):
+        pass
+"""
+
+    assert _guard_offenders(source), "the next condition sees the rebound value"
+
+
+def test_safe_while_condition_backedge_keeps_the_sink_clean() -> None:
+    source = """
+async def deliver():
+    message = "safe"
+    while (await send_message_delivery(message=message)) or (message := "still safe"):
+        pass
+"""
+
+    assert not _guard_offenders(source)
+
+
+def test_loop_backedge_augassign_reaches_an_earlier_sink() -> None:
+    source = """
+async def leak(items, error):
+    message = "safe"
+    for item in items:
+        await send_message_delivery(message=message)
+        message += str(error)
+"""
+
+    assert _guard_offenders(source), "the augmented value reaches iteration two"
+
+
+def test_safe_loop_backedge_keeps_the_sink_clean() -> None:
+    source = """
+async def deliver(items):
+    message = "safe"
+    for item in items:
+        await send_message_delivery(message=message)
+        message = "still safe"
+"""
+
+    assert not _guard_offenders(source)
+
+
+@pytest.mark.parametrize(
+    "control_flow",
+    [
+        'for item in items:\n            message = f"Runtime error: {str(e)}"',
+        'async for item in items:\n            message = f"Runtime error: {str(e)}"',
+        'while items:\n            message = f"Runtime error: {str(e)}"\n            break',
+        'match items:\n            case [item]:\n                message = f"Runtime error: {str(e)}"',
+    ],
+    ids=["for", "async-for", "while", "match"],
+)
+def test_conditional_control_flow_keeps_the_incoming_parameter(
+    control_flow: str,
+) -> None:
+    source = f"""
+async def handle_intervention(websocket, message, items):
+    try:
+        pass
+    except RuntimeError as e:
+        {control_flow}
+        await manager.send_personal_message(
+            {{"type": "error", "message": message}},
+            websocket,
+        )
+"""
+
+    assert _guard_offenders(source), "the control flow can skip the safe binding"
+
+
+def test_short_circuit_walrus_keeps_the_incoming_parameter() -> None:
+    source = """
+async def handle_intervention(websocket, message, flag):
+    try:
+        pass
+    except RuntimeError as e:
+        flag and (message := f"Runtime error: {str(e)}")
+        await manager.send_personal_message(
+            {"type": "error", "message": message},
+            websocket,
+        )
+"""
+
+    assert _guard_offenders(source), "the short-circuited walrus may never bind"
+
+
+@pytest.mark.parametrize(
+    "tail",
+    [
+        "except Exception: await send_message_delivery(message=message)",
+        "except* Exception: await send_message_delivery(message=message)",
+        "finally: await send_message_delivery(message=message)",
+        "except Exception: pass\n    await send_message_delivery(message=message)",
+    ],
+    ids=["handler", "exception-group-handler", "finally", "after-handled-try"],
+)
+def test_try_reaching_definitions_keep_the_skipped_value(tail: str) -> None:
+    source = f"""
+async def leak(message):
+    try: may_raise(); message = "safe"
+    {tail}
+"""
+    assert _guard_offenders(source)
+
+
+def test_try_assignment_reaches_a_later_sink_in_the_same_body() -> None:
+    source = """
+async def reject(message):
+    try: message = "safe"; await send_message_delivery(message=message)
+    except Exception: pass
+"""
+    assert not _guard_offenders(source)
+
+
+def test_lambda_bindings_do_not_reach_the_enclosing_scope() -> None:
+    source = """
+async def leak(websocket, error):
+    message = "safe"; build_detail = lambda: (message := error.detail)
+    await send_message_delivery(message=message)
+"""
+
+    assert not _guard_offenders(source), "the lambda has its own lexical scope"
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        """async def outer(message, raw):
+    maker = lambda message: send_message_delivery(message=message)
+    await maker(raw)""",
+        """async def outer(message, raw):
+    class Pending:
+        message = raw
+        delivery = send_message_delivery(message=message)
+    await Pending.delivery""",
+    ],
+    ids=["lambda", "class"],
+)
+def test_guard_rejects_sinks_inside_unsupported_scopes(source: str) -> None:
+    assert _guard_offenders(source)
+
+
+def test_conditional_expression_assignment_keeps_the_incoming_value() -> None:
+    source = """
+async def leak(message, flag):
+    "safe" if flag else (message := "safe")
+    await send_message_delivery(message=message)
+"""
+    assert _guard_offenders(source)
+
+
+def test_guard_catches_augassign_that_keeps_a_forwarded_parameter() -> None:
+    source = """
+async def leak(websocket, message):
+    message += "!"
+    await send_message_delivery(
+        websocket,
+        client_message_id="c",
+        turn_id="t",
+        accepted=False,
+        message=message,
+        rejection_outcome="not_accepted",
+    )
+"""
+
+    assert _guard_offenders(source)
+
+
+def test_guard_catches_a_nested_unpack_rebinding() -> None:
+    source = """
+async def leak(websocket, message, source):
+    ((message, other), final) = source
+    await send_message_delivery(
+        websocket,
+        client_message_id="c",
+        turn_id="t",
+        accepted=False,
+        message=message,
+        rejection_outcome="not_accepted",
+    )
+"""
+
+    assert _guard_offenders(source)
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "for message in items: await send_message_delivery(message=message)",
+        "await gather(*(send_message_delivery(message=message) for message in items))",
+        """match items:
+        case {"raw": message}: await send_message_delivery(message=message)""",
+        "with resource as message: await send_message_delivery(message=message)",
+        """try: pass
+    except Exception as message: await send_message_delivery(message=message)""",
+    ],
+    ids=["loop", "comprehension", "match", "with", "except"],
+)
+def test_guard_catches_non_assignment_rebindings(body: str) -> None:
+    source = f"async def leak(message, items, resource):\n    {body}\n"
+    assert _guard_offenders(source), "the binding is not a forwarded parameter"
+
+
+@pytest.mark.parametrize(
+    "expression",
+    [
+        'message_data.get("error", "fallback")',
+        'message_data.get("error")',
+        'error.__dict__.get("detail", "fallback")',
+    ],
+)
+def test_guard_rejects_get_calls_from_untrusted_receivers(expression: str) -> None:
+    source = f"""
+async def leak(websocket, message_data, error):
+    await send_message_delivery(
+        websocket,
+        client_message_id="c",
+        turn_id="t",
+        accepted=False,
+        message={expression},
+        rejection_outcome="not_accepted",
+    )
+"""
+
+    assert _guard_offenders(source)
+
+
+def test_guard_accepts_the_curated_rejection_table_lookup() -> None:
+    source = """
+async def reject(websocket, reason):
+    await send_message_delivery(
+        websocket,
+        client_message_id="c",
+        turn_id="t",
+        accepted=False,
+        message=_TURN_REJECTION_MESSAGES.get(reason, "Task is busy"),
+        rejection_outcome="not_accepted",
+    )
+"""
+
+    assert not _guard_offenders(source)
+
+
+@pytest.mark.parametrize(
+    ("parameters", "binding", "fallback"),
+    [
+        ("reason, error", "", "error.detail"),
+        ("_TURN_REJECTION_MESSAGES, reason", "", '"Task is busy"'),
+        ("reason, **_TURN_REJECTION_MESSAGES", "", '"fallback"'),
+        ("reason", "from evil import _TURN_REJECTION_MESSAGES", '"fallback"'),
+        ("reason", "class _TURN_REJECTION_MESSAGES: get = evil_get", '"fallback"'),
+    ],
+    ids=["nonliteral-fallback", "parameter", "kwargs", "import", "class"],
+)
+def test_guard_rejects_unsafe_curated_lookups(
+    parameters: str, binding: str, fallback: str
+) -> None:
+    source = f"""
+async def leak({parameters}):
+    {binding}
+    await send_message_delivery(message=_TURN_REJECTION_MESSAGES.get(reason, {fallback}))
+"""
+    assert _guard_offenders(source)
+
+
+def test_guard_rejects_a_rebound_module_curated_table() -> None:
+    source = """
+_TURN_REJECTION_MESSAGES = attacker_controlled
+async def leak(reason):
+    await send_message_delivery(message=_TURN_REJECTION_MESSAGES.get(reason, "fallback"))
+"""
+    assert _guard_offenders(source)
+
+
+def test_guard_rejects_a_conditionally_rebound_module_curated_table() -> None:
+    source = """
+_TURN_REJECTION_MESSAGES = {"busy": "safe"}
+if flag:
+    _TURN_REJECTION_MESSAGES = attacker_controlled
+async def leak(reason):
+    await send_message_delivery(message=_TURN_REJECTION_MESSAGES.get(reason, "fallback"))
+"""
+    assert _guard_offenders(source)
+
+
+@pytest.mark.parametrize(
+    "binding",
+    [
+        """def configure(value=(_TURN_REJECTION_MESSAGES := attacker_controlled)):
+    pass""",
+        "configure = lambda value=(_TURN_REJECTION_MESSAGES := attacker_controlled): value",
+        """class Configure((_TURN_REJECTION_MESSAGES := attacker_controlled)):
+    pass""",
+    ],
+    ids=["function-default", "lambda-default", "class-base"],
+)
+def test_guard_rejects_a_curated_table_rebound_during_definition(
+    binding: str,
+) -> None:
+    source = f"""
+_TURN_REJECTION_MESSAGES = {{"busy": "safe"}}
+{binding}
+async def leak(reason):
+    await send_message_delivery(message=_TURN_REJECTION_MESSAGES.get(reason, "fallback"))
+"""
+    assert _guard_offenders(source)
+
+
+def test_guard_rejects_curated_table_comprehension_and_star_import_shadows() -> None:
+    source = """
+_TURN_REJECTION_MESSAGES = {"busy": "safe"}
+from evil import *
+async def leak(reason, tables):
+    await gather(*(send_message_delivery(
+        message=_TURN_REJECTION_MESSAGES.get(reason, "fallback")
+    ) for _TURN_REJECTION_MESSAGES in tables))
+"""
+    assert _guard_offenders(source)
+
+
+def test_guard_resolves_a_single_name_producer_alias() -> None:
+    source = """
+async def leak(websocket):
+    producer = send_message_delivery
+    try:
+        pass
+    except Exception as error:
+        await producer(
+            websocket,
+            client_message_id="c",
+            turn_id="t",
+            accepted=False,
+            message=f"leaked: {str(error)}",
+            rejection_outcome="not_accepted",
+        )
+"""
+
+    assert _guard_offenders(source)
+
+
+def test_guard_resolves_a_module_level_producer_alias() -> None:
+    source = """
+producer = send_message_delivery
+
+async def leak(websocket, error):
+    await producer(
+        websocket,
+        client_message_id="c",
+        turn_id="t",
+        accepted=False,
+        message=str(error),
+        rejection_outcome="not_accepted",
+    )
+"""
+
+    assert _guard_offenders(source)
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        """async def leak(error, flag):
+    if flag:
+        producer = send_message_delivery
+    else:
+        producer = audit
+    await producer(message=str(error))""",
+        """producer = send_message_delivery
+producer = send_message_delivery
+async def leak(error):
+    await producer(message=str(error))""",
+    ],
+    ids=["conditional-local", "duplicate-module"],
+)
+def test_guard_treats_any_preceding_producer_alias_as_egress(source: str) -> None:
+    assert _guard_offenders(source)
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        """async def leak(error):
+    await producer(message=str(error))
+producer = send_message_delivery""",
+        """async def leak(error):
+    await producer(message=str(error))
+if flag:
+    producer = send_message_delivery
+else:
+    producer = audit""",
+        """async def leak(error):
+    first = send_message_delivery
+    producer = first
+    await producer(message=str(error))""",
+        """first = send_message_delivery
+producer = first
+async def leak(error):
+    await producer(message=str(error))""",
+        """async def outer(error):
+    async def leak():
+        await producer(message=str(error))
+    producer = send_message_delivery
+    return leak""",
+    ],
+    ids=[
+        "module-binding-after-function",
+        "conditional-module-binding-after-function",
+        "chained-local",
+        "chained-module",
+        "outer-closure-binding-after-function",
+    ],
+)
+def test_guard_resolves_deferred_and_chained_producer_aliases(source: str) -> None:
+    assert _guard_offenders(source)
+
+
+def test_guard_uses_the_last_unconditional_producer_alias_binding() -> None:
+    source = """
+producer = send_message_delivery
+producer = audit
+async def record(error):
+    await producer(message=str(error))
+"""
+    assert not _guard_offenders(source)
+
+
+def test_guard_does_not_treat_a_short_circuit_rebind_as_a_direct_alias() -> None:
+    source = """
+async def record(error):
+    producer = send_message_delivery
+    producer = producer and audit
+    await producer(message=str(error))
+"""
+    assert not _guard_offenders(source)
+
+
+@pytest.mark.parametrize(
+    ("source", "is_egress"),
+    [
+        (
+            """async def leak(error):
+    first = send_message_delivery
+    producer = first
+    first = audit
+    await producer(message=str(error))""",
+            True,
+        ),
+        (
+            """first = send_message_delivery
+producer = first
+first = audit
+async def leak(error):
+    await producer(message=str(error))""",
+            True,
+        ),
+        (
+            """async def record(error):
+    first = audit
+    producer = first
+    first = send_message_delivery
+    await producer(message=str(error))""",
+            False,
+        ),
+        (
+            """first = audit
+producer = first
+first = send_message_delivery
+async def record(error):
+    await producer(message=str(error))""",
+            False,
+        ),
+    ],
+    ids=[
+        "local-captures-egress",
+        "module-captures-egress",
+        "local-captures-audit",
+        "module-captures-audit",
+    ],
+)
+def test_guard_resolves_chained_aliases_at_assignment_time(
+    source: str, is_egress: bool
+) -> None:
+    assert bool(_guard_offenders(source)) is is_egress
+
+
+def test_guard_keeps_outer_aliases_that_reach_an_early_nested_call() -> None:
+    source = """
+async def outer(error):
+    producer = send_message_delivery
+    async def leak():
+        await producer(message=str(error))
+    await leak()
+    producer = audit
+"""
+    assert _guard_offenders(source)
+
+
+@pytest.mark.parametrize(
+    ("seed", "is_egress"), [("send_message_delivery", True), ("audit", False)]
+)
+@pytest.mark.parametrize("scope", ["local", "module"])
+def test_guard_preserves_seeded_self_aliases(
+    seed: str, is_egress: bool, scope: str
+) -> None:
+    module_binding = (
+        f"producer = {seed}\nproducer = producer\n" if scope == "module" else ""
+    )
+    local_binding = (
+        "" if scope == "module" else f"    producer = {seed}\n    producer = producer\n"
+    )
+    source = f"""{module_binding}async def record(error):
+{local_binding}    await producer(message=str(error))
+"""
+    assert bool(_guard_offenders(source)) is is_egress
+
+
+@pytest.mark.parametrize("scope", ["local", "module"])
+def test_guard_resolves_a_producer_alias_rebound_after_the_sink(scope: str) -> None:
+    binding = "producer = send_message_delivery\n" if scope == "module" else ""
+    local_binding = (
+        "" if scope == "module" else "    producer = send_message_delivery\n"
+    )
+    source = f"""{binding}async def leak(error):
+{local_binding}    await producer(message=str(error))
+    producer = audit
+"""
+    assert _guard_offenders(source)
+
+
+def test_guard_resolves_a_producer_alias_on_the_next_loop_iteration() -> None:
+    source = """
+async def leak(items, error):
+    producer = audit
+    for item in items:
+        await producer(message=str(error))
+        producer = send_message_delivery
+"""
+
+    assert _guard_offenders(source), "the second iteration calls the producer"
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        """async def leak(client_safe_error_message, error):
+    await send_message_delivery(message=client_safe_error_message(error))""",
+        """async def leak(error):
+    client_safe_error_message = raw_message
+    await send_message_delivery(message=client_safe_error_message(error))""",
+        """async def leak(error, builders):
+    await gather(*(send_message_delivery(message=client_safe_error_message(error))
+        for client_safe_error_message in builders))""",
+    ],
+    ids=["parameter", "local", "comprehension"],
+)
+def test_guard_rejects_shadowed_safe_message_builders(source: str) -> None:
+    assert _guard_offenders(source)
+
+
+def test_guard_rejects_a_conditionally_rebound_safe_message_builder() -> None:
+    source = """
+def client_safe_error_message(error):
+    return "safe"
+if flag:
+    client_safe_error_message = raw_message
+async def leak(error):
+    await send_message_delivery(message=client_safe_error_message(error))
+"""
+    assert _guard_offenders(source)
+
+
+def test_guard_rejects_a_safe_builder_rebound_in_a_decorator() -> None:
+    source = """
+def client_safe_error_message(error):
+    return "safe"
+@(client_safe_error_message := attacker_controlled)
+def configure():
+    pass
+async def leak(error):
+    await send_message_delivery(message=client_safe_error_message(error))
+"""
+    assert _guard_offenders(source)
+
+
+def test_allowlist_does_not_apply_to_a_same_named_nested_handler() -> None:
+    source = """
+async def outer(websocket):
+    async def handle_intervention():
+        try:
+            pass
+        except RuntimeError as e:
+            await manager.send_personal_message(
+                {"type": "error", "message": f"Runtime error: {str(e)}"},
+                websocket,
+            )
+"""
+
+    assert _guard_offenders(source)
+
+
+def test_guard_ignores_a_same_named_method_on_an_unrelated_receiver() -> None:
+    source = """
+async def audit_failure(audit, error):
+    await audit.send_text(
+        json.dumps({"type": "error", "message": str(error)})
+    )
+"""
+
+    assert not _guard_offenders(source)
+
+
 # The concurrent-delete race (TaskCommandTaskMissing between lookup and
 # enqueue) is pinned in tests/web/services/test_task_command_transport.py:
 # recovery-allowed returns None, and the strict path converts to
 # ClientVisibleValidationError with "Task N not found" preserved.
-
-
 # --- Round 5: runtime payload contracts for the changed egresses ------------
 
 

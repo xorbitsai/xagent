@@ -660,3 +660,154 @@ describe("ClarificationForm delivery failures", () => {
     expect(screen.queryByRole("alert")).toBeNull()
   })
 })
+
+describe("ClarificationForm blank option filtering", () => {
+  beforeEach(() => {
+    appContextMock.dispatch.mockReset()
+    appContextMock.filesDisabled = false
+    appContextMock.providerAvailable = true
+    appContextMock.sendMessage.mockReset()
+    toastErrorMock.mockReset()
+  })
+
+  afterEach(() => {
+    cleanup()
+  })
+
+  // The option label is rendered into a <span> on both branches this suite
+  // covers: select_one's dropdown option (ui/select.tsx, "font-medium
+  // truncate") and action_cards' card (clarification-form.tsx, "font-medium
+  // text-sm text-foreground"). action_cards renders each card as a <div
+  // onClick>, not a <button> -- getAllByRole("button") returns an empty
+  // array for it regardless of whether the blank-option filter is
+  // trim-aware, so it cannot be used to detect a blank card here. No other
+  // <span> in this component's default render (no files staged, no
+  // description set on any option) is ever blank, so a <span> with blank
+  // text content can only be a surviving blank option.
+  const blankOptionSpans = (container: HTMLElement) =>
+    Array.from(container.querySelectorAll("span")).filter(
+      (el) => el.textContent !== "" && el.textContent?.trim() === "",
+    )
+
+  it("a select_one interaction whose only option is blank shows no options", () => {
+    const interactions = [
+      {
+        type: "select_one" as const,
+        field: "choice",
+        label: "Choice",
+        options: [{ label: "   ", value: "   " }],
+      },
+    ]
+    render(<ClarificationForm interactions={interactions} onSend={vi.fn()} />)
+
+    fireEvent.click(screen.getByText("chatPage.clarification.selectOption"))
+
+    expect(screen.getByText("common.noOptions")).toBeInTheDocument()
+  })
+
+  it("a select_one interaction drops an option whose label alone is blank", () => {
+    // label and value are independent halves of the same filter
+    // (opt.value.trim() !== "" && opt.label.trim() !== ""); a blank value
+    // makes this option non-blank in isolation, so a regression that only
+    // reverted the label half back to a truthiness check would let this
+    // option survive even though a case that leaves both halves blank at
+    // once would still be dropped by the (unregressed) value half alone.
+    const interactions = [
+      {
+        type: "select_one" as const,
+        field: "choice",
+        label: "Choice",
+        options: [
+          { label: "Import", value: "import" },
+          { label: "   ", value: "blank-label-only" },
+        ],
+      },
+    ]
+    const { container } = render(
+      <ClarificationForm interactions={interactions} onSend={vi.fn()} />,
+    )
+
+    fireEvent.click(screen.getByText("chatPage.clarification.selectOption"))
+
+    expect(screen.getByText("Import")).toBeInTheDocument()
+    expect(blankOptionSpans(container)).toHaveLength(0)
+  })
+
+  it("a select_one interaction drops an option whose value alone is blank", () => {
+    // Mirrors the case above for the other half of the same filter: a
+    // non-blank label makes this option non-blank in isolation, so a
+    // regression that only reverted the value half back to a truthiness
+    // check would let this option survive.
+    const interactions = [
+      {
+        type: "select_one" as const,
+        field: "choice",
+        label: "Choice",
+        options: [
+          { label: "Import", value: "import" },
+          { label: "Blank value only", value: "   " },
+        ],
+      },
+    ]
+    const { container } = render(
+      <ClarificationForm interactions={interactions} onSend={vi.fn()} />,
+    )
+
+    fireEvent.click(screen.getByText("chatPage.clarification.selectOption"))
+
+    expect(screen.getByText("Import")).toBeInTheDocument()
+    expect(screen.queryByText("Blank value only")).not.toBeInTheDocument()
+  })
+
+  it("an action_cards interaction keeps a good option and drops a blank one", () => {
+    // Mirrors the shape the agent-builder skill instructs the model to use
+    // for this interaction type: a mix of a real choice and, in the failure
+    // case this fix targets, a blank one.
+    const interactions = [
+      {
+        type: "action_cards" as const,
+        field: "source",
+        label: "Source",
+        options: [
+          { label: "Import", value: "import" },
+          { label: "   ", value: "   " },
+        ],
+      },
+    ]
+    const { container } = render(
+      <ClarificationForm interactions={interactions} onSend={vi.fn()} />,
+    )
+
+    // No dropdown to open: action_cards renders its cards directly inside
+    // CollapsibleContent, which is open by default (active defaults to true).
+    expect(screen.getByText("Import")).toBeInTheDocument()
+    expect(blankOptionSpans(container)).toHaveLength(0)
+  })
+
+  it("renders options from a legacy message that still carries actions", () => {
+    // The backend normalizer now strips a well-formed interaction down to
+    // one options carrier and never emits actions, but that only applies to
+    // new payloads. Rows persisted before that change, and anything from
+    // Agent Builder's self-parsed chat response (which never reaches the
+    // backend normalizer at all), can still carry only actions with no
+    // options key -- this component's own fallback (rawOptions above) is
+    // the sole thing still rendering those.
+    const interactions = [
+      {
+        type: "action_cards" as const,
+        field: "source",
+        label: "Source",
+        actions: [
+          { label: "Import", value: "import" },
+          { label: "   ", value: "   " },
+        ],
+      },
+    ]
+    const { container } = render(
+      <ClarificationForm interactions={interactions} onSend={vi.fn()} />,
+    )
+
+    expect(screen.getByText("Import")).toBeInTheDocument()
+    expect(blankOptionSpans(container)).toHaveLength(0)
+  })
+})

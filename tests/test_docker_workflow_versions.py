@@ -24,6 +24,7 @@ SANDBOX_DISTRIBUTION_IMPORTS = {
     "numpy": "numpy",
     "matplotlib": "matplotlib",
     "openpyxl": "openpyxl",
+    "python-docx": "docx",
     "fsspec": "fsspec",
 }
 SANDBOX_DIRECT_REQUIREMENTS = {
@@ -35,6 +36,7 @@ SANDBOX_DIRECT_REQUIREMENTS = {
     "numpy": "numpy>=1.21.0",
     "matplotlib": "matplotlib>=3.5.0",
     "openpyxl": "openpyxl>=3.1.0",
+    "python-docx": "python-docx>=1.1.0",
     "fsspec": "fsspec>=2024.0.0",
 }
 

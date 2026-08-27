@@ -271,14 +271,18 @@ class OpenAICompatibleLLM(BaseLLM):
         result: Dict[str, Any],
         *,
         thinking: Optional[Dict[str, Any]] = None,
+        response_format: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Return opaque provider-owned message state for future LLM requests.
 
-        ``thinking`` is the request's thinking configuration, made available
-        so a subclass can tell whether reasoning content was actually asked
-        for (e.g. to decide whether an empty capture is worth a warning).
+        ``thinking`` and ``response_format`` are this request's own thinking
+        configuration and response format, made available so a subclass can
+        decide whether this request could have produced reasoning at all
+        (e.g. to decide whether an empty capture is worth a warning).
+        Mirrors ``_check_stream_reasoning_capture``'s parameters, for the
+        non-streaming path.
         """
-        _ = result, thinking
+        _ = result, thinking, response_format
         return {}
 
     def _delta_reasoning_content(self, delta: Any) -> tuple[bool, Any]:
@@ -293,6 +297,7 @@ class OpenAICompatibleLLM(BaseLLM):
         self,
         *,
         thinking: Optional[Dict[str, Any]],
+        response_format: Optional[Dict[str, Any]],
         has_tool_calls: bool,
         has_reasoning_content: bool,
         observed_field_names: tuple[str, ...],
@@ -303,11 +308,18 @@ class OpenAICompatibleLLM(BaseLLM):
         the streaming path: called with the whole stream's outcome (whether
         any delta ever carried a recognized reasoning field, whether the
         response ended with tool calls, and every field name -- never a
-        value -- seen on any delta), so a subclass can warn when thinking
-        was requested but nothing recognized was ever captured. Default is a
+        value -- seen on any delta), so a subclass can decide whether this
+        request could have produced reasoning at all. ``response_format`` is
+        the value this request's extra_body was built from. Default is a
         no-op; only ``OpenRouterLLM`` currently overrides it.
         """
-        _ = thinking, has_tool_calls, has_reasoning_content, observed_field_names
+        _ = (
+            thinking,
+            response_format,
+            has_tool_calls,
+            has_reasoning_content,
+            observed_field_names,
+        )
 
     def _build_request_messages(
         self,
@@ -413,6 +425,13 @@ class OpenAICompatibleLLM(BaseLLM):
 
         self._apply_output_config(completion_params, output_config)
 
+        # The response_format degrade branch below (retry without
+        # response_format after a 400) resets the ``response_format``
+        # local to None so the structured-output degrade check further
+        # down still gates correctly. The capture sentinel further below
+        # needs to know what this particular request was actually built
+        # with, which can differ from that local on that narrow path, so
+        # it is tracked separately here.
         extra_body = self._prepare_provider_reasoning_extra_body(
             extra_body=extra_body,
             thinking=thinking,
@@ -421,6 +440,7 @@ class OpenAICompatibleLLM(BaseLLM):
             output_config=output_config,
             is_streaming=False,
         )
+        built_response_format = response_format
 
         # Helper function to process response
         async def _make_api_call() -> Any:
@@ -502,7 +522,9 @@ class OpenAICompatibleLLM(BaseLLM):
                     result["reasoning_content"] = reasoning_content
                     result["reasoning"] = reasoning_content
                 provider_state = self._response_provider_state(
-                    result, thinking=request_thinking
+                    result,
+                    thinking=request_thinking,
+                    response_format=built_response_format,
                 )
                 if provider_state:
                     result[PROVIDER_STATE_METADATA_KEY] = provider_state
@@ -632,6 +654,7 @@ class OpenAICompatibleLLM(BaseLLM):
                             output_config=output_config,
                             is_streaming=False,
                         )
+                        built_response_format = response_format
                         response = await _make_api_call()
                         result = _process_response(
                             response, request_thinking=retry_thinking
@@ -867,7 +890,7 @@ class OpenAICompatibleLLM(BaseLLM):
                     result["reasoning_content"] = reasoning_content
                     result["reasoning"] = reasoning_content
                 provider_state = self._response_provider_state(
-                    result, thinking=thinking
+                    result, thinking=thinking, response_format=response_format
                 )
                 if provider_state:
                     result[PROVIDER_STATE_METADATA_KEY] = provider_state
@@ -1131,11 +1154,18 @@ class OpenAICompatibleLLM(BaseLLM):
                     yield chunk
 
             # One-time hook for a subclass to detect a silent streaming
-            # capture failure (thinking requested, tool calls in the
-            # response, but no recognized reasoning field ever captured).
-            # See ``_check_stream_reasoning_capture``'s docstring.
+            # capture failure (the request did not go out with reasoning
+            # disabled, tool calls in the response, but no recognized
+            # reasoning field ever captured). See
+            # ``_check_stream_reasoning_capture``'s docstring.
+            # ``response_format`` is passed as the value this request's
+            # extra_body was built from: the response_format pop-and-retry
+            # above drops it from completion_params only and reuses the
+            # already-built extra_body, so the local variable still
+            # describes what actually went on the wire.
             self._check_stream_reasoning_capture(
                 thinking=thinking,
+                response_format=response_format,
                 has_tool_calls=bool(accumulated_tool_calls),
                 has_reasoning_content=has_reasoning_content,
                 observed_field_names=tuple(sorted(observed_reasoning_field_names)),

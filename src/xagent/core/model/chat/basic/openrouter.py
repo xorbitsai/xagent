@@ -361,6 +361,7 @@ class OpenRouterLLM(OpenAILLM):
         result: Dict[str, Any],
         *,
         thinking: Optional[Dict[str, Any]] = None,
+        response_format: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         if not self._uses_deepseek_tool_protocol:
             return {}
@@ -370,20 +371,30 @@ class OpenRouterLLM(OpenAILLM):
         if (
             not provider_state
             and result.get("tool_calls")
-            and _thinking_requested(thinking)
+            and not self._provider_reasoning_intent(
+                thinking=thinking, response_format=response_format, is_streaming=False
+            )[0]
         ):
-            # Thinking was requested and the response is a tool call, but
-            # neither known reasoning field spelling was captured. This is
-            # the one silent-failure mode of the whole mechanism (see
-            # OPENROUTER_REASONING_FIELDS): the next request in this tool
-            # chain will 400 with no clue pointing back here, so log which
-            # reasoning-like keys (if any) actually showed up -- key names
-            # only, never their content.
+            # This request did not go out with an explicit disable payload,
+            # so the endpoint was free to produce reasoning content and its
+            # absence from a tool-call response is a real capture miss:
+            # the next request in this chain will 400 with no clue pointing
+            # back here. Log which reasoning-like keys (if any) showed up --
+            # key names only, never their content.
+            #
+            # ``response_format`` is the value the caller building this
+            # particular request used to construct its extra_body, not
+            # necessarily whatever ``response_format`` was originally
+            # passed in: structured requests disable reasoning on this
+            # path too, so a sentinel that assumed ``None`` would report a
+            # miss against a response it had itself made impossible.
+            # ``is_streaming`` stays a literal because both call sites of
+            # this hook are non-streaming.
             logger.warning(
-                "OpenRouter deepseek model %s returned a tool call with "
-                "thinking requested, but no reasoning content was captured "
-                "under any known field spelling %s; observed reasoning-like "
-                "keys: %s",
+                "OpenRouter deepseek model %s returned a tool call "
+                "without thinking disabled, but no reasoning content was "
+                "captured under any known field spelling %s; observed "
+                "reasoning-like keys: %s",
                 self._model_name,
                 OPENROUTER_REASONING_FIELDS,
                 reasoning_field_names(result),
@@ -431,29 +442,33 @@ class OpenRouterLLM(OpenAILLM):
         self,
         *,
         thinking: Optional[Dict[str, Any]],
+        response_format: Optional[Dict[str, Any]],
         has_tool_calls: bool,
         has_reasoning_content: bool,
         observed_field_names: tuple[str, ...],
     ) -> None:
         """Streaming counterpart of the WARNING in ``_response_provider_state``.
 
-        Same silent-failure mode, same gate (deepseek slugs only, thinking
-        requested, response ended with tool calls), just checked over the
-        whole stream's outcome instead of one non-streaming response body:
-        if no delta ever carried a recognized reasoning field, the next
-        request in this tool chain will 400 with nothing pointing back here.
+        Same silent-failure mode, same gate (deepseek slugs only, this
+        request did not go out with thinking disabled, response ended with
+        tool calls), just checked over the whole stream's outcome instead of
+        one non-streaming response body: if no delta ever carried a
+        recognized reasoning field, the next request in this tool chain will
+        400 with nothing pointing back here.
         """
         if (
             self._uses_deepseek_tool_protocol
             and has_tool_calls
-            and _thinking_requested(thinking)
             and not has_reasoning_content
+            and not self._provider_reasoning_intent(
+                thinking=thinking, response_format=response_format, is_streaming=True
+            )[0]
         ):
             logger.warning(
-                "OpenRouter deepseek model %s streamed a tool call with "
-                "thinking requested, but no reasoning content was captured "
-                "under any known field spelling %s across the stream; "
-                "observed reasoning-like keys: %s",
+                "OpenRouter deepseek model %s streamed a tool call "
+                "without thinking disabled, but no reasoning content was "
+                "captured under any known field spelling %s across the "
+                "stream; observed reasoning-like keys: %s",
                 self._model_name,
                 OPENROUTER_REASONING_FIELDS,
                 observed_field_names,
@@ -1021,6 +1036,80 @@ class OpenRouterLLM(OpenAILLM):
             },
         }
 
+    def _provider_reasoning_intent(
+        self,
+        *,
+        thinking: Optional[Dict[str, Any]],
+        response_format: Optional[Dict[str, Any]],
+        is_streaming: bool,
+    ) -> tuple[bool, bool]:
+        """Return ``(should_disable, should_enable)`` for one request.
+
+        Single source of truth for what this client asks the endpoint to do
+        about reasoning. The request builder below turns the pair into
+        extra_body keys; the two capture sentinels ask the same method
+        whether this request actually went out with thinking disabled.
+        Recomputing the branch separately in a sentinel would let the two
+        answers drift apart, and a sentinel that disagrees with the payload
+        is worse than no sentinel.
+        """
+        if thinking is not None:
+            should_enable = thinking.get("type") == "enabled" or thinking.get(
+                "enable", False
+            )
+            should_disable = not should_enable and (
+                thinking.get("type") == "disabled" or not thinking.get("enable", False)
+            )
+            return bool(should_disable), bool(should_enable)
+
+        if response_format:
+            # The caller said nothing about reasoning and this request asks
+            # for structured output, where provider reasoning can corrupt
+            # the JSON. Disable it for every DeepSeek-served model, declared
+            # ability or not: the ability says the operator wants reasoning,
+            # it does not say they want it mixed into a JSON body. Models
+            # from other authors keep the streaming-only rule this client
+            # has always had -- widening that one would change requests for
+            # models this change is not about. A caller that asked for
+            # reasoning explicitly is answered above and is not overridden
+            # here.
+            return (
+                self._uses_deepseek_tool_protocol
+                or (is_streaming and self.supports_thinking_mode),
+                False,
+            )
+
+        # No caller-supplied thinking configuration. DeepSeek-served
+        # endpoints turn reasoning on by themselves, so the only question
+        # here is whether this client overrides that with an explicit
+        # disable payload. It does, unless the model record declares the
+        # ``thinking_mode`` ability.
+        #
+        # The ability is operator-set configuration read from the model
+        # record, while ``_uses_deepseek_tool_protocol`` is inferred from
+        # the model name. Gating on the explicit configuration keeps the
+        # decision with whoever configured the model: a record that asks
+        # for thinking gets the endpoint's reasoning, and a record that
+        # never asked for it keeps the cheaper non-reasoning shape it has
+        # always had. Reasoning produced this way is captured and replayed
+        # on the next request of a tool-call chain
+        # (``_prepare_messages_for_request``, ``_response_provider_state``,
+        # ``_attach_reasoning_content_to_raw``), which is what makes
+        # leaving it on safe.
+        #
+        # This is deliberately different from ``DeepSeekLLM``, which
+        # disables reasoning for every request that does not ask for it and
+        # never consults abilities. That client talks to one endpoint whose
+        # default it knows; this one routes the same author's models
+        # through endpoints whose defaults it does not control, so the
+        # declared ability is the only signal available about what the
+        # operator wants. Aligning the direct client is a separate decision
+        # about a different endpoint and is not made here.
+        return (
+            self._uses_deepseek_tool_protocol and not self.supports_thinking_mode,
+            False,
+        )
+
     def _prepare_provider_reasoning_extra_body(
         self,
         *,
@@ -1033,35 +1122,11 @@ class OpenRouterLLM(OpenAILLM):
     ) -> Dict[str, Any]:
         _ = tools, output_config
         updated_extra_body = dict(extra_body)
-
-        if thinking is not None:
-            should_enable = thinking.get("type") == "enabled" or thinking.get(
-                "enable", False
-            )
-            should_disable = not should_enable and (
-                thinking.get("type") == "disabled" or not thinking.get("enable", False)
-            )
-        elif is_streaming and response_format:
-            should_disable = (
-                self.supports_thinking_mode or self._uses_deepseek_tool_protocol
-            )
-            should_enable = False
-        else:
-            # DeepSeek-served endpoints can default to thinking mode, and once a
-            # response carries reasoning_content they require it to be replayed
-            # verbatim on the next request of a tool-call chain. That replay is
-            # implemented (_prepare_messages_for_request, _response_provider_
-            # state, _attach_reasoning_content_to_raw below), so this is no
-            # longer the reason thinking stays off by default. It stays off
-            # here anyway, matching DeepSeekLLM's own default: turning
-            # thinking on changes token cost and response shape for every
-            # DeepSeek-authored slug on this client, which is a separate call
-            # from closing the replay gap and is left for a change that makes
-            # that call explicitly (#1537). This deliberately ignores
-            # supports_thinking_mode: a declared thinking_mode ability does
-            # not flip this default on its own.
-            should_disable = self._uses_deepseek_tool_protocol
-            should_enable = False
+        should_disable, should_enable = self._provider_reasoning_intent(
+            thinking=thinking,
+            response_format=response_format,
+            is_streaming=is_streaming,
+        )
 
         if should_disable:
             updated_extra_body["reasoning"] = {"enabled": False}

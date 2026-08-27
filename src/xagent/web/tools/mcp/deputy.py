@@ -95,33 +95,37 @@ def _instance_url() -> str:
     instance_url = os.environ.get("DEPUTY_INSTANCE_URL")
     if not instance_url:
         raise ValueError("DEPUTY_INSTANCE_URL environment variable is missing")
-    parsed = urlparse(instance_url.rstrip("/"))
-    # rstrip: a trailing-dot FQDN (e.g. "acme.au.deputy.com.") is a valid,
-    # equivalent hostname that just wouldn't satisfy endswith below
-    # otherwise -- Deputy's own token response never sends one, but there's
-    # no reason to reject it if it ever did.
-    hostname = (parsed.hostname or "").rstrip(".")
     try:
-        # .port is a lazy property that raises ValueError for a non-numeric
-        # port (e.g. "...deputy.com:abc") -- accessed here, before the
-        # scheme/host check below, so that case raises this function's own
-        # clear message instead of urlparse's cryptic
-        # "Port could not be cast to integer value" escaping uncaught.
+        # urlparse() itself, not just the .port access below, can raise
+        # ValueError on malformed input (e.g. an IPv6-literal-like host:
+        # urlparse("https://[::1].deputy.com") raises "Invalid IPv6 URL")
+        # -- both calls share this one try/except, and everything needed
+        # below is pulled out as plain strings here (not a `parsed`
+        # reference kept for later), so either failure mode raises this
+        # function's own clear message -- rather than urlparse's cryptic
+        # one (or, for .port, "Port could not be cast to integer value")
+        # escaping uncaught, or mypy having to reason about a ParseResult
+        # that may or may not exist below.
+        parsed = urlparse(instance_url.rstrip("/"))
+        scheme = parsed.scheme
+        # rstrip: a trailing-dot FQDN (e.g. "acme.au.deputy.com.") is a
+        # valid, equivalent hostname that just wouldn't satisfy endswith
+        # below otherwise -- Deputy's own token response never sends one,
+        # but there's no reason to reject it if it ever did.
+        hostname = (parsed.hostname or "").rstrip(".")
         port = f":{parsed.port}" if parsed.port else ""
     except ValueError:
-        port = None
-    if (
-        port is None
-        or parsed.scheme != "https"
-        or not (
-            hostname == _INSTANCE_URL_HOST_SUFFIX
-            or hostname.endswith(f".{_INSTANCE_URL_HOST_SUFFIX}")
-        )
+        scheme = None
+        hostname = ""
+        port = ""
+    if scheme != "https" or not (
+        hostname == _INSTANCE_URL_HOST_SUFFIX
+        or hostname.endswith(f".{_INSTANCE_URL_HOST_SUFFIX}")
     ):
         raise ValueError(
             f"DEPUTY_INSTANCE_URL is not a valid Deputy host: {instance_url!r}"
         )
-    return f"{parsed.scheme}://{hostname}{port}"
+    return f"{scheme}://{hostname}{port}"
 
 
 def _headers() -> dict[str, str]:
@@ -158,15 +162,15 @@ def _extract_error_detail(response: requests.Response) -> str | None:
     return None
 
 
-def _request_absolute(
+def _request(
     method: str,
-    url: str,
+    path: str,
     *,
     json_data: Any = None,
 ) -> Any:
     response = requests.request(
         method=method,
-        url=url,
+        url=f"{_instance_url()}/api/v1{path}",
         headers=_headers(),
         json=json_data,
         timeout=DEFAULT_TIMEOUT_SECONDS,
@@ -184,17 +188,6 @@ def _request_absolute(
     if response.status_code == 204 or not response.content:
         return {}
     return response.json()
-
-
-def _request(
-    method: str,
-    path: str,
-    *,
-    json_data: Any = None,
-) -> Any:
-    return _request_absolute(
-        method, f"{_instance_url()}/api/v1{path}", json_data=json_data
-    )
 
 
 @mcp.tool()
@@ -228,8 +221,15 @@ def deputy_list_resource(resource: str) -> str:
     try:
         safe_resource = url_path_id(resource, "resource")
         result = _request("GET", f"/resource/{safe_resource}")
-        items = result if isinstance(result, list) else []
-        return _success_with_capped_list("records", items)
+        if not isinstance(result, list):
+            # Distinct from "genuinely zero records" (an empty list is a
+            # valid, common response) -- coercing an unexpected shape to []
+            # here would make a malformed/unexpected Deputy response
+            # indistinguishable from a real empty result, unlike
+            # deputy_get_resource/deputy_get_current_user, which both
+            # already error on an unexpected shape rather than guessing.
+            return _error(f"Deputy returned an unexpected response for {resource}")
+        return _success_with_capped_list("records", result)
     except Exception as e:
         logger.error(f"Error listing Deputy resource {resource}: {e}", exc_info=True)
         return _error(str(e))
@@ -278,7 +278,7 @@ def deputy_query_resource(
     names (e.g. "s1", "s2", ...), each an object with "field", "data", and
     "type" (a comparison operator, e.g. "eq", "gt", "lt", "ge", "le", "in").
     Example: {"s1": {"field": "Date", "data": "2026-08-01", "type": "gt"}}.
-    sort: optional {"field": <field name>, "order": "asc"|"desc"}.
+    sort: optional field-name-to-direction map, e.g. {"Id": "asc"}.
     join: optional list of related object names to include in each result,
     e.g. ["TimesheetObject"].
     """
@@ -292,8 +292,11 @@ def deputy_query_resource(
         if join:
             body["join"] = join
         result = _request("POST", f"/resource/{safe_resource}/QUERY", json_data=body)
-        items = result if isinstance(result, list) else []
-        return _success_with_capped_list("records", items)
+        if not isinstance(result, list):
+            # See deputy_list_resource's identical check: distinct from
+            # "genuinely zero records" (a valid, common response).
+            return _error(f"Deputy returned an unexpected response for {resource}")
+        return _success_with_capped_list("records", result)
     except Exception as e:
         logger.error(f"Error querying Deputy resource {resource}: {e}", exc_info=True)
         return _error(str(e))

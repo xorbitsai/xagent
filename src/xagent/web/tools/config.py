@@ -701,10 +701,12 @@ async def refresh_oauth_token_if_needed(
             # Deputy's docs (both the code-exchange and refresh legs) list
             # `redirect_uri` and `scope` as required body params here too,
             # matching the code-exchange branch in api/auth.py. scope is
-            # read from provider_config.default_scopes (same source as the
-            # code-exchange leg) rather than a hardcoded literal, so an
-            # admin who edits this provider row's scopes doesn't leave
-            # refresh silently still sending the old value.
+            # read from provider_config.default_scopes -- same source, and
+            # same "no app-level oauth_scopes override" caveat, as that
+            # code-exchange leg (see its comment) -- rather than a
+            # hardcoded literal, so an admin who edits this provider row's
+            # scopes doesn't leave refresh silently still sending the old
+            # value.
             data["redirect_uri"] = _resolve_oauth_redirect_uri(
                 provider_name, provider_config
             )

@@ -60,6 +60,20 @@ class MockResponse:
         ("   ", None),
         (None, None),
         (123, None),
+        # The same equivalence cases deputy.py's own _instance_url() is
+        # tested against (tests/web/tools/test_deputy_mcp.py) -- these two
+        # functions are meant to accept/reject the same inputs.
+        ("https://acme.au.deputy.com:8443", "https://acme.au.deputy.com:8443"),
+        ("https://acme.au.deputy.com.", "https://acme.au.deputy.com"),
+        (
+            "https://user:pw@acme.au.deputy.com/evil/path?x=1",
+            "https://acme.au.deputy.com",
+        ),
+        ("https://acme.au.deputy.com:abc", None),
+        # urlparse() itself (not just the .port access) can raise
+        # ValueError on an IPv6-literal-like host -- must return None, not
+        # let the ValueError escape uncaught.
+        ("https://[::1].deputy.com", None),
     ],
 )
 def test_normalize_deputy_endpoint(raw_endpoint, expected):
@@ -636,6 +650,61 @@ async def test_deputy_refresh_keeps_prior_instance_url_when_endpoint_malformed(
     assert oauth_account.access_token == "new-token"
     assert oauth_account.instance_url == "https://acme.au.deputy.com"
     assert any("malformed" in record.message for record in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_deputy_refresh_returns_false_on_non_200_response(
+    db_session, monkeypatch
+):
+    """Mirrors the equivalent coverage for other providers in this file
+    (e.g. Meta) -- a non-200 refresh response must leave the stored token
+    untouched and report failure, not raise or silently treat it as
+    success."""
+    db, user = db_session
+    db.add(
+        OAuthProvider(
+            provider_name="deputy",
+            name="Deputy",
+            client_id=encrypt_value("deputy-client-id"),
+            client_secret=encrypt_value("deputy-client-secret"),
+            auth_url="https://once.deputy.com/my/oauth/login",
+            token_url="https://once.deputy.com/my/oauth/access_token",
+            redirect_uri="https://app.example.com/api/auth/deputy/callback",
+            userinfo_url="",
+            user_id_path="",
+            email_path="",
+            default_scopes=["longlife_refresh_token"],
+        )
+    )
+    oauth_account = UserOAuth(
+        user_id=user.id,
+        provider="deputy",
+        access_token="old-token",
+        refresh_token="old-refresh",
+        instance_url="https://acme.au.deputy.com",
+        expires_at=datetime.now(timezone.utc) - timedelta(minutes=1),
+        provider_user_id="42",
+    )
+    db.add(oauth_account)
+    db.commit()
+
+    class FakeAsyncClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return None
+
+        async def post(self, url, **kwargs):
+            return MockResponse(status_code=401, text="invalid_grant")
+
+    monkeypatch.setattr(tool_config.httpx, "AsyncClient", FakeAsyncClient)
+
+    assert (
+        await tool_config.refresh_oauth_token_if_needed(db, oauth_account, "deputy")
+        is False
+    )
+    assert oauth_account.access_token == "old-token"
 
 
 @pytest.mark.asyncio

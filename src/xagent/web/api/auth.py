@@ -207,12 +207,18 @@ def _normalize_deputy_endpoint(raw_endpoint: object) -> Optional[str]:
 
     from urllib.parse import urlparse
 
-    parsed = urlparse(endpoint.rstrip("/"))
-    hostname = (parsed.hostname or "").rstrip(".")
     try:
+        # urlparse() itself, not just the .port access below, can raise
+        # ValueError on malformed input (e.g. an IPv6-literal-like host:
+        # urlparse("https://[::1].deputy.com") raises "Invalid IPv6 URL")
+        # -- wrapping only .port would let that escape uncaught here and
+        # surface as a raw 500 instead of this function's intended "not a
+        # valid endpoint" None return.
+        parsed = urlparse(endpoint.rstrip("/"))
         port = f":{parsed.port}" if parsed.port else ""
     except ValueError:
         return None
+    hostname = (parsed.hostname or "").rstrip(".")
     if parsed.scheme != "https" or not (
         hostname == _DEPUTY_HOST_SUFFIX or hostname.endswith(f".{_DEPUTY_HOST_SUFFIX}")
     ):
@@ -2314,11 +2320,16 @@ def generic_oauth_callback(
             # -- without it Deputy still exchanges the code but omits
             # refresh_token from the response, matching the same
             # requirement on the refresh leg in tools/config.py. Read from
-            # db_provider.default_scopes (the same column the authorize
-            # redirect's own scope_str is built from above) rather than a
-            # hardcoded literal, so an admin who edits this provider row's
-            # scopes doesn't leave the code-exchange/refresh requests
-            # silently still sending the old value.
+            # db_provider.default_scopes rather than a hardcoded literal,
+            # so an admin who edits this provider row's scopes doesn't
+            # leave the code-exchange/refresh requests silently still
+            # sending the old value. Not routed through the authorize
+            # redirect's _merge_oauth_scopes(default_scopes, app_scopes)
+            # above -- this leg only has db_provider in scope, not the
+            # per-app oauth_scopes override -- so an app-level scope
+            # override on the Deputy catalog row (none exists today) would
+            # be reflected in the authorize URL but not here. Revisit if
+            # one is ever added.
             data["scope"] = " ".join(db_provider.default_scopes or []) or (
                 "longlife_refresh_token"
             )

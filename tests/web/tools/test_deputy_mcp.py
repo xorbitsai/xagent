@@ -138,6 +138,15 @@ def test_instance_url_strips_trailing_dot_from_hostname(monkeypatch):
     assert deputy._instance_url() == "https://acme.au.deputy.com"
 
 
+def test_instance_url_rejects_ipv6_literal_host_with_clear_message(monkeypatch):
+    """urlparse() itself (not just the .port access) raises ValueError on
+    an IPv6-literal-like host -- must not escape uncaught."""
+    monkeypatch.setenv("DEPUTY_INSTANCE_URL", "https://[::1].deputy.com")
+
+    with pytest.raises(ValueError, match="not a valid Deputy host"):
+        deputy._instance_url()
+
+
 # ---------------------------------------------------------------------------
 # _extract_error_detail
 # ---------------------------------------------------------------------------
@@ -267,7 +276,12 @@ def test_list_resource_returns_error_on_failure(monkeypatch):
     assert result["status"] == "error"
 
 
-def test_list_resource_treats_non_list_response_as_empty(monkeypatch):
+def test_list_resource_errors_on_non_list_response(monkeypatch):
+    """A non-list body is an unexpected Deputy response shape, not
+    "genuinely zero records" -- must surface as an error (matching
+    deputy_get_resource/deputy_get_current_user's own unexpected-shape
+    handling), not silently coerce to an empty, indistinguishable-from-
+    real-zero-records list."""
     monkeypatch.setattr(
         deputy.requests,
         "request",
@@ -276,8 +290,7 @@ def test_list_resource_treats_non_list_response_as_empty(monkeypatch):
 
     result = json.loads(deputy.deputy_list_resource("Employee"))
 
-    assert result["status"] == "success"
-    assert result["records"] == []
+    assert result["status"] == "error"
 
 
 def test_list_resource_rejects_surrounding_whitespace_resource_without_raising(
@@ -439,7 +452,9 @@ def test_query_resource_returns_error_on_failure(monkeypatch):
     assert "bad" in result["message"]
 
 
-def test_query_resource_treats_non_list_response_as_empty(monkeypatch):
+def test_query_resource_errors_on_non_list_response(monkeypatch):
+    """See test_list_resource_errors_on_non_list_response's docstring --
+    same reasoning applies here."""
     monkeypatch.setattr(
         deputy.requests,
         "request",
@@ -448,8 +463,7 @@ def test_query_resource_treats_non_list_response_as_empty(monkeypatch):
 
     result = json.loads(deputy.deputy_query_resource("Roster"))
 
-    assert result["status"] == "success"
-    assert result["records"] == []
+    assert result["status"] == "error"
 
 
 def test_query_resource_rejects_surrounding_whitespace_resource_without_raising(

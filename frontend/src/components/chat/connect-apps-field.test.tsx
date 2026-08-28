@@ -817,6 +817,30 @@ describe("ConnectAppsField", () => {
     ).not.toBeInTheDocument();
   });
 
+  it("does not treat the card as all-connected when one requested app name never resolves in the catalog", () => {
+    // resolveRows silently drops a name that doesn't match anything in the
+    // catalog - a multi-connection template (e.g. hire-agent.ts's uncapped
+    // connections list) with one bad/unresolvable name must not read as
+    // "all connected" just because the row(s) that DID resolve are.
+    mcpAppsMock.apps = [makeApp({ provider: "google", is_connected: true })];
+
+    render(
+      <ConnectAppsField
+        interaction={{ ...LEO_INTERACTION, apps: ["Gmail", "Not A Real App"] }}
+        onSkip={vi.fn()}
+        onContinue={vi.fn()}
+      />
+    );
+
+    expect(
+      screen.queryByText("chatPage.clarification.connectApps.allConnectedNote")
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "chatPage.clarification.connectApps.continue" }),
+    ).not.toBeInTheDocument();
+    expect(screen.getByText("chatPage.clarification.connectApps.skip")).toBeInTheDocument();
+  });
+
   it("shows a Continue button instead of the completion note alone once every row is Connected, when onContinue is supplied", () => {
     mcpAppsMock.apps = [makeApp({ provider: "google", is_connected: true })];
     const onContinue = vi.fn();

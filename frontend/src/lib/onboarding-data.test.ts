@@ -50,6 +50,21 @@ describe("recommendedTemplates", () => {
     expect(result).toEqual([{ templateId: "support-inbox-manager", goalId: "inbox" }])
   })
 
+  // Pins the templateId-based `seen` dedup itself: no two goals in today's
+  // real ONBOARDING_GOALS share a templateId, so the test above can't tell
+  // this branch apart from deleting it entirely - a synthetic catalog with
+  // two DISTINCT goals sharing one templateId is the only way to prove it.
+  it("dedupes two distinct selected goals that map to the same template", () => {
+    const catalog = [
+      { id: "a", labelKey: "onboarding.goal.inbox" as const, templateId: "shared-template", fn: "sales" as const },
+      { id: "b", labelKey: "onboarding.goal.social" as const, templateId: "shared-template", fn: "sales" as const },
+    ]
+
+    const result = recommendedTemplates(["a", "b"], catalog)
+
+    expect(result).toEqual([{ templateId: "shared-template", goalId: "a" }])
+  })
+
   it("falls back to the fixed 3-agent default when no goals are selected", () => {
     const result = recommendedTemplates([])
     expect(result).toEqual(

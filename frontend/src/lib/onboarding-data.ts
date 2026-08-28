@@ -118,8 +118,17 @@ export interface RecommendedTemplate {
  * with a persona first, THEN caps at 3. Capping here, before that filter,
  * used to mean a 4th-ranked match with a real persona could never fill a
  * slot vacated by a top-3 match that turned out to have none. */
-export function recommendedTemplates(selectedGoalIds: string[]): RecommendedTemplate[] {
-  const picked = ONBOARDING_GOALS.filter((goal) => selectedGoalIds.includes(goal.id));
+// `catalog`/`fallbackTemplateIds` default to the real data but are
+// overridable so a test can prove the templateId-based `seen` dedup below
+// actually does something: no two goals in today's real ONBOARDING_GOALS
+// share a templateId, so exercising that branch (rather than just the
+// filter above collapsing a repeated SELECTED id) needs a synthetic catalog.
+export function recommendedTemplates(
+  selectedGoalIds: string[],
+  catalog: OnboardingGoal[] = ONBOARDING_GOALS,
+  fallbackTemplateIds: string[] = ONBOARDING_FALLBACK_TEMPLATE_IDS
+): RecommendedTemplate[] {
+  const picked = catalog.filter((goal) => selectedGoalIds.includes(goal.id));
   const seen = new Set<string>();
   const out: RecommendedTemplate[] = [];
   for (const goal of picked) {
@@ -128,7 +137,7 @@ export function recommendedTemplates(selectedGoalIds: string[]): RecommendedTemp
     out.push({ templateId: goal.templateId, goalId: goal.id });
   }
   if (out.length === 0) {
-    for (const templateId of ONBOARDING_FALLBACK_TEMPLATE_IDS) {
+    for (const templateId of fallbackTemplateIds) {
       out.push({ templateId, goalId: null });
     }
   }

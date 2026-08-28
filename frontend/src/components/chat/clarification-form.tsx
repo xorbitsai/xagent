@@ -651,10 +651,16 @@ export function ClarificationForm({
       // real widget instead of falling to the "unsupported type" case below.
       case "connect_apps":
         return (
+          // Connect/Skip stay live regardless of `active` (see the
+          // LIVE_WIDGET_TYPES comment above) - but unlike those, Continue
+          // sends a chat message that resumes/replans the CURRENT turn, so
+          // it must not be offered from a historical or Hire-seed card that
+          // isn't the live pause, or it hijacks whatever the task is doing
+          // right now.
           <ConnectAppsField
             interaction={interaction}
             onSkip={handleSkipConnectApps}
-            onContinue={handleContinueConnectApps}
+            onContinue={active ? handleContinueConnectApps : undefined}
           />
         )
 
@@ -703,7 +709,7 @@ export function ClarificationForm({
                 key={`${interaction.field}-${index}`}
                 interaction={interaction}
                 onSkip={handleSkipConnectApps}
-                onContinue={handleContinueConnectApps}
+                onContinue={active ? handleContinueConnectApps : undefined}
               />
             ))}
           </div>

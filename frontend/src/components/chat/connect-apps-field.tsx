@@ -189,9 +189,10 @@ export function ConnectAppsField({
   /** Called once every requested app is connected, in place of onSkip -
    * distinct so the message it sends can say "connected" rather than
    * "I'll do this later" (see clarification-form.tsx's
-   * handleContinueConnectApps). Optional so an older/mixed-list caller
-   * that doesn't pass it just keeps the allConnectedNote-only footer this
-   * card had before, rather than crashing. */
+   * handleContinueConnectApps). Optional (and omitted) when this card
+   * isn't the live, active pause - clarification-form.tsx passes it only
+   * when `active`, since Continue sends a message that resumes/replans the
+   * current turn, unlike Connect/Skip which stay usable on any card. */
   onContinue?: () => Promise<void> | void;
 }) {
   const { apps, refresh, isLoading, error } = useMcpApps();
@@ -226,11 +227,20 @@ export function ConnectAppsField({
   }, []);
 
   const rows = useMemo(() => resolveRows(interaction.apps, apps), [interaction.apps, apps]);
+  // resolveRows silently drops any requested name that doesn't resolve in
+  // the catalog (see its own comment) - a multi-connection template (e.g.
+  // hire-agent.ts's uncapped connections list) with one unresolvable name
+  // must not read as "all connected" just because every row that DID render
+  // happens to be connected.
+  const hasUnresolvedApp = useMemo(
+    () => (interaction.apps || []).some((name) => !findMatchingMcpApp(apps, name)),
+    [interaction.apps, apps],
+  );
   // Recomputed on every render (not memoized against rows, which doesn't
   // change when just an app's is_connected flips) - the footer's "not
   // connected yet" copy plus a Skip button, alongside a card whose every row
   // already shows Connected, would read as an outright contradiction.
-  const allConnected = rows.length > 0 && rows.every((row) => !!row.app.is_connected);
+  const allConnected = !hasUnresolvedApp && rows.length > 0 && rows.every((row) => !!row.app.is_connected);
 
   if (rows.length === 0) {
     // ClarificationForm's Collapsible card (title bar + chevron) is already

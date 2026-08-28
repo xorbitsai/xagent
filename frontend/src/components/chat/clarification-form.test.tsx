@@ -339,6 +339,144 @@ describe("ClarificationForm connect_apps interaction", () => {
     ).not.toBeInTheDocument()
   })
 
+  it("does not offer Continue on a historical/Hire-seed card (active=false), even once every app is connected", () => {
+    // Connect/Skip must stay usable regardless of active (the test above
+    // covers that), but Continue sends a chat message that resumes/replans
+    // the CURRENT turn - offering it from a card that isn't the live pause
+    // would hijack whatever the task is doing right now.
+    mcpAppsMock.apps = [
+      {
+        id: "gmail",
+        name: "Gmail",
+        description: "",
+        icon: "",
+        users: "",
+        transport: "builtin",
+        provider: "google",
+        category: "Communication",
+        is_connected: true,
+      },
+    ]
+
+    render(
+      <ClarificationForm
+        interactions={[CONNECT_APPS_INTERACTION]}
+        active={false}
+        onSend={vi.fn()}
+      />,
+    )
+
+    expect(
+      screen.queryByRole("button", { name: "chatPage.clarification.connectApps.continue" }),
+    ).not.toBeInTheDocument()
+  })
+
+  it("offers Continue once every app is connected on the live pause card (active=true)", () => {
+    mcpAppsMock.apps = [
+      {
+        id: "gmail",
+        name: "Gmail",
+        description: "",
+        icon: "",
+        users: "",
+        transport: "builtin",
+        provider: "google",
+        category: "Communication",
+        is_connected: true,
+      },
+    ]
+
+    render(
+      <ClarificationForm
+        interactions={[CONNECT_APPS_INTERACTION]}
+        active={true}
+        onSend={vi.fn()}
+      />,
+    )
+
+    expect(
+      screen.getByRole("button", { name: "chatPage.clarification.connectApps.continue" }),
+    ).toBeInTheDocument()
+  })
+
+  it("sends the continue acknowledgement message when Continue is clicked", async () => {
+    mcpAppsMock.apps = [
+      {
+        id: "gmail",
+        name: "Gmail",
+        description: "",
+        icon: "",
+        users: "",
+        transport: "builtin",
+        provider: "google",
+        category: "Communication",
+        is_connected: true,
+      },
+    ]
+    const onSend = vi.fn().mockResolvedValue(undefined)
+
+    render(
+      <ClarificationForm
+        interactions={[CONNECT_APPS_INTERACTION]}
+        active={true}
+        onSend={onSend}
+      />,
+    )
+
+    fireEvent.click(
+      screen.getByRole("button", { name: "chatPage.clarification.connectApps.continue" }),
+    )
+
+    await waitFor(() => {
+      expect(onSend).toHaveBeenCalledWith(
+        "chatPage.clarification.connectApps.continue",
+        [],
+        {},
+      )
+    })
+  })
+
+  it("toasts an error and lets the Continue button reappear (via rethrow) when sending the continue message fails", async () => {
+    mcpAppsMock.apps = [
+      {
+        id: "gmail",
+        name: "Gmail",
+        description: "",
+        icon: "",
+        users: "",
+        transport: "builtin",
+        provider: "google",
+        category: "Communication",
+        is_connected: true,
+      },
+    ]
+    const onSend = vi.fn().mockRejectedValue(new Error("network down"))
+
+    render(
+      <ClarificationForm
+        interactions={[CONNECT_APPS_INTERACTION]}
+        active={true}
+        onSend={onSend}
+      />,
+    )
+
+    fireEvent.click(
+      screen.getByRole("button", { name: "chatPage.clarification.connectApps.continue" }),
+    )
+
+    await waitFor(() => {
+      expect(toastErrorMock).toHaveBeenCalledWith("chatPage.clarification.sendError")
+    })
+    // The rethrow lets connect-apps-field.tsx's catch reset `continued` to
+    // false, so the Continue button comes back instead of staying hidden
+    // with no way to retry.
+    await waitFor(() => {
+      expect(
+        screen.getByRole("button", { name: "chatPage.clarification.connectApps.continue" }),
+      ).toBeInTheDocument()
+    })
+  })
+
   it("sends a skip acknowledgement message when 'I'll do this later' is clicked", async () => {
     const onSend = vi.fn()
     render(

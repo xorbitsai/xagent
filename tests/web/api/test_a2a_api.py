@@ -3180,6 +3180,54 @@ def test_subscribe_stream_ends_at_server_lifetime_limit(monkeypatch) -> None:
     assert event["task"]["status"]["state"] == "TASK_STATE_WORKING"
 
 
+@pytest.mark.asyncio
+async def test_a2a_resume_syncs_connector_runtime_turn_after_reservation() -> None:
+    """An A2A input-required resume must sync the connector runtime turn
+    binding for the turn whose message it just injected, once (and only
+    once) it is the sole admitted owner of the cached agent - not on a
+    cache-hit fetch that predates admission. Guards the A2A-vs-websocket-
+    resume race: without this sync, an A2A resume that inherits a cached
+    agent left mid-turn by a losing websocket resume would execute against
+    that losing turn's tool_config/ephemeral-secret binding instead of its
+    own."""
+
+    from xagent.web.api import websocket as websocket_api
+
+    real_manager = websocket_api.BackgroundTaskManager()
+    lease = TaskLease(task_id=5454, runner_id="runner-z", run_id="run-a2a-sync")
+    resume_gate = asyncio.Event()
+    mgr = MagicMock()
+
+    async def execute_resume_background(**_kwargs) -> None:
+        await resume_gate.wait()
+
+    with (
+        patch.object(websocket_api, "background_task_manager", real_manager),
+        patch.object(
+            websocket_api,
+            "execute_resume_background",
+            side_effect=execute_resume_background,
+        ),
+        patch("xagent.web.api.chat.get_agent_manager", return_value=mgr),
+    ):
+        await a2a_api._schedule_waiting_a2a_resume(
+            task_id=5454,
+            agent_service=MagicMock(),
+            task_owner_user_id=1,
+            task_lease=lease,
+            heartbeat_stop=asyncio.Event(),
+            heartbeat_task=asyncio.ensure_future(asyncio.sleep(0)),
+            resumable_status=TaskStatus.WAITING_FOR_USER,
+            connector_runtime_turn_id="a2a:5454:the-real-turn",
+        )
+        try:
+            mgr.sync_connector_runtime_turn.assert_called_once_with(
+                5454, "a2a:5454:the-real-turn"
+            )
+        finally:
+            resume_gate.set()
+
+
 def test_subscribe_projects_claimed_waiting_resume_as_working(monkeypatch) -> None:
     agent_id, full_key = _create_published_agent_with_key()
     db = _direct_db_session()

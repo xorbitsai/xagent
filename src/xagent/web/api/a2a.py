@@ -164,13 +164,23 @@ async def _schedule_waiting_a2a_resume(
     heartbeat_stop: asyncio.Event,
     heartbeat_task: asyncio.Task[TaskLeaseHeartbeatOutcome],
     resumable_status: TaskStatus,
+    connector_runtime_turn_id: str,
 ) -> None:
+    from .chat import get_agent_manager
     from .websocket import background_task_manager, execute_resume_background
 
     if task_lease.task_id != task_id or task_lease.run_id is None:
         raise ValueError("A2A resume scheduling requires an exact task lease")
     if not background_task_manager.reserve_resume(task_id):
         raise RuntimeError(f"Task {task_id} already has a resume in progress")
+    # This request is now the sole admitted owner of the cached agent's
+    # tool_config for this task (see websocket.py's message-triggered and
+    # explicit-resume handlers for the same reasoning) - only now is it
+    # safe to sync the connector runtime turn binding to the turn whose
+    # message was just injected, so a reconnected app's tools rebuild
+    # against it instead of leaving a losing resume's turn/cache context
+    # on the shared agent this one is about to execute under.
+    get_agent_manager().sync_connector_runtime_turn(task_id, connector_runtime_turn_id)
     previous_task = background_task_manager.running_tasks.get(task_id)
     bg_task: asyncio.Task[None] | None = None
     try:
@@ -492,6 +502,8 @@ async def _resume_input_required_a2a_task(
             lambda: active_interaction_id_sync(task_id)
         )
 
+        a2a_turn_id = f"a2a:{task_id}:{message_id}"
+
         async def inject_user_message() -> tuple[Any, bool]:
             from .chat import get_agent_manager
 
@@ -504,7 +516,7 @@ async def _resume_input_required_a2a_task(
                 str(task_id),
                 execution_message=text,
                 display_message=text,
-                turn_id=f"a2a:{task_id}:{message_id}",
+                turn_id=a2a_turn_id,
                 request_interrupt=False,
                 reason="A2A input-required response",
             )
@@ -551,6 +563,7 @@ async def _resume_input_required_a2a_task(
             heartbeat_stop=heartbeat_stop,
             heartbeat_task=heartbeat_task,
             resumable_status=resumable_status,
+            connector_runtime_turn_id=a2a_turn_id,
         )
         ownership_transferred = True
     except CheckpointReadError as exc:

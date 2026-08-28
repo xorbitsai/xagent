@@ -381,8 +381,9 @@ async def _schedule_waiting_reply_resume(
     task_lease: TaskLease,
     heartbeat_stop: asyncio.Event,
     heartbeat_task: "asyncio.Task[TaskLeaseHeartbeatOutcome]",
+    connector_runtime_turn_id: str,
 ) -> None:
-    from .. import websocket
+    from .. import chat, websocket
 
     if task_lease.task_id != task_id or task_lease.run_id is None:
         raise ValueError("Reply resume scheduling requires an exact task lease")
@@ -392,6 +393,16 @@ async def _schedule_waiting_reply_resume(
         # would read a lost race on the claim itself, rather than a bare
         # 500: retrying (after the other resume settles) can succeed.
         raise V1ApiError(V1ErrorCode.TASK_BUSY, 409)
+    # This request is now the sole admitted owner of the cached agent's
+    # tool_config for this task (see websocket.py's message-triggered and
+    # explicit-resume handlers for the same reasoning) - only now is it
+    # safe to sync the connector runtime turn binding to the turn whose
+    # message was just injected, so a reconnected app's tools rebuild
+    # against it instead of leaving a losing resume's turn/cache context
+    # on the shared agent this one is about to execute under.
+    chat.get_agent_manager().sync_connector_runtime_turn(
+        task_id, connector_runtime_turn_id
+    )
     previous_task = websocket.background_task_manager.running_tasks.get(task_id)
     bg_task: "asyncio.Task[None] | None" = None
     try:
@@ -524,6 +535,8 @@ async def reply_to_task(
             lambda: active_interaction_id_sync(task_id)
         )
 
+        reply_turn_id = f"v1:reply:{task_id}:{uuid4()}"
+
         async def inject_user_message() -> tuple[Any, bool]:
             from .. import chat
 
@@ -536,7 +549,7 @@ async def reply_to_task(
                 str(task_id),
                 execution_message=ctx.text,
                 display_message=ctx.text,
-                turn_id=f"v1:reply:{task_id}:{uuid4()}",
+                turn_id=reply_turn_id,
                 request_interrupt=False,
                 reason="V1 interaction response",
             )
@@ -577,6 +590,7 @@ async def reply_to_task(
             task_lease=task_lease,
             heartbeat_stop=heartbeat_stop,
             heartbeat_task=heartbeat_task,
+            connector_runtime_turn_id=reply_turn_id,
         )
         ownership_transferred = True
     except CheckpointReadError as exc:

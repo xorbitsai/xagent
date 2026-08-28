@@ -983,6 +983,7 @@ async def test_reply_resume_binds_the_coordinator_to_the_leased_run() -> None:
             task_lease=lease,
             heartbeat_stop=asyncio.Event(),
             heartbeat_task=asyncio.ensure_future(asyncio.sleep(0)),
+            connector_runtime_turn_id="v1:reply:4242:test-turn",
         )
         try:
             assert (
@@ -998,4 +999,52 @@ async def test_reply_resume_binds_the_coordinator_to_the_leased_run() -> None:
         finally:
             resume_gate.set()
             coordinator = real_manager.resume_tasks[4242]
+            await asyncio.wait_for(coordinator, timeout=5)
+
+
+@pytest.mark.asyncio
+async def test_reply_resume_syncs_connector_runtime_turn_after_reservation() -> None:
+    """A v1 reply resume must sync the connector runtime turn binding for
+    the turn whose message it just injected, once (and only once) it is the
+    sole admitted owner of the cached agent - not on a cache-hit fetch that
+    predates admission. Guards the reply-vs-websocket-resume race: without
+    this sync, a reply that inherits a cached agent left mid-turn by a
+    losing websocket resume would execute against that losing turn's
+    tool_config/ephemeral-secret binding instead of its own."""
+
+    from xagent.web.api import websocket as websocket_api
+
+    real_manager = websocket_api.BackgroundTaskManager()
+    lease = TaskLease(task_id=4343, runner_id="runner-y", run_id="run-reply-sync")
+    resume_gate = asyncio.Event()
+    mgr = MagicMock()
+
+    async def execute_resume_background(**_kwargs) -> None:
+        await resume_gate.wait()
+
+    with (
+        patch.object(websocket_api, "background_task_manager", real_manager),
+        patch.object(
+            websocket_api,
+            "execute_resume_background",
+            side_effect=execute_resume_background,
+        ),
+        patch("xagent.web.api.chat.get_agent_manager", return_value=mgr),
+    ):
+        await task_reply_module._schedule_waiting_reply_resume(
+            task_id=4343,
+            agent_service=MagicMock(),
+            task_owner_user_id=1,
+            task_lease=lease,
+            heartbeat_stop=asyncio.Event(),
+            heartbeat_task=asyncio.ensure_future(asyncio.sleep(0)),
+            connector_runtime_turn_id="v1:reply:4343:the-real-turn",
+        )
+        try:
+            mgr.sync_connector_runtime_turn.assert_called_once_with(
+                4343, "v1:reply:4343:the-real-turn"
+            )
+        finally:
+            resume_gate.set()
+            coordinator = real_manager.resume_tasks[4343]
             await asyncio.wait_for(coordinator, timeout=5)

@@ -5,13 +5,18 @@ import json
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
+import httpx
+import openai
 import pytest
+from openai.types.chat.chat_completion_chunk import ChoiceDelta
+from pydantic import BaseModel, ConfigDict
 
 from xagent.core.model.chat.basic.base import BaseLLM
 from xagent.core.model.chat.basic.openai import (
     PROVIDER_STATE_METADATA_KEY,
     OpenAILLM,
     _format_openai_error,
+    field_content,
 )
 from xagent.core.model.chat.error import retry_on
 from xagent.core.model.chat.exceptions import LLMEmptyContentError, LLMRetryableError
@@ -36,6 +41,37 @@ def _tool_call_delta(index, call_id, name, arguments, call_type="function"):
         id=call_id,
         type=call_type,
         function=SimpleNamespace(name=name, arguments=arguments),
+    )
+
+
+def _response_format_bad_request(message: str) -> openai.BadRequestError:
+    """A 400 whose text matches the response_format fallback's trigger check."""
+    return openai.BadRequestError(
+        f"Error code: 400 - {{'error': {{'message': '{message}'}}}}",
+        response=httpx.Response(
+            400,
+            request=httpx.Request("POST", "https://api.openai.com/v1/chat/completions"),
+        ),
+        body={"error": {"message": message, "code": 400}},
+    )
+
+
+def _unrelated_bad_request() -> openai.BadRequestError:
+    """A 400 that has nothing to do with response_format."""
+    return openai.BadRequestError(
+        "Error code: 400 - {'error': {'message': 'Unsupported image format'}}",
+        response=httpx.Response(
+            400,
+            request=httpx.Request("POST", "https://api.openai.com/v1/chat/completions"),
+        ),
+        body={"error": {"message": "Unsupported image format", "code": 400}},
+    )
+
+
+def _api_timeout_error() -> openai.APITimeoutError:
+    """The SDK's timeout error, as raised by a request that never answered."""
+    return openai.APITimeoutError(
+        request=httpx.Request("POST", "https://api.openai.com/v1/chat/completions")
     )
 
 
@@ -600,6 +636,96 @@ class TestOpenAILLM:
         call_args = mock_client.chat.completions.create.call_args
         assert call_args.kwargs["temperature"] == 0.0
         assert "max_tokens" not in call_args.kwargs
+
+    @pytest.mark.asyncio
+    async def test_vision_chat_returns_the_response_format_retry_result(
+        self, openai_llm_config, mock_chat_completion, mocker
+    ):
+        """Dropping response_format must not also drop the answer.
+
+        The retry succeeds, so vision_chat has to return that reply's
+        envelope. Returning ``None`` instead reaches the vision tool as an
+        unsupported response shape, turning a successful answer into a
+        detection failure.
+        """
+        mock_client = mocker.AsyncMock()
+        mock_client.chat.completions.create.side_effect = [
+            _response_format_bad_request(
+                "response_format is not supported by this model"
+            ),
+            mock_chat_completion,
+        ]
+        mocker.patch(
+            "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+            return_value=mock_client,
+        )
+
+        llm = OpenAILLM(**openai_llm_config, abilities=["chat", "vision"])
+        response = await llm.vision_chat(
+            [{"role": "user", "content": "Describe this image."}],
+            response_format={"type": "json_object"},
+        )
+
+        assert response == {
+            "type": "text",
+            "content": "Hello World",
+            "raw": mock_chat_completion.model_dump(),
+        }
+        assert mock_client.chat.completions.create.await_count == 2
+        retry_kwargs = mock_client.chat.completions.create.call_args_list[1].kwargs
+        assert "response_format" not in retry_kwargs
+
+    @pytest.mark.asyncio
+    async def test_vision_chat_unrelated_bad_request_is_terminal(
+        self, openai_llm_config, mocker
+    ):
+        """A 400 unrelated to response_format keeps failing with its own message."""
+        mock_client = mocker.AsyncMock()
+        mock_client.chat.completions.create.side_effect = _unrelated_bad_request()
+        mocker.patch(
+            "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+            return_value=mock_client,
+        )
+
+        llm = OpenAILLM(**openai_llm_config, abilities=["chat", "vision"])
+        with pytest.raises(RuntimeError, match="OpenAI bad request"):
+            await llm.vision_chat(
+                [{"role": "user", "content": "Describe this image."}],
+                response_format={"type": "json_object"},
+            )
+
+        assert mock_client.chat.completions.create.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_vision_chat_reports_a_failed_retry_as_a_runtime_error(
+        self, openai_llm_config, mocker
+    ):
+        """A retry that is rejected too surfaces as the documented RuntimeError.
+
+        The method documents ``Raises: RuntimeError``; a raw provider
+        exception escaping from the retry would break that, and would differ
+        from how ``stream_chat`` reports the same double rejection.
+        """
+        mock_client = mocker.AsyncMock()
+        mock_client.chat.completions.create.side_effect = [
+            _response_format_bad_request(
+                "response_format is not supported by this model"
+            ),
+            _unrelated_bad_request(),
+        ]
+        mocker.patch(
+            "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+            return_value=mock_client,
+        )
+
+        llm = OpenAILLM(**openai_llm_config, abilities=["chat", "vision"])
+        with pytest.raises(RuntimeError, match="OpenAI bad request"):
+            await llm.vision_chat(
+                [{"role": "user", "content": "Describe this image."}],
+                response_format={"type": "json_object"},
+            )
+
+        assert mock_client.chat.completions.create.await_count == 2
 
     @pytest.mark.asyncio
     async def test_cleanup(self, openai_llm_config, mock_chat_completion, mocker):
@@ -1278,3 +1404,316 @@ class TestOpenAILLM:
 
         assert final_chunk is not None
         assert final_chunk.tool_calls[0]["function"]["arguments"] == expected
+
+    @pytest.mark.asyncio
+    async def test_chat_response_format_retry_failure_wraps_runtime_error(
+        self, openai_llm_config, mocker
+    ):
+        """A second BadRequestError from the response_format resend must be
+        wrapped into RuntimeError, not escape as a bare SDK exception, just
+        like every other ``chat()`` failure path. This pins WHICH of the two
+        errors becomes ``__cause__``: it must be the resend's own failure,
+        not the first attempt's, and the wrapped message must carry the
+        resend's text."""
+        first_error = _response_format_bad_request(
+            "the model does not support response_format on the first attempt"
+        )
+        second_error = _response_format_bad_request(
+            "the model still rejects response_format on the resend"
+        )
+        mock_client = mocker.AsyncMock()
+        mock_client.chat.completions.create.side_effect = [first_error, second_error]
+        mocker.patch(
+            "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+            return_value=mock_client,
+        )
+        llm = OpenAILLM(**openai_llm_config)
+
+        with pytest.raises(RuntimeError) as exc_info:
+            await llm.chat(
+                [{"role": "user", "content": "hi"}],
+                response_format={"type": "json_object"},
+            )
+
+        assert exc_info.value.__cause__ is second_error
+        assert "on the resend" in str(exc_info.value)
+        assert mock_client.chat.completions.create.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_chat_response_format_retry_success_returns_result(
+        self, openai_llm_config, mock_chat_completion, mocker
+    ):
+        """When the resend succeeds, ``chat()`` already returns the processed
+        result today; this pins that behavior against the same failure-path
+        restructuring."""
+        mock_client = mocker.AsyncMock()
+        mock_client.chat.completions.create.side_effect = [
+            _response_format_bad_request(
+                "the model does not support response_format for this request"
+            ),
+            mock_chat_completion,
+        ]
+        mocker.patch(
+            "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+            return_value=mock_client,
+        )
+        llm = OpenAILLM(**openai_llm_config)
+
+        result = await llm.chat(
+            [{"role": "user", "content": "hi"}],
+            response_format={"type": "json_object"},
+        )
+
+        assert result.get("content") == "Hello World"
+        assert mock_client.chat.completions.create.await_count == 2
+        second_call = mock_client.chat.completions.create.call_args_list[1].kwargs
+        assert "response_format" not in second_call
+
+    @pytest.mark.asyncio
+    async def test_vision_chat_response_format_retry_failure_wraps_runtime_error(
+        self, openai_llm_config, mocker
+    ):
+        """Same guarantee as ``chat()``: the vision path must not leak a bare
+        BadRequestError when the response_format resend also fails. This
+        pins WHICH of the two errors becomes ``__cause__``: it must be the
+        resend's own failure, not the first attempt's, and the wrapped
+        message must carry the resend's text."""
+        first_error = _response_format_bad_request(
+            "the model does not support response_format on the first attempt"
+        )
+        second_error = _response_format_bad_request(
+            "the model still rejects response_format on the resend"
+        )
+        mock_client = mocker.AsyncMock()
+        mock_client.chat.completions.create.side_effect = [first_error, second_error]
+        mocker.patch(
+            "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+            return_value=mock_client,
+        )
+        llm = OpenAILLM(**openai_llm_config, abilities=["chat", "vision"])
+
+        with pytest.raises(RuntimeError) as exc_info:
+            await llm.vision_chat(
+                [{"role": "user", "content": "describe this"}],
+                response_format={"type": "json_object"},
+            )
+
+        assert exc_info.value.__cause__ is second_error
+        assert "on the resend" in str(exc_info.value)
+        assert mock_client.chat.completions.create.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_vision_chat_response_format_retry_success_returns_result(
+        self, openai_llm_config, mock_chat_completion, mocker
+    ):
+        """A successful resend must return the processed result, not fall
+        through to an implicit ``None`` (the vision_chat() half of #1650)."""
+        mock_client = mocker.AsyncMock()
+        mock_client.chat.completions.create.side_effect = [
+            _response_format_bad_request(
+                "the model does not support response_format for this request"
+            ),
+            mock_chat_completion,
+        ]
+        mocker.patch(
+            "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+            return_value=mock_client,
+        )
+        llm = OpenAILLM(**openai_llm_config, abilities=["chat", "vision"])
+
+        result = await llm.vision_chat(
+            [{"role": "user", "content": "describe this"}],
+            response_format={"type": "json_object"},
+        )
+
+        assert result is not None
+        assert result.get("type") == "text"
+        assert result.get("content") == "Hello World"
+        assert mock_client.chat.completions.create.await_count == 2
+        second_call = mock_client.chat.completions.create.call_args_list[1].kwargs
+        assert "response_format" not in second_call
+
+    @pytest.mark.asyncio
+    async def test_chat_response_format_resend_timeout_wraps_runtime_error(
+        self, openai_llm_config, mocker
+    ):
+        """Before this PR the response_format resend lived directly inside
+        the ``except openai.BadRequestError`` clause, so a non-BadRequestError
+        failure from that resend escaped unwrapped. The nested-try
+        restructuring routes it to ``chat()``'s own
+        ``except openai.APITimeoutError`` handler instead; this path is
+        newly correct and was previously untested."""
+        timeout_error = _api_timeout_error()
+        mock_client = mocker.AsyncMock()
+        mock_client.chat.completions.create.side_effect = [
+            _response_format_bad_request(
+                "the model does not support response_format for this request"
+            ),
+            timeout_error,
+        ]
+        mocker.patch(
+            "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+            return_value=mock_client,
+        )
+        llm = OpenAILLM(**openai_llm_config)
+
+        with pytest.raises(RuntimeError) as exc_info:
+            await llm.chat(
+                [{"role": "user", "content": "hi"}],
+                response_format={"type": "json_object"},
+            )
+
+        assert "OpenAI API timeout" in str(exc_info.value)
+        assert exc_info.value.__cause__ is timeout_error
+        assert mock_client.chat.completions.create.await_count == 2
+        second_call = mock_client.chat.completions.create.call_args_list[1].kwargs
+        assert "response_format" not in second_call
+
+    @pytest.mark.asyncio
+    async def test_vision_chat_response_format_resend_timeout_wraps_runtime_error(
+        self, openai_llm_config, mocker
+    ):
+        """Before this PR the response_format resend lived directly inside
+        the ``except openai.BadRequestError`` clause, so a non-BadRequestError
+        failure from that resend escaped unwrapped. The nested-try
+        restructuring routes it to ``vision_chat()``'s own
+        ``except openai.APITimeoutError`` handler instead; this path is
+        newly correct and was previously untested."""
+        timeout_error = _api_timeout_error()
+        mock_client = mocker.AsyncMock()
+        mock_client.chat.completions.create.side_effect = [
+            _response_format_bad_request(
+                "the model does not support response_format for this request"
+            ),
+            timeout_error,
+        ]
+        mocker.patch(
+            "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+            return_value=mock_client,
+        )
+        llm = OpenAILLM(**openai_llm_config, abilities=["chat", "vision"])
+
+        with pytest.raises(RuntimeError) as exc_info:
+            await llm.vision_chat(
+                [{"role": "user", "content": "describe this"}],
+                response_format={"type": "json_object"},
+            )
+
+        assert "OpenAI API timeout" in str(exc_info.value)
+        assert exc_info.value.__cause__ is timeout_error
+        assert mock_client.chat.completions.create.await_count == 2
+        second_call = mock_client.chat.completions.create.call_args_list[1].kwargs
+        assert "response_format" not in second_call
+
+    @pytest.mark.asyncio
+    async def test_stream_chat_response_format_resend_timeout_is_retryable(
+        self, openai_llm_config, mocker
+    ):
+        """``stream_chat`` already had this nested-try shape before this PR;
+        its diff is untouched here. This test pins the sibling contract that
+        ``test_chat_...`` and ``test_vision_chat_...`` above were aligned
+        to: ``stream_chat`` classifies the same response_format-resend
+        timeout as ``LLMRetryableError`` rather than ``RuntimeError``."""
+        timeout_error = _api_timeout_error()
+        mock_client = mocker.AsyncMock()
+        mock_client.chat.completions.create.side_effect = [
+            _response_format_bad_request(
+                "the model does not support response_format for this request"
+            ),
+            timeout_error,
+        ]
+        mocker.patch(
+            "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+            return_value=mock_client,
+        )
+        llm = OpenAILLM(**openai_llm_config)
+
+        with pytest.raises(LLMRetryableError) as exc_info:
+            _ = [
+                chunk
+                async for chunk in llm.stream_chat(
+                    [{"role": "user", "content": "hi"}],
+                    response_format={"type": "json_object"},
+                )
+            ]
+
+        assert "OpenAI API timeout" in str(exc_info.value)
+        assert exc_info.value.__cause__ is timeout_error
+        assert mock_client.chat.completions.create.await_count == 2
+        second_call = mock_client.chat.completions.create.call_args_list[1].kwargs
+        assert "response_format" not in second_call
+
+    @pytest.mark.asyncio
+    async def test_vision_chat_empty_content_after_resend_raises_empty_content_error(
+        self, openai_llm_config, mocker
+    ):
+        """Pins ``vision_chat()``'s empty-content contract, which had zero
+        tests of its own (``chat()`` has ``test_empty_content_response``;
+        ``vision_chat()`` had nothing). The response_format resend is the
+        carrier here because falling through to the normal processing path
+        is what makes this outcome reachable on the resend at all: before
+        this PR, a successful resend short-circuited to ``None`` instead of
+        running that processing path."""
+        mock_choice = MagicMock()
+        mock_choice.finish_reason = "stop"
+        mock_message = MagicMock()
+        mock_message.content = ""
+        mock_message.tool_calls = None
+        mock_message.reasoning_content = None
+        mock_choice.message = mock_message
+        empty_response = MagicMock()
+        empty_response.choices = [mock_choice]
+
+        mock_client = mocker.AsyncMock()
+        mock_client.chat.completions.create.side_effect = [
+            _response_format_bad_request(
+                "the model does not support response_format for this request"
+            ),
+            empty_response,
+        ]
+        mocker.patch(
+            "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+            return_value=mock_client,
+        )
+        llm = OpenAILLM(**openai_llm_config, abilities=["chat", "vision"])
+
+        with pytest.raises(
+            LLMEmptyContentError,
+            match="LLM returned empty content and no tool calls",
+        ):
+            await llm.vision_chat(
+                [{"role": "user", "content": "describe this"}],
+                response_format={"type": "json_object"},
+            )
+
+        assert mock_client.chat.completions.create.await_count == 2
+        second_call = mock_client.chat.completions.create.call_args_list[1].kwargs
+        assert "response_format" not in second_call
+
+
+class TestFieldContent:
+    """``field_content`` must not mistake a pydantic model's declared default
+    for a value the provider actually sent."""
+
+    class _MessageWithDeclaredDefault(BaseModel):
+        model_config = ConfigDict(extra="allow")
+
+        reasoning_content: str = "sdk-default-not-from-provider"
+
+    def test_field_content_ignores_a_declared_default_on_a_pydantic_model(self):
+        message = self._MessageWithDeclaredDefault()
+
+        assert field_content(message, "reasoning_content") == (False, None)
+
+    def test_field_content_reads_a_value_passed_through_model_extra(self):
+        """The real-world path: the OpenAI SDK builds response and delta
+        objects through ``construct()``, which -- unlike a normal pydantic
+        ``__init__`` -- only adds explicitly-declared fields to
+        ``model_fields_set`` and routes every unrecognized field straight to
+        ``model_extra``. ``ChoiceDelta`` doesn't declare ``reasoning_content``,
+        so this is exactly how a provider's reasoning field actually arrives
+        on a streaming delta."""
+        delta = ChoiceDelta.construct(role="assistant", reasoning_content="step 1")
+
+        assert "reasoning_content" not in delta.model_fields_set
+        assert field_content(delta, "reasoning_content") == (True, "step 1")

@@ -21,7 +21,12 @@ that step never appears on this stream at all, since its start was
 broadcast before this connection existed.
 Clients attaching mid-task reconcile against
 ``GET /v1/chat/tasks/{task_id}/steps``, which reads the database and
-so is unaffected by when the stream was opened.
+so is unaffected by when the stream was opened. The two attach-time
+fast paths are the exception to all of this: an attach that finds the
+task already terminal, or already waiting on user input, closes without
+ever registering a projector, and sends a bounded one-shot snapshot of
+the task's steps between ``task.status`` and its conclusion frame (see
+``_fast_path_step_snapshot``) instead of projecting anything live.
 
 No ``task.status`` frame is
 ever guaranteed to be fresh or in order, at any point in the stream's
@@ -81,6 +86,34 @@ values it deliberately leaves unbounded, in one place:
     inside ordinary backlog territory, so 4 MiB is the tightest value
     that leaves ordinary traffic alone -- against the ~16 MiB a full
     element-capped queue of maximum frames would otherwise hold.
+  - One attach-time fast-path step snapshot: ``REPLAY_MAX_STEPS`` (512
+    steps) *and* ``MAX_SNAPSHOT_WIRE_BYTES`` (4 MiB of serialized frame
+    text). Whichever binds first cuts the snapshot short: the step cap
+    binds on a long history of ordinary steps, the byte budget on a
+    short history of large ones -- 512 steps each carrying a ``data``
+    sub-object right at the 64 KiB cap is ~32 MiB generated into one
+    response, and these paths are exempt from the concurrency caps
+    below, so nothing else bounds how many such responses run at once.
+    The step cap keeps the most recent steps (in ``started_at`` order);
+    the byte budget then admits that window from its oldest end, so the
+    snapshot stays a contiguous run in wire order. Either way the
+    conclusion frame (``task.completed`` / ``task.input_required``)
+    carries ``snapshot_truncated`` (``true``) and ``snapshot_total_steps``
+    (the task's full public step count), so the client can tell a bounded
+    snapshot from a complete one and knows how much of it is missing --
+    ``GET .../steps`` is the authoritative full history. The conclusion
+    carries it, not a ``step.*`` frame, because the conclusion is the one
+    frame every exit of these paths emits: a snapshot the byte budget cut
+    to zero steps still has to be reportable, and a ``step.*`` frame that
+    does not exist cannot report it. ``MAX_SNAPSHOT_WIRE_BYTES`` measures
+    only the step frames' own wire bytes -- the marker riding the
+    conclusion is not part of what it bounds. These bound how much one
+    response may hold, not how much backlog may accumulate: the fast
+    paths ``yield`` their frames straight from the generator, so no sink
+    and no outbound queue exist
+    on those paths and neither queue bound above applies to them. Each
+    of those frames is still subject to the 64 KiB per-step ``data``
+    cap, which is applied per frame wherever the frame is built.
   - Concurrent streams: ``PER_TASK_STREAM_CAP`` (2) and
     ``PER_PRINCIPAL_STREAM_CAP`` (32), both rejected with 429 at
     attach, before any sink exists.
@@ -101,7 +134,9 @@ values it deliberately leaves unbounded, in one place:
     sits outside the ``data`` sub-object the 64 KiB cap covers. A step
     id derives from the event's own ``tool_call_id``/``step_id``, so
     what bounds it is the 256 KiB check on the inbound frame carrying
-    it, and the queue's byte budget bounds ids in aggregate. Today's
+    it, and in aggregate the queue's byte budget on the live path or
+    ``MAX_SNAPSHOT_WIRE_BYTES`` on the two attach-time fast paths, which
+    have no queue of their own. Today's
     only ``message_id`` producer emits a fixed 45 characters
     (``f"final_answer_{uuid4().hex}"``,
     ``core/agent/runtime.py``'s ``start_final_answer_stream``), but
@@ -213,6 +248,26 @@ MAX_QUEUED_WIRE_BYTES = 64 * MAX_FRAME_CONTENT_BYTES
 # delay the completion signal to the watchdog's next cycle instead of
 # firing it immediately.
 MAX_RAW_FRAME_TEXT_CHARS = 4 * MAX_FRAME_CONTENT_BYTES
+# Upper bound on how many steps either attach-time fast path
+# (already-terminal / already-waiting-for-user) puts on the wire in its
+# one-shot response. Those paths emit their whole step snapshot in a
+# single burst and then close, so they have no admission / deadline /
+# heartbeat loop and no per-attach outbound queue of their own to
+# otherwise bound how much one response can hold. Exceeding it keeps
+# only the most recent ``REPLAY_MAX_STEPS`` steps (in ``started_at``
+# order, same as everywhere else) and marks the response's conclusion
+# frame as truncated -- see ``_fast_path_step_snapshot``. Bounds the
+# count only; ``MAX_SNAPSHOT_WIRE_BYTES`` below bounds the size.
+REPLAY_MAX_STEPS = 512
+# The attach-time snapshot's second bound, on the total wire bytes one
+# response may hold rather than on its step count -- the fast paths'
+# analogue of the queue's ``MAX_QUEUED_WIRE_BYTES``, sized the same way
+# and measured the same way. Why this value, and why the step-count cap
+# alone leaves the response unbounded, is argued once in the module
+# docstring's size-bounds section, not repeated here. Strictly over the
+# budget stops the snapshot, exactly on it does not -- the same boundary
+# rule the queue budget and ``MAX_RAW_FRAME_TEXT_CHARS`` use.
+MAX_SNAPSHOT_WIRE_BYTES = 64 * MAX_FRAME_CONTENT_BYTES
 # Floor for the final wait when the 1-hour deadline is close: keeps the
 # queue wait from being called with a near-zero timeout, which would spin
 # the loop instead of actually waiting.
@@ -260,6 +315,41 @@ def _stream_close_reason(status: TaskStatus, control_state: str | None) -> str |
 # -- never called directly.
 TaskSnapshotReader = Callable[[int, "ApiKeyPrincipal"], Any]
 
+# A sync callable: (task_id, principal) -> ``StepsResponse``-shaped
+# object (duck-typed: ``.steps``, a list of already-validated
+# ``PublicStep``), backed by the *same cache* the polling
+# ``GET .../steps`` endpoint uses (keyed by ``max_event_id`` -- see
+# ``tasks.py``'s ``_get_chat_task_steps_sync``). Used only by the two
+# attach-time fast paths (already-terminal / already-waiting-for-user):
+# they're one-shot and need no live pairing state, so a cache hit there
+# collapses a burst of fast-path attaches on the same task into the read
+# ``steps()`` polling already pays for, instead of each one re-reading
+# and re-projecting the task's full trace history independently.
+TaskStepsResponseReader = Callable[[int, "ApiKeyPrincipal"], Any]
+
+# A sync callable: (task_id, principal) -> ``_TaskStepsVersionSnapshot``-
+# shaped object (duck-typed: ``.task_id`` / ``.agent_id`` /
+# ``.max_event_id``) -- the same cheap ``max(TraceEvent.id)`` read
+# ``tasks.py``'s ``_load_task_steps_version_snapshot`` runs for the
+# ``GET .../steps`` cache key. Distinct from ``TaskSnapshotReader``
+# because the two readers return different shapes: this one carries
+# ``max_event_id``, not ``run_id``/``state_version``. Used only by the
+# attach-time fast paths' steps-cursor fence (see
+# ``_fast_path_steps_cursor_changed``) to catch a trace row landing
+# between the steps read and the fence's recheck.
+TaskStepsVersionReader = Callable[[int, "ApiKeyPrincipal"], Any]
+
+# A callable of one argument -- ``snapshot_total_steps`` -- returning the
+# already-built conclusion frame (``task.completed`` /
+# ``task.input_required``) for one attach-time fast path. Bound by each
+# fast path to its own authoritative snapshot (see
+# ``_terminal_snapshot_stream`` / ``_input_required_snapshot_stream``), so
+# the shared body (``_fast_path_snapshot_stream``) can supply the one
+# thing only it knows -- whether the step snapshot it just read was cut
+# short -- without either caller handing over a pre-built string that
+# could go stale by the time the body decides how to build it.
+ConclusionFrameBuilder = Callable[[int | None], str]
+
 
 # -- Wire format --------------------------------------------------------
 
@@ -285,16 +375,40 @@ def status_frame(status: str) -> str:
 # untruncated ``data``. The recovery channel for these two is
 # ``GET /v1/chat/tasks/{task_id}``: ``TaskInfoResponse.output`` and
 # ``TaskInfoResponse.pending_interaction.question``. Cost of the
-# exemption is bounded by construction: each is sent once per stream, as
-# its closing frame (``enqueue_close`` on the live path, the last yield
-# on each attach-time fast path), never repeatedly.
-def completed_frame(*, status: str, output: str | None, error: str | None) -> str:
+# exemption is bounded by construction: each is sent exactly once per
+# stream, as that stream's conclusion frame -- ``enqueue_close`` on the
+# live path, and on each attach-time fast path the frame every exit
+# emits before returning. On the fast paths that conclusion is not
+# necessarily the last frame on the wire: four of the five exits follow
+# it with a ``stream.error`` (a failed steps read, a failed generation
+# reread, a confirmed generation change, or a failed step
+# serialization), and only the ordinary exit ends there. That two-frame
+# close order -- conclusion first, then the error naming why the step
+# snapshot is incomplete -- is what
+# ``GET /v1/chat/tasks/{task_id}/events`` documents for these paths.
+# What this exemption bounds is how many times the uncapped payload
+# itself goes out, which is once either way.
+def completed_frame(
+    *,
+    status: str,
+    output: str | None,
+    error: str | None,
+    snapshot_total_steps: int | None = None,
+) -> str:
     return _sse_frame(
-        "task.completed", {"status": status, "output": output, "error": error}
+        "task.completed",
+        {
+            "status": status,
+            "output": output,
+            "error": error,
+            **_snapshot_marker_fields(snapshot_total_steps),
+        },
     )
 
 
-def input_required_frame(task_id: int, prompt: str | None) -> str:
+def input_required_frame(
+    task_id: int, prompt: str | None, *, snapshot_total_steps: int | None = None
+) -> str:
     # ``prompt`` is uncapped for the reason stated above
     # ``completed_frame``, which covers both conclusion-frame fields.
     # ``prompt`` comes straight from ``_TaskInfoSnapshot.pending_question``
@@ -304,7 +418,14 @@ def input_required_frame(task_id: int, prompt: str | None) -> str:
     # snapshot in hand from its own authoritative row read, so this
     # never triggers a query of its
     # own and never sniffs live agent_message frames for question text.
-    return _sse_frame("task.input_required", {"task_id": task_id, "prompt": prompt})
+    return _sse_frame(
+        "task.input_required",
+        {
+            "task_id": task_id,
+            "prompt": prompt,
+            **_snapshot_marker_fields(snapshot_total_steps),
+        },
+    )
 
 
 _ERROR_MESSAGES = {
@@ -317,13 +438,27 @@ _ERROR_MESSAGES = {
 }
 
 
-def error_frame(code: str) -> str:
+def error_frame(code: str, *, message: str | None = None) -> str:
     """Build a ``stream.error`` frame. ``code`` is always the machine-
-    readable value from ``_ERROR_MESSAGES`` (clients branch on it), and
-    the lookup runs unconditionally, so an unrecognized ``code`` raises
-    ``KeyError`` rather than reaching the wire as a frame with no
-    message."""
-    return _sse_frame("stream.error", {"code": code, "message": _ERROR_MESSAGES[code]})
+    readable value from ``_ERROR_MESSAGES`` (clients branch on it) --
+    ``message`` overrides only the human-readable text for a call site
+    whose actual cause ``_ERROR_MESSAGES[code]``'s generic wording
+    doesn't describe (e.g. a DB read failing under the ``resync_required``
+    code, which the default wording describes as a queue overflow).
+    Defaults to ``_ERROR_MESSAGES[code]`` when omitted. The lookup runs
+    either way, so an unrecognized ``code`` raises ``KeyError`` whether
+    or not a ``message`` was passed -- the check is on the code, not on
+    which optional argument the caller supplied.
+
+    An explicitly empty ``message`` is kept as-is rather than falling
+    back to the default: only an omitted override (``None``) selects
+    ``_ERROR_MESSAGES[code]``.
+    """
+    default_message = _ERROR_MESSAGES[code]
+    return _sse_frame(
+        "stream.error",
+        {"code": code, "message": message if message is not None else default_message},
+    )
 
 
 # -- Content projection: step.* / message.* --------------------------------
@@ -522,6 +657,27 @@ def _capped_step_data(data: dict[str, Any]) -> dict[str, Any]:
     return bare_marker
 
 
+def _snapshot_marker_fields(snapshot_total_steps: int | None) -> dict[str, Any]:
+    """The attach-time snapshot's truncation marker, or nothing when the
+    snapshot was complete.
+
+    Folded onto the conclusion frame rather than sent as a frame of its
+    own: a standalone marker would be a 9th SSE event type on top of the
+    8 the endpoint docstring documents, for a condition that already has
+    a client-side recovery story (``steps()`` for the authoritative full
+    history). The conclusion is the carrier because it is the one frame
+    every exit of these paths emits -- a snapshot the byte budget cut to
+    zero steps still has to be reportable, and a ``step.*`` frame that
+    does not exist cannot report it.
+    """
+    if snapshot_total_steps is None:
+        return {}
+    return {
+        "snapshot_truncated": True,
+        "snapshot_total_steps": snapshot_total_steps,
+    }
+
+
 def step_started_frame(public_step: dict[str, Any]) -> str:
     return _sse_frame("step.started", {"step": public_step})
 
@@ -546,15 +702,24 @@ def message_completed_frame(message_id: str, content: str) -> str:
     return _sse_frame("message.completed", data)
 
 
-def _step_wire_frame(public_step_json: dict[str, Any]) -> str:
-    """Pick ``step.started`` vs ``step.completed`` for an already-JSON-safe
-    step dict, after applying the single-frame content cap to its
-    ``data`` sub-object. One status -> event-name rule, and one size cap,
-    in one place: the only producer of step content on this stream is
-    live folding (``_step_content_frame``, below), and keeping the rule
-    here rather than inline there is what lets a second producer be added
-    later without a second copy of it that could disagree.
+def _step_wire_frame(step: "PublicStep") -> str:
+    """Turn one validated ``PublicStep`` into its ``step.started`` /
+    ``step.completed`` frame: normalize it to JSON-safe values, apply the
+    single-frame content cap to its ``data`` sub-object, then pick the
+    event name from its status.
+
+    This is the only place step content is normalized for this stream.
+    Both producers route through here -- live folding
+    (``_step_content_frame``, below) and the attach-time fast paths'
+    cached snapshot (``_fast_path_step_snapshot``, consumed frame-by-frame
+    in each fast path's own yield loop) -- so there is one
+    ``model_dump(mode="json")`` call site, one size cap, and one status ->
+    event-name rule, rather than a copy per producer that could drift
+    apart. Taking the model rather than an already-dumped dict is what
+    makes that structural: a caller cannot supply un-normalized values
+    without going around the type.
     """
+    public_step_json = step.model_dump(mode="json")
     capped = {**public_step_json, "data": _capped_step_data(public_step_json["data"])}
     if capped["status"] == "running":
         return step_started_frame(capped)
@@ -574,10 +739,14 @@ def _step_content_frame(step: dict[str, Any]) -> str:
     the step had moved past by the time it was actually read out of the
     queue. Routing every field through ``PublicStep`` here is also what
     keeps this wire shape identical to ``steps()``'s -- same validation,
-    same JSON coercion (``started_at``/``completed_at`` in particular),
-    same public step-type list, zero second copy of any of it.
+    same public step-type list, zero second copy of either. The JSON
+    coercion that goes with it (``started_at``/``completed_at`` in
+    particular) happens one level down, in ``_step_wire_frame``, which
+    both producers of step content share; this function's own job is
+    the raw-dict-to-model validation that only the live path needs,
+    because the fast paths read ``PublicStep`` objects already.
     """
-    return _step_wire_frame(PublicStep(**step).model_dump(mode="json"))
+    return _step_wire_frame(PublicStep(**step))
 
 
 def _feed_trace_event(
@@ -1307,28 +1476,629 @@ def _sse_response(body: AsyncIterator[str]) -> StreamingResponse:
     return StreamingResponse(body, media_type="text/event-stream", headers=_SSE_HEADERS)
 
 
-async def _terminal_snapshot_stream(
-    snapshot: "_TaskInfoSnapshot",
-) -> AsyncIterator[str]:
-    """Attach-time fast path for an already-terminal task: emit
-    ``task.status`` + ``task.completed`` and end. No sink, no
-    registration, no watchdog -- there's nothing left to watch."""
-    yield status_frame(snapshot.status.value)
-    yield completed_frame(
-        status=snapshot.status.value, output=snapshot.output, error=snapshot.error
+def _snapshot_steps_within_wire_budget(
+    steps: "list[PublicStep]",
+) -> "list[PublicStep]":
+    """The longest prefix of ``steps`` whose serialized frames fit
+    ``MAX_SNAPSHOT_WIRE_BYTES``.
+
+    Measures with ``_step_wire_frame`` -- the same builder the emit loop
+    uses -- and throws the text away, so at most one frame is
+    materialized at a time. Serializing twice is what buys that: the fast
+    paths return before the per-task / per-principal caps are checked, so
+    a design that held the admitted frames to avoid the second pass would
+    hold up to the whole budget per attach with nothing bounding how many
+    attaches run at once. The doubled work is bounded by the budget
+    itself (2 x 4 MiB), against the ~32 MiB a single unbounded snapshot
+    could serialize today, so this pass lowers the worst case rather than
+    adding to it. ``_step_wire_frame`` is a pure function of the step
+    (``_capped_step_data`` builds new dicts and never mutates its input),
+    so the second pass produces byte-identical frames.
+
+    A prefix, not a suffix, even though ``REPLAY_MAX_STEPS`` keeps the
+    most recent steps: a step whose ``data`` cannot be serialized cannot
+    be measured either, and admitting it here is what keeps the emit loop
+    reaching it and reporting it through
+    ``_fast_path_step_serialize_error_frame`` -- with the steps before it
+    already on the wire, which is the behavior
+    ``GET /v1/chat/tasks/{task_id}/events`` documents. Dropping from the
+    oldest end instead would put an unserializable step at the head of
+    the window, where it suppresses every good step behind it, or force
+    the failure to be folded into "snapshot truncated" and never
+    reported. The budget only binds on a window averaging more than 8 KiB
+    per step, and a client whose snapshot was cut is told so by the
+    conclusion frame's ``snapshot_truncated`` and sent to
+    ``GET .../steps`` either way.
+    """
+    budget_remaining = MAX_SNAPSHOT_WIRE_BYTES
+    admitted = 0
+    for step in steps:
+        try:
+            frame_bytes = len(_step_wire_frame(step))
+        except Exception:
+            # Unmeasurable: admit it so the emit loop fails on it -- see
+            # the docstring above.
+            admitted += 1
+            break
+        if frame_bytes > budget_remaining:
+            break
+        budget_remaining -= frame_bytes
+        admitted += 1
+    return steps[:admitted]
+
+
+async def _fast_path_step_snapshot(
+    task_id: int,
+    principal: "ApiKeyPrincipal",
+    read_task_steps_response: TaskStepsResponseReader,
+) -> "tuple[list[PublicStep], int | None]":
+    """Shared by both attach-time fast paths: the task's current public
+    steps, read through the same cache ``GET .../steps`` uses (see
+    ``TaskStepsResponseReader``) rather than a fresh trace read, so a
+    burst of fast-path attaches on one task collapses into a cache hit
+    instead of each one re-reading and re-projecting independently.
+
+    Bounded by two caps, whichever binds first: ``REPLAY_MAX_STEPS``
+    (step count) and ``MAX_SNAPSHOT_WIRE_BYTES`` (serialized size, via
+    ``_snapshot_steps_within_wire_budget``). Without them, a fast-path
+    attach to a task with an unusually long or heavy step history
+    returned every step from this cached list in one shot, with no
+    admission / deadline / heartbeat loop to pace it, unlike everything
+    else this stream serves. The cached list is already in
+    ``started_at`` order -- the public contract ``GET .../steps``
+    documents (``schemas/v1.py``'s ``StepsResponse``: "Steps are
+    returned in monotonic started_at order") and
+    ``map_trace_events_to_public_steps`` enforces with an explicit final
+    sort (``_step_mapping.py:640-643``), not a property its projection's
+    own fold order already guarantees on its own -- that sort is exactly
+    why it's needed. ``steps[-REPLAY_MAX_STEPS:]`` keeps the most recent
+    steps and drops the oldest; the byte budget is then applied to that
+    window from its oldest end (see ``_snapshot_steps_within_wire_budget`` for why a
+    prefix, not a suffix, is what it keeps). Returns the validated
+    ``PublicStep`` objects themselves, not their serialized frame text
+    -- serialization happens one frame at a time in each fast path's own
+    yield loop below instead, so a large step list is never fully
+    materialized as SSE text (or held as a list of strings) all at once;
+    the byte budget's own measuring pass is the one place that comes
+    close, and it holds at most one frame's text at a time (see that
+    function's docstring).
+    The second element is the task's true total public step count
+    whenever the returned list is short of it, by either bound, or
+    ``None`` when the whole history fits. The truncation marker built
+    from it rides the conclusion frame, not a step frame, so it is never
+    counted against ``MAX_SNAPSHOT_WIRE_BYTES``: what the measuring pass
+    above counts is exactly what the step frames put on the wire.
+    """
+    steps_response = await run_db_io_cancellation_safe(
+        lambda: read_task_steps_response(task_id, principal)
+    )
+    steps = steps_response.steps
+    total_steps = len(steps)
+    admitted = _snapshot_steps_within_wire_budget(steps[-REPLAY_MAX_STEPS:])
+    if len(admitted) < total_steps:
+        return admitted, total_steps
+    return admitted, None
+
+
+def _fast_path_steps_read_error_frame(
+    exc: BaseException, task_id: int, path_name: str
+) -> str:
+    """Close frame for a failure preparing the fast path's step snapshot
+    -- either the cursor baseline read (``read_task_steps_version``, when
+    supplied) or the steps read itself (``_fast_path_step_snapshot``).
+    Both run inside the same ``try`` in ``_fast_path_snapshot_stream``,
+    shared by both attach-time fast paths' ``except`` blocks below, so
+    this is called whichever of the two actually raised and the wording
+    below has to be true of either -- not just the steps read.
+
+    Both readers re-resolve the task (``TaskStepsResponseReader``,
+    ``TaskStepsVersionReader``) after ``build_event_stream_response``
+    already resolved it once to pick this fast path -- a task deleted in
+    that gap surfaces here as ``V1ApiError(TASK_NOT_FOUND)`` from
+    whichever one ran, same as it does to the watchdog (which already
+    emits ``task_deleted`` for it, not ``resync_required``): the task is
+    gone, not merely unreadable, so ``steps()`` + reattach would just
+    404 instead of resyncing anything. Only that specific shape gets
+    ``task_deleted``; every other failure (a transient DB error, a bug
+    in projection) keeps the existing ``resync_required`` handling and
+    is logged -- ``task_deleted`` isn't logged here for the same reason
+    the watchdog path doesn't log it: a deleted task racing the attach
+    isn't a bug in this stream.
+
+    Must be called from inside the ``except`` block it serves -- the
+    ``logger.exception`` call below relies on the caller's still-active
+    exception context to attach a traceback.
+    """
+    if isinstance(exc, V1ApiError) and exc.code is V1ErrorCode.TASK_NOT_FOUND:
+        return error_frame("task_deleted")
+    logger.exception(
+        "v1 SSE %s fast-path step snapshot preparation failed for task "
+        "%s; closing for resync instead of leaving the client with a "
+        "bare disconnect and no close frame",
+        path_name,
+        task_id,
+    )
+    return error_frame(
+        "resync_required",
+        message=(
+            "Preparing the task's step snapshot failed; call steps() to "
+            "resync, then re-attach."
+        ),
     )
 
 
-async def _input_required_snapshot_stream(
+async def _fast_path_generation_changed(
+    original: "_TaskInfoSnapshot",
+    principal: "ApiKeyPrincipal",
+    read_task_snapshot: TaskSnapshotReader,
+) -> bool:
+    """Whether the task row has been written at all since ``original``
+    was read, checked by rereading it and comparing
+    ``run_id``/``state_version`` against it.
+
+    ``state_version`` is the field that actually carries this. Every
+    lifecycle transition increments it
+    (``web/services/task_execution_controller.py`` bumps it
+    unconditionally on the same UPDATE that sets the control state, and
+    the lease service's own case bumps it whenever a write changes the
+    row's (status, control_state) pair), whether or not a new run
+    begins. ``run_id`` is the narrower of the two and cannot
+    stand alone: a ``POST reply`` resuming a ``WAITING_FOR_USER`` task
+    deliberately keeps the same ``run_id`` (``task_lease_service``'s
+    ``lease_run_id_case`` writes the same candidate back for that
+    status), and that resume is the most common trigger of the
+    waiting-for-user fast path. A fence comparing ``run_id`` alone would
+    be a no-op for exactly that case.
+
+    So the contract enforced here is "any lifecycle write invalidates
+    this snapshot", not "a new run started". Ordinary intra-run writes
+    -- finalizing into COMPLETED/FAILED/WAITING_FOR_USER/PAUSED, a lease
+    release, a lease-expiry recovery -- bump ``state_version`` without
+    touching ``run_id``, and each of them can land in the window right
+    after the task reaches the state that selected this fast path. A
+    write there withholds a snapshot that was in fact still current and
+    sends the client to ``steps()`` instead. That is the deliberate
+    trade: this reread cannot tell a write that superseded the snapshot
+    from one that did not, so it treats every write as superseding.
+    Losing a snapshot costs one ``steps()`` call; pairing a conclusion
+    with step content from a generation this path never confirmed has no
+    bounded cost.
+
+    This is one of two signals the caller checks before trusting the
+    steps it already read -- see ``_fast_path_steps_cursor_changed`` for
+    the other. Trace rows commit through ``DatabaseTraceHandler``'s own
+    session, and that commit can itself write this same task row: when
+    a checkpoint anchor lands while the task is ``RUNNING``,
+    ``trace_handlers.py`` issues an ``UPDATE tasks`` in the same commit
+    for ``last_checkpoint_event_id``/``last_checkpoint_trace_event_id``.
+    That UPDATE never sets ``run_id`` or ``state_version`` --
+    ``state_version`` has no ``onupdate``, so nothing bumps it but the
+    lifecycle writers named above -- so a trace row landing in the same
+    window this function is guarding still cannot move either field,
+    and this reread alone cannot see it.
+    """
+    current = await run_db_io_cancellation_safe(
+        lambda: read_task_snapshot(original.task_id, principal)
+    )
+    return bool(
+        current.run_id != original.run_id
+        or current.state_version != original.state_version
+    )
+
+
+async def _fast_path_steps_cursor_changed(
+    task_id: int,
+    original_max_event_id: int,
+    principal: "ApiKeyPrincipal",
+    read_task_steps_version: TaskStepsVersionReader,
+) -> bool:
+    """Whether a trace row has landed since ``original_max_event_id`` was
+    captured, checked by rereading the steps cursor and comparing.
+
+    The companion signal to ``_fast_path_generation_changed``:
+    ``DatabaseTraceHandler`` commits trace rows (mapped to public
+    ``step.*`` content by ``read_task_steps_response``) through its own
+    session, and a checkpoint anchor row's commit can carry its own
+    ``UPDATE tasks`` (``last_checkpoint_event_id``/
+    ``last_checkpoint_trace_event_id``, gated on the task being
+    ``RUNNING``) -- but that UPDATE never sets ``run_id`` or
+    ``state_version``, so a trace row that lands after the steps read
+    returns and before this reread runs is invisible to the
+    run_id/state_version fence even on the commits that do write the
+    row. Reuses the same ``max(TraceEvent.id)`` query ``tasks.py``'s
+    ``_load_task_steps_version_snapshot`` already runs for the
+    ``GET .../steps`` cache key, so a landed row is caught at the same
+    cursor precision that cache already keys reads on.
+
+    ``original_max_event_id`` is captured before the steps read even
+    runs (see the call site in ``_fast_path_snapshot_stream``), not
+    after it returns -- the window this guards starts there, because a
+    trace row can land while that read is still in flight. That makes
+    the window this function actually checks slightly wider than "after
+    the steps read, before this recheck": a row landing *during* the
+    steps read is already reflected in the steps this call receives
+    (they were read after the baseline), yet the cursor still moved
+    between the baseline and this recheck, so this comparison flags it
+    as changed anyway. That is an accepted false positive, the same
+    trade ``_fast_path_generation_changed`` makes for an ordinary
+    intra-run write: the cost is one extra ``steps()`` call for a
+    client that already had a perfectly good snapshot, never a silent
+    gap.
+    """
+    current = await run_db_io_cancellation_safe(
+        lambda: read_task_steps_version(task_id, principal)
+    )
+    return bool(current.max_event_id != original_max_event_id)
+
+
+def _fast_path_generation_reread_error_frame(
+    exc: BaseException, task_id: int, path_name: str
+) -> str:
+    """Close frame for a failed reread inside the fence, called from
+    inside the ``except`` block it serves (same traceback-attachment
+    requirement as ``_fast_path_steps_read_error_frame``).
+
+    Shared by two different rereads, and the wording below is written
+    to be true of either: ``_fast_path_generation_changed``'s
+    run_id/state_version reread, and, when it runs,
+    ``_fast_path_steps_cursor_changed``'s cursor recheck that follows
+    it. The two share one ``try``/``except`` (see the call site), so
+    this function cannot tell which of them actually raised -- and by
+    the time the cursor recheck runs at all, the generation reread has
+    already returned cleanly, so a failure here must never be described
+    as a failure to confirm the run/state generation specifically; that
+    part may already be confirmed, with only the cursor check left
+    unresolved.
+
+    Classifies the same way ``_fast_path_steps_read_error_frame`` does:
+    a task deleted in the gap between the steps read and this reread
+    surfaces the same ``V1ApiError(TASK_NOT_FOUND)`` and gets the same
+    ``task_deleted`` frame; everything else gets ``resync_required``,
+    logged.
+
+    Kept separate from ``_fast_path_steps_read_error_frame`` rather than
+    reused outright because the two failures warrant different
+    ``resync_required`` wording -- the steps read never learned anything
+    about the task's generation or cursor, while this reread specifically
+    failed to confirm one of them, so the default steps-read wording
+    would describe a cause this failure didn't have.
+    """
+    if isinstance(exc, V1ApiError) and exc.code is V1ErrorCode.TASK_NOT_FOUND:
+        return error_frame("task_deleted")
+    logger.exception(
+        "v1 SSE %s fast-path staleness recheck failed for task %s; "
+        "closing for resync instead of leaving the client with a bare "
+        "disconnect and no close frame",
+        path_name,
+        task_id,
+    )
+    return error_frame(
+        "resync_required",
+        message=(
+            "Confirming the task's steps are still current failed; "
+            "call steps() to resync, then re-attach."
+        ),
+    )
+
+
+def _fast_path_step_serialize_error_frame(task_id: int, path_name: str) -> str:
+    """Close frame for a step that could not be serialized onto the wire,
+    called from inside the ``except`` block it serves (same traceback-
+    attachment requirement as ``_fast_path_steps_read_error_frame``).
+
+    Always ``resync_required``, never ``task_deleted``: the task row was
+    already read successfully to get here, so a failure at this point is
+    about one step's own content, not the task's existence.
+    ``PublicStep.data`` is a ``Dict[str, Any]`` -- the keys are fixed per
+    step type, the values are arbitrary tool JSON -- and
+    ``model_dump(mode="json")`` raises
+    ``PydanticSerializationError`` on a value it has no encoding rule
+    for. This loop runs after ``StreamingResponse`` has already sent 200
+    and the headers, a position where an escaped exception becomes an
+    opaque disconnect the client cannot classify as anything but the
+    connection dropping. This guard is a defensive boundary for that
+    position -- exercised in tests through a stub reader, not a live
+    tool result -- the bare disconnect
+    ``_fast_path_steps_read_error_frame`` exists to rule out.
+    """
+    logger.exception(
+        "v1 SSE %s fast-path step serialization failed for task %s; "
+        "closing for resync instead of leaving the client with a bare "
+        "disconnect and no close frame",
+        path_name,
+        task_id,
+    )
+    return error_frame(
+        "resync_required",
+        message=(
+            "Serializing the task's steps failed; call steps() to "
+            "resync, then re-attach."
+        ),
+    )
+
+
+async def _fast_path_snapshot_stream(
     snapshot: "_TaskInfoSnapshot",
+    principal: "ApiKeyPrincipal",
+    read_task_steps_response: TaskStepsResponseReader,
+    read_task_snapshot: TaskSnapshotReader,
+    *,
+    build_conclusion: ConclusionFrameBuilder,
+    path_name: str,
+    read_task_steps_version: TaskStepsVersionReader | None = None,
+) -> AsyncIterator[str]:
+    """Body shared by both attach-time fast paths (``_terminal_snapshot_stream``,
+    ``_input_required_snapshot_stream``): emit ``task.status``, the
+    task's current steps, then the conclusion frame, and end. No sink, no
+    registration, no watchdog -- there's nothing left to watch.
+
+    ``build_conclusion`` is supplied by the caller, bound to its own
+    authoritative row read (``completed_frame`` for the terminal path,
+    ``input_required_frame`` for the waiting-for-user one), before this
+    generator is ever entered -- so each caller's own generation is what
+    its conclusion describes, not a copy that could drift between them.
+    This body calls it with the one field only it knows: the step
+    snapshot's ``snapshot_total_steps`` on the one exit that confirmed and
+    sent that snapshot in full, ``None`` on every other exit -- a failed
+    steps read, a withheld generation mismatch, or a failed step
+    serialization never confirmed a snapshot to report a truncation count
+    for.
+    ``path_name`` plays no part in any branching decision in this body,
+    and never reaches the client: it is passed only into the
+    ``logger.exception`` calls inside the error-frame builders below, so
+    an operator reading the logs can tell which fast path failed. The
+    ``stream.error`` text those builders put on the wire is fixed per
+    failure kind and carries no path label -- see
+    ``_fast_path_steps_read_error_frame``.
+
+    ``task.status`` is emitted first, then the steps read runs inside a
+    ``try``/``except`` that also covers the cursor baseline capture
+    below (when ``read_task_steps_version`` is supplied) -- both reads
+    have to succeed before any step content is trusted, so a failure in
+    either is handled identically. A bare exception here
+    would not produce a different HTTP status: ``StreamingResponse``
+    sends the response start (200, headers) before ever pulling a chunk
+    from this generator, so letting the read's exception propagate
+    unguarded just ends an already-started 200 response with no bytes
+    at all -- indistinguishable, from the client's side, from the
+    connection merely dropping. Catching the failure and closing with a
+    ``stream.error`` frame instead keeps this module's own invariant
+    that a close frame is always how a client tells "the task ended"
+    apart from "the stream ended" -- ``task_deleted`` when the task
+    disappeared out from under this read, ``resync_required`` for
+    everything else; see ``_fast_path_steps_read_error_frame``.
+
+    ``snapshot`` was already resolved, from its own authoritative read,
+    before this function was ever called, so the conclusion describes
+    the generation this path was picked for. What this path
+    will not do is pair that conclusion with step content from a
+    generation it never confirmed. Step content is a different matter:
+    the steps this path is about to read reflect whatever run/state
+    generation the task row is in *at that read*, and a concurrent
+    restart (a ``POST reply`` resuming a ``WAITING_FOR_USER`` task, or a
+    WS ``APPEND`` resuming a ``COMPLETED``/``FAILED`` one) can move the
+    row to a new generation in the gap between ``snapshot`` and that
+    read. The rule this path enforces: the conclusion goes out on
+    every exit, and the fence decides only whether step content joins
+    it. The conclusion describes ``snapshot``'s own generation -- the
+    authoritative read that selected this fast path -- so a client that
+    tracks only lifecycle gets the same single conclusion frame it
+    would get if this path carried no step content at all. When the
+    reread below confirms a newer generation, ``snapshot`` is
+    superseded, and it is the ``stream.error(resync_required)`` that
+    follows which tells the client to refetch, not a retraction of the
+    conclusion already sent. Step content is the part that can go
+    stale, so it goes out only once the task row has been read once
+    more and confirmed to still be ``snapshot``'s own generation
+    (``_fast_path_generation_changed``), and, when
+    ``read_task_steps_version`` is supplied, once the steps cursor
+    (``max_event_id``) is confirmed unmoved too
+    (``_fast_path_steps_cursor_changed``). A trace row can land after
+    the steps read and before this recheck; the same commit that lands
+    it can also write this task row's checkpoint-pointer columns
+    (``last_checkpoint_event_id``/``last_checkpoint_trace_event_id``,
+    ``trace_handlers.py``, gated on the task being ``RUNNING``) without
+    ever setting ``run_id`` or ``state_version``, so the
+    run_id/state_version reread alone cannot see that write either way.
+    ``read_task_steps_version`` defaults to ``None`` for callers that
+    don't need this second signal (existing unit tests exercising the
+    run_id/state_version fence on its own); the live attach endpoint
+    always supplies it. When it is supplied, its *baseline* read is
+    unconditional -- captured before the steps read even runs, inside
+    the same guard block described above, whether or not that read
+    ends up returning any steps or fails outright -- because the window
+    this second signal guards starts at that read, not after it. The
+    *recheck* against that baseline is what actually gates on step
+    content: like the run_id/state_version reread, it runs only once
+    there is step content to protect, so a failed steps read and an
+    empty one both skip the recheck (not the baseline, which already
+    ran by then). A step-carrying attach that reaches this fence
+    therefore costs two cursor queries when ``read_task_steps_version``
+    is supplied -- the baseline and the recheck -- on top of the one
+    run_id/state_version reread it already paid, except when that
+    reread already confirmed a change, which short-circuits the
+    recheck; an attach whose steps
+    turn out empty, or whose steps read fails, still pays for the
+    baseline alone. A confirmed match on both signals sends the steps,
+    then the conclusion. A confirmed change on either means the steps
+    just read may belong to content this path never confirmed against,
+    so the steps are withheld and
+    the conclusion is followed by ``stream.error(resync_required)``. A
+    reread that fails outright can't tell a match from a change and is
+    handled the same way, except that its ``stream.error`` names the
+    failed confirmation rather than claiming the task moved
+    (``_fast_path_generation_reread_error_frame``, same
+    ``task_deleted``-vs-everything-else split as
+    ``_fast_path_steps_read_error_frame``). Serializing a step can fail
+    too -- ``PublicStep.data`` carries arbitrary tool JSON -- which ends
+    the step content there and closes the same way, so no exit leaves
+    the client with an already-started 200 response and no close frame.
+    """
+    task_id = snapshot.task_id
+    yield status_frame(snapshot.status.value)
+    try:
+        # Captured before the steps read below, not after: the window this
+        # guards is "a trace row lands after steps are read, before the
+        # fence rechecks", so the reference point has to predate the read
+        # it is meant to protect. See ``_fast_path_steps_cursor_changed``.
+        steps_version_before = None
+        if read_task_steps_version is not None:
+            version_reader = read_task_steps_version
+            steps_version_before = await run_db_io_cancellation_safe(
+                lambda: version_reader(task_id, principal)
+            )
+        steps, snapshot_total_steps = await _fast_path_step_snapshot(
+            task_id, principal, read_task_steps_response
+        )
+    except Exception as exc:
+        # The conclusion goes out first -- see the docstring above -- so
+        # a failure reading the cursor baseline or the steps themselves
+        # never also swallows the outcome the conclusion frame carries.
+        # No snapshot was confirmed here, so the conclusion carries no
+        # truncation marker.
+        yield build_conclusion(None)
+        yield _fast_path_steps_read_error_frame(exc, task_id, path_name)
+        return
+    if steps:
+        try:
+            changed = await _fast_path_generation_changed(
+                snapshot, principal, read_task_snapshot
+            )
+            if not changed and read_task_steps_version is not None:
+                # ``steps_version_before`` was captured above under the
+                # same ``read_task_steps_version is not None`` guard, so
+                # it is never ``None`` here -- mypy can't carry that
+                # invariant across the two ``if`` blocks on its own.
+                assert steps_version_before is not None
+                changed = await _fast_path_steps_cursor_changed(
+                    task_id,
+                    steps_version_before.max_event_id,
+                    principal,
+                    read_task_steps_version,
+                )
+        except Exception as exc:
+            # Same conclusion-first ordering as the steps-read ``except``
+            # block above -- see the docstring for why a reread failure
+            # gets the same treatment as a steps-read failure.
+            yield build_conclusion(None)
+            yield _fast_path_generation_reread_error_frame(exc, task_id, path_name)
+            return
+        if changed:
+            yield build_conclusion(None)
+            yield error_frame(
+                "resync_required",
+                message=(
+                    "The task changed while this attach was reading "
+                    "its steps; call steps() to resync, then "
+                    "re-attach."
+                ),
+            )
+            return
+    for step in steps:
+        try:
+            step_frame = _step_wire_frame(step)
+        except Exception:
+            # Only the serialization is inside the ``try``, not the
+            # ``yield``: a consumer going away arrives as
+            # ``GeneratorExit``/``CancelledError``, both
+            # ``BaseException``, so this handler cannot turn a client
+            # disconnect into a close frame nobody reads.
+            yield build_conclusion(None)
+            yield _fast_path_step_serialize_error_frame(task_id, path_name)
+            return
+        yield step_frame
+    yield build_conclusion(snapshot_total_steps)
+
+
+def _terminal_snapshot_stream(
+    snapshot: "_TaskInfoSnapshot",
+    principal: "ApiKeyPrincipal",
+    read_task_steps_response: TaskStepsResponseReader,
+    read_task_snapshot: TaskSnapshotReader,
+    read_task_steps_version: TaskStepsVersionReader | None = None,
+) -> AsyncIterator[str]:
+    """Attach-time fast path for an already-terminal task: emit
+    ``task.status``, the task's current steps, then ``task.completed``,
+    and end. No sink, no registration, no watchdog -- there's nothing
+    left to watch.
+
+    The frame order, the generation fence, and how every failure exit
+    still closes with a frame all live in ``_fast_path_snapshot_stream``,
+    the body both fast paths share; this function supplies the
+    conclusion frame -- built from the authoritative read that selected
+    this path -- and the ``"terminal"`` path label.
+    """
+
+    # Bound here, before the shared body is entered, to ``snapshot``'s own
+    # authoritative read -- the read that selected this fast path -- so
+    # that read is what every call the shared body makes describes, not
+    # whatever the steps read or the generation reread inside the shared
+    # body observe afterward. The shared body supplies only the one field
+    # it alone knows: whether the step snapshot it read was truncated.
+    def build_conclusion(snapshot_total_steps: int | None) -> str:
+        return completed_frame(
+            status=snapshot.status.value,
+            output=snapshot.output,
+            error=snapshot.error,
+            snapshot_total_steps=snapshot_total_steps,
+        )
+
+    return _fast_path_snapshot_stream(
+        snapshot,
+        principal,
+        read_task_steps_response,
+        read_task_snapshot,
+        build_conclusion=build_conclusion,
+        path_name="terminal",
+        read_task_steps_version=read_task_steps_version,
+    )
+
+
+def _input_required_snapshot_stream(
+    snapshot: "_TaskInfoSnapshot",
+    principal: "ApiKeyPrincipal",
+    read_task_steps_response: TaskStepsResponseReader,
+    read_task_snapshot: TaskSnapshotReader,
+    read_task_steps_version: TaskStepsVersionReader | None = None,
 ) -> AsyncIterator[str]:
     """Attach-time fast path for a task already waiting on user input (and
-    not mid-resume): emit ``task.status`` + ``task.input_required`` and
-    end. Same rationale as ``_terminal_snapshot_stream`` -- without this,
-    the same conclusion is only reached via the watchdog's first cycle,
-    up to ``watchdog_interval_seconds`` (30s in production) after attach."""
-    yield status_frame(snapshot.status.value)
-    yield input_required_frame(snapshot.task_id, snapshot.pending_question)
+    not mid-resume): emit ``task.status``, the task's current steps, then
+    ``task.input_required``, and end. Same rationale as
+    ``_terminal_snapshot_stream`` -- without this, the same conclusion is
+    only reached via the watchdog's first cycle, up to
+    ``watchdog_interval_seconds`` (30s in production) after attach.
+
+    Same ordering, the same read-failure handling, the same pre-steps
+    generation fence, and the same guard around step serialization as
+    ``_terminal_snapshot_stream`` -- ``_fast_path_snapshot_stream``, the
+    body both paths share, documents why the steps read is guarded in
+    its own ``try``/``except`` rather than left to raise past the
+    generator's first ``yield``, why step content is withheld until a
+    reread confirms the task row is still the generation ``snapshot``
+    was read from, and why the conclusion goes out on every exit
+    regardless of what the fence decides about step content.
+    """
+
+    # Bound here, before the shared body is entered, for the same reason
+    # as ``_terminal_snapshot_stream``'s own ``build_conclusion``: it
+    # describes the authoritative read that selected this fast path, not
+    # whatever the shared body's own reads observe afterward.
+    def build_conclusion(snapshot_total_steps: int | None) -> str:
+        return input_required_frame(
+            snapshot.task_id,
+            snapshot.pending_question,
+            snapshot_total_steps=snapshot_total_steps,
+        )
+
+    return _fast_path_snapshot_stream(
+        snapshot,
+        principal,
+        read_task_steps_response,
+        read_task_snapshot,
+        build_conclusion=build_conclusion,
+        path_name="input-required",
+        read_task_steps_version=read_task_steps_version,
+    )
 
 
 async def _generate(
@@ -1481,6 +2251,8 @@ async def build_event_stream_response(
     principal: ApiKeyPrincipal,
     initial_snapshot: "_TaskInfoSnapshot",
     read_task_snapshot: TaskSnapshotReader,
+    read_task_steps_response: TaskStepsResponseReader,
+    read_task_steps_version: TaskStepsVersionReader | None = None,
     watchdog_interval_seconds: float = WATCHDOG_INTERVAL_SECONDS,
     stream_max_duration_seconds: float = STREAM_MAX_DURATION_SECONDS,
     heartbeat_interval_seconds: float = HEARTBEAT_INTERVAL_SECONDS,
@@ -1492,16 +2264,48 @@ async def build_event_stream_response(
     function does no auth of its own. Concurrency caps (429) are
     checked here, before the generator (and therefore the sink and the
     per-principal reservation) ever exists, so a rejected attach never
-    touches ``manager`` or the per-principal counter.
+    touches ``manager`` or the per-principal counter. Both fast paths
+    below read their step content through ``read_task_steps_response``
+    (see ``TaskStepsResponseReader``), a cache-backed read of the
+    task's current step list -- they're one-shot and don't need a
+    live-foldable projector. They also take ``read_task_snapshot``
+    directly, the same reader that authorized ``initial_snapshot``, to
+    reread the task row once their own steps read returns non-empty
+    content and confirm nothing restarted the task in between (see
+    ``_fast_path_generation_changed``), and ``read_task_steps_version``
+    to reread the steps cursor (``max_event_id``) the same way -- a
+    trace row can land in that same window, and even the commits that
+    write the task row itself (a checkpoint-pointer ``UPDATE``, see
+    ``_fast_path_steps_cursor_changed``) never touch ``run_id`` or
+    ``state_version``, so the run_id/state_version reread alone cannot
+    see it either way. Defaults to ``None``
+    (skips the cursor reread) only so callers that aren't exercising it
+    don't have to supply a reader; the router below always does.
     """
     close_reason = _stream_close_reason(
         initial_snapshot.status, initial_snapshot.control_state
     )
     if close_reason == "terminal":
-        return _sse_response(_terminal_snapshot_stream(initial_snapshot))
+        return _sse_response(
+            _terminal_snapshot_stream(
+                initial_snapshot,
+                principal,
+                read_task_steps_response,
+                read_task_snapshot,
+                read_task_steps_version=read_task_steps_version,
+            )
+        )
 
     if close_reason == "input_required":
-        return _sse_response(_input_required_snapshot_stream(initial_snapshot))
+        return _sse_response(
+            _input_required_snapshot_stream(
+                initial_snapshot,
+                principal,
+                read_task_steps_response,
+                read_task_snapshot,
+                read_task_steps_version=read_task_steps_version,
+            )
+        )
 
     if count_task_sinks(task_id) >= PER_TASK_STREAM_CAP:
         raise V1ApiError(V1ErrorCode.RATE_LIMITED, 429)

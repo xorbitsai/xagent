@@ -13,6 +13,10 @@ import pytest
 from xagent.core.model.chat.basic.base import BaseLLM
 from xagent.core.retry.wrapper import create_retry_wrapper
 from xagent.core.tools.adapters.vibe.vision_tool import VisionTool, get_vision_tool
+from xagent.core.tools.core.vision_tool import (
+    UnderstandMediaResult,
+    _normalize_vision_response,
+)
 from xagent.web.services.model_service import get_default_vision_model
 
 
@@ -158,6 +162,175 @@ def sample_images_data():
             "format": "png",
         },
     ]
+
+
+# Each row is (label, response, expected_kind, expected_text,
+# expected_tool_calls, expected_raw_display). Rows cover every shape
+# ``_normalize_vision_response`` must classify: bare strings (empty,
+# whitespace-only, and non-empty are tested as separate rows so a
+# whitespace string cannot satisfy two rows' criteria at once), text/
+# tool_call/unrecognized envelopes, a missing "type" key, ``None``, and
+# other Python types.
+_VISION_RESPONSE_SHAPE_MATRIX = [
+    (
+        "non_empty_str",
+        "a plain text reply",
+        "text",
+        "a plain text reply",
+        [],
+        "a plain text reply",
+    ),
+    ("empty_str", "", "empty", "", [], ""),
+    ("whitespace_only_str", "   ", "empty", "   ", [], "   "),
+    (
+        "text_envelope",
+        {"type": "text", "content": "hello from the envelope"},
+        "text",
+        "hello from the envelope",
+        [],
+        "hello from the envelope",
+    ),
+    (
+        "text_envelope_empty_content",
+        {"type": "text", "content": ""},
+        "empty",
+        "",
+        [],
+        "",
+    ),
+    (
+        "text_envelope_whitespace_content",
+        {"type": "text", "content": "   "},
+        "empty",
+        "   ",
+        [],
+        "   ",
+    ),
+    (
+        "text_envelope_non_str_content",
+        {"type": "text", "content": 5},
+        "unknown",
+        None,
+        [],
+        str({"type": "text", "content": 5}),
+    ),
+    (
+        "tool_call_envelope",
+        {"type": "tool_call", "tool_calls": [{"id": "c1", "type": "function"}]},
+        "tool_call",
+        None,
+        [{"id": "c1", "type": "function"}],
+        str({"type": "tool_call", "tool_calls": [{"id": "c1", "type": "function"}]}),
+    ),
+    (
+        "unknown_type_dict",
+        {"type": "mystery", "payload": 1},
+        "unknown",
+        None,
+        [],
+        str({"type": "mystery", "payload": 1}),
+    ),
+    (
+        "dict_without_type_key",
+        {"payload": 1},
+        "unknown",
+        None,
+        [],
+        str({"payload": 1}),
+    ),
+    ("none", None, "unknown", None, [], "None"),
+    ("other_type_int", 123, "unknown", None, [], "123"),
+    (
+        "other_type_list",
+        [1, 2, 3],
+        "unknown",
+        None,
+        [],
+        str([1, 2, 3]),
+    ),
+]
+
+
+class TestNormalizeVisionResponse:
+    """Behavior of the response classifier shared by detect_objects and
+    understand_media. Exercised directly against the pure function -- the
+    call sites are exercised separately against the shapes they actually
+    branch on."""
+
+    @pytest.mark.parametrize(
+        "label,response,expected_kind,expected_text,expected_tool_calls,expected_raw_display",
+        _VISION_RESPONSE_SHAPE_MATRIX,
+        ids=[row[0] for row in _VISION_RESPONSE_SHAPE_MATRIX],
+    )
+    def test_shape_matrix(
+        self,
+        label,
+        response,
+        expected_kind,
+        expected_text,
+        expected_tool_calls,
+        expected_raw_display,
+    ):
+        result = _normalize_vision_response(response)
+        assert result.kind == expected_kind
+        assert result.text == expected_text
+        assert result.tool_calls == expected_tool_calls
+        assert result.raw_display == expected_raw_display
+
+    def test_shape_matrix_covers_exactly_four_kinds(self):
+        kinds = {row[2] for row in _VISION_RESPONSE_SHAPE_MATRIX}
+        assert kinds == {"text", "empty", "tool_call", "unknown"}
+
+    # Covers the shape matrix plus a handful of other plain-data inputs --
+    # not a claim that the classifier never raises for any input whatsoever.
+    @pytest.mark.parametrize(
+        "response",
+        [row[1] for row in _VISION_RESPONSE_SHAPE_MATRIX]
+        + [object(), 3.14, {"nested": {"type": "text"}}],
+    )
+    def test_never_raises(self, response):
+        result = _normalize_vision_response(response)
+        assert result.kind in {"text", "empty", "tool_call", "unknown"}
+
+    @pytest.mark.parametrize(
+        "label,response,expected_kind,expected_text,expected_tool_calls,expected_raw_display",
+        _VISION_RESPONSE_SHAPE_MATRIX,
+        ids=[row[0] for row in _VISION_RESPONSE_SHAPE_MATRIX],
+    )
+    def test_text_field_type_follows_kind(
+        self,
+        label,
+        response,
+        expected_kind,
+        expected_text,
+        expected_tool_calls,
+        expected_raw_display,
+    ):
+        result = _normalize_vision_response(response)
+        if result.kind in {"text", "empty"}:
+            assert isinstance(result.text, str)
+        else:
+            assert result.text is None
+
+    @pytest.mark.parametrize(
+        "label,response",
+        [
+            ("bare_whitespace", " " * 9000),
+            ("envelope_whitespace_content", {"type": "text", "content": " " * 9000}),
+        ],
+    )
+    def test_empty_raw_display_is_truncated(self, label, response):
+        """The shape matrix rows are all short, so the cap holds trivially
+        there. A whitespace-only payload long enough to exceed the limit
+        forces the empty branches to route through the truncator like every
+        other branch does."""
+        result = _normalize_vision_response(response)
+
+        assert result.kind == "empty"
+        # The 4000-char prefix plus the marker: the marker is appended
+        # *after* the cap, so the returned string is 4025 chars, not 4000.
+        assert result.raw_display == " " * 4000 + "...<truncated 5000 chars>"
+        assert len(result.raw_display) == 4025
 
 
 class TestVisionToolInitialization:
@@ -1037,6 +1210,178 @@ class TestVisionToolUnderstandMedia:
         assert [call.args[0][4] for call in run.call_args_list] == ["2.000", "6.000"]
 
 
+class TestVisionToolUnderstandMediaEnvelope:
+    """Response-shape handling in understand_media. None of the module's
+    other fixtures produce an envelope response, so these configure the
+    mock model's return value directly per case."""
+
+    @pytest.mark.asyncio
+    async def test_understand_media_returns_envelope_content(
+        self, vision_tool_without_workspace, mock_vision_model
+    ):
+        """A text envelope's content must become the answer verbatim, and
+        the envelope itself must not leak into it."""
+        mock_vision_model.vision_chat.return_value = {
+            "type": "text",
+            "content": "The lake is Lake Louise.",
+            "raw": {"id": "resp-1"},
+        }
+
+        result = await vision_tool_without_workspace.understand_media(
+            "data:image/jpeg;base64,ZmFrZV9pbWFnZV9kYXRh", "Where is this?"
+        )
+
+        assert result.success is True
+        assert result.answer == "The lake is Lake Louise."
+        assert "'type'" not in result.answer
+        assert "'raw'" not in result.answer
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "label,response,expected_error",
+        [
+            (
+                "unknown_dict",
+                {"type": "mystery", "payload": 1},
+                "Vision model returned an unsupported response shape",
+            ),
+            (
+                "non_str_content",
+                {"type": "text", "content": 5},
+                "Vision model returned an unsupported response shape",
+            ),
+            (
+                "none",
+                None,
+                "Vision model returned an unsupported response shape",
+            ),
+        ],
+    )
+    async def test_understand_media_rejects_shapes_without_text_payload(
+        self,
+        vision_tool_without_workspace,
+        mock_vision_model,
+        label,
+        response,
+        expected_error,
+    ):
+        """A response with no text payload must not be turned into an
+        answer via str(response); it must fail explicitly instead."""
+        mock_vision_model.vision_chat.return_value = response
+
+        result = await vision_tool_without_workspace.understand_media(
+            "data:image/jpeg;base64,ZmFrZV9pbWFnZV9kYXRh", "Describe this."
+        )
+
+        assert result.success is False
+        assert result.answer is None
+        assert result.error == expected_error
+
+    @pytest.mark.asyncio
+    async def test_understand_media_tool_call_message_unchanged(
+        self, vision_tool_without_workspace, mock_vision_model
+    ):
+        """The existing tool-call message text is not part of this fix and
+        must survive the rewrite unchanged."""
+        mock_vision_model.vision_chat.return_value = {
+            "type": "tool_call",
+            "tool_calls": [{"id": "c1", "type": "function"}],
+            "raw": {"id": "resp-1"},
+        }
+
+        result = await vision_tool_without_workspace.understand_media(
+            "data:image/jpeg;base64,ZmFrZV9pbWFnZV9kYXRh", "Describe this."
+        )
+
+        assert result.success is True
+        assert result.answer == (
+            "Model triggered tool call instead of answering: "
+            "[{'id': 'c1', 'type': 'function'}]"
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "label,response",
+        [
+            ("bare_empty", ""),
+            ("bare_whitespace", "   "),
+            ("envelope_empty_content", {"type": "text", "content": ""}),
+            ("envelope_whitespace_content", {"type": "text", "content": "   "}),
+        ],
+    )
+    async def test_understand_media_rejects_empty_text_payload(
+        self, vision_tool_without_workspace, mock_vision_model, label, response
+    ):
+        """An empty or whitespace-only response, bare or wrapped in an
+        envelope, must not be reported as a successful empty answer."""
+        mock_vision_model.vision_chat.return_value = response
+
+        result = await vision_tool_without_workspace.understand_media(
+            "data:image/jpeg;base64,ZmFrZV9pbWFnZV9kYXRh", "Describe this."
+        )
+
+        assert result.success is False
+        assert result.answer is None
+        assert result.error == "Vision model returned an empty response"
+
+    @pytest.mark.asyncio
+    async def test_raw_display_confined_to_detect_objects_diagnostics(
+        self, vision_tool_without_workspace, mock_vision_model
+    ):
+        """raw_display -- the classifier's length-capped diagnostic string
+        -- must never leak into a user-visible answer, UnderstandMediaResult
+        must not grow a field to carry it, and DetectObjectsResult must
+        keep populating its own raw_response diagnostic field."""
+        # Frozen field set. Equality rather than a `"raw_display" not in`
+        # check is deliberate: it also pins the absence of `parsing_method`
+        # and `raw_response`, which the detect_objects result carries and
+        # this one must not. Adding a field to this public result object is
+        # a deliberate contract change, so update this line in the same
+        # commit that adds it.
+        assert set(UnderstandMediaResult.model_fields) == {
+            "success",
+            "answer",
+            "media_processed",
+            "images_processed",
+            "videos_processed",
+            "native_videos_processed",
+            "frames_extracted",
+            "model_used",
+            "warnings",
+            "error",
+        }
+
+        # A content payload longer than the truncation limit must reach
+        # `answer` in full. If `answer` were ever sourced from the
+        # length-capped raw_display instead of the classifier's `text`
+        # field, this would come back shorter than the original.
+        long_content = "x" * 5000
+        mock_vision_model.vision_chat.return_value = {
+            "type": "text",
+            "content": long_content,
+            "raw": {"id": "resp-1"},
+        }
+        result = await vision_tool_without_workspace.understand_media(
+            "data:image/jpeg;base64,ZmFrZV9pbWFnZV9kYXRh", "Describe this."
+        )
+        assert result.answer == long_content
+        assert len(result.answer) > 4000
+
+        # detect_objects still populates its own raw_response field.
+        model = Mock(spec=BaseLLM)
+        model.vision_chat = AsyncMock(
+            return_value=(
+                '{"detections": [{"class": "person", "confidence": 0.9, '
+                '"bbox": [0.1, 0.1, 0.6, 0.8]}]}'
+            )
+        )
+        model.has_ability = Mock(return_value=True)
+        detect_result = await VisionTool(model).detect_objects(
+            "data:image/jpeg;base64,ZmFrZV9pbWFnZV9kYXRh", task="Find objects"
+        )
+        assert detect_result.raw_response
+
+
 class TestVisionToolDescribeImages:
     """Test cases for describe_images method"""
 
@@ -1273,6 +1618,214 @@ class TestVisionToolDetectObjects:
             finally:
                 if os.path.exists(temp_image_path):
                     os.unlink(temp_image_path)
+
+    @pytest.mark.asyncio
+    async def test_detect_objects_parses_text_envelope_payload(self):
+        """OpenAI-family providers wrap the detection JSON in a text
+        envelope; the envelope's content must reach the same parser a bare
+        JSON string would."""
+        detection_json = (
+            '{"detections": [{"class": "person", "confidence": 0.95, '
+            '"bbox": [0.1, 0.1, 0.6, 0.8]}], "image_info": {"width": "640", '
+            '"height": "480"}}'
+        )
+        model = Mock(spec=BaseLLM)
+        model.vision_chat = AsyncMock(
+            return_value={
+                "type": "text",
+                "content": detection_json,
+                "raw": {"id": "resp-1"},
+            }
+        )
+        model.has_ability = Mock(return_value=True)
+
+        vision_tool = VisionTool(model)
+        result = await vision_tool.detect_objects(
+            "data:image/jpeg;base64,ZmFrZV9pbWFnZV9kYXRh",
+            task="Find all objects in the image",
+        )
+
+        assert result.success is True
+        assert result.total_detections == 1
+        assert result.detections[0]["class"] == "person"
+        assert result.parsing_method == "json"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "label,response,expected_error,expected_parsing_method,expected_raw_response",
+        [
+            (
+                "tool_call",
+                {
+                    "type": "tool_call",
+                    "tool_calls": [{"id": "c1", "type": "function"}],
+                },
+                "Vision model returned a tool call instead of a detection payload",
+                "tool_call_response",
+                "{'type': 'tool_call', 'tool_calls': [{'id': 'c1', 'type': 'function'}]}",
+            ),
+            (
+                "unknown_dict",
+                {"type": "mystery", "payload": 1},
+                "Vision model returned an unsupported response shape",
+                "unknown_type",
+                "{'type': 'mystery', 'payload': 1}",
+            ),
+            (
+                "non_str_content",
+                {"type": "text", "content": 5},
+                "Vision model returned an unsupported response shape",
+                "unknown_type",
+                "{'type': 'text', 'content': 5}",
+            ),
+            (
+                "none",
+                None,
+                "Vision model returned an unsupported response shape",
+                "unknown_type",
+                "None",
+            ),
+        ],
+    )
+    @pytest.mark.parametrize("mark_objects", [False, True])
+    async def test_detect_objects_flags_shapes_without_text_payload(
+        self,
+        label,
+        response,
+        expected_error,
+        expected_parsing_method,
+        expected_raw_response,
+        mark_objects,
+    ):
+        """A response with no text payload must be reported as a failure
+        with a non-empty error, and must never reach the marking step that
+        writes a bounding-box image to disk. Uses a real local file (rather
+        than a data: URL) so the mark_objects=True rows exercise the actual
+        marking code path instead of being rejected earlier by the
+        local-file-only guard for URL/data images."""
+        model = Mock(spec=BaseLLM)
+        model.vision_chat = AsyncMock(return_value=response)
+        model.has_ability = Mock(return_value=True)
+
+        vision_tool = VisionTool(model)
+        with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as temp_file:
+            temp_image_path = temp_file.name
+            temp_file.write(b"fake_image_data")
+
+        try:
+            with patch.object(vision_tool.core, "_draw_bounding_boxes") as mock_draw:
+                result = await vision_tool.detect_objects(
+                    temp_image_path,
+                    task="Find all objects in the image",
+                    mark_objects=mark_objects,
+                )
+                mock_draw.assert_not_called()
+        finally:
+            if os.path.exists(temp_image_path):
+                os.unlink(temp_image_path)
+
+        assert result.success is False
+        assert result.error == expected_error
+        assert result.parsing_method == expected_parsing_method
+        assert result.raw_response == expected_raw_response
+        assert result.total_detections == 0
+        assert result.marked_image_path is None
+        # 4000 is the truncation limit; the suffix is the truncation marker.
+        # Exactly one of the two must hold for every raw_response.
+        # The cap is the only bound on provider-internal keys; no key-level
+        # redaction is performed.
+        assert result.raw_response is not None
+        assert len(result.raw_response) <= 4000 or result.raw_response.endswith(
+            " chars>"
+        )
+
+    @pytest.mark.asyncio
+    # bare_empty / bare_whitespace: zhipu.py's vision entry point (lines
+    # 1027/1033) returns a bare "" or a bare unstripped `content` when there
+    # are no tool calls; its vision path has no whitespace guard, unlike its
+    # chat path's `.strip()` check at zhipu.py:369.
+    # envelope_whitespace_content: xinference.py:347 gates its text exit on
+    # bare truthiness, so whitespace-only content passes through unrejected.
+    # envelope_empty_content: no confirmed production source; exercised
+    # defensively as a normalization boundary.
+    @pytest.mark.parametrize(
+        "label,response,expected_raw_response",
+        [
+            ("bare_empty", "", ""),
+            ("bare_whitespace", "   \n\t ", "   \n\t "),
+            ("envelope_empty_content", {"type": "text", "content": ""}, ""),
+            (
+                "envelope_whitespace_content",
+                {"type": "text", "content": "   "},
+                "   ",
+            ),
+        ],
+    )
+    @pytest.mark.parametrize("mark_objects", [False, True])
+    async def test_detect_objects_rejects_empty_text_payload(
+        self, label, response, expected_raw_response, mark_objects
+    ):
+        """An empty or whitespace-only text payload -- bare or wrapped in a
+        text envelope -- must be reported as a failure rather than an
+        empty-but-successful detection, and must never reach the marking
+        step. Uses a real local file (rather than a data: URL) so the
+        mark_objects=True rows exercise the actual marking code path
+        instead of being rejected earlier by the local-file-only guard for
+        URL/data images."""
+        model = Mock(spec=BaseLLM)
+        model.vision_chat = AsyncMock(return_value=response)
+        model.has_ability = Mock(return_value=True)
+
+        vision_tool = VisionTool(model)
+        with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as temp_file:
+            temp_image_path = temp_file.name
+            temp_file.write(b"fake_image_data")
+
+        try:
+            with patch.object(vision_tool.core, "_draw_bounding_boxes") as mock_draw:
+                result = await vision_tool.detect_objects(
+                    temp_image_path,
+                    task="Find all objects in the image",
+                    mark_objects=mark_objects,
+                )
+                mock_draw.assert_not_called()
+        finally:
+            if os.path.exists(temp_image_path):
+                os.unlink(temp_image_path)
+
+        assert result.success is False
+        assert result.error == "Vision model returned an empty response"
+        assert result.parsing_method == "empty_response"
+        assert result.raw_response == expected_raw_response
+        assert result.detections == []
+        assert result.total_detections == 0
+        assert result.marked_image_path is None
+
+    @pytest.mark.asyncio
+    async def test_detect_objects_truncates_large_raw_response(self):
+        """The no-text-payload rows above are all short, so the truncation
+        bound holds trivially whether or not truncation actually runs. This
+        forces an oversized payload (str(result) > 4000 chars) so the
+        truncation marker assertion has something to catch."""
+        model = Mock(spec=BaseLLM)
+        model.vision_chat = AsyncMock(
+            return_value={"type": "mystery", "payload": "x" * 5000}
+        )
+        model.has_ability = Mock(return_value=True)
+
+        vision_tool = VisionTool(model)
+        result = await vision_tool.detect_objects(
+            "data:image/jpeg;base64,ZmFrZV9pbWFnZV9kYXRh",
+            task="Find all objects in the image",
+        )
+
+        assert result.success is False
+        assert result.raw_response is not None
+        # The truncated string is the 4000-char prefix plus a "...<truncated
+        # N chars>" marker, so its length is *not* <= 4000 -- it must carry
+        # the marker instead.
+        assert result.raw_response.endswith(" chars>")
+        assert len(result.raw_response) > 4000
 
 
 class TestVisionToolHelperMethods:

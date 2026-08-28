@@ -133,6 +133,7 @@ def get_builtin_oauth_provider_rows() -> list[dict[str, Any]]:
                 "chat:write.public",
                 "channels:read",
                 "channels:history",
+                "channels:join",
                 "groups:read",
                 "groups:history",
                 "im:read",
@@ -229,6 +230,70 @@ def get_builtin_oauth_provider_rows() -> list[dict[str, Any]]:
             # Intercom's actual behavior instead of sending a param it
             # ignores.
             "default_scopes": [],
+        },
+        {
+            "provider_name": "salesforce",
+            "name": "Salesforce",
+            "client_id": os.environ.get("SALESFORCE_CLIENT_ID", ""),
+            "client_secret": os.environ.get("SALESFORCE_CLIENT_SECRET", ""),
+            # The generic login.salesforce.com/test.salesforce.com hosts
+            # (rather than a customer's own My Domain, e.g.
+            # acme.my.salesforce.com) work for any org: Salesforce resolves
+            # the actual org during login and issues a token scoped to it,
+            # returning that org's real API host as `instance_url` in the
+            # token response -- see the userinfo_url note below and
+            # UserOAuth.instance_url (api/auth.py persists it generically
+            # for any provider that returns this key).
+            "auth_url": "https://login.salesforce.com/services/oauth2/authorize",
+            "token_url": "https://login.salesforce.com/services/oauth2/token",
+            "redirect_uri": os.environ.get("SALESFORCE_REDIRECT_URI", ""),
+            # Salesforce's OIDC userinfo endpoint IS a fixed host
+            # (login.salesforce.com, same as auth_url/token_url -- see
+            # salesforce.py's USERINFO_URL), not the per-org instance_url
+            # used by every other endpoint. Left empty anyway, on purpose:
+            # populating it here would add a network round-trip to every
+            # OAuth connect just to fill in email/provider_user_id, which
+            # this connector doesn't otherwise need -- identity is instead
+            # fetched lazily, on demand, via salesforce_get_current_user.
+            # UserOAuth.email/provider_user_id stay NULL for every Salesforce
+            # grant as a result; is_connected still works from access_token
+            # alone (see test_salesforce_oauth.py's dedicated coverage).
+            "userinfo_url": "",
+            "user_id_path": "user_id",
+            "email_path": "email",
+            # refresh_token: required to get a refresh_token back at all.
+            # openid: required for the OIDC userinfo endpoint
+            # salesforce_get_current_user calls.
+            "default_scopes": ["api", "refresh_token", "openid"],
+        },
+        {
+            "provider_name": "deputy",
+            "name": "Deputy",
+            "client_id": os.environ.get("DEPUTY_CLIENT_ID", ""),
+            "client_secret": os.environ.get("DEPUTY_CLIENT_SECRET", ""),
+            "auth_url": "https://once.deputy.com/my/oauth/login",
+            "token_url": "https://once.deputy.com/my/oauth/access_token",
+            "redirect_uri": os.environ.get("DEPUTY_REDIRECT_URI", ""),
+            # Deputy has no fixed userinfo host -- each customer's actual API
+            # host (e.g. "acme.au.deputy.com", no scheme) is returned as
+            # `endpoint` in the token response instead, similar in spirit to
+            # Salesforce's instance_url above but under a different response
+            # key and without a scheme, so api/auth.py normalizes it into
+            # UserOAuth.instance_url itself rather than reusing the generic
+            # token_data.get("instance_url") persistence every other provider
+            # shares. Left empty so generic_oauth_callback's `elif
+            # userinfo_url and access_token:` branch is skipped; identity
+            # instead comes from a dedicated `elif provider.lower() ==
+            # "deputy"` branch there that calls the per-install
+            # GET /api/v1/me once instance_url is known.
+            "userinfo_url": "",
+            "user_id_path": "",
+            "email_path": "",
+            # Deputy's only documented OAuth scope. Not a permission scope in
+            # the usual sense -- it just tells Deputy to also issue a
+            # refresh_token -- but the authorize, code-exchange, and refresh
+            # requests all require it to be present verbatim.
+            "default_scopes": ["longlife_refresh_token"],
         },
         {
             "provider_name": "linear",
@@ -342,7 +407,7 @@ def get_builtin_public_mcp_app_rows() -> list[dict[str, Any]]:
             "transport": "oauth",
             "provider_name": "google",
             "category": "Scheduling",
-            "oauth_scopes": ["https://www.googleapis.com/auth/calendar"],
+            "oauth_scopes": ["https://www.googleapis.com/auth/calendar.events"],
             "is_visible_in_connector": True,
             "launch_config": {
                 "command": "python",
@@ -439,6 +504,25 @@ def get_builtin_public_mcp_app_rows() -> list[dict[str, Any]]:
             "launch_config": {
                 "command": "python",
                 "args": ["-m", "xagent.web.tools.mcp.google_analytics"],
+                "env_mapping": {"GOOGLE_ACCESS_TOKEN": "access_token"},
+            },
+        },
+        {
+            "app_id": "google-search-console",
+            "name": "Google Search Console",
+            "description": "Connect to Google Search Console to list verified sites, query search analytics (clicks, impressions, CTR, position), inspect URLs, and list sitemaps.",
+            "icon": "https://www.google.com/s2/favicons?domain=search.google.com&sz=128",
+            "transport": "oauth",
+            "provider_name": "google",
+            # "Analytics" (not "Marketing", which google-analytics uses —
+            # a pre-existing mismatch, not a precedent to repeat) since this
+            # connector is squarely a search-analytics tool.
+            "category": "Analytics",
+            "oauth_scopes": ["https://www.googleapis.com/auth/webmasters.readonly"],
+            "is_visible_in_connector": True,
+            "launch_config": {
+                "command": "python",
+                "args": ["-m", "xagent.web.tools.mcp.google_search_console"],
                 "env_mapping": {"GOOGLE_ACCESS_TOKEN": "access_token"},
             },
         },
@@ -643,7 +727,7 @@ def get_builtin_public_mcp_app_rows() -> list[dict[str, Any]]:
         {
             "app_id": "slack",
             "name": "Slack",
-            "description": "Connect to Slack to search and read channel, thread, and DM history, post messages and replies, react to messages, and upload files, e.g. incident summaries and recommended fixes.",
+            "description": "Connect to Slack to search and read channel, thread, and DM history, post messages and replies, react to messages, upload files, and join public channels when asked to, e.g. incident summaries and recommended fixes.",
             "icon": "https://www.google.com/s2/favicons?domain=slack.com&sz=128",
             "transport": "oauth",
             "provider_name": "slack",
@@ -653,6 +737,7 @@ def get_builtin_public_mcp_app_rows() -> list[dict[str, Any]]:
                 "chat:write.public",
                 "channels:read",
                 "channels:history",
+                "channels:join",
                 "groups:read",
                 "groups:history",
                 "im:read",
@@ -914,6 +999,52 @@ def get_builtin_public_mcp_app_rows() -> list[dict[str, Any]]:
                 "command": "python",
                 "args": ["-m", "xagent.web.tools.mcp.intercom"],
                 "env_mapping": {"INTERCOM_ACCESS_TOKEN": "access_token"},
+            },
+        },
+        {
+            "app_id": "salesforce",
+            "name": "Salesforce",
+            "description": "Connect to Salesforce to query and manage records (accounts, contacts, leads, opportunities, and custom objects) with SOQL/SOSL, and browse object schemas.",
+            "icon": "https://www.google.com/s2/favicons?domain=salesforce.com&sz=128",
+            "transport": "oauth",
+            "provider_name": "salesforce",
+            "category": "CRM",
+            "oauth_scopes": ["api", "refresh_token", "openid"],
+            "is_visible_in_connector": True,
+            "launch_config": {
+                "command": "python",
+                "args": ["-m", "xagent.web.tools.mcp.salesforce"],
+                # instance_url is the per-org API host from the OAuth grant
+                # (UserOAuth.instance_url) -- see the oauth_providers row
+                # above for why Salesforce needs this second mapping entry
+                # that no other connector here does.
+                "env_mapping": {
+                    "SALESFORCE_ACCESS_TOKEN": "access_token",
+                    "SALESFORCE_INSTANCE_URL": "instance_url",
+                },
+            },
+        },
+        {
+            "app_id": "deputy",
+            "name": "Deputy",
+            "description": "Connect to Deputy to look up employees, view rosters/shifts, and read timesheets.",
+            "icon": "https://www.google.com/s2/favicons?domain=deputy.com&sz=128",
+            "transport": "oauth",
+            "provider_name": "deputy",
+            "category": "Scheduling",
+            "oauth_scopes": ["longlife_refresh_token"],
+            "is_visible_in_connector": True,
+            "launch_config": {
+                "command": "python",
+                "args": ["-m", "xagent.web.tools.mcp.deputy"],
+                # instance_url is the per-install API host from the OAuth
+                # grant (UserOAuth.instance_url) -- see the oauth_providers
+                # row above for why Deputy needs this second mapping entry,
+                # the same reason Salesforce's row above does.
+                "env_mapping": {
+                    "DEPUTY_ACCESS_TOKEN": "access_token",
+                    "DEPUTY_INSTANCE_URL": "instance_url",
+                },
             },
         },
         {

@@ -39,6 +39,7 @@ from ..services.deployments import (
     new_share_token,
     new_widget_key,
 )
+from ..services.trace_event_types import GENERAL_ERROR_EVENT_TYPES
 from ..services.trace_message_storage import decode_trace_events_data
 from ..services.triggers import unregister_deleted_trigger_bindings
 from ..services.workforce_access import (
@@ -128,6 +129,10 @@ class WorkforceRunRequest(BaseModel):
     execution_mode: str | None = None
     is_preview: bool = False
     is_visible: bool = True
+    # Opening turn starts inside this request, so the zone rides here or the
+    # first answer renders against UTC. Unresolvable names degrade to UTC at
+    # the render site rather than 422 here.
+    timezone: str | None = Field(default=None, max_length=64)
 
 
 class WorkforcePreviewRunRequest(BaseModel):
@@ -138,6 +143,7 @@ class WorkforcePreviewRunRequest(BaseModel):
     message: str = Field(..., min_length=1)
     files: list[str] = Field(default_factory=list)
     execution_mode: str | None = None
+    timezone: str | None = Field(default=None, max_length=64)
 
 
 def _field_supplied(model: BaseModel, field_name: str) -> bool:
@@ -333,7 +339,7 @@ def _derive_agent_execution_status(
     }
     for event in reversed(trace_events):
         event_type = str(event.get("event_type") or "")
-        if event_type == "trace_error":
+        if event_type in GENERAL_ERROR_EVENT_TYPES:
             return "failed"
         if event_type not in {
             "react_task_end",
@@ -663,6 +669,7 @@ async def create_workforce_preview_run(
         message=request.message,
         selected_file_ids=request.files,
         execution_mode=request.execution_mode,
+        timezone=request.timezone,
     )
     return {
         "workforce_run_id": result.workforce_run.id,
@@ -828,7 +835,7 @@ async def archive_or_delete_workforce(
 
         def _load_and_delete_permanently() -> tuple[
             list[WorkforceRunPauseTarget],
-            list[tuple[AgentTrigger, str, dict[str, Any]]],
+            list[tuple[AgentTrigger, str, dict[str, Any], str | None]],
         ]:
             # Offloaded as one unit (load + the cascade-heavy delete
             # itself), not just the delete: a workforce with a large
@@ -1420,6 +1427,7 @@ async def create_workforce_run(
         execution_mode=request.execution_mode,
         is_preview=request.is_preview,
         is_visible=request.is_visible,
+        timezone=request.timezone,
     )
     return {
         "workforce_run_id": result.workforce_run.id,

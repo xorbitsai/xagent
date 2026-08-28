@@ -12,6 +12,11 @@ from ...core.agent.trace import (
     TraceHandler,
     TraceScope,
 )
+from ..services.trace_event_types import (
+    LEGACY_GENERAL_ERROR_EVENT_TYPE,
+    STEP_GENERAL_ERROR_EVENT_TYPE,
+    TASK_GENERAL_ERROR_EVENT_TYPE,
+)
 from .public_trace_events import is_audit_only_trace_data, normalize_public_trace_event
 from .websocket import create_stream_event, manager
 
@@ -102,8 +107,20 @@ def get_event_type_mapping(event: TraceEvent) -> str:
         and category == TraceCategory.TOOL
     ):
         return "tool_execution_failed"
+    elif (
+        scope == TraceScope.TASK
+        and action == TraceAction.ERROR
+        and category == TraceCategory.GENERAL
+    ):
+        return TASK_GENERAL_ERROR_EVENT_TYPE
+    elif (
+        scope == TraceScope.STEP
+        and action == TraceAction.ERROR
+        and category == TraceCategory.GENERAL
+    ):
+        return STEP_GENERAL_ERROR_EVENT_TYPE
     elif action == TraceAction.ERROR:
-        return "trace_error"
+        return LEGACY_GENERAL_ERROR_EVENT_TYPE
     elif (
         scope == TraceScope.ACTION
         and action == TraceAction.START

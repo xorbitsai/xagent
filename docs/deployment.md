@@ -200,3 +200,132 @@ Because this release cannot create actor-owned rows, the downgrade remains avail
 SQLite can commit each schema operation separately during a batch-table rebuild. If a downgrade fails, do not retry against the changed database. For a disposable local database, delete and recreate it through normal application startup. Otherwise, restore the verified backup. Make sure that `alembic current` reports the owner-aware revision before you retry the downgrade.
 
 The migration refuses the downgrade if a non-null owner row exists. If a caller created such a row, disable that caller. Revoke and remove the credential with an approved procedure. Then retry the downgrade.
+
+## 2026-08-24 — Gmail ordinary-owner fence
+
+### Scope
+
+This release adds no schema, dependency, environment variable, or cleanup state. It restricts Gmail watch and trigger code to ordinary OAuth rows.
+
+Mailbox release now calls Gmail `users.stop` before Pub/Sub cleanup. Each release can add one Gmail API request.
+
+Actor-owned Gmail credentials remain available to builtin MCP tools. Gmail provisioning, renewal, callback, trigger, and release paths reject these rows.
+
+### Prerequisites and configuration
+
+Keep every actor-owned credential writer disabled during this rollout. The owner-aware OAuth migration above must already be current.
+
+### Gmail trigger binding contract
+
+`oauth_account_id` has three states:
+
+1. An absent key is a persisted legacy binding. Its mailbox (`resource_id`) must be non-empty.
+2. A positive integer or ASCII decimal string is an explicit binding. It must match a same-user ordinary Gmail account.
+3. Any other present value is invalid. New API requests reject it. Persisted invalid bindings fail closed, are marked failed, and prevent mailbox teardown until repaired.
+
+Provisioning resolves a legacy binding only when its mailbox matches exactly one same-user ordinary Gmail account. It does not add an account ID to the stored legacy configuration. A missing or ambiguous match fails closed.
+
+New or edited Gmail trigger configurations must use an explicit account ID. You can re-enable a persisted legacy trigger without editing its configuration. To repair an unavailable legacy binding, replace it with the matching ordinary Gmail account ID.
+
+Do not remove an invalid key to repair a trigger unless it is a confirmed legacy mailbox binding. Do not use `0`, `null`, booleans, floats, or non-decimal strings as Gmail account IDs.
+
+### Deployment and migration steps
+
+1. Deploy this release to every Gmail API, callback, trigger, dispatcher, and worker process.
+2. Make sure that no older process remains.
+3. Run the ownership query below.
+4. If the result is not zero, keep actor credential writers disabled. The fence does not clean invalid watches. Track the approved cleanup path in [issue #1652](https://github.com/xorbitsai/xagent/issues/1652).
+5. Enable actor credential writers only after the result is zero.
+
+### Verification and monitoring
+
+Run this query before actor credential writers become active:
+
+```sql
+SELECT count(*)
+FROM gmail_watch_states AS watch
+LEFT JOIN user_oauth AS account ON account.id = watch.oauth_account_id
+WHERE account.id IS NULL
+   OR watch.user_id <> account.user_id
+   OR account.provider <> 'gmail'
+   OR account.resource_owner_key IS NOT NULL;
+```
+
+The result must be zero. Existing ordinary Gmail watch and trigger tests must also pass before deployment.
+
+A callback with only invalid or actor-owned trigger bindings is acknowledged as unknown and does not advance the Gmail history cursor. Restore a valid ordinary trigger binding before callback processing can continue.
+
+If a trigger reports `Gmail trigger has an invalid OAuth account binding`, replace its `oauth_account_id` with the matching ordinary Gmail account ID. Remove the key only for a confirmed legacy mailbox binding. Do not change actor-owned credentials or watch rows as part of this rollout.
+
+### Rollback
+
+Keep this fence during an actor-feature rollback. Disable actor credential writers before you roll back another actor layer.
+
+The watch-ownership query above detects invalid watch bindings. Before you revert this fence, also run:
+
+```sql
+SELECT count(*)
+FROM user_oauth
+WHERE provider = 'gmail'
+  AND resource_owner_key IS NOT NULL;
+```
+
+Both query results must be zero only when you revert this fence. The second query proves that no actor-owned Gmail credential remains. This includes credentials without watch state. Actor-owned credentials can exist while the fence remains. A normal actor-feature rollback does not revert this release.
+
+## 2026-08-26 — PostgreSQL 17 default for the bundled Compose database
+
+### Deployment impact
+
+The bundled `postgres` service in `docker-compose.yml` now defaults to `postgres:17-bookworm`, aligning self-hosted deployments with the PostgreSQL 17 major that production runs and CI validates against. There is no Alembic revision, no schema change, and no application-code change. This is a data-directory migration only.
+
+PostgreSQL never upgrades a data directory across major versions. A `postgres_data` volume initialized by PostgreSQL 16 does not open under a PostgreSQL 17 server: the server exits with `FATAL: database files are incompatible with server` without modifying the directory, restart-loops as `unhealthy`, and `backend`, `worker`, and `scheduler` never start because they wait for `service_healthy`. The v16 data stays intact, so pinning the previous tag restores service. Treat an unplanned upgrade of an existing v16 deployment as a full outage until that happens or the migration below completes.
+
+Fresh installations are unaffected, because they initialize directly under v17. So are deployments whose `DATABASE_URL` points at an external or managed PostgreSQL, because the bundled service is not in their path.
+
+### Prerequisites and configuration
+
+`POSTGRES_IMAGE_TAG` is new in this release. It sets the tag of the bundled `postgres` image, defaults to `17-bookworm`, and is documented in `example.env`. Set it to `16-bookworm` to keep an existing v16 volume running until it is migrated.
+
+Before migrating, confirm the deployment uses the bundled `postgres` service rather than an external database, and identify the Compose-prefixed volume name with `docker volume ls | grep postgres_data`. Reserve a maintenance window: the database is unavailable from the point writers stop until verification passes, and `nginx` and `frontend` keep serving errors to users for that whole window.
+
+Never run `docker compose down -v` or remove the live `postgres_data` volume. Both destroy the database irreversibly and neither is an upgrade step. Removing the separate `_pg16_backup` copy that the runbook creates is a different operation and is expected.
+
+The runbook is a general method, not a procedure tuned to any one deployment. Use the backup and verification process you already trust for this database, and rehearse the migration against a copy before running it on production.
+
+### Deployment and migration steps
+
+The executable commands are the [PostgreSQL major version upgrade (16 to 17)](../docker/README.md#postgresql-major-version-upgrade-16-to-17) runbook in `docker/README.md`; each numbered step below is one runbook step, in order. A deployment that uses a sandbox runtime overlay must keep its `-f` overlay arguments on every Compose command, or `backend`, `worker`, and `scheduler` come back without the overlay.
+
+1. Pin `POSTGRES_IMAGE_TAG` to `16-bookworm` and confirm the deployment is healthy on v16.
+2. Stop `backend`, `worker`, and `scheduler`, leaving `postgres` running.
+3. Run your backup process, verify its result, and record the values you will compare after the restore.
+4. Stop the stack without `-v` and copy the v16 volume to a separate volume, so rollback never depends on the dump alone.
+5. Remove the v16 data directory from the live volume, guarded on the dump being complete and the copy being v16.
+6. Unpin `POSTGRES_IMAGE_TAG` and start `postgres` on v17, which initializes a fresh cluster.
+7. Restore the dump with `ON_ERROR_STOP=1`, then run the verification below.
+8. Start the remaining services only after verification passes.
+
+Keep the v16 volume copy while you are still deciding whether the upgrade held, then remove it with `docker volume rm`.
+
+### Verification and monitoring
+
+After the restore, `SHOW server_version` must report a 17.x version, and `SELECT version_num FROM alembic_version` must equal the value recorded in step 3. The second check is schema-only: a restore that stopped early does not change that value.
+
+Those two establish that the schema arrived. What proves the data arrived depends on the deployment, so run the checks that matter for yours — row counts on the tables you care about, spot checks against recent records, an application smoke test.
+
+Then run `vacuumdb --all --analyze-in-stages` inside the `postgres` container. `pg_dump` does not carry optimizer statistics across a restore, and a restored cluster plans queries badly until they exist.
+
+Before starting the writers, confirm that `docker compose ps` reports `postgres` as `healthy` and that `docker compose logs postgres` shows a startup with no `FATAL` line.
+
+### Rollback
+
+Valid only until step 8 restarts the writers. Until that point a v17 server has never opened the volume copy taken in step 4, so it is still a complete picture of the database and rollback restores it directly instead of replaying the dump.
+
+1. Stop the stack without `-v`.
+2. Confirm the preserved v16 volume exists and reports `PG_VERSION` 16, before removing anything. Docker creates a named volume that does not exist, so an unchecked copy-back from a missing volume restores nothing over a directory it has already deleted.
+3. Remove the data directory from the live volume and copy the preserved v16 volume back over it.
+4. Pin `POSTGRES_IMAGE_TAG` to `16-bookworm`, start the stack, and confirm that `SHOW server_version` reports a 16.x version.
+
+Roll back rather than repair in place when verification fails after a partial restore under v17. A cluster left half-populated by an interrupted restore is not a state to diagnose during an outage. If the v16 volume copy is unavailable, restore the verified dump from step 3 onto a v16 cluster initialized from `16-bookworm`.
+
+After v17 accepts writes the volume copy is stale, and restoring it discards everything written since the cutover. Recovery from that point means taking a fresh v17 backup and reconciling the two, not a copy-back.

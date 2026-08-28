@@ -4,17 +4,20 @@ from typing import Any, AsyncIterator, Dict, List, Optional
 
 from ...providers import is_placeholder_api_key
 from .base import StreamChunk
-from .deepseek_tool_protocol import (
+from .deepseek_tool_protocol import (  # noqa: F401 - re-exported, see below
+    DEEPSEEK_PROVIDER_STATE_NAMESPACE,
+    DEEPSEEK_REASONING_CONTENT_STATE_KEY,
     adapt_deepseek_stream,
+    deepseek_reasoning_provider_state,
+    deepseek_reasoning_provider_state_payload,
     normalize_deepseek_response,
+    restore_deepseek_reasoning_content,
 )
 from .openai import PROVIDER_STATE_METADATA_KEY, OpenAICompatibleLLM
 
 logger = logging.getLogger(__name__)
 
 DEEPSEEK_DEFAULT_BASE_URL = "https://api.deepseek.com"
-DEEPSEEK_PROVIDER_STATE_NAMESPACE = "deepseek"
-DEEPSEEK_REASONING_CONTENT_STATE_KEY = "reasoning_content"
 DEEPSEEK_SUPPORTED_MODELS = (
     "deepseek-v4-flash",
     "deepseek-v4-pro",
@@ -144,44 +147,25 @@ class DeepSeekLLM(OpenAICompatibleLLM):
         """Preserve DeepSeek thinking metadata on assistant tool-call history.
 
         DeepSeek V4 requires assistant messages in a tool-call chain to replay
-        the exact ``reasoning_content`` returned by the provider. An explicit
-        empty string is semantically different from a missing field, so this
-        must use key presence rather than truthiness. If older context lacks
-        captured provider state, use an empty string fallback to keep assistant
-        tool-call history structurally valid for later DeepSeek requests.
+        the exact ``reasoning_content`` returned by the provider. Replay is
+        unconditional -- it does not depend on ``thinking`` -- and an older
+        message with no captured state falls back to an empty string; see
+        ``restore_deepseek_reasoning_content`` for the exact rules.
         """
-        prepared: List[Dict[str, Any]] = []
-        for message in messages:
-            prepared_message = dict(message)
-            provider_state = prepared_message.get(PROVIDER_STATE_METADATA_KEY)
-            if isinstance(provider_state, dict):
-                deepseek_metadata = provider_state.get(
-                    DEEPSEEK_PROVIDER_STATE_NAMESPACE
-                )
-                if (
-                    isinstance(deepseek_metadata, dict)
-                    and DEEPSEEK_REASONING_CONTENT_STATE_KEY in deepseek_metadata
-                ):
-                    prepared_message["reasoning_content"] = deepseek_metadata[
-                        DEEPSEEK_REASONING_CONTENT_STATE_KEY
-                    ]
-            if (
-                prepared_message.get("role") == "assistant"
-                and prepared_message.get("tool_calls")
-                and "reasoning_content" not in prepared_message
-            ):
-                prepared_message["reasoning_content"] = ""
-            prepared.append(prepared_message)
-        return prepared
+        _ = thinking
+        return restore_deepseek_reasoning_content(messages, model_name=self._model_name)
 
-    def _response_provider_state(self, result: Dict[str, Any]) -> Dict[str, Any]:
-        if "reasoning_content" not in result:
-            return {}
-        return {
-            DEEPSEEK_PROVIDER_STATE_NAMESPACE: {
-                DEEPSEEK_REASONING_CONTENT_STATE_KEY: result["reasoning_content"],
-            },
-        }
+    def _response_provider_state(
+        self,
+        result: Dict[str, Any],
+        *,
+        thinking: Optional[Dict[str, Any]] = None,
+        response_format: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        _ = thinking, response_format
+        return deepseek_reasoning_provider_state(
+            result, fields=(DEEPSEEK_REASONING_CONTENT_STATE_KEY,)
+        )
 
     def _attach_reasoning_content_to_raw(
         self,
@@ -196,11 +180,9 @@ class DeepSeekLLM(OpenAICompatibleLLM):
             has_reasoning_content=has_reasoning_content,
         )
         if has_reasoning_content and isinstance(raw_payload, dict):
-            raw_payload[PROVIDER_STATE_METADATA_KEY] = {
-                DEEPSEEK_PROVIDER_STATE_NAMESPACE: {
-                    DEEPSEEK_REASONING_CONTENT_STATE_KEY: reasoning_content,
-                },
-            }
+            raw_payload[PROVIDER_STATE_METADATA_KEY] = (
+                deepseek_reasoning_provider_state_payload(reasoning_content)
+            )
         return raw_payload
 
     def _normalize_response_format(

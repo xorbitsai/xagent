@@ -150,6 +150,7 @@ from xagent.web.services.ops_signals import (
     active_degradations,
     clear_degradation,
 )
+from xagent.web.services.task_clarification_draft import CLARIFICATION_REQUEST_TTL
 from xagent.web.services.task_lease_service import TASK_RUN_ID_TRACE_FIELD
 
 _DEGRADATION_SIGNALS_UNDER_TEST = (
@@ -496,6 +497,321 @@ def test_cv3_values_not_shaped_like_v1_payload_is_rejected(
     assert outcome == svc.CreateValidationRejected(reason="invalid_values")
 
 
+def _interaction(**overrides: Any) -> dict[str, Any]:
+    item: dict[str, Any] = {"type": "text_input", "field": "env", "label": "Env"}
+    item.update(overrides)
+    return item
+
+
+def _values(interactions: list[dict[str, Any]], message: str = "Which one?") -> Any:
+    return {"message": message, "interactions": interactions}
+
+
+# The write side's admissibility rules, one row per rule. Every row here is
+# shape-valid per AskUserQuestionArgs and JSON-serializable, so the only
+# thing that can reject it is validate_v1_write_payload.
+@pytest.mark.parametrize(
+    "values",
+    [
+        pytest.param(_values([], message="   "), id="blank_message"),
+        pytest.param(_values([], message=""), id="empty_message"),
+        pytest.param(
+            _values([_interaction(type="carrier_pigeon")]), id="unrenderable_type"
+        ),
+        pytest.param(
+            _values([_interaction(field="env"), _interaction(field="env")]),
+            id="duplicated_field",
+        ),
+        pytest.param(
+            _values([_interaction(type="select_one", options=None)]),
+            id="select_one_without_options",
+        ),
+        pytest.param(
+            _values([_interaction(type="select_one", options=[])]),
+            id="select_one_with_an_empty_option_list",
+        ),
+        pytest.param(
+            _values([_interaction(type="select_multiple", options=None)]),
+            id="select_multiple_without_options",
+        ),
+        pytest.param(
+            _values([_interaction(type="action_cards", options=None)]),
+            id="action_cards_without_options",
+        ),
+        pytest.param(
+            _values(
+                [_interaction(options=[{"label": "Yes", "value": "yes"}])],
+            ),
+            id="text_input_with_options",
+        ),
+        pytest.param(
+            _values(
+                [
+                    _interaction(
+                        type="confirm", options=[{"label": "Yes", "value": "yes"}]
+                    )
+                ],
+            ),
+            id="confirm_with_options",
+        ),
+        pytest.param(
+            _values([_interaction(type="number_input", min=10, max=3)]),
+            id="min_greater_than_max",
+        ),
+        pytest.param(
+            _values(
+                [_interaction(type="select_one", options=[{"label": "", "value": "a"}])]
+            ),
+            id="option_with_a_blank_label",
+        ),
+        pytest.param(
+            _values(
+                [_interaction(type="select_one", options=[{"label": "A", "value": ""}])]
+            ),
+            id="option_with_a_blank_value",
+        ),
+        pytest.param(
+            _values(
+                [
+                    _interaction(
+                        type="action_cards",
+                        options=[
+                            {"label": "A", "value": "a"},
+                            {"label": "", "value": ""},
+                        ],
+                    )
+                ]
+            ),
+            id="one_blank_option_among_usable_ones",
+        ),
+    ],
+)
+def test_cv4_write_side_payload_rules_reject_the_envelope(
+    _db: Session, _seeded_task: int, values: Any
+) -> None:
+    task = _db.query(Task).filter(Task.id == _seeded_task).first()
+    outcome = svc.create(
+        _db,
+        task_id=_seeded_task,
+        principal=_owning_principal(task.user_id),
+        envelope=_valid_envelope(values=values),
+    )
+    assert outcome == svc.CreateValidationRejected(reason="invalid_values")
+
+
+@pytest.mark.parametrize(
+    "values",
+    [
+        pytest.param(
+            _values(
+                [
+                    _interaction(
+                        type="select_one", options=[{"label": "A", "value": "a"}]
+                    ),
+                    _interaction(
+                        type="select_multiple",
+                        field="tags",
+                        options=[{"label": "B", "value": "b"}],
+                    ),
+                    _interaction(type="text_input", field="notes"),
+                    _interaction(type="file_upload", field="doc"),
+                    _interaction(type="confirm", field="agree"),
+                    _interaction(type="number_input", field="count", min=1, max=9),
+                    _interaction(
+                        type="action_cards",
+                        field="action",
+                        options=[{"label": "C", "value": "c"}],
+                    ),
+                ]
+            ),
+            id="one_item_of_every_v1_type",
+        ),
+        pytest.param(_values([]), id="prose_only_question_with_no_form"),
+        pytest.param(
+            _values([_interaction(type="number_input", field="n", min=3, max=3)]),
+            id="min_equal_to_max",
+        ),
+    ],
+)
+def test_cv4_write_side_payload_rules_accept_a_legal_payload(
+    _db: Session, _seeded_task: int, values: Any
+) -> None:
+    task = _db.query(Task).filter(Task.id == _seeded_task).first()
+    outcome = svc.create(
+        _db,
+        task_id=_seeded_task,
+        principal=_owning_principal(task.user_id),
+        envelope=_valid_envelope(values=values),
+    )
+    assert outcome == svc.CreateNotWired(reason="seam_not_wired")
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        pytest.param("", id="empty"),
+        pytest.param("   ", id="all_whitespace"),
+    ],
+)
+def test_validate_rejects_a_blank_interaction_field(
+    _db: Session, _seeded_task: int, field: str
+) -> None:
+    values = _values([_interaction(field=field)])
+    parsed = svc.parse_v1_request_payload(values)
+    with pytest.raises(ValueError, match=r"interactions\[0\]\.field is blank"):
+        svc.validate_v1_write_payload(parsed)
+
+
+def test_validate_rejects_a_field_with_surrounding_whitespace(
+    _db: Session, _seeded_task: int
+) -> None:
+    """Non-blank once stripped, but the stored key still would not be the
+    key a strip-agnostic answer-side comparison would need: ``" a "`` never
+    equal-matches an answer keyed ``"a"``, the same key-integrity reason a
+    blank field is refused."""
+
+    values = _values([_interaction(field=" a ")])
+    parsed = svc.parse_v1_request_payload(values)
+    with pytest.raises(
+        ValueError, match=r"interactions\[0\]\.field carries surrounding whitespace"
+    ):
+        svc.validate_v1_write_payload(parsed)
+
+
+def test_validate_accepts_a_field_with_no_surrounding_whitespace(
+    _db: Session, _seeded_task: int
+) -> None:
+    values = _values([_interaction(field="a")])
+    parsed = svc.parse_v1_request_payload(values)
+    svc.validate_v1_write_payload(parsed)
+
+
+def test_validate_reports_a_blank_field_as_blank_not_as_duplicated(
+    _db: Session, _seeded_task: int
+) -> None:
+    """Two blank fields would also be equal to each other, so the blank
+    check has to run before the duplicate check reaches them -- otherwise
+    the caller learns "duplicated" for a payload whose real problem is that
+    neither interaction names a field at all."""
+
+    values = _values([_interaction(field=""), _interaction(field="", label="Second")])
+    parsed = svc.parse_v1_request_payload(values)
+    with pytest.raises(ValueError) as excinfo:
+        svc.validate_v1_write_payload(parsed)
+    assert "field is blank" in str(excinfo.value)
+    assert "is duplicated" not in str(excinfo.value)
+
+
+def test_validate_rejects_duplicate_option_values_within_one_interaction(
+    _db: Session, _seeded_task: int
+) -> None:
+    values = _values(
+        [
+            _interaction(
+                type="select_one",
+                options=[
+                    {"label": "First", "value": "a"},
+                    {"label": "Second", "value": "a"},
+                ],
+            )
+        ]
+    )
+    parsed = svc.parse_v1_request_payload(values)
+    with pytest.raises(
+        ValueError, match=r"interactions\[0\]\.options\[1\]\.value 'a' is duplicated"
+    ):
+        svc.validate_v1_write_payload(parsed)
+
+
+def test_validate_accepts_duplicate_option_labels(
+    _db: Session, _seeded_task: int
+) -> None:
+    """Labels may repeat -- the renderer resolves a submitted answer back to
+    an option by matching on value, so two options sharing a label are only
+    confusing to look at; the answer still names exactly one of them."""
+
+    values = _values(
+        [
+            _interaction(
+                type="select_one",
+                options=[
+                    {"label": "Same", "value": "a"},
+                    {"label": "Same", "value": "b"},
+                ],
+            )
+        ]
+    )
+    parsed = svc.parse_v1_request_payload(values)
+    svc.validate_v1_write_payload(parsed)
+
+
+def test_validate_accepts_a_blank_interaction_label(
+    _db: Session, _seeded_task: int
+) -> None:
+    """This is the decision that a blank ``label`` is not refused, pinned
+    down: ``clarification-form.tsx`` renders ``interaction.label ||
+    interaction.field`` (line 492), so the field name stands in for a blank
+    label, and ``_normalize_ask_user_interactions`` (``react.py``) repairs a
+    blank ``field`` on every ``ask_user_question`` payload but never touches
+    ``label``, so a model that emits ``label=""`` reaches
+    ``build_clarification_payload`` with it. Refusing it would refuse a
+    shape the second producer really emits."""
+
+    values = _values([_interaction(label="")])
+    parsed = svc.parse_v1_request_payload(values)
+    svc.validate_v1_write_payload(parsed)
+
+
+def test_validate_accepts_an_empty_accept_list_on_file_upload(
+    _db: Session, _seeded_task: int
+) -> None:
+    values = _values([_interaction(type="file_upload", field="doc", accept=[])])
+    parsed = svc.parse_v1_request_payload(values)
+    svc.validate_v1_write_payload(parsed)
+
+
+def test_validate_accepts_min_and_max_on_a_non_number_type(
+    _db: Session, _seeded_task: int
+) -> None:
+    """Only number_input reads min/max; on every other type they are an
+    ignored hint, and the question still asks exactly what it asks."""
+
+    values = _values([_interaction(type="text_input", min=1, max=5)])
+    parsed = svc.parse_v1_request_payload(values)
+    svc.validate_v1_write_payload(parsed)
+
+
+def test_validate_accepts_an_inverted_min_max_on_a_non_number_type(
+    _db: Session, _seeded_task: int
+) -> None:
+    """The min > max rule is scoped to the one type that reads the pair.
+    ``clarification-form.tsx`` passes min and max to the rendered control
+    only in its number_input branch, so on a text_input an inverted range
+    never reaches the user: it is a hint nobody reads, not a question
+    nobody can answer, and the write is not refused for it."""
+
+    values = _values([_interaction(type="text_input", min=10, max=3)])
+    parsed = svc.parse_v1_request_payload(values)
+    svc.validate_v1_write_payload(parsed)
+
+
+def test_cv4_the_read_direction_parser_still_accepts_what_the_write_side_rejects(
+    _db: Session, _seeded_task: int
+) -> None:
+    """The two directions have different failure policies for the same
+    payload. parse_v1_request_payload is what the read surface calls on an
+    already-persisted row, and it must keep accepting every payload it
+    accepts today -- widening it would turn readable-but-odd rows into
+    unanswerable ones. Only the write side refuses."""
+
+    values = _values([_interaction(type="select_one", options=None)])
+    parsed = svc.parse_v1_request_payload(values)
+    assert parsed.message == "Which one?"
+    assert parsed.interactions[0].type == "select_one"
+    with pytest.raises(ValueError):
+        svc.validate_v1_write_payload(parsed)
+
+
 def test_cv3_ttl_out_of_policy_range_is_rejected_not_clamped(
     _db: Session, _seeded_task: int
 ) -> None:
@@ -510,6 +826,7 @@ def test_cv3_ttl_out_of_policy_range_is_rejected_not_clamped(
 @pytest.mark.parametrize(
     "ttl_seconds",
     [
+        pytest.param(59, id="one_below_min_rejected"),
         pytest.param(604801, id="one_above_max_rejected"),
         # True is also rejected via the range check below on its own (it
         # compares equal to 1, under the 60-second minimum), independent of
@@ -554,6 +871,22 @@ def test_cv3_ttl_at_policy_boundary_reaches_create_not_wired(
     assert outcome == svc.CreateNotWired(reason="seam_not_wired")
 
 
+def test_the_published_ttl_falls_inside_the_override_interval() -> None:
+    """The two constants describe different quantities -- one the value
+    the publication path writes into expires_at, the other the range a
+    caller's own override has to fall inside -- and are deliberately not
+    unified. The one relationship that does have to hold between them is
+    pinned here, so that moving either number alone cannot leave the
+    published TTL outside the range this facade would accept for it."""
+
+    published_ttl_seconds = CLARIFICATION_REQUEST_TTL.total_seconds()
+    assert (
+        svc._MIN_INTERACTION_TTL_SECONDS
+        <= published_ttl_seconds
+        <= svc._MAX_INTERACTION_TTL_SECONDS
+    )
+
+
 def test_ca1_principal_not_owning_the_task_is_unauthorized(
     _db: Session, _seeded_task: int
 ) -> None:
@@ -567,12 +900,265 @@ def test_ca1_principal_not_owning_the_task_is_unauthorized(
     assert outcome == svc.CreateUnauthorized(reason="not_task_principal")
 
 
-def test_cu1_missing_task_is_unavailable(_db: Session) -> None:
-    envelope = _valid_envelope()
+def _admin_principal(user_id: int) -> svc.InteractionPrincipal:
+    return svc.InteractionPrincipal(
+        kind="user",
+        user_id=user_id,
+        is_admin=True,
+        auth_mode=None,
+    )
+
+
+# The id create() is asked about when a scenario wants no matching row.
+_ABSENT_TASK_ID = 999999999
+
+
+# create()'s task lookup, one row per (principal branch x ownership x
+# whether the task exists). The three branches load differently on
+# purpose: a non-admin "user" and a guest both carry the same owner
+# predicate (Task.user_id == principal.user_id) into the lookup, while an
+# admin loads by id alone. That difference is what decides which of the
+# two "no row" outcomes each branch can return, so the table below is the
+# single place all of it is asserted.
+#
+# The guest branch's positive cell is not in this table: it needs a task
+# whose agent_config carries the widget binding, which this table's
+# _seeded_task fixture does not build. It lives in
+# test_ca1_guest_principal_is_authorized_on_its_own_task.
+#
+# The three guest rows below all end in the same outcome and get there by
+# three different routes, which is the point of listing them separately:
+#
+#   guest_on_an_absent_task            no row for that id at all
+#   guest_of_another_owner_...         a row exists, the owner term in the
+#                                      lookup excludes it, so nothing loads
+#   guest_on_an_existing_non_matching  the owner term admits the row, and
+#                                      the post-load Python predicate
+#                                      (task_is_owned_by_public_principal)
+#                                      refuses it on agent_config
+#
+# None of the three separates the owner term from the Python predicate on
+# its own -- _seeded_task carries no agent_config, so the second row would
+# still be refused with the owner term removed. The cell that does
+# separate them needs a task whose agent_config matches in full and whose
+# user_id does not, and it lives in
+# test_ca1_guest_principal_is_rejected_on_another_owners_matching_task.
+@pytest.mark.parametrize(
+    ("make_principal", "task_exists", "expected"),
+    [
+        pytest.param(
+            lambda owner_id: _owning_principal(owner_id),
+            True,
+            svc.CreateNotWired(reason="seam_not_wired"),
+            id="owner_user_on_its_own_task",
+        ),
+        pytest.param(
+            lambda owner_id: _owning_principal(owner_id + 1000),
+            True,
+            svc.CreateUnauthorized(reason="not_task_principal"),
+            id="foreign_user_on_an_existing_task",
+        ),
+        pytest.param(
+            lambda owner_id: _owning_principal(owner_id),
+            False,
+            svc.CreateUnauthorized(reason="not_task_principal"),
+            id="user_on_an_absent_task",
+        ),
+        pytest.param(
+            lambda owner_id: _admin_principal(owner_id + 1000),
+            True,
+            svc.CreateNotWired(reason="seam_not_wired"),
+            id="admin_on_someone_elses_task",
+        ),
+        pytest.param(
+            lambda owner_id: _admin_principal(owner_id + 1000),
+            False,
+            svc.CreateUnavailable(reason="task_missing"),
+            id="admin_on_an_absent_task",
+        ),
+        pytest.param(
+            lambda owner_id: _widget_workforce_guest_principal(
+                user_id=owner_id, workforce_id=9
+            ),
+            False,
+            svc.CreateUnauthorized(reason="not_task_principal"),
+            id="guest_on_an_absent_task",
+        ),
+        pytest.param(
+            lambda owner_id: _widget_workforce_guest_principal(
+                user_id=owner_id + 1000, workforce_id=9
+            ),
+            True,
+            svc.CreateUnauthorized(reason="not_task_principal"),
+            id="guest_of_another_owner_on_an_existing_task",
+        ),
+        pytest.param(
+            lambda owner_id: _widget_workforce_guest_principal(
+                user_id=owner_id, workforce_id=9
+            ),
+            True,
+            svc.CreateUnauthorized(reason="not_task_principal"),
+            id="guest_on_an_existing_non_matching_task",
+        ),
+    ],
+)
+def test_ca2_task_lookup_is_owner_scoped_for_every_branch_but_admin(
+    _db: Session,
+    _seeded_task: int,
+    make_principal: Any,
+    task_exists: bool,
+    expected: Any,
+) -> None:
+    task = _db.query(Task).filter(Task.id == _seeded_task).first()
+    task_id = _seeded_task if task_exists else _ABSENT_TASK_ID
     outcome = svc.create(
-        _db, task_id=999999999, principal=_owning_principal(1), envelope=envelope
+        _db,
+        task_id=task_id,
+        principal=make_principal(task.user_id),
+        envelope=_valid_envelope(),
+    )
+    assert outcome == expected
+
+
+def test_ca2_a_non_admin_user_cannot_tell_a_foreign_task_from_an_absent_one(
+    _db: Session, _seeded_task: int
+) -> None:
+    """The owner predicate lives in the lookup's WHERE clause, so a
+    non-admin "user" principal gets one empty result set for both "this
+    task belongs to someone else" and "there is no such task". Both must
+    produce the identical outcome object, or the pair is an existence
+    oracle for a principal not entitled to one."""
+
+    principal = _owning_principal(999999)
+    on_a_foreign_task = svc.create(
+        _db, task_id=_seeded_task, principal=principal, envelope=_valid_envelope()
+    )
+    on_an_absent_task = svc.create(
+        _db, task_id=_ABSENT_TASK_ID, principal=principal, envelope=_valid_envelope()
+    )
+    assert on_a_foreign_task == on_an_absent_task
+    assert on_a_foreign_task == svc.CreateUnauthorized(reason="not_task_principal")
+
+
+@pytest.mark.parametrize("is_admin", [False, True], ids=["plain_user", "admin"])
+@pytest.mark.parametrize("task_exists", [True, False], ids=["real_task", "absent_task"])
+def test_ca3_create_rejects_a_user_principal_carrying_no_user_id(
+    _db: Session, _seeded_task: int, is_admin: bool, task_exists: bool
+) -> None:
+    """is_admin authorizes without ownership, but not without an identity.
+    Rejected before the lookup on both branches: the owner predicate would
+    otherwise render as Task.user_id IS NULL and match every ownerless
+    task, and an admin passing on the flag alone would reach the write
+    point with nothing to record as who acted."""
+
+    principal = svc.InteractionPrincipal(
+        kind="user",
+        user_id=None,
+        is_admin=is_admin,
+        auth_mode=None,
+    )
+    outcome = svc.create(
+        _db,
+        task_id=_seeded_task if task_exists else _ABSENT_TASK_ID,
+        principal=principal,
+        envelope=_valid_envelope(),
+    )
+    assert outcome == svc.CreateUnauthorized(reason="not_task_principal")
+
+
+def test_ca4_an_unauthorized_principal_learns_nothing_about_the_payload(
+    _db: Session, _seeded_task: int
+) -> None:
+    """A caller with no claim on the task must not learn which envelope
+    shapes this service accepts. Authorization now runs before any envelope
+    check, so a malformed envelope from an unauthorized caller is still
+    reported as unauthorized, not as a validation rejection."""
+
+    task = _db.query(Task).filter(Task.id == _seeded_task).first()
+    outcome = svc.create(
+        _db,
+        task_id=_seeded_task,
+        principal=_owning_principal(task.user_id + 1000),
+        envelope=_valid_envelope(kind="not_a_kind"),
+    )
+    assert outcome == svc.CreateUnauthorized(reason="not_task_principal")
+
+
+def test_ca4_an_absent_task_is_reported_before_the_payload_is_judged(
+    _db: Session, _seeded_task: int
+) -> None:
+    """Mirrors the unauthorized case for the other id-only outcome: an
+    admin against a task that does not exist learns task_missing, never a
+    validation reason, regardless of how malformed the envelope is."""
+
+    outcome = svc.create(
+        _db,
+        task_id=_ABSENT_TASK_ID,
+        principal=_admin_principal(1),
+        envelope=_valid_envelope(kind="not_a_kind"),
     )
     assert outcome == svc.CreateUnavailable(reason="task_missing")
+
+
+@pytest.mark.parametrize(
+    ("envelope_overrides", "expected_reason"),
+    [
+        pytest.param({"kind": "not_a_kind"}, "unknown_kind", id="bad_kind"),
+        pytest.param(
+            {"protocol_version": 999},
+            "unknown_protocol_version",
+            id="bad_protocol_version",
+        ),
+        pytest.param(
+            {"request_idempotency_key": "not url safe!"},
+            "malformed_idempotency_key",
+            id="bad_idempotency_key",
+        ),
+        pytest.param(
+            {"values": {"not": "a valid payload"}},
+            "invalid_values",
+            id="bad_values",
+        ),
+    ],
+)
+def test_cv_authorized_caller_still_gets_every_validation_reason(
+    _db: Session,
+    _seeded_task: int,
+    envelope_overrides: dict[str, Any],
+    expected_reason: str,
+) -> None:
+    """Authorization moving ahead of validation must not change what an
+    authorized caller sees: the same four reasons, unchanged, for the same
+    four malformed shapes."""
+
+    task = _db.query(Task).filter(Task.id == _seeded_task).first()
+    outcome = svc.create(
+        _db,
+        task_id=_seeded_task,
+        principal=_owning_principal(task.user_id),
+        envelope=_valid_envelope(**envelope_overrides),
+    )
+    assert outcome == svc.CreateValidationRejected(reason=expected_reason)
+
+
+def test_create_logs_the_refused_payload_diagnostic(
+    _db: Session, _seeded_task: int, caplog: pytest.LogCaptureFixture
+) -> None:
+    task = _db.query(Task).filter(Task.id == _seeded_task).first()
+    values = _values(
+        [_interaction(type="select_one", options=[{"label": "", "value": "a"}])]
+    )
+    with caplog.at_level(logging.WARNING):
+        outcome = svc.create(
+            _db,
+            task_id=_seeded_task,
+            principal=_owning_principal(task.user_id),
+            envelope=_valid_envelope(values=values),
+        )
+
+    assert outcome == svc.CreateValidationRejected(reason="invalid_values")
+    assert [r.levelno for r in caplog.records] == [logging.WARNING]
+    assert "interactions[0].options[0] has a blank label or value" in caplog.text
 
 
 def test_cw1_fully_valid_call_returns_not_wired(
@@ -594,15 +1180,25 @@ def test_create_never_touches_staging_or_stages_a_row(
 ) -> None:
     """create() must not call stage_interaction_request -- confirmed here
     by asserting the table it would write to stays empty across a
-    successful (CreateNotWired) call."""
+    successful (CreateNotWired) call.
 
+    The principal here is a foreign admin, not the admin-with-no-user-id
+    this test used to carry: create() now rejects the latter before the
+    lookup, so it can no longer reach the staging seam this test is about.
+    That input did not lose its coverage -- it moved to
+    test_ca3_create_rejects_a_user_principal_carrying_no_user_id, whose four
+    cells (is_admin x task_exists) pin the rejection itself. What this test
+    still owns is the seam: a call that gets all the way to CreateNotWired
+    writes no interaction row."""
+
+    task = _db.query(Task).filter(Task.id == _seeded_task).first()
     envelope = _valid_envelope()
     outcome = svc.create(
         _db,
         task_id=_seeded_task,
         principal=svc.InteractionPrincipal(
             kind="user",
-            user_id=None,
+            user_id=task.user_id + 1000,
             is_admin=True,
             auth_mode=None,
         ),
@@ -707,6 +1303,74 @@ def test_ca1_guest_principal_is_rejected_on_a_non_matching_task(
     assert outcome == svc.CreateUnauthorized(reason="not_task_principal")
 
 
+def test_ca1_guest_principal_is_rejected_on_another_owners_matching_task(
+    _db: Session, _session_factory
+) -> None:
+    """Every conjunct task_is_owned_by_public_principal evaluates matches
+    -- auth_mode, the workforce binding, and guest_id are all the task's
+    own values -- and the task still belongs to a different user. The
+    predicate deliberately does not carry the Task.user_id term (see its
+    docstring: the four public-chat entry points enforce it as a filter on
+    the query that loads the task, never as a post-load check), so the
+    only thing that can refuse this call is create()'s own owner-scoped
+    lookup. Drop Task.user_id from that lookup and this call is
+    authorized against another user's task."""
+
+    db = _session_factory()
+    owner_id = make_user(db)
+    other_user_id = make_user(db)
+    task_id = _widget_workforce_task(db, user_id=owner_id, workforce_id=9)
+    db.close()
+
+    assert other_user_id != owner_id
+    principal = _widget_workforce_guest_principal(user_id=other_user_id, workforce_id=9)
+    outcome = svc.create(
+        _db, task_id=task_id, principal=principal, envelope=_valid_envelope()
+    )
+    assert outcome == svc.CreateUnauthorized(reason="not_task_principal")
+
+
+def test_ca3_create_rejects_a_guest_principal_carrying_no_user_id(
+    _db: Session, _session_factory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The guest lookup is owner-scoped, so a guest with no user_id would
+    compile to Task.user_id IS NULL and reject only because the column is
+    NOT NULL. create() rejects before the lookup instead, and the outcome
+    object cannot tell the two apart -- both are
+    Unauthorized(not_task_principal). What separates them is whether the
+    query was built at all, so that is what this test asserts: with the
+    pre-lookup guard in place db.query is never called; delete the guard
+    and it is, even though the outcome stays the same."""
+
+    db = _session_factory()
+    owner_id = make_user(db)
+    task_id = _widget_workforce_task(db, user_id=owner_id, workforce_id=9)
+    db.close()
+
+    queried: list[Any] = []
+    real_query = _db.query
+
+    def _recording_query(*args: Any, **kwargs: Any) -> Any:
+        queried.append(args)
+        return real_query(*args, **kwargs)
+
+    monkeypatch.setattr(_db, "query", _recording_query)
+
+    principal = svc.InteractionPrincipal(
+        kind="guest",
+        user_id=None,
+        is_admin=False,
+        auth_mode="widget",
+        widget_workforce_id=9,
+        guest_id="guest-1",
+    )
+    outcome = svc.create(
+        _db, task_id=task_id, principal=principal, envelope=_valid_envelope()
+    )
+    assert outcome == svc.CreateUnauthorized(reason="not_task_principal")
+    assert queried == []
+
+
 def test_ca1_guest_principal_with_two_populated_directions_is_unauthorized_not_raised(
     _db: Session, _seeded_task: int
 ) -> None:
@@ -716,9 +1380,14 @@ def test_ca1_guest_principal_with_two_populated_directions_is_unauthorized_not_r
     Unauthorized(not_task_principal), not let it escape as an unhandled
     exception."""
 
+    # The guest lookup is owner-scoped, so this has to be the task's real
+    # owner: a mismatched user_id would return the empty result set and
+    # reject before the predicate is ever called, and this test would pass
+    # without exercising the ValueError translation it exists for.
+    task = _db.query(Task).filter(Task.id == _seeded_task).first()
     principal = svc.InteractionPrincipal(
         kind="guest",
-        user_id=1,
+        user_id=task.user_id,
         is_admin=False,
         auth_mode="widget",
         widget_agent_id=1,
@@ -734,9 +1403,11 @@ def test_ca1_guest_principal_with_two_populated_directions_is_unauthorized_not_r
 def test_ca1_guest_principal_with_zero_populated_directions_is_unauthorized_not_raised(
     _db: Session, _seeded_task: int
 ) -> None:
+    # Owner-scoped for the same reason as the two-directions test above.
+    task = _db.query(Task).filter(Task.id == _seeded_task).first()
     principal = svc.InteractionPrincipal(
         kind="guest",
-        user_id=1,
+        user_id=task.user_id,
         is_admin=False,
         auth_mode="widget",
         guest_id="guest-1",
@@ -764,6 +1435,51 @@ def test_ca1_unknown_principal_kind_is_always_unauthorized(
         _db, task_id=_seeded_task, principal=principal, envelope=_valid_envelope()
     )
     assert outcome == svc.CreateUnauthorized(reason="not_task_principal")
+
+
+@pytest.mark.parametrize("task_exists", [True, False], ids=["present", "absent"])
+def test_ca1_unknown_principal_kind_is_rejected_before_the_task_lookup(
+    _db: Session, _seeded_task: int, monkeypatch: pytest.MonkeyPatch, task_exists: bool
+) -> None:
+    """An unrecognized kind is not owner-scoped, so a lookup built for it
+    would run by id alone -- and the id-only branch reports
+    Unavailable(task_missing) for a task that does not exist. Rejecting
+    before the lookup is what keeps the two task ids below indistinguishable
+    to such a principal: the same Unauthorized(not_task_principal) for a task
+    that exists and for one that does not.
+
+    The outcome alone cannot show where the rejection happened, since the
+    end of the branch chain returns the same object for the existing task.
+    What separates them is whether the lookup was built at all, so that is
+    asserted too: with the guard in place db.query is never called; delete
+    it and the absent-task case turns Unavailable(task_missing) while the
+    present-task case starts querying."""
+
+    task_id = _seeded_task if task_exists else _seeded_task + 10_000
+    if not task_exists:
+        assert _db.query(Task).filter(Task.id == task_id).first() is None
+
+    queried: list[Any] = []
+    real_query = _db.query
+
+    def _recording_query(*args: Any, **kwargs: Any) -> Any:
+        queried.append(args)
+        return real_query(*args, **kwargs)
+
+    monkeypatch.setattr(_db, "query", _recording_query)
+
+    principal = svc.InteractionPrincipal(
+        kind="service",
+        user_id=1,
+        is_admin=False,
+        auth_mode=None,
+    )
+    outcome = svc.create(
+        _db, task_id=task_id, principal=principal, envelope=_valid_envelope()
+    )
+
+    assert outcome == svc.CreateUnauthorized(reason="not_task_principal")
+    assert queried == []
 
 
 def test_ca1_entity_binding_with_non_int_convertible_config_value_is_rejected_not_raised(
@@ -2326,6 +3042,35 @@ def test_respond_rejects_a_user_principal_that_does_not_own_the_task(
         assert outcome == svc.RespondUnauthorized(reason="not_task_principal")
 
 
+@pytest.mark.parametrize("is_admin", [False, True], ids=["plain_user", "admin"])
+def test_respond_rejects_a_user_principal_carrying_no_user_id(
+    _respond_db, is_admin: bool
+) -> None:
+    """is_admin authorizes without ownership, but not without an identity:
+    a principal that passed on the flag alone would reach the write point
+    with nothing to record as who answered."""
+
+    _owner_id, task_id = _waiting_task(_respond_db)
+    interaction_id = _active_row_ready_for_respond(_respond_db, task_id=task_id)
+    principal = svc.InteractionPrincipal(
+        kind="user",
+        user_id=None,
+        is_admin=is_admin,
+        auth_mode=None,
+    )
+    with _asserts_no_side_effects(
+        _respond_db, task_id=task_id, interaction_id=interaction_id
+    ):
+        outcome = svc.respond(
+            interaction_id=interaction_id,
+            task_id=task_id,
+            principal=principal,
+            envelope=_respond_envelope(),
+        )
+
+        assert outcome == svc.RespondUnauthorized(reason="not_task_principal")
+
+
 def test_respond_rejects_a_guest_whose_bindings_match_but_principal_user_id_does_not(
     _respond_db,
 ) -> None:
@@ -2511,6 +3256,81 @@ def test_respond_rejects_a_guest_principal_with_zero_populated_directions(
             interaction_id=interaction_id,
             task_id=task_id,
             principal=guest,
+            envelope=_respond_envelope(),
+        )
+
+        assert outcome == svc.RespondUnauthorized(reason="not_task_principal")
+
+
+@pytest.mark.parametrize(
+    ("make_principal", "agent_config"),
+    [
+        pytest.param(
+            lambda owner_id: svc.InteractionPrincipal(
+                kind="user", user_id=None, is_admin=True, auth_mode=None
+            ),
+            None,
+            id="user_without_an_id",
+        ),
+        pytest.param(
+            lambda owner_id: svc.InteractionPrincipal(
+                kind="guest",
+                user_id=owner_id,
+                is_admin=False,
+                auth_mode="widget",
+                widget_workforce_id=9,
+                guest_id="",
+            ),
+            # Every conjunct ahead of the guest_id pair matches -- the
+            # auth_mode and the workforce binding -- and the task's own
+            # guest_id is blank too, so the equality below the guard
+            # ("" == "") would pass as well. The one thing left to refuse
+            # this call is the guard that requires principal.guest_id to
+            # be non-empty before the comparison runs. Without an
+            # agent_config the task carries none at all, the auth_mode
+            # conjunct does the refusing, and the guard is never the
+            # reason the assertion holds.
+            {
+                "auth_mode": "widget",
+                "widget_workforce_id": 9,
+                "guest_id": "",
+            },
+            id="guest_with_a_blank_guest_id",
+        ),
+        pytest.param(
+            lambda owner_id: svc.InteractionPrincipal(
+                kind="service", user_id=owner_id, is_admin=False, auth_mode=None
+            ),
+            None,
+            id="unrecognized_kind",
+        ),
+    ],
+)
+def test_respond_rejects_every_principal_identity_string_cannot_name(
+    _respond_db, make_principal: Any, agent_config: dict[str, Any] | None
+) -> None:
+    """``identity_string()`` raises for exactly three principal shapes, and
+    ``respond()`` calls it at four points with no guard of its own. What
+    keeps those four calls safe is the authorization gate above them, which
+    happens to require the same fields -- a real coupling that nothing
+    enforced until this test. Each shape below must come back as
+    ``RespondUnauthorized(reason="not_task_principal")``, never as a raised
+    ``ValueError`` escaping the function."""
+
+    owner_id, task_id = _waiting_task(_respond_db, agent_config=agent_config)
+    principal = make_principal(owner_id)
+
+    with pytest.raises(ValueError):
+        principal.identity_string()
+
+    interaction_id = _active_row_ready_for_respond(_respond_db, task_id=task_id)
+    with _asserts_no_side_effects(
+        _respond_db, task_id=task_id, interaction_id=interaction_id
+    ):
+        outcome = svc.respond(
+            interaction_id=interaction_id,
+            task_id=task_id,
+            principal=principal,
             envelope=_respond_envelope(),
         )
 

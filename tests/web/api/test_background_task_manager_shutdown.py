@@ -32,7 +32,7 @@ async def test_shutdown_cancels_snapshot_once_and_drains_before_clearing() -> No
     second = asyncio.create_task(execution(1))
     manager.register_task(1, first)
     assert manager.reserve_resume(1)
-    manager.register_reserved_resume(1, first)
+    manager.register_reserved_resume(1, first, run_id=None)
     manager.register_task(2, second)
     assert manager.reserve_resume(99)
     await asyncio.gather(*(event.wait() for event in started))
@@ -109,7 +109,7 @@ async def test_shutdown_admission_fence_rejects_late_task_registration() -> None
 
     late_resume = asyncio.create_task(asyncio.sleep(60))
     with pytest.raises(RuntimeError, match="shutting down"):
-        manager.register_reserved_resume(2, late_resume)
+        manager.register_reserved_resume(2, late_resume, run_id=None)
 
     await asyncio.gather(late_execution, late_resume, return_exceptions=True)
     assert late_execution.cancelled()
@@ -147,7 +147,7 @@ async def test_shutdown_fence_prevents_cancelled_resume_from_promoting() -> None
             raise
 
     resume = asyncio.create_task(resume_coordinator())
-    manager.register_reserved_resume(7, resume)
+    manager.register_reserved_resume(7, resume, run_id=None)
 
     shutdown = asyncio.create_task(manager.shutdown())
     await cancellation_seen.wait()
@@ -195,7 +195,7 @@ async def test_cleanup_child_can_release_pending_owner_registration() -> None:
     owner_task = asyncio.create_task(owner())
     manager.register_task(7, owner_task)
     assert manager.reserve_resume(7)
-    manager.register_reserved_resume(7, owner_task)
+    manager.register_reserved_resume(7, owner_task, run_id=None)
 
     async def cleanup_child() -> None:
         manager.cleanup_task(7, expected_task=owner_task)

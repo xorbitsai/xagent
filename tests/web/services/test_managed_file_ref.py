@@ -581,3 +581,291 @@ def test_adopt_existing_object_refreshes_same_size_checksum_mismatch_from_local_
     assert storage.stat_calls == [record.storage_key]
     assert storage.put_calls == [(local_path, record.storage_key)]
     assert record.checksum == sha256(b"new-data").hexdigest()
+
+
+def test_the_wrap_keeps_the_storage_key_out_of_its_own_message(tmp_path):
+    """``str(exc)`` is the value that escapes; it must not carry the key.
+
+    The key's scope segments encode the owning user's id, and ``str(exc)`` on
+    these classes reaches places the raise site does not control: a bare
+    ``raise`` from a WebSocket fault arm carries it into a task-wide broadcast
+    and a persisted command row, and broad ``except RuntimeError`` arms
+    interpolate it into client-facing text (#1497). The invariant therefore
+    has to hold at the exception, not at each egress.
+    """
+    source = tmp_path / "uploads" / "leak-probe.txt"
+    source.parent.mkdir()
+    source.write_text("leak probe", encoding="utf-8")
+    record = _record(source, file_size=source.stat().st_size)
+
+    with pytest.raises(DurableStorageOperationError) as raised:
+        ManagedFileRef(record, storage=FailingStorage()).sync_to_durable()
+
+    fault = raised.value
+    assert fault.storage_key, "the wrap must carry the key on the attribute"
+    assert fault.storage_key not in str(fault)
+    assert "users/" not in str(fault)
+
+
+def test_no_wrap_site_interpolates_into_the_message():
+    """Every construction of these classes, not just the one driven above.
+
+    A new wrap site that puts the key back into the message would reopen the
+    leak at every ``str(exc)`` egress at once, and no runtime test can drive a
+    site that does not exist yet. Parsing the module is what closes that gap.
+
+    It also asserts ``storage_key=`` is present at every site: the invariant
+    is the key off the message *and* on the attribute, and mypy enforcing the
+    required keyword elsewhere is not a reason to leave the second half
+    unpinned here.
+
+    The message must be a string literal or a bare name (a module constant
+    like ``FILE_INTEGRITY_REUPLOAD_MESSAGE``) -- a whitelist, because the
+    first version of this test blacklisted f-strings only, and ``"..." + key``,
+    ``"%s" % key``, and ``"{}".format(key)`` all walked past it. The second
+    version read only the positional slot, so ``message=...`` slipped past as
+    a keyword; it is looked up in both places now, and a ``**`` unpacking --
+    which no static check can see through -- fails outright rather than being
+    skipped. Calls are matched by bare name and by attribute
+    (``module.DurableStorageOperationError(...)``), with the guarded name set
+    derived from the class hierarchy so a future subclass is covered without
+    editing this test. What the whitelist still cannot see: a name bound to
+    dynamically built text one statement earlier, or a construction hidden
+    behind an alias -- which is what the exact count below turns into a
+    failure instead of a silent skip.
+    """
+    import ast
+
+    from xagent.web.services import managed_file_ref
+
+    def _hierarchy_names(cls: type) -> set[str]:
+        names = {cls.__name__}
+        for sub in cls.__subclasses__():
+            names |= _hierarchy_names(sub)
+        return names
+
+    guarded = _hierarchy_names(DurableStorageOperationError)
+
+    tree = ast.parse(Path(managed_file_ref.__file__).read_text(encoding="utf-8"))
+    checked = 0
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        callee = node.func
+        callee_name = (
+            callee.id
+            if isinstance(callee, ast.Name)
+            else callee.attr
+            if isinstance(callee, ast.Attribute)
+            else None
+        )
+        if callee_name not in guarded:
+            continue
+        assert not any(kw.arg is None for kw in node.keywords), (
+            f"managed_file_ref.py:{node.lineno} constructs via ** unpacking, "
+            "which this check cannot see through; spell the arguments out so "
+            "the message stays statically checkable"
+        )
+        # The invariant has two halves: the key is off the message AND on the
+        # attribute. mypy enforces the required keyword, but pin it here too so
+        # a site that regressed to a message-only construction fails on this
+        # assertion rather than on a type-check that runs elsewhere. storage_key
+        # is keyword-only, so it can only appear as a keyword.
+        assert any(kw.arg == "storage_key" for kw in node.keywords), (
+            f"managed_file_ref.py:{node.lineno} constructs "
+            f"{callee_name} without storage_key=; the key must ride the "
+            "attribute, not just be absent from the message"
+        )
+        if node.args:
+            message = node.args[0]
+        else:
+            message = next(
+                (kw.value for kw in node.keywords if kw.arg == "message"), None
+            )
+        if message is None:
+            continue
+        checked += 1
+        is_literal = isinstance(message, ast.Constant) and isinstance(
+            message.value, str
+        )
+        assert is_literal or isinstance(message, ast.Name), (
+            f"managed_file_ref.py:{node.lineno} builds the message dynamically "
+            f"({ast.unparse(message)!r}); it must be a string literal or a "
+            "module constant -- the identifier belongs in storage_key= so "
+            "str(exc) stays safe"
+        )
+    # The count is part of the contract: consolidating constructions into a
+    # helper would leave only the helper's own body visible to this walk while
+    # every real call site goes dark, and an aliased construction is invisible
+    # to the name match -- both would silently shrink coverage. A changed count
+    # means a construction was added, removed, or hidden: update it
+    # deliberately and give the new site its coverage story.
+    assert checked == 8, (
+        f"expected 8 constructions (7 wraps + the integrity raise), found "
+        f"{checked} -- a construction was added, removed, aliased, or moved "
+        "behind a helper; update this count deliberately"
+    )
+
+
+class _SentinelProviderFault(RuntimeError):
+    """The provider error a wrap must keep reachable through ``__cause__``."""
+
+
+_REMOTE_CHECKSUM = sha256(b"durable bytes").hexdigest()
+
+
+class _ProviderFaultStorage:
+    """Raise ``fault`` from one named backend call; let the others succeed.
+
+    Only the call under test may fail. If everything raised, a site could pass
+    by wrapping some *earlier* call's fault, which is the opposite of what these
+    cases pin down.
+
+    ``materialize`` and ``signed_url`` raise on their success path because no
+    case reaches them successfully; a path change that starts calling one shows
+    up as a failure instead of passing on a fault nobody meant to test.
+    """
+
+    def __init__(
+        self,
+        fault: Exception,
+        failing: str,
+        *,
+        remote_checksum: str = _REMOTE_CHECKSUM,
+        remote_size: int = 0,
+    ):
+        self.fault = fault
+        self.failing = failing
+        self.remote_checksum = remote_checksum
+        self.remote_size = remote_size
+
+    def _maybe_fail(self, name: str) -> None:
+        if name == self.failing:
+            raise self.fault
+
+    def _stored(self, key: str) -> StoredObject:
+        return StoredObject(
+            backend="s3",
+            key=key,
+            uri=f"s3://bucket/{key}",
+            size=self.remote_size,
+            checksum=self.remote_checksum,
+            etag="etag",
+        )
+
+    def copy_to_path(self, key, target_path):
+        self._maybe_fail("copy_to_path")
+        Path(target_path).write_bytes(b"durable bytes")
+
+    def materialize(self, key, filename=None):
+        self._maybe_fail("materialize")
+        raise AssertionError("unreachable in these cases")
+
+    def put_file(self, source, key, content_type=None):
+        self._maybe_fail("put_file")
+        return self._stored(key)
+
+    def signed_url(self, key, *, expires, content_type=None, content_disposition=None):
+        self._maybe_fail("signed_url")
+        raise AssertionError("unreachable in these cases")
+
+    def content_hash(self, key):
+        self._maybe_fail("content_hash")
+        return self.remote_checksum
+
+    def stat(self, key):
+        self._maybe_fail("stat")
+        return self._stored(key)
+
+
+def _durable_record(tmp_path, *, local_bytes: bytes | None, **overrides):
+    local_path = tmp_path / "uploads" / "payload.txt"
+    local_path.parent.mkdir(parents=True, exist_ok=True)
+    if local_bytes is not None:
+        local_path.write_bytes(local_bytes)
+    return _record(
+        local_path,
+        storage_backend="s3",
+        storage_key="users/7/uploads/file-123/payload.txt",
+        storage_status="available",
+        **overrides,
+    )
+
+
+def _drive_ensure_local(tmp_path, storage):
+    ref = ManagedFileRef(_durable_record(tmp_path, local_bytes=None), storage=storage)
+    return ref.ensure_local
+
+
+def _drive_materialize(tmp_path, storage):
+    ref = ManagedFileRef(_durable_record(tmp_path, local_bytes=None), storage=storage)
+    return ref.materialize
+
+
+def _drive_signed_access_url(tmp_path, storage):
+    # The signing call is reached only past the checksum gate, so the DB
+    # checksum has to agree with what ``content_hash`` reports.
+    record = _durable_record(tmp_path, local_bytes=None, checksum=_REMOTE_CHECKSUM)
+    ref = ManagedFileRef(record, storage=storage)
+    return lambda: ref.signed_access_url(expires=60)
+
+
+def _drive_sync_to_durable(tmp_path, storage):
+    ref = ManagedFileRef(
+        _durable_record(tmp_path, local_bytes=b"local bytes"), storage=storage
+    )
+    return ref.sync_to_durable
+
+
+def _drive_adopt(tmp_path, storage):
+    """Both ``adopt_existing_object`` wraps, selected by which call fails.
+
+    With no local copy, failing ``stat`` hits the metadata wrap directly; letting
+    ``stat`` succeed while reporting no checksum falls through to the second
+    ``content_hash`` lookup, which is wrapped separately a few lines further on.
+    """
+    record = _durable_record(tmp_path, local_bytes=None)
+    ref = ManagedFileRef(record, storage=storage)
+    return lambda: ref.adopt_existing_object(record.storage_key)
+
+
+@pytest.mark.parametrize(
+    ("failing", "expected_message", "driver", "storage_kwargs"),
+    [
+        ("copy_to_path", "restore durable object", _drive_ensure_local, {}),
+        ("materialize", "materialize durable object", _drive_materialize, {}),
+        ("signed_url", "sign durable object URL", _drive_signed_access_url, {}),
+        ("put_file", "write durable object", _drive_sync_to_durable, {}),
+        ("stat", "inspect durable object metadata", _drive_adopt, {}),
+        (
+            "content_hash",
+            "inspect durable object metadata",
+            _drive_adopt,
+            {"remote_checksum": ""},
+        ),
+    ],
+)
+def test_every_wrap_keeps_the_provider_fault_as_its_cause(
+    tmp_path, failing, expected_message, driver, storage_kwargs
+):
+    """``from exc`` at each real wrap site, asserted on a real raise.
+
+    The fault-logging suite builds its wraps by assigning ``__cause__`` on a
+    hand-made exception, so it proves what the logger does with a chain that is
+    already there -- not that these sites still produce one. Dropping ``from
+    exc`` at any wrap below would leave every assertion over there passing while
+    #1467 silently reopened: the provider class, the HTTP status and throttle vs.
+    timeout vs. rejected credentials live in ``__cause__`` and nowhere else.
+
+    Each case fails exactly one backend call and asserts the wrap raised for
+    *that* call carries *that* fault instance -- identity, not just type, so a
+    wrap re-raising some other error cannot pass.
+    """
+    fault = _SentinelProviderFault("SlowDown: reduce your request rate")
+    storage = _ProviderFaultStorage(fault, failing, **storage_kwargs)
+
+    with pytest.raises(DurableStorageOperationError) as raised:
+        driver(tmp_path, storage)()
+
+    assert expected_message in str(raised.value)
+    assert raised.value.__cause__ is fault

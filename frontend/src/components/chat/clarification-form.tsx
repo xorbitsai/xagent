@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from "react"
+import React, { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react"
 import { Interaction } from "@/contexts/app-context-chat"
 import { Input } from "@/components/ui/input"
 import { Button } from "@/components/ui/button"
@@ -13,11 +13,14 @@ import { toast } from "@/components/ui/sonner"
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible"
 import { ChevronDown, ChevronRight, MessageSquare, Upload, File as FileIcon, X, Globe } from "lucide-react"
 import { ConnectAppsField } from "./connect-apps-field"
+import type { MessageDeliveryDisposition } from "@/hooks/use-websocket"
+import type { TranslationKey } from "@/i18n/translations"
 
 interface ClarificationFormProps {
   message?: string
   interactions: Interaction[]
   messageId?: string
+  requestId?: string
   active?: boolean
   filesDisabled?: boolean
   onSend?: (message: string, files?: File[], metadata?: any) => Promise<void> | void
@@ -45,6 +48,62 @@ const isFileActionSelection = (
   ? isFileActionOption(option)
   : isFileActionValue(value)
 
+/**
+ * Delivery failures carry whether the turn definitely never reached the agent.
+ * Plain errors (local validation, unexpected throws) carry nothing, and are
+ * left unqualified rather than guessed at: telling a visitor to resubmit a
+ * turn that may have landed is worse than saying nothing. Errors are probed
+ * structurally rather than by `instanceof`, because the `onSend` branch's
+ * failures come from arbitrary builder callbacks (see #1485).
+ */
+const readSendDisposition = (error: unknown): MessageDeliveryDisposition | null => {
+  if (typeof error !== "object" || error === null || !("disposition" in error)) {
+    return null
+  }
+  const disposition = (error as { disposition: unknown }).disposition
+  return disposition === "not_sent"
+    || disposition === "rejected"
+    || disposition === "outcome_unknown"
+    ? disposition
+    : null
+}
+
+/**
+ * Only the reasons the sender can act on — the backend's rejection text — are
+ * shown as-is. Connection plumbing messages stay behind the localized string:
+ * they are English diagnostics, and a widget visitor is not the audience for
+ * them.
+ *
+ * The message is probed structurally for the same reason the disposition is:
+ * an `onSend` callback's rejection need not be an `Error` instance. Nothing
+ * new becomes displayable either way — `userFacing` still has to be set.
+ */
+const readSendReason = (error: unknown): string => {
+  if (
+    typeof error !== "object"
+    || error === null
+    || (error as { userFacing?: unknown }).userFacing !== true
+  ) {
+    return ""
+  }
+  const message = (error as { message?: unknown }).message
+  return typeof message === "string" ? message.trim() : ""
+}
+
+/**
+ * The hint that belongs with a disposition, as a key rather than a translated
+ * string: the toast needs it once at failure time, while the persistent alert
+ * has to re-resolve it on every render so a locale switch is not stuck behind
+ * whatever language was active when the send failed.
+ */
+const sendHintKey = (
+  disposition: MessageDeliveryDisposition | null,
+): TranslationKey | null => disposition === "outcome_unknown"
+  ? "chatPage.clarification.sendOutcomeUnknown"
+  : disposition === "not_sent" || disposition === "rejected"
+    ? "chatPage.clarification.sendNotSent"
+    : null
+
 // Interaction types that are "live widgets" reflecting external state (e.g.
 // useMcpApps()'s connection state), not a question with an answer to submit
 // - see the comment on isConnectAppsOnly below for why that distinction
@@ -57,6 +116,7 @@ export const LIVE_WIDGET_TYPES = new Set(["connect_apps"])
 export function ClarificationForm({
   interactions,
   messageId,
+  requestId,
   active = true,
   filesDisabled: filesDisabledOverride,
   onSend,
@@ -100,14 +160,36 @@ export function ClarificationForm({
       : interaction.label || interaction.field
 
   const [formState, setFormState] = useState<Record<string, any>>({})
+  const previousRequestIdRef = useRef(requestId)
+  const latestRequestIdRef = useRef(requestId)
   const [isSubmitting, setIsSubmitting] = useState(false)
   const [isSubmitted, setIsSubmitted] = useState(!active && !isConnectAppsOnly)
   const [isOpen, setIsOpen] = useState(active || isConnectAppsOnly)
+  // Raw evidence only. Translating at render (not at failure time) is what
+  // lets a locale switch reach an alert that is already on screen.
+  const [sendFailure, setSendFailure] = useState<
+    { detail: string; disposition: MessageDeliveryDisposition | null } | null
+  >(null)
+
+  useLayoutEffect(() => {
+    latestRequestIdRef.current = requestId
+    if (previousRequestIdRef.current === requestId) return
+    previousRequestIdRef.current = requestId
+    setFormState({})
+    setIsSubmitting(false)
+    setIsSubmitted(!active && !isConnectAppsOnly)
+    setIsOpen(active || isConnectAppsOnly)
+    setSendFailure(null)
+  }, [active, isConnectAppsOnly, requestId])
 
   useEffect(() => {
     if (active) {
+      // A new clarification round reuses this component instance on the live
+      // turn render path, so a stale round-1 failure alert would sit on top
+      // of round 2's question.
       setIsSubmitted(false)
       setIsOpen(true)
+      setSendFailure(null)
     }
   }, [active])
 
@@ -141,7 +223,7 @@ export function ClarificationForm({
           description: typeof opt?.description === "string" ? opt.description : undefined,
           action_type: typeof opt?.action_type === "string" ? opt.action_type : undefined,
         }))
-        .filter((opt: { value: string; label: string }) => opt.value && opt.label)
+        .filter((opt: { value: string; label: string }) => opt.value.trim() !== "" && opt.label.trim() !== "")
       return {
         ...interaction,
         type,
@@ -189,11 +271,13 @@ export function ClarificationForm({
 
   const handleInputChange = (field: string, value: any) => {
     setFormState((prev) => ({ ...prev, [field]: value }))
+    setSendFailure(null)
   }
 
   const handleSubmit = async () => {
+    const submittedRequestId = requestId
     // Construct the message
-    const metadata: any = {}
+    const metadata: any = requestId ? { request_id: requestId } : {}
     const lines = normalizedInteractions.flatMap(interaction => {
       const value = formState[interaction.field]
 
@@ -281,6 +365,7 @@ export function ClarificationForm({
 
     try {
       setIsSubmitting(true)
+      setSendFailure(null)
       // If textMessage is empty but we have files, send a generic message?
       const outboundFiles = filesDisabled ? [] : files
       const finalMessage = textMessage || (outboundFiles.length > 0 ? t("chatPage.clarification.uploadedFiles") : t("chatPage.clarification.confirmed"))
@@ -291,16 +376,36 @@ export function ClarificationForm({
         await sendMessage(finalMessage, { force: true, metadata }, outboundFiles)
       }
 
+      if (latestRequestIdRef.current !== submittedRequestId) return
       setIsSubmitted(true)
       setIsOpen(false)
       if (!onSend && dispatch) {
         dispatch({ type: "UPDATE_TASK_STATUS", payload: { status: "running" } })
       }
     } catch (error) {
+      if (latestRequestIdRef.current !== submittedRequestId) return
       console.error("Failed to send clarification response", error)
-      toast.error(t("chatPage.clarification.sendError"))
+      // The rejection reason ("a previous guidance message is still being
+      // applied") is the only actionable part of the failure; the fixed
+      // string is a last resort.
+      const detail = readSendReason(error)
+      const disposition = readSendDisposition(error)
+      setSendFailure({ detail, disposition })
+      // The toast is a snapshot - it keeps whatever language was active when
+      // it fired. The alert below is not, and re-resolves on every render.
+      // The draft is preserved and Submit stays enabled in every case, so the
+      // copy may only warn, never promise: a resubmit after an unknown
+      // outcome mints a fresh delivery and could answer the question twice.
+      const hintKey = sendHintKey(disposition)
+      const hint = hintKey ? t(hintKey) : null
+      toast.error(
+        detail || t("chatPage.clarification.sendError"),
+        hint ? { description: hint } : undefined,
+      )
     } finally {
-      setIsSubmitting(false)
+      if (latestRequestIdRef.current === submittedRequestId) {
+        setIsSubmitting(false)
+      }
     }
   }
 
@@ -310,11 +415,12 @@ export function ClarificationForm({
   // formState machinery handleSubmit above uses (there's nothing to gather).
   const handleSkipConnectApps = async () => {
     const message = t("chatPage.clarification.connectApps.skip")
+    const metadata = requestId ? { request_id: requestId } : {}
     try {
       if (onSend) {
-        await onSend(message, [], {})
+        await onSend(message, [], metadata)
       } else if (sendMessage) {
-        await sendMessage(message, { force: true }, [])
+        await sendMessage(message, { force: true, metadata }, [])
       }
     } catch (error) {
       console.error("Failed to send connect-apps skip response", error)
@@ -557,6 +663,10 @@ export function ClarificationForm({
     }
   }
 
+  // Recomputed on every render, which is the point: a locale change re-renders
+  // this component without remounting it.
+  const sendFailureHintKey = sendFailure ? sendHintKey(sendFailure.disposition) : null
+
   return (
     <Collapsible
       open={isOpen}
@@ -613,6 +723,15 @@ export function ClarificationForm({
                 )
               ))}
             </div>
+
+            {sendFailure && (
+              <div role="alert" className="rounded-md border border-destructive/40 bg-destructive/5 p-3 text-sm text-destructive">
+                <div>{sendFailure.detail || t("chatPage.clarification.sendError")}</div>
+                {sendFailureHintKey && (
+                  <div className="mt-1 text-xs text-destructive/80">{t(sendFailureHintKey)}</div>
+                )}
+              </div>
+            )}
 
             <div className="pt-2 flex gap-2">
               <Button className="flex-1" size="sm" onClick={handleSubmit} disabled={!active || isSubmitting || isSubmitted}>

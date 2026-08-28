@@ -344,6 +344,91 @@ async def test_react_builder_creates_multiple_agents_before_workforce() -> None:
     }
 
 
+def _recording_agent_service_class(captured_kwargs: dict[str, Any]) -> type:
+    """A fake AgentService that records its constructor kwargs and reports
+    a bare completion with no finalized Workforce - used by the two voice
+    tests below, which only need the constructor call to have happened."""
+
+    class RecordingAgentService:
+        def __init__(self, **kwargs: Any) -> None:
+            captured_kwargs.update(kwargs)
+
+        def set_allowed_skills(self, _allowed_skills: list[str]) -> None:
+            pass
+
+        async def execute_task(self, *_args: Any, **_kwargs: Any) -> dict[str, Any]:
+            return {"success": True, "completion_outcome": "completed"}
+
+    return RecordingAgentService
+
+
+@pytest.mark.asyncio
+async def test_build_workforce_prompt_plan_applies_voice_to_system_prompt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """builder_response is a free-text assistant reply persisted into the
+    Workforce's conversation - the same "every agent this user talks to"
+    voice policy that Builder chat and task chat already apply must reach
+    this runtime's own AgentService too."""
+    captured_kwargs: dict[str, Any] = {}
+    monkeypatch.setattr(
+        workforce_prompt_runtime,
+        "AgentService",
+        _recording_agent_service_class(captured_kwargs),
+    )
+    monkeypatch.setattr(
+        workforce_prompt_runtime,
+        "extract_assistant_message",
+        lambda _result: "工作组已完成配置。",
+    )
+
+    with pytest.raises(WorkforcePromptBuilderError):
+        # The mock never calls create_workforce, so to_plan() raises - the
+        # assertion below only needs the AgentService construction to have
+        # already happened, which it has by this point.
+        await build_workforce_prompt_plan(
+            prompt="创建一个产品研究工作组。",
+            llm=FakeLLM([]),
+            available_agents=[],
+            voice="warm",
+        )
+
+    system_prompt = captured_kwargs["system_prompt"]
+    assert system_prompt.startswith(
+        workforce_prompt_builder_system_prompt() + "\n\n## OUTPUT VOICE\n"
+    )
+    assert "Empathetic and reassuring" in system_prompt
+    # apply_output_voice's own scoping caveat (not something this call
+    # site adds itself) must still cover create_agent/create_workforce's
+    # persisted arguments here, or a tone like "concise" could start
+    # trimming agent names/descriptions/instructions too.
+    assert "persisted as configuration" in system_prompt
+    assert system_prompt.index("## OUTPUT VOICE") < system_prompt.index(
+        "persisted as configuration"
+    )
+
+
+@pytest.mark.asyncio
+async def test_build_workforce_prompt_plan_without_voice_leaves_prompt_unchanged(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured_kwargs: dict[str, Any] = {}
+    monkeypatch.setattr(
+        workforce_prompt_runtime,
+        "AgentService",
+        _recording_agent_service_class(captured_kwargs),
+    )
+
+    with pytest.raises(WorkforcePromptBuilderError):
+        await build_workforce_prompt_plan(
+            prompt="创建一个产品研究工作组。",
+            llm=FakeLLM([]),
+            available_agents=[],
+        )
+
+    assert captured_kwargs["system_prompt"] == workforce_prompt_builder_system_prompt()
+
+
 @pytest.mark.asyncio
 async def test_available_agent_tool_bounds_each_model_result() -> None:
     state = WorkforcePromptBuilderState.from_agents(
@@ -526,6 +611,53 @@ async def test_generation_releases_database_before_react_runtime(
     assert result == {"name": "Research Workforce"}
     assert events == ["release", "runtime"]
     assert catalog_limits == [MAX_WORKFORCE_BUILDER_EXISTING_AGENTS]
+
+
+@pytest.mark.asyncio
+async def test_generation_resolves_voice_from_the_user_row(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """generate_workforce_creation_plan must resolve voice from the live
+    `user` row and thread it into build_workforce_prompt_plan - the two
+    build_workforce_prompt_plan tests above only exercise that function
+    directly with an explicit voice= kwarg, not this caller's own
+    resolution step, which is what's under test here."""
+    llm = FakeLLM([])
+    captured_voice: list[str | None] = []
+
+    class ModelStorage:
+        def __init__(self, _db: object) -> None:
+            pass
+
+        def get_configured_defaults(self, _user_id: int | None) -> tuple[Any, ...]:
+            return (llm, None, None, None)
+
+    async def fake_build_workforce_prompt_plan(**kwargs: Any) -> dict[str, Any]:
+        captured_voice.append(kwargs["voice"])
+        return {"name": "Research Workforce"}
+
+    monkeypatch.setattr(workforce_creator, "UserAwareModelStorage", ModelStorage)
+    monkeypatch.setattr(
+        workforce_creator,
+        "list_accessible_published_agents",
+        lambda _db, _user, **_kwargs: [],
+    )
+    monkeypatch.setattr(
+        workforce_creator, "release_db_connection_if_clean", lambda _db: True
+    )
+    monkeypatch.setattr(
+        workforce_creator,
+        "build_workforce_prompt_plan",
+        fake_build_workforce_prompt_plan,
+    )
+
+    await generate_workforce_creation_plan(
+        object(),
+        SimpleNamespace(id=7, preferences={"voice": "warm"}),
+        "Create a research Workforce.",
+    )
+
+    assert captured_voice == ["warm"]
 
 
 @pytest.mark.asyncio

@@ -38,7 +38,7 @@ import { Textarea } from "@/components/ui/textarea"
 import { Label } from "@/components/ui/label"
 import { RadioGroup, RadioGroupItem } from "@/components/ui/radio-group"
 import { useEffect } from "react"
-import { sanitizeAppIntegrations } from "@/lib/team-sharing-sanitizers"
+import { sanitizeAppIntegrations, sanitizeConnectorStatus } from "@/lib/team-sharing-sanitizers"
 
 import {
   isValidMcpName,
@@ -357,8 +357,7 @@ export function ConnectMcpDialog({
         body: JSON.stringify({ refs }),
       })
       if (!response.ok) return
-      const status: Record<string, { shared: boolean; is_owner: boolean; needs_config: boolean }> =
-        await response.json()
+      const status = sanitizeConnectorStatus(await response.json())
       setApps((prev) =>
         prev.map((app) => {
           const ref = connectorRef(app)
@@ -1487,7 +1486,19 @@ export function ConnectMcpDialog({
                                   {app.is_local ? <Home className="h-3 w-3 mr-1.5 text-slate-400" /> : <Globe className="h-3 w-3 mr-1.5 text-slate-400" />}
                                   {app.is_local ? t('tools.mcp.dialog.local') : t('tools.mcp.dialog.remote')}
                                 </Badge>
-                                {inTeam && isGloballyConnected && connectorRef(app) && (
+                                {/* The ownership badge reports team-sharing status, which is not a
+                                    credential fact, so it does not gate on isGloballyConnected.
+                                    connectorRef(app) requires the entry to have a sharing identity
+                                    at all (a numeric server_id); without it an unconnected catalog
+                                    entry would render "Private" from a shared field nobody set.
+                                    typeof app.shared === "boolean" holds for a well-formed answer
+                                    from the sharing route (the merge above only ever writes a
+                                    sanitized triple), or for a shared field the /api/mcp/apps
+                                    listing itself chose to supply -- sanitizeAppIntegrations does
+                                    not strip unknown fields. connectorRef(app) is what keeps that
+                                    second case from rendering a badge on an entry with no sharing
+                                    identity at all. */}
+                                {inTeam && connectorRef(app) && typeof app.shared === "boolean" && (
                                   <Badge variant="secondary" className={`font-medium px-2 py-0.5 rounded-md border shadow-none ${app.shared ? 'bg-blue-50 text-blue-700 border-blue-200' : 'bg-slate-100 text-slate-600 border-slate-200'}`}>
                                     {!app.shared
                                       ? t('tools.mcp.sharing.private')

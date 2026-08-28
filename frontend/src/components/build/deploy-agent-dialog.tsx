@@ -647,6 +647,9 @@ export function DeployAgentDialog({ deployAgent, onClose, onUpdate, onManageApiK
               <div className="text-sm text-muted-foreground">
                 {t("deploy_agent.embed_snippet.desc") || "Copy and paste this script tag into the <body> of your website."}
               </div>
+              <div className="text-xs text-muted-foreground">
+                {t("deploy_agent.embed_snippet.timezone_hint") || "Optional: add data-timezone=\"Australia/Perth\" (any IANA name) to the script tag to set the chat's time zone. Precedence: data-timezone → the visitor's browser time zone → UTC. If omitted or empty, the browser time zone is used; an unrecognized value falls back to UTC."}
+              </div>
               <div className="bg-muted p-4 rounded-md text-xs font-mono relative overflow-hidden group mt-4">
                 <pre className="whitespace-pre-wrap break-all text-muted-foreground">
                   {widgetKey && widgetOrigin

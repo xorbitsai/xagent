@@ -62,6 +62,7 @@ from xagent.web.services.task_command_transport import COMMAND_ID_PATTERN
 from xagent.web.services.task_interaction_service import (
     materialize_compatibility_view,
     parse_v1_request_payload,
+    validate_v1_write_payload,
 )
 from xagent.web.services.task_interaction_staging import (
     InteractionAnchor,
@@ -91,6 +92,7 @@ def _draft(
     """
 
     values: dict[str, Any] = {
+        "event_id": "11111111-1111-4111-8111-111111111111",
         "source": "send_message",
         "message": message,
         "message_type": "info",
@@ -164,6 +166,36 @@ def test_waiting_with_draft_is_publishable() -> None:
     )
     assert isinstance(resolution, Publishable)
     assert resolution.fail_closed_reason is None
+
+
+def test_waiting_draft_without_question_event_identity_fails_closed() -> None:
+    result = {
+        "status": "waiting_for_user",
+        "clarification_draft": _draft(event_id=""),
+    }
+    resolution = resolve_publishable_clarification(
+        result, task=_task(), lease=_lease(), anchor=_anchor(), now=_now()
+    )
+    assert isinstance(resolution, FailClosed)
+    assert resolution.fail_closed_reason == "missing_event_id"
+
+
+@pytest.mark.parametrize(
+    "event_id",
+    [None, 0, False, [], " id ", "bad/id", "bad\x00id", "a" * 65],
+)
+def test_invalid_question_event_identity_fails_closed(event_id: Any) -> None:
+    result = {
+        "status": "waiting_for_user",
+        "clarification_draft": _draft(event_id=event_id),
+    }
+
+    resolution = resolve_publishable_clarification(
+        result, task=_task(), lease=_lease(), anchor=_anchor(), now=_now()
+    )
+
+    assert isinstance(resolution, FailClosed)
+    assert resolution.fail_closed_reason == "invalid_event_id"
 
 
 def test_waiting_without_draft_fails_closed_as_missing_draft() -> None:
@@ -360,6 +392,75 @@ def test_cross_run_anchor_mismatch_still_resolves_as_publishable() -> None:
 # ---------------------------------------------------------------------------
 # Payload construction and parsing
 # ---------------------------------------------------------------------------
+
+
+# This builder and task_interaction_service's write-side rules are two
+# halves of one contract with no shared type to enforce it: everything this
+# builder produces is offered to the write path, so a payload it can build
+# that those rules reject is a clarification that can never be published.
+# The rows below are the shapes it actually produces, fed through the real
+# parser and the real rules rather than through a hand-written mirror.
+@pytest.mark.parametrize(
+    "make_draft",
+    [
+        pytest.param(
+            lambda: _draft(),
+            id="send_message_draft_carries_no_interactions",
+        ),
+        pytest.param(
+            lambda: _draft(
+                source="ask_user_question",
+                interactions=(
+                    {
+                        "type": "select_one",
+                        "field": "colour",
+                        "label": "Colour",
+                        "options": [{"label": "Red", "value": "red"}],
+                    },
+                    {"type": "text_input", "field": "why", "label": "Why?"},
+                ),
+            ),
+            id="ask_user_question_draft_carries_a_form",
+        ),
+        pytest.param(
+            lambda: _draft(
+                source="ask_user_question",
+                interactions=tuple(
+                    {
+                        "type": "text_input",
+                        "field": f"field_{index}",
+                        "label": "x" * 512,
+                    }
+                    for index in range(400)
+                ),
+            ),
+            id="oversized_form_is_dropped_to_an_empty_list",
+        ),
+    ],
+)
+def test_the_clarification_payload_builder_satisfies_the_write_side_rules(
+    make_draft: Any,
+) -> None:
+    payload = build_clarification_payload(make_draft())
+    validate_v1_write_payload(parse_v1_request_payload(payload))
+
+
+def test_an_oversized_clarification_form_really_is_dropped_to_an_empty_list() -> None:
+    """The row above named "oversized" only proves something if the builder
+    actually took its drop branch. Pin that here rather than trusting the
+    row's id."""
+
+    payload = build_clarification_payload(
+        _draft(
+            source="ask_user_question",
+            interactions=tuple(
+                {"type": "text_input", "field": f"field_{index}", "label": "x" * 512}
+                for index in range(400)
+            ),
+        )
+    )
+    assert payload["interactions"] == []
+    assert payload["interactions_dropped"] is True
 
 
 def test_payload_round_trip_matches_the_legacy_reader_shape_for_a_send_message_draft(
@@ -829,13 +930,22 @@ def test_idempotency_key_matches_the_command_id_pattern() -> None:
     draft = _draft()
     key = clarification_idempotency_key(draft)
     assert COMMAND_ID_PATTERN.fullmatch(key) is not None
-    assert key.startswith("clarification.")
-    assert len(key) == 46
+    assert key == draft.event_id
+
+
+def test_question_event_identity_is_carried_in_the_v1_payload() -> None:
+    draft = _draft()
+    assert build_clarification_payload(draft)["event_id"] == draft.event_id
+
+
+def test_idempotency_key_changes_with_question_event_identity() -> None:
+    base = _draft(event_id="11111111-1111-4111-8111-111111111111")
+    changed = _draft(event_id="22222222-2222-4222-8222-222222222222")
+    assert clarification_idempotency_key(base) != clarification_idempotency_key(changed)
 
 
 def test_idempotency_key_ignores_message_content() -> None:
-    """The key is derived only from ``turn_marker``; changing ``message``
-    (including via truncation) must never change it."""
+    """Changing payload content cannot rename the published question."""
 
     base = _draft(message="short")
     changed = _draft(message="a completely different, much longer question")
@@ -843,11 +953,7 @@ def test_idempotency_key_ignores_message_content() -> None:
 
 
 def test_idempotency_key_ignores_source() -> None:
-    """``turn_marker`` is composed from ``turn_message_count``,
-    ``origin_step_id``, and ``requests`` only (see ``_compose_turn_marker``);
-    ``source`` is not one of its inputs. Two drafts differing only in
-    ``source`` -- e.g. the same turn reported by ``send_message`` versus
-    ``ask_user_question`` -- must therefore produce the same key."""
+    """The question event identity stays authoritative across draft sources."""
 
     base = _draft(source="send_message")
     changed = _draft(source="ask_user_question")
@@ -855,9 +961,7 @@ def test_idempotency_key_ignores_source() -> None:
 
 
 def test_idempotency_key_ignores_origin_execution_id() -> None:
-    """Same reasoning as ``test_idempotency_key_ignores_source`` above:
-    ``origin_execution_id`` is not one of ``_compose_turn_marker``'s inputs
-    either, so two drafts differing only in it must produce the same key."""
+    """Execution bookkeeping cannot create a second question identity."""
 
     base = _draft(origin_execution_id="exec-1")
     changed = _draft(origin_execution_id="exec-2")
@@ -929,9 +1033,7 @@ def test_request_leaf_control_characters_are_stripped_from_the_payload() -> None
         }
     ]
 
-    # The idempotency key is derived only from turn_marker (computed from
-    # the *raw*, unfiltered requests), so filtering the payload's requests
-    # leaves must not move it.
+    # Filtering payload leaves must not move the event-derived identity.
     key_before = clarification_idempotency_key(draft)
     build_clarification_payload(draft)
     assert clarification_idempotency_key(draft) == key_before
@@ -951,9 +1053,7 @@ def test_message_type_control_characters_are_stripped_from_the_payload() -> None
     payload = build_clarification_payload(draft)
     assert payload["message_type"] == "infoBEL-AND-NUL"
 
-    # Same independence check as the requests-leaf test above: filtering
-    # message_type must not move the idempotency key, since that key is
-    # derived only from turn_marker.
+    # Filtering message_type must not move the event-derived identity.
     key_before = clarification_idempotency_key(draft)
     build_clarification_payload(draft)
     assert clarification_idempotency_key(draft) == key_before

@@ -142,6 +142,7 @@ async def create_workforce_run_endpoint(
             is_visible=False,
             source="sdk",
             idempotency_key=request.idempotency_key,
+            timezone=request.timezone,
         )
     except HTTPException as exc:
         _raise_v1_for_workforce_http_error(exc)

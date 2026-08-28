@@ -14,7 +14,7 @@
     "test:kb-components": "vitest run --config vitest.config.ts src/components/kb",
     "test:ci-manifest": "vitest run --config vitest.config.ts src/ci/frontend-test-manifest.test.ts",
     "test:app-pages": "vitest run --config vitest.config.ts src/app",
-    "test:home-build-contracts": "vitest run --config vitest.config.ts src/lib/models.test.ts src/lib/task-create.test.ts src/i18n/translations.test.ts src/lib/utils.test.ts src/lib/time-utils.test.ts",
+    "test:home-build-contracts": "vitest run --config vitest.config.ts src/lib/models.test.ts src/lib/task-create.test.ts src/i18n/translations.test.ts src/lib/utils.test.ts src/lib/time-utils.test.ts src/lib/team-sharing-sanitizers.test.ts",
     "test:widget": "vitest run --config vitest.widget.config.ts",
     "test:widget:coverage": "vitest run --config vitest.widget.config.ts --coverage"
   },

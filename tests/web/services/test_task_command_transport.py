@@ -67,6 +67,7 @@ from xagent.web.services.task_command_transport import (
     start_task_command_dispatcher,
     stop_task_command_dispatcher,
     task_has_live_foreign_runner,
+    task_has_live_runner,
 )
 
 
@@ -378,11 +379,14 @@ def test_live_foreign_runner_is_rechecked_before_cancel(db_session) -> None:
 
     assert task_has_live_foreign_runner(int(task.id), runner_id="runner-b") is True
     assert task_has_live_foreign_runner(int(task.id), runner_id="runner-a") is False
+    assert task_has_live_runner(int(task.id), expected_run_id="run-1") is True
+    assert task_has_live_runner(int(task.id), expected_run_id="run-2") is False
 
     task.lease_expires_at = datetime.utcnow() - timedelta(seconds=1)
     db_session.commit()
 
     assert task_has_live_foreign_runner(int(task.id), runner_id="runner-b") is False
+    assert task_has_live_runner(int(task.id), expected_run_id="run-1") is False
 
 
 @pytest.mark.asyncio
@@ -437,24 +441,75 @@ async def test_cancel_command_defers_on_a_live_foreign_owner(db_session) -> None
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("kind", [TaskCommandKind.PAUSE, TaskCommandKind.RESUME])
-async def test_control_command_defers_on_a_live_foreign_owner(
-    db_session,
-    kind: TaskCommandKind,
-) -> None:
+async def test_pause_command_defers_on_a_live_foreign_owner(db_session) -> None:
     user, task = _create_running_task(db_session)
     command = ClaimedTaskCommand(
         id=1,
         task_id=int(task.id),
         actor_user_id=int(user.id),
-        command_id=f"misrouted-{kind.value}",
-        kind=kind,
-        payload={"type": f"{kind.value}_task"},
+        command_id="misrouted-pause",
+        kind=TaskCommandKind.PAUSE,
+        payload={"type": "pause_task"},
         target_run_id=None,
         attempt_count=1,
     )
 
     with pytest.raises(TaskCommandDeferred, match="active task lease owner"):
+        await execute_durable_task_command(command)
+
+
+@pytest.mark.asyncio
+async def test_resume_completes_when_the_target_run_has_a_live_foreign_owner(
+    db_session,
+) -> None:
+    user, task = _create_running_task(db_session)
+    task.control_state = "running"
+    db_session.commit()
+    command = ClaimedTaskCommand(
+        id=1,
+        task_id=int(task.id),
+        actor_user_id=int(user.id),
+        command_id="idempotent-foreign-resume",
+        kind=TaskCommandKind.RESUME,
+        payload={"type": "resume_task"},
+        target_run_id="run-1",
+        attempt_count=1,
+    )
+
+    result = await execute_durable_task_command(command)
+
+    assert result is not None
+    assert result["resume_outcome"] == "already_in_progress"
+
+
+@pytest.mark.asyncio
+async def test_resume_defers_when_a_settling_turn_still_holds_a_foreign_lease(
+    db_session,
+) -> None:
+    """RESUME still defers for a foreign lease in a state it cannot classify.
+
+    The idempotency evidence only settles RUNNING rows. A turn that has
+    committed WAITING_FOR_USER but whose lease columns have not been cleared
+    yet is not evidence that anything is resuming, so the command must defer
+    rather than schedule into the previous owner's live lease.
+    """
+
+    user, task = _create_running_task(db_session)
+    task.status = TaskStatus.WAITING_FOR_USER
+    task.control_state = "waiting_for_user"
+    db_session.commit()
+    command = ClaimedTaskCommand(
+        id=1,
+        task_id=int(task.id),
+        actor_user_id=int(user.id),
+        command_id="resume-into-foreign-lease",
+        kind=TaskCommandKind.RESUME,
+        payload={"type": "resume_task"},
+        target_run_id="run-1",
+        attempt_count=1,
+    )
+
+    with pytest.raises(TaskCommandDeferred):
         await execute_durable_task_command(command)
 
 
@@ -1981,7 +2036,7 @@ def test_websocket_enqueue_returns_none_when_the_task_vanishes_mid_enqueue(
     assert result is None
 
 
-def test_websocket_enqueue_reraises_missing_task_when_recovery_is_not_allowed(
+def test_websocket_enqueue_rejects_missing_task_with_client_visible_wording(
     db_session,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1996,7 +2051,11 @@ def test_websocket_enqueue_reraises_missing_task_when_recovery_is_not_allowed(
 
     monkeypatch.setattr(websocket_api, "enqueue_task_command", raise_missing)
 
-    with pytest.raises(TaskCommandTaskMissing):
+    # The rejection is re-raised as ClientVisibleValidationError at this
+    # boundary (still a ValueError, so pause/resume reject it the same way)
+    # so the redaction chokepoint keeps "not found" wording on this race
+    # instead of flattening it to the generic string (#1514 round 5).
+    with pytest.raises(ValueError) as raised:
         websocket_api._enqueue_websocket_task_command_sync(
             task_id=task_id,
             actor_user_id=int(user.id),
@@ -2006,6 +2065,8 @@ def test_websocket_enqueue_reraises_missing_task_when_recovery_is_not_allowed(
             payload={"type": "pause_task"},
             allow_missing_task=False,
         )
+    assert isinstance(raised.value, websocket_api.ClientVisibleValidationError)
+    assert str(raised.value) == f"Task {task_id} not found"
 
 
 def test_task_foreign_key_violation_is_reported_as_a_missing_task(

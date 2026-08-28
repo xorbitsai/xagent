@@ -62,8 +62,10 @@ from ..services.tool_credentials import (
     get_sql_connection_map,
     get_user_tool_allowlist,
     get_user_tool_overrides,
+    has_user_tool_overrides_hook,
     has_user_tool_policy_hooks,
     resolve_tool_credential,
+    unresolved_tool_policy_allowlist,
 )
 from ..services.user_oauth import (
     get_scoped_user_oauth_account,
@@ -137,17 +139,23 @@ class ResolvedToken:
     comparison. Resolvers SHOULD set ``expires_at`` to enable MCP config
     caching; ``expires_at=None`` means the token is usable for this build only
     and this ``WebToolConfig`` instance will reload MCP configs on later calls.
+    ``instance_url`` carries the per-org API host a provider like Salesforce
+    returns alongside its access token; providers without one leave it None.
     """
 
     access_token: str = field(repr=False)
     expires_at: datetime | None = None
     generation: str | None = field(default=None, repr=False)
+    instance_url: str | None = None
 
 
 @dataclass(frozen=True)
 class _LegacyOAuthTokenResolution:
     access_token: str | None
     refresh_failed: bool = False
+    # Set only for providers that return a per-org API host instead of
+    # using a fixed domain (Salesforce) -- None for everyone else.
+    instance_url: str | None = None
 
 
 TokenResolverResult = ResolvedToken | Awaitable[ResolvedToken | None] | None
@@ -260,6 +268,7 @@ class _ResolvedHookToken:
     access_token: str = field(repr=False)
     expires_at: datetime | None
     generation: str | None = field(repr=False)
+    instance_url: str | None = None
 
 
 class _OAuthTokenResolverFailed(Exception):
@@ -284,6 +293,24 @@ class _OAuthLaunchConfigInvalid(Exception):
     def __init__(self, *, field: str) -> None:
         super().__init__(field)
         self.field = field
+
+
+class _OAuthInstanceUrlRequired(Exception):
+    """The launch_config declares an instance_url env mapping, but the
+    resolved token (hook or legacy DB path) didn't supply one.
+
+    Raised instead of silently omitting the env var so the connector comes
+    back as unavailable/reconnect-required, matching how a missing
+    access_token is already surfaced, rather than launching a subprocess
+    that fails opaquely on its first real tool call. Carries the env_mapping
+    key that triggered it, mirroring _OAuthLaunchConfigInvalid.field, so a
+    second provider adding its own instance_url-mapped key someday doesn't
+    leave both call sites' log lines unable to say which one failed.
+    """
+
+    def __init__(self, *, env_key: str) -> None:
+        super().__init__(env_key)
+        self.env_key = env_key
 
 
 @dataclass(frozen=True)
@@ -576,7 +603,7 @@ async def refresh_oauth_token_if_needed(
 
     logger.info(f"Token expired for {provider_name}, attempting to refresh...")
     try:
-        from ..api.auth import _resolve_oauth_secret
+        from ..api.auth import _resolve_oauth_redirect_uri, _resolve_oauth_secret
         from ..models.oauth_provider import OAuthProvider
         from ..oauth_provider_quirks import requires_json_accept_header
 
@@ -669,6 +696,55 @@ async def refresh_oauth_token_if_needed(
             data["client_id"] = client_id
             data["client_secret"] = client_secret
 
+        refresh_token_url = provider_config.token_url
+        if normalized_provider == "deputy":
+            # Deputy's docs (both the code-exchange and refresh legs) list
+            # `redirect_uri` and `scope` as required body params here too,
+            # matching the code-exchange branch in api/auth.py. scope is
+            # read from provider_config.default_scopes -- same source, and
+            # same "no app-level oauth_scopes override" caveat, as that
+            # code-exchange leg (see its comment) -- rather than a
+            # hardcoded literal, so an admin who edits this provider row's
+            # scopes doesn't leave refresh silently still sending the old
+            # value.
+            # Resolved from the CURRENT provider row/env var, not whatever
+            # redirect_uri was actually used for this grant's original
+            # authorization -- UserOAuth has no per-grant redirect_uri
+            # column to read instead (no provider in this codebase needs
+            # one; Deputy is the only one requiring redirect_uri on
+            # refresh at all). If an admin changes the Deputy provider's
+            # redirect_uri (or DEPUTY_REDIRECT_URI) after users have
+            # already connected, Deputy may reject those users' next
+            # refresh with a redirect_uri mismatch until they reconnect --
+            # a known limitation, not something this function can resolve
+            # without a schema change.
+            data["redirect_uri"] = _resolve_oauth_redirect_uri(
+                provider_name, provider_config
+            )
+            data["scope"] = (
+                " ".join(
+                    stripped
+                    for scope in provider_config.default_scopes or []
+                    if isinstance(scope, str) and (stripped := scope.strip())
+                )
+                or "longlife_refresh_token"
+            )
+            # Deputy's generic once.deputy.com host only serves the initial
+            # code exchange -- token renewal must go to the same per-install
+            # host returned as `endpoint` in that exchange (and persisted as
+            # UserOAuth.instance_url), not the static token_url on the
+            # provider row. See deputy.py's _instance_url() for the matching
+            # use-time validation of that same stored value.
+            stored_instance_url = getattr(oauth_account, "instance_url", None)
+            if not stored_instance_url:
+                logger.warning(
+                    f"Cannot refresh Deputy token for user "
+                    f"{oauth_account.user_id}: no instance_url stored on "
+                    "this connection."
+                )
+                return False
+            refresh_token_url = f"{stored_instance_url}/oauth/access_token"
+
         headers = {}
         if normalized_provider == "linkedin":
             headers["Content-Type"] = "application/x-www-form-urlencoded"
@@ -684,7 +760,7 @@ async def refresh_oauth_token_if_needed(
 
         async with httpx.AsyncClient() as client:
             response = await client.post(
-                provider_config.token_url,
+                refresh_token_url,
                 headers=headers,
                 timeout=10.0,
                 **body_kwarg,
@@ -697,6 +773,46 @@ async def refresh_oauth_token_if_needed(
                 oauth_account.access_token = data["access_token"]
                 if "refresh_token" in data:
                     oauth_account.refresh_token = data["refresh_token"]
+                if "instance_url" in data:
+                    # Matches the code-exchange branch in api/auth.py:
+                    # Salesforce can return a different instance_url on
+                    # refresh (e.g. after an org migration), so this is
+                    # re-persisted here too, not just at initial connect.
+                    # Type/non-empty checked (not full host/scheme
+                    # validation -- that stays salesforce.py's own
+                    # use-time job) before overwriting: this row's
+                    # existing instance_url is a previously-valid value,
+                    # and a malformed refresh response replacing it would
+                    # break the connector on its next use with no signal
+                    # at refresh time that anything went wrong.
+                    refreshed_instance_url = data["instance_url"]
+                    if (
+                        isinstance(refreshed_instance_url, str)
+                        and refreshed_instance_url
+                    ):
+                        oauth_account.instance_url = refreshed_instance_url
+                    else:
+                        logger.warning(
+                            f"Refresh response for {provider_name} (user "
+                            f"{oauth_account.user_id}) had a malformed "
+                            "instance_url; keeping the previously stored value"
+                        )
+                if normalized_provider == "deputy" and "endpoint" in data:
+                    # Deputy's equivalent of the block above -- its refresh
+                    # response carries the per-install host under `endpoint`,
+                    # not `instance_url`, and without a scheme (matches the
+                    # code-exchange branch in api/auth.py).
+                    from ..api.auth import _normalize_deputy_endpoint
+
+                    refreshed_endpoint = _normalize_deputy_endpoint(data["endpoint"])
+                    if refreshed_endpoint:
+                        oauth_account.instance_url = refreshed_endpoint
+                    else:
+                        logger.warning(
+                            f"Refresh response for {provider_name} (user "
+                            f"{oauth_account.user_id}) had a malformed "
+                            "endpoint; keeping the previously stored value"
+                        )
                 if "expires_in" in data:
                     oauth_account.expires_at = datetime.now(timezone.utc) + timedelta(
                         seconds=data["expires_in"]
@@ -1154,6 +1270,15 @@ def _load_tool_runtime_policy_snapshot(
 
     from ..models.user import User
 
+    # A registering application enforces authorization through the policy
+    # hooks, so "could not resolve the policy" must not be reported as "no
+    # policy configured". Both branches below reach the hooks not at all, so
+    # the application has nothing to intercept; the loader itself has to fail
+    # closed. Recorded per input and collapsed into a deny-all allowlist after
+    # every input has had its own isolated Session, so an unresolvable
+    # overrides read cannot skip the independent allowlist read.
+    unresolved: set[str] = set()
+
     def load_policy_input(
         input_name: str,
         loader: Callable[[Any, Any], Any],
@@ -1163,11 +1288,21 @@ def _load_tool_runtime_policy_snapshot(
             try:
                 user = db.query(User).filter(User.id == user_id).first()
                 if user is None:
+                    unresolved.add(input_name)
+                    logger.warning(
+                        "Tool policy %s unresolved: user %s could not be reloaded",
+                        input_name,
+                        user_id,
+                    )
                     return default
                 return loader(db, user)
             except Exception as exc:
+                # Pool timeouts keep propagating (the caller retries the turn),
+                # and CancelledError is a BaseException that is deliberately
+                # not caught here.
                 if is_database_pool_timeout(exc):
                     raise
+                unresolved.add(input_name)
                 logger.exception("Failed to get user tool %s", input_name)
                 return default
 
@@ -1184,6 +1319,16 @@ def _load_tool_runtime_policy_snapshot(
         lambda db, user: normalize_tool_allowlist(get_user_tool_allowlist(db, user)),
         None,
     )
+    if unresolved:
+        fail_closed = unresolved_tool_policy_allowlist()
+        if fail_closed is not None:
+            logger.error(
+                "Tool policy unresolved for user %s (%s); denying every tool "
+                "for this turn",
+                user_id,
+                ", ".join(sorted(unresolved)),
+            )
+            tool_allowlist = fail_closed
     return _ToolRuntimePolicySnapshot(
         tool_overrides=tool_overrides,
         tool_allowlist=tool_allowlist,
@@ -1234,6 +1379,11 @@ class WebToolConfig(BaseToolConfig):
         connector_team_id: Optional[int] = None,
         agent_creator_user_id: Optional[int] = None,
         declared_knowledge_bases: Optional[List[str]] = None,
+        # Appended after every pre-existing parameter (not inserted
+        # alongside its closest siblings above) so a caller still using
+        # positional arguments for anything after agent_call_stack keeps
+        # binding the same values it always did.
+        voice: Optional[str] = None,
     ):
         # ``tool_selection_spec`` accepts :class:`ToolSelectionSpec` from
         # the tools adapter package; typed as ``Any`` here to avoid an
@@ -1331,6 +1481,10 @@ class WebToolConfig(BaseToolConfig):
         self._parent_task_id = parent_task_id
         self._parent_tracer = parent_tracer
         self._agent_call_stack = list(agent_call_stack or [])
+        # Already-resolved onboarding output-voice preference (see
+        # get_voice's docstring on BaseToolConfig for why this threads into
+        # delegated AgentTool children).
+        self._voice = voice
         self._excluded_agent_id: Optional[int] = None
 
         # Cache user object for hook queries.
@@ -1341,6 +1495,13 @@ class WebToolConfig(BaseToolConfig):
         # separate flag tracks whether the hook has been consulted yet.
         self._cached_tool_allowlist: Optional[list] = None
         self._tool_allowlist_cached: bool = False
+        # Names the policy inputs whose read could not be resolved (the hook
+        # never ran). ``get_user_tool_allowlist`` turns a non-empty set into a
+        # deny-all allowlist so the execution layer fails closed instead of
+        # building every tool. Each accessor clears its own entry before
+        # re-reading, so a transient failure cannot latch deny-all onto a config
+        # that is reused across turns.
+        self._unresolved_tool_policy_inputs: set[str] = set()
 
         # Sandbox instance - only store reference, lifecycle managed by upper layer
         self._sandbox: Optional[Any] = sandbox
@@ -2053,21 +2214,84 @@ class WebToolConfig(BaseToolConfig):
         """Get active agent delegation call stack for recursion prevention."""
         return self._agent_call_stack
 
+    def get_voice(self) -> Optional[str]:
+        """See BaseToolConfig.get_voice's docstring."""
+        return self._voice
+
+    def _note_unresolved_tool_policy(self, input_name: str, reason: str) -> None:
+        """Record that a policy input could not be resolved for this turn.
+
+        The registered hook never ran on these paths, so the application that
+        owns authorization has nothing to intercept and cannot repair the read.
+        ``get_user_tool_allowlist`` converts a recorded input into a deny-all
+        allowlist so the execution layer builds no tools instead of the full
+        default set. Entries live only as long as the cached read that produced
+        them: each accessor drops its own entry before consulting the hook
+        again, so a transient failure denies one turn rather than latching.
+        """
+        if not has_user_tool_policy_hooks():
+            # No application policy to lose: standalone xagent keeps its
+            # unrestricted default rather than denying every tool.
+            return
+        self._unresolved_tool_policy_inputs.add(input_name)
+        # Invalidate any allowlist already cached by an earlier read. The two
+        # inputs are read in either order, so a clean allowlist cached before
+        # this failure would otherwise keep reporting "no filtering" and hand
+        # the turn the full tool set. Re-deriving it applies the denial.
+        if input_name != "allowlist":
+            self._tool_allowlist_cached = False
+            self._cached_tool_allowlist = None
+        logger.error(
+            "Tool policy %s unresolved for user %s (%s); denying every tool "
+            "for this turn",
+            input_name,
+            self._user_id,
+            reason,
+        )
+
     def get_user_tool_overrides(self) -> dict:
         """Return per-user tool overrides from the registered hook.
 
-        Both display layer and execution layer use this as the single
-        source of truth for per-user tool policies.
+        Both display layer and execution layer read per-user tool policy from
+        here, but this is no longer the whole picture: ``{}`` means either "no
+        overrides configured" or "the policy could not be resolved", and the
+        two are not distinguishable from the return value. The fail-closed
+        signal for an unresolved read is carried by
+        :meth:`get_user_tool_allowlist`, so the execution layer must consult
+        both.
         """
+        from ..services.db_runtime import is_database_pool_timeout
+
         if self._cached_tool_overrides is not None:
             return self._cached_tool_overrides
+        # This read supersedes whatever the previous one concluded.
+        self._unresolved_tool_policy_inputs.discard("overrides")
         if self._user is None:
+            # No user to hand the hook: the policy is unresolved, not absent.
+            # The overrides mapping stays a dict (the tool-listing API indexes
+            # it); ``get_user_tool_allowlist`` carries the fail-closed signal.
+            #
+            # Gated on the overrides hook specifically, not on either hook:
+            # with no overrides hook registered ``get_user_tool_overrides``
+            # ignores ``user`` and returns ``{}`` regardless, so a missing user
+            # resolves this input. Recording it would deny an allowlist-only
+            # deployment whose allowlist hook answered successfully.
+            if has_user_tool_overrides_hook():
+                self._note_unresolved_tool_policy("overrides", "no runtime user")
             self._cached_tool_overrides = {}
             return {}
         try:
             self._cached_tool_overrides = get_user_tool_overrides(self.db, self._user)
-        except Exception:
+        except Exception as exc:
+            # A pool checkout timeout is not an unresolved policy: the very next
+            # step needs the same pool, so propagate it for the caller to retry
+            # rather than spending the turn with no tools. Matches
+            # ``_load_tool_runtime_policy_snapshot``. Nothing is cached and no
+            # input is recorded, so the retry re-reads from scratch.
+            if is_database_pool_timeout(exc):
+                raise
             logger.exception("Failed to get user tool overrides")
+            self._note_unresolved_tool_policy("overrides", "hook read failed")
             self._cached_tool_overrides = {}
         return self._cached_tool_overrides
 
@@ -2142,6 +2366,10 @@ class WebToolConfig(BaseToolConfig):
         self._cached_tool_overrides = snapshot.tool_overrides
         self._cached_tool_allowlist = snapshot.tool_allowlist
         self._tool_allowlist_cached = True
+        # The worker resolved the policy itself and already folded any
+        # unresolvable input into ``snapshot.tool_allowlist``; stale entries from
+        # an earlier in-request read must not latch deny-all onto this snapshot.
+        self._unresolved_tool_policy_inputs.clear()
 
     async def prepare_factory_runtime(self) -> None:
         """Prefetch synchronous ToolFactory inputs without blocking its loop.
@@ -2286,6 +2514,10 @@ class WebToolConfig(BaseToolConfig):
                 self._cached_tool_overrides = None
                 self._tool_allowlist_cached = False
                 self._cached_tool_allowlist = None
+                # The accessors below each drop their own entry before
+                # re-reading, so nothing from a previous turn survives; clearing
+                # here keeps that explicit for the in-request branch.
+                self._unresolved_tool_policy_inputs.clear()
                 self.refresh_user_tool_overrides()
                 self.refresh_user_tool_allowlist()
                 return
@@ -2304,6 +2536,10 @@ class WebToolConfig(BaseToolConfig):
         self._cached_tool_overrides = policy_snapshot.tool_overrides
         self._cached_tool_allowlist = policy_snapshot.tool_allowlist
         self._tool_allowlist_cached = True
+        # This snapshot is authoritative for the turn (the loader already
+        # fail-closed any input it could not resolve), so drop entries left by
+        # an earlier read rather than denying every tool for the rest of the run.
+        self._unresolved_tool_policy_inputs.clear()
         self._pending_runtime_policy = policy_snapshot
 
     def refresh_user_tool_overrides(self) -> dict:
@@ -2319,16 +2555,45 @@ class WebToolConfig(BaseToolConfig):
         list means keep only those tool names (execution layer only). The
         allowlist is resolved from the active execution scope by the hook, so
         it can differ per turn even for the same user.
+
+        When a policy hook is registered but a policy input could not be
+        resolved, this returns the empty list ("no tools allowed") rather than
+        ``None``: the hook never ran, so the application enforcing
+        authorization has nothing to intercept, and reporting "no allowlist"
+        would build the globally available tool set. With no hook registered
+        there is no policy to lose and the unrestricted default is kept.
         """
+        from ..services.db_runtime import is_database_pool_timeout
+
         if self._tool_allowlist_cached:
             return self._cached_tool_allowlist
+        # This read supersedes whatever the previous one concluded. The
+        # overrides entry is left alone: an unresolved overrides read in this
+        # same turn must still deny below.
+        self._unresolved_tool_policy_inputs.discard("allowlist")
         try:
+            # ``self._user`` may legitimately be ``None`` here: the allowlist is
+            # resolved from the active execution scope, so the hook is consulted
+            # with whatever user the config holds rather than short-circuited.
             self._cached_tool_allowlist = normalize_tool_allowlist(
                 get_user_tool_allowlist(self.db, self._user)
             )
-        except Exception:
+        except Exception as exc:
+            # See get_user_tool_overrides: a pool timeout propagates for retry
+            # instead of being recorded as an unresolved policy. Left uncached
+            # so the retry re-reads, and no deny-all is applied on the way out.
+            if is_database_pool_timeout(exc):
+                raise
             logger.exception("Failed to get user tool allowlist")
+            self._note_unresolved_tool_policy("allowlist", "hook read failed")
             self._cached_tool_allowlist = None
+        if self._unresolved_tool_policy_inputs:
+            # An unresolved read on either policy input denies every tool
+            # rather than reporting "no allowlist configured", which would
+            # skip the execution layer's positive filter entirely.
+            fail_closed = unresolved_tool_policy_allowlist()
+            if fail_closed is not None:
+                self._cached_tool_allowlist = fail_closed
         self._tool_allowlist_cached = True
         return self._cached_tool_allowlist
 
@@ -2336,6 +2601,10 @@ class WebToolConfig(BaseToolConfig):
         """Reload the positive tool allowlist from the registered hook."""
         # The active execution scope (hence the CA allowlist) can change while
         # an AgentService instance is reused across turns.
+        #
+        # ``get_user_tool_allowlist`` drops only its own unresolved entry before
+        # re-reading, so a fresh allowlist answer lifts the denial it caused
+        # while an unresolved overrides read from the same turn still denies.
         self._tool_allowlist_cached = False
         self._cached_tool_allowlist = None
         return self.get_user_tool_allowlist()
@@ -2911,6 +3180,14 @@ class WebToolConfig(BaseToolConfig):
                 exception_type="InvalidGeneration",
                 resource=resource,
             )
+        if resolved.instance_url is not None and (
+            type(resolved.instance_url) is not str or not resolved.instance_url
+        ):
+            raise _OAuthTokenResolverFailed(
+                providers=providers,
+                exception_type="InvalidInstanceUrl",
+                resource=resource,
+            )
 
         expires_at = _normalize_oauth_expires_at(resolved.expires_at)
         if expires_at is not None and _oauth_token_is_expired(expires_at):
@@ -2925,6 +3202,7 @@ class WebToolConfig(BaseToolConfig):
             access_token=resolved.access_token,
             expires_at=expires_at,
             generation=resolved.generation,
+            instance_url=resolved.instance_url,
         )
 
     def _mark_hook_token_cache_metadata(self, resolved: _ResolvedHookToken) -> None:
@@ -3044,6 +3322,7 @@ class WebToolConfig(BaseToolConfig):
         server: Any,
         app_info: Mapping[str, Any],
         access_token: str,
+        instance_url: str | None = None,
     ) -> Dict[str, Any]:
         launch_config = _oauth_launch_config_mapping(app_info.get("launch_config"))
         if launch_config:
@@ -3059,6 +3338,28 @@ class WebToolConfig(BaseToolConfig):
             ).items():
                 if token_type == "access_token":
                     env[env_key] = access_token
+                elif token_type == "instance_url":
+                    if not instance_url:
+                        raise _OAuthInstanceUrlRequired(env_key=env_key)
+                    env[env_key] = instance_url
+                else:
+                    # A typo'd env_mapping value (e.g. "acess_token") would
+                    # otherwise silently emit neither an env var nor an
+                    # error -- the exact opaque failure mode
+                    # _OAuthInstanceUrlRequired exists to prevent for the
+                    # one token_type above it. Not developer-only: an admin
+                    # can reach this through POST /admin/mcp/apps, whose
+                    # launch_config is an unvalidated free-form dict (see
+                    # PublicMCPAppCreate in admin_mcp.py -- its validator
+                    # checks command/required_env/url/auth.type, not
+                    # env_mapping's values), so a hand-typed custom OAuth
+                    # app's env_mapping can carry this too.
+                    logger.warning(
+                        "Unrecognized launch_config.env_mapping token_type "
+                        "'%s' for env var '%s'; no value forwarded",
+                        token_type,
+                        env_key,
+                    )
 
             for env_key, host_env_var in _oauth_launch_config_static_env(
                 launch_config
@@ -3202,8 +3503,17 @@ class WebToolConfig(BaseToolConfig):
                 )
 
             access_token = str(oauth_account.access_token)
+            # Not direct attribute access: mypy infers oauth_account's
+            # instance_url as Column[str] here (get_scoped_user_oauth_account
+            # returns a type the SQLAlchemy plugin doesn't narrow the same
+            # way as a plain query result), so getattr's own 3-arg overload
+            # is what actually produces the correct `str | None` this
+            # function's return type declares.
+            instance_url = getattr(oauth_account, "instance_url", None)
             oauth_db.commit()
-            return _LegacyOAuthTokenResolution(access_token=access_token)
+            return _LegacyOAuthTokenResolution(
+                access_token=access_token, instance_url=instance_url
+            )
         except Exception:
             oauth_db.rollback()
             raise
@@ -3292,6 +3602,7 @@ class WebToolConfig(BaseToolConfig):
                         server=server,
                         app_info=app_info,
                         access_token=hook_token.access_token,
+                        instance_url=hook_token.instance_url,
                     )
                 except _OAuthLaunchConfigInvalid as error:
                     logger.warning(
@@ -3302,6 +3613,18 @@ class WebToolConfig(BaseToolConfig):
                     return self._build_unavailable_mcp_config(
                         server=server,
                         reason="invalid_launch_config",
+                    )
+                except _OAuthInstanceUrlRequired as error:
+                    logger.info(
+                        "OAuth token resolver hook did not supply %s for MCP server '%s'",
+                        error.env_key,
+                        getattr(server, "name", "<unknown>"),
+                    )
+                    return self._build_unavailable_mcp_config(
+                        server=server,
+                        reason="oauth_token_required",
+                        message=UNAVAILABLE_MCP_CREDENTIAL_MESSAGE,
+                        failure_code="oauth_token_required",
                     )
                 config["transport"] = "stdio"
                 logger.info(
@@ -3339,6 +3662,7 @@ class WebToolConfig(BaseToolConfig):
                         server=server,
                         app_info=app_info,
                         access_token=legacy_token.access_token,
+                        instance_url=legacy_token.instance_url,
                     )
                 except _OAuthLaunchConfigInvalid as error:
                     logger.warning(
@@ -3349,6 +3673,18 @@ class WebToolConfig(BaseToolConfig):
                     return self._build_unavailable_mcp_config(
                         server=server,
                         reason="invalid_launch_config",
+                    )
+                except _OAuthInstanceUrlRequired as error:
+                    logger.info(
+                        "OAUTH CONFIG: No %s found for '%s'.",
+                        error.env_key,
+                        provider_name,
+                    )
+                    return self._build_unavailable_mcp_config(
+                        server=server,
+                        reason="oauth_token_required",
+                        message=UNAVAILABLE_MCP_CREDENTIAL_MESSAGE,
+                        failure_code="oauth_token_required",
                     )
                 config["transport"] = "stdio"
 

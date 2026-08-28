@@ -46,6 +46,7 @@ class AgentRunner:
         callbacks: list[Any] | None = None,
         context_manager: ContextManager | None = None,
         workspace_base_dir: str = "workspace",
+        workspace_enabled: bool = True,
         scope_segments: tuple[str, ...] = (),
         outbound_message_handler: Any | None = None,
     ) -> None:
@@ -56,6 +57,7 @@ class AgentRunner:
         self.callbacks = callbacks or []
         self.context_manager = context_manager or ContextManager()
         self.workspace_base_dir = workspace_base_dir
+        self.workspace_enabled = workspace_enabled
         self.scope_segments = scope_segments
         self.outbound_message_handler = outbound_message_handler
         self._active_controls: dict[str, ExecutionControl] = {}
@@ -191,7 +193,7 @@ class AgentRunner:
             interrupt_checker=interrupt_checker,
             outbound_message_handler=self.outbound_message_handler,
         )
-        if runtime.context_ref_resolver is None:
+        if self.workspace_enabled and runtime.context_ref_resolver is None:
             if workspace is None:
                 workspace_base = base_dir or self.workspace_base_dir
                 if context.workspace_path:
@@ -719,24 +721,30 @@ class AgentRunner:
         allowed_external_dirs: list[str] | None,
         base_dir: str | None,
         metadata: dict[str, Any] | None,
-    ) -> tuple[ExecutionContext, Any]:
-        workspace = self.workspace_manager.get_or_create_workspace(
-            base_dir=base_dir or self.workspace_base_dir,
-            task_id=workspace_id or execution_id,
-            allowed_external_dirs=allowed_external_dirs,
-            scope_segments=self.scope_segments,
-        )
-        if inspect.isawaitable(workspace):
-            workspace = await workspace
+    ) -> tuple[ExecutionContext, Any | None]:
+        workspace = None
+        context_kwargs: dict[str, Any] = {}
+        if self.workspace_enabled:
+            workspace = self.workspace_manager.get_or_create_workspace(
+                base_dir=base_dir or self.workspace_base_dir,
+                task_id=workspace_id or execution_id,
+                allowed_external_dirs=allowed_external_dirs,
+                scope_segments=self.scope_segments,
+            )
+            if inspect.isawaitable(workspace):
+                workspace = await workspace
+            context_kwargs = {
+                "workspace_id": workspace.id,
+                "workspace_path": str(workspace.workspace_dir),
+                "cwd": str(workspace.workspace_dir),
+                "workspace_state": self._workspace_state(workspace),
+            }
         context = self.context_manager.create_context(
             execution_id=execution_id,
             user_id=user_id,
             session_id=session_id,
             system_prompt=getattr(self.agent, "system_prompt", None),
-            workspace_id=workspace.id,
-            workspace_path=str(workspace.workspace_dir),
-            cwd=str(workspace.workspace_dir),
-            workspace_state=self._workspace_state(workspace),
+            **context_kwargs,
         )
         # Snapshotted at task start. On resume the context (and this threshold)
         # is restored verbatim from the checkpoint, so a context-window or ratio

@@ -1,6 +1,11 @@
 import { beforeEach, describe, expect, it, vi } from "vitest"
 
 const apiRequestMock = vi.hoisted(() => vi.fn())
+const resolveTimezoneMock = vi.hoisted(() => vi.fn<() => string | undefined>())
+
+vi.mock("@/hooks/use-websocket", () => ({
+  resolveReportedTimezone: resolveTimezoneMock,
+}))
 
 vi.mock("@/lib/api-wrapper", async () => {
   const actual = await vi.importActual<typeof import("@/lib/api-wrapper")>(
@@ -25,6 +30,7 @@ import {
   listAgentOptions,
   listWorkforces,
   runWorkforce,
+  runWorkforcePreview,
   unarchiveWorkforce,
 } from "./workforces-api"
 
@@ -39,6 +45,8 @@ function jsonResponse(data: unknown, init?: ResponseInit) {
 describe("workforces-api", () => {
   beforeEach(() => {
     apiRequestMock.mockReset()
+    resolveTimezoneMock.mockReset()
+    resolveTimezoneMock.mockReturnValue(undefined)
   })
 
   it("uses the PR5 list pagination and visibility contract", async () => {
@@ -134,6 +142,78 @@ describe("workforces-api", () => {
       }),
     )
     expect(result.redirect_url).toBe("/task/10")
+  })
+
+  it("attaches the reported timezone to a workforce run opener", async () => {
+    resolveTimezoneMock.mockReturnValue("Australia/Melbourne")
+    apiRequestMock.mockResolvedValueOnce(
+      jsonResponse({
+        workforce_run_id: 9,
+        task_id: 10,
+        status: "running",
+        redirect_url: "/task/10",
+      }),
+    )
+
+    await runWorkforce(5, { message: "go", files: ["file-1"] })
+
+    const body = JSON.parse(apiRequestMock.mock.calls[0][1].body)
+    expect(body.timezone).toBe("Australia/Melbourne")
+  })
+
+  it("omits the timezone from a workforce run opener when none resolves", async () => {
+    resolveTimezoneMock.mockReturnValue(undefined)
+    apiRequestMock.mockResolvedValueOnce(
+      jsonResponse({
+        workforce_run_id: 9,
+        task_id: 10,
+        status: "running",
+        redirect_url: "/task/10",
+      }),
+    )
+
+    await runWorkforce(5, { message: "go" })
+
+    const body = JSON.parse(apiRequestMock.mock.calls[0][1].body)
+    expect("timezone" in body).toBe(false)
+  })
+
+  it("lets an explicit timezone on the payload win over the resolver", async () => {
+    resolveTimezoneMock.mockReturnValue("Australia/Melbourne")
+    apiRequestMock.mockResolvedValueOnce(
+      jsonResponse({
+        workforce_run_id: 9,
+        task_id: 10,
+        status: "running",
+        redirect_url: "/task/10",
+      }),
+    )
+
+    await runWorkforce(5, { message: "go", timezone: "Asia/Kolkata" })
+
+    const body = JSON.parse(apiRequestMock.mock.calls[0][1].body)
+    expect(body.timezone).toBe("Asia/Kolkata")
+  })
+
+  it("attaches the reported timezone to a workforce preview opener", async () => {
+    resolveTimezoneMock.mockReturnValue("Australia/Melbourne")
+    apiRequestMock.mockResolvedValueOnce(
+      jsonResponse({
+        workforce_run_id: 9,
+        task_id: 10,
+        status: "running",
+        redirect_url: "/task/10",
+      }),
+    )
+
+    await runWorkforcePreview({
+      manager_agent_id: 1,
+      workers: [{ agent_id: 2, assignment_instructions: "do it" }],
+      message: "go",
+    })
+
+    const body = JSON.parse(apiRequestMock.mock.calls[0][1].body)
+    expect(body.timezone).toBe("Australia/Melbourne")
   })
 
   it("loads one delegated Agent execution on demand", async () => {

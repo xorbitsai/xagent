@@ -2,9 +2,17 @@ import React from "react"
 import { cleanup, fireEvent, render, screen } from "@testing-library/react"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 
+type PanelTraceEvent = {
+  event_id?: string
+  event_type?: string
+  timestamp?: string | number
+  data?: Record<string, unknown>
+  [key: string]: unknown
+}
+
 const appState = vi.hoisted(() => ({
   messages: [] as Array<Record<string, unknown>>,
-  traceEvents: [],
+  traceEvents: [] as PanelTraceEvent[],
   currentTask: null as null | Record<string, unknown>,
   taskRuntimeExtensions: {} as Record<string, Record<string, unknown>>,
   isProcessing: false,
@@ -35,6 +43,7 @@ const chatInputProps = vi.hoisted(() => ({
     voiceInputEnabled?: boolean
     hideFileUpload?: boolean
     isLoading?: boolean
+    currentInteractionRequestId?: string
     onFilesChange?: (files: File[]) => void
     onPause?: () => void
     onResume?: () => void
@@ -111,6 +120,8 @@ vi.mock("@/components/chat/ChatMessage", () => ({
     onOpenExecutionPlan,
     contextBadges,
     taskRuntimeExtensionMetadata,
+    interactionRequestId,
+    interactions,
   }: {
     content?: string | null
     interactionsActive?: boolean
@@ -125,6 +136,8 @@ vi.mock("@/components/chat/ChatMessage", () => ({
       bindings: string[]
       publicMetadata: Record<string, Record<string, unknown>>
     }
+    interactionRequestId?: string
+    interactions?: unknown[]
   }) => (
     <div
       data-testid="chat-message"
@@ -136,6 +149,8 @@ vi.mock("@/components/chat/ChatMessage", () => ({
       data-show-process-view={showProcessView ? "true" : "false"}
       data-context-badges={JSON.stringify(contextBadges || [])}
       data-runtime-extension-metadata={JSON.stringify(taskRuntimeExtensionMetadata || {})}
+      data-request-id={interactionRequestId || ""}
+      data-interactions={JSON.stringify(interactions || [])}
     >
       {content}
       {onOpenExecutionPlan && traceEvents?.some((event) => {
@@ -476,6 +491,23 @@ describe("TaskConversationPanel", () => {
     expect(chatInputProps.current?.onResume).toBe(resumeTaskMock)
   })
 
+  it("does not offer a retained waiting request identity from a different task", () => {
+    appState.taskId = 43
+    appState.currentTask = {
+      id: "42",
+      title: "Previous waiting task",
+      description: "Previous waiting task",
+      status: "waiting_for_user",
+      createdAt: "2026-01-01T00:00:00Z",
+      updatedAt: "2026-01-01T00:00:00Z",
+      waitingRequestId: "inputreq_stale",
+    }
+
+    render(<TaskConversationPanel mode="page" />)
+
+    expect(chatInputProps.current?.currentInteractionRequestId).toBeUndefined()
+  })
+
   it("keeps the composer busy during Session reset and durable delivery", () => {
     appControls.isConversationResetPending = true
     const { rerender } = render(
@@ -528,6 +560,131 @@ describe("TaskConversationPanel", () => {
 
     expect(screen.getByText("Which dataset should I use?")).toBeInTheDocument()
     expect(screen.getByTestId("chat-message")).toHaveAttribute("data-active", "true")
+  })
+
+  it("keeps each rendered clarification bound to its own request id", () => {
+    appState.messages = [
+      {
+        id: "q1",
+        role: "assistant",
+        content: "Which city?",
+        timestamp: "1000",
+        isResult: true,
+        interactions: [{ type: "text_input", field: "city", label: "City" }],
+        interactionRequestId: "inputreq_q1",
+      },
+      {
+        id: "q2",
+        role: "assistant",
+        content: "Which hotel?",
+        timestamp: "2000",
+        isResult: true,
+        interactions: [{ type: "text_input", field: "hotel", label: "Hotel" }],
+        interactionRequestId: "inputreq_q2",
+      },
+    ]
+    appState.traceEvents = []
+    appState.currentTask = {
+      id: "42",
+      title: "Preview",
+      description: "Preview",
+      status: "waiting_for_user",
+      createdAt: "2026-01-01T00:00:00Z",
+      updatedAt: "2026-01-01T00:00:00Z",
+      waitingQuestion: "Which hotel?",
+      waitingRequestId: "inputreq_q2",
+    } as any
+
+    render(<TaskConversationPanel mode="embedded-preview" />)
+
+    const rendered = screen.getAllByTestId("chat-message")
+    expect(rendered[0]).toHaveAttribute("data-request-id", "inputreq_q1")
+    expect(rendered[1]).toHaveAttribute("data-request-id", "inputreq_q2")
+  })
+
+  it("keeps an identified text-only wait separate from stale structured trace interactions", () => {
+    appState.messages = [{
+      id: "user-r2",
+      role: "user",
+      content: "Start the next question",
+      timestamp: 2000,
+    }]
+    appState.traceEvents = [{
+      event_id: "stale-r1",
+      event_type: "agent_message",
+      timestamp: 1000,
+      data: {
+        message: "Choose the old city",
+        expect_response: true,
+        metadata: {
+          interactions: [{
+            type: "select_one",
+            field: "city",
+            label: "City",
+            options: [{ label: "Paris", value: "paris" }],
+          }],
+        },
+      },
+    }]
+    appState.currentTask = {
+      id: "42",
+      title: "Preview",
+      description: "Preview",
+      status: "waiting_for_user",
+      createdAt: "2026-01-01T00:00:00Z",
+      updatedAt: "2026-01-01T00:00:00Z",
+      waitingQuestion: "Type the current answer",
+      waitingRequestId: "inputreq_r2",
+    }
+
+    render(<TaskConversationPanel mode="embedded-preview" />)
+
+    const currentWait = screen.getAllByTestId("chat-message").find(
+      (message) => message.getAttribute("data-request-id") === "inputreq_r2",
+    )
+    expect(currentWait).toHaveAttribute("data-interactions", "[]")
+    expect(chatInputProps.current?.currentInteractionRequestId).toBe("inputreq_r2")
+  })
+
+  it("keeps the historical trace fallback for id-less waiting state", () => {
+    appState.messages = [{
+      id: "user-legacy",
+      role: "user",
+      content: "Start the legacy question",
+      timestamp: 2000,
+    }]
+    appState.traceEvents = [{
+      event_id: "legacy-wait",
+      event_type: "agent_message",
+      timestamp: 1000,
+      data: {
+        message: "Choose a city",
+        expect_response: true,
+        metadata: {
+          interactions: [{ type: "text_input", field: "city", label: "City" }],
+        },
+      },
+    }]
+    appState.currentTask = {
+      id: "42",
+      title: "Legacy preview",
+      description: "Legacy preview",
+      status: "waiting_for_user",
+      createdAt: "2026-01-01T00:00:00Z",
+      updatedAt: "2026-01-01T00:00:00Z",
+      waitingQuestion: "Choose a city",
+    }
+
+    render(<TaskConversationPanel mode="embedded-preview" />)
+
+    const activeWait = screen.getAllByTestId("chat-message").find(
+      (message) => message.getAttribute("data-active") === "true",
+    )
+    expect(activeWait).toHaveAttribute(
+      "data-interactions",
+      JSON.stringify([{ type: "text_input", field: "city", label: "City" }]),
+    )
+    expect(chatInputProps.current?.currentInteractionRequestId).toBeUndefined()
   })
 
   it("shows history loading before waiting-for-user content while history is loading", () => {

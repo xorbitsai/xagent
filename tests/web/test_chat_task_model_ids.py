@@ -1975,6 +1975,7 @@ def test_task_create_seeds_assistant_message(test_db, user1_headers):
         )
         assert len(messages) == 1
         assert messages[0].role == "assistant"
+        assert messages[0].message_type == "assistant_response"
         assert messages[0].content == "Hi — I'm Leo, your Email Lead Response Agent."
     finally:
         db.close()

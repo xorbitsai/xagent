@@ -7,6 +7,9 @@ from typing import TYPE_CHECKING, Any
 from urllib.parse import unquote, urlparse
 
 from ....core.file_ref import parse_file_id_ref
+from ...services.assistant_history_safety import (
+    LEGACY_UNTRUSTED_ASSISTANT_MESSAGE_TYPE,
+)
 
 if TYPE_CHECKING:
     from sqlalchemy.orm import Session
@@ -234,7 +237,7 @@ def persist_telegram_assistant_turn(
     user_id: int,
     content: str,
     interactions: list[dict[str, Any]] | None = None,
-    message_type: str = "assistant_message",
+    message_type: str = LEGACY_UNTRUSTED_ASSISTANT_MESSAGE_TYPE,
 ) -> None:
     """Persist a Telegram assistant turn when it has text or structured prompts."""
     from ...services.chat_history_service import persist_assistant_message

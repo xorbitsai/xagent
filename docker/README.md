@@ -18,7 +18,9 @@ Compose overlays, including sandbox runtime options, live in this directory.
 
 - **Frontend**: Next.js standalone build served by nginx
 - **Backend**: FastAPI with Python 3.11, Node.js 22, Playwright, LibreOffice
-- **PostgreSQL**: PostgreSQL 16 database
+- **PostgreSQL**: PostgreSQL 17 database; the image tag is overridable via `POSTGRES_IMAGE_TAG`
+
+> **Required action on upgrade:** A `postgres_data` volume initialized by PostgreSQL 16 cannot be switched to 17 in place. PostgreSQL 17 refuses to open it and exits, so `postgres` restart-loops and `backend`, `worker`, and `scheduler` never start. Pin `POSTGRES_IMAGE_TAG="16-bookworm"` to defer, then migrate with [PostgreSQL major version upgrade (16 to 17)](#postgresql-major-version-upgrade-16-to-17). Fresh installations are unaffected.
 
 ## Quick Start
 
@@ -248,8 +250,10 @@ overlay defaults `XAGENT_SANDBOX_HOST_PROJECT_ROOT` to the current project root
 and binds `${XAGENT_HOST_STORAGE_ROOT:-/root/.xagent}` to `/root/.xagent`. It
 also passes `XAGENT_SANDBOX_HOST_STORAGE_ROOT` into the backend so sandbox
 workspace mounts under `/root/.xagent` are translated back to the host storage
-path before they reach the host Docker daemon. Override these values when the
-host checkout or storage directory lives elsewhere:
+path before they reach the host Docker daemon. When set,
+`XAGENT_SANDBOX_HOST_STORAGE_ROOT` must be an absolute Docker-host path;
+relative paths and `~` are not supported. Override these values when the host
+checkout or storage directory lives elsewhere:
 
 ```bash
 XAGENT_SANDBOX_HOST_PROJECT_ROOT="$PWD" \
@@ -263,6 +267,20 @@ docker compose \
 In Docker sibling mode, `SANDBOX_VOLUMES` sources are host-side paths. Use
 absolute host paths; relative paths and `~` are rejected instead of being
 expanded inside the backend container.
+
+Sandbox workspace guest paths are reserved below
+`<XAGENT_UPLOADS_DIR>/user_<id>`. A `SANDBOX_VOLUMES` destination or
+`XAGENT_EXTERNAL_UPLOAD_DIRS` mount at that directory or any descendant now
+fails backend readiness, because Docker would let the more-specific bind hide
+the managed workspace. Move shared mounts elsewhere under the uploads root
+(for example `<uploads>/shared`) or mount a suitable ancestor before upgrading.
+
+External-upload symlink aliases authorize the physical directory they resolve
+to. Ordinary aliases are supported, but ambiguous spellings such as
+`symlink/..` are rejected; configure the intended directory directly.
+Xagent creates and owns each `<uploads>/user_<id>` directory as a normal
+directory; replacing one with a symlink or changing that topology while the
+service is running is unsupported.
 
 > **Required action on upgrade:** Every existing deployment with
 > `SANDBOX_ENABLED=true` and `SANDBOX_IMPLEMENTATION=docker` must provide
@@ -540,6 +558,10 @@ Key production variables:
 # Database (set via docker-compose.yml)
 DATABASE_URL="postgresql://xagent:password@postgres:5432/xagent"
 
+# Image tag of the bundled postgres service (default: 17-bookworm).
+# Pin "16-bookworm" for a postgres_data volume that v16 initialized.
+POSTGRES_IMAGE_TAG="17-bookworm"
+
 # Security
 ENCRYPTION_KEY="your-encryption-key"
 ```
@@ -562,6 +584,108 @@ docker compose exec postgres pg_dump -U xagent xagent > backup.sql
 docker compose exec -T postgres psql -U xagent xagent < backup.sql
 ```
 
+### PostgreSQL major version upgrade (16 to 17)
+
+The bundled `postgres` service defaults to `postgres:17-bookworm`. PostgreSQL never upgrades a data directory across major versions: a v17 server refuses to open a v16 directory, exits with `FATAL: database files are incompatible with server`, and restart-loops as `unhealthy`, which blocks `backend`, `worker`, and `scheduler`. It does not modify the directory, so pinning `POSTGRES_IMAGE_TAG="16-bookworm"` restores service at any point.
+
+The steps below are the standard major-version path — dump under v16, initialize a fresh v17 cluster, restore. **This is a general method, not a procedure tuned to your deployment: use the backup and verification process you already trust for this database, and rehearse it against a copy first.** Release-level context is the dated entry in [`docs/deployment.md`](../docs/deployment.md).
+
+> **Data loss warning:** `docker compose down -v` and removing the live `<project>_postgres_data` volume destroy the database irreversibly. Neither is an upgrade step. Removing the separate `_pg16_backup` copy created in step 4 is expected.
+
+> **Sandbox overlays:** keep the `-f docker/docker-compose.sandbox.*.yml` arguments on every Compose command below, or `backend`, `worker`, and `scheduler` come back without the overlay.
+
+Set up. `PGVOL` is the Compose-prefixed volume name — find it with `docker volume ls | grep postgres_data`. Keep `BACKUP` outside the checkout; the dump carries password hashes, OAuth tokens, and encrypted provider credentials.
+
+```bash
+PGVOL=xagent_postgres_data
+BACKUP="$HOME/xagent-pg16-backup.sql"
+unset POSTGRES_IMAGE_TAG   # Compose prefers a shell value over .env
+```
+
+**1. Pin v16 and confirm the deployment is healthy.**
+
+```bash
+printf '\nPOSTGRES_IMAGE_TAG="16-bookworm"\n' >> .env
+docker compose up -d postgres
+docker compose exec postgres psql -U xagent -d xagent -tAc 'SHOW server_version'
+```
+
+**2. Stop the writers**, leaving `postgres` running. `nginx` and `frontend` keep serving errors for the whole window; stop them too if that is unacceptable.
+
+```bash
+docker compose stop backend worker scheduler
+```
+
+**3. Back up and record what you will compare against.** An interrupted `pg_dump` still leaves a plausible-looking file, so check the result.
+
+```bash
+docker compose exec -T postgres pg_dump -U xagent -d xagent > "$BACKUP"
+grep -q 'PostgreSQL database dump complete' "$BACKUP" && echo OK || echo 'INCOMPLETE - do not proceed'
+docker compose exec -T postgres psql -U xagent -d xagent -tAc 'SELECT version_num FROM alembic_version'
+```
+
+**4. Stop the stack and copy the v16 volume**, so rollback never depends on the dump alone. No `-v`; `-t 60` lets Postgres finish its shutdown checkpoint. The destination must be a fresh volume, because `cp -a` merges rather than mirrors.
+
+```bash
+docker compose down -t 60
+docker volume rm "${PGVOL}_pg16_backup" 2>/dev/null   # absent on a first attempt
+docker volume create "${PGVOL}_pg16_backup"
+docker run --rm -v "$PGVOL":/from:ro -v "${PGVOL}_pg16_backup":/to alpine sh -c 'cp -a /from/. /to/'
+docker run --rm -v "${PGVOL}_pg16_backup":/d alpine cat /d/pgdata/PG_VERSION   # expect: 16
+```
+
+**5. Remove the v16 data directory from the live volume.** The guard blocks the destructive command unless the dump completed and the copy really is v16.
+
+```bash
+if grep -q 'PostgreSQL database dump complete' "$BACKUP" \
+   && [ "$(docker run --rm -v "${PGVOL}_pg16_backup":/d alpine cat /d/pgdata/PG_VERSION)" = 16 ]; then
+  docker run --rm -v "$PGVOL":/d alpine sh -c 'rm -rf /d/pgdata'
+else
+  echo 'PRECONDITIONS NOT MET - nothing changed; do not continue'
+fi
+```
+
+**6. Delete the `POSTGRES_IMAGE_TAG` line from `.env`** and start `postgres`, which initializes a fresh v17 cluster. `pg_isready` needs `-h 127.0.0.1`: during initialization the image runs a temporary server on the Unix socket only, which a socket check reports as ready.
+
+```bash
+docker compose up -d postgres
+docker compose exec postgres pg_isready -h 127.0.0.1 -U xagent -d xagent
+```
+
+**7. Restore and verify.** `ON_ERROR_STOP=1` fails loudly instead of leaving a half-populated database.
+
+```bash
+docker compose exec -T postgres psql -U xagent -d xagent -v ON_ERROR_STOP=1 < "$BACKUP"
+docker compose exec -T postgres psql -U xagent -d xagent -tAc 'SHOW server_version'                        # expect: 17.x
+docker compose exec -T postgres psql -U xagent -d xagent -tAc 'SELECT version_num FROM alembic_version'    # expect: the step 3 value
+docker compose exec -T postgres vacuumdb -U xagent --all --analyze-in-stages
+```
+
+Those two queries establish only that the schema arrived. Run whatever proves the *data* arrived for your deployment — row counts on the tables you care about, spot checks against recent records, an application smoke test. `vacuumdb` rebuilds the optimizer statistics that `pg_dump` does not carry across.
+
+**8. Bring the writers back, only after your verification passes.**
+
+```bash
+docker compose up -d
+```
+
+**Rollback — valid only until step 8 restarts the writers.** Until then nothing has written to the v16 copy from step 4. Confirm it exists and really is v16 *before* removing anything: `docker run -v` creates a named volume that does not exist, so an unchecked copy-back from a missing volume restores nothing over a directory it has already deleted.
+
+```bash
+docker compose down -t 60
+if docker volume inspect "${PGVOL}_pg16_backup" >/dev/null 2>&1 \
+   && [ "$(docker run --rm -v "${PGVOL}_pg16_backup":/d alpine cat /d/pgdata/PG_VERSION)" = 16 ]; then
+  docker run --rm -v "$PGVOL":/d alpine sh -c 'rm -rf /d/pgdata'
+  docker run --rm -v "${PGVOL}_pg16_backup":/from:ro -v "$PGVOL":/to alpine sh -c 'cp -a /from/. /to/'
+  printf '\nPOSTGRES_IMAGE_TAG="16-bookworm"\n' >> .env
+  docker compose up -d
+else
+  echo "BACKUP VOLUME MISSING OR NOT v16 - live data untouched; restore from $BACKUP instead"
+fi
+```
+
+After v17 accepts writes the copy is stale, and copying it back discards everything written since the cutover; recovery from that point means a fresh v17 backup plus reconciliation. Keep the copy while you are still deciding whether the upgrade held, then remove it with `docker volume rm "${PGVOL}_pg16_backup"`.
+
 ## Troubleshooting
 
 ### Container Won't Start
@@ -583,6 +707,24 @@ docker compose exec postgres pg_isready -U xagent
 # Check database logs
 docker compose logs postgres
 ```
+
+### PostgreSQL Won't Start After an Upgrade
+
+`docker compose ps` reports `postgres` as `restarting` and `unhealthy`, and `backend`, `worker`, and `scheduler` never start because they wait for `service_healthy`. A data directory initialized by an older major version produces this in `docker compose logs postgres`:
+
+```
+FATAL:  database files are incompatible with server
+DETAIL:  The data directory was initialized by PostgreSQL version 16, which is not compatible with this version 17.11 (Debian 17.11-1.pgdg12+2).
+```
+
+PostgreSQL 17 refuses to open the directory rather than modifying it, so the v16 data is intact. Pin the previous major version to restore service immediately, then upgrade deliberately using [PostgreSQL major version upgrade (16 to 17)](#postgresql-major-version-upgrade-16-to-17).
+
+```bash
+printf '\nPOSTGRES_IMAGE_TAG="16-bookworm"\n' >> .env
+docker compose up -d postgres
+```
+
+If `postgres` still starts on 17 after this, a `POSTGRES_IMAGE_TAG` exported in the shell is overriding `.env`; `unset` it and retry.
 
 ### Rebuild After Code Changes
 

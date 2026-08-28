@@ -660,6 +660,8 @@ class PatternRuntime:
             "visible": visible,
             "metadata": outbound_metadata,
         }
+        if expect_response or message_type == "question":
+            payload["event_id"] = str(uuid4())
         if step_id:
             payload["step_id"] = str(step_id)
         self.outbound_messages.append(payload)

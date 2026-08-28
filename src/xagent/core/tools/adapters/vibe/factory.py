@@ -10,6 +10,7 @@ and configuration management.
 import logging
 from collections import Counter
 from collections.abc import Callable, Iterable, Mapping
+from pathlib import Path
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -166,6 +167,7 @@ class ToolRegistry:
                 audio_tool,
                 basic_tools,
                 browser_tools,
+                current_time_tool,
                 custom_api_factory,
                 file_ingestion_tool,
                 image_tool,
@@ -195,6 +197,11 @@ class ToolRegistry:
         spec: ToolSelectionSpec | None,
         selection_gate: str | None,
     ) -> bool:
+        if selection_gate == "intrinsic":
+            # Always-available tool: assemble for every non-NONE spec, but an
+            # explicit zero-tools agent still gets nothing.
+            return spec is None or not spec.is_none()
+
         if spec is None or declared_cats is None or spec.categories is None:
             return True
 
@@ -763,12 +770,44 @@ class ToolFactory:
             if workspace is None:
                 workspace = ToolFactory.create_workspace(config.get_workspace_config())
             if workspace is not None:
-                from .sandboxed_tool.sandboxed_tool_wrapper import (
-                    create_workspace_in_sandbox,
+                directories = workspace.get_allowed_dirs()
+                # Mount coverage is sufficient only when the backend-side
+                # directories already exist. TaskWorkspace creates them in
+                # its constructor; MockWorkspace deliberately does not, so it
+                # must retain the historical in-sandbox mkdir fallback.
+                directories_exist_on_backend_storage = all(
+                    Path(directory).is_dir() for directory in directories
                 )
+                # Resolve on the concrete type: getattr(instance, ...) against
+                # unittest.mock.Mock auto-creates an attribute and would make
+                # an unimplemented capability look present. Instance-only
+                # duck-typed capabilities intentionally keep the safe fallback.
+                host_mount_check = getattr(
+                    type(sandbox), "workspace_dirs_are_host_mounted", None
+                )
+                workspace_is_host_mounted = False
+                if directories_exist_on_backend_storage and callable(host_mount_check):
+                    try:
+                        workspace_is_host_mounted = (
+                            host_mount_check(sandbox, directories) is True
+                        )
+                    except Exception:
+                        # This is an optimization probe. If it cannot prove
+                        # coverage, preserve the pre-optimization behavior
+                        # instead of failing task/tool creation.
+                        logger.warning(
+                            "Workspace host-mount coverage check failed; "
+                            "falling back to sandbox directory setup",
+                            exc_info=True,
+                        )
+                if not workspace_is_host_mounted:
+                    from .sandboxed_tool.sandboxed_tool_wrapper import (
+                        create_workspace_in_sandbox,
+                        resolve_primary_sandbox,
+                    )
 
-                setup_sandbox = getattr(sandbox, "primary_sandbox", sandbox)
-                await create_workspace_in_sandbox(setup_sandbox, workspace)
+                    setup_sandbox = resolve_primary_sandbox(sandbox)
+                    await create_workspace_in_sandbox(setup_sandbox, workspace)
             tools = await ToolFactory._wrap_sandbox_tools(tools, sandbox)
 
         # Apply output filtering to all tools

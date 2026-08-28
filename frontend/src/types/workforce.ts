@@ -199,6 +199,7 @@ export interface WorkforceRunPayload {
   execution_mode?: string | null
   is_preview?: boolean
   is_visible?: boolean
+  timezone?: string
 }
 
 export interface WorkforceRunResponse {
@@ -220,6 +221,7 @@ export interface WorkforcePreviewRunPayload {
   message: string
   files?: string[]
   execution_mode?: string | null
+  timezone?: string
 }
 
 export interface WorkforceShareLink {

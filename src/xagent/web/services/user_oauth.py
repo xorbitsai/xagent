@@ -10,6 +10,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 from typing import Any
 
+from sqlalchemy import and_
 from sqlalchemy.orm import Query, Session
 from sqlalchemy.sql.elements import ColumnElement
 
@@ -17,6 +18,8 @@ from ..models.user_oauth import (
     USER_OAUTH_RESOURCE_OWNER_KEY_MAX_LENGTH,
     UserOAuth,
 )
+
+GMAIL_OAUTH_PROVIDER = "gmail"
 
 
 def normalize_user_oauth_resource_owner_key(value: Any) -> str | None:
@@ -44,6 +47,25 @@ def user_oauth_owner_clause(
     if owner_key is None:
         return UserOAuth.resource_owner_key.is_(None)
     return UserOAuth.resource_owner_key == owner_key
+
+
+def ordinary_gmail_clause() -> ColumnElement[bool]:
+    """Build the ordinary-Gmail conditions for a direct ``UserOAuth`` query.
+
+    Queries based on ``scoped_user_oauth_query(..., resource_owner_key=None)``
+    must also filter ``UserOAuth.provider`` to Gmail.
+    """
+    return and_(
+        UserOAuth.provider == GMAIL_OAUTH_PROVIDER,
+        user_oauth_owner_clause(None),
+    )
+
+
+def is_ordinary_gmail(account: UserOAuth) -> bool:
+    """Return whether a loaded credential is an ordinary Gmail credential."""
+    return bool(
+        account.provider == GMAIL_OAUTH_PROVIDER and account.resource_owner_key is None
+    )
 
 
 def scoped_user_oauth_query(

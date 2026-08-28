@@ -872,10 +872,12 @@ def _replay_or_raise_closed(
     snapshots of the same waiting turn, and the fields that could
     disagree cannot. The one key derivation that exists today,
     ``clarification_idempotency_key`` (``task_clarification_draft.py``),
-    honours this by hashing only ``ClarificationDraft.turn_marker``, which
-    is composed from the turn's message count, origin step and ordered
-    pending-request ids and from nothing else -- deliberately not from the
-    message text, so reshaping the payload cannot move the key.
+    honours this by reusing ``ClarificationDraft.event_id``. The runtime
+    allocates that identity before publishing the question and carries it
+    through the waiting checkpoint; ``turn_marker`` is descriptive checkpoint
+    state only. The request payload carries the same event id as correlation
+    metadata, but staging receives it separately as the idempotency key and
+    never extracts or normalizes identity from the payload.
 
     This is the obligation any future key derivation inherits. A key
     derived from anything that can change while the waiting turn stays the
@@ -981,9 +983,13 @@ def stage_interaction_request(
     call's pre-read and its own INSERT. Under REPEATABLE READ or
     SERIALIZABLE the re-read reuses this transaction's original snapshot,
     does not see that row, and classifies a legitimate replay as
-    ``InteractionSlotTaken`` -- measured on PostgreSQL 16 at both levels.
-    That is a degradation, not a corruption: ``InteractionSlotTaken`` is
-    swallowed, so the caller's turn survives and the question is lost.
+    ``InteractionSlotTaken`` at both levels: a query in such a
+    transaction sees a snapshot as of the start of the transaction's
+    first non-transaction-control statement rather than of the current
+    statement, so the re-read cannot see a row committed after that
+    point. That is a degradation, not a corruption:
+    ``InteractionSlotTaken`` is swallowed, so the caller's turn survives
+    and the question is lost.
     READ COMMITTED is PostgreSQL's default and this codebase sets no
     ``isolation_level`` on its engine. Both halves of that are asserted,
     not assumed: one test reads the server's effective

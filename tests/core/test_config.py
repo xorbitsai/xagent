@@ -102,6 +102,7 @@ from xagent.config import (
     TASK_LEASE_TTL_SECONDS,
     TASK_RUNTIME_HOOK_MAX_WORKERS,
     TASK_RUNTIME_HOOK_QUEUE_TIMEOUT_SECONDS,
+    TEMP_FILE_CLEANUP_SHUTDOWN_TIMEOUT_SECONDS,
     TRIGGER_DISPATCHER_BATCH_SIZE,
     TRIGGER_DISPATCHER_ENABLED,
     TRIGGER_DISPATCHER_INTERVAL_SECONDS,
@@ -113,6 +114,7 @@ from xagent.config import (
     WEB_CRAWL_TLS_IMPERSONATE,
     WEB_DIR,
     WEB_SEARCH_PROVIDER,
+    ExternalUploadsDirConfigurationError,
     format_file_size,
     get_agent_pattern_for_execution_mode,
     get_agent_runtime,
@@ -206,6 +208,7 @@ from xagent.config import (
     get_task_lease_recovery_interval_seconds,
     get_task_runtime_hook_max_workers,
     get_task_runtime_hook_queue_timeout_seconds,
+    get_temp_file_cleanup_shutdown_timeout_seconds,
     get_trigger_dispatcher_batch_size,
     get_trigger_dispatcher_enabled,
     get_trigger_dispatcher_interval_seconds,
@@ -741,6 +744,28 @@ class TestCeleryBackgroundJobConfig:
         assert get_uploaded_file_recovery_stale_seconds() == 300
         assert get_uploaded_file_recovery_batch_size() == 100
 
+    def test_temp_file_cleanup_shutdown_timeout_tuning(self, monkeypatch):
+        assert (
+            TEMP_FILE_CLEANUP_SHUTDOWN_TIMEOUT_SECONDS
+            == "XAGENT_TEMP_FILE_CLEANUP_SHUTDOWN_TIMEOUT_SECONDS"
+        )
+
+        monkeypatch.delenv(TEMP_FILE_CLEANUP_SHUTDOWN_TIMEOUT_SECONDS, raising=False)
+        assert get_temp_file_cleanup_shutdown_timeout_seconds() == 10
+
+        monkeypatch.setenv(TEMP_FILE_CLEANUP_SHUTDOWN_TIMEOUT_SECONDS, "45")
+        assert get_temp_file_cleanup_shutdown_timeout_seconds() == 45
+
+        # Invalid / non-positive values fall back to the default.
+        monkeypatch.setenv(TEMP_FILE_CLEANUP_SHUTDOWN_TIMEOUT_SECONDS, "0")
+        assert get_temp_file_cleanup_shutdown_timeout_seconds() == 10
+
+        monkeypatch.setenv(TEMP_FILE_CLEANUP_SHUTDOWN_TIMEOUT_SECONDS, "abc")
+        assert get_temp_file_cleanup_shutdown_timeout_seconds() == 10
+
+        monkeypatch.setenv(TEMP_FILE_CLEANUP_SHUTDOWN_TIMEOUT_SECONDS, "-5")
+        assert get_temp_file_cleanup_shutdown_timeout_seconds() == 10
+
 
 class TestGetWebSearchProvider:
     """Test get_web_search_provider() function."""
@@ -1208,6 +1233,47 @@ class TestGetExternalUploadDirs:
             assert len(result) == 2
             assert dir1 in result
             assert dir2 in result
+
+    def test_expands_environment_tilde_and_preserves_symlink_spelling(
+        self, tmp_path, monkeypatch
+    ):
+        physical = tmp_path / "physical" / "uploads"
+        physical.mkdir(parents=True)
+        alias = tmp_path / "alias"
+        alias.symlink_to(physical, target_is_directory=True)
+        monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.setenv("EXTERNAL_NAME", "alias")
+        monkeypatch.setenv(EXTERNAL_UPLOAD_DIRS, "~/$EXTERNAL_NAME")
+
+        assert get_external_upload_dirs() == [alias]
+
+    def test_rejects_symlink_followed_by_dotdot(self, tmp_path, monkeypatch):
+        base = tmp_path / "base"
+        outside = tmp_path / "outside" / "nested"
+        base.mkdir()
+        outside.mkdir(parents=True)
+        (base / "link").symlink_to(outside, target_is_directory=True)
+        monkeypatch.setenv(EXTERNAL_UPLOAD_DIRS, str(base / "link" / ".."))
+
+        with pytest.raises(ExternalUploadsDirConfigurationError, match="two different"):
+            get_external_upload_dirs()
+
+    def test_relative_dir_is_pinned_to_first_working_directory(
+        self, tmp_path, monkeypatch
+    ):
+        first_cwd = tmp_path / "first"
+        second_cwd = tmp_path / "second"
+        external = first_cwd / "relative-external"
+        external.mkdir(parents=True)
+        second_cwd.mkdir()
+        relative_spelling = "relative-external"
+        monkeypatch.setenv(EXTERNAL_UPLOAD_DIRS, relative_spelling)
+
+        monkeypatch.chdir(first_cwd)
+        assert get_external_upload_dirs() == [external]
+
+        monkeypatch.chdir(second_cwd)
+        assert get_external_upload_dirs() == [external]
 
 
 class TestGetExternalSkillsDirs:

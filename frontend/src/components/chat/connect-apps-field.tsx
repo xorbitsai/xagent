@@ -34,6 +34,8 @@ export const PROVIDER_DISPLAY_NAMES: Record<string, string> = {
   github: "GitHub",
   linear: "Linear",
   jira: "Jira",
+  salesforce: "Salesforce",
+  deputy: "Deputy",
 };
 
 // connectingKeys/connectingKeysRef below hold both of these kinds of key in

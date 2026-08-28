@@ -186,6 +186,43 @@ def _manager_agent_id(workforce_id: int) -> int:
 # ===== POST /v1/workforces/{id}/runs =====
 
 
+def test_create_run_forwards_timezone_to_the_opening_turn(mock_schedule_bg):
+    """The workforce SDK opener starts its turn inside this HTTP request and
+    has no websocket, so the create body is its only way to declare a zone."""
+    headers = _admin_headers()
+    workforce_id = _create_active_workforce(headers)
+    full_key = _create_workforce_key(headers, workforce_id)
+
+    resp = client.post(
+        f"/v1/workforces/{workforce_id}/runs",
+        headers=_bearer(full_key),
+        json={
+            "message": {"role": "user", "content": "how many shifts tomorrow?"},
+            "timezone": "Australia/Melbourne",
+        },
+    )
+
+    assert resp.status_code == 202, resp.text
+    assert mock_schedule_bg.call_args.kwargs["context"] == {
+        "timezone": "Australia/Melbourne"
+    }
+
+
+def test_create_run_without_timezone_sends_no_context(mock_schedule_bg):
+    headers = _admin_headers()
+    workforce_id = _create_active_workforce(headers)
+    full_key = _create_workforce_key(headers, workforce_id)
+
+    resp = client.post(
+        f"/v1/workforces/{workforce_id}/runs",
+        headers=_bearer(full_key),
+        json={"message": {"role": "user", "content": "coordinate the work"}},
+    )
+
+    assert resp.status_code == 202, resp.text
+    assert mock_schedule_bg.call_args.kwargs["context"] is None
+
+
 def test_create_run_happy_path():
     headers = _admin_headers()
     workforce_id = _create_active_workforce(headers)

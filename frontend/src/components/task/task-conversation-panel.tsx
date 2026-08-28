@@ -56,6 +56,7 @@ type CombinedItem = {
   isStreamingFinalAnswer?: boolean
   traceEvents?: any[]
   interactions?: any[]
+  interactionRequestId?: string
   showEmptyStatus?: boolean
   processStatus?: string
   timelineOrder?: number
@@ -122,10 +123,13 @@ const isWorkforceAgentToolTraceEvent = (event: unknown): boolean => {
   return isAgentDelegationToolName(toolName)
 }
 
-// Combined (not two independent scans): the prompt text and its
-// interactions must come from the SAME pause event, or a plain-text
-// question that happens to follow an older connect_apps-carrying pause in
-// trace history gets its interactions list from that unrelated older event
+// message and interactions each resolve independently against currentTask
+// first (one field being intentionally absent - e.g. a generic
+// connect_apps placeholder has no waitingQuestion - must not suppress the
+// OTHER field's own resolution). Only once BOTH still need a trace-event
+// fallback do they get pulled from the SAME event: two independent scans
+// would let a plain-text question that follows an older connect_apps pause
+// in trace history pick up that unrelated older event's interactions
 // instead of correctly having none.
 export const findWaitingPromptAndInteractions = (
   currentTask: any,
@@ -134,38 +138,63 @@ export const findWaitingPromptAndInteractions = (
   if (currentTask?.status !== "waiting_for_user") {
     return { message: null, interactions: undefined }
   }
-  if (currentTask.waitingQuestion || currentTask.waitingInteractions?.length) {
-    return {
-      message: currentTask.waitingQuestion || null,
-      interactions: currentTask.waitingInteractions?.length ? currentTask.waitingInteractions : undefined,
-    }
+
+  const taskMessage: string | null = currentTask.waitingQuestion || null
+  let taskInteractions: any[] | undefined
+  let interactionsFromTask = false
+  if (currentTask.waitingRequestId) {
+    taskInteractions = currentTask.waitingInteractions?.length ? currentTask.waitingInteractions : undefined
+    interactionsFromTask = true
+  } else if (currentTask.waitingInteractions?.length) {
+    taskInteractions = currentTask.waitingInteractions
+    interactionsFromTask = true
+  }
+
+  const needMessage = taskMessage === null
+  const needInteractions = !interactionsFromTask
+  if (!needMessage && !needInteractions) {
+    return { message: taskMessage, interactions: taskInteractions }
   }
 
   for (let i = traceEvents.length - 1; i >= 0; i--) {
     const event = traceEvents[i]
+    let hasMessage = false
+    let eventMessage: string | null = null
+    let hasInteractions = false
+    let eventInteractions: any[] | undefined
     if (event.event_type === "agent_message" && event.data?.expect_response === true) {
       const message = event.data?.message || event.data?.content
       const interactions = event.data?.metadata?.interactions
-      if ((typeof message === "string" && message.trim()) || (Array.isArray(interactions) && interactions.length > 0)) {
-        return {
-          message: typeof message === "string" && message.trim() ? message : null,
-          interactions: Array.isArray(interactions) && interactions.length > 0 ? interactions : undefined,
-        }
-      }
-    }
-    if (event.event_type === "react_task_end" && event.data?.result?.status === "waiting_for_user") {
+      hasMessage = typeof message === "string" && Boolean(message.trim())
+      eventMessage = hasMessage ? message : null
+      hasInteractions = Array.isArray(interactions) && interactions.length > 0
+      eventInteractions = hasInteractions ? interactions : undefined
+    } else if (event.event_type === "react_task_end" && event.data?.result?.status === "waiting_for_user") {
       const result = event.data.result
-      const interactions = result?.interactions
-      if ((typeof result.message === "string" && result.message.trim()) || (Array.isArray(interactions) && interactions.length > 0)) {
-        return {
-          message: typeof result.message === "string" && result.message.trim() ? result.message : null,
-          interactions: Array.isArray(interactions) && interactions.length > 0 ? interactions : undefined,
-        }
+      hasMessage = typeof result.message === "string" && Boolean(result.message.trim())
+      eventMessage = hasMessage ? result.message : null
+      hasInteractions = Array.isArray(result.interactions) && result.interactions.length > 0
+      eventInteractions = hasInteractions ? result.interactions : undefined
+    } else {
+      continue
+    }
+
+    if (needMessage && needInteractions) {
+      if (hasMessage || hasInteractions) {
+        return { message: eventMessage, interactions: eventInteractions }
+      }
+    } else if (needMessage) {
+      if (hasMessage) {
+        return { message: eventMessage, interactions: taskInteractions }
+      }
+    } else if (needInteractions) {
+      if (hasInteractions) {
+        return { message: taskMessage, interactions: eventInteractions }
       }
     }
   }
 
-  return { message: null, interactions: undefined }
+  return { message: taskMessage, interactions: taskInteractions }
 }
 
 export function TaskConversationPanel({
@@ -287,6 +316,7 @@ export function TaskConversationPanel({
             (event: unknown) => !shouldHideWorkforceInternalTrace(event),
           ),
           interactions: message.interactions,
+          interactionRequestId: message.interactionRequestId,
           isSystemNotice: message.isSystemNotice,
         }
       })
@@ -767,6 +797,7 @@ export function TaskConversationPanel({
                         }
                         timestamp={item.timestamp}
                         interactions={item.interactions}
+                        interactionRequestId={item.interactionRequestId}
                         interactionsActive={item.id === activeWaitingMessageId}
                         showEmptyStatus={item.showEmptyStatus}
                         contextBadges={item.role === "user" ? userMessageContextBadges : undefined}
@@ -793,6 +824,7 @@ export function TaskConversationPanel({
                       processStatus={state.currentTask?.status}
                       taskStatus={state.currentTask?.status}
                       interactions={state.currentTask?.status === "waiting_for_user" ? waitingInteractions : undefined}
+                      interactionRequestId={state.currentTask?.status === "waiting_for_user" ? state.currentTask.waitingRequestId : undefined}
                       interactionsActive={state.currentTask?.status === "waiting_for_user"}
                       onOpenExecutionPlan={showDagPreview ? openDagPreview : undefined}
                       onAgentExecutionClick={onAgentExecutionClick}
@@ -838,6 +870,12 @@ export function TaskConversationPanel({
 
             <ChatInput
               onSend={handleSend}
+              currentInteractionRequestId={
+                state.currentTask?.status === "waiting_for_user" &&
+                state.currentTask.id === String(state.taskId)
+                  ? state.currentTask.waitingRequestId
+                  : undefined
+              }
               isLoading={
                 state.isProcessing
                 || isConversationResetPending

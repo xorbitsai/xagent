@@ -213,6 +213,54 @@ describe("widget session mode", () => {
     })
   })
 
+  it("passes data-timezone to the session iframe", () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse(200, exchangeBody()))
+
+    runWidget({ "data-encrypted-context": GRANT, "data-timezone": "Australia/Perth" })
+
+    expect(iframeEl()?.src).toBe(`${HOST}/widget/chat/session?timezone=Australia%2FPerth`)
+  })
+
+  it("appends data-timezone to the guest iframe URL that already has a query", async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse(200, { ticket: "t", agent_id: 17 }))
+
+    runWidget({ "data-widget-key": "widget-secret", "data-timezone": "Australia/Perth" })
+
+    await vi.waitFor(() => {
+      expect(iframeEl()?.src).toContain("&timezone=Australia%2FPerth")
+    })
+    expect(iframeEl()?.src).toContain("?guest_id=")
+  })
+
+  it("leaves the iframe URL untouched for a blank data-timezone", () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse(200, exchangeBody()))
+
+    runWidget({ "data-encrypted-context": GRANT, "data-timezone": "   " })
+
+    expect(iframeEl()?.src).toBe(`${HOST}/widget/chat/session`)
+  })
+
+  it("still loads the session iframe when data-timezone is malformed", () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse(200, exchangeBody()))
+
+    // A lone surrogate makes encodeURIComponent throw; the widget must fall
+    // back to a plain iframe URL rather than never assigning src.
+    runWidget({ "data-encrypted-context": GRANT, "data-timezone": "\uD800" })
+
+    expect(iframeEl()?.src).toBe(`${HOST}/widget/chat/session`)
+  })
+
+  it("still loads the guest iframe when data-timezone is malformed", async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse(200, { ticket: "t", agent_id: 17 }))
+
+    runWidget({ "data-widget-key": "widget-secret", "data-timezone": "\uD800" })
+
+    await vi.waitFor(() => {
+      expect(iframeEl()?.src).toContain("/widget/chat/default")
+    })
+    expect(iframeEl()?.src).not.toContain("timezone=")
+  })
+
   it("navigates the iframe to the session URL and exchanges the grant immediately", () => {
     fetchMock.mockResolvedValueOnce(jsonResponse(200, exchangeBody()))
     const observeSpy = vi.spyOn(MutationObserver.prototype, "observe")
@@ -220,7 +268,21 @@ describe("widget session mode", () => {
     runWidget({ "data-encrypted-context": GRANT })
 
     expect(iframeEl()?.src).toBe(`${HOST}/widget/chat/session`)
-    expect(observeSpy).toHaveBeenCalledWith(document.body, { childList: true, subtree: true })
+    // Two MutationObservers now exist in session mode: the widget's own
+    // panel-removal teardown (armed before mode.attach runs) and this
+    // controller's iframe-connectivity one, both on document.documentElement
+    // with the same options -- so "was called with these args" alone no
+    // longer pins this controller's own observer specifically. Assert every
+    // observe() call has the expected target/options, so a regression in
+    // either one (e.g. this controller's own observer losing `subtree`, or
+    // reverting to document.body -- which misses a host framework replacing
+    // <body> wholesale on navigation) still fails here instead of being
+    // masked by the other happening to be correct.
+    expect(observeSpy).toHaveBeenCalledTimes(2)
+    observeSpy.mock.calls.forEach(([target, options]) => {
+      expect(target).toBe(document.documentElement)
+      expect(options).toEqual({ childList: true, subtree: true })
+    })
     expect(fetchMock).toHaveBeenCalledTimes(1)
     expect(fetchMock).toHaveBeenCalledWith(EXCHANGE_URL, expect.objectContaining({
       method: "POST",

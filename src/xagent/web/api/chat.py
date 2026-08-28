@@ -78,6 +78,7 @@ from ..services.agent_team_scope import (
     owned_agent_clause,
     resolve_authorized_agent,
 )
+from ..services.assistant_history_safety import ASSISTANT_RESPONSE_MESSAGE_TYPE
 from ..services.chat_history_service import (
     load_task_transcript,
     persist_assistant_message_no_commit,
@@ -138,6 +139,7 @@ from ..services.task_setup_snapshot import (
     RuntimeUserFields,
     TaskOwnerMismatchError,
     TaskSetupSnapshot,
+    detach_runtime_user_fields,
     load_task_setup_snapshot_sync,
 )
 from ..services.workforce_runtime import (
@@ -640,6 +642,7 @@ async def create_default_tools(
 
     # Create a WebToolConfig to properly initialize tools
     from ..tools.config import WebToolConfig
+    from .agents import voice_from_runtime_user
 
     db_factory = None
     if db is None:
@@ -700,6 +703,7 @@ async def create_default_tools(
         parent_task_id=parent_task_id,
         parent_tracer=parent_tracer,
         agent_call_stack=agent_call_stack,
+        voice=voice_from_runtime_user(user),
         connector_runtime_turn_id=connector_runtime_turn_id,
         mcp_failure_policy=mcp_failure_policy,
         mcp_load_summary_tracer=mcp_load_summary_tracer,
@@ -1252,6 +1256,14 @@ async def _load_task_setup_snapshot_for_agent(
     return await _run_agent_runtime_db_io(
         caller_db, lambda: load_task_setup_snapshot_sync(task_id, task_owner_user_id)
     )
+
+
+# invalidate_cached_agents_for_owner's bound on acquiring a per-task build
+# lock it finds merely locked()-false-but-FIFO-queued (see that method's
+# docstring) - short enough to never reintroduce the multi-second stall a
+# genuinely busy lock would cause, long enough to cover ordinary event-loop
+# scheduling jitter for a waiter that's about to resume.
+_INVALIDATION_LOCK_ACQUIRE_TIMEOUT = 0.05
 
 
 class AgentServiceManager:
@@ -2027,7 +2039,7 @@ class AgentServiceManager:
             agent_config, workforce_runtime, task_id=task_id
         )
         workspace_owner_id = int(task.user_id)
-        # Actor-logical access policy + CA-physical mount intent, built by
+        # Actor-logical access policy + CA mount intent, built by
         # the single shared projection (see build_chat_workspace_binding's
         # docstring for the covered/covering/disjoint folding it applies).
         workspace_binding = build_chat_workspace_binding(workspace_owner_id, scope)
@@ -2216,6 +2228,24 @@ class AgentServiceManager:
             and (user is None or user.id is None or int(user.id) != runtime_user_id)
         ):
             runtime_user = db.query(User).filter(User.id == runtime_user_id).first()
+        # Detach immediately, whatever the source (the passthrough `user`
+        # default above, or the fresh query just above): the very next
+        # statement below can release `db` (resolve_execution_scope via
+        # _run_agent_runtime_db_io, whose first action is
+        # release_db_connection_if_clean - see _run_agent_runtime_caller_
+        # session), which unconditionally expires every object loaded
+        # through it. A live User surviving past that point would turn
+        # a later attribute read (e.g. voice_from_runtime_user) into an
+        # implicit reload on the event loop - detaching here is the
+        # first point where it's possible: no session-releasing call ran
+        # between `runtime_user` being resolved above and here (an
+        # earlier one, for the cache-miss snapshot load, only runs
+        # before `runtime_user` exists at all, and re-checks out a fresh
+        # connection for the query above regardless). Detaching later,
+        # inside a failure branch after a release already ran, is too
+        # late to help (the row is already expired by then).
+        if isinstance(runtime_user, User):
+            runtime_user = detach_runtime_user_fields(runtime_user)
 
         # One turn resolves once. Orchestrated execute/resume callers pass the
         # resolved value explicitly, including ``None`` for an intentionally
@@ -2654,7 +2684,7 @@ class AgentServiceManager:
                     raise ValueError(f"Task {task_id} has no resolved owner")
                 workspace_owner_id = int(runtime_user_id)
                 scope_segments = scope.workspace_segments if scope is not None else ()
-                # Actor-logical access policy + CA-physical mount intent,
+                # Actor-logical access policy + CA mount intent,
                 # built by the single shared projection (see
                 # build_chat_workspace_binding's docstring for the
                 # covered/covering/disjoint folding it applies).
@@ -2766,7 +2796,11 @@ class AgentServiceManager:
                     tools_list, tool_config = tools
 
                     # Get system prompt from agent config (if available)
-                    from .agents import enhance_system_prompt_with_kb
+                    from .agents import (
+                        apply_user_voice,
+                        enhance_system_prompt_with_kb,
+                        voice_from_runtime_user,
+                    )
 
                     system_prompt = (
                         agent_config.get("instructions") if agent_config else None
@@ -2779,6 +2813,13 @@ class AgentServiceManager:
                     )
                     system_prompt = _build_workforce_system_prompt(
                         system_prompt, workforce_runtime
+                    )
+                    # `runtime_user` (not a fresh query) - see
+                    # apply_user_voice's docstring for why: this session may
+                    # already be released back to the pool by this point
+                    # (release_db_connection_if_clean above).
+                    system_prompt = apply_user_voice(
+                        system_prompt, voice_from_runtime_user(runtime_user)
                     )
 
                     # Extract memory similarity threshold from agent config
@@ -2866,7 +2907,14 @@ class AgentServiceManager:
                     await self._load_persisted_execution_context(task_id, db)
 
             except Exception as e:
-                logger.error(f"Failed to create AgentService for task {task_id}: {e}")
+                # ``exc_info`` because this arm absorbs any wrapped fault --
+                # a durable-storage one from attachment restore included --
+                # whose provider cause lives only in ``__cause__`` (#1467).
+                # It re-raises, so nothing but the log line changes.
+                logger.error(
+                    f"Failed to create AgentService for task {task_id}: {e}",
+                    exc_info=True,
+                )
                 # Re-raise the exception - no fallback logic allowed
                 raise
 
@@ -2939,6 +2987,133 @@ class AgentServiceManager:
                 "Refreshing tools for task %s: execution scope advanced", task_id
             )
             agent.invalidate_tools()
+
+    async def invalidate_cached_agents_for_owner(self, owner_user_id: int) -> None:
+        """Evict every cached AgentService owned by ``owner_user_id`` that
+        is not currently mid-execution.
+
+        A cached AgentService bakes its system prompt in at construction
+        time (``AgentService.__init__`` -> ``self._base_system_prompt``)
+        and the cache-hit path only re-checks owner/scope invariants, not
+        preferences - so a voice PATCH would otherwise be silently ignored
+        by every already-warm task until incidental eviction/rebuild.
+        Call this right after committing a voice change so the next turn
+        on each affected task rebuilds from a fresh snapshot instead.
+
+        Two races this must not create, both found by review on the first
+        version of this method:
+
+        - Popping a task's AgentService while it has an in-flight
+          execution orphans that execution - the next live-control call
+          (stop/interrupt/message) builds a *new* AgentService with an
+          empty execution registry, disconnected from the real run
+          (get_agent_for_task/_get_agent_for_task_unlocked). Guarded by
+          checking get_execution_status before evicting: is_running or
+          is_resumable (paused/waiting-for-user, which still holds the
+          slot for a resume) means this task's eviction is deferred, not
+          forced - the same tolerance for eventual (not immediate) cache
+          consistency already accepted for the cross-process case tracked
+          in issue #1639.
+        - Racing a concurrent build (get_agent_for_task, guarded by
+          _agent_build_locks) is not just "which one goes first": a build
+          already past its old-voice prompt construction has nothing left
+          for a same-moment pop to invalidate, and would then overwrite
+          this eviction with the stale-voice result the instant it
+          finishes. Checking the same per-task lock's locked() before
+          deciding this task's fate detects the common case of that race
+          without blocking on it: a build already in flight (sandbox
+          startup, remote MCP init - multi-second work) would otherwise
+          serialize every one of this owner's *other* concurrent tasks'
+          invalidation behind it with no timeout, turning one voice PATCH
+          into a multi-second stall. locked() alone isn't quite enough,
+          though: asyncio.Lock is FIFO-fair, so a second get_agent_for_task
+          call already queued behind an in-flight build for the *same*
+          task_id can leave locked() briefly False the instant the first
+          build releases, while acquire() still queues behind that second
+          waiter rather than taking the fast path - an unbounded `async
+          with lock` here would then block for that waiter's own build
+          duration too. Bounding the acquire itself with a short timeout
+          closes that gap without reintroducing the original stall: on a
+          genuinely free lock the acquire is immediate (well under the
+          bound); on a busy one - contended or merely FIFO-queued - it
+          defers, same as the locked() check catches directly. A busy/
+          timed-out lock defers this task's eviction, the same tolerance-
+          for-eventual-consistency already used for an in-flight execution
+          above - a later voice PATCH from the same user, or an unrelated
+          eviction (task removal, owner/scope change), still catches the
+          stale-voice result once the build finishes; absent either of
+          those, it persists for the cached instance's remaining lifetime.
+
+        Mirrors the scope-fingerprint-mismatch eviction above: the
+        workspace is deliberately NOT cleaned up here (same owner, same
+        on-disk data must survive the rebuild) - only the manager's cache
+        bookkeeping is cleared, and only for tasks actually evicted.
+        """
+        stale_task_ids = [
+            task_id
+            for task_id, cached_owner_id in self._agent_owner_ids.items()
+            if cached_owner_id == owner_user_id
+        ]
+        evicted_task_ids: List[int] = []
+        deferred_task_ids: List[int] = []
+        for task_id in stale_task_ids:
+            lock = self._agent_build_locks.get(task_id)
+            # A lock already held means a build is in flight for this
+            # task - defer rather than block on it (see docstring); only
+            # ever create a fresh lock (never contended, so never blocks)
+            # for the case where invalidation reaches a task_id no build
+            # has touched yet.
+            if lock is not None and lock.locked():
+                deferred_task_ids.append(task_id)
+                continue
+            if lock is None:
+                lock = asyncio.Lock()
+                self._agent_build_locks[task_id] = lock
+            try:
+                # Bounded, not `async with lock:` - see docstring's FIFO-
+                # fairness note. A free lock acquires immediately, well
+                # under this bound; only a contended/queued one times out.
+                await asyncio.wait_for(
+                    lock.acquire(), timeout=_INVALIDATION_LOCK_ACQUIRE_TIMEOUT
+                )
+            except TimeoutError:
+                deferred_task_ids.append(task_id)
+                continue
+            try:
+                agent = self._agents.get(task_id)
+                if agent is not None:
+                    status = agent.get_execution_status(str(task_id))
+                    if status is not None and (
+                        status.get("is_running") or status.get("is_resumable")
+                    ):
+                        deferred_task_ids.append(task_id)
+                        continue
+                self._agents.pop(task_id, None)
+                self._agent_owner_ids.pop(task_id, None)
+                self._agent_sandbox_keys.pop(task_id, None)
+                self._agent_sandbox_providers.pop(task_id, None)
+                self._agent_scope_fingerprints.pop(task_id, None)
+                self._agent_evicted_scope_fingerprints.pop(task_id, None)
+                evicted_task_ids.append(task_id)
+            finally:
+                lock.release()
+        if evicted_task_ids:
+            logger.info(
+                "Invalidated %d cached AgentService(s) for user %s after a "
+                "preference change: %s",
+                len(evicted_task_ids),
+                owner_user_id,
+                evicted_task_ids,
+            )
+        if deferred_task_ids:
+            logger.info(
+                "Deferred cache invalidation for %d in-flight task(s) for "
+                "user %s after a preference change - will pick up the new "
+                "preferences on a later eviction/rebuild: %s",
+                len(deferred_task_ids),
+                owner_user_id,
+                deferred_task_ids,
+            )
 
     def remove_agent(self, task_id: int, user_id: Optional[int] = None) -> None:
         """Remove AgentService instance for completed task"""
@@ -3611,7 +3786,11 @@ class AgentServiceManager:
                 task_setup_snapshot=snapshot,
             )
 
-            from .agents import enhance_system_prompt_with_kb
+            from .agents import (
+                apply_user_voice,
+                enhance_system_prompt_with_kb,
+                voice_from_runtime_user,
+            )
 
             agent_config = snapshot.agent_config
             system_prompt = agent_config.get("instructions") if agent_config else None
@@ -3620,6 +3799,9 @@ class AgentServiceManager:
             system_prompt = _build_workforce_system_prompt(
                 system_prompt,
                 snapshot.workforce_runtime,
+            )
+            system_prompt = apply_user_voice(
+                system_prompt, voice_from_runtime_user(snapshot.runtime_user)
             )
             memory_similarity_threshold = (
                 agent_config.get("memory_similarity_threshold")
@@ -4143,6 +4325,7 @@ async def create_task(
                 user_id=int(user.id),
                 content=request.seed_assistant_message,
                 interactions=request.seed_interactions,
+                message_type=ASSISTANT_RESPONSE_MESSAGE_TYPE,
             )
             if seeded_message is None:
                 # persist_assistant_message_no_commit silently drops a

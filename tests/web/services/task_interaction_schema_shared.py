@@ -75,10 +75,12 @@ def tables_excluding_interaction_requests() -> list:
     """Every table this repo's models declare, except the interaction table.
 
     Building a database from this filtered set reproduces the shape of a
-    deployment upgraded through every migration except the (unmerged) one
-    that creates task_interaction_requests -- the table has no inbound
-    foreign keys, so excluding it cannot break create order (verified in the
-    audit: 52 of 53 tables created, zero inbound FKs to the target).
+    deployment upgraded through every migration except the one that creates
+    task_interaction_requests. That migration is merged, so what this shape
+    stands for is a deployment that has not caught up to it yet, not a
+    change that has not landed. The table has no inbound foreign keys, so
+    excluding it cannot break create order (verified in the audit: 52 of 53
+    tables created, zero inbound FKs to the target).
     """
     return [
         table

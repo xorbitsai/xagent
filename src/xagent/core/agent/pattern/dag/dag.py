@@ -363,6 +363,7 @@ class DAGPattern(AgentPattern):
         | str = ReActReasoningMode.TOOL_CALLING,
         max_concurrency: int = 4,
         max_completion_replans: int = 3,
+        user_interaction_enabled: bool = True,
     ) -> None:
         self.plan_generator = (
             plan_generator
@@ -373,6 +374,7 @@ class DAGPattern(AgentPattern):
         self.react_reasoning_mode = ReActReasoningMode(react_reasoning_mode)
         self.max_concurrency = max(1, max_concurrency)
         self.max_completion_replans = max(0, max_completion_replans)
+        self.user_interaction_enabled = user_interaction_enabled
         self.status = "idle"
         self.plan: ExecutionPlan | None = None
         self.active_step_id: str | None = None
@@ -988,6 +990,7 @@ class DAGPattern(AgentPattern):
             max_iterations=self.react_max_iterations,
             reasoning_mode=self.react_reasoning_mode,
             finalize_after_tool_result=False,
+            user_interaction_enabled=self.user_interaction_enabled,
         )
         active_pattern_state = self.active_step_pattern_states.get(step.id)
         if active_pattern_state is not None:

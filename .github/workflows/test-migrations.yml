@@ -19,6 +19,8 @@ on:
       - 'src/xagent/web/services/agent_management.py'
       - 'src/xagent/web/services/api_keys.py'
       - 'tests/web/services/test_runtime_key_transition_postgres.py'
+      - 'src/xagent/web/api/auth.py'
+      - 'tests/web/services/test_user_preferences_lock_postgres.py'
       - 'src/xagent/web/services/task_command_transport.py'
       - 'tests/web/services/test_task_command_transport.py'
       - 'src/xagent/web/models/task.py'
@@ -104,6 +106,8 @@ jobs:
             src/xagent/web/services/agent_management.py
             src/xagent/web/services/api_keys.py
             tests/web/services/test_runtime_key_transition_postgres.py
+            src/xagent/web/api/auth.py
+            tests/web/services/test_user_preferences_lock_postgres.py
             src/xagent/web/services/task_command_transport.py
             tests/web/services/test_task_command_transport.py
             src/xagent/web/models/task.py
@@ -236,7 +240,7 @@ jobs:
 
     services:
       postgres:
-        image: postgres:16-bookworm
+        image: postgres:17-bookworm
         env:
           POSTGRES_USER: xagent
           POSTGRES_PASSWORD: xagent
@@ -344,6 +348,13 @@ jobs:
         if: needs.detect-migration-changes.outputs.should-test == 'true'
         run: |
           pytest tests/web/services/test_runtime_key_transition_postgres.py -q
+        env:
+          XAGENT_TEST_POSTGRES_URL: postgresql://xagent:xagent@localhost:5432/xagent_test
+
+      - name: Test preferences update locking (Postgres-only)
+        if: needs.detect-migration-changes.outputs.should-test == 'true'
+        run: |
+          pytest tests/web/services/test_user_preferences_lock_postgres.py -q
         env:
           XAGENT_TEST_POSTGRES_URL: postgresql://xagent:xagent@localhost:5432/xagent_test
 

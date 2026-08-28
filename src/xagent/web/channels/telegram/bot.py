@@ -1903,6 +1903,7 @@ class TelegramBotInstance:
                 assistant_content=projection.transcript_content,
                 interactions=projection.interactions,
                 message_type=projection.message_type,
+                error_message=projection.diagnostic_error,
             ):
                 raise TaskLeaseLostError(
                     f"task {task_id} ownership changed before Telegram result"
@@ -2088,6 +2089,7 @@ class TelegramBotInstance:
                 try:
                     finalized = await managed_lease.finalize_result(
                         status=TaskStatus.FAILED,
+                        error_message=str(e),
                     )
                 except Exception:
                     logger.warning(

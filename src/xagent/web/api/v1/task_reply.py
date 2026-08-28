@@ -60,6 +60,7 @@ from ...services.db_runtime import (
 )
 from ...services.task_execution_controller import TaskControlState
 from ...services.task_interaction_close import (
+    active_interaction_id_sync,
     clear_interaction_marker_if_unpaired,
     close_legacy_resume_interaction,
 )
@@ -313,8 +314,17 @@ async def _restore_reply_prelease_isolated(task_lease: TaskLease) -> bool:
 RESUME_INPUT_FENCE_UPDATE_COLUMNS = frozenset({"input", "output", "error_message"})
 
 
-def _update_reply_input_sync(task_lease: TaskLease, text: str) -> bool:
-    """Persist the reply's input only while the exact prelease remains current."""
+def _update_reply_input_sync(
+    task_lease: TaskLease, text: str, interaction_id: int | None
+) -> bool:
+    """Persist the reply's input only while the exact prelease remains current.
+
+    ``interaction_id`` is the active interaction row the caller observed
+    before injecting the message, passed in rather than read here: this
+    function's session does not open until after the injection has already
+    committed. See ``task_interaction_close``'s module docstring for why
+    the read has to precede the injection.
+    """
     SessionLocal = get_session_local()
     with SessionLocal() as db:
         updated = (
@@ -354,7 +364,10 @@ def _update_reply_input_sync(task_lease: TaskLease, text: str) -> bool:
         assert task_lease.run_id is not None
         if interaction_requests_table_exists(db):
             close_legacy_resume_interaction(
-                db, task_id=task_lease.task_id, run_id=task_lease.run_id
+                db,
+                task_id=task_lease.task_id,
+                run_id=task_lease.run_id,
+                interaction_id=interaction_id,
             )
         db.commit()
         return True
@@ -398,7 +411,11 @@ async def _schedule_waiting_reply_resume(
                 preacquired_prior_status=TaskStatus.WAITING_FOR_USER,
             )
         )
-        websocket.background_task_manager.register_reserved_resume(task_id, bg_task)
+        websocket.background_task_manager.register_reserved_resume(
+            task_id,
+            bg_task,
+            run_id=task_lease.run_id,
+        )
     except BaseException:
         if bg_task is not None:
             await cancel_and_drain_async_task(bg_task)
@@ -500,6 +517,12 @@ async def reply_to_task(
         return await _restore_reply_prelease_isolated(task_lease)
 
     try:
+        # Read before the injection below, not inside
+        # _update_reply_input_sync, whose session opens only afterwards.
+        # See task_interaction_close's module docstring for why.
+        active_interaction_id = await run_db_io_cancellation_safe(
+            lambda: active_interaction_id_sync(task_id)
+        )
 
         async def inject_user_message() -> tuple[Any, bool]:
             from .. import chat
@@ -538,7 +561,9 @@ async def reply_to_task(
             raise V1ApiError(V1ErrorCode.INTERACTION_NOT_RESUMABLE, 409)
 
         updated = await run_db_io_cancellation_safe(
-            lambda: _update_reply_input_sync(task_lease, ctx.text)
+            lambda: _update_reply_input_sync(
+                task_lease, ctx.text, active_interaction_id
+            )
         )
         if not updated:
             raise TaskLeaseLostError(

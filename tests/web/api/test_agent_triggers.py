@@ -941,6 +941,36 @@ def test_gmail_trigger_requires_oauth_account() -> None:
     assert "oauth_account_id" in created.json()["detail"]
 
 
+@pytest.mark.parametrize(
+    "oauth_account_id",
+    [None, True, 1.5, "not-an-account-id", 0, "0"],
+)
+def test_gmail_trigger_rejects_invalid_oauth_account_id(
+    oauth_account_id: object,
+) -> None:
+    headers = _admin_headers()
+    agent_id = _create_agent(headers)
+
+    created = client.post(
+        f"/api/agents/{agent_id}/triggers",
+        headers=headers,
+        json={
+            "type": "gmail",
+            "name": "Invalid account",
+            "config": {
+                "watch_label": "INBOX",
+                "oauth_account_id": oauth_account_id,
+            },
+        },
+    )
+
+    assert created.status_code == 400
+    assert created.json()["detail"] == (
+        "gmail trigger config invalid: gmail.oauth_account_id: "
+        "oauth_account_id must be a positive integer"
+    )
+
+
 def test_gmail_trigger_rejects_foreign_oauth_account() -> None:
     headers = _admin_headers()
     agent_id = _create_agent(headers)
@@ -1253,6 +1283,96 @@ def test_gmail_trigger_update_releases_previous_mailbox_and_provisions_new_one(
     assert released == [first_account_id]
 
 
+@pytest.mark.parametrize("operation", ["disable", "delete", "rebind"])
+def test_gmail_legacy_trigger_releases_previous_mailbox(
+    monkeypatch: pytest.MonkeyPatch,
+    operation: str,
+) -> None:
+    provisioned: list[int] = []
+    released: list[int] = []
+
+    def fake_provision_gmail_trigger(db, trigger: AgentTrigger) -> str:
+        provisioned.append(int(trigger.config["oauth_account_id"]))
+        setattr(trigger, "provisioning_status", TriggerProvisioningStatus.ACTIVE.value)
+        setattr(trigger, "provisioning_error", None)
+        db.add(trigger)
+        db.commit()
+        return TriggerProvisioningStatus.ACTIVE.value
+
+    def fake_release_gmail_mailbox_if_unused(db, oauth_account_id: int) -> bool:
+        released.append(oauth_account_id)
+        return True
+
+    monkeypatch.setattr(
+        "xagent.web.services.trigger_providers.gmail.provision_gmail_trigger",
+        fake_provision_gmail_trigger,
+    )
+    monkeypatch.setattr(
+        "xagent.web.services.trigger_providers.gmail.release_gmail_mailbox_if_unused",
+        fake_release_gmail_mailbox_if_unused,
+    )
+    headers = _admin_headers()
+    agent_id = _create_agent(headers)
+    first_email = "legacy-first@gmail.example"
+    first_account_id = _connect_gmail_account(email=first_email)
+    second_account_id = _connect_gmail_account(email="legacy-second@gmail.example")
+    created = client.post(
+        f"/api/agents/{agent_id}/triggers",
+        headers=headers,
+        json={
+            "type": "gmail",
+            "name": "Legacy inbox",
+            "config": {
+                "watch_label": "INBOX",
+                "oauth_account_id": first_account_id,
+            },
+        },
+    )
+    assert created.status_code == 200, created.text
+    trigger_id = int(created.json()["id"])
+
+    db = _direct_db_session()
+    try:
+        trigger = db.get(AgentTrigger, trigger_id)
+        assert trigger is not None
+        trigger.config = {"watch_label": "INBOX"}
+        trigger.resource_id = first_email
+        db.commit()
+    finally:
+        db.close()
+
+    if operation == "delete":
+        response = client.delete(
+            f"/api/agents/{agent_id}/triggers/{trigger_id}",
+            headers=headers,
+        )
+    else:
+        updates = (
+            {"enabled": False}
+            if operation == "disable"
+            else {
+                "config": {
+                    "watch_label": "INBOX",
+                    "oauth_account_id": second_account_id,
+                }
+            }
+        )
+        response = client.patch(
+            f"/api/agents/{agent_id}/triggers/{trigger_id}",
+            headers=headers,
+            json=updates,
+        )
+
+    assert response.status_code == 200, response.text
+    assert released == [first_account_id]
+    expected_provisioned = (
+        [first_account_id, second_account_id]
+        if operation == "rebind"
+        else [first_account_id]
+    )
+    assert provisioned == expected_provisioned
+
+
 def test_gmail_trigger_update_still_provisions_new_binding_when_previous_unregister_raises(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1541,7 +1661,9 @@ def test_trigger_crud_dispatches_through_provider_protocol() -> None:
             db.commit()
             return RegistrationResult(status=TriggerProvisioningStatus.ACTIVE)
 
-        async def unregister(self, db, trigger, config) -> None:
+        async def unregister(
+            self, db, trigger, config, *, resource_id: str | None = None
+        ) -> None:
             calls.append(("unregister", int(config["oauth_account_id"])))
 
     register_trigger_provider(RecordingProvider(), replace=True)

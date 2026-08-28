@@ -89,6 +89,7 @@ export interface ChatMessageProps {
   processStatus?: string;
   timestamp?: number | string;
   interactions?: any[];
+  interactionRequestId?: string;
   interactionsActive?: boolean;
   showEmptyStatus?: boolean;
   onOpenExecutionPlan?: () => void;
@@ -315,6 +316,7 @@ export function ChatMessage({
   processStatus,
   timestamp,
   interactions,
+  interactionRequestId,
   interactionsActive = true,
   showEmptyStatus = true,
   onOpenExecutionPlan,
@@ -624,6 +626,7 @@ export function ChatMessage({
                 <div className="mt-4 border-t pt-4">
                   <ClarificationForm
                     interactions={interactions}
+                    requestId={interactionRequestId}
                     active={interactionsActive}
                     filesDisabled={filesDisabled}
                     onSend={onSendInteraction}

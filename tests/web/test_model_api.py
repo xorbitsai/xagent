@@ -1658,3 +1658,111 @@ class TestModelAPI:
             max_tokens=16,
             thinking={"type": "disabled"},
         )
+
+    @pytest.mark.parametrize(
+        ("model_name", "temperature", "expected_default_temperature"),
+        [
+            ("openai/gpt-5.6-sol", None, None),
+            ("gpt-4o", 0.0, 0.0),
+            ("o1", 0.5, None),
+            ("gpt-4o", 0.5, 0.5),
+        ],
+        ids=[
+            "unset_temperature_is_never_invented",
+            "explicit_zero_is_not_swallowed",
+            "reasoning_model_still_rejects_explicit_temperature",
+            "non_reasoning_model_forwards_explicit_temperature",
+        ],
+    )
+    def test_test_connection_llm_default_temperature_matches_request(
+        self,
+        test_db,
+        regular_user,
+        regular_headers,
+        model_name,
+        temperature,
+        expected_default_temperature,
+    ):
+        """The connection test must forward only a temperature the caller
+        actually set, never invent one, and never let 0.0 be treated as
+        falsy."""
+        captured = {}
+
+        def fake_create_base_llm(config):
+            captured["default_temperature"] = config.default_temperature
+
+            class FakeLLM:
+                async def chat(self, messages, **kwargs):
+                    return {"content": "hi"}
+
+            return FakeLLM()
+
+        payload = {
+            "model_provider": "openai",
+            "model_name": model_name,
+            "api_key": "test-api-key",
+            "base_url": "https://api.openai.com/v1",
+            "category": "llm",
+        }
+        if temperature is not None:
+            payload["temperature"] = temperature
+
+        with patch(
+            "xagent.core.model.chat.basic.adapter.create_base_llm",
+            side_effect=fake_create_base_llm,
+        ):
+            response = client.post(
+                "/api/models/test-connection",
+                json=payload,
+                headers=regular_headers,
+            )
+
+        assert response.status_code == 200
+        assert captured["default_temperature"] == expected_default_temperature
+
+    @pytest.mark.parametrize(
+        ("model_name", "expected_chat_kwargs"),
+        [
+            ("o1", {}),
+            ("gpt-4o", {"max_tokens": 16}),
+        ],
+        ids=[
+            "reasoning_model_lets_adapter_pick_max_tokens",
+            "non_reasoning_model_still_caps_max_tokens_at_16",
+        ],
+    )
+    def test_test_connection_llm_max_tokens_matches_reasoning_heuristic(
+        self,
+        test_db,
+        regular_user,
+        regular_headers,
+        model_name,
+        expected_chat_kwargs,
+    ):
+        """max_tokens handling is unrelated to the temperature fix and must
+        stay pinned to the existing reasoning-model heuristic."""
+        mock_llm = Mock()
+        mock_llm.chat = AsyncMock(
+            return_value={"type": "text", "content": "ok", "raw": {}}
+        )
+
+        with patch(
+            "xagent.core.model.chat.basic.adapter.create_base_llm",
+            return_value=mock_llm,
+        ):
+            response = client.post(
+                "/api/models/test-connection",
+                json={
+                    "model_provider": "openai",
+                    "model_name": model_name,
+                    "api_key": "test-api-key",
+                    "base_url": "https://api.openai.com/v1",
+                    "category": "llm",
+                },
+                headers=regular_headers,
+            )
+
+        assert response.status_code == 200
+        mock_llm.chat.assert_awaited_once_with(
+            [{"role": "user", "content": "Hello"}], **expected_chat_kwargs
+        )

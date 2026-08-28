@@ -1,6 +1,7 @@
 """Authentication API endpoints"""
 
 import asyncio
+import base64
 import hashlib
 import html
 import json
@@ -9,7 +10,7 @@ import os
 import re
 import secrets
 from datetime import datetime, timedelta, timezone
-from typing import Annotated, Any, Dict, Literal, Optional, cast
+from typing import Annotated, Any, Dict, List, Literal, Optional, cast
 
 import requests
 
@@ -19,11 +20,21 @@ os.environ["OAUTHLIB_RELAX_TOKEN_SCOPE"] = "1"
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from fastapi.responses import HTMLResponse, RedirectResponse
 from jose import JWTError, jwt
-from pydantic import BaseModel, Field, StrictInt, StrictStr, field_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    StrictBool,
+    StrictInt,
+    StrictStr,
+    field_validator,
+)
+from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from ...config import get_app_base_url, get_password_reset_expire_minutes
+from ...core.agent.voice_policy import VALID_VOICES as _CORE_VALID_VOICES
 from ..auth_config import (
     ACCESS_TOKEN_EXPIRE_MINUTES,
     JWT_ALGORITHM,
@@ -32,13 +43,14 @@ from ..auth_config import (
     REFRESH_TOKEN_EXPIRE_DAYS,
 )
 from ..auth_dependencies import get_current_user
-from ..models.database import get_db
+from ..models.database import get_db, get_session_local, release_db_connection_if_clean
 from ..models.system_setting import SystemSetting
 from ..models.user import User
 from ..models.user_oauth import UserOAuth
 from ..oauth_provider_quirks import requires_json_accept_header
 from ..services import gmail_provisioning
 from ..services.auth_email import send_password_reset_email
+from ..services.db_runtime import await_task_settlement, propagate_deferred_cancellation
 from ..services.user_oauth import delete_scoped_user_oauth_accounts
 from ..utils.graphql_errors import graphql_errors_message, truncate_error_text
 
@@ -134,6 +146,84 @@ def _run_post_commit_oauth_side_effects(
 
 def _oauth_env_name(provider: str, suffix: str) -> str:
     return f"{provider.upper()}_{suffix}"
+
+
+def _is_salesforce_provider(provider: str) -> bool:
+    """Match the Salesforce family, including admin-created sandbox rows.
+
+    A prefix match, not exact equality: example.env's documented sandbox
+    workaround is an admin hand-creating a second provider row (e.g.
+    "salesforce-sandbox") pointing at test.salesforce.com, since the
+    provider-row model has no per-user sandbox toggle. Every Salesforce-only
+    code path -- PKCE, the instance_url presence guard, and the
+    provider_user_id identity backfill -- must use this same predicate; an
+    exact match on any one of them would silently grant that row the
+    capability while skipping its safeguard.
+
+    Anchored to a "-" separator, not a bare prefix: `oauth_providers.name` is
+    admin-settable via POST/PUT /admin/mcp/providers, so a bare
+    `.startswith("salesforce")` would also match an unrelated custom
+    provider an admin happened to name e.g. "salesforcelite" -- routing it
+    through PKCE and the instance_url-required guard it has no reason to
+    satisfy. Requiring "salesforce" or "salesforce-<anything>" keeps the
+    sandbox row matched without widening the blast radius that far.
+    """
+    lowered = provider.lower()
+    return lowered == "salesforce" or lowered.startswith("salesforce-")
+
+
+_DEPUTY_HOST_SUFFIX = "deputy.com"
+
+
+def _normalize_deputy_endpoint(raw_endpoint: object) -> Optional[str]:
+    """Turn Deputy's token-response ``endpoint`` field into the full origin
+    UserOAuth.instance_url stores for every provider that has one.
+
+    Deputy returns this as a bare host (e.g. "acme.au.deputy.com", no
+    scheme -- unlike Salesforce's instance_url, which already includes
+    "https://"). Unlike the shallow "is this non-empty" check Salesforce's
+    instance_url guard below does, this fully canonicalizes and validates
+    the value up front (same depth as deputy.py's own _instance_url(),
+    which every tool call routes through) rather than deferring to it:
+    this value is also consumed directly by this file's own
+    _fetch_deputy_identity() and by tools/config.py's refresh-URL builder,
+    both of which build a URL via plain string concatenation with no
+    re-parsing of their own, so a value good enough to only pass a shallow
+    check here (e.g. carrying a trailing slash, an embedded path, or a
+    non-https scheme) would silently produce a malformed request URL at
+    those two call sites, or connect "successfully" only for every
+    deputy_*.py tool call to then fail with an opaque instance_url error.
+    Returning None (rather than raising, like deputy.py's version does)
+    lets the callback's own guard turn a bad value into one clear
+    "did not return an endpoint" error at connect time instead.
+    """
+    if not isinstance(raw_endpoint, str):
+        return None
+    endpoint = raw_endpoint.strip()
+    if not endpoint:
+        return None
+    if not endpoint.startswith("https://") and not endpoint.startswith("http://"):
+        endpoint = f"https://{endpoint}"
+
+    from urllib.parse import urlparse
+
+    try:
+        # urlparse() itself, not just the .port access below, can raise
+        # ValueError on malformed input (e.g. an IPv6-literal-like host:
+        # urlparse("https://[::1].deputy.com") raises "Invalid IPv6 URL")
+        # -- wrapping only .port would let that escape uncaught here and
+        # surface as a raw 500 instead of this function's intended "not a
+        # valid endpoint" None return.
+        parsed = urlparse(endpoint.rstrip("/"))
+        port = f":{parsed.port}" if parsed.port else ""
+    except ValueError:
+        return None
+    hostname = (parsed.hostname or "").rstrip(".")
+    if parsed.scheme != "https" or not (
+        hostname == _DEPUTY_HOST_SUFFIX or hostname.endswith(f".{_DEPUTY_HOST_SUFFIX}")
+    ):
+        return None
+    return f"{parsed.scheme}://{hostname}{port}"
 
 
 def _resolve_oauth_secret(
@@ -488,6 +578,64 @@ def _fetch_linear_viewer_identity(
     return viewer.get("id"), viewer.get("email")
 
 
+def _fetch_deputy_identity(
+    access_token: str, instance_url: str
+) -> tuple[Optional[str], Optional[str]]:
+    """Fetch the connected employee's id/email from Deputy's per-install
+    ``GET /api/v1/me`` -- the same endpoint Deputy's own docs point to for
+    validating a token ("Validate tokens via GET to .../api/v1/me").
+
+    Deputy has no fixed userinfo host the generic ``userinfo_url`` REST-GET
+    branch below could point at -- the host itself is per-account (see
+    instance_url) -- so this mirrors _fetch_linear_viewer_identity's
+    approach of a dedicated fetch instead. It also doubles as the same
+    post-exchange token verification every other provider gets for free
+    from its REST userinfo call: a token Deputy won't honour is caught
+    here and reported, instead of being persisted as healthy and failing
+    opaquely later from inside a tool call.
+
+    Raises RuntimeError with a human-readable message on a failed/
+    unparsable response, matching _fetch_linear_viewer_identity. Which
+    exact keys Deputy's employee object uses for id/email is not
+    guaranteed here the way Linear's GraphQL shape is -- a handful of
+    plausible keys are tried, and a miss just leaves that half of the
+    identity pair as None rather than failing the whole connect, since no
+    deputy_*.py tool depends on this identity pair to function.
+    """
+    response = requests.get(
+        f"{instance_url}/api/v1/me",
+        headers={"Authorization": f"Bearer {access_token}"},
+        timeout=10.0,
+    )
+    if response.status_code != 200:
+        detail = truncate_error_text(response.text.strip(), limit=500)
+        raise RuntimeError(
+            f"Deputy API error (status {response.status_code})"
+            + (f": {detail}" if detail else "")
+        )
+    try:
+        payload = response.json()
+    except ValueError:
+        raise RuntimeError(
+            "Deputy API returned a non-JSON response: "
+            f"{truncate_error_text(response.text.strip(), limit=500)}"
+        ) from None
+    if not isinstance(payload, dict):
+        raise RuntimeError("Deputy API returned an unexpected response body")
+
+    raw_id = payload.get("Id")
+    provider_user_id = (
+        str(raw_id) if isinstance(raw_id, (str, int)) and raw_id != "" else None
+    )
+    email = None
+    for email_key in ("Email", "CompanyEmail", "DeputyEmail"):
+        candidate = payload.get(email_key)
+        if isinstance(candidate, str) and candidate:
+            email = candidate
+            break
+    return provider_user_id, email
+
+
 def create_access_token(
     data: Dict[str, Any], expires_delta: Optional[timedelta] = None
 ) -> str:
@@ -616,6 +764,88 @@ class UpdateEmailRequest(BaseModel):
 
 
 class UpdateEmailResponse(BaseModel):
+    success: bool
+    message: str
+    user: Optional[Dict[str, Any]] = None
+
+
+# The 5 voice options the onboarding "Launch" step offers - each agent's
+# system prompt gets a short instruction derived from whichever one the
+# user picked (see apply_user_voice in api/agents.py). Re-exported from
+# core.agent.voice_policy (the canonical source, not redeclared here) so
+# this and _VOICE_INSTRUCTIONS there can never drift into two
+# independently-maintained copies of the same 5-string set.
+VALID_USER_VOICES = _CORE_VALID_VOICES
+
+# Onboarding's "About you"/"Goals" steps are short free-text labels and a
+# handful of goal picks, not open-ended documents - these mirror the
+# max_length this codebase already puts on comparably-scoped free-text
+# fields (e.g. agents.py's/custom_api.py's name/description Fields).
+# Without a bound, the full preferences JSON is replayed through every
+# login/`/me`/email-update/token-validation/PATCH response, so an
+# unbounded field lets a user inflate all of those response bodies.
+PREFERENCES_TEXT_FIELD_MAX_LENGTH = 200
+PREFERENCES_GOALS_MAX_ITEMS = 20
+
+
+class UpdatePreferencesRequest(BaseModel):
+    """Partial update for the current user's onboarding/voice preferences.
+    Only fields actually present in the request body are merged into the
+    stored dict (see exclude_unset=True below) - onboarding writes these
+    incrementally, one step at a time, not all at once."""
+
+    # Pydantic's default (extra="ignore") would validate a typo'd key
+    # (e.g. "voce") to an empty, all-unset model: model_dump(exclude_unset=True)
+    # then returns {}, so the PATCH silently skips persistence and cache
+    # invalidation while still reporting success - forbid so a typo/unknown
+    # key is a 422, not a lost write the client believes succeeded.
+    model_config = ConfigDict(extra="forbid")
+
+    onboarded: Optional[StrictBool] = None
+    department: Optional[str] = Field(
+        default=None, max_length=PREFERENCES_TEXT_FIELD_MAX_LENGTH
+    )
+    industry: Optional[str] = Field(
+        default=None, max_length=PREFERENCES_TEXT_FIELD_MAX_LENGTH
+    )
+    voice: Optional[str] = None
+    goals: Optional[
+        List[Annotated[str, Field(max_length=PREFERENCES_TEXT_FIELD_MAX_LENGTH)]]
+    ] = Field(default=None, max_length=PREFERENCES_GOALS_MAX_ITEMS)
+
+    @field_validator("voice")
+    @classmethod
+    def _validate_voice(cls, value: Optional[str]) -> Optional[str]:
+        if value is not None and value not in VALID_USER_VOICES:
+            raise ValueError(f"voice must be one of {sorted(VALID_USER_VOICES)}")
+        return value
+
+    # A blank string is meaningless stored data, not a "clear this field"
+    # signal - a merge-style PATCH already has one for that (send `null`
+    # for the key, same as tokens_must_not_be_blank rejects a blank
+    # access/refresh token above rather than treating it as "no token").
+    @field_validator("department", "industry")
+    @classmethod
+    def _reject_blank_text(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return value
+        stripped = value.strip()
+        if not stripped:
+            raise ValueError("must not be blank")
+        return stripped
+
+    @field_validator("goals")
+    @classmethod
+    def _reject_blank_goals(cls, value: Optional[List[str]]) -> Optional[List[str]]:
+        if value is None:
+            return value
+        stripped_goals = [item.strip() for item in value]
+        if any(not item for item in stripped_goals):
+            raise ValueError("goal must not be blank")
+        return stripped_goals
+
+
+class UpdatePreferencesResponse(BaseModel):
     success: bool
     message: str
     user: Optional[Dict[str, Any]] = None
@@ -912,12 +1142,24 @@ def validate_email_for_login_namespace(
     return None
 
 
+def _normalized_preferences(user: User) -> Dict[str, Any]:
+    """The user's stored preferences as a plain dict, tolerating a NULL or
+    malformed value. ``preferences`` has no nested-type constraint (same
+    reasoning as apply_output_voice's isinstance guard on the ``voice``
+    value it holds), so a corrupted/hand-edited row could store a non-dict
+    JSON value here - ``dict(value or {})`` would raise on any of those
+    instead of degrading to an empty dict."""
+    preferences = cast(Any, user.preferences)
+    return dict(preferences) if isinstance(preferences, dict) else {}
+
+
 def serialize_auth_user(user: User, include_login_time: bool = False) -> Dict[str, Any]:
     payload: Dict[str, Any] = {
         "id": user.id,
         "username": user.username,
         "email": user.email,
         "is_admin": bool(cast(Any, user.is_admin)),
+        "preferences": _normalized_preferences(user),
     }
     if include_login_time:
         payload["loginTime"] = datetime.now(timezone.utc).timestamp()
@@ -1275,6 +1517,199 @@ async def update_current_user_email(
     )
 
 
+def _lock_user_row_for_preferences_update(db: Session, user_id: int) -> bool:
+    """Serialize concurrent preferences PATCHes for one user, in every
+    database - mirrors acquire_runtime_key_transition_fence's dual-dialect
+    pattern (services/api_keys.py). PostgreSQL/MySQL take a row-level
+    ``FOR UPDATE`` lock; SQLite ignores that clause, so a no-op write grabs
+    its write lock instead. Held until this transaction commits, so a
+    second concurrent PATCH's read-modify-write of the same JSON column
+    blocks here instead of reading stale data and silently dropping the
+    first request's disjoint fields on its own commit.
+
+    Returns ``False`` when the user no longer exists (deleted between the
+    caller resolving the id and this call), the same contract the
+    mirrored helper uses - letting the caller turn that into a clean 404
+    instead of an unhandled ``ObjectDeletedError`` from the subsequent
+    fetch."""
+    if db.get_bind().dialect.name == "sqlite":
+        db.execute(
+            text("UPDATE users SET id = id WHERE id = :user_id"),
+            {"user_id": user_id},
+        )
+        return db.query(User.id).filter(User.id == user_id).first() is not None
+    return (
+        db.query(User.id).filter(User.id == user_id).with_for_update().first()
+        is not None
+    )
+
+
+def _merge_user_preferences_locked(
+    user_id: int, updates: Dict[str, Any]
+) -> Dict[str, Any] | None:
+    """Entirely self-contained: opens and closes its own Session and never
+    touches a request-scoped `user`/`db`. This is required, not just
+    tidy: the lock wait this is built around is a real, potentially slow
+    blocking DB call under contention, so the endpoint runs this whole
+    operation through asyncio.to_thread and drains it via
+    await_task_settlement (the same primitive run_db_io_cancellation_safe
+    wraps, called directly here so the endpoint can still invalidate the
+    voice cache off a settled-but-cancelled result before that
+    cancellation propagates) - if the request is cancelled (client
+    disconnect, timeout) while this worker is mid-transaction, FastAPI
+    can tear down the request's own Session concurrently, and the
+    contract is exactly "operation must create/use/close its own Session
+    and return only detached data" so that race can't happen (see
+    db_runtime.py's docstring on it; this mirrors admin_users.py's
+    _delete_user_rows_sync).
+
+    Returns the serialized response payload (not the ORM object), built
+    BEFORE commit: Session.commit() defaults to expire_on_commit=True, so
+    any attribute access after commit would force a fresh SELECT - itself
+    a race, since the lock is released the instant commit() returns and a
+    concurrent delete could land in that gap. The preferences merge is
+    already reflected in the in-memory object the moment it's set, so
+    nothing here needs a post-commit read at all.
+
+    Returns ``None`` if the user no longer exists (deleted between the
+    caller resolving ``user_id`` and this call)."""
+    session_factory = get_session_local()
+    worker_db = session_factory()
+    try:
+        if not _lock_user_row_for_preferences_update(worker_db, user_id):
+            return None
+        # Loaded fresh, under the lock, in this operation's own session -
+        # not whatever `User` row the caller may have loaded earlier,
+        # which could be stale (a concurrent PATCH may have committed its
+        # own merge while this request was waiting on the lock).
+        worker_user = worker_db.get(User, user_id)
+        if worker_user is None:
+            return None
+        current_preferences = _normalized_preferences(worker_user)
+        for key, value in updates.items():
+            # An explicit `null` is this endpoint's only clear-a-field
+            # signal (see UpdatePreferencesRequest's blank-string
+            # rejection) - storing a literal `{key: None}` entry instead
+            # of deleting the key would have every future read replay a
+            # stale explicit-null forever. Note this doesn't apply to
+            # `goals: []`: an empty list is itself a valid value (not a
+            # clear signal) and is stored as-is, so `null` and `[]` are
+            # two different representations of "no goals" that can
+            # coexist - harmless today since nothing branches on the
+            # distinction, but worth knowing if that ever changes.
+            if value is None:
+                current_preferences.pop(key, None)
+            else:
+                current_preferences[key] = value
+        setattr(worker_user, "preferences", current_preferences)
+        payload = serialize_auth_user(worker_user)
+        worker_db.commit()
+        return payload
+    finally:
+        worker_db.close()
+
+
+@auth_router.patch("/me/preferences", response_model=UpdatePreferencesResponse)
+async def update_current_user_preferences(
+    request: UpdatePreferencesRequest,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> UpdatePreferencesResponse:
+    """Merge the given fields into the current user's stored preferences.
+    Each onboarding step (About you, Goals, Launch) calls this with only
+    its own fields - a merge, not a replace, so an earlier step's answer
+    survives a later step's PATCH."""
+    updates = request.model_dump(exclude_unset=True)
+    if not updates:
+        return UpdatePreferencesResponse(
+            success=True,
+            message="Preferences updated successfully",
+            user=serialize_auth_user(user),
+        )
+
+    # Read before releasing `db` below: Session.rollback() unconditionally
+    # expires every object loaded through that session, `user` included
+    # (unlike expire_on_commit, this isn't conditional on a session
+    # setting), so touching `user.id` after release would force an
+    # implicit reload - reacquiring the very connection just released,
+    # synchronously on the event loop, defeating the point of releasing
+    # it at all, and raising ObjectDeletedError outright if the row was
+    # deleted concurrently in the meantime.
+    user_id = int(user.id)
+
+    # `db` is declared only to release it here, not to do any work with it
+    # directly: FastAPI's per-request dependency caching means this is the
+    # same (read-only, since get_current_user only did a SELECT) session
+    # get_current_user already used, and _merge_user_preferences_locked
+    # is about to open a second, independent session and block on a real
+    # row lock - without this, that session would sit idle-in-transaction,
+    # holding a pool slot, for the whole lock wait (issue #889, same
+    # pattern already used before chat.py's sandbox startup and
+    # workforce_creator.py's ReAct builder call). A read-only session
+    # should always release cleanly; treating a failure as a hard error
+    # (mirroring workforce_creator.py's own release_db_connection_if_clean
+    # call) surfaces that as a signal instead of silently holding the
+    # connection through the lock wait anyway.
+    if not release_db_connection_if_clean(db):
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "code": "preferences_update_unavailable",
+                "message": "Could not release the database before updating preferences.",
+            },
+        )
+
+    # run_db_io_cancellation_safe's own contract discards a settled result
+    # in favor of re-raising the caller's deferred cancellation (see its
+    # docstring), which would otherwise skip the cache invalidation below
+    # entirely - the merge already committed by the time that cancellation
+    # is observed, so the cache must still be invalidated before this
+    # function lets that cancellation propagate. propagate_deferred_
+    # cancellation (the same helper task_command_transport.py's heartbeat
+    # settlement uses) makes that ordering safe even if invalidation
+    # itself raises, or 404s below: cancellation always wins over a
+    # later exception or return, never the reverse.
+    worker = asyncio.get_running_loop().create_task(
+        asyncio.to_thread(_merge_user_preferences_locked, user_id, updates)
+    )
+    serialized_user, cancellation = await await_task_settlement(worker)
+    with propagate_deferred_cancellation(cancellation):
+        if serialized_user is None:
+            raise HTTPException(status_code=404, detail="User not found")
+
+        if "voice" in updates:
+            # A cached AgentService bakes voice into its system prompt at
+            # construction time and won't re-check preferences on later
+            # turns (see invalidate_cached_agents_for_owner's docstring),
+            # so an already-warm task would otherwise keep speaking in the
+            # old (or now-cleared) voice until incidental eviction/rebuild.
+            #
+            # The merge above already committed - this is best-effort
+            # follow-up, not part of "did the write succeed." An
+            # unguarded raise here would turn a successful PATCH into a
+            # client-visible 500 for a write that already happened,
+            # mirroring the exact bug _run_post_commit_oauth_side_effects
+            # (issue #1150) exists to prevent; same fix, same reasoning.
+            from .chat import get_agent_manager
+
+            try:
+                await get_agent_manager().invalidate_cached_agents_for_owner(user_id)
+            except Exception:
+                logger.warning(
+                    "Voice cache invalidation failed for user %s after a "
+                    "successful preferences write; a warm task may keep "
+                    "speaking in the old voice until incidental eviction",
+                    user_id,
+                    exc_info=True,
+                )
+
+        return UpdatePreferencesResponse(
+            success=True,
+            message="Preferences updated successfully",
+            user=serialized_user,
+        )
+
+
 @auth_router.post("/refresh", response_model=RefreshTokenResponse)
 async def refresh_token(
     request: RefreshTokenRequest,
@@ -1466,6 +1901,47 @@ def generic_oauth_login(
         "app_id": app_id,
         "redirect": redirect,
     }
+    # Newer Salesforce orgs enforce PKCE on this authorization-code grant at
+    # the org level, with no per-app way to disable it (Setup > External
+    # Client Apps > Security > "Require Proof Key for Code Exchange" is
+    # locked once an org has it on). The verifier rides inside this signed,
+    # short-lived state token rather than a new DB row, to avoid a schema
+    # change for one provider -- but `state` itself goes out as a URL query
+    # param on the redirect to Salesforce and back, so it lands in browser
+    # history/Referer headers/proxy logs. HS256 signing alone doesn't hide
+    # the payload (it's base64, not encrypted), so the verifier is encrypted
+    # here before being embedded, and decrypted back out in the callback
+    # below. The token exchange still requires the server-held client_secret
+    # regardless, so this is defense-in-depth on top of that, not the only
+    # thing standing between an interceptor and a token.
+    code_verifier = (
+        secrets.token_urlsafe(64) if _is_salesforce_provider(provider) else None
+    )
+    if code_verifier:
+        from ...core.utils.encryption import encrypt_value
+
+        try:
+            state_payload["code_verifier"] = encrypt_value(code_verifier)
+        except ValueError:
+            # get_cipher() raises this when ENCRYPTION_KEY is unset outside
+            # development -- every other provider's login route never calls
+            # encrypt_value at all, so this misconfiguration is otherwise
+            # invisible until the first Salesforce connect attempt. Not
+            # routed through _oauth_provider_config_error: that helper's
+            # "Missing X for provider Y" phrasing is written for a
+            # provider-prefixed env var (e.g. SALESFORCE_CLIENT_ID) and
+            # would misleadingly suggest a SALESFORCE_ENCRYPTION_KEY-style
+            # variable exists, when ENCRYPTION_KEY is a single global
+            # setting unrelated to any one provider.
+            return HTMLResponse(
+                content=(
+                    "<h1>Error: Server misconfigured</h1>"
+                    "<p>The ENCRYPTION_KEY environment variable is not set. "
+                    "This is required to connect Salesforce; set it and "
+                    "restart the backend.</p>"
+                ),
+                status_code=500,
+            )
     state = create_access_token(data=state_payload, expires_delta=timedelta(minutes=10))
 
     app_scopes: list[str] | None = None
@@ -1535,6 +2011,12 @@ def generic_oauth_login(
         params["prompt"] = "consent"
     if provider.lower() == "zoom":
         params["prompt"] = "login"
+    if code_verifier:
+        digest = hashlib.sha256(code_verifier.encode("ascii")).digest()
+        params["code_challenge"] = (
+            base64.urlsafe_b64encode(digest).decode("ascii").rstrip("=")
+        )
+        params["code_challenge_method"] = "S256"
     if provider.lower() == "jira":
         # Required by Atlassian's authorize endpoint for every 3LO app,
         # regardless of scopes requested -- identifies the resource server
@@ -1679,6 +2161,12 @@ def generic_oauth_callback(
     db_provider: Optional[Any] = None,
 ) -> Any:
     """Handle generic OAuth callback"""
+    # Computed once and reused at every Deputy-specific branch below
+    # (`provider` is this function's own parameter, never reassigned) --
+    # matches tools/config.py's refresh_oauth_token_if_needed's
+    # `normalized_provider` precedent, rather than re-lowering/re-comparing
+    # the same string five separate times across the function.
+    is_deputy = provider.lower() == "deputy"
     if db is None:
         raise RuntimeError("db session is required")
     code = request.query_params.get("code")
@@ -1717,6 +2205,30 @@ def generic_oauth_callback(
         )
     user_id = user_id_claim
     app_id = payload.get("app_id")
+    encrypted_code_verifier = payload.get("code_verifier")
+    code_verifier = None
+    if encrypted_code_verifier:
+        from ...core.utils.encryption import decrypt_value_strict
+
+        # Strict, not the lenient decrypt_value: a verifier this can't open
+        # (e.g. ENCRYPTION_KEY rotated mid-flight, inside the state token's
+        # 10-minute window) must not silently fall back to sending the raw
+        # ciphertext to Salesforce as code_verifier -- that only surfaces as
+        # an opaque invalid_grant from Salesforce instead of a clear cause.
+        # Catching ValueError, not just its EncryptionDecodeError subclass:
+        # decrypt_value_strict's own get_cipher() call raises a bare
+        # ValueError when ENCRYPTION_KEY is unset outside development,
+        # which is exactly the same "surface it clearly" case, not just a
+        # token that fails to decrypt under a present key.
+        try:
+            code_verifier = decrypt_value_strict(encrypted_code_verifier)
+        except ValueError:
+            return HTMLResponse(
+                content=(
+                    "<h1>Error: Session expired</h1><p>Please try connecting again.</p>"
+                ),
+                status_code=400,
+            )
 
     if not app_id:
         from ..mcp_apps import requires_app_scoped_oauth_grant
@@ -1806,6 +2318,32 @@ def generic_oauth_callback(
             "code": code,
             "redirect_uri": redirect_uri,
         }
+        if code_verifier:
+            data["code_verifier"] = code_verifier
+        if is_deputy:
+            # Deputy's docs list `scope` as a required body param on the
+            # code-exchange request itself, not just the authorize redirect
+            # -- without it Deputy still exchanges the code but omits
+            # refresh_token from the response, matching the same
+            # requirement on the refresh leg in tools/config.py. Read from
+            # db_provider.default_scopes rather than a hardcoded literal,
+            # so an admin who edits this provider row's scopes doesn't
+            # leave the code-exchange/refresh requests silently still
+            # sending the old value. Not routed through the authorize
+            # redirect's _merge_oauth_scopes(default_scopes, app_scopes)
+            # above -- this leg only has db_provider in scope, not the
+            # per-app oauth_scopes override -- so an app-level scope
+            # override on the Deputy catalog row (none exists today) would
+            # be reflected in the authorize URL but not here. Revisit if
+            # one is ever added.
+            data["scope"] = (
+                " ".join(
+                    stripped
+                    for scope in db_provider.default_scopes or []
+                    if isinstance(scope, str) and (stripped := scope.strip())
+                )
+                or "longlife_refresh_token"
+            )
         headers = {"Content-Type": "application/x-www-form-urlencoded"}
         if requires_json_accept_header(provider):
             headers["Accept"] = "application/json"
@@ -1956,6 +2494,53 @@ def generic_oauth_callback(
                 status_code=400,
             )
 
+        salesforce_instance_url = token_data.get("instance_url")
+        if _is_salesforce_provider(provider) and (
+            not isinstance(salesforce_instance_url, str) or not salesforce_instance_url
+        ):
+            # Every real Salesforce token exchange includes a non-empty
+            # string instance_url; anything else here (missing, empty, or a
+            # non-string value) means the response is unusable for this
+            # connector (launch_config.env_mapping requires it, so the
+            # server would come back unavailable/reconnect-required on the
+            # very next load) -- full host/scheme validation still only
+            # happens at use-time in salesforce.py's _instance_url(), this
+            # is just "is this even a plausible value to store" before
+            # committing it. Checked before the delete-then-recreate below,
+            # not after: that block unconditionally drops any existing
+            # UserOAuth row for this user+provider first, so letting a bad
+            # response through here would destroy a prior *working* grant
+            # while still telling the user "Connected Successfully".
+            return HTMLResponse(
+                content=(
+                    "<h1>Error exchanging token</h1>"
+                    f"<p>{html.escape(provider)} did not return an instance_url.</p>"
+                ),
+                status_code=400,
+            )
+
+        deputy_instance_url = (
+            _normalize_deputy_endpoint(token_data.get("endpoint"))
+            if is_deputy
+            else None
+        )
+        if is_deputy and not deputy_instance_url:
+            # Same reasoning as the Salesforce instance_url guard above:
+            # every real Deputy token exchange includes a non-empty
+            # `endpoint` (Deputy's per-install API host); this connector's
+            # launch_config.env_mapping requires it, so letting a bad
+            # response through would just come back unavailable on the
+            # very next load, or -- worse, since this runs before the
+            # delete-then-recreate below -- destroy a prior *working* grant
+            # while still telling the user "Connected Successfully".
+            return HTMLResponse(
+                content=(
+                    "<h1>Error exchanging token</h1>"
+                    f"<p>{html.escape(provider)} did not return an endpoint.</p>"
+                ),
+                status_code=400,
+            )
+
         provider_user_id = None
         email = None
 
@@ -1992,6 +2577,91 @@ def generic_oauth_callback(
                     content=(
                         "<h1>Error verifying the connected account</h1>"
                         f"<p>Could not reach Linear to verify the connection: "
+                        f"{html.escape(str(e))}</p>"
+                    ),
+                    status_code=400,
+                )
+        elif _is_salesforce_provider(provider):
+            # Salesforce's userinfo_url is deliberately left empty (see the
+            # registry row's comment: an extra round-trip just for a label
+            # this connector doesn't otherwise need), which also means
+            # provider_user_id stays NULL here -- and UserOAuth's unique
+            # constraint is (user_id, provider, provider_user_id), which
+            # SQL treats as non-conflicting across multiple NULLs. Every
+            # other provider gets real protection from that constraint
+            # because their provider_user_id is a real value; Salesforce
+            # would get none at all, letting concurrent callbacks for the
+            # same user leave more than one row with no error. The token
+            # response's own "id" field (Salesforce's identity URL, unique
+            # per org+user) closes that gap for free -- no extra network
+            # call, unlike a real userinfo lookup. This branch preempting
+            # the generic `elif userinfo_url and access_token` branch below
+            # is deliberate, not an oversight: it means the seeded row's
+            # user_id_path/email_path columns are dead by construction for
+            # Salesforce, which is fine -- Salesforce's userinfo endpoint is
+            # still reachable (salesforce_get_current_user calls it
+            # directly against the fixed USERINFO_URL host), it's just not
+            # used for callback-time identity, on purpose.
+            raw_provider_user_id = token_data.get("id")
+            # Every real Salesforce token response's "id" is a non-empty
+            # string URL; a non-string or empty value (a malformed/
+            # proxy-mangled response) would otherwise get str()-ified into
+            # the uniqueness key below instead of falling back to the same
+            # NULL-tolerant path a missing "id" already takes.
+            provider_user_id = (
+                raw_provider_user_id
+                if isinstance(raw_provider_user_id, str) and raw_provider_user_id
+                else None
+            )
+            if raw_provider_user_id and provider_user_id is None:
+                # Only a truthy-but-wrong-type "id" is anomalous enough to
+                # warn about -- a falsy one (missing entirely) is the
+                # already-expected, silent case every other provider using
+                # this same fallback also hits.
+                logger.warning(
+                    'Salesforce token response\'s "id" field was not a '
+                    "usable string (got %s); falling back to NULL "
+                    "provider_user_id for this grant",
+                    type(raw_provider_user_id).__name__,
+                )
+        elif is_deputy:
+            # Deputy's userinfo_url is deliberately left empty (see the
+            # registry row's comment) -- the host itself is per-account, so
+            # there is no fixed URL the generic `elif userinfo_url and
+            # access_token:` branch below could use. deputy_instance_url is
+            # guaranteed non-None here (guarded above; this branch can only
+            # be reached once that guard has already returned on a falsy
+            # value) -- asserted rather than left implicit so mypy narrows
+            # it from `str | None` to `str` for _fetch_deputy_identity's
+            # signature.
+            assert deputy_instance_url is not None
+            try:
+                provider_user_id, email = _fetch_deputy_identity(
+                    access_token, deputy_instance_url
+                )
+            except RuntimeError as e:
+                # A deliberate failure raised by _fetch_deputy_identity
+                # itself -- Deputy's API responded, just not usably.
+                return HTMLResponse(
+                    content=(
+                        "<h1>Error verifying the connected account</h1>"
+                        f"<p>The provider reported: {html.escape(str(e))}</p>"
+                    ),
+                    status_code=400,
+                )
+            except Exception as e:
+                # A network-level failure (timeout, connection error) --
+                # distinct from the case above: Deputy never actually
+                # responded, so attributing this to "the provider reported"
+                # would be misleading. The client only sees str(e) (via the
+                # HTMLResponse below); the full traceback is logged here so
+                # an unexpected failure mode (not just a plain timeout) is
+                # still diagnosable server-side.
+                logger.error("Deputy identity verification failed", exc_info=True)
+                return HTMLResponse(
+                    content=(
+                        "<h1>Error verifying the connected account</h1>"
+                        f"<p>Could not reach Deputy to verify the connection: "
                         f"{html.escape(str(e))}</p>"
                     ),
                     status_code=400,
@@ -2113,6 +2783,21 @@ def generic_oauth_callback(
             setattr(oauth_account, "email", email)
             if "refresh_token" in token_data:
                 setattr(oauth_account, "refresh_token", token_data.get("refresh_token"))
+            # Salesforce returns the per-org API host here instead of using a
+            # fixed domain -- no other provider (besides Deputy, handled
+            # explicitly below) sends this key, and oauth_account is freshly
+            # created above (never an update to an existing row), so
+            # token_data.get() returning None for every other provider is
+            # already the correct, final value: no `if "instance_url" in
+            # token_data` guard needed to avoid clobbering anything.
+            resolved_instance_url = token_data.get("instance_url")
+            if is_deputy:
+                # Deputy's equivalent is `endpoint`, not `instance_url`, and
+                # arrives without a scheme -- deputy_instance_url is the
+                # already-guarded, normalized value from above (Deputy
+                # can't reach this branch without it).
+                resolved_instance_url = deputy_instance_url
+            setattr(oauth_account, "instance_url", resolved_instance_url)
             if "expires_in" in token_data:
                 setattr(
                     oauth_account,

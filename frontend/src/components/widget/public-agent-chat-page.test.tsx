@@ -237,6 +237,10 @@ describe("PublicAgentChatPage", () => {
     sessionStorage.clear()
     fetchMock.mockReset()
     vi.stubGlobal("fetch", fetchMock)
+    // Pinned so the create-body assertions below do not depend on the host zone.
+    vi.spyOn(Intl.DateTimeFormat.prototype, "resolvedOptions").mockReturnValue(
+      { timeZone: "Australia/Melbourne" } as Intl.ResolvedDateTimeFormatOptions,
+    )
   })
 
   afterEach(() => {
@@ -478,6 +482,7 @@ describe("PublicAgentChatPage", () => {
         body: JSON.stringify({
           title: "first message",
           description: "first message",
+          timezone: "Australia/Melbourne",
           agent_id: 17,
         }),
       },
@@ -502,6 +507,26 @@ describe("PublicAgentChatPage", () => {
 
     expect(await screen.findByTestId("conversation-panel")).toBeInTheDocument()
     expect(app.setTaskId).toHaveBeenCalledWith(42, { navigate: false })
+  })
+
+  it("omits the timezone from the opening turn when the browser resolves none", async () => {
+    vi.spyOn(Intl.DateTimeFormat.prototype, "resolvedOptions").mockReturnValue(
+      { timeZone: "" } as Intl.ResolvedDateTimeFormatOptions,
+    )
+    fetchMock
+      .mockResolvedValueOnce(jsonResponse(successfulWorkforceAuth))
+      .mockResolvedValueOnce(jsonResponse(widgetTaskResponse(44, "running")))
+
+    renderWidgetPage({ searchAgentId: null, widgetKey: "widget-secret" })
+
+    fireEvent.click(await screen.findByRole("button", { name: "start:Support Workforce" }))
+
+    await waitFor(() => {
+      expect(app.setTaskId).toHaveBeenCalledWith(44, { navigate: false })
+    })
+    const createBody = JSON.parse(fetchMock.mock.calls[1][1].body)
+    expect("timezone" in createBody).toBe(false)
+    expect(createBody.description).toBe("first message")
   })
 
   it("lets workforce task creation start the opening turn without sending it again", async () => {
@@ -543,6 +568,7 @@ describe("PublicAgentChatPage", () => {
         body: JSON.stringify({
           title: "first message",
           description: "first message",
+          timezone: "Australia/Melbourne",
         }),
       },
     )

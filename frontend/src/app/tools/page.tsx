@@ -39,6 +39,7 @@ import { getApiUrl, cn } from "@/lib/utils"
 import { apiRequest } from "@/lib/api-wrapper"
 import { ConnectMcpDialog, AppIntegration } from "@/components/mcp/connect-mcp-dialog"
 import { OfficialMcpSettingsDialog } from "@/components/mcp/official-mcp-settings-dialog"
+import { sanitizeConnectorStatusEntry } from "@/lib/team-sharing-sanitizers"
 import { CustomApiForm, MCPServerFormData } from "@/components/mcp/custom-api-form"
 import { CustomMcpForm } from "@/components/mcp/custom-mcp-form"
 import {
@@ -583,8 +584,23 @@ function ToolsPageContent() {
       // We need to fetch the icon or use a generic one
       let icon = getAppIcon(server.name) || "";
 
-      // Create an AppIntegration-like object for the dialog
+      // Same key derivation the card uses to read connectorStatus, so the
+      // settings dialog shows the same ownership label as the card it was
+      // opened from. Sanitized so the dialog's badge gate (which requires
+      // app.shared to be a real boolean) only ever sees a well-formed answer.
+      // This branch only runs for isOfficial servers, which are always
+      // transport === 'oauth' (see the isOfficial check above), so the key
+      // prefix here is always 'mcp'.
+      const connType = 'mcp'
+      const sharingStatus = sanitizeConnectorStatusEntry(connectorStatus[`${connType}:${server.id}`])
+
+      // Create an AppIntegration-like object for the dialog. The sanitized
+      // sharing status is spread FIRST: today it carries exactly the three
+      // sharing keys, but spreading it last would let any extra key a future
+      // sanitizer change lets through silently override the identity fields
+      // set below (server_id, is_connected, auth_type).
       setEditingOfficialApp({
+        ...(sharingStatus ?? {}),
         id: appId, // Store the app ID for OAuth flow
         server_id: server.id, // Store the actual server ID for disconnect
         name: server.name,
@@ -597,7 +613,7 @@ function ToolsPageContent() {
         // This reconstruction path is only reached for oauth servers (gated
         // above); set auth_type explicitly so the settings dialog's isKeyBased
         // check stays correct if this path is ever reused for other transports.
-        auth_type: "builtin_oauth"
+        auth_type: "builtin_oauth",
       })
       setIsOfficialAppDialogOpen(true)
     } else if (server.transport === "custom_api") {

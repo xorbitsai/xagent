@@ -41,6 +41,7 @@ from xagent.web.services.task_setup_snapshot import (
     RuntimeUserFields,
     TaskSetupSnapshot,
     _TaskFields,
+    detach_runtime_user_fields,
     load_task_setup_snapshot_sync,
 )
 from xagent.web.services.trace_message_storage import (
@@ -199,6 +200,64 @@ def test_basic_task_no_agent_builder(db_session) -> None:
 
     # task_pattern derived from execution_mode
     assert snapshot.task_pattern == "single_call"  # "flash" -> single_call
+
+
+def test_runtime_user_voice_reduced_from_preferences(db_session) -> None:
+    """`RuntimeUserFields.voice` is reduced from the owner's preferences
+    JSON by the SAME query that fetches id/is_admin - see
+    api/agents.py's apply_user_voice, which relies on this to avoid a
+    second query against a request session that may already be
+    released by the time a system prompt is assembled."""
+    user = _create_user(db_session)
+    user.preferences = {"voice": "warm", "department": "Sales"}
+    db_session.commit()
+    task = _create_task(db_session, user_id=int(user.id))
+
+    snapshot = load_task_setup_snapshot_sync(
+        task_id=int(task.id), task_owner_user_id=int(user.id)
+    )
+
+    assert snapshot is not None
+    assert snapshot.runtime_user == RuntimeUserFields(
+        id=int(user.id), is_admin=False, voice="warm"
+    )
+
+
+def test_runtime_user_voice_is_none_without_preferences(db_session) -> None:
+    user = _create_user(db_session)
+    task = _create_task(db_session, user_id=int(user.id))
+
+    snapshot = load_task_setup_snapshot_sync(
+        task_id=int(task.id), task_owner_user_id=int(user.id)
+    )
+
+    assert snapshot is not None
+    assert snapshot.runtime_user.voice is None
+
+
+def test_detach_runtime_user_fields_reduces_a_live_user_row(db_session) -> None:
+    """detach_runtime_user_fields is the fallback get_agent_for_task uses
+    when a live ORM User made it into `runtime_user` and the richer
+    snapshot load that would normally replace it with a RuntimeUserFields
+    failed - see chat.py's _get_agent_for_task_unlocked. Must reduce to
+    the exact same shape load_task_setup_snapshot_sync produces, read
+    while the row is still attached (not after a session release would
+    have expired it)."""
+    user = _create_user(db_session)
+    user.preferences = {"voice": "warm", "department": "Sales"}
+    db_session.commit()
+
+    fields = detach_runtime_user_fields(user)
+
+    assert fields == RuntimeUserFields(id=int(user.id), is_admin=False, voice="warm")
+
+
+def test_detach_runtime_user_fields_handles_missing_preferences(db_session) -> None:
+    user = _create_user(db_session)
+
+    fields = detach_runtime_user_fields(user)
+
+    assert fields.voice is None
 
 
 @pytest.mark.parametrize("source", ["sdk", "trigger", None])

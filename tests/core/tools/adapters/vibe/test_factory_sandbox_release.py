@@ -22,6 +22,32 @@ class _FakeSandbox:
     pass
 
 
+class _HostMountedSandboxProvider:
+    def __init__(self) -> None:
+        self.primary_sandbox = _FakeSandbox()
+        self.checked_directories: list[str] = []
+
+    def workspace_dirs_are_host_mounted(self, directories) -> bool:
+        self.checked_directories = list(directories)
+        return True
+
+
+class _FailingHostMountedSandboxProvider:
+    def __init__(self) -> None:
+        self.primary_sandbox = _FakeSandbox()
+
+    def workspace_dirs_are_host_mounted(self, directories) -> bool:
+        raise RuntimeError("coverage probe sentinel")
+
+
+class _NotHostMountedSandboxProvider:
+    def __init__(self) -> None:
+        self.primary_sandbox = _FakeSandbox()
+
+    def workspace_dirs_are_host_mounted(self, directories) -> bool:
+        return False
+
+
 class _FakeConfig:
     def __init__(self, calls):
         self._calls = calls
@@ -500,3 +526,157 @@ async def test_release_db_before_sandbox_workspace_setup(monkeypatch):
     assert calls.index("release_db") > calls.index("load_overrides")
     assert calls.index("release_db") > calls.index("load_allowlist")
     assert calls.index("release_db") < calls.index("sandbox_exec")
+
+
+@pytest.mark.asyncio
+async def test_host_mounted_workspace_skips_sandbox_exec(monkeypatch, tmp_path):
+    calls: list[str] = []
+    provider = _HostMountedSandboxProvider()
+
+    async def fake_create_registered_tools(config):
+        return []
+
+    monkeypatch.setattr(
+        ToolRegistry,
+        "create_registered_tools",
+        staticmethod(fake_create_registered_tools),
+    )
+
+    from xagent.core.tools.adapters.vibe.sandboxed_tool import (
+        sandboxed_tool_wrapper,
+    )
+
+    async def unexpected_create_workspace_in_sandbox(sandbox, workspace):
+        raise AssertionError("host-mounted workspace must not run sandbox mkdir")
+
+    monkeypatch.setattr(
+        sandboxed_tool_wrapper,
+        "create_workspace_in_sandbox",
+        unexpected_create_workspace_in_sandbox,
+    )
+
+    config = _FakeConfig(calls)
+    config.get_sandbox = lambda: provider
+    config.get_workspace_config = lambda: {
+        "task_id": "task-1",
+        "base_dir": str(tmp_path),
+    }
+    await ToolFactory.create_all_tools(config)
+
+    assert provider.checked_directories
+    assert "release_db" in calls
+
+
+@pytest.mark.asyncio
+async def test_mock_workspace_keeps_sandbox_exec_when_mount_is_covered(monkeypatch):
+    """Virtual workspace paths are not made real by a covering host mount."""
+    calls: list[str] = []
+    provider = _HostMountedSandboxProvider()
+
+    async def fake_create_registered_tools(config):
+        return []
+
+    monkeypatch.setattr(
+        ToolRegistry,
+        "create_registered_tools",
+        staticmethod(fake_create_registered_tools),
+    )
+
+    from xagent.core.tools.adapters.vibe.sandboxed_tool import (
+        sandboxed_tool_wrapper,
+    )
+
+    async def fake_create_workspace_in_sandbox(sandbox, workspace):
+        calls.append("sandbox_exec")
+
+    monkeypatch.setattr(
+        sandboxed_tool_wrapper,
+        "create_workspace_in_sandbox",
+        fake_create_workspace_in_sandbox,
+    )
+
+    config = _FakeConfig(calls)
+    config.get_sandbox = lambda: provider
+    await ToolFactory.create_all_tools(config)
+
+    assert "sandbox_exec" in calls
+    assert provider.checked_directories == []
+
+
+@pytest.mark.asyncio
+async def test_uncovered_workspace_falls_back_to_sandbox_exec(monkeypatch, tmp_path):
+    calls: list[str] = []
+    provider = _NotHostMountedSandboxProvider()
+
+    async def fake_create_registered_tools(config):
+        return []
+
+    monkeypatch.setattr(
+        ToolRegistry,
+        "create_registered_tools",
+        staticmethod(fake_create_registered_tools),
+    )
+
+    from xagent.core.tools.adapters.vibe.sandboxed_tool import (
+        sandboxed_tool_wrapper,
+    )
+
+    async def fake_create_workspace_in_sandbox(sandbox, workspace):
+        calls.append("sandbox_exec")
+
+    monkeypatch.setattr(
+        sandboxed_tool_wrapper,
+        "create_workspace_in_sandbox",
+        fake_create_workspace_in_sandbox,
+    )
+
+    config = _FakeConfig(calls)
+    config.get_sandbox = lambda: provider
+    config.get_workspace_config = lambda: {
+        "task_id": "task-1",
+        "base_dir": str(tmp_path),
+    }
+    await ToolFactory.create_all_tools(config)
+
+    assert "sandbox_exec" in calls
+
+
+@pytest.mark.asyncio
+async def test_host_mount_probe_failure_falls_back_to_sandbox_exec(
+    monkeypatch, caplog, tmp_path
+):
+    calls: list[str] = []
+    provider = _FailingHostMountedSandboxProvider()
+
+    async def fake_create_registered_tools(config):
+        return []
+
+    monkeypatch.setattr(
+        ToolRegistry,
+        "create_registered_tools",
+        staticmethod(fake_create_registered_tools),
+    )
+
+    from xagent.core.tools.adapters.vibe.sandboxed_tool import (
+        sandboxed_tool_wrapper,
+    )
+
+    async def fake_create_workspace_in_sandbox(sandbox, workspace):
+        calls.append("sandbox_exec")
+
+    monkeypatch.setattr(
+        sandboxed_tool_wrapper,
+        "create_workspace_in_sandbox",
+        fake_create_workspace_in_sandbox,
+    )
+
+    config = _FakeConfig(calls)
+    config.get_sandbox = lambda: provider
+    config.get_workspace_config = lambda: {
+        "task_id": "task-1",
+        "base_dir": str(tmp_path),
+    }
+    await ToolFactory.create_all_tools(config)
+
+    assert "sandbox_exec" in calls
+    assert "Workspace host-mount coverage check failed" in caplog.text

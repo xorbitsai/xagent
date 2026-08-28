@@ -7,6 +7,7 @@ from pydantic import BaseModel, Field
 from .....web.tools.config import WebToolConfig
 from .base import AbstractBaseTool, ToolCategory, ToolVisibility
 from .factory import register_tool
+from .interaction_types import INTERACTION_TYPES
 
 logger = logging.getLogger(__name__)
 
@@ -26,7 +27,7 @@ class InteractionOption(BaseModel):
 
 class InteractionArg(BaseModel):
     type: str = Field(
-        description="Type of interaction: select_one, select_multiple, text_input, file_upload, confirm, number_input, action_cards"
+        description="Type of interaction: " + ", ".join(INTERACTION_TYPES)
     )
     field: str = Field(description="Field name for the data")
     label: str = Field(description="Display label for the field")

@@ -139,8 +139,19 @@ def test_send_message_draft_classifies_and_shapes_requests() -> None:
     assert draft.requests[0].interaction_id == "call-send"
     assert draft.requests[0].tool_name == "send_message"
     assert draft.origin_execution_id == "exec-1"
+    assert draft.event_id == ""  # legacy checkpoints did not carry this field
     assert draft.interactions == ()
     assert draft.message == "Choose A or B"
+
+
+def test_restored_non_string_event_identity_is_preserved_for_web_validation() -> None:
+    request = _send_message_request()
+    request["event_id"] = 123
+
+    draft = draft_from_waiting_request(request, execution_id="exec-1", step_id=None)
+
+    assert draft is not None
+    assert draft.event_id == 123
 
 
 def test_ask_user_question_draft_classifies_and_matches_normalized_interactions() -> (
@@ -284,6 +295,9 @@ async def test_checkpoint_snapshot_survives_real_trace_serializer() -> None:
     result = await pattern.run(context=context, tools=[], llm=llm)
     assert result["status"] == "waiting_for_user"
     waiting_request_before = dict(pattern.waiting_for_user_request or {})
+    question_event_id = waiting_request_before["event_id"]
+    assert question_event_id
+    assert result["clarification_draft"].event_id == question_event_id
 
     backend = RecordingTraceBackend()
     store = TraceCheckpointStore(backend)
@@ -304,6 +318,10 @@ async def test_checkpoint_snapshot_survives_real_trace_serializer() -> None:
     assert (
         out["snapshot"]["pattern_state"]["waiting_for_user_request"]
         == waiting_request_before
+    )
+    assert (
+        out["snapshot"]["pattern_state"]["waiting_for_user_request"]["event_id"]
+        == question_event_id
     )
     assert "_serialization_error" not in out
 
@@ -362,19 +380,13 @@ def test_distinct_nonempty_tool_call_ids_produce_distinct_markers() -> None:
 
 
 def test_compose_turn_marker_produces_a_fixed_literal_format() -> None:
-    """The replay contract in ``_replay_or_raise_closed``
-    (``task_interaction_staging.py``) rests on ``clarification_idempotency_key``
-    hashing ``turn_marker`` and nothing else, and on ``turn_marker`` staying a
-    function of the waiting turn's own identity. Every existing marker test
-    compares two markers to each other, so this encoding's literal output
-    could change -- a different separator, a dropped length prefix -- without
-    any test here noticing.
+    """``turn_marker`` is descriptive checkpoint state, not publication identity.
 
-    This test failing does not mean the code is wrong: it means the encoding
-    changed, which is exactly the moment ``clarification_idempotency_key``'s
-    output for every already-published row also changes, silently. Whoever
-    causes this test to fail must audit whether that key shift is safe for
-    rows already on disk before touching the assertion below.
+    Every other marker test compares two generated markers, so the literal
+    encoding could change -- a different separator or a dropped length prefix
+    -- without those tests noticing. A change here requires checking marker
+    consumers and restore compatibility, but it cannot rename a published
+    interaction: that identity comes only from the question ``event_id``.
     """
 
     marker = _compose_turn_marker(
@@ -387,6 +399,7 @@ def test_compose_turn_marker_produces_a_fixed_literal_format() -> None:
 
 def _marker_draft(**overrides: Any) -> ClarificationDraft:
     values: dict[str, Any] = {
+        "event_id": "11111111-1111-4111-8111-111111111111",
         "source": "send_message",
         "message": "what is your favorite color?",
         "message_type": "info",
@@ -405,22 +418,18 @@ def _marker_draft(**overrides: Any) -> ClarificationDraft:
     return ClarificationDraft(turn_marker=turn_marker, **values)
 
 
-def test_idempotency_key_input_set_is_exactly_the_turn_marker_components() -> None:
-    """Completes the half of the replay contract
-    ``test_idempotency_key_ignores_message_content``
-    (``tests/web/services/test_task_clarification_draft.py``) leaves
-    uncovered: that test pins that ``message`` does not move the key. This
-    pins the other side -- ``message_type`` and ``interactions`` do not move
-    it either, since neither is a ``turn_marker`` component -- and that each
-    of the three components that do make up ``turn_marker``
-    (``turn_message_count``, ``origin_step_id``, ``requests``) changes the
-    key when it changes, one field at a time.
+def test_idempotency_key_input_is_exactly_the_question_event_id() -> None:
+    """Checkpoint-derived fields and payload content cannot rename a question.
+
+    The event identity is allocated before publication, so it is now the
+    complete idempotency input. The older turn marker remains useful for
+    describing the waiting turn, but it no longer creates a second identity.
     """
 
     base = _marker_draft()
     base_key = clarification_idempotency_key(base)
 
-    # Not turn_marker components: the key must not move.
+    # Neither payload content nor checkpoint-derived marker components move it.
     assert clarification_idempotency_key(
         _marker_draft(message="a different question")
     ) == (base_key)
@@ -432,19 +441,24 @@ def test_idempotency_key_input_set_is_exactly_the_turn_marker_components() -> No
         == base_key
     )
 
-    # turn_marker components: the key must move for each, independently.
     assert (
-        clarification_idempotency_key(_marker_draft(turn_message_count=4)) != base_key
+        clarification_idempotency_key(_marker_draft(turn_message_count=4)) == base_key
     )
     assert (
         clarification_idempotency_key(_marker_draft(origin_step_id="step-2"))
-        != base_key
+        == base_key
     )
     assert (
         clarification_idempotency_key(
             _marker_draft(
                 requests=(ClarificationRequestItem("respond", "call-2", "call-2"),)
             )
+        )
+        == base_key
+    )
+    assert (
+        clarification_idempotency_key(
+            _marker_draft(event_id="22222222-2222-4222-8222-222222222222")
         )
         != base_key
     )

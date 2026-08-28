@@ -24,6 +24,7 @@ SANDBOX_DISTRIBUTION_IMPORTS = {
     "numpy": "numpy",
     "matplotlib": "matplotlib",
     "openpyxl": "openpyxl",
+    "python-docx": "docx",
     "fsspec": "fsspec",
 }
 SANDBOX_DIRECT_REQUIREMENTS = {
@@ -35,6 +36,7 @@ SANDBOX_DIRECT_REQUIREMENTS = {
     "numpy": "numpy>=1.21.0",
     "matplotlib": "matplotlib>=3.5.0",
     "openpyxl": "openpyxl>=3.1.0",
+    "python-docx": "python-docx>=1.1.0",
     "fsspec": "fsspec>=2024.0.0",
 }
 
@@ -208,6 +210,49 @@ def test_backend_runtime_keeps_uv_binaries() -> None:
     dockerfile = read_repo_file("docker/Dockerfile.backend")
 
     assert dockerfile.count("COPY --from=uv /uv /uvx /usr/local/bin/") == 2
+
+
+def test_backend_dockerfile_installs_docker_cli_without_the_daemon() -> None:
+    """docker.io ships an engine + containerd + runc that a daemonless
+    container never uses, but /usr/bin/docker must survive the swap:
+    command_policy.py gates the agent shell by path, not by an allowlist.
+    See https://github.com/xorbitsai/xagent/pull/1807
+    """
+
+    dockerfile = read_repo_file("docker/Dockerfile.backend")
+
+    # `runtime` is FROM runtime-base and copies no apt layer out of the build
+    # stages, so an install that drifted into backend-base would ship an image
+    # with no /usr/bin/docker at all.
+    runtime_base = dockerfile.split(
+        "FROM python:${PYTHON_VERSION}-bookworm AS runtime-base\n", maxsplit=1
+    )[1].split("\nFROM ", maxsplit=1)[0]
+    block = next(
+        chunk for chunk in runtime_base.split("\n\n") if "docker-ce-cli" in chunk
+    )
+    install = "\n".join(line for line in block.splitlines() if not line.startswith("#"))
+
+    # Hardcoding an arch here would break the arm64 image (docker-publish.yml
+    # publishes amd64 + arm64); --no-install-recommends keeps
+    # docker-buildx-plugin/docker-compose-plugin out.
+    assert (
+        "arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/docker.gpg"
+        in install
+    )
+    assert "--no-install-recommends docker-ce-cli \\" in install
+    for daemon_package in ("docker.io", "docker-ce ", "containerd", "runc"):
+        assert daemon_package not in install
+
+    # The key and source list must be dropped by the same layer that added
+    # them, or download.docker.com stays resolvable in the running container.
+    assert (
+        "rm -rf /var/lib/apt/lists/* /etc/apt/sources.list.d/docker.list"
+        " /usr/share/keyrings/docker.gpg" in install
+    )
+    # Smoke-tested during the build so a broken swap fails on both published
+    # architectures instead of shipping.
+    assert "test -x /usr/bin/docker \\" in install
+    assert "! command -v dockerd \\" in install
 
 
 def test_backend_package_version_is_vcs_based_for_normal_builds() -> None:

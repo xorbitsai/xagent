@@ -1,97 +1,35 @@
-"""Tests for RouterLLM provider compatibility retries."""
+"""Tests for RouterLLM's xrouter routing and per-call dispatch.
+
+Provider-compatibility retries used to live here too; they are now owned by
+OpenRouterLLM itself (see test_openrouter.py) since RouterLLM no longer
+retries the downstream call on its own.
+"""
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 from typing import Any, AsyncIterator
 
+import httpx
+import openai
 import pytest
 
 from xagent.core.context_ref import CONTEXT_REFS_KEY, ContextReference
 from xagent.core.model.chat.basic.base import BaseLLM
+from xagent.core.model.chat.basic.openrouter import OpenRouterLLM
 from xagent.core.model.chat.basic.router import (
     RouterLLM,
     RouterModalityRoutingError,
 )
-from xagent.core.model.chat.types import ChunkType, StreamChunk
-
-_OPENROUTER_TOOL_CHOICE_ERROR = (
-    "OpenAI API error (404): Error code: 404 - {'error': {'message': "
-    "\"No endpoints found that support the provided 'tool_choice' value.\"}}"
+from xagent.core.model.chat.error import retry_on
+from xagent.core.model.chat.exceptions import LLMToolProtocolError
+from xagent.core.model.chat.types import (
+    PROVIDER_STATE_METADATA_KEY,
+    ChunkType,
+    StreamChunk,
 )
-_THINKING_TOOL_CHOICE_ERROR = (
-    "OpenAI bad request (400): Thinking mode does not support this tool_choice"
-)
-_MANDATORY_REASONING_ERROR = (
-    "OpenAI bad request (400): Reasoning is mandatory for this endpoint "
-    "and cannot be disabled."
-)
-
-
-def _tool_schema() -> dict[str, Any]:
-    return {
-        "type": "function",
-        "function": {
-            "name": "answer",
-            "description": "Answer the user",
-            "parameters": {"type": "object", "properties": {}},
-        },
-    }
-
-
-class _ToolChoiceRetryLLM(BaseLLM):
-    def __init__(self) -> None:
-        self.chat_tool_choices: list[str | dict[str, Any] | None] = []
-        self.stream_tool_choices: list[str | dict[str, Any] | None] = []
-
-    @property
-    def abilities(self) -> list[str]:
-        return ["chat", "tool_calling"]
-
-    @property
-    def model_name(self) -> str:
-        return "z-ai/glm-5.2"
-
-    @property
-    def supports_thinking_mode(self) -> bool:
-        return False
-
-    async def chat(
-        self,
-        messages: list[dict[str, Any]],
-        temperature: float | None = None,
-        max_tokens: int | None = None,
-        tools: list[dict[str, Any]] | None = None,
-        tool_choice: str | dict[str, Any] | None = None,
-        response_format: dict[str, Any] | None = None,
-        thinking: dict[str, Any] | None = None,
-        output_config: dict[str, Any] | None = None,
-        **kwargs: Any,
-    ) -> str | dict[str, Any]:
-        del messages, temperature, max_tokens, tools, response_format
-        del thinking, output_config, kwargs
-        self.chat_tool_choices.append(tool_choice)
-        if tool_choice == "required":
-            raise RuntimeError(_OPENROUTER_TOOL_CHOICE_ERROR)
-        return "ok"
-
-    async def stream_chat(
-        self,
-        messages: list[dict[str, str]],
-        temperature: float | None = None,
-        max_tokens: int | None = None,
-        tools: list[dict[str, Any]] | None = None,
-        tool_choice: str | dict[str, Any] | None = None,
-        response_format: dict[str, Any] | None = None,
-        thinking: dict[str, Any] | None = None,
-        output_config: dict[str, Any] | None = None,
-        **kwargs: Any,
-    ) -> AsyncIterator[StreamChunk]:
-        del messages, temperature, max_tokens, tools, response_format
-        del thinking, output_config, kwargs
-        self.stream_tool_choices.append(tool_choice)
-        if tool_choice == "required":
-            raise RuntimeError(_OPENROUTER_TOOL_CHOICE_ERROR)
-        yield StreamChunk(type=ChunkType.TOKEN, content="ok", delta="ok")
+from xagent.core.retry.strategy import FixedDelay
+from xagent.core.retry.wrapper import create_retry_wrapper
 
 
 class _ScriptedChatLLM(BaseLLM):
@@ -151,10 +89,6 @@ class _ScriptedChatLLM(BaseLLM):
         if self.errors:
             raise RuntimeError(self.errors.pop(0))
         yield StreamChunk(type=ChunkType.TOKEN, content="ok", delta="ok")
-
-
-async def _select_glm(_prompt: str) -> str:
-    return "z-ai/glm-5.2"
 
 
 @pytest.mark.asyncio
@@ -532,177 +466,139 @@ def test_profile_context_window_returns_none_when_catalog_lookup_fails(
     assert "Could not resolve xrouter context window for test/model" in caplog.text
 
 
-@pytest.mark.asyncio
-async def test_router_chat_relaxes_required_tool_choice_on_openrouter_endpoint_error(
-    monkeypatch,
+async def _select_glm(_prompt: str) -> str:
+    return "z-ai/glm-5.2"
+
+
+def _tool_schema() -> dict[str, Any]:
+    return {
+        "type": "function",
+        "function": {
+            "name": "answer",
+            "description": "Answer the user",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    }
+
+
+# ==========================================================================
+# Three-layer sandwich: RouterLLM -> create_retry_wrapper -> OpenRouterLLM.
+#
+# RouterLLM itself no longer retries (see router.py); OpenRouterLLM owns the
+# provider-compat retry, and create_retry_wrapper (adapter.py's usual wrapping
+# of a downstream model) owns the outer retry-on-retryable-error budget. This
+# pins the combined upper bound on upstream calls so the two layers cannot
+# compound into an unbounded retry storm.
+# ==========================================================================
+
+_PURE_TOOL_CHOICE_404 = (
+    "No endpoints found that support the provided 'tool_choice' value."
+)
+_THINKING_ONLY_CONFLICT = "Thinking mode does not support this tool_choice"
+_MANDATORY_REASONING_ONLY = (
+    "Reasoning is mandatory for this endpoint and cannot be disabled."
+)
+
+
+def _sandwiched_openrouter_llm(
+    mocker,
+    *,
+    side_effect,
+    max_retries: int,
+    model_name: str = "z-ai/glm-5.2",
 ):
-    llm = _ToolChoiceRetryLLM()
-    router = RouterLLM(downstream_resolver=lambda _model_id: llm)
+    """RouterLLM wired to create_retry_wrapper(OpenRouterLLM), matching how
+    adapter.py wraps a resolved downstream model in production.
 
-    async def select_model(_prompt: str) -> str:
-        return "z-ai/glm-5.2"
-
-    monkeypatch.setattr(router, "_select_model", select_model)
-
-    result = await router.chat(
-        [{"role": "user", "content": "score?"}],
-        tools=[_tool_schema()],
-        tool_choice="required",
+    The OpenAI client itself is mocked (not ``_chat_with_prefix_retry``), so
+    ``mock_client.chat.completions.create.await_count`` reflects the real
+    number of upstream requests OpenRouterLLM actually issues.
+    """
+    mock_client = mocker.AsyncMock()
+    mock_client.chat.completions.create.side_effect = side_effect
+    mocker.patch(
+        "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+        return_value=mock_client,
     )
-
-    assert result == "ok"
-    assert llm.chat_tool_choices == ["required", "auto"]
-
-
-@pytest.mark.asyncio
-async def test_router_stream_relaxes_required_tool_choice_before_first_chunk(
-    monkeypatch,
-):
-    llm = _ToolChoiceRetryLLM()
-    router = RouterLLM(downstream_resolver=lambda _model_id: llm)
-
-    async def select_model(_prompt: str) -> str:
-        return "z-ai/glm-5.2"
-
-    monkeypatch.setattr(router, "_select_model", select_model)
-
-    chunks = [
-        chunk
-        async for chunk in router.stream_chat(
-            [{"role": "user", "content": "score?"}],
-            tools=[_tool_schema()],
-            tool_choice="required",
-        )
-    ]
-
-    assert [chunk.delta for chunk in chunks] == ["ok"]
-    assert llm.stream_tool_choices == ["required", "auto"]
+    inner = OpenRouterLLM(model_name=model_name, api_key="test-key")
+    wrapped = create_retry_wrapper(
+        inner,
+        BaseLLM,  # type: ignore[type-abstract]
+        retry_methods={"chat"},
+        strategy=FixedDelay(delay_ms=0),
+        max_retries=max_retries,
+        retry_on=retry_on,
+    )
+    router = RouterLLM(downstream_resolver=lambda _model_id: wrapped)
+    return router, mock_client
 
 
 @pytest.mark.asyncio
-async def test_router_chat_does_not_relax_auto_tool_choice_on_openrouter_error(
-    monkeypatch,
-):
-    llm = _ScriptedChatLLM([_OPENROUTER_TOOL_CHOICE_ERROR])
-    router = RouterLLM(downstream_resolver=lambda _model_id: llm)
+async def test_sandwiched_pure_404_bounds_total_upstream_calls(monkeypatch, mocker):
+    """A persistent tool_choice 404 never compounds past the documented bound.
+
+    OpenRouterLLM's own rule 3 relaxes tool_choice to "auto" once; a second
+    identical 404 then fails rule 3's own precondition (tool_choice is no
+    longer a strict value), so the compat retry gives up with a plain
+    RuntimeError that create_retry_wrapper's retry_on() does not retry.
+    """
+    router, mock_client = _sandwiched_openrouter_llm(
+        mocker,
+        side_effect=RuntimeError(_PURE_TOOL_CHOICE_404),
+        max_retries=2,
+    )
     monkeypatch.setattr(router, "_select_model", _select_glm)
 
     with pytest.raises(RuntimeError, match="No endpoints found"):
         await router.chat(
             [{"role": "user", "content": "score?"}],
             tools=[_tool_schema()],
-            tool_choice="auto",
-        )
-
-    assert llm.tool_choices == ["auto"]
-
-
-@pytest.mark.asyncio
-async def test_router_chat_propagates_non_matching_errors_without_retry(monkeypatch):
-    llm = _ScriptedChatLLM(["different provider error"])
-    router = RouterLLM(downstream_resolver=lambda _model_id: llm)
-    monkeypatch.setattr(router, "_select_model", _select_glm)
-
-    with pytest.raises(RuntimeError, match="different provider error"):
-        await router.chat(
-            [{"role": "user", "content": "score?"}],
-            tools=[_tool_schema()],
             tool_choice="required",
         )
 
-    assert llm.tool_choices == ["required"]
+    # 1 original call + 1 tool_choice relaxation: the second identical 404
+    # then fails rule 3's own precondition (tool_choice is already "auto"),
+    # so no further adjustment is possible and the exact count is pinned.
+    assert mock_client.chat.completions.create.await_count == 2
 
 
-@pytest.mark.parametrize(
-    "thinking",
-    [None, {"type": "disabled", "enable": False}],
-    ids=["unspecified", "disabled"],
-)
 @pytest.mark.asyncio
-async def test_router_chat_enables_thinking_when_selected_model_requires_it(
-    monkeypatch, thinking
+async def test_sandwiched_alternating_errors_bounds_total_upstream_calls(
+    monkeypatch, mocker
 ):
-    llm = _ScriptedChatLLM([_MANDATORY_REASONING_ERROR])
-    router = RouterLLM(downstream_resolver=lambda _model_id: llm)
-    monkeypatch.setattr(router, "_select_model", _select_glm)
+    """A worst-case chain (all 3 compat rules fire, then a wrapper-retryable
+    error) repeats at most once per wrapper attempt, bounding total upstream
+    calls at wrapper_budget * 4 (1 original + 3 adjustments per attempt).
+    """
+    calls = 0
 
-    result = await router.chat(
-        [{"role": "user", "content": "score?"}],
-        tools=[_tool_schema()],
-        tool_choice="required",
-        thinking=thinking,
+    def fake_create(*_args, **kwargs):
+        nonlocal calls
+        del kwargs
+        calls += 1
+        position = (calls - 1) % 4
+        if position == 0:
+            raise RuntimeError(_PURE_TOOL_CHOICE_404)
+        if position == 1:
+            raise RuntimeError(_THINKING_ONLY_CONFLICT)
+        if position == 2:
+            raise RuntimeError(_MANDATORY_REASONING_ONLY)
+        # The 4th call in each attempt: every compat rule has already fired
+        # once this call, so this retryable error is what escapes to the
+        # outer wrapper and decides whether to spend another whole attempt.
+        raise LLMToolProtocolError(
+            provider="deepseek",
+            code="model_output_boundary",
+            message="retryable boundary condition",
+        )
+
+    wrapper_budget = 2
+    router, mock_client = _sandwiched_openrouter_llm(
+        mocker, side_effect=fake_create, max_retries=wrapper_budget
     )
-
-    assert result == "ok"
-    assert llm.thinking_values == [
-        thinking,
-        {"type": "enabled", "enable": True},
-    ]
-    assert llm.tool_choices == ["required", "required"]
-
-
-@pytest.mark.asyncio
-async def test_router_stream_enables_thinking_when_selected_model_requires_it(
-    monkeypatch,
-):
-    llm = _ScriptedChatLLM([_MANDATORY_REASONING_ERROR])
-    router = RouterLLM(downstream_resolver=lambda _model_id: llm)
     monkeypatch.setattr(router, "_select_model", _select_glm)
 
-    chunks = [
-        chunk
-        async for chunk in router.stream_chat(
-            [{"role": "user", "content": "score?"}],
-            tools=[_tool_schema()],
-            tool_choice="required",
-            thinking={"type": "disabled", "enable": False},
-        )
-    ]
-
-    assert [chunk.delta for chunk in chunks] == ["ok"]
-    assert llm.thinking_values == [
-        {"type": "disabled", "enable": False},
-        {"type": "enabled", "enable": True},
-    ]
-
-
-@pytest.mark.asyncio
-async def test_router_does_not_repeat_mandatory_reasoning_retry(monkeypatch):
-    llm = _ScriptedChatLLM(
-        [
-            _MANDATORY_REASONING_ERROR,
-            _THINKING_TOOL_CHOICE_ERROR,
-            _MANDATORY_REASONING_ERROR,
-        ]
-    )
-    router = RouterLLM(downstream_resolver=lambda _model_id: llm)
-    monkeypatch.setattr(router, "_select_model", _select_glm)
-
-    with pytest.raises(RuntimeError, match="Reasoning is mandatory"):
-        await router.chat(
-            [{"role": "user", "content": "score?"}],
-            tools=[_tool_schema()],
-            tool_choice="required",
-            thinking={"type": "disabled", "enable": False},
-        )
-
-    assert llm.thinking_values == [
-        {"type": "disabled", "enable": False},
-        {"type": "enabled", "enable": True},
-        {"type": "disabled", "enable": False},
-    ]
-    assert llm.tool_choices == ["required", "required", "required"]
-
-
-@pytest.mark.asyncio
-async def test_router_does_not_retry_mandatory_reasoning_when_already_enabled(
-    monkeypatch,
-):
-    llm = _ScriptedChatLLM([_MANDATORY_REASONING_ERROR])
-    router = RouterLLM(downstream_resolver=lambda _model_id: llm)
-    monkeypatch.setattr(router, "_select_model", _select_glm)
-
-    with pytest.raises(RuntimeError, match="Reasoning is mandatory"):
+    with pytest.raises(LLMToolProtocolError, match="retryable boundary"):
         await router.chat(
             [{"role": "user", "content": "score?"}],
             tools=[_tool_schema()],
@@ -710,48 +606,246 @@ async def test_router_does_not_retry_mandatory_reasoning_when_already_enabled(
             thinking={"type": "enabled", "enable": True},
         )
 
-    assert llm.thinking_values == [{"type": "enabled", "enable": True}]
-    assert llm.tool_choices == ["required"]
+    assert mock_client.chat.completions.create.await_count <= wrapper_budget * 4
 
 
-@pytest.mark.asyncio
-async def test_router_chat_does_not_retry_same_action_twice(monkeypatch):
-    llm = _ScriptedChatLLM([_THINKING_TOOL_CHOICE_ERROR, _THINKING_TOOL_CHOICE_ERROR])
-    router = RouterLLM(downstream_resolver=lambda _model_id: llm)
-    monkeypatch.setattr(router, "_select_model", _select_glm)
-
-    with pytest.raises(RuntimeError, match="Thinking mode does not support"):
-        await router.chat(
-            [{"role": "user", "content": "score?"}],
-            tools=[_tool_schema()],
-            tool_choice="required",
-            thinking={"type": "disabled", "enable": False},
-        )
-
-    assert llm.tool_choices == ["required", "required"]
-    assert llm.thinking_values == [
-        {"type": "disabled", "enable": False},
-        {"type": "disabled", "enable": False},
-    ]
-
-
-@pytest.mark.asyncio
-async def test_router_chat_can_chain_thinking_and_tool_choice_retries(monkeypatch):
-    llm = _ScriptedChatLLM([_THINKING_TOOL_CHOICE_ERROR, _OPENROUTER_TOOL_CHOICE_ERROR])
-    router = RouterLLM(downstream_resolver=lambda _model_id: llm)
-    monkeypatch.setattr(router, "_select_model", _select_glm)
-
-    result = await router.chat(
-        [{"role": "user", "content": "score?"}],
-        tools=[_tool_schema()],
-        tool_choice="required",
-        thinking={"type": "enabled", "enable": True},
+def _deepseek_prefix_error() -> openai.BadRequestError:
+    return openai.BadRequestError(
+        "Error code: 400 - {'error': {'message': 'Provider returned error'}}",
+        response=httpx.Response(
+            400,
+            request=httpx.Request(
+                "POST", "https://openrouter.ai/api/v1/chat/completions"
+            ),
+        ),
+        body={
+            "error": {
+                "message": "Provider returned error",
+                "code": 400,
+                "metadata": {
+                    "provider_name": "DeepSeek",
+                    "raw": (
+                        '{"error":{"message":'
+                        '"Function call should not be used with prefix"}}'
+                    ),
+                },
+            }
+        },
     )
 
-    assert result == "ok"
-    assert llm.tool_choices == ["required", "required", "auto"]
-    assert llm.thinking_values == [
-        {"type": "enabled", "enable": True},
-        {"type": "disabled", "enable": False},
-        {"type": "disabled", "enable": False},
+
+def _deepseek_tool_call_history() -> list[dict]:
+    return [
+        {"role": "user", "content": "Generate music"},
+        {
+            "role": "assistant",
+            "content": "I will generate the music first.",
+            "tool_calls": [
+                {
+                    "id": "call_music",
+                    "type": "function",
+                    "function": {
+                        "name": "generate_music",
+                        "arguments": '{"prompt":"intro"}',
+                    },
+                }
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call_music", "content": '{"success":true}'},
     ]
+
+
+async def _select_deepseek(_prompt: str) -> str:
+    return "deepseek/deepseek-v4-flash"
+
+
+@pytest.mark.asyncio
+async def test_sandwiched_deepseek_prefix_sanitizes_messages_once(monkeypatch, mocker):
+    """A DeepSeek prefix rejection sanitizes messages once per call, not once
+    per compat iteration.
+
+    Before the out-param fix, ``_run_chat_with_compat_retry`` replayed the
+    same unsanitized messages on every compat iteration, so a DeepSeek model
+    chaining a prefix rejection with a compat-adjustable error re-triggered
+    the prefix rejection (and its sanitize-and-retry) on every iteration
+    too, doubling the real upstream call count. With the fix, the sanitized
+    messages from the first iteration carry over, so the prefix rejection
+    only ever fires once and the total call count stays bounded.
+    """
+    calls = 0
+    prefix_error_count = 0
+    post_sanitize_calls = 0
+    success_response = SimpleNamespace(
+        choices=[
+            SimpleNamespace(
+                message=SimpleNamespace(
+                    content="ok", tool_calls=None, reasoning_content=None
+                )
+            )
+        ],
+        usage=None,
+        model_dump=lambda: {"id": "openrouter-sandwiched-deepseek"},
+    )
+
+    def fake_create(*_args, **kwargs):
+        nonlocal calls, prefix_error_count, post_sanitize_calls
+        calls += 1
+        messages = kwargs["messages"]
+        assistant_message = next(
+            message for message in messages if message.get("tool_calls")
+        )
+        if assistant_message.get("content"):
+            prefix_error_count += 1
+            raise _deepseek_prefix_error()
+        post_sanitize_calls += 1
+        if post_sanitize_calls == 1:
+            raise RuntimeError(_MANDATORY_REASONING_ONLY)
+        return success_response
+
+    router, mock_client = _sandwiched_openrouter_llm(
+        mocker,
+        side_effect=fake_create,
+        max_retries=2,
+        model_name="deepseek/deepseek-v4-flash",
+    )
+    monkeypatch.setattr(router, "_select_model", _select_deepseek)
+
+    result = await router.chat(_deepseek_tool_call_history())
+
+    assert result["content"] == "ok"
+    assert prefix_error_count == 1
+    # 1 prefix rejection + 1 sanitized-but-mandatory-reasoning failure + 1
+    # sanitized success: the sanitized messages carry over across compat
+    # iterations, so the prefix rejection never fires a second time.
+    assert mock_client.chat.completions.create.await_count == 3
+
+
+# ---------------------------------------------------------------------------
+# ``_resolve_route``'s fallback branch (no injected ``downstream_resolver``):
+# the abilities passed to the ``ChatModelConfig`` it builds must be the
+# caller's original configuration, not ``RouterLLM._abilities`` (which always
+# excludes vision/thinking_mode -- see ``_UNROUTED_ROUTER_ABILITIES`` -- since
+# a virtual router cannot claim a candidate's dynamic abilities before
+# routing picks one). Before this fix, a user-declared
+# ``thinking_mode``/``vision`` ability was silently dropped from the
+# actually-constructed downstream client on this branch.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_router_fallback_downstream_supports_thinking_mode_matches_configured_abilities(
+    monkeypatch,
+):
+    router = RouterLLM(
+        api_key="test-key",
+        abilities=["chat", "tool_calling", "thinking_mode"],
+    )
+    monkeypatch.setattr(router, "_select_model", _select_deepseek)
+
+    model_id, downstream = await router._resolve_route(
+        [{"role": "user", "content": "hi"}]
+    )
+
+    assert model_id == "deepseek/deepseek-v4-flash"
+    # The router's own advertised abilities never include thinking_mode...
+    assert router.supports_thinking_mode is False
+    # ...but the downstream client the fallback branch actually built must
+    # still see it, because that is what the user configured.
+    assert downstream.supports_thinking_mode is True
+
+
+@pytest.mark.asyncio
+async def test_router_fallback_downstream_has_ability_vision_matches_configured_abilities(
+    monkeypatch,
+):
+    router = RouterLLM(
+        api_key="test-key",
+        abilities=["chat", "tool_calling", "vision"],
+    )
+    monkeypatch.setattr(router, "_select_model", _select_deepseek)
+
+    _model_id, downstream = await router._resolve_route(
+        [{"role": "user", "content": "hi"}]
+    )
+
+    assert router.has_ability("vision") is False
+    assert downstream.has_ability("vision") is True
+
+
+@pytest.mark.asyncio
+async def test_router_auto_fallback_vision_deepseek_round_trips_reasoning(
+    monkeypatch, mocker
+):
+    """Auto routing to a deepseek model on a vision call still captures reasoning.
+
+    This is where two separate behaviors meet: ``vision_chat`` inheriting
+    reasoning capture, and the fallback branch building its downstream
+    client from the caller's configured abilities. The combination is a real
+    user situation -- an image in the conversation, no explicit model
+    chosen, routed by "auto" to a deepseek slug, on the code path with no
+    injected ``downstream_resolver`` -- so it must run end-to-end with
+    capture firing.
+    """
+    tool_call = SimpleNamespace(
+        id="call_1",
+        type="function",
+        function=SimpleNamespace(name="search", arguments="{}"),
+    )
+    message = SimpleNamespace(
+        content=None,
+        tool_calls=[tool_call],
+        reasoning_content="Looking at the picture first.",
+    )
+    response = SimpleNamespace(
+        choices=[SimpleNamespace(message=message)],
+        usage=None,
+        model_dump=lambda: {"id": "auto-fallback-vision-deepseek"},
+    )
+    mock_client = mocker.AsyncMock()
+    mock_client.chat.completions.create.return_value = response
+    mocker.patch(
+        "xagent.core.model.chat.basic.openai.AsyncOpenAI",
+        return_value=mock_client,
+    )
+
+    async def select_deepseek(_prompt: str, **_kwargs: Any) -> str:
+        return "deepseek/deepseek-v4-flash"
+
+    router = RouterLLM(
+        api_key="test-key",
+        abilities=["chat", "tool_calling", "vision", "thinking_mode"],
+    )
+    monkeypatch.setattr(router, "_select_model", select_deepseek)
+    monkeypatch.setattr(router, "_profile_context_window", lambda _model_id: None)
+    monkeypatch.setattr(
+        RouterLLM,
+        "_profile_input_modalities",
+        staticmethod(lambda _model_id: ("image",)),
+    )
+
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "what is in this image?"},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,x"}},
+            ],
+        }
+    ]
+
+    prepared = await router.prepare_for_call(messages)
+    # xrouter's profile reports this model supports the image modality, so
+    # the resolved wrapper's own abilities pick up "vision" too (separate
+    # from the fallback-construction fix above, but both must hold for this
+    # combined scenario to actually reach vision_chat successfully).
+    assert prepared.has_ability("vision") is True
+
+    result = await prepared.vision_chat(
+        messages,
+        tools=[_tool_schema()],
+        thinking={"type": "enabled"},
+    )
+
+    assert result[PROVIDER_STATE_METADATA_KEY] == {
+        "deepseek": {"reasoning_content": "Looking at the picture first."}
+    }

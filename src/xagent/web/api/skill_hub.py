@@ -345,6 +345,27 @@ def _summary_source(skill_dict: dict) -> str:
     return skill_dict.get("source") or _classify_source(skill_dict.get("path", ""))
 
 
+# Archiving a folder on macOS sweeps in Finder and resource-fork droppings.
+# Any skill folder that has been opened in Finder carries them, so refusing a
+# whole archive over a .DS_Store rejects an entirely ordinary bundle. They
+# carry nothing a skill needs: drop them rather than fail the archive.
+_IGNORED_ARCHIVE_NAMES = frozenset({".DS_Store", "Thumbs.db", "desktop.ini"})
+
+# Inflate archive members in slices so a decompression bomb cannot make the
+# peak footprint a multiple of the size budget.
+_ARCHIVE_CHUNK_BYTES = 1024 * 1024
+
+
+def _is_archive_cruft(path: str) -> bool:
+    """True for OS bookkeeping files that are never part of a skill."""
+    if path.startswith("__MACOSX/"):
+        return True
+    segments = path.split("/")
+    return any(
+        seg in _IGNORED_ARCHIVE_NAMES or seg.startswith("._") for seg in segments
+    )
+
+
 def _normalize_skill_files(files: dict[str, bytes]) -> dict[str, bytes]:
     out: dict[str, bytes] = {}
     total = 0
@@ -355,9 +376,18 @@ def _normalize_skill_files(files: dict[str, bytes]) -> dict[str, bytes]:
                 status_code=400,
                 detail="Skill file path contains a path-traversal sequence.",
             )
-        if path.startswith("."):
+        if _is_archive_cruft(path):
+            continue
+        # Check every segment, not just the first character of the whole path:
+        # ".env" at the root was refused while "sub/.env" sailed through.
+        dotted = next((seg for seg in path.split("/") if seg.startswith(".")), None)
+        if dotted is not None:
             raise HTTPException(
-                status_code=400, detail="Skill file path must not start with a dot."
+                status_code=400,
+                detail=(
+                    f"Skill bundle contains a hidden file ({dotted}). "
+                    "Remove it and try again."
+                ),
             )
         total += len(content)
         if total > _MAX_DOWNLOAD_BYTES:
@@ -510,41 +540,133 @@ def _installed_slugs(mgr: Any) -> set[str]:
 
 
 def _safe_zip_to_files(zip_bytes: bytes) -> dict[str, bytes]:
-    """Read a ClawHub ZIP into a normalized skill file bundle."""
-    try:
-        zf = zipfile.ZipFile(io.BytesIO(zip_bytes))
-    except zipfile.BadZipFile as exc:
-        raise HTTPException(
-            status_code=502, detail="ClawHub returned a bad ZIP."
-        ) from exc
+    """Read a skill ZIP into a normalized skill file bundle."""
+    files, _root = _safe_zip_extract(zip_bytes)
+    return files
 
+
+def _safe_zip_extract(
+    zip_bytes: bytes, *, bad_zip_status: int = 502
+) -> tuple[dict[str, bytes], str]:
+    """Read a skill ZIP into ``(normalized files, root dir name)``.
+
+    ``bad_zip_status`` is the status for an archive that cannot be read at
+    all, letting the caller say who supplied it: 502 when it arrived from a
+    registry proxy (the default), 4xx when the client handed it to us.
+    Rejections about an archive's *contents* keep their own status
+    regardless, so a caller cannot mask a traversal or a size overrun.
+
+    The size budget is enforced on the *actual* decompressed byte count,
+    not the sizes declared in the ZIP headers — a hostile archive can
+    declare small sizes for members that inflate far larger.
+    """
+    # One guard around the whole "read an untrusted archive" region, rather than
+    # naming exception types per call site. Enumerating them only ever covers
+    # what was thought of: a tampered end-of-central-directory offset raises
+    # ValueError from the constructor, an encrypted member RuntimeError, a
+    # broken DEFLATE stream zlib.error, BZIP2/LZMA corruption OSError or
+    # lzma.LZMAError — none of which subclass one another. Whatever zipfile
+    # raises next is covered here too. Our own HTTPExceptions re-raise unchanged
+    # so their specific status and message survive.
     total = 0
     raw_files: dict[str, bytes] = {}
-    for info in zf.infolist():
-        if info.is_dir():
-            continue
-        if info.file_size > _MAX_DOWNLOAD_BYTES:
-            raise HTTPException(status_code=413, detail="Skill ZIP member too large.")
-        total += info.file_size
-        if total > _MAX_DOWNLOAD_BYTES:
-            raise HTTPException(
-                status_code=413, detail="Skill ZIP exceeds size budget."
-            )
-        path = info.filename.replace("\\", "/").lstrip("/")
-        if not path or ".." in path.split("/"):
-            raise HTTPException(
-                status_code=400, detail="Skill ZIP contains unsafe paths."
-            )
-        raw_files[path] = zf.read(info)
+    try:
+        zf = zipfile.ZipFile(io.BytesIO(zip_bytes))
+        for info in zf.infolist():
+            if info.is_dir():
+                continue
+            path = info.filename.replace("\\", "/").lstrip("/")
+            if not path or ".." in path.split("/"):
+                raise HTTPException(
+                    status_code=400, detail="Skill ZIP contains unsafe paths."
+                )
+            remaining = _MAX_DOWNLOAD_BYTES - total
+            # Reject on the declared size before inflating anything. zipfile
+            # validates each member against its declared length and CRC while
+            # reading, so a header that under-declares fails the read rather
+            # than smuggling bytes past this check; the running total below
+            # backstops it regardless.
+            if info.file_size > remaining:
+                raise HTTPException(
+                    status_code=413, detail="Skill ZIP exceeds size budget."
+                )
+            # Inflate in bounded chunks rather than one read(remaining + 1):
+            # a single read of the whole budget holds the result and zipfile's
+            # own growing buffer at once, so a ~800 KiB bomb peaked at twice
+            # the 50 MiB budget. Chunking caps the overshoot at one chunk.
+            chunks: list[bytes] = []
+            read_total = 0
+            with zf.open(info) as member:
+                while True:
+                    chunk = member.read(_ARCHIVE_CHUNK_BYTES)
+                    if not chunk:
+                        break
+                    read_total += len(chunk)
+                    if read_total > remaining:
+                        # Belt and braces, and deliberately not covered by a
+                        # test: every way to get here is already intercepted,
+                        # by the declared-size check above or by zipfile's own
+                        # CRC/length validation of the member. It stands so a
+                        # member that ever does out-produce its header -- a
+                        # zipfile change, a format we do not decompress today
+                        # -- cannot walk past the budget.
+                        raise HTTPException(
+                            status_code=413, detail="Skill ZIP exceeds size budget."
+                        )
+                    chunks.append(chunk)
+            content = b"".join(chunks)
+            total += len(content)
+            raw_files[path] = content
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.warning(
+            "Skill Hub: unreadable archive (%s)", type(exc).__name__, exc_info=True
+        )
+        raise HTTPException(
+            status_code=bad_zip_status,
+            detail="Skill archive is not a readable ZIP.",
+        ) from exc
 
-    skill_md_paths = sorted(
-        path for path in raw_files if path.endswith("/SKILL.md") or path == "SKILL.md"
-    )
+    # Choose the root by depth, not by alphabet. A plain sort asserted the
+    # wrong invariant: a skill folder shipping its own "Examples/SKILL.md"
+    # sorts before the real root marker, so the example was imported *as* the
+    # skill — named "Examples", with the true root's files silently dropped and
+    # a 200 returned. Cruft is filtered first so a crafted "__MACOSX/SKILL.md"
+    # cannot win either.
+    skill_md_paths = [
+        path
+        for path in raw_files
+        if (path.endswith("/SKILL.md") or path == "SKILL.md")
+        and not _is_archive_cruft(path)
+    ]
     if not skill_md_paths:
         raise HTTPException(
-            status_code=400, detail="ClawHub artifact has no SKILL.md anywhere in it."
+            status_code=400, detail="Skill archive has no SKILL.md anywhere in it."
         )
-    skill_root = skill_md_paths[0].removesuffix("SKILL.md").rstrip("/")
+    min_depth = min(path.count("/") for path in skill_md_paths)
+    shallowest = sorted(p for p in skill_md_paths if p.count("/") == min_depth)
+    if len(shallowest) > 1:
+        # Two skills at the same depth: picking one would discard the other, so
+        # make the user say which. Bounded so a crafted archive cannot reflect
+        # an unlimited list of its own directory names back through the error.
+        roots = ", ".join(
+            (path.removesuffix("SKILL.md").rstrip("/") or ".")[:60]
+            for path in shallowest[:5]
+        )
+        if len(shallowest) > 5:
+            roots += f", and {len(shallowest) - 5} more"
+        # 400 on both paths, matching the "no SKILL.md" rejection above:
+        # ``bad_zip_status`` distinguishes who supplied an *unreadable* archive,
+        # and this one parsed fine — it just carries the wrong contents.
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Skill archive contains multiple skills ({roots}). "
+                "Upload one skill per archive."
+            ),
+        )
+    skill_root = shallowest[0].removesuffix("SKILL.md").rstrip("/")
     files: dict[str, bytes] = {}
     for path, content in raw_files.items():
         if skill_root:
@@ -556,7 +678,7 @@ def _safe_zip_to_files(zip_bytes: bytes) -> dict[str, bytes]:
             rel = path
         if rel:
             files[rel] = content
-    return _normalize_skill_files(files)
+    return _normalize_skill_files(files), skill_root.rsplit("/", 1)[-1]
 
 
 def _check_registry_security_gate(registry: Any, detail: dict) -> None:

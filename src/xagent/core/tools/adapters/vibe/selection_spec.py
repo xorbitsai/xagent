@@ -59,6 +59,7 @@ from typing import Any, List, Optional, Set
 from .base import (
     AGENT_CONFIG_UNASSIGNABLE_CATEGORIES,
     BINDING_AUTHORIZED_CATEGORIES,
+    INTRINSIC_TOOL_NAMES,
 )
 
 logger = logging.getLogger(__name__)
@@ -725,6 +726,16 @@ class _SpecByCategories(ToolSelectionSpec):
             # contributed tool is admitted on the task-scoped signal alone and
             # never depends on its (default ``other``) category metadata.
             if tool_name in extension_tool_names:
+                names.add(tool_name)
+                continue
+
+            # Intrinsic admit: an always-available tool rides along any non-NONE
+            # selection regardless of the category picker (NONE never reaches
+            # this subclass). Same ID-level shape as the task-runtime admit.
+            # This runs ahead of any injection-only scoping too, so an
+            # unconfigured workforce-manager spec also gets it; harmless, as the
+            # tool is read-only and grants no new capability.
+            if tool_name in INTRINSIC_TOOL_NAMES:
                 names.add(tool_name)
                 continue
 

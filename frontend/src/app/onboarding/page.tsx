@@ -358,6 +358,21 @@ export default function OnboardingPage() {
     // single Back press would return the user to a stale, reset-to-step-0
     // wizard even though they've just finished with it (or escaped it).
     if (isMountedRef.current) {
+      // Reset on "escaped" too (not just retry_in_place above), matching
+      // the pre-refactor behavior of resetting on every failure regardless
+      // of outcome - NOT on "saved", which correctly leaves the button in
+      // its launching state through a successful exit's navigation, same
+      // as before. The extraction that introduced trySavePreferences
+      // originally dropped this reset on the "escaped" outcome specifically,
+      // on the reasoning that a navigation is about to unmount the page
+      // anyway - but that leaves the exit button/spinner visibly stuck in
+      // its launching state for however long router.replace takes to
+      // actually resolve and unmount, a real (if narrow) regression caught
+      // by a dedicated self-review pass on the refactor itself.
+      if (outcome === "escaped") {
+        launchingRef.current = false;
+        setLaunching(false);
+      }
       // Escaping despite the failure only works if AuthGuard's own
       // onboarding check on `destination` doesn't immediately see
       // onboarded:false and bounce the user right back (self-review found

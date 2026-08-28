@@ -1171,6 +1171,12 @@ describe("OnboardingPage", () => {
     // false and immediately bounce the user right back, defeating the
     // point of escaping at all.
     expect(markOnboardingSaveEscapedMock).toHaveBeenCalledTimes(1)
+    // Pins a regression caught by self-reviewing the trySavePreferences
+    // extraction: the shared-helper refactor initially dropped this reset
+    // on the "escaped" outcome specifically (only restoring it on
+    // retry_in_place), leaving the exit button visibly stuck disabled for
+    // as long as router.replace takes to actually resolve and unmount.
+    expect(screen.getByText("Skip setup").closest("button")).not.toBeDisabled()
   })
 
   // Pins a self-review finding: the failure count is per-destination, not

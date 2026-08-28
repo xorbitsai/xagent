@@ -179,18 +179,19 @@ export const findWaitingPromptAndInteractions = (
       continue
     }
 
-    if (needMessage && needInteractions) {
-      if (hasMessage || hasInteractions) {
-        return { message: eventMessage, interactions: eventInteractions }
-      }
-    } else if (needMessage) {
-      if (hasMessage) {
-        return { message: eventMessage, interactions: taskInteractions }
-      }
-    } else if (needInteractions) {
-      if (hasInteractions) {
-        return { message: taskMessage, interactions: eventInteractions }
-      }
+    if (!hasMessage && !hasInteractions) continue
+
+    // This is the most recent event that represents ANY kind of pause -
+    // resolve whichever field(s) are still needed from exactly this one
+    // event, not an older event further back. Scanning past it for an
+    // older event that happens to have the still-needed field would pair
+    // fields from two unrelated pauses (e.g. a newer plain-text question
+    // with an older connect_apps pause's interactions, when the question
+    // was already resolved from currentTask and only interactions still
+    // needed scanning).
+    return {
+      message: needMessage ? eventMessage : taskMessage,
+      interactions: needInteractions ? eventInteractions : taskInteractions,
     }
   }
 

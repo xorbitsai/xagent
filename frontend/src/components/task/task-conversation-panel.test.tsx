@@ -1478,6 +1478,41 @@ describe("findWaitingPromptAndInteractions", () => {
     })
   })
 
+  it("does not backfill interactions from an older connect_apps event when the newer resolved question has none of its own", () => {
+    // currentTask.waitingQuestion already resolves the message (a new
+    // plain-text question), leaving only interactions to scan for. The
+    // newest trace event that represents a pause (has a message OR
+    // interactions) is the one the message came from, and it has no
+    // interactions - that must win over an OLDER event further back that
+    // happens to carry a stale connect_apps interaction, or the wrong app
+    // card would become active for an unrelated question.
+    const task = {
+      status: "waiting_for_user",
+      waitingQuestion: "Which dataset should I use?",
+      waitingInteractions: [],
+    } as any
+    const traceEvents = [
+      {
+        event_type: "agent_message",
+        data: {
+          expect_response: true,
+          metadata: {
+            interactions: [{ type: "connect_apps", field: "connect_apps", apps: ["Gmail"] }],
+          },
+        },
+      },
+      {
+        event_type: "agent_message",
+        data: { expect_response: true, message: "Which dataset should I use?" },
+      },
+    ]
+
+    expect(findWaitingPromptAndInteractions(task, traceEvents)).toEqual({
+      message: "Which dataset should I use?",
+      interactions: undefined,
+    })
+  })
+
   it("pairs the message and interactions from the SAME trace event, not two independently-found events", () => {
     const traceEvents = [
       {

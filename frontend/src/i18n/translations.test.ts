@@ -105,6 +105,19 @@ describe("translations", () => {
     )
   })
 
+  it("interpolates a value containing $& and $$ verbatim instead of treating it as a replacement-string token", () => {
+    // String.replace's replacement-STRING form gives $&/$$/$1 special
+    // meaning; an admin-created MCP app name containing one (interpolated
+    // into connectApps.needAccess's {apps}) must not corrupt the output.
+    expect(
+      resolveTranslation("en", "chatPage.clarification.connectApps.needAccess", {
+        apps: "Weird $& App, $$ Bot",
+      }),
+    ).toBe(
+      "I need access to Weird $& App, $$ Bot to continue. Please connect below, then let me know once you have.",
+    )
+  })
+
   it("provides localized Agent delete dependency copy", () => {
     const english = (translations.en.builds.list as Record<string, unknown>).deleteDialog
     const chinese = (translations.zh.builds.list as Record<string, unknown>).deleteDialog

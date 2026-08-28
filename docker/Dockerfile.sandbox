@@ -29,14 +29,10 @@ LABEL description="Full sandbox image with all tools"
 
 COPY --from=uv /uv /uvx /usr/local/bin/
 
-# Fixed, world-writable npm/npx cache location, set before anything in
-# this stage might invoke npx. npm's default cache path is keyed to
-# $HOME, which varies by which user actually runs a command; a cache
-# warmed under one user's $HOME and read from another's would silently
-# stay cold. A single fixed path removes that specific failure mode --
-# but does not by itself guarantee the warmed cache is ever consulted;
-# see the npx warm-up comment below for a known gap in the connector's
-# actual launch path that currently limits this.
+# Fixed npm/npx cache location, set before anything in this stage might
+# invoke npx -- npm's default path is keyed to $HOME, which varies by
+# exec user. Doesn't by itself guarantee the warmed cache gets used;
+# see the npx warm-up comment below (xorbitsai/xagent#1869).
 ENV NPM_CONFIG_CACHE=/opt/npm-cache
 RUN mkdir -p "$NPM_CONFIG_CACHE" && chmod 1777 "$NPM_CONFIG_CACHE"
 
@@ -58,52 +54,32 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 ######################## browser install (apt): Chrome on amd64, Chromium on arm64
 #
-# Browser for the built-in "chrome" MCP connector (chrome-devtools-mcp),
-# mirroring Dockerfile.backend's INSTALL_CHROME block: that image only
-# covers the non-sandboxed path (SANDBOX_ENABLED=false), where the connector
-# runs directly on the backend host. Whenever a sandbox is configured,
-# should_sandbox_mcp_connection() routes every npx/uvx-launched MCP
-# connector -- chrome-devtools-mcp included -- into *this* image instead,
-# which never got the same browser install, so the connector's tool calls
-# fail with "Could not find Google Chrome executable" the moment sandboxing
-# is turned on. Same ARG gate, same reasoning: deployments that never
-# intend to enable this connector can drop the image size and the
-# /opt/google/chrome/chrome binary + npx cache with
-# --build-arg INSTALL_CHROME=false.
+# Browser for the built-in "chrome" MCP connector (chrome-devtools-mcp).
+# Dockerfile.backend's own INSTALL_CHROME block only covers the non-
+# sandboxed path; should_sandbox_mcp_connection() routes every npx/uvx
+# connector into *this* image once a sandbox is configured, so it needs
+# the same browser or the connector fails with "Could not find Google
+# Chrome executable". --build-arg INSTALL_CHROME=false skips it (and the
+# npx cache below) for deployments that never enable the connector.
 #
-# Security posture, matching Dockerfile.backend's (not a new risk this
-# image introduces): DockerSandboxService always creates/execs this
-# container as root regardless of the USER directive later in this file
-# (src/xagent/sandbox/docker_sandbox.py: "Run as root to match the file
-# access behavior of Boxlite"), and the connector's launch_config passes
-# --chrome-arg=--no-sandbox --chrome-arg=--disable-setuid-sandbox, so
-# Chrome parses arbitrary page content as UID 0 with its own process
-# sandbox disabled. Accepted for now only because the connector stays
-# is_visible_in_connector: false until the security review that
-# Dockerfile.backend's own comment tracks (root Chrome there too) is
-# done -- do not treat this image as a safer alternative to that one.
+# Security posture matches Dockerfile.backend's, not a new risk: this
+# container always execs as root (docker_sandbox.py) and the connector's
+# launch_config passes --no-sandbox/--disable-setuid-sandbox, so Chrome
+# runs as UID 0 with its own sandbox disabled. Accepted only because the
+# connector stays is_visible_in_connector: false pending the same
+# security review Dockerfile.backend's comment tracks.
 ARG INSTALL_CHROME=true
-# chrome-devtools-mcp's default "stable" channel resolution checks exactly
-# /opt/google/chrome/chrome on Linux -- see Dockerfile.backend's block for
-# the full per-architecture rationale (Google ships no arm64 Chrome; Debian
-# Chromium is CDP-compatible and gets symlinked into the same path so both
-# images and both architectures share one resolver path with no
-# --executablePath override needed in builtin_mcp_registry.py's
-# launch_config).
+# Resolves "stable" to exactly /opt/google/chrome/chrome on Linux -- see
+# Dockerfile.backend's block for the per-architecture rationale (no
+# arm64 Chrome from Google; Chromium is CDP-compatible and gets
+# symlinked to the same path so both images share one resolver path).
 #
-# fonts-liberation + fonts-noto-cjk on both branches: neither Debian's
-# chromium package (its fonts-liberation dependency is only a Recommends,
-# skipped by --no-install-recommends) nor this node:22-slim base image
-# ships any font. Headless Chrome/Chromium with zero fonts installed
-# renders text as blank/tofu boxes -- a silent failure of this
-# connector's primary use case (screenshots, reading rendered page
-# content), not a crash, so it wouldn't surface as a build or launch
-# error. amd64's google-chrome-stable .deb hard-Depends on
-# fonts-liberation already, making that half a no-op there, but explicit
-# beats relying on an incidental transitive dependency; fonts-noto-cjk
-# (CJK glyph coverage) is not pulled in by either package and matches
-# Dockerfile.backend's shared runtime-base stage, which installs it
-# unconditionally for the same connector.
+# fonts-liberation + fonts-noto-cjk: neither Debian's chromium package
+# (fonts-liberation is only a Recommends, skipped by
+# --no-install-recommends) nor node:22-slim ships any font, and headless
+# Chrome/Chromium with none installed silently renders blank/tofu text
+# instead of failing the build. fonts-noto-cjk matches what
+# Dockerfile.backend's base stage already installs for this connector.
 RUN if [ "$INSTALL_CHROME" != "true" ]; then \
         echo "INSTALL_CHROME=$INSTALL_CHROME -- skipping Chrome/Chromium install"; \
     else \
@@ -132,48 +108,24 @@ RUN if [ "$INSTALL_CHROME" != "true" ]; then \
         [ -e /opt/google/chrome/chrome ] || { echo "ERROR: the Chrome/Chromium install did not produce /opt/google/chrome/chrome -- update the chrome-devtools-mcp resolver path handling" >&2; exit 1; }; \
     fi
 
-# Warm the npx cache for the exact version pinned in
-# builtin_mcp_registry.py's launch_config, same rationale as
-# Dockerfile.backend's identical step: avoid a needless npm-registry
-# round-trip (and its latency/flakiness) on every sandboxed launch of
-# this connector, not just the first -- when the warmed cache actually
-# gets consulted by that launch; see the known gap below. Reads/writes
-# NPM_CONFIG_CACHE (set once, near the top of this stage) rather than
-# the default $HOME/.npm/_npx, so warming this doesn't need to guess
-# which user's $HOME a later npx invocation will resolve against.
-#
-# Known gap, not yet closed (xorbitsai/xagent#1869): the MCP stdio
-# launcher every connector goes through (mcp.client.stdio's
-# get_default_environment(), invoked from this repo's own
-# sessions.py::_create_stdio_session) only forwards HOME/LOGNAME/PATH/
-# SHELL/TERM/USER to the process it actually spawns, and this
-# connector's launch_config sets no "env" key -- so NPM_CONFIG_CACHE,
-# despite being set on this container, does not reach the npx process
-# this warm-up exists to serve. The warm-up below still runs (harmless,
-# and it becomes useful the moment that gap closes), but today it does
-# not measurably help: the spawned npx falls back to its own default
-# cache and still needs npm-registry access on every launch. This is
-# not unique to this image -- Dockerfile.backend's identical, already-
-# shipped warm-up has the same gap, since its non-sandboxed launch path
-# goes through the exact same call chain.
-#
-# Separately (also #1869): DockerSandboxService always execs this
-# container as root regardless of the USER directive below, but
-# Boxlite -- this project's other sandbox backend, sharing this same
-# image via SANDBOX_IMAGE -- execs as the image's *declared* user by
-# default when no override is passed, which is what this codebase does
-# (boxlite_sandbox.py), i.e. `sandbox`, not root. So even once the gap
-# above closes, a non-root Boxlite exec can only benefit from cache
-# hits already warmed here at build time; it cannot write a new entry
-# into a cache root-owned and world-*readable*-only (umask 0022 below).
+# Warm the npx cache for the version pinned in builtin_mcp_registry.py's
+# launch_config, mirroring Dockerfile.backend's identical step, to skip
+# the npm registry on launch -- when the cache actually gets consulted,
+# which today it doesn't (xorbitsai/xagent#1869: the MCP stdio launcher
+# every connector goes through only forwards a fixed env allowlist to
+# the spawned process, stripping NPM_CONFIG_CACHE; also affects
+# Dockerfile.backend's identical warm-up). Harmless either way -- npx
+# still falls back to a normal fetch on a cache miss. #1869 also covers
+# Boxlite (this image's other sandbox backend) execing as the non-root
+# `sandbox` user by default, relevant once the env gap above is closed:
+# it could read an already-warmed cache but not write a new entry into
+# one root-owned and world-*readable*-only (see umask below).
 #
 # `--help` exercises resolution without starting Chrome, so this needs
-# no display/GPU setup at build time. umask 0022 (world-readable, not
-# world-writable): the goal is only cross-user *read* access to the
-# warmed cache, so a laxer 0000 would needlessly leave the cache tree
-# writable by any future lower-privileged process with filesystem
-# access inside the container -- an avoidable way to tamper with a
-# package `--prefer-offline` trusts without re-verifying.
+# no display/GPU setup at build time. umask 0022, not 0000: only
+# cross-user *read* access is needed, so a laxer mask would needlessly
+# leave the cache tree writable by any future lower-privileged process
+# in the container.
 RUN if [ "$INSTALL_CHROME" = "true" ]; then \
         umask 0022 && npx -y --prefer-offline chrome-devtools-mcp@1.6.0 --help > /dev/null; \
     fi

@@ -238,8 +238,19 @@
   var MOBILE_BREAKPOINT = 480;
   var HORIZONTAL_VIEWPORT_MARGIN = 40;
 
+  // window.innerWidth includes a classic (non-overlay) scrollbar's own
+  // width, but the CSS media query below measures the viewport itself -- on
+  // a desktop browser with a visible scrollbar those two can disagree by a
+  // few pixels right at the boundary. matchMedia asks the CSS engine the
+  // same question directly, so it can never drift from it; fall back to the
+  // innerWidth comparison only where matchMedia itself is unavailable (this
+  // project's own jsdom test environment has no matchMedia at all).
+  var mobileMediaQuery = typeof window.matchMedia === 'function'
+    ? window.matchMedia('(max-width: ' + MOBILE_BREAKPOINT + 'px)')
+    : null;
+
   function isMobileViewport() {
-    return window.innerWidth <= MOBILE_BREAKPOINT;
+    return mobileMediaQuery ? mobileMediaQuery.matches : window.innerWidth <= MOBILE_BREAKPOINT;
   }
 
   function clampPanelWidth(width) {
@@ -369,11 +380,19 @@
       background: rgba(0, 0, 0, 0.15);
     }
 
-    /* visibility transitions to a closed panel keep it hit-testable for the
-       duration of the transition (per spec, as long as either end of the
-       transition is 'visible') -- without this, the handle stays draggable
-       and cursor-hinting during that window even though the panel is
-       already fading out. */
+    /* visibility transitions keep an element hit-testable for the whole
+       transition (per spec, as long as either end is 'visible') -- without
+       this, a closed-but-still-fading panel stays clickable/touchable for
+       the ~300ms fade, silently swallowing input meant for whatever's
+       underneath it on the host page. On mobile this covers the entire
+       viewport, not just the small desktop popup's footprint. */
+    .xagent-widget-panel:not(.open) {
+      pointer-events: none;
+    }
+
+    /* Same transition-visibility gap as above, applied to the resize handle
+       specifically: without this it stays draggable and cursor-hinting
+       during that window even though the panel is already fading out. */
     .xagent-widget-panel:not(.open) .xagent-widget-resize-handle {
       display: none;
     }
@@ -386,14 +405,22 @@
         height: 100%;
         max-height: 100%;
         /* Dynamic viewport units track a mobile browser's address-bar
-           show/hide and on-screen-keyboard changes; browsers that don't
-           parse dvh at all ignore these two lines entirely and keep the
-           100% fallback above. */
+           show/hide (under the default interactive-widget=resizes-visual
+           behavior this widget doesn't override, an on-screen keyboard
+           opening does NOT change dvh on either iOS Safari or Android
+           Chrome); browsers that don't parse dvh at all ignore these two
+           lines entirely and keep the 100% fallback above. */
         height: 100dvh;
         max-height: 100dvh;
         border: none;
         border-radius: 0;
         box-shadow: none;
+        /* The safe-area padding strips below have no scrollable content of
+           their own -- without this, a touch-drag starting on one of them
+           can chain into scrolling the host page hidden behind this "modal"
+           instead of doing nothing, even with body scroll separately locked
+           in JS (a known gap in body-only overflow:hidden on iOS Safari). */
+        overscroll-behavior: none;
         /* Full-screen means edge-to-edge, including under a notch/home
            indicator or, in landscape, a side notch -- the fallback keeps
            unsupporting browsers at 0. */
@@ -426,7 +453,7 @@
          without this guard the FAB would disappear as soon as the panel
          opens regardless, leaving a full-screen overlay with no dismiss
          action at all in those states. */
-      .xagent-widget-panel.open.xagent-chrome-ready ~ .xagent-widget-fab {
+      .xagent-widget-panel.open.xagent-widget-chrome-ready ~ .xagent-widget-fab {
         display: none;
       }
     }
@@ -671,6 +698,16 @@
     // this the handle would still show its ew-resize cursor and hover
     // highlight, looking interactive while doing nothing).
     resizeHandle.style.display = 'none';
+    // Same belt-and-suspenders, but for a much worse failure mode on
+    // reinsertion: fab.onclick and the iframe's own postMessage close
+    // channel are BOTH permanently guarded by torndown now, so a reinserted
+    // node that still carried a stale 'open'/'xagent-widget-chrome-ready'
+    // class from before teardown would render a full-screen mobile overlay
+    // with no way left to dismiss it. Clearing them here means a reinserted
+    // node always starts fully closed; hiding the FAB keeps a now-
+    // permanently-inert control from looking like it still does something.
+    panel.classList.remove('open', 'xagent-widget-chrome-ready');
+    fab.style.display = 'none';
   });
 
   // FAB
@@ -685,12 +722,12 @@
 
   var isOpen = false;
 
-  // True exactly while THIS instance owns a reference on the shared lock
-  // below -- a second widget script on the same host page (or this one
-  // reloaded into an SPA route) runs its own independent copy of this whole
-  // closure, so per-instance state alone can't tell whether some other
-  // instance still needs the lock this one is about to release.
-  var scrollLockOwned = false;
+  // Non-null exactly while THIS instance owns a reference on the shared lock
+  // below, and which body element that reference is against -- a second
+  // widget script on the same host page (or this one reloaded into an SPA
+  // route) runs its own independent copy of this whole closure, so
+  // per-instance state alone can't tell whether some other instance still
+  // needs the lock this one is about to release.
   var scrollLockedBodyEl = null;
 
   // The lock itself is ref-counted on the body element it was applied to
@@ -704,29 +741,34 @@
   // document.body read at release time, so a body swap mid-lock can't write
   // a stale snapshot onto the replacement.
   function acquireBodyScrollLock() {
-    if (scrollLockOwned) return;
+    if (scrollLockedBodyEl) return;
     var body = document.body;
     if (!body) return;
-    var state = body.__xagentScrollLock;
+    var state = body.__xagentScrollLockV1;
     if (!state) {
-      state = body.__xagentScrollLock = { count: 0, original: body.style.overflow };
+      state = body.__xagentScrollLockV1 = { count: 0, original: body.style.overflow };
+    } else if (body.style.overflow !== 'hidden') {
+      // Some other owner already holds this lock (count > 0), but the live
+      // value isn't our own 'hidden' sentinel -- the host page must have
+      // changed it independently since the lock was first acquired. Resync
+      // so an eventual full release restores THAT value, not the stale one
+      // captured back at the very first acquire.
+      state.original = body.style.overflow;
     }
     state.count += 1;
     body.style.overflow = 'hidden';
-    scrollLockOwned = true;
     scrollLockedBodyEl = body;
   }
 
   function releaseBodyScrollLock() {
-    if (!scrollLockOwned) return;
-    scrollLockOwned = false;
     var body = scrollLockedBodyEl;
+    if (!body) return;
     scrollLockedBodyEl = null;
-    var state = body && body.__xagentScrollLock;
+    var state = body.__xagentScrollLockV1;
     if (!state) return;
     state.count -= 1;
     if (state.count > 0) return;
-    delete body.__xagentScrollLock;
+    delete body.__xagentScrollLockV1;
     // Only restore if it's still our 'hidden' -- a host page that changed it
     // independently in the meantime (matching the userSelect/cursor drag
     // guard above) owns whatever it set last, not us.
@@ -811,9 +853,9 @@
       // Until this arrives (or after it's revoked below), the FAB stays the
       // parent-owned fallback so a stuck child state can never fully trap
       // the visitor behind a full-screen mobile panel with no dismiss action.
-      panel.classList.add('xagent-chrome-ready');
+      panel.classList.add('xagent-widget-chrome-ready');
     } else if (data.type === 'widget_chrome_not_ready') {
-      panel.classList.remove('xagent-chrome-ready');
+      panel.classList.remove('xagent-widget-chrome-ready');
     }
   }
   window.addEventListener('message', onChromeMessage);

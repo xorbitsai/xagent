@@ -416,6 +416,18 @@ describe("widget bootstrap", () => {
       )
     })
 
+    it("declares the closed-panel rule that stops it swallowing clicks during its fade-out", () => {
+      // Same visibility-transition gap as the resize-handle rule above, but
+      // for the panel itself: without pointer-events: none here, a closed
+      // panel stays hit-testable for the whole ~300ms fade, silently
+      // intercepting input meant for the host page underneath -- the full
+      // viewport on mobile, not just the small desktop popup's footprint.
+      runWidget({ "data-widget-key": "widget-secret" })
+      const css = document.head.querySelector("style")!.textContent!
+
+      expect(css).toMatch(/\.xagent-widget-panel:not\(\.open\)\s*\{[^}]*pointer-events:\s*none;/)
+    })
+
     it("ignores a drag start below the mobile breakpoint", () => {
       setInnerWidth(400)
       runWidget({ "data-widget-key": "widget-secret" })
@@ -884,6 +896,35 @@ describe("widget bootstrap", () => {
       expect(document.body.style.userSelect).toBe("text")
     })
 
+    it("starts fully closed if the same open panel node is later re-inserted into the DOM", async () => {
+      // Regression coverage: fab.onclick and the iframe's own postMessage
+      // close channel are BOTH permanently guarded by the torndown flag, so
+      // a reinserted node that still carried a stale 'open'/readiness class
+      // from before teardown would render an unclosable full-screen mobile
+      // overlay -- the FAB hidden by CSS, and neither remaining "close" path
+      // able to do anything about it.
+      runWidget({ "data-widget-key": "widget-secret" })
+      openPanel()
+      window.dispatchEvent(new MessageEvent("message", {
+        data: { xagent: true, v: 1, type: "widget_chrome_ready" },
+        origin: "https://chat.example",
+        source: widgetIframe().contentWindow as Window,
+      }))
+      expect(panel()).toHaveClass("open")
+      expect(panel()).toHaveClass("xagent-widget-chrome-ready")
+      const container = document.querySelector(".xagent-widget-container")!
+      const detachedFab = document.querySelector<HTMLButtonElement>(".xagent-widget-fab")!
+
+      container.remove()
+      await Promise.resolve() // teardown observer fires and disconnects
+
+      document.body.appendChild(container)
+
+      expect(panel()).not.toHaveClass("open")
+      expect(panel()).not.toHaveClass("xagent-widget-chrome-ready")
+      expect(detachedFab.style.display).toBe("none")
+    })
+
     it("stops reacting to window/document listeners once the panel leaves the DOM", async () => {
       // Spy without mockImplementation so these still call through -- we
       // want the real listeners attached, just also recorded.
@@ -991,35 +1032,54 @@ describe("widget bootstrap", () => {
       // or an overflow against the "large" viewport 100% resolves against.
       expect(block).toMatch(/\.xagent-widget-panel\s*\{[^}]*height:\s*100dvh;/)
       expect(block).toMatch(/\.xagent-widget-panel\s*\{[^}]*max-height:\s*100dvh;/)
+      // Order matters, not just presence: on equal specificity the LAST
+      // declaration wins, so the 100dvh enhancement must come after its 100%
+      // fallback -- reordering them would still make every assertion above
+      // pass while silently breaking the fallback for browsers that don't
+      // parse dvh at all (they'd apply 100dvh as an unrecognized value, no
+      // fallback left behind it).
+      const panelRule = block.match(/\.xagent-widget-panel\s*\{([^}]*)\}/)![1]
+      expect(panelRule.search(/height:\s*100dvh;/)).toBeGreaterThan(panelRule.search(/height:\s*100%;/))
+      expect(panelRule.search(/max-height:\s*100dvh;/)).toBeGreaterThan(panelRule.search(/max-height:\s*100%;/))
     })
 
     it("respects device safe areas instead of drawing under a notch or home indicator", () => {
       runWidget({ "data-widget-key": "widget-secret" })
 
-      const block = mobileBlock()
+      // Scoped to the panel rule's own body, not the whole mobile media
+      // block -- an unscoped match would still pass if these declarations
+      // were ever moved into an unrelated rule in the same block.
+      const panelRule = mobileBlock().match(/\.xagent-widget-panel\s*\{([^}]*)\}/)![1]
       // Match the whole env() expression, fallback included -- a regex that
       // stops at the property name would still pass if the ", 0px" fallback
       // (the only thing keeping non-supporting browsers at zero padding) were
       // ever dropped.
-      expect(block).toMatch(/padding-top:\s*env\(safe-area-inset-top,\s*0px\)/)
-      expect(block).toMatch(/padding-bottom:\s*env\(safe-area-inset-bottom,\s*0px\)/)
+      expect(panelRule).toMatch(/padding-top:\s*env\(safe-area-inset-top,\s*0px\)/)
+      expect(panelRule).toMatch(/padding-bottom:\s*env\(safe-area-inset-bottom,\s*0px\)/)
       // Landscape can put a side notch on either edge.
-      expect(block).toMatch(/padding-left:\s*env\(safe-area-inset-left,\s*0px\)/)
-      expect(block).toMatch(/padding-right:\s*env\(safe-area-inset-right,\s*0px\)/)
+      expect(panelRule).toMatch(/padding-left:\s*env\(safe-area-inset-left,\s*0px\)/)
+      expect(panelRule).toMatch(/padding-right:\s*env\(safe-area-inset-right,\s*0px\)/)
+    })
+
+    it("stops the safe-area padding strips from chaining a touch-scroll through to the host page", () => {
+      runWidget({ "data-widget-key": "widget-secret" })
+
+      const panelRule = mobileBlock().match(/\.xagent-widget-panel\s*\{([^}]*)\}/)![1]
+      expect(panelRule).toMatch(/overscroll-behavior:\s*none;/)
     })
 
     it("hides the FAB only once the iframe has confirmed its own close control is mounted", () => {
       runWidget({ "data-widget-key": "widget-secret" })
 
       const block = mobileBlock()
-      // Gated on .xagent-chrome-ready (toggled by onChromeMessage in response
+      // Gated on .xagent-widget-chrome-ready (toggled by onChromeMessage in response
       // to widget_chrome_ready/widget_chrome_not_ready), not just .open --
       // see widget-chrome.test.ts for the message-driven class toggling this
       // selector depends on. Without that gate, a loading/auth-failure/
       // degraded Session state (none of which render a header) would hide
       // the parent's only close control on a full-screen mobile panel with
       // nothing to replace it.
-      expect(block).toMatch(/\.xagent-widget-panel\.open\.xagent-chrome-ready\s*~\s*\.xagent-widget-fab\s*\{[^}]*display:\s*none;/)
+      expect(block).toMatch(/\.xagent-widget-panel\.open\.xagent-widget-chrome-ready\s*~\s*\.xagent-widget-fab\s*\{[^}]*display:\s*none;/)
     })
 
     it("stacks the fallback FAB above the fixed panel instead of letting it paint underneath", () => {
@@ -1035,6 +1095,20 @@ describe("widget bootstrap", () => {
       const block = mobileBlock()
       expect(block).toMatch(/\.xagent-widget-fab\s*\{[^}]*position:\s*relative;/)
       expect(block).toMatch(/\.xagent-widget-fab\s*\{[^}]*z-index:\s*1;/)
+    })
+
+    it("keeps the panel before the FAB in DOM order, which the FAB-hiding sibling selector depends on", () => {
+      // .xagent-widget-panel.open.xagent-widget-chrome-ready ~ .xagent-widget-fab
+      // only ever matches a FAB that comes AFTER the panel -- it would
+      // silently match nothing (leaving the FAB visible forever once ready)
+      // if that append order were ever reversed by a future edit, with no
+      // other test in this file that would catch it.
+      runWidget({ "data-widget-key": "widget-secret" })
+
+      const panel = document.querySelector(".xagent-widget-panel")!
+      const fab = document.querySelector(".xagent-widget-fab")!
+      const panelComesFirst = Boolean(panel.compareDocumentPosition(fab) & Node.DOCUMENT_POSITION_FOLLOWING)
+      expect(panelComesFirst).toBe(true)
     })
   })
 
@@ -1176,6 +1250,43 @@ describe("widget bootstrap", () => {
 
       fabs[1]!.click() // closes the second and last instance
       expect(document.body.style.overflow).toBe("")
+    })
+
+    it("resyncs the restore value if the host changes overflow independently while another instance still holds the lock", () => {
+      // The very first acquire captures 'original' once; every later
+      // acquire while the lock is already held (count > 0) must NOT blindly
+      // re-read the live value, since that value is normally just our own
+      // 'hidden' sentinel -- capturing THAT as 'original' would mean a full
+      // release restores 'hidden' forever. Resync must only happen when the
+      // live value has genuinely diverged from 'hidden', which can only mean
+      // the host changed it independently in between.
+      setInnerWidth(400)
+      fetchMock.mockImplementation(() => Promise.resolve(new Response(JSON.stringify({
+        ticket: "ticket/one",
+        agent_id: 17,
+      }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      })))
+      runWidget({ "data-widget-key": "widget-secret" })
+      document.querySelector<HTMLButtonElement>(".xagent-widget-fab")!.click()
+      expect(document.body.style.overflow).toBe("hidden")
+
+      // The host page independently opens its own modal (or otherwise
+      // changes this) while the widget still believes it holds the lock.
+      document.body.style.overflow = "scroll"
+
+      runWidget({ "data-widget-key": "widget-secret-2" })
+      document.querySelectorAll<HTMLButtonElement>(".xagent-widget-fab")[1]!.click()
+      expect(document.body.style.overflow).toBe("hidden")
+
+      document.querySelectorAll<HTMLButtonElement>(".xagent-widget-fab")[0]!.click()
+      expect(document.body.style.overflow).toBe("hidden") // second instance still holds it
+
+      document.querySelectorAll<HTMLButtonElement>(".xagent-widget-fab")[1]!.click()
+      // Restores the host's own later value, not the stale '' from the very
+      // first acquire before the host ever touched it.
+      expect(document.body.style.overflow).toBe("scroll")
     })
 
     it("does not re-lock scroll on a FAB click after the panel is torn down while open", async () => {

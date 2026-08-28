@@ -262,6 +262,11 @@ describe("PublicAgentChatPage", () => {
     renderWidgetPage({ embedTicket: "embed-ticket", widgetKey: "widget-secret" })
 
     expect(screen.queryByRole("button", { name: "widgetChat.close" })).toBeNull()
+    // Pin a positive assertion too, not just the negative above -- otherwise
+    // a bug that made this branch render nothing at all would pass this test
+    // undetected. The loading spinner has no accessible role/text of its own
+    // to query by.
+    expect(document.querySelector("svg.animate-spin")).not.toBeNull()
   })
 
   it("authenticates embedded widgets with the ticket and never sends the widget key", async () => {

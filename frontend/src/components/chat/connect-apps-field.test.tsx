@@ -801,6 +801,40 @@ describe("ConnectAppsField", () => {
     ).toBeInTheDocument();
   });
 
+  it("restores the Skip link when onSkip rejects, instead of leaving the card looking resolved", async () => {
+    mcpAppsMock.apps = [makeApp({ provider: "google" })];
+    const onSkip = vi.fn().mockRejectedValue(new Error("network error"));
+
+    render(
+      <ConnectAppsField interaction={{ ...LEO_INTERACTION, apps: ["Gmail"] }} onSkip={onSkip} />
+    );
+
+    fireEvent.click(screen.getByText("chatPage.clarification.connectApps.skip"));
+
+    await waitFor(() => {
+      expect(screen.getByText("chatPage.clarification.connectApps.skip")).toBeInTheDocument();
+    });
+    expect(
+      screen.queryByText("chatPage.clarification.connectApps.skippedNote")
+    ).not.toBeInTheDocument();
+    expect(onSkip).toHaveBeenCalledTimes(1);
+  });
+
+  it("only calls onSkip once when the skip link is clicked twice before React re-renders", () => {
+    mcpAppsMock.apps = [makeApp({ provider: "google" })];
+    const onSkip = vi.fn().mockResolvedValue(undefined);
+
+    render(
+      <ConnectAppsField interaction={{ ...LEO_INTERACTION, apps: ["Gmail"] }} onSkip={onSkip} />
+    );
+
+    const skipLink = screen.getByText("chatPage.clarification.connectApps.skip");
+    fireEvent.click(skipLink);
+    fireEvent.click(skipLink);
+
+    expect(onSkip).toHaveBeenCalledTimes(1);
+  });
+
   it("hides the Skip link and shows a completion note once every row is already Connected", () => {
     mcpAppsMock.apps = [makeApp({ provider: "google", is_connected: true })];
 

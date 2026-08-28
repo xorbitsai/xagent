@@ -194,7 +194,7 @@ export function ConnectAppsField({
   onContinue,
 }: {
   interaction: Interaction;
-  onSkip: () => void;
+  onSkip: () => Promise<void> | void;
   /** Called once every requested app is connected, in place of onSkip -
    * distinct so the message it sends can say "connected" rather than
    * "I'll do this later" (see clarification-form.tsx's
@@ -224,6 +224,10 @@ export function ConnectAppsField({
   // Continue message is not idempotent the way a Connect popup is - two
   // clicks before React re-renders would send it twice.
   const continuedRef = useRef(false);
+  // Same rationale as continuedRef, mirrored for Skip: a failed send must roll
+  // the optimistic skippedNote back instead of leaving the card looking
+  // resolved while the acknowledgement never actually went through.
+  const skippedRef = useRef(false);
   // Synchronous shadow of connectingKeys, same reason connect-mcp-dialog.tsx
   // keeps loadingAppsRef alongside loadingApps (#1330 there): setState-based
   // `disabled={isConnecting}` lags a commit cycle behind two clicks landing
@@ -570,9 +574,18 @@ export function ConnectAppsField({
               <button
                 type="button"
                 className="flex-shrink-0 rounded-md px-2 py-1 text-xs font-medium text-muted-foreground hover:bg-muted hover:text-foreground"
-                onClick={() => {
+                onClick={async () => {
+                  if (skippedRef.current) return;
+                  skippedRef.current = true;
                   setSkipped(true);
-                  onSkip();
+                  try {
+                    await onSkip();
+                  } catch {
+                    skippedRef.current = false;
+                    if (isMountedRef.current) {
+                      setSkipped(false);
+                    }
+                  }
                 }}
               >
                 {t("chatPage.clarification.connectApps.skip")}

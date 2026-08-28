@@ -555,6 +555,26 @@ describe("ClarificationForm connect_apps interaction", () => {
     })
   })
 
+  it("toasts an error and lets the Skip link reappear (via rethrow) when sending the skip message fails", async () => {
+    const onSend = vi.fn().mockRejectedValue(new Error("network down"))
+
+    render(
+      <ClarificationForm interactions={[CONNECT_APPS_INTERACTION]} onSend={onSend} />,
+    )
+
+    fireEvent.click(screen.getByText("chatPage.clarification.connectApps.skip"))
+
+    await waitFor(() => {
+      expect(toastErrorMock).toHaveBeenCalledWith("chatPage.clarification.sendError")
+    })
+    // The rethrow lets connect-apps-field.tsx's catch reset `skipped` to
+    // false, so the Skip link comes back instead of the card silently
+    // looking resolved while the acknowledgement never went through.
+    await waitFor(() => {
+      expect(screen.getByText("chatPage.clarification.connectApps.skip")).toBeInTheDocument()
+    })
+  })
+
   it("renders the real connect_apps widget instead of an 'unsupported type' error when mixed into a list with another interaction type", () => {
     // Not producible by any seeder today (see LIVE_WIDGET_TYPES's comment in
     // clarification-form.tsx), but nothing rules it out - isConnectAppsOnly

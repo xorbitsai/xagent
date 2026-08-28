@@ -425,6 +425,7 @@ export function ClarificationForm({
     } catch (error) {
       console.error("Failed to send connect-apps skip response", error)
       toast.error(t("chatPage.clarification.sendError"))
+      throw error
     }
   }
 

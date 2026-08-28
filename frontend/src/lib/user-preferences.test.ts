@@ -128,14 +128,41 @@ describe("markOnboardingSaveEscaped / consumeOnboardingSaveEscapeFlag", () => {
   })
 
   it("consume returns false when nothing was marked", () => {
-    expect(consumeOnboardingSaveEscapeFlag()).toBe(false)
+    expect(consumeOnboardingSaveEscapeFlag("user-a")).toBe(false)
   })
 
-  it("consume returns true once after marking, then false again (one-shot)", () => {
-    markOnboardingSaveEscaped()
+  it("consume returns true once after marking, for the SAME user, then false again (one-shot)", () => {
+    markOnboardingSaveEscaped("user-a")
 
-    expect(consumeOnboardingSaveEscapeFlag()).toBe(true)
-    expect(consumeOnboardingSaveEscapeFlag()).toBe(false)
+    expect(consumeOnboardingSaveEscapeFlag("user-a")).toBe(true)
+    expect(consumeOnboardingSaveEscapeFlag("user-a")).toBe(false)
+  })
+
+  // Pins a PR review finding: a bare timestamp is identity-agnostic - the
+  // same cross-tab-identity-swap vulnerability class the
+  // checkedOnboardingUserIdRef fix in auth-guard.tsx closed for the normal
+  // onboarding check also applied here, letting a DIFFERENT user who logs
+  // in in this tab within the TTL window consume user A's leftover escape
+  // and skip their own mandatory onboarding check.
+  it("consume returns false (and still discards the flag) for a DIFFERENT user than the one who set it", () => {
+    markOnboardingSaveEscaped("user-a")
+
+    expect(consumeOnboardingSaveEscapeFlag("user-b")).toBe(false)
+    // One-shot even on a mismatch - a second read (even by the correct
+    // user) must not find a flag that was already consumed-and-discarded.
+    expect(consumeOnboardingSaveEscapeFlag("user-a")).toBe(false)
+  })
+
+  it("consume returns false when no identity has resolved yet (null)", () => {
+    markOnboardingSaveEscaped("user-a")
+
+    expect(consumeOnboardingSaveEscapeFlag(null)).toBe(false)
+  })
+
+  it("mark no-ops (and consume finds nothing) when no user id is available to bind to", () => {
+    markOnboardingSaveEscaped(undefined)
+
+    expect(consumeOnboardingSaveEscapeFlag("user-a")).toBe(false)
   })
 
   it("does not throw when sessionStorage is unavailable", () => {
@@ -148,8 +175,8 @@ describe("markOnboardingSaveEscaped / consumeOnboardingSaveEscapeFlag", () => {
     })
 
     try {
-      expect(() => markOnboardingSaveEscaped()).not.toThrow()
-      expect(consumeOnboardingSaveEscapeFlag()).toBe(false)
+      expect(() => markOnboardingSaveEscaped("user-a")).not.toThrow()
+      expect(consumeOnboardingSaveEscapeFlag("user-a")).toBe(false)
     } finally {
       Object.defineProperty(window, "sessionStorage", { configurable: true, value: original })
     }
@@ -162,10 +189,10 @@ describe("markOnboardingSaveEscaped / consumeOnboardingSaveEscapeFlag", () => {
   it("consume returns false once the flag is older than the TTL, and still clears it", () => {
     vi.useFakeTimers()
     try {
-      markOnboardingSaveEscaped()
+      markOnboardingSaveEscaped("user-a")
       vi.advanceTimersByTime(30_001)
 
-      expect(consumeOnboardingSaveEscapeFlag()).toBe(false)
+      expect(consumeOnboardingSaveEscapeFlag("user-a")).toBe(false)
       expect(window.sessionStorage.getItem("xagent-onboarding-save-escape")).toBeNull()
     } finally {
       vi.useRealTimers()
@@ -175,19 +202,26 @@ describe("markOnboardingSaveEscaped / consumeOnboardingSaveEscapeFlag", () => {
   it("consume still returns true just under the TTL boundary", () => {
     vi.useFakeTimers()
     try {
-      markOnboardingSaveEscaped()
+      markOnboardingSaveEscaped("user-a")
       vi.advanceTimersByTime(29_999)
 
-      expect(consumeOnboardingSaveEscapeFlag()).toBe(true)
+      expect(consumeOnboardingSaveEscapeFlag("user-a")).toBe(true)
     } finally {
       vi.useRealTimers()
     }
   })
 
-  it("consume returns false and clears a non-numeric stored value", () => {
-    window.sessionStorage.setItem("xagent-onboarding-save-escape", "not-a-timestamp")
+  it("consume returns false and clears a malformed (non-JSON) stored value", () => {
+    window.sessionStorage.setItem("xagent-onboarding-save-escape", "not-json")
 
-    expect(consumeOnboardingSaveEscapeFlag()).toBe(false)
+    expect(consumeOnboardingSaveEscapeFlag("user-a")).toBe(false)
+    expect(window.sessionStorage.getItem("xagent-onboarding-save-escape")).toBeNull()
+  })
+
+  it("consume returns false and clears a well-formed JSON value missing the expected shape", () => {
+    window.sessionStorage.setItem("xagent-onboarding-save-escape", JSON.stringify({ foo: "bar" }))
+
+    expect(consumeOnboardingSaveEscapeFlag("user-a")).toBe(false)
     expect(window.sessionStorage.getItem("xagent-onboarding-save-escape")).toBeNull()
   })
 })

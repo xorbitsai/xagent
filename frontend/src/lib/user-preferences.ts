@@ -85,10 +85,20 @@ const SAVE_ESCAPE_TTL_MS = 30_000;
  * loop between the destination and /onboarding, each one resetting the
  * failure counter on remount). sessionStorage (not a ref/module variable)
  * because the check that needs to see this runs in AuthGuard, a different
- * component the onboarding page has no direct handle on. */
-export function markOnboardingSaveEscaped(): void {
+ * component the onboarding page has no direct handle on.
+ *
+ * Bound to `userId`: a PR review finding caught that a bare timestamp is
+ * identity-agnostic, so a cross-tab identity swap (the same vulnerability
+ * class the checkedOnboardingUserIdRef fix in auth-guard.tsx closed for the
+ * normal check) could let a DIFFERENT user who logs in in this tab within
+ * the TTL window consume user A's leftover escape and skip their own
+ * mandatory onboarding check entirely. No-ops without a userId (rather than
+ * falling back to an unscoped flag) - no worse than the pre-existing
+ * behavior of not marking anything at all. */
+export function markOnboardingSaveEscaped(userId: string | undefined): void {
+  if (!userId) return;
   try {
-    window.sessionStorage.setItem(SAVE_ESCAPE_KEY, String(Date.now()));
+    window.sessionStorage.setItem(SAVE_ESCAPE_KEY, JSON.stringify({ userId, setAt: Date.now() }));
   } catch {
     // Storage unavailable (private mode, disabled) - AuthGuard just won't
     // see the flag and will redirect as it did before this existed; no
@@ -98,14 +108,22 @@ export function markOnboardingSaveEscaped(): void {
 
 /** Reads and clears the flag set by markOnboardingSaveEscaped() - always
  * removed on read (one-shot; a stale or corrupt value must not linger
- * either), and only honored within SAVE_ESCAPE_TTL_MS of being set. */
-export function consumeOnboardingSaveEscapeFlag(): boolean {
+ * either), and only honored within SAVE_ESCAPE_TTL_MS of being set AND for
+ * the SAME user id that set it - see markOnboardingSaveEscaped's comment on
+ * why an identity-agnostic flag is unsafe. `userId` is the CURRENTLY
+ * authenticated identity at the moment of the check (may be null while
+ * auth is still resolving); a flag that doesn't match - or a caller with no
+ * resolved identity yet - is discarded rather than honored, never latched
+ * to a mismatched or unknown user. */
+export function consumeOnboardingSaveEscapeFlag(userId: string | null): boolean {
   try {
     const raw = window.sessionStorage.getItem(SAVE_ESCAPE_KEY);
     window.sessionStorage.removeItem(SAVE_ESCAPE_KEY);
     if (!raw) return false;
-    const setAt = Number(raw);
-    return Number.isFinite(setAt) && Date.now() - setAt < SAVE_ESCAPE_TTL_MS;
+    const parsed = JSON.parse(raw) as { userId?: unknown; setAt?: unknown };
+    if (typeof parsed?.userId !== "string" || typeof parsed?.setAt !== "number") return false;
+    if (userId === null || parsed.userId !== userId) return false;
+    return Number.isFinite(parsed.setAt) && Date.now() - parsed.setAt < SAVE_ESCAPE_TTL_MS;
   } catch {
     return false;
   }

@@ -249,4 +249,14 @@ describe("translations", () => {
     expect(resolveTranslation("zh", "onboarding.team.subtitleExtraOne").startsWith(" ")).toBe(false)
     expect(resolveTranslation("zh", "onboarding.team.subtitleExtraMany").startsWith(" ")).toBe(false)
   })
+
+  // Pins a PR review finding: the welcome heading's closing punctuation was
+  // a hardcoded ASCII period in JSX (page.tsx), appended after the Chinese
+  // titlePrefix which already ends with its own full-width comma - mixed
+  // Chinese/ASCII punctuation in the same rendered heading. Each locale now
+  // owns its own closing punctuation via titleSuffix.
+  it("gives the welcome heading locale-appropriate closing punctuation", () => {
+    expect(resolveTranslation("en", "onboarding.welcome.titleSuffix")).toBe(".")
+    expect(resolveTranslation("zh", "onboarding.welcome.titleSuffix")).toBe("。")
+  })
 })

@@ -169,6 +169,10 @@
   color: hsl(var(--foreground));
   background: hsl(var(--muted));
 }
+.ob-exit:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
 
 .ob-rail {
   position: fixed;
@@ -373,6 +377,10 @@
   color: hsl(var(--foreground));
   background: hsl(var(--muted));
 }
+.ob-btn-back:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
 .ob-skip {
   margin-top: 18px;
   font-size: 12.5px;
@@ -422,6 +430,10 @@
   border-color: hsl(var(--primary));
   box-shadow: 0 0 0 4px hsl(var(--primary) / 0.1);
 }
+.ob-input:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
 
 .ob-chips {
   display: flex;
@@ -453,6 +465,10 @@
 }
 .ob-chips .ob-chip:active {
   transform: translateY(1px);
+}
+.ob-chips .ob-chip:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
 }
 .ob-chips .ob-chip[aria-pressed="true"] {
   border-color: hsl(var(--primary));
@@ -509,6 +525,10 @@
 .ob-tm[aria-pressed="true"] {
   border-color: hsl(var(--primary));
   box-shadow: 0 0 0 1px hsl(var(--primary)), 0 16px 38px hsl(var(--primary) / 0.14);
+}
+.ob-tm:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
 }
 .ob-tm-tick {
   position: absolute;
@@ -660,11 +680,31 @@
     padding: 0 26px 4px;
     margin-bottom: 8px;
   }
+  /* Visually hidden, not display:none: a completed/future step's rail
+     button keeps only a check icon or dot at this width, but the button
+     itself stays enabled/focusable (is-done ones are clickable) - removing
+     its label from the accessibility tree entirely would leave screen
+     reader/keyboard users with an unlabeled control, not just a visually
+     compact one. */
   .ob-rl span {
-    display: none;
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    padding: 0;
+    margin: -1px;
+    overflow: hidden;
+    clip: rect(0, 0, 0, 0);
+    white-space: nowrap;
+    border: 0;
   }
   .ob-rl.is-now span {
-    display: inline;
+    position: static;
+    width: auto;
+    height: auto;
+    margin: 0;
+    overflow: visible;
+    clip: auto;
+    white-space: normal;
   }
   .ob-rl i {
     width: 16px;

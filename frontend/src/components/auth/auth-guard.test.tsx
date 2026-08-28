@@ -220,6 +220,34 @@ describe("AuthGuard onboarding redirect", () => {
     expect(fetchUserPreferencesMock).not.toHaveBeenCalled()
   })
 
+  // Pins a PR review finding: the escape flag itself is identity-agnostic
+  // (a bare timestamp) unless the currently authenticated user's id is
+  // passed through so consumeOnboardingSaveEscapeFlag can bind/verify
+  // against it - without this, a cross-tab identity swap could let a
+  // different user consume a leftover flag meant for someone else.
+  it("passes the current user's id to consumeOnboardingSaveEscapeFlag", async () => {
+    authState.user = { id: "user-a" }
+    consumeOnboardingSaveEscapeFlagMock.mockReturnValue(false)
+    fetchUserPreferencesMock.mockResolvedValue(null)
+
+    render(<AuthGuard><div data-testid="children" /></AuthGuard>)
+
+    expect(consumeOnboardingSaveEscapeFlagMock).toHaveBeenCalledWith("user-a")
+    await waitFor(() => expect(fetchUserPreferencesMock).toHaveBeenCalled())
+  })
+
+  it("passes null to consumeOnboardingSaveEscapeFlag when no user has resolved yet", () => {
+    authState.user = null
+    consumeOnboardingSaveEscapeFlagMock.mockReturnValue(false)
+
+    render(<AuthGuard><div data-testid="children" /></AuthGuard>)
+
+    expect(consumeOnboardingSaveEscapeFlagMock).toHaveBeenCalledWith(null)
+    // With no user, the effect returns right after this check - the
+    // preferences fetch never fires.
+    expect(fetchUserPreferencesMock).not.toHaveBeenCalled()
+  })
+
   // Pins a PR review finding: fetchUserPreferences returns null (not {}) on
   // a failed/unreachable GET - that's "unknown," not "confirmed not
   // onboarded," so it must not redirect an already-onboarded user into the

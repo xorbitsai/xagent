@@ -6,7 +6,7 @@ import OnboardingPage from "./page"
 
 const routerPush = vi.hoisted(() => vi.fn())
 const routerReplace = vi.hoisted(() => vi.fn())
-const authUser = vi.hoisted(() => ({ username: "Shulei" as string | undefined }))
+const authUser = vi.hoisted(() => ({ id: "user-a", username: "Shulei" as string | undefined }))
 const apiRequestMock = vi.hoisted(() => vi.fn())
 const updateUserPreferencesMock = vi.hoisted(() => vi.fn())
 const hireAgentFromTemplateMock = vi.hoisted(() => vi.fn())
@@ -331,6 +331,31 @@ describe("OnboardingPage", () => {
     })
   })
 
+  // Pins a PR review finding: buildPreferencesPayload() snapshots its
+  // answers before the PATCH is sent, so an answer changed while a save is
+  // in flight would silently never be saved, then get discarded entirely
+  // once the page navigates away - the data-entry controls (not just the
+  // exit buttons) must be disabled for the duration of a save too.
+  it("disables the goal chips and industry input while a save is in flight", async () => {
+    let resolveSave!: (v: { ok: boolean }) => void
+    updateUserPreferencesMock.mockReturnValue(new Promise((resolve) => { resolveSave = resolve }))
+
+    await goToWelcomeThenBusiness()
+    fireEvent.click(screen.getByText("Other"))
+    fireEvent.change(screen.getByPlaceholderText("e.g. Property management"), {
+      target: { value: "Legal services" },
+    })
+
+    fireEvent.click(screen.getByText("Skip setup"))
+
+    expect(screen.getByText("Other").closest("button")).toBeDisabled()
+    expect(screen.getByPlaceholderText("e.g. Property management")).toBeDisabled()
+
+    await act(async () => {
+      resolveSave({ ok: true })
+    })
+  })
+
   // Pins a bug found in full-feature self-review: the save-escape flag used
   // to be marked unconditionally on the 2nd consecutive failure, even though
   // the matching navigation right after it is gated on isMountedRef - an
@@ -459,6 +484,96 @@ describe("OnboardingPage", () => {
       expect.objectContaining({ templateId: "marketing-social-media-content-manager" })
     )
     expect(routerReplace).toHaveBeenCalledWith("/task/42")
+  })
+
+  // Pins a PR review finding: onboarded:true used to be saved durably as
+  // part of the FIRST preferences save, before the freshness re-check and
+  // hireAgentFromTemplate (both of which can still fail or the component
+  // can still unmount) ever ran - a later failure could leave the backend
+  // saying "onboarded" with no agent ever actually delivered, and no way
+  // back into onboarding to finish it. It must now be saved separately,
+  // only once an agent is confirmed to exist.
+  it("does not include onboarded:true in the main save - only in a separate save once the agent is confirmed", async () => {
+    await goToWelcomeThenBusiness()
+    fireEvent.click(screen.getByText("Marketing"))
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/take off your plate/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Post on social media"))
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/Meet your AI team/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/How should/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText("You're all set.")).toBeInTheDocument())
+
+    await act(async () => {
+      fireEvent.click(screen.getByText("Start with Maya"))
+    })
+
+    await waitFor(() => expect(updateUserPreferencesMock).toHaveBeenCalledTimes(2))
+    expect(updateUserPreferencesMock.mock.calls[0][0]).not.toHaveProperty("onboarded")
+    expect(updateUserPreferencesMock.mock.calls[1][0]).toEqual({ onboarded: true })
+    // The agent-confirming call must happen before the onboarded save, not
+    // just eventually - hireAgentFromTemplateMock resolves synchronously in
+    // this mock, so by the time updateUserPreferences is called a 2nd time,
+    // the agent already exists.
+    expect(hireAgentFromTemplateMock).toHaveBeenCalledTimes(1)
+  })
+
+  // Pins the same finding from the failure side: if hireAgentFromTemplate
+  // itself throws, onboarded must never be sent at all - no agent was ever
+  // delivered, so there is nothing to mark complete.
+  it("never sends onboarded:true if hireAgentFromTemplate itself fails", async () => {
+    hireAgentFromTemplateMock.mockRejectedValueOnce(new Error("network down"))
+
+    await goToWelcomeThenBusiness()
+    fireEvent.click(screen.getByText("Marketing"))
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/take off your plate/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Post on social media"))
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/Meet your AI team/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/How should/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText("You're all set.")).toBeInTheDocument())
+
+    await act(async () => {
+      fireEvent.click(screen.getByText("Start with Maya"))
+    })
+
+    await waitFor(() => expect(toastErrorMock).toHaveBeenCalled())
+    for (const call of updateUserPreferencesMock.mock.calls) {
+      expect(call[0]).not.toHaveProperty("onboarded")
+    }
+  })
+
+  // Pins the ordering fix's own fallback: an agent that's genuinely hired
+  // must still navigate the user there even if the LAST-mile onboarded:true
+  // save itself fails - and that failure must still tell AuthGuard to stand
+  // down once, same as every other escape path, since the deliverable (the
+  // agent) is real regardless of whether the flag landed.
+  it("still navigates to the hired agent, and marks the escape flag, if only the final onboarded save fails", async () => {
+    updateUserPreferencesMock.mockResolvedValueOnce({ ok: true }).mockResolvedValueOnce({ ok: false, retryable: true })
+
+    await goToWelcomeThenBusiness()
+    fireEvent.click(screen.getByText("Marketing"))
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/take off your plate/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Post on social media"))
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/Meet your AI team/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/How should/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText("You're all set.")).toBeInTheDocument())
+
+    await act(async () => {
+      fireEvent.click(screen.getByText("Start with Maya"))
+    })
+
+    await waitFor(() => expect(routerReplace).toHaveBeenCalledWith("/task/42"))
+    expect(markOnboardingSaveEscapedMock).toHaveBeenCalledTimes(1)
   })
 
   // Pins a test-coverage gap found in full-feature self-review: handleLaunch
@@ -814,7 +929,12 @@ describe("OnboardingPage", () => {
     })
 
     await waitFor(() => expect(hireAgentFromTemplateMock).toHaveBeenCalled())
-    expect(markOnboardingSaveEscapedMock).toHaveBeenCalledTimes(1)
+    // The escape flag is no longer tied to the main fields save escalating -
+    // only to whether the SEPARATE final onboarded:true save (below,
+    // deliberately not mocked to fail here) succeeds. It does, by the
+    // default beforeEach mock, so nothing needs to tell AuthGuard to stand
+    // down.
+    expect(markOnboardingSaveEscapedMock).not.toHaveBeenCalled()
   })
 
   // Pins a test-coverage gap found in full-feature self-review: the escape
@@ -1171,6 +1291,10 @@ describe("OnboardingPage", () => {
     // false and immediately bounce the user right back, defeating the
     // point of escaping at all.
     expect(markOnboardingSaveEscapedMock).toHaveBeenCalledTimes(1)
+    // Pins a PR review finding: the escape flag must be bound to the
+    // CURRENT user's id (not left identity-agnostic) so a cross-tab
+    // identity swap can't let a different user consume it.
+    expect(markOnboardingSaveEscapedMock).toHaveBeenCalledWith("user-a")
     // Pins a regression caught by self-reviewing the trySavePreferences
     // extraction: the shared-helper refactor initially dropped this reset
     // on the "escaped" outcome specifically (only restoring it on

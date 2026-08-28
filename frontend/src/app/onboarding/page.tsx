@@ -86,14 +86,16 @@ function Chip({
   onClick,
   children,
   icon,
+  disabled,
 }: {
   selected: boolean;
   onClick: () => void;
   children: React.ReactNode;
   icon?: React.ReactNode;
+  disabled?: boolean;
 }) {
   return (
-    <button type="button" aria-pressed={selected} onClick={onClick} className="ob-chip">
+    <button type="button" aria-pressed={selected} onClick={onClick} disabled={disabled} className="ob-chip">
       {icon}
       {children}
     </button>
@@ -276,10 +278,12 @@ export default function OnboardingPage() {
     return work ? null : undefined;
   };
 
-  const buildPreferencesPayload = (): UserPreferences => {
+  // `includeOnboarded: false` is handleLaunch's own case - see the comment
+  // where it calls this. Every other caller wants the default (true).
+  const buildPreferencesPayload = ({ includeOnboarded = true }: { includeOnboarded?: boolean } = {}): UserPreferences => {
     const industryValue = industryPayloadValue();
     return {
-      onboarded: true,
+      ...(includeOnboarded ? { onboarded: true } : {}),
       ...(work ? { department: work } : {}),
       ...(industryValue !== undefined ? { industry: industryValue } : {}),
       ...(goals.length ? { goals } : {}),
@@ -308,9 +312,9 @@ export default function OnboardingPage() {
   // anyway would hire an agent while preferences were never actually saved.
   const trySavePreferences = async (
     failureKey: string,
-    { requireRetryableToEscape }: { requireRetryableToEscape: boolean }
+    { requireRetryableToEscape, includeOnboarded = true }: { requireRetryableToEscape: boolean; includeOnboarded?: boolean }
   ): Promise<SavePreferencesOutcome> => {
-    const saved = await updateUserPreferences(buildPreferencesPayload());
+    const saved = await updateUserPreferences(buildPreferencesPayload({ includeOnboarded }));
     if (saved.ok) {
       saveFailureCountByDestRef.current[failureKey] = 0;
       return "saved";
@@ -379,7 +383,7 @@ export default function OnboardingPage() {
       // this happens for real: sometimes as a bounce loop, sometimes it
       // silently means the escape never actually reaches its destination).
       // This flag tells that check to stand down once.
-      if (outcome === "escaped") markOnboardingSaveEscaped();
+      if (outcome === "escaped") markOnboardingSaveEscaped(user?.id);
       router.replace(destination);
     }
   };
@@ -391,13 +395,19 @@ export default function OnboardingPage() {
     launchingRef.current = true;
     setLaunching(true);
     try {
-      // Not marked here even if the outcome is "escaped": the freshness
-      // re-check and hireAgentFromTemplate are both still ahead and can
-      // throw, and self-review found that marking the flag this early
-      // leaves it dangling in sessionStorage - live, but with nothing left
-      // to navigate and consume it - if either of those throws instead. Set
-      // only right before whichever navigation below actually fires.
-      const outcome = await trySavePreferences(LAUNCH_FAILURE_KEY, { requireRetryableToEscape: true });
+      // onboarded is deliberately EXCLUDED from this save (includeOnboarded:
+      // false) - a PR review finding caught that saving it durably true
+      // here, before the freshness re-check and hireAgentFromTemplate below
+      // (both of which can still fail or the component can still unmount),
+      // let a later failure leave the backend saying "onboarded" with no
+      // agent/task ever actually delivered - a guard check afterward would
+      // then skip onboarding entirely with no way back in to finish it.
+      // It's saved separately, only once an agent is actually in hand, in
+      // markOnboardedAndNavigate below.
+      const outcome = await trySavePreferences(LAUNCH_FAILURE_KEY, {
+        requireRetryableToEscape: true,
+        includeOnboarded: false,
+      });
       if (outcome === "retry_in_place") {
         if (isMountedRef.current) {
           launchingRef.current = false;
@@ -405,13 +415,24 @@ export default function OnboardingPage() {
         }
         return;
       }
-      const shouldMarkSaveEscape = outcome === "escaped";
+
+      // The one point in handleLaunch that's actually safe to mark
+      // onboarded:true - every call site below is reached only once an
+      // agent genuinely exists (already hired, freshly re-confirmed hired,
+      // or just hired). Awaited so a failure here can still fall back to
+      // the escape flag (this save's own retries/escalation don't apply -
+      // the agent is real either way, so navigation must not be blocked on
+      // this one best-effort field ever landing).
+      const markOnboardedAndNavigate = async (destination: string) => {
+        const onboardedSave = await updateUserPreferences({ onboarded: true });
+        if (isMountedRef.current) {
+          if (!onboardedSave.ok) markOnboardingSaveEscaped(user?.id);
+          router.replace(destination);
+        }
+      };
 
       if (selected.hired && selected.hired_agent_id) {
-        if (isMountedRef.current) {
-          if (shouldMarkSaveEscape) markOnboardingSaveEscaped();
-          router.replace(`/agent/${selected.hired_agent_id}`);
-        }
+        await markOnboardedAndNavigate(`/agent/${selected.hired_agent_id}`);
         return;
       }
 
@@ -424,6 +445,12 @@ export default function OnboardingPage() {
       // onto an agent the user already has a real conversation with. Best
       // effort only: if the recheck itself fails, fall through to hiring
       // normally rather than blocking the action on it.
+      // Captured rather than navigating from inside this try - the block
+      // below is only for the best-effort recheck fetch itself; if
+      // markOnboardedAndNavigate ran here and somehow threw, this catch
+      // would wrongly treat it as "recheck failed, fall through to hiring"
+      // instead of the save/navigation failure it actually is.
+      let freshlyHiredAgentId: number | undefined;
       try {
         const freshCheck = await apiRequest(
           `${getApiUrl()}/api/templates/${encodeURIComponent(selected.id)}?lang=${locale}`
@@ -431,15 +458,15 @@ export default function OnboardingPage() {
         if (freshCheck.ok) {
           const freshTemplate = (await freshCheck.json()) as TemplateDetail;
           if (freshTemplate.hired && freshTemplate.hired_agent_id) {
-            if (isMountedRef.current) {
-              if (shouldMarkSaveEscape) markOnboardingSaveEscaped();
-              router.replace(`/agent/${freshTemplate.hired_agent_id}`);
-            }
-            return;
+            freshlyHiredAgentId = freshTemplate.hired_agent_id;
           }
         }
       } catch {
         // Fall through - see the best-effort note above.
+      }
+      if (freshlyHiredAgentId !== undefined) {
+        await markOnboardedAndNavigate(`/agent/${freshlyHiredAgentId}`);
+        return;
       }
       if (!isMountedRef.current) return;
 
@@ -454,8 +481,7 @@ export default function OnboardingPage() {
         connections: selected.connections,
       });
       if (!isMountedRef.current) return;
-      if (shouldMarkSaveEscape) markOnboardingSaveEscaped();
-      router.replace(`/task/${result.taskId}`);
+      await markOnboardedAndNavigate(`/task/${result.taskId}`);
     } catch {
       if (!isMountedRef.current) return;
       toast.error(
@@ -526,7 +552,8 @@ export default function OnboardingPage() {
               <h1 ref={stepHeadingRef} tabIndex={-1}>
                 {t("onboarding.welcome.titlePrefix", { appName: branding.appName })}
                 <br />
-                <em>{firstName}</em>.
+                <em>{firstName}</em>
+                {t("onboarding.welcome.titleSuffix")}
               </h1>
               <p className="ob-sub">{t("onboarding.welcome.subtitle")}</p>
               <div className="ob-cta">
@@ -552,6 +579,7 @@ export default function OnboardingPage() {
                   <Chip
                     key={option.id}
                     selected={work === option.id}
+                    disabled={launching}
                     onClick={() => {
                       setWork(option.id);
                       if (option.id !== "other") setIndustry("");
@@ -576,6 +604,12 @@ export default function OnboardingPage() {
                     // src/xagent/web/api/auth.py - a defensive client-side
                     // cap, not a replacement for the backend's own validation.
                     maxLength={200}
+                    // Disabled while a save is in flight (not just the exit
+                    // buttons): buildPreferencesPayload() snapshots this
+                    // value before the PATCH is sent, so an edit made during
+                    // that window would silently never be saved, then get
+                    // discarded entirely once the page navigates away.
+                    disabled={launching}
                     className="ob-input"
                   />
                 </div>
@@ -607,6 +641,7 @@ export default function OnboardingPage() {
                     <Chip
                       key={goal.id}
                       selected={selected}
+                      disabled={launching}
                       onClick={() => toggleGoal(goal.id)}
                       icon={
                         selected ? (
@@ -746,7 +781,7 @@ export default function OnboardingPage() {
               <p className="ob-sub">{t("onboarding.voice.subtitle")}</p>
               <div className="ob-chips" style={{ marginTop: 34 }}>
                 {ONBOARDING_VOICES.map((option) => (
-                  <Chip key={option.id} selected={voice === option.id} onClick={() => setVoice(option.id)}>
+                  <Chip key={option.id} selected={voice === option.id} disabled={launching} onClick={() => setVoice(option.id)}>
                     {t(option.nameKey)}
                   </Chip>
                 ))}

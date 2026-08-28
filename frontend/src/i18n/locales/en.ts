@@ -1615,6 +1615,7 @@ Build when you need.`,
     },
     welcome: {
       titlePrefix: "Welcome to {appName},",
+      titleSuffix: ".",
       fallbackName: "there",
       subtitle: "I'll set up your first AI teammate — a few questions about your business, then you can put them to work. It takes about a minute.",
       cta: "Let's go",

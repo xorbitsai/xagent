@@ -71,7 +71,7 @@ export function AuthGuard({ children }: AuthGuardProps) {
     // Reading it first, before any early return, guarantees it's consumed
     // the very next time this effect runs after being set, regardless of
     // which branch would otherwise apply.
-    if (consumeOnboardingSaveEscapeFlag()) {
+    if (consumeOnboardingSaveEscapeFlag(user?.id ?? null)) {
       checkedOnboardingUserIdRef.current = user?.id ?? null
       return
     }

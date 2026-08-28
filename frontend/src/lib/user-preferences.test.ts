@@ -72,17 +72,34 @@ describe("updateUserPreferences", () => {
 
     const result = await updateUserPreferences({ onboarded: true, department: "sales" })
 
-    expect(result).toEqual({ ok: true })
+    expect(result).toEqual({ ok: true, retryable: true })
     const [url, options] = apiRequestMock.mock.calls[0]
     expect(url).toContain("/api/auth/me/preferences")
     expect(options.method).toBe("PATCH")
     expect(JSON.parse(options.body)).toEqual({ onboarded: true, department: "sales" })
   })
 
-  it("reports ok: false without throwing when the request fails", async () => {
+  it("reports ok: false, retryable: true without throwing when the request itself throws (network failure)", async () => {
     apiRequestMock.mockRejectedValue(new Error("network down"))
 
-    expect(await updateUserPreferences({ onboarded: true })).toEqual({ ok: false })
+    expect(await updateUserPreferences({ onboarded: true })).toEqual({ ok: false, retryable: true })
+  })
+
+  // Pins a PR review finding: a caller (handleLaunch in page.tsx) that gives
+  // up and proceeds anyway after repeated failures must not treat a
+  // transient error the same as a permanent one - retrying an identical
+  // rejected payload will only ever 4xx again, so proceeding to an
+  // irreversible action afterward would be unsafe.
+  it("reports retryable: true for a 5xx server error", async () => {
+    apiRequestMock.mockResolvedValue({ ok: false, status: 503 })
+
+    expect(await updateUserPreferences({ onboarded: true })).toEqual({ ok: false, retryable: true })
+  })
+
+  it("reports retryable: false for a 4xx client error (e.g. a rejected payload)", async () => {
+    apiRequestMock.mockResolvedValue({ ok: false, status: 422 })
+
+    expect(await updateUserPreferences({ onboarded: true })).toEqual({ ok: false, retryable: false })
   })
 })
 

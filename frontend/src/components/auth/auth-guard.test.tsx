@@ -5,7 +5,11 @@ import { AuthGuard } from "./auth-guard"
 import { resolveTranslation, type TranslationKey } from "@/i18n/translations"
 
 const route = vi.hoisted(() => ({ pathname: "/" as string | null }))
-const authState = vi.hoisted(() => ({ isAuthenticated: false, isLoading: true }))
+const authState = vi.hoisted(() => ({
+  isAuthenticated: false,
+  isLoading: true,
+  user: { id: "user-a" } as { id: string } | null,
+}))
 const routerPush = vi.hoisted(() => vi.fn())
 const routerReplace = vi.hoisted(() => vi.fn())
 const fetchUserPreferencesMock = vi.hoisted(() => vi.fn())
@@ -25,6 +29,7 @@ vi.mock("@/contexts/auth-context", () => ({
   useAuth: () => ({
     isAuthenticated: authState.isAuthenticated,
     isLoading: authState.isLoading,
+    user: authState.user,
     checkAuth: vi.fn(async () => true),
   }),
 }))
@@ -102,6 +107,7 @@ describe("AuthGuard onboarding redirect", () => {
     route.pathname = "/settings"
     authState.isAuthenticated = true
     authState.isLoading = false
+    authState.user = { id: "user-a" }
     routerPush.mockClear()
     routerReplace.mockClear()
     fetchUserPreferencesMock.mockReset()
@@ -133,6 +139,18 @@ describe("AuthGuard onboarding redirect", () => {
     expect(routerReplace).not.toHaveBeenCalledWith("/onboarding")
   })
 
+  // Pins a finding verified during PR review: the GET boundary doesn't
+  // validate this field's type, so a malformed stored value (a truthy
+  // non-boolean, e.g. the string "false") must still redirect rather than
+  // being read as "already onboarded" via a loose truthiness check.
+  it("redirects when the stored onboarded value is a truthy non-boolean (e.g. the string \"false\")", async () => {
+    fetchUserPreferencesMock.mockResolvedValue({ onboarded: "false" as unknown as boolean })
+
+    render(<AuthGuard><div data-testid="children" /></AuthGuard>)
+
+    await waitFor(() => expect(routerReplace).toHaveBeenCalledWith("/onboarding"))
+  })
+
   // Pins the core behavior checkedOnboardingRef exists to implement, found
   // untested in full-feature self-review: every other latch scenario (the
   // escape flag, a cancelled in-flight check) is pinned, but not the plain
@@ -149,6 +167,28 @@ describe("AuthGuard onboarding redirect", () => {
     rerender(<AuthGuard><div data-testid="children" /></AuthGuard>)
 
     expect(fetchUserPreferencesMock).toHaveBeenCalledTimes(1)
+  })
+
+  // Pins a finding verified during PR review: AuthGuard doesn't remount
+  // across a client-side auth swap - AuthProvider reacts to a same-origin
+  // `storage` event (a DIFFERENT user logging in from another tab) by
+  // updating `isAuthenticated`/`user` in place, in this same mounted
+  // instance. A bare "have we ever checked" boolean would stay latched from
+  // user A's completed check and let user B through with no check of their
+  // own at all - the ref must be keyed by user id so a genuine identity
+  // change always forces a fresh check.
+  it("re-checks preferences when the authenticated user changes, even though a check already completed for the previous user", async () => {
+    fetchUserPreferencesMock.mockResolvedValue({ onboarded: true })
+
+    const { rerender } = render(<AuthGuard><div data-testid="children" /></AuthGuard>)
+    await waitFor(() => expect(fetchUserPreferencesMock).toHaveBeenCalledTimes(1))
+
+    fetchUserPreferencesMock.mockResolvedValue({})
+    authState.user = { id: "user-b" }
+    rerender(<AuthGuard><div data-testid="children" /></AuthGuard>)
+
+    await waitFor(() => expect(fetchUserPreferencesMock).toHaveBeenCalledTimes(2))
+    await waitFor(() => expect(routerReplace).toHaveBeenCalledWith("/onboarding"))
   })
 
   // Pins a PR review finding (regression in this mechanism's first version):

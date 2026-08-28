@@ -192,4 +192,61 @@ describe("translations", () => {
     ).toBe("Unavailable")
     expect(onMissing).toHaveBeenCalledWith("tools.mcp.runtime.missing")
   })
+
+  // Pins a PR review finding: the onboarding Done step composes these
+  // prefix/<b>value</b>/suffix strings in JSX (page.tsx) with no space of
+  // its own between them - each locale must carry its OWN spacing, since
+  // English needs a space between words where Chinese's equivalents (which
+  // sit directly against the bold value, or against nothing at all for an
+  // empty suffix) don't. A hardcoded JSX-level space used to leak into
+  // Chinese copy as visible gaps like "所在领域： 市场营销".
+  it("gives the onboarding Done step's composed summary lines English-only inter-word spacing", () => {
+    const enPrefixes = [
+      resolveTranslation("en", "onboarding.done.workingInPrefix"),
+      resolveTranslation("en", "onboarding.done.briefedPrefix"),
+      resolveTranslation("en", "onboarding.done.writingInPrefix"),
+      resolveTranslation("en", "onboarding.done.willConnectPrefix"),
+    ]
+    for (const prefix of enPrefixes) {
+      expect(prefix.endsWith(" ")).toBe(true)
+    }
+    const enSuffixes = [
+      resolveTranslation("en", "onboarding.done.briefedSuffixOne"),
+      resolveTranslation("en", "onboarding.done.briefedSuffixOther"),
+      resolveTranslation("en", "onboarding.done.writingInSuffix"),
+      resolveTranslation("en", "onboarding.done.willConnectSuffix"),
+    ]
+    for (const suffix of enSuffixes) {
+      expect(suffix.startsWith(" ")).toBe(true)
+    }
+
+    const zhPrefixes = [
+      resolveTranslation("zh", "onboarding.done.workingInPrefix"),
+      resolveTranslation("zh", "onboarding.done.briefedPrefix"),
+      resolveTranslation("zh", "onboarding.done.writingInPrefix"),
+      resolveTranslation("zh", "onboarding.done.willConnectPrefix"),
+    ]
+    for (const prefix of zhPrefixes) {
+      expect(prefix.endsWith(" ")).toBe(false)
+    }
+    const zhSuffixes = [
+      resolveTranslation("zh", "onboarding.done.briefedSuffixOne"),
+      resolveTranslation("zh", "onboarding.done.briefedSuffixOther"),
+    ]
+    for (const suffix of zhSuffixes) {
+      expect(suffix.startsWith(" ")).toBe(false)
+    }
+  })
+
+  // Pins the same finding for the team step's "N other matches" subtitle:
+  // the em-dash-led extra-matches phrase is appended directly after the
+  // base sentence in JSX with no space of its own - English needs one
+  // before the em dash, Chinese's own em dash must sit directly against
+  // the preceding sentence with no space.
+  it("gives the team step's 'other matches' subtitle English-only leading spacing before the em dash", () => {
+    expect(resolveTranslation("en", "onboarding.team.subtitleExtraOne").startsWith(" ")).toBe(true)
+    expect(resolveTranslation("en", "onboarding.team.subtitleExtraMany").startsWith(" ")).toBe(true)
+    expect(resolveTranslation("zh", "onboarding.team.subtitleExtraOne").startsWith(" ")).toBe(false)
+    expect(resolveTranslation("zh", "onboarding.team.subtitleExtraMany").startsWith(" ")).toBe(false)
+  })
 })

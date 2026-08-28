@@ -1614,7 +1614,7 @@ const zh = {
       launch: "启动",
     },
     welcome: {
-      titlePrefix: "欢迎来到 Xagent，",
+      titlePrefix: "欢迎来到 {appName}，",
       fallbackName: "你好",
       subtitle: "我会帮你配置第一位 AI 员工——先问几个关于你业务的问题，然后就可以让它开始工作了。大概花你一分钟。",
       cta: "开始吧",

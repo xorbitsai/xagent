@@ -11,7 +11,9 @@ import type { OnboardingVoiceId } from "@/lib/onboarding-data";
 export interface UserPreferences {
   onboarded?: boolean;
   department?: string;
-  industry?: string;
+  // null is this endpoint's merge-PATCH "clear this field" signal (see
+  // buildPreferencesPayload in page.tsx) - not the same as omitting the key.
+  industry?: string | null;
   voice?: OnboardingVoiceId;
   goals?: string[];
 }
@@ -42,19 +44,26 @@ export async function fetchUserPreferences(): Promise<UserPreferences | null> {
 
 /** PATCH /api/auth/me/preferences - merges the given fields into the
  * stored preferences server-side (a partial update, not a replace), so
- * callers only need to send what they actually collected. */
+ * callers only need to send what they actually collected.
+ *
+ * `retryable` distinguishes a transient failure (network error, 5xx) from a
+ * permanent one (4xx - the backend rejected this exact payload, e.g. a
+ * malformed/oversized field): a caller that gives up and proceeds anyway
+ * after repeated failures (see MAX_SAVE_FAILURES_BEFORE_ESCAPE in page.tsx)
+ * must not treat the two the same when what follows is irreversible -
+ * retrying an identical rejected payload will only ever 4xx again. */
 export async function updateUserPreferences(
   updates: UserPreferences
-): Promise<{ ok: boolean }> {
+): Promise<{ ok: boolean; retryable: boolean }> {
   try {
     const response = await apiRequest(`${getApiUrl()}/api/auth/me/preferences`, {
       method: "PATCH",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(updates),
     });
-    return { ok: response.ok };
+    return { ok: response.ok, retryable: response.ok || response.status >= 500 };
   } catch {
-    return { ok: false };
+    return { ok: false, retryable: true };
   }
 }
 

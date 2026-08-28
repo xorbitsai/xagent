@@ -15,7 +15,7 @@ interface AuthGuardProps {
 }
 
 export function AuthGuard({ children }: AuthGuardProps) {
-  const { isAuthenticated, isLoading, checkAuth } = useAuth()
+  const { isAuthenticated, isLoading, checkAuth, user } = useAuth()
   const router = useRouter()
   const pathname = usePathname()
   const [mounted, setMounted] = useState(false)
@@ -47,7 +47,16 @@ export function AuthGuard({ children }: AuthGuardProps) {
   // user navigates again while the GET is still in flight), `active` goes
   // false and the ref is left untouched, so the next run (with the new
   // deps) retries instead of the check being silently disarmed forever.
-  const checkedOnboardingRef = useRef(false)
+  //
+  // Keyed by user id, not a bare boolean: AuthGuard doesn't remount across
+  // a client-side auth swap - AuthProvider's own `storage`-event listener
+  // updates `isAuthenticated`/`user` in place when a DIFFERENT user logs in
+  // from another tab (same-origin localStorage change), so a bare "have we
+  // ever checked" boolean would stay latched from the PREVIOUS user's check
+  // and let the new one through with no check of their own at all. Storing
+  // whose check last completed, and comparing against the CURRENT user's id
+  // instead, forces a fresh check whenever the identity actually changes.
+  const checkedOnboardingUserIdRef = useRef<string | null>(null)
   useEffect(() => {
     if (!mounted || isAuthPage || pathname === ONBOARDING_PATH) return
 
@@ -63,11 +72,11 @@ export function AuthGuard({ children }: AuthGuardProps) {
     // the very next time this effect runs after being set, regardless of
     // which branch would otherwise apply.
     if (consumeOnboardingSaveEscapeFlag()) {
-      checkedOnboardingRef.current = true
+      checkedOnboardingUserIdRef.current = user?.id ?? null
       return
     }
 
-    if (isLoading || !isAuthenticated || checkedOnboardingRef.current) return
+    if (isLoading || !isAuthenticated || !user || checkedOnboardingUserIdRef.current === user.id) return
 
     let active = true
     void (async () => {
@@ -77,8 +86,12 @@ export function AuthGuard({ children }: AuthGuardProps) {
       // onboarded." Leave the ref unlatched so the next navigation retries
       // instead of redirecting an already-onboarded user on a transient error.
       if (preferences === null) return
-      checkedOnboardingRef.current = true
-      if (!preferences.onboarded) {
+      checkedOnboardingUserIdRef.current = user.id
+      // Strict `!== true`, not `!preferences.onboarded`: the GET boundary
+      // doesn't validate this field's type, so a malformed stored value
+      // (e.g. a string "false", which is truthy) must not read as "already
+      // onboarded" - only an explicit boolean true should ever skip the redirect.
+      if (preferences.onboarded !== true) {
         // replace, not push: a `push` here leaves the pre-redirect page in
         // history, so a single Back press returns the user there with the
         // ref already latched - no re-check ever fires again this session,
@@ -89,7 +102,7 @@ export function AuthGuard({ children }: AuthGuardProps) {
     return () => {
       active = false
     }
-  }, [mounted, isAuthPage, pathname, isLoading, isAuthenticated, router])
+  }, [mounted, isAuthPage, pathname, isLoading, isAuthenticated, user, router])
 
   useEffect(() => {
     // Reduce check frequency, only check when user is active

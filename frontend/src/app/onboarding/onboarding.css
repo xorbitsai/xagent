@@ -457,7 +457,14 @@
 .ob-chips .ob-chip[aria-pressed="true"] {
   border-color: hsl(var(--primary));
   background: hsl(var(--primary) / 0.12);
-  color: hsl(var(--primary));
+  /* Not hsl(var(--primary)): computed contrast against this 12%-tinted
+     background is only ~3.4-3.5:1 on the blue/green/purple/cyberLight
+     presets (verified against theme.ts's actual palette values), below the
+     4.5:1 AA floor for this normal-size selected-state text. --foreground
+     is guaranteed high-contrast against any background token in every
+     theme by definition, and the border/background tint still clearly
+     signal "selected" without needing the text itself recolored. */
+  color: hsl(var(--foreground));
   font-weight: 560;
 }
 .ob-chips .ob-chip .ob-ic {
@@ -681,11 +688,31 @@
     padding-bottom: 36px;
   }
 }
+@media (max-width: 480px) {
+  /* The centered logo and the absolutely positioned left Skip/right account
+     controls reserve no space for one another - a long username's badge can
+     grow wide enough to overlap the logo at narrow phone widths. Hiding the
+     username text (keeping just the small avatar circle) caps the badge's
+     footprint regardless of username length, without needing a layout
+     rewrite. */
+  .ob-acct b {
+    display: none;
+  }
+  .ob-acct {
+    padding: 5px;
+  }
+}
 @media (prefers-reduced-motion: reduce) {
+  /* iteration-count:1, not just a near-zero duration: these are infinite
+     animations, so a near-zero duration alone still loops forever - just at
+     high speed, causing rapid repeated phase changes instead of the static
+     composition this rule is meant to produce. Stopping after one (near
+     instant) pass actually holds still. */
   .ob-aurora b,
   .ob-step .ob-orb::before,
   .ob-step .ob-orb::after,
   .ob-step {
     animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
   }
 }

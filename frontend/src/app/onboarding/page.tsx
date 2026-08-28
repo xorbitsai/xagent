@@ -265,7 +265,21 @@ export default function OnboardingPage() {
   const buildPreferencesPayload = (): UserPreferences => ({
     onboarded: true,
     ...(work ? { department: work } : {}),
-    ...(work === "other" && industry.trim() ? { industry: industry.trim() } : {}),
+    // Explicit `null` (not omission) once a real, non-"other" department is
+    // chosen: a PR review finding caught that switching away from "Other"
+    // after typing an industry only cleared the LOCAL `industry` state -
+    // since this is a merge PATCH, omitting the key left a stale industry
+    // value stored server-side, now silently paired with the new
+    // department (e.g. {department: "other", industry: "Legal"} becoming
+    // {department: "sales", industry: "Legal"}). `null` is this endpoint's
+    // actual "clear this field" signal (see UpdatePreferencesRequest).
+    ...(work === "other"
+      ? industry.trim()
+        ? { industry: industry.trim() }
+        : {}
+      : work
+        ? { industry: null }
+        : {}),
     ...(goals.length ? { goals } : {}),
     ...(hasReachedVoiceRef.current ? { voice } : {}),
   });
@@ -361,7 +375,16 @@ export default function OnboardingPage() {
         // failing must not leave it permanently unusable (even though the
         // adjacent "Take me to the catalogue" skip link is still a way out)
         // - let it through after a couple of tries too, same as every exit.
-        if (failureCount < MAX_SAVE_FAILURES_BEFORE_ESCAPE) {
+        //
+        // Only for a RETRYABLE failure, though: unlike persistAndLeave's
+        // escape (which just leaves without saving), this one proceeds to
+        // an IRREVERSIBLE hireAgentFromTemplate call. A non-retryable
+        // failure (a 4xx - the backend rejected this exact payload) will
+        // keep rejecting the identical payload no matter how many times
+        // it's retried, so escalating to "proceed anyway" would hire an
+        // agent while preferences were never actually saved, for a save
+        // that was never going to succeed in the first place.
+        if (failureCount < MAX_SAVE_FAILURES_BEFORE_ESCAPE || !saved.retryable) {
           if (isMountedRef.current) {
             launchingRef.current = false;
             setLaunching(false);
@@ -490,7 +513,7 @@ export default function OnboardingPage() {
             <>
               <Orb />
               <h1 ref={stepHeadingRef} tabIndex={-1}>
-                {t("onboarding.welcome.titlePrefix")}
+                {t("onboarding.welcome.titlePrefix", { appName: branding.appName })}
                 <br />
                 <em>{firstName}</em>.
               </h1>
@@ -614,21 +637,26 @@ export default function OnboardingPage() {
                     // an "other match waiting" before we actually know that.
                     `${t("onboarding.team.subtitleBase")}${
                       !templatesLoading && goals.length - validRecommended.length > 0
-                        ? ` ${t(
+                        ? t(
                             goals.length - validRecommended.length === 1
                               ? "onboarding.team.subtitleExtraOne"
                               : "onboarding.team.subtitleExtraMany",
                             { count: goals.length - validRecommended.length }
-                          )}`
+                          )
                         : t("onboarding.team.subtitleEnd")
                     }`}
               </p>
               {templatesLoading ? (
-                <div style={{ marginTop: 40, display: "flex", justifyContent: "center" }}>
+                <div
+                  role="status"
+                  style={{ marginTop: 40, display: "flex", justifyContent: "center" }}
+                >
                   <div
+                    aria-hidden="true"
                     data-testid="onboarding-team-loading"
                     className="h-8 w-8 animate-spin rounded-full border-2 border-[hsl(var(--border))] border-t-[hsl(var(--primary))]"
                   />
+                  <span className="sr-only">{t("common.loading")}</span>
                 </div>
               ) : (
                 <div
@@ -770,20 +798,20 @@ export default function OnboardingPage() {
                       <div className="ob-sum-li">
                         <Check className="mt-0.5 h-[18px] w-[18px]" style={{ color: "#22A05B" }} />
                         <span>
-                          {t("onboarding.done.workingInPrefix")} <b>{workLabel}</b>
+                          {t("onboarding.done.workingInPrefix")}<b>{workLabel}</b>
                         </span>
                       </div>
                       <div className="ob-sum-li">
                         <Check className="mt-0.5 h-[18px] w-[18px]" style={{ color: "#22A05B" }} />
                         <span>
-                          {t("onboarding.done.briefedPrefix")} <b>{jobCount}</b>{" "}
+                          {t("onboarding.done.briefedPrefix")}<b>{jobCount}</b>
                           {t(jobCount === 1 ? "onboarding.done.briefedSuffixOne" : "onboarding.done.briefedSuffixOther")}
                         </span>
                       </div>
                       <div className="ob-sum-li">
                         <Check className="mt-0.5 h-[18px] w-[18px]" style={{ color: "#22A05B" }} />
                         <span>
-                          {t("onboarding.done.writingInPrefix")} <b>{t(voiceOption.nameKey).toLowerCase()}</b>{" "}
+                          {t("onboarding.done.writingInPrefix")}<b>{t(voiceOption.nameKey).toLowerCase()}</b>
                           {t("onboarding.done.writingInSuffix")}
                         </span>
                       </div>
@@ -794,14 +822,14 @@ export default function OnboardingPage() {
                         />
                         {appNames.length ? (
                           <span>
-                            {t("onboarding.done.willConnectPrefix")}{" "}
+                            {t("onboarding.done.willConnectPrefix")}
                             <b>
                               {joinWithAnd(
                                 appNames,
                                 t("onboarding.done.willConnectAnd"),
                                 t("onboarding.done.willConnectSeparator")
                               )}
-                            </b>{" "}
+                            </b>
                             {t("onboarding.done.willConnectSuffix")}
                           </span>
                         ) : (

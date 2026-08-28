@@ -37,11 +37,15 @@ describe("recommendedTemplates", () => {
     ])
   })
 
-  it("dedupes when two selected goals point at the same template", () => {
-    // "inbox" and "support" both map to a support-inbox flavored template? -
-    // pick two goals that share a templateId to prove dedup, using the real
-    // data: "support" -> support-ai-chatbot-agent is distinct, so instead
-    // assert general dedup behavior using a goal selected twice via id reuse.
+  // Pins a PR review finding: this only proves duplicate SELECTED ids don't
+  // produce duplicate output - `ONBOARDING_GOALS.filter(...includes...)`
+  // already collapses a repeated id to one matched goal before the
+  // templateId-based `seen` dedup loop ever runs, so deleting that loop
+  // entirely would leave this test passing. No two goals in today's real
+  // catalog share a templateId, so proving the `seen` loop itself would
+  // need a synthetic catalog; not worth mocking the whole module (every
+  // other test here relies on the real one) for this one case.
+  it("collapses a goal id selected more than once to a single result", () => {
     const result = recommendedTemplates(["inbox", "inbox"])
     expect(result).toEqual([{ templateId: "support-inbox-manager", goalId: "inbox" }])
   })

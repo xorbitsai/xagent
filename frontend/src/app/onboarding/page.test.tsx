@@ -168,6 +168,27 @@ describe("OnboardingPage", () => {
     expect(continueButton).not.toBeDisabled()
   })
 
+  // Pins a finding verified during PR review: switching the department away
+  // from "Other" only cleared the LOCAL `industry` state - since the save
+  // is a merge PATCH, omitting the key left a stale industry value stored
+  // server-side, silently paired with the new department. `null` is this
+  // endpoint's actual "clear this field" signal.
+  it("explicitly clears a previously-typed industry when switching the department away from 'Other'", async () => {
+    await goToWelcomeThenBusiness()
+    fireEvent.click(screen.getByText("Other"))
+    fireEvent.change(screen.getByPlaceholderText("e.g. Property management"), {
+      target: { value: "Legal services" },
+    })
+
+    fireEvent.click(screen.getByText("Marketing"))
+    fireEvent.click(screen.getByText("Skip setup"))
+
+    await waitFor(() => expect(updateUserPreferencesMock).toHaveBeenCalled())
+    expect(updateUserPreferencesMock).toHaveBeenCalledWith(
+      expect.objectContaining({ department: "marketing", industry: null })
+    )
+  })
+
   // Matches PREFERENCES_TEXT_FIELD_MAX_LENGTH in src/xagent/web/api/auth.py -
   // a defensive client-side cap flagged by PR review.
   it("caps the free-text industry field at 200 characters", async () => {
@@ -583,8 +604,8 @@ describe("OnboardingPage", () => {
   // Flagged by PR review (xorbitsai/xagent#1617, major finding #4): unlike
   // every persistAndLeave exit, "Start with X" had no escape hatch at all -
   // a save that kept failing left the primary CTA permanently unusable.
-  it("proceeds to hire anyway after 2 consecutive save failures on 'Start with X', marking the save-escape flag", async () => {
-    updateUserPreferencesMock.mockResolvedValue({ ok: false })
+  it("proceeds to hire anyway after 2 consecutive RETRYABLE save failures on 'Start with X', marking the save-escape flag", async () => {
+    updateUserPreferencesMock.mockResolvedValue({ ok: false, retryable: true })
 
     await goToWelcomeThenBusiness()
     fireEvent.click(screen.getByText("Marketing"))
@@ -610,6 +631,39 @@ describe("OnboardingPage", () => {
     await waitFor(() => expect(hireAgentFromTemplateMock).toHaveBeenCalled())
     expect(routerReplace).toHaveBeenCalledWith("/task/42")
     expect(markOnboardingSaveEscapedMock).toHaveBeenCalledTimes(1)
+  })
+
+  // Pins a finding verified during PR review: unlike persistAndLeave's
+  // escape hatch (which just leaves without saving), handleLaunch's
+  // proceeds to an IRREVERSIBLE hireAgentFromTemplate call. A NON-retryable
+  // failure (e.g. a 422 the backend will reject identically every time)
+  // must never escalate to "proceed anyway," no matter how many times it's
+  // retried - it hires an agent while preferences were never actually
+  // saved, for a save that could never have succeeded.
+  it("never proceeds to hire after repeated NON-retryable save failures on 'Start with X'", async () => {
+    updateUserPreferencesMock.mockResolvedValue({ ok: false, retryable: false })
+
+    await goToWelcomeThenBusiness()
+    fireEvent.click(screen.getByText("Marketing"))
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/take off your plate/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Post on social media"))
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/Meet your AI team/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/How should/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText("You're all set.")).toBeInTheDocument())
+
+    for (let i = 0; i < 4; i++) {
+      await act(async () => {
+        fireEvent.click(screen.getByText("Start with Maya"))
+      })
+    }
+
+    expect(hireAgentFromTemplateMock).not.toHaveBeenCalled()
+    expect(markOnboardingSaveEscapedMock).not.toHaveBeenCalled()
+    expect(routerReplace).not.toHaveBeenCalledWith(expect.stringContaining("/task/"))
   })
 
   // Pins C2: a recommended templateId that never loaded (or has no persona)

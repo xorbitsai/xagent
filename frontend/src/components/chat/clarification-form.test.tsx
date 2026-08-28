@@ -436,6 +436,45 @@ describe("ClarificationForm connect_apps interaction", () => {
     })
   })
 
+  it("binds a connect_apps continue to the rendered interaction request, via the default sendMessage sender", async () => {
+    mcpAppsMock.apps = [
+      {
+        id: "gmail",
+        name: "Gmail",
+        description: "",
+        icon: "",
+        users: "",
+        transport: "builtin",
+        provider: "google",
+        category: "Communication",
+        is_connected: true,
+      },
+    ]
+
+    render(
+      <ClarificationForm
+        interactions={[CONNECT_APPS_INTERACTION]}
+        active={true}
+        requestId="inputreq_0011223344556677889900aabbccddee"
+      />,
+    )
+
+    fireEvent.click(
+      screen.getByRole("button", { name: "chatPage.clarification.connectApps.continue" }),
+    )
+
+    await waitFor(() => {
+      expect(appContextMock.sendMessage).toHaveBeenCalledWith(
+        "chatPage.clarification.connectApps.continue",
+        {
+          force: true,
+          metadata: { request_id: "inputreq_0011223344556677889900aabbccddee" },
+        },
+        [],
+      )
+    })
+  })
+
   it("toasts an error and lets the Continue button reappear (via rethrow) when sending the continue message fails", async () => {
     mcpAppsMock.apps = [
       {

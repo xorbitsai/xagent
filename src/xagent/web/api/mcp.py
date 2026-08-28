@@ -2775,19 +2775,28 @@ def _ensure_catalog_app_server(db: Session, app_id: str) -> tuple[MCPServer, dic
     server = db.query(MCPServer).filter(MCPServer.name == server_name).first()
     # Server names are a single global namespace. A row under this catalog id may
     # be a hijack — a custom server someone created with their own command — so
-    # only reuse it if it matches the official launch config. Otherwise a victim
-    # would run a foreign command with their own key attached.
+    # only reuse it if the command/transport match the official launch config.
+    # Otherwise a victim would run a foreign command with their own key attached.
     if server:
-        if (
-            server.command != command
-            or (server.args or []) != (launch.get("args") or [])
-            or str(server.transport or "").lower() != "stdio"
-        ):
+        if server.command != command or str(server.transport or "").lower() != "stdio":
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
                 detail="A server with this name already exists with a different configuration",
             )
         _reject_user_owned_catalog_squat(db, server)
+        # Unlike command/transport, args is not an identity check: the
+        # catalog stays the source of truth for it (mirroring how
+        # _ensure_catalog_mcp_oauth_server treats its "auth" config below),
+        # so a shared row created before a legitimate registry args change
+        # (a version bump, a new flag) is healed here instead of 409ing
+        # every connect attempt until an operator manually intervenes.
+        # Safe only because command/transport already proved this is the
+        # official row, not a hijack, and the owned-check above proved it
+        # isn't a user's own row.
+        current_args = launch.get("args") or []
+        if (server.args or []) != current_args:
+            cast(Any, server).args = current_args
+            db.commit()
     if not server:
         try:
             config = _build_server_config(

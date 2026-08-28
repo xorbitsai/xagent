@@ -562,6 +562,40 @@ def test_connect_rejects_user_owned_server_even_with_matching_config(test_db):
     assert exc.value.status_code == 409
 
 
+def test_connect_heals_stale_args_on_matching_command(test_db):
+    """A pre-existing row with the right command/transport but args from
+    before a legitimate catalog update (a version bump, a new flag) must not
+    409 forever -- unlike a command mismatch (a real hijack), this is healed
+    in place so this and every future connect attempt succeeds with the
+    current official args, mirroring how _ensure_catalog_mcp_oauth_server
+    already syncs a drifted "auth" config instead of rejecting it."""
+    from xagent.web.api.mcp import MCPAppConnectRequest, connect_mcp_app
+
+    test_db.add(
+        MCPServer(
+            name="google-maps",
+            managed="external",
+            transport="stdio",
+            command="npx",
+            # Missing "--stdio": simulates a row created before that flag was
+            # added to the catalog's launch_config.
+            args=["-y", "@cablate/mcp-google-map"],
+        )
+    )
+    test_db.commit()
+
+    response = connect_mcp_app(
+        "google-maps",
+        MCPAppConnectRequest(env={"GOOGLE_MAPS_API_KEY": "my-key"}),
+        current_user=_user(test_db, 1),
+        db=test_db,
+    )
+    assert response is not None
+
+    healed = test_db.query(MCPServer).filter(MCPServer.name == "google-maps").first()
+    assert healed.args == ["-y", "@cablate/mcp-google-map", "--stdio"]
+
+
 @pytest.mark.parametrize("name", ["google-maps", "Google-Maps", "google maps"])
 def test_create_server_rejects_catalog_app_id(test_db, name):
     """Custom servers can't squat a catalog app id (the hijack precondition),

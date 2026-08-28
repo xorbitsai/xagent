@@ -1160,20 +1160,12 @@ def get_builtin_public_mcp_app_rows() -> list[dict[str, Any]]:
             # the chrome row's note (is_visible_in_connector is not
             # builtin-protected).
             #
-            # A second, independent reason to keep this hidden for now:
-            # the vendored server's own handle_api_errors decorator
-            # (chartmogul_mcp/api_client.py, upstream, at the pinned commit)
-            # catches every exception -- auth failures, rate limits, network
-            # errors, parse errors -- logs it, and returns None, which
-            # FastMCP then serializes as a normal (non-error) empty tool
-            # result. An agent or user has no way to distinguish "no data"
-            # from "the token is invalid" or "ChartMogul is down." Fixing
-            # this means patching upstream's error handling (a fork to
-            # maintain across future pin bumps) or writing a first-party
-            # wrapper instead of vendoring -- tracked in
-            # https://github.com/xorbitsai/xagent/issues/1871, resolve one
-            # of those (or that issue's other proposed paths) before
-            # unhiding.
+            # A second, independent reason to keep this hidden for now: the
+            # vendored server's own error handling swallows failures into a
+            # silent empty result, so an agent can't tell "no data" from
+            # "the token is invalid" -- see
+            # https://github.com/xorbitsai/xagent/issues/1871 for the
+            # details and proposed fixes; resolve it before unhiding.
             "is_visible_in_connector": False,
             # Key-based (non-oauth), like aws/google-maps/posthog/stripe:
             # ChartMogul has no OAuth flow at all, only a per-user API key
@@ -1198,6 +1190,16 @@ def get_builtin_public_mcp_app_rows() -> list[dict[str, Any]]:
             # XAGENT_CHARTMOGUL_MCP_VENDOR_PATH to whatever it actually
             # cloned into, so this reads the real build-time value back
             # instead of an independently-maintained copy of it.
+            # This makes chartmogul the only row here whose launch_config is
+            # computed rather than a static literal, so
+            # validate_builtin_public_mcp_apps's drift check compares it
+            # against whatever value was persisted at seed time -- an
+            # existing deployment upgraded to a build with a non-default
+            # CHARTMOGUL_MCP_VENDOR_PATH will log a permanent (but harmless)
+            # "Built-in MCP catalog drift" warning every startup, since the
+            # real launch always reads the live value regardless of what's
+            # persisted. Not fixed here: doing so generically means teaching
+            # the shared drift check about per-app dynamic fields.
             "launch_config": {
                 "command": "uv",
                 "args": [
@@ -1363,7 +1365,8 @@ def seed_builtin_oauth_and_public_mcp_apps(bind: Connection) -> None:
         }
         # Same guard as the chrome seed migration's upgrade(), and for the
         # same reason: is_visible_in_connector is load-bearing for the
-        # hidden-rollout gate several rows ship behind (chrome today), so
+        # hidden-rollout gate several rows ship behind (chrome and
+        # chartmogul today), so
         # _filter_row silently dropping it and falling back to the table's
         # visible-by-default would seed those rows visible. This caller only
         # runs against a table just created from the current model (see

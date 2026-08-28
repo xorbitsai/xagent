@@ -303,7 +303,7 @@ COPY --from=uv /uv /uvx /usr/local/bin/
 # before every cache-sensitive copy, sidesteps that without the added
 # complexity.
 #
-# Gated behind INSTALL_CHARTMOGUL, mirroring INSTALL_CHROME below: default
+# Gated behind INSTALL_CHARTMOGUL, mirroring INSTALL_CHROME above: default
 # true means every standard image build now clones this repo, downloads a
 # second Python 3.13 interpreter, and carries the added image weight, same
 # as INSTALL_CHROME's default already adds a Chrome install and npx cache.

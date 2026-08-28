@@ -2183,10 +2183,9 @@ def get_chartmogul_mcp_vendor_path() -> str:
     Returns:
         Absolute path to the vendored chartmogul-mcp-server clone.
     """
-    env_value = os.getenv(CHARTMOGUL_MCP_VENDOR_PATH, "").strip()
-    if env_value:
-        return env_value
-    return "/opt/xagent/vendor/chartmogul-mcp-server"
+    return (
+        os.getenv(CHARTMOGUL_MCP_VENDOR_PATH) or ""
+    ).strip() or "/opt/xagent/vendor/chartmogul-mcp-server"
 
 
 def get_sandbox_image() -> str:

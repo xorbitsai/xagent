@@ -1347,17 +1347,12 @@ class TestGetChartmogulMcpVendorPath:
         result = get_chartmogul_mcp_vendor_path()
         assert result == "/custom/chartmogul-path"
 
-    def test_vendor_path_empty_env_var_falls_back_to_default(self, monkeypatch):
-        """An explicitly empty value must not be passed through as-is --
-        the registry feeds this straight into `uv --directory`, so an empty
-        string would only fail far away at first tool-call time."""
-        monkeypatch.setenv(CHARTMOGUL_MCP_VENDOR_PATH, "")
-        result = get_chartmogul_mcp_vendor_path()
-        assert result == "/opt/xagent/vendor/chartmogul-mcp-server"
-
-    def test_vendor_path_whitespace_env_var_falls_back_to_default(self, monkeypatch):
-        """Same as the empty-string case but for a whitespace-only value."""
-        monkeypatch.setenv(CHARTMOGUL_MCP_VENDOR_PATH, "   ")
+    @pytest.mark.parametrize("value", ["", "   "])
+    def test_vendor_path_blank_env_var_falls_back_to_default(self, monkeypatch, value):
+        """A blank value must not be passed through as-is -- the registry
+        feeds this straight into `uv --directory`, so a blank string would
+        only fail far away at first tool-call time."""
+        monkeypatch.setenv(CHARTMOGUL_MCP_VENDOR_PATH, value)
         result = get_chartmogul_mcp_vendor_path()
         assert result == "/opt/xagent/vendor/chartmogul-mcp-server"
 

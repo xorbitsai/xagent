@@ -3788,13 +3788,18 @@ async def test_direct_dag_preserves_legacy_auto_language_authority() -> None:
 
 
 @pytest.mark.asyncio
-async def test_dag_request_preview_preserves_trailing_language_directive() -> None:
+async def test_dag_request_preview_preserves_mid_request_language_directive() -> None:
     generator = LLMPlanGenerator()
-    context = ExecutionContext(execution_id="dag-language-directive-tail")
+    context = ExecutionContext(execution_id="dag-language-directive-middle")
     directive = "Please write every plan field and the final answer in English."
-    context.add_user_message(
-        "请分析以下很长的背景材料。" + "背景资料" * 400 + directive
+    request = (
+        "请分析以下很长的背景材料。"
+        + "背景资料" * 200
+        + directive
+        + "背景资料" * 200
+        + "谢谢。"
     )
+    context.add_user_message(request)
     llm = PlanLLM(
         plan_tool_response(
             [
@@ -3822,9 +3827,8 @@ async def test_dag_request_preview_preserves_trailing_language_directive() -> No
     )
 
     prompt_payload = json.loads(llm.calls[0]["messages"][1]["content"])
-    assert "middle truncated" in prompt_payload["latest_user_request"]
-    assert prompt_payload["latest_user_request"].endswith(directive)
-    assert len(prompt_payload["latest_user_request"]) == 1200
+    assert prompt_payload["latest_user_request"] == request
+    assert directive in prompt_payload["latest_user_request"]
 
 
 @pytest.mark.asyncio
@@ -5288,6 +5292,13 @@ async def test_restored_dag_step_instruction_drops_stale_language_policy(
     assert "Use the same natural language as the current user request" in instruction
 
 
+_FILE_REFERENCE_BLOCK = (
+    "\n\nAttached file(s):\n- quarterly.pdf\nInspect every attached file with "
+    "the provided tools before answering, and reference each one by the exact "
+    "path shown above. Do not invent paths that were not listed here."
+)
+
+
 def _chinese_rewrite_plan_response() -> dict[str, Any]:
     return plan_tool_response(
         [
@@ -5301,6 +5312,34 @@ def _chinese_rewrite_plan_response() -> dict[str, Any]:
         ],
         response_language="Simplified Chinese",
     )
+
+
+@pytest.mark.asyncio
+async def test_plan_language_anchor_ignores_the_appended_file_reference_block() -> None:
+    generator = LLMPlanGenerator()
+    context = ExecutionContext(execution_id="dag-file-turn-language-anchor")
+    typed = "请把这份公告重写得更易读。"
+    context.add_user_message(
+        typed + _FILE_REFERENCE_BLOCK,
+        metadata={"display_message": typed},
+    )
+    llm = SequenceLLM([_chinese_rewrite_plan_response()])
+
+    plan = await generator.generate_plan(
+        request=PlanGenerationRequest(
+            context=context,
+            execution_id=context.execution_id,
+            available_tool_names=[],
+        ),
+        llm=llm,
+    )
+
+    assert plan.steps[0].id == "rewrite"
+    # One call: the Chinese plan matches the Chinese request the user typed, so
+    # the script nudge must not fire on the English file block.
+    assert llm.calls == 1
+    prompt_payload = json.loads(llm.seen_messages[0][1]["content"])
+    assert prompt_payload["latest_user_request"] == typed
 
 
 @pytest.mark.asyncio

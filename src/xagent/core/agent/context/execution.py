@@ -490,7 +490,13 @@ class ExecutionContext:
             "instead of computing from this value."
         )
 
-    def _current_user_request_text(self) -> str:
+    def _current_user_request_text(self, *, prefer_display: bool = False) -> str:
+        """Return the current request text.
+
+        ``prefer_display`` yields the user-typed message instead of the
+        execution prompt, whose appended file-reference block is fixed English
+        and would otherwise decide the language of a short foreign request.
+        """
         for message in reversed(self.messages):
             if message.hidden or message.role != "user":
                 continue
@@ -500,6 +506,10 @@ class ExecutionContext:
             # scaffolding; only the root request may anchor the response language.
             if message.metadata.get("dag_step_id"):
                 continue
+            if prefer_display:
+                display = str(message.metadata.get("display_message") or "").strip()
+                if display:
+                    return display
             content = str(message.content or "").strip()
             if content:
                 return content
@@ -590,7 +600,7 @@ class ExecutionContext:
             request_anchor = output_language_directives(
                 output_language,
                 section="dag_step_request_anchor",
-                request=current_task,
+                request=self._current_user_request_text(prefer_display=True),
             )
             if request_anchor:
                 parts.append(request_anchor)

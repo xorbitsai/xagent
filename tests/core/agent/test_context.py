@@ -714,8 +714,8 @@ def test_dag_step_without_output_language_quotes_the_request_for_language() -> N
     assert "Output language:" not in system_content
 
 
-def test_dag_step_language_quote_is_middle_truncated() -> None:
-    request = "A" * 900 + "TAIL_DIRECTIVE" + "B" * 900 + " Reply in French."
+def test_dag_step_language_quote_keeps_a_mid_request_directive() -> None:
+    request = "A" * 900 + " Reply in French. " + "B" * 900 + " Ship it."
     ctx = ExecutionContext()
     ctx.metadata["dag_step_id"] = "step-1"
     ctx.metadata["dag_step_name"] = "Extract release notes"
@@ -723,10 +723,29 @@ def test_dag_step_language_quote_is_middle_truncated() -> None:
 
     system_content = ctx.get_messages_for_llm()[0]["content"]
 
-    assert request not in system_content
-    assert "middle truncated" in system_content
-    assert "Reply in French." in system_content
-    assert "TAIL_DIRECTIVE" not in system_content
+    assert request in system_content
+    assert "middle truncated" not in system_content
+
+
+def test_dag_step_language_quote_uses_the_typed_message() -> None:
+    typed = "请把发布说明整理成一段话。"
+    ctx = ExecutionContext()
+    ctx.metadata["dag_step_id"] = "step-1"
+    ctx.metadata["dag_step_name"] = "Extract release notes"
+    ctx.add_user_message(
+        typed + "\n\nAttached file(s):\n- notes.pdf\nInspect every attached "
+        "file with the provided tools before answering, and reference each one "
+        "by the exact path shown above.",
+        metadata={"display_message": typed},
+    )
+
+    system_content = ctx.get_messages_for_llm()[0]["content"]
+    quote = system_content.split(
+        "Current user request, quoted for response language only:\n"
+    )[1]
+
+    assert quote.startswith(typed)
+    assert "Attached file(s)" not in quote
 
 
 def test_root_request_without_output_language_constrains_tool_arguments() -> None:

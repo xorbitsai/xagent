@@ -18,7 +18,6 @@ from ...language import (
     output_language_directives,
     plan_language_rules,
     request_context_output_language,
-    truncate_request_preview,
 )
 from ..base import (
     RequiredToolCallError,
@@ -562,7 +561,7 @@ class LLMPlanGenerator(PlanGenerator):
         }
 
     def _build_prompt(self, request: PlanGenerationRequest) -> str:
-        latest_request = latest_user_text(request.context) or ""
+        latest_request = latest_user_text(request.context, prefer_display=True) or ""
         expected_language, language_source = self._language_authority(request.context)
         latest_messages = [
             {"role": message.role, "content": message.content}
@@ -572,7 +571,9 @@ class LLMPlanGenerator(PlanGenerator):
         payload = {
             "execution_id": request.execution_id,
             "replan": request.replan,
-            "latest_user_request": truncate_request_preview(latest_request),
+            # Quoted whole: the planner picks response_language from this field,
+            # and "messages" below already carries the full text anyway.
+            "latest_user_request": latest_request.strip(),
             "output_language_policy": output_language_directives(
                 None
                 if language_source == OUTPUT_LANGUAGE_SOURCE_PLAN
@@ -686,7 +687,7 @@ class LLMPlanGenerator(PlanGenerator):
         Script comparison cannot tell a biased plan from a request that legitimately
         asks for another language, so it may only nudge once, never reject a plan.
         """
-        request = latest_user_text(context) or ""
+        request = latest_user_text(context, prefer_display=True) or ""
         for step in plan.steps:
             mismatch = detect_prose_script_mismatch(
                 request, LLMPlanGenerator._step_prose(step)

@@ -9,8 +9,6 @@ OUTPUT_LANGUAGE_METADATA_KEY = "output_language"
 OUTPUT_LANGUAGE_SOURCE_METADATA_KEY = "output_language_source"
 OUTPUT_LANGUAGE_SOURCE_PLAN = "dag_plan"
 REQUEST_CONTEXT_METADATA_KEY = "request_context"
-LANGUAGE_REQUEST_PREVIEW_LIMIT = 1200
-_MIDDLE_TRUNCATION_MARKER = "\n... [middle truncated] ...\n"
 
 _ALLOWED_RESPONSE_LANGUAGE_LABELS = frozenset(
     {
@@ -394,21 +392,6 @@ def reset_metadata_output_language(metadata: dict[str, Any]) -> None:
         metadata[OUTPUT_LANGUAGE_METADATA_KEY] = external
 
 
-def truncate_request_preview(
-    request_text: str,
-    *,
-    limit: int = LANGUAGE_REQUEST_PREVIEW_LIMIT,
-) -> str:
-    """Keep both ends of a bounded request so trailing directives survive."""
-    stripped = request_text.strip()
-    if len(stripped) <= limit:
-        return stripped
-    available = limit - len(_MIDDLE_TRUNCATION_MARKER)
-    head_length = available // 2
-    tail_length = available - head_length
-    return stripped[:head_length] + _MIDDLE_TRUNCATION_MARKER + stripped[-tail_length:]
-
-
 def output_language_policy(response_language: str | None = None) -> str:
     """Return a compact policy for downstream language preservation."""
     language = normalize_response_language_label(response_language)
@@ -578,9 +561,11 @@ def output_language_directives(
         # only when no pinned language already answers the same question.
         if language or not request:
             return ""
+        # Quoted whole: any truncation can drop an explicit target-language
+        # instruction sitting in the middle of a long request.
         return (
             "Current user request, quoted for response language only:\n"
-            f"{truncate_request_preview(request)}\n\n"
+            f"{request.strip()}\n\n"
             "This request is not the executable goal for this step; use it "
             "only to decide the natural language of user-facing prose.\n\n"
             f"{response_language_rules()}"

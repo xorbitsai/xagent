@@ -1134,6 +1134,14 @@ class UnavailableMCPTool(AbstractBaseTool):
     def state_type(self) -> Optional[Type[BaseModel]]:
         return None
 
+    def _with_reason_and_failure_code(self, result: Dict[str, Any]) -> Dict[str, Any]:
+        """Attach the optional public diagnostic fields both branches below share."""
+        if self._reason is not None:
+            result["reason"] = self._reason
+        if self._failure_code is not None:
+            result["failure_code"] = self._failure_code
+        return result
+
     def _run_unavailable(self) -> Dict[str, Any]:
         from ....agent.result import is_oauth_token_required_code
 
@@ -1152,31 +1160,29 @@ class UnavailableMCPTool(AbstractBaseTool):
                 f"I need access to {self._app_name} to continue. "
                 "Please connect it below, then let me know once you have."
             )
-            pause_result: Dict[str, Any] = {
-                "success": False,
-                "status": "waiting_for_user",
-                "message": pause_message,
-                # Populated alongside `message`/`status` (not just left to the
-                # declared _UnavailableMCPToolResult defaults) so a caller that
-                # stringifies via return_value_as_string still sees real text
-                # instead of "No content returned", and this failure class
-                # still classifies for trace/diagnostic purposes the same way
-                # the error branch below does.
-                "content": [{"text": pause_message}],
-                "interactions": [
-                    {
-                        "type": "connect_apps",
-                        "field": "connect_apps",
-                        "label": "Connect your apps",
-                        "apps": [self._app_name],
-                    }
-                ],
-            }
-            if self._reason is not None:
-                pause_result["reason"] = self._reason
-            if self._failure_code is not None:
-                pause_result["failure_code"] = self._failure_code
-            return pause_result
+            return self._with_reason_and_failure_code(
+                {
+                    "success": False,
+                    "status": "waiting_for_user",
+                    "message": pause_message,
+                    # Populated alongside `message`/`status` (not just left to
+                    # the declared _UnavailableMCPToolResult defaults) so a
+                    # caller that stringifies via return_value_as_string still
+                    # sees real text instead of "No content returned", and
+                    # this failure class still classifies for trace/
+                    # diagnostic purposes the same way the error branch below
+                    # does.
+                    "content": [{"text": pause_message}],
+                    "interactions": [
+                        {
+                            "type": "connect_apps",
+                            "field": "connect_apps",
+                            "label": "Connect your apps",
+                            "apps": [self._app_name],
+                        }
+                    ],
+                }
+            )
 
         content_message = self._message
         if self._message == _DEFAULT_UNAVAILABLE_MCP_MESSAGE:
@@ -1184,18 +1190,15 @@ class UnavailableMCPTool(AbstractBaseTool):
                 "MCP server credentials are unavailable. Please reconnect "
                 "the MCP server credentials and retry."
             )
-        result: Dict[str, Any] = {
-            "success": False,
-            "status": "error",
-            "error": self._message,
-            "content": [{"text": content_message}],
-            "is_error": True,
-        }
-        if self._reason is not None:
-            result["reason"] = self._reason
-        if self._failure_code is not None:
-            result["failure_code"] = self._failure_code
-        return result
+        return self._with_reason_and_failure_code(
+            {
+                "success": False,
+                "status": "error",
+                "error": self._message,
+                "content": [{"text": content_message}],
+                "is_error": True,
+            }
+        )
 
     async def run_json_async(self, args: Mapping[str, Any]) -> Any:
         return self._run_unavailable()

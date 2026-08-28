@@ -155,6 +155,7 @@ async def test_unavailable_tool_oauth_required_with_app_name_pauses_for_connect_
     tool = _unavailable_tool(
         allow_users=["7"],
         failure_code="oauth_token_required",
+        reason="oauth_token_resolver_failed",
         app_name="Gmail",
     )
 
@@ -183,6 +184,7 @@ async def test_unavailable_tool_oauth_required_with_app_name_pauses_for_connect_
                 "apps": ["Gmail"],
             }
         ],
+        "reason": "oauth_token_resolver_failed",
         "failure_code": "oauth_token_required",
     }
 

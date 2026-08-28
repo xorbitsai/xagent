@@ -332,3 +332,45 @@ def test_invalid_stable_app_id_does_not_fall_back_to_name(
     )
 
     assert app is None
+
+
+@pytest.mark.parametrize(
+    "transport",
+    [
+        "streamable_http",
+        "Streamable_HTTP",
+        " streamable_http ",
+        "  STREAMABLE_HTTP\t",
+    ],
+    ids=["canonical", "mixed-case", "padded", "padded-upper"],
+)
+def test_classify_app_auth_normalizes_transport_like_the_write_path(transport: str):
+    """This must agree with normalize_transport(), which the write-time
+    validators use. A local .lower() here would still disagree about a padded
+    legacy row, reintroducing the same class of chain-disagreement bug via
+    whitespace instead of case."""
+    assert (
+        classify_app_auth(
+            transport,
+            {"url": "https://mcp.example.com/mcp", "auth": {"type": "mcp_oauth"}},
+        )
+        == "mcp_oauth"
+    )
+
+
+@pytest.mark.parametrize(
+    "transport",
+    ["stdio", "STDIO", " stdio "],
+    ids=["canonical", "upper", "padded"],
+)
+def test_classify_app_auth_normalizes_transport_for_keyless(transport: str):
+    assert classify_app_auth(transport, {"command": "npx"}) == "keyless"
+
+
+@pytest.mark.parametrize(
+    "transport",
+    ["oauth", "OAuth", " oauth "],
+    ids=["canonical", "mixed-case", "padded"],
+)
+def test_classify_app_auth_normalizes_transport_for_builtin_oauth(transport: str):
+    assert classify_app_auth(transport, {"command": "npx"}) == "builtin_oauth"

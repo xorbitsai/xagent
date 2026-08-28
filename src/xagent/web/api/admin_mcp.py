@@ -18,6 +18,11 @@ from ..models.database import get_db
 from ..models.oauth_provider import OAuthProvider
 from ..models.public_mcp import PublicMCPApp, PublicMCPAppAudit
 from ..models.user import User
+from ..services.mcp_runtime import (
+    NormalizedTransport,
+    OptionalNormalizedTransport,
+    normalize_transport,
+)
 
 admin_mcp_router = APIRouter(prefix="/api/admin/mcp", tags=["Admin MCP"])
 
@@ -90,9 +95,20 @@ class PublicMCPAppBase(BaseModel):
 
 
 class PublicMCPAppCreate(PublicMCPAppBase):
-    # Validator lives on the write model only, not PublicMCPAppBase — otherwise
-    # PublicMCPAppResponse would inherit it and re-run on response serialization,
-    # turning one legacy/partial DB row into a full-list 500 on read.
+    # Both the transport override below and _enforce_auth_classification live on
+    # the write models only, not on PublicMCPAppBase — PublicMCPAppResponse
+    # inherits from that base, so putting them there would re-run them on
+    # response serialization: one legacy/partial DB row would turn a full-list
+    # read into a 500, and a row still stored mixed-case would be *reported*
+    # lowercased, a read that lies about the table.
+    #
+    # Redeclaring the field narrows the inherited `str` to the shared
+    # annotated type. Transport is free-form, and an admin-authored
+    # "Streamable_HTTP" passes the shape check below (classify_app_auth compares
+    # case-insensitively) yet produces a shared server row the connect path's
+    # exact comparisons reject.
+    transport: NormalizedTransport = "oauth"
+
     @model_validator(mode="after")
     def _enforce_auth_classification(self) -> "PublicMCPAppCreate":
         # Reuse the single source of truth (classify_app_auth) rather than
@@ -136,7 +152,7 @@ class PublicMCPAppUpdate(BaseModel):
     name: Optional[str] = None
     description: Optional[str] = None
     icon: Optional[str] = None
-    transport: Optional[str] = None
+    transport: OptionalNormalizedTransport = None
     provider_name: Optional[str] = None
     category: Optional[str] = None
     oauth_scopes: Optional[List[str]] = None
@@ -240,6 +256,22 @@ def _validate_public_mcp_app_values(
     try:
         model.model_validate(values)
     except ValidationError:
+        # A legacy row can hold a blank transport (there is no DB-level
+        # non-empty constraint, and these models only started rejecting it
+        # recently). Such a row cannot be healed -- there is no canonical value
+        # to strip down to, and writing "" would be the very state this
+        # rejection exists to prevent -- so the edit genuinely cannot proceed.
+        # Name the reason rather than answering with a bare "invalid
+        # configuration" about a field the admin may not have touched.
+        if not str(values.get("transport") or "").strip():
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=(
+                    "This app has no transport set. Include a valid "
+                    "'transport' in this request to repair it before "
+                    "editing its other fields."
+                ),
+            ) from None
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail="Invalid MCP app configuration",
@@ -250,6 +282,32 @@ def _apply_public_mcp_app_update(db_app: PublicMCPApp, changes: Dict[str, Any]) 
     canonical = get_builtin_public_mcp_app(db_app.app_id)
     persisted = _public_mcp_app_values(db_app)
     enforce_connect_shape = bool({"transport", "launch_config"} & changes.keys())
+
+    # Decide the heal up front, before validation runs.
+    #
+    # `exclude_unset=True` means a PATCH of an unrelated field persists nothing
+    # for transport, so a row authored before the write models normalized would
+    # otherwise stay padded forever while the `mcp_servers` row written on
+    # connect is canonical -- the two then disagree and the connect path 409s.
+    #
+    # Deciding it here rather than after validation is what keeps the blank
+    # case safe: an earlier revision computed the heal *after* the merged state
+    # was validated and assigned it with no re-check, so a whitespace-only
+    # legacy transport was normalized to "" and persisted -- precisely the
+    # silently-unconnectable state these validators exist to prevent. The
+    # `normalize_transport(...)` truthiness test below is that guard: a value
+    # with nothing left after trimming is not healed at all, and the row is
+    # left for the backfill migration.
+    #
+    # (Only the write below matters, not the validated dict: the write models
+    # normalize transport on the way in, so a padded value validates
+    # identically either way.)
+    stored_transport = persisted.get("transport")
+    healed_transport: Optional[str] = None
+    if "transport" not in changes and isinstance(stored_transport, str):
+        candidate = normalize_transport(stored_transport)
+        if candidate and candidate != stored_transport:
+            healed_transport = candidate
 
     if canonical is not None:
         for field in _BUILTIN_PROTECTED_FIELDS.intersection(changes):
@@ -284,6 +342,14 @@ def _apply_public_mcp_app_update(db_app: PublicMCPApp, changes: Dict[str, Any]) 
         writable_changes = {
             field: value for field, value in changes.items() if field != "app_id"
         }
+
+    # Only persist the heal once the merged state above validated cleanly. A
+    # builtin's transport is a protected field, so it is excluded from
+    # writable_changes by design -- but healing only ever strips and lowercases,
+    # never moves a row away from its canonical value, so applying it there is
+    # safe and converges the row.
+    if healed_transport is not None:
+        writable_changes = {**writable_changes, "transport": healed_transport}
 
     for field, value in writable_changes.items():
         setattr(db_app, field, value)

@@ -106,12 +106,16 @@ def classify_app_auth(transport: Any, launch_config: Any) -> str:
     """
     # Reuses the runtime's notion of which transports are remote ("oauth"
     # here instead means a static-provider redirect wrapping our own stdio
-    # module). Lowercased like the builtin_oauth check above: an admin PATCH
-    # can store a mixed-case transport, and the two halves of this feature
-    # must not disagree about the same row.
-    from .services.mcp_runtime import HTTP_MCP_TRANSPORTS
+    # module). Normalized through the same helper the write path uses:
+    # transport is canonicalized on write now, but rows stored before that may
+    # still be mixed-case or padded, and the two halves of this feature must
+    # not disagree about the same row. Going through the shared helper rather
+    # than a local .lower() keeps this from drifting out of step with it again.
+    from .services.mcp_runtime import HTTP_MCP_TRANSPORTS, normalize_transport
 
-    if str(transport or "").lower() == "oauth":
+    normalized_transport = normalize_transport(transport)
+
+    if normalized_transport == "oauth":
         return "builtin_oauth"
     launch = launch_config if isinstance(launch_config, dict) else {}
     if launch.get("required_env") and launch.get("command"):
@@ -125,7 +129,7 @@ def classify_app_auth(transport: Any, launch_config: Any) -> str:
     # keyless would offer a no-secrets Connect button for a server that fails
     # at tool-call time for a missing token.
     if (
-        str(transport or "").lower() == "stdio"
+        normalized_transport == "stdio"
         and launch.get("command")
         and not launch.get("required_env")
         and not launch.get("env_mapping")
@@ -133,7 +137,7 @@ def classify_app_auth(transport: Any, launch_config: Any) -> str:
         return "keyless"
     auth = launch.get("auth")
     if (
-        str(transport or "").lower() in HTTP_MCP_TRANSPORTS
+        normalized_transport in HTTP_MCP_TRANSPORTS
         and launch.get("url")
         and isinstance(auth, dict)
         and auth.get("type") == "mcp_oauth"

@@ -1237,3 +1237,105 @@ def test_connect_coerces_scalar_env_values(test_db):
     )
     assoc2 = test_db.query(UserMCPServer).filter(UserMCPServer.user_id == 2).first()
     assert assoc2.env is None
+
+
+def test_connect_reuses_shared_stdio_row_with_padded_transport(test_db):
+    """The stdio reuse guard must normalize like its mcp_oauth sibling.
+
+    This comparison's right side is a literal "stdio", so lowercasing alone
+    was enough while nothing normalized the left side. It is the same shape as
+    the mcp_oauth check that produced a permanent 409 lockout for catalog
+    apps, and the row on the left is exactly the one this feature leaves
+    un-normalized until the backfill lands: a legacy " stdio " row is the same
+    stdio server, and rejecting it as a different configuration would strand
+    the catalog app for every user until someone hand-edits the database."""
+    from xagent.web.api.mcp import MCPAppConnectRequest, connect_mcp_app
+    from xagent.web.models.mcp import MCPServer
+
+    test_db.add(
+        MCPServer(
+            name="google-maps",
+            managed="external",
+            transport=" Stdio ",
+            command="npx",
+            args=["-y", "@cablate/mcp-google-map", "--stdio"],
+        )
+    )
+    test_db.commit()
+
+    connect_mcp_app(
+        "google-maps",
+        MCPAppConnectRequest(env={"GOOGLE_MAPS_API_KEY": "alice-key"}),
+        current_user=_user(test_db, 1),
+        db=test_db,
+    )
+
+    # Reused, not duplicated or rejected with a 409.
+    assert test_db.query(MCPServer).filter(MCPServer.name == "google-maps").count() == 1
+
+
+def test_connect_heals_a_padded_transport_on_the_shared_row(test_db):
+    """Accepting a legacy row obliges the reuse path to canonicalize it.
+
+    The reuse guard compares transport tolerantly so a padded row isn't
+    rejected as a different configuration. Everything downstream is not
+    tolerant: MCPServerConfig.to_connection_dict() dispatches on an exact
+    match, so leaving the row dirty produces a connection with no
+    command/args/env and no error surfaced -- strictly worse than the 409 the
+    tolerant comparison replaced. Tolerate on read, canonicalize on write."""
+    from xagent.web.api.mcp import MCPAppConnectRequest, connect_mcp_app
+    from xagent.web.models.mcp import MCPServer
+
+    test_db.add(
+        MCPServer(
+            name="google-maps",
+            managed="external",
+            transport=" Stdio ",
+            command="npx",
+            args=["-y", "@cablate/mcp-google-map", "--stdio"],
+        )
+    )
+    test_db.commit()
+
+    connect_mcp_app(
+        "google-maps",
+        MCPAppConnectRequest(env={"GOOGLE_MAPS_API_KEY": "alice-key"}),
+        current_user=_user(test_db, 1),
+        db=test_db,
+    )
+
+    row = test_db.query(MCPServer).filter(MCPServer.name == "google-maps").one()
+    assert row.transport == "stdio"
+
+    # The point of healing: the exact-match consumer downstream still works.
+    connection = row.to_connection_dict()
+    assert connection["transport"] == "stdio"
+    assert connection["command"] == "npx"
+    assert connection["args"] == ["-y", "@cablate/mcp-google-map", "--stdio"]
+
+
+def test_connect_does_not_blank_a_transport_it_cannot_heal(test_db):
+    """Healing must never create the blank state the write models prevent.
+
+    A row whose transport normalizes to "" has nothing to be healed to.
+    Writing "" would turn an already-unusable row into a silently
+    unconnectable one, so the heal is skipped and the row is left for the
+    backfill migration."""
+    from xagent.web.api.mcp import _heal_server_transport
+    from xagent.web.models.mcp import MCPServer
+
+    row = MCPServer(name="blank", managed="external", transport="   ")
+    _heal_server_transport(row)
+    assert row.transport == "   "
+
+    # A non-string stored value is left alone rather than stringified.
+    # `None` alone doesn't discriminate -- it normalizes to "" and the blank
+    # guard above would block the write anyway. A value that normalizes to
+    # something non-blank is what proves the isinstance check is load-bearing:
+    # healing canonicalizes a transport, it does not coerce whatever type
+    # happens to be in the column.
+    for odd in (None, 123, ["sse"], True):
+        row2 = MCPServer(name="odd", managed="external", transport="stdio")
+        row2.transport = odd
+        _heal_server_transport(row2)
+        assert row2.transport is odd

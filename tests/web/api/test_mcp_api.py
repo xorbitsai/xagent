@@ -664,6 +664,28 @@ class TestMCPApiFunctions:
         # Changed top-level name -> tampered
         assert _global_config_tampered(MCPServerUpdate(name="other"), server)
 
+    def test_global_config_tampered_normalizes_both_sides_of_transport(self):
+        """MCPServerUpdate.transport is normalized by its validator, but the
+        stored value on a row written before that validator shipped is not.
+        Comparing normalized-vs-raw would flag a non-owner who merely echoes
+        the row's own unchanged transport as tampering (spurious 403)."""
+        server = MCPServer.from_config(
+            {
+                "name": "svc",
+                "managed": "external",
+                "transport": "streamable_http",
+                "url": "https://mcp.example.com/mcp",
+            }
+        )
+        # Simulate a legacy row stored before write-time normalization.
+        server.transport = "Streamable_HTTP"
+
+        echoed = MCPServerUpdate(transport="Streamable_HTTP")
+        assert _global_config_tampered(echoed, server) is False
+
+        # A genuinely different transport is still caught.
+        assert _global_config_tampered(MCPServerUpdate(transport="sse"), server)
+
     def test_auth_metadata_tampered(self):
         """Non-secret auth metadata is diffed; secrets/masked values are ignored."""
         current = {"type": "oauth2", "client_id": "abc", "client_secret": "enc"}
@@ -855,3 +877,116 @@ class TestMCPApiModels:
         response = MCPConnectionTestResponse(**minimal_response)
         assert response.success is False
         assert response.details is None
+
+
+class TestTransportNormalizationOnWriteModels:
+    """All five write models share one annotated type, so they must agree on
+    spelling and on rejecting a transport that normalizes away to nothing."""
+
+    @staticmethod
+    def _build(model_name: str, transport: str):
+        from xagent.web.api.admin_mcp import PublicMCPAppCreate, PublicMCPAppUpdate
+        from xagent.web.api.mcp import MCPConnectionTest
+
+        url = "https://mcp.example.com/mcp"
+        builders = {
+            "MCPServerCreate": lambda t: MCPServerCreate(
+                name="remote", transport=t, config={"url": url}
+            ),
+            "MCPServerUpdate": lambda t: MCPServerUpdate(transport=t),
+            "MCPConnectionTest": lambda t: MCPConnectionTest(
+                name="remote", transport=t, config={"url": url}
+            ),
+            "PublicMCPAppCreate": lambda t: PublicMCPAppCreate(
+                app_id="a", name="A", transport=t
+            ),
+            "PublicMCPAppUpdate": lambda t: PublicMCPAppUpdate(transport=t),
+        }
+        return builders[model_name](transport)
+
+    ALL_MODELS = [
+        "MCPServerCreate",
+        "MCPServerUpdate",
+        "MCPConnectionTest",
+        "PublicMCPAppCreate",
+        "PublicMCPAppUpdate",
+    ]
+
+    @pytest.mark.parametrize("model_name", ALL_MODELS)
+    @pytest.mark.parametrize(
+        "raw",
+        ["streamable_http", "Streamable_HTTP", "  STREAMABLE_HTTP\t", " sse "],
+        ids=["canonical", "mixed-case", "padded-upper", "padded"],
+    )
+    def test_transport_is_canonicalized(self, model_name: str, raw: str):
+        expected = raw.strip().lower()
+        assert self._build(model_name, raw).transport == expected
+
+    @pytest.mark.parametrize("model_name", ALL_MODELS)
+    @pytest.mark.parametrize(
+        "blank", ["", "   ", "\t\n"], ids=["empty", "spaces", "tabs"]
+    )
+    def test_blank_transport_is_rejected(self, model_name: str, blank: str):
+        """Uniform across all five: an endpoint-level guard on one model let a
+        blank transport persist through the other four (a catalog app with
+        transport="" is silently unconnectable, answered with a 200)."""
+        with pytest.raises(ValidationError):
+            self._build(model_name, blank)
+
+    @pytest.mark.parametrize("model_name", ["MCPServerUpdate", "PublicMCPAppUpdate"])
+    def test_omitted_transport_stays_none_on_patch_models(self, model_name: str):
+        """None means "unchanged" and must not be swept up by the blank check."""
+        from xagent.web.api.admin_mcp import PublicMCPAppUpdate
+
+        model = {
+            "MCPServerUpdate": MCPServerUpdate,
+            "PublicMCPAppUpdate": PublicMCPAppUpdate,
+        }[model_name]
+        assert model().transport is None
+        assert model(transport=None).transport is None
+
+    def test_catalog_create_keeps_its_default_transport(self):
+        """The annotated type is applied by redeclaring the inherited field;
+        the default must survive that redeclaration."""
+        from xagent.web.api.admin_mcp import PublicMCPAppCreate
+
+        assert PublicMCPAppCreate(app_id="a", name="A").transport == "oauth"
+
+    def test_non_string_transport_is_coerced_not_rejected(self):
+        """Known gap, pinned so it cannot drift silently.
+
+        The normalizing step is a BeforeValidator, so it runs ahead of
+        pydantic's own `str` check and a non-string body value is stringified
+        rather than rejected. For MCPServerCreate that is contained --
+        MCPServerConfig's allowed-value list rejects the result downstream, as
+        asserted below. It is *not* contained for the catalog write models,
+        where a payload like {"transport": ["sse"]} with no recognized
+        launch_config shape persists transport="['sse']".
+
+        Tightening this means splitting normalization from coercion so the
+        type check runs first, which changes the shared annotated type used by
+        all five models; tracked with the other normalization-consolidation
+        work in #1828 rather than widened into this PR. This test documents
+        the current behaviour, it does not endorse it."""
+        coerced = MCPServerCreate(
+            name="remote", transport=123, config={"url": "https://e/x"}
+        )
+        assert coerced.transport == "123"
+
+        # Contained here: the allowed-value list rejects it before storage.
+        with pytest.raises(ValueError, match="Invalid transport"):
+            _build_server_config(coerced)
+
+        # Not contained on the catalog write models.
+        from xagent.web.api.admin_mcp import PublicMCPAppCreate
+
+        assert (
+            PublicMCPAppCreate(app_id="a", name="A", transport=["sse"]).transport
+            == "['sse']"
+        )
+
+        # None is falsy, so it normalizes to "" and is rejected as blank.
+        with pytest.raises(ValidationError):
+            MCPServerCreate(
+                name="remote", transport=None, config={"url": "https://e/x"}
+            )

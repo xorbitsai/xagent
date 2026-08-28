@@ -3,11 +3,13 @@ from __future__ import annotations
 import json
 from datetime import timedelta
 from types import SimpleNamespace
+from typing import Any, cast
 from urllib.parse import parse_qs, urlparse
 
 import httpx
 import pytest
 from fastapi import HTTPException
+from pydantic import ValidationError
 from sqlalchemy import create_engine
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import sessionmaker
@@ -3193,3 +3195,179 @@ async def test_status_reports_discovered_grant_without_configured_selectors(db_s
     status_response = await get_mcp_oauth_status(server.id, user, db)
 
     assert [item.id for item in status_response.grants] == [grant.id]
+
+
+@pytest.mark.parametrize("blank", ["", "   ", "\t\n"], ids=["empty", "spaces", "tabs"])
+def test_update_rejects_blank_transport_at_the_model_boundary(blank: str):
+    """A blank transport is rejected when the request model is built, not in
+    the endpoint body.
+
+    Pre-PR the two blank shapes behaved differently and neither was safe: a
+    whitespace-only transport reached MCPServerConfig.validate_transport and
+    400'd there, while a literal "" was already falsy and hit the update
+    path's `or server.transport` fallback -- silently keeping the stored
+    transport with no error at all. Normalization collapses both to "", so
+    both must be rejected, and rejecting at the model means it happens before
+    any permission branching (see the non-owner test below)."""
+    with pytest.raises(ValidationError):
+        MCPServerUpdate(transport=blank)
+
+
+def test_update_does_not_fall_back_to_stored_transport_for_a_blank_value(
+    db_session,
+):
+    """Defense in depth for the `or server.transport` fallback that was here.
+
+    MCPServerUpdate now rejects a blank transport, so `""` cannot reach this
+    endpoint through the API -- the model is built with validation bypassed to
+    exercise the endpoint's own handling of a value the model would refuse.
+    The old `or` fallback treated `""` as "not supplied" and silently kept the
+    stored transport, answering 200 for an edit that never happened. The
+    explicit `is not None` check passes the blank through instead, where
+    MCPServerCreate rejects it and the endpoint surfaces a failure.
+
+    The status here is 500 rather than 400: a ValidationError raised while
+    rebuilding MCPServerCreate lands in the endpoint's generic handler. That
+    is acceptable precisely because this path is unreachable through the API
+    -- the 400 for a blank transport is produced by the model, before the
+    endpoint runs (see test_update_rejects_blank_transport_at_the_model_
+    boundary). What this test pins is that the value is not silently
+    swallowed."""
+    db, user, _ = db_session
+    server = MCPServer(
+        name="editable",
+        managed="external",
+        transport="streamable_http",
+        url="https://mcp.example.com/mcp",
+    )
+    db.add(server)
+    db.commit()
+    db.refresh(server)
+    db.add(
+        UserMCPServer(
+            user_id=user.id,
+            mcpserver_id=server.id,
+            is_owner=True,
+            is_active=True,
+            can_edit=True,
+        )
+    )
+    db.commit()
+
+    blank = MCPServerUpdate.model_construct(transport="")
+    with pytest.raises(mcp_api.HTTPException) as exc:
+        update_mcp_server(server.id, blank, user, db)
+    assert exc.value.status_code >= 400
+    assert "blank" in str(exc.value.detail).lower()
+
+    db.refresh(server)
+    assert server.transport == "streamable_http"
+
+
+def test_update_keeps_stored_transport_when_none_is_supplied(db_session):
+    """The `or server.transport` fallback was replaced with an explicit
+    `is not None` check. An omitted transport must still leave the stored
+    value alone -- that is the case the old fallback existed to serve."""
+    db, user, _ = db_session
+    server = MCPServer(
+        name="editable",
+        managed="external",
+        transport="streamable_http",
+        url="https://mcp.example.com/mcp",
+    )
+    db.add(server)
+    db.commit()
+    db.refresh(server)
+    db.add(
+        UserMCPServer(
+            user_id=user.id,
+            mcpserver_id=server.id,
+            is_owner=True,
+            is_active=True,
+            can_edit=True,
+        )
+    )
+    db.commit()
+
+    update_mcp_server(server.id, MCPServerUpdate(description="edited"), user, db)
+
+    db.refresh(server)
+    assert server.transport == "streamable_http"
+    assert server.description == "edited"
+
+
+@pytest.mark.asyncio
+async def test_padded_catalog_transport_does_not_lock_out_repeat_connects(
+    db_session, monkeypatch
+):
+    """Regression: write-side normalization must not strand a legacy catalog row.
+
+    A catalog row authored before normalization can hold " streamable_http ".
+    The first connect writes the shared `mcp_servers` row through
+    MCPServerCreate, which canonicalizes it. Every later connect then compares
+    the normalized stored row against the still-padded catalog value; a
+    comparison that lowercases without stripping sees " streamable_http " !=
+    "streamable_http" and raises a permanent 409 that no admin action taken
+    from the UI can clear. Both sides go through normalize_transport now."""
+    db, user, _ = db_session
+    monkeypatch.setenv("XAGENT_PUBLIC_API_BASE_URL", "https://api.xagent.test/")
+    db.add(
+        PublicMCPApp(
+            app_id="padded-notes",
+            name="PaddedNotes",
+            transport=" Streamable_HTTP ",
+            launch_config={
+                "url": "https://mcp.example.com/mcp",
+                "auth": {"type": "mcp_oauth"},
+            },
+        )
+    )
+    db.commit()
+
+    async def fake_discover(*args, **kwargs):
+        return _discovery()
+
+    def registration_handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            201,
+            json={
+                "client_id": "dynamic-client-123",
+                "token_endpoint_auth_method": "none",
+            },
+        )
+
+    registration_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(registration_handler)
+    )
+    monkeypatch.setattr(mcp_api, "discover_mcp_oauth_metadata", fake_discover)
+    monkeypatch.setattr(
+        mcp_oauth_service,
+        "create_mcp_oauth_http_client",
+        lambda **kwargs: registration_client,
+    )
+
+    first = await connect_mcp_oauth_app(
+        "padded-notes", MCPOAuthConnectRequest(redirect_after="/x"), user, db
+    )
+    assert first.status_code == 303
+
+    # The shared row was written canonical...
+    row = db.query(MCPServer).filter(MCPServer.name == "padded-notes").one()
+    assert row.transport == "streamable_http"
+
+    # ...and a legacy shared row admitted by the tolerant comparison is healed
+    # rather than left dirty for the exact-match consumers downstream.
+    cast(Any, row).transport = " Streamable_HTTP "
+    db.commit()
+    await connect_mcp_oauth_app(
+        "padded-notes", MCPOAuthConnectRequest(redirect_after="/x"), user, db
+    )
+    db.refresh(row)
+    assert row.transport == "streamable_http"
+
+    # ...and the second connect must reuse it rather than 409.
+    second = await connect_mcp_oauth_app(
+        "padded-notes", MCPOAuthConnectRequest(redirect_after="/x"), user, db
+    )
+    assert second.status_code == 303
+    assert db.query(MCPServer).filter(MCPServer.name == "padded-notes").count() == 1

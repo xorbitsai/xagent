@@ -3,7 +3,9 @@ from __future__ import annotations
 import logging
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Any, Callable, Iterator, Protocol
+from typing import Annotated, Any, Callable, Iterator, Optional, Protocol
+
+from pydantic import AfterValidator, BeforeValidator
 
 from ...core.tools.adapters.vibe.connector_runtime import (
     ERROR_CONNECTOR_RUNTIME_UNAVAILABLE,
@@ -12,6 +14,63 @@ from ...core.tools.adapters.vibe.connector_runtime import (
 from .mcp_oauth import MCPOAuthRuntimeError, resolve_mcp_oauth_runtime_auth
 
 HTTP_MCP_TRANSPORTS = frozenset({"sse", "websocket", "streamable_http"})
+
+
+def normalize_transport(transport: Any) -> str:
+    """Canonicalize a transport identifier to its stored lowercase form.
+
+    Transport is a free-form string on the API models, so a mixed-case value
+    ("Streamable_HTTP") can be authored through the admin catalog or the
+    server create/update endpoints. Half of this feature compares it
+    case-insensitively and half compares it exactly, so an un-normalized row
+    is classified as connectable by one half and rejected by the other.
+    Normalizing at every write keeps the stored value in the one form all of
+    those comparisons agree on.
+    """
+    return str(transport or "").strip().lower()
+
+
+def _reject_blank_transport(transport: str) -> str:
+    """Reject a transport that normalized away to nothing.
+
+    Kept as a validator rather than an endpoint-body check so it fires the
+    same way for every write model and *before* any permission branching: an
+    endpoint-level check inside an owner-only branch makes a non-owner who
+    sends a blank transport fail the ownership comparison first and receive a
+    403 about the shared configuration instead of an error about their input.
+
+    Raising here surfaces as FastAPI's 422 for a request-body validation
+    failure -- the /api/mcp/* routes have no handler that rewrites that to a
+    400 (the app's RequestValidationError handler only reshapes /v1/ and
+    /api/a2a/ responses). 422 rather than 400 is the shape callers should
+    expect for every blank-transport rejection on these endpoints.
+    """
+    if not transport:
+        raise ValueError("Transport must not be blank")
+    return transport
+
+
+# The one spelling every write model uses. Declared here, next to the helper
+# and the transport set it has to agree with, so a sixth write model added
+# later picks up trimming, lowercasing and the blank check by construction
+# instead of by remembering to copy a validator.
+#
+# BeforeValidator, not AfterValidator, for the normalizing step: it has to run
+# on the raw input, ahead of the str type check, so a non-string body value
+# reaches normalize_transport rather than failing with a bare type error.
+NormalizedTransport = Annotated[
+    str,
+    BeforeValidator(normalize_transport),
+    AfterValidator(_reject_blank_transport),
+]
+
+# Optional variant for PATCH-shaped models: an omitted transport stays None
+# and means "unchanged", while a supplied one gets the full treatment above.
+OptionalNormalizedTransport = Annotated[
+    Optional[str],
+    BeforeValidator(lambda v: None if v is None else normalize_transport(v)),
+    AfterValidator(lambda v: None if v is None else _reject_blank_transport(v)),
+]
 
 
 @dataclass(frozen=True)

@@ -71,7 +71,12 @@ from ..services.mcp_oauth import (
     select_mcp_oauth_grants,
     validate_mcp_oauth_persisted_value,
 )
-from ..services.mcp_runtime import HTTP_MCP_TRANSPORTS
+from ..services.mcp_runtime import (
+    HTTP_MCP_TRANSPORTS,
+    NormalizedTransport,
+    OptionalNormalizedTransport,
+    normalize_transport,
+)
 from ..services.user_oauth import (
     delete_scoped_user_oauth_accounts,
     list_scoped_user_oauth_accounts,
@@ -102,7 +107,12 @@ class MCPServerCreate(BaseModel):
     """Request model for creating MCP server."""
 
     name: str = Field(..., min_length=1, max_length=100, description="Server name")
-    transport: str = Field(
+    # Trimmed, lowercased and blank-rejected by the shared annotated type, so
+    # the value TransportFieldValidator reads and the row stores is the one
+    # every later comparison must agree on. Also applies to the update
+    # endpoint, which rebuilds this model from the request and the stored row,
+    # so editing a legacy mixed-case server heals it.
+    transport: NormalizedTransport = Field(
         ..., description="Transport type (stdio, sse, websocket, streamable_http)"
     )
     description: Optional[str] = Field(None, description="Server description")
@@ -128,7 +138,12 @@ class MCPServerUpdate(BaseModel):
     name: Optional[str] = Field(
         None, min_length=1, max_length=100, description="Server name"
     )
-    transport: Optional[str] = Field(None, description="Transport type")
+    # Normalized before _global_config_tampered compares the incoming transport
+    # with the stored one, so a payload that only re-cases an unchanged
+    # transport doesn't read as a global-config edit by a non-owner. Blank is
+    # rejected here rather than in the endpoint body so it 400s uniformly and
+    # ahead of the ownership branch.
+    transport: OptionalNormalizedTransport = Field(None, description="Transport type")
     description: Optional[str] = Field(None, description="Server description")
     config: Optional[dict] = Field(None, description="Transport-specific configuration")
     is_active: Optional[bool] = Field(None, description="Whether the server is active")
@@ -208,7 +223,12 @@ class MCPConnectionTest(BaseModel):
     """Request model for testing MCP connection."""
 
     name: str = Field(..., description="Connection name")
-    transport: str = Field(..., description="Transport type")
+    # Same spelling rules as the save path (MCPServerCreate), so Test and Save
+    # agree on how a transport is written. Spelling only: Test still does not
+    # validate against MCPServerConfig's allowed-value list, so an unknown
+    # transport is accepted here and fails at connect time, where Save rejects
+    # it up front.
+    transport: NormalizedTransport = Field(..., description="Transport type")
     config: dict[str, Any] = Field(..., description="Connection configuration")
 
 
@@ -1402,7 +1422,17 @@ def _global_config_tampered(server_data: MCPServerUpdate, server: MCPServer) -> 
     fields_set = server_data.model_fields_set
     if server_data.name is not None and server_data.name != server.name:
         return True
-    if server_data.transport is not None and server_data.transport != server.transport:
+    # Both sides normalized. The right side is the raw stored value, which for
+    # a row written before this validator shipped may still be mixed-case or
+    # padded; comparing it against the already-normalized left side would flag
+    # a non-owner who merely echoes the row's own unchanged transport as
+    # tampering. The left side is re-normalized only so the two sides are
+    # visibly symmetric -- it has already been through the model's annotated
+    # type, and normalize_transport is idempotent, so that call is a no-op
+    # kept for the reader rather than for the result.
+    if server_data.transport is not None and normalize_transport(
+        server_data.transport
+    ) != normalize_transport(server.transport):
         return True
     if (
         server_data.description is not None
@@ -2739,6 +2769,27 @@ def _reject_hidden_catalog_app(app_info: dict) -> None:
         )
 
 
+def _heal_server_transport(server: MCPServer) -> None:
+    """Canonicalize a shared row's stored transport in place.
+
+    Called from the catalog reuse branches, which compare transport
+    tolerantly and would otherwise leave a legacy row dirty for every
+    exact-match consumer downstream.
+
+    Skips a value that normalizes to blank rather than persisting "": that is
+    the one state the write models exist to prevent, and healing must never be
+    the thing that creates it. Such a row is left alone for the backfill
+    migration to deal with -- it was already unusable, and blanking it would
+    make it silently unconnectable instead.
+    """
+    stored = getattr(server, "transport", None)
+    if not isinstance(stored, str):
+        return
+    healed = normalize_transport(stored)
+    if healed and healed != stored:
+        cast(Any, server).transport = healed
+
+
 def _ensure_catalog_app_server(db: Session, app_id: str) -> tuple[MCPServer, dict]:
     """Idempotently ensure the shared server row for a key-based or keyless
     catalog app exists, without creating any per-user association. Returns
@@ -2781,13 +2832,24 @@ def _ensure_catalog_app_server(db: Session, app_id: str) -> tuple[MCPServer, dic
         if (
             server.command != command
             or (server.args or []) != (launch.get("args") or [])
-            or str(server.transport or "").lower() != "stdio"
+            # Normalized like the mcp_oauth reuse check below. Inert today
+            # (the right side is a literal), but the same shape, and the row
+            # on the left is the one this feature keeps un-normalized.
+            or normalize_transport(server.transport) != "stdio"
         ):
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
                 detail="A server with this name already exists with a different configuration",
             )
         _reject_user_owned_catalog_squat(db, server)
+        # Accepting a legacy row obliges us to heal it. The comparison above
+        # is deliberately tolerant, but everything downstream is not:
+        # MCPServerConfig.to_connection_dict() dispatches on an exact
+        # transport match, so a row left as " Stdio " reaches the runtime with
+        # no command/args/env at all -- a silently broken connection where the
+        # un-normalized row used to produce a loud 409. Tolerate on read,
+        # canonicalize on write, in the same breath.
+        _heal_server_transport(server)
     if not server:
         try:
             config = _build_server_config(
@@ -2840,8 +2902,14 @@ def _ensure_catalog_mcp_oauth_server(
     # may be a hijack (a custom server someone created with a different remote
     # URL), so only reuse it if it matches the official configuration.
     if server:
+        # Both sides through the shared helper, not a bare .lower(): the
+        # catalog value may still be padded (a PATCH that doesn't touch
+        # transport persists the stored value unchanged), while the shared row
+        # was written through MCPServerCreate and is therefore normalized.
+        # Lowercasing without stripping compares " sse " against "sse" and
+        # 409s every connect after the first, with no way to fix it from the UI.
         if (
-            str(server.transport or "").lower() != transport.lower()
+            normalize_transport(server.transport) != normalize_transport(transport)
             or server.url != url
         ):
             raise HTTPException(
@@ -2849,6 +2917,11 @@ def _ensure_catalog_mcp_oauth_server(
                 detail="A server with this name already exists with a different configuration",
             )
         _reject_user_owned_catalog_squat(db, server)
+        # Same obligation as the stdio path above: the tolerant comparison
+        # admits a legacy row, so canonicalize it before any exact-match
+        # consumer (the runtime's transport dispatch, _is_mcp_oauth_http_server)
+        # sees it.
+        _heal_server_transport(server)
         # The catalog stays the source of truth for the row's auth config: if
         # the registry entry's auth changed since this shared row was created
         # (e.g. a scope hint or static client_id was added), sync it so
@@ -3280,12 +3353,30 @@ def update_mcp_server(
                     detail=f"MCP server '{server_data.name}' already exists",
                 )
 
-        # Build update config - only include provided fields. Non-owners keep the
-        # existing global config untouched.
+        # Build update config - only include provided fields. Non-owners keep
+        # the existing global config: _global_config_tampered above already
+        # rejected any payload that would change it, so the values below fall
+        # back to the stored row. (Transport is the one exception, and only in
+        # spelling: a non-owner's request still round-trips the stored value
+        # through MCPServerCreate, which canonicalizes it, so a legacy
+        # mixed-case row is healed as a byproduct. The transport *type* is
+        # unchanged -- a real change would have been caught as tampering.)
+        #
+        # An explicitly-supplied transport is passed through rather than
+        # `or`-ed against the stored value: normalization maps a
+        # whitespace-only transport to "", which is falsy, so the old fallback
+        # would have silently kept the stored transport. MCPServerUpdate now
+        # rejects a blank transport outright, before this point and before the
+        # ownership branch above, so nothing blank reaches here.
+        requested_transport = (
+            server_data.transport
+            if can_edit_global and server_data.transport is not None
+            else server.transport
+        )
+
         update_data = MCPServerCreate(
             name=(server_data.name if can_edit_global else None) or server.name,
-            transport=(server_data.transport if can_edit_global else None)
-            or server.transport,
+            transport=requested_transport,
             description=server_data.description
             if can_edit_global and server_data.description is not None
             else server.description,

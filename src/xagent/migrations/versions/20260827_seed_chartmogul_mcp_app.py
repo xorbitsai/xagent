@@ -39,7 +39,7 @@ APP_ID = "chartmogul"
 ROW = {
     "app_id": APP_ID,
     "name": "ChartMogul",
-    "description": "Connect your ChartMogul account to look up subscription metrics, customers, and revenue analytics -- this connector can also create and update customers, contacts, opportunities, tasks, plans, and invoices, not just read them.",
+    "description": "Connect your ChartMogul account to look up subscription metrics, customers, and revenue analytics -- this connector can also create and update customers, contacts, customer notes, opportunities, plans, plan groups, subscription events, and tasks, and import invoices, not just read them.",
     "icon": "https://www.google.com/s2/favicons?domain=chartmogul.com&sz=128",
     "transport": "stdio",
     "provider_name": None,
@@ -85,24 +85,43 @@ def upgrade() -> None:
             "chartmogul row must not seed visible"
         )
 
-    existing = set(bind.execute(sa.select(PUBLIC_MCP_APPS_TABLE.c.app_id)).scalars())
-    if APP_ID in existing:
-        # A row with this app_id already exists (e.g. hand-created by an
-        # operator before this migration deployed). Such a row keeps its own
-        # is_visible_in_connector, which defaults to TRUE for hand-created
-        # rows -- and the builtin registry overlays the real
-        # transport/launch_config onto ANY row sharing this app_id at read
-        # time, so a visible pre-existing row would silently become a
-        # working, one-click-connectable ChartMogul connector that only
-        # functions inside the Docker image, defeating the hidden gate with
-        # no further action. Enforce hidden on the collision branch too,
-        # instead of returning untouched.
+    # Only compares columns that actually exist -- description can be
+    # dropped on a pre-this-migration schema (handled below), and this
+    # collision check must degrade the same way rather than erroring on a
+    # column that isn't there yet.
+    identity_fields = [f for f in ("name", "description", "transport") if f in columns]
+    existing_row = (
         bind.execute(
-            sa.update(PUBLIC_MCP_APPS_TABLE)
-            .where(PUBLIC_MCP_APPS_TABLE.c.app_id == APP_ID)
-            .values(is_visible_in_connector=False)
+            sa.select(*(PUBLIC_MCP_APPS_TABLE.c[f] for f in identity_fields)).where(
+                PUBLIC_MCP_APPS_TABLE.c.app_id == APP_ID
+            )
         )
-        return
+        .mappings()
+        .first()
+    )
+    if existing_row is not None:
+        if all(existing_row[f] == ROW[f] for f in identity_fields):
+            # Matches what this migration would have inserted -- this is our
+            # own row from an earlier run (upgrade() must stay idempotent),
+            # not a collision. Nothing to do.
+            return
+        # 'chartmogul' had no special meaning before this migration: nothing
+        # stopped an operator from hand-creating a custom PublicMCPApp with
+        # this exact app_id beforehand (admin_mcp.py only rejects app_ids
+        # that are ALREADY builtin). Silently adopting that row here would
+        # mean the builtin registry starts overlaying ChartMogul's real
+        # transport/launch_config onto someone else's connector at read
+        # time, and a later downgrade could delete it outright. Neither is
+        # safe to do automatically without knowing whether the row is
+        # actually ours, so fail loudly and let an operator resolve the
+        # collision by hand instead.
+        raise RuntimeError(
+            f"public_mcp_apps already has a row with app_id={APP_ID!r} "
+            "that this migration did not create (its name, description, "
+            "or transport don't match the seed row) -- rename or remove "
+            "that row before upgrading, since 'chartmogul' is now a "
+            "reserved built-in app_id"
+        )
 
     # Silently degrades rather than failing outright (this table is never
     # expected to be missing a column that predates this migration by
@@ -134,17 +153,16 @@ def downgrade() -> None:
     # rows are not owned by this migration and are cleaned up through the
     # normal disconnect path.
     #
-    # An unconditional DELETE-by-app_id is NOT safe here: upgrade()'s
-    # collision branch adopts a pre-existing hand-created row by flipping
-    # only is_visible_in_connector -- name/description/transport are left
-    # exactly as the operator set them. Deleting unconditionally on downgrade
-    # would destroy that operator's own row, not "remove the entry this
-    # migration owns." Matching on name/description/transport (specific
-    # enough that a hand-made row coincidentally matching all three isn't a
-    # realistic concern) distinguishes a genuinely migration-created row from
-    # an adopted one without a new tracking column -- a row that doesn't
-    # match is left in place, restored rather than destroyed. Mirrors
-    # 20260806_seed_chrome_mcp_app.py's downgrade for the same reason.
+    # An unconditional DELETE-by-app_id is NOT safe here: upgrade() only
+    # ever inserts a row matching name/description/transport exactly (a
+    # foreign row with this app_id makes it raise instead), but there is no
+    # tracking column recording that this row came from this migration.
+    # Matching on name/description/transport (specific enough that a
+    # hand-made row coincidentally matching all three isn't a realistic
+    # concern) is the same identity check upgrade() itself uses to tell "our
+    # row" from a collision -- a row that doesn't match is left in place
+    # rather than destroyed. Mirrors 20260806_seed_chrome_mcp_app.py's
+    # downgrade for the same reason.
     # Also connect/disconnect routes 404 once this row is gone
     # (get_app_by_id returns None), so leftover connections from users who
     # already connected are removed via the server-level route (DELETE

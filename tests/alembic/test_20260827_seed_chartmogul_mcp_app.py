@@ -142,15 +142,14 @@ def test_upgrade_warns_and_still_inserts_when_column_missing(tmp_path, caplog):
         )
 
 
-def test_upgrade_forces_hidden_on_a_preexisting_colliding_row(tmp_path):
-    """A hand-created row with this app_id (visible by the table default)
-    would otherwise survive the collision branch untouched -- and the
-    builtin registry overlays the real launch config onto any row sharing
-    the app_id at read time, silently yielding a visible ChartMogul
-    connector that only functions inside the Docker image, defeating the
-    hidden gate. The collision branch must enforce hidden instead of
-    returning early, without inserting a duplicate or touching the
-    operator's other fields."""
+def test_upgrade_raises_on_foreign_app_id_collision(tmp_path):
+    """'chartmogul' had no special meaning before this migration -- nothing
+    stopped an operator from hand-creating a custom PublicMCPApp with this
+    exact app_id beforehand. Silently adopting that row (the old behavior)
+    would let the builtin registry overlay ChartMogul's real
+    transport/launch_config onto someone else's connector, and let a later
+    downgrade delete it outright. upgrade() must instead fail loudly and
+    leave the foreign row completely untouched."""
     engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
     migration = _load_migration_module()
     with engine.begin() as connection:
@@ -164,7 +163,8 @@ def test_upgrade_forces_hidden_on_a_preexisting_colliding_row(tmp_path):
             )
         )
         with patch.object(migration, "op", _operations(connection)):
-            migration.upgrade()
+            with pytest.raises(RuntimeError, match="did not create"):
+                migration.upgrade()
         row = connection.execute(
             text(
                 "SELECT COUNT(*), MIN(is_visible_in_connector), MIN(name) "
@@ -172,17 +172,17 @@ def test_upgrade_forces_hidden_on_a_preexisting_colliding_row(tmp_path):
             )
         ).first()
         assert row[0] == 1  # no duplicate inserted
-        assert row[1] == 0  # forced hidden
+        assert row[1] == 1  # left exactly as the operator set it
         assert row[2] == "Operator ChartMogul"  # other fields left alone
 
 
-def test_downgrade_preserves_an_adopted_preexisting_row(tmp_path):
-    """The collision branch in upgrade() adopts a hand-created row by
-    flipping only is_visible_in_connector -- it does not overwrite
-    name/description/transport. An unconditional DELETE-by-app_id on
-    downgrade would then destroy the operator's own row, not "remove the
-    entry this migration owns." Pin that upgrade (adopt) -> downgrade
-    (restore, not destroy) sequence."""
+def test_downgrade_leaves_a_non_matching_row_in_place(tmp_path):
+    """downgrade() only ever runs after a successful upgrade() (which now
+    raises on any non-matching collision), so in practice a foreign row
+    can't coexist with a completed upgrade -- but downgrade()'s own
+    name/description/transport match is what makes that guarantee hold
+    without a dedicated tracking column, so pin it directly rather than
+    relying only on upgrade()'s behavior."""
     engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
     migration = _load_migration_module()
     with engine.begin() as connection:
@@ -196,7 +196,6 @@ def test_downgrade_preserves_an_adopted_preexisting_row(tmp_path):
             )
         )
         with patch.object(migration, "op", _operations(connection)):
-            migration.upgrade()
             migration.downgrade()
         row = connection.execute(
             text(
@@ -204,11 +203,11 @@ def test_downgrade_preserves_an_adopted_preexisting_row(tmp_path):
                 "WHERE app_id='chartmogul'"
             )
         ).first()
-        # Adopted and forced hidden by upgrade(), then left in place by
-        # downgrade() -- destroyed would mean row is None.
+        # Doesn't match ROW's name/description/transport -- left in place,
+        # not deleted.
         assert row is not None
         assert row[0] == "Operator ChartMogul"
-        assert row[1] == 0
+        assert row[1] == 1
 
 
 def test_upgrade_raises_if_visibility_column_is_missing(tmp_path):
@@ -295,6 +294,23 @@ def test_seed_row_matches_registry():
     assert migration.ROW == registry_row
 
 
+def test_registry_launch_config_reflects_a_custom_vendor_path_env(monkeypatch):
+    """The Dockerfile/config tests each check their own half of the ARG ->
+    ENV -> get_chartmogul_mcp_vendor_path() -> registry chain in isolation,
+    but none of them actually set a custom env value and ask the live
+    registry for its launch_config -- so a registry-side hardcode, a
+    renamed config key, or a stage that re-clobbers the ENV could still
+    leave every one of those tests green. Chain all of it end to end."""
+    from xagent.config import CHARTMOGUL_MCP_VENDOR_PATH
+    from xagent.web.builtin_mcp_registry import get_builtin_public_mcp_app_rows
+
+    monkeypatch.setenv(CHARTMOGUL_MCP_VENDOR_PATH, "/custom/chartmogul-path")
+    registry_row = next(
+        r for r in get_builtin_public_mcp_app_rows() if r["app_id"] == "chartmogul"
+    )
+    assert "/custom/chartmogul-path" in registry_row["launch_config"]["args"]
+
+
 def test_downgrade_removes_chartmogul(tmp_path):
     engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
     migration = _load_migration_module()
@@ -376,7 +392,15 @@ def test_dockerfile_vendoring_precedes_cache_sensitive_copies():
     dockerfile = (
         Path(__file__).parent.parent.parent / "docker/Dockerfile.backend"
     ).read_text()
-    vendoring_index = dockerfile.index("ARG INSTALL_CHARTMOGUL=true")
+    # Anchored on the executable `git clone` inside the RUN block itself,
+    # not the `ARG INSTALL_CHARTMOGUL` declaration above it -- an ARG can
+    # sit anywhere before its first use, so a future edit could move the
+    # actual clone+sync RUN block down past the COPY instructions below while leaving
+    # the ARG in place, and an ARG-anchored check would stay green through
+    # exactly the regression this test exists to catch.
+    vendoring_index = dockerfile.index(
+        'git clone "$CHARTMOGUL_MCP_REPO_URL" "$CHARTMOGUL_MCP_VENDOR_PATH"'
+    )
     for marker in (
         "COPY --from=runtime-frontend-tools /opt/xagent/frontend /opt/xagent/frontend",
         "COPY --from=runtime-playwright /ms-playwright /ms-playwright",

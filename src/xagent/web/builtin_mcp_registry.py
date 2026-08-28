@@ -1139,7 +1139,7 @@ def get_builtin_public_mcp_app_rows() -> list[dict[str, Any]]:
         {
             "app_id": "chartmogul",
             "name": "ChartMogul",
-            "description": "Connect your ChartMogul account to look up subscription metrics, customers, and revenue analytics -- this connector can also create and update customers, contacts, opportunities, tasks, plans, and invoices, not just read them.",
+            "description": "Connect your ChartMogul account to look up subscription metrics, customers, and revenue analytics -- this connector can also create and update customers, contacts, customer notes, opportunities, plans, plan groups, subscription events, and tasks, and import invoices, not just read them.",
             "icon": "https://www.google.com/s2/favicons?domain=chartmogul.com&sz=128",
             "transport": "stdio",
             "provider_name": None,

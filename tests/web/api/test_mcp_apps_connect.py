@@ -1237,3 +1237,36 @@ def test_connect_coerces_scalar_env_values(test_db):
     )
     assoc2 = test_db.query(UserMCPServer).filter(UserMCPServer.user_id == 2).first()
     assert assoc2.env is None
+
+
+def test_connect_reuses_shared_stdio_row_with_padded_transport(test_db):
+    """_ensure_catalog_app_server's stdio guard must normalize like the rest of
+    the chain.
+
+    A legacy shared row stored as " stdio " is the same stdio server; rejecting
+    it as a different configuration (409) would strand the catalog app for
+    every user until the row is hand-edited.
+    """
+    from xagent.web.api.mcp import MCPAppConnectRequest, connect_mcp_app
+    from xagent.web.models.mcp import MCPServer
+
+    test_db.add(
+        MCPServer(
+            name="google-maps",
+            managed="external",
+            transport=" stdio ",
+            command="npx",
+            args=["-y", "@cablate/mcp-google-map", "--stdio"],
+        )
+    )
+    test_db.commit()
+
+    connect_mcp_app(
+        "google-maps",
+        MCPAppConnectRequest(env={"GOOGLE_MAPS_API_KEY": "alice-key"}),
+        current_user=_user(test_db, 1),
+        db=test_db,
+    )
+
+    # Reused, not duplicated or rejected.
+    assert test_db.query(MCPServer).filter(MCPServer.name == "google-maps").count() == 1

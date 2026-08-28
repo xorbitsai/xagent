@@ -14,6 +14,20 @@ from .mcp_oauth import MCPOAuthRuntimeError, resolve_mcp_oauth_runtime_auth
 HTTP_MCP_TRANSPORTS = frozenset({"sse", "websocket", "streamable_http"})
 
 
+def normalize_transport(transport: Any) -> str:
+    """Canonicalize a transport identifier to its stored lowercase form.
+
+    Transport is a free-form string on the API models, so a mixed-case value
+    ("Streamable_HTTP") can be authored through the admin catalog or the
+    server create/update endpoints. Half of this feature compares it
+    case-insensitively and half compares it exactly, so an un-normalized row
+    is classified as connectable by one half and rejected by the other.
+    Normalizing at every write keeps the stored value in the one form all of
+    those comparisons agree on.
+    """
+    return str(transport or "").strip().lower()
+
+
 @dataclass(frozen=True)
 class MCPRuntimeConnectionBuild:
     """Executable MCP connection plus any runtime authorization diagnostic."""
@@ -573,8 +587,15 @@ def _is_mcp_oauth_http_server(server: Any, auth_config: Any) -> bool:
     # a different layer than the catalog auth_type (mcp_apps.classify_app_auth):
     # this also covers user-added custom HTTP servers that were never catalog
     # entries, so it stays independent by design.
+    #
+    # Compared case-insensitively for the same reason the rest of the feature
+    # is: transport is normalized on every write now, but a row stored before
+    # that may still be mixed-case, and a False here is not a rejection — the
+    # caller falls through and returns the connection unauthorized, skipping
+    # the per-user OAuth token exchange entirely. Matching the stored row
+    # loosely is strictly safer than silently serving it without a grant.
     return (
-        getattr(server, "transport", None) in HTTP_MCP_TRANSPORTS
+        normalize_transport(getattr(server, "transport", None)) in HTTP_MCP_TRANSPORTS
         and isinstance(auth_config, dict)
         and auth_config.get("type") == "mcp_oauth"
     )

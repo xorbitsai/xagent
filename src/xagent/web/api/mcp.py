@@ -21,7 +21,7 @@ from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 import httpx
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
 from fastapi.responses import JSONResponse, RedirectResponse, Response
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -71,7 +71,7 @@ from ..services.mcp_oauth import (
     select_mcp_oauth_grants,
     validate_mcp_oauth_persisted_value,
 )
-from ..services.mcp_runtime import HTTP_MCP_TRANSPORTS
+from ..services.mcp_runtime import HTTP_MCP_TRANSPORTS, normalize_transport
 from ..services.user_oauth import (
     delete_scoped_user_oauth_accounts,
     list_scoped_user_oauth_accounts,
@@ -121,6 +121,17 @@ class MCPServerCreate(BaseModel):
         False, description="Allow runtime Authorization header binding"
     )
 
+    # Canonicalize before anything reads it: transport is free-form here, and
+    # the value validated by TransportFieldValidator / stored on the row is the
+    # one every later comparison (exact and case-insensitive alike) must agree
+    # on. Also applies to the update endpoint, which rebuilds this model from
+    # the request and the stored row, so editing a legacy mixed-case server
+    # heals it.
+    @field_validator("transport")
+    @classmethod
+    def _normalize_transport(cls, value: str) -> str:
+        return normalize_transport(value)
+
 
 class MCPServerUpdate(BaseModel):
     """Request model for updating MCP server."""
@@ -144,6 +155,15 @@ class MCPServerUpdate(BaseModel):
     allow_delegated_authorization: Optional[bool] = Field(
         None, description="Allow runtime Authorization header binding"
     )
+
+    # Same canonicalization as MCPServerCreate, applied before
+    # _global_config_tampered compares the incoming transport with the stored
+    # one — otherwise a payload that only re-cases an unchanged transport would
+    # read as a global-config edit by a non-owner.
+    @field_validator("transport")
+    @classmethod
+    def _normalize_transport(cls, value: Optional[str]) -> Optional[str]:
+        return None if value is None else normalize_transport(value)
 
 
 class MCPAppConnectRequest(BaseModel):
@@ -210,6 +230,16 @@ class MCPConnectionTest(BaseModel):
     name: str = Field(..., description="Connection name")
     transport: str = Field(..., description="Transport type")
     config: dict[str, Any] = Field(..., description="Connection configuration")
+
+    # Same case/whitespace canonicalization as the save path
+    # (MCPServerCreate), so Test and Save agree on how a transport is spelled.
+    # This is spelling parity only: Test still does not validate against
+    # MCPServerConfig's allowed-value list, so an unknown transport is accepted
+    # here and fails at connect time, where Save rejects it up front.
+    @field_validator("transport")
+    @classmethod
+    def _normalize_transport(cls, value: str) -> str:
+        return normalize_transport(value)
 
 
 class MCPConnectionTestResponse(BaseModel):
@@ -609,7 +639,7 @@ def _get_mcp_oauth_config(server: MCPServer) -> dict[str, Any]:
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="MCP server is not configured for MCP OAuth",
         )
-    if server.transport not in HTTP_MCP_TRANSPORTS:
+    if normalize_transport(server.transport) not in HTTP_MCP_TRANSPORTS:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="MCP OAuth is only supported for HTTP MCP transports",
@@ -1402,7 +1432,14 @@ def _global_config_tampered(server_data: MCPServerUpdate, server: MCPServer) -> 
     fields_set = server_data.model_fields_set
     if server_data.name is not None and server_data.name != server.name:
         return True
-    if server_data.transport is not None and server_data.transport != server.transport:
+    # Both sides normalized: server_data.transport has already been through the
+    # MCPServerUpdate validator, while server.transport is the raw stored value,
+    # which for a row written before that validator shipped may still be
+    # mixed-case or padded. Comparing normalized-vs-raw would flag a non-owner
+    # who merely echoes the row's own unchanged transport as tampering.
+    if server_data.transport is not None and normalize_transport(
+        server_data.transport
+    ) != normalize_transport(server.transport):
         return True
     if (
         server_data.description is not None
@@ -1491,7 +1528,10 @@ def _db_server_to_response(
         id=server.id,
         user_id=user_mcp.user_id,
         name=server.name,
-        transport=server.transport,
+        # Normalized on read too: the frontend compares this value exactly, so
+        # an un-migrated row must not report a spelling the API itself would no
+        # longer accept on write.
+        transport=normalize_transport(server.transport),
         description=server.description,
         config=config,
         is_active=user_mcp.is_active,
@@ -1550,7 +1590,7 @@ def _enrich_oauth_server_info(
     Return (app_id, provider, connected_account) for an OAuth-based MCPServer.
     This encapsulates the logic of looking up app information in O(1) time.
     """
-    if server.transport != "oauth":
+    if normalize_transport(server.transport) != "oauth":
         return None, None, None
 
     app_info = get_app_by_name(db, str(server.name))
@@ -1668,7 +1708,15 @@ def _oauth_keys_for_app(app: dict) -> list[str]:
 
 
 def _is_oauth_server_for_app(server: MCPServer, app: dict) -> bool:
-    if server.transport != "oauth":
+    # Normalized so this agrees with _build_active_oauth_server_lookup and
+    # _server_catalog_keys, which admit a row into the lookup. Note those two
+    # use a *different* helper (_normalize_app_key); the two normalizers agree
+    # on every transport value (both strip and lowercase, and transports carry
+    # no internal whitespace for _normalize_app_key to hyphenate), which is
+    # what makes this safe. An exact check here would reject a row those two
+    # just accepted, so _lookup_oauth_server_for_app returns None and a
+    # connected OAuth app renders as disconnected.
+    if normalize_transport(server.transport) != "oauth":
         return False
 
     app_id = _normalize_app_key(app.get("id"))
@@ -1915,7 +1963,7 @@ def _is_mcp_oauth_server(server: MCPServer) -> bool:
     whether the server counts as connected."""
     auth: dict[str, Any] = server.auth if isinstance(server.auth, dict) else {}
     return (
-        str(server.transport or "").lower() in HTTP_MCP_TRANSPORTS
+        normalize_transport(server.transport) in HTTP_MCP_TRANSPORTS
         and auth.get("type") == "mcp_oauth"
     )
 
@@ -2337,7 +2385,7 @@ def list_mcp_apps(
                 "description": server.description or "Custom MCP Server",
                 "icon": "",
                 "users": "1",
-                "transport": server.transport,
+                "transport": normalize_transport(server.transport),
                 # F1: this loop's own membership check above (name-based)
                 # doesn't gate on a real grant, so a custom mcp_oauth
                 # server the user abandoned mid-consent must not be
@@ -2781,7 +2829,7 @@ def _ensure_catalog_app_server(db: Session, app_id: str) -> tuple[MCPServer, dic
         if (
             server.command != command
             or (server.args or []) != (launch.get("args") or [])
-            or str(server.transport or "").lower() != "stdio"
+            or normalize_transport(server.transport) != "stdio"
         ):
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
@@ -2841,7 +2889,7 @@ def _ensure_catalog_mcp_oauth_server(
     # URL), so only reuse it if it matches the official configuration.
     if server:
         if (
-            str(server.transport or "").lower() != transport.lower()
+            normalize_transport(server.transport) != normalize_transport(transport)
             or server.url != url
         ):
             raise HTTPException(
@@ -3282,10 +3330,25 @@ def update_mcp_server(
 
         # Build update config - only include provided fields. Non-owners keep the
         # existing global config untouched.
+        # An explicitly-supplied transport must not fall back to the stored
+        # value just because it normalized to "". Before write-time
+        # normalization a blank/whitespace-only transport failed
+        # MCPServerConfig.validate_transport with a 400; the `or` fallback
+        # below would silently keep the old transport instead, turning a
+        # rejected edit into a no-op the caller never learns about.
+        if can_edit_global and server_data.transport is not None:
+            if not server_data.transport:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Transport must not be blank",
+                )
+            requested_transport = server_data.transport
+        else:
+            requested_transport = server.transport
+
         update_data = MCPServerCreate(
             name=(server_data.name if can_edit_global else None) or server.name,
-            transport=(server_data.transport if can_edit_global else None)
-            or server.transport,
+            transport=requested_transport,
             description=server_data.description
             if can_edit_global and server_data.description is not None
             else server.description,
@@ -3400,7 +3463,7 @@ def _catalog_server_has_platform_key(db: Session, server: MCPServer) -> bool:
     with no signal to the admin. A catalog row with no platform key is not
     special and cascades away as before.
     """
-    if str(getattr(server, "transport", "") or "").lower() == "oauth":
+    if normalize_transport(getattr(server, "transport", None)) == "oauth":
         return False
     env = getattr(server, "env", None)
     if not env:
@@ -3470,7 +3533,7 @@ async def delete_mcp_server(
             )
 
         # If it's an OAuth server, also delete the corresponding OAuth tokens
-        if server.transport == "oauth":
+        if normalize_transport(server.transport) == "oauth":
             from ..mcp_apps import get_app_by_name
 
             # Find the corresponding app_id and provider

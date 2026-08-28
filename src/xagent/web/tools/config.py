@@ -3523,10 +3523,20 @@ class WebToolConfig(BaseToolConfig):
             getattr(server, "allow_delegated_authorization", False)
         )
         runtime_values = self._get_connector_runtime_for("mcp", int(server.id))
+        from ...web.services.mcp_runtime import (
+            HTTP_MCP_TRANSPORTS,
+            normalize_transport,
+        )
+
+        # Normalized, not raw: this value is consumed downstream by the core
+        # session layer's exact-match transport dispatch (via ToolFactory), so
+        # a legacy mixed-case row would reach it as "Streamable_HTTP" and fail
+        # with `ValueError: Unsupported transport`. The branch selection below
+        # normalizes too; this is the value that actually leaves the function.
         config: Dict[str, Any] = {
             "id": int(server.id),
             "name": server.name,
-            "transport": server.transport,
+            "transport": normalize_transport(server.transport),
             "description": server.description,
             "runtime_input_schema": getattr(server, "runtime_input_schema", None),
             "runtime_bindings": runtime_bindings,
@@ -3543,8 +3553,10 @@ class WebToolConfig(BaseToolConfig):
         # Add transport-specific configuration
         transport_config: Dict[str, Any] = {}
 
-        # Handle OAuth credentials
-        if server.transport == "oauth":
+        # Handle OAuth credentials. Normalized like the rest of the transport
+        # chain: an exact comparison sends a legacy mixed-case row down the
+        # non-OAuth path, silently dropping its OAuth credential wiring.
+        if normalize_transport(server.transport) == "oauth":
             # Find corresponding OAuth account
             # The provider might be linkedin, google, etc. based on the app config
             from ...web.mcp_apps import get_app_for_mcp_server
@@ -3673,7 +3685,12 @@ class WebToolConfig(BaseToolConfig):
                     )
                 config["transport"] = "stdio"
 
-        if server.transport == "stdio":
+        # Normalized like the OAuth check above: a legacy mixed-case/padded row
+        # would otherwise match neither branch, leaving transport_config empty
+        # so the connection loses its command/env or its url/headers entirely.
+        normalized_server_transport = normalize_transport(server.transport)
+
+        if normalized_server_transport == "stdio":
             if server.command:
                 transport_config["command"] = server.command
             if server.args:
@@ -3694,7 +3711,7 @@ class WebToolConfig(BaseToolConfig):
             if server.cwd:
                 transport_config["cwd"] = server.cwd
 
-        elif server.transport in ["sse", "websocket", "streamable_http"]:
+        elif normalized_server_transport in HTTP_MCP_TRANSPORTS:
             from ...web.mcp_apps import get_app_for_mcp_server
             from ...web.services.mcp_runtime import (
                 build_mcp_runtime_connection,

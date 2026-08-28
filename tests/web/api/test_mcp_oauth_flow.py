@@ -3193,3 +3193,235 @@ async def test_status_reports_discovered_grant_without_configured_selectors(db_s
     status_response = await get_mcp_oauth_status(server.id, user, db)
 
     assert [item.id for item in status_response.grants] == [grant.id]
+
+
+@pytest.mark.asyncio
+async def test_connect_app_reuses_mixed_case_shared_row_without_pkce_rejection(
+    db_session, monkeypatch
+):
+    """A legacy shared row whose transport differs only in case must not be
+    admitted by the reuse check and then rejected by the PKCE start.
+
+    `transport` is a free-form string, so a row stored before write-time
+    normalization can hold "Streamable_HTTP". _ensure_catalog_mcp_oauth_server
+    compares it case-insensitively and reuses it, so the connect must go
+    through to discovery rather than 400 at _get_mcp_oauth_config.
+    """
+    db, user, _ = db_session
+    _add_remote_oauth_catalog_app(db)
+    monkeypatch.setenv("XAGENT_PUBLIC_API_BASE_URL", "https://api.xagent.test/")
+
+    # Written directly, the way a row predating normalization would exist.
+    db.add(
+        MCPServer(
+            name="remote-notes",
+            transport="Streamable_HTTP",
+            url="https://mcp.example.com/mcp",
+            auth={"type": "mcp_oauth"},
+            managed="external",
+        )
+    )
+    db.commit()
+
+    async def fake_discover(*args, **kwargs):
+        return _discovery()
+
+    def registration_handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            201,
+            json={
+                "client_id": "dynamic-client-123",
+                "token_endpoint_auth_method": "none",
+            },
+        )
+
+    registration_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(registration_handler)
+    )
+    monkeypatch.setattr(mcp_api, "discover_mcp_oauth_metadata", fake_discover)
+    monkeypatch.setattr(
+        mcp_oauth_service,
+        "create_mcp_oauth_http_client",
+        lambda **kwargs: registration_client,
+    )
+
+    response = await connect_mcp_oauth_app(
+        "remote-notes",
+        MCPOAuthConnectRequest(redirect_after="/settings/mcp"),
+        user,
+        db,
+    )
+
+    # The reuse check admitted the row, so the PKCE start must too.
+    assert response.status_code == 303
+    query = parse_qs(urlparse(response.headers["location"]).query)
+    assert query["client_id"] == ["dynamic-client-123"]
+
+    # Reused, not duplicated.
+    assert db.query(MCPServer).filter(MCPServer.name == "remote-notes").count() == 1
+
+
+def test_get_mcp_oauth_config_accepts_mixed_case_http_transport():
+    """_get_mcp_oauth_config must classify transport the same way the reuse
+    check that admits the row does."""
+    server = MCPServer(
+        name="mixed-case",
+        transport="Streamable_HTTP",
+        url="https://mcp.example.com/mcp",
+        auth={"type": "mcp_oauth"},
+        managed="external",
+    )
+
+    assert mcp_api._get_mcp_oauth_config(server) == {"type": "mcp_oauth"}
+
+
+def test_get_mcp_oauth_config_still_rejects_non_http_transport():
+    """Normalizing case must not admit a genuinely non-HTTP transport."""
+    server = MCPServer(
+        name="stdio-server",
+        transport="STDIO",
+        url="https://mcp.example.com/mcp",
+        auth={"type": "mcp_oauth"},
+        managed="external",
+    )
+
+    with pytest.raises(HTTPException) as exc:
+        mcp_api._get_mcp_oauth_config(server)
+    assert exc.value.status_code == 400
+    assert "HTTP MCP transports" in str(exc.value.detail)
+
+
+def test_mcp_server_create_normalizes_transport():
+    """Write-time normalization is what keeps mixed-case rows from being
+    created in the first place."""
+    created = mcp_api.MCPServerCreate(
+        name="remote",
+        transport="  Streamable_HTTP ",
+        config={"url": "https://mcp.example.com/mcp"},
+    )
+    assert created.transport == "streamable_http"
+
+    updated = MCPServerUpdate(transport="SSE")
+    assert updated.transport == "sse"
+    assert MCPServerUpdate().transport is None
+
+    # The test-connection path must agree with the save path, so a transport
+    # spelling can't be accepted by one and rejected by the other.
+    tested = mcp_api.MCPConnectionTest(
+        name="remote",
+        transport=" Streamable_HTTP ",
+        config={"url": "https://mcp.example.com/mcp"},
+    )
+    assert tested.transport == "streamable_http"
+
+
+@pytest.mark.asyncio
+async def test_connect_app_reuses_shared_row_for_padded_catalog_transport(
+    db_session, monkeypatch
+):
+    """A padded legacy catalog transport must not 409 against a canonical
+    shared row.
+
+    classify_app_auth routes the app here by normalizing (strip + lower), so
+    the reuse check must normalize identically. A local .lower() there would
+    leave " streamable_http " != "streamable_http" and reject the row as a
+    different configuration -- admitted by one half of the chain, rejected by
+    the other, which is the very class of bug this feature guards against.
+    """
+    db, user, _ = db_session
+    monkeypatch.setenv("XAGENT_PUBLIC_API_BASE_URL", "https://api.xagent.test/")
+
+    db.add(
+        PublicMCPApp(
+            app_id="padded-notes",
+            name="PaddedNotes",
+            transport=" streamable_http ",
+            launch_config={
+                "url": "https://mcp.example.com/mcp",
+                "auth": {"type": "mcp_oauth"},
+            },
+        )
+    )
+    db.add(
+        MCPServer(
+            name="padded-notes",
+            transport="streamable_http",
+            url="https://mcp.example.com/mcp",
+            auth={"type": "mcp_oauth"},
+            managed="external",
+        )
+    )
+    db.commit()
+
+    async def fake_discover(*args, **kwargs):
+        return _discovery()
+
+    def registration_handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            201,
+            json={
+                "client_id": "dynamic-client-123",
+                "token_endpoint_auth_method": "none",
+            },
+        )
+
+    registration_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(registration_handler)
+    )
+    monkeypatch.setattr(mcp_api, "discover_mcp_oauth_metadata", fake_discover)
+    monkeypatch.setattr(
+        mcp_oauth_service,
+        "create_mcp_oauth_http_client",
+        lambda **kwargs: registration_client,
+    )
+
+    response = await connect_mcp_oauth_app(
+        "padded-notes",
+        MCPOAuthConnectRequest(redirect_after="/settings/mcp"),
+        user,
+        db,
+    )
+
+    assert response.status_code == 303
+    assert db.query(MCPServer).filter(MCPServer.name == "padded-notes").count() == 1
+
+
+def test_update_rejects_blank_transport_instead_of_silently_keeping_the_old_one(
+    db_session,
+):
+    """`normalize_transport("   ")` is `""`, which is falsy. The update path's
+    `or server.transport` fallback would therefore silently keep the stored
+    transport, turning an invalid edit into a no-op the caller never learns
+    about -- before write-time normalization this failed with a 400."""
+    db, user, _ = db_session
+    server = MCPServer(
+        name="editable",
+        managed="external",
+        transport="streamable_http",
+        url="https://mcp.example.com/mcp",
+    )
+    db.add(server)
+    db.commit()
+    db.refresh(server)
+    db.add(
+        UserMCPServer(
+            user_id=user.id,
+            mcpserver_id=server.id,
+            is_owner=True,
+            is_active=True,
+            can_edit=True,
+        )
+    )
+    db.commit()
+
+    with pytest.raises(mcp_api.HTTPException) as exc:
+        update_mcp_server(
+            server.id,
+            MCPServerUpdate(transport="   "),
+            user,
+            db,
+        )
+    assert exc.value.status_code == 400
+
+    db.refresh(server)
+    assert server.transport == "streamable_http"

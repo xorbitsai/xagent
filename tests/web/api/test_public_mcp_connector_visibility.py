@@ -2312,3 +2312,61 @@ def test_admin_custom_catalog_writes_record_before_after_audits() -> None:
             shutil.rmtree(temp_dir)
         except OSError:
             pass
+
+
+def test_admin_catalog_write_normalizes_transport_case() -> None:
+    """`transport` is a free-form string, and the shape check that guards these
+    writes (classify_app_auth) compares it case-insensitively — so a mixed-case
+    "Streamable_HTTP" is accepted here, while the connect path it feeds compares
+    exactly. Normalize on write so the stored row can't be classified
+    connectable by one half of the feature and rejected by the other."""
+    temp_dir = _setup_test_db()
+    try:
+        _setup_admin()
+        admin_headers = _login("admin", "admin123")
+
+        created = client.post(
+            "/api/admin/mcp/apps",
+            headers=admin_headers,
+            json={
+                "app_id": "remote-mixed",
+                "name": "RemoteMixed",
+                "transport": "Streamable_HTTP",
+                "launch_config": {
+                    "url": "https://mcp.example.com/mcp",
+                    "auth": {"type": "mcp_oauth"},
+                },
+            },
+        )
+        assert created.status_code == 200
+        app_pk = created.json()["id"]
+
+        db = next(get_db())
+        try:
+            stored = db.query(PublicMCPApp).filter(PublicMCPApp.id == app_pk).one()
+            assert stored.transport == "streamable_http"
+        finally:
+            db.close()
+
+        # A PATCH must not be able to reintroduce a mixed-case row either.
+        patched = client.patch(
+            f"/api/admin/mcp/apps/{app_pk}",
+            headers=admin_headers,
+            json={"transport": "SSE"},
+        )
+        assert patched.status_code == 200
+
+        db = next(get_db())
+        try:
+            stored = db.query(PublicMCPApp).filter(PublicMCPApp.id == app_pk).one()
+            assert stored.transport == "sse"
+        finally:
+            db.close()
+    finally:
+        Base.metadata.drop_all(bind=get_engine())
+        try:
+            import shutil
+
+            shutil.rmtree(temp_dir)
+        except OSError:
+            pass

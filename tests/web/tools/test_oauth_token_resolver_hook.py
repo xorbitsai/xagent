@@ -21,6 +21,7 @@ from xagent.web.models.oauth_provider import OAuthProvider
 from xagent.web.models.public_mcp import PublicMCPApp
 from xagent.web.models.user import User
 from xagent.web.models.user_oauth import UserOAuth
+from xagent.web.services import mcp_runtime as mcp_runtime_module
 from xagent.web.services.mcp_oauth import MCPAuthorizationChallenge
 from xagent.web.tools import config as web_tools_config
 from xagent.web.tools.config import (
@@ -2713,3 +2714,139 @@ async def test_remote_hook_refresh_classification_reaches_tool_failure_trace(
     public_output = repr(result) + repr(tracer.events) + caplog.text
     assert private_exception_text not in public_output
     assert "http-private-exception-secret" not in public_output
+
+
+@pytest.mark.asyncio
+async def test_mixed_case_oauth_transport_still_gets_oauth_credential_wiring(
+    db_session,
+):
+    """A legacy row stored as "OAuth" must still take the OAuth branch in
+    _build_mcp_server_config.
+
+    An exact `server.transport == "oauth"` check sends such a row down the
+    non-OAuth path, which silently drops its credential wiring -- the config is
+    built without the injected access token, so the connector fails at
+    tool-call time rather than reporting a credential problem.
+    """
+    server = _add_oauth_server(
+        db_session[0],
+        db_session[1],
+        name="Gmail Legacy Case",
+        app_id="gmail-legacy-case",
+        provider="google",
+        launch_config={
+            "command": "uv",
+            "args": ["run", "python", "-m", "xagent.web.tools.mcp.gmail"],
+            "env_mapping": {"GOOGLE_ACCESS_TOKEN": "access_token"},
+        },
+    )
+    db, user = db_session
+    # Simulate a row written before write-time transport normalization.
+    server.transport = "OAuth"
+    db.commit()
+
+    async def resolver(request: TokenRequest) -> ResolvedToken | None:
+        return ResolvedToken(
+            access_token="hook-token",
+            expires_at=datetime.now(timezone.utc) + timedelta(hours=1),
+        )
+
+    set_oauth_token_resolver_hook(resolver)
+
+    configs = await _tool_config(db, user).get_mcp_server_configs()
+
+    # The OAuth branch ran: the token was injected into the launch env.
+    assert configs[0]["config"]["env"]["GOOGLE_ACCESS_TOKEN"] == "hook-token"
+
+
+@pytest.mark.asyncio
+async def test_mixed_case_http_transport_takes_the_http_dispatch_branch(
+    db_session, monkeypatch
+):
+    """A legacy HTTP row stored as "Streamable_HTTP" must still match the HTTP
+    branch of _build_mcp_server_config's transport dispatch.
+
+    Matching neither branch leaves transport_config empty, so the row silently
+    loses the whole remote pipeline (runtime connection build, OAuth token
+    exchange, header wiring) instead of reporting a failure.
+
+    Note the assertion is on the connection-shaped keys this branch adds, not
+    on `url`: `url` comes from MCPServer.to_connection_dict() in the core MCP
+    layer, whose own exact-match comparison is deliberately outside this PR's
+    scope (a mixed-case row loses `url` there identically before and after this
+    branch). The backfill migration is what removes that input; this assertion
+    pins the part the web layer actually controls.
+    """
+    db, user = db_session
+    server = MCPServer(
+        name="remote-notes",
+        description="remote",
+        managed="external",
+        transport="Streamable_HTTP",
+        url="https://mcp.example.com/mcp",
+    )
+    db.add(server)
+    db.commit()
+    db.refresh(server)
+    db.add(
+        UserMCPServer(
+            user_id=user.id,
+            mcpserver_id=server.id,
+            is_owner=True,
+            is_active=True,
+        )
+    )
+    db.commit()
+
+    # The HTTP branch is the only caller of build_mcp_runtime_connection on
+    # this path, so observing that call is a direct signal that the dispatch
+    # matched. Under the old exact-match dispatch neither branch ran and it
+    # was never called.
+    calls: list = []
+    real_build = mcp_runtime_module.build_mcp_runtime_connection
+
+    async def spy(db_arg, server_arg, **kwargs):
+        calls.append(server_arg)
+        return await real_build(db_arg, server_arg, **kwargs)
+
+    monkeypatch.setattr(mcp_runtime_module, "build_mcp_runtime_connection", spy)
+
+    await _tool_config(db, user).get_mcp_server_configs()
+
+    assert [s.name for s in calls] == ["remote-notes"]
+
+
+@pytest.mark.asyncio
+async def test_built_config_reports_normalized_transport(db_session):
+    """The `transport` value in the returned config is consumed by the core
+    session layer's exact-match dispatch (via ToolFactory), so it must be the
+    canonical form -- not the raw stored value.
+
+    Selecting the right branch is not enough: a legacy row that takes the
+    correct branch but carries "Streamable_HTTP" downstream still dies with
+    `ValueError: Unsupported transport` at session creation.
+    """
+    db, user = db_session
+    server = MCPServer(
+        name="remote-raw-transport",
+        description="remote",
+        managed="external",
+        transport="Streamable_HTTP",
+        url="https://mcp.example.com/mcp",
+    )
+    db.add(server)
+    db.commit()
+    db.refresh(server)
+    db.add(
+        UserMCPServer(
+            user_id=user.id,
+            mcpserver_id=server.id,
+            is_owner=True,
+            is_active=True,
+        )
+    )
+    db.commit()
+
+    configs = await _tool_config(db, user).get_mcp_server_configs()
+
+    assert configs[0]["transport"] == "streamable_http"

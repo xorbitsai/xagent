@@ -3,7 +3,13 @@ from typing import Any, Dict, List, Optional
 from uuid import uuid4
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
-from pydantic import BaseModel, Field, ValidationError, model_validator
+from pydantic import (
+    BaseModel,
+    Field,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -90,9 +96,25 @@ class PublicMCPAppBase(BaseModel):
 
 
 class PublicMCPAppCreate(PublicMCPAppBase):
-    # Validator lives on the write model only, not PublicMCPAppBase — otherwise
-    # PublicMCPAppResponse would inherit it and re-run on response serialization,
-    # turning one legacy/partial DB row into a full-list 500 on read.
+    # Validators live on the write models only, not PublicMCPAppBase — otherwise
+    # PublicMCPAppResponse would inherit them and re-run on response serialization,
+    # turning one legacy/partial DB row into a full-list 500 on read (and, for
+    # the transport normalizer below, reporting a lowercased transport for a row
+    # that is still stored mixed-case).
+
+    # Canonicalize the stored transport: it is a free-form string, and an
+    # admin-authored mixed-case value ("Streamable_HTTP") passes the shape check
+    # below (classify_app_auth compares case-insensitively) yet produces a shared
+    # server row that the connect path's exact comparisons reject. Storing the
+    # lowercase form keeps the catalog and the connect path from disagreeing
+    # about the same app.
+    @field_validator("transport")
+    @classmethod
+    def _normalize_transport(cls, value: str) -> str:
+        from ..services.mcp_runtime import normalize_transport
+
+        return normalize_transport(value)
+
     @model_validator(mode="after")
     def _enforce_auth_classification(self) -> "PublicMCPAppCreate":
         # Reuse the single source of truth (classify_app_auth) rather than
@@ -145,6 +167,15 @@ class PublicMCPAppUpdate(BaseModel):
         default=None,
         description=_LAUNCH_CONFIG_DESCRIPTION,
     )
+
+    # Same canonicalization as PublicMCPAppCreate, so a PATCH that re-cases a
+    # transport can't reintroduce a mixed-case row.
+    @field_validator("transport")
+    @classmethod
+    def _normalize_transport(cls, value: Optional[str]) -> Optional[str]:
+        from ..services.mcp_runtime import normalize_transport
+
+        return None if value is None else normalize_transport(value)
 
 
 _PUBLIC_MCP_APP_FIELDS = tuple(PublicMCPAppBase.model_fields)

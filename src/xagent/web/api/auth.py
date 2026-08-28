@@ -51,6 +51,7 @@ from ..oauth_provider_quirks import requires_json_accept_header
 from ..services import gmail_provisioning
 from ..services.auth_email import send_password_reset_email
 from ..services.db_runtime import await_task_settlement, propagate_deferred_cancellation
+from ..services.mcp_runtime import normalize_transport
 from ..services.user_oauth import delete_scoped_user_oauth_accounts
 from ..utils.graphql_errors import graphql_errors_message, truncate_error_text
 
@@ -2084,7 +2085,10 @@ def _ensure_user_mcp_server(
         return metadata
 
     def _ensure_server_matches_oauth_app(server: MCPServer) -> None:
-        if server.transport != "oauth":
+        # Normalized like every other transport check on this path: an exact
+        # comparison rejects a legacy mixed-case row as a conflicting custom
+        # server, blocking a legitimate reconnect to its own OAuth app.
+        if normalize_transport(server.transport) != "oauth":
             raise ValueError(
                 f"OAuth app '{app_info['name']}' conflicts with an existing MCP server "
                 f"using transport '{server.transport}'. Delete or rename that custom "

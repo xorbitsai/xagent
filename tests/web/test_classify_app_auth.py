@@ -332,3 +332,70 @@ def test_invalid_stable_app_id_does_not_fall_back_to_name(
     )
 
     assert app is None
+
+
+@pytest.mark.parametrize(
+    "transport",
+    [
+        "streamable_http",
+        "Streamable_HTTP",
+        " streamable_http ",
+        "  STREAMABLE_HTTP\t",
+    ],
+    ids=["canonical", "mixed-case", "padded", "padded-upper"],
+)
+def test_classify_app_auth_normalizes_transport_like_the_write_path(transport: str):
+    """This must agree with normalize_transport(), which the write-time
+    validators and the connect path both use. A local .lower() here would
+    still disagree about a padded legacy row, reintroducing the same class of
+    chain-disagreement bug via whitespace instead of case."""
+    assert (
+        classify_app_auth(
+            transport,
+            {"url": "https://mcp.example.com/mcp", "auth": {"type": "mcp_oauth"}},
+        )
+        == "mcp_oauth"
+    )
+
+
+@pytest.mark.parametrize(
+    "transport",
+    ["stdio", "STDIO", " stdio "],
+    ids=["canonical", "upper", "padded"],
+)
+def test_classify_app_auth_normalizes_transport_for_keyless(transport: str):
+    assert classify_app_auth(transport, {"command": "npx"}) == "keyless"
+
+
+@pytest.mark.parametrize(
+    "transport",
+    ["oauth", "OAuth", " oauth "],
+    ids=["canonical", "mixed-case", "padded"],
+)
+def test_classify_app_auth_normalizes_transport_for_builtin_oauth(transport: str):
+    assert classify_app_auth(transport, {"command": "npx"}) == "builtin_oauth"
+
+
+def test_catalog_listing_reports_normalized_transport(catalog_db):
+    """The connector listing's `transport` and `auth_type` come from the same
+    row; auth_type is derived from the normalized value, so transport must be
+    normalized too or the two disagree about one app."""
+    catalog_db.add(
+        PublicMCPApp(
+            app_id="padded-remote",
+            name="Padded Remote",
+            transport=" Streamable_HTTP ",
+            launch_config={
+                "url": "https://mcp.example.com/mcp",
+                "auth": {"type": "mcp_oauth"},
+            },
+        )
+    )
+    catalog_db.commit()
+
+    app = next(
+        a for a in mcp_apps.get_all_mcp_apps(catalog_db) if a["id"] == "padded-remote"
+    )
+
+    assert app["transport"] == "streamable_http"
+    assert app["auth_type"] == "mcp_oauth"

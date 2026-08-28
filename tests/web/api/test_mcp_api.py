@@ -2,7 +2,8 @@
 Test MCP API endpoints and functions
 """
 
-from unittest.mock import MagicMock
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
 import pytest
 from pydantic import ValidationError
@@ -17,10 +18,13 @@ from xagent.web.api.mcp import (
     MCPServerCreate,
     MCPServerUpdate,
     _auth_metadata_tampered,
+    _build_active_oauth_server_lookup,
     _build_server_config,
     _check_mcp_permission,
     _db_server_to_response,
     _global_config_tampered,
+    _is_oauth_server_for_app,
+    _lookup_oauth_server_for_app,
     _mask_env,
     _merge_masked_env,
     get_mcp_servers,
@@ -664,6 +668,28 @@ class TestMCPApiFunctions:
         # Changed top-level name -> tampered
         assert _global_config_tampered(MCPServerUpdate(name="other"), server)
 
+    def test_global_config_tampered_normalizes_both_sides_of_transport(self):
+        """MCPServerUpdate.transport is normalized by its validator, but the
+        stored value on a row written before that validator shipped is not.
+        Comparing normalized-vs-raw would flag a non-owner who merely echoes
+        the row's own unchanged transport as tampering (spurious 403)."""
+        server = MCPServer.from_config(
+            {
+                "name": "svc",
+                "managed": "external",
+                "transport": "streamable_http",
+                "url": "https://mcp.example.com/mcp",
+            }
+        )
+        # Simulate a legacy row stored before write-time normalization.
+        server.transport = "Streamable_HTTP"
+
+        echoed = MCPServerUpdate(transport="Streamable_HTTP")
+        assert _global_config_tampered(echoed, server) is False
+
+        # A genuinely different transport is still caught.
+        assert _global_config_tampered(MCPServerUpdate(transport="sse"), server)
+
     def test_auth_metadata_tampered(self):
         """Non-secret auth metadata is diffed; secrets/masked values are ignored."""
         current = {"type": "oauth2", "client_id": "abc", "client_secret": "enc"}
@@ -855,3 +881,174 @@ class TestMCPApiModels:
         response = MCPConnectionTestResponse(**minimal_response)
         assert response.success is False
         assert response.details is None
+
+
+class TestOAuthServerLookupTransportNormalization:
+    """The lookup that decides whether a connected OAuth app renders as
+    connected spans three helpers. Two normalize transport via
+    _normalize_app_key; the confirmation check must agree with them, or a row
+    they admit is rejected downstream and the app shows as disconnected."""
+
+    @staticmethod
+    def _server(transport: str) -> MCPServer:
+        return MCPServer(
+            id=1,
+            name="slack",
+            transport=transport,
+            auth={"app_id": "slack", "provider": "slack"},
+            managed="external",
+        )
+
+    APP = {"id": "slack", "provider": "slack", "name": "Slack"}
+
+    @pytest.mark.parametrize(
+        "transport",
+        ["oauth", "OAuth", " oauth ", "OAUTH"],
+        ids=["canonical", "mixed-case", "padded", "upper"],
+    )
+    def test_connected_oauth_app_is_found_regardless_of_transport_spelling(
+        self, transport: str
+    ):
+        server = self._server(transport)
+        user_mcp = SimpleNamespace(is_active=True)
+
+        lookup = _build_active_oauth_server_lookup([(server, user_mcp)])
+        # The row is admitted into the lookup by the normalizing builder...
+        assert lookup, "row should be admitted by the normalizing lookup builder"
+        # ...so the confirmation check must not reject it.
+        assert _is_oauth_server_for_app(server, self.APP) is True
+        assert _lookup_oauth_server_for_app(self.APP, lookup) is server
+
+    @pytest.mark.parametrize(
+        "transport",
+        ["stdio", "oauth2", "streamable_http", "custom_api", "auth", ""],
+        ids=["stdio", "oauth2", "http", "custom-api", "substring", "empty"],
+    )
+    def test_non_oauth_transport_is_still_excluded(self, transport: str):
+        """Normalization must not widen the set. `stdio` alone does not
+        discriminate; `oauth2` and `auth` would be admitted by a normalizer
+        that matched loosely instead of on the exact canonical value."""
+        server = self._server(transport)
+        assert _is_oauth_server_for_app(server, self.APP) is False
+
+
+class TestMcpOAuthServerTransportNormalization:
+    """`_is_mcp_oauth_server` backs both the connection-state gate and the
+    connector picker's auth_type hint, so it must classify a legacy row the
+    same way the rest of the chain does."""
+
+    @pytest.mark.parametrize(
+        "transport",
+        ["streamable_http", "Streamable_HTTP", " streamable_http ", "SSE"],
+        ids=["canonical", "mixed-case", "padded", "upper-sse"],
+    )
+    def test_mcp_oauth_server_detected_regardless_of_spelling(self, transport: str):
+        from xagent.web.api.mcp import _is_mcp_oauth_server
+
+        server = MCPServer(
+            id=1,
+            name="remote",
+            transport=transport,
+            url="https://mcp.example.com/mcp",
+            auth={"type": "mcp_oauth"},
+            managed="external",
+        )
+        assert _is_mcp_oauth_server(server) is True
+
+    @pytest.mark.parametrize(
+        "transport",
+        ["STDIO", "oauth", "http", "streamable", "custom_api", ""],
+        ids=["stdio-upper", "oauth", "http", "prefix", "custom-api", "empty"],
+    )
+    def test_non_http_transport_is_not_an_mcp_oauth_server(self, transport: str):
+        """Includes values a loose normalizer would wrongly admit ("http" as a
+        substring of no canonical value, "streamable" as a prefix of one)."""
+        from xagent.web.api.mcp import _is_mcp_oauth_server
+
+        server = MCPServer(
+            id=1,
+            name="local",
+            transport=transport,
+            auth={"type": "mcp_oauth"},
+            managed="external",
+        )
+        assert _is_mcp_oauth_server(server) is False
+
+
+class TestTransportNormalizationOnRead:
+    """Stored transport must not be reported raw: the frontend compares these
+    values exactly, and `auth_type` on the same payload is already derived from
+    the normalized value."""
+
+    def test_server_response_reports_normalized_transport(self):
+        server = MCPServer(
+            id=1,
+            name="remote",
+            transport=" Streamable_HTTP ",
+            url="https://mcp.example.com/mcp",
+            managed="external",
+        )
+        user_mcp = MagicMock()
+        user_mcp.user_id = 1
+        user_mcp.is_active = True
+        user_mcp.is_default = False
+        user_mcp.is_owner = True
+        user_mcp.env = None
+        user_mcp.env_source = None
+
+        response = _db_server_to_response(
+            server=server,
+            user_mcp=user_mcp,
+            manager=MagicMock(),
+        )
+
+        assert response.transport == "streamable_http"
+
+
+class TestOAuthTransportNormalizationCoverage:
+    """Positive coverage for the gate the review flagged as fixed-but-untested:
+    a mixed-case "OAuth" row must pass it, not just a lowercase one.
+
+    These drive the real functions rather than re-asserting normalize_transport,
+    so they fail if the call site reverts to an exact comparison."""
+
+    @pytest.mark.parametrize(
+        "transport",
+        ["oauth", "OAuth", " oauth ", "OAUTH"],
+        ids=["canonical", "mixed-case", "padded", "upper"],
+    )
+    def test_mixed_case_oauth_server_is_enriched_as_an_oauth_server(
+        self, transport: str
+    ):
+        """_enrich_oauth_server_info returns (None, None, None) for a
+        non-OAuth transport, so a legacy "OAuth" row would lose its app_id,
+        provider and connected-account in the server listing."""
+        from xagent.web.api.mcp import _enrich_oauth_server_info
+
+        db = MagicMock()
+        db.query.return_value.filter.return_value.first.return_value = None
+        server = MCPServer(
+            id=1, name="no-such-app", transport=transport, managed="external"
+        )
+
+        # No catalog app matches, so it still returns (None, None, None) --
+        # but only after passing the transport gate. Patch the lookup to prove
+        # the gate was passed rather than short-circuited.
+        with patch(
+            "xagent.web.api.mcp.get_app_by_name",
+            return_value={"id": "slack", "provider": "slack"},
+        ):
+            app_id, provider, _ = _enrich_oauth_server_info(db, server, {})
+
+        assert (app_id, provider) == ("slack", "slack")
+
+    def test_non_oauth_transport_is_not_enriched(self):
+        """The gate must still exclude a genuinely non-OAuth row."""
+        from xagent.web.api.mcp import _enrich_oauth_server_info
+
+        server = MCPServer(id=1, name="local", transport="stdio", managed="external")
+        assert _enrich_oauth_server_info(MagicMock(), server, {}) == (
+            None,
+            None,
+            None,
+        )

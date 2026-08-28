@@ -106,6 +106,31 @@ async def test_mcp_config_builders_require_an_explicit_user_identity(
             )
 
 
+def test_build_unavailable_mcp_config_omits_app_name_for_a_hidden_catalog_app() -> None:
+    """A catalog app with is_visible_in_connector=False must not be named in
+    a connect_apps pause: /api/mcp/apps (the frontend's connector catalog)
+    excludes it, so naming it would leave the user staring at a dead-end
+    pause card with no Connect button to act on."""
+    cfg = WebToolConfig(db=None, request=None, user_id=7)
+    server = SimpleNamespace(id=1, name="Hidden App", description=None)
+
+    visible = cfg._build_unavailable_mcp_config(
+        server=server,
+        reason="oauth_token_required",
+        failure_code="oauth_token_required",
+        app_info={"name": "Hidden App", "is_visible_in_connector": True},
+    )
+    hidden = cfg._build_unavailable_mcp_config(
+        server=server,
+        reason="oauth_token_required",
+        failure_code="oauth_token_required",
+        app_info={"name": "Hidden App", "is_visible_in_connector": False},
+    )
+
+    assert visible["config"]["app_name"] == "Hidden App"
+    assert "app_name" not in hidden["config"]
+
+
 @pytest.mark.asyncio
 async def test_identity_free_mcp_load_returns_before_cache_or_database(
     monkeypatch: pytest.MonkeyPatch,

@@ -3301,8 +3301,11 @@ class WebToolConfig(BaseToolConfig):
         # app (see `UnavailableMCPTool._run_unavailable`) instead of only
         # ever surfacing a raw error - only populated when the caller already
         # resolved the catalog app, so an unresolvable server keeps the old
-        # error-only behavior.
-        if app_info is not None:
+        # error-only behavior. A hidden app is deliberately treated the same
+        # as unresolvable: /api/mcp/apps (the frontend's connector catalog)
+        # excludes it, so naming it in a pause would leave the user staring
+        # at a dead-end connect_apps card with no Connect button to act on.
+        if app_info is not None and app_info.get("is_visible_in_connector", True):
             app_name = app_info.get("name")
             if isinstance(app_name, str) and app_name:
                 inner_config["app_name"] = app_name

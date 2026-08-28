@@ -174,6 +174,37 @@ describe("ChatMessage Session file capability", () => {
     ).not.toBeInTheDocument()
   })
 
+  it("keeps showing the localized pause text after the task resolves and interactionsActive flips back to false, instead of reverting to raw English in scrollback", () => {
+    const interactions = [{ type: "connect_apps", field: "connect_apps", apps: ["Gmail"] }]
+    const { rerender } = render(
+      <ChatMessage
+        role="assistant"
+        content="I need access to Gmail to continue. Please connect it below, then let me know once you have."
+        interactions={interactions}
+        interactionsActive={true}
+      />,
+    )
+    expect(
+      screen.getByText("chatPage.clarification.connectApps.needAccess"),
+    ).toBeInTheDocument()
+
+    rerender(
+      <ChatMessage
+        role="assistant"
+        content="I need access to Gmail to continue. Please connect it below, then let me know once you have."
+        interactions={interactions}
+        interactionsActive={false}
+      />,
+    )
+
+    expect(
+      screen.getByText("chatPage.clarification.connectApps.needAccess"),
+    ).toBeInTheDocument()
+    expect(
+      screen.queryByText(/I need access to Gmail to continue\. Please connect/),
+    ).not.toBeInTheDocument()
+  })
+
   it("keeps the raw backend content when the interaction list mixes connect_apps with another type", () => {
     render(
       <ChatMessage

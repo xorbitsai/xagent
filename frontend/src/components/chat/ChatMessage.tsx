@@ -466,12 +466,30 @@ export function ChatMessage({
   // only sets interactionsActive true for the one message that is actually
   // the live, unanswered pause, so a seeded kickoff message's real content
   // is left alone here.
-  const connectAppsOnlyApps =
+  //
+  // Latched (not just interactionsActive) once confirmed: interactionsActive
+  // flips back to false the moment this pause resolves (the task leaves
+  // waiting_for_user), which would otherwise revert this SAME bubble in
+  // scrollback from the localized string back to the raw English backend
+  // text mid-conversation. The key={item.id} on this component in
+  // task-conversation-panel.tsx keeps one instance mounted across that
+  // transition for the one message that ever legitimately turns this on -
+  // a Hire-seed message's interactionsActive is never true in the first
+  // place, so it never latches.
+  const [hasBeenActiveConnectApps, setHasBeenActiveConnectApps] = useState(false);
+  const isActiveConnectAppsPause =
     !isUser && interactionsActive && interactions && interactions.length > 0 &&
-    interactions.every((interaction) => LIVE_WIDGET_TYPES.has(interaction?.type))
+    interactions.every((interaction) => LIVE_WIDGET_TYPES.has(interaction?.type));
+  useEffect(() => {
+    if (isActiveConnectAppsPause) {
+      setHasBeenActiveConnectApps(true);
+    }
+  }, [isActiveConnectAppsPause]);
+  const connectAppsOnlyApps =
+    isActiveConnectAppsPause || hasBeenActiveConnectApps
       ? Array.from(
           new Set(
-            interactions.flatMap((interaction) =>
+            (interactions || []).flatMap((interaction) =>
               Array.isArray(interaction.apps) ? interaction.apps : []
             )
           )

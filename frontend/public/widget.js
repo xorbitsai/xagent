@@ -380,12 +380,33 @@
 
     @media (max-width: ${MOBILE_BREAKPOINT}px) {
       .xagent-widget-panel {
-        width: calc(100vw - ${HORIZONTAL_VIEWPORT_MARGIN}px);
-        height: calc(100vh - 120px);
+        position: fixed;
+        inset: 0;
+        width: 100%;
+        height: 100%;
+        max-height: 100%;
+        border: none;
+        border-radius: 0;
+        box-shadow: none;
+        /* Full-screen means edge-to-edge, including under a notch/home
+           indicator -- the fallback keeps unsupporting browsers at 0. */
+        padding-top: env(safe-area-inset-top, 0px);
+        padding-bottom: env(safe-area-inset-bottom, 0px);
       }
 
       .xagent-widget-resize-handle {
         display: none;
+      }
+
+      /* The FAB doubles as the full-screen panel's close control (it already
+         swaps to the close icon in openPanel()); reposition it to the top
+         corner so it doesn't sit on top of the composer docked at the
+         bottom of the screen it's now covering. */
+      .xagent-widget-fab.xagent-widget-fab-panel-open {
+        position: fixed;
+        top: calc(12px + env(safe-area-inset-top, 0px));
+        right: 12px;
+        bottom: auto;
       }
     }
   `;
@@ -637,12 +658,14 @@
   function openPanel() {
     isOpen = true;
     panel.classList.add('open');
+    fab.classList.add('xagent-widget-fab-panel-open');
     fab.innerHTML = closeIcon;
   }
 
   function closePanel() {
     isOpen = false;
     panel.classList.remove('open');
+    fab.classList.remove('xagent-widget-fab-panel-open');
     fab.innerHTML = chatIcon;
   }
 

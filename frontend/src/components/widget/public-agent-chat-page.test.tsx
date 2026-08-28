@@ -162,6 +162,10 @@ async function expectWidgetAuthFailure(detail: string) {
   expect(screen.queryByRole("button", { name: /start:/ })).toBeNull()
   expect(sessionStorage.getItem("xagent_public_access_token")).toBeNull()
   expect(app.setTaskId).not.toHaveBeenCalled()
+  // This early-return branch renders no header at all -- widget.js's mobile
+  // full-screen FAB-hiding guard depends on WidgetChromeControls never
+  // rendering (and thus never announcing chrome-ready) here.
+  expect(screen.queryByRole("button", { name: "widgetChat.close" })).toBeNull()
 }
 
 function expectPublicProviderToken() {
@@ -247,6 +251,17 @@ describe("PublicAgentChatPage", () => {
     cleanup()
     vi.unstubAllGlobals()
     vi.restoreAllMocks()
+  })
+
+  it("renders no header, and thus no close control, while auth is still in flight", () => {
+    // Same underlying risk as expectWidgetAuthFailure's assertion below, but
+    // for the *other* early-return branch (isInitializing) -- this widget
+    // mode result never resolves within the test, keeping it in that state.
+    fetchMock.mockReturnValueOnce(new Promise(() => {}))
+
+    renderWidgetPage({ embedTicket: "embed-ticket", widgetKey: "widget-secret" })
+
+    expect(screen.queryByRole("button", { name: "widgetChat.close" })).toBeNull()
   })
 
   it("authenticates embedded widgets with the ticket and never sends the widget key", async () => {

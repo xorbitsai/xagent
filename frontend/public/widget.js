@@ -635,6 +635,7 @@
     window.removeEventListener('resize', onWindowResize);
     window.removeEventListener('blur', onWindowBlur);
     window.removeEventListener('message', onChromeMessage);
+    iframe.removeEventListener('load', onIframeLoad);
     document.removeEventListener('pointermove', onPointerMove);
     document.removeEventListener('pointerup', endDrag);
     document.removeEventListener('pointercancel', cancelDrag);
@@ -718,6 +719,19 @@
     }
   }
   window.addEventListener('message', onChromeMessage);
+
+  // Safety net for widget_chrome_ready's revocation side: that only fires
+  // from WidgetChromeControls's React unmount cleanup, which never runs if
+  // the iframe's document is replaced by a real navigation (a full reload,
+  // not the app's own client-side routing, which never fires `load`) rather
+  // than an orderly React unmount. A fresh document has confirmed nothing
+  // about its own chrome yet, so treat any (re)load as "not ready" until a
+  // new widget_chrome_ready arrives for it -- including the very first load,
+  // where this is already the default and thus a harmless no-op.
+  function onIframeLoad() {
+    panel.classList.remove('xagent-chrome-ready');
+  }
+  iframe.addEventListener('load', onIframeLoad);
 
   mode.attach(iframe);
 

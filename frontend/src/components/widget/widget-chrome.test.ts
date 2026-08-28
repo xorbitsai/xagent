@@ -206,6 +206,38 @@ describe("widget close chrome", () => {
     expect(panelEl()).toHaveClass("open")
   })
 
+  it("resets chrome-ready on an iframe reload, since a fresh document has confirmed nothing yet", () => {
+    // widget_chrome_not_ready is only ever sent from WidgetChromeControls's
+    // React unmount cleanup -- a real navigation of the iframe's document
+    // (as opposed to the app's own client-side routing, which never fires
+    // `load`) replaces that whole document without running it, which would
+    // otherwise leave a stale .xagent-chrome-ready from the previous
+    // document hiding the FAB with nothing behind it to close the panel.
+    runWidget()
+    fabEl()?.click()
+    fromIframe("widget_chrome_ready")
+    expect(panelEl()).toHaveClass("xagent-chrome-ready")
+
+    iframeEl()?.dispatchEvent(new Event("load"))
+
+    expect(panelEl()).not.toHaveClass("xagent-chrome-ready")
+  })
+
+  it("stops resetting chrome-ready on iframe load once the widget is torn down", async () => {
+    runWidget()
+    fabEl()?.click()
+    fromIframe("widget_chrome_ready")
+    const capturedPanel = panelEl()
+    const capturedIframe = iframeEl()
+
+    document.querySelector(".xagent-widget-container")?.remove()
+    await Promise.resolve()
+
+    capturedIframe?.dispatchEvent(new Event("load"))
+
+    expect(capturedPanel).toHaveClass("xagent-chrome-ready")
+  })
+
   it("ignores an unrecognized chrome message type", () => {
     runWidget()
     fabEl()?.click()

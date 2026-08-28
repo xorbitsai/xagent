@@ -186,6 +186,12 @@ describe("SessionAgentChatPage", () => {
     render(<SessionAgentChatPage />)
 
     expect(screen.getByText("widgetChat.status.initializing")).toBeInTheDocument()
+    // This "waiting" branch renders no header at all -- widget.js's mobile
+    // full-screen FAB-hiding guard depends on WidgetChromeControls (and thus
+    // this close button) never rendering here; a regression that added it
+    // without the panel actually being able to close would go uncaught
+    // without this.
+    expect(screen.queryByRole("button", { name: "widgetChat.close" })).not.toBeInTheDocument()
     expect(app.provider?.token).toBeUndefined()
     expect(app.provider?.transport?.session).toEqual({
       connection: null,
@@ -428,6 +434,7 @@ describe("SessionAgentChatPage", () => {
     expect(screen.getByText("widgetSession.unavailable.description")).toBeInTheDocument()
     expect(screen.queryByText("widgetChat.status.initializing")).not.toBeInTheDocument()
     expect(screen.queryByText("widgetChat.status.connecting")).not.toBeInTheDocument()
+    expect(screen.queryByRole("button", { name: "widgetChat.close" })).not.toBeInTheDocument()
   })
 
   it("removes all conversation controls after degradation with an existing Agent", () => {
@@ -445,6 +452,11 @@ describe("SessionAgentChatPage", () => {
     expect(screen.queryByRole("button", {
       name: "widgetSession.startNewConversation",
     })).not.toBeInTheDocument()
+    // This branch renders no header at all -- including WidgetChromeControls
+    // itself, not just its menu. A regression that only dropped the menu
+    // item's own render path (leaving the close button behind) would slip
+    // past the two assertions above alone.
+    expect(screen.queryByRole("button", { name: "widgetChat.close" })).not.toBeInTheDocument()
     expect(screen.queryByTestId("session-conversation-panel")).not.toBeInTheDocument()
     expect(app.provider?.transport?.session?.connection).toBeNull()
   })

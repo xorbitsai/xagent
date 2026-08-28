@@ -8951,17 +8951,21 @@ async def _handle_resume_task_unserialized(
                 return ResumeCommandResult(ResumeCommandOutcome.ALREADY_IN_PROGRESS)
             if reservation is not ResumeReservationOutcome.RESERVED:
                 return _defer_for_slot(reservation)
-            # This command is now the sole admitted owner of the cached
-            # agent's tool_config for this task. A fresh id every call is
-            # deliberate (no per-message turn id exists on this path,
-            # unlike the new-user-message resume handler): this path is
-            # infrequent enough that always rebuilding connector-backed
-            # tools is cheaper than trying to detect whether anything
-            # actually changed since the task paused.
-            get_agent_manager().sync_connector_runtime_turn(task_id, str(uuid.uuid4()))
             resume_snapshot: Any | None = None
             bg_task: asyncio.Task[None] | None = None
             try:
+                # This command is now the sole admitted owner of the cached
+                # agent's tool_config for this task. A fresh id every call
+                # is deliberate (no per-message turn id exists on this
+                # path, unlike the new-user-message resume handler): this
+                # path is infrequent enough that always rebuilding
+                # connector-backed tools is cheaper than trying to detect
+                # whether anything actually changed since the task paused.
+                # Inside the try so a raise here still releases the
+                # reservation below, instead of leaking it.
+                get_agent_manager().sync_connector_runtime_turn(
+                    task_id, str(uuid.uuid4())
+                )
                 resume_snapshot = await task_execution_controller.transition(
                     task_id,
                     TaskControlState.RESUME_REQUESTED,

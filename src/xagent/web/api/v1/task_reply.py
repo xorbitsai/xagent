@@ -393,19 +393,21 @@ async def _schedule_waiting_reply_resume(
         # would read a lost race on the claim itself, rather than a bare
         # 500: retrying (after the other resume settles) can succeed.
         raise V1ApiError(V1ErrorCode.TASK_BUSY, 409)
-    # This request is now the sole admitted owner of the cached agent's
-    # tool_config for this task (see websocket.py's message-triggered and
-    # explicit-resume handlers for the same reasoning) - only now is it
-    # safe to sync the connector runtime turn binding to the turn whose
-    # message was just injected, so a reconnected app's tools rebuild
-    # against it instead of leaving a losing resume's turn/cache context
-    # on the shared agent this one is about to execute under.
-    chat.get_agent_manager().sync_connector_runtime_turn(
-        task_id, connector_runtime_turn_id
-    )
     previous_task = websocket.background_task_manager.running_tasks.get(task_id)
     bg_task: "asyncio.Task[None] | None" = None
     try:
+        # This request is now the sole admitted owner of the cached agent's
+        # tool_config for this task (see websocket.py's message-triggered
+        # and explicit-resume handlers for the same reasoning) - only now
+        # is it safe to sync the connector runtime turn binding to the turn
+        # whose message was just injected, so a reconnected app's tools
+        # rebuild against it instead of leaving a losing resume's turn/
+        # cache context on the shared agent this one is about to execute
+        # under. Inside the try so a raise here still releases the
+        # reservation below, instead of leaking it.
+        chat.get_agent_manager().sync_connector_runtime_turn(
+            task_id, connector_runtime_turn_id
+        )
         bg_task = asyncio.create_task(
             websocket.execute_resume_background(
                 task_id=task_id,

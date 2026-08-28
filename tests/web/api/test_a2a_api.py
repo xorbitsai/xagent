@@ -3226,6 +3226,8 @@ async def test_a2a_resume_syncs_connector_runtime_turn_after_reservation() -> No
             )
         finally:
             resume_gate.set()
+            coordinator = real_manager.resume_tasks[5454]
+            await asyncio.wait_for(coordinator, timeout=5)
 
 
 def test_subscribe_projects_claimed_waiting_resume_as_working(monkeypatch) -> None:

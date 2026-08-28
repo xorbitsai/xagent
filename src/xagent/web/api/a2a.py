@@ -173,17 +173,21 @@ async def _schedule_waiting_a2a_resume(
         raise ValueError("A2A resume scheduling requires an exact task lease")
     if not background_task_manager.reserve_resume(task_id):
         raise RuntimeError(f"Task {task_id} already has a resume in progress")
-    # This request is now the sole admitted owner of the cached agent's
-    # tool_config for this task (see websocket.py's message-triggered and
-    # explicit-resume handlers for the same reasoning) - only now is it
-    # safe to sync the connector runtime turn binding to the turn whose
-    # message was just injected, so a reconnected app's tools rebuild
-    # against it instead of leaving a losing resume's turn/cache context
-    # on the shared agent this one is about to execute under.
-    get_agent_manager().sync_connector_runtime_turn(task_id, connector_runtime_turn_id)
     previous_task = background_task_manager.running_tasks.get(task_id)
     bg_task: asyncio.Task[None] | None = None
     try:
+        # This request is now the sole admitted owner of the cached agent's
+        # tool_config for this task (see websocket.py's message-triggered
+        # and explicit-resume handlers for the same reasoning) - only now
+        # is it safe to sync the connector runtime turn binding to the turn
+        # whose message was just injected, so a reconnected app's tools
+        # rebuild against it instead of leaving a losing resume's turn/
+        # cache context on the shared agent this one is about to execute
+        # under. Inside the try so a raise here still releases the
+        # reservation below, instead of leaking it.
+        get_agent_manager().sync_connector_runtime_turn(
+            task_id, connector_runtime_turn_id
+        )
         bg_task = asyncio.create_task(
             execute_resume_background(
                 task_id=task_id,

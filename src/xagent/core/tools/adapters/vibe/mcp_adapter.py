@@ -1166,7 +1166,7 @@ class UnavailableMCPTool(AbstractBaseTool):
         if self._app_name and is_oauth_token_required_code(self._failure_code):
             pause_message = (
                 f"I need access to {self._app_name} to continue. "
-                "Please connect it below, then let me know once you have."
+                "Please connect below, then let me know once you have."
             )
             return self._with_reason_and_failure_code(
                 {

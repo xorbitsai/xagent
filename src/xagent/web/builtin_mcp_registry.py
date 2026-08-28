@@ -1199,7 +1199,8 @@ def get_builtin_public_mcp_app_rows() -> list[dict[str, Any]]:
             # "Built-in MCP catalog drift" warning every startup, since the
             # real launch always reads the live value regardless of what's
             # persisted. Not fixed here: doing so generically means teaching
-            # the shared drift check about per-app dynamic fields.
+            # the shared drift check about per-app dynamic fields -- tracked
+            # in https://github.com/xorbitsai/xagent/issues/1875.
             "launch_config": {
                 "command": "uv",
                 "args": [

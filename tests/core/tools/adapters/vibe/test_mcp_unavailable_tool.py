@@ -30,6 +30,7 @@ def _unavailable_tool(
     reason: str | None = None,
     message: str | None = None,
     app_name: str | None = None,
+    app_id: str | None = None,
 ) -> UnavailableMCPTool:
     kwargs: dict[str, Any] = {
         "server_name": server_name,
@@ -43,6 +44,8 @@ def _unavailable_tool(
         kwargs["message"] = message
     if app_name is not None:
         kwargs["app_name"] = app_name
+    if app_id is not None:
+        kwargs["app_id"] = app_id
     return UnavailableMCPTool(
         **kwargs,
     )
@@ -55,6 +58,7 @@ def _unavailable_config(
     allow_users: list[str] | None = None,
     failure_code: object | None = None,
     app_name: str | None = None,
+    app_id: str | None = None,
 ) -> dict:
     config = {
         "name": name,
@@ -72,6 +76,8 @@ def _unavailable_config(
         config["config"]["failure_code"] = failure_code
     if app_name is not None:
         config["config"]["app_name"] = app_name
+    if app_id is not None:
+        config["config"]["app_id"] = app_id
     return config
 
 
@@ -187,6 +193,54 @@ async def test_unavailable_tool_oauth_required_with_app_name_pauses_for_connect_
         "reason": "oauth_token_resolver_failed",
         "failure_code": "oauth_token_required",
     }
+
+
+@pytest.mark.asyncio
+async def test_unavailable_tool_oauth_required_with_app_id_pauses_with_stable_identity(
+    monkeypatch,
+):
+    """When the catalog app was resolved with a stable id (see
+    _build_unavailable_mcp_config's app_id threading), the connect_apps
+    interaction names it alongside the display name - two visible apps can
+    share a name (PublicMCPApp.name has no unique constraint, unlike
+    app_id), so the frontend must be able to resolve by id, not just name."""
+    monkeypatch.setenv("XAGENT_USER_ID", "7")
+    tool = _unavailable_tool(
+        allow_users=["7"],
+        failure_code="oauth_token_required",
+        app_name="Gmail",
+        app_id="gmail",
+    )
+
+    result = await tool.run_json_async({})
+
+    assert result["interactions"] == [
+        {
+            "type": "connect_apps",
+            "field": "connect_apps",
+            "label": "Connect your apps",
+            "apps": [{"id": "gmail", "name": "Gmail"}],
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_unavailable_tool_oauth_required_without_app_id_keeps_plain_name(
+    monkeypatch,
+):
+    """No app_id was resolvable (e.g. a resolver-failure path with no
+    app_info) - the interaction keeps the plain-string shape rather than
+    emitting an object with a null id."""
+    monkeypatch.setenv("XAGENT_USER_ID", "7")
+    tool = _unavailable_tool(
+        allow_users=["7"],
+        failure_code="oauth_token_required",
+        app_name="Gmail",
+    )
+
+    result = await tool.run_json_async({})
+
+    assert result["interactions"][0]["apps"] == ["Gmail"]
 
 
 @pytest.mark.asyncio
@@ -466,6 +520,25 @@ async def test_factory_threads_app_name_into_unavailable_tool(
 
     assert result["status"] == "waiting_for_user"
     assert result["interactions"][0]["apps"] == ["Gmail"]
+
+
+@pytest.mark.asyncio
+async def test_factory_threads_app_id_into_unavailable_tool(
+    monkeypatch,
+):
+    monkeypatch.setenv("XAGENT_USER_ID", "7")
+    config = _unavailable_config(
+        allow_users=["7"],
+        failure_code="oauth_token_required",
+        app_name="Gmail",
+        app_id="gmail",
+    )
+
+    tools = await ToolFactory._create_mcp_tools_from_configs([config])
+    result = await tools[0].run_json_async({})
+
+    assert result["status"] == "waiting_for_user"
+    assert result["interactions"][0]["apps"] == [{"id": "gmail", "name": "Gmail"}]
 
 
 @pytest.mark.asyncio

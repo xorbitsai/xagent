@@ -86,10 +86,10 @@ type ConnectAppsRow =
  * about it either way.
  */
 function resolveRows(
-  appNames: string[] | undefined,
+  appEntries: Array<string | { id?: string; name?: string }> | undefined,
   allApps: McpApp[],
 ): { rows: ConnectAppsRow[]; hasUnresolvedApp: boolean } {
-  const wanted = appNames || [];
+  const wanted = appEntries || [];
   if (wanted.length === 0) return { rows: [], hasUnresolvedApp: false };
 
   // findMatchingMcpApp (lib/mcp-lookup.ts) matches by name OR id, tolerating
@@ -101,8 +101,18 @@ function resolveRows(
   const seen = new Set<string>();
   const resolved: McpApp[] = [];
   let hasUnresolvedApp = false;
-  for (const name of wanted) {
-    const app = findMatchingMcpApp(allApps, name);
+  for (const entry of wanted) {
+    const entryId = typeof entry === "string" ? undefined : entry.id;
+    const entryName = typeof entry === "string" ? entry : entry.name;
+    // An id resolves to exactly one catalog row, unlike a display name -
+    // two visible apps can share a name (see Interaction.apps' doc
+    // comment), so an exact id match must win whenever one is available.
+    // Only fall back to the fuzzy name lookup when no id was sent at all
+    // (the legacy plain-string shape) or the id no longer resolves (the
+    // app was deleted from the catalog since the pause was created).
+    const app =
+      (entryId ? allApps.find((candidate) => candidate.id === entryId) : undefined) ??
+      (entryName ? findMatchingMcpApp(allApps, entryName) : undefined);
     if (!app) {
       hasUnresolvedApp = true;
       continue;

@@ -3309,6 +3309,16 @@ class WebToolConfig(BaseToolConfig):
             app_name = app_info.get("name")
             if isinstance(app_name, str) and app_name:
                 inner_config["app_name"] = app_name
+            # The catalog's stable id, alongside the display name above: two
+            # visible apps can share a name (PublicMCPApp.name has no unique
+            # constraint, unlike app_id), so the frontend resolves the pause
+            # by id first and only falls back to name-matching for the
+            # legacy/plain-string shape. Only meaningful paired with
+            # app_name - a pause naming nothing has no card to attach an id
+            # to.
+            app_id = app_info.get("id")
+            if isinstance(app_id, str) and app_id and "app_name" in inner_config:
+                inner_config["app_id"] = app_id
         serialized_user_id = self._serialize_mcp_user_id()
         return {
             "name": getattr(server, "name", ""),

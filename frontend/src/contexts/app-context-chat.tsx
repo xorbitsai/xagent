@@ -336,10 +336,15 @@ export interface Interaction {
   default_value?: string | number | boolean | null;
   accept?: string[] | string;
   multiple?: boolean;
-  /** For "connect_apps": connector app display names (matched against
-   * useMcpApps()'s McpApp.name) to group by OAuth provider and render as
-   * connect cards - e.g. ["Gmail", "Google Calendar", "HubSpot"]. */
-  apps?: string[];
+  /** For "connect_apps": connector apps to group by OAuth provider and
+   * render as connect cards. A plain string is a display name only
+   * (matched against useMcpApps()'s McpApp.name) - the legacy shape, still
+   * used by Hire-seeded cards and older persisted interactions. An object
+   * additionally carries the catalog's stable id (McpApp.id), which
+   * resolveRows in connect-apps-field.tsx prefers over name-matching,
+   * since two visible apps can share a display name but never an id -
+   * e.g. [{ id: "gmail", name: "Gmail" }, "HubSpot"]. */
+  apps?: Array<string | { id?: string; name?: string }>;
 }
 import {
   useWebSocket,
@@ -599,7 +604,23 @@ export const normalizeInteractions = (value: unknown): Interaction[] => {
       if (Array.isArray(item.accept) || typeof item.accept === "string") normalized.accept = item.accept
       if (typeof item.multiple === "boolean") normalized.multiple = item.multiple
       if (Array.isArray(item.apps)) {
-        normalized.apps = item.apps.filter((app: unknown): app is string => typeof app === "string")
+        // A string is the legacy display-name-only shape; an object also
+        // carries the catalog's stable id (see Interaction.apps' doc
+        // comment) - keep both, dropping only an entry that's neither.
+        normalized.apps = item.apps
+          .map((app: unknown): string | { id?: string; name?: string } | undefined => {
+            if (typeof app === "string") return app
+            if (app && typeof app === "object") {
+              const id = typeof (app as Record<string, unknown>).id === "string" ? (app as Record<string, unknown>).id as string : undefined
+              const name = typeof (app as Record<string, unknown>).name === "string" ? (app as Record<string, unknown>).name as string : undefined
+              if (id || name) return { id, name }
+            }
+            return undefined
+          })
+          .filter(
+            (app: string | { id?: string; name?: string } | undefined): app is string | { id?: string; name?: string } =>
+              app !== undefined
+          )
       }
 
       return normalized

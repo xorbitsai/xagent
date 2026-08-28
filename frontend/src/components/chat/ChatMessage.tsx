@@ -490,7 +490,16 @@ export function ChatMessage({
       ? Array.from(
           new Set(
             (interactions || []).flatMap((interaction) =>
-              Array.isArray(interaction.apps) ? interaction.apps : []
+              Array.isArray(interaction.apps)
+                ? // Each entry is either the legacy plain display-name string,
+                  // or an { id, name } object carrying the catalog's stable id
+                  // alongside it (see Interaction.apps' doc comment) - only
+                  // the name is needed for this sentence, Intl.ListFormat
+                  // below needs plain strings.
+                  (interaction.apps as Array<string | { name?: string } | undefined>)
+                    .map((entry) => (typeof entry === "string" ? entry : entry?.name))
+                    .filter((name: string | undefined): name is string => Boolean(name))
+                : []
             )
           )
         )

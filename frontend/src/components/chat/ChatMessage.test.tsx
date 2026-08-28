@@ -189,6 +189,29 @@ describe("ChatMessage Session file capability", () => {
     ).toBeInTheDocument()
   })
 
+  it("extracts the display name from an { id, name } app entry, not just a plain string", () => {
+    // The backend now sends an object alongside the display name when it
+    // resolved a stable catalog id (see Interaction.apps' doc comment) -
+    // the localized pause sentence only needs the name half of it.
+    render(
+      <ChatMessage
+        role="assistant"
+        content="raw backend text"
+        interactions={[
+          {
+            type: "connect_apps",
+            field: "connect_apps",
+            apps: [{ id: "gmail", name: "Gmail" }],
+          },
+        ]}
+      />,
+    )
+
+    expect(
+      screen.getByText('chatPage.clarification.connectApps.needAccess:{"apps":"Gmail"}'),
+    ).toBeInTheDocument()
+  })
+
   it("replaces the raw backend pause text with a localized message when every interaction is connect_apps", () => {
     render(
       <ChatMessage

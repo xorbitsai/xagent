@@ -875,6 +875,66 @@ describe("ConnectAppsField", () => {
     expect(screen.getByText("chatPage.clarification.connectApps.skip")).toBeInTheDocument();
   });
 
+  it("resolves a name-colliding app by id, not by whichever same-named app appears first in the catalog", () => {
+    // PublicMCPApp.name has no unique constraint (unlike app_id) - two
+    // visible catalog apps can share a display name. resolveRows must
+    // prefer an exact id match over the fuzzy name lookup, or a pause
+    // naming the id-resolvable "notion-personal" could silently resolve to
+    // the wrong, unconnected "notion-work" row instead.
+    mcpAppsMock.apps = [
+      makeApp({ id: "notion-work", name: "Notion", is_connected: false }),
+      makeApp({ id: "notion-personal", name: "Notion", is_connected: true }),
+    ];
+
+    render(
+      <ConnectAppsField
+        interaction={{
+          ...LEO_INTERACTION,
+          apps: [{ id: "notion-personal", name: "Notion" }],
+        }}
+        onSkip={vi.fn()}
+      />
+    );
+
+    expect(
+      screen.getByText("chatPage.clarification.connectApps.allConnectedNote")
+    ).toBeInTheDocument();
+    expect(screen.queryByText("chatPage.clarification.connectApps.skip")).not.toBeInTheDocument();
+  });
+
+  it("falls back to name matching when an app entry carries no id (the legacy plain-string shape)", () => {
+    mcpAppsMock.apps = [makeApp({ id: "gmail", name: "Gmail", is_connected: true })];
+
+    render(
+      <ConnectAppsField
+        interaction={{ ...LEO_INTERACTION, apps: ["Gmail"] }}
+        onSkip={vi.fn()}
+      />
+    );
+
+    expect(
+      screen.getByText("chatPage.clarification.connectApps.allConnectedNote")
+    ).toBeInTheDocument();
+  });
+
+  it("falls back to name matching when an app entry's id no longer resolves in the catalog", () => {
+    mcpAppsMock.apps = [makeApp({ id: "gmail", name: "Gmail", is_connected: true })];
+
+    render(
+      <ConnectAppsField
+        interaction={{
+          ...LEO_INTERACTION,
+          apps: [{ id: "deleted-app-id", name: "Gmail" }],
+        }}
+        onSkip={vi.fn()}
+      />
+    );
+
+    expect(
+      screen.getByText("chatPage.clarification.connectApps.allConnectedNote")
+    ).toBeInTheDocument();
+  });
+
   it("shows a Continue button instead of the completion note alone once every row is Connected, when onContinue is supplied", () => {
     mcpAppsMock.apps = [makeApp({ provider: "google", is_connected: true })];
     const onContinue = vi.fn();

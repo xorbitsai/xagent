@@ -2,6 +2,7 @@ import { readFileSync } from "node:fs"
 import { resolve } from "node:path"
 import { pathToFileURL } from "node:url"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
+import type { WidgetParentMessageType } from "@/lib/widget-parent-message"
 
 const widgetScriptPath = resolve(process.cwd(), "public/widget.js")
 const widgetScript = readFileSync(widgetScriptPath, "utf8")
@@ -58,7 +59,17 @@ describe("widget close chrome", () => {
     }))
   })
 
-  afterEach(() => {
+  afterEach(async () => {
+    for (const container of document.querySelectorAll(".xagent-widget-container")) {
+      container.remove()
+    }
+    // Let panelRemovalObserver's callback run its production teardown (which
+    // touches `window`) before Vitest tears down the jsdom globals -- a
+    // container left in the DOM until then fires that MutationObserver
+    // callback after `window` is already gone, surfacing as an uncaught
+    // "window is not defined" even though every test still passes.
+    await Promise.resolve()
+
     if (currentScriptDescriptor) {
       Object.defineProperty(document, "currentScript", currentScriptDescriptor)
     } else {
@@ -66,6 +77,16 @@ describe("widget close chrome", () => {
     }
     vi.unstubAllGlobals()
     vi.restoreAllMocks()
+  })
+
+  it("keeps the widget_close message type literal in sync with the host script", () => {
+    // widget.js is a hand-authored static asset with no build-time import
+    // from TS source, so nothing else ties these two literals together --
+    // a rename on one side without the other would silently break the close
+    // button (a same-origin, same-source, correctly-enveloped message the
+    // host would now just ignore) with no compiler error to catch it.
+    const messageType: WidgetParentMessageType = "widget_close"
+    expect(widgetScript).toContain(`data.type === '${messageType}'`)
   })
 
   it("starts closed for a first-time visitor", () => {
@@ -99,6 +120,21 @@ describe("widget close chrome", () => {
     fromIframe("widget_close")
 
     expect(panelEl()).not.toHaveClass("open")
+  })
+
+  it("reopens on FAB click after a widget_close message closed it", () => {
+    // openPanel()/closePanel() share one `isOpen` variable with fab.onclick;
+    // a widget_close message must leave that variable in the same state a
+    // manual FAB close would, not just the panel's CSS class, or the FAB
+    // toggle desyncs from the panel on the very next click.
+    runWidget()
+    fabEl()?.click()
+    fromIframe("widget_close")
+    expect(panelEl()).not.toHaveClass("open")
+
+    fabEl()?.click()
+
+    expect(panelEl()).toHaveClass("open")
   })
 
   it("stops reacting to widget_close once the widget is torn down (removed from the DOM)", async () => {

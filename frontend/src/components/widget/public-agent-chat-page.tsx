@@ -4,7 +4,7 @@ import React, { useCallback, useEffect, useMemo, useState } from "react"
 import { Loader2, MessageSquarePlus } from "lucide-react"
 import { ChatStartScreen } from "@/components/chat/ChatStartScreen"
 import { TaskConversationPanel } from "@/components/task/task-conversation-panel"
-import { WidgetChromeControls } from "@/components/widget/widget-chrome-controls"
+import { iconButtonClassName, WidgetChromeControls } from "@/components/widget/widget-chrome-controls"
 import { AppProvider, useApp, type AppProviderTransportConfig } from "@/contexts/app-context-chat"
 import { resolveReportedTimezone } from "@/hooks/use-websocket"
 import { usePublicFileAccessPolicy } from "@/contexts/file-access-context"
@@ -407,7 +407,7 @@ function PublicConversationContent({
                 onClick={handleNewConversation}
                 title={t("widgetChat.newConversation")}
                 aria-label={t("widgetChat.newConversation")}
-                className="ml-auto p-2 rounded-md text-muted-foreground hover:text-foreground hover:bg-muted/50 transition-colors"
+                className={`ml-auto ${iconButtonClassName}`}
               >
                 <MessageSquarePlus className="w-4 h-4" />
               </button>

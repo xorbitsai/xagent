@@ -5,7 +5,9 @@ import { Loader2, MessageSquarePlus, MoreHorizontal, X } from "lucide-react"
 import { useI18n } from "@/contexts/i18n-context"
 import { postToParentWidget } from "@/lib/widget-parent-message"
 
-const iconButtonClassName =
+// Exported so the standalone share-mode reset button (public-agent-chat-page.tsx)
+// can match this styling instead of drifting with its own duplicate string.
+export const iconButtonClassName =
   "p-2 rounded-md text-muted-foreground hover:text-foreground hover:bg-muted/50 transition-colors "
   + "disabled:pointer-events-none disabled:opacity-50 "
   + "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
@@ -52,8 +54,14 @@ export function WidgetChromeControls({ newConversation }: WidgetChromeControlsPr
     // widget.js can hide this whole iframe from the host page's own FAB, a
     // click entirely outside this document that the two listeners above
     // never see. The iframe is never unmounted, so without this the menu
-    // would still be open the next time the panel is shown.
-    const handleBlur = () => setIsMenuOpen(false)
+    // would still be open the next time the panel is shown. Guarded the same
+    // way as widget.js's own onWindowBlur: focus moving into a child of this
+    // same document (e.g. the chat composer autofocusing) also fires a
+    // window blur without the panel actually being hidden.
+    const handleBlur = () => {
+      if (document.hasFocus()) return
+      setIsMenuOpen(false)
+    }
 
     document.addEventListener("pointerdown", handlePointerDown)
     document.addEventListener("keydown", handleKeyDown)

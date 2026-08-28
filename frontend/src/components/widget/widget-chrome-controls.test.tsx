@@ -101,6 +101,7 @@ describe("WidgetChromeControls", () => {
     fireEvent.click(trigger)
     fireEvent.click(screen.getByRole("menuitem", { name: "Start over" }))
     expect(screen.queryByRole("menu")).toBeNull()
+    expect(onNewConversation).toHaveBeenCalledTimes(1)
 
     rerender(
       <WidgetChromeControls
@@ -115,6 +116,9 @@ describe("WidgetChromeControls", () => {
 
     expect(trigger).toBeDisabled()
     expect(screen.queryByRole("menu")).toBeNull()
+    // Not just "disabled" -- the whole point of this prop is a visible
+    // in-progress indicator on the trigger once the menu itself has closed.
+    expect(trigger.querySelector("svg.animate-spin")).not.toBeNull()
   })
 
   it("closes the menu on Escape", () => {
@@ -139,6 +143,23 @@ describe("WidgetChromeControls", () => {
     fireEvent(window, new Event("blur"))
 
     expect(screen.queryByRole("menu")).toBeNull()
+  })
+
+  it("ignores a blur caused by focus moving within this same document, not the panel being hidden", () => {
+    // e.g. focus moving into the chat composer -- document.hasFocus() stays
+    // true because the iframe itself was never actually hidden; only a blur
+    // where it goes false (focus left the iframe's document entirely) means
+    // the host page hid the panel out from under an open menu.
+    const hasFocusSpy = vi.spyOn(document, "hasFocus").mockReturnValue(true)
+    render(<WidgetChromeControls newConversation={{ label: "Start over", onClick: onNewConversation }} />)
+
+    fireEvent.click(screen.getByRole("button", { name: "widgetChat.moreOptions" }))
+    expect(screen.getByRole("menu")).toBeInTheDocument()
+
+    fireEvent(window, new Event("blur"))
+
+    expect(screen.getByRole("menu")).toBeInTheDocument()
+    hasFocusSpy.mockRestore()
   })
 
   it("ignores a pointerdown whose target was removed from the DOM during dispatch", () => {

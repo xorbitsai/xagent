@@ -362,12 +362,16 @@ describe("SessionAgentChatPage", () => {
     fireEvent.click(trigger)
     fireEvent.click(screen.getByRole("menuitem", { name: "widgetSession.startNewConversation" }))
     expect(screen.queryByRole("menu")).toBeNull()
+    expect(app.startNewConversation).toHaveBeenCalledTimes(1)
 
     app.isConversationResetPending = true
     rerender(<SessionAgentChatPage />)
 
     expect(trigger).toBeDisabled()
     expect(screen.queryByRole("menu")).toBeNull()
+    // Not just "disabled" -- the whole point of this prop is a visible
+    // in-progress indicator on the trigger once the menu itself has closed.
+    expect(trigger.querySelector("svg.animate-spin")).not.toBeNull()
   })
 
   it("shows connecting and the non-blocking absolute-expiry warning", () => {

@@ -37,15 +37,16 @@ def _operations(connection):
     return Operations(MigrationContext.configure(connection))
 
 
-def _create_table(connection):
+def _create_table(connection, *, omit_description=False):
+    description_column = "" if omit_description else "description TEXT,"
     connection.execute(
         text(
-            """
+            f"""
             CREATE TABLE public_mcp_apps (
                 id INTEGER PRIMARY KEY,
                 app_id VARCHAR(100) NOT NULL UNIQUE,
                 name VARCHAR(200) NOT NULL,
-                description TEXT,
+                {description_column}
                 icon VARCHAR(1000),
                 transport VARCHAR(50) NOT NULL DEFAULT 'oauth',
                 provider_name VARCHAR(50),
@@ -105,28 +106,17 @@ def test_upgrade_warns_and_still_inserts_when_column_missing(tmp_path, caplog):
     engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
     migration = _load_migration_module()
     with engine.begin() as connection:
-        connection.execute(
-            text(
-                """
-                CREATE TABLE public_mcp_apps (
-                    id INTEGER PRIMARY KEY,
-                    app_id VARCHAR(100) NOT NULL UNIQUE,
-                    name VARCHAR(200) NOT NULL,
-                    icon VARCHAR(1000),
-                    transport VARCHAR(50) NOT NULL DEFAULT 'oauth',
-                    provider_name VARCHAR(50),
-                    category VARCHAR(100),
-                    oauth_scopes JSON,
-                    is_visible_in_connector BOOLEAN NOT NULL DEFAULT 1,
-                    launch_config JSON
-                )
-                """
-            )
-        )
+        _create_table(connection, omit_description=True)
         with patch.object(migration, "op", _operations(connection)):
             with caplog.at_level("WARNING"):
                 migration.upgrade()
         assert "chartmogul" in _app_ids(connection)
+        assert any(
+            "description" in message and "chartmogul" in message
+            for message in caplog.messages
+        ), (
+            f"expected a warning naming the dropped 'description' column, got: {caplog.text!r}"
+        )
 
 
 def test_seed_row_matches_registry():
@@ -196,6 +186,29 @@ def test_chartmogul_mcp_ref_is_a_pinned_commit():
     assert match is not None
     assert re.fullmatch(r"[0-9a-f]{40}", match.group(1)), (
         f"CHARTMOGUL_MCP_REF={match.group(1)!r} is not a full 40-character commit SHA"
+    )
+
+
+def test_dockerfile_vendoring_precedes_backend_build_copies():
+    """The ChartMogul clone+sync RUN block is deliberately placed before the
+    `COPY --from=backend-build /opt/xagent/src` line (per the comment above
+    it in the Dockerfile) so an xagent source change doesn't also bust this
+    unrelated third-party clone's build cache. That ordering is an invariant
+    nothing else enforces -- a future edit could silently move it back
+    (regressing build times, not correctness) with no test or build failure
+    to catch it.
+    """
+    dockerfile = (
+        Path(__file__).parent.parent.parent / "docker/Dockerfile.backend"
+    ).read_text()
+    vendoring_index = dockerfile.index("ARG INSTALL_CHARTMOGUL=true")
+    backend_build_copy_index = dockerfile.index(
+        "COPY --from=backend-build /opt/xagent/src /opt/xagent/src"
+    )
+    assert vendoring_index < backend_build_copy_index, (
+        "the ChartMogul vendoring block must come before the "
+        "backend-build COPY instructions, or every xagent src/ change "
+        "will also bust its build cache"
     )
 
 

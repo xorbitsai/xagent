@@ -14,8 +14,9 @@ from ...language import (
     OUTPUT_LANGUAGE_SOURCE_PLAN,
     detect_prose_script_mismatch,
     detect_response_language_script_mismatch,
+    effective_output_language,
     normalize_response_language_label,
-    output_language_policy,
+    output_language_directives,
     plan_language_rules,
 )
 from ..base import (
@@ -548,10 +549,11 @@ class LLMPlanGenerator(PlanGenerator):
             "execution_id": request.execution_id,
             "replan": request.replan,
             "latest_user_request": self._latest_user_request_preview(latest_request),
-            "output_language_policy": output_language_policy(
+            "output_language_policy": output_language_directives(
                 None
                 if language_source == OUTPUT_LANGUAGE_SOURCE_PLAN
-                else expected_language
+                else expected_language,
+                section="plan_payload",
             ),
             "messages": latest_messages,
             "retrieved_memory_context": request.context.metadata.get(
@@ -591,9 +593,7 @@ class LLMPlanGenerator(PlanGenerator):
         metadata = getattr(context, "metadata", None)
         if not isinstance(metadata, dict):
             return "", ""
-        language = normalize_response_language_label(
-            str(metadata.get(OUTPUT_LANGUAGE_METADATA_KEY) or "")
-        )
+        language = effective_output_language(context)
         source = str(metadata.get(OUTPUT_LANGUAGE_SOURCE_METADATA_KEY) or "")
         if language and not source and metadata.get("pattern") == "dag_plan_execute":
             source = OUTPUT_LANGUAGE_SOURCE_PLAN

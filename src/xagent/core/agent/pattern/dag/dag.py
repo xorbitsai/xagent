@@ -20,8 +20,9 @@ from ...frame import ExecutionFrame, ExecutionSnapshot, ExecutionStatus
 from ...grounding import grounding_rule
 from ...language import (
     OUTPUT_LANGUAGE_METADATA_KEY,
+    effective_output_language,
     final_answer_language_rule,
-    output_language_policy,
+    output_language_directives,
 )
 from ...result import unwrap_final_answer_content
 from ...runtime import (
@@ -1508,10 +1509,9 @@ class DAGPattern(AgentPattern):
             if getattr(message, "role", None) == "user"
         ]
         payload = {
-            "output_language_policy": output_language_policy(
-                getattr(context, "metadata", {}).get(OUTPUT_LANGUAGE_METADATA_KEY)
-                if isinstance(getattr(context, "metadata", {}), dict)
-                else None
+            "output_language_policy": output_language_directives(
+                effective_output_language(context),
+                section="completion_assessment",
             ),
             "authoritative_user_requests": authoritative_user_requests,
             "messages": latest_messages,
@@ -1697,7 +1697,10 @@ class DAGPattern(AgentPattern):
         return {dep: self.step_results.get(dep) for dep in step.dependencies}
 
     def _step_instruction(self, *, root_context: Any, step: PlanStep) -> str:
-        language_policy = output_language_policy(self._output_language(root_context))
+        language_policy = output_language_directives(
+            effective_output_language(root_context),
+            section="dag_step_instruction",
+        )
         dependency_note = (
             "Dependency results, if any, are provided immediately before this "
             "message. Use them as inputs for this step only."

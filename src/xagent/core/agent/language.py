@@ -2,7 +2,7 @@
 
 import re
 from dataclasses import dataclass
-from typing import Literal
+from typing import Any, Literal
 
 OUTPUT_LANGUAGE_METADATA_KEY = "output_language"
 OUTPUT_LANGUAGE_SOURCE_METADATA_KEY = "output_language_source"
@@ -368,6 +368,24 @@ def normalize_response_language_label(response_language: str | None) -> str:
     return ""
 
 
+def effective_output_language(context: Any) -> str:
+    """Return the normalized output language a context carries, or an empty string.
+
+    Callers pass whatever shape they hold: an execution context, a serialized
+    context dict, or an object without usable metadata.
+    """
+    metadata = (
+        context.get("metadata")
+        if isinstance(context, dict)
+        else getattr(context, "metadata", None)
+    )
+    if not isinstance(metadata, dict):
+        return ""
+    return normalize_response_language_label(
+        str(metadata.get(OUTPUT_LANGUAGE_METADATA_KEY) or "")
+    )
+
+
 def response_language_rules(*, subject: str = "current user request") -> str:
     """Return language rules for user-facing prose.
 
@@ -426,3 +444,38 @@ def dag_step_language_rules(*, subject: str = "output language policy") -> str:
         "step language unless the output language policy explicitly allows that "
         "language change."
     )
+
+
+OutputLanguageSection = Literal[
+    "root_system_context",
+    "dag_step_scope",
+    "dag_step_rules",
+    "dag_step_instruction",
+    "completion_assessment",
+    "plan_payload",
+]
+
+
+def output_language_directives(
+    language: str | None,
+    *,
+    section: OutputLanguageSection,
+) -> str:
+    """Return the language instructions one prompt section must emit.
+
+    Sections differ because the surrounding prompt text differs, not because the
+    language decision differs; the decision lives in effective_output_language.
+    """
+    if section == "root_system_context":
+        if language:
+            return (
+                f"{response_language_rules()}"
+                "\n\nOutput language policy:\n"
+                f"{output_language_policy(language)}"
+            )
+        return response_language_rules()
+    if section == "dag_step_scope":
+        return output_language_policy(language).strip()
+    if section == "dag_step_rules":
+        return dag_step_language_rules()
+    return output_language_policy(language)

@@ -537,13 +537,25 @@ export function TaskConversationPanel({
     const currentTurnStart =
       userTurnAnchors.length > 0 ? userTurnAnchors[userTurnAnchors.length - 1].timestamp : null
 
+    // No user turn has happened yet (e.g. right after a Hire-flow seed,
+    // before the user's first reply) - there is no "current turn" for this
+    // tier to scope to, and falling through to an unscoped match would
+    // reintroduce exactly the stale-Hire-card bug this scoping exists to
+    // prevent (the seed message is the only thing with interactions at
+    // that point). shouldShowVirtualMessage's status-driven fallback
+    // already covers a genuine pause whose own message hasn't persisted
+    // yet, so returning null here is safe, not a missed case.
+    if (currentTurnStart === null) {
+      return null
+    }
+
     for (let i = messageItems.length - 1; i >= 0; i--) {
       const item = messageItems[i]
       if (
         item.role === "assistant" &&
         item.interactions &&
         item.interactions.length > 0 &&
-        (currentTurnStart === null || item.timestamp >= currentTurnStart)
+        item.timestamp >= currentTurnStart
       ) {
         return item.id
       }

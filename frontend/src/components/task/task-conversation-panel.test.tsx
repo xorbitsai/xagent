@@ -709,6 +709,44 @@ describe("TaskConversationPanel", () => {
     expect(hireItem).toHaveAttribute("data-active", "false")
   })
 
+  it("does not activate a Hire-flow seed message when no user turn has happened yet", () => {
+    // The turn-scoping guard above falls through unscoped when there is no
+    // user message yet (currentTurnStart === null) - e.g. right after a
+    // Hire-flow seed, before the user's first reply, if the agent's own
+    // kickoff execution hits a genuine oauth_token_required pause before
+    // any user turn exists. Falling through unscoped there would match the
+    // Hire-seed message itself (the only thing with interactions at that
+    // point), reintroducing the exact bug the turn-scoping exists to
+    // prevent - just in the zero-user-turns edge case instead of the
+    // stale-earlier-turn one.
+    appState.messages = [
+      {
+        id: "hire-seed",
+        role: "assistant",
+        content: "Connect your apps to get started.",
+        timestamp: 600,
+        isResult: true,
+        interactions: [{ type: "connect_apps", field: "connect_apps", apps: ["Notion"] }],
+      },
+    ]
+    appState.traceEvents = []
+    appState.currentTask = {
+      id: "43",
+      title: "Preview",
+      description: "Preview",
+      status: "waiting_for_user",
+      createdAt: "2026-01-01T00:00:00Z",
+      updatedAt: "2026-01-01T00:00:00Z",
+      waitingQuestion: "I need access to Gmail to continue. Please connect below, then let me know once you have.",
+    } as any
+
+    render(<TaskConversationPanel mode="embedded-preview" />)
+
+    const rendered = screen.getAllByTestId("chat-message")
+    const hireItem = rendered.find((m) => m.textContent?.includes("Connect your apps to get started."))
+    expect(hireItem).toHaveAttribute("data-active", "false")
+  })
+
   it("keeps an identified text-only wait separate from stale structured trace interactions", () => {
     appState.messages = [{
       id: "user-r2",

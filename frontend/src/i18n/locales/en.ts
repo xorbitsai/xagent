@@ -353,7 +353,7 @@ const en = {
         connecting: "Connecting…",
         skip: "I'll do this later",
         continue: "Continue",
-        needAccess: "I need access to {apps} to continue. Please connect it below, then let me know once you have.",
+        needAccess: "I need access to {apps} to continue. Please connect below, then let me know once you have.",
         connectFailed: "Couldn't connect {provider}. Please try again.",
         popupBlocked: "Popup blocked — please allow popups for this site to connect.",
         privacyNote: "{appName} never sees your password.",

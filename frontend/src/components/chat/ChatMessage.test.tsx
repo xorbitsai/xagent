@@ -21,7 +21,13 @@ vi.mock("@/contexts/app-context-chat", () => ({
 
 vi.mock("@/contexts/i18n-context", () => ({
   useI18n: () => ({
-    t: (key: string) => key,
+    // Interpolates vars into the key (matching clarification-form.test.tsx's
+    // mock convention) rather than ignoring them, so a test asserting on the
+    // rendered text actually exercises whether the real vars (e.g. {apps})
+    // reached t() - a bare `(key) => key` mock would still pass even if
+    // {apps} were missing, empty, or wrong.
+    t: (key: string, vars?: Record<string, string | number>) =>
+      vars ? `${key}:${JSON.stringify(vars)}` : key,
     tDynamic: (key: string) => key,
   }),
 }))
@@ -76,13 +82,21 @@ vi.mock("./TraceEventRenderer", async () => {
   }
 })
 
-vi.mock("./clarification-form", () => ({
-  ClarificationForm: (props: unknown) => {
-    clarificationFormMock(props)
-    return null
-  },
-  LIVE_WIDGET_TYPES: new Set(["connect_apps"]),
-}))
+vi.mock("./clarification-form", async () => {
+  // Re-export the REAL LIVE_WIDGET_TYPES (not a second hardcoded copy) so
+  // this test suite can't silently diverge from production if a live-widget
+  // type is ever added there - only ClarificationForm itself is stubbed out.
+  const actual = await vi.importActual<typeof import("./clarification-form")>(
+    "./clarification-form",
+  )
+  return {
+    ...actual,
+    ClarificationForm: (props: unknown) => {
+      clarificationFormMock(props)
+      return null
+    },
+  }
+})
 
 import { ChatMessage } from "./ChatMessage"
 
@@ -157,6 +171,24 @@ describe("ChatMessage Session file capability", () => {
     )
   })
 
+  it("joins multiple requested app names with a locale-correct conjunction, not a raw comma", () => {
+    render(
+      <ChatMessage
+        role="assistant"
+        content="raw backend text"
+        interactions={[
+          { type: "connect_apps", field: "connect_apps", apps: ["Gmail", "Slack", "Notion"] },
+        ]}
+      />,
+    )
+
+    expect(
+      screen.getByText(
+        'chatPage.clarification.connectApps.needAccess:{"apps":"Gmail, Slack, and Notion"}',
+      ),
+    ).toBeInTheDocument()
+  })
+
   it("replaces the raw backend pause text with a localized message when every interaction is connect_apps", () => {
     render(
       <ChatMessage
@@ -167,7 +199,7 @@ describe("ChatMessage Session file capability", () => {
     )
 
     expect(
-      screen.getByText("chatPage.clarification.connectApps.needAccess"),
+      screen.getByText('chatPage.clarification.connectApps.needAccess:{"apps":"Gmail"}'),
     ).toBeInTheDocument()
     expect(
       screen.queryByText(/I need access to Gmail to continue\. Please connect/),
@@ -185,7 +217,7 @@ describe("ChatMessage Session file capability", () => {
       />,
     )
     expect(
-      screen.getByText("chatPage.clarification.connectApps.needAccess"),
+      screen.getByText('chatPage.clarification.connectApps.needAccess:{"apps":"Gmail"}'),
     ).toBeInTheDocument()
 
     rerender(
@@ -198,7 +230,7 @@ describe("ChatMessage Session file capability", () => {
     )
 
     expect(
-      screen.getByText("chatPage.clarification.connectApps.needAccess"),
+      screen.getByText('chatPage.clarification.connectApps.needAccess:{"apps":"Gmail"}'),
     ).toBeInTheDocument()
     expect(
       screen.queryByText(/I need access to Gmail to continue\. Please connect/),
@@ -212,7 +244,7 @@ describe("ChatMessage Session file capability", () => {
         content="Which app should I use?"
         interactions={[
           { type: "connect_apps", field: "connect_apps", apps: ["Gmail"] },
-          { type: "select", field: "app_choice", label: "App" },
+          { type: "select_one", field: "app_choice", label: "App" },
         ]}
       />,
     )

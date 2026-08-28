@@ -325,7 +325,7 @@ export function ChatMessage({
   contextBadges,
   taskRuntimeExtensionMetadata,
 }: ChatMessageProps) {
-  const { t, tDynamic } = useI18n();
+  const { t, tDynamic, locale } = useI18n();
   const { filesDisabled, openFilePreview } = useApp();
   const router = useRouter();
   const isUser = role === "user";
@@ -498,7 +498,14 @@ export function ChatMessage({
   const displayContent =
     connectAppsOnlyApps && connectAppsOnlyApps.length > 0
       ? t("chatPage.clarification.connectApps.needAccess", {
-          apps: connectAppsOnlyApps.join(", "),
+          // Intl.ListFormat instead of a raw ", " join: locale-correct
+          // conjunction ("Gmail and Slack" / "Gmail, Slack, and Notion")
+          // for the (rare but real) multi-app pause case, matching the
+          // conjunction the connectApps.title copy itself doesn't need but
+          // this sentence does since it lists the apps inline.
+          apps: new Intl.ListFormat(locale, { style: "long", type: "conjunction" }).format(
+            connectAppsOnlyApps,
+          ),
         })
       : content;
 

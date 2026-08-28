@@ -6430,10 +6430,12 @@ async def _handle_chat_message_unserialized(
                     # the sync here, before this handler's own admission
                     # check, let a command that goes on to lose reserve_resume
                     # still clobber the turn/cache context an already-
-                    # admitted resume is executing under. Deferred to right
-                    # after reserve_resume succeeds below instead, so it can
-                    # only ever run once this command is the sole admitted
-                    # owner of the cached agent.
+                    # admitted resume is executing under. Deferred further
+                    # still, to right after this handler's own message-
+                    # delivery claim actually commits (see the comment there)
+                    # - reserve_resume succeeding only proves no OTHER
+                    # command holds the slot, not that THIS message will be
+                    # delivered at all.
                     resolved_execution_scope=resolved_execution_scope,
                 )
                 if hasattr(agent_service, "set_outbound_message_handler"):
@@ -6455,11 +6457,6 @@ async def _handle_chat_message_unserialized(
                         rejection_outcome="not_accepted",
                     )
                     return
-                # This command is now the sole admitted owner of the cached
-                # agent's tool_config for this task - see the comment on
-                # get_agent_for_task above for why the sync can't safely run
-                # any earlier than this.
-                get_agent_manager().sync_connector_runtime_turn(task_id, turn_id)
                 # Pass the user-typed bubble text + display-safe file refs
                 # alongside the LLM-augmented execution text. The runner
                 # persists them onto Message.metadata so its tracing
@@ -6494,6 +6491,20 @@ async def _handle_chat_message_unserialized(
                         await finish_existing_delivery(delivery_claim)
                         return
                     delivery_claimed = True
+                    # reserve_resume above only proves no OTHER command holds
+                    # the resume slot - it says nothing about whether THIS
+                    # message will actually be delivered. Syncing any earlier
+                    # (e.g. right after reserve_resume, before this claim
+                    # commits) mutates the shared cached agent's tool_config
+                    # for a turn that might never be used if the claim below
+                    # then fails, with no rollback on that path - and because
+                    # admission doesn't consult running_tasks, a still-live
+                    # original execution for this same task could observe
+                    # that speculative, possibly-abandoned turn binding mid-
+                    # flight. Only once delivery_claimed is true is turn_id
+                    # guaranteed to be the turn this handler is about to
+                    # inject, so only now is the sync safe.
+                    get_agent_manager().sync_connector_runtime_turn(task_id, turn_id)
 
                     # Read before the injection below and before the posted
                     # fork, so both branches carry the same observation --

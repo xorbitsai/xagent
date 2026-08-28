@@ -1232,6 +1232,65 @@ async def test_rejected_live_resume_never_syncs_connector_runtime_turn(
 
 
 @pytest.mark.asyncio
+async def test_admitted_but_undelivered_message_never_syncs_connector_runtime_turn(
+    db_session,
+) -> None:
+    """reserve_resume succeeding only proves no OTHER command holds the
+    resume slot - it says nothing about whether THIS message will actually
+    be delivered. The sync must wait for the delivery claim to actually
+    commit, so a message that goes on to fail that claim (e.g. a retried
+    delivery attempt that already failed) never mutates the shared cached
+    agent's tool_config for a turn nothing ends up using - with no rollback
+    on that path, that mutation would otherwise be observable by a still-
+    live original execution for this same task, which admission never
+    checks for."""
+    from xagent.web.api.websocket import _UserMessageDeliverySnapshot
+
+    owner = _user(db_session, "undelivered-sync-owner")
+    task = _task(db_session, owner.id, status=TaskStatus.RUNNING)
+    task.runner_id = "live-runner"
+    task.run_id = "live-run"
+    db_session.commit()
+    agent = MagicMock()
+    agent.supports_live_control.return_value = True
+    agent.get_dag_pattern.return_value = None
+    mgr = MagicMock(get_agent_for_task=AsyncMock(return_value=agent))
+    ws_manager = MagicMock(
+        broadcast_to_task=AsyncMock(),
+        send_personal_message=AsyncMock(),
+    )
+    bg_mgr = MagicMock()
+    bg_mgr.reserve_resume.return_value = True
+
+    failed_claim = _UserMessageDeliverySnapshot(
+        claimed=False, payload_matches=True, failed=True, pending=False
+    )
+
+    with (
+        patch("xagent.web.api.chat.get_agent_manager", return_value=mgr),
+        patch("xagent.web.api.websocket.manager", ws_manager),
+        patch("xagent.web.api.websocket.background_task_manager", bg_mgr),
+        patch(
+            "xagent.web.api.websocket._claim_user_message_delivery_isolated",
+            return_value=failed_claim,
+        ),
+    ):
+        await handle_chat_message(
+            MagicMock(),
+            int(task.id),
+            {
+                "message": "a retried delivery that already failed once",
+                "client_message_id": "undelivered-turn-1",
+                "user": owner,
+                "files": [],
+            },
+        )
+
+    mgr.sync_connector_runtime_turn.assert_not_called()
+    bg_mgr.release_resume_reservation.assert_called_once_with(int(task.id))
+
+
+@pytest.mark.asyncio
 async def test_admitted_explicit_resume_syncs_connector_runtime_turn_after_reservation(
     db_session,
 ) -> None:

@@ -1278,11 +1278,13 @@ class TestVisionToolUnderstandMediaEnvelope:
         assert result.error == expected_error
 
     @pytest.mark.asyncio
-    async def test_understand_media_tool_call_message_unchanged(
+    async def test_understand_media_tool_call_fails_explicitly(
         self, vision_tool_without_workspace, mock_vision_model
     ):
-        """The existing tool-call message text is not part of this fix and
-        must survive the rewrite unchanged."""
+        """A tool-call envelope is not an answer: understand_media reports an
+        explicit tool-side failure rather than a successful explanatory
+        answer (PR #1787 review finding N5, superseding the message text
+        #1721 deliberately preserved)."""
         mock_vision_model.vision_chat.return_value = {
             "type": "tool_call",
             "tool_calls": [{"id": "c1", "type": "function"}],
@@ -1293,11 +1295,9 @@ class TestVisionToolUnderstandMediaEnvelope:
             "data:image/jpeg;base64,ZmFrZV9pbWFnZV9kYXRh", "Describe this."
         )
 
-        assert result.success is True
-        assert result.answer == (
-            "Model triggered tool call instead of answering: "
-            "[{'id': 'c1', 'type': 'function'}]"
-        )
+        assert result.success is False
+        assert result.answer is None
+        assert result.error == "Vision model returned a tool call instead of an answer"
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(

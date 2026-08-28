@@ -210,6 +210,74 @@ def test_downgrade_leaves_a_non_matching_row_in_place(tmp_path):
         assert row[1] == 1
 
 
+def test_upgrade_tolerates_an_admin_edited_description_as_still_our_row(tmp_path):
+    """description is admin-editable even on this row (see downgrade()'s
+    comment), so a row that only differs from ROW in its description is an
+    admin's ordinary edit to our own previously-seeded row, not a foreign
+    collision -- upgrade() must stay a no-op here, not raise. Matching on
+    name/transport (both code-owned and immutable) is enough to recognize
+    it; requiring description too would make a sanctioned admin edit block
+    a later idempotent re-run."""
+    engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
+    migration = _load_migration_module()
+    with engine.begin() as connection:
+        _create_table(connection)
+        connection.execute(
+            text(
+                "INSERT INTO public_mcp_apps "
+                "(app_id, name, description, transport, is_visible_in_connector) "
+                "VALUES ('chartmogul', 'ChartMogul', 'An admin edited this', "
+                "'stdio', 0)"
+            )
+        )
+        with patch.object(migration, "op", _operations(connection)):
+            migration.upgrade()
+        row = connection.execute(
+            text(
+                "SELECT COUNT(*), MIN(description), MIN(is_visible_in_connector) "
+                "FROM public_mcp_apps WHERE app_id='chartmogul'"
+            )
+        ).first()
+        assert row[0] == 1  # no duplicate inserted, no raise
+        assert row[1] == "An admin edited this"  # description left alone
+        assert row[2] == 0  # still hidden
+
+
+def test_upgrade_forces_hidden_on_a_coincidentally_matching_visible_row(tmp_path):
+    """A row that coincidentally matches on name/transport (real for an
+    operator who picked the same obvious name and transport for their own
+    ChartMogul integration) but was never forced hidden -- e.g. hand-made
+    before this migration shipped, is_visible_in_connector defaults to
+    TRUE -- must not sail through the "this is our own row" no-op path
+    still visible. is_visible_in_connector is deliberately excluded from
+    the match itself (an admin can flip it later; that's a separate,
+    already-accepted risk), but a completed upgrade() must never leave a
+    matching row visible regardless of what it finds."""
+    engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
+    migration = _load_migration_module()
+    with engine.begin() as connection:
+        _create_table(connection)
+        connection.execute(
+            text(
+                "INSERT INTO public_mcp_apps "
+                "(app_id, name, description, transport, is_visible_in_connector) "
+                "VALUES ('chartmogul', 'ChartMogul', 'my own notes', "
+                "'stdio', 1)"
+            )
+        )
+        with patch.object(migration, "op", _operations(connection)):
+            migration.upgrade()
+        row = connection.execute(
+            text(
+                "SELECT COUNT(*), MIN(description), MIN(is_visible_in_connector) "
+                "FROM public_mcp_apps WHERE app_id='chartmogul'"
+            )
+        ).first()
+        assert row[0] == 1  # no duplicate inserted, no raise
+        assert row[1] == "my own notes"  # description still left alone
+        assert row[2] == 0  # forced hidden, not left visible
+
+
 def test_upgrade_raises_if_visibility_column_is_missing(tmp_path):
     """Exercises the RuntimeError path directly (this suite runs without
     -O, so the assert-vs-raise distinction is otherwise never actually

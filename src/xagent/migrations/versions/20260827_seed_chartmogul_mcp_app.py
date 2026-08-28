@@ -36,6 +36,15 @@ PUBLIC_MCP_APPS_TABLE = sa.table(
 
 APP_ID = "chartmogul"
 
+# The full set of fields that identify "our" row. downgrade() matches on
+# all of them before deleting -- a stricter bar is the safe direction
+# there, since a false match destroys data while a false non-match just
+# leaves a harmless orphan. upgrade() uses a narrower subset of this same
+# tuple (see its own comment) for the opposite reason: a false "not ours"
+# there raises and blocks a deploy, so it can't afford to trip on a field
+# that's expected to legitimately drift.
+IDENTITY_FIELDS = ("name", "description", "transport")
+
 ROW = {
     "app_id": APP_ID,
     "name": "ChartMogul",
@@ -85,14 +94,40 @@ def upgrade() -> None:
             "chartmogul row must not seed visible"
         )
 
-    # Only compares columns that actually exist -- description can be
-    # dropped on a pre-this-migration schema (handled below), and this
-    # collision check must degrade the same way rather than erroring on a
-    # column that isn't there yet.
-    identity_fields = [f for f in ("name", "description", "transport") if f in columns]
+    # Which of ROW's keys actually exist as columns -- description can be
+    # dropped on a pre-this-migration schema, and both the own-row check
+    # below and the insert further down must degrade the same way rather
+    # than erroring on a column that isn't there yet.
+    present_keys = set(ROW) & columns
+
+    # Deliberately excludes 'description' from IDENTITY_FIELDS here, unlike
+    # downgrade()'s stricter use of the same tuple: description is
+    # admin-editable even on this row (see downgrade()'s comment below), so
+    # an operator's ordinary edit to it must not make a later idempotent
+    # re-run of this migration mistake its own row for a foreign collision
+    # and raise. name/transport are both code-owned and immutable on a
+    # builtin row (admin_mcp.py's _BUILTIN_PROTECTED_FIELDS), so they're
+    # enough to recognize "this is the row we seeded" without depending on
+    # a field that's expected to drift.
+    own_row_fields = [
+        f for f in IDENTITY_FIELDS if f != "description" and f in present_keys
+    ]
+    if not own_row_fields:
+        # name and transport are both core, NOT NULL columns this table has
+        # carried since long before this migration -- unlike description,
+        # neither is ever expected to be missing. An empty own_row_fields
+        # would make sa.select() below emit a column-less SELECT (invalid
+        # SQL, a confusing DB-level error) and, were that guarded around
+        # instead, would make the match check vacuously true for any
+        # existing row regardless of content. Fail loudly and specifically
+        # rather than either of those.
+        raise RuntimeError(
+            "public_mcp_apps.name and .transport are both missing; cannot "
+            "tell an existing chartmogul row apart from a foreign one"
+        )
     existing_row = (
         bind.execute(
-            sa.select(*(PUBLIC_MCP_APPS_TABLE.c[f] for f in identity_fields)).where(
+            sa.select(*(PUBLIC_MCP_APPS_TABLE.c[f] for f in own_row_fields)).where(
                 PUBLIC_MCP_APPS_TABLE.c.app_id == APP_ID
             )
         )
@@ -100,10 +135,23 @@ def upgrade() -> None:
         .first()
     )
     if existing_row is not None:
-        if all(existing_row[f] == ROW[f] for f in identity_fields):
-            # Matches what this migration would have inserted -- this is our
-            # own row from an earlier run (upgrade() must stay idempotent),
-            # not a collision. Nothing to do.
+        if all(existing_row[f] == ROW[f] for f in own_row_fields):
+            # Matches what this migration would have inserted -- either our
+            # own row from an earlier run, or (rarer) a row that happens to
+            # coincide on name/transport. Either way, force hidden rather
+            # than trusting whatever is_visible_in_connector already holds:
+            # it isn't part of the match (an admin flipping it later is a
+            # separate, already-accepted risk -- see the registry's
+            # comment), so a coincidentally-matching row that was already
+            # visible would otherwise sail through untouched and start
+            # getting ChartMogul's real launch_config overlaid onto it at
+            # read time. A no-op if it's already hidden, which is the
+            # common case for our own row.
+            bind.execute(
+                sa.update(PUBLIC_MCP_APPS_TABLE)
+                .where(PUBLIC_MCP_APPS_TABLE.c.app_id == APP_ID)
+                .values(is_visible_in_connector=False)
+            )
             return
         # 'chartmogul' had no special meaning before this migration: nothing
         # stopped an operator from hand-creating a custom PublicMCPApp with
@@ -117,10 +165,10 @@ def upgrade() -> None:
         # collision by hand instead.
         raise RuntimeError(
             f"public_mcp_apps already has a row with app_id={APP_ID!r} "
-            "that this migration did not create (its name, description, "
-            "or transport don't match the seed row) -- rename or remove "
-            "that row before upgrading, since 'chartmogul' is now a "
-            "reserved built-in app_id"
+            "that this migration did not create (its name or transport "
+            "don't match the seed row) -- rename or remove that row "
+            "before upgrading, since 'chartmogul' is now a reserved "
+            "built-in app_id"
         )
 
     # Silently degrades rather than failing outright (this table is never
@@ -147,6 +195,11 @@ def downgrade() -> None:
     inspector = sa.inspect(bind)
     if "public_mcp_apps" not in set(inspector.get_table_names()):
         return
+    # Degrades the same way upgrade() does if description was dropped from
+    # an old schema -- see the identical comment there.
+    columns = {c["name"] for c in inspector.get_columns("public_mcp_apps")}
+    identity_fields = [f for f in IDENTITY_FIELDS if f in columns]
+
     # Only the catalog entry is removed. ChartMogul has no oauth_providers row
     # (it is key-based). Any MCPServer/UserMCPServer rows created by users who
     # already connected are intentionally left in place -- connect-driven
@@ -154,15 +207,15 @@ def downgrade() -> None:
     # normal disconnect path.
     #
     # An unconditional DELETE-by-app_id is NOT safe here: upgrade() only
-    # ever inserts a row matching name/description/transport exactly (a
-    # foreign row with this app_id makes it raise instead), but there is no
-    # tracking column recording that this row came from this migration.
-    # Matching on name/description/transport (specific enough that a
-    # hand-made row coincidentally matching all three isn't a realistic
-    # concern) is the same identity check upgrade() itself uses to tell "our
-    # row" from a collision -- a row that doesn't match is left in place
-    # rather than destroyed. Mirrors 20260806_seed_chrome_mcp_app.py's
-    # downgrade for the same reason.
+    # ever inserts a row matching IDENTITY_FIELDS exactly (a foreign row
+    # with this app_id makes it raise instead), but there is no tracking
+    # column recording that this row came from this migration. Matching on
+    # IDENTITY_FIELDS (specific enough that a hand-made row coincidentally
+    # matching all of them isn't a realistic concern) is the same identity
+    # check upgrade() itself uses to tell "our row" from a collision -- a
+    # row that doesn't match is left in place rather than destroyed.
+    # Mirrors 20260806_seed_chrome_mcp_app.py's downgrade for the same
+    # reason.
     # Also connect/disconnect routes 404 once this row is gone
     # (get_app_by_id returns None), so leftover connections from users who
     # already connected are removed via the server-level route (DELETE
@@ -173,10 +226,9 @@ def downgrade() -> None:
     # then leaves a hidden orphan row behind rather than risking deleting
     # operator-owned data. Same tradeoff the chrome and zoom seed migrations
     # make for the identical reason.
-    bind.execute(
-        sa.delete(PUBLIC_MCP_APPS_TABLE)
-        .where(PUBLIC_MCP_APPS_TABLE.c.app_id == APP_ID)
-        .where(PUBLIC_MCP_APPS_TABLE.c.name == ROW["name"])
-        .where(PUBLIC_MCP_APPS_TABLE.c.description == ROW["description"])
-        .where(PUBLIC_MCP_APPS_TABLE.c.transport == ROW["transport"])
+    query = sa.delete(PUBLIC_MCP_APPS_TABLE).where(
+        PUBLIC_MCP_APPS_TABLE.c.app_id == APP_ID
     )
+    for field in identity_fields:
+        query = query.where(PUBLIC_MCP_APPS_TABLE.c[field] == ROW[field])
+    bind.execute(query)

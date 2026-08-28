@@ -304,10 +304,12 @@ COPY --from=uv /uv /uvx /usr/local/bin/
 # complexity.
 #
 # Gated behind INSTALL_CHARTMOGUL, mirroring INSTALL_CHROME below: default
-# true keeps the default build unchanged, but a deployment that doesn't
-# want this connector -- or whose build environment can't reach
-# github.com -- can pass --build-arg INSTALL_CHARTMOGUL=false to skip the
-# clone, the extra interpreter download, and the image weight entirely.
+# true means every standard image build now clones this repo, downloads a
+# second Python 3.13 interpreter, and carries the added image weight, same
+# as INSTALL_CHROME's default already adds a Chrome install and npx cache.
+# A deployment that doesn't want this connector -- or whose build
+# environment can't reach github.com -- can pass
+# --build-arg INSTALL_CHARTMOGUL=false to skip all of that entirely.
 ARG INSTALL_CHARTMOGUL=true
 ARG CHARTMOGUL_MCP_REPO_URL="https://github.com/chartmogul/chartmogul-mcp-server.git"
 ARG CHARTMOGUL_MCP_REF="e385e9b8987135f8753a25bbb30645cdfcd505c0"

@@ -39,7 +39,7 @@ APP_ID = "chartmogul"
 ROW = {
     "app_id": APP_ID,
     "name": "ChartMogul",
-    "description": "Connect your ChartMogul account to query subscription metrics, customers, and revenue analytics.",
+    "description": "Connect your ChartMogul account to look up subscription metrics, customers, and revenue analytics -- this connector can also create and update customers, contacts, opportunities, tasks, plans, and invoices, not just read them.",
     "icon": "https://www.google.com/s2/favicons?domain=chartmogul.com&sz=128",
     "transport": "stdio",
     "provider_name": None,

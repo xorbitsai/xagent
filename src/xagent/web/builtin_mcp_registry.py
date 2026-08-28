@@ -1139,7 +1139,7 @@ def get_builtin_public_mcp_app_rows() -> list[dict[str, Any]]:
         {
             "app_id": "chartmogul",
             "name": "ChartMogul",
-            "description": "Connect your ChartMogul account to query subscription metrics, customers, and revenue analytics.",
+            "description": "Connect your ChartMogul account to look up subscription metrics, customers, and revenue analytics -- this connector can also create and update customers, contacts, opportunities, tasks, plans, and invoices, not just read them.",
             "icon": "https://www.google.com/s2/favicons?domain=chartmogul.com&sz=128",
             "transport": "stdio",
             "provider_name": None,
@@ -1159,6 +1159,19 @@ def get_builtin_public_mcp_app_rows() -> list[dict[str, Any]]:
             # follow-up once the gap is closed -- no redeploy needed, per
             # the chrome row's note (is_visible_in_connector is not
             # builtin-protected).
+            #
+            # A second, independent reason to keep this hidden for now:
+            # the vendored server's own handle_api_errors decorator
+            # (chartmogul_mcp/api_client.py, upstream, at the pinned commit)
+            # catches every exception -- auth failures, rate limits, network
+            # errors, parse errors -- logs it, and returns None, which
+            # FastMCP then serializes as a normal (non-error) empty tool
+            # result. An agent or user has no way to distinguish "no data"
+            # from "the token is invalid" or "ChartMogul is down." Fixing
+            # this means patching upstream's error handling (a fork to
+            # maintain across future pin bumps) or writing a first-party
+            # wrapper instead of vendoring (see the design-question note in
+            # PR #1804) -- resolve one of those before unhiding.
             "is_visible_in_connector": False,
             # Key-based (non-oauth), like aws/google-maps/posthog/stripe:
             # ChartMogul has no OAuth flow at all, only a per-user API key

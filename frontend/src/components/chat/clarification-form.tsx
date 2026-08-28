@@ -440,11 +440,12 @@ export function ClarificationForm({
   // once every app the agent actually asked for is already connected.
   const handleContinueConnectApps = async () => {
     const message = t("chatPage.clarification.connectApps.continue")
+    const metadata = requestId ? { request_id: requestId } : {}
     try {
       if (onSend) {
-        await onSend(message, [], {})
+        await onSend(message, [], metadata)
       } else if (sendMessage) {
-        await sendMessage(message, { force: true }, [])
+        await sendMessage(message, { force: true, metadata }, [])
       }
     } catch (error) {
       console.error("Failed to send connect-apps continue response", error)

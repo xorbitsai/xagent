@@ -287,6 +287,48 @@ export default function OnboardingPage() {
     };
   };
 
+  // The three-way result of one preferences-save attempt, shared by both
+  // persistAndLeave's exits and handleLaunch's "Start with X" - both used to
+  // hand-roll this same failure-count/toast/reset/escape policy
+  // independently, which had already drifted once (this round's PR review
+  // found handleLaunch's copy missing the retryable check persistAndLeave's
+  // never needed) and kept costing a fresh review cycle every time a new
+  // edge case surfaced in one copy but not the other.
+  type SavePreferencesOutcome = "saved" | "retry_in_place" | "escaped";
+
+  // `requireRetryableToEscape` is the one real behavioral difference between
+  // the two callers, so it stays a parameter rather than being hidden inside
+  // this function: persistAndLeave's escape just leaves without saving (not
+  // irreversible), so it must escape after MAX_SAVE_FAILURES_BEFORE_ESCAPE
+  // regardless of failure type - the only way out on the one page in the app
+  // with no other nav affordance. handleLaunch's escape proceeds to an
+  // IRREVERSIBLE hireAgentFromTemplate call, so it must only escape for a
+  // RETRYABLE failure - a non-retryable one (a 4xx) will keep rejecting the
+  // identical payload no matter how many times it's retried, so escalating
+  // anyway would hire an agent while preferences were never actually saved.
+  const trySavePreferences = async (
+    failureKey: string,
+    { requireRetryableToEscape }: { requireRetryableToEscape: boolean }
+  ): Promise<SavePreferencesOutcome> => {
+    const saved = await updateUserPreferences(buildPreferencesPayload());
+    if (saved.ok) {
+      saveFailureCountByDestRef.current[failureKey] = 0;
+      return "saved";
+    }
+    const failureCount = (saveFailureCountByDestRef.current[failureKey] ?? 0) + 1;
+    saveFailureCountByDestRef.current[failureKey] = failureCount;
+    if (isMountedRef.current) toast.error(t("onboarding.done.saveFailed"));
+    // Don't escape on the FIRST failure: onboarded would stay false
+    // server-side, and AuthGuard would just bounce the user right back -
+    // retrying in place is the better first response. But a save that keeps
+    // failing must not trap the caller forever - let it through after a
+    // couple of tries even though the save didn't land; they'll just be
+    // asked again next session instead of being stuck this one.
+    const canEscape =
+      failureCount >= MAX_SAVE_FAILURES_BEFORE_ESCAPE && (!requireRetryableToEscape || saved.retryable);
+    return canEscape ? "escaped" : "retry_in_place";
+  };
+
   // Matches the reference UI's finish() exactly: every exit path (header
   // "Skip setup", the goals step's "Not sure yet", the done step's "Take me
   // to the catalogue") persists whatever's been picked so far, unconditionally
@@ -304,48 +346,25 @@ export default function OnboardingPage() {
     // a GET as soon as `destination` mounts, and that GET winning the race
     // against this PATCH would read the old onboarded:false and bounce the
     // user straight back into onboarding right after they left it.
-    const saved = await updateUserPreferences(buildPreferencesPayload());
-    // Set only right before the navigation below actually fires (guarded by
-    // the same isMountedRef check), not unconditionally here - self-review
-    // found that marking it regardless of mount state leaves it dangling in
-    // sessionStorage, live, if the component unmounts for an unrelated
-    // reason (e.g. a forced re-auth navigation) between this failure and the
-    // replace() below: the flag would then wrongly stand down AuthGuard's
-    // very next check on wherever the user actually lands instead.
-    let shouldMarkSaveEscape = false;
-    if (!saved.ok) {
-      const failureCount = (saveFailureCountByDestRef.current[destination] ?? 0) + 1;
-      saveFailureCountByDestRef.current[destination] = failureCount;
+    const outcome = await trySavePreferences(destination, { requireRetryableToEscape: false });
+    if (outcome === "retry_in_place") {
       if (isMountedRef.current) {
-        toast.error(t("onboarding.done.saveFailed"));
         launchingRef.current = false;
         setLaunching(false);
       }
-      // Don't navigate on the FIRST failure to this destination: onboarded
-      // would stay false server-side, and AuthGuard would just bounce the
-      // user right back here - retrying in place is the better first
-      // response. But this is the only full-screen page in the app with no
-      // other nav affordance, so a save that keeps failing (backend down, a
-      // persistent 422) must not trap the user here forever with zero way
-      // out - let them through after a couple of tries even though the save
-      // didn't land; they'll just be asked again next session instead of
-      // being stuck this one.
-      if (failureCount < MAX_SAVE_FAILURES_BEFORE_ESCAPE) return;
+      return;
+    }
+    // replace, not push: leaving a /onboarding entry in history means a
+    // single Back press would return the user to a stale, reset-to-step-0
+    // wizard even though they've just finished with it (or escaped it).
+    if (isMountedRef.current) {
       // Escaping despite the failure only works if AuthGuard's own
       // onboarding check on `destination` doesn't immediately see
       // onboarded:false and bounce the user right back (self-review found
       // this happens for real: sometimes as a bounce loop, sometimes it
       // silently means the escape never actually reaches its destination).
       // This flag tells that check to stand down once.
-      shouldMarkSaveEscape = true;
-    } else {
-      saveFailureCountByDestRef.current[destination] = 0;
-    }
-    // replace, not push: leaving a /onboarding entry in history means a
-    // single Back press would return the user to a stale, reset-to-step-0
-    // wizard even though they've just finished with it (or escaped it).
-    if (isMountedRef.current) {
-      if (shouldMarkSaveEscape) markOnboardingSaveEscaped();
+      if (outcome === "escaped") markOnboardingSaveEscaped();
       router.replace(destination);
     }
   };
@@ -357,48 +376,21 @@ export default function OnboardingPage() {
     launchingRef.current = true;
     setLaunching(true);
     try {
-      const saved = await updateUserPreferences(buildPreferencesPayload());
-      // Set only right before whichever navigation below actually fires, not
-      // here: the freshness re-check and hireAgentFromTemplate are both still
-      // ahead and can throw, and self-review found that marking the flag this
-      // early leaves it dangling in sessionStorage - live, but with nothing
-      // left to navigate and consume it - if either of those throws instead.
-      let shouldMarkSaveEscape = false;
-      if (!saved.ok) {
-        // Same per-destination escape hatch as persistAndLeave, keyed under
-        // a fixed name since this path's actual destination (an existing
-        // agent vs. a freshly hired one) isn't known until after the save.
-        const failureCount = (saveFailureCountByDestRef.current[LAUNCH_FAILURE_KEY] ?? 0) + 1;
-        saveFailureCountByDestRef.current[LAUNCH_FAILURE_KEY] = failureCount;
-        if (isMountedRef.current) toast.error(t("onboarding.done.saveFailed"));
-        // Don't proceed to hire on the FIRST failure: onboarded would stay
-        // false server-side, and AuthGuard would just bounce the user right
-        // back here - retrying in place is the better first response. But
-        // "Start with X" is the primary CTA here, and a save that keeps
-        // failing must not leave it permanently unusable (even though the
-        // adjacent "Take me to the catalogue" skip link is still a way out)
-        // - let it through after a couple of tries too, same as every exit.
-        //
-        // Only for a RETRYABLE failure, though: unlike persistAndLeave's
-        // escape (which just leaves without saving), this one proceeds to
-        // an IRREVERSIBLE hireAgentFromTemplate call. A non-retryable
-        // failure (a 4xx - the backend rejected this exact payload) will
-        // keep rejecting the identical payload no matter how many times
-        // it's retried, so escalating to "proceed anyway" would hire an
-        // agent while preferences were never actually saved, for a save
-        // that was never going to succeed in the first place.
-        const shouldEscape = saved.retryable && failureCount >= MAX_SAVE_FAILURES_BEFORE_ESCAPE;
-        if (!shouldEscape) {
-          if (isMountedRef.current) {
-            launchingRef.current = false;
-            setLaunching(false);
-          }
-          return;
+      // Not marked here even if the outcome is "escaped": the freshness
+      // re-check and hireAgentFromTemplate are both still ahead and can
+      // throw, and self-review found that marking the flag this early
+      // leaves it dangling in sessionStorage - live, but with nothing left
+      // to navigate and consume it - if either of those throws instead. Set
+      // only right before whichever navigation below actually fires.
+      const outcome = await trySavePreferences(LAUNCH_FAILURE_KEY, { requireRetryableToEscape: true });
+      if (outcome === "retry_in_place") {
+        if (isMountedRef.current) {
+          launchingRef.current = false;
+          setLaunching(false);
         }
-        shouldMarkSaveEscape = true;
-      } else {
-        saveFailureCountByDestRef.current[LAUNCH_FAILURE_KEY] = 0;
+        return;
       }
+      const shouldMarkSaveEscape = outcome === "escaped";
 
       if (selected.hired && selected.hired_agent_id) {
         if (isMountedRef.current) {

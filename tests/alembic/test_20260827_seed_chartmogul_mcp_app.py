@@ -5,6 +5,7 @@ import re
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
 from alembic.migration import MigrationContext
 from alembic.operations import Operations
 from sqlalchemy import create_engine, text
@@ -17,6 +18,22 @@ from sqlalchemy import create_engine, text
 # together. Mirrors the hardcoded-literal convention already used by e.g.
 # test_20260818_seed_stripe_mcp_app.py.
 EXPECTED_VENDOR_PATH = "/opt/xagent/vendor/chartmogul-mcp-server"
+
+
+@pytest.fixture(autouse=True)
+def _clear_vendor_path_env(monkeypatch):
+    """get_builtin_public_mcp_app_rows() -> get_chartmogul_mcp_vendor_path()
+    reads XAGENT_CHARTMOGUL_MCP_VENDOR_PATH from the process environment,
+    unlike every other builtin connector's launch_config, which is a static
+    literal. Any test in this file that touches the live registry would
+    otherwise silently fail in an environment that happens to have this var
+    set (e.g. a shell that sourced a deployment .env, or a CI job that
+    carries a --build-arg override's env through to its test step) --
+    confirmed by reproducing it directly. Clearing it here, autouse, means
+    no test in this file has to remember to do it individually."""
+    from xagent.config import CHARTMOGUL_MCP_VENDOR_PATH
+
+    monkeypatch.delenv(CHARTMOGUL_MCP_VENDOR_PATH, raising=False)
 
 
 def _load_migration_module():
@@ -74,14 +91,20 @@ def test_upgrade_inserts_chartmogul(tmp_path):
         assert "chartmogul" in _app_ids(connection)
         row = connection.execute(
             text(
-                "SELECT transport, provider_name, launch_config FROM public_mcp_apps"
-                " WHERE app_id='chartmogul'"
+                "SELECT transport, provider_name, is_visible_in_connector, "
+                "launch_config FROM public_mcp_apps WHERE app_id='chartmogul'"
             )
         ).first()
         assert row[0] == "stdio"
         assert row[1] is None
-        assert EXPECTED_VENDOR_PATH in str(row[2])
-        assert "CHARTMOGUL_TOKEN" in str(row[2])
+        # The table defaults is_visible_in_connector to TRUE, so this must be
+        # asserted against the actual persisted value, not just the dict
+        # equality test_seed_row_matches_registry does -- a dropped/mistyped
+        # key in ROW would otherwise insert visible without anything here
+        # catching it. Mirrors test_upgrade_inserts_chrome's identical check.
+        assert row[2] == 0
+        assert EXPECTED_VENDOR_PATH in str(row[3])
+        assert "CHARTMOGUL_TOKEN" in str(row[3])
 
 
 def test_upgrade_is_idempotent(tmp_path):
@@ -226,6 +249,40 @@ def test_upgrade_raises_if_visibility_column_is_missing(tmp_path):
         assert "chartmogul" not in _app_ids(connection)
 
 
+def test_seed_row_classifies_api_key():
+    """The ChartMogul entry must classify as "api_key" -- an
+    "unconnectable" classification would make the catalog entry dead on
+    arrival in the connector UI once it's flipped visible."""
+    from xagent.web.mcp_apps import classify_app_auth
+
+    migration = _load_migration_module()
+    assert (
+        classify_app_auth(migration.ROW["transport"], migration.ROW["launch_config"])
+        == "api_key"
+    )
+
+
+def test_downgrade_then_upgrade_round_trip(tmp_path):
+    """A downgrade only deletes the catalog row (leftover
+    MCPServer/UserMCPServer rows are intentionally left in place per the
+    downgrade docstring), so a subsequent upgrade must cleanly re-seed it
+    rather than hitting the existing-row early return or a uniqueness
+    conflict."""
+    engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
+    migration = _load_migration_module()
+    with engine.begin() as connection:
+        _create_table(connection)
+        with patch.object(migration, "op", _operations(connection)):
+            migration.upgrade()
+            migration.downgrade()
+            migration.upgrade()
+        rows = connection.execute(
+            text("SELECT COUNT(*) FROM public_mcp_apps WHERE app_id='chartmogul'")
+        ).scalar()
+        assert rows == 1
+        assert "chartmogul" in _app_ids(connection)
+
+
 def test_seed_row_matches_registry():
     """The migration snapshot and the runtime registry must define the same
     chartmogul row (the migration is a frozen copy; this catches drift)."""
@@ -250,23 +307,17 @@ def test_downgrade_removes_chartmogul(tmp_path):
 
 
 def test_dockerfile_vendor_path_matches_registry():
-    """The vendored clone destination is pinned in two places: the
-    Dockerfile's CHARTMOGUL_MCP_VENDOR_PATH build ARG default and
-    config.get_chartmogul_mcp_vendor_path()'s own default (which the
-    registry's launch_config reads at runtime, covered by
-    test_seed_row_matches_registry). Passing the ARG through as
-    XAGENT_CHARTMOGUL_MCP_VENDOR_PATH at build time (asserted below) makes
-    the *built image* self-consistent regardless of these two defaults --
-    but the defaults themselves (what a fresh checkout/local dev run without
-    that env var gets) must still agree, or a non-Docker/test invocation of
-    get_chartmogul_mcp_vendor_path() silently disagrees with what the image
-    would actually build. Same shape as test_dockerfile_npx_cache_pin_matches_registry
-    for the chrome-devtools connector's npx version pin.
+    """The Dockerfile's CHARTMOGUL_MCP_VENDOR_PATH build ARG default must
+    match config.get_chartmogul_mcp_vendor_path()'s own default -- the
+    registry's launch_config reads that function at runtime (covered by
+    test_seed_row_matches_registry, and test_config.py separately pins the
+    function's default in isolation), so this only needs to check the
+    Dockerfile side of the pair. Passing the ARG through as
+    XAGENT_CHARTMOGUL_MCP_VENDOR_PATH at build time (asserted below) then
+    makes the *built image* self-consistent regardless of either default.
+    Same shape as test_dockerfile_npx_cache_pin_matches_registry for the
+    chrome-devtools connector's npx version pin.
     """
-    from xagent.config import get_chartmogul_mcp_vendor_path
-
-    assert get_chartmogul_mcp_vendor_path() == EXPECTED_VENDOR_PATH
-
     dockerfile = (
         Path(__file__).parent.parent.parent / "docker/Dockerfile.backend"
     ).read_text()

@@ -145,6 +145,16 @@ def downgrade() -> None:
     # an adopted one without a new tracking column -- a row that doesn't
     # match is left in place, restored rather than destroyed. Mirrors
     # 20260806_seed_chrome_mcp_app.py's downgrade for the same reason.
+    # Also connect/disconnect routes 404 once this row is gone
+    # (get_app_by_id returns None), so leftover connections from users who
+    # already connected are removed via the server-level route (DELETE
+    # /api/mcp/servers/{id}), not the catalog one.
+    # Known edge, in the safe direction: description (unlike name/transport)
+    # is admin-editable even on builtin rows, so a migration-created row
+    # whose description an admin later changed is skipped too -- downgrade
+    # then leaves a hidden orphan row behind rather than risking deleting
+    # operator-owned data. Same tradeoff the chrome and zoom seed migrations
+    # make for the identical reason.
     bind.execute(
         sa.delete(PUBLIC_MCP_APPS_TABLE)
         .where(PUBLIC_MCP_APPS_TABLE.c.app_id == APP_ID)

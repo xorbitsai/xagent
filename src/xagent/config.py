@@ -2170,9 +2170,15 @@ def get_chartmogul_mcp_vendor_path() -> str:
 
     chartmogul-mcp-server ships no PyPI/npm package, so docker/Dockerfile.backend
     clones a pinned commit of it into the image at build time and sets this same
-    env var to the value it cloned into -- Python reads it back here instead of
-    hardcoding an independent copy of the path, so the Dockerfile ARG default is
-    the only place the value actually needs to change.
+    env var to the value it cloned into -- Python reads it back here at runtime
+    instead of hardcoding an independent copy of the path for the *built image*
+    to agree with itself. The seed migration
+    (20260827_seed_chartmogul_mcp_app.py) still keeps its own hardcoded copy of
+    this function's default, by design: migrations are frozen snapshots that
+    must not change behavior if this default ever does. That copy needs
+    updating by hand alongside this one (tests/alembic/'s
+    test_seed_row_matches_registry and test_dockerfile_vendor_path_matches_registry
+    catch a missed update).
 
     Returns:
         Absolute path to the vendored chartmogul-mcp-server clone.

@@ -128,10 +128,16 @@ def test_backend_dockerfile_uses_uv_deployment_sync() -> None:
     assert "uv pip compile" not in dockerfile
     assert "uv pip sync" not in dockerfile
     assert "--no-emit-package xagent" not in dockerfile
-    assert dockerfile.count("uv sync") == 2
+    # 3, not 2: the two xagent deployment syncs below, plus the unrelated
+    # `uv sync --locked --no-dev` that vendors the ChartMogul MCP server's
+    # own dependencies (not an xagent package sync, so it doesn't share
+    # --active/--no-editable/--group backend-image with the two deployment
+    # syncs and isn't part of this test's assertions on those -- --no-dev is
+    # shared only because both mean the same generic "skip dev deps" thing).
+    assert dockerfile.count("uv sync") == 3
     assert dockerfile.count("--active") == 2
-    assert dockerfile.count("--locked") == 2
-    assert dockerfile.count("--no-dev") == 2
+    assert dockerfile.count("--locked") == 3
+    assert dockerfile.count("--no-dev") == 3
     assert dockerfile.count("--no-editable") == 2
     assert dockerfile.count("--group backend-image") == 2
     assert "--torch-backend" not in dockerfile

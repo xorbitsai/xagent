@@ -349,6 +349,12 @@ def get_builtin_oauth_provider_rows() -> list[dict[str, Any]]:
     ]
 
 
+# Must match the clone destination in docker/Dockerfile.backend's
+# CHARTMOGUL_MCP_VENDOR_PATH build arg -- can't be shared across the
+# Dockerfile/Python boundary, so keep both in sync by hand on change.
+CHARTMOGUL_MCP_VENDOR_PATH = "/opt/xagent/vendor/chartmogul-mcp-server"
+
+
 def get_builtin_public_mcp_app_rows() -> list[dict[str, Any]]:
     return [
         {
@@ -1132,6 +1138,60 @@ def get_builtin_public_mcp_app_rows() -> list[dict[str, Any]]:
                 "command": "python",
                 "args": ["-m", "xagent.web.tools.mcp.stripe"],
                 "required_env": ["STRIPE_API_KEY"],
+            },
+        },
+        {
+            "app_id": "chartmogul",
+            "name": "ChartMogul",
+            "description": "Connect your ChartMogul account to query subscription metrics, customers, and revenue analytics.",
+            "icon": "https://www.google.com/s2/favicons?domain=chartmogul.com&sz=128",
+            "transport": "stdio",
+            "provider_name": None,
+            "category": "Analytics",
+            "oauth_scopes": None,
+            # Hidden until launch_config's Docker-image coupling below is
+            # resolved (a runtime existence check gating visibility, or this
+            # connector explicitly declared Docker-only): the "no Docker or
+            # Node required" `uv tool install xagent-ai` / `pip install
+            # xagent-ai` install path in README.md never runs
+            # Dockerfile.backend, so it never vendors chartmogul-mcp-server
+            # at all -- a user on that path would see this connector,
+            # configure CHARTMOGUL_TOKEN, and hit an opaque subprocess-launch
+            # failure on first tool call. Same precedent as chrome-devtools
+            # and intercom above, each hidden for their own reason but the
+            # same is_visible_in_connector escape hatch; flip to True via a
+            # follow-up once the gap is closed -- no redeploy needed, per
+            # the chrome row's note (is_visible_in_connector is not
+            # builtin-protected).
+            "is_visible_in_connector": False,
+            # Key-based (non-oauth), like aws/google-maps/posthog/stripe:
+            # ChartMogul has no OAuth flow at all, only a per-user API key
+            # generated from Profile -> API keys in their own account --
+            # sent as HTTP Basic Auth username, same no-review self-serve
+            # bar as an OAuth App.
+            #
+            # Unlike every other stdio entry above, this one runs a
+            # third-party repo (github.com/chartmogul/chartmogul-mcp-server)
+            # that ships no PyPI/npm package and no version tags/releases --
+            # upstream's own docs assume a local `git clone` run via
+            # `uv --directory <path> run main.py`. Dockerfile.backend vendors
+            # a pinned commit of that repo into the image at build time
+            # (git clone + uv sync) at the path below, so this launch_config
+            # only works inside that image, not on an arbitrary host --
+            # see the is_visible_in_connector note above.
+            # --no-sync skips uv's own launch-time lockfile/sync check
+            # (which needs network access) since the venv was already
+            # synced at build time and never changes at runtime.
+            "launch_config": {
+                "command": "uv",
+                "args": [
+                    "--directory",
+                    CHARTMOGUL_MCP_VENDOR_PATH,
+                    "run",
+                    "--no-sync",
+                    "main.py",
+                ],
+                "required_env": ["CHARTMOGUL_TOKEN"],
             },
         },
     ]

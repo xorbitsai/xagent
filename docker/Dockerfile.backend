@@ -280,6 +280,68 @@ COPY --from=uv /uv /uvx /usr/local/bin/
 COPY --from=runtime-frontend-tools /opt/xagent/frontend /opt/xagent/frontend
 COPY --from=runtime-playwright /ms-playwright /ms-playwright
 
+# ChartMogul's MCP server (github.com/chartmogul/chartmogul-mcp-server) has
+# no PyPI/npm package and no version tags/releases -- upstream's own README
+# assumes a local `git clone` run via `uv --directory <path> run main.py`.
+# Vendor it into the image at build time instead of requiring every deploy
+# to manually clone it onto the host and bind-mount it in: a host clone
+# doesn't survive a redeploy or a new replica, while baking it in here
+# keeps it versioned and reproducible with everything else this Dockerfile
+# builds. Pinned to a commit (not a branch) since upstream ships neither
+# tags nor releases to pin to instead.
+#
+# Placed here, before the backend-build COPY instructions below, rather
+# than after them: those copies (particularly /opt/xagent/src) are
+# invalidated by every xagent source change, and everything after an
+# invalidated layer is forced to rebuild too -- putting this block first
+# keeps a src/ change from also forcing a redundant re-clone/re-sync of
+# this unrelated third-party project. A dedicated builder stage (COPY
+# --from=, like deepdoc-models/playwright/frontend-tools above) would give
+# the same isolation, but would also need to carry the uv-managed 3.13
+# interpreter it downloads across the stage boundary -- its .venv
+# references that interpreter by absolute path, so the copy has to land at
+# an identical path in both stages. Doing the clone+sync in place, ordered
+# before the cache-sensitive copies, sidesteps that without the added
+# complexity.
+#
+# Gated behind INSTALL_CHARTMOGUL, mirroring INSTALL_CHROME below: default
+# true keeps the default build unchanged, but a deployment that doesn't
+# want this connector -- or whose build environment can't reach
+# github.com -- can pass --build-arg INSTALL_CHARTMOGUL=false to skip the
+# clone, the extra interpreter download, and the image weight entirely.
+ARG INSTALL_CHARTMOGUL=true
+ARG CHARTMOGUL_MCP_REPO_URL="https://github.com/chartmogul/chartmogul-mcp-server.git"
+ARG CHARTMOGUL_MCP_REF="e385e9b8987135f8753a25bbb30645cdfcd505c0"
+# Must match CHARTMOGUL_MCP_VENDOR_PATH in
+# src/xagent/web/builtin_mcp_registry.py -- can't be shared across the
+# Dockerfile/Python boundary, so keep both in sync by hand on change.
+ARG CHARTMOGUL_MCP_VENDOR_PATH="/opt/xagent/vendor/chartmogul-mcp-server"
+ARG PYPI_INDEX_URL=""
+# requires-python >=3.13 (its own pyproject.toml), newer than this image's
+# 3.11 system interpreter -- UV_PYTHON_DOWNLOADS=auto lets uv download
+# and manage that interpreter for this project's own .venv only, isolated
+# from the /opt/venv backend environment copied in above. uv's own default
+# install location for that interpreter is under $HOME (~/.local/share/uv,
+# i.e. /root/... since this image runs as root throughout), which a 0700
+# home directory would put out of reach for a container run under a
+# different/restricted UID -- redirect it to a world-readable path instead
+# so it isn't tied to root's home directory.
+ENV UV_PYTHON_INSTALL_DIR="/opt/uv/python"
+# git needs no explicit install here, unlike backend-base's own apt-get
+# list: this stage's python:*-bookworm base already carries git
+# transitively via buildpack-deps:bookworm-scm.
+RUN --mount=type=cache,target=/root/.cache/uv \
+    if [ "$INSTALL_CHARTMOGUL" != "true" ]; then \
+        echo "INSTALL_CHARTMOGUL=$INSTALL_CHARTMOGUL -- skipping ChartMogul MCP server vendoring"; \
+    else \
+        git clone "$CHARTMOGUL_MCP_REPO_URL" "$CHARTMOGUL_MCP_VENDOR_PATH" \
+        && cd "$CHARTMOGUL_MCP_VENDOR_PATH" \
+        && git checkout "$CHARTMOGUL_MCP_REF" \
+        && rm -rf .git \
+        && { [ -f main.py ] || { echo "ERROR: pinned commit $CHARTMOGUL_MCP_REF has no main.py at the repo root -- update CHARTMOGUL_MCP_REF or this connector's launch_config" >&2; exit 1; }; } \
+        && UV_COMPILE_BYTECODE=1 UV_LINK_MODE=copy UV_PYTHON_DOWNLOADS=auto uv sync --locked --no-dev ${PYPI_INDEX_URL:+--default-index $PYPI_INDEX_URL}; \
+    fi
+
 COPY --from=backend-build /opt/venv /opt/venv
 COPY --from=backend-build /opt/xagent/src /opt/xagent/src
 COPY --from=backend-build /opt/xagent/pyproject.toml /opt/xagent/

@@ -6426,6 +6426,17 @@ async def _handle_chat_message_unserialized(
                     # message that triggered it, matching what
                     # `execute_task_background` already passes for a fresh
                     # run (`context_dict.get("turn_id")`).
+                    #
+                    # This mutates the shared cached agent's tool_config
+                    # before this handler reserves the resume slot below -
+                    # safe only because this handler and the explicit-resume
+                    # one (the other get_agent_for_task call in this file)
+                    # both run exclusively off the durable command queue,
+                    # which claim_task_command's ~_unfinished_earlier_command
+                    # filter serializes per task_id: a second command for
+                    # this task cannot even be claimed while this one is
+                    # in flight, so the two calls can never race on the
+                    # same task's cached agent.
                     connector_runtime_turn_id=turn_id,
                     resolved_execution_scope=resolved_execution_scope,
                 )

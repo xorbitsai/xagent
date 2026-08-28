@@ -101,6 +101,21 @@ describe("updateUserPreferences", () => {
 
     expect(await updateUserPreferences({ onboarded: true })).toEqual({ ok: false, retryable: false })
   })
+
+  // Pins the exact 4xx/5xx boundary: an off-by-one (>. instead of >=, or a
+  // hardcoded wrong threshold) would silently change whether a failing
+  // save is allowed to escalate to an irreversible action in handleLaunch.
+  it("reports retryable: true at exactly the 500 boundary", async () => {
+    apiRequestMock.mockResolvedValue({ ok: false, status: 500 })
+
+    expect(await updateUserPreferences({ onboarded: true })).toEqual({ ok: false, retryable: true })
+  })
+
+  it("reports retryable: false at exactly 499, just below the boundary", async () => {
+    apiRequestMock.mockResolvedValue({ ok: false, status: 499 })
+
+    expect(await updateUserPreferences({ onboarded: true })).toEqual({ ok: false, retryable: false })
+  })
 })
 
 // Coordinates persistAndLeave's give-up-after-repeated-failures escape hatch

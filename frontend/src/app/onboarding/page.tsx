@@ -262,27 +262,30 @@ export default function OnboardingPage() {
   // Shared by persistAndLeave and handleLaunch - these used to independently
   // hand-build the same PATCH payload and had already drifted (goals was
   // conditional in one, unconditional in the other) before this existed.
-  const buildPreferencesPayload = (): UserPreferences => ({
-    onboarded: true,
-    ...(work ? { department: work } : {}),
-    // Explicit `null` (not omission) once a real, non-"other" department is
-    // chosen: a PR review finding caught that switching away from "Other"
-    // after typing an industry only cleared the LOCAL `industry` state -
-    // since this is a merge PATCH, omitting the key left a stale industry
-    // value stored server-side, now silently paired with the new
-    // department (e.g. {department: "other", industry: "Legal"} becoming
-    // {department: "sales", industry: "Legal"}). `null` is this endpoint's
-    // actual "clear this field" signal (see UpdatePreferencesRequest).
-    ...(work === "other"
-      ? industry.trim()
-        ? { industry: industry.trim() }
-        : {}
-      : work
-        ? { industry: null }
-        : {}),
-    ...(goals.length ? { goals } : {}),
-    ...(hasReachedVoiceRef.current ? { voice } : {}),
-  });
+  // Explicit `null` (not omission) once a real, non-"other" department is
+  // chosen: a PR review finding caught that switching away from "Other"
+  // after typing an industry only cleared the LOCAL `industry` state -
+  // since the save is a merge PATCH, omitting the key left a stale
+  // industry value stored server-side, silently paired with the new
+  // department (e.g. {department: "other", industry: "Legal"} becoming
+  // {department: "sales", industry: "Legal"}). `null` is this endpoint's
+  // actual "clear this field" signal (see UpdatePreferencesRequest).
+  // `undefined` (an untouched field, work never set) still omits the key.
+  const industryPayloadValue = (): string | null | undefined => {
+    if (work === "other") return industry.trim() || undefined;
+    return work ? null : undefined;
+  };
+
+  const buildPreferencesPayload = (): UserPreferences => {
+    const industryValue = industryPayloadValue();
+    return {
+      onboarded: true,
+      ...(work ? { department: work } : {}),
+      ...(industryValue !== undefined ? { industry: industryValue } : {}),
+      ...(goals.length ? { goals } : {}),
+      ...(hasReachedVoiceRef.current ? { voice } : {}),
+    };
+  };
 
   // Matches the reference UI's finish() exactly: every exit path (header
   // "Skip setup", the goals step's "Not sure yet", the done step's "Take me
@@ -384,7 +387,8 @@ export default function OnboardingPage() {
         // it's retried, so escalating to "proceed anyway" would hire an
         // agent while preferences were never actually saved, for a save
         // that was never going to succeed in the first place.
-        if (failureCount < MAX_SAVE_FAILURES_BEFORE_ESCAPE || !saved.retryable) {
+        const shouldEscape = saved.retryable && failureCount >= MAX_SAVE_FAILURES_BEFORE_ESCAPE;
+        if (!shouldEscape) {
           if (isMountedRef.current) {
             launchingRef.current = false;
             setLaunching(false);

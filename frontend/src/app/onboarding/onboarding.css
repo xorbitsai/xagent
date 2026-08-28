@@ -457,14 +457,14 @@
 .ob-chips .ob-chip[aria-pressed="true"] {
   border-color: hsl(var(--primary));
   background: hsl(var(--primary) / 0.12);
-  /* Not hsl(var(--primary)): computed contrast against this 12%-tinted
-     background is only ~3.4-3.5:1 on the blue/green/purple/cyberLight
-     presets (verified against theme.ts's actual palette values), below the
-     4.5:1 AA floor for this normal-size selected-state text. --foreground
-     is guaranteed high-contrast against any background token in every
-     theme by definition, and the border/background tint still clearly
-     signal "selected" without needing the text itself recolored. */
-  color: hsl(var(--foreground));
+  /* No color override here (inherits the base rule's --foreground) - text
+     was previously recolored to hsl(var(--primary)), but computed contrast
+     against this 12%-tinted background is only ~3.4-3.5:1 on the
+     blue/green/purple/cyberLight presets (verified against theme.ts's real
+     palette values), below the 4.5:1 AA floor. --foreground is guaranteed
+     high-contrast against any background token in every theme by
+     definition, and the border/background tint alone still clearly signal
+     "selected" without needing the text itself recolored. */
   font-weight: 560;
 }
 .ob-chips .ob-chip .ob-ic {
@@ -703,11 +703,14 @@
   }
 }
 @media (prefers-reduced-motion: reduce) {
-  /* iteration-count:1, not just a near-zero duration: these are infinite
-     animations, so a near-zero duration alone still loops forever - just at
-     high speed, causing rapid repeated phase changes instead of the static
-     composition this rule is meant to produce. Stopping after one (near
-     instant) pass actually holds still. */
+  /* iteration-count:1, not just a near-zero duration: .ob-aurora b and
+     .ob-orb::before/::after are infinite animations, so a near-zero
+     duration alone still loops forever on those - just at high speed,
+     causing rapid repeated phase changes instead of the static composition
+     this rule is meant to produce. Stopping after one (near instant) pass
+     actually holds still. (.ob-step's own entrance animation already runs
+     once - iteration-count:1 is a no-op for it, just along for the ride as
+     part of this shared selector list.) */
   .ob-aurora b,
   .ob-step .ob-orb::before,
   .ob-step .ob-orb::after,

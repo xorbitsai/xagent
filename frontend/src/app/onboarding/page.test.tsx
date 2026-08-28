@@ -12,6 +12,7 @@ const updateUserPreferencesMock = vi.hoisted(() => vi.fn())
 const hireAgentFromTemplateMock = vi.hoisted(() => vi.fn())
 const toastErrorMock = vi.hoisted(() => vi.fn())
 const markOnboardingSaveEscapedMock = vi.hoisted(() => vi.fn())
+const i18nState = vi.hoisted(() => ({ locale: "en" as "en" | "zh" }))
 
 vi.mock("next/navigation", () => ({
   useRouter: () => ({ push: routerPush, replace: routerReplace }),
@@ -28,8 +29,8 @@ vi.mock("@/contexts/auth-context", () => ({
 vi.mock("@/contexts/i18n-context", () => ({
   useI18n: () => ({
     t: (key: string, vars?: Record<string, string | number>) =>
-      resolveTranslation("en", key as TranslationKey, vars),
-    locale: "en",
+      resolveTranslation(i18nState.locale, key as TranslationKey, vars),
+    locale: i18nState.locale,
   }),
 }))
 
@@ -108,6 +109,7 @@ describe("OnboardingPage", () => {
   beforeEach(() => {
     routerPush.mockClear()
     routerReplace.mockClear()
+    i18nState.locale = "en"
     authUser.username = "Shulei"
     apiRequestMock.mockReset()
     apiRequestMock.mockResolvedValue({ ok: true, json: async () => TEMPLATES })
@@ -187,6 +189,24 @@ describe("OnboardingPage", () => {
     expect(updateUserPreferencesMock).toHaveBeenCalledWith(
       expect.objectContaining({ department: "marketing", industry: null })
     )
+  })
+
+  // Companion to the test above: an `industry: null` clear signal must only
+  // ever fire once a real department has actually been chosen - a user who
+  // never reached (or never touched) the business step must not have this
+  // field explicitly cleared on their behalf, which would be a different,
+  // wrong claim ("the user had an industry and removed it") from the true
+  // one ("this field was never touched").
+  it("omits industry entirely (neither a value nor a clear) when the department was never chosen", async () => {
+    render(<OnboardingPage />)
+    await waitFor(() => expect(screen.getByText(/Welcome to Xagent/)).toBeInTheDocument())
+
+    fireEvent.click(screen.getByText("Skip setup"))
+
+    await waitFor(() => expect(updateUserPreferencesMock).toHaveBeenCalled())
+    const call = updateUserPreferencesMock.mock.calls.at(-1)![0]
+    expect(call).not.toHaveProperty("industry")
+    expect(call).not.toHaveProperty("department")
   })
 
   // Matches PREFERENCES_TEXT_FIELD_MAX_LENGTH in src/xagent/web/api/auth.py -
@@ -361,6 +381,34 @@ describe("OnboardingPage", () => {
     await waitFor(() => expect(screen.getByText("Maya")).toBeInTheDocument())
     const card = screen.getByText("Maya").closest("button")!
     expect(card.querySelector('[aria-hidden="true"]')).toHaveTextContent("M")
+  })
+
+  // Pins a test-coverage gap found in incremental self-review: every other
+  // test in this file renders in English only, and the raw-string spacing
+  // tests in translations.test.ts never render actual JSX - neither would
+  // catch a future JSX-level literal space reintroduced specifically on
+  // the Chinese render path. Drives the full flow in zh and asserts the
+  // exact combined textContent has no space between the full-width colon
+  // and the value, matching the originally-reported "所在领域： 市场营销" bug.
+  it("renders the Done step's 'working in' line with no stray space in Chinese", async () => {
+    i18nState.locale = "zh"
+
+    render(<OnboardingPage />)
+    await waitFor(() => expect(screen.getByText(/欢迎来到/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("开始吧"))
+    await waitFor(() => expect(screen.getByText(/你的团队/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("市场营销"))
+    fireEvent.click(screen.getByText("继续"))
+    await waitFor(() => expect(screen.getByText("发布社交媒体内容")).toBeInTheDocument())
+    fireEvent.click(screen.getByText("发布社交媒体内容"))
+    fireEvent.click(screen.getByText("继续"))
+    await waitFor(() => expect(screen.getByText("认识一下你的 AI 团队。")).toBeInTheDocument())
+    fireEvent.click(screen.getByText("继续"))
+    fireEvent.click(screen.getByText("继续"))
+    await waitFor(() => expect(screen.getByText("一切就绪。")).toBeInTheDocument())
+
+    const line = screen.getByText("市场营销").closest(".ob-sum-li")!
+    expect(line.textContent).toBe("所在领域：市场营销")
   })
 
   it("hires the selected agent and navigates to /task/{taskId} on launch", async () => {
@@ -664,6 +712,68 @@ describe("OnboardingPage", () => {
     expect(hireAgentFromTemplateMock).not.toHaveBeenCalled()
     expect(markOnboardingSaveEscapedMock).not.toHaveBeenCalled()
     expect(routerReplace).not.toHaveBeenCalledWith(expect.stringContaining("/task/"))
+  })
+
+  // Pins a test-coverage gap found in incremental self-review: the escape
+  // decision looks only at the CURRENT attempt's retryable flag alongside
+  // the cumulative failure count, not some "was ever non-retryable" memory
+  // - these two tests exercise both attempts having DIFFERENT retryable
+  // values, which a constant-mock test can't distinguish from a sticky/
+  // AND'd implementation.
+  it("does not escalate when failure #1 is retryable but failure #2 is not", async () => {
+    updateUserPreferencesMock
+      .mockResolvedValueOnce({ ok: false, retryable: true })
+      .mockResolvedValueOnce({ ok: false, retryable: false })
+
+    await goToWelcomeThenBusiness()
+    fireEvent.click(screen.getByText("Marketing"))
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/take off your plate/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Post on social media"))
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/Meet your AI team/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/How should/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText("You're all set.")).toBeInTheDocument())
+
+    await act(async () => {
+      fireEvent.click(screen.getByText("Start with Maya"))
+    })
+    await act(async () => {
+      fireEvent.click(screen.getByText("Start with Maya"))
+    })
+
+    expect(hireAgentFromTemplateMock).not.toHaveBeenCalled()
+    expect(markOnboardingSaveEscapedMock).not.toHaveBeenCalled()
+  })
+
+  it("escalates on failure #2 when it's retryable, even though failure #1 was not", async () => {
+    updateUserPreferencesMock
+      .mockResolvedValueOnce({ ok: false, retryable: false })
+      .mockResolvedValueOnce({ ok: false, retryable: true })
+
+    await goToWelcomeThenBusiness()
+    fireEvent.click(screen.getByText("Marketing"))
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/take off your plate/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Post on social media"))
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/Meet your AI team/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/How should/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText("You're all set.")).toBeInTheDocument())
+
+    await act(async () => {
+      fireEvent.click(screen.getByText("Start with Maya"))
+    })
+    await act(async () => {
+      fireEvent.click(screen.getByText("Start with Maya"))
+    })
+
+    await waitFor(() => expect(hireAgentFromTemplateMock).toHaveBeenCalled())
+    expect(markOnboardingSaveEscapedMock).toHaveBeenCalledTimes(1)
   })
 
   // Pins C2: a recommended templateId that never loaded (or has no persona)

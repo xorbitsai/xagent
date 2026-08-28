@@ -31,12 +31,12 @@ COPY --from=uv /uv /uvx /usr/local/bin/
 
 # Fixed, world-writable npm/npx cache location, set before anything in
 # this stage might invoke npx. npm's default cache path is keyed to
-# $HOME, which varies by which user actually runs a command -- root
-# during this build, root at container runtime too (Docker-backed
-# sandboxes: see the npx warm-up comment below), but not guaranteed to
-# stay that way forever. A cache warmed under one user's $HOME and read
-# from another's would silently stay cold; a single fixed path removes
-# that failure mode regardless of which user npx runs as, now or later.
+# $HOME, which varies by which user actually runs a command; a cache
+# warmed under one user's $HOME and read from another's would silently
+# stay cold. A single fixed path removes that specific failure mode --
+# but does not by itself guarantee the warmed cache is ever consulted;
+# see the npx warm-up comment below for a known gap in the connector's
+# actual launch path that currently limits this.
 ENV NPM_CONFIG_CACHE=/opt/npm-cache
 RUN mkdir -p "$NPM_CONFIG_CACHE" && chmod 1777 "$NPM_CONFIG_CACHE"
 
@@ -136,22 +136,37 @@ RUN if [ "$INSTALL_CHROME" != "true" ]; then \
 # builtin_mcp_registry.py's launch_config, same rationale as
 # Dockerfile.backend's identical step: avoid a needless npm-registry
 # round-trip (and its latency/flakiness) on every sandboxed launch of
-# this connector, not just the first. Reads/writes NPM_CONFIG_CACHE
-# (set once, near the top of this stage) rather than the default
-# $HOME/.npm/_npx, so this is correct regardless of which user actually
-# execs npx at runtime -- deliberately not assumed to be this image's own
-# `USER sandbox` (declared later in this file): DockerSandboxService
-# always creates/execs this container with `"user": "root"` regardless
-# of the image's own USER directive ("Run as root to match the file
-# access behavior of Boxlite" -- src/xagent/sandbox/docker_sandbox.py).
-# A cache keyed to $HOME would have to guess that correctly; one fixed,
-# world-writable path doesn't need to -- verified this actually holds,
-# not just in theory: `umask 0022` below, because the top-level
-# NPM_CONFIG_CACHE directory being world-writable does not make npm's
-# own subdirectories/files under it world-readable too (npm creates
-# those with root's normal, restrictive umask); without this, a
-# different exec user can list the cache directory but still gets
-# ENOTCACHED trying to actually read a --offline resolution out of it.
+# this connector, not just the first -- when the warmed cache actually
+# gets consulted by that launch; see the known gap below. Reads/writes
+# NPM_CONFIG_CACHE (set once, near the top of this stage) rather than
+# the default $HOME/.npm/_npx, so warming this doesn't need to guess
+# which user's $HOME a later npx invocation will resolve against.
+#
+# Known gap, not yet closed (xorbitsai/xagent#1869): the MCP stdio
+# launcher every connector goes through (mcp.client.stdio's
+# get_default_environment(), invoked from this repo's own
+# sessions.py::_create_stdio_session) only forwards HOME/LOGNAME/PATH/
+# SHELL/TERM/USER to the process it actually spawns, and this
+# connector's launch_config sets no "env" key -- so NPM_CONFIG_CACHE,
+# despite being set on this container, does not reach the npx process
+# this warm-up exists to serve. The warm-up below still runs (harmless,
+# and it becomes useful the moment that gap closes), but today it does
+# not measurably help: the spawned npx falls back to its own default
+# cache and still needs npm-registry access on every launch. This is
+# not unique to this image -- Dockerfile.backend's identical, already-
+# shipped warm-up has the same gap, since its non-sandboxed launch path
+# goes through the exact same call chain.
+#
+# Separately (also #1869): DockerSandboxService always execs this
+# container as root regardless of the USER directive below, but
+# Boxlite -- this project's other sandbox backend, sharing this same
+# image via SANDBOX_IMAGE -- execs as the image's *declared* user by
+# default when no override is passed, which is what this codebase does
+# (boxlite_sandbox.py), i.e. `sandbox`, not root. So even once the gap
+# above closes, a non-root Boxlite exec can only benefit from cache
+# hits already warmed here at build time; it cannot write a new entry
+# into a cache root-owned and world-*readable*-only (umask 0022 below).
+#
 # `--help` exercises resolution without starting Chrome, so this needs
 # no display/GPU setup at build time. umask 0022 (world-readable, not
 # world-writable): the goal is only cross-user *read* access to the

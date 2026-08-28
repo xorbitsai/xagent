@@ -393,15 +393,19 @@ Custom `SANDBOX_IMAGE` images used with sandboxed uvx MCP connections must
 provide `uvx` on `PATH`; Xagent no longer installs uv dynamically. A custom
 image that wants the built-in Chrome MCP connector (`chrome-devtools-mcp`)
 to work once enabled must also provide `npx` plus a browser resolvable at
-`/opt/google/chrome/chrome` (or an npx cache warmed for the exact pinned
-`chrome-devtools-mcp@` version) — otherwise sandboxed calls to that
-connector fail with "Could not find Google Chrome executable".
+`/opt/google/chrome/chrome` — otherwise sandboxed calls to that connector
+fail with "Could not find Google Chrome executable". A warmed npx cache
+for the exact pinned `chrome-devtools-mcp@` version is not a substitute
+for the browser, and today doesn't even reach this connector's actual
+npx process regardless (xorbitsai/xagent#1869) — it's an unrelated,
+currently-inert latency optimization, not part of what makes the
+connector work.
 
 **Build args:**
 
 | Arg | Default | Effect |
 |-----|---------|--------|
-| `INSTALL_CHROME` | `true` | Installs Google Chrome (amd64) or Chromium (arm64), each with `fonts-liberation`/`fonts-noto-cjk` (headless Chrome with no fonts installed renders blank/tofu text, not an error), symlinked to the same `/opt/google/chrome/chrome` resolver path Dockerfile.backend's copy uses, plus a warmed `npx` cache for the built-in Chrome MCP connector — same effect and same reasoning as Dockerfile.backend's identical arg (see the Backend section's table row above); pass `--build-arg INSTALL_CHROME=false` to skip both for deployments that never enable the connector. **Runs as root, not the `sandbox` user this image later switches to**: `DockerSandboxService` always execs sandboxed commands as root regardless of the image's own `USER` directive. The npx cache lives at a fixed `NPM_CONFIG_CACHE=/opt/npm-cache` (world-writable directory, `umask 0022` at warm-up time so the warmed files are world-readable without also being world-writable) rather than `$HOME`, so it resolves correctly however sandboxed commands end up executing, not only as root. The connector's launch config passes `--chrome-arg=--no-sandbox --chrome-arg=--disable-setuid-sandbox --chrome-arg=--disable-dev-shm-usage`, matching (not exceeding) the same root-Chrome exposure Dockerfile.backend already carries. |
+| `INSTALL_CHROME` | `true` | Installs Google Chrome (amd64) or Chromium (arm64), each with `fonts-liberation`/`fonts-noto-cjk` (headless Chrome with no fonts installed renders blank/tofu text, not an error), symlinked to the same `/opt/google/chrome/chrome` resolver path Dockerfile.backend's copy uses, plus a warmed `npx` cache for the built-in Chrome MCP connector — same effect and same reasoning as Dockerfile.backend's identical arg (see the Backend section's table row above); pass `--build-arg INSTALL_CHROME=false` to skip both for deployments that never enable the connector. **Runs as root under `DockerSandboxService`** (which always execs sandboxed commands as root regardless of the image's own `USER` directive), **but not under Boxlite** — this project's other sandbox backend, sharing this same image, execs as the image's declared `sandbox` user by default. The npx cache lives at a fixed `NPM_CONFIG_CACHE=/opt/npm-cache` (world-writable directory, `umask 0022` at warm-up time so the warmed files are world-readable without also being world-writable) so a cache hit doesn't depend on guessing which user's `$HOME` npx would otherwise resolve against — but the cache is currently not consulted by this connector's actual npx process at all, regardless of exec user (xorbitsai/xagent#1869), so this only matters once that gap closes. The connector's launch config passes `--chrome-arg=--no-sandbox --chrome-arg=--disable-setuid-sandbox --chrome-arg=--disable-dev-shm-usage`, matching (not exceeding) the same root-Chrome exposure Dockerfile.backend already carries. |
 
 ```bash
 docker buildx build \

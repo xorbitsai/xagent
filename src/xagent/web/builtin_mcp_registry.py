@@ -874,8 +874,14 @@ def get_builtin_public_mcp_app_rows() -> list[dict[str, Any]]:
             # Dockerfile.sandbox (should_sandbox_mcp_connection() routes
             # every npx/uvx MCP connector into the sandbox image whenever
             # one is configured) independently pre-install this exact
-            # version and warm an npx cache for it, so npx resolves
-            # locally instead of hitting the npm registry on every launch.
+            # version and warm an npx cache for it. That warm-up is
+            # intended to make npx resolve locally instead of hitting the
+            # npm registry on every launch, but currently does not: the
+            # MCP stdio launcher this connector's process goes through
+            # only forwards a fixed env allowlist to the spawned npx
+            # child (no NPM_CONFIG_CACHE), so every launch still needs
+            # npm-registry access regardless of the warm-up -- tracked in
+            # xorbitsai/xagent#1869, not yet fixed here.
             # No --executablePath/--channel: the default "stable" channel
             # resolution finds Chrome per-platform (/Applications/... on
             # macOS dev hosts, /opt/google/chrome/chrome in both the
@@ -904,12 +910,14 @@ def get_builtin_public_mcp_app_rows() -> list[dict[str, Any]]:
                 "command": "npx",
                 "args": [
                     "-y",
-                    # npm-exec flag, must precede the package spec: with the
-                    # exact-version cache warmed at image build time (both
-                    # Dockerfile.backend and Dockerfile.sandbox), resolution
-                    # never hits the npm registry at launch; on a cache miss
-                    # (e.g. first run on a dev machine) it still fetches
-                    # normally.
+                    # npm-exec flag, must precede the package spec: intended
+                    # to let the exact-version cache warmed at image build
+                    # time (both Dockerfile.backend and Dockerfile.sandbox)
+                    # skip the npm registry at launch, though that warm-up
+                    # currently doesn't reach this connector's actual npx
+                    # process (xorbitsai/xagent#1869) -- harmless either
+                    # way, since --prefer-offline still falls back to a
+                    # normal fetch on any cache miss.
                     "--prefer-offline",
                     "chrome-devtools-mcp@1.6.0",
                     "--headless",

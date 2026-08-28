@@ -322,25 +322,51 @@ def detect_prose_script_mismatch(
     return mismatch
 
 
+def _reset_serialized_context(context_payload: Any) -> None:
+    if isinstance(context_payload, dict) and isinstance(
+        context_payload.get("metadata"), dict
+    ):
+        reset_metadata_output_language(context_payload["metadata"])
+
+
+def _reset_serialized_pattern_state(pattern_state: Any) -> None:
+    if not isinstance(pattern_state, dict):
+        return
+    _reset_serialized_context(pattern_state.get("active_step_context"))
+    active_step_contexts = pattern_state.get("active_step_contexts")
+    if isinstance(active_step_contexts, dict):
+        for child_context in active_step_contexts.values():
+            _reset_serialized_context(child_context)
+    for key in ("react_state", "dag_state", "active_step_pattern_state"):
+        _reset_serialized_pattern_state(pattern_state.get(key))
+    nested_states = pattern_state.get("active_step_pattern_states")
+    if isinstance(nested_states, dict):
+        for child_state in nested_states.values():
+            _reset_serialized_pattern_state(child_state)
+
+
 def reset_output_language_to_request_context(checkpoint_payload: Any) -> None:
     """Keep only the ``output_language`` that ``request_context`` can prove.
 
-    Every ``metadata`` dict in the payload is visited, so serialized child
-    contexts inside a pattern state are migrated too. Any label an internal
-    component derived is dropped regardless of its recorded source: a resume
-    skips the decision that produced it, so it would otherwise survive as a
-    hard instruction the current request never asked for.
+    Only nodes the checkpoint schema declares to be ExecutionContexts are
+    migrated; every other ``metadata`` dict in the payload (message metadata,
+    tool arguments, step results) belongs to someone else and stays untouched.
+    Any label an internal component derived is dropped regardless of its
+    recorded source: a resume skips the decision that produced it, so it would
+    otherwise survive as a hard instruction the current request never asked for.
     """
-    if isinstance(checkpoint_payload, list):
-        for item in checkpoint_payload:
-            reset_output_language_to_request_context(item)
-        return
     if not isinstance(checkpoint_payload, dict):
         return
-    for key, value in checkpoint_payload.items():
-        if key == "metadata" and isinstance(value, dict):
-            reset_metadata_output_language(value)
-        reset_output_language_to_request_context(value)
+    _reset_serialized_context(checkpoint_payload.get("context"))
+    _reset_serialized_pattern_state(checkpoint_payload.get("pattern_state"))
+    snapshot = checkpoint_payload.get("execution_snapshot")
+    frames = snapshot.get("frames") if isinstance(snapshot, dict) else None
+    if isinstance(frames, dict):
+        for frame in frames.values():
+            if not isinstance(frame, dict):
+                continue
+            _reset_serialized_context(frame.get("context"))
+            _reset_serialized_pattern_state(frame.get("pattern_state"))
 
 
 def request_context_output_language(metadata: Any) -> str:

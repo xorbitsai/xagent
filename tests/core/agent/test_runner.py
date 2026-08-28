@@ -22,6 +22,7 @@ from xagent.core.agent.checkpoint import (
 from xagent.core.agent.language import (
     OUTPUT_LANGUAGE_METADATA_KEY,
     OUTPUT_LANGUAGE_SOURCE_METADATA_KEY,
+    reset_output_language_to_request_context,
 )
 from xagent.core.agent.runner import AgentRunner
 from xagent.core.agent.runtime import LLMCallInterrupted
@@ -1963,3 +1964,80 @@ async def test_inject_user_message_cold_start_keeps_caller_output_language() -> 
     assert context is not None
     assert context.metadata[OUTPUT_LANGUAGE_METADATA_KEY] == "French"
     assert OUTPUT_LANGUAGE_SOURCE_METADATA_KEY not in context.metadata
+
+
+def test_resume_migration_only_touches_execution_context_nodes() -> None:
+    """The migration owns ExecutionContext metadata and nothing else: a
+    ``metadata`` dict inside a message, a tool argument, or a step result is
+    someone else's payload, and a cold start would persist a silent edit."""
+    root = ExecutionContext(execution_id="exec-migration-ownership")
+    root.metadata["pattern"] = "dag_plan_execute"
+    root.metadata[OUTPUT_LANGUAGE_METADATA_KEY] = "Simplified Chinese"
+    root.metadata[OUTPUT_LANGUAGE_SOURCE_METADATA_KEY] = "dag_plan"
+    root.add_user_message(
+        "Translate the attached note.",
+        metadata={OUTPUT_LANGUAGE_METADATA_KEY: "French"},
+    )
+    child = ExecutionContext(execution_id="exec-migration-ownership_child")
+    child.metadata[OUTPUT_LANGUAGE_METADATA_KEY] = "Simplified Chinese"
+    child.metadata[OUTPUT_LANGUAGE_SOURCE_METADATA_KEY] = "dag_plan"
+
+    checkpoint = {
+        "context": root.to_dict(),
+        "pattern": "DAGPattern",
+        "metadata": {OUTPUT_LANGUAGE_METADATA_KEY: "French"},
+        "pattern_state": {
+            "active_step_contexts": {"step_1": child.to_dict()},
+            "step_results": {
+                "step_1": {"metadata": {OUTPUT_LANGUAGE_METADATA_KEY: "French"}}
+            },
+            "active_step_pattern_states": {
+                "step_1": {
+                    "last_response": {
+                        "tool_calls": [
+                            {
+                                "arguments": {
+                                    "metadata": {OUTPUT_LANGUAGE_METADATA_KEY: "French"}
+                                }
+                            }
+                        ]
+                    }
+                }
+            },
+        },
+    }
+
+    reset_output_language_to_request_context(checkpoint)
+
+    assert OUTPUT_LANGUAGE_METADATA_KEY not in checkpoint["context"]["metadata"]
+    assert OUTPUT_LANGUAGE_SOURCE_METADATA_KEY not in checkpoint["context"]["metadata"]
+    restored_child = checkpoint["pattern_state"]["active_step_contexts"]["step_1"]
+    assert OUTPUT_LANGUAGE_METADATA_KEY not in restored_child["metadata"]
+    assert OUTPUT_LANGUAGE_SOURCE_METADATA_KEY not in restored_child["metadata"]
+
+    message_metadata = checkpoint["context"]["messages"][0]["metadata"]
+    assert message_metadata[OUTPUT_LANGUAGE_METADATA_KEY] == "French"
+    assert checkpoint["metadata"][OUTPUT_LANGUAGE_METADATA_KEY] == "French"
+    step_result = checkpoint["pattern_state"]["step_results"]["step_1"]
+    assert step_result["metadata"][OUTPUT_LANGUAGE_METADATA_KEY] == "French"
+    tool_arguments = checkpoint["pattern_state"]["active_step_pattern_states"][
+        "step_1"
+    ]["last_response"]["tool_calls"][0]["arguments"]
+    assert tool_arguments["metadata"][OUTPUT_LANGUAGE_METADATA_KEY] == "French"
+
+
+def test_resume_migration_reaches_a_nested_auto_pattern_child_context() -> None:
+    child = ExecutionContext(execution_id="exec-migration-nested_child")
+    child.metadata[OUTPUT_LANGUAGE_METADATA_KEY] = "Simplified Chinese"
+    child.metadata[OUTPUT_LANGUAGE_SOURCE_METADATA_KEY] = "auto_router"
+    checkpoint = {
+        "context": ExecutionContext(execution_id="exec-migration-nested").to_dict(),
+        "pattern_state": {
+            "dag_state": {"active_step_contexts": {"step_1": child.to_dict()}}
+        },
+    }
+
+    reset_output_language_to_request_context(checkpoint)
+
+    nested = checkpoint["pattern_state"]["dag_state"]["active_step_contexts"]["step_1"]
+    assert OUTPUT_LANGUAGE_METADATA_KEY not in nested["metadata"]

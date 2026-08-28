@@ -48,21 +48,34 @@ describe("WidgetChromeControls", () => {
     )
   })
 
-  it("announces chrome_ready on mount and chrome_not_ready on unmount", () => {
+  it("announces chrome_ready exactly once on mount and chrome_not_ready exactly once on unmount", () => {
     // widget.js's mobile FAB-hiding guard keys off exactly this pair: without
     // a reliable not-ready signal when this component disappears (e.g. a
     // Session degrading mid-conversation), the parent's only fallback close
-    // control would stay hidden with no way to bring it back.
-    const { unmount } = render(<WidgetChromeControls />)
+    // control would stay hidden with no way to bring it back. Exact counts,
+    // not just toHaveBeenCalledWith, so a dependency-array bug that re-runs
+    // this effect mid-life (flashing the fallback FAB during an otherwise
+    // uneventful re-render) would actually fail this test.
+    const { unmount, rerender } = render(<WidgetChromeControls />)
 
-    expect(postMessageSpy).toHaveBeenCalledWith(
+    expect(postMessageSpy).toHaveBeenCalledTimes(1)
+    expect(postMessageSpy).toHaveBeenNthCalledWith(
+      1,
       { xagent: true, v: 1, type: "widget_chrome_ready" },
       "*",
     )
 
+    // An unrelated prop change re-renders the component without unmounting
+    // it -- the effect's empty deps array must not treat this as a fresh
+    // mount.
+    rerender(<WidgetChromeControls newConversation={{ label: "Start over", onClick: onNewConversation }} />)
+    expect(postMessageSpy).toHaveBeenCalledTimes(1)
+
     unmount()
 
-    expect(postMessageSpy).toHaveBeenCalledWith(
+    expect(postMessageSpy).toHaveBeenCalledTimes(2)
+    expect(postMessageSpy).toHaveBeenNthCalledWith(
+      2,
       { xagent: true, v: 1, type: "widget_chrome_not_ready" },
       "*",
     )

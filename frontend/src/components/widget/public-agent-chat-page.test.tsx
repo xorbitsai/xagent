@@ -726,8 +726,10 @@ describe("PublicAgentChatPage", () => {
     expect(panel).toHaveAttribute("data-show-process-view", "true")
     // The share/widget exclusion only means something once there's an active
     // conversation -- in widget mode this same state renders the "..." menu
-    // (see the standalone-newConversation share button asserted below).
+    // and close button (see the standalone-newConversation share button
+    // asserted below).
     expect(screen.queryByRole("button", { name: "widgetChat.moreOptions" })).toBeNull()
+    expect(screen.queryByRole("button", { name: "widgetChat.close" })).toBeNull()
     expect(screen.getByRole("button", { name: "widgetChat.newConversation" })).toBeInTheDocument()
   })
 

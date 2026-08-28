@@ -385,6 +385,12 @@
         width: 100%;
         height: 100%;
         max-height: 100%;
+        /* Dynamic viewport units track a mobile browser's address-bar
+           show/hide and on-screen-keyboard changes; browsers that don't
+           parse dvh at all ignore these two lines entirely and keep the
+           100% fallback above. */
+        height: 100dvh;
+        max-height: 100dvh;
         border: none;
         border-radius: 0;
         box-shadow: none;
@@ -610,6 +616,10 @@
     // the drag -- worse than doing nothing.
     if (!widthChanged) return;
     applyPanelWidth();
+    // Crossing the breakpoint while open -- realistically a device rotation,
+    // since virtually every phone's landscape width already exceeds it --
+    // must re-evaluate the lock either way, not just apply it once at open.
+    applyBodyScrollLock();
     // A genuine width change mid-drag invalidates this drag's frozen startX/
     // startWidth anchors -- rather than let a later pointermove misread the
     // viewport's own movement as the user shrinking the panel (and persist
@@ -635,11 +645,15 @@
     window.removeEventListener('resize', onWindowResize);
     window.removeEventListener('blur', onWindowBlur);
     window.removeEventListener('message', onChromeMessage);
-    iframe.removeEventListener('load', onIframeLoad);
     document.removeEventListener('pointermove', onPointerMove);
     document.removeEventListener('pointerup', endDrag);
     document.removeEventListener('pointercancel', cancelDrag);
     cancelDrag();
+    // A host SPA removing the widget while open must not leave the host
+    // page's own scroll stranded locked -- there'd be nothing left to
+    // reopen and unlock it.
+    isOpen = false;
+    applyBodyScrollLock();
     // Belt-and-suspenders for a host SPA that re-inserts this same node
     // later (torndown permanently blocks a new drag regardless, but without
     // this the handle would still show its ew-resize cursor and hover
@@ -659,16 +673,43 @@
 
   var isOpen = false;
 
+  // Non-null exactly while WE own document.body.style.overflow -- guards
+  // restoring it against a host page that changed it independently in the
+  // meantime, matching the userSelect/cursor guard the resize drag above
+  // already uses for the same reason.
+  var lockedBodyOverflow = null;
+
+  // The full-screen mobile panel has no scrollable ancestor of its own
+  // outside the iframe (the safe-area padding strips are plain background),
+  // so a touch-scroll gesture starting there would otherwise fall through to
+  // the host page and scroll it invisibly behind the "modal" overlay.
+  // Re-evaluated on resize too (see onWindowResize) so rotating a device
+  // across the breakpoint while open doesn't strand the lock.
+  function applyBodyScrollLock() {
+    var shouldLock = isOpen && isMobileViewport();
+    if (shouldLock && lockedBodyOverflow === null) {
+      lockedBodyOverflow = document.body.style.overflow;
+      document.body.style.overflow = 'hidden';
+    } else if (!shouldLock && lockedBodyOverflow !== null) {
+      if (document.body.style.overflow === 'hidden') {
+        document.body.style.overflow = lockedBodyOverflow;
+      }
+      lockedBodyOverflow = null;
+    }
+  }
+
   function openPanel() {
     isOpen = true;
     panel.classList.add('open');
     fab.innerHTML = closeIcon;
+    applyBodyScrollLock();
   }
 
   function closePanel() {
     isOpen = false;
     panel.classList.remove('open');
     fab.innerHTML = chatIcon;
+    applyBodyScrollLock();
   }
 
   fab.onclick = function () {
@@ -719,19 +760,6 @@
     }
   }
   window.addEventListener('message', onChromeMessage);
-
-  // Safety net for widget_chrome_ready's revocation side: that only fires
-  // from WidgetChromeControls's React unmount cleanup, which never runs if
-  // the iframe's document is replaced by a real navigation (a full reload,
-  // not the app's own client-side routing, which never fires `load`) rather
-  // than an orderly React unmount. A fresh document has confirmed nothing
-  // about its own chrome yet, so treat any (re)load as "not ready" until a
-  // new widget_chrome_ready arrives for it -- including the very first load,
-  // where this is already the default and thus a harmless no-op.
-  function onIframeLoad() {
-    panel.classList.remove('xagent-chrome-ready');
-  }
-  iframe.addEventListener('load', onIframeLoad);
 
   mode.attach(iframe);
 

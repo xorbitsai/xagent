@@ -39,6 +39,7 @@ describe("widget bootstrap", () => {
     // test anywhere in the file that touches these can't leak into another.
     document.body.style.userSelect = ""
     document.body.style.cursor = ""
+    document.body.style.overflow = ""
     localStorage.setItem("xagent_guest_id", "guest-fixed")
     vi.stubGlobal("fetch", fetchMock)
     fetchMock.mockReset()
@@ -985,6 +986,11 @@ describe("widget bootstrap", () => {
       expect(block).toMatch(/\.xagent-widget-panel\s*\{[^}]*width:\s*100%;/)
       expect(block).toMatch(/\.xagent-widget-panel\s*\{[^}]*height:\s*100%;/)
       expect(block).toMatch(/\.xagent-widget-panel\s*\{[^}]*max-height:\s*100%;/)
+      // Progressive enhancement over the two 100% fallbacks above -- tracks
+      // a mobile browser's address-bar show/hide instead of leaving a gap
+      // or an overflow against the "large" viewport 100% resolves against.
+      expect(block).toMatch(/\.xagent-widget-panel\s*\{[^}]*height:\s*100dvh;/)
+      expect(block).toMatch(/\.xagent-widget-panel\s*\{[^}]*max-height:\s*100dvh;/)
     })
 
     it("respects device safe areas instead of drawing under a notch or home indicator", () => {
@@ -1014,6 +1020,114 @@ describe("widget bootstrap", () => {
       // the parent's only close control on a full-screen mobile panel with
       // nothing to replace it.
       expect(block).toMatch(/\.xagent-widget-panel\.open\.xagent-chrome-ready\s*~\s*\.xagent-widget-fab\s*\{[^}]*display:\s*none;/)
+    })
+  })
+
+  describe("mobile scroll lock", () => {
+    let originalInnerWidth: number
+
+    beforeEach(() => {
+      originalInnerWidth = window.innerWidth
+      fetchMock.mockResolvedValue(new Response(JSON.stringify({
+        ticket: "ticket/one",
+        agent_id: 17,
+      }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      }))
+    })
+
+    afterEach(() => {
+      setInnerWidth(originalInnerWidth)
+    })
+
+    function setInnerWidth(value: number) {
+      Object.defineProperty(window, "innerWidth", { configurable: true, value })
+    }
+
+    function openViaFab() {
+      document.querySelector<HTMLButtonElement>(".xagent-widget-fab")!.click()
+    }
+
+    it("locks the host page's scroll on mobile while the panel is open", () => {
+      setInnerWidth(400)
+      runWidget({ "data-widget-key": "widget-secret" })
+
+      openViaFab()
+
+      expect(document.body.style.overflow).toBe("hidden")
+    })
+
+    it("restores the host page's own overflow value on close", () => {
+      setInnerWidth(400)
+      document.body.style.overflow = "auto"
+      runWidget({ "data-widget-key": "widget-secret" })
+
+      openViaFab()
+      openViaFab()
+
+      expect(document.body.style.overflow).toBe("auto")
+    })
+
+    it("does not restore overflow if the host page changed it since the lock was applied", () => {
+      // Matches the existing userSelect/cursor guard for the same reason:
+      // a host page that made its own deliberate choice while we were open
+      // shouldn't have it silently clobbered back to whatever it was before.
+      setInnerWidth(400)
+      runWidget({ "data-widget-key": "widget-secret" })
+      openViaFab()
+      expect(document.body.style.overflow).toBe("hidden")
+
+      document.body.style.overflow = "scroll"
+      openViaFab()
+
+      expect(document.body.style.overflow).toBe("scroll")
+    })
+
+    it("never locks on desktop", () => {
+      setInnerWidth(1280)
+      runWidget({ "data-widget-key": "widget-secret" })
+
+      openViaFab()
+
+      expect(document.body.style.overflow).toBe("")
+    })
+
+    it("unlocks if a device rotation crosses the breakpoint while the panel stays open", () => {
+      setInnerWidth(400)
+      runWidget({ "data-widget-key": "widget-secret" })
+      openViaFab()
+      expect(document.body.style.overflow).toBe("hidden")
+
+      setInnerWidth(800)
+      window.dispatchEvent(new Event("resize"))
+
+      expect(document.body.style.overflow).toBe("")
+    })
+
+    it("locks if a device rotation crosses the breakpoint the other way while open", () => {
+      setInnerWidth(800)
+      runWidget({ "data-widget-key": "widget-secret" })
+      openViaFab()
+      expect(document.body.style.overflow).toBe("")
+
+      setInnerWidth(400)
+      window.dispatchEvent(new Event("resize"))
+
+      expect(document.body.style.overflow).toBe("hidden")
+    })
+
+    it("releases the lock if a host SPA removes the widget while open on mobile", async () => {
+      setInnerWidth(400)
+      runWidget({ "data-widget-key": "widget-secret" })
+      openViaFab()
+      expect(document.body.style.overflow).toBe("hidden")
+
+      document.querySelector(".xagent-widget-container")?.remove()
+      // The teardown observer's callback fires as a microtask.
+      await Promise.resolve()
+
+      expect(document.body.style.overflow).toBe("")
     })
   })
 })

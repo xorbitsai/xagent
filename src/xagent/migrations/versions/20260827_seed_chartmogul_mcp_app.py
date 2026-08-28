@@ -94,37 +94,11 @@ def upgrade() -> None:
             "chartmogul row must not seed visible"
         )
 
-    # Which of ROW's keys actually exist as columns -- description can be
-    # dropped on a pre-this-migration schema, and both the own-row check
-    # below and the insert further down must degrade the same way rather
-    # than erroring on a column that isn't there yet.
-    present_keys = set(ROW) & columns
-
-    # Deliberately excludes 'description' from IDENTITY_FIELDS here, unlike
-    # downgrade()'s stricter use of the same tuple: description is
-    # admin-editable even on this row (see downgrade()'s comment below), so
-    # an operator's ordinary edit to it must not make a later idempotent
-    # re-run of this migration mistake its own row for a foreign collision
-    # and raise. name/transport are both code-owned and immutable on a
-    # builtin row (admin_mcp.py's _BUILTIN_PROTECTED_FIELDS), so they're
-    # enough to recognize "this is the row we seeded" without depending on
-    # a field that's expected to drift.
-    own_row_fields = [
-        f for f in IDENTITY_FIELDS if f != "description" and f in present_keys
-    ]
-    if not own_row_fields:
-        # name and transport are both core, NOT NULL columns this table has
-        # carried since long before this migration -- unlike description,
-        # neither is ever expected to be missing. An empty own_row_fields
-        # would make sa.select() below emit a column-less SELECT (invalid
-        # SQL, a confusing DB-level error) and, were that guarded around
-        # instead, would make the match check vacuously true for any
-        # existing row regardless of content. Fail loudly and specifically
-        # rather than either of those.
-        raise RuntimeError(
-            "public_mcp_apps.name and .transport are both missing; cannot "
-            "tell an existing chartmogul row apart from a foreign one"
-        )
+    # Excludes 'description' from IDENTITY_FIELDS (see its own comment) --
+    # name/transport are core, NOT NULL columns this table has carried
+    # since long before this migration, so unlike the dropped_keys handling
+    # further down there's no realistic case where they're absent.
+    own_row_fields = [f for f in IDENTITY_FIELDS if f != "description"]
     existing_row = (
         bind.execute(
             sa.select(*(PUBLIC_MCP_APPS_TABLE.c[f] for f in own_row_fields)).where(

@@ -407,6 +407,18 @@
         display: none;
       }
 
+      /* The panel and the FAB are stacking siblings inside the same
+         z-index:999999 container -- a position:fixed panel always paints
+         above a plain in-flow (position:static, the FAB's default) sibling
+         regardless of DOM order, so without this the fixed full-screen panel
+         would visually cover, and fail hit-testing against, the FAB in every
+         state below that intentionally keeps it as the fallback close
+         control. */
+      .xagent-widget-fab {
+        position: relative;
+        z-index: 1;
+      }
+
       /* Hide the FAB only once the iframe has confirmed (via
          widget_chrome_ready in onChromeMessage) that its own in-header
          close control is actually mounted -- loading, auth-failure, and
@@ -673,11 +685,55 @@
 
   var isOpen = false;
 
-  // Non-null exactly while WE own document.body.style.overflow -- guards
-  // restoring it against a host page that changed it independently in the
-  // meantime, matching the userSelect/cursor guard the resize drag above
-  // already uses for the same reason.
-  var lockedBodyOverflow = null;
+  // True exactly while THIS instance owns a reference on the shared lock
+  // below -- a second widget script on the same host page (or this one
+  // reloaded into an SPA route) runs its own independent copy of this whole
+  // closure, so per-instance state alone can't tell whether some other
+  // instance still needs the lock this one is about to release.
+  var scrollLockOwned = false;
+  var scrollLockedBodyEl = null;
+
+  // The lock itself is ref-counted on the body element it was applied to
+  // (not a module-level variable), so it's naturally shared by every widget
+  // instance on the page and naturally reset if a host SPA swaps in a whole
+  // new document.body: acquire() on the same body increments a shared count
+  // instead of re-capturing 'original', and release() only restores once the
+  // last owner lets go -- one widget closing while another (or the host's
+  // own same-value lock) still holds it can't unlock the page out from under
+  // it. Restoring always targets the *captured* body element, not a fresh
+  // document.body read at release time, so a body swap mid-lock can't write
+  // a stale snapshot onto the replacement.
+  function acquireBodyScrollLock() {
+    if (scrollLockOwned) return;
+    var body = document.body;
+    if (!body) return;
+    var state = body.__xagentScrollLock;
+    if (!state) {
+      state = body.__xagentScrollLock = { count: 0, original: body.style.overflow };
+    }
+    state.count += 1;
+    body.style.overflow = 'hidden';
+    scrollLockOwned = true;
+    scrollLockedBodyEl = body;
+  }
+
+  function releaseBodyScrollLock() {
+    if (!scrollLockOwned) return;
+    scrollLockOwned = false;
+    var body = scrollLockedBodyEl;
+    scrollLockedBodyEl = null;
+    var state = body && body.__xagentScrollLock;
+    if (!state) return;
+    state.count -= 1;
+    if (state.count > 0) return;
+    delete body.__xagentScrollLock;
+    // Only restore if it's still our 'hidden' -- a host page that changed it
+    // independently in the meantime (matching the userSelect/cursor drag
+    // guard above) owns whatever it set last, not us.
+    if (body.style.overflow === 'hidden') {
+      body.style.overflow = state.original;
+    }
+  }
 
   // The full-screen mobile panel has no scrollable ancestor of its own
   // outside the iframe (the safe-area padding strips are plain background),
@@ -686,15 +742,10 @@
   // Re-evaluated on resize too (see onWindowResize) so rotating a device
   // across the breakpoint while open doesn't strand the lock.
   function applyBodyScrollLock() {
-    var shouldLock = isOpen && isMobileViewport();
-    if (shouldLock && lockedBodyOverflow === null) {
-      lockedBodyOverflow = document.body.style.overflow;
-      document.body.style.overflow = 'hidden';
-    } else if (!shouldLock && lockedBodyOverflow !== null) {
-      if (document.body.style.overflow === 'hidden') {
-        document.body.style.overflow = lockedBodyOverflow;
-      }
-      lockedBodyOverflow = null;
+    if (isOpen && isMobileViewport()) {
+      acquireBodyScrollLock();
+    } else {
+      releaseBodyScrollLock();
     }
   }
 
@@ -713,6 +764,12 @@
   }
 
   fab.onclick = function () {
+    // A host SPA can remove just the panel (leaving container/FAB in place;
+    // panelRemovalObserver already covers that -- see its own comment
+    // above), which disconnects the observer with no future chance to
+    // release a lock a stray later click would otherwise reacquire on a
+    // detached panel that nothing will ever clean back up.
+    if (torndown) return;
     if (isOpen) {
       closePanel();
     } else {

@@ -1021,6 +1021,21 @@ describe("widget bootstrap", () => {
       // nothing to replace it.
       expect(block).toMatch(/\.xagent-widget-panel\.open\.xagent-chrome-ready\s*~\s*\.xagent-widget-fab\s*\{[^}]*display:\s*none;/)
     })
+
+    it("stacks the fallback FAB above the fixed panel instead of letting it paint underneath", () => {
+      // The FAB is a plain in-flow (position: static) element by default;
+      // the panel becomes position: fixed at this breakpoint. A positioned
+      // element always paints above a non-positioned sibling regardless of
+      // DOM order, so without an explicit stacking rule here the fixed
+      // full-screen panel would visually cover -- and fail hit-testing
+      // against -- the FAB in every state above that intentionally keeps it
+      // as the fallback close control.
+      runWidget({ "data-widget-key": "widget-secret" })
+
+      const block = mobileBlock()
+      expect(block).toMatch(/\.xagent-widget-fab\s*\{[^}]*position:\s*relative;/)
+      expect(block).toMatch(/\.xagent-widget-fab\s*\{[^}]*z-index:\s*1;/)
+    })
   })
 
   describe("mobile scroll lock", () => {
@@ -1127,6 +1142,60 @@ describe("widget bootstrap", () => {
       // The teardown observer's callback fires as a microtask.
       await Promise.resolve()
 
+      expect(document.body.style.overflow).toBe("")
+    })
+
+    it("keeps the lock held while a second widget instance on the same page still needs it", () => {
+      // The lock lives on the body element, ref-counted, precisely so one
+      // instance closing can't unlock scrolling out from under another
+      // instance (or, in production, an unrelated host-page modal that
+      // happens to have set the same 'hidden' value independently).
+      setInnerWidth(400)
+      // A single shared Response instance (the describe-level default) can
+      // only have its body read once -- give each of the two instances'
+      // embed-ticket fetch its own fresh Response so the second doesn't log
+      // a spurious "Body is unusable" failure unrelated to what's under test.
+      fetchMock.mockImplementation(() => Promise.resolve(new Response(JSON.stringify({
+        ticket: "ticket/one",
+        agent_id: 17,
+      }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      })))
+      runWidget({ "data-widget-key": "widget-secret" })
+      runWidget({ "data-widget-key": "widget-secret-2" })
+      const fabs = document.querySelectorAll<HTMLButtonElement>(".xagent-widget-fab")
+      expect(fabs.length).toBe(2)
+
+      fabs[0]!.click()
+      fabs[1]!.click()
+      expect(document.body.style.overflow).toBe("hidden")
+
+      fabs[0]!.click() // closes only the first instance
+      expect(document.body.style.overflow).toBe("hidden")
+
+      fabs[1]!.click() // closes the second and last instance
+      expect(document.body.style.overflow).toBe("")
+    })
+
+    it("does not re-lock scroll on a FAB click after the panel is torn down while open", async () => {
+      // Regression coverage: the panel can be removed directly while the
+      // container/FAB stay in the DOM (see the "tears down when the panel is
+      // removed directly" test elsewhere in this file). Teardown itself
+      // releases the lock, but the FAB's click handler used to have no
+      // torndown guard, so a later click could still call openPanel() on the
+      // now-detached panel and reacquire the lock -- with the teardown
+      // observer already disconnected, nothing would ever release it again.
+      setInnerWidth(400)
+      runWidget({ "data-widget-key": "widget-secret" })
+      openViaFab()
+      expect(document.body.style.overflow).toBe("hidden")
+
+      document.querySelector(".xagent-widget-panel")?.remove()
+      await Promise.resolve() // teardown observer's callback fires as a microtask
+      expect(document.body.style.overflow).toBe("")
+
+      openViaFab() // the FAB is still in the DOM and clickable
       expect(document.body.style.overflow).toBe("")
     })
   })

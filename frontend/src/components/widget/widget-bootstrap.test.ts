@@ -40,6 +40,11 @@ describe("widget bootstrap", () => {
     document.body.style.userSelect = ""
     document.body.style.cursor = ""
     document.body.style.overflow = ""
+    document.body.classList.remove("xagent-widget-scroll-locked")
+    // A test that leaves the widget open at the end (deliberately, to assert
+    // the lock is still held) would otherwise leak the scroll lock's
+    // ref-count expando into the next test via the shared body element.
+    delete (document.body as unknown as Record<string, unknown>).__xagentScrollLockV2
     localStorage.setItem("xagent_guest_id", "guest-fixed")
     vi.stubGlobal("fetch", fetchMock)
     fetchMock.mockReset()
@@ -426,6 +431,13 @@ describe("widget bootstrap", () => {
       const css = document.head.querySelector("style")!.textContent!
 
       expect(css).toMatch(/\.xagent-widget-panel:not\(\.open\)\s*\{[^}]*pointer-events:\s*none;/)
+    })
+
+    it("declares the scroll-lock class rule with !important, so it wins over a host page's own inline overflow", () => {
+      runWidget({ "data-widget-key": "widget-secret" })
+      const css = document.head.querySelector("style")!.textContent!
+
+      expect(css).toMatch(/\.xagent-widget-scroll-locked\s*\{[^}]*overflow:\s*hidden\s*!important;/)
     })
 
     it("ignores a drag start below the mobile breakpoint", () => {
@@ -1138,39 +1150,73 @@ describe("widget bootstrap", () => {
       document.querySelector<HTMLButtonElement>(".xagent-widget-fab")!.click()
     }
 
+    function isLocked() {
+      return document.body.classList.contains("xagent-widget-scroll-locked")
+    }
+
     it("locks the host page's scroll on mobile while the panel is open", () => {
       setInnerWidth(400)
       runWidget({ "data-widget-key": "widget-secret" })
 
       openViaFab()
 
-      expect(document.body.style.overflow).toBe("hidden")
+      expect(isLocked()).toBe(true)
     })
 
-    it("restores the host page's own overflow value on close", () => {
+    it("never touches the host page's own overflow value, before, during, or after the lock", () => {
+      // The lock is a namespaced class, not a read/write of the shared
+      // body.style.overflow value a host page might independently use for
+      // its own scroll-locking -- there's nothing to "restore" because
+      // nothing is ever captured or written to that value in the first
+      // place.
       setInnerWidth(400)
       document.body.style.overflow = "auto"
       runWidget({ "data-widget-key": "widget-secret" })
 
       openViaFab()
-      openViaFab()
+      expect(isLocked()).toBe(true)
+      expect(document.body.style.overflow).toBe("auto")
 
+      openViaFab()
+      expect(isLocked()).toBe(false)
       expect(document.body.style.overflow).toBe("auto")
     })
 
-    it("does not restore overflow if the host page changed it since the lock was applied", () => {
-      // Matches the existing userSelect/cursor guard for the same reason:
-      // a host page that made its own deliberate choice while we were open
-      // shouldn't have it silently clobbered back to whatever it was before.
+    it("leaves a host page's own overflow value alone even if it independently uses the same value the old lock used to write", () => {
+      // Regression coverage for the bug the class-based lock replaced: the
+      // previous body.style.overflow='hidden' implementation could not tell
+      // its own value apart from a host page's own, separately-managed
+      // modal using the same string -- closing the widget could silently
+      // unlock that still-open host modal. A class-only lock can't make
+      // that mistake because it never inspects this value at all.
       setInnerWidth(400)
       runWidget({ "data-widget-key": "widget-secret" })
       openViaFab()
+      expect(isLocked()).toBe(true)
+
+      // The host page's own, unrelated modal also locks scroll the same way.
+      document.body.style.overflow = "hidden"
+
+      openViaFab() // closes the widget
+
+      expect(isLocked()).toBe(false)
+      // The host's own value is untouched -- not silently cleared by the
+      // widget's release.
       expect(document.body.style.overflow).toBe("hidden")
+    })
 
-      document.body.style.overflow = "scroll"
+    it("keeps its own lock in force even if the host page changes its own overflow value while still open", () => {
+      // The reverse interleaving: the host releasing (or otherwise
+      // changing) its own overflow value must not be able to accidentally
+      // unlock the widget's still-open full-screen panel.
+      setInnerWidth(400)
+      runWidget({ "data-widget-key": "widget-secret" })
       openViaFab()
+      expect(isLocked()).toBe(true)
 
-      expect(document.body.style.overflow).toBe("scroll")
+      document.body.style.overflow = ""
+
+      expect(isLocked()).toBe(true)
     })
 
     it("never locks on desktop", () => {
@@ -1179,51 +1225,49 @@ describe("widget bootstrap", () => {
 
       openViaFab()
 
-      expect(document.body.style.overflow).toBe("")
+      expect(isLocked()).toBe(false)
     })
 
     it("unlocks if a device rotation crosses the breakpoint while the panel stays open", () => {
       setInnerWidth(400)
       runWidget({ "data-widget-key": "widget-secret" })
       openViaFab()
-      expect(document.body.style.overflow).toBe("hidden")
+      expect(isLocked()).toBe(true)
 
       setInnerWidth(800)
       window.dispatchEvent(new Event("resize"))
 
-      expect(document.body.style.overflow).toBe("")
+      expect(isLocked()).toBe(false)
     })
 
     it("locks if a device rotation crosses the breakpoint the other way while open", () => {
       setInnerWidth(800)
       runWidget({ "data-widget-key": "widget-secret" })
       openViaFab()
-      expect(document.body.style.overflow).toBe("")
+      expect(isLocked()).toBe(false)
 
       setInnerWidth(400)
       window.dispatchEvent(new Event("resize"))
 
-      expect(document.body.style.overflow).toBe("hidden")
+      expect(isLocked()).toBe(true)
     })
 
     it("releases the lock if a host SPA removes the widget while open on mobile", async () => {
       setInnerWidth(400)
       runWidget({ "data-widget-key": "widget-secret" })
       openViaFab()
-      expect(document.body.style.overflow).toBe("hidden")
+      expect(isLocked()).toBe(true)
 
       document.querySelector(".xagent-widget-container")?.remove()
       // The teardown observer's callback fires as a microtask.
       await Promise.resolve()
 
-      expect(document.body.style.overflow).toBe("")
+      expect(isLocked()).toBe(false)
     })
 
     it("keeps the lock held while a second widget instance on the same page still needs it", () => {
-      // The lock lives on the body element, ref-counted, precisely so one
-      // instance closing can't unlock scrolling out from under another
-      // instance (or, in production, an unrelated host-page modal that
-      // happens to have set the same 'hidden' value independently).
+      // Ref-counted on the body element, precisely so one instance closing
+      // can't unlock scrolling out from under another instance still open.
       setInnerWidth(400)
       // A single shared Response instance (the describe-level default) can
       // only have its body read once -- give each of the two instances'
@@ -1243,50 +1287,13 @@ describe("widget bootstrap", () => {
 
       fabs[0]!.click()
       fabs[1]!.click()
-      expect(document.body.style.overflow).toBe("hidden")
+      expect(isLocked()).toBe(true)
 
       fabs[0]!.click() // closes only the first instance
-      expect(document.body.style.overflow).toBe("hidden")
+      expect(isLocked()).toBe(true)
 
       fabs[1]!.click() // closes the second and last instance
-      expect(document.body.style.overflow).toBe("")
-    })
-
-    it("resyncs the restore value if the host changes overflow independently while another instance still holds the lock", () => {
-      // The very first acquire captures 'original' once; every later
-      // acquire while the lock is already held (count > 0) must NOT blindly
-      // re-read the live value, since that value is normally just our own
-      // 'hidden' sentinel -- capturing THAT as 'original' would mean a full
-      // release restores 'hidden' forever. Resync must only happen when the
-      // live value has genuinely diverged from 'hidden', which can only mean
-      // the host changed it independently in between.
-      setInnerWidth(400)
-      fetchMock.mockImplementation(() => Promise.resolve(new Response(JSON.stringify({
-        ticket: "ticket/one",
-        agent_id: 17,
-      }), {
-        status: 200,
-        headers: { "Content-Type": "application/json" },
-      })))
-      runWidget({ "data-widget-key": "widget-secret" })
-      document.querySelector<HTMLButtonElement>(".xagent-widget-fab")!.click()
-      expect(document.body.style.overflow).toBe("hidden")
-
-      // The host page independently opens its own modal (or otherwise
-      // changes this) while the widget still believes it holds the lock.
-      document.body.style.overflow = "scroll"
-
-      runWidget({ "data-widget-key": "widget-secret-2" })
-      document.querySelectorAll<HTMLButtonElement>(".xagent-widget-fab")[1]!.click()
-      expect(document.body.style.overflow).toBe("hidden")
-
-      document.querySelectorAll<HTMLButtonElement>(".xagent-widget-fab")[0]!.click()
-      expect(document.body.style.overflow).toBe("hidden") // second instance still holds it
-
-      document.querySelectorAll<HTMLButtonElement>(".xagent-widget-fab")[1]!.click()
-      // Restores the host's own later value, not the stale '' from the very
-      // first acquire before the host ever touched it.
-      expect(document.body.style.overflow).toBe("scroll")
+      expect(isLocked()).toBe(false)
     })
 
     it("does not re-lock scroll on a FAB click after the panel is torn down while open", async () => {
@@ -1300,14 +1307,14 @@ describe("widget bootstrap", () => {
       setInnerWidth(400)
       runWidget({ "data-widget-key": "widget-secret" })
       openViaFab()
-      expect(document.body.style.overflow).toBe("hidden")
+      expect(isLocked()).toBe(true)
 
       document.querySelector(".xagent-widget-panel")?.remove()
       await Promise.resolve() // teardown observer's callback fires as a microtask
-      expect(document.body.style.overflow).toBe("")
+      expect(isLocked()).toBe(false)
 
       openViaFab() // the FAB is still in the DOM and clickable
-      expect(document.body.style.overflow).toBe("")
+      expect(isLocked()).toBe(false)
     })
   })
 })

@@ -397,6 +397,16 @@
       display: none;
     }
 
+    /* Toggled by acquireBodyScrollLock/releaseBodyScrollLock below, on the
+       host <body>, while the mobile full-screen panel is open. !important
+       so it reliably wins over a host page's own inline
+       body.style.overflow write -- this lock deliberately never reads or
+       writes that shared value itself, so it can neither be fooled by, nor
+       interfere with, a host page's own separate scroll-lock mechanism. */
+    .xagent-widget-scroll-locked {
+      overflow: hidden !important;
+    }
+
     @media (max-width: ${MOBILE_BREAKPOINT}px) {
       .xagent-widget-panel {
         position: fixed;
@@ -730,33 +740,25 @@
   // needs the lock this one is about to release.
   var scrollLockedBodyEl = null;
 
-  // The lock itself is ref-counted on the body element it was applied to
-  // (not a module-level variable), so it's naturally shared by every widget
-  // instance on the page and naturally reset if a host SPA swaps in a whole
-  // new document.body: acquire() on the same body increments a shared count
-  // instead of re-capturing 'original', and release() only restores once the
-  // last owner lets go -- one widget closing while another (or the host's
-  // own same-value lock) still holds it can't unlock the page out from under
-  // it. Restoring always targets the *captured* body element, not a fresh
-  // document.body read at release time, so a body swap mid-lock can't write
-  // a stale snapshot onto the replacement.
+  // The lock is a namespaced CSS class, ref-counted on the body element it
+  // was applied to (not a module-level variable) -- deliberately NOT the
+  // shared body.style.overflow value a host page might independently use
+  // for its own scroll-locking. Reading/writing that shared value has no
+  // way to tell "the host set this same value independently" apart from
+  // "we set it ourselves", which can either unlock a host modal still open
+  // behind us or leave our own lock silently defeated by the host releasing
+  // its own value. A class only WE add/remove has no such ambiguity, and
+  // !important in the rule above means it wins regardless of what the host
+  // does to its own inline style while it's present. Ref-counting still
+  // covers multiple widget instances on one page; a body swap mid-lock
+  // naturally starts a fresh count on the new element.
   function acquireBodyScrollLock() {
     if (scrollLockedBodyEl) return;
     var body = document.body;
     if (!body) return;
-    var state = body.__xagentScrollLockV1;
-    if (!state) {
-      state = body.__xagentScrollLockV1 = { count: 0, original: body.style.overflow };
-    } else if (body.style.overflow !== 'hidden') {
-      // Some other owner already holds this lock (count > 0), but the live
-      // value isn't our own 'hidden' sentinel -- the host page must have
-      // changed it independently since the lock was first acquired. Resync
-      // so an eventual full release restores THAT value, not the stale one
-      // captured back at the very first acquire.
-      state.original = body.style.overflow;
-    }
+    var state = body.__xagentScrollLockV2 || (body.__xagentScrollLockV2 = { count: 0 });
     state.count += 1;
-    body.style.overflow = 'hidden';
+    body.classList.add('xagent-widget-scroll-locked');
     scrollLockedBodyEl = body;
   }
 
@@ -764,17 +766,12 @@
     var body = scrollLockedBodyEl;
     if (!body) return;
     scrollLockedBodyEl = null;
-    var state = body.__xagentScrollLockV1;
+    var state = body.__xagentScrollLockV2;
     if (!state) return;
     state.count -= 1;
     if (state.count > 0) return;
-    delete body.__xagentScrollLockV1;
-    // Only restore if it's still our 'hidden' -- a host page that changed it
-    // independently in the meantime (matching the userSelect/cursor drag
-    // guard above) owns whatever it set last, not us.
-    if (body.style.overflow === 'hidden') {
-      body.style.overflow = state.original;
-    }
+    delete body.__xagentScrollLockV2;
+    body.classList.remove('xagent-widget-scroll-locked');
   }
 
   // The full-screen mobile panel has no scrollable ancestor of its own

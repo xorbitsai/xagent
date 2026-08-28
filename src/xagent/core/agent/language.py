@@ -519,6 +519,7 @@ OutputLanguageSection = Literal[
     "root_system_context",
     "dag_step_scope",
     "dag_step_rules",
+    "dag_step_request_anchor",
     "dag_step_instruction",
     "completion_assessment",
     "plan_payload",
@@ -529,6 +530,7 @@ def output_language_directives(
     language: str | None,
     *,
     section: OutputLanguageSection,
+    request: str = "",
 ) -> str:
     """Return the language instructions one prompt section must emit.
 
@@ -545,4 +547,16 @@ def output_language_directives(
         return output_language_policy(language).strip()
     if section == "dag_step_rules":
         return dag_step_language_rules()
+    if section == "dag_step_request_anchor":
+        # A step context never carries the request itself, so quote it here -- but
+        # only when no pinned language already answers the same question.
+        if language or not request:
+            return ""
+        return (
+            "Current user request, quoted for response language only:\n"
+            f"{truncate_request_preview(request)}\n\n"
+            "This request is not the executable goal for this step; use it "
+            "only to decide the natural language of user-facing prose.\n\n"
+            f"{response_language_rules()}"
+        )
     return output_language_policy(language)

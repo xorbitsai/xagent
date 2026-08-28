@@ -24,8 +24,6 @@ from ...tools.artifacts import (
 from ..language import (
     effective_output_language,
     output_language_directives,
-    response_language_rules,
-    truncate_request_preview,
 )
 from ..result import CONTROL_TOOL_NAMES, tool_result_succeeded
 from .components import (
@@ -589,14 +587,13 @@ class ExecutionContext:
                 "provided in the latest DAG step instruction message.\n\n"
                 f"{step_language_rules}"
             )
-            if current_task and not output_language:
-                parts.append(
-                    "Current user request, quoted for response language only:\n"
-                    f"{truncate_request_preview(current_task)}\n\n"
-                    "This request is not the executable goal for this step; use it "
-                    "only to decide the natural language of user-facing prose.\n\n"
-                    f"{response_language_rules()}"
-                )
+            request_anchor = output_language_directives(
+                output_language,
+                section="dag_step_request_anchor",
+                request=current_task,
+            )
+            if request_anchor:
+                parts.append(request_anchor)
         memory_context = self.metadata.get(MEMORY_CONTEXT_METADATA_KEY)
         if memory_context:
             parts.append(

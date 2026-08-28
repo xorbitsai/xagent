@@ -238,21 +238,29 @@ export function ConnectAppsField({
   // the optimistic skippedNote back instead of leaving the card looking
   // resolved while the acknowledgement never actually went through.
   const skippedRef = useRef(false);
-  // Shared by the footer's Skip button and the all-unresolved fallback below
-  // - same optimistic-flip-then-roll-back-on-failure contract either way.
-  const handleSkipClick = async () => {
-    if (skippedRef.current) return;
-    skippedRef.current = true;
-    setSkipped(true);
+  // Shared by Skip (footer + all-unresolved fallback) and Continue: set the
+  // ref synchronously before any await so a second click landing in the
+  // same tick is a no-op, flip the optimistic state, then roll both back on
+  // failure so a failed send doesn't leave the card looking resolved while
+  // the message never actually went through.
+  const runOptimisticAck = async (
+    ref: React.MutableRefObject<boolean>,
+    setState: (value: boolean) => void,
+    action: () => Promise<void> | void,
+  ) => {
+    if (ref.current) return;
+    ref.current = true;
+    setState(true);
     try {
-      await onSkip();
+      await action();
     } catch {
-      skippedRef.current = false;
+      ref.current = false;
       if (isMountedRef.current) {
-        setSkipped(false);
+        setState(false);
       }
     }
   };
+  const handleSkipClick = () => runOptimisticAck(skippedRef, setSkipped, onSkip);
   // Synchronous shadow of connectingKeys, same reason connect-mcp-dialog.tsx
   // keeps loadingAppsRef alongside loadingApps (#1330 there): setState-based
   // `disabled={isConnecting}` lags a commit cycle behind two clicks landing
@@ -608,19 +616,7 @@ export function ConnectAppsField({
               <button
                 type="button"
                 className="flex-shrink-0 rounded-md bg-primary px-2.5 py-1 text-xs font-medium text-primary-foreground hover:bg-primary/90"
-                onClick={async () => {
-                  if (continuedRef.current) return;
-                  continuedRef.current = true;
-                  setContinued(true);
-                  try {
-                    await onContinue();
-                  } catch {
-                    continuedRef.current = false;
-                    if (isMountedRef.current) {
-                      setContinued(false);
-                    }
-                  }
-                }}
+                onClick={() => runOptimisticAck(continuedRef, setContinued, onContinue)}
               >
                 {t("chatPage.clarification.connectApps.continue")}
               </button>

@@ -409,38 +409,20 @@ export function ClarificationForm({
     }
   }
 
-  // "connect_apps" has no form fields to gather - skipping just logs a
-  // plain acknowledgement message, matching every other interaction type's
-  // "answer becomes a chat message" contract, but without the lines/
-  // formState machinery handleSubmit above uses (there's nothing to gather).
-  const handleSkipConnectApps = async () => {
-    const message = t("chatPage.clarification.connectApps.skip")
-    const metadata = requestId ? { request_id: requestId } : {}
-    try {
-      if (onSend) {
-        await onSend(message, [], metadata)
-      } else if (sendMessage) {
-        await sendMessage(message, { force: true, metadata }, [])
-      }
-    } catch (error) {
-      console.error("Failed to send connect-apps skip response", error)
-      toast.error(t("chatPage.clarification.sendError"))
-      throw error
-    }
-  }
-
-  // A distinct message from Skip's, sent once every requested app is
-  // connected. Functionally this is the same "acknowledgement becomes a
-  // chat message" mechanism as Skip - but the wording matters here beyond
-  // just what the user reads: when this card is paused mid-task (a tool
-  // itself returned waiting_for_user because a connector it needed was
-  // missing - see UnavailableMCPTool._run_unavailable), the task's own
-  // resume protocol only replans once a *new* message has been appended
+  // "connect_apps" has no form fields to gather - both Skip and Continue
+  // just log a plain acknowledgement message, matching every other
+  // interaction type's "answer becomes a chat message" contract, but
+  // without the lines/formState machinery handleSubmit above uses (there's
+  // nothing to gather). Distinct translation keys, not a shared message: the
+  // wording matters when this card is paused mid-task (a tool itself
+  // returned waiting_for_user because a connector it needed was missing -
+  // see UnavailableMCPTool._run_unavailable) - the task's own resume
+  // protocol only replans once a *new* message has been appended
   // (ReActPattern._resume_waiting_for_user_if_needed compares message
-  // counts) - Skip's "I'll do this later" text would read as a non sequitur
-  // once every app the agent actually asked for is already connected.
-  const handleContinueConnectApps = async () => {
-    const message = t("chatPage.clarification.connectApps.continue")
+  // counts), so Continue's "connected" text would read as a non sequitur
+  // from Skip's "I'll do this later", and vice versa.
+  const sendConnectAppsAck = async (translationKey: TranslationKey, logLabel: string) => {
+    const message = t(translationKey)
     const metadata = requestId ? { request_id: requestId } : {}
     try {
       if (onSend) {
@@ -449,11 +431,15 @@ export function ClarificationForm({
         await sendMessage(message, { force: true, metadata }, [])
       }
     } catch (error) {
-      console.error("Failed to send connect-apps continue response", error)
+      console.error(`Failed to send connect-apps ${logLabel} response`, error)
       toast.error(t("chatPage.clarification.sendError"))
       throw error
     }
   }
+  const handleSkipConnectApps = () =>
+    sendConnectAppsAck("chatPage.clarification.connectApps.skip", "skip")
+  const handleContinueConnectApps = () =>
+    sendConnectAppsAck("chatPage.clarification.connectApps.continue", "continue")
 
   const renderField = (interaction: Interaction) => {
     const value = formState[interaction.field]

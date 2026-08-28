@@ -987,6 +987,9 @@ describe("widget bootstrap", () => {
       const block = mobileBlock()
       expect(block).toMatch(/\.xagent-widget-panel\s*\{[^}]*padding-top:\s*env\(safe-area-inset-top/)
       expect(block).toMatch(/\.xagent-widget-panel\s*\{[^}]*padding-bottom:\s*env\(safe-area-inset-bottom/)
+      // Landscape can put a side notch on either edge.
+      expect(block).toMatch(/\.xagent-widget-panel\s*\{[^}]*padding-left:\s*env\(safe-area-inset-left/)
+      expect(block).toMatch(/\.xagent-widget-panel\s*\{[^}]*padding-right:\s*env\(safe-area-inset-right/)
     })
 
     it("hides the FAB while the full-screen panel is open, since its own header already has a close control", () => {

@@ -389,9 +389,12 @@
         border-radius: 0;
         box-shadow: none;
         /* Full-screen means edge-to-edge, including under a notch/home
-           indicator -- the fallback keeps unsupporting browsers at 0. */
+           indicator or, in landscape, a side notch -- the fallback keeps
+           unsupporting browsers at 0. */
         padding-top: env(safe-area-inset-top, 0px);
         padding-bottom: env(safe-area-inset-bottom, 0px);
+        padding-left: env(safe-area-inset-left, 0px);
+        padding-right: env(safe-area-inset-right, 0px);
       }
 
       .xagent-widget-resize-handle {

@@ -1064,6 +1064,14 @@ class _UnavailableMCPToolResult(BaseModel):
         default=True,
         description="Whether the tool execution resulted in an error",
     )
+    message: str | None = Field(
+        default=None,
+        description="User-facing pause text for a waiting_for_user status",
+    )
+    interactions: List[Dict[str, Any]] | None = Field(
+        default=None,
+        description="Interaction requests for a waiting_for_user status",
+    )
 
 
 class UnavailableMCPTool(AbstractBaseTool):

@@ -309,6 +309,29 @@ def test_unavailable_tool_return_schema_accepts_access_denied_result(monkeypatch
     assert parsed.is_error is True
 
 
+@pytest.mark.asyncio
+async def test_unavailable_tool_return_schema_accepts_waiting_for_user_result(
+    monkeypatch,
+):
+    """_UnavailableMCPToolResult must declare message/interactions too, not
+    just the error-branch fields - a supported return_type().model_validate()
+    consumer would otherwise silently drop the pause text and connect_apps
+    payload for every waiting_for_user result."""
+    monkeypatch.setenv("XAGENT_USER_ID", "7")
+    tool = _unavailable_tool(
+        allow_users=["7"],
+        failure_code="oauth_token_required",
+        app_name="Gmail",
+    )
+
+    result = await tool.run_json_async({})
+    parsed = tool.return_type().model_validate(result)
+
+    assert parsed.status == "waiting_for_user"
+    assert parsed.message == result["message"]
+    assert parsed.interactions == result["interactions"]
+
+
 def test_unavailable_tool_sync_unauthorized_uses_mcp_access_denied(monkeypatch):
     monkeypatch.setenv("XAGENT_USER_ID", "8")
     tool = _unavailable_tool(allow_users=["7"])

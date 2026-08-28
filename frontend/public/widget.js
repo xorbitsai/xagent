@@ -444,6 +444,16 @@
         display: none;
       }
 
+      /* The container (not the FAB itself) is what anchors the fallback
+         FAB's on-screen position -- the panel's own safe-area padding above
+         has no effect on it, so without this a notch/home-indicator inset
+         wider than the base 20px can leave part of the touch target inside
+         that unsafe area while the child hasn't confirmed readiness. */
+      .xagent-widget-container {
+        bottom: calc(20px + env(safe-area-inset-bottom, 0px));
+        right: calc(20px + env(safe-area-inset-right, 0px));
+      }
+
       /* The panel and the FAB are stacking siblings inside the same
          z-index:999999 container -- a position:fixed panel always paints
          above a plain in-flow (position:static, the FAB's default) sibling
@@ -729,6 +739,11 @@
   var closeIcon = '<svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path d="M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/></svg>';
 
   fab.innerHTML = chatIcon;
+  // In the no-ready mobile states, this is the only dismiss control the
+  // panel has at all -- an unlabeled icon-only button leaves a screen
+  // reader user with no way to know what it does. Kept in sync with the
+  // icon swap in openPanel/closePanel below.
+  fab.setAttribute('aria-label', 'Open chat');
 
   var isOpen = false;
 
@@ -792,6 +807,7 @@
     isOpen = true;
     panel.classList.add('open');
     fab.innerHTML = closeIcon;
+    fab.setAttribute('aria-label', 'Close chat');
     applyBodyScrollLock();
   }
 
@@ -799,6 +815,7 @@
     isOpen = false;
     panel.classList.remove('open');
     fab.innerHTML = chatIcon;
+    fab.setAttribute('aria-label', 'Open chat');
     applyBodyScrollLock();
   }
 

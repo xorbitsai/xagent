@@ -1037,12 +1037,16 @@ describe("widget bootstrap", () => {
       // width: 380px / height: 600px / max-height: calc(100vh - 100px) --
       // these three overrides are what actually makes it edge-to-edge.
       expect(block).toMatch(/\.xagent-widget-panel\s*\{[^}]*width:\s*100%;/)
-      expect(block).toMatch(/\.xagent-widget-panel\s*\{[^}]*height:\s*100%;/)
+      // (?<!max-) so this can't be silently satisfied by max-height's own
+      // "...height:" substring if the real height: declaration were removed
+      // -- "max-height:" literally ends in "height:", so an unanchored
+      // /height:\s*100%;/ matches inside it too.
+      expect(block).toMatch(/\.xagent-widget-panel\s*\{[^}]*(?<!max-)height:\s*100%;/)
       expect(block).toMatch(/\.xagent-widget-panel\s*\{[^}]*max-height:\s*100%;/)
       // Progressive enhancement over the two 100% fallbacks above -- tracks
       // a mobile browser's address-bar show/hide instead of leaving a gap
       // or an overflow against the "large" viewport 100% resolves against.
-      expect(block).toMatch(/\.xagent-widget-panel\s*\{[^}]*height:\s*100dvh;/)
+      expect(block).toMatch(/\.xagent-widget-panel\s*\{[^}]*(?<!max-)height:\s*100dvh;/)
       expect(block).toMatch(/\.xagent-widget-panel\s*\{[^}]*max-height:\s*100dvh;/)
       // Order matters, not just presence: on equal specificity the LAST
       // declaration wins, so the 100dvh enhancement must come after its 100%
@@ -1051,7 +1055,7 @@ describe("widget bootstrap", () => {
       // parse dvh at all (they'd apply 100dvh as an unrecognized value, no
       // fallback left behind it).
       const panelRule = block.match(/\.xagent-widget-panel\s*\{([^}]*)\}/)![1]
-      expect(panelRule.search(/height:\s*100dvh;/)).toBeGreaterThan(panelRule.search(/height:\s*100%;/))
+      expect(panelRule.search(/(?<!max-)height:\s*100dvh;/)).toBeGreaterThan(panelRule.search(/(?<!max-)height:\s*100%;/))
       expect(panelRule.search(/max-height:\s*100dvh;/)).toBeGreaterThan(panelRule.search(/max-height:\s*100%;/))
     })
 
@@ -1109,6 +1113,19 @@ describe("widget bootstrap", () => {
       expect(block).toMatch(/\.xagent-widget-fab\s*\{[^}]*z-index:\s*1;/)
     })
 
+    it("offsets the fallback FAB's anchor point for device safe areas too", () => {
+      // The panel's own safe-area padding has no effect on the FAB, which
+      // is anchored by the container's bottom/right instead -- without this,
+      // a safe-area inset wider than the base 20px can leave part of the
+      // touch target inside a notch/home-indicator/gesture area while the
+      // child hasn't confirmed readiness.
+      runWidget({ "data-widget-key": "widget-secret" })
+
+      const block = mobileBlock()
+      expect(block).toMatch(/\.xagent-widget-container\s*\{[^}]*bottom:\s*calc\(20px \+ env\(safe-area-inset-bottom,\s*0px\)\);/)
+      expect(block).toMatch(/\.xagent-widget-container\s*\{[^}]*right:\s*calc\(20px \+ env\(safe-area-inset-right,\s*0px\)\);/)
+    })
+
     it("keeps the panel before the FAB in DOM order, which the FAB-hiding sibling selector depends on", () => {
       // .xagent-widget-panel.open.xagent-widget-chrome-ready ~ .xagent-widget-fab
       // only ever matches a FAB that comes AFTER the panel -- it would
@@ -1121,6 +1138,90 @@ describe("widget bootstrap", () => {
       const fab = document.querySelector(".xagent-widget-fab")!
       const panelComesFirst = Boolean(panel.compareDocumentPosition(fab) & Node.DOCUMENT_POSITION_FOLLOWING)
       expect(panelComesFirst).toBe(true)
+    })
+  })
+
+  describe("matchMedia-driven viewport detection", () => {
+    let originalInnerWidth: number
+
+    beforeEach(() => {
+      originalInnerWidth = window.innerWidth
+      fetchMock.mockResolvedValue(new Response(JSON.stringify({
+        ticket: "ticket/one",
+        agent_id: 17,
+      }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      }))
+    })
+
+    afterEach(() => {
+      setInnerWidth(originalInnerWidth)
+    })
+
+    function setInnerWidth(value: number) {
+      Object.defineProperty(window, "innerWidth", { configurable: true, value })
+    }
+
+    // isMobileViewport() prefers window.matchMedia over window.innerWidth,
+    // but jsdom (every other test in this file) has no matchMedia at all --
+    // that only exercises the innerWidth fallback branch. These tests stub
+    // matchMedia in so the primary branch itself is actually covered, not
+    // just assumed correct from reading the source.
+    function stubMatchMedia() {
+      let matches = false
+      const mql = {
+        get matches() {
+          return matches
+        },
+        media: "",
+      }
+      const matchMediaSpy = vi.fn((query: string) => {
+        mql.media = query
+        return mql as unknown as MediaQueryList
+      })
+      vi.stubGlobal("matchMedia", matchMediaSpy)
+      return { matchMediaSpy, set: (value: boolean) => { matches = value } }
+    }
+
+    function panelWidthStyle() {
+      return document.querySelector<HTMLDivElement>(".xagent-widget-panel")!.style.width
+    }
+
+    it("queries the exact mobile breakpoint media string", () => {
+      const { matchMediaSpy } = stubMatchMedia()
+
+      runWidget({ "data-widget-key": "widget-secret" })
+
+      expect(matchMediaSpy).toHaveBeenCalledWith("(max-width: 480px)")
+    })
+
+    it("prefers matchMedia over a conflicting innerWidth when deciding mobile behavior", () => {
+      // A genuine innerWidth-vs-CSS-viewport-width disagreement (see
+      // isMobileViewport()'s own comment) is exactly why matchMedia exists
+      // here -- innerWidth alone would say "desktop" at this width.
+      setInnerWidth(1280)
+      const { set } = stubMatchMedia()
+      set(true) // the CSS engine says mobile
+
+      runWidget({ "data-widget-key": "widget-secret" })
+
+      // Mobile means the CSS media query owns sizing -- no inline width.
+      expect(panelWidthStyle()).toBe("")
+    })
+
+    it("re-reads a stubbed matchMedia's answer on resize, not just at initial load", () => {
+      setInnerWidth(1280)
+      const { set } = stubMatchMedia()
+      set(false)
+      runWidget({ "data-widget-key": "widget-secret" })
+      expect(panelWidthStyle()).not.toBe("")
+
+      set(true)
+      setInnerWidth(1281) // must actually change, or onWindowResize no-ops
+      window.dispatchEvent(new Event("resize"))
+
+      expect(panelWidthStyle()).toBe("")
     })
   })
 

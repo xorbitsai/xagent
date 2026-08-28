@@ -119,6 +119,20 @@ describe("widget close chrome", () => {
     expect(panelEl()).not.toHaveClass("open")
   })
 
+  it("labels the FAB for screen readers, and keeps the label in sync with open/close state", () => {
+    // In the no-ready mobile states this is the only dismiss control the
+    // panel has at all -- an unlabeled icon-only button leaves a screen
+    // reader user with no way to know what it does.
+    runWidget()
+    expect(fabEl()).toHaveAttribute("aria-label", "Open chat")
+
+    fabEl()?.click()
+    expect(fabEl()).toHaveAttribute("aria-label", "Close chat")
+
+    fabEl()?.click()
+    expect(fabEl()).toHaveAttribute("aria-label", "Open chat")
+  })
+
   it("closes the panel when the iframe posts widget_close", () => {
     runWidget()
     fabEl()?.click()

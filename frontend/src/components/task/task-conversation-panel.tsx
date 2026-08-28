@@ -502,8 +502,10 @@ export function TaskConversationPanel({
     // interactions), which - now that Continue is gated on this being the
     // active message (see clarification-form.tsx) - would leave the REAL
     // live connect_apps pause with no button at all once its apps show
-    // connected. waitingRequestId only exists on newer pauses; older data
-    // without it falls through to the heuristics unchanged.
+    // connected. waitingRequestId isn't populated by any production writer
+    // yet (see task_interaction_staging.py) - this branch is forward
+    // compatible for when that lands, not a live legacy-data fallback -
+    // so every pause today still falls through to the heuristics below.
     if (state.currentTask?.waitingRequestId) {
       for (let i = messageItems.length - 1; i >= 0; i--) {
         const item = messageItems[i]

@@ -495,6 +495,24 @@ export function TaskConversationPanel({
       return null
     }
 
+    // Prefer an exact identity match over the content-string/last-with-
+    // interactions heuristics below: those can misidentify the active
+    // message (e.g. a whitespace/localization mismatch against
+    // waitingPrompt, or a stale earlier message that still carries
+    // interactions), which - now that Continue is gated on this being the
+    // active message (see clarification-form.tsx) - would leave the REAL
+    // live connect_apps pause with no button at all once its apps show
+    // connected. waitingRequestId only exists on newer pauses; older data
+    // without it falls through to the heuristics unchanged.
+    if (state.currentTask?.waitingRequestId) {
+      for (let i = messageItems.length - 1; i >= 0; i--) {
+        const item = messageItems[i]
+        if (item.interactionRequestId === state.currentTask.waitingRequestId) {
+          return item.id
+        }
+      }
+    }
+
     if (waitingPrompt) {
       const normalizedPrompt = waitingPrompt.trim()
       for (let i = messageItems.length - 1; i >= 0; i--) {
@@ -513,7 +531,7 @@ export function TaskConversationPanel({
     }
 
     return null
-  }, [messageItems, state.currentTask?.status, waitingPrompt])
+  }, [messageItems, state.currentTask?.status, state.currentTask?.waitingRequestId, waitingPrompt])
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView?.({ behavior: "smooth" })

@@ -602,6 +602,57 @@ describe("TaskConversationPanel", () => {
     expect(rendered[1]).toHaveAttribute("data-request-id", "inputreq_q2")
   })
 
+  it("prefers the waitingRequestId identity match over the content-string/last-with-interactions heuristics when they'd disagree", () => {
+    // The persisted message's content can legitimately diverge from
+    // currentTask.waitingQuestion in trivial ways (an internal formatting
+    // difference the content-string match doesn't tolerate) - which would
+    // make the content match miss the real active message and fall back to
+    // "last assistant message with interactions." That fallback can land on
+    // a LATER, unrelated connect_apps message instead of the actually-live
+    // one. Continue is now gated on this identification (see
+    // clarification-form.tsx), so getting the wrong message active would
+    // leave the true live pause with no button once its apps connect.
+    appState.messages = [
+      {
+        id: "live-connect-apps",
+        role: "assistant",
+        content: "I need access to Gmail  to continue.",
+        timestamp: 1000,
+        isResult: true,
+        interactions: [{ type: "connect_apps", field: "connect_apps", apps: ["Gmail"] }],
+        interactionRequestId: "inputreq_live",
+      },
+      {
+        id: "later-stale-connect-apps",
+        role: "assistant",
+        content: "Please connect Slack first.",
+        timestamp: 2000,
+        isResult: true,
+        interactions: [{ type: "connect_apps", field: "connect_apps", apps: ["Slack"] }],
+        interactionRequestId: "inputreq_stale_2",
+      },
+    ]
+    appState.traceEvents = []
+    appState.currentTask = {
+      id: "42",
+      title: "Preview",
+      description: "Preview",
+      status: "waiting_for_user",
+      createdAt: "2026-01-01T00:00:00Z",
+      updatedAt: "2026-01-01T00:00:00Z",
+      waitingQuestion: "I need access to Gmail to continue.",
+      waitingRequestId: "inputreq_live",
+    } as any
+
+    render(<TaskConversationPanel mode="embedded-preview" />)
+
+    const rendered = screen.getAllByTestId("chat-message")
+    const liveItem = rendered.find((m) => m.getAttribute("data-request-id") === "inputreq_live")
+    const staleItem = rendered.find((m) => m.getAttribute("data-request-id") === "inputreq_stale_2")
+    expect(liveItem).toHaveAttribute("data-active", "true")
+    expect(staleItem).toHaveAttribute("data-active", "false")
+  })
+
   it("keeps an identified text-only wait separate from stale structured trace interactions", () => {
     appState.messages = [{
       id: "user-r2",

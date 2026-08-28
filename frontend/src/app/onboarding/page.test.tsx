@@ -209,6 +209,28 @@ describe("OnboardingPage", () => {
     expect(call).not.toHaveProperty("department")
   })
 
+  // Pins a test-coverage gap found in full-feature self-review: the header
+  // "Skip setup" exit is reachable from any step regardless of Continue's
+  // validation state (it's only disabled while a save is in flight), so a
+  // user can pick "Other," type only whitespace, and exit before Continue
+  // would have ever required real text. Whitespace-only industry must be
+  // omitted, not sent as-is - `industry.trim() || undefined` regressing to
+  // `industry || undefined` would send the raw whitespace string instead.
+  it("omits industry (does not send whitespace) when 'Other' is picked but only whitespace was typed, exited via header Skip", async () => {
+    await goToWelcomeThenBusiness()
+    fireEvent.click(screen.getByText("Other"))
+    fireEvent.change(screen.getByPlaceholderText("e.g. Property management"), {
+      target: { value: "   " },
+    })
+
+    fireEvent.click(screen.getByText("Skip setup"))
+
+    await waitFor(() => expect(updateUserPreferencesMock).toHaveBeenCalled())
+    const call = updateUserPreferencesMock.mock.calls.at(-1)![0]
+    expect(call).toHaveProperty("department", "other")
+    expect(call).not.toHaveProperty("industry")
+  })
+
   // Matches PREFERENCES_TEXT_FIELD_MAX_LENGTH in src/xagent/web/api/auth.py -
   // a defensive client-side cap flagged by PR review.
   it("caps the free-text industry field at 200 characters", async () => {
@@ -596,6 +618,25 @@ describe("OnboardingPage", () => {
     expect(screen.getByText("Continue").closest("button")).toBeDisabled()
   })
 
+  // Pins a test-coverage gap found in full-feature self-review: prior tests
+  // only asserted the loading spinner's presence via data-testid, never its
+  // accessible status semantics directly - a regression that dropped
+  // role="status" (or moved it off the wrapping element) would pass every
+  // other test in this file.
+  it("exposes the team-step loading state to assistive technology via role=status", async () => {
+    apiRequestMock.mockResolvedValue({ ok: false })
+
+    await goToWelcomeThenBusiness()
+    fireEvent.click(screen.getByText("Marketing"))
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/take off your plate/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Post on social media"))
+    fireEvent.click(screen.getByText("Continue"))
+
+    await waitFor(() => expect(screen.getByText(/Meet your AI team/)).toBeInTheDocument())
+    expect(screen.getByRole("status")).toBeInTheDocument()
+  })
+
   it("stays on the loading spinner when the templates fetch resolves ok with a non-array body", async () => {
     apiRequestMock.mockResolvedValue({ ok: true, json: async () => ({ not: "an array" }) })
 
@@ -774,6 +815,46 @@ describe("OnboardingPage", () => {
 
     await waitFor(() => expect(hireAgentFromTemplateMock).toHaveBeenCalled())
     expect(markOnboardingSaveEscapedMock).toHaveBeenCalledTimes(1)
+  })
+
+  // Pins a test-coverage gap found in full-feature self-review: the escape
+  // path still has the freshness re-check and hireAgentFromTemplate ahead of
+  // it after escalating, both of which can throw - the freshness re-check's
+  // own try/catch is documented as "fall through" on failure, but nothing
+  // proved the escalation (shouldMarkSaveEscape, the eventual hire and
+  // navigation) actually survives that specific combination rather than,
+  // say, an unhandled rejection short-circuiting the whole function.
+  it("still proceeds to hire and marks the escape flag when the escalated freshness re-check itself throws", async () => {
+    updateUserPreferencesMock.mockResolvedValue({ ok: false, retryable: true })
+    apiRequestMock.mockImplementation((url: string) => {
+      if (url.includes("/api/templates/marketing-social-media-content-manager")) {
+        return Promise.reject(new Error("network down"))
+      }
+      return Promise.resolve({ ok: true, json: async () => TEMPLATES })
+    })
+
+    await goToWelcomeThenBusiness()
+    fireEvent.click(screen.getByText("Marketing"))
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/take off your plate/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Post on social media"))
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/Meet your AI team/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/How should/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText("You're all set.")).toBeInTheDocument())
+
+    await act(async () => {
+      fireEvent.click(screen.getByText("Start with Maya"))
+    })
+    await act(async () => {
+      fireEvent.click(screen.getByText("Start with Maya"))
+    })
+
+    await waitFor(() => expect(hireAgentFromTemplateMock).toHaveBeenCalled())
+    expect(markOnboardingSaveEscapedMock).toHaveBeenCalledTimes(1)
+    expect(routerReplace).toHaveBeenCalledWith("/task/42")
   })
 
   // Pins C2: a recommended templateId that never loaded (or has no persona)
@@ -1025,6 +1106,25 @@ describe("OnboardingPage", () => {
     fireEvent.click(screen.getByText("My team"))
     expect(screen.getByText(/How should/)).toBeInTheDocument()
     expect(screen.queryByText(/Meet your AI team/)).not.toBeInTheDocument()
+  })
+
+  // Pins a test-coverage gap found in full-feature self-review: prior rail
+  // tests only asserted via visible step content changing, never via the
+  // aria-current attribute itself - a regression that stopped setting it
+  // (while still updating the visual is-now CSS class) would pass every
+  // other test in this file.
+  it("marks only the current rail group with aria-current=step", async () => {
+    await goToWelcomeThenBusiness()
+
+    expect(screen.getByText("About you").closest("button")).toHaveAttribute("aria-current", "step")
+    expect(screen.getByText("Goals").closest("button")).not.toHaveAttribute("aria-current")
+
+    fireEvent.click(screen.getByText("Marketing"))
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/take off your plate/)).toBeInTheDocument())
+
+    expect(screen.getByText("Goals").closest("button")).toHaveAttribute("aria-current", "step")
+    expect(screen.getByText("About you").closest("button")).not.toHaveAttribute("aria-current")
   })
 
   // Pins a self-review finding: a rail link (e.g. "About you", reachable

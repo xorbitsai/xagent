@@ -789,6 +789,7 @@ export default function OnboardingPage() {
                         sizeClassName="h-[62px] w-[62px]"
                         textClassName="text-2xl"
                         className="ob-tm-av"
+                        decorative
                         style={{
                           boxShadow: `0 0 0 1px hsl(var(--border)), 0 0 0 4px hsl(var(--card)), 0 0 0 5px ${ring}`,
                         }}

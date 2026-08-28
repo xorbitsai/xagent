@@ -86,10 +86,9 @@ def test_effective_output_language_accepts_every_caller_context_shape() -> None:
 
 
 def test_output_language_directives_render_each_section_verbatim() -> None:
+    # A pinned language is the sole rule here; the soft rules would compete with it.
     assert output_language_directives("Japanese", section="root_system_context") == (
-        f"{response_language_rules()}"
-        "\n\nOutput language policy:\n"
-        f"{output_language_policy('Japanese')}"
+        f"Output language policy:\n{output_language_policy('Japanese')}"
     )
     assert (
         output_language_directives("", section="root_system_context")

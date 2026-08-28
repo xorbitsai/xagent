@@ -1387,6 +1387,46 @@ describe("findWaitingPromptAndInteractions", () => {
     })
   })
 
+  it("falls back to a trace-scanned message when only waitingInteractions is set on currentTask, instead of losing the prompt text", () => {
+    const task = {
+      status: "waiting_for_user",
+      waitingInteractions: [{ type: "connect_apps", field: "connect_apps", apps: ["Gmail"] }],
+    } as any
+    const traceEvents = [
+      {
+        event_type: "agent_message",
+        data: { expect_response: true, message: "I need access to Gmail to continue." },
+      },
+    ]
+
+    expect(findWaitingPromptAndInteractions(task, traceEvents)).toEqual({
+      message: "I need access to Gmail to continue.",
+      interactions: task.waitingInteractions,
+    })
+  })
+
+  it("falls back to trace-scanned interactions when only waitingQuestion is set on currentTask, instead of losing the widget", () => {
+    const task = {
+      status: "waiting_for_user",
+      waitingQuestion: "Which dataset?",
+      waitingInteractions: [],
+    } as any
+    const traceEvents = [
+      {
+        event_type: "agent_message",
+        data: {
+          expect_response: true,
+          metadata: { interactions: [{ type: "select_one", field: "dataset" }] },
+        },
+      },
+    ]
+
+    expect(findWaitingPromptAndInteractions(task, traceEvents)).toEqual({
+      message: "Which dataset?",
+      interactions: [{ type: "select_one", field: "dataset" }],
+    })
+  })
+
   it("pairs the message and interactions from the SAME trace event, not two independently-found events", () => {
     const traceEvents = [
       {

@@ -47,6 +47,7 @@ from typing import Any, Dict, List, Optional
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from fastapi.responses import Response
 from pydantic import BaseModel, Field
+from sqlalchemy.exc import IntegrityError
 
 from xagent.skills.library import SkillScopeContext
 from xagent.web.api.skill_hub_registry import (
@@ -400,6 +401,107 @@ def _normalize_skill_files(files: dict[str, bytes]) -> dict[str, bytes]:
     return out
 
 
+# The only files ``SkillParser.parse_bundle`` decodes, in the order it reads
+# them. Everything else in a bundle is carried as opaque bytes, so a decode
+# failure can only have come from one of these.
+_PARSER_DECODED_FILES = ("SKILL.md", "template.md")
+
+
+def _is_utf8(content: bytes) -> bool:
+    try:
+        content.decode("utf-8")
+    except UnicodeDecodeError:
+        return False
+    return True
+
+
+def _assert_bundle_parses(files: dict[str, bytes]) -> None:
+    """Refuse a bundle that ``SkillManager.reload`` would fail to load.
+
+    This is what makes the write safe to trust once it commits. ``reload``
+    skips a record only when ``SkillParser.parse_bundle`` raises, so running
+    that same call over the same bytes here matches its failure surface by
+    construction rather than by restating the parser's rules -- including
+    whatever the parser starts rejecting later.
+
+    Today that surface is narrow: a missing ``SKILL.md``, and non-UTF-8 bytes
+    in ``SKILL.md`` or ``template.md``, which are the only two files
+    ``parse_bundle`` decodes. Malformed frontmatter is *not* in it --
+    ``_extract_frontmatter`` swallows YAML errors -- so a bundle with broken
+    YAML loads fine and must not be refused here. Checking more than the
+    parser does would reject bundles ``reload`` would happily serve; the
+    clauses below only translate what it raises into an HTTP response.
+
+    Validating first is what lets the write be final. Committing and then
+    re-reading would mean answering for a row that is already durable, and the
+    only remedy at that point is a compensating delete -- which has to identify
+    the row it is undoing, and gets it wrong whenever the name has been reused
+    or the primary key recycled.
+    """
+    from xagent.skills.parser import SkillParser
+
+    try:
+        SkillParser.parse_bundle(name="candidate", files=files)
+    except HTTPException:
+        raise
+    except UnicodeDecodeError as exc:
+        # parse_bundle does not say which file failed, and that is the
+        # actionable half of the message. Only the files the parser actually
+        # decodes can be the cause: scanning every file instead would blame a
+        # binary asset the parser never reads and hide the real culprit.
+        culprit = next(
+            (
+                path
+                for path in _PARSER_DECODED_FILES
+                if path in files and not _is_utf8(files[path])
+            ),
+            None,
+        )
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"{culprit} must be UTF-8 text."
+                if culprit
+                else "SKILL.md and template.md must be UTF-8 text."
+            ),
+        ) from exc
+    except ValueError as exc:
+        # The parser's own way of saying the bundle is unusable -- today, a
+        # missing SKILL.md. Anything else propagates: a service defect must
+        # keep its 5xx rather than be presented to the caller as bad input,
+        # and nothing has been written yet, so letting it through cannot
+        # leave a partial write behind.
+        raise HTTPException(
+            status_code=400, detail=f"Skill bundle could not be parsed: {exc}"
+        ) from exc
+
+
+def _is_skill_name_unique_violation(error: BaseException) -> bool:
+    """Recognize the authoritative ``(user_id, name)`` unique-constraint failure.
+
+    PostgreSQL names the constraint (``uq_user_skill_name``) in its message;
+    SQLite names the columns (``user_skills.user_id, user_skills.name``).
+    Matching either keeps an unrelated IntegrityError -- a foreign-key
+    violation, or the ``(skill_id, path)`` file constraint -- from being
+    reported as a duplicate name.
+    """
+    current: BaseException | None = error
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        message = str(current).lower()
+        if "uq_user_skill_name" in message:
+            return True
+        if (
+            "user_skills.user_id" in message
+            and "user_skills.name" in message
+            and ("unique" in message or "duplicate" in message)
+        ):
+            return True
+        current = current.__cause__ or current.__context__
+    return False
+
+
 def _write_personal_skill(
     *,
     db: Any,
@@ -410,12 +512,21 @@ def _write_personal_skill(
     clawhub_slug: str | None = None,
     clawhub_version: str | None = None,
 ) -> None:
+    """Persist one personal skill, refusing anything that would not load.
+
+    The bundle is validated against the parser *before* the commit, so a
+    committed row is one the skill machinery can read. Nothing here has to be
+    undone afterwards, which is the point: a compensating delete would have to
+    identify the row it is undoing, and a name or a recycled primary key does
+    not identify it.
+    """
     from xagent.skills.library import guess_media_type
     from xagent.web.models.skill import UserSkill, UserSkillFile
 
     _validate_skill_name(name)
     user_id = int(user.id)
     normalized = _normalize_skill_files(files)
+    _assert_bundle_parses(normalized)
     existing = (
         db.query(UserSkill)
         .filter(UserSkill.user_id == user_id, UserSkill.name == name)
@@ -436,19 +547,39 @@ def _write_personal_skill(
         updated_by_user_id=user_id,
     )
     db.add(skill)
-    db.flush()
-    for path, content in sorted(normalized.items()):
-        db.add(
-            UserSkillFile(
-                skill_id=skill.id,
-                path=path,
-                content=content,
-                size_bytes=len(content),
-                sha256=hashlib.sha256(content).hexdigest(),
-                media_type=guess_media_type(path),
+    # The pre-check SELECT above and this write are not atomic: two concurrent
+    # requests for the same (user, name) both see "no row" and both proceed.
+    # The loser must still get the documented 409 rather than leaking an
+    # IntegrityError as a 500. The guard spans the flush as well as the commit
+    # because the INSERT reaches the database at flush time -- that is where
+    # SQLite raises, while a deferred constraint would not surface until the
+    # commit. Anything that is not this constraint is re-raised untouched.
+    try:
+        db.flush()
+        # Read the key while the instance is guaranteed live. After the commit
+        # the session may expire it, and re-reading would emit another SELECT
+        # -- or fail outright once #1888 closes the session behind us.
+        skill_id = int(skill.id)
+        for path, content in sorted(normalized.items()):
+            db.add(
+                UserSkillFile(
+                    skill_id=skill_id,
+                    path=path,
+                    content=content,
+                    size_bytes=len(content),
+                    sha256=hashlib.sha256(content).hexdigest(),
+                    media_type=guess_media_type(path),
+                )
             )
-        )
-    db.commit()
+        db.commit()
+    except IntegrityError as exc:
+        db.rollback()
+        if not _is_skill_name_unique_violation(exc):
+            raise
+        raise HTTPException(
+            status_code=409,
+            detail=f"A personal skill named {name!r} already exists.",
+        ) from exc
 
 
 def _update_personal_skill_md(*, db: Any, user: User, name: str, skill_md: str) -> None:
@@ -476,6 +607,7 @@ def _update_personal_skill_md(*, db: Any, user: User, name: str, skill_md: str) 
 
 
 def _delete_personal_skill(*, db: Any, user: User, name: str) -> None:
+    """Delete one personal skill the caller owns, addressed by name."""
     from xagent.web.models.skill import UserSkill
 
     skill = (
@@ -487,6 +619,27 @@ def _delete_personal_skill(*, db: Any, user: User, name: str) -> None:
         raise HTTPException(status_code=404, detail="Personal skill not found")
     db.delete(skill)
     db.commit()
+
+
+def _summary_for_committed_write(*, name: str, files: dict[str, bytes]) -> SkillSummary:
+    """Describe a personal skill that is committed but not visible yet.
+
+    The write is durable and was parsed before it landed, so the request
+    succeeded; only the read-side view is behind. Answering 5xx here would be
+    a lie the client cannot act on: a replay re-enters the ``(user, name)``
+    pre-check and gets a deterministic 409, so "retry" is guidance that cannot
+    work, and generic 5xx retry logic would replay a non-idempotent create.
+
+    The bytes re-parsed here are the ones just validated -- the same source
+    the manager would have read -- and the result goes through
+    ``_skill_to_summary`` like every other response, so this cannot drift away
+    from the shape the normal path returns.
+    """
+    from xagent.skills.parser import SkillParser
+
+    parsed = SkillParser.parse_bundle(name=name, files=files)
+    parsed["scope"] = "personal"
+    return _skill_to_summary(parsed)
 
 
 def _summary_from_registry_item(
@@ -754,7 +907,14 @@ async def delete_installed(
     db: Any = Depends(get_db),
     _user: User = Depends(get_current_user),
 ) -> Response:
-    """Remove a user-installed skill. Builtin / external are refused."""
+    """Remove a user-installed skill. Builtin / external are refused.
+
+    ``name`` is resolved through the manager, so every provider keeps its own
+    namespace here. Recovery by primary key lives on its own route rather than
+    as a prefix of this one: ``:`` is not reserved by the provider contracts,
+    and the team create path does not run ``_validate_skill_name``, so a
+    compliant provider may legitimately own a record named ``id:42``.
+    """
     mgr = await _get_scoped_manager(request, context, db)
     skill = await mgr.get_skill(name)
     if not skill:
@@ -824,19 +984,29 @@ async def create_skill(
             files={"SKILL.md": body.skill_md.encode("utf-8")},
         )
 
+    files = {"SKILL.md": body.skill_md.encode("utf-8")}
     mgr = await _get_scoped_manager(request, context, db)
     skill = await mgr.get_skill(body.name)
     if skill is None:
-        # Most likely cause: malformed YAML frontmatter that the parser
-        # rejected. Leave the file on disk so the user can fix it via
-        # PUT, but tell them why nothing showed up.
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                "Skill written to disk but failed to re-parse — check the "
-                "YAML frontmatter at the top of SKILL.md."
-            ),
+        if body.scope != "personal":
+            # Provider-owned scopes validate inside their own writer, so an
+            # absent record here is that provider's failure to report.
+            raise HTTPException(
+                status_code=500,
+                detail=(
+                    f"Skill {body.name!r} was written to the {body.scope} scope "
+                    "but the provider does not serve it back."
+                ),
+            )
+        # The personal write is durable and was parsed before it landed, so
+        # the request succeeded and the read side is merely behind. See
+        # _summary_for_committed_write for why this is not a 5xx.
+        logger.warning(
+            "Skill Hub: created user skill %r but the library does not serve "
+            "it yet; answering from the validated bundle",
+            body.name,
         )
+        return _summary_for_committed_write(name=body.name, files=files)
     logger.info(
         "Skill Hub: created user skill %r (%d bytes)", body.name, len(body.skill_md)
     )
@@ -1053,13 +1223,20 @@ async def install_skill(
     mgr = await _get_scoped_manager(request, context, db)
     skill = await mgr.get_skill(body.slug)
     if skill is None:
-        raise HTTPException(
-            status_code=500,
-            detail=(
-                f"{registry.display_name} skill {body.slug!r} installed but failed "
-                "to re-parse. Inspect SKILL.md by hand or remove and retry."
-            ),
+        if body.scope == "team":
+            raise HTTPException(
+                status_code=500,
+                detail=(
+                    f"{registry.display_name} skill {body.slug!r} was written to "
+                    "the team scope but the provider does not serve it back."
+                ),
+            )
+        logger.warning(
+            "Skill Hub: installed %r but the library does not serve it yet; "
+            "answering from the validated bundle",
+            body.slug,
         )
+        return _summary_for_committed_write(name=body.slug, files=files)
     logger.info(
         "Skill Hub: installed %s skill %r (v%s, scan=%s)",
         registry.id,

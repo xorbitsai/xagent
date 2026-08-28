@@ -6232,6 +6232,53 @@ async def test_tool_result_user_interaction_disabled_preserves_the_tool_message(
 
 
 @pytest.mark.asyncio
+async def test_tool_result_user_interaction_disabled_caps_an_unbounded_message() -> (
+    None
+):
+    """A misbehaving or malicious tool could return an arbitrarily long
+    message - it must be capped, not flow uncapped into this failure text."""
+
+    class UnboundedMessageTool:
+        metadata = SimpleNamespace(name="mcp_gmail", description="Send email.")
+
+        def args_type(self) -> type[BaseModel]:
+            return CalculatorArgs
+
+        async def run_json_async(self, args: dict[str, Any]) -> dict[str, Any]:
+            return {
+                "success": False,
+                "status": "waiting_for_user",
+                "message": "x" * 5000,
+            }
+
+    pattern = ReActPattern(max_iterations=2, user_interaction_enabled=False)
+    runtime = PatternRuntime(execution_id="unattended-task-3")
+    context = ExecutionContext(execution_id="unattended-task-3")
+    context.add_user_message("Run unattended.")
+
+    result = await pattern.run(
+        context=context,
+        tools=[UnboundedMessageTool()],
+        llm=FakeLLM(
+            [
+                {
+                    "tool_calls": [
+                        {
+                            "id": "wait-call",
+                            "function": {"name": "mcp_gmail", "arguments": "{}"},
+                        }
+                    ]
+                }
+            ]
+        ),
+        runtime=runtime,
+    )
+
+    assert "x" * 2000 in result["error"]
+    assert "x" * 2001 not in result["error"]
+
+
+@pytest.mark.asyncio
 async def test_tool_result_can_pause_and_resume_with_user_response() -> None:
     class ResumableTool:
         def __init__(self) -> None:

@@ -2616,9 +2616,13 @@ class ReActPattern(AgentPattern):
             # more specific than "a tool wanted to ask something", a
             # regression from the plain error these same failures produced
             # before interactive tools could pause instead of erroring.
+            # Capped per message, matching agent_tool.py's
+            # _DELEGATION_TRACE_TEXT_LIMIT convention for the same reason:
+            # an unbounded message from a misbehaving or malicious tool
+            # would otherwise flow uncapped into this failure's error text.
             waiting_messages = sorted(
                 {
-                    result["message"].strip()
+                    result["message"].strip()[:2000]
                     for _, result in waiting_pairs
                     if isinstance(result.get("message"), str)
                     and result["message"].strip()

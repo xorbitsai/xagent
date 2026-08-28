@@ -1676,8 +1676,12 @@ def _classify_delegated_child_failure(
         # produced. Only the plain message string is read, never the full
         # result (see _classified_failure's docstring on why).
         child_message = result.get("message")
+        # Capped the same as output/error in _delegation_trace_data above -
+        # a plain string, but an unbounded one from a misbehaving or
+        # malicious nested tool would otherwise flow uncapped into this
+        # failure's error/output/response text.
         detail = (
-            f" {child_message.strip()}"
+            f" {child_message.strip()[:_DELEGATION_TRACE_TEXT_LIMIT]}"
             if isinstance(child_message, str) and child_message.strip()
             else ""
         )

@@ -339,7 +339,17 @@ class LLMPlanGenerator(PlanGenerator):
             },
             {"role": "user", "content": self._build_prompt(request)},
         ]
+
+        def finalize(plan: ExecutionPlan) -> ExecutionPlan:
+            return self._filter_suggested_tools(
+                plan=plan,
+                available_tool_names=request.available_tool_names,
+            )
+
         retry_feedback: str | None = None
+        # A plan that only triggered the soft language nudge stays usable, so a
+        # worse second attempt must not turn a working plan into a hard failure.
+        nudged_plan: ExecutionPlan | None = None
         for attempt in range(MAX_PLAN_TOOL_CALL_ATTEMPTS):
             attempt_messages = list(messages)
             if retry_feedback:
@@ -362,6 +372,8 @@ class LLMPlanGenerator(PlanGenerator):
                 )
             except RequiredToolCallError:
                 if attempt + 1 >= MAX_PLAN_TOOL_CALL_ATTEMPTS:
+                    if nudged_plan is not None:
+                        return finalize(nudged_plan)
                     raise
                 retry_feedback = self._required_tool_call_retry_feedback(
                     self.PLAN_TOOL_NAME
@@ -376,6 +388,8 @@ class LLMPlanGenerator(PlanGenerator):
                 continue
             except PlanToolArgumentsError as exc:
                 if attempt + 1 >= MAX_PLAN_TOOL_CALL_ATTEMPTS:
+                    if nudged_plan is not None:
+                        return finalize(nudged_plan)
                     raise
                 retry_feedback = self._invalid_tool_arguments_retry_feedback(exc)
                 logger.warning(
@@ -395,6 +409,8 @@ class LLMPlanGenerator(PlanGenerator):
                 )
             except PlanValidationError as exc:
                 if attempt + 1 >= MAX_PLAN_TOOL_CALL_ATTEMPTS:
+                    if nudged_plan is not None:
+                        return finalize(nudged_plan)
                     raise
                 retry_feedback = self._invalid_plan_retry_feedback(exc)
                 logger.warning(
@@ -410,16 +426,14 @@ class LLMPlanGenerator(PlanGenerator):
                 reminder = self._request_language_reminder(request.context, plan)
                 if reminder is not None:
                     retry_feedback = reminder
+                    nudged_plan = plan
                     logger.info(
                         "LLMPlanGenerator plan language may not match the request; "
                         "asking the planner to re-check once. execution_id=%s",
                         request.execution_id,
                     )
                     continue
-            return self._filter_suggested_tools(
-                plan=plan,
-                available_tool_names=request.available_tool_names,
-            )
+            return finalize(plan)
         raise RuntimeError("LLMPlanGenerator retry loop exited unexpectedly.")
 
     def _filter_suggested_tools(

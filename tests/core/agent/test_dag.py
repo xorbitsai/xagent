@@ -5286,3 +5286,124 @@ async def test_restored_dag_step_instruction_drops_stale_language_policy(
     )
     assert "Output language: Simplified Chinese" not in instruction
     assert "Use the same natural language as the current user request" in instruction
+
+
+def _chinese_rewrite_plan_response() -> dict[str, Any]:
+    return plan_tool_response(
+        [
+            {
+                "id": "rewrite",
+                "task": "重写这份公告，使其更易于阅读，并保留原有的关键信息与时间安排",
+                "description": "使用中文输出改写后的完整公告，保留时间与关键信息。",
+                "dependencies": [],
+                "tool_names": [],
+            }
+        ],
+        response_language="Simplified Chinese",
+    )
+
+
+@pytest.mark.asyncio
+async def test_language_nudge_keeps_the_validated_plan_when_the_retry_omits_it() -> (
+    None
+):
+    generator = LLMPlanGenerator()
+    context = ExecutionContext(execution_id="dag-nudge-fallback-missing-tool-call")
+    context.add_user_message(
+        "Rewrite this announcement so our Shanghai colleagues can read it easily."
+    )
+    llm = SequenceLLM(
+        [
+            _chinese_rewrite_plan_response(),
+            {"content": "plain text instead of a tool call"},
+        ]
+    )
+
+    plan = await generator.generate_plan(
+        request=PlanGenerationRequest(
+            context=context,
+            execution_id=context.execution_id,
+            available_tool_names=[],
+        ),
+        llm=llm,
+    )
+
+    assert llm.calls == 2
+    assert [step.id for step in plan.steps] == ["rewrite"]
+
+
+@pytest.mark.asyncio
+async def test_language_nudge_keeps_the_validated_plan_on_invalid_retry_arguments() -> (
+    None
+):
+    generator = LLMPlanGenerator()
+    context = ExecutionContext(execution_id="dag-nudge-fallback-invalid-json")
+    context.add_user_message(
+        "Rewrite this announcement so our Shanghai colleagues can read it easily."
+    )
+    llm = SequenceLLM(
+        [
+            _chinese_rewrite_plan_response(),
+            {
+                "tool_calls": [
+                    {
+                        "id": "call_generate_execution_plan",
+                        "type": "function",
+                        "function": {
+                            "name": "generate_execution_plan",
+                            "arguments": "not json at all",
+                        },
+                    }
+                ]
+            },
+        ]
+    )
+
+    plan = await generator.generate_plan(
+        request=PlanGenerationRequest(
+            context=context,
+            execution_id=context.execution_id,
+            available_tool_names=[],
+        ),
+        llm=llm,
+    )
+
+    assert llm.calls == 2
+    assert [step.id for step in plan.steps] == ["rewrite"]
+
+
+@pytest.mark.asyncio
+async def test_language_nudge_keeps_the_validated_plan_on_invalid_retry_plan() -> None:
+    generator = LLMPlanGenerator()
+    context = ExecutionContext(execution_id="dag-nudge-fallback-invalid-plan")
+    context.add_user_message(
+        "Rewrite this announcement so our Shanghai colleagues can read it easily."
+    )
+    llm = SequenceLLM(
+        [
+            _chinese_rewrite_plan_response(),
+            plan_tool_response(
+                [
+                    {
+                        "id": "rewrite",
+                        "task": "Rewrite the announcement",
+                        "dependencies": ["missing_step"],
+                        "tool_names": [],
+                    }
+                ]
+            ),
+        ]
+    )
+
+    plan = await generator.generate_plan(
+        request=PlanGenerationRequest(
+            context=context,
+            execution_id=context.execution_id,
+            available_tool_names=[],
+        ),
+        llm=llm,
+    )
+
+    assert llm.calls == 2
+    assert [step.id for step in plan.steps] == ["rewrite"]
+    assert plan.steps[0].task.startswith("重写")

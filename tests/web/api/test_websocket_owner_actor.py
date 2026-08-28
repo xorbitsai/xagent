@@ -1232,6 +1232,70 @@ async def test_rejected_live_resume_never_syncs_connector_runtime_turn(
 
 
 @pytest.mark.asyncio
+async def test_admitted_explicit_resume_syncs_connector_runtime_turn_after_reservation(
+    db_session,
+) -> None:
+    """The explicit-resume path's connector runtime turn sync is the one
+    call site with no dedicated assertion anywhere (the message-resume
+    sync above has its own pair of tests; this is the sibling for
+    ``handle_resume_task``). Confirms the sync fires with a fresh turn id
+    once try_reserve_resume grants sole admitted ownership, strictly
+    before the resume background task is scheduled."""
+    owner = _user(db_session, "explicit-sync-owner")
+    task = _task(db_session, owner.id, status=TaskStatus.PAUSED)
+    captured, agent, mgr, ws_manager = _patched_manager_and_agent()
+    agent.supports_live_control = MagicMock(return_value=True)
+
+    call_order: list[str] = []
+    mgr.sync_connector_runtime_turn = MagicMock(
+        side_effect=lambda *a, **k: call_order.append("sync_connector_runtime_turn")
+    )
+
+    async def _execute_resume_background(**_kwargs) -> None:
+        call_order.append("execute_resume_background")
+
+    resume_bg = AsyncMock(side_effect=_execute_resume_background)
+    transition = AsyncMock(
+        return_value=SimpleNamespace(
+            run_id="run-explicit-sync",
+            status=TaskStatus.PAUSED,
+            state_version=1,
+        )
+    )
+    bg_mgr = MagicMock()
+    bg_mgr.running_tasks.get = MagicMock(return_value=None)
+    bg_mgr.resume_admission_state.return_value = None
+    bg_mgr.try_reserve_resume.return_value = ResumeReservationOutcome.RESERVED
+
+    with (
+        patch("xagent.web.api.chat.get_agent_manager", return_value=mgr),
+        patch("xagent.web.api.websocket.manager", ws_manager),
+        patch("xagent.web.api.websocket.execute_resume_background", resume_bg),
+        patch(
+            "xagent.web.api.websocket.task_execution_controller.transition",
+            new=transition,
+        ),
+        patch("xagent.web.api.websocket.background_task_manager", bg_mgr),
+    ):
+        await handle_resume_task(MagicMock(), int(task.id), {"user": owner})
+        for _ in range(100):
+            if "execute_resume_background" in call_order:
+                break
+            await asyncio.sleep(0.01)
+        else:
+            raise AssertionError("durable resume command was not dispatched in time")
+
+    assert "connector_runtime_turn_id" not in mgr.get_agent_for_task.await_args.kwargs
+    assert mgr.sync_connector_runtime_turn.call_count == 1
+    turn_id = mgr.sync_connector_runtime_turn.call_args.args[1]
+    assert mgr.sync_connector_runtime_turn.call_args.args[0] == int(task.id)
+    assert isinstance(turn_id, str) and turn_id
+    # The sync must run strictly before the background resume is scheduled,
+    # not merely somewhere in the handler.
+    assert call_order == ["sync_connector_runtime_turn", "execute_resume_background"]
+
+
+@pytest.mark.asyncio
 async def test_legacy_continuation_runtime_fails_closed_without_side_effects(
     db_session,
 ) -> None:

@@ -1,7 +1,7 @@
 """seed built-in ChartMogul (key-based) MCP connector
 
 Revision ID: 20260827_seed_chartmogul_mcp_app
-Revises: 20260826_seed_deputy_mcp_app
+Revises: 20260821_actor_oauth_flow_states
 Create Date: 2026-08-27 00:00:00.000000
 
 """
@@ -16,7 +16,7 @@ logger = logging.getLogger(__name__)
 
 # revision identifiers, used by Alembic.
 revision: str = "20260827_seed_chartmogul_mcp_app"
-down_revision: Union[str, None] = "20260826_seed_deputy_mcp_app"
+down_revision: Union[str, None] = "20260821_actor_oauth_flow_states"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 

@@ -1148,13 +1148,21 @@ class UnavailableMCPTool(AbstractBaseTool):
         # transport issue, etc.) keeps the original error behavior: there is
         # nothing a `connect_apps` card could offer for those.
         if self._app_name and is_oauth_token_required_code(self._failure_code):
-            return {
+            pause_message = (
+                f"I need access to {self._app_name} to continue. "
+                "Please connect it below, then let me know once you have."
+            )
+            pause_result: Dict[str, Any] = {
                 "success": False,
                 "status": "waiting_for_user",
-                "message": (
-                    f"I need access to {self._app_name} to continue. "
-                    "Please connect it below, then let me know once you have."
-                ),
+                "message": pause_message,
+                # Populated alongside `message`/`status` (not just left to the
+                # declared _UnavailableMCPToolResult defaults) so a caller that
+                # stringifies via return_value_as_string still sees real text
+                # instead of "No content returned", and this failure class
+                # still classifies for trace/diagnostic purposes the same way
+                # the error branch below does.
+                "content": [{"text": pause_message}],
                 "interactions": [
                     {
                         "type": "connect_apps",
@@ -1164,6 +1172,11 @@ class UnavailableMCPTool(AbstractBaseTool):
                     }
                 ],
             }
+            if self._reason is not None:
+                pause_result["reason"] = self._reason
+            if self._failure_code is not None:
+                pause_result["failure_code"] = self._failure_code
+            return pause_result
 
         content_message = self._message
         if self._message == _DEFAULT_UNAVAILABLE_MCP_MESSAGE:

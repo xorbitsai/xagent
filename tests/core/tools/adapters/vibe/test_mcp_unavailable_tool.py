@@ -167,6 +167,14 @@ async def test_unavailable_tool_oauth_required_with_app_name_pauses_for_connect_
             "I need access to Gmail to continue. "
             "Please connect it below, then let me know once you have."
         ),
+        "content": [
+            {
+                "text": (
+                    "I need access to Gmail to continue. "
+                    "Please connect it below, then let me know once you have."
+                )
+            }
+        ],
         "interactions": [
             {
                 "type": "connect_apps",
@@ -175,6 +183,7 @@ async def test_unavailable_tool_oauth_required_with_app_name_pauses_for_connect_
                 "apps": ["Gmail"],
             }
         ],
+        "failure_code": "oauth_token_required",
     }
 
 

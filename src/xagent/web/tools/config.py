@@ -3847,7 +3847,23 @@ class WebToolConfig(BaseToolConfig):
                             reason=reason,
                             message=UNAVAILABLE_MCP_CREDENTIAL_MESSAGE,
                             diagnostic=diagnostic,
-                            failure_code="oauth_token_required",
+                            # Only a genuinely missing/expired-without-
+                            # refresh-token grant is solved by prompting the
+                            # user to reconnect. token_refresh_failed and
+                            # runtime_connection_failed mean a grant already
+                            # exists and the failure is transient (network,
+                            # client metadata, a 5xx from the token
+                            # endpoint) - pausing with a connect_apps card
+                            # for those would show a false "Connected" badge
+                            # (the card checks the persisted grant, not this
+                            # live failure) and offer a Continue that just
+                            # re-triggers the same failure, looping forever
+                            # with no real diagnostic ever reaching the user.
+                            failure_code=(
+                                "oauth_token_required"
+                                if reason == "authorization_required"
+                                else None
+                            ),
                             app_info=app_info
                             if app_info is not None
                             else get_app_for_mcp_server(self.db, server),

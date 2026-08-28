@@ -48,6 +48,26 @@ describe("WidgetChromeControls", () => {
     )
   })
 
+  it("announces chrome_ready on mount and chrome_not_ready on unmount", () => {
+    // widget.js's mobile FAB-hiding guard keys off exactly this pair: without
+    // a reliable not-ready signal when this component disappears (e.g. a
+    // Session degrading mid-conversation), the parent's only fallback close
+    // control would stay hidden with no way to bring it back.
+    const { unmount } = render(<WidgetChromeControls />)
+
+    expect(postMessageSpy).toHaveBeenCalledWith(
+      { xagent: true, v: 1, type: "widget_chrome_ready" },
+      "*",
+    )
+
+    unmount()
+
+    expect(postMessageSpy).toHaveBeenCalledWith(
+      { xagent: true, v: 1, type: "widget_chrome_not_ready" },
+      "*",
+    )
+  })
+
   it("does not post a message when the page is visited directly (window.parent === window)", () => {
     // window.parent === window here means the guard's else-branch calls the
     // real window.postMessage, not the postMessageSpy stub above -- spy on

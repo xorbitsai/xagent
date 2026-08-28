@@ -35,6 +35,16 @@ export function WidgetChromeControls({ newConversation }: WidgetChromeControlsPr
   const [isMenuOpen, setIsMenuOpen] = useState(false)
   const menuRef = useRef<HTMLDivElement>(null)
 
+  // This component rendering at all *is* "the iframe has a close control" --
+  // widget.js's mobile full-screen FAB-hiding guard keys off exactly this
+  // signal so it never hides its own fallback close button while this one
+  // isn't actually mounted (a loading/auth-failure/degraded/terminal state
+  // renders no header, and thus no instance of this component, at all).
+  useEffect(() => {
+    postToParentWidget("widget_chrome_ready")
+    return () => postToParentWidget("widget_chrome_not_ready")
+  }, [])
+
   useEffect(() => {
     if (!isMenuOpen) return
 

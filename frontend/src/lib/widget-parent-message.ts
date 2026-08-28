@@ -4,7 +4,10 @@
 // third-party origin from in here, so targetOrigin can't be pinned tighter
 // than "*" -- every message sent this way carries no sensitive payload,
 // unlike the parent -> iframe session protocol.
-export type WidgetParentMessageType = "widget_close"
+// widget_chrome_ready/widget_chrome_not_ready: sent by WidgetChromeControls
+// on mount/unmount so widget.js knows whether the iframe currently has its
+// own close control -- see the mobile FAB-hiding guard in widget.js.
+export type WidgetParentMessageType = "widget_close" | "widget_chrome_ready" | "widget_chrome_not_ready"
 
 export function postToParentWidget(type: WidgetParentMessageType): void {
   // A direct (non-embedded) visit to this page has window.parent === window;

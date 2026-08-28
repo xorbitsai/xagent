@@ -89,6 +89,13 @@ describe("widget close chrome", () => {
     expect(widgetScript).toContain(`data.type === '${messageType}'`)
   })
 
+  it("keeps the chrome-readiness message type literals in sync with the host script", () => {
+    const ready: WidgetParentMessageType = "widget_chrome_ready"
+    const notReady: WidgetParentMessageType = "widget_chrome_not_ready"
+    expect(widgetScript).toContain(`data.type === '${ready}'`)
+    expect(widgetScript).toContain(`data.type === '${notReady}'`)
+  })
+
   it("starts closed for a first-time visitor", () => {
     runWidget()
 
@@ -170,6 +177,33 @@ describe("widget close chrome", () => {
     // Unchanged from the open-click above: a stray post-teardown widget_close
     // must not have run closePanel().
     expect(capturedPanel).toHaveClass("open")
+  })
+
+  it("marks the panel chrome-ready once the iframe's own close control confirms it's mounted", () => {
+    runWidget()
+    fabEl()?.click()
+    expect(panelEl()).not.toHaveClass("xagent-chrome-ready")
+
+    fromIframe("widget_chrome_ready")
+
+    expect(panelEl()).toHaveClass("xagent-chrome-ready")
+  })
+
+  it("revokes chrome-ready if the child's close control unmounts while the panel stays open", () => {
+    // e.g. an active Session degrading mid-conversation: WidgetChromeControls
+    // unmounts, but nothing closes the panel itself. The mobile FAB-hiding
+    // CSS rule keys off this class specifically so the parent's fallback
+    // close control reappears instead of leaving the visitor stuck behind a
+    // full-screen overlay with no dismiss action at all.
+    runWidget()
+    fabEl()?.click()
+    fromIframe("widget_chrome_ready")
+    expect(panelEl()).toHaveClass("xagent-chrome-ready")
+
+    fromIframe("widget_chrome_not_ready")
+
+    expect(panelEl()).not.toHaveClass("xagent-chrome-ready")
+    expect(panelEl()).toHaveClass("open")
   })
 
   it("ignores an unrecognized chrome message type", () => {

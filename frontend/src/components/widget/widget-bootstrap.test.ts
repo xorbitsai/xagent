@@ -979,24 +979,41 @@ describe("widget bootstrap", () => {
       expect(block).toMatch(/\.xagent-widget-panel\s*\{[^}]*position:\s*fixed;/)
       expect(block).toMatch(/\.xagent-widget-panel\s*\{[^}]*inset:\s*0;/)
       expect(block).toMatch(/\.xagent-widget-panel\s*\{[^}]*border-radius:\s*0;/)
+      // inset: 0 alone does not override the base rule's explicit
+      // width: 380px / height: 600px / max-height: calc(100vh - 100px) --
+      // these three overrides are what actually makes it edge-to-edge.
+      expect(block).toMatch(/\.xagent-widget-panel\s*\{[^}]*width:\s*100%;/)
+      expect(block).toMatch(/\.xagent-widget-panel\s*\{[^}]*height:\s*100%;/)
+      expect(block).toMatch(/\.xagent-widget-panel\s*\{[^}]*max-height:\s*100%;/)
     })
 
     it("respects device safe areas instead of drawing under a notch or home indicator", () => {
       runWidget({ "data-widget-key": "widget-secret" })
 
       const block = mobileBlock()
-      expect(block).toMatch(/\.xagent-widget-panel\s*\{[^}]*padding-top:\s*env\(safe-area-inset-top/)
-      expect(block).toMatch(/\.xagent-widget-panel\s*\{[^}]*padding-bottom:\s*env\(safe-area-inset-bottom/)
+      // Match the whole env() expression, fallback included -- a regex that
+      // stops at the property name would still pass if the ", 0px" fallback
+      // (the only thing keeping non-supporting browsers at zero padding) were
+      // ever dropped.
+      expect(block).toMatch(/padding-top:\s*env\(safe-area-inset-top,\s*0px\)/)
+      expect(block).toMatch(/padding-bottom:\s*env\(safe-area-inset-bottom,\s*0px\)/)
       // Landscape can put a side notch on either edge.
-      expect(block).toMatch(/\.xagent-widget-panel\s*\{[^}]*padding-left:\s*env\(safe-area-inset-left/)
-      expect(block).toMatch(/\.xagent-widget-panel\s*\{[^}]*padding-right:\s*env\(safe-area-inset-right/)
+      expect(block).toMatch(/padding-left:\s*env\(safe-area-inset-left,\s*0px\)/)
+      expect(block).toMatch(/padding-right:\s*env\(safe-area-inset-right,\s*0px\)/)
     })
 
-    it("hides the FAB while the full-screen panel is open, since its own header already has a close control", () => {
+    it("hides the FAB only once the iframe has confirmed its own close control is mounted", () => {
       runWidget({ "data-widget-key": "widget-secret" })
 
       const block = mobileBlock()
-      expect(block).toMatch(/\.xagent-widget-panel\.open\s*~\s*\.xagent-widget-fab\s*\{[^}]*display:\s*none;/)
+      // Gated on .xagent-chrome-ready (toggled by onChromeMessage in response
+      // to widget_chrome_ready/widget_chrome_not_ready), not just .open --
+      // see widget-chrome.test.ts for the message-driven class toggling this
+      // selector depends on. Without that gate, a loading/auth-failure/
+      // degraded Session state (none of which render a header) would hide
+      // the parent's only close control on a full-screen mobile panel with
+      // nothing to replace it.
+      expect(block).toMatch(/\.xagent-widget-panel\.open\.xagent-chrome-ready\s*~\s*\.xagent-widget-fab\s*\{[^}]*display:\s*none;/)
     })
   })
 })

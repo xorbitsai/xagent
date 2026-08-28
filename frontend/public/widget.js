@@ -401,11 +401,14 @@
         display: none;
       }
 
-      /* The full-screen panel already carries its own in-header close
-         control (the iframe's own React header), landing in this same
-         corner -- leaving the FAB visible here would just float a second,
-         redundant close button on top of it. */
-      .xagent-widget-panel.open ~ .xagent-widget-fab {
+      /* Hide the FAB only once the iframe has confirmed (via
+         widget_chrome_ready in onChromeMessage) that its own in-header
+         close control is actually mounted -- loading, auth-failure, and
+         degraded/terminal Session states render no header at all, and
+         without this guard the FAB would disappear as soon as the panel
+         opens regardless, leaving a full-screen overlay with no dismiss
+         action at all in those states. */
+      .xagent-widget-panel.open.xagent-chrome-ready ~ .xagent-widget-fab {
         display: none;
       }
     }
@@ -703,6 +706,15 @@
     if (!data || data.xagent !== true || data.v !== 1) return;
     if (data.type === 'widget_close') {
       closePanel();
+    } else if (data.type === 'widget_chrome_ready') {
+      // The child's own close control only exists once its "active" header
+      // has actually mounted -- loading/error/expired states render none.
+      // Until this arrives (or after it's revoked below), the FAB stays the
+      // parent-owned fallback so a stuck child state can never fully trap
+      // the visitor behind a full-screen mobile panel with no dismiss action.
+      panel.classList.add('xagent-chrome-ready');
+    } else if (data.type === 'widget_chrome_not_ready') {
+      panel.classList.remove('xagent-chrome-ready');
     }
   }
   window.addEventListener('message', onChromeMessage);

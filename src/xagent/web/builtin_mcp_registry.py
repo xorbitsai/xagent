@@ -1170,8 +1170,10 @@ def get_builtin_public_mcp_app_rows() -> list[dict[str, Any]]:
             # from "the token is invalid" or "ChartMogul is down." Fixing
             # this means patching upstream's error handling (a fork to
             # maintain across future pin bumps) or writing a first-party
-            # wrapper instead of vendoring (see the design-question note in
-            # PR #1804) -- resolve one of those before unhiding.
+            # wrapper instead of vendoring -- tracked in
+            # https://github.com/xorbitsai/xagent/issues/1871, resolve one
+            # of those (or that issue's other proposed paths) before
+            # unhiding.
             "is_visible_in_connector": False,
             # Key-based (non-oauth), like aws/google-maps/posthog/stripe:
             # ChartMogul has no OAuth flow at all, only a per-user API key

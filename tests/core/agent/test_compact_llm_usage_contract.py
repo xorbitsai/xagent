@@ -610,6 +610,68 @@ class TestResolveUsagePayload:
         assert self.runtime._extract_cached_tokens("plain string") == 0
 
 
+class TestStrictUsageIntCoercion:
+    """Usage counters are billing inputs, so coercion must be strict:
+    bools, NaN/inf, negatives, non-integral floats, and numeric strings are
+    rejected rather than silently truncated or crashed on, and an invalid
+    earlier alias must not shadow a valid later candidate."""
+
+    def setup_method(self) -> None:
+        self.runtime = PatternRuntime()
+
+    @pytest.mark.parametrize(
+        "bad",
+        [
+            float("nan"),
+            float("inf"),
+            float("-inf"),
+            True,
+            False,
+            -5,
+            10.5,
+            "10",
+            None,
+        ],
+    )
+    def test_first_int_rejects_invalid_values(self, bad: Any) -> None:
+        assert self.runtime._first_int({"prompt_tokens": bad}, ("prompt_tokens",)) == 0
+
+    @pytest.mark.parametrize(
+        ("good", "expected"),
+        [(10, 10), (0, 0), (10.0, 10), (2**40, 2**40)],
+    )
+    def test_first_int_accepts_valid_values(self, good: Any, expected: int) -> None:
+        assert (
+            self.runtime._first_int({"prompt_tokens": good}, ("prompt_tokens",))
+            == expected
+        )
+
+    def test_invalid_first_alias_falls_through_to_valid_candidate(self) -> None:
+        usage = {
+            "prompt_tokens": float("nan"),
+            "input_tokens": 7,
+            "completion_tokens": 3,
+        }
+        response = {"type": "text", "content": "x", "usage": usage}
+        assert self.runtime._extract_token_usage(response) == (7, 3)
+
+    def test_extract_token_usage_rejects_bool_and_negative(self) -> None:
+        response = {
+            "type": "text",
+            "content": "x",
+            "usage": {"prompt_tokens": True, "completion_tokens": -5},
+        }
+        assert self.runtime._extract_token_usage(response) is None
+
+    def test_extract_cached_tokens_rejects_non_finite(self) -> None:
+        response = {
+            "type": "text",
+            "content": "x",
+            "usage": {"cached_input_tokens": float("inf")},
+        }
+        assert self.runtime._extract_cached_tokens(response) == 0
+
+
 class TestUsageStampCachedTokens:
     """The stamp must carry cache metrics so ``_extract_cached_tokens`` sees
     prompt-cache hits on non-streaming calls (review findings on PR #1787).
@@ -690,6 +752,13 @@ class TestUnwrapChatText:
         with pytest.raises(LLMNoTextContentError):
             unwrap_chat_text(42)
 
+    def test_empty_plain_string_raises_empty_content(self) -> None:
+        """An empty legacy plain string is the same transient "no content"
+        as an empty envelope -- ``classify_chat_response`` is the single
+        source for that distinction."""
+        with pytest.raises(LLMEmptyContentError):
+            unwrap_chat_text("")
+
 
 @pytest.mark.asyncio
 async def test_openai_compact_cached_tokens_flow_to_trace_event(mocker) -> None:
@@ -728,6 +797,203 @@ async def test_openai_compact_cached_tokens_flow_to_trace_event(mocker) -> None:
     assert context.get_total_token_usage()["total"] == (
         PROMPT_TOKENS + COMPLETION_TOKENS
     )
+
+
+class TestSyntheticUsageFreshnessBaseline:
+    """A synthetic (context-compaction) usage record must never become the
+    freshness baseline of ``_get_total_tokens``: when an LLM compaction
+    declines (e.g. the compact model returns a tool_call envelope) the
+    messages are unchanged, so the record's fingerprint still matches and a
+    small compact-prompt token count would otherwise be mistaken for the
+    live context size -- suppressing the truncation fallback and letting
+    oversized history flow to the main model."""
+
+    def test_synthetic_record_does_not_hijack_freshness_baseline(self) -> None:
+        context = ExecutionContext()
+        context.compact_config.threshold = 100
+        context.add_user_message("u" * 2000)  # ~500 est tokens, over threshold
+        context.record_llm_usage(
+            input_tokens=10,
+            output_tokens=5,
+            synthetic_purpose="context_compaction",
+        )
+        # The fingerprint matches (messages unchanged) and 10 < threshold,
+        # but the record is synthetic: fall back to the char estimate.
+        assert context.estimate_context_tokens() > 100
+
+    def test_real_record_still_serves_as_freshness_baseline(self) -> None:
+        context = ExecutionContext()
+        context.add_user_message("u" * 2000)
+        context.record_llm_usage(input_tokens=42, output_tokens=5)
+        assert context.estimate_context_tokens() == 42
+
+    def test_synthetic_record_after_real_record_keeps_real_baseline(self) -> None:
+        context = ExecutionContext()
+        context.add_user_message("u" * 2000)
+        context.record_llm_usage(input_tokens=42, output_tokens=5)
+        context.record_llm_usage(
+            input_tokens=10,
+            output_tokens=5,
+            synthetic_purpose="context_compaction",
+        )
+        assert context.estimate_context_tokens() == 42
+
+    def test_synthetic_purpose_survives_checkpoint_roundtrip(self) -> None:
+        context = ExecutionContext()
+        context.add_user_message("hi")
+        context.record_llm_usage(
+            input_tokens=10,
+            output_tokens=5,
+            synthetic_purpose="context_compaction",
+        )
+        context.record_llm_usage(input_tokens=7, output_tokens=3)
+
+        restored = ExecutionContext.from_dict(context.to_dict())
+
+        assert [call.synthetic_purpose for call in restored.llm_calls] == [
+            "context_compaction",
+            None,
+        ]
+
+    def test_old_checkpoint_without_synthetic_purpose_defaults_none(self) -> None:
+        context = ExecutionContext()
+        context.add_user_message("hi")
+        context.record_llm_usage(input_tokens=10, output_tokens=5)
+        data = context.to_dict()
+        for call in data["llm_calls"]:
+            call.pop("synthetic_purpose", None)
+
+        restored = ExecutionContext.from_dict(data)
+
+        assert [call.synthetic_purpose for call in restored.llm_calls] == [None]
+
+    @pytest.mark.asyncio
+    async def test_failed_llm_compaction_still_truncates_oversized_history(
+        self,
+    ) -> None:
+        """Reviewer scenario: oversized history (chars/4 > threshold) and a
+        compact model returning a *stamped* tool_call envelope whose
+        prompt_tokens < threshold. LLM compaction declines, and the
+        truncation fallback must really truncate; the compact usage is
+        recorded exactly once and must not feed the freshness estimate."""
+        tracer = TraceEventRecorder()
+        context = ExecutionContext(execution_id="compact-freshness-contract")
+        context.compact_config.threshold = 100
+        context.compact_config.max_messages = 1
+        context.add_user_message("current request")
+        context.add_assistant_message(
+            "",
+            tool_calls=[
+                {"id": "call-1", "type": "function", "function": {"name": "read_file"}}
+            ],
+        )
+        context.add_tool_result(
+            "read_file", {"output": "x" * 2000}, tool_call_id="call-1"
+        )
+        assert context.estimate_context_tokens() > 100
+
+        compact_llm = FakeLLM(
+            [
+                {
+                    "type": "tool_call",
+                    "tool_calls": [
+                        {
+                            "id": "call_9",
+                            "type": "function",
+                            "function": {"name": "read_file", "arguments": "{}"},
+                        }
+                    ],
+                    "usage": {"prompt_tokens": 10, "completion_tokens": 5},
+                }
+            ]
+        )
+
+        result = await ReActPattern(max_iterations=1).run(
+            context=context,
+            tools=[],
+            llm=FakeLLM([{"content": "done"}]),
+            compact_llm=compact_llm,
+            runtime=PatternRuntime(tracer=tracer),
+        )
+
+        assert result["success"] is True
+        # Truncation really happened: the declined LLM compaction left the
+        # messages untouched, so only the fallback's compact event proves the
+        # small compact-prompt count did not hijack the estimate. (Message
+        # counts alone cannot show it: the pattern appends afterwards.)
+        compact_end = next(
+            (
+                event
+                for event in tracer.events
+                if event["event_type"] == "action_end_compact"
+            ),
+            None,
+        )
+        assert compact_end is not None, "truncation fallback did not fire"
+        assert compact_end["data"]["strategy"] == "truncate"
+        assert compact_end["data"]["removed_count"] >= 1
+        # The compact call is billed exactly once, marked synthetic.
+        assert context.get_total_token_usage() == {
+            "total": 15,
+            "input": 10,
+            "output": 5,
+            "call_count": 1,
+        }
+        assert context.llm_calls[-1].synthetic_purpose == "context_compaction"
+
+    @pytest.mark.asyncio
+    async def test_failed_llm_compaction_empty_envelope_still_truncates(self) -> None:
+        """Empty-text-envelope variant of the freshness scenario: the empty
+        summary declines the LLM compaction and the fallback must truncate
+        regardless of the small stamped usage."""
+        tracer = TraceEventRecorder()
+        context = ExecutionContext(execution_id="compact-freshness-empty")
+        context.compact_config.threshold = 100
+        context.compact_config.max_messages = 1
+        context.add_user_message("current request")
+        context.add_assistant_message(
+            "",
+            tool_calls=[
+                {"id": "call-1", "type": "function", "function": {"name": "read_file"}}
+            ],
+        )
+        context.add_tool_result(
+            "read_file", {"output": "x" * 2000}, tool_call_id="call-1"
+        )
+        assert context.estimate_context_tokens() > 100
+
+        compact_llm = FakeLLM(
+            [
+                {
+                    "type": "text",
+                    "content": "",
+                    "usage": {"prompt_tokens": 10, "completion_tokens": 5},
+                }
+            ]
+        )
+
+        result = await ReActPattern(max_iterations=1).run(
+            context=context,
+            tools=[],
+            llm=FakeLLM([{"content": "done"}]),
+            compact_llm=compact_llm,
+            runtime=PatternRuntime(tracer=tracer),
+        )
+
+        assert result["success"] is True
+        compact_end = next(
+            (
+                event
+                for event in tracer.events
+                if event["event_type"] == "action_end_compact"
+            ),
+            None,
+        )
+        assert compact_end is not None, "truncation fallback did not fire"
+        assert compact_end["data"]["strategy"] == "truncate"
+        assert compact_end["data"]["removed_count"] >= 1
+        assert context.get_total_token_usage()["call_count"] == 1
+        assert context.llm_calls[-1].synthetic_purpose == "context_compaction"
 
 
 class TestVisionChatUsageStamp:

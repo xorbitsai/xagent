@@ -731,7 +731,14 @@ class ClaudeLLM(BaseLLM):
 
             if not content:
                 # Empty response should trigger retry
-                raise LLMRetryableError("LLM returned empty content and no tool calls")
+                error = LLMRetryableError(
+                    "LLM returned empty content and no tool calls"
+                )
+                # Usage was already booked above: carry this attempt's
+                # payload so the retry layer can merge the billed tokens.
+                if usage_payload is not None:
+                    error.usage_attempts = [usage_payload]
+                raise error
 
             # If JSON format was requested, try to repair and validate JSON
             if response_format and response_format.get("type") == "json_object":
@@ -749,9 +756,14 @@ class ClaudeLLM(BaseLLM):
                     logger.warning(
                         f"JSON repair failed, retrying LLM call: {repair_error}"
                     )
-                    raise LLMRetryableError(
+                    error = LLMRetryableError(
                         "LLM returned unrepairable JSON when response_format=json_object was requested"
                     )
+                    # Usage was already booked above: carry this attempt's
+                    # payload so the retry layer can merge the billed tokens.
+                    if usage_payload is not None:
+                        error.usage_attempts = [usage_payload]
+                    raise error
 
             # Handle output_config with json_schema - content should already be valid JSON
             if output_config is not None:

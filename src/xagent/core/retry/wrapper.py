@@ -19,6 +19,36 @@ from .strategy import ExponentialBackoff, RetryStrategy
 logger = logging.getLogger(__name__)
 
 
+def _collect_usage_attempts(error: Exception, collected: list[Any]) -> None:
+    """Append billed usage attempts carried by a retryable error.
+
+    Adapters attach ``usage_attempts`` to errors they raise *after* booking
+    the attempt's tokens, so a retry must not silently drop them.
+    """
+    attempts = getattr(error, "usage_attempts", None)
+    if attempts:
+        collected.extend(attempts)
+
+
+def _merge_usage_attempts(collected: list[Any], result: Any) -> None:
+    """Fold billed attempts from failed retries into a successful result.
+
+    ``usage`` stays the final attempt (the freshness baseline);
+    ``usage_attempts`` becomes the ordered list of every billed attempt,
+    final included, and is written only when more than one attempt was
+    billed -- a single-attempt envelope never carries the key.
+    """
+    if not collected or not isinstance(result, dict):
+        return
+    final_attempts = result.get("usage_attempts")
+    if final_attempts is None:
+        final_usage = result.get("usage")
+        final_attempts = [final_usage] if final_usage is not None else []
+    merged = collected + list(final_attempts)
+    if len(merged) > 1:
+        result["usage_attempts"] = merged
+
+
 @runtime_checkable
 class Retryable(Protocol):
     def invoke(self, *args: Any, **kwargs: Any) -> Any: ...
@@ -41,14 +71,16 @@ class RetryWrapper(Retryable):
 
     def invoke(self, *args: Any, **kwargs: Any) -> Any:
         last_exception: Optional[Exception] = None
+        collected_attempts: list[Any] = []
 
         for attempt in range(self.max_retries):
             try:
-                return self.target.invoke(*args, **kwargs)
+                result = self.target.invoke(*args, **kwargs)
             except Exception as e:
                 if not self.retry_on(e):
                     raise
 
+                _collect_usage_attempts(e, collected_attempts)
                 last_exception = e
                 if attempt < self.max_retries - 1:
                     delay = self.strategy.get_delay(attempt) / 1000.0
@@ -56,21 +88,31 @@ class RetryWrapper(Retryable):
                         f"Attempt {attempt + 1} failed: {e}. Retrying in {delay:.2f}s..."
                     )
                     time.sleep(delay)
+            else:
+                _merge_usage_attempts(collected_attempts, result)
+                return result
 
         if last_exception:
+            # Every attempt failed: the collected list already includes the
+            # final exception's own attempts (gathered when it was caught),
+            # so it is the full ordered attempt history.
+            if collected_attempts:
+                last_exception.usage_attempts = collected_attempts
             raise last_exception
         raise RuntimeError("Retry failed with no exception")
 
     async def ainvoke(self, *args: Any, **kwargs: Any) -> Any:
         last_exception: Optional[Exception] = None
+        collected_attempts: list[Any] = []
 
         for attempt in range(self.max_retries):
             try:
-                return await self.target.ainvoke(*args, **kwargs)
+                result = await self.target.ainvoke(*args, **kwargs)
             except Exception as e:
                 if not self.retry_on(e):
                     raise
 
+                _collect_usage_attempts(e, collected_attempts)
                 last_exception = e
                 if attempt < self.max_retries - 1:
                     delay = self.strategy.get_delay(attempt) / 1000.0
@@ -78,8 +120,13 @@ class RetryWrapper(Retryable):
                         f"Attempt {attempt + 1} failed: {e}. Retrying in {delay:.2f}s..."
                     )
                     await asyncio.sleep(delay)
+            else:
+                _merge_usage_attempts(collected_attempts, result)
+                return result
 
         if last_exception:
+            if collected_attempts:
+                last_exception.usage_attempts = collected_attempts
             raise last_exception
         raise RuntimeError("Retry failed with no exception")
 

@@ -596,9 +596,15 @@ class OpenAICompatibleLLM(BaseLLM):
                         result["usage"] = usage_payload
                     return result
                 # If there are no tool calls and no content, this is an error
-                raise LLMEmptyContentError(
+                error = LLMEmptyContentError(
                     f"LLM returned {'empty' if content == '' else 'None'} content and no tool calls"
                 )
+                # Usage was already booked above: carry this attempt's
+                # payload so the retry layer can merge it instead of losing
+                # the billed tokens.
+                if usage_payload is not None:
+                    error.usage_attempts = [usage_payload]
+                raise error
 
             result = {
                 "type": "text",
@@ -613,6 +619,14 @@ class OpenAICompatibleLLM(BaseLLM):
             return result
 
         try:
+            # Billed usage payloads of superseded attempts inside this one
+            # logical call (currently only the thinking-disabled structured
+            # -output retry), oldest first. Assembled into the returned
+            # envelope as ``usage_attempts`` -- or prepended to a propagated
+            # retryable error -- so outer retry layers merge rather than
+            # lose the billed tokens.
+            superseded_attempts: List[Any] = []
+
             # Make the API call
             try:
                 response = await _make_api_call()
@@ -667,6 +681,12 @@ class OpenAICompatibleLLM(BaseLLM):
                             "Model returned non-JSON content with response_format while thinking was enabled. "
                             "Retrying with thinking disabled."
                         )
+                        # The first attempt was already billed: supersede it
+                        # so the envelope (or a propagated error) carries the
+                        # full ordered attempt list.
+                        first_attempt_usage = result.get("usage")
+                        if first_attempt_usage is not None:
+                            superseded_attempts.append(first_attempt_usage)
                         # One variable for both halves: what this retry
                         # sends, and what the response hook is told it
                         # sent. Two literals here would drift apart.
@@ -688,9 +708,23 @@ class OpenAICompatibleLLM(BaseLLM):
                             response, request_thinking=retry_thinking
                         )
 
+            if superseded_attempts:
+                # ``usage`` stays the final attempt (freshness baseline);
+                # ``usage_attempts`` lists every billed attempt, final
+                # included, and is set only when more than one was billed.
+                final_attempts = result.get("usage_attempts")
+                if final_attempts is None:
+                    final_usage = result.get("usage")
+                    final_attempts = [final_usage] if final_usage is not None else []
+                attempts = superseded_attempts + list(final_attempts)
+                if len(attempts) > 1:
+                    result["usage_attempts"] = attempts
+
             return result
 
-        except LLMRetryableError:
+        except LLMRetryableError as e:
+            if superseded_attempts:
+                e.usage_attempts = superseded_attempts + list(e.usage_attempts or [])
             raise
 
         except openai.BadRequestError as e:
@@ -966,9 +1000,15 @@ class OpenAICompatibleLLM(BaseLLM):
                         result["usage"] = usage_payload
                     return result
                 # If there are no tool calls and no content, this is an error
-                raise LLMEmptyContentError(
+                error = LLMEmptyContentError(
                     f"LLM returned {'empty' if content == '' else 'None'} content and no tool calls"
                 )
+                # Usage was already booked above: carry this attempt's
+                # payload so the retry layer can merge it instead of losing
+                # the billed tokens.
+                if usage_payload is not None:
+                    error.usage_attempts = [usage_payload]
+                raise error
 
             text_result: Dict[str, Any] = {
                 "type": "text",

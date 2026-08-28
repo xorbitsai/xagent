@@ -15,9 +15,22 @@ class LLMRetryableError(RuntimeError):
     - Server errors (5xx)
 
     Subclass this exception for specific retryable error types.
+
+    Attributes:
+        usage_attempts: Billed provider usage payloads of attempts made
+            before this error was raised, oldest first. Adapters attach
+            them when usage was already booked (``add_token_usage``) before
+            the failure; the retry wrapper merges them into the eventual
+            response envelope's ``usage_attempts`` (or onto the final
+            exception when every attempt fails) so billed tokens are never
+            lost from the execution context and trace. ``None`` means no
+            billed attempts were recorded. Always ``None`` at construction;
+            assigned by the adapter/wrapper afterwards.
     """
 
-    pass
+    def __init__(self, *args: Any) -> None:
+        super().__init__(*args)
+        self.usage_attempts: list[Any] | None = None
 
 
 class LLMToolProtocolError(LLMRetryableError):

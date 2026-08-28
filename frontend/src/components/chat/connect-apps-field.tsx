@@ -238,6 +238,21 @@ export function ConnectAppsField({
   // the optimistic skippedNote back instead of leaving the card looking
   // resolved while the acknowledgement never actually went through.
   const skippedRef = useRef(false);
+  // Shared by the footer's Skip button and the all-unresolved fallback below
+  // - same optimistic-flip-then-roll-back-on-failure contract either way.
+  const handleSkipClick = async () => {
+    if (skippedRef.current) return;
+    skippedRef.current = true;
+    setSkipped(true);
+    try {
+      await onSkip();
+    } catch {
+      skippedRef.current = false;
+      if (isMountedRef.current) {
+        setSkipped(false);
+      }
+    }
+  };
   // Synchronous shadow of connectingKeys, same reason connect-mcp-dialog.tsx
   // keeps loadingAppsRef alongside loadingApps (#1330 there): setState-based
   // `disabled={isConnecting}` lags a commit cycle behind two clicks landing
@@ -296,6 +311,37 @@ export function ConnectAppsField({
           >
             {t("chatPage.clarification.connectApps.retry")}
           </button>
+        </div>
+      );
+    }
+    if (hasUnresolvedApp) {
+      // The catalog loaded fine, but every requested app name failed to
+      // resolve against it (a rename between pause creation and now, or a
+      // deleted app) - falling through to `return null` below would leave
+      // this card silently gone with no Connect/Skip/Retry action at all.
+      // Retry re-fetches the catalog (in case it just hasn't caught up
+      // yet); Skip stays available the same way it would on a normal card.
+      return (
+        <div className="flex items-center gap-3">
+          <p className="flex-1 text-xs text-muted-foreground">
+            {t("chatPage.clarification.connectApps.noneMatched")}
+          </p>
+          <button
+            type="button"
+            className="flex-shrink-0 rounded-md border border-border px-2 py-1 text-xs font-medium text-foreground hover:bg-muted"
+            onClick={() => void refresh()}
+          >
+            {t("chatPage.clarification.connectApps.retry")}
+          </button>
+          {!skipped && (
+            <button
+              type="button"
+              className="flex-shrink-0 rounded-md px-2 py-1 text-xs font-medium text-muted-foreground hover:bg-muted hover:text-foreground"
+              onClick={handleSkipClick}
+            >
+              {t("chatPage.clarification.connectApps.skip")}
+            </button>
+          )}
         </div>
       );
     }
@@ -584,19 +630,7 @@ export function ConnectAppsField({
               <button
                 type="button"
                 className="flex-shrink-0 rounded-md px-2 py-1 text-xs font-medium text-muted-foreground hover:bg-muted hover:text-foreground"
-                onClick={async () => {
-                  if (skippedRef.current) return;
-                  skippedRef.current = true;
-                  setSkipped(true);
-                  try {
-                    await onSkip();
-                  } catch {
-                    skippedRef.current = false;
-                    if (isMountedRef.current) {
-                      setSkipped(false);
-                    }
-                  }
-                }}
+                onClick={handleSkipClick}
               >
                 {t("chatPage.clarification.connectApps.skip")}
               </button>

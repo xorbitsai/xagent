@@ -360,6 +360,7 @@ const zh = {
         skippedNote: "还没有连接——准备好时随时可以点击。",
         allConnectedNote: "全部完成——所有应用都已连接。",
         manualHint: "需要手动配置",
+        noneMatched: "在你的连接器列表中没有找到所请求的任何应用。",
       },
     },
   },

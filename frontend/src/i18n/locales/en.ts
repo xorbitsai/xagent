@@ -360,6 +360,7 @@ const en = {
         skippedNote: "Not connected yet — the button is here when you are ready.",
         allConnectedNote: "All set — every app is connected.",
         manualHint: "Needs manual setup",
+        noneMatched: "None of the requested apps could be found in your connector list.",
       },
     },
   },

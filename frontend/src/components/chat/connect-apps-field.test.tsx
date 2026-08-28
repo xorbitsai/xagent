@@ -174,17 +174,62 @@ describe("ConnectAppsField", () => {
     expect(screen.getByText("G")).toBeInTheDocument();
   });
 
-  it("renders nothing if none of the requested app names resolve to a catalog entry", () => {
+  it("shows a Retry/Skip fallback, not an empty panel, when none of the requested app names resolve to a catalog entry", () => {
+    // A dead-end card (nothing rendered at all) would leave a genuinely
+    // live pause with no Connect/Skip/Retry action once every requested
+    // name fails to resolve (a rename or a deleted app since the pause
+    // was created) - see connect-apps-field.tsx's hasUnresolvedApp branch.
     mcpAppsMock.apps = [];
 
-    const { container } = render(
+    render(
       <ConnectAppsField
         interaction={{ ...LEO_INTERACTION, apps: ["Some Unknown App"] }}
         onSkip={vi.fn()}
       />
     );
 
-    expect(container).toBeEmptyDOMElement();
+    expect(
+      screen.getByText("chatPage.clarification.connectApps.noneMatched")
+    ).toBeInTheDocument();
+    expect(screen.getByText("chatPage.clarification.connectApps.retry")).toBeInTheDocument();
+    expect(screen.getByText("chatPage.clarification.connectApps.skip")).toBeInTheDocument();
+  });
+
+  it("re-fetches the catalog when Retry is clicked on the all-unresolved fallback", () => {
+    mcpAppsMock.apps = [];
+
+    render(
+      <ConnectAppsField
+        interaction={{ ...LEO_INTERACTION, apps: ["Some Unknown App"] }}
+        onSkip={vi.fn()}
+      />
+    );
+
+    fireEvent.click(screen.getByText("chatPage.clarification.connectApps.retry"));
+
+    expect(mcpAppsMock.refresh).toHaveBeenCalledTimes(1);
+  });
+
+  it("skips from the all-unresolved fallback the same way as the normal footer", async () => {
+    mcpAppsMock.apps = [];
+    const onSkip = vi.fn();
+
+    render(
+      <ConnectAppsField
+        interaction={{ ...LEO_INTERACTION, apps: ["Some Unknown App"] }}
+        onSkip={onSkip}
+      />
+    );
+
+    fireEvent.click(screen.getByText("chatPage.clarification.connectApps.skip"));
+
+    expect(onSkip).toHaveBeenCalledTimes(1);
+    expect(
+      screen.queryByText("chatPage.clarification.connectApps.skip")
+    ).not.toBeInTheDocument();
+    expect(
+      screen.getByText("chatPage.clarification.connectApps.noneMatched")
+    ).toBeInTheDocument();
   });
 
   it("resolves a requested name against an app's id, not just its display name", () => {

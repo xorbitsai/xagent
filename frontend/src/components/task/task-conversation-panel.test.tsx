@@ -653,6 +653,62 @@ describe("TaskConversationPanel", () => {
     expect(staleItem).toHaveAttribute("data-active", "false")
   })
 
+  it("does not fall back to an earlier turn's stale interactive message when the current turn's own pause isn't identifiable", () => {
+    // Tier-3 ("last assistant message with any interactions") used to scan
+    // the whole history unscoped, so an earlier turn's card that still
+    // carries interactions - e.g. a Hire-flow seed message, which per
+    // ChatMessage.tsx's isActiveConnectAppsPause comment is never actually a
+    // live pause - could get wrongly marked active whenever the newer
+    // pause's own message can't be identified by the two tiers above (e.g.
+    // its row was never persisted). Wrongly activating the stale card would
+    // localize its text and expose a live Continue button on the wrong
+    // message.
+    appState.messages = [
+      {
+        id: "user-1",
+        role: "user",
+        content: "Set up my agent",
+        timestamp: 500,
+      },
+      {
+        id: "hire-seed",
+        role: "assistant",
+        content: "Connect your apps to get started.",
+        timestamp: 600,
+        isResult: true,
+        interactions: [{ type: "connect_apps", field: "connect_apps", apps: ["Notion"] }],
+      },
+      {
+        id: "user-2",
+        role: "user",
+        content: "Now post to Gmail",
+        timestamp: 1500,
+      },
+    ]
+    appState.traceEvents = []
+    appState.currentTask = {
+      id: "42",
+      title: "Preview",
+      description: "Preview",
+      status: "waiting_for_user",
+      createdAt: "2026-01-01T00:00:00Z",
+      updatedAt: "2026-01-01T00:00:00Z",
+      waitingQuestion: "I need access to Gmail to continue. Please connect below, then let me know once you have.",
+    } as any
+
+    render(<TaskConversationPanel mode="embedded-preview" />)
+
+    const rendered = screen.getAllByTestId("chat-message")
+    const hireItem = rendered.find((m) => m.textContent?.includes("Connect your apps to get started."))
+    // A separate virtual placeholder message may legitimately show active
+    // here (hardcoded to state.currentTask.status, bypassing
+    // activeWaitingMessageId) when the current turn's own pause message
+    // hasn't loaded yet - that's the intended mechanism, not the bug. What
+    // must never happen is THIS specific stale, earlier-turn message
+    // getting activated instead.
+    expect(hireItem).toHaveAttribute("data-active", "false")
+  })
+
   it("keeps an identified text-only wait separate from stale structured trace interactions", () => {
     appState.messages = [{
       id: "user-r2",

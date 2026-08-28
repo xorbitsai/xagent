@@ -526,9 +526,25 @@ export function TaskConversationPanel({
       }
     }
 
+    // Scoped to the current turn only: an unscoped scan here could surface a
+    // stale earlier-turn assistant message that still carries interactions
+    // (e.g. a Hire-flow seed card, which is never actually a live pause -
+    // see ChatMessage.tsx's isActiveConnectAppsPause comment), wrongly
+    // marking it active and letting its localization latch/Continue button
+    // fire for the wrong card once the two tiers above fail to match.
+    const sortedMessages = [...messageItems].sort((a, b) => a.timestamp - b.timestamp)
+    const userTurnAnchors = getUserTimelineAnchors(sortedMessages)
+    const currentTurnStart =
+      userTurnAnchors.length > 0 ? userTurnAnchors[userTurnAnchors.length - 1].timestamp : null
+
     for (let i = messageItems.length - 1; i >= 0; i--) {
       const item = messageItems[i]
-      if (item.role === "assistant" && item.interactions && item.interactions.length > 0) {
+      if (
+        item.role === "assistant" &&
+        item.interactions &&
+        item.interactions.length > 0 &&
+        (currentTurnStart === null || item.timestamp >= currentTurnStart)
+      ) {
         return item.id
       }
     }

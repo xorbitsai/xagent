@@ -136,7 +136,11 @@ def upgrade() -> None:
         # time, and a later downgrade could delete it outright. Neither is
         # safe to do automatically without knowing whether the row is
         # actually ours, so fail loudly and let an operator resolve the
-        # collision by hand instead.
+        # collision by hand instead. chrome/intercom's seed migrations
+        # still use the older, weaker silent-adopt pattern for the
+        # identical risk -- not backported here since it's a change to
+        # already-shipped migrations, out of scope for this one connector;
+        # tracked at https://github.com/xorbitsai/xagent/issues/1896.
         raise RuntimeError(
             f"public_mcp_apps already has a row with app_id={APP_ID!r} "
             "that this migration did not create (its name or transport "

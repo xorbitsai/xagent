@@ -480,7 +480,15 @@ export default function OnboardingPage() {
         },
         connections: selected.connections,
       });
-      if (!isMountedRef.current) return;
+      // Not `if (!isMountedRef.current) return;` here (unlike the guard
+      // before hireAgentFromTemplate above, which is fine to skip attempting
+      // entirely): self-review found that pre-checking mount state here
+      // skipped markOnboardedAndNavigate's own save attempt too, not just
+      // its navigation - the same "agent created but onboarded never even
+      // attempted" bug this whole splitting was meant to fix, just
+      // reintroduced by an unmount-mid-flight (e.g. a Back press) racing
+      // hireAgentFromTemplate. markOnboardedAndNavigate's own isMountedRef
+      // check already correctly gates only the navigation half.
       await markOnboardedAndNavigate(`/task/${result.taskId}`);
     } catch {
       if (!isMountedRef.current) return;

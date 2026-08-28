@@ -546,6 +546,49 @@ describe("OnboardingPage", () => {
     expect(routerReplace).toHaveBeenCalledWith("/task/42")
   })
 
+  // Pins a bug found in full-feature self-review: a redundant
+  // `if (!isMountedRef.current) return;` right before this 3rd call to
+  // markOnboardedAndNavigate used to skip the call ENTIRELY (including its
+  // own onboarded:true save attempt, not just its navigation) if the
+  // component unmounted while hireAgentFromTemplate was still in flight -
+  // reintroducing the exact "agent created but onboarded never even
+  // attempted" bug this whole split was meant to fix. The onboarded save
+  // must still be attempted after an unmount; only the navigation after it
+  // should be skipped, via markOnboardedAndNavigate's own internal check.
+  it("still attempts the onboarded save (but not navigation) if the component unmounts while hireAgentFromTemplate is in flight", async () => {
+    let resolveHire!: (v: { taskId: number }) => void
+    hireAgentFromTemplateMock.mockReturnValueOnce(
+      new Promise((resolve) => { resolveHire = resolve })
+    )
+
+    await goToWelcomeThenBusiness()
+    fireEvent.click(screen.getByText("Marketing"))
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/take off your plate/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Post on social media"))
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/Meet your AI team/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/How should/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText("You're all set.")).toBeInTheDocument())
+
+    await act(async () => {
+      fireEvent.click(screen.getByText("Start with Maya"))
+    })
+    await waitFor(() => expect(hireAgentFromTemplateMock).toHaveBeenCalled())
+
+    cleanup()
+
+    await act(async () => {
+      resolveHire({ taskId: 42 })
+    })
+
+    await waitFor(() => expect(updateUserPreferencesMock).toHaveBeenCalledTimes(2))
+    expect(updateUserPreferencesMock.mock.calls[1][0]).toEqual({ onboarded: true })
+    expect(routerReplace).not.toHaveBeenCalledWith("/task/42")
+  })
+
   // Pins a PR review finding: onboarded:true used to be saved durably as
   // part of the FIRST preferences save, before the freshness re-check and
   // hireAgentFromTemplate (both of which can still fail or the component

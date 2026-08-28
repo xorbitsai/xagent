@@ -310,6 +310,12 @@ COPY --from=uv /uv /uvx /usr/local/bin/
 # A deployment that doesn't want this connector -- or whose build
 # environment can't reach github.com -- can pass
 # --build-arg INSTALL_CHARTMOGUL=false to skip all of that entirely.
+# Same caveat as INSTALL_CHROME: this flag doesn't gate what an admin can
+# set is_visible_in_connector to at runtime (a mutable DB boolean, no
+# redeploy needed) -- an INSTALL_CHARTMOGUL=false image with that flag
+# force-enabled anyway would show a connector with nothing actually
+# vendored. Tracked generically (not specific to either connector) at
+# https://github.com/xorbitsai/xagent/issues/1872.
 ARG INSTALL_CHARTMOGUL=true
 ARG CHARTMOGUL_MCP_REPO_URL="https://github.com/chartmogul/chartmogul-mcp-server.git"
 ARG CHARTMOGUL_MCP_REF="e385e9b8987135f8753a25bbb30645cdfcd505c0"

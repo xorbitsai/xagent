@@ -37,6 +37,7 @@ WEB_DIR = "XAGENT_WEB_DIR"
 FRONTEND_DIST_DIR = "XAGENT_FRONTEND_DIST_DIR"
 EXTERNAL_UPLOAD_DIRS = "XAGENT_EXTERNAL_UPLOAD_DIRS"
 EXTERNAL_SKILLS_LIBRARY_DIRS = "XAGENT_EXTERNAL_SKILLS_LIBRARY_DIRS"
+CHARTMOGUL_MCP_VENDOR_PATH = "XAGENT_CHARTMOGUL_MCP_VENDOR_PATH"
 AGENT_RUNTIME = "XAGENT_AGENT_RUNTIME"
 INTERACTION_PROTOCOL_MODE = "XAGENT_INTERACTION_PROTOCOL_MODE"
 INTERACTION_NATIVE_SOURCES = "XAGENT_INTERACTION_NATIVE_SOURCES"
@@ -2158,6 +2159,27 @@ def get_storage_root() -> Path:
 
     # Default: ~/.xagent
     return Path.home() / ".xagent"
+
+
+def get_chartmogul_mcp_vendor_path() -> str:
+    """Get the vendored ChartMogul MCP server's clone destination.
+
+    Priority:
+    1. XAGENT_CHARTMOGUL_MCP_VENDOR_PATH environment variable
+    2. Default: /opt/xagent/vendor/chartmogul-mcp-server
+
+    chartmogul-mcp-server ships no PyPI/npm package, so docker/Dockerfile.backend
+    clones a pinned commit of it into the image at build time and sets this same
+    env var to the value it cloned into -- Python reads it back here instead of
+    hardcoding an independent copy of the path, so the Dockerfile ARG default is
+    the only place the value actually needs to change.
+
+    Returns:
+        Absolute path to the vendored chartmogul-mcp-server clone.
+    """
+    return os.getenv(
+        CHARTMOGUL_MCP_VENDOR_PATH, "/opt/xagent/vendor/chartmogul-mcp-server"
+    )
 
 
 def get_sandbox_image() -> str:

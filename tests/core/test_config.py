@@ -25,6 +25,7 @@ from xagent.config import (
     CELERY_BROKER_URL,
     CELERY_ENABLED,
     CELERY_RESULT_BACKEND,
+    CHARTMOGUL_MCP_VENDOR_PATH,
     DATABASE_URL,
     DB_MAX_OVERFLOW,
     DB_POOL_SIZE,
@@ -131,6 +132,7 @@ from xagent.config import (
     get_celery_broker_url,
     get_celery_enabled,
     get_celery_result_backend,
+    get_chartmogul_mcp_vendor_path,
     get_database_url,
     get_db_max_overflow,
     get_db_pool_size,
@@ -1328,6 +1330,22 @@ class TestGetStorageRoot:
         monkeypatch.setenv(STORAGE_ROOT, "~/custom-root")
         result = get_storage_root()
         assert result == tmp_path / "custom-root"
+
+
+class TestGetChartmogulMcpVendorPath:
+    """Test get_chartmogul_mcp_vendor_path() function."""
+
+    def test_default_vendor_path(self, monkeypatch):
+        """Test default ChartMogul MCP vendor path."""
+        monkeypatch.delenv(CHARTMOGUL_MCP_VENDOR_PATH, raising=False)
+        result = get_chartmogul_mcp_vendor_path()
+        assert result == "/opt/xagent/vendor/chartmogul-mcp-server"
+
+    def test_vendor_path_with_env_var(self, monkeypatch):
+        """Test ChartMogul MCP vendor path with environment variable."""
+        monkeypatch.setenv(CHARTMOGUL_MCP_VENDOR_PATH, "/custom/chartmogul-path")
+        result = get_chartmogul_mcp_vendor_path()
+        assert result == "/custom/chartmogul-path"
 
 
 class TestGetSandboxImage:

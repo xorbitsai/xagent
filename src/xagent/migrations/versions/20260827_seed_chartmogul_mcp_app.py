@@ -67,16 +67,50 @@ def upgrade() -> None:
         return
 
     columns = {c["name"] for c in inspector.get_columns("public_mcp_apps")}
+
+    # is_visible_in_connector is load-bearing for the Docker-only gate this
+    # row ships behind (see the registry row's comment), so its absence must
+    # fail loudly rather than let the column-filter below silently drop it
+    # and fall back to the table default (TRUE) -- seeding the row visible,
+    # the opposite of intent. Unreachable through any normal
+    # `alembic upgrade head` (the migration that adds the column is a real
+    # ancestor in this chain). A plain RuntimeError rather than assert:
+    # assertions are stripped under python -O/PYTHONOPTIMIZE, which would
+    # silently defeat this guard. Checked before the collision branch so
+    # both paths are covered. Mirrors 20260806_seed_chrome_mcp_app.py, which
+    # ships hidden for the same reason.
+    if "is_visible_in_connector" not in columns:
+        raise RuntimeError(
+            "public_mcp_apps.is_visible_in_connector is missing; the "
+            "chartmogul row must not seed visible"
+        )
+
     existing = set(bind.execute(sa.select(PUBLIC_MCP_APPS_TABLE.c.app_id)).scalars())
     if APP_ID in existing:
+        # A row with this app_id already exists (e.g. hand-created by an
+        # operator before this migration deployed). Such a row keeps its own
+        # is_visible_in_connector, which defaults to TRUE for hand-created
+        # rows -- and the builtin registry overlays the real
+        # transport/launch_config onto ANY row sharing this app_id at read
+        # time, so a visible pre-existing row would silently become a
+        # working, one-click-connectable ChartMogul connector that only
+        # functions inside the Docker image, defeating the hidden gate with
+        # no further action. Enforce hidden on the collision branch too,
+        # instead of returning untouched.
+        bind.execute(
+            sa.update(PUBLIC_MCP_APPS_TABLE)
+            .where(PUBLIC_MCP_APPS_TABLE.c.app_id == APP_ID)
+            .values(is_visible_in_connector=False)
+        )
         return
 
     # Silently degrades rather than failing outright (this table is never
     # expected to be missing a column that predates this migration by
-    # months), but the app_id-exists guard above means a row seeded here
-    # while a column was missing can never self-heal on a later re-run --
-    # so at least surface which keys were dropped instead of leaving no
-    # trace at all.
+    # months, and is_visible_in_connector -- the one column that actually
+    # matters for this row -- is already guaranteed present above), but the
+    # app_id-exists guard above means a row seeded here while a column was
+    # missing can never self-heal on a later re-run -- so at least surface
+    # which keys were dropped instead of leaving no trace at all.
     dropped_keys = sorted(set(ROW) - columns)
     if dropped_keys:
         logger.warning(
@@ -99,6 +133,22 @@ def downgrade() -> None:
     # already connected are intentionally left in place -- connect-driven
     # rows are not owned by this migration and are cleaned up through the
     # normal disconnect path.
+    #
+    # An unconditional DELETE-by-app_id is NOT safe here: upgrade()'s
+    # collision branch adopts a pre-existing hand-created row by flipping
+    # only is_visible_in_connector -- name/description/transport are left
+    # exactly as the operator set them. Deleting unconditionally on downgrade
+    # would destroy that operator's own row, not "remove the entry this
+    # migration owns." Matching on name/description/transport (specific
+    # enough that a hand-made row coincidentally matching all three isn't a
+    # realistic concern) distinguishes a genuinely migration-created row from
+    # an adopted one without a new tracking column -- a row that doesn't
+    # match is left in place, restored rather than destroyed. Mirrors
+    # 20260806_seed_chrome_mcp_app.py's downgrade for the same reason.
     bind.execute(
-        sa.delete(PUBLIC_MCP_APPS_TABLE).where(PUBLIC_MCP_APPS_TABLE.c.app_id == APP_ID)
+        sa.delete(PUBLIC_MCP_APPS_TABLE)
+        .where(PUBLIC_MCP_APPS_TABLE.c.app_id == APP_ID)
+        .where(PUBLIC_MCP_APPS_TABLE.c.name == ROW["name"])
+        .where(PUBLIC_MCP_APPS_TABLE.c.description == ROW["description"])
+        .where(PUBLIC_MCP_APPS_TABLE.c.transport == ROW["transport"])
     )

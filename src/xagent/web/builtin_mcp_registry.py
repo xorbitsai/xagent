@@ -9,6 +9,8 @@ from typing import Any
 import sqlalchemy as sa
 from sqlalchemy.engine import Connection
 
+from ..config import get_chartmogul_mcp_vendor_path
+
 OAUTH_PROVIDERS_TABLE = sa.table(
     "oauth_providers",
     sa.column("provider_name", sa.String),
@@ -347,12 +349,6 @@ def get_builtin_oauth_provider_rows() -> list[dict[str, Any]]:
             ],
         },
     ]
-
-
-# Must match the clone destination in docker/Dockerfile.backend's
-# CHARTMOGUL_MCP_VENDOR_PATH build arg -- can't be shared across the
-# Dockerfile/Python boundary, so keep both in sync by hand on change.
-CHARTMOGUL_MCP_VENDOR_PATH = "/opt/xagent/vendor/chartmogul-mcp-server"
 
 
 def get_builtin_public_mcp_app_rows() -> list[dict[str, Any]]:
@@ -1181,12 +1177,17 @@ def get_builtin_public_mcp_app_rows() -> list[dict[str, Any]]:
             # see the is_visible_in_connector note above.
             # --no-sync skips uv's own launch-time lockfile/sync check
             # (which needs network access) since the venv was already
-            # synced at build time and never changes at runtime.
+            # synced at build time and never changes at runtime. The path
+            # comes from config.get_chartmogul_mcp_vendor_path(), not a
+            # hardcoded literal: Dockerfile.backend sets
+            # XAGENT_CHARTMOGUL_MCP_VENDOR_PATH to whatever it actually
+            # cloned into, so this reads the real build-time value back
+            # instead of an independently-maintained copy of it.
             "launch_config": {
                 "command": "uv",
                 "args": [
                     "--directory",
-                    CHARTMOGUL_MCP_VENDOR_PATH,
+                    get_chartmogul_mcp_vendor_path(),
                     "run",
                     "--no-sync",
                     "main.py",

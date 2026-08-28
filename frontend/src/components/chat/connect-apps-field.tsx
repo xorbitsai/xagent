@@ -85,9 +85,12 @@ type ConnectAppsRow =
  * catalog entry at all is silently dropped - nothing this card could do
  * about it either way.
  */
-function resolveRows(appNames: string[] | undefined, allApps: McpApp[]): ConnectAppsRow[] {
+function resolveRows(
+  appNames: string[] | undefined,
+  allApps: McpApp[],
+): { rows: ConnectAppsRow[]; hasUnresolvedApp: boolean } {
   const wanted = appNames || [];
-  if (wanted.length === 0) return [];
+  if (wanted.length === 0) return { rows: [], hasUnresolvedApp: false };
 
   // findMatchingMcpApp (lib/mcp-lookup.ts) matches by name OR id, tolerating
   // a hyphen-for-space variant either way - the same lenient matching
@@ -97,9 +100,14 @@ function resolveRows(appNames: string[] | undefined, allApps: McpApp[]): Connect
   // its connection by app_id (e.g. "facebook-pages") instead of display name.
   const seen = new Set<string>();
   const resolved: McpApp[] = [];
+  let hasUnresolvedApp = false;
   for (const name of wanted) {
     const app = findMatchingMcpApp(allApps, name);
-    if (!app || seen.has(app.id)) continue;
+    if (!app) {
+      hasUnresolvedApp = true;
+      continue;
+    }
+    if (seen.has(app.id)) continue;
     seen.add(app.id);
     resolved.push(app);
   }
@@ -126,11 +134,12 @@ function resolveRows(appNames: string[] | undefined, allApps: McpApp[]): Connect
     group.apps.push(app);
   }
 
-  return resolved.map((app): ConnectAppsRow => {
+  const rows = resolved.map((app): ConnectAppsRow => {
     if (app.auth_type === "mcp_oauth") return { kind: "mcp_oauth", app };
     if (isOAuthApp(app)) return { kind: "oauth", app, group: groupsByProvider.get(app.provider)! };
     return { kind: "manual", app };
   });
+  return { rows, hasUnresolvedApp };
 }
 
 function RowIcon({
@@ -226,14 +235,14 @@ export function ConnectAppsField({
     };
   }, []);
 
-  const rows = useMemo(() => resolveRows(interaction.apps, apps), [interaction.apps, apps]);
   // resolveRows silently drops any requested name that doesn't resolve in
   // the catalog (see its own comment) - a multi-connection template (e.g.
   // hire-agent.ts's uncapped connections list) with one unresolvable name
   // must not read as "all connected" just because every row that DID render
-  // happens to be connected.
-  const hasUnresolvedApp = useMemo(
-    () => (interaction.apps || []).some((name) => !findMatchingMcpApp(apps, name)),
+  // happens to be connected, so it reports that alongside the rows from the
+  // same pass instead of a separate scan over interaction.apps.
+  const { rows, hasUnresolvedApp } = useMemo(
+    () => resolveRows(interaction.apps, apps),
     [interaction.apps, apps],
   );
   // Recomputed on every render (not memoized against rows, which doesn't

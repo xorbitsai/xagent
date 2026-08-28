@@ -951,10 +951,6 @@ describe("widget bootstrap", () => {
       return document.head.querySelector("style")!.innerHTML
     }
 
-    function fab() {
-      return document.querySelector<HTMLButtonElement>(".xagent-widget-fab")!
-    }
-
     // Slices from the @media marker to the end of the stylesheet text (it's
     // the last block in the template) rather than trying to match a precise
     // closing brace -- formatting drift inside the block (added/reordered
@@ -993,24 +989,11 @@ describe("widget bootstrap", () => {
       expect(block).toMatch(/\.xagent-widget-panel\s*\{[^}]*padding-bottom:\s*env\(safe-area-inset-bottom/)
     })
 
-    it("moves the close control off the composer by repositioning the open FAB to the top corner", () => {
+    it("hides the FAB while the full-screen panel is open, since its own header already has a close control", () => {
       runWidget({ "data-widget-key": "widget-secret" })
 
       const block = mobileBlock()
-      expect(block).toMatch(/\.xagent-widget-fab\.xagent-widget-fab-panel-open\s*\{[^}]*position:\s*fixed;/)
-      expect(block).toMatch(/\.xagent-widget-fab\.xagent-widget-fab-panel-open\s*\{[^}]*bottom:\s*auto;/)
-    })
-
-    it("marks the FAB open only while the panel is open, on the real open/close path", () => {
-      runWidget({ "data-widget-key": "widget-secret" })
-
-      expect(fab().classList.contains("xagent-widget-fab-panel-open")).toBe(false)
-
-      fab().click()
-      expect(fab().classList.contains("xagent-widget-fab-panel-open")).toBe(true)
-
-      fab().click()
-      expect(fab().classList.contains("xagent-widget-fab-panel-open")).toBe(false)
+      expect(block).toMatch(/\.xagent-widget-panel\.open\s*~\s*\.xagent-widget-fab\s*\{[^}]*display:\s*none;/)
     })
   })
 })

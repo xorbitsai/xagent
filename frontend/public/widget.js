@@ -398,15 +398,12 @@
         display: none;
       }
 
-      /* The FAB doubles as the full-screen panel's close control (it already
-         swaps to the close icon in openPanel()); reposition it to the top
-         corner so it doesn't sit on top of the composer docked at the
-         bottom of the screen it's now covering. */
-      .xagent-widget-fab.xagent-widget-fab-panel-open {
-        position: fixed;
-        top: calc(12px + env(safe-area-inset-top, 0px));
-        right: 12px;
-        bottom: auto;
+      /* The full-screen panel already carries its own in-header close
+         control (the iframe's own React header), landing in this same
+         corner -- leaving the FAB visible here would just float a second,
+         redundant close button on top of it. */
+      .xagent-widget-panel.open ~ .xagent-widget-fab {
+        display: none;
       }
     }
   `;
@@ -658,14 +655,12 @@
   function openPanel() {
     isOpen = true;
     panel.classList.add('open');
-    fab.classList.add('xagent-widget-fab-panel-open');
     fab.innerHTML = closeIcon;
   }
 
   function closePanel() {
     isOpen = false;
     panel.classList.remove('open');
-    fab.classList.remove('xagent-widget-fab-panel-open');
     fab.innerHTML = chatIcon;
   }
 

@@ -1669,8 +1669,20 @@ def _classify_delegated_child_failure(
     status = result.get("status")
 
     if tool_result_waits_for_user(result):
+        # The child's own pause message (e.g. naming the specific app that
+        # needs reconnecting) is the only actionable part of this failure -
+        # without it the parent gets no more than "a nested pause isn't
+        # supported", losing whatever diagnostic the child tool actually
+        # produced. Only the plain message string is read, never the full
+        # result (see _classified_failure's docstring on why).
+        child_message = result.get("message")
+        detail = (
+            f" {child_message.strip()}"
+            if isinstance(child_message, str) and child_message.strip()
+            else ""
+        )
         return _classified_failure(
-            _NESTED_WAIT_UNSUPPORTED_MESSAGE,
+            _NESTED_WAIT_UNSUPPORTED_MESSAGE + detail,
             failure_code="unsupported_nested_interaction",
         )
 

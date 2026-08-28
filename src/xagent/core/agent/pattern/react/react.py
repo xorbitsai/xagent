@@ -2610,9 +2610,25 @@ class ReActPattern(AgentPattern):
                     for tool_call, _ in waiting_pairs
                 }
             )
+            # The tool's own pause message (e.g. UnavailableMCPTool naming the
+            # specific app needing reconnection) is the only actionable part
+            # of this diagnostic - without it this execution reports nothing
+            # more specific than "a tool wanted to ask something", a
+            # regression from the plain error these same failures produced
+            # before interactive tools could pause instead of erroring.
+            waiting_messages = sorted(
+                {
+                    result["message"].strip()
+                    for _, result in waiting_pairs
+                    if isinstance(result.get("message"), str)
+                    and result["message"].strip()
+                }
+            )
+            detail = f" {' '.join(waiting_messages)}" if waiting_messages else ""
             error = (
                 "Tool-requested user interaction is disabled for this execution: "
                 + ", ".join(tool_names)
+                + detail
             )
             logger.warning("ReAct rejected tool-requested user interaction: %s", error)
             self.status = "failed"

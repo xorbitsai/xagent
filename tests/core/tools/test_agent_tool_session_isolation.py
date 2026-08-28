@@ -357,6 +357,26 @@ def test_classifier_leaves_statusless_results_untouched():
     assert mod._classify_delegated_child_failure({"output": ""}) is None
 
 
+def test_classify_delegated_child_failure_relays_the_childs_own_pause_message():
+    """A delegated child that paused (e.g. UnavailableMCPTool naming a specific
+    app needing reconnection) must still surface that diagnostic to the
+    parent - the generic 'nested calls cannot forward prompts' framing alone
+    throws away the only actionable part of the failure."""
+
+    result = {
+        "status": "waiting_for_user",
+        "success": False,
+        "message": "I need access to Gmail to continue.",
+    }
+
+    classified = mod._classify_delegated_child_failure(result)
+
+    assert classified is not None
+    assert classified["failure_code"] == "unsupported_nested_interaction"
+    assert "I need access to Gmail to continue." in classified["error"]
+    assert "cannot forward" in classified["error"]
+
+
 def test_classify_delegated_child_failure_reads_raw_output_over_backfill():
     """The classifier reads the child's own raw answer, not the backfilled one.
 

@@ -6417,27 +6417,23 @@ async def _handle_chat_message_unserialized(
                     user=task_setup_snapshot.runtime_user,
                     task_setup_snapshot=task_setup_snapshot,
                     task_owner_user_id=task_owner_user_id,
-                    # Without this, a cached AgentService whose tools were
-                    # already built (e.g. paused waiting for the user to
-                    # connect an app) keeps its stale MCP config forever:
-                    # `_sync_connector_runtime_turn` only invalidates tools
-                    # when the turn id actually changes, and every resume
-                    # this message carries a fresh one from the incoming
-                    # message that triggered it, matching what
-                    # `execute_task_background` already passes for a fresh
-                    # run (`context_dict.get("turn_id")`).
-                    #
-                    # This mutates the shared cached agent's tool_config
-                    # before this handler reserves the resume slot below -
-                    # safe only because this handler and the explicit-resume
-                    # one (the other get_agent_for_task call in this file)
-                    # both run exclusively off the durable command queue,
-                    # which claim_task_command's ~_unfinished_earlier_command
-                    # filter serializes per task_id: a second command for
-                    # this task cannot even be claimed while this one is
-                    # in flight, so the two calls can never race on the
-                    # same task's cached agent.
-                    connector_runtime_turn_id=turn_id,
+                    # No connector_runtime_turn_id here - that sync mutates
+                    # the shared cached agent's tool_config
+                    # (invalidate_tools + the per-turn ephemeral-secrets
+                    # binding), and this handler's own admitted background
+                    # task can still be executing when a LATER command for
+                    # this same task is claimed (claim_task_command's queue
+                    # serialization only covers claiming, not a fire-and-
+                    # forget background task's full lifetime - see
+                    # background_task_manager.reserve_resume below, which
+                    # exists precisely because that window is real). Doing
+                    # the sync here, before this handler's own admission
+                    # check, let a command that goes on to lose reserve_resume
+                    # still clobber the turn/cache context an already-
+                    # admitted resume is executing under. Deferred to right
+                    # after reserve_resume succeeds below instead, so it can
+                    # only ever run once this command is the sole admitted
+                    # owner of the cached agent.
                     resolved_execution_scope=resolved_execution_scope,
                 )
                 if hasattr(agent_service, "set_outbound_message_handler"):
@@ -6459,6 +6455,11 @@ async def _handle_chat_message_unserialized(
                         rejection_outcome="not_accepted",
                     )
                     return
+                # This command is now the sole admitted owner of the cached
+                # agent's tool_config for this task - see the comment on
+                # get_agent_for_task above for why the sync can't safely run
+                # any earlier than this.
+                get_agent_manager().sync_connector_runtime_turn(task_id, turn_id)
                 # Pass the user-typed bubble text + display-safe file refs
                 # alongside the LLM-augmented execution text. The runner
                 # persists them onto Message.metadata so its tracing
@@ -8902,16 +8903,11 @@ async def _handle_resume_task_unserialized(
             user=task_setup_snapshot.runtime_user,
             task_setup_snapshot=task_setup_snapshot,
             task_owner_user_id=task_owner_user_id,
-            # No per-message turn id exists on this explicit-command resume
-            # path (unlike the new-user-message resume above), but a cached
-            # AgentService's tools still need the same fresh-turn-id nudge to
-            # rebuild against connector state that may have changed (e.g. the
-            # user connecting an app) since it paused - see the sibling
-            # get_agent_for_task call's comment. A fresh id every call is
-            # deliberate: this path is infrequent enough that always
-            # rebuilding is cheaper than trying to detect whether anything
-            # actually changed.
-            connector_runtime_turn_id=str(uuid.uuid4()),
+            # No connector_runtime_turn_id here - see the sibling
+            # get_agent_for_task call's comment (websocket.py's message-
+            # triggered resume handler) for why that sync must be deferred
+            # until this command is the sole admitted owner of the cached
+            # agent, not performed at fetch time.
             resolved_execution_scope=resolved_execution_scope,
         )
         if getattr(agent_service, "supports_live_control", lambda: False)():
@@ -8944,6 +8940,14 @@ async def _handle_resume_task_unserialized(
                 return ResumeCommandResult(ResumeCommandOutcome.ALREADY_IN_PROGRESS)
             if reservation is not ResumeReservationOutcome.RESERVED:
                 return _defer_for_slot(reservation)
+            # This command is now the sole admitted owner of the cached
+            # agent's tool_config for this task. A fresh id every call is
+            # deliberate (no per-message turn id exists on this path,
+            # unlike the new-user-message resume handler): this path is
+            # infrequent enough that always rebuilding connector-backed
+            # tools is cheaper than trying to detect whether anything
+            # actually changed since the task paused.
+            get_agent_manager().sync_connector_runtime_turn(task_id, str(uuid.uuid4()))
             resume_snapshot: Any | None = None
             bg_task: asyncio.Task[None] | None = None
             try:

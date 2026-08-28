@@ -2924,6 +2924,17 @@ class AgentServiceManager:
         self._sync_execution_scope(task_id, scope)
         return self._agents[task_id]
 
+    def sync_connector_runtime_turn(
+        self, task_id: int, connector_runtime_turn_id: Optional[str]
+    ) -> None:
+        """Public entry point for callers that must defer the sync below
+        past their own admission check (see websocket.py's message-resume
+        and explicit-resume handlers) - `get_agent_for_task`'s
+        `connector_runtime_turn_id` kwarg still exists for callers that
+        don't need that deferral (e.g. a fresh execution, which has no
+        prior background task to race)."""
+        self._sync_connector_runtime_turn(task_id, connector_runtime_turn_id)
+
     def _sync_connector_runtime_turn(
         self, task_id: int, connector_runtime_turn_id: Optional[str]
     ) -> None:

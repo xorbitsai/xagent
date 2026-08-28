@@ -869,6 +869,33 @@ describe("ConnectAppsField", () => {
     ).not.toBeInTheDocument();
   });
 
+  it("only calls onContinue once when the button is clicked twice before React re-renders", () => {
+    // setContinued(true) doesn't take effect until the next render, so the
+    // button is still in the DOM for a second click that lands in the same
+    // tick - continuedRef is the synchronous guard that must catch it,
+    // since a forced Continue message isn't idempotent the way a Connect
+    // popup click is.
+    mcpAppsMock.apps = [makeApp({ provider: "google", is_connected: true })];
+    const onContinue = vi.fn().mockResolvedValue(undefined);
+
+    render(
+      <ConnectAppsField
+        interaction={{ ...LEO_INTERACTION, apps: ["Gmail"] }}
+        onSkip={vi.fn()}
+        onContinue={onContinue}
+      />
+    );
+
+    const continueButton = screen.getByRole("button", {
+      name: "chatPage.clarification.connectApps.continue",
+    });
+
+    fireEvent.click(continueButton);
+    fireEvent.click(continueButton);
+
+    expect(onContinue).toHaveBeenCalledTimes(1);
+  });
+
   it("restores the Continue button when onContinue rejects, so the user can retry", async () => {
     mcpAppsMock.apps = [makeApp({ provider: "google", is_connected: true })];
     const onContinue = vi.fn().mockRejectedValue(new Error("network error"));

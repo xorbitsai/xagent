@@ -218,6 +218,12 @@ export function ConnectAppsField({
   const [continued, setContinued] = useState(false);
   const [keyConnectApp, setKeyConnectApp] = useState<McpApp | null>(null);
   const isMountedRef = useRef(true);
+  // Synchronous shadow of `continued`, same reason connectingKeysRef shadows
+  // connectingKeys just below: setState-based `!continued` gating lags a
+  // commit cycle behind two clicks landing in the same tick, and a forced
+  // Continue message is not idempotent the way a Connect popup is - two
+  // clicks before React re-renders would send it twice.
+  const continuedRef = useRef(false);
   // Synchronous shadow of connectingKeys, same reason connect-mcp-dialog.tsx
   // keeps loadingAppsRef alongside loadingApps (#1330 there): setState-based
   // `disabled={isConnecting}` lags a commit cycle behind two clicks landing
@@ -543,10 +549,13 @@ export function ConnectAppsField({
                 type="button"
                 className="flex-shrink-0 rounded-md bg-primary px-2.5 py-1 text-xs font-medium text-primary-foreground hover:bg-primary/90"
                 onClick={async () => {
+                  if (continuedRef.current) return;
+                  continuedRef.current = true;
                   setContinued(true);
                   try {
                     await onContinue();
                   } catch {
+                    continuedRef.current = false;
                     if (isMountedRef.current) {
                       setContinued(false);
                     }

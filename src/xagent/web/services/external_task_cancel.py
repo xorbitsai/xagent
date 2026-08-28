@@ -34,6 +34,7 @@ from sqlalchemy.orm import Session
 from ..models.chat_message import TaskChatMessage
 from ..models.database import get_session_local
 from ..models.task import Task, TaskStatus
+from .assistant_history_safety import CLIENT_SAFE_FAILURE_MESSAGE_TYPE
 from .chat_history_service import (
     DELIVERY_DISPATCHED,
     DELIVERY_PENDING,
@@ -290,10 +291,10 @@ def _persist_interruption_transcript_no_commit(db: Session, task: Task) -> None:
     its own write and this line is the only one. The replay short circuit
     above returns before reaching here, so a redelivered command adds none.
 
-    The row mirrors the settlement's exactly - same content, same
-    ``chat_response`` type, no turn id - so the reader cannot tell which
-    writer won. ``content_is_reconciled`` is set because the content is a
-    server-owned constant with no file references to resolve.
+    The row mirrors the settlement's exactly - same content, same explicit
+    client-safe failure provenance, no turn id - so the reader cannot tell
+    which writer won. ``content_is_reconciled`` is set because the content is
+    a server-owned constant with no file references to resolve.
 
     A task row without an owner gets no line from either writer: the
     settlement guards on ``task.user_id is not None`` and so does this.
@@ -308,7 +309,7 @@ def _persist_interruption_transcript_no_commit(db: Session, task: Task) -> None:
         task_id=int(task.id),
         user_id=int(task.user_id),
         content=EXTERNAL_TURN_INTERRUPTED_MESSAGE,
-        message_type="chat_response",
+        message_type=CLIENT_SAFE_FAILURE_MESSAGE_TYPE,
         content_is_reconciled=True,
     )
 

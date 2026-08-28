@@ -267,6 +267,35 @@ def get_builtin_oauth_provider_rows() -> list[dict[str, Any]]:
             "default_scopes": ["api", "refresh_token", "openid"],
         },
         {
+            "provider_name": "deputy",
+            "name": "Deputy",
+            "client_id": os.environ.get("DEPUTY_CLIENT_ID", ""),
+            "client_secret": os.environ.get("DEPUTY_CLIENT_SECRET", ""),
+            "auth_url": "https://once.deputy.com/my/oauth/login",
+            "token_url": "https://once.deputy.com/my/oauth/access_token",
+            "redirect_uri": os.environ.get("DEPUTY_REDIRECT_URI", ""),
+            # Deputy has no fixed userinfo host -- each customer's actual API
+            # host (e.g. "acme.au.deputy.com", no scheme) is returned as
+            # `endpoint` in the token response instead, similar in spirit to
+            # Salesforce's instance_url above but under a different response
+            # key and without a scheme, so api/auth.py normalizes it into
+            # UserOAuth.instance_url itself rather than reusing the generic
+            # token_data.get("instance_url") persistence every other provider
+            # shares. Left empty so generic_oauth_callback's `elif
+            # userinfo_url and access_token:` branch is skipped; identity
+            # instead comes from a dedicated `elif provider.lower() ==
+            # "deputy"` branch there that calls the per-install
+            # GET /api/v1/me once instance_url is known.
+            "userinfo_url": "",
+            "user_id_path": "",
+            "email_path": "",
+            # Deputy's only documented OAuth scope. Not a permission scope in
+            # the usual sense -- it just tells Deputy to also issue a
+            # refresh_token -- but the authorize, code-exchange, and refresh
+            # requests all require it to be present verbatim.
+            "default_scopes": ["longlife_refresh_token"],
+        },
+        {
             "provider_name": "linear",
             "name": "Linear",
             "client_id": os.environ.get("LINEAR_CLIENT_ID", ""),
@@ -378,7 +407,7 @@ def get_builtin_public_mcp_app_rows() -> list[dict[str, Any]]:
             "transport": "oauth",
             "provider_name": "google",
             "category": "Scheduling",
-            "oauth_scopes": ["https://www.googleapis.com/auth/calendar"],
+            "oauth_scopes": ["https://www.googleapis.com/auth/calendar.events"],
             "is_visible_in_connector": True,
             "launch_config": {
                 "command": "python",
@@ -1012,6 +1041,29 @@ def get_builtin_public_mcp_app_rows() -> list[dict[str, Any]]:
                 "env_mapping": {
                     "SALESFORCE_ACCESS_TOKEN": "access_token",
                     "SALESFORCE_INSTANCE_URL": "instance_url",
+                },
+            },
+        },
+        {
+            "app_id": "deputy",
+            "name": "Deputy",
+            "description": "Connect to Deputy to look up employees, view rosters/shifts, and read timesheets.",
+            "icon": "https://www.google.com/s2/favicons?domain=deputy.com&sz=128",
+            "transport": "oauth",
+            "provider_name": "deputy",
+            "category": "Scheduling",
+            "oauth_scopes": ["longlife_refresh_token"],
+            "is_visible_in_connector": True,
+            "launch_config": {
+                "command": "python",
+                "args": ["-m", "xagent.web.tools.mcp.deputy"],
+                # instance_url is the per-install API host from the OAuth
+                # grant (UserOAuth.instance_url) -- see the oauth_providers
+                # row above for why Deputy needs this second mapping entry,
+                # the same reason Salesforce's row above does.
+                "env_mapping": {
+                    "DEPUTY_ACCESS_TOKEN": "access_token",
+                    "DEPUTY_INSTANCE_URL": "instance_url",
                 },
             },
         },

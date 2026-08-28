@@ -172,6 +172,60 @@ def _is_salesforce_provider(provider: str) -> bool:
     return lowered == "salesforce" or lowered.startswith("salesforce-")
 
 
+_DEPUTY_HOST_SUFFIX = "deputy.com"
+
+
+def _normalize_deputy_endpoint(raw_endpoint: object) -> Optional[str]:
+    """Turn Deputy's token-response ``endpoint`` field into the full origin
+    UserOAuth.instance_url stores for every provider that has one.
+
+    Deputy returns this as a bare host (e.g. "acme.au.deputy.com", no
+    scheme -- unlike Salesforce's instance_url, which already includes
+    "https://"). Unlike the shallow "is this non-empty" check Salesforce's
+    instance_url guard below does, this fully canonicalizes and validates
+    the value up front (same depth as deputy.py's own _instance_url(),
+    which every tool call routes through) rather than deferring to it:
+    this value is also consumed directly by this file's own
+    _fetch_deputy_identity() and by tools/config.py's refresh-URL builder,
+    both of which build a URL via plain string concatenation with no
+    re-parsing of their own, so a value good enough to only pass a shallow
+    check here (e.g. carrying a trailing slash, an embedded path, or a
+    non-https scheme) would silently produce a malformed request URL at
+    those two call sites, or connect "successfully" only for every
+    deputy_*.py tool call to then fail with an opaque instance_url error.
+    Returning None (rather than raising, like deputy.py's version does)
+    lets the callback's own guard turn a bad value into one clear
+    "did not return an endpoint" error at connect time instead.
+    """
+    if not isinstance(raw_endpoint, str):
+        return None
+    endpoint = raw_endpoint.strip()
+    if not endpoint:
+        return None
+    if not endpoint.startswith("https://") and not endpoint.startswith("http://"):
+        endpoint = f"https://{endpoint}"
+
+    from urllib.parse import urlparse
+
+    try:
+        # urlparse() itself, not just the .port access below, can raise
+        # ValueError on malformed input (e.g. an IPv6-literal-like host:
+        # urlparse("https://[::1].deputy.com") raises "Invalid IPv6 URL")
+        # -- wrapping only .port would let that escape uncaught here and
+        # surface as a raw 500 instead of this function's intended "not a
+        # valid endpoint" None return.
+        parsed = urlparse(endpoint.rstrip("/"))
+        port = f":{parsed.port}" if parsed.port else ""
+    except ValueError:
+        return None
+    hostname = (parsed.hostname or "").rstrip(".")
+    if parsed.scheme != "https" or not (
+        hostname == _DEPUTY_HOST_SUFFIX or hostname.endswith(f".{_DEPUTY_HOST_SUFFIX}")
+    ):
+        return None
+    return f"{parsed.scheme}://{hostname}{port}"
+
+
 def _resolve_oauth_secret(
     provider: str, encrypted_value: Optional[str], env_suffix: str
 ) -> str:
@@ -522,6 +576,64 @@ def _fetch_linear_viewer_identity(
             _payload_errors_message(payload) or "Linear did not return a viewer"
         )
     return viewer.get("id"), viewer.get("email")
+
+
+def _fetch_deputy_identity(
+    access_token: str, instance_url: str
+) -> tuple[Optional[str], Optional[str]]:
+    """Fetch the connected employee's id/email from Deputy's per-install
+    ``GET /api/v1/me`` -- the same endpoint Deputy's own docs point to for
+    validating a token ("Validate tokens via GET to .../api/v1/me").
+
+    Deputy has no fixed userinfo host the generic ``userinfo_url`` REST-GET
+    branch below could point at -- the host itself is per-account (see
+    instance_url) -- so this mirrors _fetch_linear_viewer_identity's
+    approach of a dedicated fetch instead. It also doubles as the same
+    post-exchange token verification every other provider gets for free
+    from its REST userinfo call: a token Deputy won't honour is caught
+    here and reported, instead of being persisted as healthy and failing
+    opaquely later from inside a tool call.
+
+    Raises RuntimeError with a human-readable message on a failed/
+    unparsable response, matching _fetch_linear_viewer_identity. Which
+    exact keys Deputy's employee object uses for id/email is not
+    guaranteed here the way Linear's GraphQL shape is -- a handful of
+    plausible keys are tried, and a miss just leaves that half of the
+    identity pair as None rather than failing the whole connect, since no
+    deputy_*.py tool depends on this identity pair to function.
+    """
+    response = requests.get(
+        f"{instance_url}/api/v1/me",
+        headers={"Authorization": f"Bearer {access_token}"},
+        timeout=10.0,
+    )
+    if response.status_code != 200:
+        detail = truncate_error_text(response.text.strip(), limit=500)
+        raise RuntimeError(
+            f"Deputy API error (status {response.status_code})"
+            + (f": {detail}" if detail else "")
+        )
+    try:
+        payload = response.json()
+    except ValueError:
+        raise RuntimeError(
+            "Deputy API returned a non-JSON response: "
+            f"{truncate_error_text(response.text.strip(), limit=500)}"
+        ) from None
+    if not isinstance(payload, dict):
+        raise RuntimeError("Deputy API returned an unexpected response body")
+
+    raw_id = payload.get("Id")
+    provider_user_id = (
+        str(raw_id) if isinstance(raw_id, (str, int)) and raw_id != "" else None
+    )
+    email = None
+    for email_key in ("Email", "CompanyEmail", "DeputyEmail"):
+        candidate = payload.get(email_key)
+        if isinstance(candidate, str) and candidate:
+            email = candidate
+            break
+    return provider_user_id, email
 
 
 def create_access_token(
@@ -2049,6 +2161,12 @@ def generic_oauth_callback(
     db_provider: Optional[Any] = None,
 ) -> Any:
     """Handle generic OAuth callback"""
+    # Computed once and reused at every Deputy-specific branch below
+    # (`provider` is this function's own parameter, never reassigned) --
+    # matches tools/config.py's refresh_oauth_token_if_needed's
+    # `normalized_provider` precedent, rather than re-lowering/re-comparing
+    # the same string five separate times across the function.
+    is_deputy = provider.lower() == "deputy"
     if db is None:
         raise RuntimeError("db session is required")
     code = request.query_params.get("code")
@@ -2202,6 +2320,30 @@ def generic_oauth_callback(
         }
         if code_verifier:
             data["code_verifier"] = code_verifier
+        if is_deputy:
+            # Deputy's docs list `scope` as a required body param on the
+            # code-exchange request itself, not just the authorize redirect
+            # -- without it Deputy still exchanges the code but omits
+            # refresh_token from the response, matching the same
+            # requirement on the refresh leg in tools/config.py. Read from
+            # db_provider.default_scopes rather than a hardcoded literal,
+            # so an admin who edits this provider row's scopes doesn't
+            # leave the code-exchange/refresh requests silently still
+            # sending the old value. Not routed through the authorize
+            # redirect's _merge_oauth_scopes(default_scopes, app_scopes)
+            # above -- this leg only has db_provider in scope, not the
+            # per-app oauth_scopes override -- so an app-level scope
+            # override on the Deputy catalog row (none exists today) would
+            # be reflected in the authorize URL but not here. Revisit if
+            # one is ever added.
+            data["scope"] = (
+                " ".join(
+                    stripped
+                    for scope in db_provider.default_scopes or []
+                    if isinstance(scope, str) and (stripped := scope.strip())
+                )
+                or "longlife_refresh_token"
+            )
         headers = {"Content-Type": "application/x-www-form-urlencoded"}
         if requires_json_accept_header(provider):
             headers["Accept"] = "application/json"
@@ -2377,6 +2519,28 @@ def generic_oauth_callback(
                 status_code=400,
             )
 
+        deputy_instance_url = (
+            _normalize_deputy_endpoint(token_data.get("endpoint"))
+            if is_deputy
+            else None
+        )
+        if is_deputy and not deputy_instance_url:
+            # Same reasoning as the Salesforce instance_url guard above:
+            # every real Deputy token exchange includes a non-empty
+            # `endpoint` (Deputy's per-install API host); this connector's
+            # launch_config.env_mapping requires it, so letting a bad
+            # response through would just come back unavailable on the
+            # very next load, or -- worse, since this runs before the
+            # delete-then-recreate below -- destroy a prior *working* grant
+            # while still telling the user "Connected Successfully".
+            return HTMLResponse(
+                content=(
+                    "<h1>Error exchanging token</h1>"
+                    f"<p>{html.escape(provider)} did not return an endpoint.</p>"
+                ),
+                status_code=400,
+            )
+
         provider_user_id = None
         email = None
 
@@ -2459,6 +2623,48 @@ def generic_oauth_callback(
                     "usable string (got %s); falling back to NULL "
                     "provider_user_id for this grant",
                     type(raw_provider_user_id).__name__,
+                )
+        elif is_deputy:
+            # Deputy's userinfo_url is deliberately left empty (see the
+            # registry row's comment) -- the host itself is per-account, so
+            # there is no fixed URL the generic `elif userinfo_url and
+            # access_token:` branch below could use. deputy_instance_url is
+            # guaranteed non-None here (guarded above; this branch can only
+            # be reached once that guard has already returned on a falsy
+            # value) -- asserted rather than left implicit so mypy narrows
+            # it from `str | None` to `str` for _fetch_deputy_identity's
+            # signature.
+            assert deputy_instance_url is not None
+            try:
+                provider_user_id, email = _fetch_deputy_identity(
+                    access_token, deputy_instance_url
+                )
+            except RuntimeError as e:
+                # A deliberate failure raised by _fetch_deputy_identity
+                # itself -- Deputy's API responded, just not usably.
+                return HTMLResponse(
+                    content=(
+                        "<h1>Error verifying the connected account</h1>"
+                        f"<p>The provider reported: {html.escape(str(e))}</p>"
+                    ),
+                    status_code=400,
+                )
+            except Exception as e:
+                # A network-level failure (timeout, connection error) --
+                # distinct from the case above: Deputy never actually
+                # responded, so attributing this to "the provider reported"
+                # would be misleading. The client only sees str(e) (via the
+                # HTMLResponse below); the full traceback is logged here so
+                # an unexpected failure mode (not just a plain timeout) is
+                # still diagnosable server-side.
+                logger.error("Deputy identity verification failed", exc_info=True)
+                return HTMLResponse(
+                    content=(
+                        "<h1>Error verifying the connected account</h1>"
+                        f"<p>Could not reach Deputy to verify the connection: "
+                        f"{html.escape(str(e))}</p>"
+                    ),
+                    status_code=400,
                 )
         elif userinfo_url and access_token:
             info_headers = {"Authorization": f"Bearer {access_token}"}
@@ -2578,13 +2784,20 @@ def generic_oauth_callback(
             if "refresh_token" in token_data:
                 setattr(oauth_account, "refresh_token", token_data.get("refresh_token"))
             # Salesforce returns the per-org API host here instead of using a
-            # fixed domain -- no other provider sends this key, and
-            # oauth_account is freshly created above (never an update to an
-            # existing row), so token_data.get() returning None for every
-            # other provider is already the correct, final value: no `if
-            # "instance_url" in token_data` guard needed to avoid clobbering
-            # anything.
-            setattr(oauth_account, "instance_url", token_data.get("instance_url"))
+            # fixed domain -- no other provider (besides Deputy, handled
+            # explicitly below) sends this key, and oauth_account is freshly
+            # created above (never an update to an existing row), so
+            # token_data.get() returning None for every other provider is
+            # already the correct, final value: no `if "instance_url" in
+            # token_data` guard needed to avoid clobbering anything.
+            resolved_instance_url = token_data.get("instance_url")
+            if is_deputy:
+                # Deputy's equivalent is `endpoint`, not `instance_url`, and
+                # arrives without a scheme -- deputy_instance_url is the
+                # already-guarded, normalized value from above (Deputy
+                # can't reach this branch without it).
+                resolved_instance_url = deputy_instance_url
+            setattr(oauth_account, "instance_url", resolved_instance_url)
             if "expires_in" in token_data:
                 setattr(
                     oauth_account,

@@ -113,6 +113,20 @@ async def test_fake_runtime_records_event_sequence() -> None:
     assert runtime.events_of("on_tool_start")[0]["tool_call_id"] == "cc-1"
 
 
+async def test_fake_runtime_returns_question_event_identity() -> None:
+    runtime = FakeRuntime()
+
+    outbound = await runtime.send_message(
+        message="which?",
+        message_type="question",
+        expect_response=True,
+        visible=True,
+    )
+
+    assert outbound["event_id"] == "fake-agent-message-1"
+    assert runtime.events_of("send_message") == [outbound]
+
+
 async def test_fake_runtime_interrupt_flag() -> None:
     runtime = FakeRuntime(interrupt=True, interrupt_reason="stop")
     assert await runtime.should_interrupt() is True

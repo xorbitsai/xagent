@@ -25,10 +25,7 @@ vi.mock("@/lib/api-wrapper", async () => {
 vi.mock("@/lib/utils", () => ({
   cn: (...classes: Array<string | false | null | undefined>) =>
     classes.filter(Boolean).join(" "),
-  generateClientMessageId: vi.fn()
-    .mockReturnValueOnce("client-message-1")
-    .mockReturnValueOnce("client-message-2")
-    .mockReturnValue("client-message-next"),
+  generateClientMessageId: vi.fn(),
   getApiUrl: () => "http://api.local",
   getUploadApiUrl: () => "http://upload.local",
 }))
@@ -92,6 +89,10 @@ const emptyJsonResponse = () =>
 
 describe("ChatInput", () => {
   beforeEach(() => {
+    let generatedClientMessageId = 0
+    vi.mocked(generateClientMessageId)
+      .mockReset()
+      .mockImplementation(() => `client-message-${++generatedClientMessageId}`)
     authUserMock.current = { id: "1", is_admin: true }
     apiRequestMock.mockReset()
     apiRequestMock.mockImplementation(() => Promise.resolve(emptyJsonResponse()))
@@ -1222,6 +1223,198 @@ describe("ChatInput", () => {
     )
   })
 
+  it("sends a free-text draft with the interaction request active when the draft begins", async () => {
+    const onSend = vi.fn()
+    const { container } = render(
+      <ChatInput
+        currentInteractionRequestId="inputreq_r1"
+        hideConfig
+        hideFileUpload
+        inputValue="Answer R1"
+        onInputChange={vi.fn()}
+        onSend={onSend}
+        readOnlyConfig
+        taskConfig={{
+          model: "model-1",
+          metadata: { source: "existing" },
+        }}
+      />
+    )
+
+    fireEvent.submit(container.querySelector("form") as HTMLFormElement)
+
+    await waitFor(() => expect(onSend).toHaveBeenCalledOnce())
+    expect(onSend.mock.calls[0][1]).toEqual(expect.objectContaining({
+      metadata: {
+        source: "existing",
+        request_id: "inputreq_r1",
+      },
+    }))
+  })
+
+  it("keeps a draft bound to its original request when the active request rotates", async () => {
+    const onSend = vi.fn()
+    const props = {
+      hideConfig: true,
+      hideFileUpload: true,
+      inputValue: "Answer begun for R1",
+      onInputChange: vi.fn(),
+      onSend,
+      readOnlyConfig: true,
+    }
+    const { container, rerender } = render(
+      <ChatInput {...props} currentInteractionRequestId="inputreq_r1" />
+    )
+
+    rerender(<ChatInput {...props} currentInteractionRequestId="inputreq_r2" />)
+    fireEvent.submit(container.querySelector("form") as HTMLFormElement)
+
+    await waitFor(() => expect(onSend).toHaveBeenCalledOnce())
+    expect(onSend.mock.calls[0][1].metadata).toEqual({
+      request_id: "inputreq_r1",
+    })
+  })
+
+  it("binds the next draft to the request active after a successful clear", async () => {
+    const onSend = vi.fn().mockResolvedValue(undefined)
+    const commonProps = {
+      hideConfig: true,
+      hideFileUpload: true,
+      onInputChange: vi.fn(),
+      onSend,
+      readOnlyConfig: true,
+    }
+    const { container, rerender } = render(
+      <ChatInput
+        {...commonProps}
+        currentInteractionRequestId="inputreq_r1"
+        inputValue="Answer R1"
+      />
+    )
+
+    fireEvent.submit(container.querySelector("form") as HTMLFormElement)
+    await waitFor(() => expect(onSend).toHaveBeenCalledTimes(1))
+
+    rerender(
+      <ChatInput
+        {...commonProps}
+        currentInteractionRequestId="inputreq_r2"
+        inputValue=""
+      />
+    )
+    rerender(
+      <ChatInput
+        {...commonProps}
+        currentInteractionRequestId="inputreq_r2"
+        inputValue="Answer R2"
+      />
+    )
+    await new Promise((resolve) => setTimeout(resolve, 550))
+    fireEvent.submit(container.querySelector("form") as HTMLFormElement)
+
+    await waitFor(() => expect(onSend).toHaveBeenCalledTimes(2))
+    expect(onSend.mock.calls[1][1].metadata).toEqual({
+      request_id: "inputreq_r2",
+    })
+  })
+
+  it("keeps a draft id-less when it began before request identities were available", async () => {
+    const onSend = vi.fn()
+    const props = {
+      hideConfig: true,
+      hideFileUpload: true,
+      inputValue: "Legacy answer",
+      onInputChange: vi.fn(),
+      onSend,
+      readOnlyConfig: true,
+    }
+    const { container, rerender } = render(<ChatInput {...props} />)
+
+    rerender(<ChatInput {...props} currentInteractionRequestId="inputreq_r2" />)
+    fireEvent.submit(container.querySelector("form") as HTMLFormElement)
+
+    await waitFor(() => expect(onSend).toHaveBeenCalledOnce())
+    expect(onSend.mock.calls[0][1]).not.toHaveProperty("metadata.request_id")
+  })
+
+  it("starts a new delivery identity after an abandoned failed draft is retyped", async () => {
+    vi.mocked(generateClientMessageId)
+      .mockReset()
+      .mockImplementationOnce(() => "abandoned-r1-delivery")
+      .mockImplementationOnce(() => "fresh-r2-delivery")
+      .mockReturnValue("later-delivery")
+    const onSend = vi.fn().mockRejectedValue(new Error("Delivery outcome unknown"))
+    const commonProps = {
+      hideConfig: true,
+      hideFileUpload: true,
+      onInputChange: vi.fn(),
+      onSend,
+      readOnlyConfig: true,
+    }
+    const { container, rerender } = render(
+      <ChatInput
+        {...commonProps}
+        currentInteractionRequestId="inputreq_r1"
+        inputValue="Same answer"
+      />
+    )
+
+    fireEvent.submit(container.querySelector("form") as HTMLFormElement)
+    await waitFor(() => expect(onSend).toHaveBeenCalledTimes(1))
+    expect(onSend.mock.calls[0][1]).toEqual(expect.objectContaining({
+      clientMessageId: "abandoned-r1-delivery",
+      metadata: { request_id: "inputreq_r1" },
+    }))
+
+    rerender(
+      <ChatInput
+        {...commonProps}
+        currentInteractionRequestId="inputreq_r2"
+        inputValue=""
+      />
+    )
+    rerender(
+      <ChatInput
+        {...commonProps}
+        currentInteractionRequestId="inputreq_r2"
+        inputValue="Same answer"
+      />
+    )
+    await new Promise((resolve) => setTimeout(resolve, 550))
+    fireEvent.submit(container.querySelector("form") as HTMLFormElement)
+
+    await waitFor(() => expect(onSend).toHaveBeenCalledTimes(2))
+    expect(onSend.mock.calls[1][1]).toEqual(expect.objectContaining({
+      clientMessageId: "fresh-r2-delivery",
+      metadata: { request_id: "inputreq_r2" },
+    }))
+  })
+
+  it("binds a file-only draft before a later request rotation", async () => {
+    const onSend = vi.fn()
+    const file = new File(["answer"], "answer.txt", { type: "text/plain" })
+    const props = {
+      files: [file],
+      hideConfig: true,
+      inputValue: "",
+      onFilesChange: vi.fn(),
+      onInputChange: vi.fn(),
+      onSend,
+      readOnlyConfig: true,
+    }
+    const { container, rerender } = render(
+      <ChatInput {...props} currentInteractionRequestId="inputreq_r1" />
+    )
+
+    rerender(<ChatInput {...props} currentInteractionRequestId="inputreq_r2" />)
+    fireEvent.submit(container.querySelector("form") as HTMLFormElement)
+
+    await waitFor(() => expect(onSend).toHaveBeenCalledOnce())
+    expect(onSend.mock.calls[0][1].metadata).toEqual({
+      request_id: "inputreq_r1",
+    })
+  })
+
   it("reuses the same clientMessageId when retrying unchanged content after an outcome-unknown failure", async () => {
     // Server-side dedup safety net: a failure that doesn't carry
     // `retryWithNewId` means the send's outcome is unknown (it may have
@@ -1232,6 +1425,7 @@ describe("ChatInput", () => {
     const onSend = vi.fn().mockRejectedValue(new Error("Message was rejected"))
     const { container } = render(
       <ChatInput
+        currentInteractionRequestId="inputreq_r1"
         hideConfig
         hideFileUpload
         inputValue="keep this draft"
@@ -1244,6 +1438,9 @@ describe("ChatInput", () => {
     fireEvent.submit(container.querySelector("form") as HTMLFormElement)
     await waitFor(() => expect(onSend).toHaveBeenCalledTimes(1))
     const firstId = onSend.mock.calls[0][1].clientMessageId
+    expect(onSend.mock.calls[0][1].metadata).toEqual({
+      request_id: "inputreq_r1",
+    })
 
     // isSubmittingRef only releases 500ms after a submit settles.
     await new Promise((resolve) => setTimeout(resolve, 550))
@@ -1251,6 +1448,9 @@ describe("ChatInput", () => {
     await waitFor(() => expect(onSend).toHaveBeenCalledTimes(2))
 
     expect(onSend.mock.calls[1][1].clientMessageId).toBe(firstId)
+    expect(onSend.mock.calls[1][1].metadata).toEqual({
+      request_id: "inputreq_r1",
+    })
   })
 
   it("generates a new clientMessageId when retrying after a retryWithNewId failure", async () => {
@@ -1258,10 +1458,7 @@ describe("ChatInput", () => {
     // the send is confirmed to have never landed, so a retry - even with
     // identical content - should get its own fresh id rather than being
     // conflated with the failed attempt.
-    // Override the shared module mock's queue for just these two calls -
-    // by this point in the suite it's already fallen through to its
-    // catch-all return value, which would make both ids look identical
-    // and defeat the point of this test regardless of the real behavior.
+    // Keep this scenario's two delivery identities explicit.
     vi.mocked(generateClientMessageId)
       .mockImplementationOnce(() => "retry-with-new-id-1")
       .mockImplementationOnce(() => "retry-with-new-id-2")

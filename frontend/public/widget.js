@@ -227,6 +227,58 @@
     return url + (url.indexOf('?') === -1 ? '?' : '&') + 'timezone=' + encoded;
   }
 
+  // Panel width: resizable via the left-edge drag handle, persisted across
+  // reloads. Inline width is only ever applied above MOBILE_BREAKPOINT --
+  // below it the CSS media query owns sizing, and inline width would win
+  // over that media query by specificity if left in place.
+  var WIDTH_STORAGE_KEY = 'xagent_widget_width';
+  var DEFAULT_PANEL_WIDTH = 380;
+  var MIN_PANEL_WIDTH = 320;
+  var MAX_PANEL_WIDTH = 720;
+  var MOBILE_BREAKPOINT = 480;
+  var HORIZONTAL_VIEWPORT_MARGIN = 40;
+
+  function isMobileViewport() {
+    return window.innerWidth <= MOBILE_BREAKPOINT;
+  }
+
+  function clampPanelWidth(width) {
+    var viewportMax = window.innerWidth - HORIZONTAL_VIEWPORT_MARGIN;
+    return Math.min(Math.max(width, MIN_PANEL_WIDTH), Math.min(MAX_PANEL_WIDTH, viewportMax));
+  }
+
+  function readStoredWidth() {
+    var raw;
+    try {
+      raw = localStorage.getItem(WIDTH_STORAGE_KEY);
+    } catch (e) {
+      return DEFAULT_PANEL_WIDTH;
+    }
+    var parsed = raw ? parseInt(raw, 10) : NaN;
+    // Bounds-check against the static MIN/MAX only (never the viewport --
+    // that's applyPanelWidth's job) so a corrupted or stale-schema stored
+    // value self-heals on the next load instead of being echoed back forever.
+    if (isNaN(parsed) || parsed < MIN_PANEL_WIDTH || parsed > MAX_PANEL_WIDTH) {
+      return DEFAULT_PANEL_WIDTH;
+    }
+    return parsed;
+  }
+
+  function persistWidth(width) {
+    try {
+      localStorage.setItem(WIDTH_STORAGE_KEY, String(width));
+    } catch (e) {
+      // Storage can be unavailable (private browsing, quota); resizing still
+      // works for the session, it just won't survive a reload.
+    }
+  }
+
+  // Raw preferred width, deliberately NOT clamped here: applyPanelWidth below
+  // clamps only for rendering, without writing the clamped value back here,
+  // so a viewport narrower than the stored preference at load never
+  // overwrites it (e.g. via a later, otherwise-unmoved drag release).
+  var panelWidth = readStoredWidth();
+
   // Styles
   var style = document.createElement('style');
   style.innerHTML = `
@@ -267,10 +319,14 @@
     }
 
     .xagent-widget-panel {
+      /* Pin the box model so the resize drag's width math (which reads
+         computed CSS width) can't drift from the host page's own
+         box-sizing default. */
+      box-sizing: border-box;
       position: absolute;
       bottom: calc(${buttonSize} + 20px);
       right: 0;
-      width: 380px;
+      width: ${DEFAULT_PANEL_WIDTH}px;
       height: 600px;
       max-height: calc(100vh - 100px);
       background: ${panelBgColor};
@@ -297,10 +353,39 @@
       background: transparent;
     }
 
-    @media (max-width: 480px) {
+    .xagent-widget-resize-handle {
+      position: absolute;
+      top: 0;
+      left: 0;
+      bottom: 0;
+      width: 6px;
+      cursor: ew-resize;
+      z-index: 2;
+      touch-action: none;
+    }
+
+    .xagent-widget-resize-handle:hover,
+    .xagent-widget-resize-handle:active {
+      background: rgba(0, 0, 0, 0.15);
+    }
+
+    /* visibility transitions to a closed panel keep it hit-testable for the
+       duration of the transition (per spec, as long as either end of the
+       transition is 'visible') -- without this, the handle stays draggable
+       and cursor-hinting during that window even though the panel is
+       already fading out. */
+    .xagent-widget-panel:not(.open) .xagent-widget-resize-handle {
+      display: none;
+    }
+
+    @media (max-width: ${MOBILE_BREAKPOINT}px) {
       .xagent-widget-panel {
-        width: calc(100vw - 40px);
+        width: calc(100vw - ${HORIZONTAL_VIEWPORT_MARGIN}px);
         height: calc(100vh - 120px);
+      }
+
+      .xagent-widget-resize-handle {
+        display: none;
       }
     }
   `;
@@ -319,6 +404,224 @@
   iframe.className = 'xagent-widget-iframe';
   panel.appendChild(iframe);
 
+  // Left-edge resize handle
+  var resizeHandle = document.createElement('div');
+  resizeHandle.className = 'xagent-widget-resize-handle';
+  panel.appendChild(resizeHandle);
+
+  // Clamp on render rather than mutating panelWidth here: a temporary narrow
+  // viewport (a shrunk window, a rotated device) must not permanently shrink
+  // the user's stored preference once the viewport widens again.
+  function applyPanelWidth() {
+    panel.style.width = isMobileViewport() ? '' : clampPanelWidth(panelWidth) + 'px';
+  }
+  applyPanelWidth();
+
+  var dragState = null;
+  // Set once this instance is torn down (panelRemovalObserver below) so a
+  // stray pointerdown can never start a new, permanently uncleanable drag --
+  // e.g. if a host SPA re-inserts this same panel node into the DOM after
+  // removing it, which flips panel.isConnected back to true but does not
+  // re-arm the (already-disconnected) observer or any removed listener.
+  var torndown = false;
+
+  resizeHandle.addEventListener('pointerdown', function (event) {
+    // event.button is 0 for touch/pen contact and the primary mouse button;
+    // a nonzero value here is a right-click, middle-click, or pen barrel
+    // button, none of which should start a resize. Guard against a
+    // non-numeric value (a synthetic event with no button field) the same
+    // way: only a real, explicit non-primary button should block the drag.
+    // Ignore a second simultaneous pointer (e.g. a touchscreen device) so it
+    // can't hijack dragState mid-drag and strand the first pointer's cleanup.
+    // The injected stylesheet already hides the handle while the panel is
+    // closed (see .xagent-widget-panel:not(.open) above), but a host page
+    // whose CSP blocks that inline <style> would leave it visually
+    // draggable with no CSS backing it up -- check the open class directly
+    // too, as defense in depth that doesn't depend on the stylesheet loading.
+    if (torndown || isMobileViewport() || dragState || (event.button || 0) !== 0 || !panel.classList.contains('open')) return;
+    dragState = {
+      pointerId: event.pointerId,
+      startX: event.clientX,
+      // getBoundingClientRect().width is always border-box regardless of
+      // box-sizing, but panel.style.width sets content-box width unless
+      // box-sizing: border-box is in effect -- computed style avoids that
+      // mismatch (a jump by the border width on every drag start) even if
+      // something on the host page ends up overriding our own box-sizing rule.
+      startWidth: parseInt(window.getComputedStyle(panel).width, 10) || DEFAULT_PANEL_WIDTH,
+      // The drag's live candidate. panelWidth itself is never written until
+      // a real release commits it (see finishDrag) -- cancelling a drag
+      // (blur, a mid-drag viewport change, pointercancel, DOM removal) then
+      // needs no rollback of anything, since the committed preference was
+      // never touched in the first place.
+      lastWidth: null,
+      // Whether this drag ever visibly rendered a width other than
+      // startWidth -- a release with this still false is a no-op (a plain
+      // click, or a drag fully absorbed by the viewport ceiling) and must
+      // leave the existing preference alone rather than re-commit whatever
+      // startWidth happened to be.
+      moved: false,
+      originalCursor: document.body.style.cursor,
+      originalUserSelect: document.body.style.userSelect
+    };
+    // Optimization, not the drag's only path: pointermove/pointerup/
+    // pointercancel are bound to `document` below specifically so the drag
+    // still works if this capture silently fails.
+    try {
+      resizeHandle.setPointerCapture(event.pointerId);
+    } catch (e) {}
+    document.body.style.cursor = 'ew-resize';
+    document.body.style.userSelect = 'none';
+    // Without this, the iframe (a sibling of the handle, not an ancestor)
+    // would intercept pointer events once the cursor moves over it mid-drag;
+    // disabling its pointer-events lets those events fall through to panel
+    // and bubble to the document-level listeners below instead of stalling
+    // on the iframe.
+    iframe.style.pointerEvents = 'none';
+    event.preventDefault();
+  });
+
+  function onPointerMove(event) {
+    if (!dragState || event.pointerId !== dragState.pointerId) return;
+    // Panel is right-anchored, so dragging the left edge left (clientX
+    // decreasing) should grow the panel.
+    var delta = dragState.startX - event.clientX;
+    var candidate = clampPanelWidth(dragState.startWidth + delta);
+    panel.style.width = candidate + 'px';
+    dragState.lastWidth = candidate;
+    // A drag that started already pinned to the viewport ceiling (the raw
+    // preference is wider than what currently fits) and never visibly moves
+    // the render away from that ceiling hasn't expressed a new choice --
+    // leave the existing preference alone rather than re-committing the
+    // ceiling value on release. Always tracking the *latest* candidate here
+    // (not a running min/max across the drag) is what makes an overshoot
+    // that gets corrected back commit the corrected value, not the peak.
+    if (candidate !== dragState.startWidth) dragState.moved = true;
+  }
+
+  function restoreDragSideEffects() {
+    // Only restore if nothing else changed it in the meantime -- a host page
+    // that set its own userSelect/cursor after this drag started (e.g. while
+    // rebuilding its own UI mid-drag) must not have that value clobbered by
+    // a stale snapshot from before it ran.
+    if (document.body.style.userSelect === 'none') {
+      document.body.style.userSelect = dragState.originalUserSelect;
+    }
+    if (document.body.style.cursor === 'ew-resize') {
+      document.body.style.cursor = dragState.originalCursor;
+    }
+    iframe.style.pointerEvents = '';
+    // The browser normally releases capture implicitly on pointerup/
+    // pointercancel, but not on blur or a plain resize event -- release
+    // explicitly so a drag ended that way can't keep this pointer's future
+    // events (and thus other elements on the host page) captured to the
+    // handle until an eventual real pointerup arrives.
+    try {
+      resizeHandle.releasePointerCapture(dragState.pointerId);
+    } catch (e) {}
+  }
+
+  // A real release (pointerup/pointercancel... see below) commits whatever
+  // was last rendered; any other way a drag ends only cancels. Both share
+  // this one path so the guard, cleanup, and re-render can't drift apart
+  // between the two the way they did across earlier rounds.
+  function finishDrag(commit, event) {
+    if (!dragState || (event && event.pointerId !== dragState.pointerId)) return;
+    restoreDragSideEffects();
+    // dragState.moved false means this release never actually rendered a
+    // different width (a plain click, or a drag fully absorbed by the
+    // viewport ceiling) -- leave the existing preference untouched rather
+    // than re-committing startWidth as if it were a real choice. Skip
+    // committing entirely once the panel has left the DOM: any width here
+    // reflects a stale, no-longer-visible instance rather than a choice the
+    // user can still see or reconsider.
+    if (commit && dragState.moved && panel.isConnected) {
+      panelWidth = dragState.lastWidth;
+      persistWidth(panelWidth);
+    }
+    dragState = null;
+    applyPanelWidth();
+  }
+  function endDrag(event) {
+    finishDrag(true, event);
+  }
+  // Cancels rather than commits: window blur, a viewport change invalidating
+  // this drag's frozen geometry, DOM removal, and pointercancel (an
+  // involuntary interruption -- a touch gesture reinterpreted as a scroll,
+  // an OS-level interrupt, capture lost to another element -- rather than
+  // the user confirming a release) are none of them the user releasing the
+  // handle, so none of them persist a width.
+  function cancelDrag(event) {
+    finishDrag(false, event);
+  }
+  document.addEventListener('pointermove', onPointerMove);
+  document.addEventListener('pointerup', endDrag);
+  document.addEventListener('pointercancel', cancelDrag);
+
+  function onWindowBlur() {
+    // Focus moving into this widget's own iframe (e.g. the chat composer
+    // autofocusing) also fires a parent-window blur; the window itself
+    // hasn't actually lost focus, so this isn't the interruption below
+    // exists for.
+    if (document.hasFocus()) return;
+    // A drag released off-window (e.g. Alt+Tab away mid-drag) never delivers
+    // pointerup/pointercancel, which would otherwise strand userSelect:
+    // 'none' on the host page indefinitely. A no-op when no drag is active.
+    cancelDrag();
+  }
+  window.addEventListener('blur', onWindowBlur);
+
+  var lastViewportWidth = window.innerWidth;
+  function onWindowResize() {
+    var currentViewportWidth = window.innerWidth;
+    var widthChanged = currentViewportWidth !== lastViewportWidth;
+    lastViewportWidth = currentViewportWidth;
+    // Only a horizontal change affects anything here -- isMobileViewport()/
+    // clampPanelWidth() and a drag's frozen startX/startWidth anchors all
+    // depend solely on innerWidth. A resize event with an unchanged
+    // innerWidth (e.g. a mobile on-screen keyboard opening, which only moves
+    // innerHeight) must be a complete no-op: applyPanelWidth() would just
+    // re-render the same value when idle, but during an active drag it would
+    // clobber the live preview (it always renders from the last *committed*
+    // width, not dragState's in-progress one) without actually cancelling
+    // the drag -- worse than doing nothing.
+    if (!widthChanged) return;
+    applyPanelWidth();
+    // A genuine width change mid-drag invalidates this drag's frozen startX/
+    // startWidth anchors -- rather than let a later pointermove misread the
+    // viewport's own movement as the user shrinking the panel (and persist
+    // that on release), end the drag cleanly here. The user can just grab
+    // the handle again if they still want to resize.
+    cancelDrag();
+  }
+  window.addEventListener('resize', onWindowResize);
+
+  // Teardown the instant the panel leaves the DOM (a microtask later, per
+  // MutationObserver) -- covers both leak prevention (the listeners above
+  // are otherwise GC roots keeping this whole closure, panel included, alive
+  // indefinitely) and the drag-interrupted-by-removal case (blur alone
+  // doesn't fire just because a host SPA removes the widget, so waiting for
+  // it would leave userSelect stranded on the host page until an unrelated
+  // future blur happens to occur, if ever). Matches the isConnected-driven
+  // detection this file already uses for the session controller's own
+  // listeners.
+  var panelRemovalObserver = new MutationObserver(function () {
+    if (panel.isConnected) return;
+    torndown = true;
+    panelRemovalObserver.disconnect();
+    window.removeEventListener('resize', onWindowResize);
+    window.removeEventListener('blur', onWindowBlur);
+    window.removeEventListener('message', onChromeMessage);
+    document.removeEventListener('pointermove', onPointerMove);
+    document.removeEventListener('pointerup', endDrag);
+    document.removeEventListener('pointercancel', cancelDrag);
+    cancelDrag();
+    // Belt-and-suspenders for a host SPA that re-inserts this same node
+    // later (torndown permanently blocks a new drag regardless, but without
+    // this the handle would still show its ew-resize cursor and hover
+    // highlight, looking interactive while doing nothing).
+    resizeHandle.style.display = 'none';
+  });
+
   // FAB
   var fab = document.createElement('button');
   fab.className = 'xagent-widget-fab';
@@ -330,20 +633,58 @@
   fab.innerHTML = chatIcon;
 
   var isOpen = false;
+
+  function openPanel() {
+    isOpen = true;
+    panel.classList.add('open');
+    fab.innerHTML = closeIcon;
+  }
+
+  function closePanel() {
+    isOpen = false;
+    panel.classList.remove('open');
+    fab.innerHTML = chatIcon;
+  }
+
   fab.onclick = function () {
-    isOpen = !isOpen;
     if (isOpen) {
-      panel.classList.add('open');
-      fab.innerHTML = closeIcon;
+      closePanel();
     } else {
-      panel.classList.remove('open');
-      fab.innerHTML = chatIcon;
+      openPanel();
     }
   };
 
   container.appendChild(panel);
   container.appendChild(fab);
   document.body.appendChild(container);
+
+  // Armed only after container is actually in the tree: subtree: true is
+  // needed because "direct child of body" alone only catches container's
+  // own removal -- a host page reaching further in (removing panel from
+  // container directly, or wiping a wrapper it added around container)
+  // would otherwise mutate a node this observer never inspects, and the
+  // callback would simply never fire.
+  // documentElement, not body: a host framework that replaces <body> wholesale
+  // on navigation (e.g. Turbo Drive, htmx boosted navigation) never mutates
+  // the childList of the *old* body node that still holds container -- only
+  // <html>'s own childList changes when body itself is swapped out.
+  panelRemovalObserver.observe(document.documentElement, { childList: true, subtree: true });
+
+  // The header's close control lives inside the iframe's React app and has
+  // no direct handle to panel/fab, so it signals intent back here over
+  // postMessage instead. Named (not inline) so panelRemovalObserver can
+  // remove it below, matching every other listener's teardown in this file
+  // -- otherwise a host SPA that removes the widget without a full page
+  // reload leaves this listener retaining the closure indefinitely.
+  function onChromeMessage(event) {
+    if (torndown || event.origin !== host || !iframe.contentWindow || event.source !== iframe.contentWindow) return;
+    var data = event.data;
+    if (!data || data.xagent !== true || data.v !== 1) return;
+    if (data.type === 'widget_close') {
+      closePanel();
+    }
+  }
+  window.addEventListener('message', onChromeMessage);
 
   mode.attach(iframe);
 
@@ -512,7 +853,10 @@
       window.addEventListener('pageshow', onPageShow);
       window.addEventListener('pagehide', onPageHide);
       state.observer = new MutationObserver(onDomMutation);
-      state.observer.observe(document.body, { childList: true, subtree: true });
+      // documentElement, not body: see panelRemovalObserver's identical
+      // reasoning above -- a full <body> replacement never mutates the old
+      // body's own childList.
+      state.observer.observe(document.documentElement, { childList: true, subtree: true });
       runLoadFlow();
     }
 

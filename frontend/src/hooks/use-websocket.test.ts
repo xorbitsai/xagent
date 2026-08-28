@@ -229,6 +229,43 @@ describe("useWebSocket message delivery", () => {
     })
   })
 
+  it("serializes the interaction request id with the caller's delivery id", async () => {
+    const { result } = renderHook(() => useWebSocket({
+      connection: sessionConnection(),
+    }))
+    await waitFor(() => expect(MockWebSocket.instances).toHaveLength(1))
+    const socket = MockWebSocket.instances[0]
+    socket.protocol = "xagent-session-v1"
+    act(() => socket.open())
+
+    let delivery!: Promise<{ client_message_id: string; turn_id: string }>
+    act(() => {
+      delivery = result.current.sendChatMessage(
+        "City: Sydney",
+        undefined,
+        true,
+        "answer-q1",
+        "inputreq_0011223344556677889900aabbccddee",
+      )
+    })
+
+    expect(JSON.parse(socket.send.mock.calls[0][0])).toMatchObject({
+      type: "chat",
+      message: "City: Sydney",
+      client_message_id: "answer-q1",
+      request_id: "inputreq_0011223344556677889900aabbccddee",
+    })
+    act(() => socket.receive({
+      type: "message_accepted",
+      client_message_id: "answer-q1",
+      turn_id: "answer-q1",
+    }))
+    await expect(delivery).resolves.toEqual({
+      client_message_id: "answer-q1",
+      turn_id: "answer-q1",
+    })
+  })
+
   it("assigns idempotency keys to pause and resume commands", async () => {
     const { result } = renderHook(() => useWebSocket({
       url: "ws://localhost",

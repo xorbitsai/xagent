@@ -1,3 +1,4 @@
+from .actor_oauth_flow import ActorOAuthFlowState
 from .agent import Agent
 from .agent_api_key import AgentApiKey
 from .background_job import BackgroundJob, BackgroundJobStatus, BackgroundJobType
@@ -40,6 +41,7 @@ from .workforce import Workforce, WorkforceAgent, WorkforceBuilderMessage, Workf
 
 __all__ = [
     "Base",
+    "ActorOAuthFlowState",
     "get_engine",
     "get_db",
     "get_session_local",

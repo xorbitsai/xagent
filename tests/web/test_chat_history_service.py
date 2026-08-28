@@ -1,4 +1,5 @@
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
 import pytest
 from sqlalchemy import create_engine
@@ -12,6 +13,8 @@ from xagent.web.models.database import Base
 from xagent.web.models.task import Task, TaskStatus
 from xagent.web.models.uploaded_file import UploadedFile
 from xagent.web.models.user import User
+from xagent.web.services import chat_history_service
+from xagent.web.services.assistant_history_safety import safe_str
 from xagent.web.services.chat_history_service import (
     _MAX_HISTORICAL_IMAGE_CONTEXT_REFS,
     DELIVERY_COMPLETED,
@@ -54,6 +57,14 @@ def _create_task(db_session):
     return task
 
 
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [(None, ""), ("", ""), (False, "False"), (0, "0"), ("answer", "answer")],
+)
+def test_safe_str_only_special_cases_none(value: object | None, expected: str) -> None:
+    assert safe_str(value) == expected
+
+
 def test_load_task_transcript_returns_prior_turns_only():
     db_session = _create_db_session()
     try:
@@ -72,7 +83,7 @@ def test_load_task_transcript_returns_prior_turns_only():
             int(task.id),
             int(task.user_id),
             "The main risks are architecture drift and persistence gaps.",
-            message_type="final_answer",
+            message_type="assistant_response",
         )
         assert assistant is not None
 
@@ -97,6 +108,107 @@ def test_load_task_transcript_returns_prior_turns_only():
                 "content": "The main risks are architecture drift and persistence gaps.",
             },
         ]
+    finally:
+        db_session.close()
+
+
+def test_persist_assistant_message_without_provenance_fails_closed_on_load() -> None:
+    db_session = _create_db_session()
+    try:
+        task = _create_task(db_session)
+        raw_content = "unproven provider token=secret"
+
+        assistant = persist_assistant_message(
+            db_session,
+            int(task.id),
+            int(task.user_id),
+            raw_content,
+        )
+
+        assert assistant is not None
+        assert assistant.message_type == "assistant_message"
+        assert load_task_transcript(db_session, int(task.id)) == [
+            {"role": "assistant", "content": "Task execution failed."}
+        ]
+    finally:
+        db_session.close()
+
+
+def test_load_task_transcript_coerces_nullable_fields_to_empty_strings(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    message = SimpleNamespace(
+        role="assistant",
+        content=None,
+        message_type=None,
+        attachments=None,
+    )
+    db = MagicMock()
+    db.query.return_value.filter.return_value.order_by.return_value.all.return_value = [
+        message
+    ]
+
+    def project_content(*, content: str, message_type: str) -> str:
+        assert content == ""
+        assert message_type == ""
+        return "safe fallback"
+
+    monkeypatch.setattr(
+        chat_history_service,
+        "client_safe_assistant_history_content",
+        project_content,
+    )
+
+    assert load_task_transcript(db, 1) == [
+        {"role": "assistant", "content": "safe fallback"}
+    ]
+
+
+@pytest.mark.parametrize(
+    ("message_type", "content", "expected_content"),
+    [
+        ("task_failure", "provider token=secret", "Task execution failed."),
+        (
+            "chat_response",
+            "A legitimate pre-cutover assistant response.",
+            "Task execution failed.",
+        ),
+        (
+            "assistant_message",
+            "Legacy managed failure token=secret",
+            "Task execution failed.",
+        ),
+        (
+            "final_answer",
+            "Legacy websocket failure token=secret",
+            "Task execution failed.",
+        ),
+        ("unknown_assistant_type", "unknown token=secret", "Task execution failed."),
+        ("assistant", "A known-safe legacy answer.", "A known-safe legacy answer."),
+        ("assistant_response", "A known-safe answer.", "A known-safe answer."),
+    ],
+)
+def test_load_task_transcript_projects_assistant_history_for_subsequent_turns(
+    message_type: str,
+    content: str,
+    expected_content: str,
+) -> None:
+    db_session = _create_db_session()
+    try:
+        task = _create_task(db_session)
+        assistant = persist_assistant_message(
+            db_session,
+            int(task.id),
+            int(task.user_id),
+            content,
+            message_type=message_type,
+        )
+        assert assistant is not None
+
+        transcript = load_task_transcript(db_session, int(task.id))
+
+        assert transcript == [{"role": "assistant", "content": expected_content}]
+        assert "secret" not in repr(transcript)
     finally:
         db_session.close()
 

@@ -92,6 +92,7 @@ def _draft(
     """
 
     values: dict[str, Any] = {
+        "event_id": "11111111-1111-4111-8111-111111111111",
         "source": "send_message",
         "message": message,
         "message_type": "info",
@@ -165,6 +166,36 @@ def test_waiting_with_draft_is_publishable() -> None:
     )
     assert isinstance(resolution, Publishable)
     assert resolution.fail_closed_reason is None
+
+
+def test_waiting_draft_without_question_event_identity_fails_closed() -> None:
+    result = {
+        "status": "waiting_for_user",
+        "clarification_draft": _draft(event_id=""),
+    }
+    resolution = resolve_publishable_clarification(
+        result, task=_task(), lease=_lease(), anchor=_anchor(), now=_now()
+    )
+    assert isinstance(resolution, FailClosed)
+    assert resolution.fail_closed_reason == "missing_event_id"
+
+
+@pytest.mark.parametrize(
+    "event_id",
+    [None, 0, False, [], " id ", "bad/id", "bad\x00id", "a" * 65],
+)
+def test_invalid_question_event_identity_fails_closed(event_id: Any) -> None:
+    result = {
+        "status": "waiting_for_user",
+        "clarification_draft": _draft(event_id=event_id),
+    }
+
+    resolution = resolve_publishable_clarification(
+        result, task=_task(), lease=_lease(), anchor=_anchor(), now=_now()
+    )
+
+    assert isinstance(resolution, FailClosed)
+    assert resolution.fail_closed_reason == "invalid_event_id"
 
 
 def test_waiting_without_draft_fails_closed_as_missing_draft() -> None:
@@ -899,13 +930,22 @@ def test_idempotency_key_matches_the_command_id_pattern() -> None:
     draft = _draft()
     key = clarification_idempotency_key(draft)
     assert COMMAND_ID_PATTERN.fullmatch(key) is not None
-    assert key.startswith("clarification.")
-    assert len(key) == 46
+    assert key == draft.event_id
+
+
+def test_question_event_identity_is_carried_in_the_v1_payload() -> None:
+    draft = _draft()
+    assert build_clarification_payload(draft)["event_id"] == draft.event_id
+
+
+def test_idempotency_key_changes_with_question_event_identity() -> None:
+    base = _draft(event_id="11111111-1111-4111-8111-111111111111")
+    changed = _draft(event_id="22222222-2222-4222-8222-222222222222")
+    assert clarification_idempotency_key(base) != clarification_idempotency_key(changed)
 
 
 def test_idempotency_key_ignores_message_content() -> None:
-    """The key is derived only from ``turn_marker``; changing ``message``
-    (including via truncation) must never change it."""
+    """Changing payload content cannot rename the published question."""
 
     base = _draft(message="short")
     changed = _draft(message="a completely different, much longer question")
@@ -913,11 +953,7 @@ def test_idempotency_key_ignores_message_content() -> None:
 
 
 def test_idempotency_key_ignores_source() -> None:
-    """``turn_marker`` is composed from ``turn_message_count``,
-    ``origin_step_id``, and ``requests`` only (see ``_compose_turn_marker``);
-    ``source`` is not one of its inputs. Two drafts differing only in
-    ``source`` -- e.g. the same turn reported by ``send_message`` versus
-    ``ask_user_question`` -- must therefore produce the same key."""
+    """The question event identity stays authoritative across draft sources."""
 
     base = _draft(source="send_message")
     changed = _draft(source="ask_user_question")
@@ -925,9 +961,7 @@ def test_idempotency_key_ignores_source() -> None:
 
 
 def test_idempotency_key_ignores_origin_execution_id() -> None:
-    """Same reasoning as ``test_idempotency_key_ignores_source`` above:
-    ``origin_execution_id`` is not one of ``_compose_turn_marker``'s inputs
-    either, so two drafts differing only in it must produce the same key."""
+    """Execution bookkeeping cannot create a second question identity."""
 
     base = _draft(origin_execution_id="exec-1")
     changed = _draft(origin_execution_id="exec-2")
@@ -999,9 +1033,7 @@ def test_request_leaf_control_characters_are_stripped_from_the_payload() -> None
         }
     ]
 
-    # The idempotency key is derived only from turn_marker (computed from
-    # the *raw*, unfiltered requests), so filtering the payload's requests
-    # leaves must not move it.
+    # Filtering payload leaves must not move the event-derived identity.
     key_before = clarification_idempotency_key(draft)
     build_clarification_payload(draft)
     assert clarification_idempotency_key(draft) == key_before
@@ -1021,9 +1053,7 @@ def test_message_type_control_characters_are_stripped_from_the_payload() -> None
     payload = build_clarification_payload(draft)
     assert payload["message_type"] == "infoBEL-AND-NUL"
 
-    # Same independence check as the requests-leaf test above: filtering
-    # message_type must not move the idempotency key, since that key is
-    # derived only from turn_marker.
+    # Filtering message_type must not move the event-derived identity.
     key_before = clarification_idempotency_key(draft)
     build_clarification_payload(draft)
     assert clarification_idempotency_key(draft) == key_before

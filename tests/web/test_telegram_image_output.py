@@ -1,6 +1,8 @@
 from unittest.mock import AsyncMock, patch
 
 import pytest
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
 
 from xagent.core.agent.trace import (
     ACTION_END_TOOL,
@@ -23,6 +25,10 @@ from xagent.web.channels.telegram.utils import (
     strip_telegram_file_refs,
     strip_telegram_image_refs,
 )
+from xagent.web.models.database import Base
+from xagent.web.models.task import Task, TaskStatus
+from xagent.web.models.user import User
+from xagent.web.services.chat_history_service import load_task_transcript
 
 
 def test_strip_telegram_image_refs_extracts_file_refs() -> None:
@@ -318,40 +324,37 @@ async def test_restore_telegram_task_context_loads_transcript_and_recovery_state
     assert agent_service.recovered_skill_context == recovery_state["skill_context"]
 
 
-def test_persist_telegram_assistant_turn_stores_failed_text_response(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    from xagent.web.services import chat_history_service
+def test_telegram_turn_without_provenance_fails_closed_on_transcript_load() -> None:
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(bind=engine)
+    db = sessionmaker(autocommit=False, autoflush=False, bind=engine)()
+    try:
+        user = User(username="telegram-history", password_hash="hash")
+        db.add(user)
+        db.flush()
+        task = Task(
+            user_id=int(user.id),
+            title="Telegram history",
+            description="Telegram history",
+            status=TaskStatus.FAILED,
+        )
+        db.add(task)
+        db.commit()
 
-    persisted = []
+        raw_content = "Telegram provider token=secret"
+        persist_telegram_assistant_turn(
+            db=db,
+            task_id=int(task.id),
+            user_id=int(user.id),
+            content=raw_content,
+            interactions=[],
+        )
 
-    def fake_persist_assistant_message(**kwargs):
-        persisted.append(kwargs)
-
-    monkeypatch.setattr(
-        chat_history_service,
-        "persist_assistant_message",
-        fake_persist_assistant_message,
-    )
-
-    persist_telegram_assistant_turn(
-        db=object(),  # type: ignore[arg-type]
-        task_id=423,
-        user_id=7,
-        content="I could not generate that image.",
-        interactions=[],
-    )
-
-    assert persisted == [
-        {
-            "db": persisted[0]["db"],
-            "task_id": 423,
-            "user_id": 7,
-            "content": "I could not generate that image.",
-            "interactions": [],
-            "message_type": "assistant_message",
-        }
-    ]
+        assert load_task_transcript(db, int(task.id)) == [
+            {"role": "assistant", "content": "Task execution failed."}
+        ]
+    finally:
+        db.close()
 
 
 def test_persist_telegram_assistant_turn_stores_interactions_as_question(

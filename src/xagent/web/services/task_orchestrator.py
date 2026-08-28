@@ -60,12 +60,20 @@ from ...core.agent.context.execution import CLOCK_TIMEZONE_METADATA_KEY
 from ...core.execution_scope import resolve_execution_scope
 from ...core.tools.adapters.vibe.config import RequiredMCPUnavailableError
 from ..models.task import Task, TaskStatus
+from .assistant_history_safety import (
+    CLIENT_SAFE_FAILURE_MESSAGE_TYPE,
+    TASK_FAILURE_MESSAGE_TYPE,
+)
 from .chat_history_service import (
     DELIVERY_COMPLETED,
     DELIVERY_DISPATCHED,
     DELIVERY_FAILED,
     DELIVERY_PENDING,
     mark_user_message_delivery_sync,
+)
+from .client_error_messages import (
+    CLIENT_SAFE_TASK_FAILURE,
+    required_mcp_unavailable_client_message,
 )
 from .db_runtime import (
     drain_async_task_cancellation_safe,
@@ -1330,6 +1338,8 @@ def settle_task_lease_isolated(
     lease: TaskLease,
     *,
     error_message: str | None = None,
+    client_error_message: str = CLIENT_SAFE_TASK_FAILURE,
+    client_message_type: str = TASK_FAILURE_MESSAGE_TYPE,
 ) -> bool:
     """Settle exactly one run/runner lease in one worker-owned Session.
 
@@ -1371,8 +1381,8 @@ def settle_task_lease_isolated(
                             settle_db,
                             task_id=lease.task_id,
                             user_id=int(task.user_id),
-                            content=error_message,
-                            message_type="chat_response",
+                            content=client_error_message,
+                            message_type=client_message_type,
                         )
                     settle_db.commit()
                     invalidate_task_cache_best_effort(lease.task_id)
@@ -1687,6 +1697,8 @@ def _schedule_bg(
         stop_event: asyncio.Event | None = None
         hb_task: asyncio.Task[TaskLeaseHeartbeatOutcome] | None = None
         settlement_error: str | None = None
+        client_history_error_message: str | None = None
+        client_history_message_type = TASK_FAILURE_MESSAGE_TYPE
         broadcast_error_message: str | None = None
         defer_settlement_to_ttl_recovery = False
         skip_delivery_reconciliation = False
@@ -1811,11 +1823,12 @@ def _schedule_bg(
                 # visitor who asked the question, so that audience gets a
                 # sentence written for it instead of the operator wording
                 # every other source keeps.
-                settlement_error = (
-                    EXTERNAL_TURN_INTERRUPTED_MESSAGE
-                    if task_source == EXTERNAL_TASK_SOURCE
-                    else "task execution cancelled"
-                )
+                if task_source == EXTERNAL_TASK_SOURCE:
+                    settlement_error = EXTERNAL_TURN_INTERRUPTED_MESSAGE
+                    client_history_error_message = settlement_error
+                    client_history_message_type = CLIENT_SAFE_FAILURE_MESSAGE_TYPE
+                else:
+                    settlement_error = "task execution cancelled"
                 raise
             except Exception as setup_or_run_err:
                 if is_database_pool_timeout(setup_or_run_err):
@@ -1834,7 +1847,10 @@ def _schedule_bg(
                         exc_info=True,
                     )
                 else:
-                    if isinstance(setup_or_run_err, RequiredMCPUnavailableError):
+                    is_public_safe_mcp_error = isinstance(
+                        setup_or_run_err, RequiredMCPUnavailableError
+                    )
+                    if is_public_safe_mcp_error:
                         # This exception's string contract is deliberately
                         # public-safe. Preserve it exactly in the durable task
                         # and TriggerRun projections; adding the exception type
@@ -1842,12 +1858,19 @@ def _schedule_bg(
                         # though the fenced settlement remains the sole owner of
                         # the terminal write.
                         settlement_error = str(setup_or_run_err)
+                        client_history_message_type = CLIENT_SAFE_FAILURE_MESSAGE_TYPE
+                        broadcast_error_message = (
+                            required_mcp_unavailable_client_message(
+                                setup_or_run_err,
+                                fallback=CLIENT_SAFE_TASK_FAILURE,
+                            )
+                        )
                     else:
                         settlement_error = (
                             "setup/run error: "
                             f"{type(setup_or_run_err).__name__}: {setup_or_run_err}"
                         )
-                    broadcast_error_message = str(setup_or_run_err)
+                        broadcast_error_message = CLIENT_SAFE_TASK_FAILURE
                     logger.error(
                         "bg task %s setup/run failed: %s",
                         task_id,
@@ -1891,6 +1914,12 @@ def _schedule_bg(
                             lambda: settle_task_lease_isolated(
                                 lease,
                                 error_message=settlement_error,
+                                client_error_message=(
+                                    client_history_error_message
+                                    or broadcast_error_message
+                                    or CLIENT_SAFE_TASK_FAILURE
+                                ),
+                                client_message_type=client_history_message_type,
                             )
                         )
                         # Gate on the returned value, not on "didn't raise":

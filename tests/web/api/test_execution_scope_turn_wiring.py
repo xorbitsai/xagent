@@ -39,6 +39,7 @@ from xagent.core.execution_scope import (
     set_execution_scope_snapshot_loader,
 )
 from xagent.web.api.websocket import (
+    ResumeReservationOutcome,
     _acquire_resume_task_lease,
     _handle_resume_task_unserialized,
     execute_resume_background,
@@ -46,6 +47,7 @@ from xagent.web.api.websocket import (
 )
 from xagent.web.models.task import Task, TaskStatus
 from xagent.web.models.user import User
+from xagent.web.services.client_error_messages import CLIENT_SAFE_TASK_FAILURE
 from xagent.web.services.task_lease_service import (
     TaskLease,
     TaskLeaseHeartbeatOutcome,
@@ -595,7 +597,10 @@ async def test_resume_handler_resolves_scope_once_off_loop_for_agent_lookup() ->
 
     background_manager = MagicMock()
     background_manager.running_tasks = {}
-    background_manager.reserve_resume.return_value = True
+    background_manager.resume_admission_state.return_value = None
+    background_manager.try_reserve_resume.return_value = (
+        ResumeReservationOutcome.RESERVED
+    )
     transition = AsyncMock(
         return_value=SimpleNamespace(run_id="run-a", status=TaskStatus.PAUSED)
     )
@@ -614,6 +619,13 @@ async def test_resume_handler_resolves_scope_once_off_loop_for_agent_lookup() ->
             patch(
                 "xagent.web.api.websocket.background_task_manager",
                 background_manager,
+            ),
+            # The handler asks the DB whether another process still holds a
+            # live lease before scheduling; this suite drives it without a
+            # task row, so answer "no foreign owner" explicitly.
+            patch(
+                "xagent.web.api.websocket.task_has_live_foreign_runner",
+                return_value=False,
             ),
             patch(
                 "xagent.web.api.websocket.execute_resume_background",
@@ -686,7 +698,10 @@ async def test_resume_survives_a_scope_authority_mismatch() -> None:
 
     background_manager = MagicMock()
     background_manager.running_tasks = {}
-    background_manager.reserve_resume.return_value = True
+    background_manager.resume_admission_state.return_value = None
+    background_manager.try_reserve_resume.return_value = (
+        ResumeReservationOutcome.RESERVED
+    )
 
     with _Patches(
         [
@@ -706,6 +721,13 @@ async def test_resume_survives_a_scope_authority_mismatch() -> None:
             patch(
                 "xagent.web.api.websocket.background_task_manager",
                 background_manager,
+            ),
+            # The handler asks the DB whether another process still holds a
+            # live lease before scheduling; this suite drives it without a
+            # task row, so answer "no foreign owner" explicitly.
+            patch(
+                "xagent.web.api.websocket.task_has_live_foreign_runner",
+                return_value=False,
             ),
             patch(
                 "xagent.web.api.websocket.execute_resume_background",
@@ -735,7 +757,9 @@ async def test_resume_survives_a_scope_authority_mismatch() -> None:
 
 
 @pytest.mark.asyncio
-async def test_resume_background_fails_closed_on_scope_authority_mismatch() -> None:
+async def test_resume_background_fails_closed_on_scope_authority_mismatch(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     """The scheduled turn's own re-resolution is fail-closed, not downgraded.
 
     ``execute_resume_background`` is the consumer that selects a namespace
@@ -780,7 +804,11 @@ async def test_resume_background_fails_closed_on_scope_authority_mismatch() -> N
     event, broadcast_task_id = broadcast_args
     assert broadcast_task_id == 42
     assert event["type"] == "task_error"
-    assert "execution scope authority mismatch" in event["message"]
+    assert event["task"]["status"] == TaskStatus.FAILED.value
+    assert event["message"] == CLIENT_SAFE_TASK_FAILURE
+    assert event["error"] == CLIENT_SAFE_TASK_FAILURE
+    assert "execution scope authority mismatch" not in repr(event).lower()
+    assert "execution scope authority mismatch" in caplog.text.lower()
 
 
 def test_resume_acquire_checkout_timeout_before_claim_does_not_try_cleanup() -> None:

@@ -42,6 +42,7 @@ interface ChatInputProps {
   onModeChange?: (mode: "task" | "process") => void;
   inputValue?: string;
   onInputChange?: (value: string) => void;
+  currentInteractionRequestId?: string;
   // Fires on the editor's own focus/blur, independent of `isLoading`/task
   // status - lets a controlled caller know it's currently unsafe to rely
   // on a programmatic `inputValue` change being reflected in the visible
@@ -84,6 +85,7 @@ interface AgentConfig {
   memorySimilarityThreshold?: number;
   executionMode?: ExecutionModeConfig;
   clientMessageId?: string;
+  metadata?: Record<string, unknown>;
   runtimeExtensions?: Record<string, Record<string, unknown>>;
 }
 
@@ -107,6 +109,7 @@ export function ChatInput({
   mode,
   inputValue,
   onInputChange,
+  currentInteractionRequestId,
   onFocusChange,
   taskStatus,
   onPause,
@@ -143,6 +146,7 @@ export function ChatInput({
   const containerRef = useRef<HTMLDivElement>(null);
   const isSubmittingRef = useRef(false);
   const deliveryAttemptRef = useRef<{ key: string; clientMessageId: string } | null>(null);
+  const draftRequestSnapshotRef = useRef<{ requestId: string | undefined } | null>(null);
   const dragDepthRef = useRef(0);
   const { t } = useI18n();
   const { user } = useAuth();
@@ -635,6 +639,16 @@ export function ChatInput({
   };
 
   const hasDraft = message.trim().length > 0 || enabledFiles.length > 0;
+  useEffect(() => {
+    if (!hasDraft) {
+      draftRequestSnapshotRef.current = null;
+      deliveryAttemptRef.current = null;
+    } else if (draftRequestSnapshotRef.current === null) {
+      draftRequestSnapshotRef.current = {
+        requestId: currentInteractionRequestId,
+      };
+    }
+  }, [currentInteractionRequestId, hasDraft]);
   const canSubmit = () => {
     const isUploadingFiles = uploadingFiles.size > 0;
     return hasDraft && !isInputBusy && !isUploadingFiles;
@@ -736,6 +750,16 @@ export function ChatInput({
         ? previousAttempt.clientMessageId
         : generateClientMessageId();
       deliveryAttemptRef.current = { key: deliveryKey, clientMessageId };
+      const existingMetadata = {
+        ...(agentConfig.metadata || {}),
+        ...(configIsDrivenByTaskConfig ? taskConfig?.metadata || {} : {}),
+      };
+      const draftRequestId = draftRequestSnapshotRef.current?.requestId;
+      const metadataToSend = draftRequestId
+        ? { ...existingMetadata, request_id: draftRequestId }
+        : Object.keys(existingMetadata).length > 0
+          ? existingMetadata
+          : undefined;
 
       const configToSend = {
         ...agentConfig,
@@ -756,6 +780,7 @@ export function ChatInput({
             }
           : {}),
         clientMessageId,
+        ...(metadataToSend ? { metadata: metadataToSend } : {}),
         ...(extraRuntimeExtensions
           ? {
               runtimeExtensions: {
@@ -771,6 +796,7 @@ export function ChatInput({
 
       await onSend(messageToSend, configToSend);
       deliveryAttemptRef.current = null;
+      draftRequestSnapshotRef.current = null;
       setPickedExecutionMode(undefined);
       setExecutionModeMenuOpen(false);
       setLocalBrowserTarget(null);

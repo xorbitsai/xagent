@@ -397,8 +397,13 @@ describe("PublicAgentChatPage", () => {
 
     expect(await screen.findByRole("button", { name: "start:Support Agent" })).toBeInTheDocument()
     expect(fetchMock).toHaveBeenCalledTimes(1)
-    // No conversation yet — nothing to end.
+    // No conversation yet — nothing to end, so the "..." menu (which would
+    // only ever hold the new-conversation action) doesn't render either.
     expect(screen.queryByRole("button", { name: "widgetChat.newConversation" })).toBeNull()
+    expect(screen.queryByRole("button", { name: "widgetChat.moreOptions" })).toBeNull()
+    // The close control still renders — it toggles the host panel, not the
+    // chat itself, so it's independent of whether a conversation exists.
+    expect(screen.getByRole("button", { name: "widgetChat.close" })).toBeInTheDocument()
   })
 
   it("ends the conversation and returns to the start screen", async () => {
@@ -409,7 +414,8 @@ describe("PublicAgentChatPage", () => {
     renderWidgetPage()
 
     await screen.findByTestId("conversation-panel")
-    fireEvent.click(screen.getByRole("button", { name: "widgetChat.newConversation" }))
+    fireEvent.click(screen.getByRole("button", { name: "widgetChat.moreOptions" }))
+    fireEvent.click(screen.getByRole("menuitem", { name: "widgetChat.newConversation" }))
 
     // The persisted id is dropped, so a reload cannot resurrect the old task,
     // and the next message goes through the fresh-task path in handleSend.
@@ -430,7 +436,8 @@ describe("PublicAgentChatPage", () => {
     renderWidgetPage()
 
     await screen.findByTestId("conversation-panel")
-    fireEvent.click(screen.getByRole("button", { name: "widgetChat.newConversation" }))
+    fireEvent.click(screen.getByRole("button", { name: "widgetChat.moreOptions" }))
+    fireEvent.click(screen.getByRole("menuitem", { name: "widgetChat.newConversation" }))
 
     expect(app.dispatch).toHaveBeenCalledWith({ type: "SET_PROCESSING", payload: false })
     expect(app.dispatch).toHaveBeenCalledWith({ type: "SET_CURRENT_TASK", payload: null })
@@ -608,6 +615,12 @@ describe("PublicAgentChatPage", () => {
     // A share visitor already has the full page; unlike the embedded widget
     // iframe, an in-tab navigation away from it is ordinary browser behavior.
     expect(app.provider?.transport?.capabilities?.linksOpenInNewTab).toBe("disabled")
+    // A share link has no parent widget.js panel to signal close to. (The
+    // "..." trigger's absence isn't asserted here -- it would also be absent
+    // in widget mode at this same taskless start screen, so it wouldn't
+    // prove anything about the share/widget exclusion specifically; that's
+    // covered instead once there's an active share conversation, below.)
+    expect(screen.queryByRole("button", { name: "widgetChat.close" })).toBeNull()
   })
 
   it("reuses a persisted, unexpired share token without re-authing", async () => {
@@ -696,6 +709,11 @@ describe("PublicAgentChatPage", () => {
     expect(fetchMock).not.toHaveBeenCalled()
     // Hiding the trace is scoped to the widget (#1041); share links keep it.
     expect(panel).toHaveAttribute("data-show-process-view", "true")
+    // The share/widget exclusion only means something once there's an active
+    // conversation -- in widget mode this same state renders the "..." menu
+    // (see the standalone-newConversation share button asserted below).
+    expect(screen.queryByRole("button", { name: "widgetChat.moreOptions" })).toBeNull()
+    expect(screen.getByRole("button", { name: "widgetChat.newConversation" })).toBeInTheDocument()
   })
 
   it("ends a share conversation and returns to the start screen", async () => {

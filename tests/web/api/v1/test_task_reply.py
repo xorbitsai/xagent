@@ -947,3 +947,55 @@ def test_reply_untagged_checkpoint_is_not_resumed_without_an_exact_run(mock_star
         assert task.run_id is not None
     finally:
         db.close()
+
+
+@pytest.mark.asyncio
+async def test_reply_resume_binds_the_coordinator_to_the_leased_run() -> None:
+    """The v1 reply scheduler must register its coordinator against its run.
+
+    The coordinator is the process-local evidence a duplicate RESUME command
+    is allowed to complete against. Bound to the wrong run -- or to no run at
+    all -- it would let a command for a different run be recorded as an
+    idempotent success.
+    """
+
+    from xagent.web.api import websocket as websocket_api
+
+    real_manager = websocket_api.BackgroundTaskManager()
+    lease = TaskLease(task_id=4242, runner_id="runner-x", run_id="run-reply")
+    resume_gate = asyncio.Event()
+
+    async def execute_resume_background(**_kwargs) -> None:
+        await resume_gate.wait()
+
+    with (
+        patch.object(websocket_api, "background_task_manager", real_manager),
+        patch.object(
+            websocket_api,
+            "execute_resume_background",
+            side_effect=execute_resume_background,
+        ),
+    ):
+        await task_reply_module._schedule_waiting_reply_resume(
+            task_id=4242,
+            agent_service=MagicMock(),
+            task_owner_user_id=1,
+            task_lease=lease,
+            heartbeat_stop=asyncio.Event(),
+            heartbeat_task=asyncio.ensure_future(asyncio.sleep(0)),
+        )
+        try:
+            assert (
+                real_manager.resume_admission_state(4242, expected_run_id="run-reply")
+                is websocket_api.ResumeReservationOutcome.COORDINATOR_RUNNING
+            )
+            assert (
+                real_manager.resume_admission_state(
+                    4242, expected_run_id="some-other-run"
+                )
+                is websocket_api.ResumeReservationOutcome.RESERVATION_HELD
+            )
+        finally:
+            resume_gate.set()
+            coordinator = real_manager.resume_tasks[4242]
+            await asyncio.wait_for(coordinator, timeout=5)

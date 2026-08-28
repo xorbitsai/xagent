@@ -18,6 +18,12 @@ from ...core.agent.transcript import (
 )
 from ...core.context_ref import CONTEXT_REFS_KEY, ContextReference
 from ..models.chat_message import TaskChatMessage
+from .assistant_history_safety import (
+    LEGACY_UNTRUSTED_ASSISTANT_MESSAGE_TYPE,
+    assistant_history_has_safe_ancillary_payload,
+    client_safe_assistant_history_content,
+    safe_str,
+)
 from .file_reference_output_service import reconcile_assistant_file_references
 from .ops_signals import (
     CLARIFICATION_LEGACY_SUPERSEDE_FAILED,
@@ -644,7 +650,7 @@ def persist_assistant_message(
     user_id: int,
     content: str,
     *,
-    message_type: str = "assistant_message",
+    message_type: str = LEGACY_UNTRUSTED_ASSISTANT_MESSAGE_TYPE,
     interactions: Optional[List[Dict[str, Any]]] = None,
     turn_id: Optional[str] = None,
     content_is_reconciled: bool = False,
@@ -680,7 +686,7 @@ def persist_assistant_message_no_commit(
     user_id: int,
     content: str,
     *,
-    message_type: str = "assistant_message",
+    message_type: str = LEGACY_UNTRUSTED_ASSISTANT_MESSAGE_TYPE,
     interactions: Optional[List[Dict[str, Any]]] = None,
     turn_id: Optional[str] = None,
     content_is_reconciled: bool = False,
@@ -751,15 +757,29 @@ def load_task_transcript(
     for index in range(len(stored_messages) - 1, -1, -1):
         if remaining_references <= 0:
             break
-        references = build_image_context_references(stored_messages[index].attachments)
+        stored_message = stored_messages[index]
+        if safe_str(stored_message.role) == "assistant" and not (
+            assistant_history_has_safe_ancillary_payload(
+                safe_str(stored_message.message_type)
+            )
+        ):
+            continue
+        references = build_image_context_references(stored_message.attachments)
         retained_references[index] = references[:remaining_references]
         remaining_references -= len(retained_references[index])
 
     messages: List[Dict[str, Any]] = []
     for message, references in zip(stored_messages, retained_references):
+        role = safe_str(message.role)
+        content = safe_str(message.content)
+        if role == "assistant":
+            content = client_safe_assistant_history_content(
+                content=content,
+                message_type=safe_str(message.message_type),
+            )
         item: Dict[str, Any] = {
-            "role": str(message.role),
-            "content": str(message.content),
+            "role": role,
+            "content": content,
         }
         if references:
             item[CONTEXT_REFS_KEY] = [

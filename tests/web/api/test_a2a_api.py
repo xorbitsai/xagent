@@ -1109,6 +1109,21 @@ async def test_a2a_handover_restores_input_required_on_unreadable_checkpoint() -
         # Ownership transferred synchronously: the scheduled resume has not run
         # yet, so its registration is still the one this handover created.
         resume_task = websocket_api.background_task_manager.resume_tasks[task_id]
+        # The coordinator is evidence only for the run it was created to
+        # resume: a command for this run sees it, a command for any other run
+        # must not be able to treat it as an idempotent success.
+        assert (
+            websocket_api.background_task_manager.resume_admission_state(
+                task_id, expected_run_id="run-handover"
+            )
+            is websocket_api.ResumeReservationOutcome.COORDINATOR_RUNNING
+        )
+        assert (
+            websocket_api.background_task_manager.resume_admission_state(
+                task_id, expected_run_id="some-other-run"
+            )
+            is websocket_api.ResumeReservationOutcome.RESERVATION_HELD
+        )
         await asyncio.wait_for(resume_task, timeout=30)
 
     agent_service.resume_execution_by_id.assert_awaited_once()

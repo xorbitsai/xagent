@@ -173,7 +173,7 @@ def test_summarize_tool_event_builds_link_from_file_id_and_filename():
     assert "[report.pdf](file:report-id)" in summary
 
 
-def test_summarize_execution_failure_event_includes_step_anchor():
+def test_summarize_execution_failure_event_excludes_raw_diagnostics():
     summary = summarize_execution_failure_event(
         {
             "status": "failed",
@@ -189,10 +189,46 @@ def test_summarize_execution_failure_event_includes_step_anchor():
     assert summary is not None
     assert "step=write_html" in summary
     assert "reason=step_failed" in summary
-    assert "connection reset" in summary
+    assert "connection reset" not in summary
 
 
-def test_load_task_execution_context_messages_includes_latest_failure_anchor():
+def test_legacy_trace_error_message_alone_does_not_prove_failure() -> None:
+    summary = summarize_execution_failure_event(
+        {"error_message": "provider token=secret"},
+        event_type="trace_error",
+    )
+
+    assert summary is None
+
+
+def test_empty_legacy_trace_error_does_not_prove_failure() -> None:
+    assert summarize_execution_failure_event({}, event_type="trace_error") is None
+
+
+@pytest.mark.parametrize("event_type", ["task_error_general", "step_error_general"])
+def test_typed_error_event_proves_failure_without_legacy_fields(
+    event_type: str,
+) -> None:
+    summary = summarize_execution_failure_event(
+        {"error_message": "provider token=secret"},
+        event_type=event_type,
+    )
+
+    assert summary == "- Previous execution failed."
+
+
+@pytest.mark.parametrize(
+    "event_type",
+    [
+        "dag_execute_end",
+        "trace_error",
+        "task_error_general",
+        "step_error_general",
+    ],
+)
+def test_load_task_execution_context_messages_includes_latest_failure_anchor(
+    event_type: str,
+):
     db_session = _create_db_session()
     try:
         task = _create_task(db_session)
@@ -201,7 +237,7 @@ def test_load_task_execution_context_messages_includes_latest_failure_anchor():
                 task_id=int(task.id),
                 build_id=None,
                 event_id="failure-event-1",
-                event_type="dag_execute_end",
+                event_type=event_type,
                 timestamp=datetime.now(timezone.utc),
                 step_id=str(task.id),
                 parent_event_id=None,
@@ -209,7 +245,7 @@ def test_load_task_execution_context_messages_includes_latest_failure_anchor():
                     "status": "failed",
                     "result": {
                         "success": False,
-                        "error": "network reset",
+                        "error": "network reset token=secret",
                         "failure_reason": "step_failed",
                         "failed_step_id": "render_poster",
                     },
@@ -222,7 +258,47 @@ def test_load_task_execution_context_messages_includes_latest_failure_anchor():
 
         assert len(messages) == 1
         assert "Previous execution failed" in messages[0]["content"]
+        assert "token=secret" not in messages[0]["content"]
         assert "step=render_poster" in messages[0]["content"]
+    finally:
+        db_session.close()
+
+
+@pytest.mark.parametrize(
+    "event_type",
+    ["task_error_general", "step_error_general"],
+)
+def test_load_task_execution_context_messages_uses_error_type_as_failure_provenance(
+    event_type: str,
+):
+    db_session = _create_db_session()
+    try:
+        task = _create_task(db_session)
+        raw_error = "provider token=secret"
+        db_session.add(
+            TraceEvent(
+                task_id=int(task.id),
+                build_id=None,
+                event_id=f"{event_type}-producer-shape",
+                event_type=event_type,
+                timestamp=datetime.now(timezone.utc),
+                step_id=str(task.id),
+                parent_event_id=None,
+                data={
+                    "error_type": "RuntimeError",
+                    "error_message": raw_error,
+                    "pattern": "react",
+                },
+            )
+        )
+        db_session.commit()
+
+        messages = load_task_execution_context_messages(db_session, int(task.id))
+
+        assert len(messages) == 1
+        assert messages[0]["role"] == "system"
+        assert "Previous execution failed" in messages[0]["content"]
+        assert raw_error not in repr(messages)
     finally:
         db_session.close()
 

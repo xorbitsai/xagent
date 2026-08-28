@@ -872,10 +872,12 @@ def _replay_or_raise_closed(
     snapshots of the same waiting turn, and the fields that could
     disagree cannot. The one key derivation that exists today,
     ``clarification_idempotency_key`` (``task_clarification_draft.py``),
-    honours this by hashing only ``ClarificationDraft.turn_marker``, which
-    is composed from the turn's message count, origin step and ordered
-    pending-request ids and from nothing else -- deliberately not from the
-    message text, so reshaping the payload cannot move the key.
+    honours this by reusing ``ClarificationDraft.event_id``. The runtime
+    allocates that identity before publishing the question and carries it
+    through the waiting checkpoint; ``turn_marker`` is descriptive checkpoint
+    state only. The request payload carries the same event id as correlation
+    metadata, but staging receives it separately as the idempotency key and
+    never extracts or normalizes identity from the payload.
 
     This is the obligation any future key derivation inherits. A key
     derived from anything that can change while the waiting turn stays the

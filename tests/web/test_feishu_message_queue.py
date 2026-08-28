@@ -216,12 +216,20 @@ async def test_channel_failure_suppresses_stale_error_after_exact_settlement_rej
 
 
 @pytest.mark.parametrize(
-    ("execution_result", "expected_status", "expected_message_type"),
+    (
+        "execution_result",
+        "expected_status",
+        "expected_message_type",
+        "expected_content",
+        "expected_error",
+    ),
     [
         (
             {"success": True, "output": "completed reply"},
             TaskStatus.COMPLETED,
-            "assistant_message",
+            "assistant_response",
+            "completed reply",
+            None,
         ),
         (
             {
@@ -234,6 +242,20 @@ async def test_channel_failure_suppresses_stale_error_after_exact_settlement_rej
             },
             TaskStatus.WAITING_FOR_USER,
             "question",
+            "Please confirm",
+            None,
+        ),
+        (
+            {
+                "success": False,
+                "status": "error",
+                "output": "provider token=secret",
+                "error": "provider token=secret",
+            },
+            TaskStatus.FAILED,
+            "assistant_response",
+            "Task execution failed.",
+            "provider token=secret",
         ),
     ],
 )
@@ -243,6 +265,8 @@ async def test_successful_channel_turn_persists_user_before_exact_assistant_sett
     execution_result: dict,
     expected_status: TaskStatus,
     expected_message_type: str,
+    expected_content: str,
+    expected_error: str | None,
 ) -> None:
     bot = object.__new__(FeishuBotInstance)
     bot.channel_id = 1
@@ -356,17 +380,14 @@ async def test_successful_channel_turn_persists_user_before_exact_assistant_sett
     assert finalized == [
         {
             "status": expected_status,
-            "assistant_content": (
-                "Please confirm"
-                if expected_status == TaskStatus.WAITING_FOR_USER
-                else "completed reply"
-            ),
+            "assistant_content": expected_content,
             "interactions": (
                 [{"label": "Continue?", "options": ["Yes", "No"]}]
                 if expected_status == TaskStatus.WAITING_FOR_USER
                 else []
             ),
             "message_type": expected_message_type,
+            "error_message": expected_error,
         }
     ]
 

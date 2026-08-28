@@ -160,8 +160,9 @@ class DeepSeekLLM(OpenAICompatibleLLM):
         result: Dict[str, Any],
         *,
         thinking: Optional[Dict[str, Any]] = None,
+        response_format: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
-        _ = thinking
+        _ = thinking, response_format
         return deepseek_reasoning_provider_state(
             result, fields=(DEEPSEEK_REASONING_CONTENT_STATE_KEY,)
         )

@@ -56,6 +56,7 @@ type CombinedItem = {
   isStreamingFinalAnswer?: boolean
   traceEvents?: any[]
   interactions?: any[]
+  interactionRequestId?: string
   showEmptyStatus?: boolean
   processStatus?: string
   timelineOrder?: number
@@ -153,6 +154,11 @@ const findWaitingPrompt = (currentTask: any, traceEvents: any[]) => {
 const findWaitingInteractions = (currentTask: any, traceEvents: any[]) => {
   if (currentTask?.status !== "waiting_for_user") {
     return undefined
+  }
+  if (currentTask.waitingRequestId) {
+    return currentTask.waitingInteractions?.length
+      ? currentTask.waitingInteractions
+      : undefined
   }
   if (currentTask.waitingInteractions?.length) {
     return currentTask.waitingInteractions
@@ -297,6 +303,7 @@ export function TaskConversationPanel({
             (event: unknown) => !shouldHideWorkforceInternalTrace(event),
           ),
           interactions: message.interactions,
+          interactionRequestId: message.interactionRequestId,
           isSystemNotice: message.isSystemNotice,
         }
       })
@@ -781,6 +788,7 @@ export function TaskConversationPanel({
                         }
                         timestamp={item.timestamp}
                         interactions={item.interactions}
+                        interactionRequestId={item.interactionRequestId}
                         interactionsActive={item.id === activeWaitingMessageId}
                         showEmptyStatus={item.showEmptyStatus}
                         contextBadges={item.role === "user" ? userMessageContextBadges : undefined}
@@ -807,6 +815,7 @@ export function TaskConversationPanel({
                       processStatus={state.currentTask?.status}
                       taskStatus={state.currentTask?.status}
                       interactions={state.currentTask?.status === "waiting_for_user" ? waitingInteractions : undefined}
+                      interactionRequestId={state.currentTask?.status === "waiting_for_user" ? state.currentTask.waitingRequestId : undefined}
                       interactionsActive={state.currentTask?.status === "waiting_for_user"}
                       onOpenExecutionPlan={showDagPreview ? openDagPreview : undefined}
                       onAgentExecutionClick={onAgentExecutionClick}
@@ -852,6 +861,12 @@ export function TaskConversationPanel({
 
             <ChatInput
               onSend={handleSend}
+              currentInteractionRequestId={
+                state.currentTask?.status === "waiting_for_user" &&
+                state.currentTask.id === String(state.taskId)
+                  ? state.currentTask.waitingRequestId
+                  : undefined
+              }
               isLoading={
                 state.isProcessing
                 || isConversationResetPending

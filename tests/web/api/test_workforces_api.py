@@ -776,6 +776,8 @@ def test_get_workforce_agent_execution_marks_orphan_interrupted() -> None:
         ("dag_execute_end", {"success": True}, "completed"),
         ("dag_execute_end", {"success": False}, "failed"),
         ("trace_error", {}, "failed"),
+        ("task_error_general", {}, "failed"),
+        ("step_error_general", {}, "failed"),
     ],
 )
 def test_agent_execution_status_recognizes_dag_terminal_events(

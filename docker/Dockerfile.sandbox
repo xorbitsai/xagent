@@ -189,7 +189,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
         -r /tmp/sandbox-requirements.txt \
     && rm /tmp/sandbox-requirements.txt \
     && uvx --version \
-    && python -c "import cloudpickle, fsspec, matplotlib, mcp; import numpy, openpyxl, pandas, pydantic, pydantic_settings"
+    && python -c "import cloudpickle, docx, fsspec, matplotlib, mcp; import numpy, openpyxl, pandas, pydantic, pydantic_settings"
 
 # Allow pip install without --break-system-packages globally. Sandboxed tools
 # can install their explicitly declared runtime dependencies as an unprivileged

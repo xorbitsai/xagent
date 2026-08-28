@@ -5,7 +5,9 @@ import re
 import subprocess
 import tomllib
 from pathlib import Path
+from typing import Any, cast
 
+import yaml
 from packaging.requirements import Requirement
 from packaging.utils import canonicalize_name
 from packaging.version import Version
@@ -24,6 +26,7 @@ SANDBOX_DISTRIBUTION_IMPORTS = {
     "numpy": "numpy",
     "matplotlib": "matplotlib",
     "openpyxl": "openpyxl",
+    "python-docx": "docx",
     "fsspec": "fsspec",
 }
 SANDBOX_DIRECT_REQUIREMENTS = {
@@ -35,6 +38,7 @@ SANDBOX_DIRECT_REQUIREMENTS = {
     "numpy": "numpy>=1.21.0",
     "matplotlib": "matplotlib>=3.5.0",
     "openpyxl": "openpyxl>=3.1.0",
+    "python-docx": "python-docx>=1.1.0",
     "fsspec": "fsspec>=2024.0.0",
 }
 
@@ -208,6 +212,49 @@ def test_backend_runtime_keeps_uv_binaries() -> None:
     dockerfile = read_repo_file("docker/Dockerfile.backend")
 
     assert dockerfile.count("COPY --from=uv /uv /uvx /usr/local/bin/") == 2
+
+
+def test_backend_dockerfile_installs_docker_cli_without_the_daemon() -> None:
+    """docker.io ships an engine + containerd + runc that a daemonless
+    container never uses, but /usr/bin/docker must survive the swap:
+    command_policy.py gates the agent shell by path, not by an allowlist.
+    See https://github.com/xorbitsai/xagent/pull/1807
+    """
+
+    dockerfile = read_repo_file("docker/Dockerfile.backend")
+
+    # `runtime` is FROM runtime-base and copies no apt layer out of the build
+    # stages, so an install that drifted into backend-base would ship an image
+    # with no /usr/bin/docker at all.
+    runtime_base = dockerfile.split(
+        "FROM python:${PYTHON_VERSION}-bookworm AS runtime-base\n", maxsplit=1
+    )[1].split("\nFROM ", maxsplit=1)[0]
+    block = next(
+        chunk for chunk in runtime_base.split("\n\n") if "docker-ce-cli" in chunk
+    )
+    install = "\n".join(line for line in block.splitlines() if not line.startswith("#"))
+
+    # Hardcoding an arch here would break the arm64 image (docker-publish.yml
+    # publishes amd64 + arm64); --no-install-recommends keeps
+    # docker-buildx-plugin/docker-compose-plugin out.
+    assert (
+        "arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/docker.gpg"
+        in install
+    )
+    assert "--no-install-recommends docker-ce-cli \\" in install
+    for daemon_package in ("docker.io", "docker-ce ", "containerd", "runc"):
+        assert daemon_package not in install
+
+    # The key and source list must be dropped by the same layer that added
+    # them, or download.docker.com stays resolvable in the running container.
+    assert (
+        "rm -rf /var/lib/apt/lists/* /etc/apt/sources.list.d/docker.list"
+        " /usr/share/keyrings/docker.gpg" in install
+    )
+    # Smoke-tested during the build so a broken swap fails on both published
+    # architectures instead of shipping.
+    assert "test -x /usr/bin/docker \\" in install
+    assert "! command -v dockerd \\" in install
 
 
 def test_backend_package_version_is_vcs_based_for_normal_builds() -> None:
@@ -473,3 +520,53 @@ def test_uv_export_locked_sandbox_group_contains_direct_distributions() -> None:
 
     for distribution in SANDBOX_DISTRIBUTION_IMPORTS:
         assert re.search(rf"^{re.escape(distribution)}==", result.stdout, re.MULTILINE)
+
+
+def sandbox_publish_step(name: str) -> dict[str, Any]:
+    workflow = yaml.safe_load(read_workflow("sandbox-publish.yml"))
+    for step in workflow["jobs"]["build-and-push"]["steps"]:
+        if step.get("name") == name:
+            return cast(dict[str, Any], step)
+    raise AssertionError(f"sandbox-publish.yml has no step named {name!r}")
+
+
+def test_sandbox_hub_description_step_is_sha_pinned_to_the_sandbox_repository() -> None:
+    step = sandbox_publish_step("Update Docker Hub repository description")
+
+    assert step["uses"] == (
+        "peter-evans/dockerhub-description@1b9a80c056b620d92cedb9d9b5a223409c68ddfa"
+    )
+    assert step["with"]["repository"] == "${{ env.SANDBOX_IMAGE }}"
+    assert step["with"]["readme-filepath"] == "./docker/README.sandbox.md"
+    assert step["with"]["username"] == "${{ secrets.DOCKERHUB_USERNAME }}"
+    assert step["with"]["password"] == "${{ secrets.DOCKERHUB_PASSWORD }}"
+
+
+# WHY: the Hub description is repository-global, not tag-scoped, so a
+# push_to_dockerhub=false dry run must not reach it.
+def test_sandbox_hub_description_gate_equals_the_image_push_gate() -> None:
+    description = sandbox_publish_step("Update Docker Hub repository description")
+    build = sandbox_publish_step("Build and push sandbox image")
+
+    assert description["if"] == build["with"]["push"]
+    assert "push_to_dockerhub == 'true'" in description["if"]
+
+
+def test_sandbox_hub_description_failure_does_not_fail_the_release() -> None:
+    step = sandbox_publish_step("Update Docker Hub repository description")
+
+    assert step["continue-on-error"] is True
+
+
+# WHY: the action truncates an oversized readme or short description and only
+# warns, so drift past a Hub limit ships silently with the run still green.
+def test_sandbox_hub_description_inputs_fit_docker_hub_limits() -> None:
+    step = sandbox_publish_step("Update Docker Hub repository description")
+
+    readme = ROOT / step["with"]["readme-filepath"]
+    assert readme.is_file()
+    assert len(readme.read_bytes()) <= 25_000
+
+    short_description = step["with"]["short-description"]
+    assert short_description
+    assert len(short_description.encode("utf-8")) <= 100

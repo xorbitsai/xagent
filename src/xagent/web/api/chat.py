@@ -78,6 +78,7 @@ from ..services.agent_team_scope import (
     owned_agent_clause,
     resolve_authorized_agent,
 )
+from ..services.assistant_history_safety import ASSISTANT_RESPONSE_MESSAGE_TYPE
 from ..services.chat_history_service import (
     load_task_transcript,
     persist_assistant_message_no_commit,
@@ -4322,6 +4323,7 @@ async def create_task(
                 user_id=int(user.id),
                 content=request.seed_assistant_message,
                 interactions=request.seed_interactions,
+                message_type=ASSISTANT_RESPONSE_MESSAGE_TYPE,
             )
             if seeded_message is None:
                 # persist_assistant_message_no_commit silently drops a

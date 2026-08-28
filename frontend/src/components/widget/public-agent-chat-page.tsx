@@ -4,6 +4,7 @@ import React, { useCallback, useEffect, useMemo, useState } from "react"
 import { Loader2, MessageSquarePlus } from "lucide-react"
 import { ChatStartScreen } from "@/components/chat/ChatStartScreen"
 import { TaskConversationPanel } from "@/components/task/task-conversation-panel"
+import { iconButtonClassName, WidgetChromeControls } from "@/components/widget/widget-chrome-controls"
 import { AppProvider, useApp, type AppProviderTransportConfig } from "@/contexts/app-context-chat"
 import { resolveReportedTimezone } from "@/hooks/use-websocket"
 import { usePublicFileAccessPolicy } from "@/contexts/file-access-context"
@@ -395,16 +396,29 @@ function PublicConversationContent({
               <p className="text-xs text-destructive">{createTaskError}</p>
             )}
           </div>
-          {state.taskId && (
-            <button
-              type="button"
-              onClick={handleNewConversation}
-              title={t("widgetChat.newConversation")}
-              aria-label={t("widgetChat.newConversation")}
-              className="ml-auto p-2 rounded-md text-muted-foreground hover:text-foreground hover:bg-muted/50 transition-colors"
-            >
-              <MessageSquarePlus className="w-4 h-4" />
-            </button>
+          {/* A standalone share link has no parent widget.js to signal, so
+              it keeps its own visible reset button instead of the "..."
+              menu -- the embedded widget is the only mode that can be
+              hidden from a host page. */}
+          {authMode === "share" ? (
+            state.taskId && (
+              <button
+                type="button"
+                onClick={handleNewConversation}
+                title={t("widgetChat.newConversation")}
+                aria-label={t("widgetChat.newConversation")}
+                className={`ml-auto ${iconButtonClassName}`}
+              >
+                <MessageSquarePlus className="w-4 h-4" />
+              </button>
+            )
+          ) : (
+            <WidgetChromeControls
+              newConversation={state.taskId ? {
+                label: t("widgetChat.newConversation"),
+                onClick: handleNewConversation,
+              } : undefined}
+            />
           )}
         </div>
       </div>

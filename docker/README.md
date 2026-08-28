@@ -389,17 +389,7 @@ group from the lockfile and checks all supported imports during the image build.
 The build stage does not copy `pyproject.toml` or `uv.lock` into the runtime
 image.
 
-Custom `SANDBOX_IMAGE` images used with sandboxed uvx MCP connections must
-provide `uvx` on `PATH`; Xagent no longer installs uv dynamically. A custom
-image that wants the built-in Chrome MCP connector (`chrome-devtools-mcp`)
-to work once enabled must also provide `npx` plus a browser resolvable at
-`/opt/google/chrome/chrome` — otherwise sandboxed calls to that connector
-fail with "Could not find Google Chrome executable". A warmed npx cache
-for the exact pinned `chrome-devtools-mcp@` version is not a substitute
-for the browser, and today doesn't even reach this connector's actual
-npx process regardless (xorbitsai/xagent#1869) — it's an unrelated,
-currently-inert latency optimization, not part of what makes the
-connector work.
+Custom `SANDBOX_IMAGE` images must stay runtime-compatible with `docker/Dockerfile.sandbox`. On `PATH` they need `python` and `node` (tool code runs as `python -c ...` and `node -e ...`, see `Sandbox.run_code` in `src/xagent/sandbox/base.py`), `pip` for run-time dependency installs, and `cat`, `rm`, `mkdir`, `/bin/sh` plus a writable `/tmp` for staging and cleanup; the Docker backend additionally needs `tail`, since it replaces the image `CMD` with `tail -f /dev/null`, and the Boxlite backend additionally needs `test`, `cp`, `mv` and a writable `/var/tmp`, which it stages file transfers through because it cannot copy into the tmpfs `/tmp`. `npx` and `uvx` are required only for sandboxed `npx`/`uvx` MCP connections — Xagent no longer installs `uv` dynamically. A custom image that additionally wants the built-in Chrome MCP connector (`chrome-devtools-mcp`) to work once enabled must also provide a browser resolvable at `/opt/google/chrome/chrome` — otherwise sandboxed calls to that connector fail with "Could not find Google Chrome executable". A warmed npx cache for the exact pinned `chrome-devtools-mcp@` version is not a substitute for the browser, and today doesn't even reach this connector's actual npx process regardless (xorbitsai/xagent#1869) — it's an unrelated, currently-inert latency optimization, not part of what makes the connector work.
 
 **Build args:**
 
@@ -419,8 +409,13 @@ The `Publish Sandbox Image` workflow in
 `.github/workflows/sandbox-publish.yml` publishes release tags and supports
 manual tags. After a new sandbox tag is published, update the `SANDBOX_IMAGE`
 pins in `docker/docker-compose.sandbox.boxlite.yml` and
-`docker/docker-compose.sandbox.docker.yml` to reference it. Rolling back only
-requires restoring the previous sandbox image tag.
+`docker/docker-compose.sandbox.docker.yml` to reference it. Rolling back means
+restoring the previous tag, but the change is not free: Xagent reconciles
+running sandboxes against the new image spec, so they are stopped, deleted and
+recreated. Bind-mounted workspace and upload data survives; the container's
+writable layer (`/tmp`, `$HOME`, packages a tool installed at run time) does not.
+
+The same workflow publishes `docker/README.sandbox.md` as the Docker Hub overview for [`xprobe/xagent-sandbox`](https://hub.docker.com/r/xprobe/xagent-sandbox). That file is the public description of the image, so keep it in step with changes to the `sandbox` dependency group, the runtime requirements above, or the sandbox lifecycle. It only reaches Docker Hub when the image is published, so an edit merged without a release tag will not appear until the next publish.
 
 ### Frontend
 
@@ -529,7 +524,11 @@ GHCR publishing.
    - Add `DOCKERHUB_USERNAME`: Your Docker Hub username
    - Add `DOCKERHUB_PASSWORD`: Your Docker Hub access token (not your password)
      - Create at: https://hub.docker.com/settings/security
-     - Use "Read & Write" permissions for pushing images
+     - "Read & Write" is enough to push images. The sandbox workflow also
+       updates the `xprobe/xagent-sandbox` Hub description with this same
+       token; that step additionally needs "Read, Write, Delete" scope and
+       Admin access on the repository, and is allowed to fail without
+       failing the release when the token lacks them
 
 2. Ensure Docker Hub repositories exist:
    - `xprobe/xagent-backend`

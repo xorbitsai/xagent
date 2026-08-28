@@ -175,6 +175,7 @@ sandbox = [
   "numpy>=1.21.0",
   "matplotlib>=3.5.0",
   "openpyxl>=3.1.0",
+  "python-docx>=1.1.0",
   "fsspec>=2024.0.0",
 ]
 
@@ -226,6 +227,7 @@ test = [
   "copilotkit==0.1.69",
   "langgraph-prebuilt<1.0.9",
   "openpyxl>=3.1.5",
+  "python-docx>=1.1.0",
   "asyncssh>=2.14.0",
 ]
 

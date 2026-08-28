@@ -22,6 +22,9 @@ from xagent.web.models.agent import Agent
 from xagent.web.models.chat_message import TaskChatMessage
 from xagent.web.models.task import Task, TaskStatus
 from xagent.web.services import external_task_cancel, task_orchestrator
+from xagent.web.services.assistant_history_safety import (
+    CLIENT_SAFE_FAILURE_MESSAGE_TYPE,
+)
 from xagent.web.services.chat_history_service import (
     DELIVERY_DISPATCHED,
     DELIVERY_PENDING,
@@ -332,7 +335,7 @@ async def test_interrupted_transcript_finalize_wins(
             )
             .one()
         )
-        assert row.message_type == "chat_response"
+        assert row.message_type == CLIENT_SAFE_FAILURE_MESSAGE_TYPE
         assert row.turn_id is None
     finally:
         db.close()
@@ -360,7 +363,7 @@ async def test_interrupted_transcript_settlement_wins(
         run_id=None,
         state_version=0,
     )
-    _broadcast_manager(monkeypatch)
+    manager = _broadcast_manager(monkeypatch)
     execution_started = asyncio.Event()
 
     async def block_until_cancelled(**_kwargs: object) -> None:
@@ -405,6 +408,20 @@ async def test_interrupted_transcript_settlement_wins(
 
     assert _interruption_transcript_count(task_id) == 1
     assert _load_task(task_id).error_message == EXTERNAL_TURN_INTERRUPTED_MESSAGE
+    assert manager.broadcast_to_task.await_count == 1
+    db = _direct_db_session()
+    try:
+        row = (
+            db.query(TaskChatMessage)
+            .filter(
+                TaskChatMessage.task_id == task_id,
+                TaskChatMessage.role == "assistant",
+            )
+            .one()
+        )
+        assert row.message_type == CLIENT_SAFE_FAILURE_MESSAGE_TYPE
+    finally:
+        db.close()
 
 
 @pytest.mark.asyncio

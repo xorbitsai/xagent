@@ -83,3 +83,16 @@ jobs:
           labels: ${{ steps.meta-sandbox.outputs.labels }}
           cache-from: type=registry,ref=${{ env.SANDBOX_IMAGE }}:buildcache
           cache-to: ${{ (github.event_name != 'workflow_dispatch' || github.event.inputs.push_to_dockerhub == 'true') && format('type=registry,ref={0}:buildcache,mode=max', env.SANDBOX_IMAGE) || '' }}
+
+      - name: Update Docker Hub repository description
+        if: ${{ github.event_name != 'workflow_dispatch' || github.event.inputs.push_to_dockerhub == 'true' }}
+        # WHY: this PATCH needs a stronger Hub entitlement than the image push,
+        # so a 403 here must not fail a release whose image is already public.
+        continue-on-error: true
+        uses: peter-evans/dockerhub-description@1b9a80c056b620d92cedb9d9b5a223409c68ddfa # v5.0.0
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_PASSWORD }}
+          repository: ${{ env.SANDBOX_IMAGE }}
+          short-description: "Sandbox runtime image for Xagent: isolated Node.js and Python execution for agent tool calls"
+          readme-filepath: ./docker/README.sandbox.md

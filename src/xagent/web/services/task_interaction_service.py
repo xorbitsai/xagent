@@ -1039,10 +1039,19 @@ def validate_v1_write_payload(parsed: AskUserQuestionArgs) -> None:
         # #1368 as a blank one. Stripped here only to test, not to
         # normalize what gets stored: the model-facing producer
         # (``_normalize_ask_user_interactions``, ``react.py``) already
-        # trims a field and substitutes for a blank one before it ever
-        # reaches this validator, so a well-formed field arrives here
-        # pre-trimmed and this pair of checks costs that producer nothing;
-        # they exist for whatever reaches this write side some other way.
+        # trims a field -- against a table covering every code point
+        # either Python's ``str.strip()`` or JavaScript's ``trim()``
+        # treats as whitespace, including a leading BOM (U+FEFF), which
+        # ``str.strip()`` alone does not -- and substitutes for a blank
+        # one before it ever reaches this validator, so a well-formed
+        # field arrives here pre-trimmed and this pair of checks costs
+        # that producer nothing. These two checks themselves use plain
+        # ``str.strip()``, though, not that table: they exist for
+        # whatever reaches this write side some other way, and for a
+        # field that does, a leading or trailing BOM would pass both of
+        # them unnoticed even though it would not survive the producer's
+        # own trim. Narrowing these two checks to match would mean
+        # importing that same table here.
         #
         # Both react.py paths run that normalizer, so both arrive
         # pre-trimmed, and there the resemblance stops -- whoever wires the
@@ -1069,17 +1078,33 @@ def validate_v1_write_payload(parsed: AskUserQuestionArgs) -> None:
         if interaction.type in _V1_TYPES_REJECTING_OPTIONS and interaction.options:
             raise ValueError(f"{where} is a {interaction.type} carrying options")
         # Either half blank, not both: an option the user can see but not
-        # submit, and one they can submit but not see, are both unusable,
-        # and the renderer already treats them the same way -- its own
-        # filter keeps an option only when value and label are both
-        # truthy (clarification-form.tsx). An option dropped there leaves
-        # a select the user cannot complete, or, if it was the only one, a
-        # form with an empty control; refusing the write is the only place
-        # that outcome can still be prevented. Falsy, not stripped: the
-        # two fields are required ``str`` on ``InteractionOption``
-        # (ask_user_tool.py), so a payload that got this far can only be
-        # blank by being the empty string, and stripping would start
-        # rejecting a whitespace label the renderer does display.
+        # submit, and one they can submit but not see, are both unusable.
+        # The renderer's own filter (clarification-form.tsx) keeps an
+        # option only when value and label are non-blank under
+        # JavaScript's own ``trim()``. The model-facing producer
+        # (``_normalize_ask_user_interactions``, react.py) keeps an option
+        # only when both are non-blank under a wider table -- every code
+        # point either Python's ``str.strip()`` or JavaScript's ``trim()``
+        # treats as whitespace, a strict superset of what the renderer
+        # checks. The two are not equivalent: a value like a single
+        # ``"\x1c"`` (a control code point Python treats as whitespace but
+        # JavaScript's ``trim()`` does not) survives the renderer's filter
+        # but is dropped by the producer, so the producer is the stricter
+        # of the two, not the looser one. This check here does not rely on
+        # either of them: it is falsy, not trim-aware, and
+        # ``InteractionOption.label``/``value`` (ask_user_tool.py) are
+        # required ``str`` with no ``min_length`` or whitespace
+        # constraint, so a whitespace-only label or value -- not just the
+        # empty string -- reaches this line, and this line lets it
+        # through. A payload that reaches this validator some way other
+        # than the react.py producer could still carry one past it;
+        # catching that here too would mean checking against the same
+        # trim table the producer uses, which this validator does not
+        # import today. An option dropped by the renderer's own filter
+        # leaves a select the user cannot complete, or, if it was the
+        # only one, a form with an empty control; refusing the write is
+        # the only place that outcome can still be prevented for whatever
+        # this check does catch.
         for option_index, option in enumerate(interaction.options or ()):
             if not option.label or not option.value:
                 raise ValueError(

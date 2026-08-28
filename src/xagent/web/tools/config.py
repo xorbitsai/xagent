@@ -603,7 +603,7 @@ async def refresh_oauth_token_if_needed(
 
     logger.info(f"Token expired for {provider_name}, attempting to refresh...")
     try:
-        from ..api.auth import _resolve_oauth_secret
+        from ..api.auth import _resolve_oauth_redirect_uri, _resolve_oauth_secret
         from ..models.oauth_provider import OAuthProvider
         from ..oauth_provider_quirks import requires_json_accept_header
 
@@ -696,6 +696,55 @@ async def refresh_oauth_token_if_needed(
             data["client_id"] = client_id
             data["client_secret"] = client_secret
 
+        refresh_token_url = provider_config.token_url
+        if normalized_provider == "deputy":
+            # Deputy's docs (both the code-exchange and refresh legs) list
+            # `redirect_uri` and `scope` as required body params here too,
+            # matching the code-exchange branch in api/auth.py. scope is
+            # read from provider_config.default_scopes -- same source, and
+            # same "no app-level oauth_scopes override" caveat, as that
+            # code-exchange leg (see its comment) -- rather than a
+            # hardcoded literal, so an admin who edits this provider row's
+            # scopes doesn't leave refresh silently still sending the old
+            # value.
+            # Resolved from the CURRENT provider row/env var, not whatever
+            # redirect_uri was actually used for this grant's original
+            # authorization -- UserOAuth has no per-grant redirect_uri
+            # column to read instead (no provider in this codebase needs
+            # one; Deputy is the only one requiring redirect_uri on
+            # refresh at all). If an admin changes the Deputy provider's
+            # redirect_uri (or DEPUTY_REDIRECT_URI) after users have
+            # already connected, Deputy may reject those users' next
+            # refresh with a redirect_uri mismatch until they reconnect --
+            # a known limitation, not something this function can resolve
+            # without a schema change.
+            data["redirect_uri"] = _resolve_oauth_redirect_uri(
+                provider_name, provider_config
+            )
+            data["scope"] = (
+                " ".join(
+                    stripped
+                    for scope in provider_config.default_scopes or []
+                    if isinstance(scope, str) and (stripped := scope.strip())
+                )
+                or "longlife_refresh_token"
+            )
+            # Deputy's generic once.deputy.com host only serves the initial
+            # code exchange -- token renewal must go to the same per-install
+            # host returned as `endpoint` in that exchange (and persisted as
+            # UserOAuth.instance_url), not the static token_url on the
+            # provider row. See deputy.py's _instance_url() for the matching
+            # use-time validation of that same stored value.
+            stored_instance_url = getattr(oauth_account, "instance_url", None)
+            if not stored_instance_url:
+                logger.warning(
+                    f"Cannot refresh Deputy token for user "
+                    f"{oauth_account.user_id}: no instance_url stored on "
+                    "this connection."
+                )
+                return False
+            refresh_token_url = f"{stored_instance_url}/oauth/access_token"
+
         headers = {}
         if normalized_provider == "linkedin":
             headers["Content-Type"] = "application/x-www-form-urlencoded"
@@ -711,7 +760,7 @@ async def refresh_oauth_token_if_needed(
 
         async with httpx.AsyncClient() as client:
             response = await client.post(
-                provider_config.token_url,
+                refresh_token_url,
                 headers=headers,
                 timeout=10.0,
                 **body_kwarg,
@@ -747,6 +796,22 @@ async def refresh_oauth_token_if_needed(
                             f"Refresh response for {provider_name} (user "
                             f"{oauth_account.user_id}) had a malformed "
                             "instance_url; keeping the previously stored value"
+                        )
+                if normalized_provider == "deputy" and "endpoint" in data:
+                    # Deputy's equivalent of the block above -- its refresh
+                    # response carries the per-install host under `endpoint`,
+                    # not `instance_url`, and without a scheme (matches the
+                    # code-exchange branch in api/auth.py).
+                    from ..api.auth import _normalize_deputy_endpoint
+
+                    refreshed_endpoint = _normalize_deputy_endpoint(data["endpoint"])
+                    if refreshed_endpoint:
+                        oauth_account.instance_url = refreshed_endpoint
+                    else:
+                        logger.warning(
+                            f"Refresh response for {provider_name} (user "
+                            f"{oauth_account.user_id}) had a malformed "
+                            "endpoint; keeping the previously stored value"
                         )
                 if "expires_in" in data:
                     oauth_account.expires_at = datetime.now(timezone.utc) + timedelta(

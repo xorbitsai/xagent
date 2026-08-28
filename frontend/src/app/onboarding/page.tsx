@@ -333,6 +333,21 @@ export default function OnboardingPage() {
     return canEscape ? "escaped" : "retry_in_place";
   };
 
+  // handleLaunch's own last-mile save - see the comment where it's called
+  // for why onboarded:true has to wait until this point. Only safe to call
+  // once an agent genuinely exists (already hired, freshly re-confirmed
+  // hired, or just hired). Awaited so a failure here can still fall back to
+  // the escape flag (this save's own retries/escalation don't apply - the
+  // agent is real either way, so navigation must not be blocked on this one
+  // best-effort field ever landing).
+  const markOnboardedAndNavigate = async (destination: string) => {
+    const onboardedSave = await updateUserPreferences({ onboarded: true });
+    if (isMountedRef.current) {
+      if (!onboardedSave.ok) markOnboardingSaveEscaped(user?.id);
+      router.replace(destination);
+    }
+  };
+
   // Matches the reference UI's finish() exactly: every exit path (header
   // "Skip setup", the goals step's "Not sure yet", the done step's "Take me
   // to the catalogue") persists whatever's been picked so far, unconditionally
@@ -402,8 +417,8 @@ export default function OnboardingPage() {
       // let a later failure leave the backend saying "onboarded" with no
       // agent/task ever actually delivered - a guard check afterward would
       // then skip onboarding entirely with no way back in to finish it.
-      // It's saved separately, only once an agent is actually in hand, in
-      // markOnboardedAndNavigate below.
+      // It's saved separately, only once an agent is actually in hand, via
+      // markOnboardedAndNavigate above.
       const outcome = await trySavePreferences(LAUNCH_FAILURE_KEY, {
         requireRetryableToEscape: true,
         includeOnboarded: false,
@@ -415,21 +430,6 @@ export default function OnboardingPage() {
         }
         return;
       }
-
-      // The one point in handleLaunch that's actually safe to mark
-      // onboarded:true - every call site below is reached only once an
-      // agent genuinely exists (already hired, freshly re-confirmed hired,
-      // or just hired). Awaited so a failure here can still fall back to
-      // the escape flag (this save's own retries/escalation don't apply -
-      // the agent is real either way, so navigation must not be blocked on
-      // this one best-effort field ever landing).
-      const markOnboardedAndNavigate = async (destination: string) => {
-        const onboardedSave = await updateUserPreferences({ onboarded: true });
-        if (isMountedRef.current) {
-          if (!onboardedSave.ok) markOnboardingSaveEscaped(user?.id);
-          router.replace(destination);
-        }
-      };
 
       if (selected.hired && selected.hired_agent_id) {
         await markOnboardedAndNavigate(`/agent/${selected.hired_agent_id}`);

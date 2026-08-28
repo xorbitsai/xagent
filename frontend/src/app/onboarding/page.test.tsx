@@ -131,6 +131,19 @@ describe("OnboardingPage", () => {
     expect(screen.queryByText(/Gerard Santos/)).not.toBeInTheDocument()
   })
 
+  // Pins a PR review finding: the welcome heading's closing punctuation used
+  // to be a hardcoded ASCII period in JSX, appended directly after
+  // <em>{firstName}</em> - now composed from a locale-owned titleSuffix key
+  // instead. Asserts the actual rendered heading, not just the raw locale
+  // string values (translations.test.ts covers those separately).
+  it("renders the welcome heading with the name and closing punctuation combined with no stray whitespace", async () => {
+    render(<OnboardingPage />)
+    await waitFor(() => expect(screen.getAllByText("Shulei").length).toBeGreaterThan(0))
+
+    const heading = screen.getByRole("heading", { level: 1 })
+    expect(heading.textContent).toBe("Welcome to Xagent,Shulei.")
+  })
+
   it("falls back to a generic name when the user has no username", async () => {
     authUser.username = undefined
     render(<OnboardingPage />)
@@ -336,7 +349,7 @@ describe("OnboardingPage", () => {
   // in flight would silently never be saved, then get discarded entirely
   // once the page navigates away - the data-entry controls (not just the
   // exit buttons) must be disabled for the duration of a save too.
-  it("disables the goal chips and industry input while a save is in flight", async () => {
+  it("disables the work chips and industry input while a save is in flight", async () => {
     let resolveSave!: (v: { ok: boolean }) => void
     updateUserPreferencesMock.mockReturnValue(new Promise((resolve) => { resolveSave = resolve }))
 
@@ -350,6 +363,53 @@ describe("OnboardingPage", () => {
 
     expect(screen.getByText("Other").closest("button")).toBeDisabled()
     expect(screen.getByPlaceholderText("e.g. Property management")).toBeDisabled()
+
+    await act(async () => {
+      resolveSave({ ok: true })
+    })
+  })
+
+  // Pins a test-coverage gap found in incremental self-review: the test
+  // above only reaches the business step's work chips - the goals step's
+  // goal chips and the voice step's voice chips also got disabled={launching}
+  // in the same round but were never actually exercised.
+  it("disables the goal chips while a save is in flight", async () => {
+    let resolveSave!: (v: { ok: boolean }) => void
+    updateUserPreferencesMock.mockReturnValue(new Promise((resolve) => { resolveSave = resolve }))
+
+    await goToWelcomeThenBusiness()
+    fireEvent.click(screen.getByText("Marketing"))
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/take off your plate/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Post on social media"))
+
+    fireEvent.click(screen.getByText("Not sure yet — show me everyone"))
+
+    expect(screen.getByText("Post on social media").closest("button")).toBeDisabled()
+
+    await act(async () => {
+      resolveSave({ ok: true })
+    })
+  })
+
+  it("disables the voice chips while a save is in flight", async () => {
+    let resolveSave!: (v: { ok: boolean }) => void
+    updateUserPreferencesMock.mockReturnValue(new Promise((resolve) => { resolveSave = resolve }))
+
+    await goToWelcomeThenBusiness()
+    fireEvent.click(screen.getByText("Marketing"))
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/take off your plate/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Post on social media"))
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/Meet your AI team/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/How should/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Playful"))
+
+    fireEvent.click(screen.getByText("Skip setup"))
+
+    expect(screen.getByText("Playful").closest("button")).toBeDisabled()
 
     await act(async () => {
       resolveSave({ ok: true })
@@ -681,6 +741,78 @@ describe("OnboardingPage", () => {
     expect(hireAgentFromTemplateMock).not.toHaveBeenCalled()
   })
 
+  // Pins a test-coverage gap found in incremental self-review: the
+  // freshness-recheck-hired branch's own onboarded-save call (via
+  // markOnboardedAndNavigate) was only ever exercised with the default
+  // succeeding mock - neither its success payload nor its failure path was
+  // directly asserted, unlike the freshly-hired branch which got both.
+  it("marks onboarded:true and navigates when the freshness recheck finds it already hired and the onboarded save succeeds", async () => {
+    apiRequestMock.mockImplementation((url: string) => {
+      if (url.includes("/api/templates/marketing-social-media-content-manager")) {
+        return Promise.resolve({
+          ok: true,
+          json: async () => ({ ...TEMPLATES[0], hired: true, hired_agent_id: 77 }),
+        })
+      }
+      return Promise.resolve({ ok: true, json: async () => TEMPLATES })
+    })
+
+    await goToWelcomeThenBusiness()
+    fireEvent.click(screen.getByText("Marketing"))
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/take off your plate/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Post on social media"))
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/Meet your AI team/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/How should/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText("You're all set.")).toBeInTheDocument())
+
+    await act(async () => {
+      fireEvent.click(screen.getByText("Start with Maya"))
+    })
+
+    await waitFor(() => expect(routerReplace).toHaveBeenCalledWith("/agent/77"))
+    expect(updateUserPreferencesMock).toHaveBeenCalledWith({ onboarded: true })
+    expect(markOnboardingSaveEscapedMock).not.toHaveBeenCalled()
+  })
+
+  it("still navigates to the existing agent, and marks the escape flag, if the onboarded save fails after a freshness-recheck-confirmed hire", async () => {
+    // 1st call is the main (includeOnboarded: false) save - must succeed so
+    // handleLaunch proceeds past it; the 2nd call is markOnboardedAndNavigate's
+    // dedicated {onboarded: true} save, which is the one this test fails.
+    updateUserPreferencesMock.mockResolvedValueOnce({ ok: true }).mockResolvedValueOnce({ ok: false, retryable: true })
+    apiRequestMock.mockImplementation((url: string) => {
+      if (url.includes("/api/templates/marketing-social-media-content-manager")) {
+        return Promise.resolve({
+          ok: true,
+          json: async () => ({ ...TEMPLATES[0], hired: true, hired_agent_id: 77 }),
+        })
+      }
+      return Promise.resolve({ ok: true, json: async () => TEMPLATES })
+    })
+
+    await goToWelcomeThenBusiness()
+    fireEvent.click(screen.getByText("Marketing"))
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/take off your plate/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Post on social media"))
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/Meet your AI team/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/How should/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText("You're all set.")).toBeInTheDocument())
+
+    await act(async () => {
+      fireEvent.click(screen.getByText("Start with Maya"))
+    })
+
+    await waitFor(() => expect(routerReplace).toHaveBeenCalledWith("/agent/77"))
+    expect(markOnboardingSaveEscapedMock).toHaveBeenCalledTimes(1)
+  })
+
   // Pins a PR review test-coverage gap: handleLaunch's already-hired
   // shortcut (skip hireAgentFromTemplate, go straight to the existing agent)
   // was never exercised.
@@ -712,6 +844,40 @@ describe("OnboardingPage", () => {
 
     await waitFor(() => expect(routerReplace).toHaveBeenCalledWith("/agent/99"))
     expect(hireAgentFromTemplateMock).not.toHaveBeenCalled()
+    expect(updateUserPreferencesMock).toHaveBeenCalledWith({ onboarded: true })
+    expect(markOnboardingSaveEscapedMock).not.toHaveBeenCalled()
+  })
+
+  // Pins a test-coverage gap found in incremental self-review: the
+  // already-hired shortcut's own onboarded-save failure path (via
+  // markOnboardedAndNavigate) was untested - only the freshly-hired branch
+  // had this covered.
+  it("still navigates to the already-hired agent, and marks the escape flag, if the onboarded save fails", async () => {
+    updateUserPreferencesMock.mockResolvedValueOnce({ ok: true }).mockResolvedValueOnce({ ok: false, retryable: true })
+    apiRequestMock.mockResolvedValue({
+      ok: true,
+      json: async () => [{ ...TEMPLATES[0], hired: true, hired_agent_id: 99 }, TEMPLATES[1], TEMPLATES[2]],
+    })
+
+    await goToWelcomeThenBusiness()
+    fireEvent.click(screen.getByText("Marketing"))
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/take off your plate/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Post on social media"))
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/Meet your AI team/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/How should/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText("You're all set.")).toBeInTheDocument())
+
+    await act(async () => {
+      fireEvent.click(screen.getByText("Start with Maya"))
+    })
+
+    await waitFor(() => expect(routerReplace).toHaveBeenCalledWith("/agent/99"))
+    expect(hireAgentFromTemplateMock).not.toHaveBeenCalled()
+    expect(markOnboardingSaveEscapedMock).toHaveBeenCalledTimes(1)
   })
 
   // Pins a PR review test-coverage gap: only the thrown/rejected variant of

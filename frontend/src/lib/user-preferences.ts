@@ -106,23 +106,34 @@ export function markOnboardingSaveEscaped(userId: string | undefined): void {
   }
 }
 
-/** Reads and clears the flag set by markOnboardingSaveEscaped() - always
- * removed on read (one-shot; a stale or corrupt value must not linger
- * either), and only honored within SAVE_ESCAPE_TTL_MS of being set AND for
- * the SAME user id that set it - see markOnboardingSaveEscaped's comment on
- * why an identity-agnostic flag is unsafe. `userId` is the CURRENTLY
- * authenticated identity at the moment of the check (may be null while
- * auth is still resolving); a flag that doesn't match - or a caller with no
- * resolved identity yet - is discarded rather than honored, never latched
- * to a mismatched or unknown user. */
+/** Reads and clears the flag set by markOnboardingSaveEscaped() - removed
+ * on a resolved read (one-shot; a stale, corrupt, or mismatched value must
+ * not linger either), and only honored within SAVE_ESCAPE_TTL_MS of being
+ * set AND for the SAME user id that set it - see markOnboardingSaveEscaped's
+ * comment on why an identity-agnostic flag is unsafe. `userId` is the
+ * CURRENTLY authenticated identity at the moment of the check (may be null
+ * while auth is still resolving).
+ *
+ * Deliberately NOT removed when `userId` is null: self-review of this same
+ * identity-binding fix found that unconditionally consuming (removing) on
+ * every call - including calls made before auth has resolved on a fresh
+ * page load, which AuthGuard's effect does unconditionally - deleted a
+ * live flag before its identity could ever actually be checked. The very
+ * next call, once auth resolves with the real user id, would then find
+ * nothing and silently fail to honor an escape that was never actually
+ * matched against anyone - the exact bounce-loop this mechanism exists to
+ * prevent. Leaving an unresolvable flag in place costs nothing: it's still
+ * fresh (TTL not yet reached) and gets a real, resolved check - matched or
+ * not - the next time this runs with a known identity. */
 export function consumeOnboardingSaveEscapeFlag(userId: string | null): boolean {
   try {
     const raw = window.sessionStorage.getItem(SAVE_ESCAPE_KEY);
-    window.sessionStorage.removeItem(SAVE_ESCAPE_KEY);
     if (!raw) return false;
+    if (userId === null) return false;
+    window.sessionStorage.removeItem(SAVE_ESCAPE_KEY);
     const parsed = JSON.parse(raw) as { userId?: unknown; setAt?: unknown };
     if (typeof parsed?.userId !== "string" || typeof parsed?.setAt !== "number") return false;
-    if (userId === null || parsed.userId !== userId) return false;
+    if (parsed.userId !== userId) return false;
     return Number.isFinite(parsed.setAt) && Date.now() - parsed.setAt < SAVE_ESCAPE_TTL_MS;
   } catch {
     return false;

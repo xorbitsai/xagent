@@ -153,10 +153,20 @@ describe("markOnboardingSaveEscaped / consumeOnboardingSaveEscapeFlag", () => {
     expect(consumeOnboardingSaveEscapeFlag("user-a")).toBe(false)
   })
 
-  it("consume returns false when no identity has resolved yet (null)", () => {
+  // Pins a regression found by self-reviewing this same identity-binding
+  // fix: AuthGuard calls this unconditionally, including on a fresh page
+  // load before auth has resolved (userId: null). If that call destructively
+  // removed the flag, the real, resolved check moments later would find
+  // nothing and silently fail to honor a genuine escape - the exact
+  // bounce-loop this mechanism exists to prevent. The flag must be left in
+  // place (not consumed) until an actual identity is available to check it
+  // against.
+  it("consume returns false but does NOT remove the flag when no identity has resolved yet (null)", () => {
     markOnboardingSaveEscaped("user-a")
 
     expect(consumeOnboardingSaveEscapeFlag(null)).toBe(false)
+    // The flag must still be there for the next, identity-resolved call.
+    expect(consumeOnboardingSaveEscapeFlag("user-a")).toBe(true)
   })
 
   it("mark no-ops (and consume finds nothing) when no user id is available to bind to", () => {

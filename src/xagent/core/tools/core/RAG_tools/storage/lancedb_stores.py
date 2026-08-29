@@ -33,6 +33,8 @@ from ..utils.string_utils import (
 )
 from ..utils.user_permissions import UserPermissions
 from .contracts import (
+    USER_ID_FILTER_UNSET,
+    ActiveGenerationStore,
     DocumentRecord,
     FilterCondition,
     FilterExpression,
@@ -41,6 +43,7 @@ from .contracts import (
     MainPointerStore,
     MetadataStore,
     PromptTemplateStore,
+    UserIdFilter,
     VectorIndexStore,
     build_filter_from_dict,
 )
@@ -4814,4 +4817,270 @@ class LanceDBMainPointerStore(MainPointerStore):
         """Async version of delete_main_pointer."""
         return self.delete_main_pointer(
             collection, doc_id, step_type, model_tag, user_id
+        )
+
+
+class LanceDBActiveGenerationStore(ActiveGenerationStore):
+    """LanceDB implementation for active generation pointer management."""
+
+    LEGACY_USER_ID = -1
+
+    _MERGE_KEYS = (
+        "collection",
+        "doc_id",
+        "parse_hash",
+        "user_id",
+        "model_tag",
+    )
+
+    def __init__(self) -> None:
+        self._sync_conn: Optional[DBConnection] = None
+        # Process-local guard so we only run schema setup once per store
+        # instance; subsequent publish/get/list calls skip the
+        # list_table_names round-trip on the hot path.
+        self._table_ensured: bool = False
+
+    def _get_sync_connection(self) -> DBConnection:
+        if self._sync_conn is None:
+            self._sync_conn = get_connection_from_env()
+        return self._sync_conn
+
+    def _ensure_table(self) -> None:
+        if self._table_ensured:
+            return
+        from ..LanceDB.schema_manager import ensure_active_generations_table
+
+        ensure_active_generations_table(self._get_sync_connection())
+        self._table_ensured = True
+
+    @staticmethod
+    def _normalize_model_tag(model_tag: Optional[str]) -> str:
+        return model_tag if model_tag is not None else ""
+
+    @classmethod
+    def _normalize_user_id(cls, user_id: Optional[int]) -> int:
+        """Map legacy user_id=None scope to a non-null merge key value."""
+        return cls.LEGACY_USER_ID if user_id is None else user_id
+
+    @classmethod
+    def _denormalize_record_user_id(cls, record: Dict[str, Any]) -> Dict[str, Any]:
+        """Hide the internal legacy-user sentinel from store callers."""
+        if record.get("user_id") != cls.LEGACY_USER_ID:
+            return record
+        normalized_record = dict(record)
+        normalized_record["user_id"] = None
+        return normalized_record
+
+    @classmethod
+    def _scope_filter_str(
+        cls,
+        collection: str,
+        doc_id: str,
+        parse_hash: str,
+        user_id: Optional[int],
+        normalized_tag: str,
+    ) -> str:
+        """Build a SQL filter selecting exactly one pointer scope."""
+        normalized_user_id = cls._normalize_user_id(user_id)
+        filter_expr: FilterExpression = (
+            FilterCondition(
+                field="collection", operator=FilterOperator.EQ, value=collection
+            ),
+            FilterCondition(field="doc_id", operator=FilterOperator.EQ, value=doc_id),
+            FilterCondition(
+                field="parse_hash", operator=FilterOperator.EQ, value=parse_hash
+            ),
+            FilterCondition(
+                field="user_id", operator=FilterOperator.EQ, value=normalized_user_id
+            ),
+            FilterCondition(
+                field="model_tag", operator=FilterOperator.EQ, value=normalized_tag
+            ),
+        )
+        return translate_filter_expression(filter_expr)
+
+    def publish_active_generation(
+        self,
+        collection: str,
+        doc_id: str,
+        parse_hash: str,
+        user_id: Optional[int],
+        model_tag: Optional[str],
+        generation_id: str,
+        config_hash: str,
+        operator: Optional[str] = None,
+    ) -> None:
+        from ..LanceDB.schema_manager import _safe_close_table
+
+        conn = self._get_sync_connection()
+        self._ensure_table()
+        table = conn.open_table("active_generations")
+        normalized_tag = self._normalize_model_tag(model_tag)
+        normalized_user_id = self._normalize_user_id(user_id)
+
+        try:
+            now = datetime.now(timezone.utc).replace(tzinfo=None)
+
+            # Look up created_at on the already-opened table to avoid the
+            # extra open_table/close round-trip that calling
+            # get_active_generation() would incur.
+            filter_str = self._scope_filter_str(
+                collection, doc_id, parse_hash, user_id, normalized_tag
+            )
+            existing_rows = table.search().where(filter_str).to_arrow().to_pylist()
+            created_at = existing_rows[0]["created_at"] if existing_rows else now
+
+            record = {
+                "collection": collection,
+                "doc_id": doc_id,
+                "parse_hash": parse_hash,
+                "user_id": normalized_user_id,
+                "model_tag": normalized_tag,
+                "generation_id": generation_id,
+                "config_hash": config_hash,
+                "created_at": created_at,
+                "updated_at": now,
+                "published_at": now,
+                "operator": operator or "unknown",
+            }
+
+            (
+                table.merge_insert(on=list(self._MERGE_KEYS))
+                .when_matched_update_all()
+                .when_not_matched_insert_all()
+                .execute([record])
+            )
+        finally:
+            _safe_close_table(table)
+
+    def get_active_generation(
+        self,
+        collection: str,
+        doc_id: str,
+        parse_hash: str,
+        user_id: Optional[int],
+        model_tag: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        from ..LanceDB.schema_manager import _safe_close_table
+
+        conn = self._get_sync_connection()
+        self._ensure_table()
+        table = conn.open_table("active_generations")
+        normalized_tag = self._normalize_model_tag(model_tag)
+
+        try:
+            filter_str = self._scope_filter_str(
+                collection, doc_id, parse_hash, user_id, normalized_tag
+            )
+            result = table.search().where(filter_str).to_arrow()
+            if len(result) == 0:
+                return None
+            rows = result.to_pylist()
+            return cast(Dict[str, Any], self._denormalize_record_user_id(rows[0]))
+        finally:
+            _safe_close_table(table)
+
+    def list_active_generations(
+        self,
+        collection: str,
+        *,
+        doc_id: Optional[str] = None,
+        user_id: UserIdFilter = USER_ID_FILTER_UNSET,
+        model_tag: Optional[str] = None,
+        limit: int = 1000,
+    ) -> List[Dict[str, Any]]:
+        from ..LanceDB.schema_manager import _safe_close_table
+
+        conn = self._get_sync_connection()
+        self._ensure_table()
+        table = conn.open_table("active_generations")
+
+        try:
+            conditions: List[FilterExpression] = [
+                FilterCondition(
+                    field="collection", operator=FilterOperator.EQ, value=collection
+                )
+            ]
+            if doc_id is not None:
+                conditions.append(
+                    FilterCondition(
+                        field="doc_id", operator=FilterOperator.EQ, value=doc_id
+                    )
+                )
+            if user_id is not USER_ID_FILTER_UNSET:
+                conditions.append(
+                    FilterCondition(
+                        field="user_id",
+                        operator=FilterOperator.EQ,
+                        value=self._normalize_user_id(cast(Optional[int], user_id)),
+                    )
+                )
+            if model_tag is not None:
+                conditions.append(
+                    FilterCondition(
+                        field="model_tag",
+                        operator=FilterOperator.EQ,
+                        value=self._normalize_model_tag(model_tag),
+                    )
+                )
+
+            filter_expr: FilterExpression = (
+                conditions[0] if len(conditions) == 1 else tuple(conditions)
+            )
+            filter_str = translate_filter_expression(filter_expr)
+            result = table.search().where(filter_str).limit(limit).to_arrow()
+            rows = result.to_pylist()
+            return [self._denormalize_record_user_id(row) for row in rows]
+        finally:
+            _safe_close_table(table)
+
+    async def publish_active_generation_async(
+        self,
+        collection: str,
+        doc_id: str,
+        parse_hash: str,
+        user_id: Optional[int],
+        model_tag: Optional[str],
+        generation_id: str,
+        config_hash: str,
+        operator: Optional[str] = None,
+    ) -> None:
+        return self.publish_active_generation(
+            collection,
+            doc_id,
+            parse_hash,
+            user_id,
+            model_tag,
+            generation_id,
+            config_hash,
+            operator,
+        )
+
+    async def get_active_generation_async(
+        self,
+        collection: str,
+        doc_id: str,
+        parse_hash: str,
+        user_id: Optional[int],
+        model_tag: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        return self.get_active_generation(
+            collection, doc_id, parse_hash, user_id, model_tag
+        )
+
+    async def list_active_generations_async(
+        self,
+        collection: str,
+        *,
+        doc_id: Optional[str] = None,
+        user_id: UserIdFilter = USER_ID_FILTER_UNSET,
+        model_tag: Optional[str] = None,
+        limit: int = 1000,
+    ) -> List[Dict[str, Any]]:
+        return self.list_active_generations(
+            collection,
+            doc_id=doc_id,
+            user_id=user_id,
+            model_tag=model_tag,
+            limit=limit,
         )

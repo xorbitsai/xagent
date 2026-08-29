@@ -193,7 +193,12 @@ def search_hybrid(
     user_id: Optional[int] = None,
     is_admin: bool = False,
 ) -> HybridSearchResponse:
-    """Performs hybrid search, combining dense and sparse retrieval."""
+    """Perform hybrid search, combining dense and sparse retrieval.
+
+    Raises:
+        DocumentValidationError: If collection, model_tag, query_text, or top_k is invalid.
+        VectorValidationError: If query-vector validation fails.
+    """
     validate_search_common_inputs(collection, model_tag, top_k)
     validate_search_query_text(query_text)
     validate_query_vector(query_vector)

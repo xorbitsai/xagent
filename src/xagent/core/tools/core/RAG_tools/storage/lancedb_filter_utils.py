@@ -5,7 +5,6 @@ Shared functions for converting abstract filter expressions to LanceDB syntax.
 
 from typing import Any
 
-from ..utils.string_utils import escape_lancedb_string
 from .contracts import FilterCondition, FilterExpression, FilterOperator
 
 
@@ -38,7 +37,7 @@ def translate_condition(condition: FilterCondition) -> str:
         values = ", ".join(format_value(v) for v in value)
         return f"{field} IN ({values})"
     elif op == FilterOperator.CONTAINS:
-        return f"{field} LIKE '%{escape_lancedb_string(value)}%'"
+        return f"strpos({field}, {format_value(value)}) > 0"
     elif op == FilterOperator.IS_NULL:
         return f"{field} IS NULL"
     elif op == FilterOperator.IS_NOT_NULL:
@@ -63,7 +62,10 @@ def format_value(value: Any) -> str:
     elif value is None:
         return "NULL"
     else:
-        return f"'{escape_lancedb_string(value)}'"
+        # DataFusion SQL treats backslashes literally in ordinary string literals;
+        # only single quotes need to be doubled.
+        string_value = str(value).replace("'", "''")
+        return f"'{string_value}'"
 
 
 def translate_filter_expression(expr: FilterExpression) -> str:

@@ -626,11 +626,10 @@ class TestSearchSparse:
         handle = LanceDBCollectionHandle.__new__(LanceDBCollectionHandle)
         results = handle._substring_fallback(
             table=mock_table,
-            collection="test_col",
             query_text="test query",
             model_tag="test_model",
             top_k=5,
-            filters=None,
+            filter_expr=None,
             current_warnings=warnings,
             is_admin=True,
         )

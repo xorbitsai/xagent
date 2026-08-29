@@ -2244,6 +2244,8 @@ class LanceDBVectorIndexStore(VectorIndexStore):
         top_k: int,
         filters: Optional[FilterExpression] = None,
         vector_column_name: str = "vector",
+        user_id: Optional[int] = None,
+        is_admin: bool = False,
     ) -> List[Dict[str, Any]]:
         """Execute vector search using async LanceDB API.
 
@@ -2267,7 +2269,7 @@ class LanceDBVectorIndexStore(VectorIndexStore):
 
             # Build filter expression
             backend_filter = self.build_filter_expression(
-                filters, user_id=None, is_admin=False
+                filters, user_id=user_id, is_admin=is_admin
             )
 
             # Build search query
@@ -2305,7 +2307,7 @@ class LanceDBVectorIndexStore(VectorIndexStore):
             return results
         except Exception as exc:
             logger.error("Async vector search failed: %s", exc)
-            return []
+            raise
         finally:
             _safe_close_table(table)
 
@@ -2317,6 +2319,8 @@ class LanceDBVectorIndexStore(VectorIndexStore):
         top_k: int,
         filters: Optional[FilterExpression] = None,
         text_column_name: str = "text",
+        user_id: Optional[int] = None,
+        is_admin: bool = False,
     ) -> List[Dict[str, Any]]:
         """Execute full-text search using async LanceDB FTS API.
 
@@ -2331,7 +2335,7 @@ class LanceDBVectorIndexStore(VectorIndexStore):
 
             # Build filter expression
             backend_filter = self.build_filter_expression(
-                filters, user_id=None, is_admin=False
+                filters, user_id=user_id, is_admin=is_admin
             )
 
             # Build FTS search query
@@ -2364,7 +2368,7 @@ class LanceDBVectorIndexStore(VectorIndexStore):
 
         except Exception as exc:
             logger.error("Async FTS search failed: %s", exc)
-            return []
+            raise
         finally:
             _safe_close_table(table)
 
@@ -2410,42 +2414,22 @@ class LanceDBVectorIndexStore(VectorIndexStore):
                 # Just apply user filter
                 combined_filter = UserPermissions.get_user_filter(user_id, is_admin)
 
-            # Helper method to select columns from a batch
-            def _select_columns(batch: Any, cols: Optional[Sequence[str]]) -> Any:
-                if cols is None:
-                    return batch
-                arrays = []
-                names = []
-                for col_name in cols:
-                    idx = batch.schema.get_field_index(col_name)
-                    if idx != -1:
-                        arrays.append(batch.column(idx))
-                        names.append(col_name)
-                if not arrays:
-                    return pa.RecordBatch.from_arrays([], [])
-                return pa.RecordBatch.from_arrays(arrays, names)
-
-            # Use LanceDB async to_batches() with column projection for efficiency
-            # Note: LanceDB to_batches supports columns parameter to avoid reading all data
+            # Use the async query batch API supported by the locked LanceDB version.
+            query = table.query()
             if combined_filter:
-                async for batch in table.to_batches(
-                    filter=combined_filter,
-                    batch_size=batch_size,
-                    columns=columns,  # Pass columns directly to avoid reading all data
-                ):
-                    if batch.num_rows > 0:
-                        yield batch
-            else:
-                async for batch in table.to_batches(
-                    batch_size=batch_size,
-                    columns=columns,  # Pass columns directly to avoid reading all data
-                ):
-                    if batch.num_rows > 0:
-                        yield batch
+                query = query.where(combined_filter)
+            if columns is not None:
+                query = query.select(list(columns))
+
+            batch_reader = await query.to_batches(max_batch_length=batch_size)
+            async for batch in batch_reader:
+                if batch.num_rows > 0:
+                    yield batch
         except Exception as exc:
-            logger.debug(
+            logger.error(
                 "Async batch iteration failed for table '%s': %s", table_name, exc
             )
+            raise
         finally:
             _safe_close_table(table)
 

@@ -406,6 +406,11 @@ def _normalize_skill_files(files: dict[str, bytes]) -> dict[str, bytes]:
 # failure can only have come from one of these.
 _PARSER_DECODED_FILES = ("SKILL.md", "template.md")
 
+# ``parse_bundle`` wants a name, but validation happens before naming matters
+# and the value is never surfaced. Say so, so it reads as deliberate if it
+# ever does reach a message.
+_VALIDATION_PLACEHOLDER_NAME = "<bundle under validation>"
+
 
 def _is_utf8(content: bytes) -> bool:
     try:
@@ -441,9 +446,7 @@ def _assert_bundle_parses(files: dict[str, bytes]) -> None:
     from xagent.skills.parser import SkillParser
 
     try:
-        SkillParser.parse_bundle(name="candidate", files=files)
-    except HTTPException:
-        raise
+        SkillParser.parse_bundle(name=_VALIDATION_PLACEHOLDER_NAME, files=files)
     except UnicodeDecodeError as exc:
         # parse_bundle does not say which file failed, and that is the
         # actionable half of the message. Only the files the parser actually
@@ -514,11 +517,10 @@ def _write_personal_skill(
 ) -> None:
     """Persist one personal skill, refusing anything that would not load.
 
-    The bundle is validated against the parser *before* the commit, so a
-    committed row is one the skill machinery can read. Nothing here has to be
-    undone afterwards, which is the point: a compensating delete would have to
-    identify the row it is undoing, and a name or a recycled primary key does
-    not identify it.
+    The bundle goes through ``_assert_bundle_parses`` before the commit, so a
+    committed row is one the skill machinery can read and nothing here has to
+    be undone afterwards. See that function for why undoing is the thing worth
+    avoiding.
     """
     from xagent.skills.library import guess_media_type
     from xagent.web.models.skill import UserSkill, UserSkillFile
@@ -621,7 +623,9 @@ def _delete_personal_skill(*, db: Any, user: User, name: str) -> None:
     db.commit()
 
 
-def _summary_for_committed_write(*, name: str, files: dict[str, bytes]) -> SkillSummary:
+def _personal_summary_from_bundle(
+    *, name: str, files: dict[str, bytes]
+) -> SkillSummary:
     """Describe a personal skill that is committed but not visible yet.
 
     The write is durable and was parsed before it landed, so the request
@@ -910,10 +914,16 @@ async def delete_installed(
     """Remove a user-installed skill. Builtin / external are refused.
 
     ``name`` is resolved through the manager, so every provider keeps its own
-    namespace here. Recovery by primary key lives on its own route rather than
-    as a prefix of this one: ``:`` is not reserved by the provider contracts,
-    and the team create path does not run ``_validate_skill_name``, so a
-    compliant provider may legitimately own a record named ``id:42``.
+    namespace here -- including names that look like an addressing scheme.
+    ``:`` is not reserved by the provider contracts and the team create path
+    does not run ``_validate_skill_name``, so a compliant provider may
+    legitimately own a record named ``id:42``; parsing such a prefix here
+    would delete the caller's unrelated personal row 42 instead.
+
+    There is deliberately no by-primary-key counterpart: the column has no
+    AUTOINCREMENT, so a client retrying a lost delete would remove whatever
+    reused the id. A row the skill library cannot load is therefore stuck
+    rather than recoverable -- tracked in #1911.
     """
     mgr = await _get_scoped_manager(request, context, db)
     skill = await mgr.get_skill(name)
@@ -1000,13 +1010,18 @@ async def create_skill(
             )
         # The personal write is durable and was parsed before it landed, so
         # the request succeeded and the read side is merely behind. See
-        # _summary_for_committed_write for why this is not a 5xx.
+        # _personal_summary_from_bundle for why this is not a 5xx.
+        logger.info(
+            "Skill Hub: created user skill %r (%d bytes)",
+            body.name,
+            len(body.skill_md),
+        )
         logger.warning(
             "Skill Hub: created user skill %r but the library does not serve "
             "it yet; answering from the validated bundle",
             body.name,
         )
-        return _summary_for_committed_write(name=body.name, files=files)
+        return _personal_summary_from_bundle(name=body.name, files=files)
     logger.info(
         "Skill Hub: created user skill %r (%d bytes)", body.name, len(body.skill_md)
     )
@@ -1231,12 +1246,19 @@ async def install_skill(
                     "the team scope but the provider does not serve it back."
                 ),
             )
+        logger.info(
+            "Skill Hub: installed %s skill %r (v%s, scan=%s)",
+            registry.id,
+            body.slug,
+            body.version or "latest",
+            scan_status,
+        )
         logger.warning(
             "Skill Hub: installed %r but the library does not serve it yet; "
             "answering from the validated bundle",
             body.slug,
         )
-        return _summary_for_committed_write(name=body.slug, files=files)
+        return _personal_summary_from_bundle(name=body.slug, files=files)
     logger.info(
         "Skill Hub: installed %s skill %r (v%s, scan=%s)",
         registry.id,

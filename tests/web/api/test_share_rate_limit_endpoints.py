@@ -27,6 +27,27 @@ from .conftest import _admin_headers, _direct_db_session, _setup_admin, client
 pytestmark = pytest.mark.usefixtures("_test_db")
 
 
+@pytest.fixture(autouse=True)
+def _isolate_terminal_task_event_subscription(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Keep rate-limit socket doubles focused on their pre-existing seam."""
+
+    from xagent.web.api import public_chat_access as pca
+
+    monkeypatch.setattr(pca, "attach_terminal_task_events", AsyncMock())
+    monkeypatch.setattr(pca, "detach_terminal_task_events", AsyncMock())
+    monkeypatch.setattr(
+        pca,
+        "resolve_initial_terminal_task_event_cursor",
+        AsyncMock(
+            side_effect=lambda *, after_event_id, **_kwargs: (
+                0 if after_event_id is None else after_event_id
+            )
+        ),
+    )
+
+
 def _user_id() -> int:
     _setup_admin()
     db = _direct_db_session()

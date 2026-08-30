@@ -46,6 +46,10 @@ class TaskExecutionCommand(Base):  # type: ignore
     # a live run stay with its lease owner; once that lease expires another
     # worker may recover them from the durable inbox.
     target_run_id = Column(String(64), nullable=True)
+    # Legacy rows created before this snapshot existed remain NULL: treating
+    # an unknown historical version as a real version 0 would create a false
+    # run-correlation tuple during recovery.
+    target_state_version = Column(Integer, nullable=True)
     target_runner_id = Column(String(255), nullable=True)
 
     status = Column(

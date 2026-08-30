@@ -15,6 +15,8 @@ type TestWebSocketMessage = {
   state_version?: number
   control_state?: string
   request_id?: string
+  old_task_id?: number
+  new_task_id?: number
 }
 
 const webSocketOptions = vi.hoisted(() => ({
@@ -46,6 +48,7 @@ const webSocketOptions = vi.hoisted(() => ({
     onConnect?: () => void
     uploadFiles?: unknown
     token?: string
+    taskId?: number
   },
   all: [] as Array<{
     onMessage?: (message: TestWebSocketMessage) => void
@@ -108,6 +111,7 @@ vi.mock("@/hooks/use-websocket", () => ({
     onConnect?: () => void
     uploadFiles?: unknown
     token?: string
+    taskId?: number
   }) => {
     webSocketOptions.current = options
     webSocketOptions.all.push(options)
@@ -552,6 +556,33 @@ describe("AppProvider websocket message routing", () => {
   afterEach(() => {
     cleanup()
     localStorage.clear()
+  })
+
+  it("adopts the real task_id_updated frame for the next connection", async () => {
+    render(
+      <AppProvider token="token">
+        <SeedExistingTask />
+        <StateProbe />
+      </AppProvider>
+    )
+    await waitFor(() => expect(screen.getByTestId("task-id")).toHaveTextContent("1"))
+    const onMessage = webSocketOptions.current?.onMessage
+    expect(onMessage).toBeDefined()
+
+    act(() => {
+      onMessage?.({
+        type: "task_id_updated",
+        timestamp: "2026-08-28T10:00:00Z",
+        old_task_id: 1,
+        new_task_id: 9,
+      })
+    })
+
+    await waitFor(() => {
+      expect(screen.getByTestId("task-id")).toHaveTextContent("9")
+      expect(webSocketOptions.current?.taskId).toBe(9)
+    })
+    expect(routerPushMock).toHaveBeenCalledWith("/task/9")
   })
 
   it("routes historical assistant transcript rows to chat and progress events to trace", async () => {

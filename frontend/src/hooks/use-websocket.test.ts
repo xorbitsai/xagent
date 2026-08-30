@@ -126,10 +126,12 @@ function writeAuthCache(
 
 describe("useWebSocket message delivery", () => {
   beforeEach(() => {
+    vi.useRealTimers()
     MockWebSocket.instances = []
     MockWebSocket.constructorError = null
     sessionConnections.clear()
     localStorage.clear()
+    sessionStorage.clear()
     authState.user = { id: "user-1" }
     authState.token = "token"
     authState.refreshToken = "refresh-token"
@@ -189,6 +191,102 @@ describe("useWebSocket message delivery", () => {
 
     expect(result.current.sendMessage({ type: "new_conversation" })).toBe("not_sent")
   })
+
+  it("reconnects after the last terminal-event cursor and ignores replay duplicates", async () => {
+    const onMessage = vi.fn()
+    const hook = renderHook(() => useWebSocket({
+      url: "ws://localhost?token=secret",
+      taskId: 7,
+      onMessage,
+    }))
+    await waitFor(() => expect(MockWebSocket.instances).toHaveLength(1))
+    const first = MockWebSocket.instances[0]
+    expect(first.url).toContain("token=secret")
+    expect(first.url).toContain("terminal_event_after=0")
+    act(() => first.open())
+
+    act(() => {
+      first.receive({
+        type: "agent_error",
+        terminal_event_cursor: 12,
+        terminal_event_id: "event-12",
+        message: "Task command resume failed.",
+        task_id: 7,
+      })
+      first.receive({
+        type: "agent_error",
+        terminal_event_cursor: 12,
+        terminal_event_id: "event-12",
+        message: "Task command resume failed.",
+        task_id: 7,
+      })
+    })
+    expect(onMessage).toHaveBeenCalledOnce()
+
+    vi.useFakeTimers()
+    act(() => first.triggerClose(1011))
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1000)
+    })
+    expect(MockWebSocket.instances).toHaveLength(2)
+    expect(MockWebSocket.instances[1].url).toContain("terminal_event_after=12")
+    hook.unmount()
+  })
+
+
+  it("moves a rebound task terminal cursor to the created task", async () => {
+    const onMessage = vi.fn()
+    const hook = renderHook(
+      ({ taskId }) => useWebSocket({
+        url: "ws://localhost?token=secret",
+        taskId,
+        onMessage,
+      }),
+      { initialProps: { taskId: 7 } },
+    )
+    await waitFor(() => expect(MockWebSocket.instances).toHaveLength(1))
+    const first = MockWebSocket.instances[0]
+    act(() => first.open())
+
+    act(() => {
+      first.receive({
+        type: "task_id_updated",
+        old_task_id: 7,
+        new_task_id: 9,
+      })
+      first.receive({
+        type: "agent_error",
+        terminal_event_cursor: 12,
+        terminal_event_id: "event-12",
+        message: "Task command resume failed.",
+        task_id: 9,
+      })
+    })
+    expect(onMessage).toHaveBeenNthCalledWith(1, expect.objectContaining({
+      type: "task_id_updated",
+      old_task_id: 7,
+      new_task_id: 9,
+    }))
+
+    hook.rerender({ taskId: 9 })
+    await waitFor(() => expect(MockWebSocket.instances).toHaveLength(2))
+    const second = MockWebSocket.instances[1]
+    expect(second.url).toContain("terminal_event_after=12")
+    act(() => {
+      second.open()
+      second.receive({
+        type: "agent_error",
+        terminal_event_cursor: 12,
+        terminal_event_id: "event-12",
+        message: "Task command resume failed.",
+        task_id: 9,
+      })
+    })
+
+    expect(onMessage).toHaveBeenCalledTimes(2)
+    hook.unmount()
+  })
+
 
   it("resolves only after the server accepts the durable message", async () => {
     const { result } = renderHook(() => useWebSocket({
@@ -604,7 +702,7 @@ describe("useWebSocket normalized connections", () => {
     vi.unstubAllGlobals()
   })
 
-  it("normalizes an undefined connection through the unchanged legacy URL", async () => {
+  it("normalizes a legacy URL with the terminal-event replay cursor", async () => {
     renderHook(() => useWebSocket({
       url: "ws://localhost",
       taskId: 7,
@@ -612,7 +710,9 @@ describe("useWebSocket normalized connections", () => {
     }))
 
     await waitFor(() => expect(MockWebSocket.instances).toHaveLength(1))
-    expect(MockWebSocket.instances[0].url).toBe("ws://localhost/ws/chat/7?token=token")
+    expect(MockWebSocket.instances[0].url).toBe(
+      "ws://localhost/ws/chat/7?token=token&terminal_event_after=0",
+    )
     expect(MockWebSocket.instances[0].protocols).toBeUndefined()
   })
 
@@ -1276,6 +1376,48 @@ describe("useWebSocket normalized connections", () => {
     ])
   })
 
+  it("reconnects a Session task after its last terminal-event cursor", async () => {
+    const onMessage = vi.fn()
+    const connection = sessionConnection({
+      taskBindingMode: "session-subprotocol",
+    })
+    const hook = renderHook(() => useWebSocket({
+      connection,
+      taskId: 42,
+      onMessage,
+    }))
+
+    await waitFor(() => expect(MockWebSocket.instances).toHaveLength(1))
+    const first = MockWebSocket.instances[0]
+    expect(first.url).toBe(
+      "wss://embed.example/v1/external/chat/sessions/ws?terminal_event_after=0",
+    )
+    expect(first.protocols).toContain("xagent-session-task.42")
+    first.protocol = "xagent-session-v1"
+    act(() => first.open())
+
+    act(() => first.receive({
+      type: "agent_error",
+      terminal_event_cursor: 12,
+      terminal_event_id: "event-12",
+      message: "Task command resume failed.",
+      task_id: 42,
+    }))
+    expect(onMessage).toHaveBeenCalledOnce()
+
+    act(() => hook.result.current.disconnect())
+    act(() => hook.result.current.connect())
+
+    expect(MockWebSocket.instances).toHaveLength(2)
+    expect(MockWebSocket.instances[1].url).toBe(
+      "wss://embed.example/v1/external/chat/sessions/ws?terminal_event_after=12",
+    )
+    expect(MockWebSocket.instances[1].protocols).toContain(
+      "xagent-session-task.42",
+    )
+    hook.unmount()
+  })
+
   it.each([4001, 4003, 1011])(
     "runs the Session close delegate first and suppresses legacy handling for %s",
     async (code) => {
@@ -1560,12 +1702,12 @@ describe("useWebSocket normalized connections", () => {
       url: "ws://localhost",
       taskId: 1,
       token: "token",
-    }, "ws://localhost/ws/chat/1?token=token"],
+    }, "ws://localhost/ws/chat/1?token=token&terminal_event_after=0"],
     ["an explicit empty legacy token", {
       url: "ws://localhost",
       taskId: 1,
       token: "",
-    }, "ws://localhost/ws/chat/1"],
+    }, "ws://localhost/ws/chat/1?terminal_event_after=0"],
     ["an explicit Session descriptor", {
       connection: sessionConnection(),
     }, "wss://embed.example/v1/external/chat/sessions/ws"],
@@ -1611,7 +1753,9 @@ describe("useWebSocket normalized connections", () => {
     }))
     await waitFor(() => expect(MockWebSocket.instances).toHaveLength(1))
     const oldSocket = MockWebSocket.instances[0]
-    expect(oldSocket.url).toBe("ws://localhost/ws/chat/1?token=old-auth-token")
+    expect(oldSocket.url).toBe(
+      "ws://localhost/ws/chat/1?token=old-auth-token&terminal_event_after=0",
+    )
     act(() => oldSocket.open())
     vi.useFakeTimers()
 
@@ -1623,7 +1767,9 @@ describe("useWebSocket normalized connections", () => {
     hook.rerender()
     expect(MockWebSocket.instances).toHaveLength(2)
     const refreshedSocket = MockWebSocket.instances[1]
-    expect(refreshedSocket.url).toBe("ws://localhost/ws/chat/1?token=new-auth-token")
+    expect(refreshedSocket.url).toBe(
+      "ws://localhost/ws/chat/1?token=new-auth-token&terminal_event_after=0",
+    )
     act(() => refreshedSocket.open())
 
     await act(async () => {

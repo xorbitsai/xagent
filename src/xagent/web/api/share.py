@@ -199,9 +199,15 @@ async def websocket_share_chat_endpoint(
     websocket: WebSocket,
     task_id: int,
     token: str = Query(..., description="Authentication token"),
+    terminal_event_after: int | None = Query(
+        None,
+        ge=0,
+        description="Last terminal task-command event cursor received",
+    ),
 ) -> None:
     await share_chat_websocket_endpoint(
         websocket=websocket,
         task_id=task_id,
         token=token,
+        terminal_event_after=terminal_event_after,
     )

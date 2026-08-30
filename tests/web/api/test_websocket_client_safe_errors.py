@@ -26,6 +26,9 @@ from xagent.web.models.user import User
 from xagent.web.services.mcp_runtime import (
     MCPBuiltinOAuthActorPolicyRequiredError,
 )
+from xagent.web.services.task_command_terminal_events import (
+    render_terminal_task_event_message,
+)
 from xagent.web.services.task_orchestrator import TaskTurnOrchestrator
 
 from .conftest import _direct_db_session
@@ -195,8 +198,12 @@ def test_no_delivery_producer_can_bypass_the_client_safe_message() -> None:
     # -- one fewer site on which raw text can reach a chat client -- and the
     # producer count above is unchanged, so the census moved by exactly the
     # one site this PR changed.
-    assert result.error_payloads == 52, (
-        f"expected exactly 52 error payloads, matched {result.error_payloads}; "
+    # 52 -> 50 here: terminal command failures now persist a presentation
+    # draft and are rendered by the durable delivery path, removing the two
+    # direct error-payload broadcasts that previously handled internal and
+    # external command failures.
+    assert result.error_payloads == 50, (
+        f"expected exactly 50 error payloads, matched {result.error_payloads}; "
         "review the changed sites and bump deliberately"
     )
     # Every allowlist entry must be earned by a live call site: a stale entry
@@ -1807,6 +1814,22 @@ async def audit_failure(audit, error):
     assert not _guard_offenders(source)
 
 
+@pytest.mark.parametrize(
+    "sink",
+    ["send_websocket_text", "fanout_websocket_text"],
+)
+def test_guard_checks_ordered_websocket_writer_payloads(sink: str) -> None:
+    source = f"""
+async def leak(websocket, error):
+    await {sink}(
+        websocket,
+        json.dumps({{"type": "error", "message": str(error)}}),
+    )
+"""
+
+    assert _guard_offenders(source)
+
+
 # The concurrent-delete race (TaskCommandTaskMissing between lookup and
 # enqueue) is pinned in tests/web/services/test_task_command_transport.py:
 # recovery-allowed returns None, and the strict path converts to
@@ -1822,25 +1845,20 @@ async def test_terminal_command_failure_keeps_context_and_redacts_detail() -> No
     redaction must not also delete the command context the client used to
     get, and the secret must not ride along in any field.
     """
-    connection_manager = MagicMock()
-    connection_manager.broadcast_to_task = AsyncMock()
     command = SimpleNamespace(
         kind=websocket_api.TaskCommandKind.PAUSE,
         task_id=7,
         command_id="cmd-7",
         payload={},
     )
-    with patch.object(websocket_api, "manager", connection_manager):
-        await websocket_api._broadcast_terminal_command_error(
-            command, RuntimeError(f"lease lost at {SECRET}")
-        )
-    (payload, task_id) = connection_manager.broadcast_to_task.await_args.args
-    assert task_id == 7
-    assert SECRET not in repr(payload)
-    assert payload["message"] == (
-        f"Task command pause failed: {websocket_api.CLIENT_SAFE_VALIDATION_ERROR}"
+    draft = await websocket_api._terminal_command_event_draft(
+        command, RuntimeError(f"lease lost at {SECRET}")
     )
-    assert payload["command_kind"] == "pause"
+    message = render_terminal_task_event_message(
+        SimpleNamespace(message_code=draft.message_code, command_kind="pause")
+    )
+    assert SECRET not in str(message)
+    assert message == "Task command pause failed: Task execution failed."
 
 
 @pytest.mark.asyncio

@@ -15,6 +15,29 @@ from xagent.web.api import public_chat_access
 from xagent.web.api.websocket import WebSocketPrincipal
 
 
+@pytest.fixture(autouse=True)
+def _detach_terminal_event_transport_from_db_boundary_tests(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """These tests own only auth DB boundaries, not terminal-event polling."""
+
+    subscription = SimpleNamespace(close=AsyncMock())
+    monkeypatch.setattr(
+        public_chat_access,
+        "attach_terminal_task_events",
+        AsyncMock(return_value=subscription),
+    )
+    monkeypatch.setattr(
+        public_chat_access,
+        "resolve_initial_terminal_task_event_cursor",
+        AsyncMock(
+            side_effect=lambda *, after_event_id, **_kwargs: (
+                0 if after_event_id is None else after_event_id
+            )
+        ),
+    )
+
+
 class _SingleMessageWebSocket:
     def __init__(self, message: dict[str, object]) -> None:
         self._message = json.dumps(message)

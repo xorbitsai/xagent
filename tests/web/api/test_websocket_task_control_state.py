@@ -7,6 +7,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 from anyio import BrokenResourceError, ClosedResourceError
+from fastapi import WebSocketDisconnect
 
 from xagent.web.api import public_chat_access
 from xagent.web.api import websocket as websocket_api
@@ -17,6 +18,32 @@ from xagent.web.api.websocket import (
 from xagent.web.models.database import Base, get_db, get_engine, init_db
 from xagent.web.models.task import Task, TaskStatus
 from xagent.web.models.user import User
+
+
+@pytest.fixture(autouse=True)
+def _isolate_terminal_event_transport(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """This file tests control envelopes, not durable event subscriptions."""
+
+    attach = AsyncMock(return_value=SimpleNamespace(close=AsyncMock()))
+    resolve = AsyncMock(
+        side_effect=lambda *, after_event_id, **_kwargs: (
+            0 if after_event_id is None else after_event_id
+        )
+    )
+    monkeypatch.setattr(websocket_api, "attach_terminal_task_events", attach)
+    monkeypatch.setattr(
+        websocket_api,
+        "resolve_initial_terminal_task_event_cursor",
+        resolve,
+    )
+    monkeypatch.setattr(public_chat_access, "attach_terminal_task_events", attach)
+    monkeypatch.setattr(
+        public_chat_access,
+        "resolve_initial_terminal_task_event_cursor",
+        resolve,
+    )
 
 
 class _BlockingWebSocket:
@@ -30,6 +57,21 @@ class _BlockingWebSocket:
         self.receive_started.set()
         await asyncio.Future()
         raise AssertionError("unreachable")
+
+
+class _SingleMessageWebSocket:
+    def __init__(self, message: dict[str, object]) -> None:
+        self._message = json.dumps(message)
+        self._received = False
+
+    async def accept(self) -> None:
+        return None
+
+    async def receive_text(self) -> str:
+        if self._received:
+            raise WebSocketDisconnect()
+        self._received = True
+        return self._message
 
 
 class _ClosedWebSocket:
@@ -181,7 +223,7 @@ async def test_websocket_endpoint_disconnects_when_cancelled(monkeypatch) -> Non
     monkeypatch.setattr(websocket_api, "handle_status_request", AsyncMock())
 
     endpoint = asyncio.create_task(
-        websocket_api.websocket_chat_endpoint(websocket, task_id, "token")
+        websocket_api.websocket_chat_endpoint(websocket, task_id, "token", None)
     )
     await websocket.receive_started.wait()
 
@@ -191,6 +233,124 @@ async def test_websocket_endpoint_disconnects_when_cancelled(monkeypatch) -> Non
     with pytest.raises(asyncio.CancelledError):
         await endpoint
 
+    assert task_id not in connection_manager.active_connections
+
+
+@pytest.mark.asyncio
+async def test_websocket_endpoint_retires_connection_before_async_detach(
+    monkeypatch,
+) -> None:
+    task_id = 42
+    websocket = _BlockingWebSocket()
+    connection_manager = ConnectionManager()
+    detach_started = asyncio.Event()
+    release_detach = asyncio.Event()
+
+    async def blocked_detach(_websocket) -> None:
+        detach_started.set()
+        await release_detach.wait()
+
+    monkeypatch.setattr(websocket_api, "manager", connection_manager)
+    monkeypatch.setattr(
+        websocket_api,
+        "get_authenticated_user",
+        AsyncMock(return_value=SimpleNamespace(id=7)),
+    )
+    monkeypatch.setattr(websocket_api, "handle_status_request", AsyncMock())
+    monkeypatch.setattr(
+        websocket_api,
+        "detach_terminal_task_events",
+        blocked_detach,
+    )
+
+    endpoint = asyncio.create_task(
+        websocket_api.websocket_chat_endpoint(websocket, task_id, "token")
+    )
+    await websocket.receive_started.wait()
+    endpoint.cancel()
+    await asyncio.wait_for(detach_started.wait(), timeout=1)
+
+    assert task_id not in connection_manager.active_connections
+
+    release_detach.set()
+    with pytest.raises(asyncio.CancelledError):
+        await endpoint
+
+
+@pytest.mark.asyncio
+async def test_websocket_endpoint_fixes_terminal_cursor_before_initial_status(
+    monkeypatch,
+) -> None:
+    task_id = 42
+    websocket = _BlockingWebSocket()
+    connection_manager = ConnectionManager()
+    resolve = AsyncMock(return_value=37)
+    status = AsyncMock()
+    attached = asyncio.Event()
+
+    async def attach(_websocket, **kwargs) -> None:
+        resolve.assert_awaited_once()
+        status.assert_awaited_once()
+        assert kwargs["after_event_id"] == 37
+        attached.set()
+
+    monkeypatch.setattr(websocket_api, "manager", connection_manager)
+    monkeypatch.setattr(
+        websocket_api,
+        "get_authenticated_user",
+        AsyncMock(return_value=SimpleNamespace(id=7)),
+    )
+    monkeypatch.setattr(
+        websocket_api,
+        "resolve_initial_terminal_task_event_cursor",
+        resolve,
+    )
+    monkeypatch.setattr(websocket_api, "handle_status_request", status)
+    monkeypatch.setattr(websocket_api, "attach_terminal_task_events", attach)
+
+    endpoint = asyncio.create_task(
+        websocket_api.websocket_chat_endpoint(websocket, task_id, "token", None)
+    )
+    await asyncio.wait_for(attached.wait(), timeout=1)
+
+    assert resolve.await_args.kwargs["after_event_id"] is None
+
+    endpoint.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await endpoint
+
+
+@pytest.mark.asyncio
+async def test_websocket_endpoint_defers_terminal_subscription_for_missing_task(
+    monkeypatch,
+) -> None:
+    task_id = 987_654
+    websocket = _SingleMessageWebSocket({"type": "chat", "message": "create it"})
+    connection_manager = ConnectionManager()
+    attach = AsyncMock()
+    chat = AsyncMock()
+
+    monkeypatch.setattr(websocket_api, "manager", connection_manager)
+    monkeypatch.setattr(
+        websocket_api,
+        "get_authenticated_user",
+        AsyncMock(return_value=SimpleNamespace(id=7)),
+    )
+    resolve = AsyncMock(return_value=None)
+    monkeypatch.setattr(
+        websocket_api,
+        "resolve_initial_terminal_task_event_cursor",
+        resolve,
+    )
+    monkeypatch.setattr(websocket_api, "handle_status_request", AsyncMock())
+    monkeypatch.setattr(websocket_api, "attach_terminal_task_events", attach)
+    monkeypatch.setattr(websocket_api, "handle_chat_message", chat)
+
+    await websocket_api.websocket_chat_endpoint(websocket, task_id, "token", None)
+
+    assert resolve.await_args.kwargs["allow_missing_task"] is True
+    attach.assert_not_awaited()
+    chat.assert_awaited_once()
     assert task_id not in connection_manager.active_connections
 
 
@@ -355,7 +515,9 @@ async def test_broadcast_rechecks_membership_after_message_enrichment(
 
 
 @pytest.mark.asyncio
-async def test_broadcast_skips_connection_moved_during_fanout() -> None:
+async def test_broadcast_uses_membership_snapshot_without_cross_socket_blocking() -> (
+    None
+):
     task_id = 42
     moved_task_id = 99
     blocking_websocket = _BlockingSendWebSocket()
@@ -372,7 +534,10 @@ async def test_broadcast_skips_connection_moved_during_fanout() -> None:
     blocking_websocket.release_send.set()
     await broadcast
 
-    assert moved_websocket.messages == []
+    # The socket was authorized when fan-out began. Per-connection sends now
+    # progress independently, so moving another socket cannot retroactively
+    # cancel a frame that was already scheduled for this connection.
+    assert moved_websocket.messages == [json.dumps({"type": "diagnostic"})]
     assert connection_manager.active_connections == {
         task_id: [blocking_websocket],
         moved_task_id: [moved_websocket],

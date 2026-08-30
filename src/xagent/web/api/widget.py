@@ -620,6 +620,11 @@ async def websocket_widget_chat_endpoint(
     websocket: WebSocket,
     task_id: int,
     token: str = Query(..., description="Authentication token"),
+    terminal_event_after: int | None = Query(
+        None,
+        ge=0,
+        description="Last terminal task-command event cursor received",
+    ),
 ) -> None:
     """WebSocket unified endpoint for widget."""
     await public_chat_websocket_endpoint(
@@ -627,4 +632,5 @@ async def websocket_widget_chat_endpoint(
         task_id=task_id,
         token=token,
         expected_auth_mode="widget",
+        terminal_event_after=terminal_event_after,
     )

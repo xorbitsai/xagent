@@ -267,6 +267,7 @@ def init_db(db_url: str | None = None) -> None:
         SystemSetting,
         Task,
         TaskChatMessage,
+        TaskCommandTerminalEvent,
         TaskConnectorRuntimeContext,
         TaskExecutionCommand,
         TemplateStats,

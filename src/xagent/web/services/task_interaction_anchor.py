@@ -24,12 +24,13 @@ not an implementation detail (see the corrupt-before-legacy note below):
 6. the row passes all six conditions and its ``checkpoint_type`` is the
    current one -> a resolved ``InteractionAnchor``.
 
-Four of the six outcomes above increment a counter
+Five of the six outcomes above increment a counter
 (``COUNTER_ANCHOR_ABSENT_NO_RUN`` for step 1,
+``COUNTER_ANCHOR_ABSENT_NO_CHECKPOINT_POINTER`` for step 2,
 ``COUNTER_ANCHOR_UNAVAILABLE_DANGLING_POINTER`` for step 3,
 ``COUNTER_ANCHOR_ABSENT_LEGACY_CHECKPOINT_TYPE`` for step 5,
 ``COUNTER_ANCHOR_RESOLVED`` for step 6; ``interaction_rollout.py``). Step
-4's true-corrupt path has no counter; it registers
+4's true-corrupt path is the only one with no counter; it registers
 ``INTERACTION_ANCHOR_CORRUPT``, an ops degradation signal rather than a
 rate metric -- see that signal's own paragraph below. Step 4's other path,
 the missing-run-partition reclassification described above, does
@@ -38,9 +39,7 @@ step 5 uses when the row's ``checkpoint_type`` is a legacy one (both
 describe the same kind of row -- a legacy-type checkpoint with no
 interaction anchor to resolve -- reached by two different paths through
 the row data), or the new ``COUNTER_ANCHOR_ABSENT_MISSING_RUN_PARTITION``
-otherwise. Step 2 (no checkpoint pointer) is the only outcome that remains
-uninstrumented: nothing downstream depends on its absence, and no caller
-has yet needed that rate.
+otherwise.
 
 Adding step 6's counter gives the existing numerators a denominator:
 once step 6 also has a count, "what fraction of resolutions were allowed
@@ -162,6 +161,7 @@ from ..models.task import TraceEvent as DatabaseTraceEvent
 from .interaction_rollout import (
     COUNTER_ANCHOR_ABSENT_LEGACY_CHECKPOINT_TYPE,
     COUNTER_ANCHOR_ABSENT_MISSING_RUN_PARTITION,
+    COUNTER_ANCHOR_ABSENT_NO_CHECKPOINT_POINTER,
     COUNTER_ANCHOR_ABSENT_NO_RUN,
     COUNTER_ANCHOR_RESOLVED,
     COUNTER_ANCHOR_UNAVAILABLE_DANGLING_POINTER,
@@ -247,6 +247,7 @@ def resolve_interaction_anchor(db: Session, task: Task) -> InteractionAnchor | N
             "task %s has no checkpoint pointer; no interaction anchor to resolve",
             task.id,
         )
+        increment_counter(COUNTER_ANCHOR_ABSENT_NO_CHECKPOINT_POINTER)
         return None
 
     row = db.get(DatabaseTraceEvent, pointer_id)

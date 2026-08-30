@@ -203,10 +203,7 @@ def test_ta1_no_checkpoint_pointer_is_absence(tmp_path: Path) -> None:
 
     assert result is None
     assert ops_signals.active_degradations() == {}
-    # Step 2 registers no counter -- only step 1 (anchor_absent_no_run) and
-    # step 3 (anchor_unavailable_dangling_pointer) do; see the resolver's
-    # own judgment table.
-    assert ir.counters_snapshot() == {}
+    assert ir.counters_snapshot() == {ir.COUNTER_ANCHOR_ABSENT_NO_CHECKPOINT_POINTER: 1}
     db.close()
 
 
@@ -809,7 +806,10 @@ def _six_outcome_resolved(db: Session) -> Task:
 
 _SIX_OUTCOME_CELLS: dict[str, tuple[Any, dict[str, int]]] = {
     "step1_no_run": (_six_outcome_no_run, {ir.COUNTER_ANCHOR_ABSENT_NO_RUN: 1}),
-    "step2_no_pointer": (_six_outcome_no_pointer, {}),
+    "step2_no_pointer": (
+        _six_outcome_no_pointer,
+        {ir.COUNTER_ANCHOR_ABSENT_NO_CHECKPOINT_POINTER: 1},
+    ),
     "step3_dangling_pointer": (
         _six_outcome_dangling_pointer,
         {ir.COUNTER_ANCHOR_UNAVAILABLE_DANGLING_POINTER: 1},

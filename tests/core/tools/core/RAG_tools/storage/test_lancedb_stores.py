@@ -2825,9 +2825,11 @@ def test_aggregate_collection_stats_basic(mock_get_connection: Mock) -> None:
 
     # The table is cached; the _get_table returns the mock_table,
     # and the code calls mock_table.search() to start the chain
-    mock_table.search.side_effect = lambda: chains.get(
-        # Figure out which table name from the cache — use a side effect approach
-        # Since _get_table caches by name, we need a smarter mock
+    mock_table.search.side_effect = (
+        lambda: chains.get(
+            # Figure out which table name from the cache — use a side effect approach
+            # Since _get_table caches by name, we need a smarter mock
+        )
     )
 
     # Update: simplify — just use MagicMock with per-table chains

@@ -181,6 +181,7 @@ def test_document_search_end_to_end(
         collection=collection,
         embeddings=embeddings,
         create_index=True,
+        user_id=1,
     )
 
     # -------- Execute sparse search --------
@@ -195,6 +196,8 @@ def test_document_search_end_to_end(
             top_k=3,
             embedding_model_id=embedding_model_id,
         ),
+        user_id=1,
+        is_admin=False,
     )
 
     assert isinstance(search_result, SearchPipelineResult)

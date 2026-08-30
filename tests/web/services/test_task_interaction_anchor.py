@@ -765,8 +765,8 @@ def test_missing_partition_discriminator_mirrors_the_main_disjunction() -> None:
 
 
 # ---------------------------------------------------------------------------
-# W5-R3-3: every one of the six judgment-table outcomes, one cell each, in a
-# single parametrized table. Each cell is also covered individually above;
+# Every one of the six judgment-table outcomes, one cell each, in a single
+# parametrized table. Each cell is also covered individually above;
 # this suite exists so a missing or misplaced ``increment_counter`` call on
 # any one outcome shows up as one obviously-named failing cell here, rather
 # than only as a hard-to-spot assertion change buried in that outcome's own

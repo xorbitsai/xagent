@@ -165,13 +165,18 @@ COUNTER_ROLLOUT_DECISION_BLOCKED_SCHEMA_ABSENT = (
 # Incremented by resolve_interaction_anchor (task_interaction_anchor.py),
 # not by anything in this module -- named here because this registry is the
 # one counter namespace, not because the rollout gate produces them. There
-# is deliberately no anchor.corrupt counter alongside these three: the
+# is deliberately no anchor.corrupt counter alongside these five: the
 # corrupt outcome registers an ops_signals degradation instead (see that
 # resolver's own docstring for why the two observability surfaces diverge
 # there).
 COUNTER_ANCHOR_ABSENT_NO_RUN = "anchor.absent_no_run"
 COUNTER_ANCHOR_UNAVAILABLE_DANGLING_POINTER = "anchor.unavailable_dangling_pointer"
 COUNTER_ANCHOR_ABSENT_LEGACY_CHECKPOINT_TYPE = "anchor.absent_legacy_checkpoint_type"
+# Missing-run-partition reclassification (a pre-existing row, not a
+# corrupt one) and a resolved anchor, respectively -- see that resolver's
+# own docstring for the six-outcome table both entries belong to.
+COUNTER_ANCHOR_ABSENT_MISSING_RUN_PARTITION = "anchor.absent_missing_run_partition"
+COUNTER_ANCHOR_RESOLVED = "anchor.resolved"
 
 # Two constants below are actively incremented, both from
 # task_interaction_service.py: COUNTER_COMPAT_READ_FALLBACK by the

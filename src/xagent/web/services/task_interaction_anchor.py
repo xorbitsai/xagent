@@ -14,30 +14,40 @@ not an implementation detail (see the corrupt-before-legacy note below):
 3. the pointer names no live ``trace_events`` row -> unavailable, reported
    to the caller as absence (see below for why).
 4. the row exists but fails any of six self-consistency conditions ->
-   corrupt.
+   corrupt, unless the only condition it fails is the run-partition match
+   and its run field is absent entirely rather than merely mismatched --
+   that shape reclassifies as absence, not corrupt (see
+   ``resolve_interaction_anchor``'s own docstring for the reclassification
+   check, a five-condition mirror of this table's six).
 5. the row passes all six conditions but its ``checkpoint_type`` is a
    legacy type -> absence, not corrupt.
 6. the row passes all six conditions and its ``checkpoint_type`` is the
    current one -> a resolved ``InteractionAnchor``.
 
-Three of the six outcomes above increment a counter
+Four of the six outcomes above increment a counter
 (``COUNTER_ANCHOR_ABSENT_NO_RUN`` for step 1,
 ``COUNTER_ANCHOR_UNAVAILABLE_DANGLING_POINTER`` for step 3,
-``COUNTER_ANCHOR_ABSENT_LEGACY_CHECKPOINT_TYPE`` for step 5;
-``interaction_rollout.py``). Step 4 (corrupt) has no counter but does
-register ``INTERACTION_ANCHOR_CORRUPT``, an ops degradation signal rather
-than a rate metric -- see that signal's own paragraph below. Steps 2 (no
-checkpoint pointer) and 6 (resolved) have neither: this is not an
-oversight, both are simply uninstrumented today, and nothing downstream
-depends on their absence the way the corrupt path's degradation signal is
-depended on. The practical cost is that none of the three counters that do
-exist can serve as a rate denominator -- there is no "how many times this
-function ran" total to divide any of them by, only the three numerators
-themselves, so today's counters answer "how many times did outcome N
-happen" and nothing answers "out of how many resolutions." Adding
-counters for steps 2 and 6 belongs to whichever change wires this
-function's first production caller, alongside deciding what that caller
-needs the rate for.
+``COUNTER_ANCHOR_ABSENT_LEGACY_CHECKPOINT_TYPE`` for step 5,
+``COUNTER_ANCHOR_RESOLVED`` for step 6; ``interaction_rollout.py``). Step
+4's true-corrupt path has no counter; it registers
+``INTERACTION_ANCHOR_CORRUPT``, an ops degradation signal rather than a
+rate metric -- see that signal's own paragraph below. Step 4's other path,
+the missing-run-partition reclassification described above, does
+increment a counter: the same ``COUNTER_ANCHOR_ABSENT_LEGACY_CHECKPOINT_TYPE``
+step 5 uses when the row's ``checkpoint_type`` is a legacy one (both
+describe the same kind of row -- a legacy-type checkpoint with no
+interaction anchor to resolve -- reached by two different paths through
+the row data), or the new ``COUNTER_ANCHOR_ABSENT_MISSING_RUN_PARTITION``
+otherwise. Step 2 (no checkpoint pointer) is the only outcome that remains
+uninstrumented: nothing downstream depends on its absence, and no caller
+has yet needed that rate.
+
+Adding step 6's counter gives the existing numerators a denominator:
+once step 6 also has a count, "what fraction of resolutions were allowed
+through / successfully resolved an anchor" becomes computable, giving
+operators a way to tell whether "no row was written after ignition"
+happened because the gate blocked it, or because anchor resolution
+itself failed to produce one.
 
 Step 4 must run before step 5: a row belonging to a *different* task, even
 one whose ``checkpoint_type`` is legacy, must still be reported corrupt.
@@ -151,7 +161,9 @@ from ..models.task import Task
 from ..models.task import TraceEvent as DatabaseTraceEvent
 from .interaction_rollout import (
     COUNTER_ANCHOR_ABSENT_LEGACY_CHECKPOINT_TYPE,
+    COUNTER_ANCHOR_ABSENT_MISSING_RUN_PARTITION,
     COUNTER_ANCHOR_ABSENT_NO_RUN,
+    COUNTER_ANCHOR_RESOLVED,
     COUNTER_ANCHOR_UNAVAILABLE_DANGLING_POINTER,
     increment_counter,
 )
@@ -210,6 +222,18 @@ def resolve_interaction_anchor(db: Session, task: Task) -> InteractionAnchor | N
     persist an empty string into a column
     (``ck_task_interaction_requests_resume_execution_id_nonempty``,
     ``models/task_interaction.py``) that must never be empty.
+
+    When the six-condition check above fails, its body first asks a
+    narrower question before deciding the row is corrupt: did it fail
+    *only* condition 5 (the run-partition match), and is that failure
+    because the row's run field is absent rather than merely wrong? That
+    question is answered by a second, five-condition check -- conditions
+    1, 2, 3, 4, and 6 above, copied verbatim a second time and combined
+    with ``and``, the same five operands the six-condition check carries
+    minus condition 5. A row matching that shape is a pre-existing row
+    whose checkpoint predates the run-partition field (see the module
+    docstring's paragraph on the two kinds), not a corrupt one, and is
+    reclassified as absence instead.
     """
 
     if task.run_id is None:
@@ -248,6 +272,50 @@ def resolve_interaction_anchor(db: Session, task: Task) -> InteractionAnchor | N
         or not partition_matches
         or (row_execution_id and row_execution_id != execution_id)
     ):
+        # A row can fail only the partition-match condition above because
+        # its run-partition field is entirely absent rather than merely
+        # mismatched -- that shape is a pre-existing row (see this
+        # module's docstring on the two kinds), not data corruption. The
+        # five-condition check below is the same five conditions the
+        # six-condition `or` above carries minus the partition-match one,
+        # copied verbatim rather than derived from it: that six-condition
+        # `or` is pinned operand-for-operand against
+        # ``_load_pk_anchored_checkpoint`` by
+        # ``test_row_validity_conditions_match_trace_handlers_structurally``,
+        # so none of its operands can be factored out into a named
+        # boolean and reused here without breaking that pin. The
+        # ``test_missing_partition_discriminator_mirrors_the_main_disjunction``
+        # static test keeps the two copies from drifting apart instead.
+        only_partition_absent = run_field is None and not (
+            row.task_id != task.id
+            or row.event_type != "system_update_general"
+            or row.build_id is not None
+            or row_data.get("checkpoint_type") not in READABLE_CHECKPOINT_TYPES
+            or (row_execution_id and row_execution_id != execution_id)
+        )
+        if only_partition_absent:
+            row_checkpoint_type = row_data.get("checkpoint_type")
+            if row_checkpoint_type in LEGACY_CHECKPOINT_TYPES:
+                logger.info(
+                    "task %s's checkpoint pointer %s is missing its "
+                    "run-partition field and names a legacy checkpoint "
+                    "type %r; no interaction anchor to resolve",
+                    task.id,
+                    pointer_id,
+                    row_checkpoint_type,
+                )
+                increment_counter(COUNTER_ANCHOR_ABSENT_LEGACY_CHECKPOINT_TYPE)
+            else:
+                logger.info(
+                    "task %s's checkpoint pointer %s is missing its "
+                    "run-partition field; treating it as a pre-existing "
+                    "row with no interaction anchor to resolve, not as "
+                    "corrupt",
+                    task.id,
+                    pointer_id,
+                )
+                increment_counter(COUNTER_ANCHOR_ABSENT_MISSING_RUN_PARTITION)
+            return None
         register_degradation(
             INTERACTION_ANCHOR_CORRUPT,
             f"task {task.id}: checkpoint pointer {pointer_id} does not "
@@ -264,6 +332,11 @@ def resolve_interaction_anchor(db: Session, task: Task) -> InteractionAnchor | N
     # checkpoint_type in READABLE_CHECKPOINT_TYPES (condition 4), which is
     # exactly {CHECKPOINT_TYPE} | LEGACY_CHECKPOINT_TYPES -- so the branch
     # below is exhaustive between steps 5 and 6, with nothing left over.
+    # A legacy-type row with no run-partition field never reaches here: the
+    # only_partition_absent branch above already returns for it. This
+    # branch is unreachable on a missing-partition row; it stays in place
+    # to cover a legacy-type row whose run-partition field is present (the
+    # field's presence, not its absence, is what routes a row here).
     checkpoint_type = row_data.get("checkpoint_type")
     if checkpoint_type in LEGACY_CHECKPOINT_TYPES:
         logger.info(
@@ -281,6 +354,7 @@ def resolve_interaction_anchor(db: Session, task: Task) -> InteractionAnchor | N
         task.id,
         pointer_id,
     )
+    increment_counter(COUNTER_ANCHOR_RESOLVED)
     return InteractionAnchor(
         trace_event_id=int(row.id),
         resume_event_id=str(row.event_id),

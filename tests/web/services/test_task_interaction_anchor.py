@@ -380,18 +380,19 @@ def test_ta4_no_run_id_short_circuits_before_corrupt_row_is_read(
 # A legacy-type row, same task, with no run-partition field at all -- the
 # only shape a real legacy checkpoint row can have, since
 # stage_trace_event_row (trace_event_staging.py) only ever writes that
-# field for current-type checkpoints. Missing the field fails the
-# run-partition self-consistency condition before the legacy-type check is
-# even reached, so this classifies corrupt, not absent.
+# field for current-type checkpoints. Missing the field fails only the
+# run-partition self-consistency condition, with every other condition
+# passing -- the shape resolve_interaction_anchor's own docstring
+# describes as a pre-existing row, not data corruption, so this
+# classifies as absence and reuses the same counter step 5 uses for an
+# ordinary legacy-type row.
 # ---------------------------------------------------------------------------
 
 
-def test_legacy_type_row_without_run_partition_field_classifies_corrupt(
+def test_legacy_type_row_without_run_partition_field_classifies_absence(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
-    caplog.set_level(
-        logging.ERROR, logger="xagent.web.services.task_interaction_anchor"
-    )
+    caplog.set_level(logging.INFO, logger="xagent.web.services.task_interaction_anchor")
     engine = _engine(tmp_path)
     db = _session_factory(engine)()
     legacy_type = next(iter(LEGACY_CHECKPOINT_TYPES))
@@ -400,14 +401,20 @@ def test_legacy_type_row_without_run_partition_field_classifies_corrupt(
     result = resolve_interaction_anchor(db, task)
 
     assert result is None
-    assert ops_signals.INTERACTION_ANCHOR_CORRUPT in ops_signals.active_degradations()
-    # Corrupt registers no counter -- the legacy-absence counter this row
-    # might look like it should reach is never incremented, because the
-    # run-partition condition fails first.
-    assert ir.counters_snapshot() == {}
-    errors = [r for r in caplog.records if r.levelno == logging.ERROR]
-    assert len(errors) == 1, caplog.records
-    assert errors[0].msg == "task %s's checkpoint pointer %s failed anchor validation"
+    assert ops_signals.active_degradations() == {}
+    # Reclassified as absence, not corrupt -- the missing-run-partition
+    # row reuses the existing legacy-type counter, not the new
+    # missing-run-partition one, because its checkpoint_type is legacy.
+    assert ir.counters_snapshot() == {
+        ir.COUNTER_ANCHOR_ABSENT_LEGACY_CHECKPOINT_TYPE: 1
+    }
+    infos = [r for r in caplog.records if r.levelno == logging.INFO]
+    assert len(infos) == 1, caplog.records
+    assert infos[0].msg == (
+        "task %s's checkpoint pointer %s is missing its run-partition "
+        "field and names a legacy checkpoint type %r; no interaction "
+        "anchor to resolve"
+    )
     db.close()
 
 
@@ -525,6 +532,7 @@ def test_ta7_happy_path_resolves_anchor(tmp_path: Path) -> None:
     assert result.resume_locator_format == "trace_event_pk_v1"
     assert result.resume_checkpoint_type == "agent_execution_checkpoint"
     assert ops_signals.active_degradations() == {}
+    assert ir.counters_snapshot() == {ir.COUNTER_ANCHOR_RESOLVED: 1}
     db.close()
 
 
@@ -690,6 +698,148 @@ def test_row_validity_conditions_match_trace_handlers_structurally() -> None:
     trace_handler_dumps = [_normalized_dump(node) for node in trace_handler_conditions]
 
     assert anchor_dumps == trace_handler_dumps
+
+
+# ---------------------------------------------------------------------------
+# The missing-run-partition reclassification inside the corrupt branch
+# carries a second, hand-copied disjunction: the same six operands above,
+# minus the partition-match one, combined with ``not (... or ...)`` instead
+# of the six-condition ``or``. That copy cannot be factored into a shared
+# helper (the six-condition ``or`` is pinned operand-for-operand against
+# trace_handlers.py by the guard above), so this test pins the copy against
+# the original directly instead of trusting the two to stay aligned by
+# hand.
+# ---------------------------------------------------------------------------
+
+_PARTITION_TERM: ast.expr = ast.UnaryOp(
+    op=ast.Not(), operand=ast.Name(id="partition_matches", ctx=ast.Load())
+)
+
+
+def _five_condition_disjunction(func: Any) -> list[ast.expr]:
+    """The five ``ast.BoolOp(op=Or)`` operands inside ``func``'s
+    ``only_partition_absent`` reclassification check. Located by shape (a
+    5-way ``or`` inside the function body), the same way
+    ``_six_condition_disjunction`` locates its own target."""
+
+    source = textwrap.dedent(inspect.getsource(func))
+    tree = ast.parse(source)
+    candidates = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.BoolOp)
+        and isinstance(node.op, ast.Or)
+        and len(node.values) == 5
+    ]
+    assert len(candidates) == 1, (
+        f"expected exactly one 5-way `or` in {func.__qualname__}, found "
+        f"{len(candidates)}"
+    )
+    return candidates[0].values
+
+
+def test_missing_partition_discriminator_mirrors_the_main_disjunction() -> None:
+    """The five conditions ``only_partition_absent`` checks must be the same
+    five conditions the six-condition disjunction above carries, minus the
+    partition-match term, in the same order. If this test turns red, the
+    two copies have drifted apart -- bring the ``only_partition_absent``
+    copy back into alignment with the six-condition ``or`` rather than
+    editing this test, the same rule
+    ``test_row_validity_conditions_match_trace_handlers_structurally``
+    applies to its own pair.
+    """
+
+    outer = _six_condition_disjunction(resolve_interaction_anchor)
+    inner = _five_condition_disjunction(resolve_interaction_anchor)
+
+    partition_term_dump = _normalized_dump(_PARTITION_TERM)
+    expected = [node for node in outer if _normalized_dump(node) != partition_term_dump]
+    assert len(expected) == 5, (
+        "expected the partition-match term to match exactly one of the six "
+        f"outer operands, found {6 - len(expected)} matching operands"
+    )
+
+    assert [_normalized_dump(n) for n in inner] == [
+        _normalized_dump(n) for n in expected
+    ]
+
+
+# ---------------------------------------------------------------------------
+# W5-R3-3: every one of the six judgment-table outcomes, one cell each, in a
+# single parametrized table. Each cell is also covered individually above;
+# this suite exists so a missing or misplaced ``increment_counter`` call on
+# any one outcome shows up as one obviously-named failing cell here, rather
+# than only as a hard-to-spot assertion change buried in that outcome's own
+# test.
+# ---------------------------------------------------------------------------
+
+
+def _six_outcome_no_run(db: Session) -> Task:
+    return _make_task(db, run_id=None)
+
+
+def _six_outcome_no_pointer(db: Session) -> Task:
+    return _make_task(db, run_id="run-a")
+
+
+def _six_outcome_dangling_pointer(db: Session) -> Task:
+    task = _make_task(db, run_id="run-a")
+    _point_dangling(db, task, 999_999)
+    return task
+
+
+def _six_outcome_corrupt(db: Session) -> Task:
+    other = _make_task(db, run_id=None)
+    task, _row = _build_scenario(db, row_task_id=other.id)
+    return task
+
+
+def _six_outcome_legacy_absence(db: Session) -> Task:
+    legacy_type = next(iter(LEGACY_CHECKPOINT_TYPES))
+    task, _row = _build_scenario(db, checkpoint_type=legacy_type)
+    return task
+
+
+def _six_outcome_resolved(db: Session) -> Task:
+    task, _row = _build_scenario(
+        db, task_run_id="run-a", run_partition="run-a", checkpoint_type=CHECKPOINT_TYPE
+    )
+    return task
+
+
+_SIX_OUTCOME_CELLS: dict[str, tuple[Any, dict[str, int]]] = {
+    "step1_no_run": (_six_outcome_no_run, {ir.COUNTER_ANCHOR_ABSENT_NO_RUN: 1}),
+    "step2_no_pointer": (_six_outcome_no_pointer, {}),
+    "step3_dangling_pointer": (
+        _six_outcome_dangling_pointer,
+        {ir.COUNTER_ANCHOR_UNAVAILABLE_DANGLING_POINTER: 1},
+    ),
+    "step4_corrupt": (_six_outcome_corrupt, {}),
+    "step5_legacy_absence": (
+        _six_outcome_legacy_absence,
+        {ir.COUNTER_ANCHOR_ABSENT_LEGACY_CHECKPOINT_TYPE: 1},
+    ),
+    "step6_resolved": (_six_outcome_resolved, {ir.COUNTER_ANCHOR_RESOLVED: 1}),
+}
+
+
+@pytest.mark.parametrize("outcome", sorted(_SIX_OUTCOME_CELLS))
+def test_ta12_six_outcome_counter_matrix(tmp_path: Path, outcome: str) -> None:
+    engine = _engine(tmp_path)
+    db = _session_factory(engine)()
+    builder, expected_counters = _SIX_OUTCOME_CELLS[outcome]
+    task = builder(db)
+
+    resolve_interaction_anchor(db, task)
+
+    if outcome == "step4_corrupt":
+        assert ops_signals.INTERACTION_ANCHOR_CORRUPT in (
+            ops_signals.active_degradations()
+        )
+    else:
+        assert ops_signals.active_degradations() == {}
+    assert ir.counters_snapshot() == expected_counters
+    db.close()
 
 
 # ---------------------------------------------------------------------------

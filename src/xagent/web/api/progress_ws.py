@@ -1,5 +1,6 @@
 """Progress monitoring WebSocket API endpoints."""
 
+import asyncio
 import logging
 from typing import Any, Dict, Optional
 
@@ -19,6 +20,12 @@ from ...core.tools.core.RAG_tools.progress import (
 )
 from ..auth_dependencies import get_current_user
 from ..models.user import User
+from ..services.db_runtime import drain_async_task_cancellation_safe
+from ..services.websocket_writer import (
+    activate_websocket_writer,
+    retire_websocket_writer,
+    send_websocket_text,
+)
 from .websocket_auth import (
     _WebSocketAuthenticationTerminated,
     get_authenticated_user,
@@ -67,6 +74,7 @@ async def progress_websocket_endpoint(
             return
 
         await websocket.accept()
+        activate_websocket_writer(websocket)
         logger.info(
             f"Progress WebSocket connected for task {task_id} (user: {user.id})"
         )
@@ -77,7 +85,7 @@ async def progress_websocket_endpoint(
                 self.ws = ws
 
             async def send_text(self, data: str) -> None:
-                await self.ws.send_text(data)
+                await send_websocket_text(self.ws, data)
 
             def is_connected(self) -> bool:
                 # WebSocket doesn't have a direct is_connected method
@@ -86,46 +94,50 @@ async def progress_websocket_endpoint(
 
         adapter = WebSocketAdapter(websocket)
 
-        # Connect to progress broadcaster
-        await progress_broadcaster.connect(task_id, adapter)
-
-        # Send current task status if available
-        task_progress = get_progress_manager().get_task_progress(task_id)
-        if task_progress:
-            # Send initial status using proper JSON serialization
-            event = ProgressUpdateEvent(
-                task_id=task_progress.task_id,
-                task_type=task_progress.task_type,
-                status=task_progress.status,
-                current_step=task_progress.current_step,
-                overall_progress=task_progress.overall_progress or 0.0,
-                timestamp=task_progress.start_time or 0,
-                data={
-                    "start_time": task_progress.start_time,
-                    "end_time": task_progress.end_time,
-                    "metadata": task_progress.metadata,
-                },
-                event_type="progress_update",
-            )
-            await adapter.send_text(event.model_dump_json())
-
         try:
-            # Keep connection alive and listen for client messages
-            while True:
-                # Wait for client messages (though we mainly send updates)
-                data = await websocket.receive_text()
-                logger.debug(f"Received message from progress client: {data}")
+            # Connect to progress broadcaster
+            await progress_broadcaster.connect(task_id, adapter)
 
-                # For now, we don't handle client messages
-                # Could be extended to handle commands like "cancel_task"
+            # Send current task status if available
+            task_progress = get_progress_manager().get_task_progress(task_id)
+            if task_progress:
+                # Send initial status using proper JSON serialization
+                event = ProgressUpdateEvent(
+                    task_id=task_progress.task_id,
+                    task_type=task_progress.task_type,
+                    status=task_progress.status,
+                    current_step=task_progress.current_step,
+                    overall_progress=task_progress.overall_progress or 0.0,
+                    timestamp=task_progress.start_time or 0,
+                    data={
+                        "start_time": task_progress.start_time,
+                        "end_time": task_progress.end_time,
+                        "metadata": task_progress.metadata,
+                    },
+                    event_type="progress_update",
+                )
+                await adapter.send_text(event.model_dump_json())
 
-        except WebSocketDisconnect:
-            logger.info(f"Progress WebSocket disconnected for task {task_id}")
-        except Exception as e:
-            logger.error(f"Progress WebSocket error for task {task_id}: {e}")
+            try:
+                # Keep connection alive and listen for client messages
+                while True:
+                    # Wait for client messages (though we mainly send updates)
+                    data = await websocket.receive_text()
+                    logger.debug(f"Received message from progress client: {data}")
+
+                    # For now, we don't handle client messages
+                    # Could be extended to handle commands like "cancel_task"
+
+            except WebSocketDisconnect:
+                logger.info(f"Progress WebSocket disconnected for task {task_id}")
+            except Exception as e:
+                logger.error(f"Progress WebSocket error for task {task_id}: {e}")
         finally:
-            # Clean up connection
-            await progress_broadcaster.disconnect(task_id, adapter)
+            retire_websocket_writer(websocket)
+            cleanup = asyncio.create_task(
+                progress_broadcaster.disconnect(task_id, adapter)
+            )
+            await drain_async_task_cancellation_safe(cleanup)
 
     except WebSocketDisconnect:
         logger.info(f"Progress WebSocket disconnected for task {task_id}")

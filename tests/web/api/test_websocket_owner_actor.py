@@ -644,6 +644,11 @@ async def test_missing_task_create_commits_claim_message_file_and_prelease_toget
     monkeypatch.setattr(database_module, "get_session_local", lambda: SessionLocal)
     monkeypatch.setattr(websocket_api, "manager", ws_manager)
     monkeypatch.setattr(
+        websocket_api,
+        "attach_terminal_task_events",
+        AsyncMock(),
+    )
+    monkeypatch.setattr(
         "xagent.web.services.task_orchestrator.TaskTurnOrchestrator.schedule_claimed_create_turn",
         schedule,
     )

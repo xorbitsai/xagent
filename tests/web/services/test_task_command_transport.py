@@ -34,8 +34,12 @@ from xagent.web.models.database import (
 )
 from xagent.web.models.task import Task, TaskStatus
 from xagent.web.models.task_command import TaskExecutionCommand
+from xagent.web.models.task_command_terminal_event import TaskCommandTerminalEvent
 from xagent.web.models.user import User
 from xagent.web.services import task_command_transport as task_command_transport_module
+from xagent.web.services.task_command_terminal_events import (
+    terminal_event_draft_for_error,
+)
 from xagent.web.services.task_command_transport import (
     COMMAND_COMPLETED,
     COMMAND_FAILED,
@@ -372,6 +376,12 @@ def test_stale_attempt_cannot_mutate_reclaimed_command(db_session) -> None:
     assert row.status == "processing"
     assert row.claimed_by == "runner-a"
     assert row.attempt_count == second.attempt_count
+    assert (
+        db_session.query(TaskCommandTerminalEvent)
+        .filter(TaskCommandTerminalEvent.task_command_id == enqueued.command_id)
+        .count()
+        == 0
+    )
 
 
 def test_live_foreign_runner_is_rechecked_before_cancel(db_session) -> None:
@@ -600,7 +610,9 @@ async def test_pause_command_with_a_real_actor_gets_past_the_actor_check(
 
 
 @pytest.mark.asyncio
-async def test_only_terminal_command_failure_is_broadcast(db_session) -> None:
+async def test_only_terminal_command_failure_is_staged_for_durable_delivery(
+    db_session,
+) -> None:
     _user, task = _create_running_task(db_session)
     task.runner_id = None
     task.lease_expires_at = None
@@ -633,21 +645,23 @@ async def test_only_terminal_command_failure_is_broadcast(db_session) -> None:
         "broadcast_to_task",
         new=AsyncMock(),
     ) as broadcast:
-        with pytest.raises(ValueError, match="Agent ID is missing"):
+        with pytest.raises(ValueError, match="Agent ID is missing") as transient_error:
             await execute_durable_task_command(transient)
         broadcast.assert_not_awaited()
+        assert terminal_event_draft_for_error(transient_error.value) is None
 
-        with pytest.raises(ValueError, match="Agent ID is missing"):
+        with pytest.raises(ValueError, match="Agent ID is missing") as terminal_error:
             await execute_durable_task_command(terminal)
-        broadcast.assert_awaited_once()
-        event, event_task_id = broadcast.await_args.args
-        assert event_task_id == int(task.id)
-        assert event["type"] == "agent_error"
-        assert event["command_id"] == "terminal-cancel-failure"
+        broadcast.assert_not_awaited()
+        draft = terminal_event_draft_for_error(terminal_error.value)
+        assert draft is not None
+        assert draft.message_code.value == "task_command_failed"
 
 
 @pytest.mark.asyncio
-async def test_final_command_deferral_is_broadcast(db_session) -> None:
+async def test_final_command_deferral_is_staged_for_durable_delivery(
+    db_session,
+) -> None:
     _user, task = _create_running_task(db_session)
     command = ClaimedTaskCommand(
         id=1,
@@ -666,9 +680,15 @@ async def test_final_command_deferral_is_broadcast(db_session) -> None:
         "broadcast_to_task",
         new=AsyncMock(),
     ) as broadcast:
-        with pytest.raises(TaskCommandDeferred, match="active task lease owner"):
+        with pytest.raises(
+            TaskCommandDeferred,
+            match="active task lease owner",
+        ) as deferred_error:
             await execute_durable_task_command(command)
-        broadcast.assert_awaited_once()
+        broadcast.assert_not_awaited()
+        draft = terminal_event_draft_for_error(deferred_error.value)
+        assert draft is not None
+        assert draft.message_code.value == "task_command_deferred"
 
 
 @pytest.mark.asyncio
@@ -876,6 +896,13 @@ async def test_deferred_message_eventually_fails_and_unblocks_cancel(
     assert row.status == COMMAND_FAILED
     assert row.failure_count == 0
     assert row.defer_count == MAX_COMMAND_DEFERS
+    event = (
+        db_session.query(TaskCommandTerminalEvent)
+        .filter(TaskCommandTerminalEvent.task_command_id == message.command_id)
+        .one()
+    )
+    assert event.outcome == COMMAND_FAILED
+    assert event.outcome_version == row.attempt_count
 
     cancel_claim = claim_task_command(db_session)
     assert cancel_claim is not None

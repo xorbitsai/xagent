@@ -6,6 +6,11 @@ import type { AuthSessionSnapshot } from "@/lib/auth-cache"
 import { apiRequest, getUploadErrorMessage, isJsonRecord, parseApiResponse, UPLOAD_ERROR_MESSAGES } from "@/lib/api-wrapper"
 import { generateClientMessageId, getWsUrl, getUploadApiUrl } from "@/lib/utils"
 import { isFinalAnswerStreamEventType } from "@/lib/streaming-final-answer"
+import {
+  readTerminalEventCursor,
+  terminalEventCursorKey,
+  writeTerminalEventCursor,
+} from "@/lib/terminal-event-cursor"
 
 interface RecentMessage {
   message: string
@@ -36,6 +41,10 @@ interface WebSocketMessage {
   step_id?: string
   event_id?: string
   event_type?: string
+  terminal_event_id?: string
+  terminal_event_cursor?: number
+  old_task_id?: number
+  new_task_id?: number
   message_id?: string
   delta?: string
   content?: string
@@ -362,6 +371,7 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
   const descriptorKeyRef = useRef<ConnectionDescriptorIdentity | null>(connectionDescriptorIdentity)
   const retryTimersRef = useRef(new Map<ReturnType<typeof setTimeout>, ScheduledRetry>())
   const reconnectAttemptsRef = useRef(0)
+  const terminalEventCursorsRef = useRef(new Map<string, number>())
   const authRefreshRetriesRef = useRef(0)
   const authRefreshRetryBudgetSessionIdRef = useRef(getInternalSessionId(normalizedConnection))
   const deliveryGenerationRef = useRef(deliveryGeneration)
@@ -715,10 +725,20 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
       }
 
       const attemptEpoch = ++attemptEpochRef.current
+      const terminalTaskId = connection.taskId ?? taskIdRef.current
+      const terminalCursorKey = terminalEventCursorKey({
+        ...connection,
+        taskId: terminalTaskId,
+      })
+      const terminalCursor = terminalEventCursorsRef.current.get(terminalCursorKey)
+        ?? readTerminalEventCursor(terminalCursorKey)
+      const socketUrl = terminalTaskId
+        ? `${connection.url}${connection.url.includes("?") ? "&" : "?"}terminal_event_after=${terminalCursor}`
+        : connection.url
       const protocols = getConnectionProtocols(connection, taskIdRef.current)
       const socket = protocols
-        ? new WebSocket(connection.url, protocols)
-        : new WebSocket(connection.url)
+        ? new WebSocket(socketUrl, protocols)
+        : new WebSocket(socketUrl)
       const owner: SocketOwner = {
         callbacks: callbacksRef.current,
         connection,
@@ -920,6 +940,29 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
         try {
           const data = JSON.parse(event.data)
 
+          const terminalEventCursor = data.terminal_event_cursor
+          const terminalEventId = data.terminal_event_id
+          let terminalCursorUpdate: { key: string; cursor: number } | null = null
+          if (
+            Number.isSafeInteger(terminalEventCursor)
+            && terminalEventCursor >= 0
+            && typeof terminalEventId === "string"
+            && terminalEventId.length > 0
+          ) {
+            const terminalTaskId = Number.isSafeInteger(data.task_id)
+              && data.task_id > 0
+              ? data.task_id
+              : owner.connection.taskId
+            const cursorKey = terminalEventCursorKey({
+              ...owner.connection,
+              taskId: terminalTaskId,
+            })
+            const currentCursor = terminalEventCursorsRef.current.get(cursorKey)
+              ?? readTerminalEventCursor(cursorKey)
+            if (terminalEventCursor <= currentCursor) return
+            terminalCursorUpdate = { key: cursorKey, cursor: terminalEventCursor }
+          }
+
           if (data.type === 'message_accepted' || data.type === 'message_rejected') {
             const clientMessageId = data.client_message_id
             const pending = typeof clientMessageId === 'string'
@@ -1073,6 +1116,14 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
               timestamp: data.timestamp,
               task_id: data.task_id,
             }
+          } else if (data.type === "task_id_updated") {
+            message = {
+              type: "task_id_updated",
+              data,
+              timestamp: data.timestamp,
+              old_task_id: data.old_task_id,
+              new_task_id: data.new_task_id,
+            }
           } else {
             // Generic message handling
             const messageData = data.data || data;
@@ -1100,6 +1151,16 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
 
           setLastMessage(message)
           owner.callbacks.onMessage?.(message)
+          if (terminalCursorUpdate) {
+            terminalEventCursorsRef.current.set(
+              terminalCursorUpdate.key,
+              terminalCursorUpdate.cursor,
+            )
+            writeTerminalEventCursor(
+              terminalCursorUpdate.key,
+              terminalCursorUpdate.cursor,
+            )
+          }
         } catch (error) {
           console.error("Error parsing WebSocket message", error)
         }

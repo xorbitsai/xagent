@@ -42,6 +42,10 @@ from xagent.web.services.task_command_transport import (
     TaskCommandKind,
     TaskCommandRejected,
 )
+from xagent.web.services.task_command_terminal_events import (
+    render_terminal_task_event_message,
+    terminal_event_draft_for_error,
+)
 from xagent.web.services.task_execution_controller import TaskControlState
 from xagent.web.services.task_orchestrator import TaskTurnPayload
 
@@ -895,10 +899,8 @@ async def test_external_cancel_failures_classified_rejected(
 
 
 @pytest.mark.asyncio
-async def test_terminal_command_error_text_external(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """An exhausted external cancel broadcasts the neutral sentence.
+async def test_terminal_command_error_text_external() -> None:
+    """An exhausted external cancel stages the neutral sentence code.
 
     Driven by a deleted task row, which is a real raise site outside the
     external core: the failure budget runs out and the broadcast reaches the
@@ -919,7 +921,6 @@ async def test_terminal_command_error_text_external(
         db.commit()
     finally:
         db.close()
-    manager = _broadcast_manager(monkeypatch)
     command = ClaimedTaskCommand(
         id=1,
         task_id=task_id,
@@ -940,14 +941,18 @@ async def test_terminal_command_error_text_external(
     with pytest.raises(ValueError) as raised:
         await websocket_api.execute_durable_task_command(command)
 
-    payloads = _broadcast_payloads(manager)
-    assert [payload["type"] for payload in payloads] == ["agent_error"]
-    assert payloads[0]["message"] == EXTERNAL_CANCEL_NOT_APPLIED_MESSAGE
-    assert "command_kind" not in payloads[0]
-    assert "command_id" not in payloads[0]
-    assert str(raised.value) not in repr(payloads)
-    assert command.command_id not in repr(payloads)
-    assert set(payloads[0]) == {"type", "message", "task_id", "timestamp"}
+    draft = terminal_event_draft_for_error(raised.value)
+    assert draft is not None
+    assert draft.include_command_identity is False
+    message = render_terminal_task_event_message(
+        SimpleNamespace(
+            message_code=draft.message_code,
+            command_kind=command.kind.value,
+        )
+    )
+    assert message == EXTERNAL_CANCEL_NOT_APPLIED_MESSAGE
+    assert str(raised.value) not in str(message)
+    assert command.command_id not in str(message)
 
 
 @pytest.mark.asyncio
@@ -967,7 +972,6 @@ async def test_terminal_command_error_text_external(
     ],
 )
 async def test_terminal_command_error_text_follows_the_task_state(
-    monkeypatch: pytest.MonkeyPatch,
     task_status: TaskStatus,
     expected_message: str,
 ) -> None:
@@ -985,7 +989,6 @@ async def test_terminal_command_error_text_follows_the_task_state(
         status=task_status,
         control_state=TaskControlState.RUNNING.value,
     )
-    manager = _broadcast_manager(monkeypatch)
     command = ClaimedTaskCommand(
         id=1,
         task_id=task_id,
@@ -1001,12 +1004,19 @@ async def test_terminal_command_error_text_follows_the_task_state(
         attempt_count=1,
     )
 
-    await websocket_api._broadcast_terminal_command_error(
+    draft = await websocket_api._terminal_command_event_draft(
         command, RuntimeError(f"lease lost at {task_id}")
     )
 
-    payloads = _broadcast_payloads(manager)
-    assert payloads[0]["message"] == expected_message
+    assert (
+        render_terminal_task_event_message(
+            SimpleNamespace(
+                message_code=draft.message_code,
+                command_kind=command.kind.value,
+            )
+        )
+        == expected_message
+    )
 
 
 @pytest.mark.asyncio

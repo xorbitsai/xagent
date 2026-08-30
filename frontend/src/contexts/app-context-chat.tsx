@@ -32,6 +32,8 @@ interface WebSocketMessage {
   control_state?: TaskControlState
   status?: unknown
   task?: Record<string, unknown>
+  old_task_id?: number
+  new_task_id?: number
 }
 
 type TaskControlState =
@@ -57,6 +59,7 @@ const VERSIONED_TASK_EVENT_TYPES = new Set([
   "agent_error",
   "error",
   "task_completed",
+  "task_command_outcome",
   "task_error",
   "task_pause_requested",
   "task_paused",
@@ -1941,6 +1944,9 @@ export function AppProvider({
     stateRef.current = next
     privateCommit({ state: next })
   }, [])
+  const adoptTaskIdRef = useRef<(taskId: number) => void>((taskId) => {
+    dispatch({ type: "SET_TASK_ID", payload: taskId })
+  })
   const sessionConversationRef = useRef<SessionConversationState>(initialSessionConversationState)
   const dispatchSessionConversation = useCallback(
     (action: SessionConversationAction) => {
@@ -2741,6 +2747,23 @@ export function AppProvider({
     }
 
     switch (message.type) {
+      case "task_id_updated": {
+        const oldTaskId = message.old_task_id
+        const newTaskId = message.new_task_id
+        if (
+          typeof oldTaskId !== "number"
+          || !Number.isSafeInteger(oldTaskId)
+          || oldTaskId <= 0
+          || oldTaskId !== currentState.taskId
+          ||
+          typeof newTaskId !== "number"
+          || !Number.isSafeInteger(newTaskId)
+          || newTaskId <= 0
+        ) break
+        adoptTaskIdRef.current(newTaskId)
+        break
+      }
+
       case "chat":
         const chatData = message as any
         const messageContent = chatData.message || ""
@@ -6652,6 +6675,10 @@ export function AppProvider({
       dispatch({ type: "SET_HISTORY_LOADING", payload: true })
     }
   }, [dispatch, router])
+
+  useLayoutEffect(() => {
+    adoptTaskIdRef.current = (taskId) => setTaskId(taskId)
+  }, [setTaskId])
 
   const openFilePreview = useCallback((fileId: string, fileName: string, files?: Array<{ fileId: string; fileName: string }>, index?: number) => {
     if (filesDisabled) return

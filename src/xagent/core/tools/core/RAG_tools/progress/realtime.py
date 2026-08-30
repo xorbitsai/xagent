@@ -125,17 +125,24 @@ class ProgressBroadcaster:
             logger.error("Failed to serialize progress event: %s", e)
             return
 
-        # Send to all connections
-        disconnected = []
-        for connection in connections:
+        async def send(connection: WebSocketConnection) -> WebSocketConnection | None:
             try:
                 if connection.is_connected():
                     await connection.send_text(message)
                 else:
-                    disconnected.append(connection)
+                    return connection
             except Exception as e:
                 logger.warning("Failed to send progress update to connection: %s", e)
-                disconnected.append(connection)
+                return connection
+            return None
+
+        disconnected = [
+            connection
+            for connection in await asyncio.gather(
+                *(send(connection) for connection in connections)
+            )
+            if connection is not None
+        ]
 
         # Clean up disconnected connections
         if disconnected:

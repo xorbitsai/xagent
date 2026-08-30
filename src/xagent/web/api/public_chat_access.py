@@ -57,11 +57,14 @@ from ..utils.db_timezone import format_datetime_for_api
 from .files import store_uploaded_files
 from .websocket import (
     WebSocketPrincipal,
+    attach_terminal_task_events,
+    detach_terminal_task_events,
     handle_chat_message,
     handle_execute_task,
     handle_intervention,
     handle_status_request,
     manager,
+    resolve_initial_terminal_task_event_cursor,
     send_message_delivery,
 )
 from .websocket_auth import send_websocket_authentication_infrastructure_failure
@@ -1438,6 +1441,7 @@ async def public_chat_websocket_endpoint(
     task_id: int,
     token: str = Query(..., description="Authentication token"),
     expected_auth_mode: str,
+    terminal_event_after: int | None = None,
 ) -> None:
     """Serve widget websocket chat with per-message revalidation."""
     # Handshake budget (#1056): mirror of the share connect gate — a widget
@@ -1478,7 +1482,18 @@ async def public_chat_websocket_endpoint(
     manager.register_connection(websocket, task_id)
 
     try:
+        terminal_event_cursor = await resolve_initial_terminal_task_event_cursor(
+            task_id=task_id,
+            principal=principal,
+            after_event_id=terminal_event_after,
+        )
         await handle_status_request(websocket, task_id, principal)
+        await attach_terminal_task_events(
+            websocket,
+            task_id=task_id,
+            principal=principal,
+            after_event_id=terminal_event_cursor,
+        )
 
         while True:
             data = await websocket.receive_text()
@@ -1538,6 +1553,7 @@ async def public_chat_websocket_endpoint(
             logger.error("Public chat WebSocket error: %s", exc)
     finally:
         manager.disconnect(websocket)
+        await detach_terminal_task_events(websocket)
 
 
 async def share_chat_websocket_endpoint(
@@ -1545,6 +1561,7 @@ async def share_chat_websocket_endpoint(
     websocket: WebSocket,
     task_id: int,
     token: str = Query(..., description="Authentication token"),
+    terminal_event_after: int | None = None,
 ) -> None:
     """Serve share websocket chat with per-message revalidation."""
     # Handshake budget (#973): accept-before-auth (below) means every connect
@@ -1585,7 +1602,18 @@ async def share_chat_websocket_endpoint(
     manager.register_connection(websocket, task_id)
 
     try:
+        terminal_event_cursor = await resolve_initial_terminal_task_event_cursor(
+            task_id=task_id,
+            principal=principal,
+            after_event_id=terminal_event_after,
+        )
         await handle_status_request(websocket, task_id, principal)
+        await attach_terminal_task_events(
+            websocket,
+            task_id=task_id,
+            principal=principal,
+            after_event_id=terminal_event_cursor,
+        )
 
         while True:
             data = await websocket.receive_text()
@@ -1640,3 +1668,4 @@ async def share_chat_websocket_endpoint(
             logger.error("Share chat WebSocket error: %s", exc)
     finally:
         manager.disconnect(websocket)
+        await detach_terminal_task_events(websocket)

@@ -153,6 +153,18 @@ from ..services.mcp_runtime import (
     MCPBuiltinOAuthActorPolicy,
     MCPBuiltinOAuthActorPolicyRequiredError,
 )
+from ..services.task_command_terminal_events import (
+    TerminalTaskEvent,
+    TerminalTaskEventDraft,
+    TerminalTaskEventLoopRegistry,
+    TerminalTaskEventMessageCode,
+    TerminalTaskEventPrincipal,
+    TerminalTaskEventSubscription,
+    bind_terminal_event_draft,
+    is_external_cancel_command,
+    resolve_terminal_task_event_cursor,
+    terminal_task_event_payload,
+)
 from ..services.task_command_transport import (
     COMMAND_FAILED,
     COMMAND_ID_PATTERN,
@@ -212,6 +224,12 @@ from ..services.uploaded_file_store import (
     compensate_staged_uploaded_files,
     snapshot_uploaded_file_version,
     stage_uploaded_file_from_local_path,
+)
+from ..services.websocket_writer import (
+    activate_websocket_writer,
+    fanout_websocket_text,
+    retire_websocket_writer,
+    send_websocket_text,
 )
 from ..services.workforce_runtime import (
     sync_workforce_run_status,
@@ -455,7 +473,7 @@ def client_safe_task_command_failure(
     running would be false, and the visitor would keep waiting on a turn
     nobody stopped.
     """
-    if kind == TaskCommandKind.CANCEL and scope == EXTERNAL_COMMAND_SCOPE:
+    if is_external_cancel_command(kind=kind.value, scope=scope):
         return external_cancel_exhausted_message(task_status)
     return f"Task command {kind.value} failed: {client_safe_error_message(error)}"
 
@@ -4206,6 +4224,7 @@ class BackgroundTaskManager:
         # a newer run as an idempotent success.
         self._resume_run_ids: dict[int, str | None] = {}
         self._resume_reservations: set[int] = set()
+        self._resume_owner_started_at: dict[int, float] = {}
         self._shutting_down = False
         self._shutdown_lock = asyncio.Lock()
 
@@ -4218,6 +4237,7 @@ class BackgroundTaskManager:
             or self.resume_tasks
             or self._resume_run_ids
             or self._resume_reservations
+            or self._resume_owner_started_at
         ):
             raise RuntimeError("Background task manager still owns background work")
         # asyncio synchronization primitives are bound to the event loop that
@@ -4291,7 +4311,16 @@ class BackgroundTaskManager:
         if existing is not None:
             self.resume_tasks.pop(task_id, None)
             self._resume_run_ids.pop(task_id, None)
+            self._resume_owner_started_at.pop(task_id, None)
         return None
+
+    def resume_holder_age_seconds(self, task_id: int) -> float | None:
+        """Return the local resume-slot holder's monotonic age, if known."""
+
+        started_at = self._resume_owner_started_at.get(task_id)
+        if started_at is None:
+            return None
+        return max(0.0, time.monotonic() - started_at)
 
     def try_reserve_resume(
         self,
@@ -4310,6 +4339,7 @@ class BackgroundTaskManager:
         if existing_state is not None:
             return existing_state
         self._resume_reservations.add(task_id)
+        self._resume_owner_started_at[task_id] = time.monotonic()
         return ResumeReservationOutcome.RESERVED
 
     def reserve_resume(self, task_id: int) -> bool:
@@ -4337,6 +4367,7 @@ class BackgroundTaskManager:
         if task_id not in self._resume_reservations:
             raise RuntimeError(f"Task {task_id} has no reserved resume slot")
         self._resume_reservations.discard(task_id)
+        self._resume_owner_started_at.setdefault(task_id, time.monotonic())
         self.resume_tasks[task_id] = task
         self._resume_run_ids[task_id] = run_id
         logger.info("Registered resume coordinator for task %s", task_id)
@@ -4345,6 +4376,7 @@ class BackgroundTaskManager:
         if self._shutting_down:
             return
         self._resume_reservations.discard(task_id)
+        self._resume_owner_started_at.pop(task_id, None)
 
     def promote_resume_task(self, task_id: int, task: asyncio.Task) -> None:
         if self._shutting_down:
@@ -4381,6 +4413,7 @@ class BackgroundTaskManager:
         if resume_task is not None and owns_registration(resume_task):
             self.resume_tasks.pop(task_id, None)
             self._resume_run_ids.pop(task_id, None)
+            self._resume_owner_started_at.pop(task_id, None)
             logger.info("Cleaned up resume coordinator for task %s", task_id)
 
     async def cancel_task(
@@ -4396,6 +4429,12 @@ class BackgroundTaskManager:
             )
             if task is not None
         }
+        if not self._shutting_down:
+            # A cancel can race the await between reservation and coordinator
+            # registration. Clear that pre-registration owner even when there
+            # is no asyncio task to cancel yet.
+            self._resume_reservations.discard(task_id)
+            self._resume_owner_started_at.pop(task_id, None)
         if not tasks:
             return BackgroundTaskCancelOutcome(requested=False)
 
@@ -4425,7 +4464,6 @@ class BackgroundTaskManager:
             self.running_tasks.pop(task_id, None)
             self.resume_tasks.pop(task_id, None)
             self._resume_run_ids.pop(task_id, None)
-            self._resume_reservations.discard(task_id)
         return BackgroundTaskCancelOutcome(requested=requested)
 
     async def shutdown(self) -> None:
@@ -4457,6 +4495,7 @@ class BackgroundTaskManager:
                 self.resume_tasks.clear()
                 self._resume_run_ids.clear()
                 self._resume_reservations.clear()
+                self._resume_owner_started_at.clear()
 
 
 # Global background task manager
@@ -4552,7 +4591,7 @@ class SharedWebSocketTracer(TraceHandler):
             if self.is_preview:
                 stream_event["is_preview"] = True
 
-            await self.ws.send_text(json.dumps(stream_event))
+            await send_websocket_text(self.ws, json.dumps(stream_event))
 
         except (RuntimeError, ConnectionError) as e:
             error_msg = str(e)
@@ -4747,6 +4786,7 @@ _VERSIONED_TASK_EVENT_TYPES = {
     "agent_error",
     "error",
     "task_completed",
+    "task_command_outcome",
     "task_error",
     "task_pause_requested",
     "task_paused",
@@ -4986,6 +5026,7 @@ class ConnectionManager:
 
     def register_connection(self, websocket: WebSocket, task_id: int) -> None:
         """Register an already-accepted websocket for task broadcasts."""
+        activate_websocket_writer(websocket)
         current_task_id = self._connection_task_ids.get(websocket)
         if current_task_id is not None and current_task_id != task_id:
             self._remove_from_task(websocket, current_task_id)
@@ -5005,6 +5046,12 @@ class ConnectionManager:
                 pass
 
     def disconnect(self, websocket: WebSocket) -> None:
+        self.unregister_connection(websocket)
+        retire_websocket_writer(websocket)
+
+    def unregister_connection(self, websocket: WebSocket) -> None:
+        """Detach task routing while keeping the accepted socket usable."""
+
         task_id = self._connection_task_ids.pop(websocket, None)
         if task_id is not None:
             self._remove_from_task(websocket, task_id)
@@ -5017,6 +5064,7 @@ class ConnectionManager:
             if self._connection_task_ids.get(connection) == task_id:
                 del self._connection_task_ids[connection]
             _command_origins.discard_socket(connection)
+            retire_websocket_writer(connection)
         return connections
 
     def connections_for_task(self, task_id: int) -> List[WebSocket]:
@@ -5037,41 +5085,129 @@ class ConnectionManager:
 
     async def send_personal_message(self, message: dict, websocket: WebSocket) -> None:
         versioned_message = await _with_current_task_control_state(message)
-        await websocket.send_text(json.dumps(versioned_message))
+        await send_websocket_text(websocket, json.dumps(versioned_message))
 
     async def broadcast_to_task(self, message: dict, task_id: int) -> None:
-        if self.connections_for_task(task_id):
-            versioned_message = await _with_current_task_control_state(
-                message,
-                fallback_task_id=task_id,
-            )
-            for connection in self.connections_for_task(task_id):
-                if not self.is_connection_registered(connection, task_id):
-                    continue
-                try:
-                    await connection.send_text(json.dumps(versioned_message))
-                except (
+        connections = self.connections_for_task(task_id)
+        if not connections:
+            return
+        versioned_message = await _with_current_task_control_state(
+            message,
+            fallback_task_id=task_id,
+        )
+        failures = await fanout_websocket_text(
+            connections,
+            json.dumps(versioned_message),
+            is_active=lambda connection: self.is_connection_registered(
+                connection,
+                task_id,
+            ),
+        )
+        unexpected: Exception | None = None
+        for connection, error in failures:
+            if isinstance(
+                error,
+                (
                     BrokenResourceError,
                     ClosedResourceError,
                     ConnectionError,
                     WebSocketDisconnect,
                     RuntimeError,
-                ) as e:
-                    # Network connection error, remove disconnected connection
-                    logger.warning(f"Connection error for task {task_id}: {e}")
-                    self.disconnect(connection)
-                except Exception as e:
-                    # Other errors should not be silently handled, log and re-raise
-                    logger.error(
-                        f"Unexpected error broadcasting to task {task_id}: {e}"
-                    )
-                    # Remove disconnected connection but preserve error propagation
-                    self.disconnect(connection)
-                    raise
+                ),
+            ):
+                logger.warning(f"Connection error for task {task_id}: {error}")
+            else:
+                logger.error(
+                    f"Unexpected error broadcasting to task {task_id}: {error}"
+                )
+                unexpected = unexpected or error
+            self.disconnect(connection)
+        if unexpected is not None:
+            raise unexpected
 
 
 # Global connection manager
 manager = ConnectionManager()
+
+_terminal_task_event_registry = TerminalTaskEventLoopRegistry()
+
+
+async def _send_terminal_task_event(
+    websocket: WebSocket,
+    event: TerminalTaskEvent,
+) -> None:
+    """Send the immutable event snapshot without current-task relabeling."""
+
+    await send_websocket_text(
+        websocket,
+        json.dumps(terminal_task_event_payload(event)),
+        is_active=lambda: manager.is_connection_registered(
+            websocket,
+            event.task_id,
+        ),
+    )
+
+
+async def attach_terminal_task_events(
+    websocket: WebSocket,
+    *,
+    task_id: int,
+    principal: User | WebSocketPrincipal,
+    after_event_id: int | None,
+) -> TerminalTaskEventSubscription:
+    """Attach an authorized socket to this worker's durable event tailer."""
+
+    resolved_after_event_id = (
+        after_event_id
+        if isinstance(after_event_id, int) and not isinstance(after_event_id, bool)
+        else None
+    )
+
+    async def send(event: TerminalTaskEvent) -> None:
+        if manager.is_connection_registered(websocket, task_id):
+            await _send_terminal_task_event(websocket, event)
+
+    return await _terminal_task_event_registry.attach(
+        connection=websocket,
+        principal=TerminalTaskEventPrincipal(
+            user_id=int(principal.id),
+            is_admin=bool(getattr(principal, "is_admin", False)),
+        ),
+        task_id=task_id,
+        sink=send,
+        after_event_id=resolved_after_event_id,
+    )
+
+
+async def resolve_initial_terminal_task_event_cursor(
+    *,
+    task_id: int,
+    principal: User | WebSocketPrincipal,
+    after_event_id: int | None,
+    allow_missing_task: bool = False,
+) -> int | None:
+    """Fix the event baseline before initial status/history awaits."""
+
+    resolved_after_event_id = (
+        after_event_id
+        if isinstance(after_event_id, int) and not isinstance(after_event_id, bool)
+        else None
+    )
+    return await resolve_terminal_task_event_cursor(
+        principal=TerminalTaskEventPrincipal(
+            user_id=int(principal.id),
+            is_admin=bool(getattr(principal, "is_admin", False)),
+        ),
+        task_id=task_id,
+        after_event_id=resolved_after_event_id,
+        allow_missing_task=allow_missing_task,
+    )
+
+
+async def detach_terminal_task_events(websocket: WebSocket) -> None:
+    """Detach the current durable-event subscription for one local socket."""
+
+    await _terminal_task_event_registry.detach(websocket)
 
 
 async def handle_file_upload_for_task(
@@ -6355,6 +6491,12 @@ async def _handle_chat_message_unserialized(
             if preparation.task_created:
                 old_task_id = preparation.requested_task_id
                 manager.move_connection(websocket, task_id)
+                await attach_terminal_task_events(
+                    websocket,
+                    task_id=task_id,
+                    principal=user,
+                    after_event_id=0,
+                )
                 await manager.send_personal_message(
                     {
                         "type": "task_id_updated",
@@ -6448,7 +6590,46 @@ async def _handle_chat_message_unserialized(
             if task_uses_live_control and supports_live_control:
                 logger.info(f"Using agent message control for task {task_id}")
                 assert agent_service is not None
-                if not background_task_manager.reserve_resume(task_id):
+                reservation = background_task_manager.try_reserve_resume(
+                    task_id,
+                    expected_run_id=task_run_id,
+                )
+                if reservation is not ResumeReservationOutcome.RESERVED:
+                    if suppress_delivery_ack:
+                        # Durable commands own their retry budget. All three
+                        # occupied states can clear without this attempt doing
+                        # anything: a reservation can register or release, a
+                        # coordinator can finish, and shutdown is retained as
+                        # a defensive state even though normal shutdown stops
+                        # the dispatcher before setting the manager flag.
+                        holder_age_seconds = (
+                            background_task_manager.resume_holder_age_seconds(task_id)
+                        )
+                        holder_age_text = (
+                            f"{holder_age_seconds:.3f}"
+                            if holder_age_seconds is not None
+                            else "unknown"
+                        )
+                        logger.info(
+                            "Deferring message %s for task %s: resume slot "
+                            "unavailable (%s), holder_age_seconds=%s",
+                            turn_id,
+                            task_id,
+                            reservation.value,
+                            holder_age_text,
+                        )
+                        message_data["_durable_command_defer"] = turn_id
+                        message_data["_durable_command_defer_reason"] = (
+                            f"Message {turn_id} is waiting for the live-control "
+                            f"resume slot ({reservation.value})"
+                        )
+                        if recovered_delivery is not None:
+                            # A prior attempt claimed the durable delivery and
+                            # may have injected it. Task/run-local occupancy is
+                            # not evidence that this command owns the live
+                            # coordinator after a worker handoff.
+                            message_data["_durable_command_defer_unsafe"] = turn_id
+                        return
                     await finish_delivery(
                         False,
                         "A previous guidance message is still being applied. "
@@ -8096,6 +8277,11 @@ async def websocket_chat_endpoint(
     websocket: WebSocket,
     task_id: int,
     token: Optional[str] = Query(None, description="Authentication token"),
+    terminal_event_after: Optional[int] = Query(
+        None,
+        ge=0,
+        description="Last terminal task-command event cursor received",
+    ),
 ) -> None:
     """WebSocket unified endpoint - handle chat, execution status, and DAG intervention"""
     # Verify user identity
@@ -8115,10 +8301,22 @@ async def websocket_chat_endpoint(
     # Initialised here, not in the loop, because the initial status request runs
     # before the first message is ever parsed.
     dispatching = "websocket initial status request"
-
     try:
+        terminal_event_cursor = await resolve_initial_terminal_task_event_cursor(
+            task_id=task_id,
+            principal=user,
+            after_event_id=terminal_event_after,
+            allow_missing_task=True,
+        )
         # Send initial state
         await handle_status_request(websocket, task_id, user)
+        if terminal_event_cursor is not None:
+            await attach_terminal_task_events(
+                websocket,
+                task_id=task_id,
+                principal=user,
+                after_event_id=terminal_event_cursor,
+            )
 
         while True:
             # Receive client message
@@ -8185,6 +8383,7 @@ async def websocket_chat_endpoint(
         raise
     finally:
         manager.disconnect(websocket)
+        await detach_terminal_task_events(websocket)
 
 
 async def handle_intervention(
@@ -9211,6 +9410,21 @@ async def _execute_durable_task_command(
         await _handle_chat_message_unserialized(
             websocket, command.task_id, message_data
         )
+        if message_data.get("_durable_command_defer") == command.command_id:
+            # This marker is mutually exclusive with commit-outcome-unknown:
+            # the handler returns immediately after recording contention.
+            raise TaskCommandDeferred(
+                str(message_data["_durable_command_defer_reason"]),
+                resend_safe=(
+                    # Every settled contention increments defer_count once.
+                    # Equality proves there is no extra expired/failed claim
+                    # whose worker might still resume and inject after this
+                    # attempt observed no delivery row.
+                    command.attempt_count == command.defer_count + 1
+                    and message_data.get("_durable_command_defer_unsafe")
+                    != command.command_id
+                ),
+            )
         if message_data.get("_commit_outcome_unknown") == command.command_id:
             raise ClientVisibleTaskCommandDeferred(
                 f"Message {command.command_id} has an unknown commit outcome"
@@ -9389,54 +9603,41 @@ def _is_external_cancel(command: ClaimedTaskCommand) -> bool:
     )
 
 
-async def _broadcast_terminal_command_error(
+async def _terminal_command_event_draft(
     command: ClaimedTaskCommand,
     error: BaseException,
-) -> None:
-    scope = _command_scope(command)
-    # Two things separate an external-scope cancel from every other command
-    # that exhausts its budget, and both come from who reads the frame. The
-    # wording has to be true about the turn, which takes reading the task.
-    # And ``command_kind``/``command_id`` are operator handles: an anonymous
-    # visitor cannot act on them and should not be shown the durable command
-    # identity of a task they do not own. Two payload literals rather than
-    # one built and trimmed: the client-safe guard only inspects dict
-    # literals passed straight to the sink, and a payload assembled in a
-    # variable would drop this site out of its view entirely.
+) -> TerminalTaskEventDraft:
+    """Build safe presentation metadata; disposition code persists it."""
+
     if _is_external_cancel(command):
-        task_status = await _load_terminal_command_task_status(command.task_id)
-        await manager.broadcast_to_task(
-            {
-                "type": "agent_error",
-                "message": client_safe_task_command_failure(
-                    command.kind,
-                    error,
-                    scope=scope,
-                    task_status=task_status,
-                ),
-                "task_id": command.task_id,
-                "timestamp": datetime.now(timezone.utc).timestamp(),
-            },
-            command.task_id,
-        )
-        return
-    await manager.broadcast_to_task(
-        {
-            "type": "agent_error",
-            # A blessed constructor rather than an f-string at the call
-            # site: the guard cannot see inside an interpolation. The kind
-            # also travels as a structured field for consumers that want it.
-            "message": client_safe_task_command_failure(
-                command.kind,
-                error,
-                scope=scope,
+        try:
+            task_status = await _load_terminal_command_task_status(command.task_id)
+        except Exception as exc:
+            logger.warning(
+                "Could not classify external terminal command outcome; "
+                "using conservative client message task_id=%s error_type=%s",
+                command.task_id,
+                type(exc).__name__,
+            )
+            task_status = None
+        return TerminalTaskEventDraft(
+            message_code=(
+                TerminalTaskEventMessageCode.EXTERNAL_TURN_INTERRUPTED
+                if task_status in {TaskStatus.COMPLETED, TaskStatus.FAILED}
+                else TerminalTaskEventMessageCode.EXTERNAL_CANCEL_NOT_APPLIED
             ),
-            "command_kind": command.kind.value,
-            "task_id": command.task_id,
-            "command_id": command.command_id,
-            "timestamp": datetime.now(timezone.utc).timestamp(),
-        },
-        command.task_id,
+            resend_safe=False,
+            include_command_identity=False,
+        )
+    return TerminalTaskEventDraft(
+        message_code=(
+            TerminalTaskEventMessageCode.TASK_COMMAND_DEFERRED
+            if isinstance(error, TaskCommandDeferred)
+            else TerminalTaskEventMessageCode.TASK_COMMAND_FAILED
+        ),
+        resend_safe=(
+            error.resend_safe if isinstance(error, TaskCommandDeferred) else False
+        ),
     )
 
 
@@ -9450,7 +9651,10 @@ async def execute_durable_task_command(
     except TaskCommandDeferred as exc:
         if command.defer_count + 1 >= MAX_COMMAND_DEFERS:
             _command_origins.discard_command(command.command_id, command.task_id)
-            await _broadcast_terminal_command_error(command, exc)
+            bind_terminal_event_draft(
+                exc,
+                await _terminal_command_event_draft(command, exc),
+            )
         # A deferral that will retry keeps its origin entry.
         raise
     except TaskCommandRejected:
@@ -9461,7 +9665,10 @@ async def execute_durable_task_command(
     except Exception as exc:
         if command.failure_count + 1 >= MAX_COMMAND_FAILURES:
             _command_origins.discard_command(command.command_id, command.task_id)
-            await _broadcast_terminal_command_error(command, exc)
+            bind_terminal_event_draft(
+                exc,
+                await _terminal_command_event_draft(command, exc),
+            )
         raise
     _command_origins.discard_command(command.command_id, command.task_id)
     return result
@@ -9542,6 +9749,7 @@ async def websocket_builder_chat_endpoint(
         return
 
     await websocket.accept()
+    activate_websocket_writer(websocket)
     logger.info(f"Builder chat WebSocket connection established for user {user.id}")
     active_chat_task: asyncio.Task[None] | None = None
 
@@ -9568,9 +9776,12 @@ async def websocket_builder_chat_endpoint(
     except Exception as e:
         logger.error(f"Unexpected error in builder chat WebSocket: {e}")
     finally:
-        if active_chat_task is not None:
-            await cancel_and_drain_async_task(active_chat_task)
-        websocket.state.chat_task = None
+        retire_websocket_writer(websocket)
+        try:
+            if active_chat_task is not None:
+                await cancel_and_drain_async_task(active_chat_task)
+        finally:
+            websocket.state.chat_task = None
 
 
 async def handle_builder_chat(
@@ -9712,7 +9923,8 @@ clarification questions as plain assistant text.
 
         async def send_builder_outbound_message(payload: Dict[str, Any]) -> None:
             """Bridge agent agent-to-user messages to the builder chat socket."""
-            await websocket.send_text(
+            await send_websocket_text(
+                websocket,
                 json.dumps(
                     create_stream_event(
                         _agent_outbound_event_type(payload),
@@ -9731,17 +9943,18 @@ clarification questions as plain assistant text.
                         },
                         event_id=payload.get("event_id"),
                     )
-                )
+                ),
             )
 
         llm = runtime_inputs.llm
         compact_llm = runtime_inputs.compact_llm
 
         if not llm:
-            await websocket.send_text(
+            await send_websocket_text(
+                websocket,
                 json.dumps(
                     {"type": "error", "message": "No LLM configured for builder chat"}
-                )
+                ),
             )
             return
 
@@ -9960,7 +10173,8 @@ clarification questions as plain assistant text.
                         "chat_response"
                     )
 
-                await websocket.send_text(
+                await send_websocket_text(
+                    websocket,
                     json.dumps(
                         {
                             "type": "task_completed",
@@ -9969,15 +10183,16 @@ clarification questions as plain assistant text.
                             "success": result.get("success", True),
                             "timestamp": datetime.now(timezone.utc).timestamp(),
                         }
-                    )
+                    ),
                 )
             except Exception as e:
                 logger.warning(f"Failed to send task_completed: {e}")
 
     except Exception as e:
         logger.error("Error handling builder chat: %s", e, exc_info=True)
-        await websocket.send_text(
-            json.dumps({"type": "error", "message": client_safe_error_message(e)})
+        await send_websocket_text(
+            websocket,
+            json.dumps({"type": "error", "message": client_safe_error_message(e)}),
         )
 
 
@@ -9997,6 +10212,7 @@ async def websocket_build_preview_endpoint(
         return
 
     await websocket.accept()
+    activate_websocket_writer(websocket)
     logger.info(f"Build preview WebSocket connection established for user {user.id}")
 
     try:
@@ -10019,13 +10235,14 @@ async def websocket_build_preview_endpoint(
                         {"type": "pause_task", "user": user},
                     )
                 else:
-                    await websocket.send_text(
+                    await send_websocket_text(
+                        websocket,
                         json.dumps(
                             {
                                 "type": "error",
                                 "message": "No active agent to pause",
                             }
-                        )
+                        ),
                     )
             elif message_type == "resume":
                 task_id = getattr(websocket.state, "preview_task_id", None)
@@ -10036,28 +10253,32 @@ async def websocket_build_preview_endpoint(
                         {"type": "resume_task", "user": user},
                     )
                 else:
-                    await websocket.send_text(
+                    await send_websocket_text(
+                        websocket,
                         json.dumps(
                             {
                                 "type": "error",
                                 "message": "No active agent to resume",
                             }
-                        )
+                        ),
                     )
             elif message_type == "clear_context":
-                manager.disconnect(websocket)
+                manager.unregister_connection(websocket)
+                await detach_terminal_task_events(websocket)
                 websocket.state.preview_task_id = None
-                await websocket.send_text(
+                await send_websocket_text(
+                    websocket,
                     json.dumps(
                         {
                             "type": "context_cleared",
                             "timestamp": datetime.now(timezone.utc).timestamp(),
                         }
-                    )
+                    ),
                 )
                 logger.info(f"Cleared build preview context for user {user.id}")
             else:
-                await websocket.send_text(
+                await send_websocket_text(
+                    websocket,
                     json.dumps(
                         {
                             "type": "error",
@@ -10065,7 +10286,7 @@ async def websocket_build_preview_endpoint(
                             # "Unknown message type" site above.
                             "message": "Unknown message type",
                         }
-                    )
+                    ),
                 )
 
     except WebSocketDisconnect:
@@ -10076,6 +10297,7 @@ async def websocket_build_preview_endpoint(
         logger.error(f"Unexpected error in build preview WebSocket: {e}")
     finally:
         manager.disconnect(websocket)
+        await detach_terminal_task_events(websocket)
 
 
 async def handle_build_preview_execution(
@@ -10090,13 +10312,14 @@ async def handle_build_preview_execution(
     user_message = message_data.get("message", "")
     files_data = message_data.get("files", [])
     if not user_message and not files_data:
-        await websocket.send_text(
+        await send_websocket_text(
+            websocket,
             json.dumps(
                 {
                     "type": "error",
                     "message": "Message or files are required for preview",
                 }
-            )
+            ),
         )
         return
 
@@ -10161,6 +10384,14 @@ async def handle_build_preview_execution(
         manager.register_connection(websocket, preview_task_id)
     else:
         preview_task_id = int(str(preview_task_id))
+
+    if not _terminal_task_event_registry.has_subscription(websocket):
+        await attach_terminal_task_events(
+            websocket,
+            task_id=preview_task_id,
+            principal=cast(WebSocketPrincipal, user),
+            after_event_id=0,
+        )
 
     await handle_chat_message(
         websocket,

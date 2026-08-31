@@ -42,16 +42,26 @@ export async function fetchUserPreferences(): Promise<UserPreferences | null> {
   }
 }
 
+// 4xx statuses that are conventionally transient (HTTP semantics), not a
+// rejection of this exact payload - a PR review finding caught that lumping
+// every 4xx in with "permanent" would misclassify a 429 (rate limited) or a
+// gateway-injected 408/425 (this endpoint itself doesn't raise these today,
+// but a proxy/load balancer in front of it can) as unrecoverable, which
+// would then permanently block a caller that only escalates past a genuine
+// permanent rejection (see saveFailureHasPermanentByDestRef in page.tsx).
+const RETRYABLE_4XX_STATUSES = new Set([408, 425, 429]);
+
 /** PATCH /api/auth/me/preferences - merges the given fields into the
  * stored preferences server-side (a partial update, not a replace), so
  * callers only need to send what they actually collected.
  *
- * `retryable` distinguishes a transient failure (network error, 5xx) from a
- * permanent one (4xx - the backend rejected this exact payload, e.g. a
- * malformed/oversized field): a caller that gives up and proceeds anyway
- * after repeated failures (see MAX_SAVE_FAILURES_BEFORE_ESCAPE in page.tsx)
- * must not treat the two the same when what follows is irreversible -
- * retrying an identical rejected payload will only ever 4xx again. */
+ * `retryable` distinguishes a transient failure (network error, 5xx, or one
+ * of the RETRYABLE_4XX_STATUSES above) from a permanent one (any other 4xx -
+ * the backend rejected this exact payload, e.g. a malformed/oversized
+ * field): a caller that gives up and proceeds anyway after repeated
+ * failures (see MAX_SAVE_FAILURES_BEFORE_ESCAPE in page.tsx) must not treat
+ * the two the same when what follows is irreversible - retrying an
+ * identical rejected payload will only ever 4xx again. */
 export async function updateUserPreferences(
   updates: UserPreferences
 ): Promise<{ ok: boolean; retryable: boolean }> {
@@ -61,7 +71,10 @@ export async function updateUserPreferences(
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(updates),
     });
-    return { ok: response.ok, retryable: response.ok || response.status >= 500 };
+    return {
+      ok: response.ok,
+      retryable: response.ok || response.status >= 500 || RETRYABLE_4XX_STATUSES.has(response.status),
+    };
   } catch {
     return { ok: false, retryable: true };
   }

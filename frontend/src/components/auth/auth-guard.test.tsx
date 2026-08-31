@@ -169,6 +169,31 @@ describe("AuthGuard onboarding redirect", () => {
     expect(fetchUserPreferencesMock).toHaveBeenCalledTimes(1)
   })
 
+  // Pins a PR review finding: the ref used to latch on ANY successfully-
+  // resolved check, including one that found the user NOT onboarded and
+  // redirected them - so a user who never actually finishes the wizard, but
+  // instead navigates (e.g. a browser Back button) to a DIFFERENT
+  // already-visited protected route, would skip every future check for the
+  // rest of the session with onboarding never actually done. Only latching
+  // once onboarding is CONFIRMED true means a not-yet-onboarded identity
+  // keeps being re-checked on every route change instead.
+  it("keeps re-checking on later routes when a completed check found the user not onboarded", async () => {
+    fetchUserPreferencesMock.mockResolvedValue({})
+
+    const { rerender } = render(<AuthGuard><div data-testid="children" /></AuthGuard>)
+    await waitFor(() => expect(fetchUserPreferencesMock).toHaveBeenCalledTimes(1))
+    await waitFor(() => expect(routerReplace).toHaveBeenCalledWith("/onboarding"))
+
+    // Simulates navigating away from the redirect target to some OTHER
+    // already-visited protected route (e.g. via Back), not completing
+    // onboarding - the mocked router.replace above doesn't actually change
+    // route.pathname, so this stands in for that separate navigation.
+    route.pathname = "/dashboard"
+    rerender(<AuthGuard><div data-testid="children" /></AuthGuard>)
+
+    await waitFor(() => expect(fetchUserPreferencesMock).toHaveBeenCalledTimes(2))
+  })
+
   // Pins a finding verified during PR review: AuthGuard doesn't remount
   // across a client-side auth swap - AuthProvider reacts to a same-origin
   // `storage` event (a DIFFERENT user logging in from another tab) by

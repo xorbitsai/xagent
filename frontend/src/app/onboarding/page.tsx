@@ -106,6 +106,20 @@ export default function OnboardingPage() {
   const router = useRouter();
   const { user } = useAuth();
   const { t, locale } = useI18n();
+  // The identity this wizard was opened for - a PR review finding caught
+  // that this page's own state (work/industry/goals/voice, the selected
+  // template, etc.) has no identity binding of its own, unlike the
+  // escape flag and AuthGuard's own onboarding-redirect check, which both
+  // account for AuthProvider updating `user` in place (via its `storage`
+  // event listener) on a same-origin cross-tab login as a DIFFERENT user,
+  // with no remount of this page. Without this, a half-filled wizard's
+  // answers - or an in-flight save/hire that started under the original
+  // identity - could be sent, or completed, under a swapped-in identity's
+  // session. This deliberately does NOT reset or rehydrate the wizard for
+  // the new identity (a larger redesign); it only guards the handful of
+  // mutating calls below so identity A's data is never written or
+  // completed as identity B.
+  const wizardUserIdRef = useRef(user?.id);
 
   const [stepIndex, setStepIndex] = useState(0);
   const step = STEP_ORDER[stepIndex];
@@ -137,6 +151,14 @@ export default function OnboardingPage() {
   // its real destination (an existing agent vs. a freshly hired one) until
   // after the save succeeds, so it gets its own fixed bucket instead.
   const saveFailureCountByDestRef = useRef<Record<string, number>>({});
+  // Whether ANY failure in the current streak for this key was non-retryable
+  // (a permanent 4xx rejection of this exact payload) - a PR review finding
+  // caught that handleLaunch's escape only checked the LATEST failure's
+  // retryable bit, so a permanent rejection followed by a later transient
+  // one (e.g. 422 then a 503) still escalated to an irreversible hire, even
+  // though the payload itself was already known to be rejected outright.
+  // Reset alongside the count, on the same success/streak-reset events.
+  const saveFailureHasPermanentByDestRef = useRef<Record<string, boolean>>({});
 
   useEffect(() => {
     isMountedRef.current = true;
@@ -314,13 +336,22 @@ export default function OnboardingPage() {
     failureKey: string,
     { requireRetryableToEscape, includeOnboarded = true }: { requireRetryableToEscape: boolean; includeOnboarded?: boolean }
   ): Promise<SavePreferencesOutcome> => {
+    // See wizardUserIdRef's comment - never send this identity's answers
+    // under a swapped-in session. Not counted as a failure of THIS payload
+    // (it was never actually sent), so it doesn't feed the escape counter.
+    if (user?.id !== wizardUserIdRef.current) {
+      if (isMountedRef.current) toast.error(t("onboarding.done.saveFailed"));
+      return "retry_in_place";
+    }
     const saved = await updateUserPreferences(buildPreferencesPayload({ includeOnboarded }));
     if (saved.ok) {
       saveFailureCountByDestRef.current[failureKey] = 0;
+      saveFailureHasPermanentByDestRef.current[failureKey] = false;
       return "saved";
     }
     const failureCount = (saveFailureCountByDestRef.current[failureKey] ?? 0) + 1;
     saveFailureCountByDestRef.current[failureKey] = failureCount;
+    if (!saved.retryable) saveFailureHasPermanentByDestRef.current[failureKey] = true;
     if (isMountedRef.current) toast.error(t("onboarding.done.saveFailed"));
     // Don't escape on the FIRST failure: onboarded would stay false
     // server-side, and AuthGuard would just bounce the user right back -
@@ -328,8 +359,17 @@ export default function OnboardingPage() {
     // failing must not trap the caller forever - let it through after a
     // couple of tries even though the save didn't land; they'll just be
     // asked again next session instead of being stuck this one.
+    //
+    // requireRetryableToEscape callers must look at whether a non-retryable
+    // failure was EVER seen in this streak, not just this latest attempt -
+    // a PR review finding caught that checking only the latest attempt let a
+    // permanent 4xx rejection escalate anyway if the very next retry
+    // happened to fail transiently instead (e.g. 422 then a network blip).
+    // The identical, already-rejected payload doesn't become escapable just
+    // because a later attempt failed a different way.
     const canEscape =
-      failureCount >= MAX_SAVE_FAILURES_BEFORE_ESCAPE && (!requireRetryableToEscape || saved.retryable);
+      failureCount >= MAX_SAVE_FAILURES_BEFORE_ESCAPE &&
+      (!requireRetryableToEscape || !saveFailureHasPermanentByDestRef.current[failureKey]);
     return canEscape ? "escaped" : "retry_in_place";
   };
 
@@ -340,8 +380,31 @@ export default function OnboardingPage() {
   // the escape flag (this save's own retries/escalation don't apply - the
   // agent is real either way, so navigation must not be blocked on this one
   // best-effort field ever landing).
+  //
+  // Sends the FULL payload (buildPreferencesPayload's default
+  // includeOnboarded:true), not just `{onboarded: true}` alone - a PR
+  // review finding caught that the earlier main save in handleLaunch below
+  // is deliberately allowed to escape (proceed anyway) after repeated
+  // RETRYABLE failures, meaning department/industry/goals/voice can still
+  // be genuinely unsaved by the time this runs. Sending only the marker
+  // here would let this call succeed on its own and durably complete the
+  // account - onboarded:true, but with the rest of the answers never
+  // actually persisted, and no way back in to finish since onboarded:true
+  // skips onboarding entirely. Resending everything together here means a
+  // successful completion always carries the real answers with it.
   const markOnboardedAndNavigate = async (destination: string) => {
-    const onboardedSave = await updateUserPreferences({ onboarded: true });
+    // See wizardUserIdRef's comment - never complete onboarding, or write
+    // this identity's collected answers, under a swapped-in session. No
+    // escape marker here: that flag is for a save that genuinely failed,
+    // not for an attempt this identity never actually got to make.
+    if (user?.id !== wizardUserIdRef.current) {
+      if (isMountedRef.current) {
+        launchingRef.current = false;
+        setLaunching(false);
+      }
+      return;
+    }
+    const onboardedSave = await updateUserPreferences(buildPreferencesPayload());
     if (isMountedRef.current) {
       if (!onboardedSave.ok) markOnboardingSaveEscaped(user?.id);
       router.replace(destination);
@@ -469,6 +532,13 @@ export default function OnboardingPage() {
         return;
       }
       if (!isMountedRef.current) return;
+      // See wizardUserIdRef's comment - never hire an agent under a
+      // swapped-in identity's session on this identity's behalf.
+      if (user?.id !== wizardUserIdRef.current) {
+        launchingRef.current = false;
+        setLaunching(false);
+        return;
+      }
 
       const result = await hireAgentFromTemplate({
         templateId: selected.id,

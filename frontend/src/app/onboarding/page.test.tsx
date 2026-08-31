@@ -110,6 +110,7 @@ describe("OnboardingPage", () => {
     routerPush.mockClear()
     routerReplace.mockClear()
     i18nState.locale = "en"
+    authUser.id = "user-a"
     authUser.username = "Shulei"
     apiRequestMock.mockReset()
     apiRequestMock.mockResolvedValue({ ok: true, json: async () => TEMPLATES })
@@ -585,7 +586,7 @@ describe("OnboardingPage", () => {
     })
 
     await waitFor(() => expect(updateUserPreferencesMock).toHaveBeenCalledTimes(2))
-    expect(updateUserPreferencesMock.mock.calls[1][0]).toEqual({ onboarded: true })
+    expect(updateUserPreferencesMock.mock.calls[1][0]).toEqual(expect.objectContaining({ onboarded: true }))
     expect(routerReplace).not.toHaveBeenCalledWith("/task/42")
   })
 
@@ -615,7 +616,7 @@ describe("OnboardingPage", () => {
 
     await waitFor(() => expect(updateUserPreferencesMock).toHaveBeenCalledTimes(2))
     expect(updateUserPreferencesMock.mock.calls[0][0]).not.toHaveProperty("onboarded")
-    expect(updateUserPreferencesMock.mock.calls[1][0]).toEqual({ onboarded: true })
+    expect(updateUserPreferencesMock.mock.calls[1][0]).toEqual(expect.objectContaining({ onboarded: true }))
     // The agent-confirming call must happen before the onboarded save, not
     // just eventually - hireAgentFromTemplateMock resolves synchronously in
     // this mock, so by the time updateUserPreferences is called a 2nd time,
@@ -817,7 +818,7 @@ describe("OnboardingPage", () => {
     })
 
     await waitFor(() => expect(routerReplace).toHaveBeenCalledWith("/agent/77"))
-    expect(updateUserPreferencesMock).toHaveBeenCalledWith({ onboarded: true })
+    expect(updateUserPreferencesMock).toHaveBeenCalledWith(expect.objectContaining({ onboarded: true }))
     expect(markOnboardingSaveEscapedMock).not.toHaveBeenCalled()
   })
 
@@ -887,7 +888,7 @@ describe("OnboardingPage", () => {
 
     await waitFor(() => expect(routerReplace).toHaveBeenCalledWith("/agent/99"))
     expect(hireAgentFromTemplateMock).not.toHaveBeenCalled()
-    expect(updateUserPreferencesMock).toHaveBeenCalledWith({ onboarded: true })
+    expect(updateUserPreferencesMock).toHaveBeenCalledWith(expect.objectContaining({ onboarded: true }))
     expect(markOnboardingSaveEscapedMock).not.toHaveBeenCalled()
   })
 
@@ -1046,6 +1047,45 @@ describe("OnboardingPage", () => {
     expect(markOnboardingSaveEscapedMock).toHaveBeenCalledTimes(1)
   })
 
+  // Pins a PR review finding: after escaping past 2 failed attempts to save
+  // the collected fields, the FINAL completion write must resend those same
+  // fields together with onboarded:true - sending only the marker would let
+  // the account end up "onboarded" with department/goals/voice never
+  // actually persisted, and no way back in to finish since onboarded:true
+  // skips onboarding entirely.
+  it("resends the full collected fields (not just the marker) in the final completion write after escaping 2 failed field saves", async () => {
+    updateUserPreferencesMock
+      .mockResolvedValueOnce({ ok: false, retryable: true })
+      .mockResolvedValueOnce({ ok: false, retryable: true })
+      .mockResolvedValueOnce({ ok: true })
+
+    await goToWelcomeThenBusiness()
+    fireEvent.click(screen.getByText("Marketing"))
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/take off your plate/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Post on social media"))
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/Meet your AI team/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/How should/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText("You're all set.")).toBeInTheDocument())
+
+    await act(async () => {
+      fireEvent.click(screen.getByText("Start with Maya"))
+    })
+    await act(async () => {
+      fireEvent.click(screen.getByText("Start with Maya"))
+    })
+
+    await waitFor(() => expect(hireAgentFromTemplateMock).toHaveBeenCalled())
+    expect(updateUserPreferencesMock).toHaveBeenCalledTimes(3)
+    expect(updateUserPreferencesMock.mock.calls[2][0]).toEqual(
+      expect.objectContaining({ onboarded: true, department: "marketing", goals: ["social"] })
+    )
+    expect(markOnboardingSaveEscapedMock).not.toHaveBeenCalled()
+  })
+
   // Pins a finding verified during PR review: unlike persistAndLeave's
   // escape hatch (which just leaves without saving), handleLaunch's
   // proceeds to an IRREVERSIBLE hireAgentFromTemplate call. A NON-retryable
@@ -1113,7 +1153,14 @@ describe("OnboardingPage", () => {
     expect(markOnboardingSaveEscapedMock).not.toHaveBeenCalled()
   })
 
-  it("escalates on failure #2 when it's retryable, even though failure #1 was not", async () => {
+  // Pins a PR review finding: this exact scenario used to escalate, because
+  // the escape decision only looked at the LATEST attempt's retryable flag -
+  // a permanent (non-retryable) rejection of this payload doesn't stop
+  // being permanent just because the very next attempt happens to fail a
+  // different way. Once ANY failure in the streak is known non-retryable,
+  // this key must never escalate, matching "failure #1 retryable, #2 not"
+  // above - order must not matter.
+  it("does not escalate on failure #2 even though it's retryable, since failure #1 was not", async () => {
     updateUserPreferencesMock
       .mockResolvedValueOnce({ ok: false, retryable: false })
       .mockResolvedValueOnce({ ok: false, retryable: true })
@@ -1137,12 +1184,7 @@ describe("OnboardingPage", () => {
       fireEvent.click(screen.getByText("Start with Maya"))
     })
 
-    await waitFor(() => expect(hireAgentFromTemplateMock).toHaveBeenCalled())
-    // The escape flag is no longer tied to the main fields save escalating -
-    // only to whether the SEPARATE final onboarded:true save (below,
-    // deliberately not mocked to fail here) succeeds. It does, by the
-    // default beforeEach mock, so nothing needs to tell AuthGuard to stand
-    // down.
+    expect(hireAgentFromTemplateMock).not.toHaveBeenCalled()
     expect(markOnboardingSaveEscapedMock).not.toHaveBeenCalled()
   })
 
@@ -1569,5 +1611,56 @@ describe("OnboardingPage", () => {
     // All 3 goals map to the 3 fetched templates, so once loaded there's
     // nothing extra waiting either - this only pins the *during-load* state
     // above, not a specific post-load count.
+  })
+
+  // Pins a PR review finding: this page's own state has no identity binding
+  // of its own, unlike the escape flag and AuthGuard's onboarding check.
+  // AuthProvider updates `user` in place (via its `storage` event listener)
+  // on a same-origin cross-tab login as a DIFFERENT user, with no remount of
+  // this page - without a guard, a half-filled wizard's answers, or an
+  // agent hire, could be sent/completed under the swapped-in identity's
+  // session instead of the one that actually filled them in.
+  it("does not save, hire, or navigate if the authenticated identity changes mid-wizard", async () => {
+    await goToWelcomeThenBusiness()
+    fireEvent.click(screen.getByText("Marketing"))
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/take off your plate/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Post on social media"))
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/Meet your AI team/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/How should/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText("You're all set.")).toBeInTheDocument())
+
+    // Simulates a same-origin cross-tab login as a different user while this
+    // tab still has the wizard open - authUser is a live reference read by
+    // the mocked useAuth() on every access, so mutating it here stands in
+    // for AuthProvider's in-place update with no remount of this page.
+    authUser.id = "user-b"
+
+    await act(async () => {
+      fireEvent.click(screen.getByText("Start with Maya"))
+    })
+
+    expect(updateUserPreferencesMock).not.toHaveBeenCalled()
+    expect(hireAgentFromTemplateMock).not.toHaveBeenCalled()
+    expect(routerReplace).not.toHaveBeenCalled()
+  })
+
+  // Same guard, the other mutating path: persistAndLeave's exits must not
+  // send this identity's half-filled answers under a swapped-in session either.
+  it("does not save or navigate on Skip setup if the authenticated identity changes mid-wizard", async () => {
+    render(<OnboardingPage />)
+    await waitFor(() => expect(screen.getByText(/Welcome to Xagent/)).toBeInTheDocument())
+
+    authUser.id = "user-b"
+
+    await act(async () => {
+      fireEvent.click(screen.getByText("Skip setup"))
+    })
+
+    expect(updateUserPreferencesMock).not.toHaveBeenCalled()
+    expect(routerReplace).not.toHaveBeenCalled()
   })
 })

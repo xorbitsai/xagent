@@ -36,11 +36,20 @@ export function AuthGuard({ children }: AuthGuardProps) {
     }
   }, [isAuthenticated, isLoading, router, mounted, isAuthPage])
 
-  // Checked once per app load (this component doesn't remount on client-side
-  // navigation), not on every route change - a stale read only matters until
-  // the user next completes or skips onboarding, at which point every exit
-  // path there PATCHes onboarded:true before leaving (or, on a save that
-  // keeps failing, sets the escape flag consumed below), so this won't loop.
+  // Only latches once onboarding is CONFIRMED complete for this user, not
+  // merely once a check has run - a PR review finding caught that latching
+  // on any successfully-resolved check (including a "not onboarded" one)
+  // let a user who never actually finishes the wizard bypass every future
+  // check for the rest of the session: redirected once to /onboarding, then
+  // instead of completing it, a browser Back (or any other client-side nav
+  // to a DIFFERENT already-visited protected route - this component doesn't
+  // remount on client-side navigation) lands on a page whose effect re-runs,
+  // sees the ref already latched to this user id, and skips the check
+  // entirely, rendering protected children with onboarding never actually
+  // done. Re-checking on every route change until it's actually confirmed
+  // true is the correct tradeoff here (an extra GET per route while
+  // genuinely not onboarded, which is expected to be a short-lived state)
+  // over ever latching on an unconfirmed outcome.
   //
   // The ref only latches once the check actually finishes (not before the
   // await) - if a dependency changes and cancels this run first (e.g. the
@@ -86,18 +95,21 @@ export function AuthGuard({ children }: AuthGuardProps) {
       // onboarded." Leave the ref unlatched so the next navigation retries
       // instead of redirecting an already-onboarded user on a transient error.
       if (preferences === null) return
-      checkedOnboardingUserIdRef.current = user.id
       // Strict `!== true`, not `!preferences.onboarded`: the GET boundary
       // doesn't validate this field's type, so a malformed stored value
       // (e.g. a string "false", which is truthy) must not read as "already
       // onboarded" - only an explicit boolean true should ever skip the redirect.
       if (preferences.onboarded !== true) {
-        // replace, not push: a `push` here leaves the pre-redirect page in
-        // history, so a single Back press returns the user there with the
-        // ref already latched - no re-check ever fires again this session,
-        // permanently bypassing onboarding with no error condition required.
+        // Deliberately NOT latching the ref here (see the comment on the
+        // ref's declaration) - `replace` alone only prevents a Back press
+        // from returning to THIS specific page (its history entry is gone),
+        // it does nothing about navigating to some OTHER already-visited
+        // protected route, which this effect will still see on its own
+        // pathname change and must actually re-check.
         router.replace(ONBOARDING_PATH)
+        return
       }
+      checkedOnboardingUserIdRef.current = user.id
     })()
     return () => {
       active = false

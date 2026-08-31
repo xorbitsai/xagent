@@ -116,6 +116,24 @@ describe("updateUserPreferences", () => {
 
     expect(await updateUserPreferences({ onboarded: true })).toEqual({ ok: false, retryable: false })
   })
+
+  // Pins a PR review finding: lumping every 4xx in with "permanent" would
+  // misclassify a rate limit (429) or a gateway-injected timeout (408) or
+  // "too early" (425) as an unrecoverable rejection of the payload - these
+  // are conventionally transient per HTTP semantics, not a verdict on this
+  // exact payload, and a caller that only escalates past a genuine
+  // permanent rejection must not be permanently blocked by one of these.
+  it.each([408, 425, 429])("reports retryable: true for the conventionally-transient 4xx status %i", async (status) => {
+    apiRequestMock.mockResolvedValue({ ok: false, status })
+
+    expect(await updateUserPreferences({ onboarded: true })).toEqual({ ok: false, retryable: true })
+  })
+
+  it("still reports retryable: false for a 4xx status not in the transient allowlist (e.g. 422)", async () => {
+    apiRequestMock.mockResolvedValue({ ok: false, status: 422 })
+
+    expect(await updateUserPreferences({ onboarded: true })).toEqual({ ok: false, retryable: false })
+  })
 })
 
 // Coordinates persistAndLeave's give-up-after-repeated-failures escape hatch

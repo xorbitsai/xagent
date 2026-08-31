@@ -460,6 +460,11 @@ export function ClarificationForm({
     } catch (error) {
       console.error("Failed to send connect-apps skip response", error)
       toast.error(t("chatPage.clarification.sendError"))
+      // Rethrow so the button's own click handler knows the send failed and
+      // can roll its optimistic "skipped" state back - without this, the
+      // caller has no way to tell success from failure and the button
+      // disappears even though the acknowledgement never actually went out.
+      throw error
     }
   }
 
@@ -484,6 +489,8 @@ export function ClarificationForm({
     } catch (error) {
       console.error("Failed to send connect-apps continue response", error)
       toast.error(t("chatPage.clarification.sendError"))
+      // Rethrow - see handleSkipConnectApps's identical rethrow for why.
+      throw error
     }
   }
 

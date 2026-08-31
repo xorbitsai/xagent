@@ -356,6 +356,24 @@ describe("ClarificationForm connect_apps interaction", () => {
     })
   })
 
+  it("re-shows the skip link when the send fails, instead of leaving the card looking resolved", async () => {
+    // handleSkipConnectApps must rethrow past the toast so the button's own
+    // click handler can roll its optimistic "skipped" state back - without
+    // the rethrow, a failed send would still hide the link with no way to
+    // retry.
+    const onSend = vi.fn().mockRejectedValue(new Error("network error"))
+    render(
+      <ClarificationForm interactions={[CONNECT_APPS_INTERACTION]} onSend={onSend} />,
+    )
+
+    fireEvent.click(screen.getByText("chatPage.clarification.connectApps.skip"))
+
+    await waitFor(() => {
+      expect(screen.getByText("chatPage.clarification.connectApps.skip")).toBeInTheDocument()
+    })
+    expect(onSend).toHaveBeenCalledTimes(1)
+  })
+
   it("binds a connect_apps skip to the rendered interaction request", async () => {
     render(
       <ClarificationForm

@@ -801,6 +801,25 @@ describe("ConnectAppsField", () => {
     ).toBeInTheDocument();
   });
 
+  it("restores the Skip link when onSkip rejects, instead of leaving the card looking resolved", async () => {
+    mcpAppsMock.apps = [makeApp({ provider: "google" })];
+    const onSkip = vi.fn().mockRejectedValue(new Error("network error"));
+
+    render(
+      <ConnectAppsField interaction={{ ...LEO_INTERACTION, apps: ["Gmail"] }} onSkip={onSkip} />
+    );
+
+    fireEvent.click(screen.getByText("chatPage.clarification.connectApps.skip"));
+
+    await waitFor(() => {
+      expect(screen.getByText("chatPage.clarification.connectApps.skip")).toBeInTheDocument();
+    });
+    expect(
+      screen.queryByText("chatPage.clarification.connectApps.skippedNote")
+    ).not.toBeInTheDocument();
+    expect(onSkip).toHaveBeenCalledTimes(1);
+  });
+
   it("hides the Skip link and shows a completion note once every row is already Connected", () => {
     mcpAppsMock.apps = [makeApp({ provider: "google", is_connected: true })];
 
@@ -843,6 +862,30 @@ describe("ConnectAppsField", () => {
     expect(
       screen.queryByRole("button", { name: "chatPage.clarification.connectApps.continue" })
     ).not.toBeInTheDocument();
+  });
+
+  it("restores the Continue button when onContinue rejects, instead of leaving the card looking resolved", async () => {
+    mcpAppsMock.apps = [makeApp({ provider: "google", is_connected: true })];
+    const onContinue = vi.fn().mockRejectedValue(new Error("network error"));
+
+    render(
+      <ConnectAppsField
+        interaction={{ ...LEO_INTERACTION, apps: ["Gmail"] }}
+        onSkip={vi.fn()}
+        onContinue={onContinue}
+      />
+    );
+
+    fireEvent.click(
+      screen.getByRole("button", { name: "chatPage.clarification.connectApps.continue" })
+    );
+
+    await waitFor(() => {
+      expect(
+        screen.getByRole("button", { name: "chatPage.clarification.connectApps.continue" })
+      ).toBeInTheDocument();
+    });
+    expect(onContinue).toHaveBeenCalledTimes(1);
   });
 
   it("does not show a Continue button while an app is still unconnected, even when onContinue is supplied", () => {

@@ -343,6 +343,30 @@ describe("OnboardingPage", () => {
     expect(routerReplace).toHaveBeenCalledWith("/task")
   })
 
+  // Pins a PR review finding: the hire CTA already swaps to a "Hiring…"
+  // label while launching, but the header Skip button stayed on its
+  // resting "Skip setup" label with no indication a save was in flight,
+  // even though clicks were being ignored (disabled). Also asserts
+  // aria-busy, since a sighted-only label change leaves screen-reader
+  // users with no equivalent signal.
+  it("shows a Saving… label and aria-busy on the header exit button while a save is in flight", async () => {
+    let resolveSave!: (v: { ok: boolean }) => void
+    updateUserPreferencesMock.mockReturnValue(new Promise((resolve) => { resolveSave = resolve }))
+
+    render(<OnboardingPage />)
+    await waitFor(() => expect(screen.getByText(/Welcome to Xagent/)).toBeInTheDocument())
+
+    fireEvent.click(screen.getByText("Skip setup"))
+
+    const button = await screen.findByText("Saving…")
+    expect(button.closest("button")).toHaveAttribute("aria-busy", "true")
+    expect(screen.queryByText("Skip setup")).not.toBeInTheDocument()
+
+    await act(async () => {
+      resolveSave({ ok: true })
+    })
+  })
+
   // Flagged by PR review (xorbitsai/xagent#1617): persistAndLeave had no
   // double-click guard, unlike handleLaunch's launchingRef - a fast second
   // click before the first PATCH resolved would fire two concurrent saves.
@@ -990,6 +1014,56 @@ describe("OnboardingPage", () => {
     expect(markOnboardingSaveEscapedMock).toHaveBeenCalledTimes(1)
   })
 
+  // Pins a PR review finding: markOnboardedAndNavigate checked identity
+  // before sending its OWN completion PATCH, but navigated unconditionally
+  // once that PATCH resolved - a swap happening DURING that specific await
+  // (not before entering this function, which the earlier identity-swap
+  // tests already cover) went undetected, and the swapped-in identity's
+  // browser would still get navigated to a destination that only made
+  // sense for the original identity.
+  it("does not navigate to the already-hired agent if the swap happens while THIS call's own onboarded save is in flight", async () => {
+    let resolveOnboardedSave!: (v: { ok: boolean }) => void
+    updateUserPreferencesMock
+      .mockResolvedValueOnce({ ok: true }) // the main save (trySavePreferences), resolves immediately
+      .mockReturnValueOnce(new Promise((resolve) => { resolveOnboardedSave = resolve })) // markOnboardedAndNavigate's own save
+    apiRequestMock.mockResolvedValue({
+      ok: true,
+      json: async () => [{ ...TEMPLATES[0], hired: true, hired_agent_id: 99 }, TEMPLATES[1], TEMPLATES[2]],
+    })
+
+    const { rerender } = render(<OnboardingPage />)
+    await waitFor(() => expect(screen.getByText(/Welcome to Xagent/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Let's go"))
+    fireEvent.click(screen.getByText("Marketing"))
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/take off your plate/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Post on social media"))
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/Meet your AI team/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/How should/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText("You're all set.")).toBeInTheDocument())
+
+    await act(async () => {
+      fireEvent.click(screen.getByText("Start with Maya"))
+    })
+    // The main save has resolved; markOnboardedAndNavigate's own save (the
+    // 2nd updateUserPreferences call) is now the one pending.
+    expect(updateUserPreferencesMock).toHaveBeenCalledTimes(2)
+
+    authUser.id = "user-b"
+    await act(async () => {
+      rerender(<OnboardingPage />)
+    })
+
+    await act(async () => {
+      resolveOnboardedSave({ ok: true })
+    })
+
+    expect(routerReplace).not.toHaveBeenCalledWith("/agent/99")
+  })
+
   // Pins a PR review test-coverage gap: only the thrown/rejected variant of
   // a templates-fetch failure was tested - a non-throwing !response.ok, and
   // a 200 response whose body isn't an array, are separate code paths.
@@ -1552,14 +1626,15 @@ describe("OnboardingPage", () => {
     expect(screen.queryByText("Kevin")).not.toBeInTheDocument()
   })
 
-  // Pins a test-coverage gap found by self-review: matchedRecommended must
-  // stay UNCAPPED (only validRecommended, the rendered grid, is capped at
-  // 3) - the "N other matches" subtitle math subtracts matchedRecommended
-  // from goals.length, and if a future change wrongly capped
-  // matchedRecommended too, this would start claiming extra matches are
-  // still waiting even when every single selected goal was actually
-  // matched to a real persona.
-  it("does not claim extra matches are waiting when more than 3 goals are all genuinely matched", async () => {
+  // Pins a PR review finding: with 4 goals that ALL genuinely matched a
+  // real persona, the subtitle previously counted against matchedRecommended
+  // (uncapped) instead of validRecommended (the actually-rendered,
+  // capped-at-3 list) - since matchedRecommended.length equalled
+  // goals.length, the math reported zero "extra" even though the 4th real
+  // match is hidden by the display cap and never gets a card. It must
+  // still report 1 waiting, the same as if that goal hadn't matched at all
+  // from the user's point of view (they can't see it either way).
+  it("still reports 1 match waiting when 4 goals are all genuinely matched but only 3 cards fit", async () => {
     apiRequestMock.mockResolvedValue({
       ok: true,
       json: async () => [
@@ -1597,9 +1672,9 @@ describe("OnboardingPage", () => {
     fireEvent.click(screen.getByText("Continue"))
 
     await waitFor(() => expect(screen.getByText(/Meet your AI team/)).toBeInTheDocument())
-    // All 4 selected goals matched a real persona - nothing should be
-    // reported as still waiting, even though only 3 cards render.
-    expect(screen.queryByText(/waiting in Templates/)).not.toBeInTheDocument()
+    // All 4 selected goals matched a real persona, but only 3 cards fit -
+    // the 4th real match is still genuinely hidden and must be reported.
+    expect(screen.getByText(/the other match is waiting in Templates/)).toBeInTheDocument()
   })
 
   // Flagged by PR review (xorbitsai/xagent#1617): the templates fetch used to

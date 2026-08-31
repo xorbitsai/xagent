@@ -263,6 +263,27 @@ export default function OnboardingPage() {
       .slice(0, 3);
   }, [matchedRecommended, templateById]);
 
+  // How many selected goals have no card actually shown right now, for the
+  // team step's "N other matches waiting" subtitle - a PR review finding
+  // caught that counting against matchedRecommended (uncapped) instead of
+  // validRecommended (the actually-rendered, capped-at-3 list) had swapped
+  // one bug for another: it fixed the fallback-inflation case below, but
+  // then undercounted the OPPOSITE case - 4+ goals that all genuinely
+  // matched a template report zero "extra" even though the 4th+ real match
+  // is hidden by the display cap, because matchedRecommended.length still
+  // equals goals.length there.
+  //
+  // Only goals.length - validRecommended.length is correct when there's at
+  // least one real match (matchedRecommended.length > 0): validRecommended
+  // is exactly matchedRecommended sliced to 3 in that branch, so this
+  // counts both a fully-unmatched goal AND a real match hidden by the cap.
+  // But when NOTHING matched (matchedRecommended.length === 0),
+  // validRecommended is 3 fallback filler cards unrelated to any goal, and
+  // goals.length - validRecommended.length would wrongly subtract them -
+  // every selected goal is still unmatched in that case, full stop.
+  const omittedGoalCount =
+    matchedRecommended.length > 0 ? goals.length - validRecommended.length : goals.length;
+
   // Keep the selected agent valid as the recommendation list changes -
   // default to the first recommendation whenever the current pick falls
   // out of the list (including the very first render).
@@ -454,12 +475,23 @@ export default function OnboardingPage() {
       return;
     }
     const onboardedSave = await updateUserPreferences(buildPreferencesPayload());
+    // Re-checked AFTER the await, not just before it - a PR review finding
+    // caught that this continuation used to navigate unconditionally once
+    // the PATCH above resolved, even if identity had swapped DURING that
+    // PATCH's own round trip. The save itself was sent under the original
+    // identity (confirmed by the guard above), so it's left in place, but
+    // navigating now would route the NEW identity to a destination that
+    // was only ever meant for the original one. Nothing to mark as
+    // escaped here either - the original identity isn't actually leaving
+    // via this tab anymore, so there's no exit for the flag to cover.
+    if (currentUserIdRef.current !== wizardUserIdRef.current) {
+      if (isMountedRef.current) {
+        launchingRef.current = false;
+        setLaunching(false);
+      }
+      return;
+    }
     if (isMountedRef.current) {
-      // wizardUserIdRef.current, not user?.id/currentUserIdRef - this flag
-      // is inherently about the ORIGINAL wizard identity's save outcome
-      // (the guard above already confirmed identity hadn't swapped when
-      // this PATCH was sent), not whoever happens to be live by the time
-      // this line runs after the await.
       if (!onboardedSave.ok) markOnboardingSaveEscaped(wizardUserIdRef.current);
       router.replace(destination);
     }
@@ -643,8 +675,20 @@ export default function OnboardingPage() {
       </div>
 
       <header className="ob-top">
-        <button type="button" disabled={launching} onClick={() => persistAndLeave("/task")} className="ob-exit">
-          {t("onboarding.skip")}
+        {/* aria-busy + a "Saving…" label while a save is in flight - a PR
+            review finding caught that the hire CTA already swaps to a
+            "Hiring…" label under the same launching state, but this and
+            the other exit buttons stayed on their resting label with no
+            indication anything was happening, even though clicks were
+            being ignored (disabled). */}
+        <button
+          type="button"
+          disabled={launching}
+          aria-busy={launching}
+          onClick={() => persistAndLeave("/task")}
+          className="ob-exit"
+        >
+          {launching ? t("onboarding.saving") : t("onboarding.skip")}
         </button>
         {/* eslint-disable-next-line @next/next/no-img-element -- fixed 26px brand mark, not a candidate for next/image */}
         <img className="ob-logo" src={branding.logoPath} alt={branding.appName} />
@@ -811,8 +855,14 @@ export default function OnboardingPage() {
                   {t("onboarding.continue")}
                 </button>
               </div>
-              <button type="button" disabled={launching} onClick={() => persistAndLeave("/templates")} className="ob-skip">
-                {t("onboarding.goals.skip")}
+              <button
+                type="button"
+                disabled={launching}
+                aria-busy={launching}
+                onClick={() => persistAndLeave("/templates")}
+                className="ob-skip"
+              >
+                {launching ? t("onboarding.saving") : t("onboarding.goals.skip")}
               </button>
             </>
           )}
@@ -832,22 +882,16 @@ export default function OnboardingPage() {
                     still loading, matchedRecommended is always [] (nothing
                     has resolved yet), which would otherwise claim every
                     goal has an "other match waiting" before we actually
-                    know that.
-
-                    Counts against matchedRecommended, NOT validRecommended
-                    - a PR review finding caught that validRecommended can
-                    be entirely fallback filler cards (goalId: null) when
-                    nothing actually matched any selected goal, which would
-                    make this math claim real matches were found (a small
-                    "extra" count) when the true number of goal matches was
-                    zero. */}
+                    know that. See omittedGoalCount's comment for why it's
+                    computed the way it is, not just goals.length minus
+                    either list's length directly. */}
                 {`${t("onboarding.team.subtitleBase")}${
-                  !templatesLoading && goals.length - matchedRecommended.length > 0
+                  !templatesLoading && omittedGoalCount > 0
                     ? t(
-                        goals.length - matchedRecommended.length === 1
+                        omittedGoalCount === 1
                           ? "onboarding.team.subtitleExtraOne"
                           : "onboarding.team.subtitleExtraMany",
-                        { count: goals.length - matchedRecommended.length }
+                        { count: omittedGoalCount }
                       )
                     : t("onboarding.team.subtitleEnd")
                 }`}
@@ -1060,8 +1104,14 @@ export default function OnboardingPage() {
                       {!launching && <ArrowRight className="h-4 w-4" />}
                     </button>
                   </div>
-                  <button type="button" disabled={launching} onClick={() => persistAndLeave("/templates")} className="ob-skip">
-                    {t("onboarding.done.skip")}
+                  <button
+                    type="button"
+                    disabled={launching}
+                    aria-busy={launching}
+                    onClick={() => persistAndLeave("/templates")}
+                    className="ob-skip"
+                  >
+                    {launching ? t("onboarding.saving") : t("onboarding.done.skip")}
                   </button>
                 </>
               );

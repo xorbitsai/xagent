@@ -1605,6 +1605,7 @@ const zh = {
   },
   onboarding: {
     skip: "跳过设置",
+    saving: "保存中…",
     continue: "继续",
     rail: {
       label: "设置进度",

@@ -1605,6 +1605,7 @@ Build when you need.`,
   },
   onboarding: {
     skip: "Skip setup",
+    saving: "Saving…",
     continue: "Continue",
     rail: {
       label: "Setup progress",

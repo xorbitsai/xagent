@@ -169,15 +169,15 @@ describe("AuthGuard onboarding redirect", () => {
     expect(fetchUserPreferencesMock).toHaveBeenCalledTimes(1)
   })
 
-  // Pins a PR review finding: the ref used to latch on ANY successfully-
-  // resolved check, including one that found the user NOT onboarded and
-  // redirected them - so a user who never actually finishes the wizard, but
-  // instead navigates (e.g. a browser Back button) to a DIFFERENT
-  // already-visited protected route, would skip every future check for the
-  // rest of the session with onboarding never actually done. Only latching
-  // once onboarding is CONFIRMED true means a not-yet-onboarded identity
-  // keeps being re-checked on every route change instead.
-  it("keeps re-checking on later routes when a completed check found the user not onboarded", async () => {
+  // Pins a deliberate product decision, confirmed explicitly after review:
+  // the mandatory-onboarding redirect only needs to FIRE once per app
+  // load, regardless of whether the resolved `onboarded` value was true or
+  // false. A user who gets redirected to /onboarding and then navigates
+  // away without completing it (e.g. a browser Back button to a DIFFERENT
+  // already-visited protected route) must NOT be re-prompted for the rest
+  // of the session - the ref latches on this outcome too, same as a
+  // confirmed-true one.
+  it("does not re-check on a later route even when the completed check found the user not onboarded", async () => {
     fetchUserPreferencesMock.mockResolvedValue({})
 
     const { rerender } = render(<AuthGuard><div data-testid="children" /></AuthGuard>)
@@ -191,7 +191,7 @@ describe("AuthGuard onboarding redirect", () => {
     route.pathname = "/dashboard"
     rerender(<AuthGuard><div data-testid="children" /></AuthGuard>)
 
-    await waitFor(() => expect(fetchUserPreferencesMock).toHaveBeenCalledTimes(2))
+    expect(fetchUserPreferencesMock).toHaveBeenCalledTimes(1)
   })
 
   // Pins a finding verified during PR review: AuthGuard doesn't remount

@@ -36,25 +36,20 @@ export function AuthGuard({ children }: AuthGuardProps) {
     }
   }, [isAuthenticated, isLoading, router, mounted, isAuthPage])
 
-  // On the normal (non-escape) path below, only latches once onboarding is
-  // CONFIRMED complete for this user, not merely once a check has run - a
-  // PR review finding caught that latching on any successfully-resolved
-  // check (including a "not onboarded" one) let a user who never actually
-  // finishes the wizard bypass every future check for the rest of the
-  // session: redirected once to /onboarding, then instead of completing
-  // it, a browser Back (or any other client-side nav to a DIFFERENT
-  // already-visited protected route - this component doesn't remount on
-  // client-side navigation) lands on a page whose effect re-runs, sees the
-  // ref already latched to this user id, and skips the check entirely,
-  // rendering protected children with onboarding never actually done.
-  // Re-checking on every route change until it's actually confirmed true
-  // is the correct tradeoff here (an extra GET per route while genuinely
-  // not onboarded, which is expected to be a short-lived state) over ever
-  // latching on an unconfirmed outcome. The escape-flag branch above is a
-  // separate, deliberate exception to this - it latches unconditionally on
-  // its own one-time bypass signal, not on an ordinary "not onboarded"
-  // resolution, so it doesn't reintroduce the same problem; see its own
-  // comment for why.
+  // Checked once per app load (this component doesn't remount on
+  // client-side navigation), not on every route change - deliberate
+  // product decision, confirmed explicitly: the mandatory-onboarding
+  // redirect only needs to FIRE once. A user who gets redirected to
+  // /onboarding and then leaves without completing it (e.g. a browser
+  // Back press, or any other client-side nav to a different
+  // already-visited protected route) is not re-prompted for the rest of
+  // the session - this latches regardless of whether the resolved
+  // `onboarded` value was true or false, not only on a confirmed-true
+  // outcome. A PR review finding flagged this exact behavior as a
+  // "bypass" and an alternate version of this file re-checked on every
+  // route change until confirmed true instead; that version was reverted
+  // once we confirmed the one-shot-prompt behavior is what's wanted here,
+  // not a bug.
   //
   // The ref only latches once the check actually finishes (not before the
   // await) - if a dependency changes and cancels this run first (e.g. the
@@ -101,21 +96,20 @@ export function AuthGuard({ children }: AuthGuardProps) {
       // onboarded." Leave the ref unlatched so the next navigation retries
       // instead of redirecting an already-onboarded user on a transient error.
       if (preferences === null) return
+      checkedOnboardingUserIdRef.current = user.id
       // Strict `!== true`, not `!preferences.onboarded`: the GET boundary
       // doesn't validate this field's type, so a malformed stored value
       // (e.g. a string "false", which is truthy) must not read as "already
       // onboarded" - only an explicit boolean true should ever skip the redirect.
       if (preferences.onboarded !== true) {
-        // Deliberately NOT latching the ref here (see the comment on the
-        // ref's declaration) - `replace` alone only prevents a Back press
-        // from returning to THIS specific page (its history entry is gone),
-        // it does nothing about navigating to some OTHER already-visited
-        // protected route, which this effect will still see on its own
-        // pathname change and must actually re-check.
+        // replace, not push: a `push` here would leave the pre-redirect
+        // page in history, so a single Back press would return the user
+        // there while ALSO re-triggering that page's own onboarding
+        // effect (a second, redundant check) - replace avoids that, but
+        // does not (and is not meant to) prevent the Back press itself;
+        // the ref above already latches regardless of this outcome.
         router.replace(ONBOARDING_PATH)
-        return
       }
-      checkedOnboardingUserIdRef.current = user.id
     })()
     return () => {
       active = false

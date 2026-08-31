@@ -596,6 +596,101 @@ def test_connect_heals_stale_args_on_matching_command(test_db):
     assert healed.args == ["-y", "@cablate/mcp-google-map", "--stdio"]
 
 
+def test_connect_heal_resets_orphan_rows_env_and_cwd(test_db):
+    """Healing args must not leave a row's own env/cwd untouched: a row with
+    today's command/transport but no *current* owner can be a pre-catalog
+    orphan (a user created a custom server under this name before the
+    catalog app existed, then was deleted -- deleting a user drops their
+    UserMCPServer association, not the shared MCPServer row). Adopting it
+    without clearing env/cwd would apply that orphan's own values to every
+    future user's connection via MCPServer.to_connection_dict()."""
+    from xagent.web.api.mcp import MCPAppConnectRequest, connect_mcp_app
+
+    test_db.add(
+        MCPServer(
+            name="google-maps",
+            managed="external",
+            transport="stdio",
+            command="npx",
+            args=["-y", "@cablate/mcp-google-map"],  # stale, triggers healing
+            env={"LEFTOVER_SECRET": "attacker-or-former-users-value"},
+            cwd="/some/orphaned/path",
+        )
+    )
+    test_db.commit()
+
+    connect_mcp_app(
+        "google-maps",
+        MCPAppConnectRequest(env={"GOOGLE_MAPS_API_KEY": "my-key"}),
+        current_user=_user(test_db, 1),
+        db=test_db,
+    )
+
+    healed = test_db.query(MCPServer).filter(MCPServer.name == "google-maps").first()
+    assert healed.args == ["-y", "@cablate/mcp-google-map", "--stdio"]
+    assert healed.env is None
+    assert healed.cwd is None
+
+
+def test_connect_rejects_malformed_catalog_args_instead_of_persisting(test_db):
+    """A custom (non-builtin) catalog app's launch_config is admin-editable
+    with no shape check on args (PublicMCPAppUpdate.launch_config is a plain
+    Dict[str, Any]) -- unlike a builtin app_id (e.g. "google-maps" is itself
+    a real registry entry, so a DB-row edit to it would just be overlaid
+    away by _app_to_dict and never reach this code path at all). Healing
+    must validate args the same way a fresh row would be, not raw-assign
+    whatever the catalog currently holds -- an admin PATCH that corrupts a
+    genuinely custom app's args into something other than list[str] must
+    surface as a 400 on the next connect, not get silently persisted onto
+    the shared row for the MCP SDK to reject later at session-init time."""
+    from fastapi import HTTPException
+
+    from xagent.web.api.mcp import MCPAppConnectRequest, connect_mcp_app
+
+    test_db.add(
+        PublicMCPApp(
+            app_id="totally-custom-app",
+            name="Totally Custom App",
+            description="A hand-created, non-builtin catalog app",
+            transport="stdio",
+            is_visible_in_connector=True,
+            launch_config={"command": "npx", "args": ["-y", "totally-custom-mcp"]},
+        )
+    )
+    test_db.add(
+        MCPServer(
+            name="totally-custom-app",
+            managed="external",
+            transport="stdio",
+            command="npx",
+            args=["-y", "totally-custom-mcp"],
+        )
+    )
+    test_db.commit()
+
+    app = (
+        test_db.query(PublicMCPApp)
+        .filter(PublicMCPApp.app_id == "totally-custom-app")
+        .first()
+    )
+    app.launch_config = {"command": "npx", "args": {"unexpected": "object"}}
+    test_db.commit()
+
+    with pytest.raises(HTTPException) as exc:
+        connect_mcp_app(
+            "totally-custom-app",
+            MCPAppConnectRequest(),
+            current_user=_user(test_db, 1),
+            db=test_db,
+        )
+    assert exc.value.status_code == 400
+
+    untouched = (
+        test_db.query(MCPServer).filter(MCPServer.name == "totally-custom-app").first()
+    )
+    assert untouched.args == ["-y", "totally-custom-mcp"]
+
+
 @pytest.mark.parametrize("name", ["google-maps", "Google-Maps", "google maps"])
 def test_create_server_rejects_catalog_app_id(test_db, name):
     """Custom servers can't squat a catalog app id (the hijack precondition),

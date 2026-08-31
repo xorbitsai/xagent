@@ -2795,7 +2795,44 @@ def _ensure_catalog_app_server(db: Session, app_id: str) -> tuple[MCPServer, dic
         # isn't a user's own row.
         current_args = launch.get("args") or []
         if (server.args or []) != current_args:
-            cast(Any, server).args = current_args
+            # Validated the same way a fresh row would be (existing_server
+            # omitted deliberately: catalog args/env/cwd fully replace
+            # whatever this row had, not merge with it) rather than
+            # raw-assigning launch_config.args -- a custom (non-builtin)
+            # catalog app's launch_config is admin-editable with no shape
+            # check on args, so an unvalidated assignment could persist a
+            # non-list-of-strings value the MCP SDK later rejects at
+            # session-init time instead of at this request.
+            try:
+                healed_config = _build_server_config(
+                    MCPServerCreate(
+                        name=server_name,
+                        transport="stdio",
+                        description=app_info.get("description"),
+                        config={"command": command, "args": current_args},
+                    )
+                )
+            except ValueError as e:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"Invalid app configuration: {str(e)}",
+                )
+            cast(Any, server).args = healed_config.args or []
+            # Also reset env/cwd to the catalog's shape (empty, for every
+            # keyless/api_key app today) rather than leaving this row's own
+            # values untouched: this row can be a pre-catalog orphan (a user
+            # created a custom server under this name before the catalog
+            # app existed, matching today's command/transport, then was
+            # deleted -- _reject_user_owned_catalog_squat only rejects a
+            # *currently* owned row, not a since-orphaned one). Healing only
+            # args would let that orphan's own env/cwd survive adoption, and
+            # to_connection_dict() applies a row's env to every user's
+            # connection through it -- a former user's own key could become
+            # every other user's fallback credential.
+            cast(Any, server).env = healed_config.env
+            cast(Any, server).cwd = (
+                str(healed_config.cwd) if healed_config.cwd is not None else None
+            )
             db.commit()
     if not server:
         try:

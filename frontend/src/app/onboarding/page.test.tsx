@@ -1891,4 +1891,58 @@ describe("OnboardingPage", () => {
     expect(updateUserPreferencesMock).toHaveBeenCalledTimes(1)
     expect(routerReplace).not.toHaveBeenCalled()
   })
+
+  // Pins a gap found in full-feature self-review: of the identity guard's 3
+  // checkpoints (trySavePreferences, markOnboardedAndNavigate, and this one -
+  // right before hireAgentFromTemplate), only the first two had a test that
+  // would fail if that SPECIFIC checkpoint were deleted. This one isolates
+  // the third: the template is NOT already hired (so the two tests above's
+  // shortcuts never apply), the main save and the freshness recheck both
+  // complete normally under the ORIGINAL identity, and the swap happens only
+  // in the narrow window after the freshness recheck resolves but before
+  // hireAgentFromTemplate would fire - the one window only this checkpoint's
+  // guard covers.
+  it("does not hire an agent under a swapped-in identity if the swap happens after the freshness recheck but before the hire call", async () => {
+    let resolveFreshCheck!: (v: { ok: boolean }) => void
+    apiRequestMock.mockImplementation((url: string) => {
+      if (url.includes("/api/templates/marketing-social-media-content-manager")) {
+        return new Promise((resolve) => { resolveFreshCheck = resolve })
+      }
+      return Promise.resolve({ ok: true, json: async () => TEMPLATES })
+    })
+
+    const { rerender } = render(<OnboardingPage />)
+    await waitFor(() => expect(screen.getByText(/Welcome to Xagent/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Let's go"))
+    fireEvent.click(screen.getByText("Marketing"))
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/take off your plate/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Post on social media"))
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/Meet your AI team/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/How should/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText("You're all set.")).toBeInTheDocument())
+
+    await act(async () => {
+      fireEvent.click(screen.getByText("Start with Maya"))
+    })
+    // Main save (default beforeEach mock, resolves immediately) already went
+    // through under the original identity; the freshness recheck is now the
+    // one pending call.
+    expect(hireAgentFromTemplateMock).not.toHaveBeenCalled()
+
+    authUser.id = "user-b"
+    await act(async () => {
+      rerender(<OnboardingPage />)
+    })
+
+    await act(async () => {
+      resolveFreshCheck({ ok: false })
+    })
+
+    expect(hireAgentFromTemplateMock).not.toHaveBeenCalled()
+    expect(routerReplace).not.toHaveBeenCalled()
+  })
 })

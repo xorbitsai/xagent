@@ -17,6 +17,7 @@ from .claude import ClaudeLLM
 from .dashscope import DashScopeLLM
 from .deepseek import DeepSeekLLM
 from .gemini import GeminiLLM
+from .litellm import LiteLLM
 from .openai import OpenAILLM
 from .openrouter import OpenRouterLLM
 from .router import RouterLLM
@@ -140,6 +141,16 @@ def create_base_llm(
             model_name=model.model_name,
             api_key=model.api_key,
             base_url=model.base_url,
+            default_temperature=model.default_temperature,
+            default_max_tokens=model.default_max_tokens,
+            timeout=model.timeout,
+            abilities=model.abilities,
+        )
+    elif provider == "litellm":
+        llm = LiteLLM(
+            model_name=model.model_name,
+            api_key=model.api_key,
+            api_base=model.base_url,
             default_temperature=model.default_temperature,
             default_max_tokens=model.default_max_tokens,
             timeout=model.timeout,

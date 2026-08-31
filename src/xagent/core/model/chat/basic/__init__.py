@@ -5,6 +5,7 @@ from .claude import ClaudeLLM
 from .dashscope import DashScopeLLM
 from .deepseek import DeepSeekLLM
 from .gemini import GeminiLLM
+from .litellm import LiteLLM
 from .openai import OpenAILLM
 from .openrouter import OpenRouterLLM
 from .zhipu import ZhipuLLM
@@ -19,5 +20,6 @@ __all__ = [
     "ZhipuLLM",
     "GeminiLLM",
     "ClaudeLLM",
+    "LiteLLM",
     "create_base_llm",
 ]

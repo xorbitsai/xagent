@@ -15,17 +15,14 @@ import pytest
 from xagent.core.tools.core.RAG_tools.core.exceptions import DocumentValidationError
 from xagent.core.tools.core.RAG_tools.core.schemas import (
     DenseSearchResponse,
-    FusionConfig,
     IndexStatus,
     SparseSearchResponse,
 )
 from xagent.core.tools.core.RAG_tools.kb.collection_handle import (
     LanceDBCollectionHandle,
-    _evaluate_filter_expression,
 )
 from xagent.core.tools.core.RAG_tools.storage.contracts import (
     FilterCondition,
-    FilterExpression,
     FilterOperator,
 )
 
@@ -58,17 +55,6 @@ def _index_result(status="index_ready", advice=None):
     obj.advice = advice
     obj.fts_enabled = True
     return obj
-
-
-def test_contains_filter_does_not_convert_null_to_literal_text() -> None:
-    batch_df = pd.DataFrame({"text": [None, "None", "needle"]})
-
-    mask = _evaluate_filter_expression(
-        batch_df,
-        FilterCondition("text", FilterOperator.CONTAINS, "None"),
-    )
-
-    assert mask.tolist() == [False, True, False]
 
 
 def test_search_dense_success_score_and_filters():
@@ -239,49 +225,19 @@ def test_search_sparse_fts_hit_scores_normalized():
     assert resp.results[0].score == pytest.approx(0.75)  # 3/(1+3)
 
 
-def test_search_sparse_preserves_or_filter_expression():
-    handle, _, store, _ = _make_handle()
-    table = MagicMock()
-    store.open_embeddings_table.return_value = (table, "embeddings_model-x")
-    store.create_index.return_value = _index_result()
-    store.build_filter_expression.return_value = "filter"
-    table.search.return_value.limit.return_value.where.return_value.to_pandas.return_value = pd.DataFrame(
-        [
-            {
-                "doc_id": "d1",
-                "chunk_id": "c1",
-                "text": "hello",
-                "parse_hash": "h",
-                "created_at": "2026",
-                "metadata": None,
-                "_score": 1.0,
-            }
-        ]
-    )
-    custom_filter = [
-        FilterCondition("doc_id", FilterOperator.EQ, "d1"),
-        FilterCondition("doc_id", FilterOperator.EQ, "d2"),
-    ]
-
-    handle.search_sparse(
-        "model-x", "hello", top_k=3, filters=custom_filter, is_admin=True
-    )
-
-    filter_expr = store.build_filter_expression.call_args.kwargs["filters"]
-    assert isinstance(filter_expr, tuple)
-    assert isinstance(filter_expr[1], list)
-    assert filter_expr[1] == custom_filter
-
-
 @pytest.mark.parametrize(
     ("filters", "expected_doc_ids"),
     [
-        ({"vector_dimension": {"operator": "gte", "value": 2}}, ["d2"]),
-        ({"doc_id": ["d1", "d2"]}, ["d1", "d2"]),
-        ({"doc_id": {"operator": "contains", "value": "d"}}, ["d1", "d2"]),
+        ({"vector_dimension": {"operator": "eq", "value": 2}}, ["d2"]),
+        ({"vector_dimension": {"operator": "ne", "value": 2}}, ["d1", "d3"]),
+        ({"vector_dimension": {"operator": "gt", "value": 1}}, ["d2", "d3"]),
+        ({"vector_dimension": {"operator": "gte", "value": 2}}, ["d2", "d3"]),
+        ({"vector_dimension": {"operator": "lt", "value": 2}}, ["d1"]),
+        ({"vector_dimension": {"operator": "lte", "value": 2}}, ["d1", "d2"]),
+        ({"doc_id": {"operator": "in", "value": ["d1", "d3"]}}, ["d1", "d3"]),
     ],
 )
-def test_substring_fallback_applies_filters_and_user_scope(
+def test_substring_fallback_applies_legacy_operators(
     filters: dict, expected_doc_ids: list[str]
 ):
     handle, _, store, _ = _make_handle()
@@ -304,7 +260,6 @@ def test_substring_fallback_applies_filters_and_user_scope(
             "created_at": ["2026", "2026", "2026"],
             "metadata": [None, None, None],
             "vector_dimension": [1, 2, 3],
-            "user_id": [7, 7, 8],
         }
     )
     table.to_batches.return_value = [batch]
@@ -314,241 +269,12 @@ def test_substring_fallback_applies_filters_and_user_scope(
         "needle",
         top_k=5,
         filters=filters,
-        user_id=7,
-        is_admin=False,
     )
 
     assert response.status == "success"
     assert [result.doc_id for result in response.results] == expected_doc_ids
     requested_columns = table.to_batches.call_args.kwargs["columns"]
     assert "page_number" not in requested_columns
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("filters", "expected_doc_ids"),
-    [
-        ({"vector_dimension": {"operator": "gte", "value": 2}}, ["d2"]),
-        ({"doc_id": {"operator": "contains", "value": "d"}}, ["d1", "d2"]),
-    ],
-)
-async def test_substring_fallback_async_uses_same_expression_evaluator(
-    filters: dict, expected_doc_ids: list[str]
-):
-    handle, _, store, _ = _make_handle()
-    table = MagicMock()
-    store.open_embeddings_table.return_value = (table, "embeddings_model-x")
-    store.create_index.return_value = _index_result()
-    store.search_fts_by_model_async = AsyncMock(return_value=[])
-    batch = MagicMock()
-    batch.to_pandas.return_value = pd.DataFrame(
-        {
-            "collection": ["col1", "col1"],
-            "doc_id": ["d1", "d2"],
-            "chunk_id": ["c1", "c2"],
-            "text": ["needle", "needle"],
-            "parse_hash": ["h1", "h2"],
-            "created_at": ["2026", "2026"],
-            "metadata": [None, None],
-            "vector_dimension": [1, 2],
-        }
-    )
-
-    async def iter_batches_async(**kwargs):
-        assert kwargs["user_id"] == 7
-        assert kwargs["is_admin"] is False
-        assert "page_number" not in kwargs["columns"]
-        yield batch
-
-    store.iter_batches_async = iter_batches_async
-
-    response = await handle.search_sparse_async(
-        "model-x",
-        "needle",
-        top_k=5,
-        filters=filters,
-        user_id=7,
-        is_admin=False,
-    )
-
-    assert response.status == "success"
-    assert [result.doc_id for result in response.results] == expected_doc_ids
-    fts_kwargs = store.search_fts_by_model_async.call_args.kwargs
-    assert fts_kwargs["user_id"] == 7
-    assert fts_kwargs["is_admin"] is False
-
-
-def test_search_rejects_chunk_only_filter_fields_before_io():
-    handle, _, store, _ = _make_handle()
-
-    response = handle.search_dense(
-        "model-x",
-        [0.1],
-        filters=FilterCondition("page_number", FilterOperator.GTE, 2),
-    )
-
-    assert response.status == "failed"
-    store.create_index.assert_not_called()
-    store.search_vectors_by_model.assert_not_called()
-
-
-@pytest.mark.parametrize("search_mode", ["dense", "sparse"])
-def test_search_rejects_empty_in_before_io(search_mode: str):
-    handle, _, store, _ = _make_handle()
-    filters = {"doc_id": {"operator": "in", "value": []}}
-
-    if search_mode == "dense":
-        response = handle.search_dense("model-x", [0.1], filters=filters)
-    else:
-        response = handle.search_sparse("model-x", "needle", top_k=5, filters=filters)
-
-    assert response.status == "failed"
-    store.create_index.assert_not_called()
-    store.open_embeddings_table.assert_not_called()
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("search_mode", ["dense", "sparse"])
-async def test_search_async_rejects_empty_in_before_io(search_mode: str):
-    handle, _, store, _ = _make_handle()
-    filters = {"doc_id": {"operator": "in", "value": []}}
-
-    if search_mode == "dense":
-        response = await handle.search_dense_async("model-x", [0.1], filters=filters)
-    else:
-        response = await handle.search_sparse_async(
-            "model-x", "needle", top_k=5, filters=filters
-        )
-
-    assert response.status == "failed"
-    store.create_index.assert_not_called()
-    store.open_embeddings_table.assert_not_called()
-
-
-def test_search_accepts_real_embedding_text_filter():
-    handle, _, store, _ = _make_handle()
-    store.create_index.return_value = _index_result()
-    store.search_vectors_by_model.return_value = []
-
-    response = handle.search_dense(
-        "model-x",
-        [0.1],
-        filters=FilterCondition("text", FilterOperator.CONTAINS, "needle"),
-    )
-
-    assert response.status == "success"
-    store.search_vectors_by_model.assert_called_once()
-
-
-def test_collection_guard_does_not_consume_user_filter_depth():
-    handle, _, store, _ = _make_handle()
-    store.create_index.return_value = _index_result()
-    store.search_vectors_by_model.return_value = []
-    custom_filter: FilterExpression = FilterCondition("doc_id", FilterOperator.EQ, "d1")
-    for _ in range(10):
-        custom_filter = [custom_filter]
-
-    response = handle.search_dense("model-x", [0.1], filters=custom_filter)
-
-    assert response.status == "success"
-    store.search_vectors_by_model.assert_called_once()
-
-
-@pytest.mark.asyncio
-async def test_substring_fallback_async_propagates_evaluator_failure():
-    handle, _, store, _ = _make_handle()
-    table = MagicMock()
-    store.open_embeddings_table.return_value = (table, "embeddings_model-x")
-    store.create_index.return_value = _index_result()
-    store.search_fts_by_model_async = AsyncMock(return_value=[])
-    batch = MagicMock()
-    batch.to_pandas.return_value = pd.DataFrame(
-        {
-            "collection": ["col1"],
-            "doc_id": ["d1"],
-            "chunk_id": ["c1"],
-            "text": ["needle"],
-            "parse_hash": ["h1"],
-            "created_at": ["2026"],
-            "metadata": [None],
-            "vector_dimension": [1],
-        }
-    )
-
-    async def iter_batches_async(**kwargs):
-        yield batch
-
-    store.iter_batches_async = iter_batches_async
-
-    response = await handle.search_sparse_async(
-        "model-x",
-        "needle",
-        top_k=5,
-        filters={"vector_dimension": {"operator": "gte", "value": "invalid"}},
-        user_id=7,
-        is_admin=False,
-    )
-
-    assert response.status == "failed"
-    assert any(warning.code == "FTS_SEARCH_FAILED" for warning in response.warnings)
-
-
-@pytest.mark.asyncio
-async def test_substring_fallback_async_propagates_storage_failure():
-    handle, _, store, _ = _make_handle()
-    store.open_embeddings_table.return_value = (MagicMock(), "embeddings_model-x")
-    store.create_index.return_value = _index_result()
-    store.search_fts_by_model_async = AsyncMock(return_value=[])
-
-    async def iter_batches_async(**kwargs):
-        raise RuntimeError("batch scan failed")
-        yield  # pragma: no cover - keeps this function an async generator
-
-    store.iter_batches_async = iter_batches_async
-
-    response = await handle.search_sparse_async(
-        "model-x",
-        "needle",
-        top_k=5,
-        user_id=7,
-        is_admin=False,
-    )
-
-    assert response.status == "failed"
-    assert any(warning.code == "FTS_SEARCH_FAILED" for warning in response.warnings)
-
-
-def test_substring_fallback_propagates_storage_failure():
-    handle, _, store, _ = _make_handle()
-    table = MagicMock()
-    store.open_embeddings_table.return_value = (table, "embeddings_model-x")
-    store.create_index.return_value = _index_result()
-    store.build_filter_expression.return_value = "filter"
-    search_query = MagicMock()
-    table.search.return_value.limit.return_value = search_query
-    search_query.where.return_value = search_query
-    search_query.to_pandas.return_value = pd.DataFrame()
-    table.to_batches.side_effect = RuntimeError("batch scan failed")
-
-    response = handle.search_sparse(
-        "model-x",
-        "needle",
-        top_k=5,
-        user_id=7,
-        is_admin=False,
-    )
-
-    assert response.status == "failed"
-    assert any(warning.code == "FTS_SEARCH_FAILED" for warning in response.warnings)
-
-
-def test_hybrid_rejects_malformed_filter_before_fan_out():
-    handle, _, store, _ = _make_handle()
-
-    with pytest.raises(ValueError, match="filter expression cannot be empty"):
-        handle.search_hybrid("model-x", "query", [0.1], filters=[])
-
-    store.create_index.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -718,123 +444,6 @@ def test_search_hybrid_linear_fusion_attaches_scores(monkeypatch):
     assert by_doc["d2"].vector_score is None and by_doc["d2"].vector_rank is None
 
 
-def test_fuse_hybrid_reports_failed_when_both_searches_fail():
-    handle, _, _, _ = _make_handle()
-    dense = DenseSearchResponse(
-        results=[],
-        total_count=0,
-        status="failed",
-        warnings=[],
-        index_status=IndexStatus.NO_INDEX,
-        index_advice=None,
-        idempotency_key=None,
-        fallback_info=None,
-        nprobes=None,
-        refine_factor=None,
-    )
-    sparse = SparseSearchResponse(
-        results=[],
-        total_count=0,
-        status="failed",
-        warnings=[],
-        fts_enabled=False,
-        query_text="q",
-    )
-
-    response = handle._fuse_hybrid(
-        "model-x",
-        "q",
-        dense,
-        sparse,
-        top_k=5,
-        fusion_config=FusionConfig(),
-    )
-
-    assert response.status == "failed"
-
-
-@pytest.mark.parametrize(
-    ("dense_status", "sparse_status"),
-    [("failed", "success"), ("success", "failed")],
-)
-def test_fuse_hybrid_reports_partial_success_for_one_failed_child(
-    dense_status: str,
-    sparse_status: str,
-):
-    handle, _, _, _ = _make_handle()
-    dense = DenseSearchResponse(
-        results=[],
-        total_count=0,
-        status=dense_status,
-        warnings=[],
-        index_status=IndexStatus.NO_INDEX,
-        index_advice=None,
-        idempotency_key=None,
-        fallback_info=None,
-        nprobes=None,
-        refine_factor=None,
-    )
-    sparse = SparseSearchResponse(
-        results=[],
-        total_count=0,
-        status=sparse_status,
-        warnings=[],
-        fts_enabled=False,
-        query_text="q",
-    )
-
-    response = handle._fuse_hybrid(
-        "model-x",
-        "q",
-        dense,
-        sparse,
-        top_k=5,
-        fusion_config=FusionConfig(),
-    )
-
-    assert response.status == "partial_success"
-
-
-@pytest.mark.asyncio
-async def test_search_hybrid_async_reports_failed_when_both_children_fail(
-    monkeypatch,
-):
-    handle, _, _, _ = _make_handle()
-    dense = DenseSearchResponse(
-        results=[],
-        total_count=0,
-        status="failed",
-        warnings=[],
-        index_status=IndexStatus.NO_INDEX,
-        index_advice=None,
-        idempotency_key=None,
-        fallback_info=None,
-        nprobes=None,
-        refine_factor=None,
-    )
-    sparse = SparseSearchResponse(
-        results=[],
-        total_count=0,
-        status="failed",
-        warnings=[],
-        fts_enabled=False,
-        query_text="q",
-    )
-
-    async def fake_dense(*args, **kwargs):
-        return dense
-
-    async def fake_sparse(*args, **kwargs):
-        return sparse
-
-    monkeypatch.setattr(type(handle), "search_dense_async", fake_dense)
-    monkeypatch.setattr(type(handle), "search_sparse_async", fake_sparse)
-
-    response = await handle.search_hybrid_async("model-x", "q", [0.1], top_k=5)
-
-    assert response.status == "failed"
-
-
 @pytest.mark.asyncio
 async def test_search_hybrid_async_capability_unsupported():
     from xagent.core.tools.core.RAG_tools.core.schemas import HybridSearchResponse
@@ -938,25 +547,6 @@ def test_all_modes_degrade_when_search_unsupported(call):
     resp = call(handle)
     assert resp.status == "failed"
     assert any(w.code == "SEARCH_NOT_SUPPORTED" for w in resp.warnings)
-
-
-# ---------------------------------------------------------------------------
-# Rollback-scope filter test
-# ---------------------------------------------------------------------------
-
-
-def test_dense_passes_collection_and_user_scope_to_store():
-    # Rollback-incomplete remnants must still be filtered: assert the store call
-    # always carries the collection filter + user scope so a stray row in another
-    # collection / another user cannot leak.
-    handle, ctx, store, _ = _make_handle()
-    store.create_index.return_value = _index_result()
-    store.search_vectors_by_model.return_value = []
-    handle.search_dense("m", [0.1], top_k=3, user_id=42, is_admin=False)
-    kwargs = store.search_vectors_by_model.call_args.kwargs
-    assert kwargs["user_id"] == 42 and kwargs["is_admin"] is False
-    # collection filter present in the FilterExpression
-    assert kwargs["filters"] is not None
 
 
 @pytest.mark.asyncio

@@ -24,10 +24,6 @@ from xagent.core.tools.core.RAG_tools.retrieval.search_hybrid import (
     _rrf_fusion,
     search_hybrid,
 )
-from xagent.core.tools.core.RAG_tools.storage.contracts import (
-    FilterCondition,
-    FilterOperator,
-)
 
 
 class TestFusionFunctions:
@@ -654,12 +650,7 @@ class TestSearchHybrid:
             warnings=[sparse_warning],
         )
 
-        filters = {"doc_id": ["d1", "d2"]}
-        normalized_filter = FilterCondition(
-            field="doc_id",
-            operator=FilterOperator.IN,
-            value=["d1", "d2"],
-        )
+        filters = {"collection": "filtered_col"}
         fusion_config = FusionConfig(strategy=FusionStrategy.RRF)
 
         response = search_hybrid(
@@ -684,7 +675,7 @@ class TestSearchHybrid:
             "test_model",
             [0.1, 0.2, 0.3],
             top_k=2,  # top_k * 2
-            filters=normalized_filter,
+            filters=filters,
             readonly=False,
             nprobes=None,
             refine_factor=None,
@@ -695,7 +686,7 @@ class TestSearchHybrid:
             "test_model",
             "filtered query",
             top_k=2,  # top_k * 2
-            filters=normalized_filter,
+            filters=filters,
             readonly=False,
             user_id=None,
             is_admin=False,

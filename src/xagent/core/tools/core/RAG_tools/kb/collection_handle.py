@@ -52,7 +52,6 @@ from ..core.schemas import (
     DocumentRecordDetail,
     DocumentRecordListResult,
     EmbeddingReadResponse,
-    EmbeddingRecordDetail,
     EmbeddingRecordSnapshot,
     EmbeddingWriteResponse,
     FusionConfig,
@@ -83,10 +82,7 @@ from ..storage.contracts import (
     VectorIndexStore,
 )
 from ..utils import check_file_type, compute_file_hash
-from ..utils.filter_utils import (
-    combine_filter_expressions,
-    normalize_filter_input,
-)
+from ..utils.filter_utils import parse_legacy_filters, validate_filter_depth
 from ..utils.hash_utils import compute_chunk_hash
 from ..utils.metadata_utils import deserialize_metadata, serialize_metadata
 from ..utils.string_utils import generate_deterministic_doc_id
@@ -102,10 +98,6 @@ from .version_compatibility import (
 )
 
 logger = logging.getLogger(__name__)
-
-_EMBEDDING_SEARCH_FILTER_FIELDS = frozenset(EmbeddingRecordDetail.model_fields) - {
-    "vector"
-}
 
 
 def _safe_int_value(value: Any, default: int = 0) -> int:
@@ -189,25 +181,11 @@ def _collect_filter_fields(expr: FilterExpression | None) -> set[str]:
     raise TypeError(f"Unsupported filter expression: {type(expr).__name__}")
 
 
-def _normalize_embedding_search_filter(
-    filters: FilterInput | None,
-) -> FilterExpression | None:
-    """Normalize one user filter and reject fields absent from embeddings rows."""
-    normalized = normalize_filter_input(filters)
-    unsupported_fields = (
-        _collect_filter_fields(normalized) - _EMBEDDING_SEARCH_FILTER_FIELDS
-    )
-    if unsupported_fields:
-        fields = ", ".join(sorted(unsupported_fields))
-        raise ValueError(f"Unsupported embedding search filter field(s): {fields}")
-    return normalized
-
-
 def _build_collection_search_filter(
     collection: str,
     filters: FilterInput | None,
 ) -> FilterExpression | None:
-    """Validate one user filter, then combine it with the collection guard."""
+    """Combine the collection guard with a legacy or prebuilt filter."""
     collection_filter = (
         FilterCondition(
             field="collection",
@@ -217,10 +195,17 @@ def _build_collection_search_filter(
         if collection
         else None
     )
-    return combine_filter_expressions(
-        collection_filter,
-        _normalize_embedding_search_filter(filters),
+    user_filter = (
+        parse_legacy_filters(filters) if isinstance(filters, dict) else filters
     )
+    if collection_filter is None:
+        combined = user_filter
+    elif user_filter is None:
+        combined = collection_filter
+    else:
+        combined = (collection_filter, user_filter)
+    validate_filter_depth(combined)
+    return combined
 
 
 def _evaluate_filter_expression(
@@ -245,14 +230,12 @@ def _evaluate_filter_expression(
 
     series = batch_df[expr.field]
     operator = expr.operator
-    if operator == FilterOperator.IS_NULL:
-        return series.isna()
-    if operator == FilterOperator.IS_NOT_NULL:
-        return series.notna()
-
     non_null = series.notna()
     if operator == FilterOperator.EQ:
-        result = series.eq(expr.value)
+        if isinstance(expr.value, (list, tuple, set)):
+            result = series.isin(list(expr.value))
+        else:
+            result = series.eq(expr.value)
     elif operator == FilterOperator.NE:
         result = series.ne(expr.value)
     elif operator == FilterOperator.GT:
@@ -265,10 +248,7 @@ def _evaluate_filter_expression(
         result = series.le(expr.value)
     elif operator == FilterOperator.IN:
         result = series.isin(expr.value)
-    elif operator == FilterOperator.CONTAINS:
-        text_series = cast("pd.Series[str]", series.astype("string"))
-        result = text_series.str.contains(str(expr.value), na=False, regex=False)
-    else:  # pragma: no cover - FilterOperator currently exhausts these branches
+    else:
         raise ValueError(f"Unsupported filter operator: {operator}")
     return (non_null & result).fillna(False).astype(bool)
 
@@ -611,7 +591,7 @@ class KBCollectionHandle(ABC):
         query_text: str,
         *,
         top_k: int,
-        filters: FilterInput | None = None,
+        filters: dict[str, Any] | None = None,
         readonly: bool = False,
         nprobes: int | None = None,
         refine_factor: int | None = None,
@@ -627,7 +607,7 @@ class KBCollectionHandle(ABC):
         query_text: str,
         *,
         top_k: int,
-        filters: FilterInput | None = None,
+        filters: dict[str, Any] | None = None,
         readonly: bool = False,
         nprobes: int | None = None,
         refine_factor: int | None = None,
@@ -644,7 +624,7 @@ class KBCollectionHandle(ABC):
         query_vector: list[float],
         *,
         top_k: int = 10,
-        filters: FilterInput | None = None,
+        filters: dict[str, Any] | None = None,
         fusion_config: FusionConfig | None = None,
         readonly: bool = False,
         nprobes: int | None = None,
@@ -652,13 +632,7 @@ class KBCollectionHandle(ABC):
         user_id: int | None = None,
         is_admin: bool = False,
     ) -> HybridSearchResponse:
-        """Execute hybrid (dense + sparse) search with fusion for this collection.
-
-        Raises:
-            DocumentValidationError: If model_tag, query_text, or top_k is invalid.
-            VectorValidationError: If query_vector is invalid.
-            ValueError: If filters cannot be normalized for embeddings search.
-        """
+        """Execute hybrid (dense + sparse) search with fusion for this collection."""
 
     @abstractmethod
     async def search_hybrid_async(
@@ -668,7 +642,7 @@ class KBCollectionHandle(ABC):
         query_vector: list[float],
         *,
         top_k: int = 10,
-        filters: FilterInput | None = None,
+        filters: dict[str, Any] | None = None,
         fusion_config: FusionConfig | None = None,
         readonly: bool = False,
         nprobes: int | None = None,
@@ -676,13 +650,7 @@ class KBCollectionHandle(ABC):
         user_id: int | None = None,
         is_admin: bool = False,
     ) -> HybridSearchResponse:
-        """Async hybrid (dense + sparse) search with fusion for this collection.
-
-        Raises:
-            DocumentValidationError: If model_tag, query_text, or top_k is invalid.
-            VectorValidationError: If query_vector is invalid.
-            ValueError: If filters cannot be normalized for embeddings search.
-        """
+        """Async hybrid (dense + sparse) search with fusion for this collection."""
 
     # --- Parse/chunk cleanup (row only, collection scoped) (#509) ---
 
@@ -2385,8 +2353,6 @@ class LanceDBCollectionHandle(KBCollectionHandle):
         top_k: int,
         filter_expr: FilterExpression | None,
         current_warnings: List[SearchWarning],
-        user_id: int | None = None,
-        is_admin: bool = False,
         batch_size: int = 2048,
     ) -> List[SearchResult]:
         """Perform a memory-friendly substring scan across the table when FTS misses."""
@@ -2401,15 +2367,13 @@ class LanceDBCollectionHandle(KBCollectionHandle):
             "metadata",
         }
         desired_columns.update(_collect_filter_fields(filter_expr))
-        if not is_admin:
-            desired_columns.add("user_id")
 
         results: List[SearchResult] = []
 
         try:
             if hasattr(table, "to_batches"):
                 batch_iter: Iterable[Any] = table.to_batches(
-                    columns=sorted(desired_columns), batch_size=batch_size
+                    columns=list(desired_columns), batch_size=batch_size
                 )
             else:
                 if pa is None:  # pragma: no cover - Safety guard when pyarrow missing
@@ -2417,11 +2381,11 @@ class LanceDBCollectionHandle(KBCollectionHandle):
                         "pyarrow is required for substring fallback when LanceDB table does not expose to_batches()."
                     )
                 arrow_table: PyArrowTable = table.to_arrow()  # type: ignore
-                arrow_table = arrow_table.select(sorted(desired_columns))
+                arrow_table = arrow_table.select(list(desired_columns))
                 batch_iter = arrow_table.to_batches(max_chunksize=batch_size)
         except Exception as exc:  # noqa: BLE001
             logger.error("Substring fallback failed to read batches: %s", exc)
-            raise
+            return results
 
         for batch in batch_iter:
             batch_df = batch.to_pandas()
@@ -2431,11 +2395,6 @@ class LanceDBCollectionHandle(KBCollectionHandle):
                 if filter_expr is not None
                 else pd.Series(True, index=batch_df.index, dtype=bool)
             )
-            if not is_admin:
-                if user_id is None or "user_id" not in batch_df.columns:
-                    mask &= False
-                else:
-                    mask &= batch_df["user_id"].eq(user_id).fillna(False)
 
             if not mask.any():
                 continue
@@ -2490,9 +2449,10 @@ class LanceDBCollectionHandle(KBCollectionHandle):
         self,
         *,
         model_tag: str,
+        collection: str,
         query_text: str,
         top_k: int,
-        filter_expr: FilterExpression | None,
+        filters: Optional[Dict[str, Any]],
         current_warnings: List[SearchWarning],
         user_id: Optional[int] = None,
         is_admin: bool = False,
@@ -2502,15 +2462,10 @@ class LanceDBCollectionHandle(KBCollectionHandle):
 
         vector_store = self.vector_index_store
         results: List[SearchResult] = []
-        desired_columns = {
-            "doc_id",
-            "chunk_id",
-            "text",
-            "parse_hash",
-            "created_at",
-            "metadata",
-        }
-        desired_columns.update(_collect_filter_fields(filter_expr))
+        # Build query filters
+        query_filters: Dict[str, Any] = {"collection": collection}
+        if filters and isinstance(filters, dict):
+            query_filters.update(filters)
 
         _table = None
         try:
@@ -2523,22 +2478,21 @@ class LanceDBCollectionHandle(KBCollectionHandle):
                 AsyncIterator[Any],
                 vector_store.iter_batches_async(
                     table_name=table_name,
-                    columns=sorted(desired_columns),
+                    columns=[
+                        "doc_id",
+                        "chunk_id",
+                        "text",
+                        "parse_hash",
+                        "created_at",
+                        "metadata",
+                    ],
                     batch_size=batch_size,
-                    # The store applies user scope. The normalized collection and
-                    # custom expression are evaluated identically to the sync path.
-                    filters=None,
+                    filters=query_filters,
                     user_id=user_id,
                     is_admin=is_admin,
                 ),
             ):
                 batch_df = batch.to_pandas()
-
-                mask = (
-                    _evaluate_filter_expression(batch_df, filter_expr)
-                    if filter_expr is not None
-                    else pd.Series(True, index=batch_df.index, dtype=bool)
-                )
 
                 # Apply substring filter
                 text_mask = (
@@ -2546,7 +2500,7 @@ class LanceDBCollectionHandle(KBCollectionHandle):
                     .astype(str)
                     .str.contains(query_text, na=False, regex=False)
                 )
-                matching_rows = batch_df[mask & text_mask]
+                matching_rows = batch_df[text_mask]
 
                 # Early exit: stop processing if we already have enough results
                 if len(results) >= top_k:
@@ -2587,6 +2541,8 @@ class LanceDBCollectionHandle(KBCollectionHandle):
                     )
                 )
 
+        except Exception as exc:
+            logger.error("Async substring fallback failed: %s", exc)
         finally:
             _safe_close_table(_table)
 
@@ -2598,7 +2554,7 @@ class LanceDBCollectionHandle(KBCollectionHandle):
         query_text: str,
         *,
         top_k: int,
-        filters: FilterInput | None = None,
+        filters: Optional[Dict[str, Any]] = None,
         readonly: bool = False,
         nprobes: Optional[int] = None,
         refine_factor: Optional[int] = None,
@@ -2708,8 +2664,6 @@ class LanceDBCollectionHandle(KBCollectionHandle):
                 top_k=top_k,
                 filter_expr=filter_expr,
                 current_warnings=current_warnings,
-                user_id=user_id,
-                is_admin=is_admin,
             )
 
             return self._build_sparse_response(
@@ -2750,7 +2704,7 @@ class LanceDBCollectionHandle(KBCollectionHandle):
         query_text: str,
         *,
         top_k: int,
-        filters: FilterInput | None = None,
+        filters: Optional[Dict[str, Any]] = None,
         readonly: bool = False,
         nprobes: Optional[int] = None,
         refine_factor: Optional[int] = None,
@@ -2778,8 +2732,6 @@ class LanceDBCollectionHandle(KBCollectionHandle):
             )
 
         try:
-            filter_expr = _build_collection_search_filter(collection, filters)
-
             # Check and create FTS index if needed (using storage abstraction layer)
             if not readonly:
                 index_result_obj = vector_store.create_index(model_tag, readonly=False)
@@ -2795,6 +2747,44 @@ class LanceDBCollectionHandle(KBCollectionHandle):
                     )
                 )
 
+            # Convert API-facing dict filters into abstract FilterExpression
+            filter_expr: Optional[FilterExpression] = None
+            if collection or filters:
+                conditions: List[FilterExpression] = []
+
+                if collection:
+                    conditions.append(
+                        FilterCondition(
+                            field="collection",
+                            operator=FilterOperator.EQ,
+                            value=collection,
+                        )
+                    )
+
+                if filters:
+                    if isinstance(filters, dict):
+                        parsed_filters = parse_legacy_filters(filters)
+                        if parsed_filters is not None:
+                            if isinstance(parsed_filters, tuple):
+                                conditions.extend(parsed_filters)
+                            else:
+                                conditions.append(parsed_filters)
+                    elif isinstance(filters, (tuple, list)):
+                        conditions.extend(
+                            filters if isinstance(filters, tuple) else list(filters)
+                        )
+                    else:
+                        conditions.append(filters)
+
+                if len(conditions) == 1:
+                    filter_expr = conditions[0]
+                elif len(conditions) > 1:
+                    filter_expr = tuple(conditions)
+
+            # Validate filter expression depth to prevent DoS
+            if filter_expr is not None:
+                validate_filter_depth(filter_expr)
+
             # Execute async FTS search using abstraction layer (by model_tag)
             raw_results = await vector_store.search_fts_by_model_async(
                 model_tag=model_tag,
@@ -2802,8 +2792,6 @@ class LanceDBCollectionHandle(KBCollectionHandle):
                 top_k=top_k,
                 filters=filter_expr,
                 text_column_name="text",
-                user_id=user_id,
-                is_admin=is_admin,
             )
 
             if not raw_results:
@@ -2814,9 +2802,10 @@ class LanceDBCollectionHandle(KBCollectionHandle):
                 # Use async iter_batches for fallback
                 fallback_results = await self._substring_fallback_async(
                     model_tag=model_tag,
+                    collection=collection,
                     query_text=query_text,
                     top_k=top_k,
-                    filter_expr=filter_expr,
+                    filters=filters,
                     current_warnings=current_warnings,
                     user_id=user_id,
                     is_admin=is_admin,
@@ -2915,7 +2904,7 @@ class LanceDBCollectionHandle(KBCollectionHandle):
         query_vector: list[float],
         *,
         top_k: int = 10,
-        filters: FilterInput | None = None,
+        filters: dict[str, Any] | None = None,
         fusion_config: FusionConfig | None = None,
         readonly: bool = False,
         nprobes: int | None = None,
@@ -2930,7 +2919,6 @@ class LanceDBCollectionHandle(KBCollectionHandle):
         if not self.capabilities.supports_search:
             return self._hybrid_unsupported(model_tag, fusion_config)
 
-        normalized_filters = _normalize_embedding_search_filter(filters)
         if fusion_config is None:
             fusion_config = FusionConfig()
 
@@ -2940,7 +2928,7 @@ class LanceDBCollectionHandle(KBCollectionHandle):
             model_tag,
             query_vector,
             top_k=top_k * 2,
-            filters=normalized_filters,
+            filters=filters,
             readonly=readonly,
             nprobes=nprobes,
             refine_factor=refine_factor,
@@ -2954,7 +2942,7 @@ class LanceDBCollectionHandle(KBCollectionHandle):
             model_tag,
             query_text,
             top_k=top_k * 2,
-            filters=normalized_filters,
+            filters=filters,
             readonly=readonly,
             user_id=user_id,
             is_admin=is_admin,
@@ -3056,19 +3044,11 @@ class LanceDBCollectionHandle(KBCollectionHandle):
         # Limit to top_k after fusion
         final_results = fused_results[:top_k]
 
-        child_statuses = (dense_response.status, sparse_response.status)
-        if all(status == "failed" for status in child_statuses):
-            status = "failed"
-        elif any(status != "success" for status in child_statuses) or all_warnings:
-            status = "partial_success"
-        else:
-            status = "success"
-
         # 6. Build Response
         return HybridSearchResponse(
             results=final_results,
             total_count=len(final_results),
-            status=status,
+            status="success" if not all_warnings else "partial_success",
             warnings=all_warnings,
             fusion_config=fusion_config,
             dense_count=len(dense_results),
@@ -3084,7 +3064,7 @@ class LanceDBCollectionHandle(KBCollectionHandle):
         query_vector: list[float],
         *,
         top_k: int = 10,
-        filters: FilterInput | None = None,
+        filters: dict[str, Any] | None = None,
         fusion_config: FusionConfig | None = None,
         readonly: bool = False,
         nprobes: int | None = None,
@@ -3099,7 +3079,6 @@ class LanceDBCollectionHandle(KBCollectionHandle):
         if not self.capabilities.supports_search:
             return self._hybrid_unsupported(model_tag, fusion_config)
 
-        normalized_filters = _normalize_embedding_search_filter(filters)
         if fusion_config is None:
             fusion_config = FusionConfig()
 
@@ -3109,7 +3088,7 @@ class LanceDBCollectionHandle(KBCollectionHandle):
             model_tag,
             query_vector,
             top_k=top_k * 2,
-            filters=normalized_filters,
+            filters=filters,
             readonly=readonly,
             nprobes=nprobes,
             refine_factor=refine_factor,
@@ -3123,7 +3102,7 @@ class LanceDBCollectionHandle(KBCollectionHandle):
             model_tag,
             query_text,
             top_k=top_k * 2,
-            filters=normalized_filters,
+            filters=filters,
             readonly=readonly,
             user_id=user_id,
             is_admin=is_admin,

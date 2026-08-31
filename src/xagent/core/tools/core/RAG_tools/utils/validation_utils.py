@@ -25,7 +25,7 @@ def validate_search_common_inputs(
         raise DocumentValidationError("Collection must be a non-empty string")
     if not model_tag or not isinstance(model_tag, str):
         raise DocumentValidationError("model_tag must be a non-empty string")
-    if not isinstance(top_k, int) or not 1 <= top_k <= 1000:
+    if top_k <= 0 or top_k > 1000:
         raise DocumentValidationError("top_k must be between 1 and 1000")
 
 

@@ -5,14 +5,13 @@ full-text search results using RRF or linear weighted combination.
 """
 
 import logging
-from typing import TYPE_CHECKING, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 from ..core.schemas import (
     FusionConfig,
     HybridSearchResponse,
     SearchResult,
 )
-from ..storage.contracts import FilterInput
 from ..utils.validation_utils import (
     validate_search_common_inputs,
     validate_search_query_text,
@@ -185,7 +184,7 @@ def search_hybrid(
     query_vector: List[float],
     *,
     top_k: int = 10,
-    filters: Optional[FilterInput] = None,
+    filters: Optional[Dict[str, Any]] = None,
     fusion_config: Optional[FusionConfig] = None,
     readonly: bool = False,
     nprobes: Optional[int] = None,

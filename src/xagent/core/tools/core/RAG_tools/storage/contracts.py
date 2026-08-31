@@ -64,7 +64,6 @@ _VALID_FILTER_FIELDS = frozenset(
         "model",
         "vector_dimension",
         "vector",
-        "text",
         # ingestion_runs table
         "status",
         "message",
@@ -162,8 +161,7 @@ def build_filter_from_dict(filters: Dict[str, Any]) -> Optional[FilterExpression
 
     This function provides a common entry point for building filter expressions
     from simple dictionary key-value pairs. All keys are validated against the
-    field name whitelist, all values are type-checked, and sequence values use
-    membership semantics.
+    field name whitelist, and all values are type-checked.
 
     Args:
         filters: Dictionary of field-name -> value mappings for equality filters.
@@ -196,14 +194,10 @@ def build_filter_from_dict(filters: Dict[str, Any]) -> Optional[FilterExpression
         # Validate value type
         validate_filter_value(value)
 
-        operator = (
-            FilterOperator.IN
-            if isinstance(value, (list, tuple, set))
-            else FilterOperator.EQ
-        )
-
         # Create filter condition
-        conditions.append(FilterCondition(field=field, operator=operator, value=value))
+        conditions.append(
+            FilterCondition(field=field, operator=FilterOperator.EQ, value=value)
+        )
 
     # Return single condition or tuple (AND combination)
     if len(conditions) == 1:
@@ -285,10 +279,6 @@ class FilterCondition:
                 raise ValueError(
                     f"IN operator requires list/tuple/set value, got {type(self.value)}"
                 )
-            if not self.value:
-                raise ValueError(
-                    "IN operator requires a non-empty list/tuple/set value"
-                )
 
 
 # Filter expression can be a single condition, AND combination (tuple), or OR combination (list)
@@ -299,8 +289,7 @@ FilterExpression = Union[
     "list[FilterExpression]",  # OR combination
 ]
 
-# API-facing filters may use the legacy dictionary form or the normalized
-# backend-agnostic expression form.
+# API-facing filters may use the legacy dictionary form or a prebuilt expression.
 FilterInput: TypeAlias = Union[Dict[str, Any], FilterExpression]
 
 
@@ -1106,8 +1095,6 @@ class VectorIndexStore(ABC):
         top_k: int,
         filters: Optional[FilterExpression] = None,
         vector_column_name: str = "vector",
-        user_id: Optional[int] = None,
-        is_admin: bool = False,
     ) -> List[Dict[str, Any]]:
         """Execute vector search (async).
 
@@ -1117,8 +1104,6 @@ class VectorIndexStore(ABC):
             top_k: Number of top results to return.
             filters: Optional abstract filter expression.
             vector_column_name: Name of vector column (default "vector").
-            user_id: Optional user ID for multi-tenancy filtering.
-            is_admin: Whether the user has admin privileges.
 
         Returns:
             List of search result dictionaries with keys:
@@ -1169,8 +1154,6 @@ class VectorIndexStore(ABC):
             top_k=top_k,
             filters=filters,
             vector_column_name=vector_column_name,
-            user_id=user_id,
-            is_admin=is_admin,
         )
 
     @abstractmethod
@@ -1182,8 +1165,6 @@ class VectorIndexStore(ABC):
         top_k: int,
         filters: Optional[FilterExpression] = None,
         text_column_name: str = "text",
-        user_id: Optional[int] = None,
-        is_admin: bool = False,
     ) -> List[Dict[str, Any]]:
         """Execute full-text search (async).
 
@@ -1193,8 +1174,6 @@ class VectorIndexStore(ABC):
             top_k: Number of top results to return.
             filters: Optional abstract filter expression.
             text_column_name: Name of text column with FTS index (default "text").
-            user_id: Optional user ID for multi-tenancy filtering.
-            is_admin: Whether the user has admin privileges.
 
         Returns:
             List of search result dictionaries with keys:
@@ -1216,8 +1195,6 @@ class VectorIndexStore(ABC):
         top_k: int,
         filters: Optional[FilterExpression] = None,
         text_column_name: str = "text",
-        user_id: Optional[int] = None,
-        is_admin: bool = False,
     ) -> List[Dict[str, Any]]:
         """Convenience method: search FTS by model_tag with automatic table resolution.
 
@@ -1230,8 +1207,6 @@ class VectorIndexStore(ABC):
             top_k: Number of top results to return.
             filters: Optional abstract filter expression.
             text_column_name: Name of text column with FTS index (default "text").
-            user_id: Optional user ID for multi-tenancy filtering.
-            is_admin: Whether the user has admin privileges.
 
         Returns:
             List of search result dictionaries with keys:
@@ -1251,8 +1226,6 @@ class VectorIndexStore(ABC):
             top_k=top_k,
             filters=filters,
             text_column_name=text_column_name,
-            user_id=user_id,
-            is_admin=is_admin,
         )
 
     @abstractmethod

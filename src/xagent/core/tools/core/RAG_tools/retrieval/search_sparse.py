@@ -1,12 +1,11 @@
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Any, Dict, Optional
 
 from ..core.schemas import (
     SparseSearchResponse,
 )
-from ..storage.contracts import FilterInput
 from ..utils.validation_utils import (
     validate_search_common_inputs,
     validate_search_query_text,
@@ -31,7 +30,7 @@ def search_sparse(
     query_text: str,
     *,
     top_k: int,
-    filters: Optional[FilterInput] = None,
+    filters: Optional[Dict[str, Any]] = None,
     readonly: bool = False,
     nprobes: Optional[int] = None,
     refine_factor: Optional[int] = None,
@@ -68,7 +67,7 @@ async def search_sparse_async(
     query_text: str,
     *,
     top_k: int,
-    filters: Optional[FilterInput] = None,
+    filters: Optional[Dict[str, Any]] = None,
     readonly: bool = False,
     nprobes: Optional[int] = None,
     refine_factor: Optional[int] = None,

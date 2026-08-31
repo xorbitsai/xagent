@@ -5422,10 +5422,8 @@ async def search(
         None,
         description="Optional filters to apply during search. "
         "Format: {field: value} for equality filters. "
-        "For advanced filters, use {field: {operator: str, value: Any}} with "
-        "eq, ne, gt, gte, lt, lte, in, or contains. Unary null filters use "
-        "{field: {operator: is_null}} or {field: {operator: is_not_null}} "
-        "without a value. This HTTP parameter accepts dictionary forms only.",
+        "For advanced filters, use {field: {operator: str, value: Any}} "
+        "where operator can be: eq, ne, gt, gte, lt, lte, in, contains.",
     ),
     fusion_config: Optional[Dict[str, Any]] = Form(
         None,

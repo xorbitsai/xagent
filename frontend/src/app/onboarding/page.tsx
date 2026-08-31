@@ -794,31 +794,35 @@ export default function OnboardingPage() {
               <Orb small />
               <h1 ref={stepHeadingRef} tabIndex={-1}>{t("onboarding.team.title")}</h1>
               <p className="ob-sub">
-                {goals.length === 0
-                  ? t("onboarding.team.subtitleNoGoals")
-                  : // Gated on !templatesLoading like the grid below it: while
-                    // still loading, matchedRecommended is always [] (nothing
-                    // has resolved yet), which would otherwise claim every
-                    // goal has an "other match waiting" before we actually
-                    // know that.
-                    //
-                    // Counts against matchedRecommended, NOT validRecommended
-                    // - a PR review finding caught that validRecommended can
-                    // be entirely fallback filler cards (goalId: null) when
-                    // nothing actually matched any selected goal, which would
-                    // make this math claim real matches were found (a small
-                    // "extra" count) when the true number of goal matches was
-                    // zero.
-                    `${t("onboarding.team.subtitleBase")}${
-                      !templatesLoading && goals.length - matchedRecommended.length > 0
-                        ? t(
-                            goals.length - matchedRecommended.length === 1
-                              ? "onboarding.team.subtitleExtraOne"
-                              : "onboarding.team.subtitleExtraMany",
-                            { count: goals.length - matchedRecommended.length }
-                          )
-                        : t("onboarding.team.subtitleEnd")
-                    }`}
+                {/* No goals.length === 0 branch - a self-review finding
+                    confirmed it's unreachable: Continue into this step
+                    requires isGoalsValid (goals.length > 0), and the goals
+                    step's only other action ("Not sure yet") exits the
+                    wizard entirely via persistAndLeave rather than
+                    continuing here. */}
+                {/* Gated on !templatesLoading like the grid below it: while
+                    still loading, matchedRecommended is always [] (nothing
+                    has resolved yet), which would otherwise claim every
+                    goal has an "other match waiting" before we actually
+                    know that.
+
+                    Counts against matchedRecommended, NOT validRecommended
+                    - a PR review finding caught that validRecommended can
+                    be entirely fallback filler cards (goalId: null) when
+                    nothing actually matched any selected goal, which would
+                    make this math claim real matches were found (a small
+                    "extra" count) when the true number of goal matches was
+                    zero. */}
+                {`${t("onboarding.team.subtitleBase")}${
+                  !templatesLoading && goals.length - matchedRecommended.length > 0
+                    ? t(
+                        goals.length - matchedRecommended.length === 1
+                          ? "onboarding.team.subtitleExtraOne"
+                          : "onboarding.team.subtitleExtraMany",
+                        { count: goals.length - matchedRecommended.length }
+                      )
+                    : t("onboarding.team.subtitleEnd")
+                }`}
               </p>
               {templatesLoading ? (
                 <div

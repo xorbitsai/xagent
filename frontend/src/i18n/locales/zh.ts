@@ -1663,7 +1663,6 @@ const zh = {
       subtitleEnd: "。",
       subtitleExtraOne: "——还有一个匹配项在模板库中等着你。",
       subtitleExtraMany: "——还有 {count} 个匹配项在模板库中等着你。",
-      subtitleNoGoals: "选一个开始吧——剩下的可以随时雇佣。",
     },
     voice: {
       titleLine1: "希望他们说话",

@@ -1663,7 +1663,6 @@ Build when you need.`,
       subtitleEnd: ".",
       subtitleExtraOne: " — the other match is waiting in Templates.",
       subtitleExtraMany: " — the other {count} matches are waiting in Templates.",
-      subtitleNoGoals: "Choose who you want to start with — you can hire the rest any time.",
     },
     voice: {
       titleLine1: "How should",

@@ -22,19 +22,25 @@ describe("WidgetChromeControls", () => {
     vi.unstubAllGlobals()
   })
 
-  it("renders only the close button when there is no new-conversation action", () => {
+  it("renders the close button and a collapsed menu trigger even with no new-conversation action", () => {
+    // Expand/collapse is always offered regardless of newConversation, so
+    // the "..." trigger has something to open onto even without it.
     render(<WidgetChromeControls />)
 
     expect(screen.getByRole("button", { name: "widgetChat.close" })).toBeInTheDocument()
-    expect(screen.queryByRole("button", { name: "widgetChat.moreOptions" })).toBeNull()
-  })
-
-  it("renders a collapsed menu trigger when a new-conversation action is given", () => {
-    render(<WidgetChromeControls newConversation={{ label: "Start over", onClick: onNewConversation }} />)
-
     const menuTrigger = screen.getByRole("button", { name: "widgetChat.moreOptions" })
     expect(menuTrigger).toHaveAttribute("aria-expanded", "false")
     expect(screen.queryByRole("menu")).toBeNull()
+  })
+
+  it("omits the new-conversation menu item when no action is given, but still offers expand", () => {
+    render(<WidgetChromeControls />)
+
+    fireEvent.click(screen.getByRole("button", { name: "widgetChat.moreOptions" }))
+    const items = screen.getAllByRole("menuitem")
+
+    expect(items).toHaveLength(1)
+    expect(items[0]).toHaveTextContent("widgetChat.expandWindow")
   })
 
   it("posts widget_close to the parent window when the close button is clicked", () => {
@@ -119,6 +125,46 @@ describe("WidgetChromeControls", () => {
     // Not just "disabled" -- the whole point of this prop is a visible
     // in-progress indicator on the trigger once the menu itself has closed.
     expect(trigger.querySelector("svg.animate-spin")).not.toBeNull()
+  })
+
+  it("toggles expand/collapse: posts the right message each way and flips the item's icon and label", () => {
+    render(<WidgetChromeControls />)
+
+    fireEvent.click(screen.getByRole("button", { name: "widgetChat.moreOptions" }))
+    fireEvent.click(screen.getByRole("menuitem", { name: "widgetChat.expandWindow" }))
+
+    expect(postMessageSpy).toHaveBeenCalledWith(
+      { xagent: true, v: 1, type: "widget_expand" },
+      "*",
+    )
+    // The menu closes on click, same as every other menu item.
+    expect(screen.queryByRole("menu")).toBeNull()
+
+    fireEvent.click(screen.getByRole("button", { name: "widgetChat.moreOptions" }))
+    expect(screen.getByRole("menuitem", { name: "widgetChat.collapseWindow" })).toBeInTheDocument()
+
+    fireEvent.click(screen.getByRole("menuitem", { name: "widgetChat.collapseWindow" }))
+
+    expect(postMessageSpy).toHaveBeenCalledWith(
+      { xagent: true, v: 1, type: "widget_collapse" },
+      "*",
+    )
+  })
+
+  it("keeps the new-conversation item and the expand toggle as two independent menu items", () => {
+    render(<WidgetChromeControls newConversation={{ label: "Start over", onClick: onNewConversation }} />)
+
+    fireEvent.click(screen.getByRole("button", { name: "widgetChat.moreOptions" }))
+    const items = screen.getAllByRole("menuitem")
+
+    expect(items).toHaveLength(2)
+    fireEvent.click(screen.getByRole("menuitem", { name: "widgetChat.expandWindow" }))
+
+    expect(onNewConversation).not.toHaveBeenCalled()
+    expect(postMessageSpy).toHaveBeenCalledWith(
+      { xagent: true, v: 1, type: "widget_expand" },
+      "*",
+    )
   })
 
   it("closes the menu on Escape", () => {

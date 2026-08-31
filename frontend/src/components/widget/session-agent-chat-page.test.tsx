@@ -312,12 +312,9 @@ describe("SessionAgentChatPage", () => {
       { mode: "balanced" },
       [],
     )
-    // No conversation yet — nothing to reset, so the "..." menu (which would
-    // only ever hold the new-conversation action) doesn't render either. (Not
-    // asserting the menuitem itself is absent here: the menu was never
-    // opened, so that check can't fail regardless of whether this logic
-    // works — the trigger's own absence, below, is what actually proves it.)
-    expect(screen.queryByRole("button", { name: "widgetChat.moreOptions" })).toBeNull()
+    // No conversation yet — nothing to reset, but the "..." trigger still
+    // renders since expand/collapse is always offered regardless.
+    expect(screen.getByRole("button", { name: "widgetChat.moreOptions" })).toBeInTheDocument()
     expect(screen.getByRole("button", { name: "widgetChat.close" })).toBeInTheDocument()
   })
 

@@ -399,10 +399,11 @@ describe("PublicAgentChatPage", () => {
 
     expect(await screen.findByRole("button", { name: "start:Support Agent" })).toBeInTheDocument()
     expect(fetchMock).toHaveBeenCalledTimes(1)
-    // No conversation yet — nothing to end, so the "..." menu (which would
-    // only ever hold the new-conversation action) doesn't render either.
+    // No conversation yet — nothing to end, so that particular menu item is
+    // absent, but the "..." trigger itself still renders since expand/
+    // collapse is always offered regardless of conversation state.
     expect(screen.queryByRole("button", { name: "widgetChat.newConversation" })).toBeNull()
-    expect(screen.queryByRole("button", { name: "widgetChat.moreOptions" })).toBeNull()
+    expect(screen.getByRole("button", { name: "widgetChat.moreOptions" })).toBeInTheDocument()
     // The close control still renders — it toggles the host panel, not the
     // chat itself, so it's independent of whether a conversation exists.
     expect(screen.getByRole("button", { name: "widgetChat.close" })).toBeInTheDocument()

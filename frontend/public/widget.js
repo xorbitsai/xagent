@@ -378,6 +378,24 @@
       display: none;
     }
 
+    /* Expand mode jumps straight to the same max width the drag-resize
+       handle already clamps to, rather than a separate arbitrary size.
+       min-width, not nested in the max-width block below, so its two-class
+       selector can never outrank the mobile layout by specificity alone --
+       structurally impossible to apply under the mobile breakpoint at all. */
+    @media (min-width: ${MOBILE_BREAKPOINT + 1}px) {
+      .xagent-widget-panel.expanded {
+        width: ${MAX_PANEL_WIDTH}px;
+        height: calc(100vh - 100px);
+      }
+
+      /* Dragging the handle sets an inline width that would win over (and
+         desync from) the expanded class's own width by specificity. */
+      .xagent-widget-panel.expanded .xagent-widget-resize-handle {
+        display: none;
+      }
+    }
+
     @media (max-width: ${MOBILE_BREAKPOINT}px) {
       .xagent-widget-panel {
         width: calc(100vw - ${HORIZONTAL_VIEWPORT_MARGIN}px);
@@ -413,6 +431,14 @@
   // viewport (a shrunk window, a rotated device) must not permanently shrink
   // the user's stored preference once the viewport widens again.
   function applyPanelWidth() {
+    // Expand mode's own CSS rule owns width while active; setting an inline
+    // width here would outrank it by specificity regardless of viewport,
+    // desyncing the panel's width from its still-expanded height -- a plain
+    // window resize that stays well above the mobile breakpoint still calls
+    // this via onWindowResize below. collapsePanel() calls this itself,
+    // after already flipping isExpanded false, specifically to restore the
+    // width this skips while expanded.
+    if (isExpanded) return;
     panel.style.width = isMobileViewport() ? '' : clampPanelWidth(panelWidth) + 'px';
   }
   applyPanelWidth();
@@ -438,7 +464,7 @@
     // whose CSP blocks that inline <style> would leave it visually
     // draggable with no CSS backing it up -- check the open class directly
     // too, as defense in depth that doesn't depend on the stylesheet loading.
-    if (torndown || isMobileViewport() || dragState || (event.button || 0) !== 0 || !panel.classList.contains('open')) return;
+    if (torndown || isMobileViewport() || isExpanded || dragState || (event.button || 0) !== 0 || !panel.classList.contains('open')) return;
     dragState = {
       pointerId: event.pointerId,
       startX: event.clientX,
@@ -633,6 +659,7 @@
   fab.innerHTML = chatIcon;
 
   var isOpen = false;
+  var isExpanded = false;
 
   function openPanel() {
     isOpen = true;
@@ -644,6 +671,22 @@
     isOpen = false;
     panel.classList.remove('open');
     fab.innerHTML = chatIcon;
+  }
+
+  function expandPanel() {
+    isExpanded = true;
+    panel.classList.add('expanded');
+    // Let the .expanded rule's own width win -- an inline width from a
+    // prior drag would otherwise outrank it by specificity regardless.
+    // A no-op under the mobile breakpoint: the .expanded CSS rule is
+    // itself scoped to min-width, so this class has nothing to apply.
+    panel.style.width = '';
+  }
+
+  function collapsePanel() {
+    isExpanded = false;
+    panel.classList.remove('expanded');
+    applyPanelWidth();
   }
 
   fab.onclick = function () {
@@ -682,6 +725,10 @@
     if (!data || data.xagent !== true || data.v !== 1) return;
     if (data.type === 'widget_close') {
       closePanel();
+    } else if (data.type === 'widget_expand') {
+      expandPanel();
+    } else if (data.type === 'widget_collapse') {
+      collapsePanel();
     }
   }
   window.addEventListener('message', onChromeMessage);

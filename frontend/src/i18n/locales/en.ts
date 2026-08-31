@@ -542,6 +542,8 @@ Build when you need.`,
     newConversation: "New conversation",
     close: "Close",
     moreOptions: "More options",
+    expandWindow: "Expand window",
+    collapseWindow: "Collapse window",
     status: {
       initializing: "Initializing...",
       connecting: "Connecting...",

@@ -542,6 +542,8 @@ const zh = {
     newConversation: "新建会话",
     close: "关闭",
     moreOptions: "更多选项",
+    expandWindow: "展开窗口",
+    collapseWindow: "收起窗口",
     status: {
       initializing: "正在初始化...",
       connecting: "连接中...",

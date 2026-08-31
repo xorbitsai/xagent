@@ -79,14 +79,17 @@ describe("widget close chrome", () => {
     vi.restoreAllMocks()
   })
 
-  it("keeps the widget_close message type literal in sync with the host script", () => {
+  it("keeps every WidgetParentMessageType literal in sync with the host script", () => {
     // widget.js is a hand-authored static asset with no build-time import
     // from TS source, so nothing else ties these two literals together --
-    // a rename on one side without the other would silently break the close
-    // button (a same-origin, same-source, correctly-enveloped message the
-    // host would now just ignore) with no compiler error to catch it.
-    const messageType: WidgetParentMessageType = "widget_close"
-    expect(widgetScript).toContain(`data.type === '${messageType}'`)
+    // a rename on one side without the other would silently break the
+    // corresponding control (a same-origin, same-source, correctly-enveloped
+    // message the host would now just ignore) with no compiler error to
+    // catch it.
+    const messageTypes: WidgetParentMessageType[] = ["widget_close", "widget_expand", "widget_collapse"]
+    for (const messageType of messageTypes) {
+      expect(widgetScript).toContain(`data.type === '${messageType}'`)
+    }
   })
 
   it("starts closed for a first-time visitor", () => {
@@ -179,6 +182,64 @@ describe("widget close chrome", () => {
     fromIframe("widget_minimize")
 
     expect(panelEl()).toHaveClass("open")
+  })
+
+  it("expands the panel when the iframe posts widget_expand", () => {
+    runWidget()
+    fabEl()?.click()
+
+    fromIframe("widget_expand")
+
+    expect(panelEl()).toHaveClass("expanded")
+  })
+
+  it("collapses the panel, restoring its normal width, when the iframe posts widget_collapse", () => {
+    localStorage.setItem("xagent_widget_width", "500")
+    runWidget()
+    fabEl()?.click()
+    fromIframe("widget_expand")
+    // The .expanded rule's own width would otherwise lose to a lingering
+    // inline one -- expanding must clear whatever the resize handle left.
+    // toHaveStyle checks computed style, which jsdom never resolves for
+    // anything behind a media query (confirmed empirically), so this reads
+    // the raw inline style directly like the resize-handle tests already do.
+    expect((panelEl() as HTMLElement).style.width).toBe("")
+
+    fromIframe("widget_collapse")
+
+    expect(panelEl()).not.toHaveClass("expanded")
+    expect((panelEl() as HTMLElement).style.width).toBe("500px")
+  })
+
+  it("does not let a same-side window resize clobber the expanded width", () => {
+    // applyPanelWidth() (called from onWindowResize on every horizontal
+    // resize) used to unconditionally set an inline width, which outranks
+    // the .expanded CSS rule's own width by specificity regardless of
+    // viewport -- desyncing the panel's width from its still-expanded
+    // height on any resize that stays well above the mobile breakpoint.
+    runWidget()
+    fabEl()?.click()
+    fromIframe("widget_expand")
+    expect((panelEl() as HTMLElement).style.width).toBe("")
+
+    Object.defineProperty(window, "innerWidth", { configurable: true, value: window.innerWidth - 50 })
+    window.dispatchEvent(new Event("resize"))
+
+    expect(panelEl()).toHaveClass("expanded")
+    expect((panelEl() as HTMLElement).style.width).toBe("")
+  })
+
+  it("stays expanded across a close/reopen within the same page view", () => {
+    // No persistence for this (unlike width): a JS variable that's simply
+    // never reset by closePanel(), so it only resets on an actual reload.
+    runWidget()
+    fabEl()?.click()
+    fromIframe("widget_expand")
+
+    fabEl()?.click()
+    fabEl()?.click()
+
+    expect(panelEl()).toHaveClass("expanded")
   })
 
   it("ignores a chrome message from a different origin", () => {

@@ -433,6 +433,28 @@ describe("widget bootstrap", () => {
       expect(panel().style.width).toBe("")
     })
 
+    it("ignores a drag start while expanded", () => {
+      // The expanded rule's own width would otherwise get fought over an
+      // inline width from a drag that isn't blocked here.
+      runWidget({ "data-widget-key": "widget-secret" })
+      openPanel()
+      window.dispatchEvent(new MessageEvent("message", {
+        data: { xagent: true, v: 1, type: "widget_expand" },
+        origin: "https://chat.example",
+        source: widgetIframe().contentWindow as Window,
+      }))
+      expect(panel()).toHaveClass("expanded")
+
+      firePointerEvent(handle(), "pointerdown", { pointerId: 1, clientX: 100 })
+
+      expect(document.body.style.userSelect).toBe("")
+      // Proves dragState was never created, not just that userSelect happens
+      // to be unset: a real drag would set an inline width here, clobbering
+      // the .expanded rule's own width.
+      firePointerEvent(handle(), "pointermove", { pointerId: 1, clientX: 250 })
+      expect(panel().style.width).toBe("")
+    })
+
     it("boundary: applies the mobile CSS at exactly the breakpoint width, not just below it", () => {
       // isMobileViewport() uses <=, matching the CSS media query's own
       // max-width: 480px (also <= in CSS terms) -- off by one here would

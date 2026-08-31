@@ -3,7 +3,7 @@
 import React, { useEffect, useRef, useState } from "react"
 import { Loader2, Maximize2, MessageSquarePlus, Minimize2, MoreHorizontal, X } from "lucide-react"
 import { useI18n } from "@/contexts/i18n-context"
-import { postToParentWidget } from "@/lib/widget-parent-message"
+import { listenForWidgetHostMessage, postToParentWidget } from "@/lib/widget-parent-message"
 
 // Exported so the standalone share-mode reset button (public-agent-chat-page.tsx)
 // can match this styling instead of drifting with its own duplicate string.
@@ -75,6 +75,15 @@ export function WidgetChromeControls({ newConversation }: WidgetChromeControlsPr
     }
   }, [isMenuOpen])
 
+  useEffect(() => (
+    // Correct the optimistic setIsExpanded(true) below when widget.js's own
+    // mobile guard rejects the widget_expand that caused it -- otherwise the
+    // menu keeps reading "Collapse window" with nothing actually expanded,
+    // and the next click (a no-op collapse from here) needs a second click
+    // after an eventual desktop-width resize to actually expand.
+    listenForWidgetHostMessage("widget_expand_rejected", () => setIsExpanded(false))
+  ), [])
+
   const handleNewConversation = () => {
     setIsMenuOpen(false)
     newConversation?.onClick()
@@ -104,7 +113,11 @@ export function WidgetChromeControls({ newConversation }: WidgetChromeControlsPr
         <button
           type="button"
           onClick={() => setIsMenuOpen((open) => !open)}
-          disabled={newConversation?.pending}
+          // Sizing (expand/collapse) has no dependency on the conversation
+          // reset, so a pending reset must not block reaching it -- the
+          // reset item already carries its own `disabled` for that action
+          // specifically. The spinner below still surfaces reset-in-flight
+          // status on the trigger itself.
           title={t("widgetChat.moreOptions")}
           aria-label={t("widgetChat.moreOptions")}
           aria-haspopup="menu"

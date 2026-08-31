@@ -366,10 +366,11 @@ describe("SessionAgentChatPage", () => {
     app.isConversationResetPending = true
     rerender(<SessionAgentChatPage />)
 
-    expect(trigger).toBeDisabled()
     expect(screen.queryByRole("menu")).toBeNull()
-    // Not just "disabled" -- the whole point of this prop is a visible
-    // in-progress indicator on the trigger once the menu itself has closed.
+    // The spinner is status feedback, not a lockout -- sizing has no
+    // dependency on the conversation reset, so the trigger itself must stay
+    // reachable even while pending.
+    expect(trigger).not.toBeDisabled()
     expect(trigger.querySelector("svg.animate-spin")).not.toBeNull()
   })
 

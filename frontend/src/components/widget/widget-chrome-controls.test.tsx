@@ -120,11 +120,36 @@ describe("WidgetChromeControls", () => {
       />,
     )
 
-    expect(trigger).toBeDisabled()
     expect(screen.queryByRole("menu")).toBeNull()
-    // Not just "disabled" -- the whole point of this prop is a visible
-    // in-progress indicator on the trigger once the menu itself has closed.
+    // The spinner is status feedback, not a lockout -- sizing has no
+    // dependency on the conversation reset, so the trigger itself must stay
+    // reachable (the reset item's own `disabled` is what actually blocks
+    // re-triggering it while pending).
+    expect(trigger).not.toBeDisabled()
     expect(trigger.querySelector("svg.animate-spin")).not.toBeNull()
+  })
+
+  it("keeps expand/collapse reachable while a conversation reset is pending", () => {
+    render(
+      <WidgetChromeControls
+        newConversation={{
+          label: "Resetting...",
+          onClick: onNewConversation,
+          disabled: true,
+          pending: true,
+        }}
+      />,
+    )
+
+    fireEvent.click(screen.getByRole("button", { name: "widgetChat.moreOptions" }))
+    expect(screen.getByRole("menuitem", { name: "Resetting..." })).toBeDisabled()
+
+    fireEvent.click(screen.getByRole("menuitem", { name: "widgetChat.expandWindow" }))
+
+    expect(postMessageSpy).toHaveBeenCalledWith(
+      { xagent: true, v: 1, type: "widget_expand" },
+      "*",
+    )
   })
 
   it("toggles expand/collapse: posts the right message each way and flips the item's icon and label", () => {
@@ -154,6 +179,41 @@ describe("WidgetChromeControls", () => {
       { xagent: true, v: 1, type: "widget_collapse" },
       "*",
     )
+  })
+
+  it("corrects the optimistic expand guess when the host rejects it (its own mobile guard)", () => {
+    // widget.js's expandPanel() no-ops under the mobile breakpoint and
+    // replies with widget_expand_rejected instead -- without listening for
+    // that, this component's own optimistic setIsExpanded(true) is never
+    // corrected, and the menu keeps reading "Collapse window" with nothing
+    // actually expanded.
+    render(<WidgetChromeControls />)
+
+    fireEvent.click(screen.getByRole("button", { name: "widgetChat.moreOptions" }))
+    fireEvent.click(screen.getByRole("menuitem", { name: "widgetChat.expandWindow" }))
+
+    fireEvent(window, new MessageEvent("message", {
+      data: { xagent: true, v: 1, type: "widget_expand_rejected" },
+      source: window.parent as unknown as MessageEventSource,
+    }))
+
+    fireEvent.click(screen.getByRole("button", { name: "widgetChat.moreOptions" }))
+    expect(screen.getByRole("menuitem", { name: "widgetChat.expandWindow" })).toBeInTheDocument()
+  })
+
+  it("ignores a rejection message not sourced from window.parent", () => {
+    render(<WidgetChromeControls />)
+
+    fireEvent.click(screen.getByRole("button", { name: "widgetChat.moreOptions" }))
+    fireEvent.click(screen.getByRole("menuitem", { name: "widgetChat.expandWindow" }))
+
+    fireEvent(window, new MessageEvent("message", {
+      data: { xagent: true, v: 1, type: "widget_expand_rejected" },
+      source: window as unknown as MessageEventSource,
+    }))
+
+    fireEvent.click(screen.getByRole("button", { name: "widgetChat.moreOptions" }))
+    expect(screen.getByRole("menuitem", { name: "widgetChat.collapseWindow" })).toBeInTheDocument()
   })
 
   it("keeps the new-conversation item and the expand toggle as two independent menu items", () => {

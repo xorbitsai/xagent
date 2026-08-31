@@ -397,7 +397,11 @@
        apply under the mobile breakpoint at all. */
     @media not all and (max-width: ${MOBILE_BREAKPOINT}px) {
       .xagent-widget-panel.expanded {
-        width: ${MAX_PANEL_WIDTH}px;
+        /* Same viewport clamp the drag-resize handle already enforces via
+           clampPanelWidth() -- a flat 720px would push the right-anchored
+           panel (and its left-edge resize handle) off the left of the
+           screen on any supported desktop width narrower than 760px. */
+        width: min(${MAX_PANEL_WIDTH}px, 100vw - ${HORIZONTAL_VIEWPORT_MARGIN}px);
         height: calc(100vh - ${buttonSize} - 40px);
       }
 
@@ -684,13 +688,15 @@
     fab.innerHTML = chatIcon;
   }
 
+  // Returns whether it actually expanded -- onChromeMessage uses this to
+  // tell the iframe when its optimistic isExpanded guess needs correcting.
   function expandPanel() {
     // The .expanded CSS rule is itself scoped above the mobile breakpoint,
     // so this would already be a visual no-op there -- but isExpanded would
     // still latch true, and nothing rechecks it on a later resize/rotation
     // (see onWindowResize below), so growing past the breakpoint afterward
     // would silently expand the panel with no further click from the user.
-    if (isMobileViewport()) return;
+    if (isMobileViewport()) return false;
     // Expanding invalidates a drag's frozen startX/startWidth anchors the
     // same way a viewport-width change does (see onWindowResize's own
     // cancelDrag() call) -- a drag can only still be active here via a
@@ -706,6 +712,7 @@
     // Let the .expanded rule's own width win -- an inline width from a
     // prior drag would otherwise outrank it by specificity regardless.
     panel.style.width = '';
+    return true;
   }
 
   function collapsePanel() {
@@ -751,7 +758,14 @@
     if (data.type === 'widget_close') {
       closePanel();
     } else if (data.type === 'widget_expand') {
-      expandPanel();
+      // Correct the iframe's optimistic isExpanded guess when the mobile
+      // guard above rejects it -- otherwise the menu keeps reading "Collapse
+      // window" with nothing actually expanded, and the visitor's next click
+      // (a no-op collapse from the iframe's perspective) needs a second
+      // click on an eventual desktop-width resize to actually expand.
+      if (!expandPanel()) {
+        iframe.contentWindow.postMessage({ xagent: true, v: 1, type: 'widget_expand_rejected' }, host);
+      }
     } else if (data.type === 'widget_collapse') {
       collapsePanel();
     }

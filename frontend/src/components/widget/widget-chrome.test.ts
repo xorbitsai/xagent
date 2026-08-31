@@ -218,6 +218,37 @@ describe("widget chrome", () => {
     expect(panelEl()).toHaveClass("expanded")
   })
 
+  it("tells the iframe to correct itself when the mobile guard rejects widget_expand", () => {
+    // Without this, the iframe's own optimistic setIsExpanded(true) is never
+    // corrected: the menu keeps reading "Collapse window" with nothing
+    // actually expanded, and the visitor's next click (a no-op collapse from
+    // the iframe's perspective) needs a second click after an eventual
+    // desktop-width resize to actually expand.
+    Object.defineProperty(window, "innerWidth", { configurable: true, value: 400 })
+    runWidget()
+    fabEl()?.click()
+    const postToIframe = vi.spyOn(iframeEl()!.contentWindow!, "postMessage")
+
+    fromIframe("widget_expand")
+
+    expect(panelEl()).not.toHaveClass("expanded")
+    expect(postToIframe).toHaveBeenCalledWith(
+      { xagent: true, v: 1, type: "widget_expand_rejected" },
+      HOST,
+    )
+  })
+
+  it("does not tell the iframe to correct itself when widget_expand actually succeeds", () => {
+    runWidget()
+    fabEl()?.click()
+    const postToIframe = vi.spyOn(iframeEl()!.contentWindow!, "postMessage")
+
+    fromIframe("widget_expand")
+
+    expect(panelEl()).toHaveClass("expanded")
+    expect(postToIframe).not.toHaveBeenCalled()
+  })
+
   it("keeps the .expanded rule (and its resize-handle override) scoped above the mobile breakpoint", () => {
     // jsdom never evaluates @media against getComputedStyle (confirmed
     // empirically), so this asserts against the generated CSS text instead --
@@ -228,7 +259,7 @@ describe("widget chrome", () => {
     runWidget({ "data-widget-key": "widget-secret" })
 
     const block = expandedBlock()
-    expect(block).toMatch(/\.xagent-widget-panel\.expanded\s*\{[^}]*width:\s*720px;/)
+    expect(block).toMatch(/\.xagent-widget-panel\.expanded\s*\{[^}]*width:\s*min\(720px, 100vw - 40px\);/)
     expect(block).toMatch(/\.xagent-widget-panel\.expanded\s+\.xagent-widget-resize-handle\s*\{[^}]*display:\s*none;/)
     expect(mobileBlock()).not.toMatch(/\.xagent-widget-panel\.expanded/)
   })

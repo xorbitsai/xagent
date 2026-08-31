@@ -865,6 +865,43 @@ describe("ConnectAppsField", () => {
     expect(onSkip).toHaveBeenCalledTimes(1);
   });
 
+  it("resets the skipped state for a new pause carrying a different requestId, instead of inheriting it from the one just skipped", () => {
+    // clarification-form.tsx keys this component only by
+    // `${interaction.field}-${index}` (field is always the literal
+    // "connect_apps"), so a later, unrelated pause landing at the same
+    // position reuses this same mounted instance rather than remounting
+    // it - without the requestId reset, this pause would render as
+    // already-skipped and hide the actions it actually needs.
+    mcpAppsMock.apps = [makeApp({ provider: "google" })];
+    const onSkip = vi.fn();
+
+    const { rerender } = render(
+      <ConnectAppsField
+        interaction={{ ...LEO_INTERACTION, apps: ["Gmail"] }}
+        requestId="pause-1"
+        onSkip={onSkip}
+      />
+    );
+
+    fireEvent.click(screen.getByText("chatPage.clarification.connectApps.skip"));
+    expect(
+      screen.getByText("chatPage.clarification.connectApps.skippedNote")
+    ).toBeInTheDocument();
+
+    rerender(
+      <ConnectAppsField
+        interaction={{ ...LEO_INTERACTION, apps: ["Gmail"] }}
+        requestId="pause-2"
+        onSkip={onSkip}
+      />
+    );
+
+    expect(
+      screen.queryByText("chatPage.clarification.connectApps.skippedNote")
+    ).not.toBeInTheDocument();
+    expect(screen.getByText("chatPage.clarification.connectApps.skip")).toBeInTheDocument();
+  });
+
   it("only calls onSkip once when the skip link is clicked twice before React re-renders", () => {
     mcpAppsMock.apps = [makeApp({ provider: "google" })];
     const onSkip = vi.fn().mockResolvedValue(undefined);

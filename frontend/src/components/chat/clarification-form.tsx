@@ -647,6 +647,7 @@ export function ClarificationForm({
           // right now.
           <ConnectAppsField
             interaction={interaction}
+            requestId={requestId}
             onSkip={handleSkipConnectApps}
             onContinue={active ? handleContinueConnectApps : undefined}
           />
@@ -696,6 +697,7 @@ export function ClarificationForm({
               <ConnectAppsField
                 key={`${interaction.field}-${index}`}
                 interaction={interaction}
+                requestId={requestId}
                 onSkip={handleSkipConnectApps}
                 onContinue={active ? handleContinueConnectApps : undefined}
               />

@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useEffect, useMemo, useRef, useState } from "react";
+import React, { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { CheckCircle2 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { useAuth } from "@/contexts/auth-context";
@@ -207,10 +207,21 @@ function ConnectedBadge({ label }: { label: string }) {
 
 export function ConnectAppsField({
   interaction,
+  requestId,
   onSkip,
   onContinue,
 }: {
   interaction: Interaction;
+  /** Identifies the pause this card is rendering. clarification-form.tsx
+   * keys ConnectAppsField only by `${interaction.field}-${index}` - field
+   * is always the literal "connect_apps" for this interaction type, so a
+   * later, unrelated pause landing at the same array position reuses this
+   * same mounted instance rather than remounting it. Without resetting on
+   * a requestId change the same way ClarificationForm's own form state
+   * already does, a fresh pause could inherit `skipped`/`continued` from
+   * one the user already acted on, permanently hiding the actions it
+   * actually needs (see the reset effect below). */
+  requestId?: string;
   onSkip: () => Promise<void> | void;
   /** Called once every requested app is connected, in place of onSkip -
    * distinct so the message it sends can say "connected" rather than
@@ -245,6 +256,20 @@ export function ConnectAppsField({
   // the optimistic skippedNote back instead of leaving the card looking
   // resolved while the acknowledgement never actually went through.
   const skippedRef = useRef(false);
+  // See requestId's own doc comment above: this instance can outlive the
+  // pause it was first rendered for, so a new requestId must reset the
+  // acknowledgement state the same way ClarificationForm resets its own
+  // form state on the same signal - useLayoutEffect, not useEffect, so a
+  // stale skippedNote/hidden-action render never paints before this runs.
+  const previousRequestIdRef = useRef(requestId);
+  useLayoutEffect(() => {
+    if (previousRequestIdRef.current === requestId) return;
+    previousRequestIdRef.current = requestId;
+    setSkipped(false);
+    setContinued(false);
+    skippedRef.current = false;
+    continuedRef.current = false;
+  }, [requestId]);
   // Shared by Skip (footer + all-unresolved fallback) and Continue: set the
   // ref synchronously before any await so a second click landing in the
   // same tick is a no-op, flip the optimistic state, then roll both back on

@@ -16,7 +16,7 @@ else:
         Anthropic = None  # type: ignore
         AsyncAnthropic = None  # type: ignore
 
-from ..exceptions import LLMRetryableError, LLMTimeoutError
+from ..exceptions import LLMRetryableError, LLMTimeoutError, attach_usage_attempts
 from ..timeout_config import TimeoutConfig
 from ..token_context import add_token_usage
 from ..types import ChunkType, StreamChunk
@@ -798,7 +798,11 @@ class ClaudeLLM(BaseLLM):
                 if isinstance(e, APIStatusError):
                     raise LLMRetryableError(str(e)) from e
 
-            raise RuntimeError(f"Claude API error: {str(e)}") from e
+            wrapped = RuntimeError(f"Claude API error: {str(e)}")
+            # Preserve any billed-attempt payload carried by the cause so the
+            # wrap does not lose it from error-path accounting.
+            attach_usage_attempts(wrapped, getattr(e, "usage_attempts", None) or [])
+            raise wrapped from e
 
     async def stream_chat(
         self,

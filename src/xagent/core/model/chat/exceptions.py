@@ -33,6 +33,40 @@ class LLMRetryableError(RuntimeError):
         self.usage_attempts: list[Any] | None = None
 
 
+def attach_usage_attempts(error: BaseException, attempts: list[Any]) -> None:
+    """Attach ordered billed-usage payloads to a surfaced exception.
+
+    This is the accounting carrier for a call that fails after the adapter
+    already booked tokens: the retry wrapper merges it into an eventual
+    success envelope, and ``PatternRuntime.on_llm_error`` books it when every
+    attempt fails. Assignment goes through ``setattr`` because only
+    ``LLMRetryableError`` declares the attribute statically.
+    """
+    if attempts:
+        setattr(error, "usage_attempts", list(attempts))
+
+
+def merge_usage_attempts_into_result(history: list[Any], result: Any) -> None:
+    """Fold billed attempts from superseded/failed retries into a success envelope.
+
+    ``usage`` stays the final attempt (the context-freshness baseline);
+    ``usage_attempts`` becomes the ordered list of every known billed
+    attempt, final included. Written whenever ``history`` is non-empty: a
+    known billed attempt is never suppressed just because the final success
+    is unmetered or because a single attempt ended up known. A call with no
+    prior billed history keeps the single-attempt shape (no key).
+    """
+    if not history or not isinstance(result, dict):
+        return
+    final_attempts = result.get("usage_attempts")
+    if final_attempts is None:
+        final_usage = result.get("usage")
+        final_attempts = [final_usage] if final_usage is not None else []
+    merged = list(history) + list(final_attempts)
+    if merged:
+        result["usage_attempts"] = merged
+
+
 class LLMToolProtocolError(LLMRetryableError):
     """Structured provider tool-protocol failure.
 

@@ -32,6 +32,7 @@ from xagent.core.model.chat.basic.base import BaseLLM
 from xagent.core.model.chat.basic.claude import ClaudeLLM
 from xagent.core.model.chat.basic.gemini import GeminiLLM
 from xagent.core.model.chat.basic.openai import OpenAILLM
+from xagent.core.model.chat.basic.zhipu import ZhipuLLM
 from xagent.core.model.chat.error import retry_on
 from xagent.core.model.chat.exceptions import LLMEmptyContentError
 from xagent.core.model.chat.token_context import get_token_usage, reset_token_usage
@@ -437,3 +438,334 @@ class TestRuntimeAttemptRecording:
         )
         assert "input_tokens" not in error_event["data"]
         assert "llm_attempt_count" not in error_event["data"]
+
+
+# ---------------------------------------------------------------------------
+# Round-2 regressions (review R1-xx on PR #1787)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_openai_generic_error_after_internal_retry_carries_attempts(
+    mocker: Any,
+) -> None:
+    """R1-01: the first (billed, superseded) attempt is followed by a
+    thinking-disabled resend that raises BadRequestError. The surfaced
+    RuntimeError wraps the SDK error -- it must still carry the known billed
+    attempt so error-path accounting does not lose it."""
+    import httpx
+    import openai as openai_pkg
+
+    reset_token_usage()
+    llm = _openai_llm(
+        mocker,
+        [
+            _openai_completion(
+                "not json at all{",
+                P1,
+                C1,
+                reasoning_content="some reasoning trace",
+            ),
+            openai_pkg.BadRequestError(
+                "second request rejected",
+                response=httpx.Response(
+                    400, request=httpx.Request("POST", "https://api.openai.com/x")
+                ),
+                body=None,
+            ),
+        ],
+    )
+
+    with pytest.raises(RuntimeError) as exc_info:
+        await llm.chat(
+            [{"role": "user", "content": "hi"}],
+            response_format={"type": "json_object"},
+        )
+
+    attempts = getattr(exc_info.value, "usage_attempts", None)
+    assert attempts is not None
+    assert [attempt["prompt_tokens"] for attempt in attempts] == [P1]
+    # The ledger booked the first attempt; the error carrier must agree.
+    assert get_token_usage().input_tokens == P1
+
+    # And the runtime books it through on_llm_error.
+    tracer = TraceEventRecorder()
+    runtime = PatternRuntime(tracer=tracer)
+    context = ExecutionContext(execution_id="r1-01")
+    context.add_user_message("hi")
+    await runtime.on_llm_error(context=context, error=exc_info.value)
+
+    assert context.get_total_token_usage() == {
+        "total": P1 + C1,
+        "input": P1,
+        "output": C1,
+        "call_count": 1,
+    }
+    error_event = next(
+        event for event in tracer.events if event["event_type"] == "action_error_llm"
+    )
+    assert error_event["data"]["input_tokens"] == P1
+
+
+@pytest.mark.asyncio
+async def test_retry_wrapper_preserves_singleton_history_when_final_unmetered() -> None:
+    """R1-02: one collected billed failure followed by an unmetered success
+    must still surface the known attempt -- a one-element history is not
+    suppressed, and nothing is promoted into ``usage``."""
+
+    class _FlakyLLM:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def chat(self, *args: Any, **kwargs: Any) -> Any:
+            self.calls += 1
+            if self.calls == 1:
+                error = LLMEmptyContentError("empty first attempt")
+                error.usage_attempts = [U1]
+                raise error
+            return {"type": "text", "content": "ok"}  # deliberately unmetered
+
+    response = await _wrapped(_FlakyLLM()).chat([{"role": "user", "content": "hi"}])
+
+    assert response.get("usage") is None
+    assert response["usage_attempts"] == [U1]
+
+    # And the runtime books that single known attempt from the envelope.
+    tracer = TraceEventRecorder()
+    runtime = PatternRuntime(tracer=tracer)
+    context = ExecutionContext(execution_id="r1-02")
+    context.add_user_message("hi")
+    await runtime.on_llm_end(context=context, response=response)
+
+    assert context.get_total_token_usage() == {
+        "total": P1 + C1,
+        "input": P1,
+        "output": C1,
+        "call_count": 1,
+    }
+    end_event = next(
+        event for event in tracer.events if event["event_type"] == "action_end_llm"
+    )
+    assert end_event["data"]["llm_attempt_count"] == 1
+    assert end_event["data"]["input_tokens"] == P1
+
+
+def test_deepseek_violation_rebuild_preserves_usage_attempts() -> None:
+    """R1-03: the protocol-error rebuild is a response transformation, not a
+    new provider request -- it must carry the full ordered attempt list, not
+    just the final usage stamp."""
+    from xagent.core.model.chat.basic.deepseek_tool_protocol import (
+        normalize_deepseek_response,
+    )
+
+    response = {
+        "type": "text",
+        "content": "Sure: <｜｜DSML｜｜tool_calls>",
+        "usage": U2,
+        "usage_attempts": [U1, U2],
+    }
+    tool = {
+        "type": "function",
+        "function": {
+            "name": "final_answer",
+            "description": "Call final_answer.",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    }
+
+    normalized = normalize_deepseek_response(response, tools=[tool])
+
+    assert normalized["type"] == "tool_protocol_error"
+    assert normalized["usage"] == U2
+    assert normalized["usage_attempts"] == [U1, U2]
+
+
+@pytest.mark.asyncio
+async def test_deepseek_rebuild_attempts_booked_through_on_llm_end() -> None:
+    """R1-03 end-to-end: the rebuilt error envelope books both attempts."""
+    from xagent.core.model.chat.basic.deepseek_tool_protocol import (
+        normalize_deepseek_response,
+    )
+
+    response = {
+        "type": "text",
+        "content": "Sure: <｜｜DSML｜｜tool_calls>",
+        "usage": U2,
+        "usage_attempts": [U1, U2],
+    }
+    tool = {
+        "type": "function",
+        "function": {
+            "name": "final_answer",
+            "description": "Call final_answer.",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    }
+    rebuilt = normalize_deepseek_response(response, tools=[tool])
+
+    tracer = TraceEventRecorder()
+    runtime = PatternRuntime(tracer=tracer)
+    context = ExecutionContext(execution_id="r1-03")
+    context.add_user_message("hi")
+    await runtime.on_llm_end(context=context, response=rebuilt)
+
+    assert [
+        (record.input_tokens, record.output_tokens) for record in context.llm_calls
+    ] == [(P1, C1), (P2, C2)]
+    end_event = next(
+        event for event in tracer.events if event["event_type"] == "action_end_llm"
+    )
+    assert end_event["data"]["llm_attempt_count"] == 2
+    assert end_event["data"]["input_tokens"] == P1 + P2
+
+
+@pytest.mark.asyncio
+async def test_zhipu_blank_response_error_carries_booked_usage() -> None:
+    """R1-05: billing is independent of retryability -- the non-retryable
+    blank-response RuntimeError must carry the usage the adapter booked."""
+    reset_token_usage()
+    llm = ZhipuLLM(model_name="glm-4.5", api_key="test-key")
+    llm._client = SimpleNamespace(
+        chat=SimpleNamespace(
+            completions=SimpleNamespace(
+                create=lambda **kwargs: SimpleNamespace(
+                    choices=[
+                        SimpleNamespace(
+                            message=SimpleNamespace(content=None, tool_calls=None),
+                            finish_reason="stop",
+                        )
+                    ],
+                    usage=SimpleNamespace(
+                        prompt_tokens=P1,
+                        completion_tokens=C1,
+                    ),
+                )
+            )
+        )
+    )
+
+    with pytest.raises(RuntimeError) as exc_info:
+        await llm.chat([{"role": "user", "content": "hi"}])
+
+    # The surfaced error is the outer "Zhipu API error" wrap; the payload
+    # must survive both the raise and the wrap.
+    attempts = getattr(exc_info.value, "usage_attempts", None)
+    assert attempts is not None
+    assert [attempt["prompt_tokens"] for attempt in attempts] == [P1]
+    assert get_token_usage().input_tokens == P1
+
+    tracer = TraceEventRecorder()
+    runtime = PatternRuntime(tracer=tracer)
+    context = ExecutionContext(execution_id="r1-05")
+    context.add_user_message("hi")
+    await runtime.on_llm_error(context=context, error=exc_info.value)
+
+    assert context.get_total_token_usage()["total"] == P1 + C1
+    error_event = next(
+        event for event in tracer.events if event["event_type"] == "action_error_llm"
+    )
+    assert error_event["data"]["input_tokens"] == P1
+
+
+class TestAttemptCacheScope:
+    """R1-04: cache metrics share the aggregate scope of the token totals --
+    summed over every billed attempt on success, and extracted on the
+    all-failed error path too."""
+
+    def setup_method(self) -> None:
+        self.tracer = TraceEventRecorder()
+        self.runtime = PatternRuntime(tracer=self.tracer)
+        self.context = ExecutionContext(execution_id="attempt-cache-scope")
+        self.context.add_user_message("hi")
+
+    @pytest.mark.asyncio
+    async def test_end_trace_sums_cache_over_attempts(self) -> None:
+        u1 = {**U1, "cached_input_tokens": 6}
+        u2 = {**U2, "prompt_tokens_details": {"cached_tokens": 2}}
+        envelope = {
+            "type": "text",
+            "content": "ok",
+            "usage": u2,
+            "usage_attempts": [u1, u2],
+        }
+
+        await self.runtime.on_llm_end(context=self.context, response=envelope)
+
+        end_event = next(
+            event
+            for event in self.tracer.events
+            if event["event_type"] == "action_end_llm"
+        )
+        assert end_event["data"]["cached_input_tokens"] == 8
+        assert end_event["data"]["llm_attempt_count"] == 2
+
+    @pytest.mark.asyncio
+    async def test_error_trace_extracts_cache_from_attempts(self) -> None:
+        error = LLMEmptyContentError("all attempts failed")
+        error.usage_attempts = [{**U1, "cached_input_tokens": 6}, U2]
+
+        await self.runtime.on_llm_error(context=self.context, error=error)
+
+        error_event = next(
+            event
+            for event in self.tracer.events
+            if event["event_type"] == "action_error_llm"
+        )
+        assert error_event["data"]["cached_input_tokens"] == 6
+
+
+class TestMalformedAttemptRows:
+    """N3 residual: unusable attempt rows are dropped so the trace attempt
+    count stays in lockstep with the booked records, and a wholly unusable
+    list falls back to the valid top-level usage."""
+
+    def setup_method(self) -> None:
+        self.tracer = TraceEventRecorder()
+        self.runtime = PatternRuntime(tracer=self.tracer)
+        self.context = ExecutionContext(execution_id="malformed-attempts")
+        self.context.add_user_message("hi")
+
+    @pytest.mark.asyncio
+    async def test_malformed_row_dropped_everywhere(self) -> None:
+        envelope = {
+            "type": "text",
+            "content": "ok",
+            "usage": U2,
+            "usage_attempts": [
+                {"prompt_tokens": True, "completion_tokens": float("nan")},
+                U2,
+            ],
+        }
+
+        await self.runtime.on_llm_end(context=self.context, response=envelope)
+
+        # Exactly one record booked, and the trace counts exactly one attempt.
+        assert len(self.context.llm_calls) == 1
+        end_event = next(
+            event
+            for event in self.tracer.events
+            if event["event_type"] == "action_end_llm"
+        )
+        assert end_event["data"]["llm_attempt_count"] == 1
+        assert end_event["data"]["input_tokens"] == P2
+
+    @pytest.mark.asyncio
+    async def test_all_invalid_attempts_fall_back_to_top_level_usage(self) -> None:
+        envelope = {
+            "type": "text",
+            "content": "ok",
+            "usage": U2,
+            "usage_attempts": [{"prompt_tokens": "ten", "completion_tokens": None}],
+        }
+
+        await self.runtime.on_llm_end(context=self.context, response=envelope)
+
+        assert self.context.get_total_token_usage()["total"] == P2 + C2
+        end_event = next(
+            event
+            for event in self.tracer.events
+            if event["event_type"] == "action_end_llm"
+        )
+        # Single-attempt historical shape restored: no attempt fields.
+        assert "llm_attempt_count" not in end_event["data"]
+        assert end_event["data"]["input_tokens"] == P2

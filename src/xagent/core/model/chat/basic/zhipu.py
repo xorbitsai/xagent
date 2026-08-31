@@ -12,7 +12,7 @@ except ImportError:
     # Fallback for when zai SDK is not available
     ZhipuAiClient = None
 
-from ..exceptions import LLMRetryableError, LLMTimeoutError
+from ..exceptions import LLMRetryableError, LLMTimeoutError, attach_usage_attempts
 from ..timeout_config import TimeoutConfig
 from ..token_context import add_token_usage, extract_cached_input_tokens
 from ..types import ChunkType, StreamChunk
@@ -395,9 +395,17 @@ class ZhipuLLM(BaseLLM):
 
                 # If there are no tool calls and no content, this is an error
                 if not tool_calls:
-                    raise RuntimeError(
+                    error = RuntimeError(
                         f"LLM returned {'empty' if content == '' else 'None'} content and no tool calls"
                     )
+                    # Billing is independent of retryability: this path stays
+                    # a non-retryable RuntimeError (#1714 problem 2), but the
+                    # already-booked usage payload must ride the exception so
+                    # ``on_llm_error`` can account for it.
+                    attach_usage_attempts(
+                        error, [usage_payload] if usage_payload is not None else []
+                    )
+                    raise error
                 else:
                     logger.info(
                         "None/empty content but tool calls present, this is expected behavior"
@@ -414,7 +422,11 @@ class ZhipuLLM(BaseLLM):
             logger.error(f"  - Exception type: {type(e).__name__}")
             logger.error(f"  - Exception message: {str(e)}")
             logger.error(f"  - Exception args: {e.args}")
-            raise RuntimeError(f"Zhipu API error: {str(e)}") from e
+            wrapped = RuntimeError(f"Zhipu API error: {str(e)}")
+            # Preserve any billed-attempt payload carried by the cause so the
+            # wrap does not lose it from error-path accounting.
+            attach_usage_attempts(wrapped, getattr(e, "usage_attempts", None) or [])
+            raise wrapped from e
 
     async def stream_chat(
         self,

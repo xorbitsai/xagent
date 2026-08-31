@@ -8,7 +8,13 @@ import openai
 from openai import AsyncOpenAI
 
 from ....utils.security import redact_sensitive_text
-from ..exceptions import LLMEmptyContentError, LLMRetryableError, LLMTimeoutError
+from ..exceptions import (
+    LLMEmptyContentError,
+    LLMRetryableError,
+    LLMTimeoutError,
+    attach_usage_attempts,
+    merge_usage_attempts_into_result,
+)
 from ..timeout_config import TimeoutConfig
 from ..token_context import add_token_usage, extract_cached_input_tokens
 from ..types import PROVIDER_STATE_METADATA_KEY, ChunkType, StreamChunk
@@ -710,15 +716,10 @@ class OpenAICompatibleLLM(BaseLLM):
 
             if superseded_attempts:
                 # ``usage`` stays the final attempt (freshness baseline);
-                # ``usage_attempts`` lists every billed attempt, final
-                # included, and is set only when more than one was billed.
-                final_attempts = result.get("usage_attempts")
-                if final_attempts is None:
-                    final_usage = result.get("usage")
-                    final_attempts = [final_usage] if final_usage is not None else []
-                attempts = superseded_attempts + list(final_attempts)
-                if len(attempts) > 1:
-                    result["usage_attempts"] = attempts
+                # ``usage_attempts`` lists every known billed attempt, final
+                # included. A known billed attempt is never suppressed, even
+                # when the final success is unmetered.
+                merge_usage_attempts_into_result(superseded_attempts, result)
 
             return result
 
@@ -730,27 +731,39 @@ class OpenAICompatibleLLM(BaseLLM):
         except openai.BadRequestError as e:
             # Handle bad request errors, including a response_format resend
             # that failed again (see the nested try/except above).
-            raise RuntimeError(_format_openai_error("OpenAI bad request", e)) from e
+            error = RuntimeError(_format_openai_error("OpenAI bad request", e))
+            attach_usage_attempts(error, superseded_attempts)
+            raise error from e
 
         except openai.APITimeoutError as e:
             # Handle timeout errors
-            raise RuntimeError(f"OpenAI API timeout: {str(e)}") from e
+            error = RuntimeError(f"OpenAI API timeout: {str(e)}")
+            attach_usage_attempts(error, superseded_attempts)
+            raise error from e
 
         except openai.RateLimitError as e:
             # Handle rate limit errors
-            raise RuntimeError(f"OpenAI rate limit exceeded: {e.message}") from e
+            error = RuntimeError(f"OpenAI rate limit exceeded: {e.message}")
+            attach_usage_attempts(error, superseded_attempts)
+            raise error from e
 
         except openai.AuthenticationError as e:
             # Handle authentication errors
-            raise RuntimeError(f"OpenAI authentication failed: {e.message}") from e
+            error = RuntimeError(f"OpenAI authentication failed: {e.message}")
+            attach_usage_attempts(error, superseded_attempts)
+            raise error from e
 
         except openai.APIError as e:
             # Handle OpenAI API errors
-            raise RuntimeError(_format_openai_error("OpenAI API error", e)) from e
+            error = RuntimeError(_format_openai_error("OpenAI API error", e))
+            attach_usage_attempts(error, superseded_attempts)
+            raise error from e
 
         except Exception as e:
             # Handle any other unexpected errors
-            raise RuntimeError(f"LLM chat failed: {str(e)}") from e
+            error = RuntimeError(f"LLM chat failed: {str(e)}")
+            attach_usage_attempts(error, superseded_attempts)
+            raise error from e
 
     @property
     def supports_thinking_mode(self) -> bool:

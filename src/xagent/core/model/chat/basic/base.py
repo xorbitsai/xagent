@@ -240,7 +240,9 @@ class BaseLLM(ABC):
                 -> dict envelope with fields:
                     - "type": "tool_call"
                     - "tool_calls": list of tool call objects
-                    - "raw": the full response JSON
+                    - "raw": the provider's full response payload -- optional,
+                      provider-dependent (e.g. Gemini's envelope omits it);
+                      callers must not require it
                     - "usage": top-level provider usage stamp, when reported
 
             Consumers needing the reply text must classify the envelope
@@ -376,16 +378,20 @@ class BaseLLM(ABC):
         # legacy plain string is a token chunk, a tool_call envelope is a
         # tool-call chunk, and anything else is an explicit error -- never a
         # silent empty TOOL_CALL chunk (the pre-contract fallback treated
-        # every non-string as a tool call).
+        # every non-string as a tool call). Usage-bearing envelopes also
+        # emit a USAGE chunk so the chat-to-stream adaptation keeps the
+        # billing metadata the runtime reads from streams.
         shape = classify_chat_response(result)
+        usage_payload = result.get("usage") if isinstance(result, dict) else None
         if shape.kind == "text":
             assert shape.text is not None  # classifier invariant
             yield StreamChunk(
                 type=ChunkType.TOKEN,
                 content=shape.text,
                 delta=shape.text,
+                raw=result,
             )
-        elif shape.kind == "tool_call":
+        elif shape.kind == "tool_call" and isinstance(result, dict):
             yield StreamChunk(
                 type=ChunkType.TOOL_CALL,
                 tool_calls=result.get("tool_calls", []),
@@ -398,4 +404,12 @@ class BaseLLM(ABC):
                     "LLM returned an unusable chat response shape "
                     f"({shape.kind}); expected a text or tool_call envelope"
                 ),
+            )
+            return
+
+        if isinstance(usage_payload, dict) and usage_payload:
+            yield StreamChunk(
+                type=ChunkType.USAGE,
+                usage=dict(usage_payload),
+                raw=result,
             )

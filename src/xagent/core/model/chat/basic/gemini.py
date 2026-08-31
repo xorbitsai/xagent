@@ -15,6 +15,7 @@ from ..exceptions import (
     LLMInvalidResponseError,
     LLMRetryableError,
     LLMTimeoutError,
+    attach_usage_attempts,
 )
 from ..timeout_config import TimeoutConfig
 from ..token_context import add_token_usage
@@ -668,14 +669,14 @@ class GeminiLLM(BaseLLM):
             content = "".join(text_parts).strip()
 
             if not content:
-                error = LLMEmptyContentError(
+                empty_error = LLMEmptyContentError(
                     "LLM returned empty content and no tool calls"
                 )
                 # Usage was already booked above: carry this attempt's
                 # payload so the retry layer can merge the billed tokens.
                 if usage_payload is not None:
-                    error.usage_attempts = [usage_payload]
-                raise error
+                    empty_error.usage_attempts = [usage_payload]
+                raise empty_error
 
             text_result: Dict[str, Any] = {"type": "text", "content": content}
             if usage_payload is not None:
@@ -714,9 +715,7 @@ class GeminiLLM(BaseLLM):
             # surfaced exception (its ``retry_on`` already looks through
             # ``__cause__`` for the retry decision itself).
             wrapped = RuntimeError(f"Gemini SDK API error: {str(e)}")
-            attempts = getattr(e, "usage_attempts", None)
-            if attempts:
-                wrapped.usage_attempts = attempts
+            attach_usage_attempts(wrapped, getattr(e, "usage_attempts", None) or [])
             raise wrapped from e
 
     async def stream_chat(

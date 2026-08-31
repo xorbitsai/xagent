@@ -248,6 +248,26 @@ _VISION_RESPONSE_SHAPE_MATRIX = [
         [],
         str([1, 2, 3]),
     ),
+    # Content-bearing dicts without a recognized type tag are text: the
+    # normalizer delegates structural decoding to the shared
+    # ``classify_chat_response`` (PR #1787 review finding R0-D4), so vision
+    # consumers accept the same duck-typed shapes as chat consumers.
+    (
+        "content_only_dict",
+        {"content": "usable text without a type tag"},
+        "text",
+        "usable text without a type tag",
+        [],
+        "usable text without a type tag",
+    ),
+    (
+        "unknown_tag_str_content",
+        {"type": "mystery", "content": "usable text on an unknown tag"},
+        "text",
+        "usable text on an unknown tag",
+        [],
+        "usable text on an unknown tag",
+    ),
 ]
 
 

@@ -16,6 +16,12 @@ from typing import (
 
 from .strategy import ExponentialBackoff, RetryStrategy
 
+# NOTE: the usage-attempt carrier helpers live in ``model.chat.exceptions``,
+# but this module is imported *by* the model package's own adapters
+# (embedding/image/rerank/...), so a top-level import would create a cycle
+# (model/__init__ -> adapter -> retry.wrapper -> model.chat.exceptions).
+# They are imported lazily at the call sites instead.
+
 logger = logging.getLogger(__name__)
 
 
@@ -28,25 +34,6 @@ def _collect_usage_attempts(error: Exception, collected: list[Any]) -> None:
     attempts = getattr(error, "usage_attempts", None)
     if attempts:
         collected.extend(attempts)
-
-
-def _merge_usage_attempts(collected: list[Any], result: Any) -> None:
-    """Fold billed attempts from failed retries into a successful result.
-
-    ``usage`` stays the final attempt (the freshness baseline);
-    ``usage_attempts`` becomes the ordered list of every billed attempt,
-    final included, and is written only when more than one attempt was
-    billed -- a single-attempt envelope never carries the key.
-    """
-    if not collected or not isinstance(result, dict):
-        return
-    final_attempts = result.get("usage_attempts")
-    if final_attempts is None:
-        final_usage = result.get("usage")
-        final_attempts = [final_usage] if final_usage is not None else []
-    merged = collected + list(final_attempts)
-    if len(merged) > 1:
-        result["usage_attempts"] = merged
 
 
 @runtime_checkable
@@ -89,7 +76,9 @@ class RetryWrapper(Retryable):
                     )
                     time.sleep(delay)
             else:
-                _merge_usage_attempts(collected_attempts, result)
+                from ..model.chat.exceptions import merge_usage_attempts_into_result
+
+                merge_usage_attempts_into_result(collected_attempts, result)
                 return result
 
         if last_exception:
@@ -97,7 +86,9 @@ class RetryWrapper(Retryable):
             # final exception's own attempts (gathered when it was caught),
             # so it is the full ordered attempt history.
             if collected_attempts:
-                last_exception.usage_attempts = collected_attempts
+                from ..model.chat.exceptions import attach_usage_attempts
+
+                attach_usage_attempts(last_exception, collected_attempts)
             raise last_exception
         raise RuntimeError("Retry failed with no exception")
 
@@ -121,12 +112,16 @@ class RetryWrapper(Retryable):
                     )
                     await asyncio.sleep(delay)
             else:
-                _merge_usage_attempts(collected_attempts, result)
+                from ..model.chat.exceptions import merge_usage_attempts_into_result
+
+                merge_usage_attempts_into_result(collected_attempts, result)
                 return result
 
         if last_exception:
             if collected_attempts:
-                last_exception.usage_attempts = collected_attempts
+                from ..model.chat.exceptions import attach_usage_attempts
+
+                attach_usage_attempts(last_exception, collected_attempts)
             raise last_exception
         raise RuntimeError("Retry failed with no exception")
 

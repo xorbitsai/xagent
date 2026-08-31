@@ -21,6 +21,7 @@ import httpx
 from pydantic import BaseModel, Field
 
 from ...model.chat.basic.base import BaseLLM
+from ...model.chat.response_shape import classify_chat_response
 from ...utils.security import fetch_public_http_bytes
 from ...utils.svg import MAX_SVG_BYTES, rasterize_svg_bytes, validate_svg_bytes
 from .web_content import get_trusted_proxy_url
@@ -86,95 +87,47 @@ class _NormalizedVisionResponse(NamedTuple):
 def _normalize_vision_response(result: Any) -> _NormalizedVisionResponse:
     """Reduce a ``vision_chat`` return value to a text/empty/tool_call/unknown shape.
 
-    ``vision_chat`` is typed ``str | dict[str, Any]``: OpenAI-family
-    providers wrap a reply in an envelope (``{"type": "text", "content":
-    ..., "raw": ...}`` or a tool-call envelope), while other providers
-    return a bare string. This function is a pure classifier: it does not
-    raise for the shapes providers actually return -- bare strings, ``None``,
-    and dicts of plain JSON data -- and it never decides whether a shape
-    counts as a failure; callers own that decision because only they know
-    what they need from the response. Diagnostic rendering for any other
-    input goes through ``str(result)``, so an object with a raising
-    ``__str__`` (or a raising ``__repr__`` on a value nested inside a dict)
-    propagates that exception to the caller's own exception handling.
-    An exception raised by ``vision_chat`` itself never reaches this
-    function; it is handled by the caller's own exception handling
-    before a return value exists to classify.
+    Structural kind/text decoding delegates to ``classify_chat_response`` --
+    the shared model/chat-layer classifier -- so every consumer reads the
+    same response union the same way (including content-only or
+    unknown-tag dicts that carry usable string content). This wrapper keeps
+    only VisionCore-specific policy: the ``tool_calls`` payload extraction
+    and the length-bounded ``raw_display`` diagnostic, which must never be
+    surfaced as a user-visible answer. ``str(result)`` is only rendered for
+    non-text shapes, so an object with a raising ``__str__`` (or a raising
+    ``__repr__`` nested inside a dict) propagates that exception to the
+    caller's own exception handling, as before. An exception raised by
+    ``vision_chat`` itself never reaches this function.
     """
-    if isinstance(result, str):
-        if not result.strip():
-            return _NormalizedVisionResponse(
-                kind="empty",
-                text=result,
-                tool_calls=[],
-                raw_display=_truncate_vision_raw_display(result),
-            )
-        return _NormalizedVisionResponse(
-            kind="text",
-            text=result,
-            tool_calls=[],
-            raw_display=_truncate_vision_raw_display(result),
-        )
+    shape = classify_chat_response(result)
+    kind = shape.kind
 
-    if result is None:
-        return _NormalizedVisionResponse(
-            kind="unknown", text=None, tool_calls=[], raw_display="None"
-        )
-
-    if isinstance(result, dict):
-        response_type = result.get("type")
-
-        if response_type == "text":
+    text: Optional[str] = shape.text
+    if kind == "empty":
+        # The shared classifier normalizes empty text away; this contract
+        # carries the original string alongside the kind, so recover it.
+        if isinstance(result, str):
+            text = result
+        elif isinstance(result, dict):
             content = result.get("content")
-            if isinstance(content, str):
-                if not content.strip():
-                    # xinference's text exit gates on bare truthiness, so
-                    # whitespace-only content is not rejected there; openai
-                    # rejects it via .strip().
-                    return _NormalizedVisionResponse(
-                        kind="empty",
-                        text=content,
-                        tool_calls=[],
-                        raw_display=_truncate_vision_raw_display(content),
-                    )
-                return _NormalizedVisionResponse(
-                    kind="text",
-                    text=content,
-                    tool_calls=[],
-                    raw_display=_truncate_vision_raw_display(content),
-                )
-            # A "text" envelope whose content is not a string carries no
-            # usable text payload, so it is classified as unknown rather
-            # than text.
-            return _NormalizedVisionResponse(
-                kind="unknown",
-                text=None,
-                tool_calls=[],
-                raw_display=_truncate_vision_raw_display(str(result)),
-            )
+            text = content if isinstance(content, str) else None
 
-        if response_type == "tool_call":
-            return _NormalizedVisionResponse(
-                kind="tool_call",
-                text=None,
-                tool_calls=result.get("tool_calls", []),
-                raw_display=_truncate_vision_raw_display(str(result)),
-            )
+    tool_calls: List[Any] = []
+    if kind == "tool_call" and isinstance(result, dict):
+        raw_tool_calls = result.get("tool_calls")
+        if isinstance(raw_tool_calls, list):
+            tool_calls = raw_tool_calls
 
-        # Unrecognized envelope shape: unknown or missing "type" key.
-        return _NormalizedVisionResponse(
-            kind="unknown",
-            text=None,
-            tool_calls=[],
-            raw_display=_truncate_vision_raw_display(str(result)),
-        )
+    raw_display: str
+    if result is None:
+        raw_display = "None"
+    elif kind in ("text", "empty") and text is not None:
+        raw_display = _truncate_vision_raw_display(text)
+    else:
+        raw_display = _truncate_vision_raw_display(str(result))
 
-    # Any other type (int, list, custom object, ...).
     return _NormalizedVisionResponse(
-        kind="unknown",
-        text=None,
-        tool_calls=[],
-        raw_display=_truncate_vision_raw_display(str(result)),
+        kind=kind, text=text, tool_calls=tool_calls, raw_display=raw_display
     )
 
 

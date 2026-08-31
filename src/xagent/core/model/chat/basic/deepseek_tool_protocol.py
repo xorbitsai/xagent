@@ -54,10 +54,14 @@ def normalize_deepseek_response(
         return response
     raw = response.get("raw") if isinstance(response, dict) else None
     error_response = tool_protocol_error_response(violation, raw=raw)
-    # Preserve the top-level usage stamp the adapter put on the original
-    # envelope so token accounting survives the error rebuild.
-    if isinstance(response, dict) and response.get("usage") is not None:
-        error_response["usage"] = response["usage"]
+    # Preserve the accounting metadata the adapter put on the original
+    # envelope -- the top-level usage stamp *and* the ordered billed-attempt
+    # list -- so token accounting survives the error rebuild intact.
+    if isinstance(response, dict):
+        if response.get("usage") is not None:
+            error_response["usage"] = response["usage"]
+        if response.get("usage_attempts") is not None:
+            error_response["usage_attempts"] = response["usage_attempts"]
     return error_response
 
 

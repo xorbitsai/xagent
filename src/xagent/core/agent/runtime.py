@@ -1022,17 +1022,17 @@ class PatternRuntime:
     ) -> None:
         event_metadata = metadata or {}
         usage = self._extract_token_usage(response)
-        attempt_pairs = self._extract_usage_attempt_pairs(response)
+        attempt_rows = self._extract_attempt_rows(response)
         # Internal calls (currently only "context_compaction") carry a
         # purpose marker; their prompt is not the live conversation, so the
         # records must not become the freshness baseline.
         purpose = event_metadata.get("purpose")
         if callable(getattr(context, "record_llm_usage", None)):
-            if attempt_pairs is not None:
+            if attempt_rows:
                 # Multi-attempt call: book every billed attempt in order --
                 # the final attempt lands last, so llm_calls[-1] stays the
                 # freshness baseline.
-                for input_tokens, output_tokens in attempt_pairs:
+                for (input_tokens, output_tokens), _payload in attempt_rows:
                     context.record_llm_usage(
                         input_tokens=input_tokens,
                         output_tokens=output_tokens,
@@ -1046,7 +1046,14 @@ class PatternRuntime:
                     prompt_message_count=len(getattr(context, "messages", [])),
                     synthetic_purpose=purpose,
                 )
-        cached_tokens = self._extract_cached_tokens(response)
+        # Cache metrics use the same aggregate scope as the token totals:
+        # summed over every billed attempt when there are several.
+        if attempt_rows:
+            cached_tokens = sum(
+                self._cached_from_payload(payload) for _pair, payload in attempt_rows
+            )
+        else:
+            cached_tokens = self._extract_cached_tokens(response)
         await self._emit_trace_event(
             TraceEventType(TraceScope.ACTION, TraceAction.END, TraceCategory.LLM),
             task_id=str(event_metadata.get("task_id") or self._task_id(context)),
@@ -1054,7 +1061,10 @@ class PatternRuntime:
             data={
                 "response": self._short_response(response),
                 "success": True,
-                **self._trace_token_fields(usage, attempt_pairs),
+                **self._trace_token_fields(
+                    None if attempt_rows else usage,
+                    [pair for pair, _payload in attempt_rows] or None,
+                ),
                 **({"cached_input_tokens": cached_tokens} if cached_tokens else {}),
                 **event_metadata,
             },
@@ -1115,28 +1125,26 @@ class PatternRuntime:
             )
         return input_tokens, output_tokens
 
-    def _extract_usage_attempt_pairs(
-        self, response: Any
-    ) -> list[tuple[int, int]] | None:
-        """(input, output) pairs of a multi-attempt envelope, or None.
+    def _extract_attempt_rows(self, carrier: Any) -> list[tuple[tuple[int, int], Any]]:
+        """Usable billed-attempt rows of a multi-attempt carrier.
 
-        Reads the ``usage_attempts`` contract key (every billed attempt of
-        one logical call, final attempt last). Each payload is extracted
-        with the same alias table as a top-level ``usage`` stamp.
+        ``carrier`` may be a response envelope (``usage_attempts`` key) or an
+        exception (``usage_attempts`` attribute). Each row is
+        ``((input, output), payload)`` for attempts whose counters coerce to
+        something usable. Wholly unusable rows are dropped so the trace
+        attempt count stays in lockstep with the records actually booked;
+        an empty result means "no usable attempts", letting callers fall
+        back to the top-level ``usage`` shape.
         """
-        attempts = self._get_value(response, "usage_attempts")
+        attempts = self._get_value(carrier, "usage_attempts")
         if not isinstance(attempts, list) or not attempts:
-            return None
-        return [self._usage_pair("usage", attempt) for attempt in attempts]
-
-    def _extract_exception_attempt_pairs(
-        self, error: Exception
-    ) -> list[tuple[int, int]] | None:
-        """(input, output) pairs carried by a failed call's exception."""
-        attempts = getattr(error, "usage_attempts", None)
-        if not isinstance(attempts, list) or not attempts:
-            return None
-        return [self._usage_pair("usage", attempt) for attempt in attempts]
+            return []
+        rows: list[tuple[tuple[int, int], Any]] = []
+        for payload in attempts:
+            pair = self._usage_pair("usage", payload)
+            if pair[0] > 0 or pair[1] > 0:
+                rows.append((pair, payload))
+        return rows
 
     @staticmethod
     def _trace_token_fields(
@@ -1150,7 +1158,7 @@ class PatternRuntime:
         across end events, so the event must match the per-attempt ledger)
         plus the attempt count and the final attempt's own numbers.
         """
-        if attempt_pairs is not None:
+        if attempt_pairs:
             total_input = sum(pair[0] for pair in attempt_pairs)
             total_output = sum(pair[1] for pair in attempt_pairs)
             return {
@@ -1174,14 +1182,33 @@ class PatternRuntime:
         for key, usage in self._resolve_usage_payload(response):
             if key != "usage":
                 continue
-            direct = self._first_int(
-                usage, ("cached_input_tokens", "cache_read_input_tokens")
-            )
-            if direct > 0:
-                return direct
-            cached = extract_cached_input_tokens(usage)
+            cached = self._cached_from_payload(usage)
             if cached:
                 return cached
+        return 0
+
+    def _cached_from_payload(self, usage: Any) -> int:
+        """Strictly-coerced cache-hit tokens from one usage payload.
+
+        Same alias table as the ledger-side ``extract_cached_input_tokens``,
+        but through ``_coerce_usage_int``: malformed values (bools, strings,
+        non-finite or non-integral numbers, negatives) are rejected rather
+        than truncated, and an invalid or zero alias never shadows the
+        nested ``prompt_tokens_details.cached_tokens`` fallback.
+        """
+        direct = self._first_int(
+            usage, ("cached_input_tokens", "cache_read_input_tokens")
+        )
+        if direct > 0:
+            return direct
+        hit = self._coerce_usage_int(self._get_value(usage, "prompt_cache_hit_tokens"))
+        if hit:
+            return hit
+        details = self._get_value(usage, "prompt_tokens_details")
+        if details is not None:
+            nested = self._coerce_usage_int(self._get_value(details, "cached_tokens"))
+            if nested:
+                return nested
         return 0
 
     def _first_int(self, source: Any, keys: tuple[str, ...]) -> int:
@@ -1237,16 +1264,22 @@ class PatternRuntime:
         # A call that failed after billing one or more attempts carries the
         # attempt payloads on the exception: book them (final last) so the
         # execution context and the error trace reflect the billed tokens.
-        attempt_pairs = self._extract_exception_attempt_pairs(error)
-        if attempt_pairs and callable(getattr(context, "record_llm_usage", None)):
+        attempt_rows = self._extract_attempt_rows(error)
+        if attempt_rows and callable(getattr(context, "record_llm_usage", None)):
             purpose = event_metadata.get("purpose")
-            for input_tokens, output_tokens in attempt_pairs:
+            for (input_tokens, output_tokens), _payload in attempt_rows:
                 context.record_llm_usage(
                     input_tokens=input_tokens,
                     output_tokens=output_tokens,
                     prompt_message_count=len(getattr(context, "messages", [])),
                     synthetic_purpose=purpose,
                 )
+        # Cache metrics use the same aggregate scope as the token totals.
+        attempt_cached = (
+            sum(self._cached_from_payload(payload) for _pair, payload in attempt_rows)
+            if attempt_rows
+            else 0
+        )
         await self._emit_trace_event(
             TraceEventType(TraceScope.ACTION, TraceAction.ERROR, TraceCategory.LLM),
             task_id=str(event_metadata.get("task_id") or self._task_id(context)),
@@ -1257,10 +1290,13 @@ class PatternRuntime:
                 "error_message": str(error),
                 "success": False,
                 **(
-                    self._trace_token_fields(None, attempt_pairs)
-                    if attempt_pairs
+                    self._trace_token_fields(
+                        None, [pair for pair, _payload in attempt_rows]
+                    )
+                    if attempt_rows
                     else {}
                 ),
+                **({"cached_input_tokens": attempt_cached} if attempt_cached else {}),
                 **protocol_metadata,
                 **event_metadata,
             },

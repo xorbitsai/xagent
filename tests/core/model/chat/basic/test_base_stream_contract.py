@@ -103,3 +103,61 @@ async def test_none_result_yields_error_chunk() -> None:
     chunks = await _collect(None)
     assert len(chunks) == 1
     assert chunks[0].type == ChunkType.ERROR
+
+
+@pytest.mark.asyncio
+async def test_usage_bearing_text_envelope_emits_usage_chunk() -> None:
+    """R1-06: the chat-to-stream adaptation must keep the billing metadata
+    the envelope carries -- raw on the content chunk and a USAGE chunk."""
+    envelope = {
+        "type": "text",
+        "content": "hi",
+        "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
+    }
+    chunks = await _collect(envelope)
+    assert [chunk.type for chunk in chunks] == [ChunkType.TOKEN, ChunkType.USAGE]
+    assert chunks[0].raw is envelope
+    assert chunks[1].usage == {
+        "prompt_tokens": 10,
+        "completion_tokens": 5,
+        "total_tokens": 15,
+    }
+    assert chunks[1].raw is envelope
+
+
+@pytest.mark.asyncio
+async def test_usage_bearing_tool_call_envelope_emits_usage_chunk() -> None:
+    envelope = {
+        "type": "tool_call",
+        "tool_calls": [
+            {
+                "id": "call_1",
+                "type": "function",
+                "function": {"name": "read_file", "arguments": "{}"},
+            }
+        ],
+        "usage": {"prompt_tokens": 10, "completion_tokens": 5},
+    }
+    chunks = await _collect(envelope)
+    assert [chunk.type for chunk in chunks] == [ChunkType.TOOL_CALL, ChunkType.USAGE]
+    assert chunks[1].usage == {"prompt_tokens": 10, "completion_tokens": 5}
+
+
+@pytest.mark.asyncio
+async def test_usage_chunk_feeds_runtime_extraction() -> None:
+    """R1-06 through the runtime's own chunk reader: the USAGE chunk the
+    default emits is what ``_chunk_usage``/reconstruction consumes."""
+    from xagent.core.agent import PatternRuntime
+
+    envelope = {
+        "type": "text",
+        "content": "hi",
+        "usage": {"prompt_tokens": 10, "completion_tokens": 5},
+    }
+    chunks = await _collect(envelope)
+    runtime = PatternRuntime()
+    usage_payload: dict[str, Any] = {}
+    for chunk in chunks:
+        usage_payload.update(runtime._chunk_usage(chunk))
+    assert usage_payload["prompt_tokens"] == 10
+    assert usage_payload["completion_tokens"] == 5

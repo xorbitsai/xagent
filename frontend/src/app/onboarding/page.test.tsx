@@ -367,6 +367,66 @@ describe("OnboardingPage", () => {
     })
   })
 
+  // Pins a test-coverage gap found by self-review: the header exit button's
+  // "Saving…"/aria-busy treatment was tested, but the goals-step and
+  // done-step skip buttons get the exact same treatment in the source with
+  // no test of their own - a future refactor (e.g. extracting a shared
+  // exit-button component) could drop it from just one of the other two
+  // with nothing failing.
+  it("shows a Saving… label and aria-busy on the goals-step skip button while a save is in flight", async () => {
+    let resolveSave!: (v: { ok: boolean }) => void
+    updateUserPreferencesMock.mockReturnValue(new Promise((resolve) => { resolveSave = resolve }))
+
+    await goToWelcomeThenBusiness()
+    fireEvent.click(screen.getByText("Marketing"))
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/take off your plate/)).toBeInTheDocument())
+
+    // Grabbed by reference before the click, not re-queried by text after -
+    // the header exit button shows the same "Saving…" label at the same
+    // time (both share the `launching` state), so a text query afterward
+    // would match 2 elements.
+    const button = screen.getByText("Not sure yet — show me everyone").closest("button")!
+    fireEvent.click(button)
+
+    await waitFor(() => expect(button).toHaveTextContent("Saving…"))
+    expect(button).toHaveAttribute("aria-busy", "true")
+
+    await act(async () => {
+      resolveSave({ ok: true })
+    })
+  })
+
+  it("shows a Saving… label and aria-busy on the done-step skip button while a save is in flight", async () => {
+    let resolveSave!: (v: { ok: boolean }) => void
+    updateUserPreferencesMock.mockReturnValue(new Promise((resolve) => { resolveSave = resolve }))
+
+    await goToWelcomeThenBusiness()
+    fireEvent.click(screen.getByText("Marketing"))
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/take off your plate/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Post on social media"))
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/Meet your AI team/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/How should/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText("You're all set.")).toBeInTheDocument())
+
+    // Grabbed by reference before the click - see the goals-step test's
+    // comment for why (the header exit button shares the same label at
+    // the same time).
+    const button = screen.getByText("Take me to the catalogue instead").closest("button")!
+    fireEvent.click(button)
+
+    await waitFor(() => expect(button).toHaveTextContent("Saving…"))
+    expect(button).toHaveAttribute("aria-busy", "true")
+
+    await act(async () => {
+      resolveSave({ ok: true })
+    })
+  })
+
   // Flagged by PR review (xorbitsai/xagent#1617): persistAndLeave had no
   // double-click guard, unlike handleLaunch's launchingRef - a fast second
   // click before the first PATCH resolved would fire two concurrent saves.
@@ -1982,6 +2042,29 @@ describe("OnboardingPage", () => {
     fireEvent.click(screen.getByText("Continue"))
 
     await waitFor(() => expect(screen.getByText(/Meet your AI team/)).toBeInTheDocument())
+    expect(screen.getByText(/the other match is waiting in Templates/)).toBeInTheDocument()
+  })
+
+  // Pins a test-coverage gap found by self-review: the existing subtitle
+  // tests only cover 0 real matches (fallback filler cards) and 4+ real
+  // matches (all past the 3-card cap) - both leave omittedGoalCount at
+  // goals.length, which several plausible wrong formulas would also
+  // produce. A partial, BELOW-cap case (some goals matched, some not, and
+  // the matched count never reaches the cap) is the only scenario that
+  // actually distinguishes the correct formula from those mutants.
+  it("counts exactly the unmatched goal when one of two selected goals matches and the other doesn't", async () => {
+    await goToWelcomeThenBusiness()
+    fireEvent.click(screen.getByText("Marketing"))
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/take off your plate/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Post on social media")) // matches - in the TEMPLATES fixture
+    fireEvent.click(screen.getByText("Summarise long documents")) // does not match - see the test above
+    fireEvent.click(screen.getByText("Continue"))
+
+    await waitFor(() => expect(screen.getByText(/Meet your AI team/)).toBeInTheDocument())
+    // 1 of 2 goals matched, well below the 3-card cap - exactly 1 must be
+    // reported as still waiting, not 0 (undercounting) and not 2
+    // (double-counting the one that already has a card).
     expect(screen.getByText(/the other match is waiting in Templates/)).toBeInTheDocument()
   })
 

@@ -475,11 +475,12 @@ export default function OnboardingPage() {
       return;
     }
     const onboardedSave = await updateUserPreferences(buildPreferencesPayload());
-    // Re-checked AFTER the await, not just before it - a PR review finding
-    // caught that this continuation used to navigate unconditionally once
-    // the PATCH above resolved, even if identity had swapped DURING that
-    // PATCH's own round trip. The save itself was sent under the original
-    // identity (confirmed by the guard above), so it's left in place, but
+    // See wizardUserIdRef's and currentUserIdRef's comments - re-checked
+    // AFTER the await, not just before it. A PR review finding caught that
+    // this continuation used to navigate unconditionally once the PATCH
+    // above resolved, even if identity had swapped DURING that PATCH's own
+    // round trip. The save itself was sent under the original identity
+    // (confirmed by the guard above), so it's left in place, but
     // navigating now would route the NEW identity to a destination that
     // was only ever meant for the original one. Nothing to mark as
     // escaped here either - the original identity isn't actually leaving
@@ -492,6 +493,11 @@ export default function OnboardingPage() {
       return;
     }
     if (isMountedRef.current) {
+      // wizardUserIdRef.current, not user?.id/currentUserIdRef - this flag
+      // is inherently about the ORIGINAL wizard identity's save outcome
+      // (both guards above already confirmed identity hadn't swapped when
+      // this PATCH was sent or when it resolved), not whoever happens to
+      // be live by the time this exact line runs.
       if (!onboardedSave.ok) markOnboardingSaveEscaped(wizardUserIdRef.current);
       router.replace(destination);
     }
@@ -504,6 +510,19 @@ export default function OnboardingPage() {
   // one here either. Bailing out via the goals step after already selecting
   // a couple of goals must not silently discard them.
   const persistAndLeave = async (destination: string) => {
+    // Deliberately does NOT re-check currentUserIdRef/wizardUserIdRef after
+    // the trySavePreferences await below, unlike markOnboardedAndNavigate's
+    // post-await check - the risk that guards against (routing a
+    // swapped-in identity to a destination that only makes sense for the
+    // original one, e.g. /agent/{id} or /task/{id}) doesn't apply here:
+    // every caller of persistAndLeave passes a fixed, identity-agnostic
+    // route (`/task` or `/templates`, never a specific resource id), so a
+    // swapped-in identity landing there just lands on their own generic
+    // page - nothing dead or unauthorized to reach. The entry guard inside
+    // trySavePreferences (which persistAndLeave still goes through) is
+    // what actually matters here: it stops this identity's answers from
+    // being sent under someone else's session.
+    //
     // Reuses the same launching/launchingRef guard as handleLaunch below -
     // a double-click on any exit button before the PATCH resolves would
     // otherwise fire two concurrent saves.

@@ -30,6 +30,13 @@ MCP_OAUTH_PERSISTED_VALUE_MAX_LENGTH = 1000
 MCP_OAUTH_SCOPE_MAX_LENGTH = 1000
 MCP_OAUTH_RESOURCE_OWNER_KEY_MAX_LENGTH = 512
 MCP_OAUTH_TOKEN_ENDPOINT_AUTH_METHOD_MAX_LENGTH = 100
+# Token endpoint auth methods we can actually perform. Lives here beside its
+# length bound rather than in the API layer so both the connect route and
+# mcp_apps' pre-flight reconnect validator test the same set -- an allowlist
+# that exists twice is one that eventually disagrees with itself.
+MCP_OAUTH_TOKEN_ENDPOINT_AUTH_METHODS = frozenset(
+    {"none", "client_secret_post", "client_secret_basic"}
+)
 MCP_OAUTH_TOKEN_TYPE_MAX_LENGTH = 50
 MCP_OAUTH_CLIENT_REGISTRATION_MAX_RESPONSE_BYTES = 64 * 1024
 OAUTH_ERROR_MESSAGE_MAX_LENGTH = 500

@@ -15,7 +15,18 @@ import shlex
 from collections.abc import Collection
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Annotated, Any, Callable, Dict, List, Literal, Optional, Union, cast
+from typing import (
+    Annotated,
+    Any,
+    Callable,
+    Dict,
+    List,
+    Literal,
+    NoReturn,
+    Optional,
+    Union,
+    cast,
+)
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import httpx
@@ -35,6 +46,14 @@ from ...core.tools.core.mcp.model import MASKED_SECRET_VALUE, SENSITIVE_AUTH_FIE
 from ...core.utils.encryption import decrypt_value, encrypt_value
 from ..auth_dependencies import get_current_user, is_admin_user
 from ..mcp_apps import (
+    MCP_OAUTH_RECONNECT_REFUSAL_APP_HIDDEN,
+    MCP_OAUTH_RECONNECT_REFUSAL_APP_MISSING,
+    MCP_OAUTH_RECONNECT_REFUSAL_INVALID_AUTH_CONFIG,
+    MCP_OAUTH_RECONNECT_REFUSAL_INVALID_SERVER_CONFIG,
+    MCP_OAUTH_RECONNECT_REFUSAL_NOT_MCP_OAUTH,
+    MCP_OAUTH_RECONNECT_REFUSAL_SERVER_CONFIG_DRIFT,
+    MCP_OAUTH_RECONNECT_REFUSAL_USER_OWNED_SQUAT,
+    explain_mcp_oauth_reconnect_refusal,
     get_all_mcp_apps,
     get_app_by_name,
     restrict_to_app_scoped_oauth_grant,
@@ -56,6 +75,7 @@ from ..services.mcp_oauth import (
     MCP_OAUTH_PERSISTED_VALUE_MAX_LENGTH,
     MCP_OAUTH_RESOURCE_OWNER_KEY_MAX_LENGTH,
     MCP_OAUTH_TOKEN_ENDPOINT_AUTH_METHOD_MAX_LENGTH,
+    MCP_OAUTH_TOKEN_ENDPOINT_AUTH_METHODS,
     MCP_OAUTH_TOKEN_TYPE_MAX_LENGTH,
     MCPOAuthDiscoveryError,
     _same_url,
@@ -92,9 +112,6 @@ MCP_OAUTH_FLOW_STATE_RETENTION = timedelta(days=1)
 # Most stale rows the sweep in connect_mcp_oauth removes per request, so a
 # first-deploy backlog cannot turn one connect into a long transaction.
 MCP_OAUTH_FLOW_STATE_SWEEP_BATCH = 1000
-MCP_OAUTH_TOKEN_ENDPOINT_AUTH_METHODS = frozenset(
-    {"none", "client_secret_post", "client_secret_basic"}
-)
 
 
 # Pydantic models for API
@@ -2807,6 +2824,57 @@ def _ensure_catalog_app_server(db: Session, app_id: str) -> tuple[MCPServer, dic
     return server, app_info
 
 
+# Each pre-flight refusal re-raised as exactly the response the connect path's
+# own gate would have produced, so moving the checks earlier changes when a
+# caller is refused but never what they see. Kept as a table beside the
+# validator's reason codes: a new code with no entry here raises KeyError in
+# tests rather than silently degrading to a generic 400 in production.
+_MCP_OAUTH_RECONNECT_REFUSAL_RESPONSES: dict[str, tuple[int, Any]] = {
+    # _reject_hidden_catalog_app deliberately mirrors the missing-app 404 so a
+    # hidden app is indistinguishable from a nonexistent one.
+    MCP_OAUTH_RECONNECT_REFUSAL_APP_MISSING: (
+        status.HTTP_404_NOT_FOUND,
+        "MCP app not found",
+    ),
+    MCP_OAUTH_RECONNECT_REFUSAL_APP_HIDDEN: (
+        status.HTTP_404_NOT_FOUND,
+        "MCP app not found",
+    ),
+    MCP_OAUTH_RECONNECT_REFUSAL_NOT_MCP_OAUTH: (
+        status.HTTP_400_BAD_REQUEST,
+        "This app is not a remote-OAuth connector",
+    ),
+    MCP_OAUTH_RECONNECT_REFUSAL_SERVER_CONFIG_DRIFT: (
+        status.HTTP_409_CONFLICT,
+        "A server with this name already exists with a different configuration",
+    ),
+    MCP_OAUTH_RECONNECT_REFUSAL_USER_OWNED_SQUAT: (
+        status.HTTP_409_CONFLICT,
+        "A user-owned server already exists under this catalog id",
+    ),
+    MCP_OAUTH_RECONNECT_REFUSAL_INVALID_SERVER_CONFIG: (
+        status.HTTP_400_BAD_REQUEST,
+        "Invalid app configuration",
+    ),
+    # connect_mcp_oauth reports its auth-config bounds with this structured
+    # detail; the message is intentionally generic because the offending field
+    # is an admin authoring fault, not something the caller can act on.
+    MCP_OAUTH_RECONNECT_REFUSAL_INVALID_AUTH_CONFIG: (
+        status.HTTP_400_BAD_REQUEST,
+        {
+            "code": "unsupported_auth_server",
+            "message": "This connector's OAuth configuration is not usable",
+        },
+    ),
+}
+
+
+def _raise_mcp_oauth_reconnect_refusal(refusal: str) -> NoReturn:
+    """Turn a pre-flight refusal code into the connect path's own response."""
+    status_code, detail = _MCP_OAUTH_RECONNECT_REFUSAL_RESPONSES[refusal]
+    raise HTTPException(status_code=status_code, detail=detail)
+
+
 def _ensure_catalog_mcp_oauth_server(
     db: Session, app_id: str
 ) -> tuple[MCPServer, dict]:
@@ -3041,6 +3109,20 @@ async def connect_mcp_oauth_app(
     server; only the server row's origin (catalog vs. a user-typed URL)
     differs.
     """
+    # Pre-flight the deterministic refusals *before* provisioning anything.
+    # This route used to commit the shared server row and this user's
+    # association first and only reach connect_mcp_oauth's auth-config
+    # validation afterwards, so a mis-authored catalog entry left the user in a
+    # one-way door: disconnect succeeded, and every reconnect re-created the
+    # association and then 400'd. Sharing the check with the pre-flight helper
+    # also keeps a consumer that asks "would a reconnect work?" from having to
+    # re-derive these rules into a copy that goes stale.
+    refusal = explain_mcp_oauth_reconnect_refusal(
+        db, app_id, cast(int, current_user.id)
+    )
+    if refusal is not None:
+        _raise_mcp_oauth_reconnect_refusal(refusal)
+
     server, app_info = _ensure_catalog_mcp_oauth_server(db, app_id)
 
     assoc: Any = (

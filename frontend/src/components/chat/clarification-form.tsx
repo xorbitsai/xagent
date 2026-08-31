@@ -12,7 +12,8 @@ import { useI18n } from "@/contexts/i18n-context"
 import { toast } from "@/components/ui/sonner"
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible"
 import { ChevronDown, ChevronRight, MessageSquare, Upload, File as FileIcon, X, Globe } from "lucide-react"
-import { ConnectAppsField } from "./connect-apps-field"
+import { ConnectAppsField, resolveRows } from "./connect-apps-field"
+import { useMcpApps } from "@/contexts/mcp-apps-context"
 import type { MessageDeliveryDisposition } from "@/hooks/use-websocket"
 import type { TranslationKey } from "@/i18n/translations"
 import {
@@ -246,6 +247,22 @@ export function ClarificationForm({
       }
     }) as Interaction[]
   }, [interactions])
+
+  // Multiple tools can pause together, each naming a different app, and
+  // each renders its own ConnectAppsField card (see the isConnectAppsOnly
+  // render branch below) - but Continue means "every requested app across
+  // this WHOLE pause is connected" (see handleContinueConnectApps's own
+  // doc comment), not just the apps on the one card the user happens to
+  // finish first. Without this global check, connecting the first card's
+  // app alone would let that card fire Continue while a sibling card's app
+  // is still unconnected, sending a premature/contradictory message.
+  const { apps: mcpApps } = useMcpApps()
+  const allConnectAppsConnected = useMemo(() => {
+    if (!isConnectAppsOnly) return false
+    const allAppNames = normalizedInteractions.flatMap((interaction) => interaction.apps ?? [])
+    const rows = resolveRows(allAppNames, mcpApps)
+    return rows.length > 0 && rows.every((row) => row.app.is_connected)
+  }, [isConnectAppsOnly, normalizedInteractions, mcpApps])
 
   useEffect(() => {
     if (!filesDisabled) return
@@ -723,7 +740,7 @@ export function ClarificationForm({
                 key={`${interaction.field}-${index}`}
                 interaction={interaction}
                 onSkip={handleSkipConnectApps}
-                onContinue={handleContinueConnectApps}
+                onContinue={allConnectAppsConnected ? handleContinueConnectApps : undefined}
               />
             ))}
           </div>

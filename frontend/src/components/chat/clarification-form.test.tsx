@@ -427,6 +427,52 @@ describe("ClarificationForm connect_apps interaction", () => {
     // An ordinary field's own persisted label is untouched by this.
     expect(screen.getByText("Note:")).toBeInTheDocument()
   })
+
+  it("does not offer Continue on one card until every app across every simultaneously-paused card is connected", () => {
+    // Two different tools can pause together, each naming a different app -
+    // each renders its own ConnectAppsField, and Continue must mean "the
+    // whole pause is resolved," not just "this one card's own app is
+    // connected." Otherwise connecting Gmail alone would let the Gmail card
+    // fire a premature Continue while Salesforce is still unconnected.
+    mcpAppsMock.apps = [
+      {
+        id: "gmail",
+        name: "Gmail",
+        description: "",
+        icon: "",
+        users: "",
+        transport: "builtin",
+        provider: "google",
+        category: "Communication",
+        is_connected: true,
+      },
+      {
+        id: "salesforce",
+        name: "Salesforce",
+        description: "",
+        icon: "",
+        users: "",
+        transport: "builtin",
+        provider: "salesforce",
+        category: "Sales",
+        is_connected: false,
+      },
+    ]
+
+    render(
+      <ClarificationForm
+        interactions={[
+          CONNECT_APPS_INTERACTION,
+          { type: "connect_apps", field: "connect_apps", label: "Connect your apps", apps: ["Salesforce"] },
+        ]}
+        onSend={vi.fn()}
+      />,
+    )
+
+    expect(
+      screen.queryByRole("button", { name: "chatPage.clarification.connectApps.continue" }),
+    ).not.toBeInTheDocument()
+  })
 })
 
 describe("ClarificationForm delivery failures", () => {

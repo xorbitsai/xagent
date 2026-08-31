@@ -12,6 +12,7 @@ import { getApiUrl } from "@/lib/utils";
 import { cn } from "@/lib/utils";
 import { getBrandingFromEnv } from "@/lib/branding";
 import { markOnboardingSaveEscaped, updateUserPreferences, type UserPreferences } from "@/lib/user-preferences";
+import { readAuthSessionSnapshot } from "@/lib/auth-cache";
 import { hireAgentFromTemplate } from "@/lib/hire-agent";
 import { PersonaAvatar } from "@/components/templates/persona-avatar";
 import { categoryLabel } from "@/lib/template-categories";
@@ -119,24 +120,36 @@ export default function OnboardingPage() {
   // identity (a larger redesign); it only guards the handful of mutating
   // calls below so identity A's data is never written or completed as
   // identity B.
-  const wizardUserIdRef = useRef(user?.id);
-  // Read live at every guard checkpoint below, NOT the `user` variable
-  // itself - a self-review agent caught that `user` comes from a plain
-  // `const` destructure, so it's frozen to whatever AuthProvider returned
-  // at the specific render that created the CURRENTLY RUNNING closure
-  // (handleLaunch/trySavePreferences/persistAndLeave are all recreated
-  // fresh every render, but an already-invoked call keeps running with
-  // the closure it started with). AuthProvider replaces `user` with a
-  // brand new object via React state (setProjection in auth-context.tsx),
-  // not an in-place mutation, so an identity swap that happens WHILE one
-  // of those functions is already awaiting a save/hire call is invisible
-  // to a `user?.id` read inside it - exactly the scenario this guard
-  // exists for. A ref updated every render via the effect below is always
-  // read live regardless of which render's closure is doing the reading.
-  const currentUserIdRef = useRef(user?.id);
-  useEffect(() => {
-    currentUserIdRef.current = user?.id;
-  }, [user?.id]);
+  const wizardUserIdRef = useRef(readAuthSessionSnapshot().userId);
+  // Reads storage directly, live, at every guard checkpoint below - NOT the
+  // `user` variable, and NOT a ref kept fresh by a useEffect. Two separate
+  // self-review findings ruled out both of those:
+  //
+  // - `user` comes from a plain `const` destructure, so it's frozen to
+  //   whatever AuthProvider returned at the specific render that created
+  //   the CURRENTLY RUNNING closure (handleLaunch/trySavePreferences/
+  //   persistAndLeave are all recreated fresh every render, but an
+  //   already-invoked call keeps running with the closure it started
+  //   with). AuthProvider replaces `user` with a brand new object via
+  //   React state (setProjection in auth-context.tsx), not an in-place
+  //   mutation, so an identity swap that happens WHILE one of those
+  //   functions is already awaiting a save/hire call is invisible to a
+  //   `user?.id` read inside it.
+  // - A ref kept fresh via `useEffect(() => { ref.current = user?.id },
+  //   [user?.id])` fixes that, but only while this component stays
+  //   mounted - the effect simply stops running once it unmounts, so the
+  //   ref freezes at whatever it last held. handleLaunch's async chain
+  //   keeps executing after an unmount (only navigation/state-setting are
+  //   gated on isMountedRef, not the save/hire calls themselves - see
+  //   their own comments for why), so an identity swap that happens
+  //   AFTER an unmount mid-flight was invisible to that ref too - an
+  //   external review round caught this exact gap.
+  //
+  // readAuthSessionSnapshot() (the same function apiRequest itself calls
+  // to decide which credentials go out on the wire - see api-wrapper.ts)
+  // reads live storage synchronously with no dependency on React
+  // rendering or mount state at all, so it can't go stale either way.
+  const currentSessionUserId = () => readAuthSessionSnapshot().userId;
 
   const [stepIndex, setStepIndex] = useState(0);
   const step = STEP_ORDER[stepIndex];
@@ -337,7 +350,19 @@ export default function OnboardingPage() {
   const next = () => goTo(stepIndex + 1);
   const back = () => goTo(stepIndex - 1);
 
+  // Mirrors hasReachedVoiceRef's latch, for the same reason: a PR review
+  // finding caught that goals.length === 0 omits `goals` entirely from the
+  // payload below, and the merge PATCH treats an omitted key as "leave
+  // whatever's already stored" - not "clear it." That's correct for a
+  // user who never touched goals at all (nothing to clear), but wrong for
+  // one who selected goals, saved (goals now nonempty server-side), came
+  // back via the rail, and deselected every chip before exiting - their
+  // explicit clear would silently do nothing, leaving a stale nonempty
+  // list stored under an account now marked onboarded. Latched (not a
+  // live length check) so it stays true even after clearing back to zero.
+  const hasToggledGoalsRef = useRef(false);
   const toggleGoal = (id: string) => {
+    hasToggledGoalsRef.current = true;
     setGoals((prev) => (prev.includes(id) ? prev.filter((g) => g !== id) : [...prev, id]));
   };
 
@@ -366,7 +391,7 @@ export default function OnboardingPage() {
       ...(includeOnboarded ? { onboarded: true } : {}),
       ...(work ? { department: work } : {}),
       ...(industryValue !== undefined ? { industry: industryValue } : {}),
-      ...(goals.length ? { goals } : {}),
+      ...(goals.length ? { goals } : hasToggledGoalsRef.current ? { goals: [] } : {}),
       ...(hasReachedVoiceRef.current ? { voice } : {}),
     };
   };
@@ -394,11 +419,11 @@ export default function OnboardingPage() {
     failureKey: string,
     { requireRetryableToEscape, includeOnboarded = true }: { requireRetryableToEscape: boolean; includeOnboarded?: boolean }
   ): Promise<SavePreferencesOutcome> => {
-    // See wizardUserIdRef's and currentUserIdRef's comments - never send
+    // See wizardUserIdRef's and currentSessionUserId's comments - never send
     // this identity's answers under a swapped-in session. Not counted as a
     // failure of THIS payload (it was never actually sent), so it doesn't
     // feed the escape counter.
-    if (currentUserIdRef.current !== wizardUserIdRef.current) {
+    if (currentSessionUserId() !== wizardUserIdRef.current) {
       if (isMountedRef.current) toast.error(t("onboarding.done.saveFailed"));
       return "retry_in_place";
     }
@@ -462,12 +487,12 @@ export default function OnboardingPage() {
   // skips onboarding entirely. Resending everything together here means a
   // successful completion always carries the real answers with it.
   const markOnboardedAndNavigate = async (destination: string) => {
-    // See wizardUserIdRef's and currentUserIdRef's comments - never
+    // See wizardUserIdRef's and currentSessionUserId's comments - never
     // complete onboarding, or write this identity's collected answers,
     // under a swapped-in session. No escape marker here: that flag is for
     // a save that genuinely failed, not for an attempt this identity never
     // actually got to make.
-    if (currentUserIdRef.current !== wizardUserIdRef.current) {
+    if (currentSessionUserId() !== wizardUserIdRef.current) {
       if (isMountedRef.current) {
         launchingRef.current = false;
         setLaunching(false);
@@ -475,7 +500,7 @@ export default function OnboardingPage() {
       return;
     }
     const onboardedSave = await updateUserPreferences(buildPreferencesPayload());
-    // See wizardUserIdRef's and currentUserIdRef's comments - re-checked
+    // See wizardUserIdRef's and currentSessionUserId's comments - re-checked
     // AFTER the await, not just before it. A PR review finding caught that
     // this continuation used to navigate unconditionally once the PATCH
     // above resolved, even if identity had swapped DURING that PATCH's own
@@ -485,7 +510,7 @@ export default function OnboardingPage() {
     // was only ever meant for the original one. Nothing to mark as
     // escaped here either - the original identity isn't actually leaving
     // via this tab anymore, so there's no exit for the flag to cover.
-    if (currentUserIdRef.current !== wizardUserIdRef.current) {
+    if (currentSessionUserId() !== wizardUserIdRef.current) {
       if (isMountedRef.current) {
         launchingRef.current = false;
         setLaunching(false);
@@ -493,7 +518,7 @@ export default function OnboardingPage() {
       return;
     }
     if (isMountedRef.current) {
-      // wizardUserIdRef.current, not user?.id/currentUserIdRef - this flag
+      // wizardUserIdRef.current, not user?.id/currentSessionUserId - this flag
       // is inherently about the ORIGINAL wizard identity's save outcome
       // (both guards above already confirmed identity hadn't swapped when
       // this PATCH was sent or when it resolved), not whoever happens to
@@ -510,7 +535,7 @@ export default function OnboardingPage() {
   // one here either. Bailing out via the goals step after already selecting
   // a couple of goals must not silently discard them.
   const persistAndLeave = async (destination: string) => {
-    // Deliberately does NOT re-check currentUserIdRef/wizardUserIdRef after
+    // Deliberately does NOT re-check currentSessionUserId/wizardUserIdRef after
     // the trySavePreferences await below, unlike markOnboardedAndNavigate's
     // post-await check - the risk that guards against (routing a
     // swapped-in identity to a destination that only makes sense for the
@@ -638,10 +663,10 @@ export default function OnboardingPage() {
         return;
       }
       if (!isMountedRef.current) return;
-      // See wizardUserIdRef's and currentUserIdRef's comments - never hire
+      // See wizardUserIdRef's and currentSessionUserId's comments - never hire
       // an agent under a swapped-in identity's session on this identity's
       // behalf.
-      if (currentUserIdRef.current !== wizardUserIdRef.current) {
+      if (currentSessionUserId() !== wizardUserIdRef.current) {
         launchingRef.current = false;
         setLaunching(false);
         return;
@@ -656,14 +681,14 @@ export default function OnboardingPage() {
           connectAppsLabel: t("chatPage.clarification.connectApps.title"),
         },
         connections: selected.connections,
-        // See wizardUserIdRef's and currentUserIdRef's comments - the guard
+        // See wizardUserIdRef's and currentSessionUserId's comments - the guard
         // right before this call only proves identity hadn't swapped BEFORE
         // hireAgentFromTemplate was invoked. That function itself makes 2
         // independent network calls (resolve, then task/create), so without
         // this, a swap landing in the gap between them would still let
         // task/create run under a different identity than the one that just
         // resolved the agent.
-        abortIfIdentityChanged: () => currentUserIdRef.current !== wizardUserIdRef.current,
+        abortIfIdentityChanged: () => currentSessionUserId() !== wizardUserIdRef.current,
       });
       // Not `if (!isMountedRef.current) return;` here (unlike the guard
       // before hireAgentFromTemplate above, which is fine to skip attempting

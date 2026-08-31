@@ -33,6 +33,18 @@ vi.mock("@/contexts/auth-context", () => ({
   useAuth: () => ({ user: { ...authUser } }),
 }))
 
+// readAuthSessionSnapshot() is called directly (not via a React hook) at
+// every identity-swap guard checkpoint, precisely so those checks read live
+// storage instead of a value that can only update while this page stays
+// mounted - see wizardUserIdRef's/currentSessionUserId's comments in
+// page.tsx. Backed by the SAME `authUser` object as the useAuth() mock
+// above (read fresh on every call, not spread into a snapshot at mock-setup
+// time) so mutating `authUser.id` mid-test - including after this
+// component has unmounted - is visible here too.
+vi.mock("@/lib/auth-cache", () => ({
+  readAuthSessionSnapshot: () => ({ userId: authUser.id }),
+}))
+
 vi.mock("@/contexts/i18n-context", () => ({
   useI18n: () => ({
     t: (key: string, vars?: Record<string, string | number>) =>
@@ -1074,6 +1086,63 @@ describe("OnboardingPage", () => {
     expect(markOnboardingSaveEscapedMock).toHaveBeenCalledTimes(1)
   })
 
+  // Pins a gap found in an external review round: the identity-swap guards
+  // used to compare against a ref (`currentUserIdRef`) kept fresh only by a
+  // useEffect that runs while this component is mounted. Once unmounted,
+  // that effect stops firing and the ref freezes at whatever it last held -
+  // so a swap happening AFTER an unmount (not while still mounted, which
+  // the other identity-swap tests cover) went completely undetected, even
+  // though handleLaunch's async chain keeps running post-unmount by design.
+  // Fixed by reading `readAuthSessionSnapshot().userId` directly at every
+  // checkpoint instead - a live storage read with no dependency on this
+  // component's mount state at all.
+  it("does not send the completion PATCH under a swapped-in identity if the swap happens after this page has already unmounted", async () => {
+    let resolveMainSave!: (v: { ok: boolean }) => void
+    updateUserPreferencesMock.mockReturnValueOnce(
+      new Promise((resolve) => { resolveMainSave = resolve })
+    )
+    apiRequestMock.mockResolvedValue({
+      ok: true,
+      json: async () => [{ ...TEMPLATES[0], hired: true, hired_agent_id: 99 }, TEMPLATES[1], TEMPLATES[2]],
+    })
+
+    const { unmount } = render(<OnboardingPage />)
+    await waitFor(() => expect(screen.getByText(/Welcome to Xagent/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Let's go"))
+    fireEvent.click(screen.getByText("Marketing"))
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/take off your plate/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Post on social media"))
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/Meet your AI team/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/How should/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText("You're all set.")).toBeInTheDocument())
+
+    fireEvent.click(screen.getByText("Start with Maya"))
+    // The main save (trySavePreferences) is now the one pending call.
+    expect(updateUserPreferencesMock).toHaveBeenCalledTimes(1)
+
+    // Unmount BEFORE the swap - no rerender happens afterward, so a ref
+    // that only updates via a mounted component's effect could never see
+    // this. Then the main save resolves, and handleLaunch (still running
+    // post-unmount) reaches the already-hired shortcut and calls
+    // markOnboardedAndNavigate for the very first time.
+    unmount()
+    authUser.id = "user-b"
+
+    await act(async () => {
+      resolveMainSave({ ok: true })
+    })
+
+    // markOnboardedAndNavigate's entry guard must catch the swap and bail
+    // BEFORE sending its own completion PATCH at all - not just before
+    // navigating with it.
+    expect(updateUserPreferencesMock).toHaveBeenCalledTimes(1)
+    expect(routerReplace).not.toHaveBeenCalledWith("/agent/99")
+  })
+
   // Pins a PR review finding: markOnboardedAndNavigate checked identity
   // before sending its OWN completion PATCH, but navigated unconditionally
   // once that PATCH resolved - a swap happening DURING that specific await
@@ -1913,6 +1982,39 @@ describe("OnboardingPage", () => {
     expect(updateUserPreferencesMock).toHaveBeenCalledWith(
       expect.objectContaining({ onboarded: true, goals: ["social"] })
     )
+  })
+
+  // Pins a PR review finding: omitting `goals` when the array is empty is
+  // correct for a user who never touched goal selection at all, but wrong
+  // for one who selected a goal, then explicitly deselected it back to
+  // zero before leaving - the merge PATCH treats an omitted key as "leave
+  // whatever's already stored," silently ignoring their explicit clear
+  // and leaving a stale nonempty list server-side.
+  it("sends an explicit empty goals array (not an omitted key) after selecting then deselecting every goal", async () => {
+    await goToWelcomeThenBusiness()
+    fireEvent.click(screen.getByText("Marketing"))
+    fireEvent.click(screen.getByText("Continue"))
+
+    await waitFor(() => expect(screen.getByText(/take off your plate/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Post on social media"))
+    fireEvent.click(screen.getByText("Post on social media")) // deselect - back to zero
+    fireEvent.click(screen.getByText("Not sure yet — show me everyone"))
+
+    expect(updateUserPreferencesMock).toHaveBeenCalledWith(
+      expect.objectContaining({ onboarded: true, goals: [] })
+    )
+  })
+
+  it("omits goals entirely (not an explicit empty array) when the user never touched goal selection at all", async () => {
+    await goToWelcomeThenBusiness()
+    fireEvent.click(screen.getByText("Marketing"))
+    fireEvent.click(screen.getByText("Continue"))
+
+    await waitFor(() => expect(screen.getByText(/take off your plate/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Not sure yet — show me everyone"))
+
+    const payload = updateUserPreferencesMock.mock.calls[0][0]
+    expect(payload).not.toHaveProperty("goals")
   })
 
   // Pins a PR review finding: the rail's "About you"/"My team" links always

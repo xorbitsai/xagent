@@ -108,7 +108,7 @@ const SAVE_ESCAPE_TTL_MS = 30_000;
  * mandatory onboarding check entirely. No-ops without a userId (rather than
  * falling back to an unscoped flag) - no worse than the pre-existing
  * behavior of not marking anything at all. */
-export function markOnboardingSaveEscaped(userId: string | undefined): void {
+export function markOnboardingSaveEscaped(userId: string | null | undefined): void {
   if (!userId) return;
   try {
     window.sessionStorage.setItem(SAVE_ESCAPE_KEY, JSON.stringify({ userId, setAt: Date.now() }));

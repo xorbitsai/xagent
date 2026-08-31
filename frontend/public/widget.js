@@ -691,6 +691,16 @@
     // (see onWindowResize below), so growing past the breakpoint afterward
     // would silently expand the panel with no further click from the user.
     if (isMobileViewport()) return;
+    // Expanding invalidates a drag's frozen startX/startWidth anchors the
+    // same way a viewport-width change does (see onWindowResize's own
+    // cancelDrag() call) -- a drag can only still be active here via a
+    // second, independent pointer (e.g. one finger holding the handle while
+    // another taps this menu item on a touch-capable desktop-width device),
+    // since isMobileViewport()/isExpanded already block a *new* drag from
+    // starting once expanded. Without this, that drag's very next
+    // pointermove would go on setting an inline width, desyncing the
+    // panel's rendered width from the .expanded class it now also carries.
+    cancelDrag();
     isExpanded = true;
     panel.classList.add('expanded');
     // Let the .expanded rule's own width win -- an inline width from a

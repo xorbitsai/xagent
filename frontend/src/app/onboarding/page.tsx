@@ -518,7 +518,7 @@ export default function OnboardingPage() {
       return;
     }
     if (isMountedRef.current) {
-      // wizardUserIdRef.current, not user?.id/currentSessionUserId - this flag
+      // wizardUserIdRef.current, not user?.id/currentSessionUserId() - this flag
       // is inherently about the ORIGINAL wizard identity's save outcome
       // (both guards above already confirmed identity hadn't swapped when
       // this PATCH was sent or when it resolved), not whoever happens to
@@ -665,7 +665,14 @@ export default function OnboardingPage() {
       if (!isMountedRef.current) return;
       // See wizardUserIdRef's and currentSessionUserId's comments - never hire
       // an agent under a swapped-in identity's session on this identity's
-      // behalf.
+      // behalf. No dedicated post-unmount test for this specific checkpoint
+      // (unlike markOnboardedAndNavigate's entry check) - the isMountedRef
+      // check directly above it already returns before this is ever
+      // reached once genuinely unmounted, so this identity check's own
+      // unmount-robustness has no separately observable effect to test
+      // here; abortIfIdentityChanged below (reached only if this passes)
+      // is what actually needs to survive an unmount mid-hire, since
+      // hireAgentFromTemplate's own calls are NOT gated by isMountedRef.
       if (currentSessionUserId() !== wizardUserIdRef.current) {
         launchingRef.current = false;
         setLaunching(false);

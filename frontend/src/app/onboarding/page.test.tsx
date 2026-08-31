@@ -7,6 +7,13 @@ import OnboardingPage from "./page"
 const routerPush = vi.hoisted(() => vi.fn())
 const routerReplace = vi.hoisted(() => vi.fn())
 const authUser = vi.hoisted(() => ({ id: "user-a", username: "Shulei" as string | undefined }))
+// Lets exactly one test diverge readAuthSessionSnapshot()'s userId from
+// authUser.id (which every other test keeps them equal to by default, so
+// none of them can tell whether wizardUserIdRef's initial capture actually
+// reads readAuthSessionSnapshot() at mount vs. user?.id). undefined (reset
+// every beforeEach) means "no override, fall back to authUser.id" - the
+// same behavior every other test already relies on.
+const sessionUserIdOverride = vi.hoisted(() => ({ current: undefined as string | null | undefined }))
 const apiRequestMock = vi.hoisted(() => vi.fn())
 const updateUserPreferencesMock = vi.hoisted(() => vi.fn())
 const hireAgentFromTemplateMock = vi.hoisted(() => vi.fn())
@@ -42,7 +49,9 @@ vi.mock("@/contexts/auth-context", () => ({
 // time) so mutating `authUser.id` mid-test - including after this
 // component has unmounted - is visible here too.
 vi.mock("@/lib/auth-cache", () => ({
-  readAuthSessionSnapshot: () => ({ userId: authUser.id }),
+  readAuthSessionSnapshot: () => ({
+    userId: sessionUserIdOverride.current !== undefined ? sessionUserIdOverride.current : authUser.id,
+  }),
 }))
 
 vi.mock("@/contexts/i18n-context", () => ({
@@ -131,6 +140,7 @@ describe("OnboardingPage", () => {
     i18nState.locale = "en"
     authUser.id = "user-a"
     authUser.username = "Shulei"
+    sessionUserIdOverride.current = undefined
     apiRequestMock.mockReset()
     apiRequestMock.mockResolvedValue({ ok: true, json: async () => TEMPLATES })
     updateUserPreferencesMock.mockReset()
@@ -703,9 +713,51 @@ describe("OnboardingPage", () => {
     })
 
     // Same callback reference from the same hireAgentFromTemplate call -
-    // it must now report the swap live, proving it reads a ref kept fresh
-    // by rendering, not a value captured once when hireAgentFromTemplate
-    // was originally invoked.
+    // it must now report the swap live, proving it reads live session
+    // storage directly (readAuthSessionSnapshot()), not a value captured
+    // once when hireAgentFromTemplate was originally invoked.
+    expect(abortIfIdentityChanged()).toBe(true)
+  })
+
+  // Pins a test-coverage gap found by self-review: unlike the guard right
+  // before hireAgentFromTemplate is called (gated behind isMountedRef, so
+  // it never matters once genuinely unmounted - see its own comment),
+  // hireAgentFromTemplate's OWN internal calls (resolve, then task/create)
+  // are NOT gated by isMountedRef at all - the whole point of adding
+  // abortIfIdentityChanged was to protect the gap BETWEEN those two calls,
+  // which keeps running post-unmount by construction. This callback must
+  // therefore still correctly detect a swap even after the page that
+  // created it has unmounted, not only while it's still mounted (the test
+  // above only proves the latter, via rerender).
+  it("keeps reporting a swap live from the abortIfIdentityChanged callback even after this page has unmounted", async () => {
+    const { unmount } = render(<OnboardingPage />)
+    await waitFor(() => expect(screen.getByText(/Welcome to Xagent/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Let's go"))
+    fireEvent.click(screen.getByText("Marketing"))
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/take off your plate/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Post on social media"))
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/Meet your AI team/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/How should/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText("You're all set.")).toBeInTheDocument())
+
+    await act(async () => {
+      fireEvent.click(screen.getByText("Start with Maya"))
+    })
+
+    await waitFor(() => expect(hireAgentFromTemplateMock).toHaveBeenCalled())
+    const { abortIfIdentityChanged } = hireAgentFromTemplateMock.mock.calls[0][0]
+    expect(abortIfIdentityChanged()).toBe(false)
+
+    unmount()
+    authUser.id = "user-b"
+
+    // No rerender happens (and none is possible) after unmount - a ref
+    // kept fresh only by a mounted component's effect could never see
+    // this, but a live storage read still can.
     expect(abortIfIdentityChanged()).toBe(true)
   })
 
@@ -1192,6 +1244,17 @@ describe("OnboardingPage", () => {
 
     expect(routerReplace).not.toHaveBeenCalledWith("/agent/99")
   })
+
+  // (A post-unmount variant of the test above was considered here and
+  // deliberately NOT added: this checkpoint's only observable effects -
+  // markOnboardingSaveEscaped and router.replace - are both already gated
+  // behind `isMountedRef.current`, independent of the identity check. Once
+  // genuinely unmounted, neither happens regardless of whether the
+  // identity check is correct, so a test asserting "no navigation after
+  // unmount" would pass for the wrong reason - isMountedRef, not the fix -
+  // and could stay green under a reverted, broken identity check. The
+  // ENTRY checkpoint's post-unmount test above is the meaningful one here,
+  // since it gates the network call itself, not just what happens after.)
 
   // Pins a PR review test-coverage gap: only the thrown/rejected variant of
   // a templates-fetch failure was tested - a non-throwing !response.ok, and
@@ -2005,6 +2068,33 @@ describe("OnboardingPage", () => {
     )
   })
 
+  // Pins a test-coverage gap found by self-review: the test above only
+  // ever toggles ONE goal (select, then deselect - 2 toggles). A latch
+  // that's actually derived from something toggle-count-dependent (e.g.
+  // "was toggleGoal called an odd number of times" or "is the goals array
+  // reference different from its initial empty one") could pass that test
+  // while failing here, where multiple goals are selected and deselected
+  // in a different order (4 toggles, ending at zero) - the scenario the
+  // fix's own comment cites as the real motivating case (a user who
+  // previously saved several goals, returns via the rail, and clears them
+  // all).
+  it("still sends an explicit empty goals array after selecting and deselecting multiple goals in a different order", async () => {
+    await goToWelcomeThenBusiness()
+    fireEvent.click(screen.getByText("Marketing"))
+    fireEvent.click(screen.getByText("Continue"))
+
+    await waitFor(() => expect(screen.getByText(/take off your plate/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Post on social media")) // select A
+    fireEvent.click(screen.getByText("Keep my inbox under control")) // select B
+    fireEvent.click(screen.getByText("Post on social media")) // deselect A
+    fireEvent.click(screen.getByText("Keep my inbox under control")) // deselect B - back to zero
+    fireEvent.click(screen.getByText("Not sure yet — show me everyone"))
+
+    expect(updateUserPreferencesMock).toHaveBeenCalledWith(
+      expect.objectContaining({ onboarded: true, goals: [] })
+    )
+  })
+
   it("omits goals entirely (not an explicit empty array) when the user never touched goal selection at all", async () => {
     await goToWelcomeThenBusiness()
     fireEvent.click(screen.getByText("Marketing"))
@@ -2252,6 +2342,44 @@ describe("OnboardingPage", () => {
     expect(screen.getByText(/the other 2 matches are waiting in Templates/)).toBeInTheDocument()
   })
 
+  // Pins a test-coverage gap found by self-review: every other identity-swap
+  // test keeps useAuth()'s user.id and readAuthSessionSnapshot()'s userId
+  // equal at mount time (they only diverge AFTER mount, to simulate a
+  // swap), so none of them can tell whether wizardUserIdRef's initial
+  // capture actually reads readAuthSessionSnapshot() - the fix - or the
+  // stale user?.id it replaced. Diverging them from the very first render
+  // is the only way to distinguish the two: if a regression reverted just
+  // this one line back to `useRef(user?.id)`, wizardUserIdRef would
+  // capture "user-a" here instead of "user-b", and every guard in the file
+  // would then see a permanent (spurious) mismatch against the CURRENT,
+  // correct identity, since currentSessionUserId() itself was untouched
+  // and correctly reads "user-b" throughout.
+  it("captures wizardUserIdRef from the live session snapshot at mount, not from the user object", async () => {
+    authUser.id = "user-a"
+    sessionUserIdOverride.current = "user-b"
+
+    await goToWelcomeThenBusiness()
+    fireEvent.click(screen.getByText("Marketing"))
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/take off your plate/)).toBeInTheDocument())
+
+    // Once mounted, resync the override to match authUser.id ("user-b") -
+    // if wizardUserIdRef had wrongly captured "user-a" (from user?.id) at
+    // mount, every guard would now see a mismatch against this genuinely
+    // unchanged, correct identity and refuse to save at all.
+    sessionUserIdOverride.current = undefined
+    authUser.id = "user-b"
+
+    fireEvent.click(screen.getByText("Post on social media"))
+    await act(async () => {
+      fireEvent.click(screen.getByText("Not sure yet — show me everyone"))
+    })
+
+    expect(updateUserPreferencesMock).toHaveBeenCalledWith(
+      expect.objectContaining({ onboarded: true, goals: ["social"] })
+    )
+  })
+
   // Pins a PR review finding: this page's own state has no identity binding
   // of its own, unlike the escape flag and AuthGuard's onboarding check.
   // AuthProvider replaces `user` (via its `storage` event listener) on a
@@ -2312,10 +2440,12 @@ describe("OnboardingPage", () => {
     expect(routerReplace).not.toHaveBeenCalled()
   })
 
-  // Pins a gap found by 2 independent self-review agents: the identity guard
-  // above only re-reads identity via a ref kept fresh through a
-  // useEffect([user?.id]) - it must correctly catch a swap that happens
-  // WHILE handleLaunch is already awaiting an earlier call, not only one
+  // Pins a gap found by 2 independent self-review agents: the identity
+  // guard above only re-reads identity via a live readAuthSessionSnapshot()
+  // call (an earlier version of this fix used a ref kept fresh through a
+  // useEffect([user?.id]) instead, since replaced) - it must correctly
+  // catch a swap that happens WHILE handleLaunch is already awaiting an
+  // earlier call, not only one
   // that already happened before the click. This is the scenario the
   // guard's own comment is actually about (an in-flight save/hire that
   // started under the original identity), and it's a fundamentally

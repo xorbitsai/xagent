@@ -275,6 +275,7 @@ def _assert_unavailable_mcp_config(
     *,
     reason: str,
     oauth_token_required: bool = False,
+    app_name: str | None = None,
 ) -> None:
     assert config["name"] == server.name
     assert config["transport"] == "unavailable"
@@ -286,6 +287,8 @@ def _assert_unavailable_mcp_config(
         assert config["config"]["failure_code"] == "oauth_token_required"
     else:
         assert "failure_code" not in config["config"]
+    if app_name is not None:
+        assert config["config"]["app_name"] == app_name
     expected_user_id = str(server.user_mcpservers[0].user_id)
     assert config["user_id"] == expected_user_id
     assert config["allow_users"] == [expected_user_id]
@@ -597,7 +600,11 @@ async def test_hook_missing_instance_url_retains_unavailable_server(db_session):
     config = (await _tool_config(db, user).get_mcp_server_configs())[0]
 
     _assert_unavailable_mcp_config(
-        config, server, reason="oauth_token_required", oauth_token_required=True
+        config,
+        server,
+        reason="oauth_token_required",
+        oauth_token_required=True,
+        app_name=server.name,
     )
 
 
@@ -625,7 +632,11 @@ async def test_legacy_missing_instance_url_retains_unavailable_server(db_session
     config = (await _tool_config(db, user).get_mcp_server_configs())[0]
 
     _assert_unavailable_mcp_config(
-        config, server, reason="oauth_token_required", oauth_token_required=True
+        config,
+        server,
+        reason="oauth_token_required",
+        oauth_token_required=True,
+        app_name=server.name,
     )
 
 

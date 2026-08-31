@@ -3828,6 +3828,7 @@ class WebToolConfig(BaseToolConfig):
                         reason="oauth_token_required",
                         message=UNAVAILABLE_MCP_CREDENTIAL_MESSAGE,
                         failure_code="oauth_token_required",
+                        app_info=app_info,
                     )
                 config["transport"] = "stdio"
                 logger.info(
@@ -3894,6 +3895,7 @@ class WebToolConfig(BaseToolConfig):
                         reason="oauth_token_required",
                         message=UNAVAILABLE_MCP_CREDENTIAL_MESSAGE,
                         failure_code="oauth_token_required",
+                        app_info=app_info,
                     )
                 config["transport"] = "stdio"
 

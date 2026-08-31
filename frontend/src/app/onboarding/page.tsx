@@ -108,18 +108,35 @@ export default function OnboardingPage() {
   const { t, locale } = useI18n();
   // The identity this wizard was opened for - a PR review finding caught
   // that this page's own state (work/industry/goals/voice, the selected
-  // template, etc.) has no identity binding of its own, unlike the
-  // escape flag and AuthGuard's own onboarding-redirect check, which both
-  // account for AuthProvider updating `user` in place (via its `storage`
-  // event listener) on a same-origin cross-tab login as a DIFFERENT user,
-  // with no remount of this page. Without this, a half-filled wizard's
-  // answers - or an in-flight save/hire that started under the original
-  // identity - could be sent, or completed, under a swapped-in identity's
-  // session. This deliberately does NOT reset or rehydrate the wizard for
-  // the new identity (a larger redesign); it only guards the handful of
-  // mutating calls below so identity A's data is never written or
-  // completed as identity B.
+  // template, etc.) has no identity binding of its own, unlike the escape
+  // flag and AuthGuard's own onboarding-redirect check, which both account
+  // for AuthProvider replacing `user` (via its `storage` event listener,
+  // on a same-origin cross-tab login as a DIFFERENT user) with no remount
+  // of this page. Without this, a half-filled wizard's answers - or an
+  // in-flight save/hire that started under the original identity - could
+  // be sent, or completed, under a swapped-in identity's session. This
+  // deliberately does NOT reset or rehydrate the wizard for the new
+  // identity (a larger redesign); it only guards the handful of mutating
+  // calls below so identity A's data is never written or completed as
+  // identity B.
   const wizardUserIdRef = useRef(user?.id);
+  // Read live at every guard checkpoint below, NOT the `user` variable
+  // itself - a self-review agent caught that `user` comes from a plain
+  // `const` destructure, so it's frozen to whatever AuthProvider returned
+  // at the specific render that created the CURRENTLY RUNNING closure
+  // (handleLaunch/trySavePreferences/persistAndLeave are all recreated
+  // fresh every render, but an already-invoked call keeps running with
+  // the closure it started with). AuthProvider replaces `user` with a
+  // brand new object via React state (setProjection in auth-context.tsx),
+  // not an in-place mutation, so an identity swap that happens WHILE one
+  // of those functions is already awaiting a save/hire call is invisible
+  // to a `user?.id` read inside it - exactly the scenario this guard
+  // exists for. A ref updated every render via the effect below is always
+  // read live regardless of which render's closure is doing the reading.
+  const currentUserIdRef = useRef(user?.id);
+  useEffect(() => {
+    currentUserIdRef.current = user?.id;
+  }, [user?.id]);
 
   const [stepIndex, setStepIndex] = useState(0);
   const step = STEP_ORDER[stepIndex];
@@ -346,10 +363,11 @@ export default function OnboardingPage() {
     failureKey: string,
     { requireRetryableToEscape, includeOnboarded = true }: { requireRetryableToEscape: boolean; includeOnboarded?: boolean }
   ): Promise<SavePreferencesOutcome> => {
-    // See wizardUserIdRef's comment - never send this identity's answers
-    // under a swapped-in session. Not counted as a failure of THIS payload
-    // (it was never actually sent), so it doesn't feed the escape counter.
-    if (user?.id !== wizardUserIdRef.current) {
+    // See wizardUserIdRef's and currentUserIdRef's comments - never send
+    // this identity's answers under a swapped-in session. Not counted as a
+    // failure of THIS payload (it was never actually sent), so it doesn't
+    // feed the escape counter.
+    if (currentUserIdRef.current !== wizardUserIdRef.current) {
       if (isMountedRef.current) toast.error(t("onboarding.done.saveFailed"));
       return "retry_in_place";
     }
@@ -403,11 +421,12 @@ export default function OnboardingPage() {
   // skips onboarding entirely. Resending everything together here means a
   // successful completion always carries the real answers with it.
   const markOnboardedAndNavigate = async (destination: string) => {
-    // See wizardUserIdRef's comment - never complete onboarding, or write
-    // this identity's collected answers, under a swapped-in session. No
-    // escape marker here: that flag is for a save that genuinely failed,
-    // not for an attempt this identity never actually got to make.
-    if (user?.id !== wizardUserIdRef.current) {
+    // See wizardUserIdRef's and currentUserIdRef's comments - never
+    // complete onboarding, or write this identity's collected answers,
+    // under a swapped-in session. No escape marker here: that flag is for
+    // a save that genuinely failed, not for an attempt this identity never
+    // actually got to make.
+    if (currentUserIdRef.current !== wizardUserIdRef.current) {
       if (isMountedRef.current) {
         launchingRef.current = false;
         setLaunching(false);
@@ -416,7 +435,12 @@ export default function OnboardingPage() {
     }
     const onboardedSave = await updateUserPreferences(buildPreferencesPayload());
     if (isMountedRef.current) {
-      if (!onboardedSave.ok) markOnboardingSaveEscaped(user?.id);
+      // wizardUserIdRef.current, not user?.id/currentUserIdRef - this flag
+      // is inherently about the ORIGINAL wizard identity's save outcome
+      // (the guard above already confirmed identity hadn't swapped when
+      // this PATCH was sent), not whoever happens to be live by the time
+      // this line runs after the await.
+      if (!onboardedSave.ok) markOnboardingSaveEscaped(wizardUserIdRef.current);
       router.replace(destination);
     }
   };
@@ -470,8 +494,9 @@ export default function OnboardingPage() {
       // onboarded:false and bounce the user right back (self-review found
       // this happens for real: sometimes as a bounce loop, sometimes it
       // silently means the escape never actually reaches its destination).
-      // This flag tells that check to stand down once.
-      if (outcome === "escaped") markOnboardingSaveEscaped(user?.id);
+      // This flag tells that check to stand down once. wizardUserIdRef.current,
+      // not user?.id - see markOnboardedAndNavigate's identical note.
+      if (outcome === "escaped") markOnboardingSaveEscaped(wizardUserIdRef.current);
       router.replace(destination);
     }
   };
@@ -542,9 +567,10 @@ export default function OnboardingPage() {
         return;
       }
       if (!isMountedRef.current) return;
-      // See wizardUserIdRef's comment - never hire an agent under a
-      // swapped-in identity's session on this identity's behalf.
-      if (user?.id !== wizardUserIdRef.current) {
+      // See wizardUserIdRef's and currentUserIdRef's comments - never hire
+      // an agent under a swapped-in identity's session on this identity's
+      // behalf.
+      if (currentUserIdRef.current !== wizardUserIdRef.current) {
         launchingRef.current = false;
         setLaunching(false);
         return;

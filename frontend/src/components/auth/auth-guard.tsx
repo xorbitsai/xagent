@@ -36,20 +36,25 @@ export function AuthGuard({ children }: AuthGuardProps) {
     }
   }, [isAuthenticated, isLoading, router, mounted, isAuthPage])
 
-  // Only latches once onboarding is CONFIRMED complete for this user, not
-  // merely once a check has run - a PR review finding caught that latching
-  // on any successfully-resolved check (including a "not onboarded" one)
-  // let a user who never actually finishes the wizard bypass every future
-  // check for the rest of the session: redirected once to /onboarding, then
-  // instead of completing it, a browser Back (or any other client-side nav
-  // to a DIFFERENT already-visited protected route - this component doesn't
-  // remount on client-side navigation) lands on a page whose effect re-runs,
-  // sees the ref already latched to this user id, and skips the check
-  // entirely, rendering protected children with onboarding never actually
-  // done. Re-checking on every route change until it's actually confirmed
-  // true is the correct tradeoff here (an extra GET per route while
-  // genuinely not onboarded, which is expected to be a short-lived state)
-  // over ever latching on an unconfirmed outcome.
+  // On the normal (non-escape) path below, only latches once onboarding is
+  // CONFIRMED complete for this user, not merely once a check has run - a
+  // PR review finding caught that latching on any successfully-resolved
+  // check (including a "not onboarded" one) let a user who never actually
+  // finishes the wizard bypass every future check for the rest of the
+  // session: redirected once to /onboarding, then instead of completing
+  // it, a browser Back (or any other client-side nav to a DIFFERENT
+  // already-visited protected route - this component doesn't remount on
+  // client-side navigation) lands on a page whose effect re-runs, sees the
+  // ref already latched to this user id, and skips the check entirely,
+  // rendering protected children with onboarding never actually done.
+  // Re-checking on every route change until it's actually confirmed true
+  // is the correct tradeoff here (an extra GET per route while genuinely
+  // not onboarded, which is expected to be a short-lived state) over ever
+  // latching on an unconfirmed outcome. The escape-flag branch above is a
+  // separate, deliberate exception to this - it latches unconditionally on
+  // its own one-time bypass signal, not on an ordinary "not onboarded"
+  // resolution, so it doesn't reintroduce the same problem; see its own
+  // comment for why.
   //
   // The ref only latches once the check actually finishes (not before the
   // await) - if a dependency changes and cancels this run first (e.g. the
@@ -59,8 +64,9 @@ export function AuthGuard({ children }: AuthGuardProps) {
   //
   // Keyed by user id, not a bare boolean: AuthGuard doesn't remount across
   // a client-side auth swap - AuthProvider's own `storage`-event listener
-  // updates `isAuthenticated`/`user` in place when a DIFFERENT user logs in
-  // from another tab (same-origin localStorage change), so a bare "have we
+  // replaces `isAuthenticated`/`user` (a React state update, not an
+  // in-place mutation) when a DIFFERENT user logs in from another tab
+  // (same-origin localStorage change), so a bare "have we
   // ever checked" boolean would stay latched from the PREVIOUS user's check
   // and let the new one through with no check of their own at all. Storing
   // whose check last completed, and comparing against the CURRENT user's id

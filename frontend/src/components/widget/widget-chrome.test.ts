@@ -292,12 +292,45 @@ describe("widget chrome", () => {
     fabEl()?.click()
     fromIframe("widget_expand")
     expect((panelEl() as HTMLElement).style.width).toBe("")
+    const postToIframe = vi.spyOn(iframeEl()!.contentWindow!, "postMessage")
 
     Object.defineProperty(window, "innerWidth", { configurable: true, value: window.innerWidth - 50 })
     window.dispatchEvent(new Event("resize"))
 
     expect(panelEl()).toHaveClass("expanded")
     expect((panelEl() as HTMLElement).style.width).toBe("")
+    // Still on the desktop side of the breakpoint -- nothing to correct.
+    expect(postToIframe).not.toHaveBeenCalled()
+  })
+
+  it("force-collapses an already-expanded panel when a resize carries it across the mobile breakpoint", () => {
+    // The .expanded CSS rule is scoped above the mobile breakpoint, so
+    // nothing previously re-validated isExpanded against a resize the way
+    // expandPanel() already does for a fresh click -- the panel would
+    // render mobile-sized while isExpanded stayed true on both sides, then
+    // silently snap back to full size if the window later widened past the
+    // breakpoint again with no further click from the visitor.
+    runWidget()
+    fabEl()?.click()
+    fromIframe("widget_expand")
+    expect(panelEl()).toHaveClass("expanded")
+    const postToIframe = vi.spyOn(iframeEl()!.contentWindow!, "postMessage")
+
+    Object.defineProperty(window, "innerWidth", { configurable: true, value: 400 })
+    window.dispatchEvent(new Event("resize"))
+
+    expect(panelEl()).not.toHaveClass("expanded")
+    expect(postToIframe).toHaveBeenCalledWith(
+      { xagent: true, v: 1, type: "widget_expand_rejected" },
+      HOST,
+    )
+
+    // Widening back past the breakpoint afterward must not silently
+    // re-expand the panel with no further click.
+    Object.defineProperty(window, "innerWidth", { configurable: true, value: 1024 })
+    window.dispatchEvent(new Event("resize"))
+
+    expect(panelEl()).not.toHaveClass("expanded")
   })
 
   it("stays expanded across a close/reopen within the same page view", () => {

@@ -28,7 +28,11 @@ export function listenForWidgetHostMessage(
   onMessage: () => void,
 ): () => void {
   const handleMessage = (event: MessageEvent) => {
-    if (event.source !== window.parent) return
+    // On a direct (non-embedded) visit window.parent === window, so without
+    // this a same-document script's own window.postMessage(..., "*") would
+    // satisfy `event.source === window.parent` trivially -- mirrors the
+    // same direct-visit guard postToParentWidget already applies above.
+    if (window.parent === window || event.source !== window.parent) return
     const data: unknown = event.data
     if (
       !data || typeof data !== "object"

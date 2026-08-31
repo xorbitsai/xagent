@@ -634,6 +634,21 @@
     // that on release), end the drag cleanly here. The user can just grab
     // the handle again if they still want to resize.
     cancelDrag();
+    // A resize can carry an already-expanded panel across the mobile
+    // breakpoint just as easily as a click can arrive there in the first
+    // place. The .expanded CSS rule stops applying (it's scoped above the
+    // breakpoint), so the panel would render as a plain mobile-sized panel
+    // while isExpanded stays true on both sides -- then widening back past
+    // the breakpoint with no further click reactivates the CSS rule and
+    // silently snaps the panel back to full size, the exact thing
+    // expandPanel()'s own mobile guard exists to prevent for a fresh
+    // request. Force the same correction path a click-time rejection uses.
+    if (isExpanded && isMobileViewport()) {
+      collapsePanel();
+      if (iframe.contentWindow) {
+        iframe.contentWindow.postMessage({ xagent: true, v: 1, type: 'widget_expand_rejected' }, host);
+      }
+    }
   }
   window.addEventListener('resize', onWindowResize);
 

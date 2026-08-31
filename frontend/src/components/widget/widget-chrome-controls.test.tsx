@@ -216,6 +216,26 @@ describe("WidgetChromeControls", () => {
     expect(screen.getByRole("menuitem", { name: "widgetChat.collapseWindow" })).toBeInTheDocument()
   })
 
+  it("ignores a same-window rejection message on a direct (non-embedded) visit", () => {
+    // window.parent === window here, so event.source === window also equals
+    // window.parent -- the "not sourced from window.parent" check above
+    // alone would NOT catch this; only an explicit window.parent === window
+    // check does, mirroring postToParentWidget's own direct-visit guard.
+    vi.stubGlobal("parent", window)
+    render(<WidgetChromeControls />)
+
+    fireEvent.click(screen.getByRole("button", { name: "widgetChat.moreOptions" }))
+    fireEvent.click(screen.getByRole("menuitem", { name: "widgetChat.expandWindow" }))
+
+    fireEvent(window, new MessageEvent("message", {
+      data: { xagent: true, v: 1, type: "widget_expand_rejected" },
+      source: window as unknown as MessageEventSource,
+    }))
+
+    fireEvent.click(screen.getByRole("button", { name: "widgetChat.moreOptions" }))
+    expect(screen.getByRole("menuitem", { name: "widgetChat.collapseWindow" })).toBeInTheDocument()
+  })
+
   it("keeps the new-conversation item and the expand toggle as two independent menu items", () => {
     render(<WidgetChromeControls newConversation={{ label: "Start over", onClick: onNewConversation }} />)
 

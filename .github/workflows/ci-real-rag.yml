@@ -77,7 +77,7 @@ jobs:
 
       - name: Checkout code
         if: steps.eligibility.outputs.run_tests == 'true' && steps.provider.outputs.configured == 'true'
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Ensure uv is available
         if: steps.eligibility.outputs.run_tests == 'true' && steps.provider.outputs.configured == 'true'

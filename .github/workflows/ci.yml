@@ -123,7 +123,7 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Check Deepdoc cache
         id: deepdoc-cache
@@ -250,7 +250,7 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
@@ -345,7 +345,7 @@ jobs:
 
       - name: Checkout code
         if: needs.changes.outputs.code == 'true'
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Ensure uv is available
         if: needs.changes.outputs.code == 'true'
@@ -441,7 +441,7 @@ jobs:
 
       - name: Checkout code
         if: needs.changes.outputs.code == 'true'
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Ensure uv is available
         if: needs.changes.outputs.code == 'true'
@@ -589,7 +589,7 @@ jobs:
 
       - name: Checkout code
         if: needs.changes.outputs.code == 'true'
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Ensure uv is available
         if: needs.changes.outputs.code == 'true'
@@ -728,7 +728,7 @@ jobs:
 
       - name: Checkout code
         if: needs.changes.outputs.code == 'true'
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Ensure uv is available
         if: needs.changes.outputs.code == 'true'
@@ -790,7 +790,7 @@ jobs:
 
       - name: Checkout code
         if: needs.changes.outputs.frontend == 'true'
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0  # full history + tags so hatch-vcs can derive the version
 

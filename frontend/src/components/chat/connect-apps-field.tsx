@@ -105,14 +105,21 @@ function resolveRows(
     const entryId = typeof entry === "string" ? undefined : entry.id;
     const entryName = typeof entry === "string" ? entry : entry.name;
     // An id resolves to exactly one catalog row, unlike a display name -
-    // two visible apps can share a name (see Interaction.apps' doc
-    // comment), so an exact id match must win whenever one is available.
-    // Only fall back to the fuzzy name lookup when no id was sent at all
-    // (the legacy plain-string shape) or the id no longer resolves (the
-    // app was deleted from the catalog since the pause was created).
-    const app =
-      (entryId ? allApps.find((candidate) => candidate.id === entryId) : undefined) ??
-      (entryName ? findMatchingMcpApp(allApps, entryName) : undefined);
+    // two visible apps can share a name (custom connector names carry no
+    // uniqueness constraint), so once an id was sent it must stay
+    // authoritative even if it no longer resolves (the app was deleted or
+    // hidden from the catalog since the pause was created) - falling back
+    // to a name match there could silently resolve to a DIFFERENT app that
+    // happens to share the deleted one's old name, and every downstream
+    // action (Connected badge, OAuth/API-key connect, Continue) would then
+    // target that unrelated app instead of leaving the pause unresolved.
+    // The fuzzy name lookup is only for the legacy plain-string shape,
+    // which never carried an id to begin with.
+    const app = entryId
+      ? allApps.find((candidate) => candidate.id === entryId)
+      : entryName
+        ? findMatchingMcpApp(allApps, entryName)
+        : undefined;
     if (!app) {
       hasUnresolvedApp = true;
       continue;

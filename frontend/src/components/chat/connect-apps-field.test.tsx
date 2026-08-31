@@ -962,7 +962,12 @@ describe("ConnectAppsField", () => {
     ).toBeInTheDocument();
   });
 
-  it("falls back to name matching when an app entry's id no longer resolves in the catalog", () => {
+  it("treats an app entry's id as unresolved rather than falling back to a same-named app, once the id no longer resolves in the catalog", () => {
+    // Custom connector names carry no uniqueness constraint - falling back
+    // to a name match here could silently resolve to a DIFFERENT app that
+    // happens to share the deleted one's old name, targeting every
+    // downstream action (Connected badge, connect, Continue) at the wrong
+    // app instead of surfacing that the referenced one is gone.
     mcpAppsMock.apps = [makeApp({ id: "gmail", name: "Gmail", is_connected: true })];
 
     render(
@@ -976,8 +981,13 @@ describe("ConnectAppsField", () => {
     );
 
     expect(
-      screen.getByText("chatPage.clarification.connectApps.allConnectedNote")
+      screen.queryByText("chatPage.clarification.connectApps.allConnectedNote")
+    ).not.toBeInTheDocument();
+    expect(
+      screen.getByText("chatPage.clarification.connectApps.noneMatched")
     ).toBeInTheDocument();
+    expect(screen.getByText("chatPage.clarification.connectApps.retry")).toBeInTheDocument();
+    expect(screen.getByText("chatPage.clarification.connectApps.skip")).toBeInTheDocument();
   });
 
   it("shows a Continue button instead of the completion note alone once every row is Connected, when onContinue is supplied", () => {

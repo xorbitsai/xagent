@@ -890,6 +890,52 @@ describe("ConnectAppsField", () => {
       screen.getByText("chatPage.clarification.connectApps.allConnectedNote")
     ).toBeInTheDocument();
   });
+
+  it("does not offer Continue after Skip, even once a refresh brings every row to Connected", async () => {
+    // Skip doesn't disable the per-row Connect buttons, so a user can click
+    // Skip and then go connect the remaining app(s) anyway - without this,
+    // the footer would swap to Continue once allConnected flips true,
+    // letting the user send a second, contradictory message on top of the
+    // "I'll do this later" Skip already sent.
+    mcpAppsMock.apps = [
+      makeApp({ id: "hubspot", name: "HubSpot", provider: "hubspot", is_connected: false }),
+    ];
+    openBuiltinOAuthPopupMock.mockResolvedValue({ success: true });
+    const onSkip = vi.fn();
+    const onContinue = vi.fn();
+
+    render(
+      <ConnectAppsField
+        interaction={{ ...LEO_INTERACTION, apps: ["HubSpot"] }}
+        onSkip={onSkip}
+        onContinue={onContinue}
+      />
+    );
+
+    fireEvent.click(screen.getByText("chatPage.clarification.connectApps.skip"));
+    expect(onSkip).toHaveBeenCalledTimes(1);
+    expect(
+      screen.getByText("chatPage.clarification.connectApps.skippedNote")
+    ).toBeInTheDocument();
+
+    mcpAppsMock.refresh.mockImplementation(async () => {
+      mcpAppsMock.apps = [
+        makeApp({ id: "hubspot", name: "HubSpot", provider: "hubspot", is_connected: true }),
+      ];
+    });
+    fireEvent.click(continueButton("HubSpot"));
+
+    await waitFor(() => {
+      expect(mcpAppsMock.refresh).toHaveBeenCalled();
+    });
+    expect(
+      screen.queryByRole("button", { name: "chatPage.clarification.connectApps.continue" })
+    ).not.toBeInTheDocument();
+    expect(onContinue).not.toHaveBeenCalled();
+    expect(
+      screen.getByText("chatPage.clarification.connectApps.skippedNote")
+    ).toBeInTheDocument();
+  });
 });
 
 describe("PROVIDER_DISPLAY_NAMES", () => {

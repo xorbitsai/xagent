@@ -85,7 +85,7 @@ type ConnectAppsRow =
  * catalog entry at all is silently dropped - nothing this card could do
  * about it either way.
  */
-function resolveRows(appNames: string[] | undefined, allApps: McpApp[]): ConnectAppsRow[] {
+export function resolveRows(appNames: string[] | undefined, allApps: McpApp[]): ConnectAppsRow[] {
   const wanted = appNames || [];
   if (wanted.length === 0) return [];
 
@@ -504,10 +504,10 @@ export function ConnectAppsField({
 
         <div className="flex items-center gap-3 border-t bg-muted/40 px-3 py-2.5">
           <span className="flex-1 text-[11.5px] text-muted-foreground">
-            {allConnected
-              ? t("chatPage.clarification.connectApps.allConnectedNote")
-              : skipped
-                ? t("chatPage.clarification.connectApps.skippedNote")
+            {skipped
+              ? t("chatPage.clarification.connectApps.skippedNote")
+              : allConnected
+                ? t("chatPage.clarification.connectApps.allConnectedNote")
                 : t("chatPage.clarification.connectApps.privacyNote", { appName: branding.appName })}
           </span>
           {/* Swaps for a Continue button once every row is Connected (see
@@ -516,8 +516,14 @@ export function ConnectAppsField({
               do, and without any button at all a card seeded onto a task
               that's genuinely paused waiting for this connection (not just
               the Hire-flow seed message, which was never actually waiting)
-              would have no way to tell the task to resume. */}
+              would have no way to tell the task to resume. Gated on !skipped
+              too - Skip already sent its own acknowledgement message, and
+              nothing here disables the per-row Connect buttons, so without
+              this a user who skips and then connects the remaining apps
+              anyway would see Continue reappear and could send a second,
+              contradictory message on top of the one Skip already sent. */}
           {allConnected ? (
+            !skipped &&
             onContinue &&
             !continued && (
               <button

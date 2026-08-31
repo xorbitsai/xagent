@@ -204,6 +204,7 @@ describe("SessionAgentChatPage", () => {
     // the conversation in place by opening a new tab.
     expect(app.provider?.transport?.capabilities).toEqual({
       linksOpenInNewTab: "enabled",
+      taskStop: "enabled",
     })
   })
 

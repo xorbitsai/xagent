@@ -566,6 +566,9 @@ const zh = {
     startMessageFailed: "无法发送消息，请重试。",
     reloadRequired: "此对话状态未知。请刷新页面后再继续。",
     expiryWarning: "此聊天会话即将过期，请刷新页面以继续。",
+    stopResponse: "停止回答",
+    stoppingResponse: "正在停止…",
+    stopTimedOut: "无法确认停止请求是否生效。",
     expired: {
       title: "聊天会话已过期",
       description: "请刷新页面以开始新的聊天会话。",

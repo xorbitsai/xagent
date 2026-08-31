@@ -209,6 +209,9 @@ export function TaskConversationPanel({
     taskControlsEnabled,
     pauseTask,
     resumeTask,
+    canStopTask,
+    stopTask,
+    stopState,
     openFilePreview,
     closeFilePreview,
     requestStatus,
@@ -880,6 +883,8 @@ export function TaskConversationPanel({
               taskStatus={state.currentTask?.status}
               onPause={taskControlsEnabled ? pauseTask : undefined}
               onResume={taskControlsEnabled ? resumeTask : undefined}
+              onStop={canStopTask ? stopTask : undefined}
+              stopState={stopState}
               taskConfig={state.currentTask ? {
                 model: state.currentTask.modelId || state.currentTask.modelName,
                 smallFastModel: state.currentTask.smallFastModelId,

@@ -169,6 +169,7 @@ function StateProbe() {
             isOptimistic: message.isOptimistic,
             isResult: message.isResult,
             interactionRequestId: message.interactionRequestId,
+            status: message.status,
           }))
         )}
       </div>
@@ -286,6 +287,13 @@ function SessionControlsProbe() {
       <div data-testid="task-controls-enabled">
         {String(sessionControls.taskControlsEnabled)}
       </div>
+      <div data-testid="task-stop-enabled">
+        {String(sessionControls.taskStopEnabled)}
+      </div>
+      <div data-testid="can-stop-task">
+        {String(sessionControls.canStopTask)}
+      </div>
+      <div data-testid="stop-state">{sessionControls.stopState}</div>
     </>
   )
 }
@@ -321,8 +329,10 @@ const makeSessionConnection = (identity = "session-one") => ({
 
 const makeSessionTransport = (
   connection: ReturnType<typeof makeSessionConnection> | null = makeSessionConnection(),
+  capabilities?: { taskStop?: "enabled" | "disabled" },
 ) => ({
   uploadFiles: vi.fn(),
+  ...(capabilities ? { capabilities } : {}),
   session: {
     connection,
     onConnectionClose: () => "handled" as const,
@@ -367,6 +377,29 @@ const taskInfoMessage = (
       ...overrides,
     },
   },
+})
+
+const taskErrorMessage = (
+  taskId: number,
+  message = "This response was interrupted.",
+): TestWebSocketMessage => ({
+  type: "task_error",
+  timestamp: "2026-05-27T05:10:00Z",
+  task_id: taskId,
+  task: { id: taskId, status: "failed" },
+  // message/error are read via an unsafe cast in production (see
+  // getWebSocketErrorMessage), so TestWebSocketMessage does not declare them;
+  // this cast mirrors the same pattern already used elsewhere in this file
+  // for other ad-hoc fields on a mock frame.
+  ...({ message, error: message } as Record<string, unknown>),
+})
+
+const taskCompletedMessage = (taskId: number): TestWebSocketMessage => ({
+  type: "task_completed",
+  timestamp: "2026-05-27T05:09:00Z",
+  task_id: taskId,
+  task: { id: taskId, status: "completed" },
+  ...({ success: true } as Record<string, unknown>),
 })
 
 const assistantMessage = (
@@ -5622,5 +5655,453 @@ describe("AppProvider websocket message routing", () => {
     const defaultLink = screen.getByRole("link", { name: "Docs" })
     expect(defaultLink).not.toHaveAttribute("target")
     expect(defaultLink).not.toHaveAttribute("rel")
+  })
+
+  it("keeps task stop closed for a transport that does not declare it", () => {
+    const cases: Array<[string, AppProviderTransportConfig]> = [
+      ["a Session transport with no capabilities bucket", makeSessionTransport()],
+      ["a Session transport with an empty capabilities bucket", makeSessionTransport(makeSessionConnection(), {})],
+      ["a Session transport with taskStop explicitly disabled", makeSessionTransport(makeSessionConnection(), { taskStop: "disabled" })],
+      ["a non-Session transport", { capabilities: {} }],
+    ]
+    expect(cases).toHaveLength(4)
+
+    for (const [, transport] of cases) {
+      const { unmount } = render(
+        <AppProvider token="token" transport={transport}>
+          <SessionControlsProbe />
+        </AppProvider>
+      )
+      expect(screen.getByTestId("task-stop-enabled").textContent).toBe("false")
+      unmount()
+    }
+  })
+
+  it("withholds task stop for each unmet precondition", () => {
+    const preconditionLabels = [
+      "transport does not declare taskStop",
+      "isProcessing is false",
+      "session phase is unbound",
+      "session phase is reset_requested",
+      "session phase is replacement_ready",
+      "session phase is reload_required",
+    ]
+    expect(preconditionLabels).toHaveLength(6)
+
+    // 1) taskStop not declared, everything else satisfied.
+    {
+      const { unmount } = render(
+        <AppProvider token="token" transport={makeSessionTransport()}>
+          <SessionControlsProbe />
+        </AppProvider>
+      )
+      act(() => webSocketOptions.current?.onMessage?.(taskInfoMessage(801)))
+      act(() => webSocketOptions.current?.onMessage?.({ type: "message_received", timestamp: "2026-05-27T05:00:02Z" }))
+      expect(screen.getByTestId("session-conversation-state").textContent).toBe("bound")
+      expect(screen.getByTestId("can-stop-task").textContent).toBe("false")
+      unmount()
+    }
+
+    // 2) taskStop declared, isProcessing never set true.
+    {
+      const { unmount } = render(
+        <AppProvider token="token" transport={makeSessionTransport(makeSessionConnection(), { taskStop: "enabled" })}>
+          <SessionControlsProbe />
+        </AppProvider>
+      )
+      act(() => webSocketOptions.current?.onMessage?.(taskInfoMessage(802)))
+      expect(screen.getByTestId("session-conversation-state").textContent).toBe("bound")
+      expect(screen.getByTestId("can-stop-task").textContent).toBe("false")
+      unmount()
+    }
+
+    // 3) taskStop declared, isProcessing true, phase unbound (no task_info fired).
+    {
+      const { unmount } = render(
+        <AppProvider token="token" transport={makeSessionTransport(makeSessionConnection(), { taskStop: "enabled" })}>
+          <SessionControlsProbe />
+        </AppProvider>
+      )
+      act(() => webSocketOptions.current?.onMessage?.({ type: "message_received", timestamp: "2026-05-27T05:00:02Z" }))
+      expect(screen.getByTestId("session-conversation-state").textContent).toBe("unbound")
+      expect(screen.getByTestId("can-stop-task").textContent).toBe("false")
+      unmount()
+    }
+
+    // 4) taskStop declared, isProcessing true, phase reset_requested.
+    {
+      const { unmount } = render(
+        <AppProvider token="token" transport={makeSessionTransport(makeSessionConnection(), { taskStop: "enabled" })}>
+          <SessionControlsProbe />
+        </AppProvider>
+      )
+      act(() => webSocketOptions.current?.onMessage?.(taskInfoMessage(804)))
+      act(() => webSocketOptions.current?.onMessage?.({ type: "message_received", timestamp: "2026-05-27T05:00:02Z" }))
+      // Never acknowledged, and unmount below cancels it - attach a no-op
+      // catch so that cancellation does not surface as an unhandled rejection.
+      act(() => { getSessionControls().startNewConversation().catch(() => {}) })
+      expect(screen.getByTestId("session-conversation-state").textContent).toBe("reset_requested")
+      expect(screen.getByTestId("can-stop-task").textContent).toBe("false")
+      unmount()
+    }
+
+    // 5) taskStop declared, isProcessing true, phase replacement_ready.
+    {
+      const { unmount } = render(
+        <AppProvider token="token" transport={makeSessionTransport(makeSessionConnection(), { taskStop: "enabled" })}>
+          <SessionControlsProbe />
+        </AppProvider>
+      )
+      act(() => webSocketOptions.current?.onMessage?.(taskInfoMessage(805)))
+      act(() => webSocketOptions.current?.onMessage?.({ type: "message_received", timestamp: "2026-05-27T05:00:02Z" }))
+      const reset = getSessionControls().startNewConversation().catch(() => {})
+      act(() => {
+        webSocketOptions.current?.onMessage?.({ type: "conversation_reset", timestamp: "2026-05-27T05:00:03Z", data: {} })
+      })
+      void reset
+      act(() => webSocketOptions.current?.onMessage?.({ type: "message_received", timestamp: "2026-05-27T05:00:04Z" }))
+      expect(screen.getByTestId("session-conversation-state").textContent).toBe("replacement_ready")
+      expect(screen.getByTestId("can-stop-task").textContent).toBe("false")
+      unmount()
+    }
+
+    // 6) taskStop declared, isProcessing true, phase reload_required.
+    {
+      const { unmount } = render(
+        <AppProvider token="token" transport={makeSessionTransport(makeSessionConnection(), { taskStop: "enabled" })}>
+          <SessionControlsProbe />
+        </AppProvider>
+      )
+      act(() => webSocketOptions.current?.onMessage?.(taskInfoMessage(806)))
+      act(() => webSocketOptions.current?.onMessage?.({ type: "message_received", timestamp: "2026-05-27T05:00:02Z" }))
+      act(() => webSocketOptions.current?.onMessage?.({
+        type: "conversation_reload_required",
+        timestamp: "2026-05-27T05:00:03Z",
+        task_id: 806,
+        data: {},
+      }))
+      expect(screen.getByTestId("session-conversation-state").textContent).toBe("reload_required")
+      expect(screen.getByTestId("can-stop-task").textContent).toBe("false")
+      unmount()
+    }
+  })
+
+  it("sends a field-less stop frame", () => {
+    render(
+      <AppProvider token="token" transport={makeSessionTransport(makeSessionConnection(), { taskStop: "enabled" })}>
+        <SessionControlsProbe />
+      </AppProvider>
+    )
+    act(() => webSocketOptions.current?.onMessage?.(taskInfoMessage(901)))
+    act(() => webSocketOptions.current?.onMessage?.({ type: "message_received", timestamp: "2026-05-27T05:00:02Z" }))
+    expect(screen.getByTestId("can-stop-task").textContent).toBe("true")
+
+    sendRawMessageMock.mockClear()
+    act(() => getSessionControls().stopTask())
+
+    expect(sendRawMessageMock.mock.calls).toEqual([[{ type: "stop" }]])
+  })
+
+  it("renders a stopped turn as a neutral result", () => {
+    render(
+      <AppProvider token="token" transport={makeSessionTransport(makeSessionConnection(), { taskStop: "enabled" })}>
+        <SessionControlsProbe />
+        <StateProbe />
+      </AppProvider>
+    )
+    act(() => webSocketOptions.current?.onMessage?.(taskInfoMessage(1001)))
+    act(() => webSocketOptions.current?.onMessage?.({ type: "message_received", timestamp: "2026-05-27T05:00:02Z" }))
+    expect(screen.getByTestId("can-stop-task").textContent).toBe("true")
+
+    act(() => getSessionControls().stopTask())
+    expect(screen.getByTestId("stop-state").textContent).toBe("stopping")
+
+    act(() => webSocketOptions.current?.onMessage?.(taskErrorMessage(1001)))
+
+    const messages = JSON.parse(screen.getByTestId("messages").textContent || "[]") as Array<{
+      content: string
+      isResult?: boolean
+      status?: string
+    }>
+    const stopped = messages.find((message) => message.content === "This response was interrupted.")
+    expect(stopped).toBeDefined()
+    expect(stopped?.isResult).toBe(true)
+    expect(stopped?.status).not.toBe("failed")
+    expect(screen.getByTestId("stop-state").textContent).toBe("idle")
+  })
+
+  it("keeps the stop intent across a reconnect and a waiting turn", () => {
+    const perturbationLabels = [
+      "the connection identity changes mid-cancel",
+      "the turn asks the visitor a question before finishing",
+      "the local 30s timeout elapses before the terminal frame",
+    ]
+    expect(perturbationLabels).toHaveLength(3)
+
+    const assertNeutral = (taskId: number) => {
+      const messages = JSON.parse(screen.getByTestId("messages").textContent || "[]") as Array<{
+        content: string
+        isResult?: boolean
+        status?: string
+      }>
+      const stopped = messages.find((message) => message.content === "This response was interrupted.")
+      expect(stopped).toBeDefined()
+      expect(stopped?.isResult).toBe(true)
+      expect(stopped?.status).not.toBe("failed")
+      void taskId
+    }
+
+    // 1) connection identity changes (routine token refresh) mid-cancel.
+    {
+      const taskId = 1101
+      const { rerender, unmount } = render(
+        <AppProvider token="token" transport={makeSessionTransport(makeSessionConnection("stop-intent-reconnect-old"), { taskStop: "enabled" })}>
+          <SessionControlsProbe />
+          <StateProbe />
+        </AppProvider>
+      )
+      act(() => webSocketOptions.current?.onMessage?.(taskInfoMessage(taskId)))
+      act(() => webSocketOptions.current?.onMessage?.({ type: "message_received", timestamp: "2026-05-27T05:00:02Z" }))
+      act(() => getSessionControls().stopTask())
+      expect(screen.getByTestId("stop-state").textContent).toBe("stopping")
+
+      rerender(
+        <AppProvider token="token" transport={makeSessionTransport(makeSessionConnection("stop-intent-reconnect-new"), { taskStop: "enabled" })}>
+          <SessionControlsProbe />
+          <StateProbe />
+        </AppProvider>
+      )
+      expect(screen.getByTestId("stop-state").textContent).toBe("idle")
+
+      act(() => webSocketOptions.current?.onMessage?.(taskErrorMessage(taskId)))
+      assertNeutral(taskId)
+      unmount()
+    }
+
+    // 2) the turn asks the visitor a question (isProcessing dips) before the terminal frame.
+    {
+      const taskId = 1102
+      const { unmount } = render(
+        <AppProvider token="token" transport={makeSessionTransport(makeSessionConnection("stop-intent-waiting"), { taskStop: "enabled" })}>
+          <SessionControlsProbe />
+          <StateProbe />
+        </AppProvider>
+      )
+      act(() => webSocketOptions.current?.onMessage?.(taskInfoMessage(taskId)))
+      act(() => webSocketOptions.current?.onMessage?.({ type: "message_received", timestamp: "2026-05-27T05:00:02Z" }))
+      act(() => getSessionControls().stopTask())
+
+      act(() => webSocketOptions.current?.onMessage?.({
+        type: "task_waiting_for_user",
+        timestamp: "2026-05-27T05:00:03Z",
+        question: "Anything else I should know?",
+        interactions: [],
+      } as TestWebSocketMessage))
+      expect(screen.getByTestId("can-stop-task").textContent).toBe("false")
+
+      act(() => webSocketOptions.current?.onMessage?.(taskErrorMessage(taskId)))
+      assertNeutral(taskId)
+      unmount()
+    }
+
+    // 3) the local 30s timeout elapses before the terminal frame arrives.
+    {
+      const taskId = 1103
+      vi.useFakeTimers()
+      try {
+        const { unmount } = render(
+          <AppProvider token="token" transport={makeSessionTransport(makeSessionConnection("stop-intent-timeout"), { taskStop: "enabled" })}>
+            <SessionControlsProbe />
+            <StateProbe />
+          </AppProvider>
+        )
+        act(() => webSocketOptions.current?.onMessage?.(taskInfoMessage(taskId)))
+        act(() => webSocketOptions.current?.onMessage?.({ type: "message_received", timestamp: "2026-05-27T05:00:02Z" }))
+        act(() => getSessionControls().stopTask())
+
+        act(() => { vi.advanceTimersByTime(30_001) })
+        expect(screen.getByTestId("stop-state").textContent).toBe("timed_out")
+
+        act(() => webSocketOptions.current?.onMessage?.(taskErrorMessage(taskId)))
+        assertNeutral(taskId)
+        unmount()
+      } finally {
+        vi.useRealTimers()
+      }
+    }
+  })
+
+  it("leaves an unsolicited failure on the error path", async () => {
+    const rowLabels = [
+      "never pressed stop",
+      "bound switched to another task before the old task's terminal frame",
+      "the stop frame was not sent",
+      "the same task's next turn fails after a normal completion",
+    ]
+    expect(rowLabels).toHaveLength(4)
+
+    const assertRed = () => {
+      const messages = JSON.parse(screen.getByTestId("messages").textContent || "[]") as Array<{
+        content: string
+        isResult?: boolean
+        status?: string
+      }>
+      const failed = messages.find((message) => message.status === "failed")
+      expect(failed).toBeDefined()
+      expect(failed?.content).toContain("agent.logs.event.messages.errorPrefix")
+      expect(failed?.isResult).toBeFalsy()
+    }
+
+    // 1) never pressed stop.
+    {
+      const { unmount } = render(
+        <AppProvider token="token" transport={makeSessionTransport(makeSessionConnection(), { taskStop: "enabled" })}>
+          <SessionControlsProbe />
+          <StateProbe />
+        </AppProvider>
+      )
+      act(() => webSocketOptions.current?.onMessage?.(taskInfoMessage(1201)))
+      act(() => webSocketOptions.current?.onMessage?.({ type: "message_received", timestamp: "2026-05-27T05:00:02Z" }))
+      act(() => webSocketOptions.current?.onMessage?.(taskErrorMessage(1201)))
+      assertRed()
+      unmount()
+    }
+
+    // 2) bound switches to another task before the OLD task's terminal frame arrives.
+    {
+      const oldTaskId = 1202
+      const newTaskId = 1212
+      const { unmount } = render(
+        <AppProvider token="token" transport={makeSessionTransport(makeSessionConnection(), { taskStop: "enabled" })}>
+          <SessionControlsProbe />
+          <StateProbe />
+        </AppProvider>
+      )
+      act(() => webSocketOptions.current?.onMessage?.(taskInfoMessage(oldTaskId)))
+      act(() => webSocketOptions.current?.onMessage?.({ type: "message_received", timestamp: "2026-05-27T05:00:02Z" }))
+      act(() => getSessionControls().stopTask())
+
+      const reset = getSessionControls().startNewConversation()
+      await act(async () => {
+        webSocketOptions.current?.onMessage?.({ type: "conversation_reset", timestamp: "2026-05-27T05:00:03Z", data: {} })
+        await reset
+      })
+      await getSessionControls().sendMessage("Replacement", { clientMessageId: "unsolicited-failure-replacement" })
+      act(() => webSocketOptions.current?.onMessage?.(taskInfoMessage(newTaskId)))
+      expect(screen.getByTestId("task-id").textContent).toBe(String(newTaskId))
+
+      const beforeCount = (
+        JSON.parse(screen.getByTestId("messages").textContent || "[]") as unknown[]
+      ).length
+      act(() => webSocketOptions.current?.onMessage?.(taskErrorMessage(oldTaskId)))
+      // The view has already moved to newTaskId, so the pre-existing
+      // isMessageForOtherTask task-scoping guard (TASK_SCOPED_ACTION_TYPES
+      // includes ADD_MESSAGE) drops the old task's frame before this turn's
+      // stop-intent branching ever runs a dispatch. No message - neutral or
+      // failed - is added for it; this is the same guard every other stray
+      // cross-task frame already goes through, unrelated to stop.
+      const messages = JSON.parse(screen.getByTestId("messages").textContent || "[]") as Array<{
+        content: string
+      }>
+      expect(messages).toHaveLength(beforeCount)
+      expect(
+        messages.find((message) => message.content === "This response was interrupted.")
+      ).toBeUndefined()
+      unmount()
+    }
+
+    // 3) the stop frame was not sent.
+    {
+      const taskId = 1203
+      const { unmount } = render(
+        <AppProvider token="token" transport={makeSessionTransport(makeSessionConnection(), { taskStop: "enabled" })}>
+          <SessionControlsProbe />
+          <StateProbe />
+        </AppProvider>
+      )
+      act(() => webSocketOptions.current?.onMessage?.(taskInfoMessage(taskId)))
+      act(() => webSocketOptions.current?.onMessage?.({ type: "message_received", timestamp: "2026-05-27T05:00:02Z" }))
+      sendRawMessageMock.mockReturnValueOnce("not_sent")
+      act(() => getSessionControls().stopTask())
+      expect(screen.getByTestId("stop-state").textContent).toBe("timed_out")
+
+      act(() => webSocketOptions.current?.onMessage?.(taskErrorMessage(taskId)))
+      assertRed()
+      unmount()
+    }
+
+    // 4) the same task's next turn fails after a normal completion ended the stopped turn.
+    {
+      const taskId = 1204
+      const { unmount } = render(
+        <AppProvider token="token" transport={makeSessionTransport(makeSessionConnection(), { taskStop: "enabled" })}>
+          <SessionControlsProbe />
+          <StateProbe />
+        </AppProvider>
+      )
+      act(() => webSocketOptions.current?.onMessage?.(taskInfoMessage(taskId)))
+      act(() => webSocketOptions.current?.onMessage?.({ type: "message_received", timestamp: "2026-05-27T05:00:02Z" }))
+      act(() => getSessionControls().stopTask())
+      act(() => webSocketOptions.current?.onMessage?.(taskCompletedMessage(taskId)))
+      act(() => webSocketOptions.current?.onMessage?.({ type: "message_received", timestamp: "2026-05-27T05:00:05Z" }))
+      act(() => webSocketOptions.current?.onMessage?.(taskErrorMessage(taskId)))
+      assertRed()
+      unmount()
+    }
+  })
+
+  it("recovers the stop control on the local timeout", () => {
+    vi.useFakeTimers()
+    try {
+      render(
+        <AppProvider token="token" transport={makeSessionTransport(makeSessionConnection(), { taskStop: "enabled" })}>
+          <SessionControlsProbe />
+        </AppProvider>
+      )
+      act(() => webSocketOptions.current?.onMessage?.(taskInfoMessage(1301)))
+      act(() => webSocketOptions.current?.onMessage?.({ type: "message_received", timestamp: "2026-05-27T05:00:02Z" }))
+      act(() => getSessionControls().stopTask())
+
+      act(() => { vi.advanceTimersByTime(29_999) })
+      expect(screen.getByTestId("stop-state").textContent).toBe("stopping")
+
+      act(() => { vi.advanceTimersByTime(2) })
+      expect(screen.getByTestId("stop-state").textContent).toBe("timed_out")
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it("does not latch a stopping state when the frame is not sent", () => {
+    vi.useFakeTimers()
+    try {
+      render(
+        <AppProvider token="token" transport={makeSessionTransport(makeSessionConnection(), { taskStop: "enabled" })}>
+          <SessionControlsProbe />
+          <StateProbe />
+        </AppProvider>
+      )
+      act(() => webSocketOptions.current?.onMessage?.(taskInfoMessage(1401)))
+      act(() => webSocketOptions.current?.onMessage?.({ type: "message_received", timestamp: "2026-05-27T05:00:02Z" }))
+      sendRawMessageMock.mockReturnValueOnce("not_sent")
+
+      act(() => getSessionControls().stopTask())
+      expect(screen.getByTestId("stop-state").textContent).toBe("timed_out")
+
+      act(() => { vi.advanceTimersByTime(30_001) })
+      expect(screen.getByTestId("stop-state").textContent).toBe("timed_out")
+
+      act(() => webSocketOptions.current?.onMessage?.(taskErrorMessage(1401)))
+      const messages = JSON.parse(screen.getByTestId("messages").textContent || "[]") as Array<{
+        content: string
+        isResult?: boolean
+        status?: string
+      }>
+      const failed = messages.find((message) => message.status === "failed")
+      expect(failed).toBeDefined()
+      expect(failed?.isResult).toBeFalsy()
+    } finally {
+      vi.useRealTimers()
+    }
   })
 })

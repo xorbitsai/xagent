@@ -1,4 +1,4 @@
-import React, { useState, useRef, useEffect, useMemo } from "react";
+import React, { useState, useRef, useEffect, useId, useMemo } from "react";
 import { createFileChipHTML } from "./FileChip";
 import { useRouter } from "next/navigation";
 import { Paperclip, X, File as FileIcon, Sparkles, Pause, Play, Loader2, ArrowUp, Globe, Mic, Square } from "lucide-react";
@@ -6,6 +6,7 @@ import { Button } from "@/components/ui/button";
 import { cn, generateClientMessageId, getApiUrl, getUploadApiUrl } from "@/lib/utils";
 import { useI18n } from "@/contexts/i18n-context";
 import { useApp } from "@/contexts/app-context-chat";
+import type { SessionStopState } from "@/contexts/app-context-chat";
 import { useAuth } from "@/contexts/auth-context";
 import { ConfigDialog } from "@/components/config-dialog";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
@@ -54,6 +55,8 @@ interface ChatInputProps {
   taskStatus?: TaskStatus | string;
   onPause?: () => void;
   onResume?: () => void;
+  onStop?: () => void;
+  stopState?: SessionStopState;
   taskConfig?: Partial<AgentConfig>;
   hideConfig?: boolean;
   readOnlyConfig?: boolean;
@@ -116,6 +119,8 @@ export function ChatInput({
   taskStatus,
   onPause,
   onResume,
+  onStop,
+  stopState = "idle",
   taskConfig,
   hideConfig = false,
   readOnlyConfig = false,
@@ -681,6 +686,19 @@ export function ChatInput({
     !!onPause &&
     isPausableTaskStatus(normalizedTaskStatus);
   const shouldShowPauseButton = canPauseTask && !hasDraft;
+  const reactId = useId();
+  const stopHintId = `${reactId}-stop-hint`;
+  // The stop control lives only in the compact toolbar, and it steps aside for
+  // the send button whenever there is a draft — the same rule the pause button
+  // already follows above. The timeout hint explains that control, so it is
+  // gated on exactly the same condition; a hint with no visible control on
+  // screen would have nothing to refer to.
+  const showStopButton = compact && !!onStop && !hasDraft;
+  const isStopInFlight = stopState === "stopping";
+  const showStopTimedOutHint = showStopButton && stopState === "timed_out";
+  const stopButtonLabel = isStopInFlight
+    ? t("widgetSession.stoppingResponse")
+    : t("widgetSession.stopResponse");
 
   const handleDragEnter = (e: React.DragEvent<HTMLFormElement>) => {
     if (
@@ -984,6 +1002,15 @@ export function ChatInput({
 
   return (
     <div className="space-y-3">
+      {showStopTimedOutHint && (
+        <p
+          id={stopHintId}
+          role="status"
+          className="text-xs text-muted-foreground"
+        >
+          {t("widgetSession.stopTimedOut")}
+        </p>
+      )}
       {/* Input area */}
       <div
         className="relative"
@@ -1085,6 +1112,7 @@ export function ChatInput({
               }}
               role="textbox"
               aria-multiline="true"
+              aria-describedby={showStopTimedOutHint ? stopHintId : undefined}
             />
             {!message && (
               <div className="pointer-events-none absolute left-4 top-3 text-[14px] text-muted-foreground/60">
@@ -1146,21 +1174,40 @@ export function ChatInput({
                   )}
                 </Button>
               )}
-              <Button
-                type="submit"
-                size="icon"
-                disabled={!canSubmit()}
-                className={cn(
-                  "h-8 w-8 rounded-lg transition-all duration-300",
-                  !canSubmit() && "bg-muted text-muted-foreground/50"
-                )}
-              >
-                {isInputBusy ? (
-                  <Sparkles className="h-4 w-4 animate-pulse" />
-                ) : (
-                  <ArrowUp className="h-4 w-4" />
-                )}
-              </Button>
+              {showStopButton ? (
+                <Button
+                  type="button"
+                  size="icon"
+                  onClick={onStop}
+                  disabled={isStopInFlight}
+                  aria-label={stopButtonLabel}
+                  title={stopButtonLabel}
+                  className={cn(
+                    "h-8 w-8 rounded-lg transition-all duration-300",
+                    isStopInFlight && "bg-muted text-muted-foreground/50"
+                  )}
+                >
+                  <Square className="h-3.5 w-3.5 fill-current" />
+                </Button>
+              ) : (
+                <Button
+                  type="submit"
+                  size="icon"
+                  disabled={!canSubmit()}
+                  aria-label={t("common.send")}
+                  title={t("common.send")}
+                  className={cn(
+                    "h-8 w-8 rounded-lg transition-all duration-300",
+                    !canSubmit() && "bg-muted text-muted-foreground/50"
+                  )}
+                >
+                  {isInputBusy ? (
+                    <Sparkles className="h-4 w-4 animate-pulse" />
+                  ) : (
+                    <ArrowUp className="h-4 w-4" />
+                  )}
+                </Button>
+              )}
             </div>
           ) : (
             <div className="absolute bottom-0 left-0 right-0 flex items-center justify-between bg-card px-4 py-3">

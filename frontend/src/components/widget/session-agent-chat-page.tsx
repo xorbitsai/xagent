@@ -263,6 +263,7 @@ export function SessionAgentChatPage() {
       // This page only renders for the embedded widget's session-resume
       // route, so an in-tab navigation always abandons the visitor's iframe.
       linksOpenInNewTab: "enabled",
+      taskStop: "enabled",
     },
     session: {
       connection,

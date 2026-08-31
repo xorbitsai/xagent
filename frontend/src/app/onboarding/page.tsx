@@ -210,13 +210,23 @@ export default function OnboardingPage() {
   // While templates are still loading, templateById is empty so this is
   // naturally [] too - no separate loading branch needed, and isTeamValid
   // (below) doesn't need its own !templatesLoading check as a result.
+  // Goal-matched recommendations with a real persona, filtered BEFORE
+  // capping at 3 (not after) - a 4th-ranked match with a real persona
+  // should fill a slot vacated by a top-3 match that turns out to have
+  // none, not lose out to the cap being applied on the unfiltered list
+  // first. Kept separate from validRecommended below (rather than just
+  // reading its length) - a PR review finding caught that validRecommended
+  // can be entirely fallback filler cards (goalId: null) when nothing
+  // actually matched, and the team step's "N other matches waiting"
+  // subtitle must count real goal matches specifically, not whatever ends
+  // up rendered.
+  const matchedRecommended = useMemo(
+    () => recommended.filter((r) => templateById.get(r.templateId)?.persona),
+    [recommended, templateById]
+  );
+
   const validRecommended = useMemo(() => {
-    // Filter for persona-availability BEFORE capping at 3 (not after) - a
-    // 4th-ranked match with a real persona should fill a slot vacated by a
-    // top-3 match that turns out to have none, not lose out to the cap
-    // being applied on the unfiltered list first.
-    const filtered = recommended.filter((r) => templateById.get(r.templateId)?.persona);
-    if (filtered.length > 0) return filtered.slice(0, 3);
+    if (matchedRecommended.length > 0) return matchedRecommended.slice(0, 3);
     // Every recommendation for the selected goals failed to load or has no
     // persona (or nothing has loaded yet) - fall back to the same 3 defaults
     // recommendedTemplates() uses when no goals were picked at all, so a
@@ -224,7 +234,7 @@ export default function OnboardingPage() {
     return ONBOARDING_FALLBACK_TEMPLATE_IDS.map((templateId) => ({ templateId, goalId: null }))
       .filter((r) => templateById.get(r.templateId)?.persona)
       .slice(0, 3);
-  }, [recommended, templateById]);
+  }, [matchedRecommended, templateById]);
 
   // Keep the selected agent valid as the recommendation list changes -
   // default to the first recommendation whenever the current pick falls
@@ -585,7 +595,12 @@ export default function OnboardingPage() {
         {/* eslint-disable-next-line @next/next/no-img-element -- fixed 26px brand mark, not a candidate for next/image */}
         <img className="ob-logo" src={branding.logoPath} alt={branding.appName} />
         <div className="ob-acct">
-          <span>{firstName.slice(0, 1).toUpperCase()}</span>
+          {/* Array.from, not .slice(0, 1): a PR review finding caught that
+              .slice indexes by UTF-16 code unit, so a name starting with a
+              non-BMP character (e.g. an emoji) would split its surrogate
+              pair and render as a broken glyph. Array.from iterates by
+              Unicode code point instead. */}
+          <span>{(Array.from(firstName)[0] ?? "").toUpperCase()}</span>
           <b>{firstName}</b>
         </div>
       </header>
@@ -756,16 +771,25 @@ export default function OnboardingPage() {
                 {goals.length === 0
                   ? t("onboarding.team.subtitleNoGoals")
                   : // Gated on !templatesLoading like the grid below it: while
-                    // still loading, validRecommended is always [] (nothing has
-                    // resolved yet), which would otherwise claim every goal has
-                    // an "other match waiting" before we actually know that.
+                    // still loading, matchedRecommended is always [] (nothing
+                    // has resolved yet), which would otherwise claim every
+                    // goal has an "other match waiting" before we actually
+                    // know that.
+                    //
+                    // Counts against matchedRecommended, NOT validRecommended
+                    // - a PR review finding caught that validRecommended can
+                    // be entirely fallback filler cards (goalId: null) when
+                    // nothing actually matched any selected goal, which would
+                    // make this math claim real matches were found (a small
+                    // "extra" count) when the true number of goal matches was
+                    // zero.
                     `${t("onboarding.team.subtitleBase")}${
-                      !templatesLoading && goals.length - validRecommended.length > 0
+                      !templatesLoading && goals.length - matchedRecommended.length > 0
                         ? t(
-                            goals.length - validRecommended.length === 1
+                            goals.length - matchedRecommended.length === 1
                               ? "onboarding.team.subtitleExtraOne"
                               : "onboarding.team.subtitleExtraMany",
-                            { count: goals.length - validRecommended.length }
+                            { count: goals.length - matchedRecommended.length }
                           )
                         : t("onboarding.team.subtitleEnd")
                     }`}
@@ -778,7 +802,12 @@ export default function OnboardingPage() {
                   <div
                     aria-hidden="true"
                     data-testid="onboarding-team-loading"
-                    className="h-8 w-8 animate-spin rounded-full border-2 border-[hsl(var(--border))] border-t-[hsl(var(--primary))]"
+                    // motion-reduce:animate-none - a PR review finding caught that this
+                    // spinner isn't covered by onboarding.css's prefers-reduced-motion
+                    // rule (which only targets the aurora/orb/step selectors), so it kept
+                    // spinning under reduced motion. Tailwind's built-in variant handles
+                    // it without adding a dedicated class to that CSS rule.
+                    className="h-8 w-8 animate-spin motion-reduce:animate-none rounded-full border-2 border-[hsl(var(--border))] border-t-[hsl(var(--primary))]"
                   />
                   <span className="sr-only">{t("common.loading")}</span>
                 </div>

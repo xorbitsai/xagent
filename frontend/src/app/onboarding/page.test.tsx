@@ -132,6 +132,20 @@ describe("OnboardingPage", () => {
     expect(screen.queryByText(/Gerard Santos/)).not.toBeInTheDocument()
   })
 
+  // Pins a PR review finding: the account badge's initial used to be
+  // firstName.slice(0, 1), which indexes by UTF-16 code unit - a username
+  // starting with a non-BMP character (surrogate pair) would split it and
+  // render a broken glyph instead of the actual character.
+  it("renders the account badge's initial from the first Unicode code point, not the first UTF-16 unit", async () => {
+    authUser.username = "\u{1F600}unicode"
+
+    render(<OnboardingPage />)
+    await waitFor(() => expect(screen.getAllByText(/unicode/).length).toBeGreaterThan(0))
+
+    const badge = document.querySelector(".ob-acct span")
+    expect(badge).toHaveTextContent("\u{1F600}")
+  })
+
   // Pins a PR review finding: the welcome heading's closing punctuation used
   // to be a hardcoded ASCII period in JSX, appended directly after
   // <em>{firstName}</em> - now composed from a locale-owned titleSuffix key
@@ -941,6 +955,10 @@ describe("OnboardingPage", () => {
     await waitFor(() => expect(screen.getByText(/Meet your AI team/)).toBeInTheDocument())
     expect(screen.getByTestId("onboarding-team-loading")).toBeInTheDocument()
     expect(screen.getByText("Continue").closest("button")).toBeDisabled()
+    // Pins a PR review finding: this spinner wasn't covered by
+    // onboarding.css's prefers-reduced-motion rule (which only targets the
+    // aurora/orb/step selectors), so it kept spinning under reduced motion.
+    expect(screen.getByTestId("onboarding-team-loading")).toHaveClass("motion-reduce:animate-none")
   })
 
   // Pins a test-coverage gap found in full-feature self-review: prior tests
@@ -1611,6 +1629,27 @@ describe("OnboardingPage", () => {
     // All 3 goals map to the 3 fetched templates, so once loaded there's
     // nothing extra waiting either - this only pins the *during-load* state
     // above, not a specific post-load count.
+  })
+
+  // Pins a PR review finding: the subtitle's "N other matches waiting" count
+  // used to subtract validRecommended.length, which can be entirely fallback
+  // filler cards (unrelated to any selected goal) once every real
+  // recommendation fails to resolve - counting those as "matched" made the
+  // subtitle claim nothing more was waiting even though the one selected
+  // goal was never actually matched to anything.
+  it("counts a goal as unmatched (not fulfilled by fallback filler cards) when its recommended template never resolves", async () => {
+    await goToWelcomeThenBusiness()
+    fireEvent.click(screen.getByText("Marketing"))
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/take off your plate/)).toBeInTheDocument())
+    // "docs" maps to general-doc-summarizer-action-extractor, which isn't in
+    // the TEMPLATES fixture - its recommendation can never resolve, and the
+    // 3 fallback IDs (which ARE in the fixture) fill validRecommended instead.
+    fireEvent.click(screen.getByText("Summarise long documents"))
+    fireEvent.click(screen.getByText("Continue"))
+
+    await waitFor(() => expect(screen.getByText(/Meet your AI team/)).toBeInTheDocument())
+    expect(screen.getByText(/the other match is waiting in Templates/)).toBeInTheDocument()
   })
 
   // Pins a PR review finding: this page's own state has no identity binding

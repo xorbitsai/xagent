@@ -151,6 +151,14 @@
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+/* :hover rules across this file (.ob-exit/.ob-rl/.ob-btn-back/.ob-chip/.ob-tm
+   below) are now scoped `:not(:disabled)` - a PR review finding caught that
+   a disabled native <button> still matches a bare :hover selector in CSS
+   (disabling only suppresses click/focus, not :hover), so these controls
+   kept showing their full interactive hover treatment - highlight color,
+   lifted card shadow/transform, etc. - while a save was in flight and
+   clicks were actually being ignored, with only .ob-btn-next's hover rule
+   correctly scoped already. */
 .ob-exit {
   position: absolute;
   left: 26px;
@@ -165,7 +173,7 @@
   cursor: pointer;
   transition: color 0.14s, background 0.14s;
 }
-.ob-exit:hover {
+.ob-exit:hover:not(:disabled) {
   color: hsl(var(--foreground));
   background: hsl(var(--muted));
 }
@@ -233,8 +241,12 @@
 .ob-rl.can-go {
   cursor: pointer;
 }
-.ob-rl.can-go:hover {
+.ob-rl.can-go:hover:not(:disabled) {
   color: hsl(var(--foreground));
+}
+.ob-rl:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
 }
 
 .ob-body {
@@ -373,7 +385,7 @@
   cursor: pointer;
   transition: color 0.14s, background 0.14s;
 }
-.ob-btn-back:hover {
+.ob-btn-back:hover:not(:disabled) {
   color: hsl(var(--foreground));
   background: hsl(var(--muted));
 }
@@ -392,9 +404,13 @@
   cursor: pointer;
   transition: color 0.14s, background 0.14s;
 }
-.ob-skip:hover {
+.ob-skip:hover:not(:disabled) {
   color: hsl(var(--foreground));
   background: hsl(var(--muted));
+}
+.ob-skip:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
 }
 
 .ob-form {
@@ -458,7 +474,7 @@
   cursor: pointer;
   transition: border-color 0.15s, background 0.15s, color 0.15s, transform 0.12s, box-shadow 0.15s;
 }
-.ob-chips .ob-chip:hover {
+.ob-chips .ob-chip:hover:not(:disabled) {
   border-color: hsl(var(--foreground) / 0.25);
   background: hsl(var(--card));
   box-shadow: 0 6px 16px rgba(20, 22, 40, 0.06);
@@ -517,7 +533,7 @@
   cursor: pointer;
   transition: border-color 0.16s, box-shadow 0.18s, transform 0.18s;
 }
-.ob-tm:hover {
+.ob-tm:hover:not(:disabled) {
   border-color: hsl(var(--border));
   box-shadow: 0 14px 34px rgba(20, 22, 40, 0.09);
   transform: translateY(-3px);

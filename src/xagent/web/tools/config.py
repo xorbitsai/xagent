@@ -1812,6 +1812,13 @@ class WebToolConfig(BaseToolConfig):
             ) from exc
         return self._connector_runtime_view
 
+    @property
+    def connector_runtime_turn_id(self) -> Optional[str]:
+        """Read-only: lets a caller that must sync ahead of its own success
+        capture the prior binding first, so it can restore it on an abort
+        path (see AgentManager.restore_connector_runtime_turn_id)."""
+        return self._connector_runtime_turn_id
+
     def set_connector_runtime_turn_id(self, turn_id: Optional[str]) -> bool:
         """Switch the per-turn connector runtime source for reused agents.
 

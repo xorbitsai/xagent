@@ -1763,6 +1763,60 @@ async def test_live_lease_injection_rejects_delivery_on_corrupt_or_refused(
 
 
 @pytest.mark.asyncio
+async def test_checkpoint_read_error_restores_the_connector_runtime_turn_it_synced(
+    db_session,
+) -> None:
+    """The connector runtime turn sync above (right before injection) is
+    still speculative until injection actually succeeds - a CheckpointReadError
+    here means this turn never ran, so the binding it set must be undone,
+    not left pointing at a turn nothing is using."""
+    owner = _user(db_session, "owner")
+    task = _task(db_session, owner.id, status=TaskStatus.RUNNING)
+    task.runner_id = "restore-runner"
+    task.run_id = "restore-run"
+    db_session.commit()
+    agent = MagicMock()
+    agent.supports_live_control.return_value = True
+    agent.get_dag_pattern.return_value = None
+    agent.post_user_message = AsyncMock(
+        side_effect=CheckpointCorruptError("all matching rows undecodable")
+    )
+    mgr = MagicMock(get_agent_for_task=AsyncMock(return_value=agent))
+    mgr.get_connector_runtime_turn_id.return_value = "prior-turn-xyz"
+    ws_manager = MagicMock(
+        broadcast_to_task=AsyncMock(),
+        send_personal_message=AsyncMock(),
+    )
+    resume_bg = AsyncMock()
+    bg_mgr = MagicMock()
+    bg_mgr.reserve_resume.return_value = True
+    bg_mgr.running_tasks.get.return_value = None
+
+    with (
+        patch("xagent.web.api.chat.get_agent_manager", return_value=mgr),
+        patch("xagent.web.api.websocket.manager", ws_manager),
+        patch("xagent.web.api.websocket.execute_resume_background", resume_bg),
+        patch("xagent.web.api.websocket.background_task_manager", bg_mgr),
+    ):
+        await _handle_chat_message_unserialized(
+            MagicMock(),
+            int(task.id),
+            {
+                "message": "Wait for the checkpoint",
+                "client_message_id": "restore-turn-1",
+                "user": owner,
+                "files": [],
+            },
+        )
+
+    mgr.get_connector_runtime_turn_id.assert_called_once_with(int(task.id))
+    mgr.sync_connector_runtime_turn.assert_called_once()
+    mgr.restore_connector_runtime_turn_id.assert_called_once_with(
+        int(task.id), "prior-turn-xyz"
+    )
+
+
+@pytest.mark.asyncio
 async def test_resume_registration_failure_keeps_injected_delivery_pending(
     db_session,
 ) -> None:

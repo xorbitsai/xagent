@@ -6504,6 +6504,18 @@ async def _handle_chat_message_unserialized(
                     # flight. Only once delivery_claimed is true is turn_id
                     # guaranteed to be the turn this handler is about to
                     # inject, so only now is the sync safe.
+                    #
+                    # This is still a speculative mutation, though: injection
+                    # below (post_user_message) can itself fail before this
+                    # turn actually starts running (CheckpointReadError), and
+                    # nothing serializes this handler's admission against an
+                    # already-running execution for the same task that is
+                    # still mid-setup - so the prior binding is captured here
+                    # to restore on that abort path, rather than leaving the
+                    # mutation stand for a turn injection never completed for.
+                    prior_connector_runtime_turn_id = (
+                        get_agent_manager().get_connector_runtime_turn_id(task_id)
+                    )
                     get_agent_manager().sync_connector_runtime_turn(task_id, turn_id)
 
                     # Read before the injection below and before the posted
@@ -6552,6 +6564,9 @@ async def _handle_chat_message_unserialized(
                                 # stays DELIVERY_PENDING forever and a retry
                                 # with the same client_message_id loops on
                                 # "still being applied".
+                                get_agent_manager().restore_connector_runtime_turn_id(
+                                    task_id, prior_connector_runtime_turn_id
+                                )
                                 background_task_manager.release_resume_reservation(
                                     task_id
                                 )

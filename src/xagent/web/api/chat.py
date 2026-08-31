@@ -2935,6 +2935,36 @@ class AgentServiceManager:
         prior background task to race)."""
         self._sync_connector_runtime_turn(task_id, connector_runtime_turn_id)
 
+    def get_connector_runtime_turn_id(self, task_id: int) -> Optional[str]:
+        """Read the connector runtime turn id currently bound to this
+        task's cached tool config - lets a caller capture the prior value
+        before its own `sync_connector_runtime_turn` call, so it can
+        restore that value with `restore_connector_runtime_turn_id` if it
+        later has to abort before the turn it synced for actually runs."""
+        agent = self._agents.get(task_id)
+        if agent is None:
+            return None
+        return getattr(agent.tool_config, "connector_runtime_turn_id", None)
+
+    def restore_connector_runtime_turn_id(
+        self, task_id: int, connector_runtime_turn_id: Optional[str]
+    ) -> None:
+        """Force the connector runtime turn id back to a value captured by
+        `get_connector_runtime_turn_id`. Unlike `sync_connector_runtime_turn`,
+        this does not skip a falsy `connector_runtime_turn_id` - an abort
+        that must undo an already-applied sync needs to restore `None`
+        (no prior turn) just as much as a real prior turn id."""
+        agent = self._agents.get(task_id)
+        if agent is None:
+            return
+        tool_config = agent.tool_config
+        if tool_config is None or not hasattr(
+            tool_config, "set_connector_runtime_turn_id"
+        ):
+            return
+        if tool_config.set_connector_runtime_turn_id(connector_runtime_turn_id):
+            agent.invalidate_tools()
+
     def _sync_connector_runtime_turn(
         self, task_id: int, connector_runtime_turn_id: Optional[str]
     ) -> None:

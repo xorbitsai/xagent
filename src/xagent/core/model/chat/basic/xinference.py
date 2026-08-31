@@ -311,7 +311,9 @@ class XinferenceLLM(BaseLLM):
         # Xinference returns a dict-like object with various fields
         response_dict = dict(response) if not isinstance(response, dict) else response
 
-        # Record token usage if available
+        # Record token usage if available; the same payload is also stamped
+        # onto the returned envelope (the adapter-boundary usage contract, so
+        # consumers never need to dig through ``raw``).
         usage = response_dict.get("usage", {})
         if usage:
             add_token_usage(
@@ -342,6 +344,8 @@ class XinferenceLLM(BaseLLM):
                 if reasoning_content:
                     result["reasoning_content"] = reasoning_content
                     result["reasoning"] = reasoning_content
+                if usage:
+                    result["usage"] = usage
                 return result
 
             # Handle text content
@@ -355,6 +359,8 @@ class XinferenceLLM(BaseLLM):
                 if reasoning_content:
                     result["reasoning_content"] = reasoning_content
                     result["reasoning"] = reasoning_content
+                if usage:
+                    result["usage"] = usage
                 return result
 
             # Reasoning models (e.g. qwen3-thinking, deepseek-r1) may emit
@@ -375,22 +381,28 @@ class XinferenceLLM(BaseLLM):
                 and reasoning_content
                 and reasoning_content.strip()
             ):
-                return {
+                result = {
                     "type": "text",
                     "content": reasoning_content,
                     "reasoning_content": reasoning_content,
                     "reasoning": reasoning_content,
                     "raw": response_dict,
                 }
+                if usage:
+                    result["usage"] = usage
+                return result
 
         # Fallback: try to get content directly from response
         content = response_dict.get("content", "")
         if content:
-            return {
+            result = {
                 "type": "text",
                 "content": content,
                 "raw": response_dict,
             }
+            if usage:
+                result["usage"] = usage
+            return result
 
         raise RuntimeError(f"Invalid Xinference response: {response_dict}")
 

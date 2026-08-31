@@ -686,6 +686,12 @@ class GeminiLLM(BaseLLM):
         except Exception as e:
             logger.error("Gemini SDK API error: %s", redact_sensitive_text(str(e)))
 
+            # Re-raise retryable errors as-is (same contract as claude.py):
+            # wrapping them into a plain RuntimeError would lose their type
+            # fidelity for any caller that catches the specific class.
+            if isinstance(e, LLMRetryableError):
+                raise
+
             error_text = str(e)
             error_text_lower = error_text.lower()
 

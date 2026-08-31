@@ -12,7 +12,7 @@ from xagent.core.model.chat.basic.deepseek_tool_protocol import (
     DEEPSEEK_PROVIDER_STATE_NAMESPACE,
     DEEPSEEK_REASONING_CONTENT_STATE_KEY,
 )
-from xagent.core.model.chat.basic.openai import OpenAILLM
+from xagent.core.model.chat.basic.openai import OpenAICompatibleLLM, OpenAILLM
 from xagent.core.model.chat.basic.openrouter import OpenRouterLLM
 from xagent.core.model.chat.error import retry_on
 from xagent.core.model.chat.exceptions import (
@@ -3847,3 +3847,87 @@ async def test_openrouter_deepseek_response_format_resend_stays_silent(mocker, c
     ]
     for record in caplog.records:
         assert "SECRET-THOUGHT" not in record.getMessage()
+
+
+@pytest.mark.asyncio
+async def test_openrouter_prefix_retry_preserves_billed_attempts(mocker, monkeypatch):
+    """C2: the prefix retry must fold the rejected attempt's billed usage
+    into the eventual envelope instead of discarding it."""
+    monkeypatch.setenv("XAGENT_OPENROUTER_OFFICIAL_PROVIDERS_ONLY", "false")
+    billed = {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}
+    prefix_failure = RuntimeError(
+        "Provider returned error: function call should not be used with prefix"
+    )
+    prefix_failure.usage_attempts = [billed]
+    success = {"type": "text", "content": "Hello World"}
+
+    mocker.patch.object(
+        OpenAICompatibleLLM,
+        "chat",
+        new=mocker.AsyncMock(side_effect=[prefix_failure, success]),
+    )
+    llm = OpenRouterLLM(model_name="deepseek/deepseek-v4-flash", api_key="test-key")
+
+    result = await llm.chat(_tool_call_history())
+
+    assert result["content"] == "Hello World"
+    assert result["usage_attempts"] == [billed]
+
+
+@pytest.mark.asyncio
+async def test_openrouter_compat_loop_preserves_billed_attempts(mocker):
+    """C2: a superseded compat iteration's billed usage must merge into the
+    eventual envelope rather than vanish with the caught exception."""
+    billed = {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}
+    compat_failure = RuntimeError(_OPENROUTER_TOOL_CHOICE_ERROR)
+    compat_failure.usage_attempts = [billed]
+    final_usage = {"prompt_tokens": 20, "completion_tokens": 7, "total_tokens": 27}
+    llm = OpenRouterLLM(model_name="z-ai/glm-5.2", api_key="test-key")
+    mocker.patch.object(
+        llm,
+        "_chat_with_prefix_retry",
+        side_effect=[
+            compat_failure,
+            {"type": "text", "content": "Hello World", "usage": final_usage},
+        ],
+    )
+
+    result = await llm.chat(
+        [{"role": "user", "content": "score?"}],
+        tools=_two_tool_schema(),
+        tool_choice="required",
+    )
+
+    assert result["content"] == "Hello World"
+    assert result["usage"] == final_usage
+    assert result["usage_attempts"] == [billed, final_usage]
+
+
+@pytest.mark.asyncio
+async def test_openrouter_compat_loop_terminal_error_carries_billed_attempts(
+    mocker,
+):
+    """C2: when no adjustment remains, the surfaced error must carry the
+    compat-superseded billed attempts collected so far."""
+    first_billed = {"prompt_tokens": 10, "completion_tokens": 5}
+    second_billed = {"prompt_tokens": 20, "completion_tokens": 7}
+    first_failure = RuntimeError(_OPENROUTER_TOOL_CHOICE_ERROR)
+    first_failure.usage_attempts = [first_billed]
+    terminal_failure = RuntimeError("an unadjustable provider error")
+    terminal_failure.usage_attempts = [second_billed]
+    llm = OpenRouterLLM(model_name="z-ai/glm-5.2", api_key="test-key")
+    mocker.patch.object(
+        llm,
+        "_chat_with_prefix_retry",
+        side_effect=[first_failure, terminal_failure],
+    )
+
+    with pytest.raises(RuntimeError) as exc_info:
+        await llm.chat(
+            [{"role": "user", "content": "score?"}],
+            tools=_two_tool_schema(),
+            tool_choice="required",
+        )
+
+    assert exc_info.value is terminal_failure
+    assert exc_info.value.usage_attempts == [first_billed, second_billed]

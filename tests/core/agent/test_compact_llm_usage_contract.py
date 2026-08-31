@@ -1249,3 +1249,54 @@ async def test_compact_dependency_falls_back_when_compact_llm_returns_empty_cont
     assert "'content': ''" not in rendered
     # The explicit truncation fallback keeps real history rather than a repr.
     assert any("a" * 100 in m["content"] for m in messages)
+
+
+@pytest.mark.asyncio
+async def test_zhipu_tool_call_envelope_uses_model_dump_raw() -> None:
+    """D8: the real zai-sdk response is a pydantic model, so the production
+    ``raw`` always goes through ``response.model_dump()`` -- the stand-in
+    must exercise that branch, not the ``str(response)`` fallback."""
+
+    class _ZaiLikeResponse(SimpleNamespace):
+        def model_dump(self) -> dict[str, Any]:
+            return {"id": "zai-1", "object": "chat.completion"}
+
+    tool_call = SimpleNamespace(
+        id="call_1",
+        type="function",
+        function=SimpleNamespace(name="calculator", arguments='{"expression": "2+2"}'),
+    )
+    response = _ZaiLikeResponse(
+        choices=[
+            SimpleNamespace(
+                message=SimpleNamespace(content=None, tool_calls=[tool_call]),
+                finish_reason="tool_calls",
+            )
+        ],
+        usage=SimpleNamespace(prompt_tokens=PROMPT_TOKENS, completion_tokens=5),
+    )
+    reset_token_usage()
+    llm = ZhipuLLM(model_name="glm-4.5", api_key="test-key")
+    llm._client = SimpleNamespace(
+        chat=SimpleNamespace(
+            completions=SimpleNamespace(create=lambda **kwargs: response)
+        )
+    )
+
+    result = await llm.chat(
+        [{"role": "user", "content": "2+2?"}],
+        tools=[
+            {
+                "type": "function",
+                "function": {
+                    "name": "calculator",
+                    "description": "calc",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            }
+        ],
+    )
+
+    assert result["type"] == "tool_call"
+    assert result["raw"] == {"id": "zai-1", "object": "chat.completion"}
+    assert result["usage"]["prompt_tokens"] == PROMPT_TOKENS

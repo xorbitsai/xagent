@@ -5,7 +5,12 @@ import openai
 
 from .....config import get_openrouter_official_providers_only
 from ..error import retry_on
-from ..exceptions import LLMRetryableError, LLMToolProtocolError
+from ..exceptions import (
+    LLMRetryableError,
+    LLMToolProtocolError,
+    attach_usage_attempts,
+    merge_usage_attempts_into_result,
+)
 from ..timeout_config import TimeoutConfig
 from ..tool_protocol import TOOL_PROTOCOL_ERROR_KEY, get_tool_protocol_error
 from ..types import PROVIDER_STATE_METADATA_KEY, StreamChunk
@@ -592,6 +597,7 @@ class OpenRouterLLM(OpenAILLM):
         the already-sanitized messages instead of re-triggering this same
         prefix rejection on every iteration.
         """
+        collected_attempts: List[Any] = []
         try:
             response = await super().chat(
                 messages=messages,
@@ -605,6 +611,9 @@ class OpenRouterLLM(OpenAILLM):
                 **kwargs,
             )
         except RuntimeError as exc:
+            # The rejected attempt may already be billed: keep its payload so
+            # the retry's success envelope (or a terminal error) carries it.
+            collected_attempts.extend(getattr(exc, "usage_attempts", None) or [])
             sanitized_messages = self._deepseek_function_prefix_retry_messages(
                 exc, messages
             )
@@ -618,17 +627,26 @@ class OpenRouterLLM(OpenAILLM):
                 "OpenRouter DeepSeek rejected function-call history with an "
                 "assistant prefix; retrying once without tool-call prefixes"
             )
-            response = await super().chat(
-                messages=sanitized_messages,
-                temperature=temperature,
-                max_tokens=max_tokens,
-                tools=tools,
-                tool_choice=tool_choice,
-                response_format=response_format,
-                thinking=thinking,
-                output_config=output_config,
-                **kwargs,
-            )
+            try:
+                response = await super().chat(
+                    messages=sanitized_messages,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    tools=tools,
+                    tool_choice=tool_choice,
+                    response_format=response_format,
+                    thinking=thinking,
+                    output_config=output_config,
+                    **kwargs,
+                )
+            except RuntimeError as final_exc:
+                attach_usage_attempts(
+                    final_exc,
+                    collected_attempts
+                    + list(getattr(final_exc, "usage_attempts", None) or []),
+                )
+                raise
+            merge_usage_attempts_into_result(collected_attempts, response)
 
         return response
 
@@ -724,6 +742,7 @@ class OpenRouterLLM(OpenAILLM):
                 is_streaming=False,
             )
 
+        collected_attempts: List[Any] = []
         while True:
             sanitized_out: List[List[Dict[str, Any]]] = []
             call_kwargs: Dict[str, Any] = dict(
@@ -739,11 +758,23 @@ class OpenRouterLLM(OpenAILLM):
             if sanitize_messages:
                 call_kwargs["sanitized_out"] = sanitized_out
             try:
-                return await call(current_messages, **call_kwargs)
-            except LLMRetryableError:
+                result = await call(current_messages, **call_kwargs)
+            except LLMRetryableError as exc:
+                # Carries its own attempts; earlier compat-superseded billed
+                # attempts must ride along too.
+                if collected_attempts:
+                    attach_usage_attempts(
+                        exc,
+                        collected_attempts + list(exc.usage_attempts or []),
+                    )
                 raise
             except _COMPAT_RETRYABLE_ERRORS as exc:
+                # Every superseded iteration may already be billed: collect its
+                # payload before deciding to adjust, re-raise, or continue.
+                exc_attempts = list(getattr(exc, "usage_attempts", None) or [])
                 if retry_on(exc):
+                    if collected_attempts or exc_attempts:
+                        attach_usage_attempts(exc, collected_attempts + exc_attempts)
                     raise
 
                 adjustment = _next_compat_adjustment(
@@ -755,8 +786,11 @@ class OpenRouterLLM(OpenAILLM):
                     render=render,
                 )
                 if adjustment is None:
+                    if collected_attempts or exc_attempts:
+                        attach_usage_attempts(exc, collected_attempts + exc_attempts)
                     raise
 
+                collected_attempts.extend(exc_attempts)
                 current_tool_choice, current_thinking, log_message, action_key = (
                     adjustment
                 )
@@ -764,6 +798,10 @@ class OpenRouterLLM(OpenAILLM):
                 if sanitized_out:
                     current_messages = sanitized_out[-1]
                 logger.info(log_message)
+            else:
+                if collected_attempts:
+                    merge_usage_attempts_into_result(collected_attempts, result)
+                return result
 
     async def _stream_chat_with_prefix_retry(
         self,

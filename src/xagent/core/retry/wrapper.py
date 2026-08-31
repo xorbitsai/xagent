@@ -65,6 +65,17 @@ class RetryWrapper(Retryable):
                 result = self.target.invoke(*args, **kwargs)
             except Exception as e:
                 if not self.retry_on(e):
+                    # A terminal non-retryable error must still carry the
+                    # history collected from earlier billed attempts; its own
+                    # payload (if any) stays last.
+                    if collected_attempts:
+                        from ..model.chat.exceptions import attach_usage_attempts
+
+                        attach_usage_attempts(
+                            e,
+                            collected_attempts
+                            + list(getattr(e, "usage_attempts", None) or []),
+                        )
                     raise
 
                 _collect_usage_attempts(e, collected_attempts)
@@ -101,6 +112,17 @@ class RetryWrapper(Retryable):
                 result = await self.target.ainvoke(*args, **kwargs)
             except Exception as e:
                 if not self.retry_on(e):
+                    # A terminal non-retryable error must still carry the
+                    # history collected from earlier billed attempts; its own
+                    # payload (if any) stays last.
+                    if collected_attempts:
+                        from ..model.chat.exceptions import attach_usage_attempts
+
+                        attach_usage_attempts(
+                            e,
+                            collected_attempts
+                            + list(getattr(e, "usage_attempts", None) or []),
+                        )
                     raise
 
                 _collect_usage_attempts(e, collected_attempts)

@@ -404,6 +404,7 @@ class BaseLLM(ABC):
                     "LLM returned an unusable chat response shape "
                     f"({shape.kind}); expected a text or tool_call envelope"
                 ),
+                raw=result,
             )
             return
 

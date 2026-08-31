@@ -769,3 +769,43 @@ class TestMalformedAttemptRows:
         # Single-attempt historical shape restored: no attempt fields.
         assert "llm_attempt_count" not in end_event["data"]
         assert end_event["data"]["input_tokens"] == P2
+
+
+@pytest.mark.asyncio
+async def test_retry_wrapper_non_retryable_terminal_carries_collected_attempts() -> (
+    None
+):
+    """C1: a non-retryable error after a billed retryable one must carry the
+    collected history out of the wrapper -- the ``not retry_on: raise``
+    short-circuit is a terminal carrier too."""
+
+    class _FlakyLLM:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def chat(self, *args: Any, **kwargs: Any) -> Any:
+            self.calls += 1
+            if self.calls == 1:
+                error = LLMEmptyContentError("empty first attempt")
+                error.usage_attempts = [U1]
+                raise error
+            raise RuntimeError("second attempt fails non-retryably")
+
+    with pytest.raises(RuntimeError) as exc_info:
+        await _wrapped(_FlakyLLM()).chat([{"role": "user", "content": "hi"}])
+
+    assert not isinstance(exc_info.value, LLMEmptyContentError)
+    assert exc_info.value.usage_attempts == [U1]
+
+    # And the runtime books the carried attempt through on_llm_error.
+    tracer = TraceEventRecorder()
+    runtime = PatternRuntime(tracer=tracer)
+    context = ExecutionContext(execution_id="c1-terminal")
+    context.add_user_message("hi")
+    await runtime.on_llm_error(context=context, error=exc_info.value)
+
+    assert context.get_total_token_usage()["total"] == P1 + C1
+    error_event = next(
+        event for event in tracer.events if event["event_type"] == "action_error_llm"
+    )
+    assert error_event["data"]["input_tokens"] == P1

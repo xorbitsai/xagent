@@ -176,6 +176,16 @@ export default function OnboardingPage() {
   // though the payload itself was already known to be rejected outright.
   // Reset alongside the count, on the same success/streak-reset events.
   const saveFailureHasPermanentByDestRef = useRef<Record<string, boolean>>({});
+  // The exact payload (serialized) that was last attempted and failed for
+  // this key - a PR review finding caught that the count/permanent-flag
+  // above are keyed only by destination, not by payload content, so a
+  // failure streak survives the user going back and editing their answers:
+  // failing once, editing goals/voice/etc., then failing or succeeding
+  // again would wrongly inherit (or wrongly escalate/block on) a PREVIOUS,
+  // different payload's failure history. Compared against the current
+  // payload on every failure below; a mismatch starts a fresh streak for
+  // the new payload instead of continuing the old one.
+  const saveFailurePayloadByDestRef = useRef<Record<string, string>>({});
 
   useEffect(() => {
     isMountedRef.current = true;
@@ -371,11 +381,21 @@ export default function OnboardingPage() {
       if (isMountedRef.current) toast.error(t("onboarding.done.saveFailed"));
       return "retry_in_place";
     }
-    const saved = await updateUserPreferences(buildPreferencesPayload({ includeOnboarded }));
+    const payload = buildPreferencesPayload({ includeOnboarded });
+    const saved = await updateUserPreferences(payload);
     if (saved.ok) {
       saveFailureCountByDestRef.current[failureKey] = 0;
       saveFailureHasPermanentByDestRef.current[failureKey] = false;
+      delete saveFailurePayloadByDestRef.current[failureKey];
       return "saved";
+    }
+    // A different payload than the one that failed last time for this key
+    // starts a fresh streak - see saveFailurePayloadByDestRef's comment.
+    const payloadKey = JSON.stringify(payload);
+    if (saveFailurePayloadByDestRef.current[failureKey] !== payloadKey) {
+      saveFailureCountByDestRef.current[failureKey] = 0;
+      saveFailureHasPermanentByDestRef.current[failureKey] = false;
+      saveFailurePayloadByDestRef.current[failureKey] = payloadKey;
     }
     const failureCount = (saveFailureCountByDestRef.current[failureKey] ?? 0) + 1;
     saveFailureCountByDestRef.current[failureKey] = failureCount;
@@ -585,6 +605,14 @@ export default function OnboardingPage() {
           connectAppsLabel: t("chatPage.clarification.connectApps.title"),
         },
         connections: selected.connections,
+        // See wizardUserIdRef's and currentUserIdRef's comments - the guard
+        // right before this call only proves identity hadn't swapped BEFORE
+        // hireAgentFromTemplate was invoked. That function itself makes 2
+        // independent network calls (resolve, then task/create), so without
+        // this, a swap landing in the gap between them would still let
+        // task/create run under a different identity than the one that just
+        // resolved the agent.
+        abortIfIdentityChanged: () => currentUserIdRef.current !== wizardUserIdRef.current,
       });
       // Not `if (!isMountedRef.current) return;` here (unlike the guard
       // before hireAgentFromTemplate above, which is fine to skip attempting

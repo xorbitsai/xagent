@@ -568,6 +568,51 @@ describe("OnboardingPage", () => {
     expect(routerReplace).toHaveBeenCalledWith("/task/42")
   })
 
+  // Pins a PR review finding: hireAgentFromTemplate itself makes 2
+  // independent network calls (resolve, then task/create), each
+  // authenticated with whatever session is live when IT fires - the guard
+  // right before this call only proves identity hadn't swapped BEFORE
+  // hireAgentFromTemplate was invoked. It's passed abortIfIdentityChanged
+  // so it can re-check between its own two calls; this pins that the
+  // callback passed actually reflects the LIVE identity guard state, not a
+  // snapshot frozen at the moment hireAgentFromTemplate was called.
+  it("passes an abortIfIdentityChanged callback to hireAgentFromTemplate that reflects the identity swap guard live", async () => {
+    const { rerender } = render(<OnboardingPage />)
+    await waitFor(() => expect(screen.getByText(/Welcome to Xagent/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Let's go"))
+    fireEvent.click(screen.getByText("Marketing"))
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/take off your plate/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Post on social media"))
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/Meet your AI team/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/How should/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText("You're all set.")).toBeInTheDocument())
+
+    await act(async () => {
+      fireEvent.click(screen.getByText("Start with Maya"))
+    })
+
+    await waitFor(() => expect(hireAgentFromTemplateMock).toHaveBeenCalled())
+    const { abortIfIdentityChanged } = hireAgentFromTemplateMock.mock.calls[0][0]
+    expect(typeof abortIfIdentityChanged).toBe("function")
+    // Identity hasn't changed yet - the callback must say so.
+    expect(abortIfIdentityChanged()).toBe(false)
+
+    authUser.id = "user-b"
+    await act(async () => {
+      rerender(<OnboardingPage />)
+    })
+
+    // Same callback reference from the same hireAgentFromTemplate call -
+    // it must now report the swap live, proving it reads a ref kept fresh
+    // by rendering, not a value captured once when hireAgentFromTemplate
+    // was originally invoked.
+    expect(abortIfIdentityChanged()).toBe(true)
+  })
+
   // Pins a bug found in full-feature self-review: a redundant
   // `if (!isMountedRef.current) return;` right before this 3rd call to
   // markOnboardedAndNavigate used to skip the call ENTIRELY (including its
@@ -1105,9 +1150,18 @@ describe("OnboardingPage", () => {
 
     await waitFor(() => expect(hireAgentFromTemplateMock).toHaveBeenCalled())
     expect(updateUserPreferencesMock).toHaveBeenCalledTimes(3)
-    expect(updateUserPreferencesMock.mock.calls[2][0]).toEqual(
-      expect.objectContaining({ onboarded: true, department: "marketing", goals: ["social"] })
-    )
+    // toEqual against the FULL exact object, not objectContaining a subset -
+    // a test-pinning review found objectContaining would stay green even if
+    // a future bug in buildPreferencesPayload silently dropped `voice`
+    // (reached via the "How should" step above, so hasReachedVoiceRef.current
+    // is true and it must be present) or `industry`.
+    expect(updateUserPreferencesMock.mock.calls[2][0]).toEqual({
+      onboarded: true,
+      department: "marketing",
+      industry: null,
+      goals: ["social"],
+      voice: "professional",
+    })
     expect(markOnboardingSaveEscapedMock).not.toHaveBeenCalled()
   })
 
@@ -1209,6 +1263,95 @@ describe("OnboardingPage", () => {
       fireEvent.click(screen.getByText("Start with Maya"))
     })
 
+    expect(hireAgentFromTemplateMock).not.toHaveBeenCalled()
+    expect(markOnboardingSaveEscapedMock).not.toHaveBeenCalled()
+  })
+
+  // Pins a test-pinning gap found by self-review: the two tests above only
+  // drive a 2-attempt streak, so they can't distinguish the correct
+  // behavior ("hasPermanent" is set on any non-retryable failure and never
+  // cleared except by success) from a subtly wrong one (accidentally also
+  // clearing it on "retry_in_place"). Both behave identically for exactly 2
+  // attempts - the difference only shows up on a 3rd, still-failing attempt
+  // with no success in between.
+  it("still blocks escalation on a 3rd attempt after 2 permanent failures, even though the 3rd is itself retryable", async () => {
+    updateUserPreferencesMock
+      .mockResolvedValueOnce({ ok: false, retryable: false })
+      .mockResolvedValueOnce({ ok: false, retryable: false })
+      .mockResolvedValueOnce({ ok: false, retryable: true })
+
+    await goToWelcomeThenBusiness()
+    fireEvent.click(screen.getByText("Marketing"))
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/take off your plate/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Post on social media"))
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/Meet your AI team/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/How should/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText("You're all set.")).toBeInTheDocument())
+
+    await act(async () => {
+      fireEvent.click(screen.getByText("Start with Maya"))
+    })
+    await act(async () => {
+      fireEvent.click(screen.getByText("Start with Maya"))
+    })
+    await act(async () => {
+      fireEvent.click(screen.getByText("Start with Maya"))
+    })
+
+    expect(hireAgentFromTemplateMock).not.toHaveBeenCalled()
+    expect(markOnboardingSaveEscapedMock).not.toHaveBeenCalled()
+  })
+
+  // Pins a PR review finding: the failure streak used to be keyed only by
+  // destination, not by payload content - so editing answers between two
+  // failed "Start with Maya" attempts let the 2nd attempt (of a genuinely
+  // DIFFERENT, never-before-tried payload) wrongly inherit the 1st
+  // attempt's failure count and escalate to an irreversible hire after
+  // only ONE real failure of the edited payload.
+  it("does not inherit a prior payload's failure streak after the user edits their answers", async () => {
+    updateUserPreferencesMock
+      .mockResolvedValueOnce({ ok: false, retryable: true })
+      .mockResolvedValueOnce({ ok: false, retryable: true })
+
+    await goToWelcomeThenBusiness()
+    fireEvent.click(screen.getByText("Marketing"))
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/take off your plate/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Post on social media"))
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/Meet your AI team/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/How should/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText("You're all set.")).toBeInTheDocument())
+
+    // 1st attempt fails - payload is {department: marketing, goals: [social]}.
+    await act(async () => {
+      fireEvent.click(screen.getByText("Start with Maya"))
+    })
+    expect(hireAgentFromTemplateMock).not.toHaveBeenCalled()
+
+    // Go back and edit: add another goal, changing the payload.
+    fireEvent.click(screen.getByText("Goals"))
+    await waitFor(() => expect(screen.getByText(/take off your plate/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Keep my inbox under control"))
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/Meet your AI team/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/How should/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText("You're all set.")).toBeInTheDocument())
+
+    // 2nd attempt is for the EDITED (different) payload - this is its 1st
+    // failure, not the 2nd failure of the old streak, so it must NOT
+    // escalate yet.
+    await act(async () => {
+      fireEvent.click(screen.getByText("Start with Maya"))
+    })
     expect(hireAgentFromTemplateMock).not.toHaveBeenCalled()
     expect(markOnboardingSaveEscapedMock).not.toHaveBeenCalled()
   })

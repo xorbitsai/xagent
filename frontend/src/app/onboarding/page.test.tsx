@@ -1490,6 +1490,65 @@ describe("OnboardingPage", () => {
     expect(markOnboardingSaveEscapedMock).not.toHaveBeenCalled()
   })
 
+  // Pins a test-coverage gap found by self-review: the payload-change reset
+  // must clear ALL THREE of saveFailureCountByDestRef,
+  // saveFailureHasPermanentByDestRef, and saveFailurePayloadByDestRef
+  // together, not just the count. The test above only ever sees retryable
+  // failures, so it can't tell whether hasPermanent specifically gets reset
+  // on a payload change - if a regression dropped just that one line, this
+  // exact scenario (a permanent failure on the OLD payload, then 2 purely
+  // retryable failures on an EDITED payload) would still wrongly refuse to
+  // escalate, blocked by the stale permanent flag from the old payload.
+  it("does not let a permanent failure on the OLD payload block escalation for 2 retryable failures on an EDITED payload", async () => {
+    updateUserPreferencesMock
+      .mockResolvedValueOnce({ ok: false, retryable: false }) // old payload: permanent failure
+      .mockResolvedValueOnce({ ok: false, retryable: true }) // edited payload: 1st failure
+      .mockResolvedValueOnce({ ok: false, retryable: true }) // edited payload: 2nd failure - must escalate
+
+    await goToWelcomeThenBusiness()
+    fireEvent.click(screen.getByText("Marketing"))
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/take off your plate/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Post on social media"))
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/Meet your AI team/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/How should/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText("You're all set.")).toBeInTheDocument())
+
+    // 1st attempt fails PERMANENTLY - payload is {department: marketing, goals: [social]}.
+    await act(async () => {
+      fireEvent.click(screen.getByText("Start with Maya"))
+    })
+    expect(hireAgentFromTemplateMock).not.toHaveBeenCalled()
+
+    // Go back and edit: add another goal, changing the payload.
+    fireEvent.click(screen.getByText("Goals"))
+    await waitFor(() => expect(screen.getByText(/take off your plate/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Keep my inbox under control"))
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/Meet your AI team/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/How should/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText("You're all set.")).toBeInTheDocument())
+
+    // Edited payload's 1st failure (purely retryable) - not yet at the
+    // 2-failure threshold, must not escalate.
+    await act(async () => {
+      fireEvent.click(screen.getByText("Start with Maya"))
+    })
+    expect(hireAgentFromTemplateMock).not.toHaveBeenCalled()
+
+    // Edited payload's 2nd failure, also purely retryable - the OLD
+    // payload's permanent failure must not still be blocking this streak.
+    await act(async () => {
+      fireEvent.click(screen.getByText("Start with Maya"))
+    })
+    expect(hireAgentFromTemplateMock).toHaveBeenCalledTimes(1)
+  })
+
   // Pins a test-coverage gap found by self-review: a SUCCESS must clear the
   // "this streak saw a non-retryable failure" memory, not just the failure
   // count - otherwise a permanent rejection from an earlier, already-resolved
@@ -2066,6 +2125,29 @@ describe("OnboardingPage", () => {
     // reported as still waiting, not 0 (undercounting) and not 2
     // (double-counting the one that already has a card).
     expect(screen.getByText(/the other match is waiting in Templates/)).toBeInTheDocument()
+  })
+
+  // Pins a test-coverage gap found by self-review: every existing
+  // "N other matches" assertion in this file hits the SINGULAR string
+  // (count === 1) - subtitleExtraMany (the plural "other {count} matches")
+  // was never exercised anywhere, and the zero-real-match fallback branch
+  // was only ever tested with exactly 1 selected goal. A regression that
+  // hardcoded singular text, swapped the ternary, or miscounted with 2+
+  // unmatched goals would pass the entire suite undetected.
+  it("reports the plural 'other N matches' when 2 selected goals both fail to resolve to a real template", async () => {
+    await goToWelcomeThenBusiness()
+    fireEvent.click(screen.getByText("Marketing"))
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/take off your plate/)).toBeInTheDocument())
+    // Neither "docs" nor "leads" maps to a template in the TEMPLATES
+    // fixture - matchedRecommended stays empty, so validRecommended falls
+    // back to filler cards and omittedGoalCount must equal goals.length (2).
+    fireEvent.click(screen.getByText("Summarise long documents"))
+    fireEvent.click(screen.getByText("Reply to new leads fast"))
+    fireEvent.click(screen.getByText("Continue"))
+
+    await waitFor(() => expect(screen.getByText(/Meet your AI team/)).toBeInTheDocument())
+    expect(screen.getByText(/the other 2 matches are waiting in Templates/)).toBeInTheDocument()
   })
 
   // Pins a PR review finding: this page's own state has no identity binding

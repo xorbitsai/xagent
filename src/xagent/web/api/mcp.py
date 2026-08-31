@@ -2793,16 +2793,52 @@ def _ensure_catalog_app_server(db: Session, app_id: str) -> tuple[MCPServer, dic
         # Safe only because command/transport already proved this is the
         # official row, not a hijack, and the owned-check above proved it
         # isn't a user's own row.
-        current_args = launch.get("args") or []
+        #
+        # `or []` would also launder a malformed-but-falsy launch_config.args
+        # (a custom app's launch_config is admin-editable with no shape
+        # check) -- {}, 0, and False -- into a validation-passing empty
+        # list, silently wiping a row's real args. Only a genuinely absent
+        # value means "no args".
+        raw_args = launch.get("args")
+        current_args = raw_args if raw_args is not None else []
         if (server.args or []) != current_args:
-            # Validated the same way a fresh row would be (existing_server
-            # omitted deliberately: catalog args/env/cwd fully replace
-            # whatever this row had, not merge with it) rather than
-            # raw-assigning launch_config.args -- a custom (non-builtin)
-            # catalog app's launch_config is admin-editable with no shape
-            # check on args, so an unvalidated assignment could persist a
-            # non-list-of-strings value the MCP SDK later rejects at
-            # session-init time instead of at this request.
+            # This row is ownerless (the check above only rejects a
+            # *currently* owned row), which is also the normal, expected
+            # state of every legitimately catalog-connected row -- connect
+            # never marks an association is_owner=True. So ownerless alone
+            # can't distinguish "the official row, just pre-dating a
+            # registry args bump" (safe to heal) from "a pre-catalog
+            # orphan" (a user created a custom server under this name
+            # before the catalog app existed, matching today's command/
+            # transport, then was deleted, leaving policy we have no way to
+            # safely canonicalize here) or from "a real admin-configured
+            # platform key" (_app_platform_env_available reads MCPServer.env
+            # directly -- healing must never destroy it). Only heal a row
+            # that carries no other configured policy beyond command/
+            # transport/args; otherwise fall through to the same 409 every
+            # such row already got before this change, leaving it and
+            # whatever it holds untouched for an operator to resolve.
+            if (
+                any(
+                    getattr(server, field, None)
+                    for field in (
+                        "env",
+                        "cwd",
+                        "concurrent_tools",
+                        "runtime_input_schema",
+                        "runtime_bindings",
+                    )
+                )
+                or server.concurrency_safe
+            ):
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail="A server with this name already exists with a different configuration",
+                )
+            # Validated the same way a fresh row would be, rather than
+            # raw-assigning launch_config.args -- an unvalidated assignment
+            # could persist a non-list-of-strings value the MCP SDK later
+            # rejects at session-init time instead of at this request.
             try:
                 healed_config = _build_server_config(
                     MCPServerCreate(
@@ -2818,21 +2854,6 @@ def _ensure_catalog_app_server(db: Session, app_id: str) -> tuple[MCPServer, dic
                     detail=f"Invalid app configuration: {str(e)}",
                 )
             cast(Any, server).args = healed_config.args or []
-            # Also reset env/cwd to the catalog's shape (empty, for every
-            # keyless/api_key app today) rather than leaving this row's own
-            # values untouched: this row can be a pre-catalog orphan (a user
-            # created a custom server under this name before the catalog
-            # app existed, matching today's command/transport, then was
-            # deleted -- _reject_user_owned_catalog_squat only rejects a
-            # *currently* owned row, not a since-orphaned one). Healing only
-            # args would let that orphan's own env/cwd survive adoption, and
-            # to_connection_dict() applies a row's env to every user's
-            # connection through it -- a former user's own key could become
-            # every other user's fallback credential.
-            cast(Any, server).env = healed_config.env
-            cast(Any, server).cwd = (
-                str(healed_config.cwd) if healed_config.cwd is not None else None
-            )
             db.commit()
     if not server:
         try:

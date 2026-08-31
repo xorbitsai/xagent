@@ -597,13 +597,22 @@ def test_connect_heals_stale_args_on_matching_command(test_db):
 
 
 def test_connect_heal_resets_orphan_rows_env_and_cwd(test_db):
-    """Healing args must not leave a row's own env/cwd untouched: a row with
-    today's command/transport but no *current* owner can be a pre-catalog
-    orphan (a user created a custom server under this name before the
-    catalog app existed, then was deleted -- deleting a user drops their
-    UserMCPServer association, not the shared MCPServer row). Adopting it
-    without clearing env/cwd would apply that orphan's own values to every
-    future user's connection via MCPServer.to_connection_dict()."""
+    """A row with today's command/transport but no *current* owner is not
+    safe to heal just because command/transport match: ownerless is also
+    the normal state of every legitimately catalog-connected row (connect
+    never marks an association is_owner=True), so it can't distinguish the
+    official row from a pre-catalog orphan (a user created a custom server
+    under this name before the catalog app existed, then was deleted --
+    deleting a user drops their UserMCPServer association, not the shared
+    MCPServer row) carrying its own env/cwd. Adopting it and blanking those
+    fields would be just as wrong as adopting it and keeping them: either
+    could destroy or leak real configuration
+    (MCPServer.to_connection_dict() applies a row's env to every user's
+    connection through it). Safe behavior is to leave a row with any
+    configured env/cwd/etc. untouched and 409, matching what it always got
+    before args-healing existed -- not adopt it, not silently wipe it."""
+    from fastapi import HTTPException
+
     from xagent.web.api.mcp import MCPAppConnectRequest, connect_mcp_app
 
     test_db.add(
@@ -612,24 +621,120 @@ def test_connect_heal_resets_orphan_rows_env_and_cwd(test_db):
             managed="external",
             transport="stdio",
             command="npx",
-            args=["-y", "@cablate/mcp-google-map"],  # stale, triggers healing
+            args=["-y", "@cablate/mcp-google-map"],  # stale, would trigger healing
             env={"LEFTOVER_SECRET": "attacker-or-former-users-value"},
             cwd="/some/orphaned/path",
         )
     )
     test_db.commit()
 
-    connect_mcp_app(
-        "google-maps",
-        MCPAppConnectRequest(env={"GOOGLE_MAPS_API_KEY": "my-key"}),
-        current_user=_user(test_db, 1),
-        db=test_db,
-    )
+    with pytest.raises(HTTPException) as exc:
+        connect_mcp_app(
+            "google-maps",
+            MCPAppConnectRequest(env={"GOOGLE_MAPS_API_KEY": "my-key"}),
+            current_user=_user(test_db, 1),
+            db=test_db,
+        )
+    assert exc.value.status_code == 409
 
-    healed = test_db.query(MCPServer).filter(MCPServer.name == "google-maps").first()
-    assert healed.args == ["-y", "@cablate/mcp-google-map", "--stdio"]
-    assert healed.env is None
-    assert healed.cwd is None
+    untouched = test_db.query(MCPServer).filter(MCPServer.name == "google-maps").first()
+    assert untouched.args == ["-y", "@cablate/mcp-google-map"]
+    assert untouched.env == {"LEFTOVER_SECRET": "attacker-or-former-users-value"}
+    assert untouched.cwd == "/some/orphaned/path"
+
+
+def test_connect_heal_refuses_row_with_platform_env_configured(test_db):
+    """The same refuse-to-heal gate must also protect a *legitimate*
+    admin-configured platform key on a real catalog row (not just an
+    orphan's leftover env) -- _app_platform_env_available reads
+    MCPServer.env directly as the platform-global fallback key, and
+    healing must never destroy it just because args also happened to drift.
+    A row with a platform key configured stays 409 (unhealed, untouched)
+    rather than silently losing that key."""
+    from fastapi import HTTPException
+
+    from xagent.web.api.mcp import MCPAppConnectRequest, connect_mcp_app
+
+    test_db.add(
+        MCPServer(
+            name="google-maps",
+            managed="external",
+            transport="stdio",
+            command="npx",
+            args=["-y", "@cablate/mcp-google-map"],  # stale, would trigger healing
+            env={"GOOGLE_MAPS_API_KEY": "encrypted-platform-key"},
+        )
+    )
+    test_db.commit()
+
+    with pytest.raises(HTTPException) as exc:
+        connect_mcp_app(
+            "google-maps",
+            MCPAppConnectRequest(),
+            current_user=_user(test_db, 1),
+            db=test_db,
+        )
+    assert exc.value.status_code == 409
+
+    untouched = test_db.query(MCPServer).filter(MCPServer.name == "google-maps").first()
+    assert untouched.env == {"GOOGLE_MAPS_API_KEY": "encrypted-platform-key"}
+
+
+def test_connect_heal_rejects_falsy_malformed_args_instead_of_wiping(test_db):
+    """launch_config.args of {}, 0, or False must not be laundered into a
+    validation-passing empty list by an `or []` fallback -- that would
+    silently wipe a row's real args on a successful connect. Only a
+    genuinely absent (None) args means "no args"; any other falsy-but-
+    wrong-type value must still fail shape validation."""
+    from fastapi import HTTPException
+
+    from xagent.web.api.mcp import MCPAppConnectRequest, connect_mcp_app
+
+    test_db.add(
+        PublicMCPApp(
+            app_id="totally-custom-app",
+            name="Totally Custom App",
+            description="A hand-created, non-builtin catalog app",
+            transport="stdio",
+            is_visible_in_connector=True,
+            launch_config={"command": "npx", "args": ["-y", "totally-custom-mcp"]},
+        )
+    )
+    test_db.add(
+        MCPServer(
+            name="totally-custom-app",
+            managed="external",
+            transport="stdio",
+            command="npx",
+            args=["-y", "totally-custom-mcp"],
+        )
+    )
+    test_db.commit()
+
+    for falsy_malformed_args in ({}, 0, False):
+        app = (
+            test_db.query(PublicMCPApp)
+            .filter(PublicMCPApp.app_id == "totally-custom-app")
+            .first()
+        )
+        app.launch_config = {"command": "npx", "args": falsy_malformed_args}
+        test_db.commit()
+
+        with pytest.raises(HTTPException) as exc:
+            connect_mcp_app(
+                "totally-custom-app",
+                MCPAppConnectRequest(),
+                current_user=_user(test_db, 1),
+                db=test_db,
+            )
+        assert exc.value.status_code == 400
+
+        untouched = (
+            test_db.query(MCPServer)
+            .filter(MCPServer.name == "totally-custom-app")
+            .first()
+        )
+        assert untouched.args == ["-y", "totally-custom-mcp"]
 
 
 def test_connect_rejects_malformed_catalog_args_instead_of_persisting(test_db):

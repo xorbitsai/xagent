@@ -8,7 +8,13 @@ import openai
 from openai import AsyncOpenAI
 
 from ....utils.security import redact_sensitive_text
-from ..exceptions import LLMEmptyContentError, LLMRetryableError, LLMTimeoutError
+from ..exceptions import (
+    LLMEmptyContentError,
+    LLMRetryableError,
+    LLMTimeoutError,
+    attach_usage_attempts,
+    merge_usage_attempts_into_result,
+)
 from ..timeout_config import TimeoutConfig
 from ..token_context import add_token_usage, extract_cached_input_tokens
 from ..types import PROVIDER_STATE_METADATA_KEY, ChunkType, StreamChunk
@@ -19,6 +25,22 @@ logger = logging.getLogger(__name__)
 # ``PROVIDER_STATE_METADATA_KEY`` now lives in ``chat.types`` (see there for
 # why); imported here so existing code and tests that import it from this
 # transport module keep working unchanged.
+
+
+def _response_usage_payload(response: Any) -> Any:
+    """Return the provider usage payload of a raw SDK response, or None.
+
+    Stamped onto every chat/vision result envelope as a top-level ``usage``
+    key so consumers (notably ``PatternRuntime._extract_token_usage``) can
+    read usage without reaching into ``raw``. Read-only: the contextvar
+    ledger write stays with the adapter's single ``add_token_usage`` call.
+    """
+    usage = getattr(response, "usage", None)
+    if usage is None:
+        return None
+    if hasattr(usage, "model_dump"):
+        return usage.model_dump()
+    return usage
 
 
 def _truncate_error_detail(value: Any, limit: int = 4000) -> str:
@@ -386,6 +408,7 @@ class OpenAICompatibleLLM(BaseLLM):
 
         Returns:
             - If normal text reply: return dict with type "text" and content
+              (plus a top-level "usage" payload when the provider reported one)
             - If tool call triggered: return dict with type "tool_call" and tool_calls list
 
         Raises:
@@ -476,6 +499,10 @@ class OpenAICompatibleLLM(BaseLLM):
             choice = resp.choices[0]
             message = choice.message
 
+            # Snapshot usage once; every result envelope below is stamped with
+            # it so downstream consumers never need to dig through ``raw``.
+            usage_payload = _response_usage_payload(resp)
+
             # Record token usage to context
             if hasattr(resp, "usage") and resp.usage:
                 add_token_usage(
@@ -515,6 +542,8 @@ class OpenAICompatibleLLM(BaseLLM):
                     "tool_calls": tool_calls,
                     "raw": resp.model_dump(),
                 }
+                if usage_payload is not None:
+                    result["usage"] = usage_payload
                 has_reasoning_content, reasoning_content = _message_reasoning_content(
                     message
                 )
@@ -562,29 +591,48 @@ class OpenAICompatibleLLM(BaseLLM):
                     and reasoning_content
                     and reasoning_content.strip()
                 ):
-                    return {
+                    result = {
                         "type": "text",
                         "content": reasoning_content,
                         "reasoning_content": reasoning_content,
                         "reasoning": reasoning_content,
                         "raw": resp.model_dump(),
                     }
+                    if usage_payload is not None:
+                        result["usage"] = usage_payload
+                    return result
                 # If there are no tool calls and no content, this is an error
-                raise LLMEmptyContentError(
+                error = LLMEmptyContentError(
                     f"LLM returned {'empty' if content == '' else 'None'} content and no tool calls"
                 )
+                # Usage was already booked above: carry this attempt's
+                # payload so the retry layer can merge it instead of losing
+                # the billed tokens.
+                if usage_payload is not None:
+                    error.usage_attempts = [usage_payload]
+                raise error
 
             result = {
                 "type": "text",
                 "content": content,
                 "raw": resp.model_dump(),
             }
+            if usage_payload is not None:
+                result["usage"] = usage_payload
             if has_reasoning_content:
                 result["reasoning_content"] = reasoning_content
                 result["reasoning"] = reasoning_content
             return result
 
         try:
+            # Billed usage payloads of superseded attempts inside this one
+            # logical call (currently only the thinking-disabled structured
+            # -output retry), oldest first. Assembled into the returned
+            # envelope as ``usage_attempts`` -- or prepended to a propagated
+            # retryable error -- so outer retry layers merge rather than
+            # lose the billed tokens.
+            superseded_attempts: List[Any] = []
+
             # Make the API call
             try:
                 response = await _make_api_call()
@@ -639,6 +687,12 @@ class OpenAICompatibleLLM(BaseLLM):
                             "Model returned non-JSON content with response_format while thinking was enabled. "
                             "Retrying with thinking disabled."
                         )
+                        # The first attempt was already billed: supersede it
+                        # so the envelope (or a propagated error) carries the
+                        # full ordered attempt list.
+                        first_attempt_usage = result.get("usage")
+                        if first_attempt_usage is not None:
+                            superseded_attempts.append(first_attempt_usage)
                         # One variable for both halves: what this retry
                         # sends, and what the response hook is told it
                         # sent. Two literals here would drift apart.
@@ -660,35 +714,56 @@ class OpenAICompatibleLLM(BaseLLM):
                             response, request_thinking=retry_thinking
                         )
 
+            if superseded_attempts:
+                # ``usage`` stays the final attempt (freshness baseline);
+                # ``usage_attempts`` lists every known billed attempt, final
+                # included. A known billed attempt is never suppressed, even
+                # when the final success is unmetered.
+                merge_usage_attempts_into_result(superseded_attempts, result)
+
             return result
 
-        except LLMRetryableError:
+        except LLMRetryableError as e:
+            if superseded_attempts:
+                e.usage_attempts = superseded_attempts + list(e.usage_attempts or [])
             raise
 
         except openai.BadRequestError as e:
             # Handle bad request errors, including a response_format resend
             # that failed again (see the nested try/except above).
-            raise RuntimeError(_format_openai_error("OpenAI bad request", e)) from e
+            error = RuntimeError(_format_openai_error("OpenAI bad request", e))
+            attach_usage_attempts(error, superseded_attempts)
+            raise error from e
 
         except openai.APITimeoutError as e:
             # Handle timeout errors
-            raise RuntimeError(f"OpenAI API timeout: {str(e)}") from e
+            error = RuntimeError(f"OpenAI API timeout: {str(e)}")
+            attach_usage_attempts(error, superseded_attempts)
+            raise error from e
 
         except openai.RateLimitError as e:
             # Handle rate limit errors
-            raise RuntimeError(f"OpenAI rate limit exceeded: {e.message}") from e
+            error = RuntimeError(f"OpenAI rate limit exceeded: {e.message}")
+            attach_usage_attempts(error, superseded_attempts)
+            raise error from e
 
         except openai.AuthenticationError as e:
             # Handle authentication errors
-            raise RuntimeError(f"OpenAI authentication failed: {e.message}") from e
+            error = RuntimeError(f"OpenAI authentication failed: {e.message}")
+            attach_usage_attempts(error, superseded_attempts)
+            raise error from e
 
         except openai.APIError as e:
             # Handle OpenAI API errors
-            raise RuntimeError(_format_openai_error("OpenAI API error", e)) from e
+            error = RuntimeError(_format_openai_error("OpenAI API error", e))
+            attach_usage_attempts(error, superseded_attempts)
+            raise error from e
 
         except Exception as e:
             # Handle any other unexpected errors
-            raise RuntimeError(f"LLM chat failed: {str(e)}") from e
+            error = RuntimeError(f"LLM chat failed: {str(e)}")
+            attach_usage_attempts(error, superseded_attempts)
+            raise error from e
 
     @property
     def supports_thinking_mode(self) -> bool:
@@ -750,6 +825,7 @@ class OpenAICompatibleLLM(BaseLLM):
 
         Returns:
             - If normal text reply: return dict with type "text" and content
+              (plus a top-level "usage" payload when the provider reported one)
             - If tool call triggered: return dict with type "tool_call" and tool_calls list
 
         Raises:
@@ -844,6 +920,10 @@ class OpenAICompatibleLLM(BaseLLM):
             choice = response.choices[0]
             message = choice.message
 
+            # Snapshot usage once; every result envelope below is stamped with
+            # it so downstream consumers never need to dig through ``raw``.
+            usage_payload = _response_usage_payload(response)
+
             # Record token usage to context
             if hasattr(response, "usage") and response.usage:
                 add_token_usage(
@@ -883,6 +963,8 @@ class OpenAICompatibleLLM(BaseLLM):
                     "tool_calls": tool_calls,
                     "raw": response.model_dump(),
                 }
+                if usage_payload is not None:
+                    result["usage"] = usage_payload
                 has_reasoning_content, reasoning_content = _message_reasoning_content(
                     message
                 )
@@ -920,23 +1002,34 @@ class OpenAICompatibleLLM(BaseLLM):
                     and reasoning_content
                     and reasoning_content.strip()
                 ):
-                    return {
+                    result = {
                         "type": "text",
                         "content": reasoning_content,
                         "reasoning_content": reasoning_content,
                         "reasoning": reasoning_content,
                         "raw": response.model_dump(),
                     }
+                    if usage_payload is not None:
+                        result["usage"] = usage_payload
+                    return result
                 # If there are no tool calls and no content, this is an error
-                raise LLMEmptyContentError(
+                error = LLMEmptyContentError(
                     f"LLM returned {'empty' if content == '' else 'None'} content and no tool calls"
                 )
+                # Usage was already booked above: carry this attempt's
+                # payload so the retry layer can merge it instead of losing
+                # the billed tokens.
+                if usage_payload is not None:
+                    error.usage_attempts = [usage_payload]
+                raise error
 
             text_result: Dict[str, Any] = {
                 "type": "text",
                 "content": content,
                 "raw": response.model_dump(),
             }
+            if usage_payload is not None:
+                text_result["usage"] = usage_payload
             if has_reasoning_content:
                 text_result["reasoning_content"] = reasoning_content
                 text_result["reasoning"] = reasoning_content

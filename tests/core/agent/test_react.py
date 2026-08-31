@@ -7712,3 +7712,33 @@ def test_tool_call_date_line_uses_the_caller_timezone() -> None:
 
 def test_tool_call_date_line_degrades_to_utc_for_an_unusable_timezone() -> None:
     assert _date_instruction(_react_clock_prompt("Not/AZone")) == UTC_DATE_INSTRUCTION
+
+
+@pytest.mark.asyncio
+async def test_react_finalize_fallback_never_leaks_envelope_repr() -> None:
+    """C3: when the model's text unwraps to an empty final answer, the
+    finalize fallback must surface the envelope's *text* -- never the whole
+    envelope, whose repr would land in the user-visible transcript."""
+    context = ExecutionContext(execution_id="react-envelope-fallback")
+    context.add_user_message("hi")
+    runtime = PatternRuntime(tracer=TraceEventRecorder())
+    json_text = '{"action": "final_answer", "action_input": ""}'
+
+    result = await ReActPattern(max_iterations=1).run(
+        context=context,
+        tools=[],
+        llm=FakeLLM(
+            [
+                {
+                    "type": "text",
+                    "content": json_text,
+                    "usage": {"prompt_tokens": 10, "completion_tokens": 5},
+                }
+            ]
+        ),
+        runtime=runtime,
+    )
+
+    assert result["success"] is True
+    assert result["output"] == json_text
+    assert "'type': 'text'" not in str(result)

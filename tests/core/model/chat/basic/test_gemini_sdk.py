@@ -90,9 +90,10 @@ class TestGeminiLLMSDK:
 
         response = await llm.chat(messages)
 
-        # Verify response
-        assert isinstance(response, str)
-        assert response == "Hello World"
+        # Verify response: a text envelope carrying the usage stamp
+        assert response["type"] == "text"
+        assert response["content"] == "Hello World"
+        assert response["usage"] == {"prompt_tokens": 10, "completion_tokens": 5}
         print(f"Basic chat response: {response}")
 
     @pytest.mark.asyncio
@@ -286,6 +287,8 @@ class TestGeminiLLMSDK:
         assert isinstance(response, dict)
         assert response.get("type") == "tool_call"
         assert "tool_calls" in response
+        # The usage stamp rides on tool_call envelopes too (no ``raw`` here).
+        assert response["usage"] == {"prompt_tokens": 15, "completion_tokens": 10}
 
         tool_calls = response["tool_calls"]
         assert len(tool_calls) > 0
@@ -454,10 +457,11 @@ class TestGeminiLLMSDK:
 
         response = await llm.chat(messages, response_format={"type": "json_object"})
 
-        # Verify JSON response
-        assert isinstance(response, str)
-        assert "greeting" in response
-        assert "count" in response
+        # Verify JSON response: text envelope, JSON in its content
+        assert response["type"] == "text"
+        assert "greeting" in response["content"]
+        assert "count" in response["content"]
+        assert response["usage"] == {"prompt_tokens": 14, "completion_tokens": 20}
         print(f"JSON mode response: {response}")
 
     @pytest.mark.asyncio
@@ -802,3 +806,38 @@ class TestGeminiPromptCacheUsage:
 
         usage_payloads = [c.usage for c in chunks if c.is_usage()]
         assert usage_payloads and usage_payloads[0]["cached_input_tokens"] == 60
+
+
+@pytest.mark.asyncio
+async def test_empty_content_error_keeps_retryable_type_fidelity(
+    mocker: pytest_mock.MockerFixture,
+) -> None:
+    """D7: an empty generation surfaces as ``LLMEmptyContentError`` itself,
+    not re-wrapped into a plain ``RuntimeError`` (same contract as claude.py)."""
+    from xagent.core.model.chat.exceptions import LLMEmptyContentError
+
+    llm = GeminiLLM(model_name="gemini-2.5-flash", api_key="test-key")
+
+    mock_sdk_client = MagicMock()
+    mock_response = MagicMock()
+    mock_candidate = MagicMock()
+    mock_content = MagicMock()
+    mock_part = MagicMock()
+    mock_part.text = ""
+    mock_part.function_call = None
+    mock_content.parts = [mock_part]
+    mock_candidate.content = mock_content
+    mock_response.candidates = [mock_candidate]
+    mock_response.usage_metadata.prompt_token_count = 10
+    mock_response.usage_metadata.candidates_token_count = 0
+    mock_response.usage_metadata.cached_content_token_count = 0
+
+    mocker.patch("google.genai.Client", return_value=mock_sdk_client)
+
+    async def mock_generate_content(*args, **kwargs):
+        return mock_response
+
+    mock_sdk_client.aio.models.generate_content = mock_generate_content
+
+    with pytest.raises(LLMEmptyContentError):
+        await llm.chat([{"role": "user", "content": "hi"}])

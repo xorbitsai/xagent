@@ -248,6 +248,26 @@ _VISION_RESPONSE_SHAPE_MATRIX = [
         [],
         str([1, 2, 3]),
     ),
+    # Content-bearing dicts without a recognized type tag are text: the
+    # normalizer delegates structural decoding to the shared
+    # ``classify_chat_response`` (PR #1787 review finding R0-D4), so vision
+    # consumers accept the same duck-typed shapes as chat consumers.
+    (
+        "content_only_dict",
+        {"content": "usable text without a type tag"},
+        "text",
+        "usable text without a type tag",
+        [],
+        "usable text without a type tag",
+    ),
+    (
+        "unknown_tag_str_content",
+        {"type": "mystery", "content": "usable text on an unknown tag"},
+        "text",
+        "usable text on an unknown tag",
+        [],
+        "usable text on an unknown tag",
+    ),
 ]
 
 
@@ -1278,11 +1298,13 @@ class TestVisionToolUnderstandMediaEnvelope:
         assert result.error == expected_error
 
     @pytest.mark.asyncio
-    async def test_understand_media_tool_call_message_unchanged(
+    async def test_understand_media_tool_call_fails_explicitly(
         self, vision_tool_without_workspace, mock_vision_model
     ):
-        """The existing tool-call message text is not part of this fix and
-        must survive the rewrite unchanged."""
+        """A tool-call envelope is not an answer: understand_media reports an
+        explicit tool-side failure rather than a successful explanatory
+        answer (PR #1787 review finding N5, superseding the message text
+        #1721 deliberately preserved)."""
         mock_vision_model.vision_chat.return_value = {
             "type": "tool_call",
             "tool_calls": [{"id": "c1", "type": "function"}],
@@ -1293,11 +1315,9 @@ class TestVisionToolUnderstandMediaEnvelope:
             "data:image/jpeg;base64,ZmFrZV9pbWFnZV9kYXRh", "Describe this."
         )
 
-        assert result.success is True
-        assert result.answer == (
-            "Model triggered tool call instead of answering: "
-            "[{'id': 'c1', 'type': 'function'}]"
-        )
+        assert result.success is False
+        assert result.answer is None
+        assert result.error == "Vision model returned a tool call instead of an answer"
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
@@ -2379,3 +2399,56 @@ class TestDrawBoundingBoxes:
             finally:
                 if os.path.exists(temp_image_path):
                     os.unlink(temp_image_path)
+
+
+class TestVisionToolChatEnvelope:
+    """Regression tests for the chat-envelope contract (#520/#1714 class).
+
+    Adapters now return ``{"type": "text", "content": ...}`` envelopes from
+    ``vision_chat``; the tool must read ``content``, never repr the envelope.
+    """
+
+    @pytest.mark.asyncio
+    async def test_understand_images_unwraps_text_envelope(self) -> None:
+        model = Mock(spec=BaseLLM)
+        model.vision_chat = AsyncMock(
+            return_value={
+                "type": "text",
+                "content": "A cat sitting on a keyboard.",
+                "usage": {"prompt_tokens": 12, "completion_tokens": 4},
+            }
+        )
+        model.has_ability = Mock(return_value=True)
+
+        result = await VisionTool(model).understand_images(
+            "data:image/jpeg;base64,ZmFrZV9pbWFnZV9kYXRh",
+            "What is in this image?",
+        )
+
+        assert result.success is True
+        assert result.answer == "A cat sitting on a keyboard."
+        assert "'type': 'text'" not in result.answer
+
+    @pytest.mark.asyncio
+    async def test_detect_objects_parses_text_envelope_content(self) -> None:
+        model = Mock(spec=BaseLLM)
+        model.vision_chat = AsyncMock(
+            return_value={
+                "type": "text",
+                "content": (
+                    '{"detections": [{"class": "person", "confidence": 0.95, '
+                    '"bbox": [0.1, 0.1, 0.6, 0.8]}]}'
+                ),
+                "usage": {"prompt_tokens": 12, "completion_tokens": 4},
+            }
+        )
+        model.has_ability = Mock(return_value=True)
+
+        result = await VisionTool(model).detect_objects(
+            "data:image/jpeg;base64,ZmFrZV9pbWFnZV9kYXRh",
+            task="Find all objects in the image",
+        )
+
+        assert result.success is True
+        assert len(result.detections) == 1
+        assert result.detections[0]["class"] == "person"

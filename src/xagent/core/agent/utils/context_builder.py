@@ -11,6 +11,7 @@ from ...file_ref import FILE_REF_MODEL_INSTRUCTIONS, FILE_REF_OUTPUT_INSTRUCTION
 from ...model.chat.basic.base import BaseLLM
 from ..trace import Tracer, trace_compact_end, trace_compact_start
 from .compact import CompactConfig, CompactUtils
+from .llm_utils import unwrap_chat_text
 
 logger = logging.getLogger(__name__)
 
@@ -396,13 +397,11 @@ class ContextBuilder:
                 },
             ]
 
-            # Get compacted response
+            # Get compacted response. ``unwrap_chat_text`` raises on a
+            # tool_call envelope instead of repr()ing it (#1714); the
+            # surrounding except falls back to truncation.
             response = await self.compact_llm.chat(messages=compact_prompt)
-            content = (
-                response
-                if isinstance(response, str)
-                else response.get("content", str(response))
-            )
+            content = unwrap_chat_text(response)
 
             # Parse back to messages format
             compacted_messages = CompactUtils.parse_compact_response(content)
@@ -489,13 +488,11 @@ class ContextBuilder:
                 },
             ]
 
-            # Get compacted response
+            # Get compacted response. ``unwrap_chat_text`` raises on a
+            # tool_call envelope instead of repr()ing it (#1714); the
+            # surrounding except falls back to truncation.
             response = await self.compact_llm.chat(messages=compact_prompt)
-            content = (
-                response
-                if isinstance(response, str)
-                else response.get("content", str(response))
-            )
+            content = unwrap_chat_text(response)
 
             # Parse back to messages format
             compacted_messages = CompactUtils.parse_compact_response(content)

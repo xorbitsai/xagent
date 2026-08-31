@@ -16,7 +16,24 @@ from typing import (
 
 from .strategy import ExponentialBackoff, RetryStrategy
 
+# NOTE: the usage-attempt carrier helpers live in ``model.chat.exceptions``,
+# but this module is imported *by* the model package's own adapters
+# (embedding/image/rerank/...), so a top-level import would create a cycle
+# (model/__init__ -> adapter -> retry.wrapper -> model.chat.exceptions).
+# They are imported lazily at the call sites instead.
+
 logger = logging.getLogger(__name__)
+
+
+def _collect_usage_attempts(error: Exception, collected: list[Any]) -> None:
+    """Append billed usage attempts carried by a retryable error.
+
+    Adapters attach ``usage_attempts`` to errors they raise *after* booking
+    the attempt's tokens, so a retry must not silently drop them.
+    """
+    attempts = getattr(error, "usage_attempts", None)
+    if attempts:
+        collected.extend(attempts)
 
 
 @runtime_checkable
@@ -41,14 +58,27 @@ class RetryWrapper(Retryable):
 
     def invoke(self, *args: Any, **kwargs: Any) -> Any:
         last_exception: Optional[Exception] = None
+        collected_attempts: list[Any] = []
 
         for attempt in range(self.max_retries):
             try:
-                return self.target.invoke(*args, **kwargs)
+                result = self.target.invoke(*args, **kwargs)
             except Exception as e:
                 if not self.retry_on(e):
+                    # A terminal non-retryable error must still carry the
+                    # history collected from earlier billed attempts; its own
+                    # payload (if any) stays last.
+                    if collected_attempts:
+                        from ..model.chat.exceptions import attach_usage_attempts
+
+                        attach_usage_attempts(
+                            e,
+                            collected_attempts
+                            + list(getattr(e, "usage_attempts", None) or []),
+                        )
                     raise
 
+                _collect_usage_attempts(e, collected_attempts)
                 last_exception = e
                 if attempt < self.max_retries - 1:
                     delay = self.strategy.get_delay(attempt) / 1000.0
@@ -56,21 +86,46 @@ class RetryWrapper(Retryable):
                         f"Attempt {attempt + 1} failed: {e}. Retrying in {delay:.2f}s..."
                     )
                     time.sleep(delay)
+            else:
+                from ..model.chat.exceptions import merge_usage_attempts_into_result
+
+                merge_usage_attempts_into_result(collected_attempts, result)
+                return result
 
         if last_exception:
+            # Every attempt failed: the collected list already includes the
+            # final exception's own attempts (gathered when it was caught),
+            # so it is the full ordered attempt history.
+            if collected_attempts:
+                from ..model.chat.exceptions import attach_usage_attempts
+
+                attach_usage_attempts(last_exception, collected_attempts)
             raise last_exception
         raise RuntimeError("Retry failed with no exception")
 
     async def ainvoke(self, *args: Any, **kwargs: Any) -> Any:
         last_exception: Optional[Exception] = None
+        collected_attempts: list[Any] = []
 
         for attempt in range(self.max_retries):
             try:
-                return await self.target.ainvoke(*args, **kwargs)
+                result = await self.target.ainvoke(*args, **kwargs)
             except Exception as e:
                 if not self.retry_on(e):
+                    # A terminal non-retryable error must still carry the
+                    # history collected from earlier billed attempts; its own
+                    # payload (if any) stays last.
+                    if collected_attempts:
+                        from ..model.chat.exceptions import attach_usage_attempts
+
+                        attach_usage_attempts(
+                            e,
+                            collected_attempts
+                            + list(getattr(e, "usage_attempts", None) or []),
+                        )
                     raise
 
+                _collect_usage_attempts(e, collected_attempts)
                 last_exception = e
                 if attempt < self.max_retries - 1:
                     delay = self.strategy.get_delay(attempt) / 1000.0
@@ -78,8 +133,17 @@ class RetryWrapper(Retryable):
                         f"Attempt {attempt + 1} failed: {e}. Retrying in {delay:.2f}s..."
                     )
                     await asyncio.sleep(delay)
+            else:
+                from ..model.chat.exceptions import merge_usage_attempts_into_result
+
+                merge_usage_attempts_into_result(collected_attempts, result)
+                return result
 
         if last_exception:
+            if collected_attempts:
+                from ..model.chat.exceptions import attach_usage_attempts
+
+                attach_usage_attempts(last_exception, collected_attempts)
             raise last_exception
         raise RuntimeError("Retry failed with no exception")
 

@@ -12,7 +12,7 @@ except ImportError:
     # Fallback for when zai SDK is not available
     ZhipuAiClient = None
 
-from ..exceptions import LLMRetryableError, LLMTimeoutError
+from ..exceptions import LLMRetryableError, LLMTimeoutError, attach_usage_attempts
 from ..timeout_config import TimeoutConfig
 from ..token_context import add_token_usage, extract_cached_input_tokens
 from ..types import ChunkType, StreamChunk
@@ -160,7 +160,8 @@ class ZhipuLLM(BaseLLM):
             **kwargs: Additional parameters to pass to the Zhipu API
 
         Returns:
-            - If normal text reply: return string
+            - If normal text reply: return dict with type "text" and content
+              (plus a top-level "usage" payload when the provider reported one)
             - If tool call triggered: return dict with type "tool_call" and tool_calls list
 
         Raises:
@@ -247,7 +248,9 @@ class ZhipuLLM(BaseLLM):
                 logger.error(f"Zhipu API response missing choices: {response}")
                 raise RuntimeError("Zhipu API response missing choices")
 
-            # Record token usage
+            # Record token usage; snapshot it as an OpenAI-style payload so the
+            # result envelopes below can carry a top-level ``usage`` stamp.
+            usage_payload: Optional[Dict[str, Any]] = None
             if hasattr(response, "usage"):
                 usage = response.usage
                 input_tokens = getattr(usage, "prompt_tokens", 0) or getattr(
@@ -256,13 +259,20 @@ class ZhipuLLM(BaseLLM):
                 output_tokens = getattr(usage, "completion_tokens", 0) or getattr(
                     usage, "output_tokens", 0
                 )
+                cached_tokens = extract_cached_input_tokens(usage)
+                usage_payload = {
+                    "prompt_tokens": input_tokens,
+                    "completion_tokens": output_tokens,
+                }
+                if cached_tokens > 0:
+                    usage_payload["cached_input_tokens"] = cached_tokens
                 add_token_usage(
                     input_tokens=input_tokens,
                     output_tokens=output_tokens,
                     model=self._model_name,
                     model_id=self.model_id,
                     call_type="chat",
-                    cached_input_tokens=extract_cached_input_tokens(usage),
+                    cached_input_tokens=cached_tokens,
                 )
 
             # Extract the choice
@@ -346,7 +356,7 @@ class ZhipuLLM(BaseLLM):
                         args = {}
 
                     # Return ReAct-compatible tool call format
-                    return {
+                    result: Dict[str, Any] = {
                         "type": "tool_call",
                         "tool_calls": [
                             {
@@ -364,6 +374,9 @@ class ZhipuLLM(BaseLLM):
                         if hasattr(response, "model_dump")
                         else str(response),
                     }
+                    if usage_payload is not None:
+                        result["usage"] = usage_payload
+                    return result
 
             # Handle text content
             content = message.content
@@ -382,15 +395,26 @@ class ZhipuLLM(BaseLLM):
 
                 # If there are no tool calls and no content, this is an error
                 if not tool_calls:
-                    raise RuntimeError(
+                    error = RuntimeError(
                         f"LLM returned {'empty' if content == '' else 'None'} content and no tool calls"
                     )
+                    # Billing is independent of retryability: this path stays
+                    # a non-retryable RuntimeError (#1714 problem 2), but the
+                    # already-booked usage payload must ride the exception so
+                    # ``on_llm_error`` can account for it.
+                    attach_usage_attempts(
+                        error, [usage_payload] if usage_payload is not None else []
+                    )
+                    raise error
                 else:
                     logger.info(
                         "None/empty content but tool calls present, this is expected behavior"
                     )
 
-            return content
+            text_result: Dict[str, Any] = {"type": "text", "content": content}
+            if usage_payload is not None:
+                text_result["usage"] = usage_payload
+            return text_result
 
         except Exception as e:
             # Handle any errors
@@ -398,7 +422,11 @@ class ZhipuLLM(BaseLLM):
             logger.error(f"  - Exception type: {type(e).__name__}")
             logger.error(f"  - Exception message: {str(e)}")
             logger.error(f"  - Exception args: {e.args}")
-            raise RuntimeError(f"Zhipu API error: {str(e)}") from e
+            wrapped = RuntimeError(f"Zhipu API error: {str(e)}")
+            # Preserve any billed-attempt payload carried by the cause so the
+            # wrap does not lose it from error-path accounting.
+            attach_usage_attempts(wrapped, getattr(e, "usage_attempts", None) or [])
+            raise wrapped from e
 
     async def stream_chat(
         self,
@@ -803,7 +831,8 @@ class ZhipuLLM(BaseLLM):
             **kwargs: Additional parameters to pass to the Zhipu API
 
         Returns:
-            - If normal text reply: return string
+            - If normal text reply: return dict with type "text" and content
+              (plus a top-level "usage" payload when the provider reported one)
             - If tool call triggered: return dict with type "tool_call" and tool_calls list
 
         Raises:
@@ -891,7 +920,9 @@ class ZhipuLLM(BaseLLM):
                 logger.error(f"Zhipu Vision API response missing choices: {response}")
                 raise RuntimeError("Zhipu Vision API response missing choices")
 
-            # Record token usage
+            # Record token usage; snapshot it as an OpenAI-style payload so the
+            # result envelopes below can carry a top-level ``usage`` stamp.
+            usage_payload: Optional[Dict[str, Any]] = None
             if hasattr(response, "usage"):
                 usage = response.usage
                 input_tokens = getattr(usage, "prompt_tokens", 0) or getattr(
@@ -900,13 +931,20 @@ class ZhipuLLM(BaseLLM):
                 output_tokens = getattr(usage, "completion_tokens", 0) or getattr(
                     usage, "output_tokens", 0
                 )
+                cached_tokens = extract_cached_input_tokens(usage)
+                usage_payload = {
+                    "prompt_tokens": input_tokens,
+                    "completion_tokens": output_tokens,
+                }
+                if cached_tokens > 0:
+                    usage_payload["cached_input_tokens"] = cached_tokens
                 add_token_usage(
                     input_tokens=input_tokens,
                     output_tokens=output_tokens,
                     model=self._model_name,
                     model_id=self.model_id,
                     call_type="vision_chat",
-                    cached_input_tokens=extract_cached_input_tokens(usage),
+                    cached_input_tokens=cached_tokens,
                 )
 
             # Extract the choice
@@ -990,7 +1028,7 @@ class ZhipuLLM(BaseLLM):
                         args = {}
 
                     # Return ReAct-compatible tool call format
-                    return {
+                    result: Dict[str, Any] = {
                         "type": "tool_call",
                         "tool_calls": [
                             {
@@ -1008,6 +1046,9 @@ class ZhipuLLM(BaseLLM):
                         if hasattr(response, "model_dump")
                         else str(response),
                     }
+                    if usage_payload is not None:
+                        result["usage"] = usage_payload
+                    return result
 
             # Handle text content
             content = message.content
@@ -1030,13 +1071,19 @@ class ZhipuLLM(BaseLLM):
                     logger.warning(
                         "No tool calls and None content, returning empty string"
                     )
-                    return ""
+                    empty_result: Dict[str, Any] = {"type": "text", "content": ""}
+                    if usage_payload is not None:
+                        empty_result["usage"] = usage_payload
+                    return empty_result
                 else:
                     logger.info(
                         "None content but tool calls present, this is expected behavior"
                     )
 
-            return content
+            vision_result: Dict[str, Any] = {"type": "text", "content": content}
+            if usage_payload is not None:
+                vision_result["usage"] = usage_payload
+            return vision_result
 
         except Exception as e:
             # Handle any errors

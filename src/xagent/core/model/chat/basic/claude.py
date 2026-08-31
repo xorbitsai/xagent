@@ -16,7 +16,7 @@ else:
         Anthropic = None  # type: ignore
         AsyncAnthropic = None  # type: ignore
 
-from ..exceptions import LLMRetryableError, LLMTimeoutError
+from ..exceptions import LLMRetryableError, LLMTimeoutError, attach_usage_attempts
 from ..timeout_config import TimeoutConfig
 from ..token_context import add_token_usage
 from ..types import ChunkType, StreamChunk
@@ -531,7 +531,8 @@ class ClaudeLLM(BaseLLM):
             **kwargs: Additional parameters to pass to the Anthropic API
 
         Returns:
-            - If normal text reply: return string
+            - If normal text reply: return dict with type "text" and content
+              (plus a top-level "usage" payload when the provider reported one)
             - If tool call triggered: return dict with type "tool_call" and tool_calls list
 
         Raises:
@@ -656,11 +657,23 @@ class ClaudeLLM(BaseLLM):
             # Make the API call
             response = await self._client.messages.create(**completion_params)
 
-            # Record token usage
+            # Record token usage; snapshot it as an OpenAI-style payload so the
+            # result envelopes below can carry a top-level ``usage`` stamp.
+            usage_payload: Optional[Dict[str, Any]] = None
             if hasattr(response, "usage"):
                 usage = response.usage
                 input_tokens, cache_read, cache_write = _anthropic_input_usage(usage)
                 output_tokens = getattr(usage, "output_tokens", 0)
+                usage_payload = {
+                    "prompt_tokens": input_tokens,
+                    "completion_tokens": output_tokens,
+                }
+                # Only stamp cache metrics when non-zero so a default 0 never
+                # shadows fallback fields in downstream extraction.
+                if cache_read > 0:
+                    usage_payload["cached_input_tokens"] = cache_read
+                if cache_write > 0:
+                    usage_payload["cache_write_input_tokens"] = cache_write
                 add_token_usage(
                     input_tokens=input_tokens,
                     output_tokens=output_tokens,
@@ -691,13 +704,16 @@ class ClaudeLLM(BaseLLM):
                         )
 
                 if tool_calls:
-                    return {
+                    result: Dict[str, Any] = {
                         "type": "tool_call",
                         "tool_calls": tool_calls,
                         "raw": response.model_dump()
                         if hasattr(response, "model_dump")
                         else str(response),
                     }
+                    if usage_payload is not None:
+                        result["usage"] = usage_payload
+                    return result
 
             # Extract text content
             text_content = []
@@ -707,27 +723,47 @@ class ClaudeLLM(BaseLLM):
 
             content = "".join(text_content).strip()
 
+            def _text_result(text: str) -> Dict[str, Any]:
+                result: Dict[str, Any] = {"type": "text", "content": text}
+                if usage_payload is not None:
+                    result["usage"] = usage_payload
+                return result
+
             if not content:
                 # Empty response should trigger retry
-                raise LLMRetryableError("LLM returned empty content and no tool calls")
+                error = LLMRetryableError(
+                    "LLM returned empty content and no tool calls"
+                )
+                # Usage was already booked above: carry this attempt's
+                # payload so the retry layer can merge the billed tokens.
+                if usage_payload is not None:
+                    error.usage_attempts = [usage_payload]
+                raise error
 
             # If JSON format was requested, try to repair and validate JSON
             if response_format and response_format.get("type") == "json_object":
                 try:
                     # Try to repair the JSON first
                     repaired_content = repair_loads(content, logging=False)
-                    # If repair succeeded, return the repaired JSON as string
-                    # to maintain consistency with normal text response
+                    # If repair succeeded, return the repaired JSON as the text
+                    # envelope's content, consistent with normal text responses
                     logger.info("JSON repair succeeded, returning repaired content")
-                    return json.dumps(repaired_content, ensure_ascii=False)
+                    return _text_result(
+                        json.dumps(repaired_content, ensure_ascii=False)
+                    )
                 except Exception as repair_error:
                     # JSON repair failed - raise retryable error to trigger retry
                     logger.warning(
                         f"JSON repair failed, retrying LLM call: {repair_error}"
                     )
-                    raise LLMRetryableError(
+                    error = LLMRetryableError(
                         "LLM returned unrepairable JSON when response_format=json_object was requested"
                     )
+                    # Usage was already booked above: carry this attempt's
+                    # payload so the retry layer can merge the billed tokens.
+                    if usage_payload is not None:
+                        error.usage_attempts = [usage_payload]
+                    raise error
 
             # Handle output_config with json_schema - content should already be valid JSON
             if output_config is not None:
@@ -736,9 +772,9 @@ class ClaudeLLM(BaseLLM):
                     # When using json_schema, the response is already validated JSON
                     # Return as-is since it's guaranteed to be valid
                     logger.info("Returning JSON schema validated response")
-                    return content
+                    return _text_result(content)
 
-            return content
+            return _text_result(content)
 
         except Exception as e:
             logger.error(f"Claude API error: {str(e)}")
@@ -762,7 +798,11 @@ class ClaudeLLM(BaseLLM):
                 if isinstance(e, APIStatusError):
                     raise LLMRetryableError(str(e)) from e
 
-            raise RuntimeError(f"Claude API error: {str(e)}") from e
+            wrapped = RuntimeError(f"Claude API error: {str(e)}")
+            # Preserve any billed-attempt payload carried by the cause so the
+            # wrap does not lose it from error-path accounting.
+            attach_usage_attempts(wrapped, getattr(e, "usage_attempts", None) or [])
+            raise wrapped from e
 
     async def stream_chat(
         self,
@@ -1197,7 +1237,8 @@ class ClaudeLLM(BaseLLM):
             **kwargs: Additional parameters to pass to the Claude API
 
         Returns:
-            - If normal text reply: return string
+            - If normal text reply: return dict with type "text" and content
+              (plus a top-level "usage" payload when the provider reported one)
             - If tool call triggered: return dict with type "tool_call" and tool_calls list
 
         Raises:

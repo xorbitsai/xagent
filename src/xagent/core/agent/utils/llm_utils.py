@@ -5,7 +5,50 @@ import logging
 import re
 from typing import Any, Dict, List
 
+from ...model.chat.exceptions import LLMEmptyContentError, LLMNoTextContentError
+from ...model.chat.response_shape import classify_chat_response
+
 logger = logging.getLogger(__name__)
+
+
+def unwrap_chat_text(response: Any) -> str:
+    """Extract the text content of a ``chat()`` response, or raise.
+
+    Adapters return either a plain string (legacy shape) or an envelope dict
+    such as ``{"type": "text", "content": ...}`` /
+    ``{"type": "tool_call", ...}``. Callers that need the text must never
+    fall back to ``str(response)``: on a tool_call envelope that yields the
+    dict's repr, which then leaks into compacted context or API responses as
+    if it were model output (#1714). Shape reading delegates to
+    ``classify_chat_response`` so every consumer shares one structural
+    source of truth.
+
+    Returns:
+        The response itself for plain-string replies, or the ``content`` of
+        a dict envelope carrying a usable non-empty string.
+
+    Raises:
+        LLMEmptyContentError: The response carries string content that is
+            empty or whitespace-only (same transient class the adapters raise
+            for an empty generation) -- envelope or legacy plain string.
+        LLMNoTextContentError: The response is a tool_call envelope, carries
+            non-string content, or has an unrecognized shape.
+    """
+    shape = classify_chat_response(response)
+    if shape.kind == "text":
+        assert shape.text is not None  # classifier invariant
+        return shape.text
+    if shape.kind == "empty":
+        raise LLMEmptyContentError("Chat response content is empty")
+    if isinstance(response, dict):
+        raise LLMNoTextContentError(
+            "Chat response has no usable text content "
+            f"(type={response.get('type')!r}, keys={sorted(response.keys())})"
+        )
+    raise LLMNoTextContentError(
+        "Chat response has no usable text content "
+        f"(response type={type(response).__name__})"
+    )
 
 
 def clean_llm_content(content: str) -> str:

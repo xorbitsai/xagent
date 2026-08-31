@@ -104,7 +104,14 @@ class Message:
 
 @dataclass
 class LLMCallRecord:
-    """Tracks token usage for a single LLM call."""
+    """Tracks token usage for a single LLM call.
+
+    ``synthetic_purpose`` marks records of internal, non-conversational
+    calls (currently only ``"context_compaction"``): their prompt is not
+    the live conversation, so they are skipped when the context-size
+    estimate picks its freshness baseline (see
+    ``ExecutionContext._get_total_tokens``).
+    """
 
     input_tokens: int
     output_tokens: int
@@ -113,3 +120,4 @@ class LLMCallRecord:
     prompt_message_count: int | None = None
     prompt_content_chars: int | None = None
     timestamp: datetime = field(default_factory=_utcnow)
+    synthetic_purpose: str | None = None

@@ -15,6 +15,7 @@ from ..exceptions import (
     LLMInvalidResponseError,
     LLMRetryableError,
     LLMTimeoutError,
+    attach_usage_attempts,
 )
 from ..timeout_config import TimeoutConfig
 from ..token_context import add_token_usage
@@ -574,7 +575,9 @@ class GeminiLLM(BaseLLM):
 
             response = await self._client.aio.models.generate_content(**api_params)
 
-            # Extract token usage
+            # Extract token usage; snapshot it as an OpenAI-style payload so
+            # the result envelopes below can carry a top-level ``usage`` stamp.
+            usage_payload: Optional[Dict[str, Any]] = None
             if hasattr(response, "usage_metadata") and response.usage_metadata:
                 usage_metadata = response.usage_metadata
                 input_tokens = getattr(usage_metadata, "prompt_token_count", 0)
@@ -584,6 +587,14 @@ class GeminiLLM(BaseLLM):
                 )
 
                 if input_tokens > 0 or output_tokens > 0:
+                    usage_payload = {
+                        "prompt_tokens": input_tokens,
+                        "completion_tokens": output_tokens,
+                    }
+                    # Guard the comparison: real SDKs report int/None here,
+                    # but token accounting must never raise out of chat().
+                    if isinstance(cached_tokens, (int, float)) and cached_tokens > 0:
+                        usage_payload["cached_input_tokens"] = cached_tokens
                     add_token_usage(
                         input_tokens=input_tokens,
                         output_tokens=output_tokens,
@@ -597,23 +608,32 @@ class GeminiLLM(BaseLLM):
 
             # Extract response content
             if not response.candidates or len(response.candidates) == 0:
-                raise LLMInvalidResponseError("No candidates in Gemini SDK response")
+                error = LLMInvalidResponseError("No candidates in Gemini SDK response")
+                if usage_payload is not None:
+                    error.usage_attempts = [usage_payload]
+                raise error
 
             candidate = response.candidates[0]
 
             # Check if candidate.content exists
             if not hasattr(candidate, "content") or candidate.content is None:
-                raise LLMInvalidResponseError(
+                error = LLMInvalidResponseError(
                     "Candidate content is None in Gemini SDK response"
                 )
+                if usage_payload is not None:
+                    error.usage_attempts = [usage_payload]
+                raise error
 
             content_parts = candidate.content.parts
 
             # Check if content_parts is None
             if content_parts is None:
-                raise LLMInvalidResponseError(
+                error = LLMInvalidResponseError(
                     "Content parts is None in Gemini SDK response"
                 )
+                if usage_payload is not None:
+                    error.usage_attempts = [usage_payload]
+                raise error
 
             tool_calls = []
             text_parts = []
@@ -638,22 +658,39 @@ class GeminiLLM(BaseLLM):
                     text_parts.append(part.text)
 
             if tool_calls:
-                return {
+                tool_result: Dict[str, Any] = {
                     "type": "tool_call",
                     "tool_calls": tool_calls,
                 }
+                if usage_payload is not None:
+                    tool_result["usage"] = usage_payload
+                return tool_result
 
             content = "".join(text_parts).strip()
 
             if not content:
-                raise LLMEmptyContentError(
+                empty_error = LLMEmptyContentError(
                     "LLM returned empty content and no tool calls"
                 )
+                # Usage was already booked above: carry this attempt's
+                # payload so the retry layer can merge the billed tokens.
+                if usage_payload is not None:
+                    empty_error.usage_attempts = [usage_payload]
+                raise empty_error
 
-            return content
+            text_result: Dict[str, Any] = {"type": "text", "content": content}
+            if usage_payload is not None:
+                text_result["usage"] = usage_payload
+            return text_result
 
         except Exception as e:
             logger.error("Gemini SDK API error: %s", redact_sensitive_text(str(e)))
+
+            # Re-raise retryable errors as-is (same contract as claude.py):
+            # wrapping them into a plain RuntimeError would lose their type
+            # fidelity for any caller that catches the specific class.
+            if isinstance(e, LLMRetryableError):
+                raise
 
             error_text = str(e)
             error_text_lower = error_text.lower()
@@ -679,7 +716,13 @@ class GeminiLLM(BaseLLM):
             if "rate limit" in str(e).lower() or "quota" in str(e).lower():
                 raise LLMRetryableError(str(e)) from e
 
-            raise RuntimeError(f"Gemini SDK API error: {str(e)}") from e
+            # Billed attempts attached by the raise sites above must survive
+            # the RuntimeError wrap: the retry wrapper reads them off the
+            # surfaced exception (its ``retry_on`` already looks through
+            # ``__cause__`` for the retry decision itself).
+            wrapped = RuntimeError(f"Gemini SDK API error: {str(e)}")
+            attach_usage_attempts(wrapped, getattr(e, "usage_attempts", None) or [])
+            raise wrapped from e
 
     async def stream_chat(
         self,

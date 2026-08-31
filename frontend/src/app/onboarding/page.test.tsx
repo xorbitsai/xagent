@@ -270,10 +270,19 @@ describe("OnboardingPage", () => {
   // "Skip setup" exit is reachable from any step regardless of Continue's
   // validation state (it's only disabled while a save is in flight), so a
   // user can pick "Other," type only whitespace, and exit before Continue
-  // would have ever required real text. Whitespace-only industry must be
-  // omitted, not sent as-is - `industry.trim() || undefined` regressing to
-  // `industry || undefined` would send the raw whitespace string instead.
-  it("omits industry (does not send whitespace) when 'Other' is picked but only whitespace was typed, exited via header Skip", async () => {
+  // would have ever required real text. Whitespace-only industry must
+  // never be sent as-is (`industry.trim() || ...` regressing to
+  // `industry || ...` would send the raw whitespace string).
+  //
+  // Sends an explicit `null`, not an omitted key, though - a later
+  // adversarial review found this field has the same "touched vs. never
+  // touched" ambiguity the goals fix (hasToggledGoalsRef) closed: typing
+  // anything at all (even whitespace that trims to nothing) is touching
+  // the field, and must clear a stale server-side value the same way a
+  // real typed-then-deleted value would - see hasTouchedIndustryRef's
+  // comment. Only a field the user never interacted with at all still
+  // omits the key (the test above).
+  it("sends an explicit null for industry (not omitted, not raw whitespace) when 'Other' is picked but only whitespace was typed, exited via header Skip", async () => {
     await goToWelcomeThenBusiness()
     fireEvent.click(screen.getByText("Other"))
     fireEvent.change(screen.getByPlaceholderText("e.g. Property management"), {
@@ -285,7 +294,27 @@ describe("OnboardingPage", () => {
     await waitFor(() => expect(updateUserPreferencesMock).toHaveBeenCalled())
     const call = updateUserPreferencesMock.mock.calls.at(-1)![0]
     expect(call).toHaveProperty("department", "other")
-    expect(call).not.toHaveProperty("industry")
+    expect(call).toHaveProperty("industry", null)
+  })
+
+  // Pins the actual motivating scenario for hasTouchedIndustryRef: a real
+  // value typed in, then fully deleted back to blank before exiting - the
+  // clearest case of "this WAS something, now it's explicitly empty,"
+  // which must send `null` (clear) rather than omit (leave whatever's
+  // stored, e.g. from an earlier onboarding attempt or a stale revisit).
+  it("sends an explicit null for industry after typing a real value and then deleting it back to blank", async () => {
+    await goToWelcomeThenBusiness()
+    fireEvent.click(screen.getByText("Other"))
+    const input = screen.getByPlaceholderText("e.g. Property management")
+    fireEvent.change(input, { target: { value: "Legal" } })
+    fireEvent.change(input, { target: { value: "" } })
+
+    fireEvent.click(screen.getByText("Skip setup"))
+
+    await waitFor(() => expect(updateUserPreferencesMock).toHaveBeenCalled())
+    const call = updateUserPreferencesMock.mock.calls.at(-1)![0]
+    expect(call).toHaveProperty("department", "other")
+    expect(call).toHaveProperty("industry", null)
   })
 
   // Matches PREFERENCES_TEXT_FIELD_MAX_LENGTH in src/xagent/web/api/auth.py -
@@ -2063,9 +2092,19 @@ describe("OnboardingPage", () => {
     fireEvent.click(screen.getByText("Post on social media")) // deselect - back to zero
     fireEvent.click(screen.getByText("Not sure yet — show me everyone"))
 
-    expect(updateUserPreferencesMock).toHaveBeenCalledWith(
-      expect.objectContaining({ onboarded: true, goals: [] })
-    )
+    // toEqual against the FULL exact object, not objectContaining a subset
+    // - a self-review finding caught that a subset check can't prove the
+    // goals-clear latch doesn't leak into (or get masked by) sibling
+    // fields: department must still be present, industry must still
+    // correctly be explicit `null` (work isn't "other" - pre-existing
+    // logic, unrelated to this fix), and voice must still be omitted
+    // entirely (the voice step was never reached in this flow).
+    expect(updateUserPreferencesMock).toHaveBeenCalledWith({
+      onboarded: true,
+      department: "marketing",
+      industry: null,
+      goals: [],
+    })
   })
 
   // Pins a test-coverage gap found by self-review: the test above only
@@ -2408,6 +2447,44 @@ describe("OnboardingPage", () => {
     // authUser is a stable mock reference, so mutating it and re-rendering
     // stands in for that state update without an actual remount.
     authUser.id = "user-b"
+    await act(async () => {
+      rerender(<OnboardingPage />)
+    })
+
+    await act(async () => {
+      fireEvent.click(screen.getByText("Start with Maya"))
+    })
+
+    expect(updateUserPreferencesMock).not.toHaveBeenCalled()
+    expect(hireAgentFromTemplateMock).not.toHaveBeenCalled()
+    expect(routerReplace).not.toHaveBeenCalled()
+  })
+
+  // Pins a test-coverage gap found by self-review: every identity-swap test
+  // so far simulates a swap to a DIFFERENT REAL user. A plain logout /
+  // session-clear mid-wizard (token expiry, an explicit logout in another
+  // tab) is arguably the more realistic trigger for this guard, and
+  // readAuthSessionSnapshot().userId genuinely can become `null` in that
+  // case (not just a different string) - this proves the comparison
+  // (`currentSessionUserId() !== wizardUserIdRef.current`) still correctly
+  // treats "session cleared" as a mismatch, not as some special "auth
+  // still resolving, let it through" case.
+  it("does not save, hire, or navigate if the session is cleared (logout) mid-wizard, not just swapped to another user", async () => {
+    const { rerender } = render(<OnboardingPage />)
+    await waitFor(() => expect(screen.getByText(/Welcome to Xagent/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Let's go"))
+    fireEvent.click(screen.getByText("Marketing"))
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/take off your plate/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Post on social media"))
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/Meet your AI team/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText(/How should/)).toBeInTheDocument())
+    fireEvent.click(screen.getByText("Continue"))
+    await waitFor(() => expect(screen.getByText("You're all set.")).toBeInTheDocument())
+
+    sessionUserIdOverride.current = null
     await act(async () => {
       rerender(<OnboardingPage />)
     })

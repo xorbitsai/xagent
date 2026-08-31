@@ -161,6 +161,17 @@ export default function OnboardingPage() {
 
   const [work, setWork] = useState<OnboardingWorkId | "">("");
   const [industry, setIndustry] = useState("");
+  // Mirrors hasToggledGoalsRef's latch, for the same root cause found in a
+  // fresh adversarial review: industryPayloadValue below already sends an
+  // explicit `null` when switching AWAY from "other" (clearing a stale
+  // value paired with the old department), but while STAYING on "other"
+  // with the field typed-then-cleared back to blank, it fell back to
+  // omitting the key - indistinguishable from "never typed anything in
+  // the first place." A user who revisits onboarding with "other"/some
+  // industry already saved, picks "other" again, and leaves the (freshly
+  // reset local) field blank before exiting would have the stale value
+  // silently survive server-side despite the field visibly showing blank.
+  const hasTouchedIndustryRef = useRef(false);
   const [goals, setGoals] = useState<string[]>([]);
   const [agentTemplateId, setAgentTemplateId] = useState("");
   const [voice, setVoice] = useState<OnboardingVoiceId>(ONBOARDING_DEFAULT_VOICE);
@@ -378,8 +389,18 @@ export default function OnboardingPage() {
   // {department: "sales", industry: "Legal"}). `null` is this endpoint's
   // actual "clear this field" signal (see UpdatePreferencesRequest).
   // `undefined` (an untouched field, work never set) still omits the key.
+  //
+  // While STAYING on "other", an explicit `null` is needed too once the
+  // field has actually been touched and typed back to blank - see
+  // hasTouchedIndustryRef's comment. Only a genuinely never-touched field
+  // (freshly reset to "" on a fresh mount, or "other" just now selected)
+  // still omits the key, matching the untouched-goals case above.
   const industryPayloadValue = (): string | null | undefined => {
-    if (work === "other") return industry.trim() || undefined;
+    if (work === "other") {
+      const trimmed = industry.trim();
+      if (trimmed) return trimmed;
+      return hasTouchedIndustryRef.current ? null : undefined;
+    }
     return work ? null : undefined;
   };
 
@@ -840,7 +861,10 @@ export default function OnboardingPage() {
                     id="onboarding-industry"
                     autoFocus
                     value={industry}
-                    onChange={(event) => setIndustry(event.target.value)}
+                    onChange={(event) => {
+                      hasTouchedIndustryRef.current = true;
+                      setIndustry(event.target.value);
+                    }}
                     placeholder={t("onboarding.business.industryPlaceholder")}
                     // Matches PREFERENCES_TEXT_FIELD_MAX_LENGTH in
                     // src/xagent/web/api/auth.py - a defensive client-side

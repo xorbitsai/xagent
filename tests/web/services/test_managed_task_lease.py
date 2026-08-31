@@ -69,6 +69,7 @@ def test_finalize_managed_result_commits_exact_status_and_transcript(
             lease,
             status=TaskStatus.COMPLETED,
             assistant_content="completed inline",
+            turn_id="accepted-turn",
             interactions=[{"type": "question", "content": "continue?"}],
             message_type="assistant_response",
         )
@@ -88,6 +89,7 @@ def test_finalize_managed_result_commits_exact_status_and_transcript(
         .one()
     )
     assert "completed inline" in stored.content
+    assert stored.turn_id == "accepted-turn"
 
 
 def test_finalize_managed_result_rejects_replacement_owner(db_session) -> None:

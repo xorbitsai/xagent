@@ -43,7 +43,12 @@ from ..auth_config import (
     REFRESH_TOKEN_EXPIRE_DAYS,
 )
 from ..auth_dependencies import get_current_user
-from ..models.database import get_db, get_session_local, release_db_connection_if_clean
+from ..models.actor_oauth_flow import ActorOAuthFlowState
+from ..models.database import (
+    get_db,
+    get_session_local,
+    release_db_connection_if_clean,
+)
 from ..models.system_setting import SystemSetting
 from ..models.user import User
 from ..models.user_oauth import UserOAuth
@@ -51,7 +56,10 @@ from ..oauth_provider_quirks import requires_json_accept_header
 from ..services import gmail_provisioning
 from ..services.auth_email import send_password_reset_email
 from ..services.db_runtime import await_task_settlement, propagate_deferred_cancellation
-from ..services.user_oauth import delete_scoped_user_oauth_accounts
+from ..services.user_oauth import (
+    delete_scoped_user_oauth_accounts,
+    normalize_user_oauth_resource_owner_key,
+)
 from ..utils.graphql_errors import graphql_errors_message, truncate_error_text
 
 logger = logging.getLogger(__name__)
@@ -62,6 +70,9 @@ REGISTRATION_ENABLED_SETTING_KEY = "registration_enabled"
 SETUP_COMPLETED_SETTING_KEY = "setup_completed"
 EMAIL_PATTERN = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 _MAX_USER_ID = 2_147_483_647
+_ACTOR_OAUTH_FLOW_TTL = timedelta(minutes=10)
+_ACTOR_OAUTH_COOKIE_PREFIX = "xagent_actor_oauth_"
+_ACTOR_OWNER_CLAIM_VERSION = 1
 
 
 def _best_effort_ensure_gmail_watches_for_user(db: Session, *, user_id: int) -> None:
@@ -1831,7 +1842,183 @@ def generic_oauth_login(
     db: Optional[Session] = None,
     db_provider: Optional[Any] = None,
 ) -> Any:
-    """Start generic OAuth flow"""
+    """Start the ordinary public OAuth flow without actor claims or cookies."""
+    return _generic_oauth_login(
+        provider,
+        token=token,
+        app_id=app_id,
+        redirect=redirect,
+        db=db,
+        db_provider=db_provider,
+        trusted_user_id=None,
+        resource_owner_key=None,
+        actor_flow_nonce=None,
+    )
+
+
+def _actor_oauth_cookie_name(nonce: str) -> str:
+    """Return a distinct cookie name for one signed flow nonce digest."""
+    return f"{_ACTOR_OAUTH_COOKIE_PREFIX}{nonce[:24]}"
+
+
+def is_actor_oauth_cookie_header(value: str) -> bool:
+    """Accept only a Set-Cookie header for an actor OAuth flow."""
+    name, separator, _rest = value.partition("=")
+    return separator == "=" and name.strip().startswith(_ACTOR_OAUTH_COOKIE_PREFIX)
+
+
+def _actor_oauth_cookie_scope(provider: str, db_provider: Any) -> tuple[bool, str]:
+    """Match the browser cookie to the configured callback URL."""
+    from urllib.parse import urlparse
+
+    redirect_uri = urlparse(_resolve_oauth_redirect_uri(provider, db_provider))
+    return redirect_uri.scheme.lower() == "https", redirect_uri.path or "/"
+
+
+def _encrypt_actor_owner_claim(owner_key: str) -> str:
+    """Encrypt one typed owner claim without ciphertext pass-through."""
+    from ...core.utils.encryption import get_cipher
+
+    envelope = json.dumps(
+        {"owner": owner_key, "version": _ACTOR_OWNER_CLAIM_VERSION},
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    return get_cipher().encrypt(envelope.encode()).decode()
+
+
+def _decrypt_actor_owner_claim(claim: str) -> str:
+    """Decrypt and validate one typed actor owner claim."""
+    from ...core.utils.encryption import decrypt_value_strict
+
+    decrypted = decrypt_value_strict(claim)
+    if decrypted == claim:
+        raise ValueError("actor owner claim is not encrypted")
+
+    envelope = json.loads(decrypted)
+    if (
+        not isinstance(envelope, dict)
+        or set(envelope) != {"owner", "version"}
+        or type(envelope.get("version")) is not int
+        or envelope.get("version") != _ACTOR_OWNER_CLAIM_VERSION
+        or not isinstance(envelope.get("owner"), str)
+    ):
+        raise ValueError("invalid actor owner envelope")
+    return cast(str, envelope["owner"])
+
+
+def _actor_link_query(db: Session, *, user_id: int, provider: str, app_id: str) -> Any:
+    """Select the exact active personal link for one builtin app."""
+    from ..mcp_apps import require_builtin_oauth_server_definition
+    from ..models.mcp import UserMCPServer
+
+    server = require_builtin_oauth_server_definition(
+        db, app_id=app_id, provider=provider
+    )
+    return db.query(UserMCPServer).filter(
+        UserMCPServer.user_id == user_id,
+        UserMCPServer.mcpserver_id == int(server.id),
+        UserMCPServer.is_active.is_(True),
+    )
+
+
+def _require_one_actor_link(links: list[Any], app_id: str) -> None:
+    if len(links) != 1:
+        raise ValueError(
+            f"actor builtin OAuth app {app_id!r} requires exactly one active "
+            "personal MCP server link"
+        )
+
+
+def _require_actor_oauth_personal_link(
+    db: Session, *, user_id: int, provider: str, app_id: str
+) -> None:
+    """Require one canonical builtin definition and its active personal link."""
+    links = _actor_link_query(
+        db, user_id=user_id, provider=provider, app_id=app_id
+    ).all()
+    _require_one_actor_link(links, app_id)
+
+
+def _lock_actor_link(db: Session, *, user_id: int, provider: str, app_id: str) -> None:
+    """Lock one active personal link before actor credential persistence."""
+    links = (
+        _actor_link_query(db, user_id=user_id, provider=provider, app_id=app_id)
+        .with_for_update()
+        .all()
+    )
+    _require_one_actor_link(links, app_id)
+
+
+def start_builtin_oauth_for_resource_owner(
+    *,
+    provider: str,
+    app_id: str,
+    user: User,
+    resource_owner_key: str,
+    redirect: str | None = None,
+    db: Session,
+    db_provider: Any,
+) -> Any:
+    """Start actor OAuth; the caller owns the surrounding transaction."""
+    if not isinstance(app_id, str) or not app_id.strip():
+        raise ValueError("actor builtin OAuth app_id must be a non-empty string")
+    if user.id is None:
+        raise ValueError("user must be persisted before starting actor OAuth")
+    owner_key = normalize_user_oauth_resource_owner_key(resource_owner_key)
+    if owner_key is None:  # pragma: no cover - normalization preserves only None
+        raise ValueError("resource_owner_key must not be null")
+    app_id = app_id.strip()
+    _require_actor_oauth_personal_link(
+        db,
+        user_id=int(user.id),
+        provider=provider,
+        app_id=app_id,
+    )
+
+    browser_nonce = secrets.token_urlsafe(32)
+    nonce_digest = hashlib.sha256(browser_nonce.encode()).hexdigest()
+    expires_at = datetime.now(timezone.utc) + _ACTOR_OAUTH_FLOW_TTL
+    response = _generic_oauth_login(
+        provider,
+        token=None,
+        app_id=app_id,
+        redirect=redirect,
+        db=db,
+        db_provider=db_provider,
+        trusted_user_id=int(user.id),
+        resource_owner_key=owner_key,
+        actor_flow_nonce=nonce_digest,
+    )
+    if not isinstance(response, RedirectResponse):
+        return response
+    db.add(ActorOAuthFlowState(nonce=nonce_digest, expires_at=expires_at))
+    cookie_secure, cookie_path = _actor_oauth_cookie_scope(provider, db_provider)
+    response.set_cookie(
+        _actor_oauth_cookie_name(nonce_digest),
+        browser_nonce,
+        max_age=int(_ACTOR_OAUTH_FLOW_TTL.total_seconds()),
+        secure=cookie_secure,
+        httponly=True,
+        samesite="lax",
+        path=cookie_path,
+    )
+    return response
+
+
+def _generic_oauth_login(
+    provider: str,
+    *,
+    token: str | None,
+    app_id: str | None,
+    redirect: str | None,
+    db: Session | None,
+    db_provider: Any | None,
+    trusted_user_id: int | None,
+    resource_owner_key: str | None,
+    actor_flow_nonce: str | None,
+) -> Any:
+    """Build an ordinary or trusted actor provider authorization redirect."""
     if db is None:
         raise RuntimeError("db session is required")
     if not db_provider:
@@ -1848,14 +2035,14 @@ def generic_oauth_login(
 
     redirect_uri = _resolve_oauth_redirect_uri(provider, db_provider)
 
-    user_id = None
-    if token:
+    user_id = trusted_user_id
+    if user_id is None and token:
         payload = verify_token(token)
         if payload and payload.get("type") == "access":
             username = payload.get("sub")
             user = db.query(User).filter(User.username == username).first()
             if user:
-                user_id = user.id
+                user_id = int(user.id)
 
     if not user_id:
         return HTMLResponse(
@@ -1942,6 +2129,25 @@ def generic_oauth_login(
                 ),
                 status_code=500,
             )
+    if actor_flow_nonce is not None:
+        if resource_owner_key is None:
+            raise RuntimeError("actor OAuth flow requires an owner key")
+        try:
+            encrypted_owner_key = _encrypt_actor_owner_claim(resource_owner_key)
+        except ValueError:
+            return HTMLResponse(
+                content=(
+                    "<h1>Error: Server misconfigured</h1>"
+                    "<p>The ENCRYPTION_KEY environment variable is not set. "
+                    "This is required to connect an actor-owned account; set "
+                    "it and restart the backend.</p>"
+                ),
+                status_code=500,
+            )
+        state_payload.update(
+            resource_owner_key=encrypted_owner_key,
+            actor_flow_nonce=actor_flow_nonce,
+        )
     state = create_access_token(data=state_payload, expires_delta=timedelta(minutes=10))
 
     app_scopes: list[str] | None = None
@@ -2172,13 +2378,17 @@ def generic_oauth_callback(
     code = request.query_params.get("code")
     state = request.query_params.get("state")
     error = request.query_params.get("error")
-
-    if error:
-        return HTMLResponse(
+    provider_error_response = (
+        HTMLResponse(
             content=f"<h1>Error: {html.escape(str(error))}</h1>", status_code=400
         )
+        if error
+        else None
+    )
 
-    if not code or not state:
+    if provider_error_response is not None and not state:
+        return provider_error_response
+    if not state or (not code and provider_error_response is None):
         return HTMLResponse(
             content="<h1>Error: Missing code or state</h1>", status_code=400
         )
@@ -2189,9 +2399,17 @@ def generic_oauth_callback(
         or payload.get("type") != "oauth_state"
         or payload.get("provider") != provider
     ):
+        if provider_error_response is not None:
+            return provider_error_response
         return HTMLResponse(
             content="<h1>Error: Invalid or expired state</h1>", status_code=400
         )
+
+    actor_flow_nonce = payload.get("actor_flow_nonce")
+    actor_owner_claim = payload.get("resource_owner_key")
+    is_actor_flow = actor_flow_nonce is not None or actor_owner_claim is not None
+    if provider_error_response is not None and not is_actor_flow:
+        return provider_error_response
 
     user_id_claim = payload.get("user_id")
     if user_id_claim is not None and (
@@ -2229,6 +2447,74 @@ def generic_oauth_callback(
                 ),
                 status_code=400,
             )
+    resource_owner_key: str | None = None
+
+    if is_actor_flow:
+        try:
+            if (
+                not isinstance(actor_flow_nonce, str)
+                or len(actor_flow_nonce) != 64
+                or any(
+                    character not in "0123456789abcdef"
+                    for character in actor_flow_nonce
+                )
+                or not isinstance(app_id, str)
+                or not app_id
+                or user_id is None
+            ):
+                raise ValueError("invalid actor OAuth claims")
+            if not isinstance(actor_owner_claim, str):
+                raise ValueError("missing actor owner")
+            resource_owner_key = normalize_user_oauth_resource_owner_key(
+                _decrypt_actor_owner_claim(actor_owner_claim)
+            )
+            if resource_owner_key is None:
+                raise ValueError("missing actor owner")
+            cookie_value = request.cookies.get(
+                _actor_oauth_cookie_name(actor_flow_nonce)
+            )
+            cookie_digest = (
+                hashlib.sha256(cookie_value.encode()).hexdigest()
+                if isinstance(cookie_value, str)
+                else ""
+            )
+            if not secrets.compare_digest(cookie_digest, actor_flow_nonce):
+                raise ValueError("actor OAuth browser cookie mismatch")
+            if db.query(User.id).filter(User.id == user_id).one_or_none() is None:
+                raise ValueError("actor OAuth user no longer exists")
+            _require_actor_oauth_personal_link(
+                db,
+                user_id=user_id,
+                provider=provider,
+                app_id=app_id,
+            )
+        except ValueError:
+            db.rollback()
+            return HTMLResponse(
+                content="<h1>Error: Invalid or expired actor OAuth flow</h1>",
+                status_code=400,
+            )
+
+        deleted = (
+            db.query(ActorOAuthFlowState)
+            .filter(
+                ActorOAuthFlowState.nonce == actor_flow_nonce,
+                ActorOAuthFlowState.expires_at > datetime.now(timezone.utc),
+            )
+            .delete(synchronize_session=False)
+        )
+        if deleted != 1:
+            db.rollback()
+            return HTMLResponse(
+                content="<h1>Error: Invalid or expired actor OAuth flow</h1>",
+                status_code=400,
+            )
+        # The nonce claim is durable before any provider exchange. A failed
+        # exchange cannot make the authorization code replayable.
+        db.commit()
+
+        if provider_error_response is not None:
+            return provider_error_response
 
     if not app_id:
         from ..mcp_apps import requires_app_scoped_oauth_grant
@@ -2747,18 +3033,42 @@ def generic_oauth_callback(
             provider_user_id = info_data.get(db_provider.user_id_path or "id")
             email = info_data.get(db_provider.email_path or "email")
 
+        if is_actor_flow:
+            assert user_id is not None
+            assert isinstance(app_id, str)
+
+            try:
+                # Provider I/O can overlap a personal disconnect. Recheck and
+                # lock the exact link before persisting the actor credential.
+                _lock_actor_link(
+                    db,
+                    user_id=user_id,
+                    provider=provider,
+                    app_id=app_id,
+                )
+            except ValueError:
+                db.rollback()
+                return HTMLResponse(
+                    content="<h1>Error: Invalid or expired actor OAuth flow</h1>",
+                    status_code=400,
+                )
+
         if user_id:
+            if is_actor_flow:
+                # Serialize replacement in the stable user namespace.
+                db.query(User.id).filter(User.id == user_id).with_for_update().one()
+
             delete_scoped_user_oauth_accounts(
                 db,
                 user_id=user_id,
-                resource_owner_key=None,
+                resource_owner_key=resource_owner_key,
                 providers=[app_id or provider],
             )
 
             oauth_account = UserOAuth(
                 user_id=user_id,
                 provider=(app_id or provider),
-                resource_owner_key=None,
+                resource_owner_key=resource_owner_key,
                 provider_user_id=str(provider_user_id) if provider_user_id else None,
             )
             db.add(oauth_account)
@@ -2809,13 +3119,15 @@ def generic_oauth_callback(
             from ..mcp_apps import get_all_mcp_apps
             from .mcp import _reject_hidden_catalog_app
 
-            if app_id:
+            if app_id and not is_actor_flow:
                 # Reuse target_app_info from the earlier hidden-app-gate
                 # check above rather than re-fetching by app_id: nothing
                 # mutates public_mcp_apps between there and here, so a second
                 # fetch would just be redundant, not more correct.
                 app_info = target_app_info
-                if app_info:
+                # A concurrent personal disconnect must win. Actor callbacks
+                # persist only the credential and never recreate its link.
+                if app_info and not is_actor_flow:
                     # A stale/crafted app_id in the OAuth state can point at a
                     # non-oauth app. Fail with a clear error instead of a generic
                     # 500 after the user already completed provider consent —
@@ -2831,7 +3143,7 @@ def generic_oauth_callback(
                             ),
                             status_code=400,
                         )
-            else:
+            elif not app_id:
                 from ..mcp_apps import requires_app_scoped_oauth_grant
 
                 apps = [
@@ -2889,9 +3201,10 @@ def generic_oauth_callback(
             # Everything past the commit belongs in the helper, which cannot
             # change what this callback returns. Add new post-commit work
             # there, not here.
-            _run_post_commit_oauth_side_effects(
-                db, user_id=user_id, connector_key=(app_id or provider)
-            )
+            if not is_actor_flow:
+                _run_post_commit_oauth_side_effects(
+                    db, user_id=user_id, connector_key=(app_id or provider)
+                )
 
         from urllib.parse import urlparse
 

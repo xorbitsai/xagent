@@ -569,6 +569,41 @@ async def test_missing_snapshot_is_loaded_off_loop_without_event_loop_queries() 
     assert agent_manager.get_agent_for_task.await_args.args[1] is None
 
 
+@pytest.mark.asyncio
+async def test_missing_snapshot_broadcasts_task_unavailable_code() -> None:
+    agent_manager = MagicMock()
+    broadcast = AsyncMock()
+
+    with _Patches(
+        [
+            patch(
+                "xagent.web.services.task_setup_snapshot.load_task_setup_snapshot_sync",
+                return_value=None,
+            ),
+            patch(
+                "xagent.web.api.websocket._terminal_task_error_payload",
+                return_value={"type": "task_error"},
+            ),
+            patch(
+                "xagent.web.api.websocket.manager.broadcast_to_task",
+                new=broadcast,
+            ),
+        ]
+    ):
+        await execute_task_background(
+            task_id=42,
+            user_message="hi",
+            context={},
+            agent_manager=agent_manager,
+            task_owner_user_id=1,
+            task_setup_snapshot=None,
+        )
+
+    payload = broadcast.await_args.args[0]
+    assert payload["error"] == "Task is no longer available."
+    assert payload["error_code"] == "task_unavailable"
+
+
 class _Patches:
     def __init__(self, patches: list[Any]) -> None:
         self._patches = patches

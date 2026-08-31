@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 from contextlib import contextmanager
 from dataclasses import dataclass
+from dataclasses import field as dataclass_field
 from typing import Any, Callable, Iterator, Protocol
 
 from ...core.tools.adapters.vibe.connector_runtime import (
@@ -10,8 +11,34 @@ from ...core.tools.adapters.vibe.connector_runtime import (
     ConnectorRuntimeError,
 )
 from .mcp_oauth import MCPOAuthRuntimeError, resolve_mcp_oauth_runtime_auth
+from .user_oauth import normalize_user_oauth_resource_owner_key
 
 HTTP_MCP_TRANSPORTS = frozenset({"sse", "websocket", "streamable_http"})
+
+
+class MCPBuiltinOAuthActorPolicyRequiredError(RuntimeError):
+    """A marked task was used without its trusted actor policy."""
+
+
+class MCPBuiltinOAuthActorPolicyMismatchError(RuntimeError):
+    """A task's already-bound actor policy was replaced."""
+
+
+@dataclass(frozen=True)
+class MCPBuiltinOAuthActorPolicy:
+    """Trusted actor owner namespace for builtin OAuth MCP execution.
+
+    Server visibility and builtin classification remain xagent runtime
+    decisions. The caller supplies only the immutable credential owner.
+    """
+
+    resource_owner_key: str = dataclass_field(repr=False)
+
+    def __post_init__(self) -> None:
+        owner_key = normalize_user_oauth_resource_owner_key(self.resource_owner_key)
+        if owner_key is None:  # pragma: no cover - normalization preserves None only
+            raise ValueError("resource_owner_key must not be null")
+        object.__setattr__(self, "resource_owner_key", owner_key)
 
 
 @dataclass(frozen=True)

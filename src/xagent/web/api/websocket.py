@@ -100,8 +100,11 @@ from ..services.chat_history_service import (
     mark_user_message_delivery_sync,
 )
 from ..services.client_error_messages import (
+    CLIENT_SAFE_GUIDANCE_IN_PROGRESS,
     CLIENT_SAFE_TASK_FAILURE,
     CLIENT_SAFE_VALIDATION_ERROR,
+    ClientErrorCode,
+    client_error_message,
 )
 from ..services.db_runtime import (
     await_task_settlement,
@@ -149,6 +152,10 @@ from ..services.managed_file_ref import (
     DurableStorageOperationError,
     log_durable_storage_fault,
 )
+from ..services.mcp_runtime import (
+    MCPBuiltinOAuthActorPolicy,
+    MCPBuiltinOAuthActorPolicyRequiredError,
+)
 from ..services.task_command_transport import (
     COMMAND_FAILED,
     COMMAND_ID_PATTERN,
@@ -195,6 +202,7 @@ from ..services.task_lease_service import (
 )
 from ..services.task_runtime import (
     SELECTED_FILE_IDS_AGENT_CONFIG_KEY,
+    mcp_runtime_authorization_policy_required,
     task_extension_bindings_from_agent_config,
 )
 from ..services.uploaded_file_store import (
@@ -224,6 +232,7 @@ from .websocket_auth import (
     WebSocketPrincipal,
     _WebSocketAuthenticationTerminated,
     get_authenticated_user,
+    send_websocket_authentication_infrastructure_failure,
 )
 
 logger = logging.getLogger(__name__)
@@ -271,26 +280,13 @@ def _waiting_or_paused_event_fields(status: TaskStatus) -> tuple[str, str]:
     return "task_paused", "Task paused"
 
 
-# User-facing messages for turn rejections that are NOT transient. The
-# default "busy" message tells the user to retry, which is actively
-# misleading for workforce rejections where retrying can never succeed.
-_TURN_REJECTION_MESSAGES = {
-    "workforce_archived": (
-        "This workforce has been archived; the conversation can no longer "
-        "accept new messages."
-    ),
-    "workforce_config_changed": (
-        "The workforce configuration has changed since this conversation "
-        "started; please start a new conversation."
-    ),
-    "workforce_run_not_found": (
-        "This workforce conversation is no longer available; please start "
-        "a new conversation."
-    ),
-    "workforce_run_not_active": (
-        "This workforce conversation was cancelled and can no longer accept "
-        "new messages; please start a new conversation."
-    ),
+# Non-transient turn rejections must not fall back to retryable busy guidance.
+_TURN_REJECTION_CODES = {
+    "actor_task_reuse_unsupported": (ClientErrorCode.MESSAGE_CONTINUATION_UNSUPPORTED),
+    "workforce_archived": ClientErrorCode.WORKFORCE_ARCHIVED,
+    "workforce_config_changed": ClientErrorCode.WORKFORCE_UNAVAILABLE,
+    "workforce_run_not_found": ClientErrorCode.WORKFORCE_UNAVAILABLE,
+    "workforce_run_not_active": ClientErrorCode.WORKFORCE_UNAVAILABLE,
 }
 
 
@@ -310,11 +306,14 @@ def _task_error_payload(
     message: str,
     *,
     event_type: str = "error",
+    error_code: str | None = None,
 ) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "type": event_type,
         "message": message,
     }
+    if error_code is not None:
+        payload["error_code"] = error_code
     task_payload = _task_status_payload(db, task_id)
     if task_payload is not None:
         payload["task"] = task_payload
@@ -354,17 +353,9 @@ def _client_message_id(value: Any) -> str | None:
 # error bubble and the message_rejected ack, so an *incidental* validation
 # failure only ever surfaces as this fixed string; the detail stays in the log.
 #
-# Agent RuntimeError text is passed through to the INITIATING SENDER only -
-# the rejection ack and the personal error bubble - which is the existing
-# contract, and narrowing that wording is the product decision left in #1479.
-#
-# The broadcast half of that passthrough is closed (maintainer scope ruling
-# on #1514): once a task resolves, the task-wide broadcast reaches every
-# connection under the task_id, anonymous widget and share visitors included,
-# and DurableStorageOperationError subclasses RuntimeError with tenant-scope
-# text in its message - so broadcasts carry CLIENT_SAFE_TASK_FAILURE, never
-# the exception text. Still #1479: whether the sender copy should also be
-# narrowed when the initiator is an anonymous public connection.
+# RuntimeError text follows the same rule for every audience. The task-wide
+# broadcast, rejection ack, and personal error bubble expose stable safe
+# fields; provider responses and internal paths remain operator-only logs.
 class ClientVisibleError(Exception):
     """Marker: this exception's text was written for the end user.
 
@@ -374,9 +365,14 @@ class ClientVisibleError(Exception):
     redacted, so forgetting the marker fails closed.
     """
 
-    def __init__(self, *args: object) -> None:
+    def __init__(
+        self,
+        *args: object,
+        error_code: ClientErrorCode = ClientErrorCode.MESSAGE_PROCESSING_FAILED,
+    ) -> None:
         if type(self) is ClientVisibleError:
             raise TypeError("ClientVisibleError must be subclassed")
+        self.error_code = error_code
         super().__init__(*args)
 
 
@@ -508,6 +504,7 @@ async def send_message_delivery(
     turn_id: str,
     accepted: bool,
     message: str | None = None,
+    error_code: str | None = None,
     retry_with_new_id: bool = False,
     rejection_outcome: Literal["not_accepted", "outcome_unknown"] | None = None,
 ) -> None:
@@ -525,6 +522,8 @@ async def send_message_delivery(
     }
     if message:
         payload["message"] = message
+    if error_code is not None:
+        payload["error_code"] = error_code
     if retry_with_new_id:
         payload["retry_with_new_id"] = True
     if rejection_outcome is not None:
@@ -668,16 +667,26 @@ def _read_task_error_payload_isolated(
     message: str,
     *,
     event_type: str = "agent_error",
+    error_code: str | None = None,
 ) -> dict[str, Any]:
     """Read a task error payload in a short Session owned by this worker."""
     SessionLocal = get_session_local()
     with SessionLocal() as db:
         try:
-            return _task_error_payload(db, task_id, message, event_type=event_type)
+            return _task_error_payload(
+                db,
+                task_id,
+                message,
+                event_type=event_type,
+                error_code=error_code,
+            )
         except Exception:
             db.rollback()
             logger.warning("Failed to read terminal task error payload", exc_info=True)
-            return {"type": event_type, "message": message}
+            payload = {"type": event_type, "message": message}
+            if error_code is not None:
+                payload["error_code"] = error_code
+            return payload
 
 
 async def _read_task_error_payload_offloop(
@@ -685,6 +694,7 @@ async def _read_task_error_payload_offloop(
     message: str,
     *,
     event_type: str = "agent_error",
+    error_code: str | None = None,
 ) -> dict[str, Any]:
     """Keep a potentially blocked pool checkout off the asyncio event loop."""
     return await run_db_io_cancellation_safe(
@@ -692,6 +702,7 @@ async def _read_task_error_payload_offloop(
             task_id,
             message,
             event_type=event_type,
+            error_code=error_code,
         )
     )
 
@@ -2615,6 +2626,7 @@ async def execute_task_background(
     resolved_execution_scope: Union[
         ExecutionScope, None, ExecutionScopeNotProvided
     ] = EXECUTION_SCOPE_NOT_PROVIDED,
+    mcp_runtime_authorization_policy: MCPBuiltinOAuthActorPolicy | None = None,
 ) -> None:
     """Execute one task without checking out a DB connection on the event loop.
 
@@ -2648,7 +2660,10 @@ async def execute_task_background(
                 )
             )
         if snapshot is None:
-            raise ClientVisibleValidationError(f"Task {task_id} not found")
+            raise ClientVisibleValidationError(
+                f"Task {task_id} not found",
+                error_code=ClientErrorCode.TASK_UNAVAILABLE,
+            )
 
         context_dict = context if isinstance(context, dict) else {}
         logger.info(f"Background task execution started for task {task_id}")
@@ -2686,6 +2701,7 @@ async def execute_task_background(
                 connector_runtime_turn_id=context_dict.get("turn_id")
                 if isinstance(context_dict.get("turn_id"), str)
                 else None,
+                mcp_runtime_authorization_policy=(mcp_runtime_authorization_policy),
                 resolved_execution_scope=execution_scope,
             )
             if hasattr(agent_service, "set_outbound_message_handler"):
@@ -2877,10 +2893,12 @@ async def execute_task_background(
             raise
 
         error_message = str(e)
-        client_error_message = client_safe_error_message(
-            e,
-            fallback=CLIENT_SAFE_TASK_FAILURE,
+        error_code = (
+            e.error_code
+            if isinstance(e, ClientVisibleError)
+            else ClientErrorCode.TASK_EXECUTION_FAILED
         )
+        safe_error_message = client_error_message(error_code)
         terminal_payload = await run_db_io_cancellation_safe(
             lambda: _terminal_task_error_payload(
                 task_id,
@@ -2915,8 +2933,9 @@ async def execute_task_background(
                     {
                         **terminal_payload,
                         "task_id": task_id,
-                        "message": client_error_message,
-                        "error": client_error_message,
+                        "message": safe_error_message,
+                        "error": safe_error_message,
+                        "error_code": error_code.value,
                         "timestamp": datetime.now(timezone.utc).timestamp(),
                     },
                     task_id,
@@ -3308,6 +3327,7 @@ async def execute_resume_background(
         accepted: bool,
         message: str | None = None,
         *,
+        error_code: ClientErrorCode | None = None,
         retry_with_new_id: bool = False,
         rejection_outcome: Literal["not_accepted", "outcome_unknown"] | None = None,
     ) -> None:
@@ -3320,6 +3340,7 @@ async def execute_resume_background(
                 turn_id=delivery_turn_id or delivery_client_message_id,
                 accepted=accepted,
                 message=message,
+                error_code=error_code.value if error_code is not None else None,
                 retry_with_new_id=retry_with_new_id,
                 rejection_outcome=rejection_outcome,
             )
@@ -3439,14 +3460,16 @@ async def execute_resume_background(
                     )
                     await notify_deferred_delivery(
                         False,
-                        "The deferred message could not be delivered. Please retry.",
+                        client_error_message(ClientErrorCode.MESSAGE_DELIVERY_FAILED),
+                        error_code=ClientErrorCode.MESSAGE_DELIVERY_FAILED,
                         retry_with_new_id=True,
                         rejection_outcome="not_accepted",
                     )
                 await manager.broadcast_to_task(
                     {
                         "type": "agent_error",
-                        "message": "Task is already running on another worker.",
+                        "message": client_error_message(ClientErrorCode.TASK_BUSY),
+                        "error_code": ClientErrorCode.TASK_BUSY.value,
                         "task": {"id": task_id, "status": TaskStatus.RUNNING.value},
                         "timestamp": datetime.now(timezone.utc).timestamp(),
                     },
@@ -3800,7 +3823,8 @@ async def execute_resume_background(
             if await mark_deferred_delivery_failed():
                 await notify_deferred_delivery(
                     False,
-                    "The deferred message was cancelled. Please retry.",
+                    client_error_message(ClientErrorCode.MESSAGE_DELIVERY_FAILED),
+                    error_code=ClientErrorCode.MESSAGE_DELIVERY_FAILED,
                     retry_with_new_id=True,
                     rejection_outcome="not_accepted",
                 )
@@ -3860,7 +3884,8 @@ async def execute_resume_background(
                 if await mark_deferred_delivery_failed():
                     await notify_deferred_delivery(
                         False,
-                        "The task's saved progress could not be read. Please retry.",
+                        client_error_message(ClientErrorCode.MESSAGE_DELIVERY_FAILED),
+                        error_code=ClientErrorCode.MESSAGE_DELIVERY_FAILED,
                         retry_with_new_id=True,
                         rejection_outcome="not_accepted",
                     )
@@ -5323,7 +5348,8 @@ def _claim_user_message_delivery_isolated(
                 )
                 if missing:
                     raise ClientVisibleValidationError(
-                        "Files are no longer bindable: " + ", ".join(missing)
+                        "Files are no longer bindable: " + ", ".join(missing),
+                        error_code=ClientErrorCode.MESSAGE_ATTACHMENT_UNAVAILABLE,
                     )
             claim_snapshot = _snapshot_user_message_delivery(claim)
             try:
@@ -5428,20 +5454,31 @@ async def handle_chat_message(
             command_id=_client_message_id(message_data.get("client_message_id")),
             allow_missing_task=True,
         )
-    except (PermissionError, ValueError) as exc:
+    except (
+        MCPBuiltinOAuthActorPolicyRequiredError,
+        PermissionError,
+        ValueError,
+    ) as exc:
         log_client_facing_failure(exc, "Chat command rejected for task %s: %s", task_id)
         client_message_id = _client_message_id(message_data.get("client_message_id"))
-        message = client_safe_error_message(exc)
+        error_code = (
+            exc.error_code
+            if isinstance(exc, ClientVisibleError)
+            else ClientErrorCode.MESSAGE_PROCESSING_FAILED
+        )
+        message = client_error_message(error_code)
         await send_message_delivery(
             websocket,
             client_message_id=client_message_id,
             turn_id=client_message_id or str(uuid.uuid4()),
             accepted=False,
             message=message,
+            error_code=error_code.value,
             rejection_outcome="not_accepted",
         )
         await manager.send_personal_message(
-            {"type": "error", "message": message}, websocket
+            {"type": "error", "message": message, "error_code": error_code.value},
+            websocket,
         )
         return
     if enqueued is None:
@@ -5457,7 +5494,8 @@ async def handle_chat_message(
             client_message_id=_client_message_id(message_data.get("client_message_id")),
             turn_id=enqueued.client_command_id,
             accepted=False,
-            message="Message id was already used for different content or files.",
+            message=client_error_message(ClientErrorCode.MESSAGE_ID_CONFLICT),
+            error_code=ClientErrorCode.MESSAGE_ID_CONFLICT.value,
             retry_with_new_id=True,
             rejection_outcome="not_accepted",
         )
@@ -5468,7 +5506,8 @@ async def handle_chat_message(
             client_message_id=_client_message_id(message_data.get("client_message_id")),
             turn_id=enqueued.client_command_id,
             accepted=False,
-            message="The previous delivery attempt failed. Please retry the draft.",
+            message=client_error_message(ClientErrorCode.MESSAGE_DELIVERY_FAILED),
+            error_code=ClientErrorCode.MESSAGE_DELIVERY_FAILED.value,
             retry_with_new_id=True,
             rejection_outcome="not_accepted",
         )
@@ -5510,10 +5549,20 @@ def _enqueue_websocket_task_command_sync(
         if task is None:
             if allow_missing_task:
                 return None
-            raise ClientVisibleValidationError(f"Task {task_id} not found")
+            raise ClientVisibleValidationError(
+                f"Task {task_id} not found",
+                error_code=ClientErrorCode.TASK_UNAVAILABLE,
+            )
         if not actor_is_admin and int(task.user_id) != actor_user_id:
+            # Keep the permission-specific text for operator logs, but expose
+            # the same code as a missing task so task IDs cannot be probed.
             raise ClientVisiblePermissionError(
-                f"Access denied: Task {task_id} does not belong to you"
+                f"Access denied: Task {task_id} does not belong to you",
+                error_code=ClientErrorCode.TASK_UNAVAILABLE,
+            )
+        if mcp_runtime_authorization_policy_required(task.agent_config):
+            raise MCPBuiltinOAuthActorPolicyRequiredError(
+                f"Task {task_id} is actor-marked; generic task commands are unsupported"
             )
         if kind == TaskCommandKind.MESSAGE:
             from ..services.chat_history_service import (
@@ -5566,7 +5615,10 @@ def _enqueue_websocket_task_command_sync(
             # The sentinel is a bare ValueError, so re-raising it as-is let
             # the pause/resume catch redact "not found" on this race alone.
             # Converted at this boundary only; transport semantics unchanged.
-            raise ClientVisibleValidationError(str(exc)) from exc
+            raise ClientVisibleValidationError(
+                str(exc),
+                error_code=ClientErrorCode.TASK_UNAVAILABLE,
+            ) from exc
         return result
 
 
@@ -5581,7 +5633,8 @@ async def _enqueue_websocket_task_command(
     user = message_data.get("user")
     if user is None:
         raise ClientVisibleValidationError(
-            "User authentication required for task command"
+            "User authentication required for task command",
+            error_code=ClientErrorCode.AUTHENTICATION_REQUIRED,
         )
     resolved_command_id = command_id or f"{kind.value}:{uuid.uuid4()}"
     # User ORM instances and server-only authentication fields are never put
@@ -5855,8 +5908,10 @@ def _prepare_websocket_turn_sync(
                     requested_task_id,
                     existing_task.user_id,
                 )
-                raise ValueError(
-                    f"Access denied: Task {requested_task_id} does not belong to you"
+                # Match the public opacity contract at command enqueue above.
+                raise ClientVisiblePermissionError(
+                    f"Access denied: Task {requested_task_id} does not belong to you",
+                    error_code=ClientErrorCode.TASK_UNAVAILABLE,
                 )
             task_created = True
 
@@ -6122,6 +6177,7 @@ async def _handle_chat_message_unserialized(
         accepted: bool,
         message: str | None = None,
         *,
+        error_code: str | None = None,
         retry_with_new_id: bool = False,
         rejection_outcome: Literal["not_accepted", "outcome_unknown"] | None = None,
     ) -> None:
@@ -6139,11 +6195,16 @@ async def _handle_chat_message_unserialized(
             turn_id=turn_id,
             accepted=accepted,
             message=message,
+            error_code=error_code,
             retry_with_new_id=retry_with_new_id,
             rejection_outcome=rejection_outcome,
         )
 
-    async def finish_delivery_failure(message: str) -> bool:
+    async def finish_delivery_failure(
+        message: str,
+        *,
+        error_code: str | None = None,
+    ) -> bool:
         """Reject pre-dispatch failures; never confuse persistence with delivery."""
 
         nonlocal delivery_failure_persist_attempted, delivery_failure_pool_timeout
@@ -6184,6 +6245,7 @@ async def _handle_chat_message_unserialized(
             await finish_delivery(
                 False,
                 message,
+                error_code=error_code,
                 rejection_outcome=(
                     "outcome_unknown"
                     if delivery_failure_pool_timeout or delivery_injected
@@ -6192,14 +6254,13 @@ async def _handle_chat_message_unserialized(
             )
         return not delivery_failure_pool_timeout
 
-    async def answer_durable_turn_failure(ack_message: str) -> bool:
+    async def answer_durable_turn_failure(sender_error_code: ClientErrorCode) -> bool:
         """Answer a durable turn failure, addressing each audience as #1514 does.
 
-        The two audiences differ deliberately: the sender's rejection ack (and
-        the detail bubble that stands in for it when the ack is suppressed)
-        carries ``ack_message``, while the task-wide broadcast -- which reaches
-        anonymous widget and share guests -- carries the fixed
-        ``CLIENT_SAFE_TASK_FAILURE``.
+        The rejection ack and its suppressed-ack replacement bubble carry the
+        specific sender code. The task-wide broadcast also reaches widget and
+        share subscribers who did not initiate the turn, so it carries only the
+        neutral task-failure code and fallback.
 
         The durable arms below precede the ``RuntimeError`` arm they subclass.
         On main those faults reached that arm and were broadcast from it, so
@@ -6207,19 +6268,20 @@ async def _handle_chat_message_unserialized(
         This keeps that notification while giving the sender the specific
         wording each fault deserves.
 
-        Used only by the arms this change adds. The pre-existing arms keep
-        their inline bodies: they landed with #1514, and rewriting them here
-        would re-open reviewed code to no benefit.
-
         Returns ``False`` when the delivery layer says the caller must stop.
         """
-        if not await finish_delivery_failure(ack_message):
+        ack_message = client_error_message(sender_error_code)
+        if not await finish_delivery_failure(
+            ack_message,
+            error_code=sender_error_code.value,
+        ):
             return False
         timestamp = datetime.now(timezone.utc).timestamp()
         if authorized_task_id is not None:
             safe_error_payload = await _read_task_error_payload_offloop(
                 authorized_task_id,
                 CLIENT_SAFE_TASK_FAILURE,
+                error_code=ClientErrorCode.TASK_EXECUTION_FAILED.value,
             )
             await manager.broadcast_to_task(
                 {**safe_error_payload, "timestamp": timestamp},
@@ -6230,13 +6292,19 @@ async def _handle_chat_message_unserialized(
                     {
                         "type": "error",
                         "message": ack_message,
+                        "error_code": sender_error_code.value,
                         "timestamp": timestamp,
                     },
                     websocket,
                 )
         else:
             await manager.send_personal_message(
-                {"type": "error", "message": ack_message, "timestamp": timestamp},
+                {
+                    "type": "error",
+                    "message": ack_message,
+                    "error_code": sender_error_code.value,
+                    "timestamp": timestamp,
+                },
                 websocket,
             )
         return True
@@ -6247,21 +6315,24 @@ async def _handle_chat_message_unserialized(
         if not claim.payload_matches:
             await finish_delivery(
                 False,
-                "Message id was already used for different content or files.",
+                client_error_message(ClientErrorCode.MESSAGE_ID_CONFLICT),
+                error_code=ClientErrorCode.MESSAGE_ID_CONFLICT.value,
                 retry_with_new_id=True,
                 rejection_outcome="not_accepted",
             )
         elif claim.failed:
             await finish_delivery(
                 False,
-                "The previous delivery attempt failed. Please retry the draft.",
+                client_error_message(ClientErrorCode.MESSAGE_DELIVERY_FAILED),
+                error_code=ClientErrorCode.MESSAGE_DELIVERY_FAILED.value,
                 retry_with_new_id=True,
                 rejection_outcome="not_accepted",
             )
         elif claim.pending:
             await finish_delivery(
                 False,
-                "The message is still being applied. Please retry shortly.",
+                client_error_message(ClientErrorCode.GUIDANCE_IN_PROGRESS),
+                error_code=ClientErrorCode.GUIDANCE_IN_PROGRESS.value,
                 rejection_outcome="outcome_unknown",
             )
         else:
@@ -6276,14 +6347,24 @@ async def _handle_chat_message_unserialized(
 
         if user is None:
             raise ClientVisibleValidationError(
-                "User authentication required for task access"
+                "User authentication required for task access",
+                error_code=ClientErrorCode.AUTHENTICATION_REQUIRED,
             )
         if not isinstance(user_message, str):
-            raise ClientVisibleValidationError("Chat message must be a string")
+            raise ClientVisibleValidationError(
+                "Chat message must be a string",
+                error_code=ClientErrorCode.INVALID_MESSAGE,
+            )
         if not isinstance(raw_context, dict):
-            raise ClientVisibleValidationError("Chat context must be an object")
+            raise ClientVisibleValidationError(
+                "Chat context must be an object",
+                error_code=ClientErrorCode.INVALID_MESSAGE,
+            )
         if not isinstance(raw_files, list):
-            raise ClientVisibleValidationError("Chat files must be a list")
+            raise ClientVisibleValidationError(
+                "Chat files must be a list",
+                error_code=ClientErrorCode.INVALID_MESSAGE,
+            )
 
         actor_user_id = int(user.id)
         actor_is_admin = bool(user.is_admin)
@@ -6452,8 +6533,8 @@ async def _handle_chat_message_unserialized(
                 if not background_task_manager.reserve_resume(task_id):
                     await finish_delivery(
                         False,
-                        "A previous guidance message is still being applied. "
-                        "Please wait for it to finish.",
+                        CLIENT_SAFE_GUIDANCE_IN_PROGRESS,
+                        error_code=ClientErrorCode.GUIDANCE_IN_PROGRESS.value,
                         rejection_outcome="not_accepted",
                     )
                     return
@@ -6570,8 +6651,8 @@ async def _handle_chat_message_unserialized(
                                 background_task_manager.release_resume_reservation(
                                     task_id
                                 )
-                                await finish_delivery_failure(
-                                    "The task's saved progress could not be read."
+                                await answer_durable_turn_failure(
+                                    ClientErrorCode.TASK_CHECKPOINT_UNREADABLE
                                 )
                                 return
                     delivery_injected = posted
@@ -6789,13 +6870,21 @@ async def _handle_chat_message_unserialized(
                 await manager.send_personal_message(
                     {
                         "type": "error",
-                        "message": "Task does not support message continuation",
+                        "message": client_error_message(
+                            ClientErrorCode.MESSAGE_CONTINUATION_UNSUPPORTED
+                        ),
+                        "error_code": (
+                            ClientErrorCode.MESSAGE_CONTINUATION_UNSUPPORTED.value
+                        ),
                     },
                     websocket,
                 )
                 await finish_delivery(
                     False,
-                    "Task does not support message continuation.",
+                    client_error_message(
+                        ClientErrorCode.MESSAGE_CONTINUATION_UNSUPPORTED
+                    ),
+                    error_code=ClientErrorCode.MESSAGE_CONTINUATION_UNSUPPORTED.value,
                     rejection_outcome="not_accepted",
                 )
                 return
@@ -6829,11 +6918,11 @@ async def _handle_chat_message_unserialized(
                     }:
                         error_payload = await _read_task_error_payload_offloop(
                             task_id,
-                            (
-                                "Task pause is still being applied; "
-                                "please retry shortly."
+                            client_error_message(
+                                ClientErrorCode.TASK_PAUSE_IN_PROGRESS
                             ),
                             event_type="agent_error",
+                            error_code=ClientErrorCode.TASK_PAUSE_IN_PROGRESS.value,
                         )
                         await manager.broadcast_to_task(
                             {
@@ -6844,7 +6933,10 @@ async def _handle_chat_message_unserialized(
                         )
                         await finish_delivery(
                             False,
-                            "Task pause is still being applied; please retry shortly.",
+                            client_error_message(
+                                ClientErrorCode.TASK_PAUSE_IN_PROGRESS
+                            ),
+                            error_code=ClientErrorCode.TASK_PAUSE_IN_PROGRESS.value,
                             rejection_outcome="not_accepted",
                         )
                         return
@@ -6927,8 +7019,9 @@ async def _handle_chat_message_unserialized(
                     )
                     error_payload = await _read_task_error_payload_offloop(
                         task_id,
-                        "Internal dispatch error; please retry.",
+                        client_error_message(ClientErrorCode.MESSAGE_PROCESSING_FAILED),
                         event_type="agent_error",
+                        error_code=ClientErrorCode.MESSAGE_PROCESSING_FAILED.value,
                     )
                     await manager.broadcast_to_task(
                         {
@@ -6939,7 +7032,8 @@ async def _handle_chat_message_unserialized(
                     )
                     await finish_delivery(
                         False,
-                        "Internal dispatch error; please retry.",
+                        client_error_message(ClientErrorCode.MESSAGE_PROCESSING_FAILED),
+                        error_code=ClientErrorCode.MESSAGE_PROCESSING_FAILED.value,
                         rejection_outcome="not_accepted",
                     )
                     return
@@ -6970,7 +7064,10 @@ async def _handle_chat_message_unserialized(
                     message_data["_commit_outcome_unknown"] = turn_id
                     await finish_delivery(
                         False,
-                        "Message acceptance is still being reconciled. Please retry shortly.",
+                        client_error_message(
+                            ClientErrorCode.MESSAGE_ACCEPTANCE_PENDING
+                        ),
+                        error_code=ClientErrorCode.MESSAGE_ACCEPTANCE_PENDING.value,
                         rejection_outcome="outcome_unknown",
                     )
                 except TaskTurnNotFoundError:
@@ -6983,8 +7080,9 @@ async def _handle_chat_message_unserialized(
                     )
                     error_payload = await _read_task_error_payload_offloop(
                         task_id,
-                        "Task is no longer available.",
+                        client_error_message(ClientErrorCode.TASK_UNAVAILABLE),
                         event_type="agent_error",
+                        error_code=ClientErrorCode.TASK_UNAVAILABLE.value,
                     )
                     await manager.broadcast_to_task(
                         {
@@ -6995,7 +7093,8 @@ async def _handle_chat_message_unserialized(
                     )
                     await finish_delivery(
                         False,
-                        "Task is no longer available.",
+                        client_error_message(ClientErrorCode.TASK_UNAVAILABLE),
+                        error_code=ClientErrorCode.TASK_UNAVAILABLE.value,
                         rejection_outcome="not_accepted",
                     )
                 except TaskTurnError as busy_err:
@@ -7008,15 +7107,15 @@ async def _handle_chat_message_unserialized(
                     logger.warning(
                         f"Refused to schedule bg for task {task_id}: {busy_err.reason}"
                     )
-                    rejection_message = _TURN_REJECTION_MESSAGES.get(
-                        busy_err.reason,
-                        "Task is currently busy; please wait for the previous "
-                        "turn to finish before sending another message.",
+                    rejection_code = _TURN_REJECTION_CODES.get(
+                        busy_err.reason, ClientErrorCode.TASK_BUSY
                     )
+                    rejection_message = client_error_message(rejection_code)
                     error_payload = await _read_task_error_payload_offloop(
                         task_id,
                         rejection_message,
                         event_type="agent_error",
+                        error_code=rejection_code.value,
                     )
                     await manager.broadcast_to_task(
                         {
@@ -7028,6 +7127,7 @@ async def _handle_chat_message_unserialized(
                     await finish_delivery(
                         False,
                         rejection_message,
+                        error_code=rejection_code.value,
                         rejection_outcome="not_accepted",
                     )
 
@@ -7035,20 +7135,46 @@ async def _handle_chat_message_unserialized(
             message_data["_commit_outcome_unknown"] = turn_id
             await finish_delivery(
                 False,
-                "Message acceptance is still being reconciled. Please retry shortly.",
+                client_error_message(ClientErrorCode.MESSAGE_ACCEPTANCE_PENDING),
+                error_code=ClientErrorCode.MESSAGE_ACCEPTANCE_PENDING.value,
                 rejection_outcome="outcome_unknown",
             )
         except (ValueError, KeyError, TypeError) as e:
             # Data validation and format error
-            message = client_safe_error_message(e)
+            if (
+                isinstance(e, ClientVisibleError)
+                and e.error_code == ClientErrorCode.MESSAGE_ATTACHMENT_UNAVAILABLE
+            ):
+                # Preparation verified the attachment before the later atomic
+                # bind lost its race.  The specific state belongs only to the
+                # verified origin; task subscribers receive the same neutral
+                # execution failure as every other sender-specific durable
+                # attachment fault.
+                log_client_facing_failure(
+                    e,
+                    "Attachment bind race in agent execution: %s",
+                )
+                if not await answer_durable_turn_failure(e.error_code):
+                    return
+                return
+            error_code = (
+                e.error_code
+                if isinstance(e, ClientVisibleError)
+                else ClientErrorCode.MESSAGE_PROCESSING_FAILED
+            )
+            message = client_error_message(error_code)
             log_client_facing_failure(e, "Data validation error in agent execution: %s")
-            if not await finish_delivery_failure(message):
+            if not await finish_delivery_failure(
+                message,
+                error_code=error_code.value,
+            ):
                 return
             timestamp = datetime.now(timezone.utc).timestamp()
             if authorized_task_id is not None:
                 error_payload = await _read_task_error_payload_offloop(
                     authorized_task_id,
                     message,
+                    error_code=error_code.value,
                 )
                 await manager.broadcast_to_task(
                     {
@@ -7062,6 +7188,7 @@ async def _handle_chat_message_unserialized(
                     {
                         "type": "error",
                         "message": message,
+                        "error_code": error_code.value,
                         "timestamp": timestamp,
                     },
                     websocket,
@@ -7074,16 +7201,10 @@ async def _handle_chat_message_unserialized(
             # answer, and a distinct one: retrying cannot help, the stored copy
             # has to be replaced.
             #
-            # The message is a fixed literal, so it is safe for both audiences
-            # and needs no ``client_safe_error_message`` pass.
-            # Spelled out rather than shared with the outer arm's copy: the
-            # client-safe guard in test_websocket_client_safe_errors resolves a
-            # producer's message only as a literal, a traceable local, or a
-            # forwarded parameter -- a module constant reads as unresolvable
-            # and fails it. The duplication is the price of that check.
+            # The allowlisted code selects a fixed fallback for every audience;
+            # no exception text crosses the boundary.
             if not await answer_durable_turn_failure(
-                "A stored file for this message failed its integrity check "
-                "and must be re-uploaded."
+                ClientErrorCode.MESSAGE_ATTACHMENT_CORRUPT
             ):
                 return
         except DurableStorageOperationError as exc:
@@ -7093,7 +7214,7 @@ async def _handle_chat_message_unserialized(
             # both the only place its provider cause can be recorded and the
             # last place its text could escape.
             #
-            # Fixed literal outbound rather than ``str(exc)``: the wrap's own
+            # Fixed contract fallback rather than ``str(exc)``: the wrap's own
             # text is not what a client should read, and this arm is also the
             # sole logging owner for this path -- the fault does not re-raise,
             # so the endpoint-level arm never sees it and cannot double-record.
@@ -7104,51 +7225,19 @@ async def _handle_chat_message_unserialized(
                 task_id=authorized_task_id,
             )
             if not await answer_durable_turn_failure(
-                "A stored file for this message could not be read. Please try again."
+                ClientErrorCode.MESSAGE_ATTACHMENT_UNAVAILABLE
             ):
                 return
         except RuntimeError as e:
-            # Runtime error. The sender's rejection ack keeps the wording
-            # (#1479 contract); the task-wide broadcast reaches anonymous
-            # subscribers and gets the fixed string instead.
-            message = f"Runtime error: {str(e)}"
+            # RuntimeError is incidental server detail. Reuse the same
+            # audience split as the durable-failure arms above: the initiator
+            # gets the message-processing code while task subscribers get the
+            # neutral task-failure code.
             logger.error("Runtime error in agent execution: %s", e, exc_info=True)
-            if not await finish_delivery_failure(message):
+            if not await answer_durable_turn_failure(
+                ClientErrorCode.MESSAGE_PROCESSING_FAILED
+            ):
                 return
-            timestamp = datetime.now(timezone.utc).timestamp()
-            if authorized_task_id is not None:
-                error_payload = await _read_task_error_payload_offloop(
-                    authorized_task_id,
-                    CLIENT_SAFE_TASK_FAILURE,
-                )
-                await manager.broadcast_to_task(
-                    {
-                        **error_payload,
-                        "timestamp": timestamp,
-                    },
-                    authorized_task_id,
-                )
-                # Only the durable path needs this: there the rejection ack
-                # is suppressed, so the detail bubble is the sender's only
-                # copy. On the live path finish_delivery_failure already sent
-                # the ack with the same wording, so a bubble would duplicate
-                # it. The origin socket came from the registry and is a
-                # discarding stub when unverifiable, so this is
-                # origin-or-nowhere by construction.
-                if suppress_delivery_ack:
-                    await manager.send_personal_message(
-                        {"type": "error", "message": message, "timestamp": timestamp},
-                        websocket,
-                    )
-            else:
-                await manager.send_personal_message(
-                    {
-                        "type": "error",
-                        "message": message,
-                        "timestamp": timestamp,
-                    },
-                    websocket,
-                )
         except Exception as e:
             # Other unknown errors, re-raise
             # The branch that withholds the detail logs it, rather than
@@ -7160,13 +7249,27 @@ async def _handle_chat_message_unserialized(
             await finish_delivery_failure(client_safe_error_message(e))
             raise
 
+    except ClientVisiblePermissionError as e:
+        log_client_facing_failure(e, "Message permission error: %s")
+        message = client_error_message(e.error_code)
+        await finish_delivery_failure(message, error_code=e.error_code.value)
+        await manager.send_personal_message(
+            {"type": "error", "message": message, "error_code": e.error_code.value},
+            websocket,
+        )
     except (ValueError, KeyError, TypeError) as e:
         # Message format error
         log_client_facing_failure(e, "Message format error: %s")
-        message = client_safe_error_message(e)
-        await finish_delivery_failure(message)
+        error_code = (
+            e.error_code
+            if isinstance(e, ClientVisibleError)
+            else ClientErrorCode.MESSAGE_PROCESSING_FAILED
+        )
+        message = client_error_message(error_code)
+        await finish_delivery_failure(message, error_code=error_code.value)
         await manager.send_personal_message(
-            {"type": "error", "message": message}, websocket
+            {"type": "error", "message": message, "error_code": error_code.value},
+            websocket,
         )
     except (ConnectionError, WebSocketDisconnect) as e:
         # Connection error
@@ -7183,11 +7286,10 @@ async def _handle_chat_message_unserialized(
         # told that rather than to retry. No exception text goes outbound; the
         # integrity ERROR with both checksums is already logged where it is
         # raised.
-        # Literal for the same reason as the inner arm above: the client-safe
-        # guard resolves only literals, traceable locals, and parameters.
+        # The allowlisted code selects the fixed re-upload guidance.
         await finish_delivery_failure(
-            "A stored file for this message failed its integrity check "
-            "and must be re-uploaded."
+            client_error_message(ClientErrorCode.MESSAGE_ATTACHMENT_CORRUPT),
+            error_code=ClientErrorCode.MESSAGE_ATTACHMENT_CORRUPT.value,
         )
         raise
     except DurableStorageOperationError as exc:
@@ -7207,7 +7309,8 @@ async def _handle_chat_message_unserialized(
             task_id=task_id,
         )
         await finish_delivery_failure(
-            "File storage is temporarily unavailable. Please try again."
+            client_error_message(ClientErrorCode.MESSAGE_ATTACHMENT_UNAVAILABLE),
+            error_code=ClientErrorCode.MESSAGE_ATTACHMENT_UNAVAILABLE.value,
         )
         raise
     except Exception as e:
@@ -7324,7 +7427,8 @@ async def handle_execute_task(
         authorized_task_id: int | None = None
         if not user:
             raise ClientVisibleValidationError(
-                "User authentication required for task execution"
+                "User authentication required for task execution",
+                error_code=ClientErrorCode.AUTHENTICATION_REQUIRED,
             )
         actor_user_id = int(user.id)
         actor_is_admin = bool(user.is_admin)
@@ -7348,7 +7452,8 @@ async def handle_execute_task(
         )
         if request is None:
             raise ClientVisibleValidationError(
-                f"Task {task_id} not found or access denied"
+                f"Task {task_id} not found or access denied",
+                error_code=ClientErrorCode.TASK_UNAVAILABLE,
             )
         authorized_task_id = request.task_id
 
@@ -7382,15 +7487,27 @@ async def handle_execute_task(
         # ordering while the scheduled coroutine owns all runtime DB work.
         await background_task
 
-    except (ValueError, KeyError, TypeError) as e:
-        # Data validation and format error
-        message = client_safe_error_message(e)
-        log_client_facing_failure(e, "Data validation error in task execution: %s")
+    except (
+        MCPBuiltinOAuthActorPolicyRequiredError,
+        ValueError,
+        KeyError,
+        TypeError,
+    ) as e:
+        # Data validation and actor-policy errors are client-safe only when
+        # explicitly marked with a stable code.
+        error_code = (
+            e.error_code
+            if isinstance(e, ClientVisibleError)
+            else ClientErrorCode.MESSAGE_PROCESSING_FAILED
+        )
+        message = client_error_message(error_code)
+        log_client_facing_failure(e, "Task execution rejected: %s")
         timestamp = datetime.now(timezone.utc).isoformat()
         if authorized_task_id is not None:
             error_payload = await _read_task_error_payload_offloop(
                 authorized_task_id,
                 message,
+                error_code=error_code.value,
             )
             await manager.broadcast_to_task(
                 {
@@ -7404,21 +7521,23 @@ async def handle_execute_task(
                 {
                     "type": "error",
                     "message": message,
+                    "error_code": error_code.value,
                     "timestamp": timestamp,
                 },
                 websocket,
             )
     except RuntimeError as e:
-        # Runtime error. The initiating sender keeps the wording (#1479
-        # contract); the task-wide broadcast reaches anonymous subscribers
-        # and gets the fixed string instead.
-        message = f"Runtime error: {str(e)}"
+        # Runtime failures can contain provider responses, paths, and other
+        # operator-only details. Keep those in the log and expose only the
+        # stable client contract to every audience.
+        message = CLIENT_SAFE_TASK_FAILURE
         logger.error("Runtime error in task execution: %s", e, exc_info=True)
         timestamp = datetime.now(timezone.utc).isoformat()
         if authorized_task_id is not None:
             error_payload = await _read_task_error_payload_offloop(
                 authorized_task_id,
                 CLIENT_SAFE_TASK_FAILURE,
+                error_code=ClientErrorCode.TASK_EXECUTION_FAILED.value,
             )
             await manager.broadcast_to_task(
                 {
@@ -7427,17 +7546,25 @@ async def handle_execute_task(
                 },
                 authorized_task_id,
             )
-            # This handler is invoked with its real ingress socket (it is not
-            # dispatched durably), so the initiating sender keeps the detail.
             await manager.send_personal_message(
-                {"type": "error", "message": message, "timestamp": timestamp},
+                {
+                    "type": "error",
+                    "error_code": ClientErrorCode.TASK_EXECUTION_FAILED.value,
+                    "message": client_error_message(
+                        ClientErrorCode.TASK_EXECUTION_FAILED
+                    ),
+                    "timestamp": timestamp,
+                },
                 websocket,
             )
         else:
             await manager.send_personal_message(
                 {
                     "type": "error",
-                    "message": message,
+                    "error_code": ClientErrorCode.TASK_EXECUTION_FAILED.value,
+                    "message": client_error_message(
+                        ClientErrorCode.TASK_EXECUTION_FAILED
+                    ),
                     "timestamp": timestamp,
                 },
                 websocket,
@@ -8116,6 +8243,24 @@ _DISPATCH_OPERATIONS = {
 _UNKNOWN_DISPATCH_OPERATION = "websocket unknown message type"
 
 
+def _private_websocket_task_access_sync(
+    *,
+    task_id: int,
+    actor_user_id: int,
+    actor_is_admin: bool,
+) -> Literal["authorized", "missing", "foreign"]:
+    """Classify private task access before a socket joins its live audience."""
+
+    SessionLocal = get_session_local()
+    with SessionLocal() as db:
+        owner_id = db.query(Task.user_id).filter(Task.id == task_id).scalar()
+        if owner_id is None:
+            return "missing"
+        if actor_is_admin or int(owner_id) == actor_user_id:
+            return "authorized"
+        return "foreign"
+
+
 @ws_router.websocket("/ws/chat/{task_id}")
 async def websocket_chat_endpoint(
     websocket: WebSocket,
@@ -8132,7 +8277,32 @@ async def websocket_chat_endpoint(
         await websocket.close(code=4001, reason="Authentication required")
         return
 
-    await manager.connect(websocket, task_id)
+    # Accept before closing an access denial so the fixed close reason survives
+    # the WebSocket handshake.  Do not register until ownership has been
+    # checked: task broadcasts are an owner-scoped private audience.
+    await websocket.accept()
+    try:
+        access = await run_db_io_cancellation_safe(
+            lambda: _private_websocket_task_access_sync(
+                task_id=task_id,
+                actor_user_id=int(user.id),
+                actor_is_admin=bool(user.is_admin),
+            )
+        )
+    except Exception as exc:
+        await send_websocket_authentication_infrastructure_failure(websocket, exc)
+        return
+    if access == "foreign":
+        await websocket.close(
+            code=4003,
+            reason=client_error_message(ClientErrorCode.TASK_UNAVAILABLE),
+        )
+        return
+    if access == "authorized":
+        manager.register_connection(websocket, task_id)
+    # A missing id deliberately stays accepted but unregistered.  The legacy
+    # first-chat recovery path creates a replacement task, then
+    # ``move_connection`` registers this already-accepted socket on that id.
 
     # Which message the loop is currently applying, for the fault arms below:
     # they guard the whole dispatch, so a fixed label would report a resume or
@@ -8246,10 +8416,19 @@ async def handle_intervention(
             {"type": "error", "message": client_safe_error_message(e)}, websocket
         )
     except RuntimeError as e:
-        # Runtime error
+        # RuntimeError is incidental server detail, never display prose. A
+        # stable code lets current clients localize the fixed fallback while
+        # old clients still receive safe English text.
         logger.error("Runtime error in intervention: %s", e, exc_info=True)
         await manager.send_personal_message(
-            {"type": "error", "message": f"Runtime error: {str(e)}"}, websocket
+            {
+                "type": "error",
+                "error_code": ClientErrorCode.MESSAGE_PROCESSING_FAILED.value,
+                "message": client_error_message(
+                    ClientErrorCode.MESSAGE_PROCESSING_FAILED
+                ),
+            },
+            websocket,
         )
     except Exception as e:
         # Re-raised, but the callers do not own the stack: the chat endpoint
@@ -8270,12 +8449,25 @@ async def handle_pause_task(
             kind=TaskCommandKind.PAUSE,
             command_id=_client_message_id(message_data.get("command_id")),
         )
-    except (PermissionError, ValueError) as exc:
+    except (
+        MCPBuiltinOAuthActorPolicyRequiredError,
+        PermissionError,
+        ValueError,
+    ) as exc:
         log_client_facing_failure(
             exc, "Pause command rejected for task %s: %s", task_id
         )
+        error_code = (
+            exc.error_code
+            if isinstance(exc, ClientVisibleError)
+            else ClientErrorCode.MESSAGE_PROCESSING_FAILED
+        )
         await manager.send_personal_message(
-            {"type": "error", "message": client_safe_error_message(exc)},
+            {
+                "type": "error",
+                "message": client_error_message(error_code),
+                "error_code": error_code.value,
+            },
             websocket,
         )
         return
@@ -8514,12 +8706,16 @@ async def _handle_pause_task_unserialized(
             {"type": "error", "message": client_safe_error_message(e)}, websocket
         )
     except RuntimeError as e:
-        # Runtime error
-        # No traceback: this branch passes the text through to the client
-        # unredacted (#1479), so nothing is being withheld from the log.
-        logger.error("Runtime error pausing task %s: %s", task_id, e)
+        logger.error("Runtime error pausing task %s: %s", task_id, e, exc_info=True)
         await manager.send_personal_message(
-            {"type": "error", "message": f"Runtime error: {str(e)}"}, websocket
+            {
+                "type": "error",
+                "error_code": ClientErrorCode.MESSAGE_PROCESSING_FAILED.value,
+                "message": client_error_message(
+                    ClientErrorCode.MESSAGE_PROCESSING_FAILED
+                ),
+            },
+            websocket,
         )
         raise
     except Exception as e:
@@ -8540,12 +8736,25 @@ async def handle_resume_task(
             kind=TaskCommandKind.RESUME,
             command_id=_client_message_id(message_data.get("command_id")),
         )
-    except (PermissionError, ValueError) as exc:
+    except (
+        MCPBuiltinOAuthActorPolicyRequiredError,
+        PermissionError,
+        ValueError,
+    ) as exc:
         log_client_facing_failure(
             exc, "Resume command rejected for task %s: %s", task_id
         )
+        error_code = (
+            exc.error_code
+            if isinstance(exc, ClientVisibleError)
+            else ClientErrorCode.MESSAGE_PROCESSING_FAILED
+        )
         await manager.send_personal_message(
-            {"type": "error", "message": client_safe_error_message(exc)},
+            {
+                "type": "error",
+                "message": client_error_message(error_code),
+                "error_code": error_code.value,
+            },
             websocket,
         )
         return
@@ -9151,12 +9360,16 @@ async def _handle_resume_task_unserialized(
             reason_code="invalid_command_payload",
         )
     except RuntimeError as e:
-        # Runtime error
-        # No traceback: this branch passes the text through to the client
-        # unredacted (#1479), so nothing is being withheld from the log.
-        logger.error("Runtime error resuming task %s: %s", task_id, e)
+        logger.error("Runtime error resuming task %s: %s", task_id, e, exc_info=True)
         await manager.send_personal_message(
-            {"type": "error", "message": f"Runtime error: {str(e)}"}, websocket
+            {
+                "type": "error",
+                "error_code": ClientErrorCode.MESSAGE_PROCESSING_FAILED.value,
+                "message": client_error_message(
+                    ClientErrorCode.MESSAGE_PROCESSING_FAILED
+                ),
+            },
+            websocket,
         )
         raise
     except Exception as e:

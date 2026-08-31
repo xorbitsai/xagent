@@ -5,7 +5,9 @@ import re
 import subprocess
 import tomllib
 from pathlib import Path
+from typing import Any, cast
 
+import yaml
 from packaging.requirements import Requirement
 from packaging.utils import canonicalize_name
 from packaging.version import Version
@@ -402,6 +404,76 @@ def test_sandbox_export_is_locked_without_managed_python_downloads() -> None:
     )
 
 
+def test_chrome_devtools_mcp_pin_matches_across_dockerfiles_and_registry() -> None:
+    # builtin_mcp_registry.py is the single source of truth for the version
+    # end users' MCP calls actually run; both Dockerfiles independently warm
+    # an npx cache for "the same" pin so npx resolves offline instead of
+    # hitting the npm registry on every sandboxed/backend-hosted launch (see
+    # Dockerfile.sandbox's INSTALL_CHROME block and its npx warm-up comment).
+    # A version bumped in the registry but missed in either warm-up command
+    # would silently leave that path's cache cold for the *new* version
+    # while still reporting success, not fail loudly -- this pins all three
+    # together so a future bump can't drift one file behind the others.
+    registry = read_repo_file("src/xagent/web/builtin_mcp_registry.py")
+    # findall, not search: if the registry ever grows a second quoted pin
+    # (e.g. a stale one left in a comment), a single search silently checks
+    # only whichever occurrence comes first -- require there to be exactly
+    # one so a duplicate/ambiguous pin fails loudly instead of passing on
+    # a coin flip of match order.
+    registry_pins = set(re.findall(r'"chrome-devtools-mcp@([\w.\-]+)"', registry))
+    assert registry_pins, "chrome-devtools-mcp pin not found in builtin_mcp_registry.py"
+    assert len(registry_pins) == 1, (
+        f"builtin_mcp_registry.py has ambiguous chrome-devtools-mcp pins: "
+        f"{sorted(registry_pins)} -- expected exactly one"
+    )
+    (pinned_version,) = registry_pins
+
+    for dockerfile_path in ("docker/Dockerfile.backend", "docker/Dockerfile.sandbox"):
+        dockerfile = read_repo_file(dockerfile_path)
+
+        # Extracts just the version each Dockerfile's own npx warm-up
+        # command resolves against, rather than requiring an
+        # exact-substring match of the whole npx invocation -- a future
+        # edit that legitimately reorders or adds flags around the same
+        # pinned version shouldn't fail this test, only an actual version
+        # mismatch should. findall (not search) for the same
+        # duplicate-match reason as the registry side above.
+        dockerfile_pins = set(
+            re.findall(r"npx\b[^\n]*\bchrome-devtools-mcp@([\w.\-]+)", dockerfile)
+        )
+        assert dockerfile_pins, (
+            f"{dockerfile_path} has no npx chrome-devtools-mcp warm-up command"
+        )
+        assert len(dockerfile_pins) == 1, (
+            f"{dockerfile_path} has ambiguous chrome-devtools-mcp npx pins: "
+            f"{sorted(dockerfile_pins)} -- expected exactly one"
+        )
+        (dockerfile_version,) = dockerfile_pins
+        assert dockerfile_version == pinned_version, (
+            f"{dockerfile_path} warms the npx cache for "
+            f"chrome-devtools-mcp@{dockerfile_version}, but "
+            f"builtin_mcp_registry.py pins chrome-devtools-mcp@{pinned_version} -- "
+            "update the warm-up command to match"
+        )
+
+    # A pinned version string surviving unchanged doesn't prove the browser
+    # install itself survived -- guard against the case this PR actually
+    # fixes (chrome-devtools-mcp launched with no Chrome to find) being
+    # silently reintroduced by a future edit that deletes the install
+    # block while leaving the (now-misleading) npx warm-up line intact.
+    sandbox_dockerfile = read_repo_file("docker/Dockerfile.sandbox")
+    assert "ARG INSTALL_CHROME" in sandbox_dockerfile, (
+        "Dockerfile.sandbox is missing its Chrome/Chromium install gate "
+        "(ARG INSTALL_CHROME) -- without it, sandboxed chrome-devtools-mcp "
+        "calls fail with 'Could not find Google Chrome executable'"
+    )
+    assert "/opt/google/chrome/chrome" in sandbox_dockerfile, (
+        "Dockerfile.sandbox is missing the /opt/google/chrome/chrome "
+        "resolver-path existence check -- without it, a broken Chrome/"
+        "Chromium install can silently ship instead of failing the build"
+    )
+
+
 def test_sandbox_uv_install_uses_buildkit_cache() -> None:
     dockerfile = read_repo_file("docker/Dockerfile.sandbox")
     runtime_stage = dockerfile.split("FROM node:22-slim AS sandbox\n", maxsplit=1)[1]
@@ -448,3 +520,53 @@ def test_uv_export_locked_sandbox_group_contains_direct_distributions() -> None:
 
     for distribution in SANDBOX_DISTRIBUTION_IMPORTS:
         assert re.search(rf"^{re.escape(distribution)}==", result.stdout, re.MULTILINE)
+
+
+def sandbox_publish_step(name: str) -> dict[str, Any]:
+    workflow = yaml.safe_load(read_workflow("sandbox-publish.yml"))
+    for step in workflow["jobs"]["build-and-push"]["steps"]:
+        if step.get("name") == name:
+            return cast(dict[str, Any], step)
+    raise AssertionError(f"sandbox-publish.yml has no step named {name!r}")
+
+
+def test_sandbox_hub_description_step_is_sha_pinned_to_the_sandbox_repository() -> None:
+    step = sandbox_publish_step("Update Docker Hub repository description")
+
+    assert step["uses"] == (
+        "peter-evans/dockerhub-description@1b9a80c056b620d92cedb9d9b5a223409c68ddfa"
+    )
+    assert step["with"]["repository"] == "${{ env.SANDBOX_IMAGE }}"
+    assert step["with"]["readme-filepath"] == "./docker/README.sandbox.md"
+    assert step["with"]["username"] == "${{ secrets.DOCKERHUB_USERNAME }}"
+    assert step["with"]["password"] == "${{ secrets.DOCKERHUB_PASSWORD }}"
+
+
+# WHY: the Hub description is repository-global, not tag-scoped, so a
+# push_to_dockerhub=false dry run must not reach it.
+def test_sandbox_hub_description_gate_equals_the_image_push_gate() -> None:
+    description = sandbox_publish_step("Update Docker Hub repository description")
+    build = sandbox_publish_step("Build and push sandbox image")
+
+    assert description["if"] == build["with"]["push"]
+    assert "push_to_dockerhub == 'true'" in description["if"]
+
+
+def test_sandbox_hub_description_failure_does_not_fail_the_release() -> None:
+    step = sandbox_publish_step("Update Docker Hub repository description")
+
+    assert step["continue-on-error"] is True
+
+
+# WHY: the action truncates an oversized readme or short description and only
+# warns, so drift past a Hub limit ships silently with the run still green.
+def test_sandbox_hub_description_inputs_fit_docker_hub_limits() -> None:
+    step = sandbox_publish_step("Update Docker Hub repository description")
+
+    readme = ROOT / step["with"]["readme-filepath"]
+    assert readme.is_file()
+    assert len(readme.read_bytes()) <= 25_000
+
+    short_description = step["with"]["short-description"]
+    assert short_description
+    assert len(short_description.encode("utf-8")) <= 100

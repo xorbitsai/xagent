@@ -29,12 +29,8 @@ from ...context.skill_tool import (
 from ...frame import ExecutionFrame, ExecutionSnapshot, ExecutionStatus
 from ...grounding import grounding_rule
 from ...language import (
-    OUTPUT_LANGUAGE_METADATA_KEY,
-    OUTPUT_LANGUAGE_SOURCE_METADATA_KEY,
-    OUTPUT_LANGUAGE_SOURCE_ROUTER,
     final_answer_language_rule,
-    normalize_response_language_label,
-    output_language_policy,
+    reset_metadata_output_language,
 )
 from ...runtime import (
     LLMCallInterrupted,
@@ -81,7 +77,6 @@ class AutoDecision:
     existing_context_sufficient: bool = True
     evidence_basis: str = ""
     missing_verification: str = ""
-    response_language: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         payload = {
@@ -94,8 +89,6 @@ class AutoDecision:
             "evidence_basis": self.evidence_basis,
             "missing_verification": self.missing_verification,
         }
-        if self.response_language:
-            payload["response_language"] = self.response_language
         if self.answer is not None:
             payload["answer"] = self.answer
         return payload
@@ -121,9 +114,6 @@ class AutoDecision:
             ),
             evidence_basis=str(payload.get("evidence_basis", "")),
             missing_verification=str(payload.get("missing_verification", "")),
-            response_language=normalize_response_language_label(
-                str(payload.get("response_language", ""))
-            ),
         )
 
 
@@ -548,7 +538,6 @@ class AutoPattern(AgentPattern):
             self._normalize_decision()
             if self.decision is None:
                 raise RuntimeError("AutoPattern decision was not set.")
-            self._apply_response_language(context)
             self.decision_user_messages = self._user_message_signature(context)
             self.selected_pattern = self.decision.action.value
             logger.info(
@@ -712,7 +701,6 @@ class AutoPattern(AgentPattern):
                 existing_context_sufficient=False,
                 evidence_basis=self.decision.evidence_basis,
                 missing_verification=self.decision.missing_verification,
-                response_language=self.decision.response_language,
             )
         if (
             self.decision.action == AutoAction.FINAL_ANSWER
@@ -729,28 +717,10 @@ class AutoPattern(AgentPattern):
                     "AutoPattern selected final_answer without a non-empty answer; "
                     "falling back to react."
                 ),
-                response_language=self.decision.response_language,
             )
         if self.decision.action == AutoAction.PLAN_EXECUTE and self.dag_pattern is None:
             raise ValueError(
                 "AutoPattern selected plan_execute without a DAGPattern configured."
-            )
-
-    def _apply_response_language(self, context: Any) -> None:
-        if self.decision is None:
-            return
-        response_language = normalize_response_language_label(
-            self.decision.response_language
-        )
-        if not response_language:
-            return
-        metadata = self._context_metadata(context)
-        if metadata is not None:
-            # Auto is the current-turn language authority; replace any
-            # request-scoped policy left by a previous turn.
-            metadata[OUTPUT_LANGUAGE_METADATA_KEY] = response_language
-            metadata[OUTPUT_LANGUAGE_SOURCE_METADATA_KEY] = (
-                OUTPUT_LANGUAGE_SOURCE_ROUTER
             )
 
     @staticmethod
@@ -766,8 +736,7 @@ class AutoPattern(AgentPattern):
     def _clear_response_language(self, context: Any) -> None:
         metadata = self._context_metadata(context)
         if metadata is not None:
-            metadata.pop(OUTPUT_LANGUAGE_METADATA_KEY, None)
-            metadata.pop(OUTPUT_LANGUAGE_SOURCE_METADATA_KEY, None)
+            reset_metadata_output_language(metadata)
 
     def _attach_decision_metadata(self, result: dict[str, Any]) -> None:
         if self.decision is None:
@@ -791,8 +760,8 @@ class AutoPattern(AgentPattern):
         if llm is None:
             raise RuntimeError("AutoPattern requires an LLM with tool calling support.")
 
-        # Re-derive the request-scoped language before routing so stale metadata
-        # cannot bias the current decision prompt.
+        # Every fresh routing decision drops all derived labels and re-derives the
+        # caller's; a resumed pattern skips _decide, so the runner migration does it.
         self._clear_response_language(context)
         await runtime.compact_context_if_needed(
             context=context,
@@ -800,10 +769,6 @@ class AutoPattern(AgentPattern):
             metadata={"phase": "auto_decision"},
         )
 
-        current_request = truncate_prompt_preview(
-            latest_user_text(context) or "",
-            limit=400,
-        )
         retry_feedback: str | None = None
         attempt = 0
         # This is a whole-loop budget, independent of the parse attempt budget.
@@ -815,7 +780,6 @@ class AutoPattern(AgentPattern):
             )
             decision_prompt = self._decision_prompt(
                 tools,
-                current_request=current_request,
                 memory_tools_available=memory_tools_available,
                 skill_loading_available=skill_loading_available,
             )
@@ -1247,7 +1211,6 @@ class AutoPattern(AgentPattern):
         self,
         tools: list[Any],
         *,
-        current_request: str = "",
         memory_tools_available: bool = False,
         skill_loading_available: bool = False,
     ) -> str:
@@ -1274,14 +1237,6 @@ class AutoPattern(AgentPattern):
             else "No execution tools are available to the downstream execution pattern."
         )
         available_actions = ", ".join(self._available_auto_actions())
-        language_anchor = (
-            "Latest user request text, quoted for response_language selection:\n"
-            f"{current_request or '(unavailable)'}\n\n"
-            "Choose response_language from that latest user request, including "
-            "any explicit language change requested inside it. Do not choose "
-            "response_language from retrieved memories, source documents, "
-            "tool results, or earlier turns. "
-        )
         skill_rule = (
             "The system context lists available skills. Before choosing an "
             "execution pattern, if one skill clearly matches the full current "
@@ -1310,7 +1265,6 @@ class AutoPattern(AgentPattern):
             "Choose how the agent should handle the user request. "
             f"{routing_requirement}"
             f"{action_requirement}"
-            f"{language_anchor}"
             "Use final_answer for simple conversational replies that need no tools; "
             "when action is final_answer, you must include a complete non-empty "
             "answer field in the same tool call. Put action before answer in the "
@@ -1323,13 +1277,6 @@ class AutoPattern(AgentPattern):
             "You must classify whether "
             "the latest request requires current or external facts, and whether "
             "the existing context is sufficient evidence for those facts. "
-            "Set response_language to the natural language that user-facing prose "
-            "should use for this request, such as English, Simplified Chinese, "
-            "Traditional Chinese, Spanish, or the language explicitly requested "
-            "by the user. For Chinese requests, choose Simplified Chinese or "
-            "Traditional Chinese to match the request script; do not use generic "
-            "Chinese. This is a routing decision field only; do not translate or "
-            "rewrite the request. "
             f"{skill_rule}"
             "If the latest user message explicitly asks to call or use an available "
             "tool, to pause for user input, or to wait for a user choice, choose "
@@ -1434,20 +1381,6 @@ class AutoPattern(AgentPattern):
                             "type": "string",
                             "description": "Brief reason for the selected action.",
                         },
-                        "response_language": {
-                            "type": "string",
-                            "description": (
-                                "Natural language to use for all user-facing prose "
-                                "and persisted tool-argument prose for this request, "
-                                "for example English, Simplified Chinese, Traditional "
-                                "Chinese, or Spanish. For Chinese requests, choose "
-                                "Simplified Chinese or Traditional Chinese to match "
-                                "the request script; do not use generic Chinese. If "
-                                "the current user request explicitly asks to answer in "
-                                "another language, use that requested target language. "
-                                f"{output_language_policy()}"
-                            ),
-                        },
                         "answer": {
                             "type": "string",
                             "description": (
@@ -1497,7 +1430,6 @@ class AutoPattern(AgentPattern):
                     "required": [
                         "action",
                         "reason",
-                        "response_language",
                         "answer",
                         "requires_current_or_external_facts",
                         "existing_context_sufficient",

@@ -19,6 +19,11 @@ from xagent.core.agent.checkpoint import (
     CheckpointCorruptError,
     CheckpointUnavailableError,
 )
+from xagent.core.agent.language import (
+    OUTPUT_LANGUAGE_METADATA_KEY,
+    OUTPUT_LANGUAGE_SOURCE_METADATA_KEY,
+    reset_output_language_to_request_context,
+)
 from xagent.core.agent.runner import AgentRunner
 from xagent.core.agent.runtime import LLMCallInterrupted
 from xagent.core.task_runtime import PREFERRED_INPUT_MODALITIES_METADATA_KEY
@@ -1793,3 +1798,246 @@ async def test_inject_user_message_raises_corrupt_on_contextless_checkpoint() ->
             "exec-inject-contextless",
             message="hello",
         )
+
+
+@pytest.mark.asyncio
+async def test_resume_drops_legacy_router_output_language(tmp_path: Path) -> None:
+    checkpoint_context = ExecutionContext(execution_id="exec-legacy-router-language")
+    checkpoint_context.metadata["pattern"] = "auto"
+    checkpoint_context.metadata[OUTPUT_LANGUAGE_METADATA_KEY] = "Simplified Chinese"
+    checkpoint_context.metadata[OUTPUT_LANGUAGE_SOURCE_METADATA_KEY] = "auto_router"
+    checkpoint_context.add_user_message("Summarize the release notes in one paragraph.")
+    child_context = ExecutionContext(execution_id="exec-legacy-router-language_child")
+    child_context.metadata[OUTPUT_LANGUAGE_METADATA_KEY] = "Simplified Chinese"
+    child_context.metadata[OUTPUT_LANGUAGE_SOURCE_METADATA_KEY] = "auto_router"
+    checkpoint = {
+        "context": checkpoint_context.to_dict(),
+        "pattern": "StatefulPattern",
+        "pattern_state": {
+            "output": "restored",
+            "active_step_contexts": {"step_1": child_context.to_dict()},
+        },
+    }
+    pattern = StatefulPattern()
+    runner = AgentRunner(
+        agent=Agent(name="writer", patterns=[pattern]),
+        workspace_manager=FakeWorkspaceManager(tmp_path),
+    )
+
+    result = await runner.run(
+        task=None,
+        execution_id="exec-legacy-router-language",
+        checkpoint=checkpoint,
+    )
+
+    assert result["success"] is True
+    metadata = result["context"].metadata
+    assert OUTPUT_LANGUAGE_METADATA_KEY not in metadata
+    assert OUTPUT_LANGUAGE_SOURCE_METADATA_KEY not in metadata
+    restored_child = pattern.state["active_step_contexts"]["step_1"]["metadata"]
+    assert OUTPUT_LANGUAGE_METADATA_KEY not in restored_child
+    assert OUTPUT_LANGUAGE_SOURCE_METADATA_KEY not in restored_child
+    system_content = result["context"].get_messages_for_llm()[0]["content"]
+    assert "Output language: Simplified Chinese" not in system_content
+    assert "Summarize the release notes in one paragraph." in system_content
+
+
+@pytest.mark.asyncio
+async def test_resume_drops_legacy_plan_output_language(tmp_path: Path) -> None:
+    checkpoint_context = ExecutionContext(execution_id="exec-legacy-plan-language")
+    checkpoint_context.metadata["pattern"] = "dag_plan_execute"
+    checkpoint_context.metadata[OUTPUT_LANGUAGE_METADATA_KEY] = "Simplified Chinese"
+    checkpoint_context.metadata[OUTPUT_LANGUAGE_SOURCE_METADATA_KEY] = "dag_plan"
+    checkpoint_context.add_user_message("Summarize the release notes in one paragraph.")
+    child_context = ExecutionContext(execution_id="exec-legacy-plan-language_child")
+    child_context.metadata[OUTPUT_LANGUAGE_METADATA_KEY] = "Simplified Chinese"
+    child_context.metadata[OUTPUT_LANGUAGE_SOURCE_METADATA_KEY] = "dag_plan"
+    checkpoint = {
+        "context": checkpoint_context.to_dict(),
+        "pattern": "StatefulPattern",
+        "pattern_state": {
+            "output": "restored",
+            "active_step_contexts": {"step_1": child_context.to_dict()},
+        },
+    }
+    pattern = StatefulPattern()
+    runner = AgentRunner(
+        agent=Agent(name="writer", patterns=[pattern]),
+        workspace_manager=FakeWorkspaceManager(tmp_path),
+    )
+
+    result = await runner.run(
+        task=None,
+        execution_id="exec-legacy-plan-language",
+        checkpoint=checkpoint,
+    )
+
+    assert result["success"] is True
+    metadata = result["context"].metadata
+    assert OUTPUT_LANGUAGE_METADATA_KEY not in metadata
+    assert OUTPUT_LANGUAGE_SOURCE_METADATA_KEY not in metadata
+    restored_child = pattern.state["active_step_contexts"]["step_1"]["metadata"]
+    assert OUTPUT_LANGUAGE_METADATA_KEY not in restored_child
+    assert OUTPUT_LANGUAGE_SOURCE_METADATA_KEY not in restored_child
+    system_content = result["context"].get_messages_for_llm()[0]["content"]
+    assert "Output language: Simplified Chinese" not in system_content
+    assert "Summarize the release notes in one paragraph." in system_content
+
+
+@pytest.mark.asyncio
+async def test_resume_keeps_caller_supplied_output_language(tmp_path: Path) -> None:
+    checkpoint_context = ExecutionContext(execution_id="exec-caller-language")
+    checkpoint_context.metadata["request_context"] = {
+        OUTPUT_LANGUAGE_METADATA_KEY: "French"
+    }
+    checkpoint_context.metadata[OUTPUT_LANGUAGE_METADATA_KEY] = "French"
+    checkpoint_context.add_user_message("Summarize the release notes.")
+    checkpoint = {
+        "context": checkpoint_context.to_dict(),
+        "pattern": "StatefulPattern",
+        "pattern_state": {"output": "restored"},
+    }
+    runner = AgentRunner(
+        agent=Agent(name="writer", patterns=[StatefulPattern()]),
+        workspace_manager=FakeWorkspaceManager(tmp_path),
+    )
+
+    result = await runner.run(
+        task=None,
+        execution_id="exec-caller-language",
+        checkpoint=checkpoint,
+    )
+
+    assert result["success"] is True
+    assert result["context"].metadata[OUTPUT_LANGUAGE_METADATA_KEY] == "French"
+    system_content = result["context"].get_messages_for_llm()[0]["content"]
+    assert "Output language: French" in system_content
+
+
+class _StoredContextCheckpointStore:
+    def __init__(self, context: ExecutionContext) -> None:
+        self.payload = {"type": "checkpoint", "context": context.to_dict()}
+
+    async def load_latest_checkpoint(self, execution_id: str) -> dict[str, Any]:
+        del execution_id
+        return self.payload
+
+
+def _cold_start_runner(context: ExecutionContext) -> AgentRunner:
+    return AgentRunner(
+        agent=Agent(name="writer", patterns=[], llm=None),
+        tracer=_StoredContextCheckpointStore(context),
+    )
+
+
+@pytest.mark.asyncio
+async def test_inject_user_message_cold_start_drops_legacy_output_language() -> None:
+    stored = ExecutionContext(execution_id="exec-inject-legacy-language")
+    stored.metadata["pattern"] = "auto"
+    stored.metadata[OUTPUT_LANGUAGE_METADATA_KEY] = "Simplified Chinese"
+    stored.metadata[OUTPUT_LANGUAGE_SOURCE_METADATA_KEY] = "auto_router"
+    stored.add_user_message("Summarize the release notes.")
+
+    context = await _cold_start_runner(stored).inject_user_message(
+        "exec-inject-legacy-language",
+        message="continue",
+    )
+
+    assert context is not None
+    assert OUTPUT_LANGUAGE_METADATA_KEY not in context.metadata
+    assert OUTPUT_LANGUAGE_SOURCE_METADATA_KEY not in context.metadata
+
+
+@pytest.mark.asyncio
+async def test_inject_user_message_cold_start_keeps_caller_output_language() -> None:
+    stored = ExecutionContext(execution_id="exec-inject-caller-language")
+    stored.metadata["request_context"] = {OUTPUT_LANGUAGE_METADATA_KEY: "French"}
+    stored.metadata[OUTPUT_LANGUAGE_METADATA_KEY] = "French"
+    stored.metadata[OUTPUT_LANGUAGE_SOURCE_METADATA_KEY] = "auto_router"
+    stored.add_user_message("Summarize the release notes.")
+
+    context = await _cold_start_runner(stored).inject_user_message(
+        "exec-inject-caller-language",
+        message="continue",
+    )
+
+    assert context is not None
+    assert context.metadata[OUTPUT_LANGUAGE_METADATA_KEY] == "French"
+    assert OUTPUT_LANGUAGE_SOURCE_METADATA_KEY not in context.metadata
+
+
+def test_resume_migration_only_touches_execution_context_nodes() -> None:
+    """The migration owns ExecutionContext metadata and nothing else: a
+    ``metadata`` dict inside a message, a tool argument, or a step result is
+    someone else's payload, and a cold start would persist a silent edit."""
+    root = ExecutionContext(execution_id="exec-migration-ownership")
+    root.metadata["pattern"] = "dag_plan_execute"
+    root.metadata[OUTPUT_LANGUAGE_METADATA_KEY] = "Simplified Chinese"
+    root.metadata[OUTPUT_LANGUAGE_SOURCE_METADATA_KEY] = "dag_plan"
+    root.add_user_message(
+        "Translate the attached note.",
+        metadata={OUTPUT_LANGUAGE_METADATA_KEY: "French"},
+    )
+    child = ExecutionContext(execution_id="exec-migration-ownership_child")
+    child.metadata[OUTPUT_LANGUAGE_METADATA_KEY] = "Simplified Chinese"
+    child.metadata[OUTPUT_LANGUAGE_SOURCE_METADATA_KEY] = "dag_plan"
+
+    checkpoint = {
+        "context": root.to_dict(),
+        "pattern": "DAGPattern",
+        "metadata": {OUTPUT_LANGUAGE_METADATA_KEY: "French"},
+        "pattern_state": {
+            "active_step_contexts": {"step_1": child.to_dict()},
+            "step_results": {
+                "step_1": {"metadata": {OUTPUT_LANGUAGE_METADATA_KEY: "French"}}
+            },
+            "active_step_pattern_states": {
+                "step_1": {
+                    "last_response": {
+                        "tool_calls": [
+                            {
+                                "arguments": {
+                                    "metadata": {OUTPUT_LANGUAGE_METADATA_KEY: "French"}
+                                }
+                            }
+                        ]
+                    }
+                }
+            },
+        },
+    }
+
+    reset_output_language_to_request_context(checkpoint)
+
+    assert OUTPUT_LANGUAGE_METADATA_KEY not in checkpoint["context"]["metadata"]
+    assert OUTPUT_LANGUAGE_SOURCE_METADATA_KEY not in checkpoint["context"]["metadata"]
+    restored_child = checkpoint["pattern_state"]["active_step_contexts"]["step_1"]
+    assert OUTPUT_LANGUAGE_METADATA_KEY not in restored_child["metadata"]
+    assert OUTPUT_LANGUAGE_SOURCE_METADATA_KEY not in restored_child["metadata"]
+
+    message_metadata = checkpoint["context"]["messages"][0]["metadata"]
+    assert message_metadata[OUTPUT_LANGUAGE_METADATA_KEY] == "French"
+    assert checkpoint["metadata"][OUTPUT_LANGUAGE_METADATA_KEY] == "French"
+    step_result = checkpoint["pattern_state"]["step_results"]["step_1"]
+    assert step_result["metadata"][OUTPUT_LANGUAGE_METADATA_KEY] == "French"
+    tool_arguments = checkpoint["pattern_state"]["active_step_pattern_states"][
+        "step_1"
+    ]["last_response"]["tool_calls"][0]["arguments"]
+    assert tool_arguments["metadata"][OUTPUT_LANGUAGE_METADATA_KEY] == "French"
+
+
+def test_resume_migration_reaches_a_nested_auto_pattern_child_context() -> None:
+    child = ExecutionContext(execution_id="exec-migration-nested_child")
+    child.metadata[OUTPUT_LANGUAGE_METADATA_KEY] = "Simplified Chinese"
+    child.metadata[OUTPUT_LANGUAGE_SOURCE_METADATA_KEY] = "auto_router"
+    checkpoint = {
+        "context": ExecutionContext(execution_id="exec-migration-nested").to_dict(),
+        "pattern_state": {
+            "dag_state": {"active_step_contexts": {"step_1": child.to_dict()}}
+        },
+    }
+
+    reset_output_language_to_request_context(checkpoint)
+
+    nested = checkpoint["pattern_state"]["dag_state"]["active_step_contexts"]["step_1"]
+    assert OUTPUT_LANGUAGE_METADATA_KEY not in nested["metadata"]

@@ -4,7 +4,7 @@ import React, { useCallback, useMemo, useState } from "react"
 import { Loader2 } from "lucide-react"
 import { ChatStartScreen } from "@/components/chat/ChatStartScreen"
 import { TaskConversationPanel } from "@/components/task/task-conversation-panel"
-import { Button } from "@/components/ui/button"
+import { WidgetChromeControls } from "@/components/widget/widget-chrome-controls"
 import {
   AppProvider,
   type AppProviderTransportConfig,
@@ -155,20 +155,16 @@ function SessionConversationContent({
                 : t("widgetChat.status.connecting")}
             </p>
           </div>
-          {hasEstablishedConversation ? (
-            <Button
-              type="button"
-              variant="outline"
-              size="sm"
-              className="ml-auto"
-              disabled={resetDisabled}
-              onClick={() => void handleStartNewConversation()}
-            >
-              {isConversationResetPending
+          <WidgetChromeControls
+            newConversation={hasEstablishedConversation ? {
+              label: isConversationResetPending
                 ? t("widgetSession.resetting")
-                : t("widgetSession.startNewConversation")}
-            </Button>
-          ) : null}
+                : t("widgetSession.startNewConversation"),
+              onClick: () => void handleStartNewConversation(),
+              disabled: resetDisabled,
+              pending: isConversationResetPending,
+            } : undefined}
+          />
         </div>
         {isAbsoluteExpiryWarningVisible ? (
           <p
@@ -256,11 +252,13 @@ export function SessionAgentChatPage() {
       ],
       expectedProtocol: SESSION_PROTOCOL,
       chatTaskIdMode: "omit",
+      taskBindingMode: "session-subprotocol",
       credentialOwner: { kind: "external" },
     }
   }, [bridge.session, bridge.status])
 
   const transport = useMemo<AppProviderTransportConfig>(() => ({
+    legacyErrorProse: "untrusted",
     capabilities: {
       // This page only renders for the embedded widget's session-resume
       // route, so an in-tab navigation always abandons the visitor's iframe.

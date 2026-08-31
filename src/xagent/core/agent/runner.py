@@ -19,6 +19,7 @@ from ..workspace import WorkspaceManager
 from .attachments import build_image_context_references
 from .checkpoint import CheckpointCorruptError, read_latest_checkpoint_payload
 from .context import ContextManager, ExecutionContext
+from .language import reset_output_language_to_request_context
 from .result import extract_assistant_message
 from .runtime import ExecutionInterrupted, PatternRuntime, load_pattern_checkpoint
 
@@ -101,6 +102,7 @@ class AgentRunner:
                 execution_id=execution_id,
             )
         if checkpoint and isinstance(checkpoint.get("context"), dict):
+            reset_output_language_to_request_context(checkpoint)
             context = ExecutionContext.from_dict(checkpoint["context"])
             self._merge_context_metadata(context, metadata, restored=True)
             self.context_manager.set_context(context)
@@ -456,6 +458,7 @@ class AgentRunner:
                     "Stored checkpoint carries no execution context to restore."
                 )
             cold_start_checkpoint = checkpoint
+            reset_output_language_to_request_context(checkpoint)
             context = ExecutionContext.from_dict(checkpoint["context"])
             self.context_manager.set_context(context)
 

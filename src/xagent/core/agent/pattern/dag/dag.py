@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 from ....file_ref import final_deliverable_file_reference_instructions
@@ -20,8 +20,9 @@ from ...frame import ExecutionFrame, ExecutionSnapshot, ExecutionStatus
 from ...grounding import grounding_rule
 from ...language import (
     OUTPUT_LANGUAGE_METADATA_KEY,
+    effective_output_language,
     final_answer_language_rule,
-    output_language_policy,
+    output_language_directives,
 )
 from ...result import unwrap_final_answer_content
 from ...runtime import (
@@ -958,6 +959,11 @@ class DAGPattern(AgentPattern):
                 OUTPUT_LANGUAGE_METADATA_KEY
             ):
                 child_context.metadata[OUTPUT_LANGUAGE_METADATA_KEY] = output_language
+            self._refresh_restored_step_instruction(
+                child_context,
+                root_context=root_context,
+                step=step,
+            )
         else:
             child_context = root_context.create_child_context(
                 metadata={
@@ -1508,10 +1514,9 @@ class DAGPattern(AgentPattern):
             if getattr(message, "role", None) == "user"
         ]
         payload = {
-            "output_language_policy": output_language_policy(
-                getattr(context, "metadata", {}).get(OUTPUT_LANGUAGE_METADATA_KEY)
-                if isinstance(getattr(context, "metadata", {}), dict)
-                else None
+            "output_language_policy": output_language_directives(
+                effective_output_language(context),
+                section="completion_assessment",
             ),
             "authoritative_user_requests": authoritative_user_requests,
             "messages": latest_messages,
@@ -1697,7 +1702,10 @@ class DAGPattern(AgentPattern):
         return {dep: self.step_results.get(dep) for dep in step.dependencies}
 
     def _step_instruction(self, *, root_context: Any, step: PlanStep) -> str:
-        language_policy = output_language_policy(self._output_language(root_context))
+        language_policy = output_language_directives(
+            effective_output_language(root_context),
+            section="dag_step_instruction",
+        )
         dependency_note = (
             "Dependency results, if any, are provided immediately before this "
             "message. Use them as inputs for this step only."
@@ -1892,6 +1900,27 @@ class DAGPattern(AgentPattern):
         self.planned_user_message_count = len(root_user_messages)
         self.status = "running"
         return True
+
+    def _refresh_restored_step_instruction(
+        self,
+        child_context: Any,
+        *,
+        root_context: Any,
+        step: PlanStep,
+    ) -> None:
+        """Re-emit the instruction message of a checkpoint-restored step.
+
+        The instruction bakes the output language policy into message content,
+        which the metadata-only checkpoint migration cannot reach.
+        """
+        instruction = self._step_instruction(root_context=root_context, step=step)
+        for index, message in enumerate(child_context.messages):
+            metadata = getattr(message, "metadata", None) or {}
+            if (
+                metadata.get("kind") == "dag_step_instruction"
+                and message.content != instruction
+            ):
+                child_context.messages[index] = replace(message, content=instruction)
 
     @staticmethod
     def _refresh_restored_step_runtime_metadata(

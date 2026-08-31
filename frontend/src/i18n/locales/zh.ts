@@ -1,4 +1,28 @@
 const zh = {
+  clientErrors: {
+    messageProcessingFailed: "消息处理失败，请重试。",
+    taskExecutionFailed: "任务执行失败。",
+    guidanceInProgress: "上一条指导消息仍在处理中，请等待处理完成。",
+    messageRateLimited: "消息发送过于频繁，请稍候重试。",
+    messageIdConflict: "此消息 ID 已用于其他内容或文件，请使用新的消息 ID 重试。",
+    messageDeliveryFailed: "消息未能送达，请重试该草稿。",
+    messageContinuationUnsupported: "当前任务不支持继续发送消息。",
+    taskPauseInProgress: "任务暂停仍在处理中，请稍后重试。",
+    messageAcceptancePending: "消息接收状态仍在确认中，请稍后重试。",
+    taskUnavailable: "任务已不可用。",
+    taskBusy: "任务正忙，请等待上一轮完成后再发送消息。",
+    workforceUnavailable: "此 Workforce 对话已无法接收新消息，请开始新对话。",
+    workforceArchived: "此 Workforce 已归档。请先取消归档并重新发布，再开始新对话；或选择一个活跃的 Workforce。",
+    messageAttachmentCorrupt: "此消息使用的已存储文件完整性校验失败，请重新上传。",
+    messageAttachmentUnavailable: "无法读取此消息使用的已存储文件，请重试。",
+    taskCheckpointUnreadable: "无法读取任务保存的进度。",
+    authenticationRequired: "需要登录后才能发送此消息。",
+    taskAccessDenied: "你无权访问此任务。",
+    invalidMessage: "消息格式无效。",
+    uploadTooLarge: "文件过大，请减小上传大小后重试。",
+    uploadProxyError: "上传请求未到达应用，请检查服务器的上传大小限制。",
+    uploadFailed: "上传失败，请重试。",
+  },
   common: {
     optional: "(可选)",
     next: "下一步",
@@ -519,6 +543,8 @@ const zh = {
   widgetChat: {
     title: "AI 助手",
     newConversation: "新建会话",
+    close: "关闭",
+    moreOptions: "更多选项",
     status: {
       initializing: "正在初始化...",
       connecting: "连接中...",

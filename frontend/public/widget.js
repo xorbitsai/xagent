@@ -610,6 +610,7 @@
     panelRemovalObserver.disconnect();
     window.removeEventListener('resize', onWindowResize);
     window.removeEventListener('blur', onWindowBlur);
+    window.removeEventListener('message', onChromeMessage);
     document.removeEventListener('pointermove', onPointerMove);
     document.removeEventListener('pointerup', endDrag);
     document.removeEventListener('pointercancel', cancelDrag);
@@ -632,14 +633,24 @@
   fab.innerHTML = chatIcon;
 
   var isOpen = false;
+
+  function openPanel() {
+    isOpen = true;
+    panel.classList.add('open');
+    fab.innerHTML = closeIcon;
+  }
+
+  function closePanel() {
+    isOpen = false;
+    panel.classList.remove('open');
+    fab.innerHTML = chatIcon;
+  }
+
   fab.onclick = function () {
-    isOpen = !isOpen;
     if (isOpen) {
-      panel.classList.add('open');
-      fab.innerHTML = closeIcon;
+      closePanel();
     } else {
-      panel.classList.remove('open');
-      fab.innerHTML = chatIcon;
+      openPanel();
     }
   };
 
@@ -658,6 +669,22 @@
   // the childList of the *old* body node that still holds container -- only
   // <html>'s own childList changes when body itself is swapped out.
   panelRemovalObserver.observe(document.documentElement, { childList: true, subtree: true });
+
+  // The header's close control lives inside the iframe's React app and has
+  // no direct handle to panel/fab, so it signals intent back here over
+  // postMessage instead. Named (not inline) so panelRemovalObserver can
+  // remove it below, matching every other listener's teardown in this file
+  // -- otherwise a host SPA that removes the widget without a full page
+  // reload leaves this listener retaining the closure indefinitely.
+  function onChromeMessage(event) {
+    if (torndown || event.origin !== host || !iframe.contentWindow || event.source !== iframe.contentWindow) return;
+    var data = event.data;
+    if (!data || data.xagent !== true || data.v !== 1) return;
+    if (data.type === 'widget_close') {
+      closePanel();
+    }
+  }
+  window.addEventListener('message', onChromeMessage);
 
   mode.attach(iframe);
 

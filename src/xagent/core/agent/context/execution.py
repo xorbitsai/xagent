@@ -22,10 +22,8 @@ from ...tools.artifacts import (
     sanitize_tool_result_for_public_context,
 )
 from ..language import (
-    OUTPUT_LANGUAGE_METADATA_KEY,
-    dag_step_language_rules,
-    output_language_policy,
-    response_language_rules,
+    effective_output_language,
+    output_language_directives,
 )
 from ..result import CONTROL_TOOL_NAMES, tool_result_succeeded
 from .components import (
@@ -492,12 +490,26 @@ class ExecutionContext:
             "instead of computing from this value."
         )
 
-    def _current_user_request_text(self) -> str:
+    def _current_user_request_text(self, *, prefer_display: bool = False) -> str:
+        """Return the current request text.
+
+        ``prefer_display`` yields the user-typed message instead of the
+        execution prompt, whose appended file-reference block is fixed English
+        and would otherwise decide the language of a short foreign request.
+        """
         for message in reversed(self.messages):
             if message.hidden or message.role != "user":
                 continue
             if message.metadata.get("response_to_waiting_for_user"):
                 continue
+            # A DAG child context copies the root messages and then appends step
+            # scaffolding; only the root request may anchor the response language.
+            if message.metadata.get("dag_step_id"):
+                continue
+            if prefer_display:
+                display = str(message.metadata.get("display_message") or "").strip()
+                if display:
+                    return display
             content = str(message.content or "").strip()
             if content:
                 return content
@@ -507,14 +519,11 @@ class ExecutionContext:
         parts = [self._current_time_context(), FILE_REF_MODEL_INSTRUCTIONS]
         dag_step_id = self.metadata.get("dag_step_id")
         current_task = self._current_user_request_text()
+        output_language = effective_output_language(self)
         if current_task and not dag_step_id:
-            language_policy = ""
-            output_language = self.metadata.get(OUTPUT_LANGUAGE_METADATA_KEY)
-            if output_language:
-                language_policy = (
-                    "\n\nOutput language policy:\n"
-                    f"{output_language_policy(output_language)}"
-                )
+            language_directives = output_language_directives(
+                output_language, section="root_system_context"
+            )
             parts.append(
                 "Current user request:\n"
                 f"{current_task}\n\n"
@@ -524,8 +533,7 @@ class ExecutionContext:
                 "previous requests or repeat previous final answers unless the "
                 "current user request explicitly asks to revise, continue, compare, "
                 "or summarize them.\n\n"
-                f"{response_language_rules()}"
-                f"{language_policy}"
+                f"{language_directives}"
             )
         process_description = str(
             self.metadata.get("process_description") or ""
@@ -553,9 +561,12 @@ class ExecutionContext:
                     "Task input/output examples:\n" + "\n".join(formatted_examples)
                 )
         if dag_step_id:
-            language_policy = output_language_policy(
-                self.metadata.get(OUTPUT_LANGUAGE_METADATA_KEY)
-            ).strip()
+            language_policy = output_language_directives(
+                output_language, section="dag_step_scope"
+            )
+            step_language_rules = output_language_directives(
+                output_language, section="dag_step_rules"
+            )
             dag_step_name = str(self.metadata.get("dag_step_name") or "").strip()
             dag_step_description = str(
                 self.metadata.get("dag_step_description") or dag_step_name
@@ -584,8 +595,15 @@ class ExecutionContext:
                 f"- Suggested tools for this step: {suggested_tools}\n\n"
                 "Only execute the current DAG step. Detailed step boundary rules are "
                 "provided in the latest DAG step instruction message.\n\n"
-                f"{dag_step_language_rules()}"
+                f"{step_language_rules}"
             )
+            request_anchor = output_language_directives(
+                output_language,
+                section="dag_step_request_anchor",
+                request=self._current_user_request_text(prefer_display=True),
+            )
+            if request_anchor:
+                parts.append(request_anchor)
         memory_context = self.metadata.get(MEMORY_CONTEXT_METADATA_KEY)
         if memory_context:
             parts.append(

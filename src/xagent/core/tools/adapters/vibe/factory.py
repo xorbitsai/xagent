@@ -202,9 +202,12 @@ class ToolRegistry:
             # explicit zero-tools agent still gets nothing.
             return spec is None or not spec.is_none()
 
-        if spec is None or declared_cats is None or spec.categories is None:
+        if spec is None or declared_cats is None:
             return True
 
+        # Creator-specific gates remain authoritative in ALL mode. Actor-marked
+        # tasks use an ALL spec with published-agent dispatch explicitly
+        # disabled, and the creator must not be reached at all.
         if selection_gate == "published_agent":
             return spec.includes_published_agent()
 
@@ -215,6 +218,9 @@ class ToolRegistry:
             # and a server scope) rather than the category intersection below,
             # or a server-only spec would skip the MCP creator entirely.
             return spec.includes_mcp()
+
+        if spec.categories is None:
+            return True
 
         # After the gates above: a creator carrying both a gate and a
         # binding-authorized category must honour its gate first.

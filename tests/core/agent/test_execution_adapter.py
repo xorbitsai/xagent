@@ -236,7 +236,6 @@ def auto_decision(
                     "arguments": {
                         "action": action,
                         "reason": reason,
-                        "response_language": "English",
                         "answer": answer,
                         "requires_current_or_external_facts": False,
                         "existing_context_sufficient": True,

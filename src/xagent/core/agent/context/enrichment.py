@@ -110,9 +110,24 @@ def build_skill_context(skill: dict[str, Any]) -> str:
     return f"## Available Skill: {name}\n\n{content}".strip()
 
 
-def latest_user_text(context: Any) -> str:
+def latest_user_text(context: Any, *, prefer_display: bool = False) -> str:
+    """Return the latest user turn's text.
+
+    ``prefer_display`` returns what the user actually typed instead of the
+    runtime-augmented execution prompt; language anchors must use it, work
+    anchors must not.
+    """
     for message in reversed(getattr(context, "messages", []) or []):
         if getattr(message, "role", None) == "user":
+            if prefer_display:
+                metadata = getattr(message, "metadata", None)
+                display = (
+                    metadata.get("display_message")
+                    if isinstance(metadata, dict)
+                    else None
+                )
+                if isinstance(display, str) and display.strip():
+                    return display
             return str(getattr(message, "content", "") or "")
     task = context.metadata.get("task") if hasattr(context, "metadata") else None
     return str(task or "")

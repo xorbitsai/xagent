@@ -16,7 +16,7 @@ import { capitalize } from "@/lib/tool-category-labels";
 import { findMatchingMcpApp } from "@/lib/mcp-lookup";
 import { ApiKeyConnectDialog, CONNECT_TIMEOUT_MS, handleIconLoadError } from "./api-key-connect-dialog";
 
-// The 11 builtin-OAuth providers (see src/xagent/web/builtin_mcp_registry.py's
+// The 13 builtin-OAuth providers (see src/xagent/web/builtin_mcp_registry.py's
 // get_builtin_oauth_provider_rows) - brand names, left untranslated in both
 // locales like every other connector name in the app. Falling back to
 // capitalize() below still runs for any provider missing here, but gets the
@@ -34,6 +34,8 @@ export const PROVIDER_DISPLAY_NAMES: Record<string, string> = {
   github: "GitHub",
   linear: "Linear",
   jira: "Jira",
+  salesforce: "Salesforce",
+  deputy: "Deputy",
 };
 
 // connectingKeys/connectingKeysRef below hold both of these kinds of key in

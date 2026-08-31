@@ -20,7 +20,7 @@ import {
 import { Button } from "@/components/ui/button";
 import { normalizeTimestampMs } from "@/lib/time-utils";
 import { FileChip } from "./FileChip";
-import { ClarificationForm } from "./clarification-form";
+import { ClarificationForm, LIVE_WIDGET_TYPES } from "./clarification-form";
 import { isStoppedTraceProcessStatus, resolveTraceProcessStatus } from "@/lib/trace-process-status";
 import {
   TaskRuntimeMessageMetadataExtension,
@@ -325,7 +325,7 @@ export function ChatMessage({
   contextBadges,
   taskRuntimeExtensionMetadata,
 }: ChatMessageProps) {
-  const { t, tDynamic } = useI18n();
+  const { t, tDynamic, locale } = useI18n();
   const { filesDisabled, openFilePreview } = useApp();
   const router = useRouter();
   const isUser = role === "user";
@@ -452,6 +452,72 @@ export function ChatMessage({
     showEmptyStatus === false &&
     (showProcessView || !isStoppedWithoutAnswer);
 
+  // A connect_apps-only pause's bubble text comes from UnavailableMCPTool's
+  // hardcoded English message (see _run_unavailable) - the backend has no
+  // locale-awareness to draw on there, so re-render it from live i18n data
+  // instead, the same way ClarificationForm already re-resolves this
+  // interaction type's label instead of trusting the persisted one.
+  //
+  // Gated on interactionsActive, not just the interaction shape: the Hire
+  // flow seeds a connect_apps interaction alongside a persona's real
+  // intro/kickoff message (hire-agent.ts's buildConnectAppsInteraction,
+  // persisted via seed_assistant_message/seed_interactions in chat.py) that
+  // never puts the task into waiting_for_user - task-conversation-panel.tsx
+  // only sets interactionsActive true for the one message that is actually
+  // the live, unanswered pause, so a seeded kickoff message's real content
+  // is left alone here.
+  //
+  // Latched (not just interactionsActive) once confirmed: interactionsActive
+  // flips back to false the moment this pause resolves (the task leaves
+  // waiting_for_user), which would otherwise revert this SAME bubble in
+  // scrollback from the localized string back to the raw English backend
+  // text mid-conversation. The key={item.id} on this component in
+  // task-conversation-panel.tsx keeps one instance mounted across that
+  // transition for the one message that ever legitimately turns this on -
+  // a Hire-seed message's interactionsActive is never true in the first
+  // place, so it never latches.
+  const [hasBeenActiveConnectApps, setHasBeenActiveConnectApps] = useState(false);
+  const isActiveConnectAppsPause =
+    !isUser && interactionsActive && interactions && interactions.length > 0 &&
+    interactions.every((interaction) => LIVE_WIDGET_TYPES.has(interaction?.type));
+  useEffect(() => {
+    if (isActiveConnectAppsPause) {
+      setHasBeenActiveConnectApps(true);
+    }
+  }, [isActiveConnectAppsPause]);
+  const connectAppsOnlyApps =
+    isActiveConnectAppsPause || hasBeenActiveConnectApps
+      ? Array.from(
+          new Set(
+            (interactions || []).flatMap((interaction) =>
+              Array.isArray(interaction.apps)
+                ? // Each entry is either the legacy plain display-name string,
+                  // or an { id, name } object carrying the catalog's stable id
+                  // alongside it (see Interaction.apps' doc comment) - only
+                  // the name is needed for this sentence, Intl.ListFormat
+                  // below needs plain strings.
+                  (interaction.apps as Array<string | { name?: string } | undefined>)
+                    .map((entry) => (typeof entry === "string" ? entry : entry?.name))
+                    .filter((name: string | undefined): name is string => Boolean(name))
+                : []
+            )
+          )
+        )
+      : null;
+  const displayContent =
+    connectAppsOnlyApps && connectAppsOnlyApps.length > 0
+      ? t("chatPage.clarification.connectApps.needAccess", {
+          // Intl.ListFormat instead of a raw ", " join: locale-correct
+          // conjunction ("Gmail and Slack" / "Gmail, Slack, and Notion")
+          // for the (rare but real) multi-app pause case, matching the
+          // conjunction the connectApps.title copy itself doesn't need but
+          // this sentence does since it lists the apps inline.
+          apps: new Intl.ListFormat(locale, { style: "long", type: "conjunction" }).format(
+            connectAppsOnlyApps,
+          ),
+        })
+      : content;
+
   // The trace carries the backend's raw error string (a Python exception, more
   // often than not). With the trace hidden the failure line must not become its
   // replacement channel, so only mine the events when the process view is on.
@@ -481,7 +547,7 @@ export function ChatMessage({
   const isAssistantFailure = !isUser && resolvedProcessStatus === "failed";
   const copyableContent = isAssistantFailure
     ? failedMessageText
-    : typeof content === "string" ? content : rawContent;
+    : typeof displayContent === "string" ? displayContent : rawContent;
   const displayCopyableContent = filesDisabled && copyableContent
     ? serializeFilesDisabledPresentation(copyableContent)
     : copyableContent;
@@ -542,16 +608,16 @@ export function ChatMessage({
                 <div className="py-3 text-sm leading-relaxed text-red-500 break-words [overflow-wrap:anywhere]">
                   {displayCopyableContent}
                 </div>
-              ) : content ? (
-                typeof content === "string" ? (
+              ) : displayContent ? (
+                typeof displayContent === "string" ? (
                   isUser ? (
                     <ExpandableMessage
-                      content={content}
+                      content={displayContent}
                       filesDisabled={filesDisabled}
                     />
                   ) : (
                     <MarkdownRenderer
-                      content={content}
+                      content={displayContent}
                       className="prose-sm pt-2 leading-relaxed break-words [overflow-wrap:anywhere]"
                       filesDisabled={filesDisabled}
                       onAgentClick={handleAgentClick}
@@ -559,7 +625,7 @@ export function ChatMessage({
                     />
                   )
                 ) : (
-                  <div className="text-sm leading-relaxed break-words [overflow-wrap:anywhere]">{content}</div>
+                  <div className="text-sm leading-relaxed break-words [overflow-wrap:anywhere]">{displayContent}</div>
                 )
               ) : (
                 // A past paused/waiting turn has showEmptyStatus=false, but with

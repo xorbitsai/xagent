@@ -6498,6 +6498,25 @@ async def _handle_chat_message_unserialized(
                     user=task_setup_snapshot.runtime_user,
                     task_setup_snapshot=task_setup_snapshot,
                     task_owner_user_id=task_owner_user_id,
+                    # No connector_runtime_turn_id here - that sync mutates
+                    # the shared cached agent's tool_config
+                    # (invalidate_tools + the per-turn ephemeral-secrets
+                    # binding), and this handler's own admitted background
+                    # task can still be executing when a LATER command for
+                    # this same task is claimed (claim_task_command's queue
+                    # serialization only covers claiming, not a fire-and-
+                    # forget background task's full lifetime - see
+                    # background_task_manager.reserve_resume below, which
+                    # exists precisely because that window is real). Doing
+                    # the sync here, before this handler's own admission
+                    # check, let a command that goes on to lose reserve_resume
+                    # still clobber the turn/cache context an already-
+                    # admitted resume is executing under. Deferred further
+                    # still, to right after this handler's own message-
+                    # delivery claim actually commits (see the comment there)
+                    # - reserve_resume succeeding only proves no OTHER
+                    # command holds the slot, not that THIS message will be
+                    # delivered at all.
                     resolved_execution_scope=resolved_execution_scope,
                 )
                 if hasattr(agent_service, "set_outbound_message_handler"):
@@ -6553,6 +6572,32 @@ async def _handle_chat_message_unserialized(
                         await finish_existing_delivery(delivery_claim)
                         return
                     delivery_claimed = True
+                    # reserve_resume above only proves no OTHER command holds
+                    # the resume slot - it says nothing about whether THIS
+                    # message will actually be delivered. Syncing any earlier
+                    # (e.g. right after reserve_resume, before this claim
+                    # commits) mutates the shared cached agent's tool_config
+                    # for a turn that might never be used if the claim below
+                    # then fails, with no rollback on that path - and because
+                    # admission doesn't consult running_tasks, a still-live
+                    # original execution for this same task could observe
+                    # that speculative, possibly-abandoned turn binding mid-
+                    # flight. Only once delivery_claimed is true is turn_id
+                    # guaranteed to be the turn this handler is about to
+                    # inject, so only now is the sync safe.
+                    #
+                    # This is still a speculative mutation, though: injection
+                    # below (post_user_message) can itself fail before this
+                    # turn actually starts running (CheckpointReadError), and
+                    # nothing serializes this handler's admission against an
+                    # already-running execution for the same task that is
+                    # still mid-setup - so the prior binding is captured here
+                    # to restore on that abort path, rather than leaving the
+                    # mutation stand for a turn injection never completed for.
+                    prior_connector_runtime_turn_id = (
+                        get_agent_manager().get_connector_runtime_turn_id(task_id)
+                    )
+                    get_agent_manager().sync_connector_runtime_turn(task_id, turn_id)
 
                     # Read before the injection below and before the posted
                     # fork, so both branches carry the same observation --
@@ -6600,6 +6645,9 @@ async def _handle_chat_message_unserialized(
                                 # stays DELIVERY_PENDING forever and a retry
                                 # with the same client_message_id loops on
                                 # "still being applied".
+                                get_agent_manager().restore_connector_runtime_turn_id(
+                                    task_id, prior_connector_runtime_turn_id
+                                )
                                 background_task_manager.release_resume_reservation(
                                     task_id
                                 )
@@ -9090,6 +9138,11 @@ async def _handle_resume_task_unserialized(
             user=task_setup_snapshot.runtime_user,
             task_setup_snapshot=task_setup_snapshot,
             task_owner_user_id=task_owner_user_id,
+            # No connector_runtime_turn_id here - see the sibling
+            # get_agent_for_task call's comment (websocket.py's message-
+            # triggered resume handler) for why that sync must be deferred
+            # until this command is the sole admitted owner of the cached
+            # agent, not performed at fetch time.
             resolved_execution_scope=resolved_execution_scope,
         )
         if getattr(agent_service, "supports_live_control", lambda: False)():
@@ -9125,6 +9178,18 @@ async def _handle_resume_task_unserialized(
             resume_snapshot: Any | None = None
             bg_task: asyncio.Task[None] | None = None
             try:
+                # This command is now the sole admitted owner of the cached
+                # agent's tool_config for this task. A fresh id every call
+                # is deliberate (no per-message turn id exists on this
+                # path, unlike the new-user-message resume handler): this
+                # path is infrequent enough that always rebuilding
+                # connector-backed tools is cheaper than trying to detect
+                # whether anything actually changed since the task paused.
+                # Inside the try so a raise here still releases the
+                # reservation below, instead of leaking it.
+                get_agent_manager().sync_connector_runtime_turn(
+                    task_id, str(uuid.uuid4())
+                )
                 resume_snapshot = await task_execution_controller.transition(
                     task_id,
                     TaskControlState.RESUME_REQUESTED,

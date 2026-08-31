@@ -31,7 +31,12 @@ function interpolate(value: string, vars?: TranslationVariables): string {
   if (!vars) return value
   return Object.entries(vars).reduce(
     (result, [key, replacement]) =>
-      result.replace(new RegExp(`\\{${key}\\}`, "g"), String(replacement)),
+      // A replacer FUNCTION, not a replacement string: String.replace treats
+      // a string second argument as a pattern where $&/$$/$1 etc. are special
+      // tokens, so a value containing a literal "$" (e.g. an admin-created
+      // MCP app name interpolated into {apps}) would otherwise corrupt the
+      // output instead of being inserted verbatim.
+      result.replace(new RegExp(`\\{${key}\\}`, "g"), () => String(replacement)),
     value,
   )
 }

@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useEffect, useMemo, useRef, useState } from "react";
+import React, { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { CheckCircle2 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { useAuth } from "@/contexts/auth-context";
@@ -34,6 +34,8 @@ export const PROVIDER_DISPLAY_NAMES: Record<string, string> = {
   github: "GitHub",
   linear: "Linear",
   jira: "Jira",
+  salesforce: "Salesforce",
+  deputy: "Deputy",
 };
 
 // connectingKeys/connectingKeysRef below hold both of these kinds of key in
@@ -83,9 +85,12 @@ type ConnectAppsRow =
  * catalog entry at all is silently dropped - nothing this card could do
  * about it either way.
  */
-function resolveRows(appNames: string[] | undefined, allApps: McpApp[]): ConnectAppsRow[] {
-  const wanted = appNames || [];
-  if (wanted.length === 0) return [];
+function resolveRows(
+  appEntries: Array<string | { id?: string; name?: string }> | undefined,
+  allApps: McpApp[],
+): { rows: ConnectAppsRow[]; hasUnresolvedApp: boolean } {
+  const wanted = appEntries || [];
+  if (wanted.length === 0) return { rows: [], hasUnresolvedApp: false };
 
   // findMatchingMcpApp (lib/mcp-lookup.ts) matches by name OR id, tolerating
   // a hyphen-for-space variant either way - the same lenient matching
@@ -95,9 +100,31 @@ function resolveRows(appNames: string[] | undefined, allApps: McpApp[]): Connect
   // its connection by app_id (e.g. "facebook-pages") instead of display name.
   const seen = new Set<string>();
   const resolved: McpApp[] = [];
-  for (const name of wanted) {
-    const app = findMatchingMcpApp(allApps, name);
-    if (!app || seen.has(app.id)) continue;
+  let hasUnresolvedApp = false;
+  for (const entry of wanted) {
+    const entryId = typeof entry === "string" ? undefined : entry.id;
+    const entryName = typeof entry === "string" ? entry : entry.name;
+    // An id resolves to exactly one catalog row, unlike a display name -
+    // two visible apps can share a name (custom connector names carry no
+    // uniqueness constraint), so once an id was sent it must stay
+    // authoritative even if it no longer resolves (the app was deleted or
+    // hidden from the catalog since the pause was created) - falling back
+    // to a name match there could silently resolve to a DIFFERENT app that
+    // happens to share the deleted one's old name, and every downstream
+    // action (Connected badge, OAuth/API-key connect, Continue) would then
+    // target that unrelated app instead of leaving the pause unresolved.
+    // The fuzzy name lookup is only for the legacy plain-string shape,
+    // which never carried an id to begin with.
+    const app = entryId
+      ? allApps.find((candidate) => candidate.id === entryId)
+      : entryName
+        ? findMatchingMcpApp(allApps, entryName)
+        : undefined;
+    if (!app) {
+      hasUnresolvedApp = true;
+      continue;
+    }
+    if (seen.has(app.id)) continue;
     seen.add(app.id);
     resolved.push(app);
   }
@@ -124,11 +151,12 @@ function resolveRows(appNames: string[] | undefined, allApps: McpApp[]): Connect
     group.apps.push(app);
   }
 
-  return resolved.map((app): ConnectAppsRow => {
+  const rows = resolved.map((app): ConnectAppsRow => {
     if (app.auth_type === "mcp_oauth") return { kind: "mcp_oauth", app };
     if (isOAuthApp(app)) return { kind: "oauth", app, group: groupsByProvider.get(app.provider)! };
     return { kind: "manual", app };
   });
+  return { rows, hasUnresolvedApp };
 }
 
 function RowIcon({
@@ -179,10 +207,30 @@ function ConnectedBadge({ label }: { label: string }) {
 
 export function ConnectAppsField({
   interaction,
+  requestId,
   onSkip,
+  onContinue,
 }: {
   interaction: Interaction;
-  onSkip: () => void;
+  /** Identifies the pause this card is rendering. clarification-form.tsx
+   * keys ConnectAppsField only by `${interaction.field}-${index}` - field
+   * is always the literal "connect_apps" for this interaction type, so a
+   * later, unrelated pause landing at the same array position reuses this
+   * same mounted instance rather than remounting it. Without resetting on
+   * a requestId change the same way ClarificationForm's own form state
+   * already does, a fresh pause could inherit `skipped`/`continued` from
+   * one the user already acted on, permanently hiding the actions it
+   * actually needs (see the reset effect below). */
+  requestId?: string;
+  onSkip: () => Promise<void> | void;
+  /** Called once every requested app is connected, in place of onSkip -
+   * distinct so the message it sends can say "connected" rather than
+   * "I'll do this later" (see clarification-form.tsx's
+   * handleContinueConnectApps). Optional (and omitted) when this card
+   * isn't the live, active pause - clarification-form.tsx passes it only
+   * when `active`, since Continue sends a message that resumes/replans the
+   * current turn, unlike Connect/Skip which stay usable on any card. */
+  onContinue?: () => Promise<void> | void;
 }) {
   const { apps, refresh, isLoading, error } = useMcpApps();
   const { token } = useAuth();
@@ -195,8 +243,56 @@ export function ConnectAppsField({
   // app id for an "mcp_oauth" row (no such sharing exists there).
   const [connectingKeys, setConnectingKeys] = useState<Set<string>>(new Set());
   const [skipped, setSkipped] = useState(false);
+  const [continued, setContinued] = useState(false);
   const [keyConnectApp, setKeyConnectApp] = useState<McpApp | null>(null);
   const isMountedRef = useRef(true);
+  // Synchronous shadow of `continued`, same reason connectingKeysRef shadows
+  // connectingKeys just below: setState-based `!continued` gating lags a
+  // commit cycle behind two clicks landing in the same tick, and a forced
+  // Continue message is not idempotent the way a Connect popup is - two
+  // clicks before React re-renders would send it twice.
+  const continuedRef = useRef(false);
+  // Same rationale as continuedRef, mirrored for Skip: a failed send must roll
+  // the optimistic skippedNote back instead of leaving the card looking
+  // resolved while the acknowledgement never actually went through.
+  const skippedRef = useRef(false);
+  // See requestId's own doc comment above: this instance can outlive the
+  // pause it was first rendered for, so a new requestId must reset the
+  // acknowledgement state the same way ClarificationForm resets its own
+  // form state on the same signal - useLayoutEffect, not useEffect, so a
+  // stale skippedNote/hidden-action render never paints before this runs.
+  const previousRequestIdRef = useRef(requestId);
+  useLayoutEffect(() => {
+    if (previousRequestIdRef.current === requestId) return;
+    previousRequestIdRef.current = requestId;
+    setSkipped(false);
+    setContinued(false);
+    skippedRef.current = false;
+    continuedRef.current = false;
+  }, [requestId]);
+  // Shared by Skip (footer + all-unresolved fallback) and Continue: set the
+  // ref synchronously before any await so a second click landing in the
+  // same tick is a no-op, flip the optimistic state, then roll both back on
+  // failure so a failed send doesn't leave the card looking resolved while
+  // the message never actually went through.
+  const runOptimisticAck = async (
+    ref: React.MutableRefObject<boolean>,
+    setState: (value: boolean) => void,
+    action: () => Promise<void> | void,
+  ) => {
+    if (ref.current) return;
+    ref.current = true;
+    setState(true);
+    try {
+      await action();
+    } catch {
+      ref.current = false;
+      if (isMountedRef.current) {
+        setState(false);
+      }
+    }
+  };
+  const handleSkipClick = () => runOptimisticAck(skippedRef, setSkipped, onSkip);
   // Synchronous shadow of connectingKeys, same reason connect-mcp-dialog.tsx
   // keeps loadingAppsRef alongside loadingApps (#1330 there): setState-based
   // `disabled={isConnecting}` lags a commit cycle behind two clicks landing
@@ -214,12 +310,21 @@ export function ConnectAppsField({
     };
   }, []);
 
-  const rows = useMemo(() => resolveRows(interaction.apps, apps), [interaction.apps, apps]);
+  // resolveRows silently drops any requested name that doesn't resolve in
+  // the catalog (see its own comment) - a multi-connection template (e.g.
+  // hire-agent.ts's uncapped connections list) with one unresolvable name
+  // must not read as "all connected" just because every row that DID render
+  // happens to be connected, so it reports that alongside the rows from the
+  // same pass instead of a separate scan over interaction.apps.
+  const { rows, hasUnresolvedApp } = useMemo(
+    () => resolveRows(interaction.apps, apps),
+    [interaction.apps, apps],
+  );
   // Recomputed on every render (not memoized against rows, which doesn't
   // change when just an app's is_connected flips) - the footer's "not
   // connected yet" copy plus a Skip button, alongside a card whose every row
   // already shows Connected, would read as an outright contradiction.
-  const allConnected = rows.length > 0 && rows.every((row) => !!row.app.is_connected);
+  const allConnected = !hasUnresolvedApp && rows.length > 0 && rows.every((row) => !!row.app.is_connected);
 
   if (rows.length === 0) {
     // ClarificationForm's Collapsible card (title bar + chevron) is already
@@ -246,6 +351,37 @@ export function ConnectAppsField({
           >
             {t("chatPage.clarification.connectApps.retry")}
           </button>
+        </div>
+      );
+    }
+    if (hasUnresolvedApp) {
+      // The catalog loaded fine, but every requested app name failed to
+      // resolve against it (a rename between pause creation and now, or a
+      // deleted app) - falling through to `return null` below would leave
+      // this card silently gone with no Connect/Skip/Retry action at all.
+      // Retry re-fetches the catalog (in case it just hasn't caught up
+      // yet); Skip stays available the same way it would on a normal card.
+      return (
+        <div className="flex items-center gap-3">
+          <p className="flex-1 text-xs text-muted-foreground">
+            {t("chatPage.clarification.connectApps.noneMatched")}
+          </p>
+          <button
+            type="button"
+            className="flex-shrink-0 rounded-md border border-border px-2 py-1 text-xs font-medium text-foreground hover:bg-muted"
+            onClick={() => void refresh()}
+          >
+            {t("chatPage.clarification.connectApps.retry")}
+          </button>
+          {!skipped && (
+            <button
+              type="button"
+              className="flex-shrink-0 rounded-md px-2 py-1 text-xs font-medium text-muted-foreground hover:bg-muted hover:text-foreground"
+              onClick={handleSkipClick}
+            >
+              {t("chatPage.clarification.connectApps.skip")}
+            </button>
+          )}
         </div>
       );
     }
@@ -499,21 +635,34 @@ export function ConnectAppsField({
                 ? t("chatPage.clarification.connectApps.skippedNote")
                 : t("chatPage.clarification.connectApps.privacyNote", { appName: branding.appName })}
           </span>
-          {/* Hidden once every row is Connected (whether that was already
-              true on first render or only became true after a later
-              refresh) - a Skip button next to an "I'll do this later" -
-              flavored note would contradict a card with nothing left to do. */}
-          {!skipped && !allConnected && (
-            <button
-              type="button"
-              className="flex-shrink-0 rounded-md px-2 py-1 text-xs font-medium text-muted-foreground hover:bg-muted hover:text-foreground"
-              onClick={() => {
-                setSkipped(true);
-                onSkip();
-              }}
-            >
-              {t("chatPage.clarification.connectApps.skip")}
-            </button>
+          {/* Swaps for a Continue button once every row is Connected (see
+              onContinue's doc comment) - a Skip button next to an "I'll do
+              this later" note would contradict a card with nothing left to
+              do, and without any button at all a card seeded onto a task
+              that's genuinely paused waiting for this connection (not just
+              the Hire-flow seed message, which was never actually waiting)
+              would have no way to tell the task to resume. */}
+          {allConnected ? (
+            onContinue &&
+            !continued && (
+              <button
+                type="button"
+                className="flex-shrink-0 rounded-md bg-primary px-2.5 py-1 text-xs font-medium text-primary-foreground hover:bg-primary/90"
+                onClick={() => runOptimisticAck(continuedRef, setContinued, onContinue)}
+              >
+                {t("chatPage.clarification.connectApps.continue")}
+              </button>
+            )
+          ) : (
+            !skipped && (
+              <button
+                type="button"
+                className="flex-shrink-0 rounded-md px-2 py-1 text-xs font-medium text-muted-foreground hover:bg-muted hover:text-foreground"
+                onClick={handleSkipClick}
+              >
+                {t("chatPage.clarification.connectApps.skip")}
+              </button>
+            )
           )}
         </div>
       </div>

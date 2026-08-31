@@ -242,7 +242,7 @@ vi.mock("@/components/layout/center-panel", () => ({
   ),
 }))
 
-import { TaskConversationPanel } from "./task-conversation-panel"
+import { TaskConversationPanel, findWaitingPromptAndInteractions } from "./task-conversation-panel"
 
 describe("TaskConversationPanel", () => {
   beforeEach(() => {
@@ -600,6 +600,151 @@ describe("TaskConversationPanel", () => {
     const rendered = screen.getAllByTestId("chat-message")
     expect(rendered[0]).toHaveAttribute("data-request-id", "inputreq_q1")
     expect(rendered[1]).toHaveAttribute("data-request-id", "inputreq_q2")
+  })
+
+  it("prefers the waitingRequestId identity match over the content-string/last-with-interactions heuristics when they'd disagree", () => {
+    // The persisted message's content can legitimately diverge from
+    // currentTask.waitingQuestion in trivial ways (an internal formatting
+    // difference the content-string match doesn't tolerate) - which would
+    // make the content match miss the real active message and fall back to
+    // "last assistant message with interactions." That fallback can land on
+    // a LATER, unrelated connect_apps message instead of the actually-live
+    // one. Continue is now gated on this identification (see
+    // clarification-form.tsx), so getting the wrong message active would
+    // leave the true live pause with no button once its apps connect.
+    appState.messages = [
+      {
+        id: "live-connect-apps",
+        role: "assistant",
+        content: "I need access to Gmail  to continue.",
+        timestamp: 1000,
+        isResult: true,
+        interactions: [{ type: "connect_apps", field: "connect_apps", apps: ["Gmail"] }],
+        interactionRequestId: "inputreq_live",
+      },
+      {
+        id: "later-stale-connect-apps",
+        role: "assistant",
+        content: "Please connect Slack first.",
+        timestamp: 2000,
+        isResult: true,
+        interactions: [{ type: "connect_apps", field: "connect_apps", apps: ["Slack"] }],
+        interactionRequestId: "inputreq_stale_2",
+      },
+    ]
+    appState.traceEvents = []
+    appState.currentTask = {
+      id: "42",
+      title: "Preview",
+      description: "Preview",
+      status: "waiting_for_user",
+      createdAt: "2026-01-01T00:00:00Z",
+      updatedAt: "2026-01-01T00:00:00Z",
+      waitingQuestion: "I need access to Gmail to continue.",
+      waitingRequestId: "inputreq_live",
+    } as any
+
+    render(<TaskConversationPanel mode="embedded-preview" />)
+
+    const rendered = screen.getAllByTestId("chat-message")
+    const liveItem = rendered.find((m) => m.getAttribute("data-request-id") === "inputreq_live")
+    const staleItem = rendered.find((m) => m.getAttribute("data-request-id") === "inputreq_stale_2")
+    expect(liveItem).toHaveAttribute("data-active", "true")
+    expect(staleItem).toHaveAttribute("data-active", "false")
+  })
+
+  it("does not fall back to an earlier turn's stale interactive message when the current turn's own pause isn't identifiable", () => {
+    // Tier-3 ("last assistant message with any interactions") used to scan
+    // the whole history unscoped, so an earlier turn's card that still
+    // carries interactions - e.g. a Hire-flow seed message, which per
+    // ChatMessage.tsx's isActiveConnectAppsPause comment is never actually a
+    // live pause - could get wrongly marked active whenever the newer
+    // pause's own message can't be identified by the two tiers above (e.g.
+    // its row was never persisted). Wrongly activating the stale card would
+    // localize its text and expose a live Continue button on the wrong
+    // message.
+    appState.messages = [
+      {
+        id: "user-1",
+        role: "user",
+        content: "Set up my agent",
+        timestamp: 500,
+      },
+      {
+        id: "hire-seed",
+        role: "assistant",
+        content: "Connect your apps to get started.",
+        timestamp: 600,
+        isResult: true,
+        interactions: [{ type: "connect_apps", field: "connect_apps", apps: ["Notion"] }],
+      },
+      {
+        id: "user-2",
+        role: "user",
+        content: "Now post to Gmail",
+        timestamp: 1500,
+      },
+    ]
+    appState.traceEvents = []
+    appState.currentTask = {
+      id: "42",
+      title: "Preview",
+      description: "Preview",
+      status: "waiting_for_user",
+      createdAt: "2026-01-01T00:00:00Z",
+      updatedAt: "2026-01-01T00:00:00Z",
+      waitingQuestion: "I need access to Gmail to continue. Please connect below, then let me know once you have.",
+    } as any
+
+    render(<TaskConversationPanel mode="embedded-preview" />)
+
+    const rendered = screen.getAllByTestId("chat-message")
+    const hireItem = rendered.find((m) => m.textContent?.includes("Connect your apps to get started."))
+    // A separate virtual placeholder message may legitimately show active
+    // here (hardcoded to state.currentTask.status, bypassing
+    // activeWaitingMessageId) when the current turn's own pause message
+    // hasn't loaded yet - that's the intended mechanism, not the bug. What
+    // must never happen is THIS specific stale, earlier-turn message
+    // getting activated instead.
+    expect(hireItem).toHaveAttribute("data-active", "false")
+  })
+
+  it("does not activate a Hire-flow seed message when no user turn has happened yet", () => {
+    // The turn-scoping guard above falls through unscoped when there is no
+    // user message yet (currentTurnStart === null) - e.g. right after a
+    // Hire-flow seed, before the user's first reply, if the agent's own
+    // kickoff execution hits a genuine oauth_token_required pause before
+    // any user turn exists. Falling through unscoped there would match the
+    // Hire-seed message itself (the only thing with interactions at that
+    // point), reintroducing the exact bug the turn-scoping exists to
+    // prevent - just in the zero-user-turns edge case instead of the
+    // stale-earlier-turn one.
+    appState.messages = [
+      {
+        id: "hire-seed",
+        role: "assistant",
+        content: "Connect your apps to get started.",
+        timestamp: 600,
+        isResult: true,
+        interactions: [{ type: "connect_apps", field: "connect_apps", apps: ["Notion"] }],
+      },
+    ]
+    appState.traceEvents = []
+    appState.currentTask = {
+      id: "43",
+      title: "Preview",
+      description: "Preview",
+      status: "waiting_for_user",
+      createdAt: "2026-01-01T00:00:00Z",
+      updatedAt: "2026-01-01T00:00:00Z",
+      waitingQuestion: "I need access to Gmail to continue. Please connect below, then let me know once you have.",
+    } as any
+
+    render(<TaskConversationPanel mode="embedded-preview" />)
+
+    const rendered = screen.getAllByTestId("chat-message")
+    const hireItem = rendered.find((m) => m.textContent?.includes("Connect your apps to get started."))
+    expect(hireItem).toHaveAttribute("data-active", "false")
   })
 
   it("keeps an identified text-only wait separate from stale structured trace interactions", () => {
@@ -1362,5 +1507,153 @@ describe("TaskConversationPanel", () => {
     for (const message of screen.getAllByTestId("chat-message")) {
       expect(message).toHaveAttribute("data-show-process-view", "true")
     }
+  })
+})
+
+describe("findWaitingPromptAndInteractions", () => {
+  const waitingTask = { status: "waiting_for_user" } as any
+
+  it("returns null/undefined when the task is not waiting_for_user", () => {
+    expect(findWaitingPromptAndInteractions({ status: "running" } as any, [])).toEqual({
+      message: null,
+      interactions: undefined,
+    })
+  })
+
+  it("prefers currentTask's own waitingQuestion/waitingInteractions fields when set", () => {
+    const task = {
+      status: "waiting_for_user",
+      waitingQuestion: "Which dataset?",
+      waitingInteractions: [{ type: "select_one", field: "dataset" }],
+    } as any
+    expect(findWaitingPromptAndInteractions(task, [])).toEqual({
+      message: "Which dataset?",
+      interactions: task.waitingInteractions,
+    })
+  })
+
+  it("falls back to a trace-scanned message when only waitingInteractions is set on currentTask, instead of losing the prompt text", () => {
+    const task = {
+      status: "waiting_for_user",
+      waitingInteractions: [{ type: "connect_apps", field: "connect_apps", apps: ["Gmail"] }],
+    } as any
+    const traceEvents = [
+      {
+        event_type: "agent_message",
+        data: { expect_response: true, message: "I need access to Gmail to continue." },
+      },
+    ]
+
+    expect(findWaitingPromptAndInteractions(task, traceEvents)).toEqual({
+      message: "I need access to Gmail to continue.",
+      interactions: task.waitingInteractions,
+    })
+  })
+
+  it("falls back to trace-scanned interactions when only waitingQuestion is set on currentTask, instead of losing the widget", () => {
+    const task = {
+      status: "waiting_for_user",
+      waitingQuestion: "Which dataset?",
+      waitingInteractions: [],
+    } as any
+    const traceEvents = [
+      {
+        event_type: "agent_message",
+        data: {
+          expect_response: true,
+          metadata: { interactions: [{ type: "select_one", field: "dataset" }] },
+        },
+      },
+    ]
+
+    expect(findWaitingPromptAndInteractions(task, traceEvents)).toEqual({
+      message: "Which dataset?",
+      interactions: [{ type: "select_one", field: "dataset" }],
+    })
+  })
+
+  it("does not backfill interactions from an older connect_apps event when the newer resolved question has none of its own", () => {
+    // currentTask.waitingQuestion already resolves the message (a new
+    // plain-text question), leaving only interactions to scan for. The
+    // newest trace event that represents a pause (has a message OR
+    // interactions) is the one the message came from, and it has no
+    // interactions - that must win over an OLDER event further back that
+    // happens to carry a stale connect_apps interaction, or the wrong app
+    // card would become active for an unrelated question.
+    const task = {
+      status: "waiting_for_user",
+      waitingQuestion: "Which dataset should I use?",
+      waitingInteractions: [],
+    } as any
+    const traceEvents = [
+      {
+        event_type: "agent_message",
+        data: {
+          expect_response: true,
+          metadata: {
+            interactions: [{ type: "connect_apps", field: "connect_apps", apps: ["Gmail"] }],
+          },
+        },
+      },
+      {
+        event_type: "agent_message",
+        data: { expect_response: true, message: "Which dataset should I use?" },
+      },
+    ]
+
+    expect(findWaitingPromptAndInteractions(task, traceEvents)).toEqual({
+      message: "Which dataset should I use?",
+      interactions: undefined,
+    })
+  })
+
+  it("pairs the message and interactions from the SAME trace event, not two independently-found events", () => {
+    const traceEvents = [
+      {
+        event_type: "agent_message",
+        data: {
+          expect_response: true,
+          message: "I need access to Gmail to continue.",
+          metadata: {
+            interactions: [{ type: "connect_apps", field: "connect_apps", apps: ["Gmail"] }],
+          },
+        },
+      },
+      {
+        event_type: "agent_message",
+        data: { expect_response: true, message: "Which dataset should I use?" },
+      },
+    ]
+
+    // The most recent qualifying event (the plain question) has no
+    // interactions of its own - it must not inherit the older connect_apps
+    // event's interactions just because that one has some.
+    expect(findWaitingPromptAndInteractions(waitingTask, traceEvents)).toEqual({
+      message: "Which dataset should I use?",
+      interactions: undefined,
+    })
+  })
+
+  it("takes interactions from the most recent event even without a message on it", () => {
+    const traceEvents = [
+      {
+        event_type: "agent_message",
+        data: { expect_response: true, message: "An older question." },
+      },
+      {
+        event_type: "agent_message",
+        data: {
+          expect_response: true,
+          metadata: {
+            interactions: [{ type: "connect_apps", field: "connect_apps", apps: ["Gmail"] }],
+          },
+        },
+      },
+    ]
+
+    expect(findWaitingPromptAndInteractions(waitingTask, traceEvents)).toEqual({
+      message: null,
+      interactions: [{ type: "connect_apps", field: "connect_apps", apps: ["Gmail"] }],
+    })
   })
 })

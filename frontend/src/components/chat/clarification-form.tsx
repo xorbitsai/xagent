@@ -121,7 +121,7 @@ const sendHintKey = (
 // currently produced by any seeder, but nothing in the type system or
 // backend schema rules it out) still renders correctly via renderField's
 // switch below instead of falling through to its "unsupported type" case.
-const LIVE_WIDGET_TYPES = new Set(["connect_apps"])
+export const LIVE_WIDGET_TYPES = new Set(["connect_apps"])
 
 export function ClarificationForm({
   interactions,
@@ -427,12 +427,20 @@ export function ClarificationForm({
     }
   }
 
-  // "connect_apps" has no form fields to gather - skipping just logs a
-  // plain acknowledgement message, matching every other interaction type's
-  // "answer becomes a chat message" contract, but without the lines/
-  // formState machinery handleSubmit above uses (there's nothing to gather).
-  const handleSkipConnectApps = async () => {
-    const message = t("chatPage.clarification.connectApps.skip")
+  // "connect_apps" has no form fields to gather - both Skip and Continue
+  // just log a plain acknowledgement message, matching every other
+  // interaction type's "answer becomes a chat message" contract, but
+  // without the lines/formState machinery handleSubmit above uses (there's
+  // nothing to gather). Distinct translation keys, not a shared message: the
+  // wording matters when this card is paused mid-task (a tool itself
+  // returned waiting_for_user because a connector it needed was missing -
+  // see UnavailableMCPTool._run_unavailable) - the task's own resume
+  // protocol only replans once a *new* message has been appended
+  // (ReActPattern._resume_waiting_for_user_if_needed compares message
+  // counts), so Continue's "connected" text would read as a non sequitur
+  // from Skip's "I'll do this later", and vice versa.
+  const sendConnectAppsAck = async (translationKey: TranslationKey, logLabel: string) => {
+    const message = t(translationKey)
     const metadata = requestId ? { request_id: requestId } : {}
     try {
       if (onSend) {
@@ -441,10 +449,15 @@ export function ClarificationForm({
         await sendMessage(message, { force: true, metadata }, [])
       }
     } catch (error) {
-      console.error("Failed to send connect-apps skip response", error)
+      console.error(`Failed to send connect-apps ${logLabel} response`, error)
       toast.error(t("chatPage.clarification.sendError"))
+      throw error
     }
   }
+  const handleSkipConnectApps = () =>
+    sendConnectAppsAck("chatPage.clarification.connectApps.skip", "skip")
+  const handleContinueConnectApps = () =>
+    sendConnectAppsAck("chatPage.clarification.connectApps.continue", "continue")
 
   const renderField = (interaction: Interaction) => {
     const value = formState[interaction.field]
@@ -643,7 +656,20 @@ export function ClarificationForm({
       // today, see LIVE_WIDGET_TYPES's comment), so that path still gets the
       // real widget instead of falling to the "unsupported type" case below.
       case "connect_apps":
-        return <ConnectAppsField interaction={interaction} onSkip={handleSkipConnectApps} />
+        return (
+          // Connect/Skip stay live regardless of `active` (see the
+          // LIVE_WIDGET_TYPES comment above) - but unlike those, Continue
+          // sends a chat message that resumes/replans the CURRENT turn, so
+          // it must not be offered from a historical or Hire-seed card that
+          // isn't the live pause, or it hijacks whatever the task is doing
+          // right now.
+          <ConnectAppsField
+            interaction={interaction}
+            requestId={requestId}
+            onSkip={handleSkipConnectApps}
+            onContinue={active ? handleContinueConnectApps : undefined}
+          />
+        )
 
       default:
         return <div className="text-destructive text-sm">{t("chatPage.clarification.unsupportedType", { type: interaction.type })}</div>
@@ -692,7 +718,9 @@ export function ClarificationForm({
               <ConnectAppsField
                 key={`${interaction.field}-${index}`}
                 interaction={interaction}
+                requestId={requestId}
                 onSkip={handleSkipConnectApps}
+                onContinue={active ? handleContinueConnectApps : undefined}
               />
             ))}
           </div>

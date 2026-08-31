@@ -275,6 +275,8 @@ def _assert_unavailable_mcp_config(
     *,
     reason: str,
     oauth_token_required: bool = False,
+    app_name: str | None = None,
+    app_id: str | None = None,
 ) -> None:
     assert config["name"] == server.name
     assert config["transport"] == "unavailable"
@@ -286,6 +288,10 @@ def _assert_unavailable_mcp_config(
         assert config["config"]["failure_code"] == "oauth_token_required"
     else:
         assert "failure_code" not in config["config"]
+    if app_name is not None:
+        assert config["config"]["app_name"] == app_name
+    if app_id is not None:
+        assert config["config"]["app_id"] == app_id
     expected_user_id = str(server.user_mcpservers[0].user_id)
     assert config["user_id"] == expected_user_id
     assert config["allow_users"] == [expected_user_id]
@@ -597,7 +603,12 @@ async def test_hook_missing_instance_url_retains_unavailable_server(db_session):
     config = (await _tool_config(db, user).get_mcp_server_configs())[0]
 
     _assert_unavailable_mcp_config(
-        config, server, reason="oauth_token_required", oauth_token_required=True
+        config,
+        server,
+        reason="oauth_token_required",
+        oauth_token_required=True,
+        app_name="Google Drive",
+        app_id="resolver-google-drive",
     )
 
 
@@ -625,7 +636,12 @@ async def test_legacy_missing_instance_url_retains_unavailable_server(db_session
     config = (await _tool_config(db, user).get_mcp_server_configs())[0]
 
     _assert_unavailable_mcp_config(
-        config, server, reason="oauth_token_required", oauth_token_required=True
+        config,
+        server,
+        reason="oauth_token_required",
+        oauth_token_required=True,
+        app_name="Google Drive",
+        app_id="resolver-google-drive",
     )
 
 
@@ -2112,6 +2128,92 @@ async def test_remote_runtime_connection_exception_retains_safe_unavailable_conf
     public_output = repr(configs[1]) + caplog.text
     assert "runtime-connection-secret" not in public_output
     assert "static-secret" not in public_output
+
+
+@pytest.mark.asyncio
+async def test_remote_runtime_connection_none_gets_connect_apps_app_name(
+    db_session, monkeypatch
+):
+    """A remote-transport oauth_token_required failure (no resolver hook, no
+    delegated connection, build_mcp_runtime_connection returns connection=None)
+    must still resolve app_info -> app_name, the same as every other
+    failure_code="oauth_token_required" call site in this file."""
+    from xagent.web.services.mcp_runtime import (
+        MCPRuntimeConnectionBuild,
+        mcp_oauth_runtime_diagnostic,
+    )
+
+    db, user = db_session
+    remote_server = _add_remote_server(db, user, name="Remote Records")
+
+    async def connection_is_none(*args, **kwargs):
+        return MCPRuntimeConnectionBuild(
+            connection=None,
+            diagnostic=mcp_oauth_runtime_diagnostic(
+                remote_server,
+                code="authorization_required",
+                message="MCP OAuth runtime requires a valid grant",
+            ),
+        )
+
+    monkeypatch.setattr(
+        "xagent.web.services.mcp_runtime.build_mcp_runtime_connection",
+        connection_is_none,
+    )
+
+    configs = await _tool_config(db, user).get_mcp_server_configs()
+
+    _assert_unavailable_mcp_config(
+        configs[0],
+        remote_server,
+        reason="authorization_required",
+        oauth_token_required=True,
+    )
+    assert configs[0]["config"]["app_name"] == "Remote Records"
+
+
+@pytest.mark.asyncio
+async def test_token_refresh_failed_does_not_pause_for_a_reconnect_the_app_already_has(
+    db_session, monkeypatch
+):
+    """A token_refresh_failed diagnostic means a grant already exists and the
+    live refresh call just failed (network, client metadata, a 5xx from the
+    token endpoint) - not that the app was never connected. It must not get
+    failure_code="oauth_token_required": that would pause with a connect_apps
+    card showing a false "Connected" badge (the card reads the persisted
+    grant, not this live failure) and a Continue button that just re-triggers
+    the same failure every time, looping with no real diagnostic surfaced."""
+    from xagent.web.services.mcp_runtime import (
+        MCPRuntimeConnectionBuild,
+        mcp_oauth_runtime_diagnostic,
+    )
+
+    db, user = db_session
+    remote_server = _add_remote_server(db, user, name="Remote Records")
+
+    async def connection_is_none(*args, **kwargs):
+        return MCPRuntimeConnectionBuild(
+            connection=None,
+            diagnostic=mcp_oauth_runtime_diagnostic(
+                remote_server,
+                code="token_refresh_failed",
+                message="MCP OAuth refresh failed",
+            ),
+        )
+
+    monkeypatch.setattr(
+        "xagent.web.services.mcp_runtime.build_mcp_runtime_connection",
+        connection_is_none,
+    )
+
+    configs = await _tool_config(db, user).get_mcp_server_configs()
+
+    _assert_unavailable_mcp_config(
+        configs[0],
+        remote_server,
+        reason="token_refresh_failed",
+    )
+    assert configs[0]["config"]["app_name"] == "Remote Records"
 
 
 @pytest.mark.asyncio

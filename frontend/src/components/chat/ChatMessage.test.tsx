@@ -21,7 +21,13 @@ vi.mock("@/contexts/app-context-chat", () => ({
 
 vi.mock("@/contexts/i18n-context", () => ({
   useI18n: () => ({
-    t: (key: string) => key,
+    // Interpolates vars into the key (matching clarification-form.test.tsx's
+    // mock convention) rather than ignoring them, so a test asserting on the
+    // rendered text actually exercises whether the real vars (e.g. {apps})
+    // reached t() - a bare `(key) => key` mock would still pass even if
+    // {apps} were missing, empty, or wrong.
+    t: (key: string, vars?: Record<string, string | number>) =>
+      vars ? `${key}:${JSON.stringify(vars)}` : key,
     tDynamic: (key: string) => key,
   }),
 }))
@@ -76,12 +82,21 @@ vi.mock("./TraceEventRenderer", async () => {
   }
 })
 
-vi.mock("./clarification-form", () => ({
-  ClarificationForm: (props: unknown) => {
-    clarificationFormMock(props)
-    return null
-  },
-}))
+vi.mock("./clarification-form", async () => {
+  // Re-export the REAL LIVE_WIDGET_TYPES (not a second hardcoded copy) so
+  // this test suite can't silently diverge from production if a live-widget
+  // type is ever added there - only ClarificationForm itself is stubbed out.
+  const actual = await vi.importActual<typeof import("./clarification-form")>(
+    "./clarification-form",
+  )
+  return {
+    ...actual,
+    ClarificationForm: (props: unknown) => {
+      clarificationFormMock(props)
+      return null
+    },
+  }
+})
 
 import { ChatMessage } from "./ChatMessage"
 
@@ -154,6 +169,131 @@ describe("ChatMessage Session file capability", () => {
     expect(clarificationFormMock).toHaveBeenCalledWith(
       expect.objectContaining({ filesDisabled: true }),
     )
+  })
+
+  it("joins multiple requested app names with a locale-correct conjunction, not a raw comma", () => {
+    render(
+      <ChatMessage
+        role="assistant"
+        content="raw backend text"
+        interactions={[
+          { type: "connect_apps", field: "connect_apps", apps: ["Gmail", "Slack", "Notion"] },
+        ]}
+      />,
+    )
+
+    expect(
+      screen.getByText(
+        'chatPage.clarification.connectApps.needAccess:{"apps":"Gmail, Slack, and Notion"}',
+      ),
+    ).toBeInTheDocument()
+  })
+
+  it("extracts the display name from an { id, name } app entry, not just a plain string", () => {
+    // The backend now sends an object alongside the display name when it
+    // resolved a stable catalog id (see Interaction.apps' doc comment) -
+    // the localized pause sentence only needs the name half of it.
+    render(
+      <ChatMessage
+        role="assistant"
+        content="raw backend text"
+        interactions={[
+          {
+            type: "connect_apps",
+            field: "connect_apps",
+            apps: [{ id: "gmail", name: "Gmail" }],
+          },
+        ]}
+      />,
+    )
+
+    expect(
+      screen.getByText('chatPage.clarification.connectApps.needAccess:{"apps":"Gmail"}'),
+    ).toBeInTheDocument()
+  })
+
+  it("replaces the raw backend pause text with a localized message when every interaction is connect_apps", () => {
+    render(
+      <ChatMessage
+        role="assistant"
+        content="I need access to Gmail to continue. Please connect it below, then let me know once you have."
+        interactions={[{ type: "connect_apps", field: "connect_apps", apps: ["Gmail"] }]}
+      />,
+    )
+
+    expect(
+      screen.getByText('chatPage.clarification.connectApps.needAccess:{"apps":"Gmail"}'),
+    ).toBeInTheDocument()
+    expect(
+      screen.queryByText(/I need access to Gmail to continue\. Please connect/),
+    ).not.toBeInTheDocument()
+  })
+
+  it("keeps showing the localized pause text after the task resolves and interactionsActive flips back to false, instead of reverting to raw English in scrollback", () => {
+    const interactions = [{ type: "connect_apps", field: "connect_apps", apps: ["Gmail"] }]
+    const { rerender } = render(
+      <ChatMessage
+        role="assistant"
+        content="I need access to Gmail to continue. Please connect it below, then let me know once you have."
+        interactions={interactions}
+        interactionsActive={true}
+      />,
+    )
+    expect(
+      screen.getByText('chatPage.clarification.connectApps.needAccess:{"apps":"Gmail"}'),
+    ).toBeInTheDocument()
+
+    rerender(
+      <ChatMessage
+        role="assistant"
+        content="I need access to Gmail to continue. Please connect it below, then let me know once you have."
+        interactions={interactions}
+        interactionsActive={false}
+      />,
+    )
+
+    expect(
+      screen.getByText('chatPage.clarification.connectApps.needAccess:{"apps":"Gmail"}'),
+    ).toBeInTheDocument()
+    expect(
+      screen.queryByText(/I need access to Gmail to continue\. Please connect/),
+    ).not.toBeInTheDocument()
+  })
+
+  it("keeps the raw backend content when the interaction list mixes connect_apps with another type", () => {
+    render(
+      <ChatMessage
+        role="assistant"
+        content="Which app should I use?"
+        interactions={[
+          { type: "connect_apps", field: "connect_apps", apps: ["Gmail"] },
+          { type: "select_one", field: "app_choice", label: "App" },
+        ]}
+      />,
+    )
+
+    expect(screen.getByText("Which app should I use?")).toBeInTheDocument()
+    expect(
+      screen.queryByText("chatPage.clarification.connectApps.needAccess"),
+    ).not.toBeInTheDocument()
+  })
+
+  it("keeps a Hire-flow seeded kickoff message intact instead of overwriting it, since its connect_apps interaction is not the active pause", () => {
+    render(
+      <ChatMessage
+        role="assistant"
+        content="Hi, I'm your new marketing agent. Before we start, connect the apps below."
+        interactions={[{ type: "connect_apps", field: "connect_apps", apps: ["Gmail", "Slack"] }]}
+        interactionsActive={false}
+      />,
+    )
+
+    expect(
+      screen.getByText("Hi, I'm your new marketing agent. Before we start, connect the apps below."),
+    ).toBeInTheDocument()
+    expect(
+      screen.queryByText("chatPage.clarification.connectApps.needAccess"),
+    ).not.toBeInTheDocument()
   })
 
   it("passes the rendered interaction request id to the clarification form", () => {

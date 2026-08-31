@@ -174,17 +174,62 @@ describe("ConnectAppsField", () => {
     expect(screen.getByText("G")).toBeInTheDocument();
   });
 
-  it("renders nothing if none of the requested app names resolve to a catalog entry", () => {
+  it("shows a Retry/Skip fallback, not an empty panel, when none of the requested app names resolve to a catalog entry", () => {
+    // A dead-end card (nothing rendered at all) would leave a genuinely
+    // live pause with no Connect/Skip/Retry action once every requested
+    // name fails to resolve (a rename or a deleted app since the pause
+    // was created) - see connect-apps-field.tsx's hasUnresolvedApp branch.
     mcpAppsMock.apps = [];
 
-    const { container } = render(
+    render(
       <ConnectAppsField
         interaction={{ ...LEO_INTERACTION, apps: ["Some Unknown App"] }}
         onSkip={vi.fn()}
       />
     );
 
-    expect(container).toBeEmptyDOMElement();
+    expect(
+      screen.getByText("chatPage.clarification.connectApps.noneMatched")
+    ).toBeInTheDocument();
+    expect(screen.getByText("chatPage.clarification.connectApps.retry")).toBeInTheDocument();
+    expect(screen.getByText("chatPage.clarification.connectApps.skip")).toBeInTheDocument();
+  });
+
+  it("re-fetches the catalog when Retry is clicked on the all-unresolved fallback", () => {
+    mcpAppsMock.apps = [];
+
+    render(
+      <ConnectAppsField
+        interaction={{ ...LEO_INTERACTION, apps: ["Some Unknown App"] }}
+        onSkip={vi.fn()}
+      />
+    );
+
+    fireEvent.click(screen.getByText("chatPage.clarification.connectApps.retry"));
+
+    expect(mcpAppsMock.refresh).toHaveBeenCalledTimes(1);
+  });
+
+  it("skips from the all-unresolved fallback the same way as the normal footer", async () => {
+    mcpAppsMock.apps = [];
+    const onSkip = vi.fn();
+
+    render(
+      <ConnectAppsField
+        interaction={{ ...LEO_INTERACTION, apps: ["Some Unknown App"] }}
+        onSkip={onSkip}
+      />
+    );
+
+    fireEvent.click(screen.getByText("chatPage.clarification.connectApps.skip"));
+
+    expect(onSkip).toHaveBeenCalledTimes(1);
+    expect(
+      screen.queryByText("chatPage.clarification.connectApps.skip")
+    ).not.toBeInTheDocument();
+    expect(
+      screen.getByText("chatPage.clarification.connectApps.noneMatched")
+    ).toBeInTheDocument();
   });
 
   it("resolves a requested name against an app's id, not just its display name", () => {
@@ -801,6 +846,77 @@ describe("ConnectAppsField", () => {
     ).toBeInTheDocument();
   });
 
+  it("restores the Skip link when onSkip rejects, instead of leaving the card looking resolved", async () => {
+    mcpAppsMock.apps = [makeApp({ provider: "google" })];
+    const onSkip = vi.fn().mockRejectedValue(new Error("network error"));
+
+    render(
+      <ConnectAppsField interaction={{ ...LEO_INTERACTION, apps: ["Gmail"] }} onSkip={onSkip} />
+    );
+
+    fireEvent.click(screen.getByText("chatPage.clarification.connectApps.skip"));
+
+    await waitFor(() => {
+      expect(screen.getByText("chatPage.clarification.connectApps.skip")).toBeInTheDocument();
+    });
+    expect(
+      screen.queryByText("chatPage.clarification.connectApps.skippedNote")
+    ).not.toBeInTheDocument();
+    expect(onSkip).toHaveBeenCalledTimes(1);
+  });
+
+  it("resets the skipped state for a new pause carrying a different requestId, instead of inheriting it from the one just skipped", () => {
+    // clarification-form.tsx keys this component only by
+    // `${interaction.field}-${index}` (field is always the literal
+    // "connect_apps"), so a later, unrelated pause landing at the same
+    // position reuses this same mounted instance rather than remounting
+    // it - without the requestId reset, this pause would render as
+    // already-skipped and hide the actions it actually needs.
+    mcpAppsMock.apps = [makeApp({ provider: "google" })];
+    const onSkip = vi.fn();
+
+    const { rerender } = render(
+      <ConnectAppsField
+        interaction={{ ...LEO_INTERACTION, apps: ["Gmail"] }}
+        requestId="pause-1"
+        onSkip={onSkip}
+      />
+    );
+
+    fireEvent.click(screen.getByText("chatPage.clarification.connectApps.skip"));
+    expect(
+      screen.getByText("chatPage.clarification.connectApps.skippedNote")
+    ).toBeInTheDocument();
+
+    rerender(
+      <ConnectAppsField
+        interaction={{ ...LEO_INTERACTION, apps: ["Gmail"] }}
+        requestId="pause-2"
+        onSkip={onSkip}
+      />
+    );
+
+    expect(
+      screen.queryByText("chatPage.clarification.connectApps.skippedNote")
+    ).not.toBeInTheDocument();
+    expect(screen.getByText("chatPage.clarification.connectApps.skip")).toBeInTheDocument();
+  });
+
+  it("only calls onSkip once when the skip link is clicked twice before React re-renders", () => {
+    mcpAppsMock.apps = [makeApp({ provider: "google" })];
+    const onSkip = vi.fn().mockResolvedValue(undefined);
+
+    render(
+      <ConnectAppsField interaction={{ ...LEO_INTERACTION, apps: ["Gmail"] }} onSkip={onSkip} />
+    );
+
+    const skipLink = screen.getByText("chatPage.clarification.connectApps.skip");
+    fireEvent.click(skipLink);
+    fireEvent.click(skipLink);
+
+    expect(onSkip).toHaveBeenCalledTimes(1);
+  });
+
   it("hides the Skip link and shows a completion note once every row is already Connected", () => {
     mcpAppsMock.apps = [makeApp({ provider: "google", is_connected: true })];
 
@@ -815,6 +931,196 @@ describe("ConnectAppsField", () => {
     expect(
       screen.queryByText('chatPage.clarification.connectApps.privacyNote:{"appName":"Xagent"}')
     ).not.toBeInTheDocument();
+  });
+
+  it("does not treat the card as all-connected when one requested app name never resolves in the catalog", () => {
+    // resolveRows silently drops a name that doesn't match anything in the
+    // catalog - a multi-connection template (e.g. hire-agent.ts's uncapped
+    // connections list) with one bad/unresolvable name must not read as
+    // "all connected" just because the row(s) that DID resolve are.
+    mcpAppsMock.apps = [makeApp({ provider: "google", is_connected: true })];
+
+    render(
+      <ConnectAppsField
+        interaction={{ ...LEO_INTERACTION, apps: ["Gmail", "Not A Real App"] }}
+        onSkip={vi.fn()}
+        onContinue={vi.fn()}
+      />
+    );
+
+    expect(
+      screen.queryByText("chatPage.clarification.connectApps.allConnectedNote")
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "chatPage.clarification.connectApps.continue" }),
+    ).not.toBeInTheDocument();
+    expect(screen.getByText("chatPage.clarification.connectApps.skip")).toBeInTheDocument();
+  });
+
+  it("resolves a name-colliding app by id, not by whichever same-named app appears first in the catalog", () => {
+    // PublicMCPApp.name has no unique constraint (unlike app_id) - two
+    // visible catalog apps can share a display name. resolveRows must
+    // prefer an exact id match over the fuzzy name lookup, or a pause
+    // naming the id-resolvable "notion-personal" could silently resolve to
+    // the wrong, unconnected "notion-work" row instead.
+    mcpAppsMock.apps = [
+      makeApp({ id: "notion-work", name: "Notion", is_connected: false }),
+      makeApp({ id: "notion-personal", name: "Notion", is_connected: true }),
+    ];
+
+    render(
+      <ConnectAppsField
+        interaction={{
+          ...LEO_INTERACTION,
+          apps: [{ id: "notion-personal", name: "Notion" }],
+        }}
+        onSkip={vi.fn()}
+      />
+    );
+
+    expect(
+      screen.getByText("chatPage.clarification.connectApps.allConnectedNote")
+    ).toBeInTheDocument();
+    expect(screen.queryByText("chatPage.clarification.connectApps.skip")).not.toBeInTheDocument();
+  });
+
+  it("falls back to name matching when an app entry carries no id (the legacy plain-string shape)", () => {
+    mcpAppsMock.apps = [makeApp({ id: "gmail", name: "Gmail", is_connected: true })];
+
+    render(
+      <ConnectAppsField
+        interaction={{ ...LEO_INTERACTION, apps: ["Gmail"] }}
+        onSkip={vi.fn()}
+      />
+    );
+
+    expect(
+      screen.getByText("chatPage.clarification.connectApps.allConnectedNote")
+    ).toBeInTheDocument();
+  });
+
+  it("treats an app entry's id as unresolved rather than falling back to a same-named app, once the id no longer resolves in the catalog", () => {
+    // Custom connector names carry no uniqueness constraint - falling back
+    // to a name match here could silently resolve to a DIFFERENT app that
+    // happens to share the deleted one's old name, targeting every
+    // downstream action (Connected badge, connect, Continue) at the wrong
+    // app instead of surfacing that the referenced one is gone.
+    mcpAppsMock.apps = [makeApp({ id: "gmail", name: "Gmail", is_connected: true })];
+
+    render(
+      <ConnectAppsField
+        interaction={{
+          ...LEO_INTERACTION,
+          apps: [{ id: "deleted-app-id", name: "Gmail" }],
+        }}
+        onSkip={vi.fn()}
+      />
+    );
+
+    expect(
+      screen.queryByText("chatPage.clarification.connectApps.allConnectedNote")
+    ).not.toBeInTheDocument();
+    expect(
+      screen.getByText("chatPage.clarification.connectApps.noneMatched")
+    ).toBeInTheDocument();
+    expect(screen.getByText("chatPage.clarification.connectApps.retry")).toBeInTheDocument();
+    expect(screen.getByText("chatPage.clarification.connectApps.skip")).toBeInTheDocument();
+  });
+
+  it("shows a Continue button instead of the completion note alone once every row is Connected, when onContinue is supplied", () => {
+    mcpAppsMock.apps = [makeApp({ provider: "google", is_connected: true })];
+    const onContinue = vi.fn();
+
+    render(
+      <ConnectAppsField
+        interaction={{ ...LEO_INTERACTION, apps: ["Gmail"] }}
+        onSkip={vi.fn()}
+        onContinue={onContinue}
+      />
+    );
+
+    expect(screen.queryByText("chatPage.clarification.connectApps.skip")).not.toBeInTheDocument();
+    expect(
+      screen.getByText("chatPage.clarification.connectApps.allConnectedNote")
+    ).toBeInTheDocument();
+    const continueButton = screen.getByRole("button", {
+      name: "chatPage.clarification.connectApps.continue",
+    });
+
+    fireEvent.click(continueButton);
+
+    expect(onContinue).toHaveBeenCalledTimes(1);
+    expect(
+      screen.queryByRole("button", { name: "chatPage.clarification.connectApps.continue" })
+    ).not.toBeInTheDocument();
+  });
+
+  it("only calls onContinue once when the button is clicked twice before React re-renders", () => {
+    // setContinued(true) doesn't take effect until the next render, so the
+    // button is still in the DOM for a second click that lands in the same
+    // tick - continuedRef is the synchronous guard that must catch it,
+    // since a forced Continue message isn't idempotent the way a Connect
+    // popup click is.
+    mcpAppsMock.apps = [makeApp({ provider: "google", is_connected: true })];
+    const onContinue = vi.fn().mockResolvedValue(undefined);
+
+    render(
+      <ConnectAppsField
+        interaction={{ ...LEO_INTERACTION, apps: ["Gmail"] }}
+        onSkip={vi.fn()}
+        onContinue={onContinue}
+      />
+    );
+
+    const continueButton = screen.getByRole("button", {
+      name: "chatPage.clarification.connectApps.continue",
+    });
+
+    fireEvent.click(continueButton);
+    fireEvent.click(continueButton);
+
+    expect(onContinue).toHaveBeenCalledTimes(1);
+  });
+
+  it("restores the Continue button when onContinue rejects, so the user can retry", async () => {
+    mcpAppsMock.apps = [makeApp({ provider: "google", is_connected: true })];
+    const onContinue = vi.fn().mockRejectedValue(new Error("network error"));
+
+    render(
+      <ConnectAppsField
+        interaction={{ ...LEO_INTERACTION, apps: ["Gmail"] }}
+        onSkip={vi.fn()}
+        onContinue={onContinue}
+      />
+    );
+
+    fireEvent.click(
+      screen.getByRole("button", { name: "chatPage.clarification.connectApps.continue" })
+    );
+
+    await waitFor(() => {
+      expect(
+        screen.getByRole("button", { name: "chatPage.clarification.connectApps.continue" })
+      ).toBeInTheDocument();
+    });
+    expect(onContinue).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not show a Continue button while an app is still unconnected, even when onContinue is supplied", () => {
+    mcpAppsMock.apps = [makeApp({ provider: "google", is_connected: false })];
+
+    render(
+      <ConnectAppsField
+        interaction={{ ...LEO_INTERACTION, apps: ["Gmail"] }}
+        onSkip={vi.fn()}
+        onContinue={vi.fn()}
+      />
+    );
+
+    expect(
+      screen.queryByRole("button", { name: "chatPage.clarification.connectApps.continue" })
+    ).not.toBeInTheDocument();
+    expect(screen.getByText("chatPage.clarification.connectApps.skip")).toBeInTheDocument();
   });
 
   it("hides the Skip link once a refresh brings every row to Connected, even though it started out actionable", async () => {

@@ -1297,6 +1297,242 @@ async def test_running_chat_message_is_persisted_before_resume(db_session) -> No
 
 
 @pytest.mark.asyncio
+async def test_admitted_live_resume_syncs_connector_runtime_turn_after_reservation(
+    db_session,
+) -> None:
+    """The connector runtime turn sync must run only once this command is
+    the sole admitted owner of the cached agent - not at the initial
+    get_agent_for_task fetch, which can happen before a losing command's
+    own reserve_resume check rejects it (see websocket.py's comment on
+    that call). Confirms both halves: no turn id is threaded into the
+    fetch itself, and the sync fires afterward for the admitted winner."""
+    owner = _user(db_session, "sync-owner")
+    task = _task(db_session, owner.id, status=TaskStatus.RUNNING)
+    task.runner_id = "live-runner"
+    task.run_id = "live-run"
+    db_session.commit()
+    agent = MagicMock()
+    agent.supports_live_control.return_value = True
+    agent.get_dag_pattern.return_value = None
+    agent.post_user_message = AsyncMock(return_value=True)
+    mgr = MagicMock(get_agent_for_task=AsyncMock(return_value=agent))
+    ws_manager = MagicMock(
+        broadcast_to_task=AsyncMock(),
+        send_personal_message=AsyncMock(),
+    )
+    bg_mgr = MagicMock()
+    bg_mgr.reserve_resume.return_value = True
+    bg_mgr.running_tasks.get.return_value = None
+
+    with (
+        patch("xagent.web.api.chat.get_agent_manager", return_value=mgr),
+        patch("xagent.web.api.websocket.manager", ws_manager),
+        patch("xagent.web.api.websocket.execute_resume_background", AsyncMock()),
+        patch("xagent.web.api.websocket.background_task_manager", bg_mgr),
+    ):
+        await handle_chat_message(
+            MagicMock(),
+            int(task.id),
+            {
+                "message": "Use the audio tool",
+                "client_message_id": "sync-turn-1",
+                "user": owner,
+                "files": [],
+            },
+        )
+        for _ in range(100):
+            if bg_mgr.register_reserved_resume.call_count:
+                break
+            await asyncio.sleep(0.01)
+        else:
+            raise AssertionError("durable live message was not dispatched in time")
+
+    assert "connector_runtime_turn_id" not in mgr.get_agent_for_task.await_args.kwargs
+    mgr.sync_connector_runtime_turn.assert_called_once_with(int(task.id), "sync-turn-1")
+    # The sync must run strictly after the fetch, not before it (the fetch
+    # returns the agent the sync then acts on).
+    call_names = [call[0] for call in mgr.mock_calls]
+    assert call_names.index("get_agent_for_task") < call_names.index(
+        "sync_connector_runtime_turn"
+    )
+
+
+@pytest.mark.asyncio
+async def test_rejected_live_resume_never_syncs_connector_runtime_turn(
+    db_session,
+) -> None:
+    """The actual regression this guards: a command that goes on to LOSE
+    reserve_resume (a previous guidance message is still being applied)
+    must never reach the connector runtime turn sync at all - it used to
+    run unconditionally at the initial get_agent_for_task fetch, before
+    this admission check, letting a losing command clobber the shared
+    tool_config an already-admitted resume was executing under."""
+    owner = _user(db_session, "rejected-sync-owner")
+    task = _task(db_session, owner.id, status=TaskStatus.RUNNING)
+    task.runner_id = "live-runner"
+    task.run_id = "live-run"
+    db_session.commit()
+    agent = MagicMock()
+    agent.supports_live_control.return_value = True
+    agent.get_dag_pattern.return_value = None
+    mgr = MagicMock(get_agent_for_task=AsyncMock(return_value=agent))
+    ws_manager = MagicMock(
+        broadcast_to_task=AsyncMock(),
+        send_personal_message=AsyncMock(),
+    )
+    bg_mgr = MagicMock()
+    bg_mgr.reserve_resume.return_value = False
+
+    with (
+        patch("xagent.web.api.chat.get_agent_manager", return_value=mgr),
+        patch("xagent.web.api.websocket.manager", ws_manager),
+        patch("xagent.web.api.websocket.background_task_manager", bg_mgr),
+    ):
+        await handle_chat_message(
+            MagicMock(),
+            int(task.id),
+            {
+                "message": "a message that arrives while a previous one is still applying",
+                "client_message_id": "rejected-turn-1",
+                "user": owner,
+                "files": [],
+            },
+        )
+
+    assert "connector_runtime_turn_id" not in mgr.get_agent_for_task.await_args.kwargs
+    mgr.sync_connector_runtime_turn.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_admitted_but_undelivered_message_never_syncs_connector_runtime_turn(
+    db_session,
+) -> None:
+    """reserve_resume succeeding only proves no OTHER command holds the
+    resume slot - it says nothing about whether THIS message will actually
+    be delivered. The sync must wait for the delivery claim to actually
+    commit, so a message that goes on to fail that claim (e.g. a retried
+    delivery attempt that already failed) never mutates the shared cached
+    agent's tool_config for a turn nothing ends up using - with no rollback
+    on that path, that mutation would otherwise be observable by a still-
+    live original execution for this same task, which admission never
+    checks for."""
+    from xagent.web.api.websocket import _UserMessageDeliverySnapshot
+
+    owner = _user(db_session, "undelivered-sync-owner")
+    task = _task(db_session, owner.id, status=TaskStatus.RUNNING)
+    task.runner_id = "live-runner"
+    task.run_id = "live-run"
+    db_session.commit()
+    # _pause_accepted_task_ids is a module-level set keyed only by int
+    # task_id, not scoped to this test's own throwaway sqlite db - a
+    # leftover mark from an unrelated test whose fresh db happened to
+    # assign the same small autoincrement id would flip uses_live_control
+    # to False here and silently no-op the whole assertion below.
+    websocket_api._clear_task_pause_accepted(int(task.id))
+    agent = MagicMock()
+    agent.supports_live_control.return_value = True
+    agent.get_dag_pattern.return_value = None
+    mgr = MagicMock(get_agent_for_task=AsyncMock(return_value=agent))
+    ws_manager = MagicMock(
+        broadcast_to_task=AsyncMock(),
+        send_personal_message=AsyncMock(),
+    )
+    bg_mgr = MagicMock()
+    bg_mgr.reserve_resume.return_value = True
+
+    failed_claim = _UserMessageDeliverySnapshot(
+        claimed=False, payload_matches=True, failed=True, pending=False
+    )
+
+    with (
+        patch("xagent.web.api.chat.get_agent_manager", return_value=mgr),
+        patch("xagent.web.api.websocket.manager", ws_manager),
+        patch("xagent.web.api.websocket.background_task_manager", bg_mgr),
+        patch(
+            "xagent.web.api.websocket._claim_user_message_delivery_isolated",
+            return_value=failed_claim,
+        ),
+    ):
+        await handle_chat_message(
+            MagicMock(),
+            int(task.id),
+            {
+                "message": "a retried delivery that already failed once",
+                "client_message_id": "undelivered-turn-1",
+                "user": owner,
+                "files": [],
+            },
+        )
+
+    mgr.sync_connector_runtime_turn.assert_not_called()
+    bg_mgr.release_resume_reservation.assert_called_once_with(int(task.id))
+
+
+@pytest.mark.asyncio
+async def test_admitted_explicit_resume_syncs_connector_runtime_turn_after_reservation(
+    db_session,
+) -> None:
+    """The explicit-resume path's connector runtime turn sync is the one
+    call site with no dedicated assertion anywhere (the message-resume
+    sync above has its own pair of tests; this is the sibling for
+    ``handle_resume_task``). Confirms the sync fires with a fresh turn id
+    once try_reserve_resume grants sole admitted ownership, strictly
+    before the resume background task is scheduled."""
+    owner = _user(db_session, "explicit-sync-owner")
+    task = _task(db_session, owner.id, status=TaskStatus.PAUSED)
+    captured, agent, mgr, ws_manager = _patched_manager_and_agent()
+    agent.supports_live_control = MagicMock(return_value=True)
+
+    call_order: list[str] = []
+    mgr.sync_connector_runtime_turn = MagicMock(
+        side_effect=lambda *a, **k: call_order.append("sync_connector_runtime_turn")
+    )
+
+    async def _execute_resume_background(**_kwargs) -> None:
+        call_order.append("execute_resume_background")
+
+    resume_bg = AsyncMock(side_effect=_execute_resume_background)
+    transition = AsyncMock(
+        return_value=SimpleNamespace(
+            run_id="run-explicit-sync",
+            status=TaskStatus.PAUSED,
+            state_version=1,
+        )
+    )
+    bg_mgr = MagicMock()
+    bg_mgr.running_tasks.get = MagicMock(return_value=None)
+    bg_mgr.resume_admission_state.return_value = None
+    bg_mgr.try_reserve_resume.return_value = ResumeReservationOutcome.RESERVED
+
+    with (
+        patch("xagent.web.api.chat.get_agent_manager", return_value=mgr),
+        patch("xagent.web.api.websocket.manager", ws_manager),
+        patch("xagent.web.api.websocket.execute_resume_background", resume_bg),
+        patch(
+            "xagent.web.api.websocket.task_execution_controller.transition",
+            new=transition,
+        ),
+        patch("xagent.web.api.websocket.background_task_manager", bg_mgr),
+    ):
+        await handle_resume_task(MagicMock(), int(task.id), {"user": owner})
+        for _ in range(100):
+            if "execute_resume_background" in call_order:
+                break
+            await asyncio.sleep(0.01)
+        else:
+            raise AssertionError("durable resume command was not dispatched in time")
+
+    assert "connector_runtime_turn_id" not in mgr.get_agent_for_task.await_args.kwargs
+    assert mgr.sync_connector_runtime_turn.call_count == 1
+    turn_id = mgr.sync_connector_runtime_turn.call_args.args[1]
+    assert mgr.sync_connector_runtime_turn.call_args.args[0] == int(task.id)
+    assert isinstance(turn_id, str) and turn_id
+    # The sync must run strictly before the background resume is scheduled,
+    # not merely somewhere in the handler.
+    assert call_order == ["sync_connector_runtime_turn", "execute_resume_background"]
+
+
+@pytest.mark.asyncio
 async def test_legacy_continuation_runtime_fails_closed_without_side_effects(
     db_session,
 ) -> None:
@@ -1769,6 +2005,60 @@ async def test_durable_failure_keeps_detail_sender_only(
         .one()
     )
     assert stored.delivery_status == DELIVERY_FAILED
+
+
+@pytest.mark.asyncio
+async def test_checkpoint_read_error_restores_the_connector_runtime_turn_it_synced(
+    db_session,
+) -> None:
+    """The connector runtime turn sync above (right before injection) is
+    still speculative until injection actually succeeds - a CheckpointReadError
+    here means this turn never ran, so the binding it set must be undone,
+    not left pointing at a turn nothing is using."""
+    owner = _user(db_session, "owner")
+    task = _task(db_session, owner.id, status=TaskStatus.RUNNING)
+    task.runner_id = "restore-runner"
+    task.run_id = "restore-run"
+    db_session.commit()
+    agent = MagicMock()
+    agent.supports_live_control.return_value = True
+    agent.get_dag_pattern.return_value = None
+    agent.post_user_message = AsyncMock(
+        side_effect=CheckpointCorruptError("all matching rows undecodable")
+    )
+    mgr = MagicMock(get_agent_for_task=AsyncMock(return_value=agent))
+    mgr.get_connector_runtime_turn_id.return_value = "prior-turn-xyz"
+    ws_manager = MagicMock(
+        broadcast_to_task=AsyncMock(),
+        send_personal_message=AsyncMock(),
+    )
+    resume_bg = AsyncMock()
+    bg_mgr = MagicMock()
+    bg_mgr.reserve_resume.return_value = True
+    bg_mgr.running_tasks.get.return_value = None
+
+    with (
+        patch("xagent.web.api.chat.get_agent_manager", return_value=mgr),
+        patch("xagent.web.api.websocket.manager", ws_manager),
+        patch("xagent.web.api.websocket.execute_resume_background", resume_bg),
+        patch("xagent.web.api.websocket.background_task_manager", bg_mgr),
+    ):
+        await _handle_chat_message_unserialized(
+            MagicMock(),
+            int(task.id),
+            {
+                "message": "Wait for the checkpoint",
+                "client_message_id": "restore-turn-1",
+                "user": owner,
+                "files": [],
+            },
+        )
+
+    mgr.get_connector_runtime_turn_id.assert_called_once_with(int(task.id))
+    mgr.sync_connector_runtime_turn.assert_called_once()
+    mgr.restore_connector_runtime_turn_id.assert_called_once_with(
+        int(task.id), "prior-turn-xyz"
+    )
 
 
 @pytest.mark.asyncio

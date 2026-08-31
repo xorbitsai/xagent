@@ -123,65 +123,79 @@ const isWorkforceAgentToolTraceEvent = (event: unknown): boolean => {
   return isAgentDelegationToolName(toolName)
 }
 
-const findWaitingPrompt = (currentTask: any, traceEvents: any[]) => {
+// message and interactions each resolve independently against currentTask
+// first (one field being intentionally absent - e.g. a generic
+// connect_apps placeholder has no waitingQuestion - must not suppress the
+// OTHER field's own resolution). Only once BOTH still need a trace-event
+// fallback do they get pulled from the SAME event: two independent scans
+// would let a plain-text question that follows an older connect_apps pause
+// in trace history pick up that unrelated older event's interactions
+// instead of correctly having none.
+export const findWaitingPromptAndInteractions = (
+  currentTask: any,
+  traceEvents: any[]
+): { message: string | null; interactions: any[] | undefined } => {
   if (currentTask?.status !== "waiting_for_user") {
-    return null
-  }
-  if (currentTask.waitingQuestion) {
-    return currentTask.waitingQuestion
+    return { message: null, interactions: undefined }
   }
 
-  for (let i = traceEvents.length - 1; i >= 0; i--) {
-    const event = traceEvents[i]
-    if (event.event_type === "agent_message") {
-      const expectsResponse = event.data?.expect_response === true
-      const message = event.data?.message || event.data?.content
-      if (expectsResponse && typeof message === "string" && message.trim()) {
-        return message
-      }
-    }
-    if (event.event_type === "react_task_end") {
-      const result = event.data?.result
-      if (result?.status === "waiting_for_user" && typeof result.message === "string" && result.message.trim()) {
-        return result.message
-      }
-    }
-  }
-
-  return null
-}
-
-const findWaitingInteractions = (currentTask: any, traceEvents: any[]) => {
-  if (currentTask?.status !== "waiting_for_user") {
-    return undefined
-  }
+  const taskMessage: string | null = currentTask.waitingQuestion || null
+  let taskInteractions: any[] | undefined
+  let interactionsFromTask = false
   if (currentTask.waitingRequestId) {
-    return currentTask.waitingInteractions?.length
-      ? currentTask.waitingInteractions
-      : undefined
+    taskInteractions = currentTask.waitingInteractions?.length ? currentTask.waitingInteractions : undefined
+    interactionsFromTask = true
+  } else if (currentTask.waitingInteractions?.length) {
+    taskInteractions = currentTask.waitingInteractions
+    interactionsFromTask = true
   }
-  if (currentTask.waitingInteractions?.length) {
-    return currentTask.waitingInteractions
+
+  const needMessage = taskMessage === null
+  const needInteractions = !interactionsFromTask
+  if (!needMessage && !needInteractions) {
+    return { message: taskMessage, interactions: taskInteractions }
   }
 
   for (let i = traceEvents.length - 1; i >= 0; i--) {
     const event = traceEvents[i]
-    if (event.event_type === "agent_message") {
-      const expectsResponse = event.data?.expect_response === true
+    let hasMessage = false
+    let eventMessage: string | null = null
+    let hasInteractions = false
+    let eventInteractions: any[] | undefined
+    if (event.event_type === "agent_message" && event.data?.expect_response === true) {
+      const message = event.data?.message || event.data?.content
       const interactions = event.data?.metadata?.interactions
-      if (expectsResponse && Array.isArray(interactions) && interactions.length > 0) {
-        return interactions
-      }
+      hasMessage = typeof message === "string" && Boolean(message.trim())
+      eventMessage = hasMessage ? message : null
+      hasInteractions = Array.isArray(interactions) && interactions.length > 0
+      eventInteractions = hasInteractions ? interactions : undefined
+    } else if (event.event_type === "react_task_end" && event.data?.result?.status === "waiting_for_user") {
+      const result = event.data.result
+      hasMessage = typeof result.message === "string" && Boolean(result.message.trim())
+      eventMessage = hasMessage ? result.message : null
+      hasInteractions = Array.isArray(result.interactions) && result.interactions.length > 0
+      eventInteractions = hasInteractions ? result.interactions : undefined
+    } else {
+      continue
     }
-    if (event.event_type === "react_task_end") {
-      const interactions = event.data?.result?.interactions
-      if (Array.isArray(interactions) && interactions.length > 0) {
-        return interactions
-      }
+
+    if (!hasMessage && !hasInteractions) continue
+
+    // This is the most recent event that represents ANY kind of pause -
+    // resolve whichever field(s) are still needed from exactly this one
+    // event, not an older event further back. Scanning past it for an
+    // older event that happens to have the still-needed field would pair
+    // fields from two unrelated pauses (e.g. a newer plain-text question
+    // with an older connect_apps pause's interactions, when the question
+    // was already resolved from currentTask and only interactions still
+    // needed scanning).
+    return {
+      message: needMessage ? eventMessage : taskMessage,
+      interactions: needInteractions ? eventInteractions : taskInteractions,
     }
   }
 
-  return undefined
+  return { message: taskMessage, interactions: taskInteractions }
 }
 
 export function TaskConversationPanel({
@@ -472,18 +486,34 @@ export function TaskConversationPanel({
     })
   }, [managerTraceEvents, messageItems])
 
-  const waitingPrompt = useMemo(
-    () => findWaitingPrompt(state.currentTask, managerTraceEvents as any[]),
-    [managerTraceEvents, state.currentTask]
-  )
-  const waitingInteractions = useMemo(
-    () => findWaitingInteractions(state.currentTask, managerTraceEvents as any[]),
+  const { message: waitingPrompt, interactions: waitingInteractions } = useMemo(
+    () => findWaitingPromptAndInteractions(state.currentTask, managerTraceEvents as any[]),
     [managerTraceEvents, state.currentTask]
   )
 
   const activeWaitingMessageId = useMemo(() => {
     if (state.currentTask?.status !== "waiting_for_user") {
       return null
+    }
+
+    // Prefer an exact identity match over the content-string/last-with-
+    // interactions heuristics below: those can misidentify the active
+    // message (e.g. a whitespace/localization mismatch against
+    // waitingPrompt, or a stale earlier message that still carries
+    // interactions), which - now that Continue is gated on this being the
+    // active message (see clarification-form.tsx) - would leave the REAL
+    // live connect_apps pause with no button at all once its apps show
+    // connected. waitingRequestId isn't populated by any production writer
+    // yet (see task_interaction_staging.py) - this branch is forward
+    // compatible for when that lands, not a live legacy-data fallback -
+    // so every pause today still falls through to the heuristics below.
+    if (state.currentTask?.waitingRequestId) {
+      for (let i = messageItems.length - 1; i >= 0; i--) {
+        const item = messageItems[i]
+        if (item.interactionRequestId === state.currentTask.waitingRequestId) {
+          return item.id
+        }
+      }
     }
 
     if (waitingPrompt) {
@@ -496,15 +526,43 @@ export function TaskConversationPanel({
       }
     }
 
+    // Scoped to the current turn only: an unscoped scan here could surface a
+    // stale earlier-turn assistant message that still carries interactions
+    // (e.g. a Hire-flow seed card, which is never actually a live pause -
+    // see ChatMessage.tsx's isActiveConnectAppsPause comment), wrongly
+    // marking it active and letting its localization latch/Continue button
+    // fire for the wrong card once the two tiers above fail to match.
+    const sortedMessages = [...messageItems].sort((a, b) => a.timestamp - b.timestamp)
+    const userTurnAnchors = getUserTimelineAnchors(sortedMessages)
+    const currentTurnStart =
+      userTurnAnchors.length > 0 ? userTurnAnchors[userTurnAnchors.length - 1].timestamp : null
+
+    // No user turn has happened yet (e.g. right after a Hire-flow seed,
+    // before the user's first reply) - there is no "current turn" for this
+    // tier to scope to, and falling through to an unscoped match would
+    // reintroduce exactly the stale-Hire-card bug this scoping exists to
+    // prevent (the seed message is the only thing with interactions at
+    // that point). shouldShowVirtualMessage's status-driven fallback
+    // already covers a genuine pause whose own message hasn't persisted
+    // yet, so returning null here is safe, not a missed case.
+    if (currentTurnStart === null) {
+      return null
+    }
+
     for (let i = messageItems.length - 1; i >= 0; i--) {
       const item = messageItems[i]
-      if (item.role === "assistant" && item.interactions && item.interactions.length > 0) {
+      if (
+        item.role === "assistant" &&
+        item.interactions &&
+        item.interactions.length > 0 &&
+        item.timestamp >= currentTurnStart
+      ) {
         return item.id
       }
     }
 
     return null
-  }, [messageItems, state.currentTask?.status, waitingPrompt])
+  }, [messageItems, state.currentTask?.status, state.currentTask?.waitingRequestId, waitingPrompt])
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView?.({ behavior: "smooth" })

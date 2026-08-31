@@ -1839,6 +1839,13 @@ class WebToolConfig(BaseToolConfig):
             ) from exc
         return self._connector_runtime_view
 
+    @property
+    def connector_runtime_turn_id(self) -> Optional[str]:
+        """Read-only: lets a caller that must sync ahead of its own success
+        capture the prior binding first, so it can restore it on an abort
+        path (see AgentManager.restore_connector_runtime_turn_id)."""
+        return self._connector_runtime_turn_id
+
     def set_connector_runtime_turn_id(self, turn_id: Optional[str]) -> bool:
         """Switch the per-turn connector runtime source for reused agents.
 
@@ -3276,6 +3283,7 @@ class WebToolConfig(BaseToolConfig):
         *,
         server: Any,
         error: _OAuthTokenResolverFailed,
+        app_info: Mapping[str, Any] | None = None,
     ) -> Dict[str, Any]:
         self._mcp_hook_resolution_failed = True
         diagnostic = self._build_oauth_token_resolver_diagnostic(
@@ -3294,6 +3302,7 @@ class WebToolConfig(BaseToolConfig):
             message=UNAVAILABLE_MCP_CREDENTIAL_MESSAGE,
             diagnostic=diagnostic,
             failure_code=error.failure_code,
+            app_info=app_info,
         )
 
     def _build_unavailable_mcp_config(
@@ -3304,6 +3313,7 @@ class WebToolConfig(BaseToolConfig):
         message: str = UNAVAILABLE_MCP_MESSAGE,
         diagnostic: Mapping[str, Any] | None = None,
         failure_code: object = None,
+        app_info: Mapping[str, Any] | None = None,
     ) -> Dict[str, Any]:
         safe_reason = (
             reason
@@ -3321,6 +3331,28 @@ class WebToolConfig(BaseToolConfig):
         normalized_failure_code = normalize_tool_failure_code(failure_code)
         if normalized_failure_code is not None:
             inner_config["failure_code"] = normalized_failure_code
+        # Lets the runtime pause with a `connect_apps` card naming the actual
+        # app (see `UnavailableMCPTool._run_unavailable`) instead of only
+        # ever surfacing a raw error - only populated when the caller already
+        # resolved the catalog app, so an unresolvable server keeps the old
+        # error-only behavior. A hidden app is deliberately treated the same
+        # as unresolvable: /api/mcp/apps (the frontend's connector catalog)
+        # excludes it, so naming it in a pause would leave the user staring
+        # at a dead-end connect_apps card with no Connect button to act on.
+        if app_info is not None and app_info.get("is_visible_in_connector", True):
+            app_name = app_info.get("name")
+            if isinstance(app_name, str) and app_name:
+                inner_config["app_name"] = app_name
+            # The catalog's stable id, alongside the display name above: two
+            # visible apps can share a name (PublicMCPApp.name has no unique
+            # constraint, unlike app_id), so the frontend resolves the pause
+            # by id first and only falls back to name-matching for the
+            # legacy/plain-string shape. Only meaningful paired with
+            # app_name - a pause naming nothing has no card to attach an id
+            # to.
+            app_id = app_info.get("id")
+            if isinstance(app_id, str) and app_id and "app_name" in inner_config:
+                inner_config["app_id"] = app_id
         serialized_user_id = self._serialize_mcp_user_id()
         return {
             "name": getattr(server, "name", ""),
@@ -3783,6 +3815,7 @@ class WebToolConfig(BaseToolConfig):
                     return self._resolver_failure_config(
                         server=server,
                         error=error,
+                        app_info=app_info,
                     )
 
             if app_info and hook_token is not None:
@@ -3815,6 +3848,7 @@ class WebToolConfig(BaseToolConfig):
                         reason="oauth_token_required",
                         message=UNAVAILABLE_MCP_CREDENTIAL_MESSAGE,
                         failure_code="oauth_token_required",
+                        app_info=app_info,
                     )
                 config["transport"] = "stdio"
                 logger.info(
@@ -3839,6 +3873,7 @@ class WebToolConfig(BaseToolConfig):
                         reason="oauth_token_refresh_failed",
                         message=UNAVAILABLE_MCP_CREDENTIAL_MESSAGE,
                         failure_code="oauth_token_required",
+                        app_info=app_info,
                     )
                 if legacy_token.access_token is None:
                     logger.info(
@@ -3849,6 +3884,7 @@ class WebToolConfig(BaseToolConfig):
                         reason="oauth_token_required",
                         message=UNAVAILABLE_MCP_CREDENTIAL_MESSAGE,
                         failure_code="oauth_token_required",
+                        app_info=app_info,
                     )
                 logger.info("OAUTH CONFIG: Mapping '%s' to executable proxy", app_id)
                 try:
@@ -3879,6 +3915,7 @@ class WebToolConfig(BaseToolConfig):
                         reason="oauth_token_required",
                         message=UNAVAILABLE_MCP_CREDENTIAL_MESSAGE,
                         failure_code="oauth_token_required",
+                        app_info=app_info,
                     )
                 config["transport"] = "stdio"
 
@@ -3916,6 +3953,12 @@ class WebToolConfig(BaseToolConfig):
                 runtime_values=runtime_values,
             )
             resolver, registration_generation = _get_oauth_token_resolver_hook()
+            # None until actually needed: a server whose delegated/static
+            # connection succeeds must not pay for a DB lookup it never uses
+            # (see test_remote_without_hook_skips_resolver_candidate_work).
+            # The `runtime_build.connection is None` fallback below resolves
+            # it lazily on the one path that actually needs it.
+            app_info = None
             remote_providers_to_resolve: list[str] = []
             remote_configured_resource: str | None = None
             remote_hook_token: _ResolvedHookToken | None = None
@@ -3941,6 +3984,7 @@ class WebToolConfig(BaseToolConfig):
                         return self._resolver_failure_config(
                             server=server,
                             error=error,
+                            app_info=app_info,
                         )
 
             if remote_hook_token is not None and resolver is not None:
@@ -4019,7 +4063,26 @@ class WebToolConfig(BaseToolConfig):
                             reason=reason,
                             message=UNAVAILABLE_MCP_CREDENTIAL_MESSAGE,
                             diagnostic=diagnostic,
-                            failure_code="oauth_token_required",
+                            # Only a genuinely missing/expired-without-
+                            # refresh-token grant is solved by prompting the
+                            # user to reconnect. token_refresh_failed and
+                            # runtime_connection_failed mean a grant already
+                            # exists and the failure is transient (network,
+                            # client metadata, a 5xx from the token
+                            # endpoint) - pausing with a connect_apps card
+                            # for those would show a false "Connected" badge
+                            # (the card checks the persisted grant, not this
+                            # live failure) and offer a Continue that just
+                            # re-triggers the same failure, looping forever
+                            # with no real diagnostic ever reaching the user.
+                            failure_code=(
+                                "oauth_token_required"
+                                if reason == "authorization_required"
+                                else None
+                            ),
+                            app_info=app_info
+                            if app_info is not None
+                            else get_app_for_mcp_server(self.db, server),
                         )
                     transport_config.update(
                         connection_to_transport_config(runtime_build.connection)

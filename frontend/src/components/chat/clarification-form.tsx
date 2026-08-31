@@ -695,7 +695,7 @@ export function ClarificationForm({
           <ConnectAppsField
             interaction={interaction}
             onSkip={handleSkipConnectApps}
-            onContinue={handleContinueConnectApps}
+            onContinue={allConnectAppsConnected ? handleContinueConnectApps : undefined}
           />
         )
 

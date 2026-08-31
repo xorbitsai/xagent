@@ -423,6 +423,40 @@ describe("ClarificationForm connect_apps interaction", () => {
     ).not.toBeInTheDocument()
   })
 
+  it("never offers Continue on a connect_apps card mixed into a list with another interaction type, even when its app is connected", () => {
+    // isConnectAppsOnly is false for a mixed list, so allConnectAppsConnected
+    // is always false here (see its own guard) - Continue would let the user
+    // submit/resume the turn from this one card while the other interaction
+    // in the list (a real question needing an answer) was never gathered.
+    mcpAppsMock.apps = [
+      {
+        id: "gmail",
+        name: "Gmail",
+        description: "",
+        icon: "",
+        users: "",
+        transport: "builtin",
+        provider: "google",
+        category: "Communication",
+        is_connected: true,
+      },
+    ]
+
+    render(
+      <ClarificationForm
+        interactions={[
+          CONNECT_APPS_INTERACTION,
+          { type: "text_input", field: "note", label: "Note" },
+        ]}
+        onSend={vi.fn()}
+      />,
+    )
+
+    expect(
+      screen.queryByRole("button", { name: "chatPage.clarification.connectApps.continue" }),
+    ).not.toBeInTheDocument()
+  })
+
   it("resolves the connect_apps field label live in the mixed-list branch too, not the persisted hire-time label", () => {
     // The singleton isConnectAppsOnly header was fixed to call t() live, but
     // that branch is skipped entirely for a mixed list (isConnectAppsOnly is

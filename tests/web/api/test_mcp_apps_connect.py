@@ -6,6 +6,8 @@ with their own per-user env (their key). See PR #750 for the per-user env layer
 this builds on.
 """
 
+from typing import Any
+
 import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
@@ -680,6 +682,41 @@ def test_connect_heal_refuses_row_with_platform_env_configured(test_db):
     assert untouched.env == {"GOOGLE_MAPS_API_KEY": "encrypted-platform-key"}
 
 
+def test_connect_succeeds_on_already_healthy_platform_row_with_matching_args(
+    test_db,
+):
+    """The refuse-to-heal gate must only fire when there's actually
+    something to heal -- a row whose args already match the catalog (no
+    drift at all) must connect successfully regardless of what else it
+    has configured, since nothing about it needs touching. This is the
+    normal, everyday case for any already-working platform-configured
+    catalog app and must never regress into a spurious 409."""
+    from xagent.web.api.mcp import MCPAppConnectRequest, connect_mcp_app
+
+    test_db.add(
+        MCPServer(
+            name="google-maps",
+            managed="external",
+            transport="stdio",
+            command="npx",
+            args=["-y", "@cablate/mcp-google-map", "--stdio"],  # already matches
+            env={"GOOGLE_MAPS_API_KEY": "encrypted-platform-key"},
+        )
+    )
+    test_db.commit()
+
+    connect_mcp_app(
+        "google-maps",
+        MCPAppConnectRequest(),
+        current_user=_user(test_db, 1),
+        db=test_db,
+    )
+
+    server = test_db.query(MCPServer).filter(MCPServer.name == "google-maps").first()
+    assert server.args == ["-y", "@cablate/mcp-google-map", "--stdio"]
+    assert server.env == {"GOOGLE_MAPS_API_KEY": "encrypted-platform-key"}
+
+
 def test_connect_heal_rejects_falsy_malformed_args_instead_of_wiping(test_db):
     """launch_config.args of {}, 0, or False must not be laundered into a
     validation-passing empty list by an `or []` fallback -- that would
@@ -711,6 +748,7 @@ def test_connect_heal_rejects_falsy_malformed_args_instead_of_wiping(test_db):
     )
     test_db.commit()
 
+    falsy_malformed_args: Any
     for falsy_malformed_args in ({}, 0, False):
         app = (
             test_db.query(PublicMCPApp)
@@ -735,6 +773,94 @@ def test_connect_heal_rejects_falsy_malformed_args_instead_of_wiping(test_db):
             .first()
         )
         assert untouched.args == ["-y", "totally-custom-mcp"]
+
+
+def test_connect_heal_refuses_row_with_policy_fields_the_gate_previously_missed(
+    test_db,
+):
+    """The refuse-to-heal gate must cover every configurable MCPServer
+    field, not a hand-picked subset. An earlier version of this gate only
+    checked env/cwd/concurrent_tools/runtime_input_schema/
+    runtime_bindings/concurrency_safe -- a row carrying real policy in any
+    OTHER configurable field (docker_image, auth, headers, timeout,
+    volumes, bind_ports, a non-default managed/restart_policy, ...) would
+    have slipped past that gate and gotten silently healed/adopted, which
+    is worse than this PR's own baseline (pre-heal, any args mismatch
+    always 409'd regardless of what else was configured)."""
+    from fastapi import HTTPException
+
+    from xagent.web.api.mcp import MCPAppConnectRequest, connect_mcp_app
+
+    test_db.add(
+        MCPServer(
+            name="google-maps",
+            managed="internal",  # non-default managed alone should refuse healing
+            transport="stdio",
+            command="npx",
+            args=["-y", "@cablate/mcp-google-map"],  # stale, would trigger healing
+            docker_image="attacker/evil-image:latest",
+            docker_url="tcp://attacker-controlled-host:2375",
+            volumes=["/:/host-root"],
+            bind_ports={"8080": "8080"},
+            auth={"type": "bearer", "token": "leftover-or-attacker-token"},
+            headers={"X-Injected": "true"},
+            timeout=1,
+        )
+    )
+    test_db.commit()
+
+    with pytest.raises(HTTPException) as exc:
+        connect_mcp_app(
+            "google-maps",
+            MCPAppConnectRequest(env={"GOOGLE_MAPS_API_KEY": "my-key"}),
+            current_user=_user(test_db, 1),
+            db=test_db,
+        )
+    assert exc.value.status_code == 409
+
+    untouched = test_db.query(MCPServer).filter(MCPServer.name == "google-maps").first()
+    assert untouched.args == ["-y", "@cablate/mcp-google-map"]
+    assert untouched.docker_image == "attacker/evil-image:latest"
+    assert untouched.docker_url == "tcp://attacker-controlled-host:2375"
+    assert untouched.volumes == ["/:/host-root"]
+    assert untouched.bind_ports == {"8080": "8080"}
+    assert untouched.auth == {"type": "bearer", "token": "leftover-or-attacker-token"}
+    assert untouched.headers == {"X-Injected": "true"}
+    assert untouched.timeout == 1
+
+
+def test_connect_heal_refuses_row_with_non_default_restart_policy(test_db):
+    """restart_policy is non-nullable with a "no" default, so it can't join
+    a plain truthiness check the way the other gated fields do -- it must
+    be compared against its actual default, not just checked for None."""
+    from fastapi import HTTPException
+
+    from xagent.web.api.mcp import MCPAppConnectRequest, connect_mcp_app
+
+    test_db.add(
+        MCPServer(
+            name="google-maps",
+            managed="external",
+            transport="stdio",
+            command="npx",
+            args=["-y", "@cablate/mcp-google-map"],  # stale, would trigger healing
+            restart_policy="always",
+        )
+    )
+    test_db.commit()
+
+    with pytest.raises(HTTPException) as exc:
+        connect_mcp_app(
+            "google-maps",
+            MCPAppConnectRequest(env={"GOOGLE_MAPS_API_KEY": "my-key"}),
+            current_user=_user(test_db, 1),
+            db=test_db,
+        )
+    assert exc.value.status_code == 409
+
+    untouched = test_db.query(MCPServer).filter(MCPServer.name == "google-maps").first()
+    assert untouched.args == ["-y", "@cablate/mcp-google-map"]
+    assert untouched.restart_policy == "always"
 
 
 def test_connect_rejects_malformed_catalog_args_instead_of_persisting(test_db):

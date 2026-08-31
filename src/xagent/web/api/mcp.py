@@ -1234,33 +1234,45 @@ def _validate_mcp_runtime_config(
     )
 
 
+# Every MCPServer field a generic server update/create request can set.
+# name==value on both sides (config attribute name equals the DB column
+# name for all of these) -- kept as a single source both
+# _update_server_from_config and _server_has_policy_beyond_catalog_identity
+# read, rather than each hand-listing its own subset: an earlier fix round
+# hand-picked env/cwd/concurrent_tools/runtime_input_schema/
+# runtime_bindings/concurrency_safe for the latter and missed docker_*,
+# auth, headers, timeout, volumes, bind_ports, managed, and restart_policy
+# entirely, letting a row carrying any of those alone slip past that gate.
+_MCP_SERVER_CONFIGURABLE_FIELDS = (
+    "name",
+    "description",
+    "transport",
+    "managed",
+    "command",
+    "args",
+    "url",
+    "env",
+    "cwd",
+    "headers",
+    "timeout",
+    "auth",
+    "concurrency_safe",
+    "concurrent_tools",
+    "docker_url",
+    "docker_image",
+    "docker_environment",
+    "docker_working_dir",
+    "volumes",
+    "bind_ports",
+    "restart_policy",
+    "auto_start",
+)
+
+
 def _update_server_from_config(server: MCPServer, config: MCPServerConfig) -> None:
     """Update database server object from MCPServerConfig."""
     # Map config fields to database fields
-    field_mapping = {
-        "name": "name",
-        "description": "description",
-        "transport": "transport",
-        "managed": "managed",
-        "command": "command",
-        "args": "args",
-        "url": "url",
-        "env": "env",
-        "cwd": "cwd",
-        "headers": "headers",
-        "timeout": "timeout",
-        "auth": "auth",
-        "concurrency_safe": "concurrency_safe",
-        "concurrent_tools": "concurrent_tools",
-        "docker_url": "docker_url",
-        "docker_image": "docker_image",
-        "docker_environment": "docker_environment",
-        "docker_working_dir": "docker_working_dir",
-        "volumes": "volumes",
-        "bind_ports": "bind_ports",
-        "restart_policy": "restart_policy",
-        "auto_start": "auto_start",
-    }
+    field_mapping = {field: field for field in _MCP_SERVER_CONFIGURABLE_FIELDS}
 
     for config_field, db_field in field_mapping.items():
         if hasattr(config, config_field) and hasattr(server, db_field):
@@ -2673,6 +2685,49 @@ def _reject_user_owned_catalog_squat(db: Session, server: MCPServer) -> None:
         )
 
 
+def _server_has_policy_beyond_catalog_identity(server: MCPServer) -> bool:
+    """Whether `server` carries any configured field beyond what a fresh
+    catalog-created row would have (name/transport/command already proved
+    as the identity; args is what the caller is about to heal).
+
+    Used to decide whether an existing row under a catalog app_id is safe
+    to heal in place: "no current owner" can't make that call by itself
+    (see _ensure_catalog_app_server) since it's the normal state of every
+    legitimate catalog row too, not just an orphan's. Checking every OTHER
+    configurable field is the fallback signal -- a row healing would
+    otherwise touch could hold a real admin-configured value (e.g.
+    MCPServer.env as a platform-global key, read directly by
+    _app_platform_env_available) or a pre-catalog orphan's own policy;
+    either way, healing must refuse rather than guess.
+
+    Walks _MCP_SERVER_CONFIGURABLE_FIELDS (the same list
+    _update_server_from_config uses) rather than a hand-picked subset --
+    an earlier fix round hand-picked env/cwd/concurrent_tools/
+    runtime_input_schema/runtime_bindings/concurrency_safe here and missed
+    docker_*, auth, headers, timeout, volumes, bind_ports, managed, and
+    restart_policy, letting a row carrying any of those alone slip past.
+    """
+    if server.managed != "external":
+        return True
+    if str(server.restart_policy or "no") != "no":
+        return True
+    if any(
+        getattr(server, field, None)
+        for field in (
+            "runtime_input_schema",
+            "runtime_bindings",
+        )
+    ):
+        return True
+    identity_fields = {"name", "description", "transport", "command", "args"}
+    already_checked = identity_fields | {"managed", "restart_policy"}
+    return any(
+        getattr(server, field, None)
+        for field in _MCP_SERVER_CONFIGURABLE_FIELDS
+        if field not in already_checked
+    )
+
+
 def _add_catalog_server_with_race_recovery(
     db: Session, config: Any, server_name: str
 ) -> MCPServer:
@@ -2818,19 +2873,7 @@ def _ensure_catalog_app_server(db: Session, app_id: str) -> tuple[MCPServer, dic
             # transport/args; otherwise fall through to the same 409 every
             # such row already got before this change, leaving it and
             # whatever it holds untouched for an operator to resolve.
-            if (
-                any(
-                    getattr(server, field, None)
-                    for field in (
-                        "env",
-                        "cwd",
-                        "concurrent_tools",
-                        "runtime_input_schema",
-                        "runtime_bindings",
-                    )
-                )
-                or server.concurrency_safe
-            ):
+            if _server_has_policy_beyond_catalog_identity(server):
                 raise HTTPException(
                     status_code=status.HTTP_409_CONFLICT,
                     detail="A server with this name already exists with a different configuration",

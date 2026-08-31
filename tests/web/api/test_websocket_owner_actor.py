@@ -1251,6 +1251,12 @@ async def test_admitted_but_undelivered_message_never_syncs_connector_runtime_tu
     task.runner_id = "live-runner"
     task.run_id = "live-run"
     db_session.commit()
+    # _pause_accepted_task_ids is a module-level set keyed only by int
+    # task_id, not scoped to this test's own throwaway sqlite db - a
+    # leftover mark from an unrelated test whose fresh db happened to
+    # assign the same small autoincrement id would flip uses_live_control
+    # to False here and silently no-op the whole assertion below.
+    websocket_api._clear_task_pause_accepted(int(task.id))
     agent = MagicMock()
     agent.supports_live_control.return_value = True
     agent.get_dag_pattern.return_value = None

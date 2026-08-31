@@ -131,6 +131,9 @@ describe("WidgetChromeControls", () => {
     render(<WidgetChromeControls />)
 
     fireEvent.click(screen.getByRole("button", { name: "widgetChat.moreOptions" }))
+    expect(
+      screen.getByRole("menuitem", { name: "widgetChat.expandWindow" }).querySelector("svg[data-icon='expand']"),
+    ).not.toBeNull()
     fireEvent.click(screen.getByRole("menuitem", { name: "widgetChat.expandWindow" }))
 
     expect(postMessageSpy).toHaveBeenCalledWith(
@@ -141,7 +144,9 @@ describe("WidgetChromeControls", () => {
     expect(screen.queryByRole("menu")).toBeNull()
 
     fireEvent.click(screen.getByRole("button", { name: "widgetChat.moreOptions" }))
-    expect(screen.getByRole("menuitem", { name: "widgetChat.collapseWindow" })).toBeInTheDocument()
+    expect(
+      screen.getByRole("menuitem", { name: "widgetChat.collapseWindow" }).querySelector("svg[data-icon='collapse']"),
+    ).not.toBeNull()
 
     fireEvent.click(screen.getByRole("menuitem", { name: "widgetChat.collapseWindow" }))
 

@@ -85,12 +85,12 @@ export function WidgetChromeControls({ newConversation }: WidgetChromeControlsPr
     // Optimistic: widget.js owns the actual panel size and can't confirm
     // back, but this is the same origin/deployment on both sides of the
     // postMessage, not an untrusted round-trip -- nothing else can disagree
-    // with this state.
-    setIsExpanded((expanded) => {
-      const next = !expanded
-      postToParentWidget(next ? "widget_expand" : "widget_collapse")
-      return next
-    })
+    // with this state. The postMessage call is a side effect, so it belongs
+    // here in the click handler, not inside setIsExpanded's updater (React
+    // may invoke that updater more than once, e.g. under StrictMode).
+    const next = !isExpanded
+    setIsExpanded(next)
+    postToParentWidget(next ? "widget_expand" : "widget_collapse")
   }
 
   const handleClose = () => {
@@ -141,9 +141,9 @@ export function WidgetChromeControls({ newConversation }: WidgetChromeControlsPr
               className="flex w-full items-center gap-2 whitespace-nowrap px-3 py-2 text-left text-sm hover:bg-muted/50 transition-colors focus-visible:bg-muted/50 focus-visible:outline-none"
             >
               {isExpanded ? (
-                <Minimize2 className="w-4 h-4 shrink-0" />
+                <Minimize2 className="w-4 h-4 shrink-0" data-icon="collapse" />
               ) : (
-                <Maximize2 className="w-4 h-4 shrink-0" />
+                <Maximize2 className="w-4 h-4 shrink-0" data-icon="expand" />
               )}
               {isExpanded ? t("widgetChat.collapseWindow") : t("widgetChat.expandWindow")}
             </button>

@@ -278,6 +278,12 @@
   // so a viewport narrower than the stored preference at load never
   // overwrites it (e.g. via a later, otherwise-unmoved drag release).
   var panelWidth = readStoredWidth();
+  // Declared here, next to the other panel-sizing state, even though it's
+  // first read (via var hoisting) much later in applyPanelWidth() below --
+  // that read only works today because the value is `undefined` (falsy)
+  // until this line runs; keep it here so a future var -> let/const
+  // conversion can't turn it into a load-time ReferenceError.
+  var isExpanded = false;
 
   // Styles
   var style = document.createElement('style');
@@ -328,7 +334,11 @@
       right: 0;
       width: ${DEFAULT_PANEL_WIDTH}px;
       height: 600px;
-      max-height: calc(100vh - 100px);
+      /* The panel's bottom edge sits buttonSize + 40px above the viewport
+         bottom (container's own 20px, plus the panel's own bottom offset
+         above -- both referenced from the rule right above), so that's the
+         most height can grow to before the top edge goes off-screen. */
+      max-height: calc(100vh - ${buttonSize} - 40px);
       background: ${panelBgColor};
       border-radius: 12px;
       box-shadow: 0 8px 24px rgba(0, 0, 0, 0.16);
@@ -379,14 +389,16 @@
     }
 
     /* Expand mode jumps straight to the same max width the drag-resize
-       handle already clamps to, rather than a separate arbitrary size.
-       min-width, not nested in the max-width block below, so its two-class
-       selector can never outrank the mobile layout by specificity alone --
-       structurally impossible to apply under the mobile breakpoint at all. */
-    @media (min-width: ${MOBILE_BREAKPOINT + 1}px) {
+       handle already clamps to, rather than a separate arbitrary size. The
+       exact logical complement of the max-width block below (not a
+       min-width one pixel above it, which would leave a sub-pixel gap
+       neither query matches), so its two-class selector can never outrank
+       the mobile layout by specificity alone -- structurally impossible to
+       apply under the mobile breakpoint at all. */
+    @media not all and (max-width: ${MOBILE_BREAKPOINT}px) {
       .xagent-widget-panel.expanded {
         width: ${MAX_PANEL_WIDTH}px;
-        height: calc(100vh - 100px);
+        height: calc(100vh - ${buttonSize} - 40px);
       }
 
       /* Dragging the handle sets an inline width that would win over (and
@@ -659,7 +671,6 @@
   fab.innerHTML = chatIcon;
 
   var isOpen = false;
-  var isExpanded = false;
 
   function openPanel() {
     isOpen = true;
@@ -674,12 +685,16 @@
   }
 
   function expandPanel() {
+    // The .expanded CSS rule is itself scoped above the mobile breakpoint,
+    // so this would already be a visual no-op there -- but isExpanded would
+    // still latch true, and nothing rechecks it on a later resize/rotation
+    // (see onWindowResize below), so growing past the breakpoint afterward
+    // would silently expand the panel with no further click from the user.
+    if (isMobileViewport()) return;
     isExpanded = true;
     panel.classList.add('expanded');
     // Let the .expanded rule's own width win -- an inline width from a
     // prior drag would otherwise outrank it by specificity regardless.
-    // A no-op under the mobile breakpoint: the .expanded CSS rule is
-    // itself scoped to min-width, so this class has nothing to apply.
     panel.style.width = '';
   }
 

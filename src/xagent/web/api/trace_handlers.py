@@ -45,6 +45,8 @@ from ...web.services.task_lease_service import (
 )
 from ...web.services.trace_event_staging import (
     checkpoint_run_partition_filter,
+    failed_checkpoint_row_conditions,
+    is_missing_run_partition_only,
     stage_trace_event_row,
 )
 from ...web.services.trace_message_storage import (
@@ -565,19 +567,29 @@ class DatabaseTraceHandler(BaseTraceHandler):
             return _AnchorFallback()
 
         row_data: Dict[str, Any] = row.data if isinstance(row.data, dict) else {}
-        run_field = row_data.get(TASK_RUN_ID_TRACE_FIELD)
-        partition_matches = (
-            run_field == run_id if run_id is not None else run_field is None
+        failed = failed_checkpoint_row_conditions(
+            row,
+            row_data,
+            task_id=self.task_id,
+            run_id=run_id,
+            execution_id=execution_id,
         )
-        row_execution_id = checkpoint_execution_id(row_data)
-        if (
-            row.task_id != self.task_id
-            or row.event_type != "system_update_general"
-            or row.build_id is not None
-            or row_data.get("checkpoint_type") not in READABLE_CHECKPOINT_TYPES
-            or not partition_matches
-            or (row_execution_id and row_execution_id != execution_id)
-        ):
+        if failed:
+            if is_missing_run_partition_only(failed, row_data):
+                # A pre-existing row, not a corrupt one. Before the pointer
+                # column existed this row reached the legacy scan below,
+                # which filters candidates by run partition and so excludes
+                # it, concluding "no checkpoint". Deferring reaches that
+                # same verdict rather than turning a pre-existing row into a
+                # permanent corruption error.
+                logger.info(
+                    "Task %s's checkpoint pointer %s is missing its "
+                    "run-partition field; deferring to the legacy scan "
+                    "rather than reporting the row as corrupt",
+                    self.task_id,
+                    pointer_id,
+                )
+                return _AnchorFallback()
             raise CheckpointCorruptError(
                 f"task {self.task_id}: checkpoint pointer {pointer_id} does "
                 "not match the row it anchors"

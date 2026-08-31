@@ -472,10 +472,15 @@ def test_classify_delegated_child_failure_caps_an_unbounded_pause_message():
     classified = mod._classify_delegated_child_failure(result)
 
     assert classified is not None
-    relayed_length = len(classified["error"]) - len(
+    # Exact equality, not just an upper-bound check - a bound alone can't
+    # tell "capped relay" apart from "no relay at all" (an empty relay is
+    # also <= the limit), so this pins both that the message is genuinely
+    # relayed AND that it's cut at exactly the limit, not merely under it.
+    assert classified["error"] == (
         mod._NESTED_WAIT_UNSUPPORTED_MESSAGE
+        + " "
+        + "x" * mod._DELEGATION_TRACE_TEXT_LIMIT
     )
-    assert relayed_length <= mod._DELEGATION_TRACE_TEXT_LIMIT + 1
 
 
 def test_agent_tool_result_declares_every_classified_failure_key():

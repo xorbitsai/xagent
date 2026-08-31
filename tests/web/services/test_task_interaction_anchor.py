@@ -18,9 +18,7 @@ file's module docstring for why file-backed rather than in-memory).
 from __future__ import annotations
 
 import ast
-import inspect
 import logging
-import textwrap
 from datetime import datetime, timedelta, timezone
 from itertools import count
 from pathlib import Path
@@ -35,7 +33,6 @@ from tests.web.services.interaction_static_scan_shared import _scan_root
 from tests.web.services.task_interaction_schema_shared import make_user
 from xagent.core.agent.checkpoint import CHECKPOINT_TYPE, LEGACY_CHECKPOINT_TYPES
 from xagent.db.sqlite import apply_sqlite_concurrency_pragmas
-from xagent.web.api import trace_handlers
 from xagent.web.models.database import Base
 from xagent.web.models.task import Task, TraceEvent
 from xagent.web.services import interaction_rollout as ir
@@ -282,9 +279,10 @@ def test_ta3_corrupt_conditions(
 
     assert result is None
     assert ops_signals.INTERACTION_ANCHOR_CORRUPT in ops_signals.active_degradations()
-    # Corrupt registers no counter -- only the three absence/unavailable
-    # outcomes do (see the resolver's own docstring: corrupt uses
-    # ops_signals, not the counter registry).
+    # The true-corrupt outcome is the only one of the judgment table's
+    # outcomes that registers no counter: it reports through ops_signals
+    # instead (see the resolver's own docstring for why the two
+    # observability surfaces diverge there).
     assert ir.counters_snapshot() == {}
     # Step 4's judgment-table entry is a logger.error call -- same rationale
     # as the dangling-pointer case's warning pin above, applied uniformly
@@ -412,6 +410,67 @@ def test_legacy_type_row_without_run_partition_field_classifies_absence(
         "field and names a legacy checkpoint type %r; no interaction "
         "anchor to resolve"
     )
+    db.close()
+
+
+# ---------------------------------------------------------------------------
+# A current-type row, same task, with no run-partition field at all -- the
+# shape the checkpoint-pointer backfill produces when the trace_events row it
+# matched was written before that field existed. Missing the field fails only
+# the run-partition self-consistency condition, so the row reclassifies as
+# absence, and this is the only shape that reaches
+# COUNTER_ANCHOR_ABSENT_MISSING_RUN_PARTITION.
+# ---------------------------------------------------------------------------
+
+
+def test_current_type_row_without_run_partition_field_classifies_absence(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.INFO, logger="xagent.web.services.task_interaction_anchor")
+    engine = _engine(tmp_path)
+    db = _session_factory(engine)()
+    task, _row = _build_scenario(
+        db, checkpoint_type=CHECKPOINT_TYPE, run_partition=None
+    )
+
+    result = resolve_interaction_anchor(db, task)
+
+    assert result is None
+    assert ops_signals.active_degradations() == {}
+    assert ir.counters_snapshot() == {ir.COUNTER_ANCHOR_ABSENT_MISSING_RUN_PARTITION: 1}
+    infos = [r for r in caplog.records if r.levelno == logging.INFO]
+    assert len(infos) == 1, caplog.records
+    assert infos[0].msg == (
+        "task %s's checkpoint pointer %s is missing its run-partition "
+        "field; treating it as a pre-existing row with no interaction "
+        "anchor to resolve, not as corrupt"
+    )
+    db.close()
+
+
+# ---------------------------------------------------------------------------
+# A row missing the run-partition field is only a reclassification when it
+# is the *only* thing wrong with the row -- a row that also belongs to
+# another task is corrupt, not pre-existing. This is also the mutation
+# killer for the "only" half of the shared predicate's
+# is_missing_run_partition_only check: swap the equality check for a
+# membership check and this cell is the one that turns red.
+# ---------------------------------------------------------------------------
+
+
+def test_cross_task_row_without_run_partition_field_still_classifies_corrupt(
+    tmp_path: Path,
+) -> None:
+    engine = _engine(tmp_path)
+    db = _session_factory(engine)()
+    other = _make_task(db, run_id=None)
+    task, _row = _build_scenario(db, row_task_id=other.id, run_partition=None)
+
+    result = resolve_interaction_anchor(db, task)
+
+    assert result is None
+    assert ops_signals.INTERACTION_ANCHOR_CORRUPT in ops_signals.active_degradations()
+    assert ir.counters_snapshot() == {}
     db.close()
 
 
@@ -609,160 +668,7 @@ def test_resolved_anchor_stages_successfully(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Structural equivalence between this module's six row-validity conditions
-# and trace_handlers.py's own copy. The two stay separate functions on
-# purpose -- their failure actions differ (this one returns None and
-# degrades, that one raises CheckpointCorruptError) -- but the six-condition
-# disjunction itself, and the order its six terms run in, must be kept
-# identical by construction, not merely by review. This is a structural
-# check, not a textual one: one known-legitimate rename (``task.id`` here
-# versus ``self.task_id`` there, since one is a bare function and the other
-# a bound method) is normalized away before comparing; everything else must
-# match verbatim.
-# ---------------------------------------------------------------------------
-
-
-class _NormalizeSelfTaskId(ast.NodeTransformer):
-    """Rewrites ``self.task_id`` to ``task.id`` wherever it appears, the one
-    legitimate rename between trace_handlers.py's bound-method form and this
-    module's bare-function form. Every other identifier must already match
-    verbatim between the two copies."""
-
-    def visit_Attribute(self, node: ast.Attribute) -> ast.AST:
-        self.generic_visit(node)
-        if (
-            isinstance(node.value, ast.Name)
-            and node.value.id == "self"
-            and node.attr == "task_id"
-        ):
-            return ast.copy_location(
-                ast.Attribute(
-                    value=ast.Name(id="task", ctx=ast.Load()),
-                    attr="id",
-                    ctx=ast.Load(),
-                ),
-                node,
-            )
-        return node
-
-
-def _six_condition_disjunction(func: Any) -> list[ast.expr]:
-    """The six ``ast.BoolOp(op=Or)`` operands inside ``func``'s corrupt-row
-    ``if`` statement. Located by shape (a 6-way ``or`` inside the function
-    body), not by line number, since the two copies live at different
-    offsets in their own files."""
-
-    source = textwrap.dedent(inspect.getsource(func))
-    tree = ast.parse(source)
-    candidates = [
-        node
-        for node in ast.walk(tree)
-        if isinstance(node, ast.BoolOp)
-        and isinstance(node.op, ast.Or)
-        and len(node.values) == 6
-    ]
-    assert len(candidates) == 1, (
-        f"expected exactly one 6-way `or` in {func.__qualname__}, "
-        f"found {len(candidates)}"
-    )
-    return candidates[0].values
-
-
-def _normalized_dump(node: ast.expr) -> str:
-    rewritten = _NormalizeSelfTaskId().visit(node)
-    ast.fix_missing_locations(rewritten)
-    return ast.dump(rewritten, annotate_fields=False)
-
-
-def test_row_validity_conditions_match_trace_handlers_structurally() -> None:
-    """If this test turns red, the six row-validity conditions
-    ``resolve_interaction_anchor`` checks and the six
-    ``_load_pk_anchored_checkpoint`` (``trace_handlers.py``) checks have
-    drifted apart -- in content, or in the order they run in, which this
-    module's own docstring states is a contract (condition 4 must precede
-    condition 5). Bring the two back into alignment rather than editing
-    this test to match whichever side changed, unless the divergence was
-    deliberate -- in which case update the docstrings on both sides that
-    say the two are kept identical, not just this test.
-    """
-
-    anchor_conditions = _six_condition_disjunction(resolve_interaction_anchor)
-    trace_handler_conditions = _six_condition_disjunction(
-        trace_handlers.DatabaseTraceHandler._load_pk_anchored_checkpoint
-    )
-
-    anchor_dumps = [_normalized_dump(node) for node in anchor_conditions]
-    trace_handler_dumps = [_normalized_dump(node) for node in trace_handler_conditions]
-
-    assert anchor_dumps == trace_handler_dumps
-
-
-# ---------------------------------------------------------------------------
-# The missing-run-partition reclassification inside the corrupt branch
-# carries a second, hand-copied disjunction: the same six operands above,
-# minus the partition-match one, combined with ``not (... or ...)`` instead
-# of the six-condition ``or``. That copy cannot be factored into a shared
-# helper (the six-condition ``or`` is pinned operand-for-operand against
-# trace_handlers.py by the guard above), so this test pins the copy against
-# the original directly instead of trusting the two to stay aligned by
-# hand.
-# ---------------------------------------------------------------------------
-
-_PARTITION_TERM: ast.expr = ast.UnaryOp(
-    op=ast.Not(), operand=ast.Name(id="partition_matches", ctx=ast.Load())
-)
-
-
-def _five_condition_disjunction(func: Any) -> list[ast.expr]:
-    """The five ``ast.BoolOp(op=Or)`` operands inside ``func``'s
-    ``only_partition_absent`` reclassification check. Located by shape (a
-    5-way ``or`` inside the function body), the same way
-    ``_six_condition_disjunction`` locates its own target."""
-
-    source = textwrap.dedent(inspect.getsource(func))
-    tree = ast.parse(source)
-    candidates = [
-        node
-        for node in ast.walk(tree)
-        if isinstance(node, ast.BoolOp)
-        and isinstance(node.op, ast.Or)
-        and len(node.values) == 5
-    ]
-    assert len(candidates) == 1, (
-        f"expected exactly one 5-way `or` in {func.__qualname__}, found "
-        f"{len(candidates)}"
-    )
-    return candidates[0].values
-
-
-def test_missing_partition_discriminator_mirrors_the_main_disjunction() -> None:
-    """The five conditions ``only_partition_absent`` checks must be the same
-    five conditions the six-condition disjunction above carries, minus the
-    partition-match term, in the same order. If this test turns red, the
-    two copies have drifted apart -- bring the ``only_partition_absent``
-    copy back into alignment with the six-condition ``or`` rather than
-    editing this test, the same rule
-    ``test_row_validity_conditions_match_trace_handlers_structurally``
-    applies to its own pair.
-    """
-
-    outer = _six_condition_disjunction(resolve_interaction_anchor)
-    inner = _five_condition_disjunction(resolve_interaction_anchor)
-
-    partition_term_dump = _normalized_dump(_PARTITION_TERM)
-    expected = [node for node in outer if _normalized_dump(node) != partition_term_dump]
-    assert len(expected) == 5, (
-        "expected the partition-match term to match exactly one of the six "
-        f"outer operands, found {6 - len(expected)} matching operands"
-    )
-
-    assert [_normalized_dump(n) for n in inner] == [
-        _normalized_dump(n) for n in expected
-    ]
-
-
-# ---------------------------------------------------------------------------
-# Every one of the six judgment-table outcomes, one cell each, in a single
+# Every outcome of the judgment table, one cell each, in a single
 # parametrized table. Each cell is also covered individually above;
 # this suite exists so a missing or misplaced ``increment_counter`` call on
 # any one outcome shows up as one obviously-named failing cell here, rather
@@ -771,63 +677,84 @@ def test_missing_partition_discriminator_mirrors_the_main_disjunction() -> None:
 # ---------------------------------------------------------------------------
 
 
-def _six_outcome_no_run(db: Session) -> Task:
+def _outcome_no_run(db: Session) -> Task:
     return _make_task(db, run_id=None)
 
 
-def _six_outcome_no_pointer(db: Session) -> Task:
+def _outcome_no_pointer(db: Session) -> Task:
     return _make_task(db, run_id="run-a")
 
 
-def _six_outcome_dangling_pointer(db: Session) -> Task:
+def _outcome_dangling_pointer(db: Session) -> Task:
     task = _make_task(db, run_id="run-a")
     _point_dangling(db, task, 999_999)
     return task
 
 
-def _six_outcome_corrupt(db: Session) -> Task:
+def _outcome_corrupt(db: Session) -> Task:
     other = _make_task(db, run_id=None)
     task, _row = _build_scenario(db, row_task_id=other.id)
     return task
 
 
-def _six_outcome_legacy_absence(db: Session) -> Task:
+def _outcome_missing_partition_legacy_type(db: Session) -> Task:
+    legacy_type = next(iter(LEGACY_CHECKPOINT_TYPES))
+    task, _row = _build_scenario(db, checkpoint_type=legacy_type, run_partition=None)
+    return task
+
+
+def _outcome_missing_partition_current_type(db: Session) -> Task:
+    task, _row = _build_scenario(
+        db, checkpoint_type=CHECKPOINT_TYPE, run_partition=None
+    )
+    return task
+
+
+def _outcome_legacy_absence(db: Session) -> Task:
     legacy_type = next(iter(LEGACY_CHECKPOINT_TYPES))
     task, _row = _build_scenario(db, checkpoint_type=legacy_type)
     return task
 
 
-def _six_outcome_resolved(db: Session) -> Task:
+def _outcome_resolved(db: Session) -> Task:
     task, _row = _build_scenario(
         db, task_run_id="run-a", run_partition="run-a", checkpoint_type=CHECKPOINT_TYPE
     )
     return task
 
 
-_SIX_OUTCOME_CELLS: dict[str, tuple[Any, dict[str, int]]] = {
-    "step1_no_run": (_six_outcome_no_run, {ir.COUNTER_ANCHOR_ABSENT_NO_RUN: 1}),
+_OUTCOME_CELLS: dict[str, tuple[Any, dict[str, int]]] = {
+    "step1_no_run": (_outcome_no_run, {ir.COUNTER_ANCHOR_ABSENT_NO_RUN: 1}),
     "step2_no_pointer": (
-        _six_outcome_no_pointer,
+        _outcome_no_pointer,
         {ir.COUNTER_ANCHOR_ABSENT_NO_CHECKPOINT_POINTER: 1},
     ),
     "step3_dangling_pointer": (
-        _six_outcome_dangling_pointer,
+        _outcome_dangling_pointer,
         {ir.COUNTER_ANCHOR_UNAVAILABLE_DANGLING_POINTER: 1},
     ),
-    "step4_corrupt": (_six_outcome_corrupt, {}),
-    "step5_legacy_absence": (
-        _six_outcome_legacy_absence,
+    "step4_corrupt": (_outcome_corrupt, {}),
+    "step4b_missing_partition_legacy_type": (
+        _outcome_missing_partition_legacy_type,
         {ir.COUNTER_ANCHOR_ABSENT_LEGACY_CHECKPOINT_TYPE: 1},
     ),
-    "step6_resolved": (_six_outcome_resolved, {ir.COUNTER_ANCHOR_RESOLVED: 1}),
+    "step4c_missing_partition_current_type": (
+        _outcome_missing_partition_current_type,
+        {ir.COUNTER_ANCHOR_ABSENT_MISSING_RUN_PARTITION: 1},
+    ),
+    "step5_legacy_absence": (
+        _outcome_legacy_absence,
+        {ir.COUNTER_ANCHOR_ABSENT_LEGACY_CHECKPOINT_TYPE: 1},
+    ),
+    "step6_resolved": (_outcome_resolved, {ir.COUNTER_ANCHOR_RESOLVED: 1}),
 }
 
 
-@pytest.mark.parametrize("outcome", sorted(_SIX_OUTCOME_CELLS))
-def test_ta12_six_outcome_counter_matrix(tmp_path: Path, outcome: str) -> None:
+@pytest.mark.parametrize("outcome", sorted(_OUTCOME_CELLS))
+def test_ta12_outcome_counter_matrix(tmp_path: Path, outcome: str) -> None:
     engine = _engine(tmp_path)
     db = _session_factory(engine)()
-    builder, expected_counters = _SIX_OUTCOME_CELLS[outcome]
+    builder, expected_counters = _OUTCOME_CELLS[outcome]
     task = builder(db)
 
     resolve_interaction_anchor(db, task)

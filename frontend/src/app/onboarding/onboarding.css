@@ -324,6 +324,16 @@
   font-weight: 760;
   letter-spacing: -0.036em;
   color: hsl(var(--foreground));
+  /* This heading gets tabIndex={-1} and a programmatic .focus() call on
+     every step change (page.tsx's stepHeadingRef effect) purely so screen
+     readers announce the new step - tabIndex={-1} already keeps it out of
+     the normal Tab order entirely, so no keyboard user ever reaches it by
+     tabbing. Without this, the browser's native focus ring (visible right
+     after a step change, until the next pointer interaction anywhere on
+     the page flips :focus-visible's heuristic) showed up as an unrelated,
+     confusing blue box around the heading text for sighted mouse users -
+     a user-reported bug, reproduced in both Chrome and Safari. */
+  outline: none;
 }
 .ob-step h1 em {
   font-style: normal;

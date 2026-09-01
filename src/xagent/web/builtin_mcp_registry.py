@@ -1170,6 +1170,28 @@ def get_builtin_public_mcp_app_rows() -> list[dict[str, Any]]:
                 "required_env": ["STRIPE_API_KEY"],
             },
         },
+        {
+            "app_id": "chartmogul",
+            "name": "ChartMogul",
+            "description": "Connect your ChartMogul account (with a per-user API key from Profile -> API keys) to look up and manage customers, contacts, and sales opportunities.",
+            "icon": "https://www.google.com/s2/favicons?domain=chartmogul.com&sz=128",
+            "transport": "stdio",
+            "provider_name": None,
+            "category": "Analytics",
+            "oauth_scopes": None,
+            "is_visible_in_connector": True,
+            # Key-based (non-oauth), like aws/google-maps/posthog/stripe:
+            # ChartMogul has no OAuth flow at all, only a per-user API key
+            # generated from Profile -> API keys in their own account --
+            # sent as HTTP Basic Auth username (confirmed against
+            # chartmogul-python's Config class), same no-review self-serve
+            # bar as an OAuth App.
+            "launch_config": {
+                "command": "python",
+                "args": ["-m", "xagent.web.tools.mcp.chartmogul"],
+                "required_env": ["CHARTMOGUL_API_KEY"],
+            },
+        },
     ]
 
 

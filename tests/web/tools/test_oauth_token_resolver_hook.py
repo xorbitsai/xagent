@@ -1197,6 +1197,25 @@ async def test_user_oauth_refresh_failure_logs_only_safe_metadata(
     assert "refresh-secret-value" not in caplog.text
 
 
+@pytest.mark.parametrize(
+    "response",
+    [
+        httpx.Response(400, json={"error": ""}),
+        httpx.Response(400, json={}),
+        httpx.Response(400, json=[]),
+        httpx.Response(400, json="not a mapping"),
+        httpx.Response(400, content=b"not json"),
+    ],
+)
+def test_oauth_refresh_error_code_rejects_malformed_bodies(response):
+    """An empty/absent `error`, a non-dict JSON body (list/string), or a
+    non-JSON body must all resolve to "no error code extracted" rather than
+    a falsy-but-truthy value (e.g. "") that would defeat the `error_code or
+    "unknown"` logging fallback or accidentally satisfy an `in` check
+    against _OAUTH_PERMANENT_REFRESH_ERROR_CODES."""
+    assert web_tools_config._oauth_refresh_error_code(response) is None
+
+
 @pytest.mark.asyncio
 async def test_remote_hook_without_app_info_can_claim_authorization(db_session):
     db, user = db_session

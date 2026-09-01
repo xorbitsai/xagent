@@ -635,10 +635,10 @@ def _oauth_refresh_error_code(response: httpx.Response) -> str | None:
         data = response.json()
     except ValueError:
         return None
-    if not isinstance(data, Mapping):
+    if not data or not isinstance(data, Mapping):
         return None
     error = data.get("error")
-    if isinstance(error, str):
+    if isinstance(error, str) and error:
         return error
     if (
         isinstance(error, Mapping)

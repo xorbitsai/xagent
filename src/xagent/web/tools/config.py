@@ -3823,12 +3823,21 @@ class WebToolConfig(BaseToolConfig):
                         error.env_key,
                         getattr(server, "name", "<unknown>"),
                     )
+                    # No app_info here, deliberately: the token itself
+                    # resolved fine, so is_connected (grant-existence-based)
+                    # already reads true and this app's card would show
+                    # "Connected" with no reconnect action offered at all -
+                    # pausing would trap the user in a Continue that just
+                    # re-hits this same missing-instance_url failure forever.
+                    # A missing instance_url is a resolver/config problem,
+                    # not something reconnecting OAuth can fix - keep this a
+                    # plain diagnostic error like every other in-scope
+                    # failure this pause mechanism can't help with.
                     return self._build_unavailable_mcp_config(
                         server=server,
                         reason="oauth_token_required",
                         message=UNAVAILABLE_MCP_CREDENTIAL_MESSAGE,
                         failure_code="oauth_token_required",
-                        app_info=app_info,
                     )
                 config["transport"] = "stdio"
                 logger.info(
@@ -3890,12 +3899,16 @@ class WebToolConfig(BaseToolConfig):
                         error.env_key,
                         provider_name,
                     )
+                    # No app_info here either - see the identical rationale
+                    # on the hook-token branch's own _OAuthInstanceUrlRequired
+                    # handler above. The legacy access token itself resolved
+                    # fine, so pausing here hits the same false-"Connected"
+                    # + no-reconnect-action loop.
                     return self._build_unavailable_mcp_config(
                         server=server,
                         reason="oauth_token_required",
                         message=UNAVAILABLE_MCP_CREDENTIAL_MESSAGE,
                         failure_code="oauth_token_required",
-                        app_info=app_info,
                     )
                 config["transport"] = "stdio"
 

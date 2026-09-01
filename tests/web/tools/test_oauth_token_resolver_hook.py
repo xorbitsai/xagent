@@ -599,12 +599,15 @@ async def test_hook_missing_instance_url_retains_unavailable_server(db_session):
 
     config = (await _tool_config(db, user).get_mcp_server_configs())[0]
 
+    # No app_info/app_name: the token itself resolved fine here, so
+    # is_connected already reads true and pausing would show a false
+    # "Connected" badge with no reconnect action offered - a missing
+    # instance_url isn't fixable by reconnecting OAuth.
     _assert_unavailable_mcp_config(
         config,
         server,
         reason="oauth_token_required",
         oauth_token_required=True,
-        app_name=server.name,
     )
 
 
@@ -631,12 +634,13 @@ async def test_legacy_missing_instance_url_retains_unavailable_server(db_session
 
     config = (await _tool_config(db, user).get_mcp_server_configs())[0]
 
+    # No app_info/app_name here either - see the hook-path test's identical
+    # rationale.
     _assert_unavailable_mcp_config(
         config,
         server,
         reason="oauth_token_required",
         oauth_token_required=True,
-        app_name=server.name,
     )
 
 

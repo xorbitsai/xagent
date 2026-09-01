@@ -608,16 +608,21 @@ def _oauth_launch_config_mapping(
     raise _OAuthLaunchConfigInvalid(field="type")
 
 
-# invalid_grant (RFC 6749) and GitHub's non-standard equivalent
-# bad_refresh_token both describe THIS account's refresh token
-# specifically (revoked/expired/already used) -- RFC 6749's invalid_client
-# and unauthorized_client instead describe the OAuthProvider row's own
-# client_id/client_secret or grant-type authorization, the same class of
-# admin-fixable, self-healing config problem refresh_oauth_token_if_needed's
-# own "missing CLIENT_ID or SECRET" check already treats as transient.
-# Bundling them in here would mass-delete every user's connection to a
-# provider over one admin typo.
-_OAUTH_PERMANENT_REFRESH_ERROR_CODES = frozenset({"invalid_grant", "bad_refresh_token"})
+# invalid_grant (RFC 6749), GitHub's non-standard equivalent
+# bad_refresh_token, and Slack's non-standard equivalent
+# invalid_refresh_token (Slack's Web API convention -- HTTP 200 with
+# {"ok": false, "error": ...} -- applies to its oauth.v2.access refresh
+# grant too, for workspaces with token rotation enabled) all describe THIS
+# account's refresh token specifically (revoked/expired/already used) --
+# RFC 6749's invalid_client and unauthorized_client instead describe the
+# OAuthProvider row's own client_id/client_secret or grant-type
+# authorization, the same class of admin-fixable, self-healing config
+# problem refresh_oauth_token_if_needed's own "missing CLIENT_ID or
+# SECRET" check already treats as transient. Bundling them in here would
+# mass-delete every user's connection to a provider over one admin typo.
+_OAUTH_PERMANENT_REFRESH_ERROR_CODES = frozenset(
+    {"invalid_grant", "bad_refresh_token", "invalid_refresh_token"}
+)
 
 
 class _OAuthRefreshPermanentlyInvalid(Exception):
@@ -656,17 +661,25 @@ def _oauth_refresh_error_code(
     return None
 
 
-def _is_permanent_oauth_refresh_error(error_code: str | None) -> bool:
+def _is_permanent_oauth_refresh_error(status_code: int, error_code: str | None) -> bool:
     """Whether the provider's error body unambiguously says the refresh
     token itself is dead. Any other failure (an unrecognized error code, a
     malformed/absent body) is left to the caller as a transient failure --
     see _OAuthRefreshPermanentlyInvalid.
 
-    Not gated on HTTP status: GitHub's classic OAuth Apps token endpoint
-    reports a dead refresh token (``{"error": "bad_refresh_token"}``) via a
-    200 response rather than a 4xx, so requiring 400/401 here would make
-    that case unclassifiable no matter what the caller checks.
+    A 5xx is excluded regardless of what the body claims: it's the
+    provider's own signal that something went wrong on its end, never
+    proof that this specific grant is dead (a proxy/gateway outage, or a
+    misbehaving custom/admin-configured token endpoint, could easily wrap
+    a stale cached or otherwise-unrelated error body in a 500). Every
+    other status is eligible, deliberately including 2xx: GitHub's classic
+    OAuth Apps token endpoint reports a dead refresh token (``{"error":
+    "bad_refresh_token"}``) via a 200 response rather than a 4xx, so
+    requiring 400/401 here would make that case unclassifiable no matter
+    what the caller checks.
     """
+    if status_code >= 500:
+        return False
     return error_code in _OAUTH_PERMANENT_REFRESH_ERROR_CODES
 
 
@@ -692,7 +705,7 @@ def _log_and_classify_failed_refresh(
         response.status_code,
         (error_code or "unknown")[:_OAUTH_ERROR_MESSAGE_LIMIT],
     )
-    if _is_permanent_oauth_refresh_error(error_code):
+    if _is_permanent_oauth_refresh_error(response.status_code, error_code):
         raise _OAuthRefreshPermanentlyInvalid()
 
 

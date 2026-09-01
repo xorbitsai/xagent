@@ -1302,6 +1302,109 @@ async def test_refresh_missing_provider_credentials_is_transient(
 
 
 @pytest.mark.asyncio
+async def test_refresh_5xx_with_oauth_shaped_body_is_transient(db_session, monkeypatch):
+    """A 5xx is the provider's own signal that something went wrong on its
+    end -- e.g. a proxy/gateway outage, or a misbehaving custom/admin-
+    configured token endpoint -- never proof that this specific grant is
+    dead. It must stay transient even if its body happens to carry an
+    otherwise-recognized permanent error code."""
+    db, user = db_session
+    db.add(
+        OAuthProvider(
+            provider_name="google",
+            name="Google",
+            client_id=encrypt_value("client-id-secret"),
+            client_secret=encrypt_value("client-secret-value"),
+            auth_url="https://auth.example/authorize",
+            token_url="https://auth.example/token",
+        )
+    )
+    oauth_account = _add_user_oauth(
+        db, user, provider="google", access_token="expired-access-secret"
+    )
+    oauth_account.refresh_token = "refresh-secret-value"
+    oauth_account.expires_at = datetime.now(timezone.utc) - timedelta(minutes=1)
+    db.commit()
+
+    class FiveHundredAsyncClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, traceback):
+            return False
+
+        async def post(self, *args, **kwargs):
+            return httpx.Response(502, json={"error": "invalid_grant"})
+
+    monkeypatch.setattr(
+        web_tools_config.httpx,
+        "AsyncClient",
+        FiveHundredAsyncClient,
+    )
+
+    assert (
+        await web_tools_config.refresh_oauth_token_if_needed(
+            db, oauth_account, "google"
+        )
+        is False
+    )
+
+
+@pytest.mark.asyncio
+async def test_refresh_slack_style_200_invalid_refresh_token_is_permanent(
+    db_session, monkeypatch
+):
+    """Slack's Web API convention -- HTTP 200 with {"ok": false, "error":
+    ...} -- applies to its oauth.v2.access refresh grant too (for
+    workspaces with token rotation enabled). invalid_refresh_token is
+    Slack's non-standard equivalent of invalid_grant/bad_refresh_token and
+    must still raise _OAuthRefreshPermanentlyInvalid despite the 200
+    status, the same way GitHub's bad_refresh_token does."""
+    db, user = db_session
+    db.add(
+        OAuthProvider(
+            provider_name="slack",
+            name="Slack",
+            client_id=encrypt_value("slack-client-id"),
+            client_secret=encrypt_value("slack-client-secret"),
+            auth_url="https://slack.com/oauth/v2/authorize",
+            token_url="https://slack.com/api/oauth.v2.access",
+        )
+    )
+    oauth_account = UserOAuth(
+        user_id=user.id,
+        provider="slack",
+        access_token="old-token",
+        refresh_token="old-refresh",
+        expires_at=datetime.now(timezone.utc) - timedelta(minutes=1),
+        provider_user_id="42",
+    )
+    db.add(oauth_account)
+    db.commit()
+
+    class SlackAsyncClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, traceback):
+            return False
+
+        async def post(self, *args, **kwargs):
+            return httpx.Response(
+                200, json={"ok": False, "error": "invalid_refresh_token"}
+            )
+
+    monkeypatch.setattr(
+        web_tools_config.httpx,
+        "AsyncClient",
+        SlackAsyncClient,
+    )
+
+    with pytest.raises(web_tools_config._OAuthRefreshPermanentlyInvalid):
+        await web_tools_config.refresh_oauth_token_if_needed(db, oauth_account, "slack")
+
+
+@pytest.mark.asyncio
 async def test_remote_hook_without_app_info_can_claim_authorization(db_session):
     db, user = db_session
     server = _add_remote_server(db, user, name="Unregistered Remote")

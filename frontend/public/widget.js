@@ -397,12 +397,14 @@
       display: none;
     }
 
-    /* Toggled by acquireBodyScrollLock/releaseBodyScrollLock below, on the
-       host <body>, while the mobile full-screen panel is open. !important
-       so it reliably wins over a host page's own inline
-       body.style.overflow write -- this lock deliberately never reads or
-       writes that shared value itself, so it can neither be fooled by, nor
-       interfere with, a host page's own separate scroll-lock mechanism. */
+    /* Toggled by acquireScrollLock/releaseScrollLock below, on whichever
+       element document.scrollingElement says actually scrolls the document
+       (see scrollLockTarget's own comment), while the mobile full-screen
+       panel is open. !important so it reliably wins over a host page's own
+       inline overflow write on that element -- this lock deliberately never
+       reads or writes that shared value itself, so it can neither be fooled
+       by, nor interfere with, a host page's own separate scroll-lock
+       mechanism. */
     .xagent-widget-scroll-locked {
       overflow: hidden !important;
     }
@@ -678,7 +680,7 @@
     // Crossing the breakpoint while open -- realistically a device rotation,
     // since virtually every phone's landscape width already exceeds it --
     // must re-evaluate the lock either way, not just apply it once at open.
-    applyBodyScrollLock();
+    applyScrollLock();
     // A genuine width change mid-drag invalidates this drag's frozen startX/
     // startWidth anchors -- rather than let a later pointermove misread the
     // viewport's own movement as the user shrinking the panel (and persist
@@ -712,7 +714,7 @@
     // page's own scroll stranded locked -- there'd be nothing left to
     // reopen and unlock it.
     isOpen = false;
-    applyBodyScrollLock();
+    applyScrollLock();
     // Belt-and-suspenders for a host SPA that re-inserts this same node
     // later (torndown permanently blocks a new drag regardless, but without
     // this the handle would still show its ew-resize cursor and hover
@@ -748,45 +750,61 @@
   var isOpen = false;
 
   // Non-null exactly while THIS instance owns a reference on the shared lock
-  // below, and which body element that reference is against -- a second
-  // widget script on the same host page (or this one reloaded into an SPA
-  // route) runs its own independent copy of this whole closure, so
-  // per-instance state alone can't tell whether some other instance still
-  // needs the lock this one is about to release.
-  var scrollLockedBodyEl = null;
+  // below, and which element that reference is against -- a second widget
+  // script on the same host page (or this one reloaded into an SPA route)
+  // runs its own independent copy of this whole closure, so per-instance
+  // state alone can't tell whether some other instance still needs the lock
+  // this one is about to release.
+  var scrollLockedEl = null;
 
-  // The lock is a namespaced CSS class, ref-counted on the body element it
-  // was applied to (not a module-level variable) -- deliberately NOT the
-  // shared body.style.overflow value a host page might independently use
-  // for its own scroll-locking. Reading/writing that shared value has no
-  // way to tell "the host set this same value independently" apart from
-  // "we set it ourselves", which can either unlock a host modal still open
-  // behind us or leave our own lock silently defeated by the host releasing
-  // its own value. A class only WE add/remove has no such ambiguity, and
-  // !important in the rule above means it wins regardless of what the host
-  // does to its own inline style while it's present. Ref-counting still
-  // covers multiple widget instances on one page; a body swap mid-lock
-  // naturally starts a fresh count on the new element.
-  function acquireBodyScrollLock() {
-    if (scrollLockedBodyEl) return;
-    var body = document.body;
-    if (!body) return;
-    var state = body.__xagentScrollLockV2 || (body.__xagentScrollLockV2 = { count: 0 });
-    state.count += 1;
-    body.classList.add('xagent-widget-scroll-locked');
-    scrollLockedBodyEl = body;
+  // document.scrollingElement is whichever element actually scrolls the
+  // document (the same thing scrollTop/scrollLeft on it would move) --
+  // <html> in standards mode almost always, but <body> in quirks mode, and
+  // <html> again (rather than <body>) even when a host page's own CSS
+  // leaves <body> as the one with propagation-eligible overflow. Locking
+  // document.body directly, as this used to, does nothing on a host page
+  // that sets its own overflow on <html> (e.g. html{overflow-y:scroll}, a
+  // common technique to avoid scrollbar-width layout shift) -- overflow
+  // propagation from body to the viewport only happens when html's own
+  // overflow is left at its default 'visible', so an explicit host value on
+  // html defeats a body-only lock entirely while the fixed full-screen panel
+  // stays pinned over a background that's still freely scrollable.
+  function scrollLockTarget() {
+    return document.scrollingElement || document.documentElement;
   }
 
-  function releaseBodyScrollLock() {
-    var body = scrollLockedBodyEl;
-    if (!body) return;
-    scrollLockedBodyEl = null;
-    var state = body.__xagentScrollLockV2;
+  // The lock is a namespaced CSS class, ref-counted on the element it was
+  // applied to (not a module-level variable) -- deliberately NOT the shared
+  // overflow value a host page might independently set on that same element
+  // for its own scroll-locking. Reading/writing that shared value has no way
+  // to tell "the host set this same value independently" apart from "we set
+  // it ourselves", which can either unlock a host modal still open behind us
+  // or leave our own lock silently defeated by the host releasing its own
+  // value. A class only WE add/remove has no such ambiguity, and !important
+  // in the rule above means it wins regardless of what the host does to its
+  // own style while it's present. Ref-counting still covers multiple widget
+  // instances on one page; a body/documentElement swap mid-lock naturally
+  // starts a fresh count on the new element.
+  function acquireScrollLock() {
+    if (scrollLockedEl) return;
+    var target = scrollLockTarget();
+    if (!target) return;
+    var state = target.__xagentScrollLockV2 || (target.__xagentScrollLockV2 = { count: 0 });
+    state.count += 1;
+    target.classList.add('xagent-widget-scroll-locked');
+    scrollLockedEl = target;
+  }
+
+  function releaseScrollLock() {
+    var target = scrollLockedEl;
+    if (!target) return;
+    scrollLockedEl = null;
+    var state = target.__xagentScrollLockV2;
     if (!state) return;
     state.count -= 1;
     if (state.count > 0) return;
-    delete body.__xagentScrollLockV2;
-    body.classList.remove('xagent-widget-scroll-locked');
+    delete target.__xagentScrollLockV2;
+    target.classList.remove('xagent-widget-scroll-locked');
   }
 
   // The full-screen mobile panel has no scrollable ancestor of its own
@@ -795,11 +813,11 @@
   // the host page and scroll it invisibly behind the "modal" overlay.
   // Re-evaluated on resize too (see onWindowResize) so rotating a device
   // across the breakpoint while open doesn't strand the lock.
-  function applyBodyScrollLock() {
+  function applyScrollLock() {
     if (isOpen && isMobileViewport()) {
-      acquireBodyScrollLock();
+      acquireScrollLock();
     } else {
-      releaseBodyScrollLock();
+      releaseScrollLock();
     }
   }
 
@@ -808,7 +826,7 @@
     panel.classList.add('open');
     fab.innerHTML = closeIcon;
     fab.setAttribute('aria-label', 'Close chat');
-    applyBodyScrollLock();
+    applyScrollLock();
   }
 
   function closePanel() {
@@ -816,7 +834,7 @@
     panel.classList.remove('open');
     fab.innerHTML = chatIcon;
     fab.setAttribute('aria-label', 'Open chat');
-    applyBodyScrollLock();
+    applyScrollLock();
   }
 
   fab.onclick = function () {

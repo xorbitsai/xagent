@@ -39,12 +39,16 @@ describe("widget bootstrap", () => {
     // test anywhere in the file that touches these can't leak into another.
     document.body.style.userSelect = ""
     document.body.style.cursor = ""
-    document.body.style.overflow = ""
-    document.body.classList.remove("xagent-widget-scroll-locked")
+    // The scroll lock targets document.scrollingElement -- <html> in jsdom
+    // (it has no scrollingElement at all) and in any real standards-mode
+    // browser regardless of which element's CSS actually governs page
+    // scrolling (see scrollLockTarget's own comment in widget.js).
+    document.documentElement.style.overflow = ""
+    document.documentElement.classList.remove("xagent-widget-scroll-locked")
     // A test that leaves the widget open at the end (deliberately, to assert
     // the lock is still held) would otherwise leak the scroll lock's
-    // ref-count expando into the next test via the shared body element.
-    delete (document.body as unknown as Record<string, unknown>).__xagentScrollLockV2
+    // ref-count expando into the next test via the shared element.
+    delete (document.documentElement as unknown as Record<string, unknown>).__xagentScrollLockV2
     localStorage.setItem("xagent_guest_id", "guest-fixed")
     vi.stubGlobal("fetch", fetchMock)
     fetchMock.mockReset()
@@ -1037,16 +1041,17 @@ describe("widget bootstrap", () => {
       // width: 380px / height: 600px / max-height: calc(100vh - 100px) --
       // these three overrides are what actually makes it edge-to-edge.
       expect(block).toMatch(/\.xagent-widget-panel\s*\{[^}]*width:\s*100%;/)
-      // (?<!max-) so this can't be silently satisfied by max-height's own
-      // "...height:" substring if the real height: declaration were removed
-      // -- "max-height:" literally ends in "height:", so an unanchored
-      // /height:\s*100%;/ matches inside it too.
-      expect(block).toMatch(/\.xagent-widget-panel\s*\{[^}]*(?<!max-)height:\s*100%;/)
+      // Anchored to a declaration boundary (start of the rule body, or right
+      // after a preceding ';\n'), not just "not preceded by max-" -- a bare
+      // negative lookbehind on "max-" still matches inside line-height,
+      // min-height, or a custom property like --panel-height, any of which
+      // could satisfy this if the real height: declaration were removed.
+      expect(block).toMatch(/\.xagent-widget-panel\s*\{[^}]*(?:^|\n)\s*height:\s*100%;/)
       expect(block).toMatch(/\.xagent-widget-panel\s*\{[^}]*max-height:\s*100%;/)
       // Progressive enhancement over the two 100% fallbacks above -- tracks
       // a mobile browser's address-bar show/hide instead of leaving a gap
       // or an overflow against the "large" viewport 100% resolves against.
-      expect(block).toMatch(/\.xagent-widget-panel\s*\{[^}]*(?<!max-)height:\s*100dvh;/)
+      expect(block).toMatch(/\.xagent-widget-panel\s*\{[^}]*(?:^|\n)\s*height:\s*100dvh;/)
       expect(block).toMatch(/\.xagent-widget-panel\s*\{[^}]*max-height:\s*100dvh;/)
       // Order matters, not just presence: on equal specificity the LAST
       // declaration wins, so the 100dvh enhancement must come after its 100%
@@ -1055,7 +1060,7 @@ describe("widget bootstrap", () => {
       // parse dvh at all (they'd apply 100dvh as an unrecognized value, no
       // fallback left behind it).
       const panelRule = block.match(/\.xagent-widget-panel\s*\{([^}]*)\}/)![1]
-      expect(panelRule.search(/(?<!max-)height:\s*100dvh;/)).toBeGreaterThan(panelRule.search(/(?<!max-)height:\s*100%;/))
+      expect(panelRule.search(/(?:^|\n)\s*height:\s*100dvh;/)).toBeGreaterThan(panelRule.search(/(?:^|\n)\s*height:\s*100%;/))
       expect(panelRule.search(/max-height:\s*100dvh;/)).toBeGreaterThan(panelRule.search(/max-height:\s*100%;/))
     })
 
@@ -1126,16 +1131,20 @@ describe("widget bootstrap", () => {
       expect(block).toMatch(/\.xagent-widget-container\s*\{[^}]*right:\s*calc\(20px \+ env\(safe-area-inset-right,\s*0px\)\);/)
     })
 
-    it("keeps the panel before the FAB in DOM order, which the FAB-hiding sibling selector depends on", () => {
+    it("keeps the panel and FAB as siblings, with the panel first, which the FAB-hiding sibling selector depends on", () => {
       // .xagent-widget-panel.open.xagent-widget-chrome-ready ~ .xagent-widget-fab
-      // only ever matches a FAB that comes AFTER the panel -- it would
-      // silently match nothing (leaving the FAB visible forever once ready)
-      // if that append order were ever reversed by a future edit, with no
-      // other test in this file that would catch it.
+      // is a general sibling combinator: it requires the panel and FAB to
+      // share the same parent AND the panel to precede the FAB. Document
+      // order alone (compareDocumentPosition) doesn't prove same-parent
+      // membership -- a future wrapper around just the FAB (or just the
+      // panel) could keep the panel textually first while making this
+      // selector permanently inert, leaving the ready-state FAB visible
+      // forever with no other test catching it.
       runWidget({ "data-widget-key": "widget-secret" })
 
       const panel = document.querySelector(".xagent-widget-panel")!
       const fab = document.querySelector(".xagent-widget-fab")!
+      expect(panel.parentElement).toBe(fab.parentElement)
       const panelComesFirst = Boolean(panel.compareDocumentPosition(fab) & Node.DOCUMENT_POSITION_FOLLOWING)
       expect(panelComesFirst).toBe(true)
     })
@@ -1252,7 +1261,7 @@ describe("widget bootstrap", () => {
     }
 
     function isLocked() {
-      return document.body.classList.contains("xagent-widget-scroll-locked")
+      return document.documentElement.classList.contains("xagent-widget-scroll-locked")
     }
 
     it("locks the host page's scroll on mobile while the panel is open", () => {
@@ -1264,46 +1273,61 @@ describe("widget bootstrap", () => {
       expect(isLocked()).toBe(true)
     })
 
+    it("locks document.scrollingElement (documentElement, where jsdom has no scrollingElement), not body specifically", () => {
+      // Regression coverage: a host page that sets its own overflow
+      // directly on <html> (e.g. html { overflow-y: scroll }, a common
+      // technique to avoid scrollbar-width layout shift) breaks the usual
+      // body-to-viewport overflow propagation -- a body-only lock would do
+      // nothing at all on such a page, leaving the background scrollable
+      // behind the "full-screen" panel.
+      setInnerWidth(400)
+      runWidget({ "data-widget-key": "widget-secret" })
+
+      openViaFab()
+
+      expect(document.documentElement).toHaveClass("xagent-widget-scroll-locked")
+      expect(document.body).not.toHaveClass("xagent-widget-scroll-locked")
+    })
+
     it("never touches the host page's own overflow value, before, during, or after the lock", () => {
       // The lock is a namespaced class, not a read/write of the shared
-      // body.style.overflow value a host page might independently use for
-      // its own scroll-locking -- there's nothing to "restore" because
-      // nothing is ever captured or written to that value in the first
-      // place.
+      // overflow value a host page might independently use for its own
+      // scroll-locking -- there's nothing to "restore" because nothing is
+      // ever captured or written to that value in the first place.
       setInnerWidth(400)
-      document.body.style.overflow = "auto"
+      document.documentElement.style.overflow = "auto"
       runWidget({ "data-widget-key": "widget-secret" })
 
       openViaFab()
       expect(isLocked()).toBe(true)
-      expect(document.body.style.overflow).toBe("auto")
+      expect(document.documentElement.style.overflow).toBe("auto")
 
       openViaFab()
       expect(isLocked()).toBe(false)
-      expect(document.body.style.overflow).toBe("auto")
+      expect(document.documentElement.style.overflow).toBe("auto")
     })
 
     it("leaves a host page's own overflow value alone even if it independently uses the same value the old lock used to write", () => {
       // Regression coverage for the bug the class-based lock replaced: the
-      // previous body.style.overflow='hidden' implementation could not tell
-      // its own value apart from a host page's own, separately-managed
-      // modal using the same string -- closing the widget could silently
-      // unlock that still-open host modal. A class-only lock can't make
-      // that mistake because it never inspects this value at all.
+      // previous overflow='hidden' implementation could not tell its own
+      // value apart from a host page's own, separately-managed modal using
+      // the same string -- closing the widget could silently unlock that
+      // still-open host modal. A class-only lock can't make that mistake
+      // because it never inspects this value at all.
       setInnerWidth(400)
       runWidget({ "data-widget-key": "widget-secret" })
       openViaFab()
       expect(isLocked()).toBe(true)
 
       // The host page's own, unrelated modal also locks scroll the same way.
-      document.body.style.overflow = "hidden"
+      document.documentElement.style.overflow = "hidden"
 
       openViaFab() // closes the widget
 
       expect(isLocked()).toBe(false)
       // The host's own value is untouched -- not silently cleared by the
       // widget's release.
-      expect(document.body.style.overflow).toBe("hidden")
+      expect(document.documentElement.style.overflow).toBe("hidden")
     })
 
     it("keeps its own lock in force even if the host page changes its own overflow value while still open", () => {
@@ -1315,7 +1339,7 @@ describe("widget bootstrap", () => {
       openViaFab()
       expect(isLocked()).toBe(true)
 
-      document.body.style.overflow = ""
+      document.documentElement.style.overflow = ""
 
       expect(isLocked()).toBe(true)
     })
@@ -1367,7 +1391,7 @@ describe("widget bootstrap", () => {
     })
 
     it("keeps the lock held while a second widget instance on the same page still needs it", () => {
-      // Ref-counted on the body element, precisely so one instance closing
+      // Ref-counted on the lock target element, precisely so one instance closing
       // can't unlock scrolling out from under another instance still open.
       setInnerWidth(400)
       // A single shared Response instance (the describe-level default) can

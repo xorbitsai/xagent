@@ -308,6 +308,26 @@ def test_unavailable_tool_sync_unauthorized_uses_mcp_access_denied(monkeypatch):
     assert "Access denied" in result["content"][0]["text"]
 
 
+def test_unavailable_tool_access_denied_wins_over_connect_apps_pause(monkeypatch):
+    # An unauthorized user must never see (or learn the existence of) a
+    # connect_apps card naming an app they may not be entitled to know
+    # about, even when the underlying failure would otherwise qualify for
+    # the OAuth-pause branch below it.
+    monkeypatch.setenv("XAGENT_USER_ID", "8")
+    tool = _unavailable_tool(
+        allow_users=["7"],
+        failure_code="oauth_token_required",
+        app_name="Gmail",
+    )
+
+    result = tool.run_json_sync({})
+
+    assert result.get("status") != "waiting_for_user"
+    assert "interactions" not in result
+    assert result["is_error"] is True
+    assert "Access denied" in result["content"][0]["text"]
+
+
 def test_unavailable_tool_missing_user_permission_regression(monkeypatch):
     monkeypatch.delenv("XAGENT_USER_ID", raising=False)
 

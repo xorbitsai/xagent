@@ -2,6 +2,7 @@ import asyncio
 import json
 import logging
 import os
+import random
 import threading
 import time
 from collections.abc import Iterator
@@ -32,6 +33,7 @@ from ..config import (
     get_trigger_dispatcher_batch_size,
     get_trigger_dispatcher_enabled,
     get_trigger_dispatcher_interval_seconds,
+    get_trigger_dispatcher_startup_jitter_seconds,
     get_uploaded_file_recovery_batch_size,
     get_uploaded_file_recovery_interval_seconds,
     get_uploaded_file_recovery_stale_seconds,
@@ -271,7 +273,21 @@ async def _run_trigger_dispatcher(
     *,
     poll_interval_seconds: int,
     batch_size: int,
+    startup_jitter_seconds: int = 0,
 ) -> None:
+    if startup_jitter_seconds > 0:
+        # Runs before the loop below's first tick, which otherwise fires
+        # immediately on startup -- see
+        # get_trigger_dispatcher_startup_jitter_seconds for why that's a
+        # problem right after a container restart.
+        delay = random.uniform(0, startup_jitter_seconds)
+        logger.info(
+            "Trigger dispatcher delaying first tick by %.1fs to spread out "
+            "a restart-time burst",
+            delay,
+        )
+        await asyncio.sleep(delay)
+
     from .models.database import get_session_local
     from .services.gmail_triggers import scan_due_gmail_watch_renewals
     from .services.triggers import (
@@ -418,18 +434,22 @@ def start_trigger_dispatcher_task(app_instance: FastAPI) -> asyncio.Task[Any] | 
 
     poll_interval_seconds = get_trigger_dispatcher_interval_seconds()
     batch_size = get_trigger_dispatcher_batch_size()
+    startup_jitter_seconds = get_trigger_dispatcher_startup_jitter_seconds()
     task = asyncio.create_task(
         _run_trigger_dispatcher(
             poll_interval_seconds=poll_interval_seconds,
             batch_size=batch_size,
+            startup_jitter_seconds=startup_jitter_seconds,
         )
     )
     _trigger_dispatcher_task = task
     app_instance.state.trigger_dispatcher_task = task
     logger.info(
-        "Started trigger dispatcher task (interval=%ss, batch_size=%s)",
+        "Started trigger dispatcher task (interval=%ss, batch_size=%s, "
+        "startup_jitter=%ss)",
         poll_interval_seconds,
         batch_size,
+        startup_jitter_seconds,
     )
     return task
 

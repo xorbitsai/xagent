@@ -1134,6 +1134,48 @@ def get_builtin_public_mcp_app_rows() -> list[dict[str, Any]]:
                 "required_env": ["STRIPE_API_KEY"],
             },
         },
+        {
+            "app_id": "shopify",
+            "name": "Shopify",
+            "description": "Connect to a Shopify store with a custom app Admin API access token to search and manage products, look up and update orders, and browse customers and collections.",
+            "icon": "https://www.google.com/s2/favicons?domain=shopify.com&sz=128",
+            "transport": "stdio",
+            "provider_name": None,
+            # "Commerce" is not one of the connect dialog's fixed sidebar
+            # category filters (connect-mcp-dialog.tsx only has CRM/Support/
+            # Marketing/Payments/Analytics/etc.), so this connector won't
+            # get a dedicated filter button yet -- still findable via the
+            # catalog's "All" view/search. "Payments" (Stripe's category)
+            # would be actively misleading: Shopify is store/inventory/order
+            # management, not a payments processor, so mislabeling it there
+            # would send a user looking for payment tooling to the wrong
+            # connector rather than just lacking its own button, same
+            # trade-off google-analytics already accepted using "Marketing"
+            # instead of a nonexistent "Analytics" mismatch (see the posthog
+            # row's comment above).
+            "category": "Commerce",
+            "oauth_scopes": None,
+            "is_visible_in_connector": True,
+            # Key-based (non-oauth), like posthog/stripe/mixpanel: a Shopify
+            # "custom app" (Settings -> Apps and sales channels -> Develop
+            # apps) issues a store-scoped Admin API access token self-serve,
+            # with no Shopify App Store review -- OAuth on Shopify is only
+            # a review-gated path for a *public* app distributed to many
+            # merchants' stores, not for a single store granting itself
+            # access. SHOPIFY_STORE_DOMAIN is just the store's subdomain
+            # label (e.g. "acme" for acme.myshopify.com), validated in
+            # shopify.py to be a single DNS label -- resolved and checked
+            # against private/internal IP ranges before every request as
+            # defense-in-depth against DNS rebinding, mirroring
+            # posthog.py's POSTHOG_HOST handling -- before it's interpolated
+            # into the hardcoded "*.myshopify.com" host, so no arbitrary
+            # host is ever accepted.
+            "launch_config": {
+                "command": "python",
+                "args": ["-m", "xagent.web.tools.mcp.shopify"],
+                "required_env": ["SHOPIFY_STORE_DOMAIN", "SHOPIFY_ACCESS_TOKEN"],
+            },
+        },
     ]
 
 

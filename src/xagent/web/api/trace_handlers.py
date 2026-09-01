@@ -91,11 +91,25 @@ class _AnchorFallback:
     legitimately exclude that row (a row carrying no execution identity is
     anchored but not scanned, see _load_pk_anchored_checkpoint), and an
     excluded row must never let an unreadable checkpoint become "no
-    checkpoint".
+    checkpoint". A row that exists but is missing its run-partition field
+    carries the same problem for a different reason: the row itself is not
+    unreadable, but this reader has no field to check it against, so it
+    cannot prove it is the one allowed to observe the row -- see
+    ``run_provenance_unavailable`` below.
     """
 
     undecodable: bool = False
     generic_failure: bool = False
+    # Set when the anchored row exists and decodes fine, but is missing the
+    # run-partition field entirely, so this reader cannot verify its own
+    # authority over it (see the branch in _load_pk_anchored_checkpoint that
+    # calls is_missing_run_partition_only). The row may still be there; this
+    # reader just cannot prove it is allowed to observe it. Deliberately
+    # excluded from saw_any_row (see _sync_load_latest_checkpoint): the
+    # legacy scan's own candidate filter would exclude this exact row too, so
+    # it must not make the scan's "no matching row" verdict register as "a
+    # row was seen".
+    run_provenance_unavailable: bool = False
 
 
 def _checkpoint_execution_id_predicate(execution_id: str) -> Any:
@@ -269,6 +283,15 @@ class DatabaseTraceHandler(BaseTraceHandler):
 
             saw_generic_failure = anchored_fallback.generic_failure
             saw_undecodable_row = anchored_fallback.undecodable
+            saw_run_provenance_unavailable = (
+                anchored_fallback.run_provenance_unavailable
+            )
+            # run_provenance_unavailable is deliberately not folded in here,
+            # unlike the two flags above: doing so would let the row the
+            # scan is about to exclude on its own run-partition filter (see
+            # is_missing_run_partition_only) count as "a row was seen",
+            # which routes the exhausted-scan verdict below into the Corrupt
+            # branch instead of the refusal this flag exists to raise.
             saw_any_row = (
                 anchored_fallback.undecodable or anchored_fallback.generic_failure
             )
@@ -386,11 +409,28 @@ class DatabaseTraceHandler(BaseTraceHandler):
                 offset += CHECKPOINT_ROW_SCAN_LIMIT
 
             if not saw_any_row:
+                if saw_run_provenance_unavailable:
+                    # The anchor deferred with nothing else to go on: the
+                    # legacy scan found no rows at all, so the only reason
+                    # this read cannot conclude "no checkpoint" is the
+                    # anchored row itself. See the comment where the anchor
+                    # path sets this flag in _load_pk_anchored_checkpoint.
+                    raise CheckpointAccessRefusedError(
+                        f"task {self.task_id}: checkpoint pointer row is "
+                        "missing its run-partition field and no readable "
+                        "row was found by the legacy scan; this reader "
+                        "cannot prove it is authoritative for it",
+                        reason="run_provenance_unavailable",
+                    )
                 return None
             # The matching set is exhausted and every candidate row failed.
             # A generic (transient) failure anywhere in the scan is
             # conservatively unavailable -- retryable. Only a fully scanned
             # set that is exclusively permanent decode failures is corrupt.
+            # Both outrank the anchor's own run-provenance refusal below:
+            # they are positive facts about rows the scan actually read,
+            # while the refusal is only a fallback for when the scan turned
+            # up nothing more specific to say.
             if saw_generic_failure:
                 register_degradation(
                     CHECKPOINT_LOAD_UNAVAILABLE,
@@ -405,6 +445,26 @@ class DatabaseTraceHandler(BaseTraceHandler):
             if saw_undecodable_row:
                 raise CheckpointCorruptError(
                     f"task {self.task_id}: all matching checkpoint rows are undecodable"
+                )
+            if saw_run_provenance_unavailable:
+                # The scan did examine rows (saw_any_row is True here) but
+                # none of them set generic_failure or undecodable, so
+                # nothing scanned has a more specific verdict to give --
+                # the anchor's own refusal is the only reason left not to
+                # return None. Today's loop cannot actually reach this
+                # combination (every row the scan sees either returns a
+                # snapshot early or sets one of the two flags above), but
+                # it is handled here for exhaustiveness rather than folding
+                # this flag into saw_any_row to reach the branch above,
+                # which would wrongly let an unrelated corrupt/unavailable
+                # row from the scan get shadowed by this refusal instead of
+                # outranking it.
+                raise CheckpointAccessRefusedError(
+                    f"task {self.task_id}: checkpoint pointer row is "
+                    "missing its run-partition field and no readable row "
+                    "was found by the legacy scan; this reader cannot "
+                    "prove it is authoritative for it",
+                    reason="run_provenance_unavailable",
                 )
             return None
         finally:
@@ -595,19 +655,26 @@ class DatabaseTraceHandler(BaseTraceHandler):
                 # same verdict rather than turning a pre-existing row into a
                 # permanent corruption error.
                 #
-                # Warning, not info, and counted: one caller of this read --
-                # the websocket ``resume_task`` handler
-                # (``_handle_resume_task_unserialized``) -- has no
-                # ``post_user_message`` gate ahead of it, unlike the other
-                # three ``execute_resume_background`` call sites. On that
-                # path a deferral that finds nothing means the resumed run
-                # starts from an empty context instead of the caller's
-                # saved progress, and nothing downstream reports that: the
-                # runner does not raise for ``checkpoint=None``, and
-                # ``execute_resume_background``'s own "no resumable
-                # checkpoint" guard only fires on a ``None`` result, which
-                # this path never produces. This line and its counter are
-                # the only record that it happened.
+                # Warning, not info, and counted: this row's own identity
+                # check passed, so the anchor cannot tell the caller "this
+                # is not a checkpoint" (CheckpointCorruptError) -- only that
+                # this reader has no run-partition field to check it
+                # against. Deferring to the legacy scan lets an older,
+                # verifiable row still answer the read if one exists; when
+                # none does, the flag set on the returned _AnchorFallback
+                # makes _sync_load_latest_checkpoint raise
+                # CheckpointAccessRefusedError (reason
+                # "run_provenance_unavailable") instead of resolving to
+                # None, so every caller of this read -- including the
+                # websocket ``resume_task`` handler
+                # (``_handle_resume_task_unserialized``), which has no
+                # ``post_user_message`` gate ahead of it unlike the other
+                # three ``execute_resume_background`` call sites -- must
+                # handle the refusal explicitly rather than silently
+                # starting the resumed run from an empty context. This line
+                # and its counter remain as the record of how often the
+                # condition itself occurs, independent of how each caller
+                # now reacts to the refusal it triggers.
                 logger.warning(
                     "Task %s's checkpoint pointer %s is missing its "
                     "run-partition field; deferring to the legacy scan "
@@ -616,7 +683,7 @@ class DatabaseTraceHandler(BaseTraceHandler):
                     pointer_id,
                 )
                 increment_counter(COUNTER_CHECKPOINT_ABSENT_MISSING_RUN_PARTITION)
-                return _AnchorFallback()
+                return _AnchorFallback(run_provenance_unavailable=True)
             raise CheckpointCorruptError(
                 f"task {self.task_id}: checkpoint pointer {pointer_id} does "
                 "not match the row it anchors"

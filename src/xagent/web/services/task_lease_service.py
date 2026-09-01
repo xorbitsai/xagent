@@ -497,12 +497,20 @@ def resolve_checkpoint_recovery(
             # A pre-existing row, not a mismatched one: the 20260804 backfill
             # can point this column at a trace_events row written before the
             # run-partition field existed. Treating it as "this pointer did
-            # not answer" rather than "this pointer named a bad row" is the
-            # same verdict the two by-primary-key read paths reach for this
-            # exact shape, and it reaches the legacy scan the same way a
-            # dangling pointer does. Nothing is loosened: that scan validates
-            # whatever row it finds through the same predicate, so a
-            # RECOVERABLE verdict still requires a real run-partition match.
+            # not answer" rather than "this pointer named a bad row" defers
+            # to the legacy scan below the same way a dangling pointer does.
+            # This function's own outcome for that shape is unchanged by
+            # that deferral -- it still reaches this scan and still requires
+            # a real run-partition match for RECOVERABLE. The two
+            # by-primary-key *read* paths this deferral pattern originates
+            # from no longer agree on what an empty scan means, though: the
+            # write-direction resolver (``task_interaction_anchor.py``)
+            # still resolves it as absence, while the read path
+            # (``_load_pk_anchored_checkpoint``, ``api/trace_handlers.py``)
+            # now raises ``CheckpointAccessRefusedError`` instead. This
+            # function is neither of those two -- it returns its own
+            # ``CheckpointRecoveryVerdict``, computed independently below --
+            # so that divergence does not reach it.
             logger.info(
                 "Task %s's checkpoint pointer %s is missing its "
                 "run-partition field; deferring to the legacy event_id scan "

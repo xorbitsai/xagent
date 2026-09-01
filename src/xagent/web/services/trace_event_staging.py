@@ -337,9 +337,16 @@ def is_missing_run_partition_only(
     whose ``run_id`` it already has -- so an explicit ``null`` is a shape
     nothing in this system produces. Distinguishing the two would put such a
     row in the corrupt branch, which is the worse direction to fail for a
-    shape we have no evidence about; treating it as pre-existing costs at
-    most one deferral to the legacy scan, which validates the partition
-    itself.
+    shape we have no evidence about; treating it as pre-existing instead
+    defers to the legacy scan, which validates the partition itself. What
+    that deferral costs differs by caller: the write-direction resolver
+    (``task_interaction_anchor.py``) resolves an empty scan as absence, same
+    as before this function existed. The by-primary-key read path
+    (``_load_pk_anchored_checkpoint``, ``api/trace_handlers.py``) does not
+    -- an empty scan there raises ``CheckpointAccessRefusedError`` (reason
+    ``"run_provenance_unavailable"``) instead, since that caller cannot
+    tell a genuinely absent checkpoint apart from one it simply could not
+    verify.
 
     That shape is a pre-existing checkpoint row, not a corrupt one: the
     checkpoint pointer column is backfilled from the legacy event-id column

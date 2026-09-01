@@ -734,6 +734,13 @@ def test_reply_checkpoint_missing_restore_clears_an_unpaired_marker(mock_start_t
             "interaction_not_resumable",
         ),
         (
+            CheckpointAccessRefusedError(
+                "refused", reason="run_provenance_unavailable"
+            ),
+            409,
+            "interaction_not_resumable",
+        ),
+        (
             CheckpointAccessRefusedError("refused", reason="lease_mismatch"),
             409,
             "task_busy",
@@ -782,6 +789,44 @@ def test_reply_checkpoint_read_error_maps_to_distinct_code(
         assert task.lease_expires_at is None
     finally:
         db.close()
+
+
+def test_reply_run_provenance_unavailable_overrides_the_start_a_new_task_message(
+    mock_start_task,
+):
+    """run_provenance_unavailable shares interaction_not_resumable's code
+    and status with superseded_legacy, but not its default message: unlike
+    a superseded legacy partition, this is not a permanent property of the
+    task -- the same task can become resumable again without starting a new
+    one. The default INTERACTION_NOT_RESUMABLE text ("Start a new task
+    instead of retrying") would tell the caller to give up on a task that
+    may recover on its own, so this reason must carry an overridden message
+    instead."""
+    agent_id, full_key = _create_agent_with_key()
+    task_id = _create_waiting_task(full_key, agent_id, run_id="run-provenance-message")
+    _insert_question_message(task_id)
+
+    agent_patch, _ = _patch_agent_service(
+        AsyncMock(
+            side_effect=CheckpointAccessRefusedError(
+                "refused", reason="run_provenance_unavailable"
+            )
+        )
+    )
+    with agent_patch:
+        resp = client.post(
+            f"/v1/chat/tasks/{task_id}/reply",
+            headers=_bearer(full_key),
+            json=_reply_body(agent_id),
+        )
+
+    assert resp.status_code == 409, resp.text
+    body = resp.json()
+    assert body["error"]["code"] == "interaction_not_resumable"
+    message = body["error"]["message"]
+    assert "start a new task" not in message.lower()
+    assert "currently running" not in message.lower()
+    assert "waiting_for_user" in message
 
 
 def test_reply_unknown_checkpoint_read_error_subclass_is_treated_as_retryable(

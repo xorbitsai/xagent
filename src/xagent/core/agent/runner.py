@@ -17,7 +17,11 @@ from ..task_runtime import (
 )
 from ..workspace import WorkspaceManager
 from .attachments import build_image_context_references
-from .checkpoint import CheckpointCorruptError, read_latest_checkpoint_payload
+from .checkpoint import (
+    CheckpointAccessRefusedError,
+    CheckpointCorruptError,
+    read_latest_checkpoint_payload,
+)
 from .context import ContextManager, ExecutionContext
 from .language import reset_output_language_to_request_context
 from .result import extract_assistant_message
@@ -514,7 +518,25 @@ class AgentRunner:
         elif cold_start_checkpoint is not None:
             checkpoint_baseline = cold_start_checkpoint
         else:
-            checkpoint_baseline = await self._load_latest_checkpoint(execution_id)
+            try:
+                checkpoint_baseline = await self._load_latest_checkpoint(execution_id)
+            except CheckpointAccessRefusedError as exc:
+                if exc.reason != "run_provenance_unavailable":
+                    raise
+                # This read only resolves a merge baseline for the durable
+                # persist below, not whether a checkpoint exists to inject
+                # into -- the context is already live (the branch above
+                # already established it, whether from an existing runtime
+                # or the cold-start read), so injection itself does not
+                # depend on this read succeeding. Before this refusal
+                # existed, the equivalent condition made this read return
+                # None, which this branch already treated as "no baseline
+                # to merge onto" -- not an injection failure. Preserve that:
+                # a refusal that only means "this reader cannot verify the
+                # anchored row" must not turn an otherwise-successful
+                # injection into a rejected one over a baseline read that
+                # was never load-bearing for the injection succeeding.
+                checkpoint_baseline = None
 
         # Attach files + display text to the new Message so they survive
         # checkpoint round-trips: Message.metadata is serialized by

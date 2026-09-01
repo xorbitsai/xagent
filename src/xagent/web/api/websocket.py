@@ -6525,25 +6525,58 @@ async def _handle_chat_message_unserialized(
                                 # from corrupt/refused, which are not
                                 # retryable by simply deferring.
                                 posted = False
-                            except CheckpointReadError:
-                                # Corrupt and refused reach here today. The
-                                # base class is deliberate: a read failure
-                                # that is not the retryable-by-deferring
-                                # unavailable case must reject the claimed
-                                # delivery rather than escape this handler
-                                # and orphan it. Use finish_delivery_failure,
-                                # not finish_delivery, so the row is actually
-                                # persisted DELIVERY_FAILED -- otherwise it
-                                # stays DELIVERY_PENDING forever and a retry
-                                # with the same client_message_id loops on
-                                # "still being applied".
-                                background_task_manager.release_resume_reservation(
-                                    task_id
-                                )
-                                await finish_delivery_failure(
-                                    "The task's saved progress could not be read."
-                                )
-                                return
+                            except CheckpointReadError as exc:
+                                # inject_user_message has two checkpoint
+                                # reads that can raise this: the cold-start
+                                # read when no in-process context exists,
+                                # and the merge-baseline read taken when a
+                                # context is already live but has no cached
+                                # runtime checkpoint. Only the cold-start one
+                                # can still surface here as a refusal -- the
+                                # merge-baseline read already downgrades this
+                                # exact reason to a None baseline inside
+                                # inject_user_message itself, since a live
+                                # context does not depend on that read
+                                # succeeding (see the try/except around
+                                # ``checkpoint_baseline`` there). For the
+                                # cold-start case, a run_provenance_unavailable
+                                # refusal means the same thing a None read
+                                # used to mean before that refusal existed:
+                                # nothing here was ever live to reject a
+                                # message into, so fold it into the same
+                                # posted=False deferral as the unavailable
+                                # case above rather than rejecting delivery
+                                # outright.
+                                if (
+                                    isinstance(exc, CheckpointAccessRefusedError)
+                                    and exc.reason == "run_provenance_unavailable"
+                                ):
+                                    posted = False
+                                else:
+                                    # Corrupt reaches here today, along with
+                                    # every other refusal reason
+                                    # (lease_mismatch / active_run /
+                                    # superseded_legacy) -- those mean a
+                                    # different execution genuinely owns
+                                    # this partition, or the partition is
+                                    # retired, not "nothing live yet", so
+                                    # deferring would silently misroute the
+                                    # message. Reject the claimed delivery
+                                    # rather than escape this handler and
+                                    # orphan it. Use finish_delivery_failure,
+                                    # not finish_delivery, so the row is
+                                    # actually persisted DELIVERY_FAILED --
+                                    # otherwise it stays DELIVERY_PENDING
+                                    # forever and a retry with the same
+                                    # client_message_id loops on "still
+                                    # being applied".
+                                    background_task_manager.release_resume_reservation(
+                                        task_id
+                                    )
+                                    await finish_delivery_failure(
+                                        "The task's saved progress could not be read."
+                                    )
+                                    return
                     delivery_injected = posted
                     if not posted:
                         logger.warning(

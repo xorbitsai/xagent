@@ -583,6 +583,11 @@ async def _resume_input_required_a2a_task(
                     "This task's checkpoint history has been superseded by "
                     "a newer run and cannot accept a new message."
                 ),
+                "run_provenance_unavailable": (
+                    "This task's saved progress cannot be verified as "
+                    "belonging to the current run and cannot accept a new "
+                    "message."
+                ),
             }.get(
                 exc.reason,
                 "Task is currently running and cannot accept a new message.",

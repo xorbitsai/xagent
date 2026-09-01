@@ -16,6 +16,7 @@ from xagent.core.agent import (
 )
 from xagent.core.agent.attachments import build_image_context_references
 from xagent.core.agent.checkpoint import (
+    CheckpointAccessRefusedError,
     CheckpointCorruptError,
     CheckpointUnavailableError,
 )
@@ -403,6 +404,52 @@ async def test_inject_user_message_propagates_unavailable() -> None:
             "Continue",
             request_interrupt=False,
         )
+
+
+class RunProvenanceUnavailableCheckpointStore:
+    """Every read refuses with ``run_provenance_unavailable``.
+
+    Models the merge-baseline read inside ``inject_user_message`` hitting a
+    checkpoint pointer row this reader cannot verify. Unlike
+    ``UnavailableCheckpointStore``, this refusal is downgraded to a ``None``
+    baseline at that one call site instead of propagating: the context is
+    already live by the time this read runs, so injection does not depend
+    on it succeeding.
+    """
+
+    async def load_latest_checkpoint(self, execution_id: str) -> dict[str, Any]:
+        del execution_id
+        raise CheckpointAccessRefusedError(
+            "checkpoint pointer row is missing its run-partition field",
+            reason="run_provenance_unavailable",
+        )
+
+
+@pytest.mark.asyncio
+async def test_inject_user_message_baseline_refusal_still_injects() -> None:
+    """A live context with no cached runtime checkpoint (the common
+    already-paused, process-still-warm case) takes the merge-baseline read
+    at the bottom of ``inject_user_message``, not the cold-start read at the
+    top. A ``run_provenance_unavailable`` refusal there must not turn an
+    otherwise-successful injection into a rejected one -- only the
+    cold-start read (see test_inject_user_message_propagates_unavailable)
+    is allowed to fail the whole call."""
+    runner = AgentRunner(
+        agent=Agent(name="checkpoint-reader", patterns=[], llm=None),
+        tracer=RunProvenanceUnavailableCheckpointStore(),
+    )
+    context = ExecutionContext(execution_id="exec-live-baseline-refused")
+    runner.context_manager.set_context(context)
+
+    result = await runner.inject_user_message(
+        "exec-live-baseline-refused",
+        "Continue",
+        request_interrupt=False,
+    )
+
+    assert result is context
+    assert len(context.messages) == 1
+    assert context.messages[0].content == "Continue"
 
 
 @pytest.mark.asyncio

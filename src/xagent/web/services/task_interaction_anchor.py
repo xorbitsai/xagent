@@ -154,12 +154,16 @@ kind increments ``COUNTER_ANCHOR_ABSENT_LEGACY_CHECKPOINT_TYPE``, the same
 counter step 5 uses for the row shape it describes; the current-type kind
 increments ``COUNTER_ANCHOR_ABSENT_MISSING_RUN_PARTITION``.
 
-The by-primary-key read path reaches the same classification.
-``_load_pk_anchored_checkpoint`` (``api/trace_handlers.py``) defers a row
-of this shape to its legacy scan instead of raising
-``CheckpointCorruptError``; that scan filters candidates by run partition,
-so it finds no candidate and the read concludes "no checkpoint" -- the
-verdict these rows got before the pointer column existed.
+The by-primary-key read path starts from the same classification but no
+longer ends at the same verdict. ``_load_pk_anchored_checkpoint``
+(``api/trace_handlers.py``) still defers a row of this shape to its legacy
+scan instead of raising ``CheckpointCorruptError``, and that scan still
+filters candidates by run partition and so finds no candidate matching this
+row. Unlike here, though, the read does not conclude "no checkpoint" from
+that: it raises ``CheckpointAccessRefusedError`` (reason
+``"run_provenance_unavailable"``), visible to every caller of that read, so
+a row this reader cannot verify is never mistaken for one that does not
+exist.
 """
 
 from __future__ import annotations

@@ -87,10 +87,14 @@ class CheckpointAccessRefusedError(CheckpointReadError):
     report an accurate message instead of one generic sentence for every
     case: ``"lease_mismatch"`` (an active lease exists but is not bound to
     this reader), ``"active_run"`` (a different run is in progress under
-    its own lease), or ``"superseded_legacy"`` (a tagged run has already
-    superseded the untagged/legacy partition this reader is confined to).
-    Defaults to ``"active_run"``, the most common case, so existing call
-    sites that do not pass ``reason`` keep working unchanged.
+    its own lease), ``"superseded_legacy"`` (a tagged run has already
+    superseded the untagged/legacy partition this reader is confined to),
+    or ``"run_provenance_unavailable"`` (the checkpoint pointer names a row
+    that exists and decodes fine but has no run-partition field to check,
+    and no other readable row was found either, so this reader cannot prove
+    it is allowed to observe it). Defaults to ``"active_run"``, the most
+    common case, so existing call sites that do not pass ``reason`` keep
+    working unchanged.
     """
 
     def __init__(self, message: str, *, reason: str = "active_run") -> None:

@@ -53,6 +53,7 @@ from xagent.web.api.websocket import (
 from xagent.web.models.chat_message import TaskChatMessage
 from xagent.web.models.database import Base, get_db, get_engine, init_db
 from xagent.web.models.task import Task, TaskStatus
+from xagent.web.models.task import TraceEvent as DatabaseTraceEvent
 from xagent.web.models.task_command import TaskExecutionCommand
 from xagent.web.models.uploaded_file import UploadedFile
 from xagent.web.models.user import User
@@ -1458,11 +1459,115 @@ async def test_live_lease_injection_degrades_to_deferred_on_checkpoint_unavailab
 
 
 @pytest.mark.asyncio
+async def test_live_lease_injection_degrades_to_deferred_on_run_provenance_unavailable(
+    db_session,
+) -> None:
+    """A ``run_provenance_unavailable`` refusal during live injection means
+    the same thing an unavailable read does here: inject_user_message found
+    no live in-process context and had to cold-start one from a checkpoint
+    read, and that read could not verify it. Nothing was ever live to
+    reject a message into, so this must fold into the same posted=False
+    deferred-delivery path as CheckpointUnavailableError -- not the
+    corrupt/refused rejection the other refusal reasons get (see
+    test_live_lease_injection_rejects_delivery_on_corrupt_or_refused)."""
+    owner = _user(db_session, "owner")
+    task = _task(db_session, owner.id, status=TaskStatus.RUNNING)
+    task.runner_id = "provenance-runner"
+    task.run_id = "provenance-run"
+    db_session.commit()
+    agent = MagicMock()
+    agent.supports_live_control.return_value = True
+    agent.get_dag_pattern.return_value = None
+    agent.post_user_message = AsyncMock(
+        side_effect=CheckpointAccessRefusedError(
+            "checkpoint pointer row is missing its run-partition field",
+            reason="run_provenance_unavailable",
+        )
+    )
+    mgr = MagicMock(get_agent_for_task=AsyncMock(return_value=agent))
+    ws_manager = MagicMock(
+        broadcast_to_task=AsyncMock(),
+        send_personal_message=AsyncMock(),
+    )
+    resume_bg = AsyncMock()
+    bg_mgr = MagicMock()
+    bg_mgr.reserve_resume.return_value = True
+    bg_mgr.running_tasks.get.return_value = None
+    websocket = MagicMock()
+
+    with (
+        patch("xagent.web.api.chat.get_agent_manager", return_value=mgr),
+        patch("xagent.web.api.websocket.manager", ws_manager),
+        patch("xagent.web.api.websocket.execute_resume_background", resume_bg),
+        patch("xagent.web.api.websocket.background_task_manager", bg_mgr),
+    ):
+        await handle_chat_message(
+            websocket,
+            int(task.id),
+            {
+                "message": "Wait for the checkpoint",
+                "client_message_id": "provenance-turn-1",
+                "user": owner,
+                "files": [],
+            },
+        )
+        for _ in range(100):
+            db_session.expire_all()
+            stored_command = (
+                db_session.query(TaskExecutionCommand)
+                .filter_by(task_id=int(task.id), command_id="provenance-turn-1")
+                .one()
+            )
+            if (
+                stored_command.status == "pending"
+                and int(stored_command.attempt_count or 0) >= 1
+                and resume_bg.await_count == 1
+            ):
+                break
+            await asyncio.sleep(0.01)
+        else:
+            raise AssertionError("deferred command claim was not released in time")
+
+    accepted = [
+        call.args[0]
+        for call in ws_manager.send_personal_message.call_args_list
+        if call.args[0].get("type") == "message_accepted"
+    ]
+    assert len(accepted) == 1
+    assert accepted[0]["client_message_id"] == "provenance-turn-1"
+    assert stored_command.status == "pending"
+    assert not any(
+        call.args[0].get("type") == "message_rejected"
+        for call in ws_manager.send_personal_message.call_args_list
+    )
+    kwargs = resume_bg.call_args.kwargs
+    assert kwargs["delivery_already_dispatched"] is False
+    assert kwargs["delivery_websocket"] is None
+    assert kwargs["delivery_client_message_id"] is None
+    # The durable message itself must actually be carried into the
+    # deferred path, not just dropped in favor of an empty resume -- a
+    # deferral that lost the message would be indistinguishable from a
+    # silent drop.
+    pending = kwargs["pending_user_message"]
+    assert pending is not None
+    assert pending["display_message"] == "Wait for the checkpoint"
+    assert pending["execution_message"] == "Wait for the checkpoint"
+    # This is a defer, not a rejection: the claimed delivery reservation
+    # must stay held for the background resume to use, unlike the
+    # corrupt/refused rejection path below which releases it.
+    bg_mgr.release_resume_reservation.assert_not_called()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "error",
     [
         CheckpointCorruptError("all matching rows undecodable"),
         CheckpointAccessRefusedError("active lease is not bound to this reader"),
+        CheckpointAccessRefusedError(
+            "a tagged run has already superseded legacy checkpoints",
+            reason="superseded_legacy",
+        ),
     ],
 )
 async def test_live_lease_injection_rejects_delivery_on_corrupt_or_refused(
@@ -3444,6 +3549,106 @@ async def test_resume_background_broadcasts_corrective_event_after_restore(
         call.args[0].get("type") == "task_error"
         for call in ws_manager.broadcast_to_task.call_args_list
     )
+
+
+@pytest.mark.parametrize(
+    ("prior_status", "expected_event_type"),
+    [
+        (TaskStatus.PAUSED, "task_paused"),
+        (TaskStatus.WAITING_FOR_USER, "task_waiting_for_user"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_resume_background_restores_prior_status_on_run_provenance_unavailable(
+    db_session,
+    prior_status: TaskStatus,
+    expected_event_type: str,
+) -> None:
+    """A ``run_provenance_unavailable`` refusal is a read that could not be
+    completed, not a policy decision the task made -- the ``except
+    Exception`` handler in execute_resume_background already matches every
+    ``CheckpointAccessRefusedError`` regardless of reason (not just
+    CheckpointUnavailableError), so this reason must restore the task to
+    its prior PAUSED/WAITING_FOR_USER status, not settle it as FAILED. Same
+    shape as test_resume_background_broadcasts_corrective_event_after_restore,
+    with the failure mode swapped for the new refusal reason."""
+    owner = _user(db_session, "provenance-restore-owner")
+    task = _task(db_session, owner.id, status=prior_status)
+    task.error_message = "earlier attempt failed"
+    task.output = "prior turn answer"
+    # An established run, continued rather than started fresh: passing this
+    # same id as expected_run_id below keeps acquire_task_lease_no_commit
+    # out of both of its pointer-clearing branches (new_run, and
+    # expected_run_id is None), which fire for other reasons unrelated to
+    # this refusal and would otherwise make the pointer assertion below
+    # meaningless -- a task that never had a run cannot resume "the same
+    # run" in the first place.
+    task.run_id = "provenance-restore-run"
+    db_session.commit()
+    # A real trace_events row -- the pointer column has an FK -- standing in
+    # for the anchored checkpoint row this refusal is about.
+    pointer_row = DatabaseTraceEvent(
+        task_id=int(task.id),
+        build_id=None,
+        event_id="provenance-restore-pointer",
+        event_type="system_update_general",
+        timestamp=datetime.now(timezone.utc),
+        data={"checkpoint_type": "agent_execution_checkpoint"},
+    )
+    db_session.add(pointer_row)
+    db_session.commit()
+    db_session.refresh(pointer_row)
+    pointer_row_id = pointer_row.id
+    task.last_checkpoint_trace_event_id = pointer_row_id
+    db_session.commit()
+    agent = MagicMock(
+        resume_execution_by_id=AsyncMock(
+            side_effect=CheckpointAccessRefusedError(
+                "checkpoint pointer row is missing its run-partition field",
+                reason="run_provenance_unavailable",
+            )
+        ),
+    )
+    ws_manager = MagicMock(broadcast_to_task=AsyncMock())
+
+    with patch("xagent.web.api.websocket.manager", ws_manager):
+        _register_current_resume(int(task.id))
+        await execute_resume_background(
+            task_id=int(task.id),
+            agent_service=agent,
+            task_owner_user_id=int(owner.id),
+            expected_run_id="provenance-restore-run",
+        )
+
+    db_session.expire_all()
+    db_session.refresh(task)
+    assert task.status == prior_status
+    assert task.error_message is None  # named: restore clears stale error
+    assert task.output == "prior turn answer"  # named: restore preserves output
+    # named: the checkpoint pointer is the anchor a future read would try
+    # again -- a restore that cleared or otherwise touched it here would
+    # destroy the very row this refusal was about, on every future retry.
+    assert task.last_checkpoint_trace_event_id == pointer_row_id
+
+    corrective = [
+        call.args[0]
+        for call in ws_manager.broadcast_to_task.call_args_list
+        if call.args[0].get("type") == expected_event_type
+    ]
+    assert len(corrective) == 1
+    assert corrective[0]["type"] == expected_event_type
+    assert corrective[0]["status"] == prior_status.value
+    assert not any(
+        call.args[0].get("type") == "task_error"
+        for call in ws_manager.broadcast_to_task.call_args_list
+    )
+
+    # Test-infra cleanup only, after every assertion above: the fixture's
+    # teardown drops tables in dependency order, and this FK-backed pointer
+    # (still live, per the assertion just made) is not itself part of what
+    # this test is verifying.
+    task.last_checkpoint_trace_event_id = None
+    db_session.commit()
 
 
 @pytest.mark.parametrize(

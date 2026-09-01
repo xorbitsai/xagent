@@ -1720,6 +1720,7 @@ def test_checkpoint_access_refused_reuses_existing_running_task_message() -> Non
     [
         ("lease_mismatch", "currently running"),
         ("superseded_legacy", "currently running"),
+        ("run_provenance_unavailable", "currently running"),
     ],
 )
 def test_checkpoint_access_refused_reason_gets_a_distinct_message(
@@ -1727,9 +1728,11 @@ def test_checkpoint_access_refused_reason_gets_a_distinct_message(
     unexpected_phrase: str,
 ) -> None:
     """Only the ``active_run`` reason reuses the pre-existing 'currently
-    running' message; the other two refusal reasons are distinct facts
-    (a stray lease, a superseded legacy partition) and must not be reported
-    with a message that claims a run is in progress."""
+    running' message; the other refusal reasons are distinct facts (a stray
+    lease, a superseded legacy partition, an unverifiable run-partition
+    field) and must not be reported with a message that claims a run is in
+    progress -- nothing is running, so a client that retried on that belief
+    would loop forever."""
     agent_id, full_key = _create_published_agent_with_key()
     task_id = _resume_error_task(agent_id, context_id=f"ctx-refused-{reason}")
 

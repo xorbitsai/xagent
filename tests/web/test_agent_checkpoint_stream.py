@@ -1589,9 +1589,13 @@ def test_database_trace_handler_load_pk_anchor_absent_run_field_defers_to_scan(
     the 20260804 backfill produces from a trace_events row written before
     that field existed -- is a pre-existing row, not a corrupt one. It
     defers to the legacy scan, which filters candidates by run partition and
-    therefore finds none, so the read concludes "no checkpoint" instead of
-    raising. That is the verdict this task got before the pointer column
-    existed. Pairs with the "run_partition" case of
+    therefore finds none. Unlike a genuine "no checkpoint" query, this
+    reader still cannot verify it is authoritative for the anchored row, so
+    the read raises CheckpointAccessRefusedError (reason
+    "run_provenance_unavailable") instead of resolving to None -- a caller
+    that treated this as "no checkpoint" would silently rebuild an empty
+    context instead of reporting that the row could not be verified. Pairs
+    with the "run_partition" case of
     test_database_trace_handler_load_pk_anchor_single_fault_raises_corrupt,
     which covers the opposite: a run-partition field that is present and
     wrong.
@@ -1636,22 +1640,19 @@ def test_database_trace_handler_load_pk_anchor_absent_run_field_defers_to_scan(
     caplog.set_level(logging.WARNING, logger="xagent.web.api.trace_handlers")
     try:
         with bind_task_lease_context(TaskLease(task_id, "runner-a", "run-a")):
-            assert (
+            with pytest.raises(CheckpointAccessRefusedError) as excinfo:
                 DatabaseTraceHandler(task_id)._sync_load_latest_checkpoint(
                     "shared-execution"
                 )
-                is None
-            )
+            assert excinfo.value.reason == "run_provenance_unavailable"
     finally:
         db.close()
 
-    # The read returning None is not by itself the contract. On the
-    # websocket ``resume_task`` path this None becomes an empty context and
-    # a run with no replay history, and nothing downstream turns that into
-    # an error the caller can see -- so the warning and the counter are the
-    # only evidence the reclassification fired at all. Assert both, at the
-    # same strength the write-direction resolver's own test asserts them
-    # (tests/web/services/test_task_interaction_anchor.py).
+    # The refusal is the contract now, but the warning and counter this
+    # condition has always set remain the record of how often it fires,
+    # independent of how each caller reacts to the refusal it triggers.
+    # Assert both, at the same strength the write-direction resolver's own
+    # test asserts them (tests/web/services/test_task_interaction_anchor.py).
     assert ir.counters_snapshot() == {
         ir.COUNTER_CHECKPOINT_ABSENT_MISSING_RUN_PARTITION: 1
     }
@@ -3572,6 +3573,139 @@ def test_database_trace_handler_load_pk_anchor_generic_decode_failure_is_unavail
     finally:
         clear_degradation(CHECKPOINT_DECODE_FALLBACK)
         clear_degradation(CHECKPOINT_LOAD_UNAVAILABLE)
+        db.close()
+
+
+def test_database_trace_handler_absent_run_field_with_scan_generic_failure_is_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A pointer row missing its run-partition field defers to the legacy
+    scan (see test_database_trace_handler_load_pk_anchor_absent_run_field_defers_to_scan),
+    which the scan's own partition filter excludes it from. If the scan then
+    finds a *different*, correctly-partitioned row that fails to decode for
+    a transient (non-decode-class) reason, that is a stronger, more specific
+    verdict than the anchor's own run-provenance refusal -- the scan
+    actually examined a row and hit a real failure. CheckpointUnavailableError
+    (retryable) must win, not CheckpointAccessRefusedError."""
+    SessionLocal, db, task = _create_trace_handler_test_task(
+        "pk-anchor-absent-run-field-scan-generic"
+    )
+    task.status = TaskStatus.RUNNING
+    task.runner_id = "runner-a"
+    task.run_id = "run-a"
+    db.commit()
+    task_id = int(task.id)
+
+    pointer_row = DatabaseTraceEvent(
+        task_id=task_id,
+        build_id=None,
+        event_id="pointer-absent-run-field-generic",
+        event_type="system_update_general",
+        timestamp=datetime.now(timezone.utc),
+        data={
+            "checkpoint_type": CHECKPOINT_TYPE,
+            "execution_id": "shared-execution",
+            "snapshot": {"label": "absent-run-field-pointer"},
+        },
+    )
+    db.add(pointer_row)
+    db.commit()
+    db.refresh(pointer_row)
+    task.last_checkpoint_trace_event_id = pointer_row.id
+    db.commit()
+
+    db.add(
+        _checkpoint_trace_row(
+            task_id=task_id,
+            event_id="scan-row-generic",
+            execution_id="shared-execution",
+            label=_BROKEN_ANCHOR_LABEL,
+            timestamp=datetime.now(timezone.utc),
+            run_id="run-a",
+        )
+    )
+    db.commit()
+
+    _bind_checkpoint_read_session(monkeypatch, SessionLocal)
+    monkeypatch.setattr(
+        "xagent.web.api.trace_handlers.decode_trace_event_data",
+        _decode_failing_on(_BROKEN_ANCHOR_LABEL, RuntimeError("blob prefetch failed")),
+    )
+
+    try:
+        with bind_task_lease_context(TaskLease(task_id, "runner-a", "run-a")):
+            with pytest.raises(CheckpointUnavailableError):
+                DatabaseTraceHandler(task_id)._sync_load_latest_checkpoint(
+                    "shared-execution"
+                )
+    finally:
+        db.close()
+
+
+def test_database_trace_handler_absent_run_field_with_scan_undecodable_row_is_corrupt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Same setup as the generic-failure sibling above, but the scan's
+    matching row is permanently undecodable instead of transiently failed.
+    A fully scanned, exclusively-undecodable candidate set outranks the
+    anchor's run-provenance refusal the same way: CheckpointCorruptError
+    (terminal, not retryable) must win, not CheckpointAccessRefusedError."""
+    from xagent.web.services.trace_message_storage import CheckpointMessageDecodeError
+
+    SessionLocal, db, task = _create_trace_handler_test_task(
+        "pk-anchor-absent-run-field-scan-undecodable"
+    )
+    task.status = TaskStatus.RUNNING
+    task.runner_id = "runner-a"
+    task.run_id = "run-a"
+    db.commit()
+    task_id = int(task.id)
+
+    pointer_row = DatabaseTraceEvent(
+        task_id=task_id,
+        build_id=None,
+        event_id="pointer-absent-run-field-undecodable",
+        event_type="system_update_general",
+        timestamp=datetime.now(timezone.utc),
+        data={
+            "checkpoint_type": CHECKPOINT_TYPE,
+            "execution_id": "shared-execution",
+            "snapshot": {"label": "absent-run-field-pointer"},
+        },
+    )
+    db.add(pointer_row)
+    db.commit()
+    db.refresh(pointer_row)
+    task.last_checkpoint_trace_event_id = pointer_row.id
+    db.commit()
+
+    db.add(
+        _checkpoint_trace_row(
+            task_id=task_id,
+            event_id="scan-row-undecodable",
+            execution_id="shared-execution",
+            label=_BROKEN_ANCHOR_LABEL,
+            timestamp=datetime.now(timezone.utc),
+            run_id="run-a",
+        )
+    )
+    db.commit()
+
+    _bind_checkpoint_read_session(monkeypatch, SessionLocal)
+    monkeypatch.setattr(
+        "xagent.web.api.trace_handlers.decode_trace_event_data",
+        _decode_failing_on(
+            _BROKEN_ANCHOR_LABEL, CheckpointMessageDecodeError("blob is gone")
+        ),
+    )
+
+    try:
+        with bind_task_lease_context(TaskLease(task_id, "runner-a", "run-a")):
+            with pytest.raises(CheckpointCorruptError):
+                DatabaseTraceHandler(task_id)._sync_load_latest_checkpoint(
+                    "shared-execution"
+                )
+    finally:
         db.close()
 
 

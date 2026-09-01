@@ -590,7 +590,31 @@ async def reply_to_task(
         if isinstance(exc, CheckpointCorruptError):
             raise V1ApiError(V1ErrorCode.INTERACTION_NOT_RESUMABLE, 409) from exc
         if isinstance(exc, CheckpointAccessRefusedError):
+            if exc.reason == "run_provenance_unavailable":
+                # Not retryable by waiting -- the TASK_BUSY default below is
+                # for reasons where a different execution is genuinely live
+                # right now, which is not this -- but also not the
+                # permanent property of the task that INTERACTION_NOT_
+                # RESUMABLE's default message assumes: the anchored row may
+                # still be there, this reader just cannot verify it right
+                # now, and the same task can become resumable again without
+                # starting a new one. Override the default "start a new
+                # task" text accordingly; wording mirrors the a2a mapping
+                # for the same reason (a2a.py's message:send dict).
+                raise V1ApiError(
+                    V1ErrorCode.INTERACTION_NOT_RESUMABLE,
+                    409,
+                    message=(
+                        "This task's saved progress cannot currently be "
+                        "verified as belonging to the current run. The "
+                        "task remains in waiting_for_user."
+                    ),
+                ) from exc
             if exc.reason == "superseded_legacy":
+                # Not retryable by waiting either, but here the default
+                # "start a new task" message is accurate: a newer run has
+                # permanently moved past the partition this reader is
+                # confined to.
                 raise V1ApiError(V1ErrorCode.INTERACTION_NOT_RESUMABLE, 409) from exc
             raise V1ApiError(V1ErrorCode.TASK_BUSY, 409) from exc
         # CheckpointUnavailableError, or any future CheckpointReadError

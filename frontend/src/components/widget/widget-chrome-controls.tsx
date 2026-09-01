@@ -1,6 +1,6 @@
 "use client"
 
-import React, { useEffect, useRef, useState } from "react"
+import React, { useCallback, useEffect, useRef, useState } from "react"
 import { Loader2, Maximize2, MessageSquarePlus, Minimize2, MoreHorizontal, X } from "lucide-react"
 import { useI18n } from "@/contexts/i18n-context"
 import { listenForWidgetHostMessage, postToParentWidget } from "@/lib/widget-parent-message"
@@ -29,12 +29,33 @@ interface WidgetChromeControlsProps {
     // visible with the menu closed.
     pending?: boolean
   }
+  // Expand/collapse state is owned here (uncontrolled) by default, which is
+  // fine as long as this component's own mount lifetime matches the panel's.
+  // Session mode's header can remount independently of the panel (its
+  // conversation content swaps to an error subtree on reconnect), which would
+  // silently reset this back to false under the panel's back; passing both
+  // props lets that caller lift the state to somewhere that doesn't unmount.
+  expanded?: boolean
+  onExpandedChange?: (expanded: boolean) => void
 }
 
-export function WidgetChromeControls({ newConversation }: WidgetChromeControlsProps) {
+export function WidgetChromeControls({
+  newConversation,
+  expanded: controlledExpanded,
+  onExpandedChange,
+}: WidgetChromeControlsProps) {
   const { t } = useI18n()
   const [isMenuOpen, setIsMenuOpen] = useState(false)
-  const [isExpanded, setIsExpanded] = useState(false)
+  const [internalExpanded, setInternalExpanded] = useState(false)
+  const isControlled = controlledExpanded !== undefined
+  const isExpanded = isControlled ? controlledExpanded : internalExpanded
+  const setIsExpanded = useCallback((next: boolean) => {
+    if (isControlled) {
+      onExpandedChange?.(next)
+    } else {
+      setInternalExpanded(next)
+    }
+  }, [isControlled, onExpandedChange])
   const menuRef = useRef<HTMLDivElement>(null)
 
   useEffect(() => {
@@ -82,7 +103,7 @@ export function WidgetChromeControls({ newConversation }: WidgetChromeControlsPr
     // and the next click (a no-op collapse from here) needs a second click
     // after an eventual desktop-width resize to actually expand.
     listenForWidgetHostMessage("widget_expand_rejected", () => setIsExpanded(false))
-  ), [])
+  ), [setIsExpanded])
 
   const handleNewConversation = () => {
     setIsMenuOpen(false)

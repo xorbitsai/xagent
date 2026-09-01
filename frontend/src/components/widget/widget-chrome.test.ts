@@ -256,12 +256,22 @@ describe("widget chrome", () => {
     // for the mobile block. Without this, a future edit that moves .expanded
     // into the mobile block, or duplicates it there, would pass every other
     // test here while silently breaking "can't expand on mobile."
-    runWidget({ "data-widget-key": "widget-secret" })
+    //
+    // A non-default data-button-size is used deliberately: both the base
+    // max-height and the expanded height are button-size-derived, and the
+    // default 60px happens to make the old hardcoded "100px" offset produce
+    // the same result (60px + 40px = 100px) -- so only a distinguishing size
+    // can catch a regression back to that hardcode.
+    runWidget({ "data-widget-key": "widget-secret", "data-button-size": "100px" })
 
     const block = expandedBlock()
     expect(block).toMatch(/\.xagent-widget-panel\.expanded\s*\{[^}]*width:\s*min\(720px, 100vw - 40px\);/)
+    expect(block).toMatch(
+      /\.xagent-widget-panel\.expanded\s*\{[^}]*height:\s*calc\(100vh - 100px - 40px\);/,
+    )
     expect(block).toMatch(/\.xagent-widget-panel\.expanded\s+\.xagent-widget-resize-handle\s*\{[^}]*display:\s*none;/)
     expect(mobileBlock()).not.toMatch(/\.xagent-widget-panel\.expanded/)
+    expect(styleText()).toMatch(/max-height:\s*calc\(100vh - 100px - 40px\);/)
   })
 
   it("collapses the panel, restoring its normal width, when the iframe posts widget_collapse", () => {

@@ -156,9 +156,15 @@ describe("WidgetChromeControls", () => {
     render(<WidgetChromeControls />)
 
     fireEvent.click(screen.getByRole("button", { name: "widgetChat.moreOptions" }))
-    expect(
-      screen.getByRole("menuitem", { name: "widgetChat.expandWindow" }).querySelector("svg[data-icon='expand']"),
-    ).not.toBeNull()
+    const expandIcon = screen.getByRole("menuitem", { name: "widgetChat.expandWindow" })
+      .querySelector("svg[data-icon='expand']")
+    expect(expandIcon).not.toBeNull()
+    // data-icon is authored by this component's own branch, so it survives a
+    // source edit that swaps which Lucide icon actually renders there. The
+    // polyline's `points` geometry comes from lucide-react's own icon
+    // definition and differs per icon, so it can't drift out of sync the
+    // same way -- a real assertion of icon identity, not just the label.
+    expect(expandIcon?.querySelector("polyline[points='15 3 21 3 21 9']")).not.toBeNull()
     fireEvent.click(screen.getByRole("menuitem", { name: "widgetChat.expandWindow" }))
 
     expect(postMessageSpy).toHaveBeenCalledWith(
@@ -169,9 +175,10 @@ describe("WidgetChromeControls", () => {
     expect(screen.queryByRole("menu")).toBeNull()
 
     fireEvent.click(screen.getByRole("button", { name: "widgetChat.moreOptions" }))
-    expect(
-      screen.getByRole("menuitem", { name: "widgetChat.collapseWindow" }).querySelector("svg[data-icon='collapse']"),
-    ).not.toBeNull()
+    const collapseIcon = screen.getByRole("menuitem", { name: "widgetChat.collapseWindow" })
+      .querySelector("svg[data-icon='collapse']")
+    expect(collapseIcon).not.toBeNull()
+    expect(collapseIcon?.querySelector("polyline[points='4 14 10 14 10 20']")).not.toBeNull()
 
     fireEvent.click(screen.getByRole("menuitem", { name: "widgetChat.collapseWindow" }))
 

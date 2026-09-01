@@ -449,6 +449,45 @@ describe("SessionAgentChatPage", () => {
     expect(app.provider?.transport?.session?.connection).toBeNull()
   })
 
+  it("keeps an accepted expansion across a degraded/active remount instead of resetting to Expand", () => {
+    // WidgetChromeControls is torn down and rebuilt across this transition
+    // (the degraded branch renders a completely different subtree with no
+    // header at all), so its own isExpanded state can't survive it -- this
+    // is why SessionAgentChatPage lifts and passes it down as a controlled
+    // prop instead of leaving it as the component's internal useState.
+    const postMessageSpy = vi.fn()
+    vi.stubGlobal("parent", { postMessage: postMessageSpy })
+    setBridge("active", activeSession())
+    app.state.taskId = 71
+    app.isConnected = true
+
+    const { rerender } = render(<SessionAgentChatPage />)
+    fireEvent.click(screen.getByRole("button", { name: "widgetChat.moreOptions" }))
+    fireEvent.click(screen.getByRole("menuitem", { name: "widgetChat.expandWindow" }))
+    expect(postMessageSpy).toHaveBeenCalledWith(
+      { xagent: true, v: 1, type: "widget_expand" },
+      "*",
+    )
+
+    setBridge("degraded", null)
+    rerender(<SessionAgentChatPage />)
+    expect(screen.getByRole("heading", {
+      name: "widgetSession.unavailable.title",
+    })).toBeInTheDocument()
+
+    setBridge("active", activeSession())
+    app.state.taskId = 71
+    rerender(<SessionAgentChatPage />)
+
+    fireEvent.click(screen.getByRole("button", { name: "widgetChat.moreOptions" }))
+    expect(screen.getByRole("menuitem", { name: "widgetChat.collapseWindow" })).toBeInTheDocument()
+    fireEvent.click(screen.getByRole("menuitem", { name: "widgetChat.collapseWindow" }))
+    expect(postMessageSpy).toHaveBeenCalledWith(
+      { xagent: true, v: 1, type: "widget_collapse" },
+      "*",
+    )
+  })
+
   it.each([
     ["session_expired", "widgetSession.expired.title", "widgetSession.expired.description"],
     ["grant_expired", "widgetSession.expired.title", "widgetSession.expired.description"],

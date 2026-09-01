@@ -617,11 +617,15 @@ OAUTH_REFRESH_RETRY_BASE_DELAY_SECONDS = 0.5
 # grant and issued a new refresh_token but the response was lost to a
 # ReadTimeout/WriteTimeout (request already sent, outcome unknown), a
 # retry would resend the now-stale refresh_token and get back a genuine
-# invalid_grant -- which _raise_if_permanent_oauth_refresh_error correctly
-# treats as confirmed-dead and deletes the connection, silently
-# reproducing the exact bug this refresh path was fixed to avoid. A
-# connect-phase failure never got that far, and a 5xx is the provider's
-# own signal that it didn't process the request, so both are safe.
+# invalid_grant for a token that, moments ago, was perfectly valid --
+# indistinguishable from an actually-dead token and forcing an
+# unnecessary reconnect. A connect-phase failure never got that far, so
+# it's unconditionally safe to retry. A 5xx is conventionally treated the
+# same way (the provider's own signal that it didn't process the
+# request) -- not an absolute guarantee, but the standard assumption
+# behind retrying 5xx across virtually every HTTP client's default retry
+# policy, and a much narrower risk window than a timeout that could land
+# on either side of the provider actually persisting the grant.
 _OAUTH_REFRESH_RETRYABLE_EXCEPTIONS = (httpx.ConnectError, httpx.ConnectTimeout)
 
 

@@ -90,14 +90,17 @@ def _meta_oauth_account(user) -> UserOAuth:
 
 
 @pytest.fixture(autouse=True)
-def _no_real_sleep(monkeypatch):
-    """The retry backoff would otherwise add real wall-clock delay to
-    every test in this file."""
+def sleep_delays(monkeypatch):
+    """Replace the retry backoff's real wall-clock sleep with one that
+    records the delay it was asked for, so tests can assert on the
+    backoff/jitter formula instead of just the resulting call count."""
+    delays: list[float] = []
 
-    async def instant_sleep(_seconds: float) -> None:
-        return None
+    async def instant_sleep(seconds: float) -> None:
+        delays.append(seconds)
 
     monkeypatch.setattr(tool_config.asyncio, "sleep", instant_sleep)
+    return delays
 
 
 class _FakeAsyncClient:
@@ -128,7 +131,7 @@ class _FakeAsyncClient:
 
 @pytest.mark.asyncio
 async def test_refresh_retries_transient_network_error_then_succeeds(
-    db_session, monkeypatch
+    db_session, monkeypatch, sleep_delays
 ):
     db, user = db_session
     oauth_account = _github_oauth_account(user)
@@ -152,6 +155,68 @@ async def test_refresh_retries_transient_network_error_then_succeeds(
         is True
     )
     assert len(calls) == 2
+    assert oauth_account.access_token == "new-token"
+    # base delay (0.5s) plus up to a full base delay of jitter -- see
+    # OAUTH_REFRESH_RETRY_BASE_DELAY_SECONDS and the backoff formula in
+    # _request_oauth_refresh_with_retries.
+    assert len(sleep_delays) == 1
+    assert 0.5 <= sleep_delays[0] < 1.0
+
+
+@pytest.mark.asyncio
+async def test_refresh_retries_connect_error_then_succeeds(db_session, monkeypatch):
+    """ConnectError (e.g. connection refused, DNS failure) is a distinct
+    exception from ConnectTimeout but carries the same "request never
+    transmitted" guarantee -- make sure it's retried too, not just
+    ConnectTimeout."""
+    db, user = db_session
+    oauth_account = _github_oauth_account(user)
+    db.add(oauth_account)
+    db.commit()
+
+    calls: list[int] = []
+
+    async def post(*args, **kwargs):
+        calls.append(1)
+        if len(calls) == 1:
+            raise httpx.ConnectError("connection refused")
+        return MockResponse({"access_token": "new-token", "expires_in": 3600})
+
+    monkeypatch.setattr(
+        tool_config.httpx, "AsyncClient", lambda: _FakeAsyncClient(post)
+    )
+
+    assert (
+        await tool_config.refresh_oauth_token_if_needed(db, oauth_account, "github")
+        is True
+    )
+    assert len(calls) == 2
+    assert oauth_account.access_token == "new-token"
+
+
+@pytest.mark.asyncio
+async def test_refresh_succeeds_on_first_try_without_retry(db_session, monkeypatch):
+    """The plain happy path: no failure, no retry spent."""
+    db, user = db_session
+    oauth_account = _github_oauth_account(user)
+    db.add(oauth_account)
+    db.commit()
+
+    calls: list[int] = []
+
+    async def post(*args, **kwargs):
+        calls.append(1)
+        return MockResponse({"access_token": "new-token", "expires_in": 3600})
+
+    monkeypatch.setattr(
+        tool_config.httpx, "AsyncClient", lambda: _FakeAsyncClient(post)
+    )
+
+    assert (
+        await tool_config.refresh_oauth_token_if_needed(db, oauth_account, "github")
+        is True
+    )
+    assert len(calls) == 1
     assert oauth_account.access_token == "new-token"
 
 
@@ -230,7 +295,40 @@ async def test_refresh_gives_up_after_max_attempts_on_persistent_network_error(
         await tool_config.refresh_oauth_token_if_needed(db, oauth_account, "github")
         is False
     )
-    assert len(calls) == tool_config.OAUTH_REFRESH_MAX_ATTEMPTS
+    # Asserts the literal attempt count (2), not tool_config.OAUTH_REFRESH_
+    # MAX_ATTEMPTS -- reading the same constant the code under test uses
+    # would make this self-referential and unable to catch a regression in
+    # the intended attempt count.
+    assert len(calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_refresh_gives_up_after_max_attempts_on_persistent_5xx(
+    db_session, monkeypatch
+):
+    """The exception-exhaustion case above has a response-based sibling:
+    every attempt returning 5xx (never an exception) must also give up
+    after OAUTH_REFRESH_MAX_ATTEMPTS and return False, not retry forever."""
+    db, user = db_session
+    oauth_account = _github_oauth_account(user)
+    db.add(oauth_account)
+    db.commit()
+
+    calls: list[int] = []
+
+    async def post(*args, **kwargs):
+        calls.append(1)
+        return MockResponse({"error": "server_error"}, status_code=503)
+
+    monkeypatch.setattr(
+        tool_config.httpx, "AsyncClient", lambda: _FakeAsyncClient(post)
+    )
+
+    assert (
+        await tool_config.refresh_oauth_token_if_needed(db, oauth_account, "github")
+        is False
+    )
+    assert len(calls) == 2
 
 
 @pytest.mark.asyncio

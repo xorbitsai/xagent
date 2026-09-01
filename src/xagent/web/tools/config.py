@@ -626,7 +626,15 @@ OAUTH_REFRESH_RETRY_BASE_DELAY_SECONDS = 0.5
 # behind retrying 5xx across virtually every HTTP client's default retry
 # policy, and a much narrower risk window than a timeout that could land
 # on either side of the provider actually persisting the grant.
-_OAUTH_REFRESH_RETRYABLE_EXCEPTIONS = (httpx.ConnectError, httpx.ConnectTimeout)
+_OAUTH_REFRESH_RETRYABLE_EXCEPTIONS = (
+    httpx.ConnectError,
+    httpx.ConnectTimeout,
+    # A proxy-handshake failure (e.g. an env-configured egress proxy,
+    # trust_env=True is httpx's default) means the request never reached
+    # the actual token endpoint either -- same "never transmitted"
+    # guarantee as ConnectError, just one hop earlier.
+    httpx.ProxyError,
+)
 
 
 async def _request_oauth_refresh_with_retries(

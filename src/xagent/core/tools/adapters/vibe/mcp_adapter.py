@@ -8,6 +8,7 @@ import asyncio
 import inspect
 import json
 import logging
+import math
 import os
 import re
 import weakref
@@ -106,6 +107,260 @@ _HTTP_401_TEXT_RE = re.compile(
     r"\b401\s+unauthorized\b",
     re.IGNORECASE,
 )
+
+# Caps one field's `description` and one field's `pattern`, both of which reach
+# the model on every LLM call. 200 mirrors the cap the repo already uses for
+# a model-facing one-line summary (`INDEX_ENTRY_MAX_CHARS`). `description` and
+# `pattern` share this number, so lowering it also drops mid-length patterns
+# entirely: a pattern is emitted whole or not at all and is never truncated.
+_FIELD_TEXT_MAX_CHARS = 200
+# Caps one field's `format`, a short identifier token such as `date-time` or
+# `uri`. 64 mirrors the repo's short-identifier cap (`MAX_AGENT_TOOL_NAME_
+# LENGTH`, `STRIP_LOG_MAX_TOOL_NAME_CHARS`, `COMPACT_DROPPED_TOOL_NAME_MAX_
+# CHARS`). `format` is emitted whole or not at all and is never truncated.
+_FIELD_TOKEN_MAX_CHARS = 64
+# `format` values the JSON Schema vocabulary defines. MCP servers are untrusted
+# input, and `format` is emitted verbatim, so only known tokens pass; anything
+# else is dropped rather than forwarded to the model as authoritative text.
+_KNOWN_FIELD_FORMATS = frozenset(
+    {
+        "date-time",
+        "date",
+        "time",
+        "duration",
+        "email",
+        "idn-email",
+        "hostname",
+        "idn-hostname",
+        "ipv4",
+        "ipv6",
+        "uri",
+        "uri-reference",
+        "iri",
+        "iri-reference",
+        "uuid",
+        "uri-template",
+        "json-pointer",
+        "relative-json-pointer",
+        "regex",
+        "byte",
+        "binary",
+        "password",
+        "int32",
+        "int64",
+        "float",
+        "double",
+    }
+)
+
+# Numeric field-schema keys carried through, in the order they are emitted.
+# Each is accepted or dropped on its own value; one key never affects another.
+_FIELD_NUMERIC_METADATA_KEYS = ("minLength", "maxLength", "minimum", "maximum")
+
+
+def _json_equal(a: Any, b: Any) -> bool:
+    """Compare two JSON values using JSON's own type distinctions.
+
+    JSON Schema treats booleans and numbers as different types, while Python
+    holds ``True == 1``. Enum membership follows JSON, not Python.
+    """
+    if isinstance(a, bool) != isinstance(b, bool):
+        return False
+    return bool(a == b)
+
+
+def _compact_json(value: Any) -> str:
+    """Serialize a value the way the emitted tool schema will carry it.
+
+    ``allow_nan=False`` matches the provider clients, which reject non-finite
+    numbers, so a value that cannot be serialized here would fail the LLM call.
+    """
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
+
+
+def _is_json_serializable(value: Any) -> bool:
+    try:
+        _compact_json(value)
+    except (TypeError, ValueError):
+        return False
+    return True
+
+
+def _is_finite_number(value: Any) -> bool:
+    """Whether a value is a JSON number, excluding booleans and non-finite floats."""
+    return (
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and math.isfinite(value)
+    )
+
+
+def _bounded_field_text(value: str) -> str:
+    """Collapse a field description to a bounded single line."""
+    text = " ".join(value.split())
+    if len(text) <= _FIELD_TEXT_MAX_CHARS:
+        return text
+    return text[: _FIELD_TEXT_MAX_CHARS - 1].rstrip() + "…"
+
+
+def _emitted_default(field_schema: Mapping[str, Any]) -> tuple[Any, bool]:
+    """Return the default an optional field emits, and whether the server chose it.
+
+    An optional field the server gave no default still emits ``None``, because
+    that is what makes it optional. That ``None`` is this adapter's doing, not
+    something the connector author asserted, and the second element says so.
+
+    A non-finite default survives ``json.loads`` and would be emitted into the
+    tool schema, where the provider client refuses to serialize it and every
+    LLM call for the agent fails -- not only calls to this tool. Only a bare
+    float needs this guard: a non-finite float nested inside a list or object
+    default is already rendered as null by the schema serializer. Replacing it
+    also makes the emitted default this adapter's own, so it is reported the
+    same way as an absent one.
+    """
+    if "default" not in field_schema:
+        return None, False
+    declared = field_schema["default"]
+    if isinstance(declared, float) and not math.isfinite(declared):
+        return None, False
+    return declared, True
+
+
+def _field_metadata_candidates(
+    field_schema: Mapping[str, Any],
+    *,
+    emitted_default: Any,
+    default_is_authored: bool,
+) -> tuple[list[tuple[str, Any]], int]:
+    """Return the metadata one field may emit, in fixed key order.
+
+    ``field_schema`` comes from an MCP server and is untrusted, so every key is
+    judged on its own: a rejected key never removes another key, the field, or
+    the tool. The order is fixed here rather than taken from the incoming
+    mapping, so a server reordering its JSON cannot change what is emitted.
+    The input is not modified. The second element counts the present keys that
+    were rejected.
+    """
+    candidates: list[tuple[str, Any]] = []
+    rejected = 0
+
+    if "description" in field_schema:
+        raw_description = field_schema["description"]
+        if isinstance(raw_description, str) and raw_description.split():
+            candidates.append(("description", _bounded_field_text(raw_description)))
+        else:
+            rejected += 1
+
+    if "enum" in field_schema:
+        raw_enum = field_schema["enum"]
+        # An over-long enum is dropped whole rather than shortened: a clipped
+        # list still reads as the complete set of legal values, so it would
+        # tell the model that a value the server accepts is illegal.
+        # A default the author wrote that sits outside their own enum
+        # contradicts itself, and the enum is the half this code chose to add,
+        # so the enum gives way. A default this adapter invented carries no
+        # such claim: dropping the author's enum over a `null` they never wrote
+        # would silence the enum on exactly the shape it helps most, an
+        # optional field with no default. Membership is tested member by member
+        # because enum members may be objects, which no hash-based container
+        # would accept.
+        if (
+            isinstance(raw_enum, list)
+            and raw_enum
+            and _is_json_serializable(raw_enum)
+            and len(_compact_json(raw_enum)) <= _FIELD_TEXT_MAX_CHARS
+            and (
+                not default_is_authored
+                or any(_json_equal(emitted_default, member) for member in raw_enum)
+            )
+        ):
+            candidates.append(("enum", list(raw_enum)))
+        else:
+            rejected += 1
+
+    if "pattern" in field_schema:
+        raw_pattern = field_schema["pattern"]
+        pattern = " ".join(raw_pattern.split()) if isinstance(raw_pattern, str) else ""
+        # A truncated regex is syntactically invalid yet still reads to the
+        # model as an authoritative rule, so an over-long pattern is dropped.
+        if pattern and len(pattern) <= _FIELD_TEXT_MAX_CHARS:
+            candidates.append(("pattern", pattern))
+        else:
+            rejected += 1
+
+    if "format" in field_schema:
+        raw_format = field_schema["format"]
+        # The whitelist already bounds the length -- its longest member is well
+        # under the cap -- so the cap is a stated ceiling on this key rather
+        # than a test that decides any real input.
+        if (
+            isinstance(raw_format, str)
+            and len(raw_format) <= _FIELD_TOKEN_MAX_CHARS
+            and raw_format in _KNOWN_FIELD_FORMATS
+        ):
+            candidates.append(("format", raw_format))
+        else:
+            rejected += 1
+
+    for key in _FIELD_NUMERIC_METADATA_KEYS:
+        if key not in field_schema:
+            continue
+        value = field_schema[key]
+        if _is_finite_number(value):
+            candidates.append((key, value))
+        else:
+            rejected += 1
+
+    return candidates, rejected
+
+
+def _tool_field_metadata(
+    properties: Mapping[str, Any],
+    required: Any,
+    excluded_names: set[str],
+) -> tuple[dict[str, tuple[Optional[str], dict[str, Any]]], int]:
+    """Decide the metadata every field of one tool emits.
+
+    Fields are independent: each key is capped on its own, so nothing one field
+    declares can change what another field emits.
+
+    Returns the per-field description and schema extras, and how many present
+    keys were rejected on their own contents.
+    """
+    metadata: dict[str, tuple[Optional[str], dict[str, Any]]] = {}
+    rejected_keys = 0
+
+    for field_name, field_schema in properties.items():
+        if field_name in excluded_names:
+            continue
+        if not isinstance(field_schema, Mapping):
+            continue
+
+        if field_name in required:
+            emitted_default: Any = None
+            default_is_authored = False
+        else:
+            emitted_default, default_is_authored = _emitted_default(field_schema)
+
+        candidates, rejected = _field_metadata_candidates(
+            field_schema,
+            emitted_default=emitted_default,
+            default_is_authored=default_is_authored,
+        )
+        rejected_keys += rejected
+
+        description: Optional[str] = None
+        extra: dict[str, Any] = {}
+        for key, value in candidates:
+            if key == "description":
+                description = value
+            else:
+                extra[key] = value
+
+        if description is not None or extra:
+            metadata[field_name] = (description, extra)
+
+    return metadata, rejected_keys
 
 
 def _bounded_exception_nodes(
@@ -506,7 +761,19 @@ class MCPToolAdapter(AbstractBaseTool):
         return True
 
     def _build_args_model(self) -> Type[BaseModel]:
-        """Build Pydantic model from MCP tool input schema."""
+        """Build Pydantic model from MCP tool input schema.
+
+        Field-level metadata the connector author wrote (description, enum,
+        pattern, format and the length/range bounds) is carried through to the
+        emitted schema as presentation only: it goes in as
+        ``json_schema_extra``, which never becomes a Pydantic validator, so
+        argument validation behaves exactly as it would without it.
+
+        A field's default is the one exception, and it is not presentation: a
+        non-finite default is replaced by ``None``, so such a field is omitted
+        from the arguments sent to the server instead of carrying a value no
+        provider client can serialize.
+        """
         try:
             if not self.mcp_tool.inputSchema:
                 # No input parameters
@@ -532,19 +799,45 @@ class MCPToolAdapter(AbstractBaseTool):
             # Build field definitions for create_model
             fields: Dict[str, Any] = {}
             runtime_bound_args = self._runtime_bound_tool_argument_names(properties)
+            metadata, rejected_keys = _tool_field_metadata(
+                properties, required, runtime_bound_args
+            )
 
             for field_name, field_schema in properties.items():
                 if field_name in runtime_bound_args:
                     continue
                 field_type = self._json_schema_to_python_type(field_schema)
+                description, extra = metadata.get(field_name, (None, {}))
 
                 # Check if field is required
                 if field_name in required:
-                    fields[field_name] = (field_type, ...)
+                    default_value: Any = ...
+                    annotation: Any = field_type
                 else:
                     # Optional field with default
-                    default_value = field_schema.get("default", None)
-                    fields[field_name] = (Optional[field_type], default_value)
+                    default_value, _ = _emitted_default(field_schema)
+                    annotation = Optional[field_type]
+
+                if description is None and not extra:
+                    # A field with nothing to say keeps the plain tuple form,
+                    # so its emitted schema is unchanged.
+                    fields[field_name] = (annotation, default_value)
+                else:
+                    fields[field_name] = (
+                        annotation,
+                        Field(
+                            default=default_value,
+                            description=description,
+                            json_schema_extra=extra or None,
+                        ),
+                    )
+
+            if rejected_keys:
+                logger.debug(
+                    "MCP tool %s rejected %d field schema metadata keys",
+                    self.mcp_tool.name,
+                    rejected_keys,
+                )
 
             # Create the model
             model_name = f"{self.mcp_tool.name.title().replace('_', '')}Args"

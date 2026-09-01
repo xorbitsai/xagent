@@ -673,6 +673,9 @@ async def test_stop_during_the_loading_message_removes_it_and_replies(
         async def get_agent_for_task(self, *_args, **_kwargs):  # type: ignore[no-untyped-def]
             return agent_service
 
+        def refresh_connector_runtime_tools(self, _task_id):  # type: ignore[no-untyped-def]
+            pass
+
     monkeypatch.setattr(
         "xagent.web.channels.telegram.bot.get_agent_manager",
         lambda: FakeAgentManager(),
@@ -1427,9 +1430,14 @@ async def test_empty_output_edits_the_loading_message_with_a_placeholder(
         set_recovered_skill_context=lambda _context: None,
     )
 
+    refresh_calls: list[int] = []
+
     class FakeAgentManager:
         async def get_agent_for_task(self, *_args, **_kwargs):  # type: ignore[no-untyped-def]
             return agent_service
+
+        def refresh_connector_runtime_tools(self, task_id):  # type: ignore[no-untyped-def]
+            refresh_calls.append(task_id)
 
         def execute_task(self, **_kwargs):  # type: ignore[no-untyped-def]
             async def run() -> str:
@@ -1514,6 +1522,7 @@ async def test_empty_output_edits_the_loading_message_with_a_placeholder(
     message = Message()
     await bot._process_user_messages_batch(123, [message])  # type: ignore[arg-type]
 
+    assert refresh_calls == [44]
     assert len(edits) == 1
     assert edits[0].strip() != ""
     assert "Task completed." in edits[0]
@@ -1578,6 +1587,9 @@ async def test_channel_failure_suppresses_stale_error_after_exact_settlement_rej
     class FakeAgentManager:
         async def get_agent_for_task(self, *_args, **_kwargs):  # type: ignore[no-untyped-def]
             return agent_service
+
+        def refresh_connector_runtime_tools(self, _task_id):  # type: ignore[no-untyped-def]
+            pass
 
         async def execute_task(self, **_kwargs):  # type: ignore[no-untyped-def]
             raise RuntimeError("channel execution failed")

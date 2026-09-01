@@ -1259,9 +1259,14 @@ async def test_successful_slack_turn_reuses_channel_runtime(
         set_recovered_skill_context=lambda _context: None,
     )
 
+    refresh_calls: list[int] = []
+
     class FakeAgentManager:
         async def get_agent_for_task(self, *_args: Any, **_kwargs: Any) -> Any:
             return agent_service
+
+        def refresh_connector_runtime_tools(self, task_id: int) -> None:
+            refresh_calls.append(task_id)
 
         async def execute_task(self, **_kwargs: Any) -> dict[str, Any]:
             return {"success": True, "output": "Slack reply"}
@@ -1322,6 +1327,7 @@ async def test_successful_slack_turn_reuses_channel_runtime(
 
     assert bot.active_tasks == {"T1:D1:U1:direct": 45}
     assert persisted[0]["content"] == "hello"
+    assert refresh_calls == [45]
     assert finalized == [(TaskStatus.COMPLETED, "Slack reply")]
     assert final_messages == [
         {

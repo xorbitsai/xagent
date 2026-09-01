@@ -286,6 +286,12 @@ class FeishuBotInstance:
                 task_setup_snapshot=setup_snapshot,
                 task_owner_user_id=owner_user_id,
             )
+            # Same nudge as the websocket/A2A/v1 resume paths: a cached
+            # AgentService whose tools were already built (e.g. paused
+            # waiting for the user to connect an app) would otherwise keep
+            # its stale MCP config forever, and a Feishu reply is one of
+            # the ways a connect_apps pause gets answered.
+            agent_manager.refresh_connector_runtime_tools(task_id)
             agent_service.set_conversation_history(
                 [dict(message) for message in setup_snapshot.conversation_history]
             )

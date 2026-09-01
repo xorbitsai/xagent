@@ -608,9 +608,15 @@ def _oauth_launch_config_mapping(
     raise _OAuthLaunchConfigInvalid(field="type")
 
 
-_OAUTH_PERMANENT_REFRESH_ERROR_CODES = frozenset(
-    {"invalid_grant", "invalid_client", "unauthorized_client"}
-)
+# Only invalid_grant describes THIS account's refresh token specifically
+# (revoked/expired/already used) -- RFC 6749's invalid_client and
+# unauthorized_client instead describe the OAuthProvider row's own
+# client_id/client_secret or grant-type authorization, the same class of
+# admin-fixable, self-healing config problem refresh_oauth_token_if_needed's
+# own "missing CLIENT_ID or SECRET" check already treats as transient.
+# Bundling them in here would mass-delete every user's connection to a
+# provider over one admin typo.
+_OAUTH_PERMANENT_REFRESH_ERROR_CODES = frozenset({"invalid_grant"})
 
 
 class _OAuthRefreshPermanentlyInvalid(Exception):
@@ -625,12 +631,14 @@ class _OAuthRefreshPermanentlyInvalid(Exception):
 def _oauth_refresh_error_code(response: httpx.Response) -> str | None:
     """Best-effort OAuth ``error`` code from a failed refresh response body.
 
-    Most providers use the standard top-level string ``error`` field. Meta
-    nests its error as an object instead (``{"error": {"type":
-    "OAuthException", "code": 190, ...}}``); code 190 is Meta's documented
-    "access token is invalid/expired" signal, so it's normalized to the
-    standard ``invalid_grant`` code the caller already recognizes.
+    Most providers use the standard top-level string ``error`` field.
+    Provider-specific shapes (e.g. Meta's nested error object) are
+    normalized via oauth_provider_quirks, shared with the initial code
+    exchange in api/auth.py so a quirk fixed in one lifecycle path can't
+    silently regress in the other.
     """
+    from ..oauth_provider_quirks import meta_invalid_token_error_code
+
     try:
         data = response.json()
     except ValueError:
@@ -640,13 +648,7 @@ def _oauth_refresh_error_code(response: httpx.Response) -> str | None:
     error = data.get("error")
     if isinstance(error, str) and error:
         return error
-    if (
-        isinstance(error, Mapping)
-        and error.get("type") == "OAuthException"
-        and error.get("code") == 190
-    ):
-        return "invalid_grant"
-    return None
+    return meta_invalid_token_error_code(error)
 
 
 def _raise_if_permanent_oauth_refresh_error(

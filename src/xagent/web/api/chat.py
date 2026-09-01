@@ -2160,6 +2160,26 @@ class AgentServiceManager:
             ExecutionScope, None, ExecutionScopeNotProvided
         ] = EXECUTION_SCOPE_NOT_PROVIDED,
     ) -> AgentService:
+        """Fetch or build the cached ``AgentService`` for a task.
+
+        A cached instance's connector/MCP tool config can go stale between
+        calls (e.g. the user connects an app while the task was paused on a
+        ``connect_apps`` interaction). ``connector_runtime_turn_id`` is only
+        for a call site that owns a turn id genuinely tied to the execution
+        storing that turn's ephemeral connector secrets (e.g. a fresh
+        execution's own turn id) - passing a fabricated one to force a
+        rebuild corrupts that lookup for V1/SDK tasks (see
+        ``WebToolConfig.invalidate_connector_runtime_cache``'s docstring).
+
+        Any OTHER caller resuming a task that might have paused on
+        ``connect_apps`` - a resume command, an inbound message on a
+        channel, an A2A/v1 REST reply - must call
+        ``AgentServiceManager.refresh_connector_runtime_tools(task_id)``
+        itself right after this returns, instead of passing a turn id here.
+        Forgetting that call is the root cause fixed at every one of this
+        method's current resume call sites; there's no way for this method
+        to detect or enforce it on your behalf.
+        """
         lock = self._agent_build_locks.get(task_id)
         if lock is None:
             lock = asyncio.Lock()

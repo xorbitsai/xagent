@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import threading
 import time
 from collections.abc import Iterator
@@ -53,6 +54,7 @@ from xagent.web.models.task import TraceEvent as DatabaseTraceEvent
 from xagent.web.models.task_interaction import TaskInteractionRequest
 from xagent.web.models.user import User
 from xagent.web.models.workforce import WorkforceRun
+from xagent.web.services import interaction_rollout as ir
 from xagent.web.services.ops_signals import (
     CHECKPOINT_PRUNE_FAILED,
     active_degradations,
@@ -77,6 +79,17 @@ def _shared_memory_sqlite_engine():
         connect_args={"check_same_thread": False},
         poolclass=StaticPool,
     )
+
+
+@pytest.fixture(autouse=True)
+def _reset_interaction_counters() -> Iterator[None]:
+    """The counter registry is process-global; clear it on both sides of
+    every test so one test's counts can never be read by another."""
+    ir._counters.clear()
+    try:
+        yield
+    finally:
+        ir._counters.clear()
 
 
 def test_agent_checkpoint_is_not_converted_to_websocket_stream_event() -> None:
@@ -1570,6 +1583,7 @@ def test_database_trace_handler_load_pk_anchor_single_fault_raises_corrupt(
 
 def test_database_trace_handler_load_pk_anchor_absent_run_field_defers_to_scan(
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """A pointer row missing the run-partition field entirely -- the shape
     the 20260804 backfill produces from a trace_events row written before
@@ -1606,7 +1620,8 @@ def test_database_trace_handler_load_pk_anchor_absent_run_field_defers_to_scan(
     db.add(row)
     db.commit()
     db.refresh(row)
-    task.last_checkpoint_trace_event_id = row.id
+    row_id = row.id
+    task.last_checkpoint_trace_event_id = row_id
     db.commit()
 
     def get_test_db() -> Iterator[Session]:
@@ -1618,6 +1633,7 @@ def test_database_trace_handler_load_pk_anchor_absent_run_field_defers_to_scan(
 
     monkeypatch.setattr("xagent.web.api.trace_handlers.get_db", get_test_db)
 
+    caplog.set_level(logging.WARNING, logger="xagent.web.api.trace_handlers")
     try:
         with bind_task_lease_context(TaskLease(task_id, "runner-a", "run-a")):
             assert (
@@ -1628,6 +1644,25 @@ def test_database_trace_handler_load_pk_anchor_absent_run_field_defers_to_scan(
             )
     finally:
         db.close()
+
+    # The read returning None is not by itself the contract. On the
+    # websocket ``resume_task`` path this None becomes an empty context and
+    # a run with no replay history, and nothing downstream turns that into
+    # an error the caller can see -- so the warning and the counter are the
+    # only evidence the reclassification fired at all. Assert both, at the
+    # same strength the write-direction resolver's own test asserts them
+    # (tests/web/services/test_task_interaction_anchor.py).
+    assert ir.counters_snapshot() == {
+        ir.COUNTER_CHECKPOINT_ABSENT_MISSING_RUN_PARTITION: 1
+    }
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1, caplog.records
+    assert warnings[0].msg == (
+        "Task %s's checkpoint pointer %s is missing its "
+        "run-partition field; deferring to the legacy scan "
+        "rather than reporting the row as corrupt"
+    )
+    assert warnings[0].args == (task_id, row_id)
 
 
 def test_database_trace_handler_load_pk_anchor_without_execution_identity_loads(

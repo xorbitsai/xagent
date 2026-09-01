@@ -30,6 +30,10 @@ from ...web.models.task import Task, TaskStatus
 from ...web.models.task import TraceEvent as DatabaseTraceEvent
 from ...web.models.task_interaction import TaskInteractionRequest
 from ...web.models.tool_config import ToolUsage
+from ...web.services.interaction_rollout import (
+    COUNTER_CHECKPOINT_ABSENT_MISSING_RUN_PARTITION,
+    increment_counter,
+)
 from ...web.services.ops_signals import (
     CHECKPOINT_DECODE_FALLBACK,
     CHECKPOINT_LOAD_UNAVAILABLE,
@@ -582,13 +586,28 @@ class DatabaseTraceHandler(BaseTraceHandler):
                 # it, concluding "no checkpoint". Deferring reaches that
                 # same verdict rather than turning a pre-existing row into a
                 # permanent corruption error.
-                logger.info(
+                #
+                # Warning, not info, and counted: one caller of this read --
+                # the websocket ``resume_task`` handler
+                # (``_handle_resume_task_unserialized``) -- has no
+                # ``post_user_message`` gate ahead of it, unlike the other
+                # three ``execute_resume_background`` call sites. On that
+                # path a deferral that finds nothing means the resumed run
+                # starts from an empty context instead of the caller's
+                # saved progress, and nothing downstream reports that: the
+                # runner does not raise for ``checkpoint=None``, and
+                # ``execute_resume_background``'s own "no resumable
+                # checkpoint" guard only fires on a ``None`` result, which
+                # this path never produces. This line and its counter are
+                # the only record that it happened.
+                logger.warning(
                     "Task %s's checkpoint pointer %s is missing its "
                     "run-partition field; deferring to the legacy scan "
                     "rather than reporting the row as corrupt",
                     self.task_id,
                     pointer_id,
                 )
+                increment_counter(COUNTER_CHECKPOINT_ABSENT_MISSING_RUN_PARTITION)
                 return _AnchorFallback()
             raise CheckpointCorruptError(
                 f"task {self.task_id}: checkpoint pointer {pointer_id} does "

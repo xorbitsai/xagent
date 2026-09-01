@@ -179,6 +179,15 @@ COUNTER_ANCHOR_ABSENT_LEGACY_CHECKPOINT_TYPE = "anchor.absent_legacy_checkpoint_
 COUNTER_ANCHOR_ABSENT_MISSING_RUN_PARTITION = "anchor.absent_missing_run_partition"
 COUNTER_ANCHOR_RESOLVED = "anchor.resolved"
 
+# Incremented by _load_pk_anchored_checkpoint (api/trace_handlers.py), the
+# checkpoint read path's own by-primary-key resolver -- the anchor.* family
+# above belongs to resolve_interaction_anchor and stays distinguishable from
+# this one, because the two reclassify the same row shape for different
+# callers and an operator needs to know which path is producing the rate.
+COUNTER_CHECKPOINT_ABSENT_MISSING_RUN_PARTITION = (
+    "checkpoint.absent_missing_run_partition"
+)
+
 # Two constants below are actively incremented, both from
 # task_interaction_service.py: COUNTER_COMPAT_READ_FALLBACK by the
 # compatibility view, COUNTER_LIFECYCLE_RESPONSE_CONFLICT by respond().

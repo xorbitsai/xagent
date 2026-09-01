@@ -628,14 +628,18 @@ class _OAuthRefreshPermanentlyInvalid(Exception):
     """
 
 
-def _oauth_refresh_error_code(response: httpx.Response) -> str | None:
+def _oauth_refresh_error_code(
+    response: httpx.Response, provider_name: str
+) -> str | None:
     """Best-effort OAuth ``error`` code from a failed refresh response body.
 
     Most providers use the standard top-level string ``error`` field.
     Provider-specific shapes (e.g. Meta's nested error object) are
     normalized via oauth_provider_quirks, shared with the initial code
     exchange in api/auth.py so a quirk fixed in one lifecycle path can't
-    silently regress in the other.
+    silently regress in the other -- gated on provider_name so an unrelated
+    provider whose error object happens to carry the same
+    type/code-shaped keys isn't misread as Meta's.
     """
     from ..oauth_provider_quirks import meta_invalid_token_error_code
 
@@ -648,7 +652,9 @@ def _oauth_refresh_error_code(response: httpx.Response) -> str | None:
     error = data.get("error")
     if isinstance(error, str) and error:
         return error
-    return meta_invalid_token_error_code(error)
+    if provider_name.lower() == "meta":
+        return meta_invalid_token_error_code(error)
+    return None
 
 
 def _raise_if_permanent_oauth_refresh_error(
@@ -748,7 +754,7 @@ async def refresh_oauth_token_if_needed(
                     )
                     return True
             else:
-                error_code = _oauth_refresh_error_code(response)
+                error_code = _oauth_refresh_error_code(response, provider_name)
                 logger.error(
                     "Failed to refresh %s token (status %s, error=%s)",
                     provider_name,
@@ -918,7 +924,7 @@ async def refresh_oauth_token_if_needed(
                 )
                 return True
         else:
-            error_code = _oauth_refresh_error_code(response)
+            error_code = _oauth_refresh_error_code(response, provider_name)
             logger.error(
                 "Failed to refresh %s token (status %s, error=%s)",
                 provider_name,

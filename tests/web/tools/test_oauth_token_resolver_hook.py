@@ -1213,7 +1213,22 @@ def test_oauth_refresh_error_code_rejects_malformed_bodies(response):
     a falsy-but-truthy value (e.g. "") that would defeat the `error_code or
     "unknown"` logging fallback or accidentally satisfy an `in` check
     against _OAUTH_PERMANENT_REFRESH_ERROR_CODES."""
-    assert web_tools_config._oauth_refresh_error_code(response) is None
+    assert web_tools_config._oauth_refresh_error_code(response, "google") is None
+
+
+def test_oauth_refresh_error_code_gates_meta_shape_on_provider():
+    """Meta's nested-error-object normalization must only apply when the
+    caller is actually refreshing a Meta connection -- an unrelated
+    provider whose error body happens to carry the same {"type":
+    "OAuthException", "code": 190} shape must not be misread as Meta's
+    "access token is invalid/expired" signal."""
+    response = httpx.Response(
+        400, json={"error": {"type": "OAuthException", "code": 190}}
+    )
+    assert web_tools_config._oauth_refresh_error_code(response, "meta") == (
+        "invalid_grant"
+    )
+    assert web_tools_config._oauth_refresh_error_code(response, "google") is None
 
 
 @pytest.mark.asyncio

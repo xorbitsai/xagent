@@ -608,15 +608,16 @@ def _oauth_launch_config_mapping(
     raise _OAuthLaunchConfigInvalid(field="type")
 
 
-# Only invalid_grant describes THIS account's refresh token specifically
-# (revoked/expired/already used) -- RFC 6749's invalid_client and
-# unauthorized_client instead describe the OAuthProvider row's own
+# invalid_grant (RFC 6749) and GitHub's non-standard equivalent
+# bad_refresh_token both describe THIS account's refresh token
+# specifically (revoked/expired/already used) -- RFC 6749's invalid_client
+# and unauthorized_client instead describe the OAuthProvider row's own
 # client_id/client_secret or grant-type authorization, the same class of
 # admin-fixable, self-healing config problem refresh_oauth_token_if_needed's
 # own "missing CLIENT_ID or SECRET" check already treats as transient.
 # Bundling them in here would mass-delete every user's connection to a
 # provider over one admin typo.
-_OAUTH_PERMANENT_REFRESH_ERROR_CODES = frozenset({"invalid_grant"})
+_OAUTH_PERMANENT_REFRESH_ERROR_CODES = frozenset({"invalid_grant", "bad_refresh_token"})
 
 
 class _OAuthRefreshPermanentlyInvalid(Exception):
@@ -634,12 +635,10 @@ def _oauth_refresh_error_code(
     """Best-effort OAuth ``error`` code from a failed refresh response body.
 
     Most providers use the standard top-level string ``error`` field.
-    Provider-specific shapes (e.g. Meta's nested error object) are
-    normalized via oauth_provider_quirks, shared with the initial code
-    exchange in api/auth.py so a quirk fixed in one lifecycle path can't
-    silently regress in the other -- gated on provider_name so an unrelated
-    provider whose error object happens to carry the same
-    type/code-shaped keys isn't misread as Meta's.
+    Meta's differently-shaped nested error object is normalized via
+    oauth_provider_quirks.meta_invalid_token_error_code -- gated on
+    provider_name so an unrelated provider whose error object happens to
+    carry the same type/code-shaped keys isn't misread as Meta's.
     """
     from ..oauth_provider_quirks import meta_invalid_token_error_code
 
@@ -657,18 +656,38 @@ def _oauth_refresh_error_code(
     return None
 
 
-def _raise_if_permanent_oauth_refresh_error(
-    *, status_code: int, error_code: str | None
-) -> None:
+def _raise_if_permanent_oauth_refresh_error(*, error_code: str | None) -> None:
     """Raise only when the provider's error body unambiguously says the
-    refresh token itself is dead. Any other 4xx/5xx (rate limiting, a
-    momentary outage, a malformed body) is left to the caller as a
-    transient failure -- see _OAuthRefreshPermanentlyInvalid.
+    refresh token itself is dead. Any other failure (an unrecognized error
+    code, a malformed/absent body) is left to the caller as a transient
+    failure -- see _OAuthRefreshPermanentlyInvalid.
+
+    Not gated on HTTP status: GitHub's classic OAuth Apps token endpoint
+    reports a dead refresh token (``{"error": "bad_refresh_token"}``) via a
+    200 response rather than a 4xx, so requiring 400/401 here would make
+    that case unclassifiable no matter what the caller checks.
     """
-    if status_code not in (400, 401):
-        return
     if error_code in _OAUTH_PERMANENT_REFRESH_ERROR_CODES:
         raise _OAuthRefreshPermanentlyInvalid()
+
+
+def _log_and_classify_failed_refresh(
+    *, response: httpx.Response, provider_name: str
+) -> None:
+    """Log a failed refresh response and raise _OAuthRefreshPermanentlyInvalid
+    when its body confirms the refresh token itself is dead. Shared by
+    every response shape that means "this refresh did not produce a usable
+    access_token" -- a non-200 status, and a 200 status whose body still
+    lacks access_token (see _raise_if_permanent_oauth_refresh_error).
+    """
+    error_code = _oauth_refresh_error_code(response, provider_name)
+    logger.error(
+        "Failed to refresh %s token (status %s, error=%s)",
+        provider_name,
+        response.status_code,
+        error_code or "unknown",
+    )
+    _raise_if_permanent_oauth_refresh_error(error_code=error_code)
 
 
 async def refresh_oauth_token_if_needed(
@@ -753,16 +772,14 @@ async def refresh_oauth_token_if_needed(
                         f"Successfully refreshed {provider_name} token for user {oauth_account.user_id}"
                     )
                     return True
-            else:
-                error_code = _oauth_refresh_error_code(response, provider_name)
-                logger.error(
-                    "Failed to refresh %s token (status %s, error=%s)",
-                    provider_name,
-                    response.status_code,
-                    error_code or "unknown",
+                # A 200 with no access_token still isn't a successful
+                # refresh -- see _log_and_classify_failed_refresh.
+                _log_and_classify_failed_refresh(
+                    response=response, provider_name=provider_name
                 )
-                _raise_if_permanent_oauth_refresh_error(
-                    status_code=response.status_code, error_code=error_code
+            else:
+                _log_and_classify_failed_refresh(
+                    response=response, provider_name=provider_name
                 )
             return False
 
@@ -923,16 +940,16 @@ async def refresh_oauth_token_if_needed(
                     f"Successfully refreshed {provider_name} token for user {oauth_account.user_id}"
                 )
                 return True
-        else:
-            error_code = _oauth_refresh_error_code(response, provider_name)
-            logger.error(
-                "Failed to refresh %s token (status %s, error=%s)",
-                provider_name,
-                response.status_code,
-                error_code or "unknown",
+            # A 200 with no access_token still isn't a successful refresh --
+            # e.g. GitHub's classic OAuth Apps token endpoint reports a dead
+            # refresh_token this way instead of via a 4xx. See
+            # _log_and_classify_failed_refresh.
+            _log_and_classify_failed_refresh(
+                response=response, provider_name=provider_name
             )
-            _raise_if_permanent_oauth_refresh_error(
-                status_code=response.status_code, error_code=error_code
+        else:
+            _log_and_classify_failed_refresh(
+                response=response, provider_name=provider_name
             )
 
     except _OAuthRefreshPermanentlyInvalid:

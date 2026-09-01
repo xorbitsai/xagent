@@ -1,0 +1,715 @@
+import json
+import socket
+from unittest.mock import Mock
+
+import pytest
+import requests
+
+from xagent.web.tools.mcp import zendesk
+
+
+def _fake_getaddrinfo(*ips):
+    def _impl(host, port, *args, **kwargs):
+        return [
+            (
+                socket.AF_INET6 if ":" in ip else socket.AF_INET,
+                socket.SOCK_STREAM,
+                6,
+                "",
+                (ip, port),
+            )
+            for ip in ips
+        ]
+
+    return _impl
+
+
+class MockResponse:
+    def __init__(
+        self,
+        json_data=None,
+        status_code: int = 200,
+        text: str = "",
+        url: str = "",
+        json_raises: bool = False,
+        headers: dict | None = None,
+        content: bytes | None = None,
+    ):
+        self._json_data = json_data if json_data is not None else {}
+        self._json_raises = json_raises
+        self.status_code = status_code
+        self.text = text or (json.dumps(self._json_data) if json_data else "")
+        self.content = content if content is not None else self.text.encode()
+        self.url = url
+        self.headers = headers or {}
+
+    def json(self):
+        if self._json_raises:
+            raise json.JSONDecodeError("Expecting value", self.text, 0)
+        return self._json_data
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise requests.HTTPError(
+                f"{self.status_code} Client Error for url: {self.url}", response=self
+            )
+
+
+@pytest.fixture(autouse=True)
+def _credentials(monkeypatch):
+    monkeypatch.setenv("ZENDESK_SUBDOMAIN", "acme")
+    monkeypatch.setenv("ZENDESK_EMAIL", "agent@acme.com")
+    monkeypatch.setenv("ZENDESK_API_TOKEN", "test-token")
+    # _base_url() resolves DNS to catch a hostname that rebinds to a private
+    # address; tests must not depend on real network/DNS, so every test gets
+    # a fake resolver returning an unambiguously public IP by default.
+    monkeypatch.setattr(zendesk.socket, "getaddrinfo", _fake_getaddrinfo("1.1.1.1"))
+
+
+def test_auth_requires_email(monkeypatch):
+    monkeypatch.delenv("ZENDESK_EMAIL")
+
+    with pytest.raises(ValueError, match="ZENDESK_EMAIL"):
+        zendesk._auth()
+
+
+def test_auth_requires_api_token(monkeypatch):
+    monkeypatch.delenv("ZENDESK_API_TOKEN")
+
+    with pytest.raises(ValueError, match="ZENDESK_API_TOKEN"):
+        zendesk._auth()
+
+
+def test_auth_returns_email_token_username_and_token_password():
+    assert zendesk._auth() == ("agent@acme.com/token", "test-token")
+
+
+def test_base_url_requires_subdomain(monkeypatch):
+    monkeypatch.delenv("ZENDESK_SUBDOMAIN")
+
+    with pytest.raises(ValueError, match="ZENDESK_SUBDOMAIN"):
+        zendesk._base_url()
+
+
+def test_base_url_builds_from_subdomain():
+    assert zendesk._base_url() == "https://acme.zendesk.com/api/v2"
+
+
+def test_base_url_lowercases_subdomain(monkeypatch):
+    monkeypatch.setenv("ZENDESK_SUBDOMAIN", "ACME")
+
+    assert zendesk._base_url() == "https://acme.zendesk.com/api/v2"
+
+
+@pytest.mark.parametrize(
+    "subdomain",
+    [
+        "",
+        "   ",
+        "acme.evil.com",
+        "acme/../evil",
+        "https://acme",
+        "acme:8080",
+        "-acme",
+        "acme-",
+        "acme evil",
+    ],
+)
+def test_base_url_rejects_invalid_subdomain(monkeypatch, subdomain):
+    monkeypatch.setenv("ZENDESK_SUBDOMAIN", subdomain)
+
+    with pytest.raises(ValueError, match="ZENDESK_SUBDOMAIN"):
+        zendesk._base_url()
+
+
+def test_base_url_rejects_subdomain_resolving_to_private_ip(monkeypatch):
+    # A syntactically valid subdomain that only *resolves* to a private
+    # address -- the DNS-rebinding case a literal-string check alone can't
+    # catch.
+    monkeypatch.setattr(zendesk.socket, "getaddrinfo", _fake_getaddrinfo("10.0.0.5"))
+
+    with pytest.raises(ValueError, match="not allowed"):
+        zendesk._base_url()
+
+
+def test_base_url_rejects_when_any_resolved_address_is_private(monkeypatch):
+    monkeypatch.setattr(
+        zendesk.socket, "getaddrinfo", _fake_getaddrinfo("1.1.1.1", "10.0.0.5")
+    )
+
+    with pytest.raises(ValueError, match="not allowed"):
+        zendesk._base_url()
+
+
+def test_base_url_raises_when_dns_resolution_fails(monkeypatch):
+    def _raise(*args, **kwargs):
+        raise socket.gaierror("Name or service not known")
+
+    monkeypatch.setattr(zendesk.socket, "getaddrinfo", _raise)
+
+    with pytest.raises(ValueError, match="could not be resolved"):
+        zendesk._base_url()
+
+
+@pytest.mark.parametrize(
+    "limit, expected",
+    [
+        (0, 1),
+        (-5, 1),
+        (1, 1),
+        (zendesk.MAX_LIMIT, zendesk.MAX_LIMIT),
+        (zendesk.MAX_LIMIT + 1, zendesk.MAX_LIMIT),
+        (10_000, zendesk.MAX_LIMIT),
+    ],
+)
+def test_clamp_limit_boundaries(limit, expected):
+    assert zendesk._clamp_limit(limit) == expected
+
+
+@pytest.mark.parametrize("value", ["", "   ", None])
+def test_require_non_blank_rejects_empty_values(value):
+    with pytest.raises(ValueError, match="field"):
+        zendesk._require_non_blank(value, "field")
+
+
+def test_require_non_blank_accepts_non_empty_value():
+    assert zendesk._require_non_blank("hello", "field") == "hello"
+
+
+def test_unwrap_extracts_key_from_envelope():
+    assert zendesk._unwrap({"ticket": {"id": 1}}, "ticket") == {"id": 1}
+
+
+def test_unwrap_falls_back_to_raw_value_when_not_a_dict():
+    assert zendesk._unwrap([1, 2], "ticket") == [1, 2]
+
+
+def test_unwrap_falls_back_to_payload_when_key_missing():
+    assert zendesk._unwrap({"other": 1}, "ticket") == {"other": 1}
+
+
+def test_extract_error_detail_prefers_description():
+    response = MockResponse(
+        json_data={"error": "RecordNotFound", "description": "Not found"}
+    )
+
+    assert zendesk._extract_error_detail(response) == "Not found"
+
+
+def test_extract_error_detail_falls_back_to_string_error():
+    response = MockResponse(json_data={"error": "Couldn't authenticate you"})
+
+    assert zendesk._extract_error_detail(response) == "Couldn't authenticate you"
+
+
+def test_extract_error_detail_handles_nested_error_object():
+    response = MockResponse(
+        json_data={"error": {"title": "Unauthorized", "message": "Bad credentials"}}
+    )
+
+    assert zendesk._extract_error_detail(response) == "Bad credentials"
+
+
+def test_extract_error_detail_returns_none_for_non_json_body():
+    response = MockResponse(status_code=500, text="not json", json_raises=True)
+
+    assert zendesk._extract_error_detail(response) is None
+
+
+def test_cursor_page_returns_next_cursor_when_has_more():
+    page, has_more, after_cursor = zendesk._cursor_page(
+        {
+            "tickets": [{"id": 1}, {"id": 2}],
+            "meta": {"has_more": True, "after_cursor": "abc"},
+        },
+        "tickets",
+        limit=2,
+    )
+
+    assert page == [{"id": 1}, {"id": 2}]
+    assert has_more is True
+    assert after_cursor == "abc"
+
+
+def test_cursor_page_no_next_cursor_when_not_truncated():
+    page, has_more, after_cursor = zendesk._cursor_page(
+        {"tickets": [{"id": 1}], "meta": {"has_more": False}}, "tickets", limit=50
+    )
+
+    assert has_more is False
+    assert after_cursor is None
+
+
+def test_cursor_page_rejects_non_dict_payload():
+    with pytest.raises(ValueError, match="JSON object"):
+        zendesk._cursor_page([], "tickets", limit=10)
+
+
+def test_cursor_page_rejects_non_list_field():
+    with pytest.raises(ValueError, match="tickets"):
+        zendesk._cursor_page({"tickets": "not-a-list"}, "tickets", limit=10)
+
+
+def test_offset_page_has_more_when_next_page_present():
+    page, has_more = zendesk._offset_page(
+        {"results": [{"id": 1}], "next_page": "https://acme.zendesk.com/x"},
+        "results",
+        limit=1,
+    )
+
+    assert page == [{"id": 1}]
+    assert has_more is True
+
+
+def test_offset_page_not_more_when_no_next_page():
+    _page, has_more = zendesk._offset_page(
+        {"results": [{"id": 1}], "next_page": None}, "results", limit=50
+    )
+
+    assert has_more is False
+
+
+def test_request_uses_configured_host_and_auth(monkeypatch):
+    mock_request = Mock(return_value=MockResponse(json_data={"ok": True}))
+    monkeypatch.setattr(zendesk.requests, "request", mock_request)
+
+    result = zendesk._request("GET", "/tickets.json")
+
+    assert result == {"ok": True}
+    assert (
+        mock_request.call_args.kwargs["url"]
+        == "https://acme.zendesk.com/api/v2/tickets.json"
+    )
+    assert mock_request.call_args.kwargs["auth"] == (
+        "agent@acme.com/token",
+        "test-token",
+    )
+    assert mock_request.call_args.kwargs["allow_redirects"] is False
+
+
+@pytest.mark.parametrize("status_code", [301, 302, 303, 307, 308])
+def test_request_rejects_redirect_response(monkeypatch, status_code):
+    monkeypatch.setattr(
+        zendesk.requests,
+        "request",
+        Mock(
+            return_value=MockResponse(
+                status_code=status_code, url="https://acme.zendesk.com/x"
+            )
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="redirect"):
+        zendesk._request("GET", "/tickets.json")
+
+
+def test_request_passes_configured_timeout(monkeypatch):
+    mock_request = Mock(return_value=MockResponse(json_data={"ok": True}))
+    monkeypatch.setattr(zendesk.requests, "request", mock_request)
+
+    zendesk._request("GET", "/tickets.json")
+
+    assert mock_request.call_args.kwargs["timeout"] == zendesk.DEFAULT_TIMEOUT_SECONDS
+
+
+def test_request_returns_empty_dict_for_204(monkeypatch):
+    monkeypatch.setattr(
+        zendesk.requests,
+        "request",
+        Mock(return_value=MockResponse(status_code=204, text="")),
+    )
+
+    assert zendesk._request("DELETE", "/tickets/1.json") == {}
+
+
+def test_request_retries_once_on_429_with_retry_after(monkeypatch):
+    responses = [
+        MockResponse(status_code=429, url="x", headers={"Retry-After": "1"}),
+        MockResponse(json_data={"ok": True}),
+    ]
+    mock_request = Mock(side_effect=responses)
+    monkeypatch.setattr(zendesk.requests, "request", mock_request)
+    monkeypatch.setattr(zendesk.time, "sleep", Mock())
+
+    result = zendesk._request("GET", "/tickets.json")
+
+    assert result == {"ok": True}
+    assert mock_request.call_count == 2
+    zendesk.time.sleep.assert_called_once_with(1)
+
+
+def test_request_does_not_retry_a_second_429(monkeypatch):
+    response = MockResponse(status_code=429, url="x", headers={"Retry-After": "1"})
+    mock_request = Mock(return_value=response)
+    monkeypatch.setattr(zendesk.requests, "request", mock_request)
+    monkeypatch.setattr(zendesk.time, "sleep", Mock())
+
+    with pytest.raises(RuntimeError):
+        zendesk._request("GET", "/tickets.json")
+
+    assert mock_request.call_count == 2
+
+
+def test_request_redacts_connection_error_message(monkeypatch):
+    def _raise(*args, **kwargs):
+        raise requests.exceptions.ProxyError(
+            "Unable to connect to proxy: "
+            "https://user:sp-secret-proxy-pass@proxy.internal:8080/"
+        )
+
+    monkeypatch.setattr(zendesk.requests, "request", _raise)
+
+    with pytest.raises(RuntimeError) as excinfo:
+        zendesk._request("GET", "/tickets.json")
+
+    assert "sp-secret-proxy-pass" not in str(excinfo.value)
+
+
+def test_request_raises_with_structured_error_detail(monkeypatch):
+    monkeypatch.setattr(
+        zendesk.requests,
+        "request",
+        Mock(
+            return_value=MockResponse(
+                status_code=404,
+                json_data={"error": "RecordNotFound", "description": "Not found"},
+            )
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="Not found"):
+        zendesk._request("GET", "/tickets/999.json")
+
+
+def test_request_raises_clear_error_for_non_json_2xx_body(monkeypatch):
+    monkeypatch.setattr(
+        zendesk.requests,
+        "request",
+        Mock(
+            return_value=MockResponse(
+                status_code=200, text="<html>not json</html>", json_raises=True
+            )
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="non-JSON"):
+        zendesk._request("GET", "/tickets.json")
+
+
+def test_request_truncates_unstructured_error_body(monkeypatch):
+    long_body = "x" * 5000
+    monkeypatch.setattr(
+        zendesk.requests,
+        "request",
+        Mock(return_value=MockResponse(status_code=500, text=long_body)),
+    )
+
+    with pytest.raises(RuntimeError) as excinfo:
+        zendesk._request("GET", "/tickets.json")
+
+    assert "[truncated]" in str(excinfo.value)
+    assert len(str(excinfo.value)) < len(long_body)
+
+
+def test_search_requires_non_blank_query():
+    result = json.loads(zendesk.zendesk_search("   "))
+
+    assert result["status"] == "error"
+
+
+def test_search_sends_per_page_and_page_params(monkeypatch):
+    mock_request = Mock(
+        return_value=MockResponse(
+            json_data={
+                "results": [
+                    {"result_type": "ticket", "id": 1, "subject": "Help"},
+                    {"result_type": "user", "id": 2, "name": "Jane"},
+                ],
+                "count": 2,
+                "next_page": None,
+            }
+        )
+    )
+    monkeypatch.setattr(zendesk.requests, "request", mock_request)
+
+    result = json.loads(
+        zendesk.zendesk_search("type:ticket status:open", limit=10, page=2)
+    )
+
+    assert result["status"] == "success"
+    results = result["results"]["results"]
+    assert results[0]["result_type"] == "ticket"
+    assert results[0]["subject"] == "Help"
+    assert results[1]["result_type"] == "user"
+    assert mock_request.call_args.kwargs["params"] == {
+        "query": "type:ticket status:open",
+        "per_page": 10,
+        "page": 2,
+    }
+
+
+def test_search_clamps_page_to_at_least_one(monkeypatch):
+    mock_request = Mock(
+        return_value=MockResponse(json_data={"results": [], "count": 0})
+    )
+    monkeypatch.setattr(zendesk.requests, "request", mock_request)
+
+    zendesk.zendesk_search("type:ticket", page=0)
+
+    assert mock_request.call_args.kwargs["params"]["page"] == 1
+
+
+def test_list_tickets_sends_page_size_and_cursor(monkeypatch):
+    mock_request = Mock(
+        return_value=MockResponse(
+            json_data={"tickets": [{"id": 1}], "meta": {"has_more": False}}
+        )
+    )
+    monkeypatch.setattr(zendesk.requests, "request", mock_request)
+
+    zendesk.zendesk_list_tickets(limit=10, after_cursor="cur1")
+
+    params = mock_request.call_args.kwargs["params"]
+    assert params["page[size]"] == 10
+    assert params["page[after]"] == "cur1"
+
+
+def test_get_ticket_returns_summary(monkeypatch):
+    monkeypatch.setattr(
+        zendesk.requests,
+        "request",
+        Mock(
+            return_value=MockResponse(
+                json_data={"ticket": {"id": 1, "subject": "Help", "status": "open"}}
+            )
+        ),
+    )
+
+    result = json.loads(zendesk.zendesk_get_ticket(1))
+
+    assert result["status"] == "success"
+    assert result["ticket"]["subject"] == "Help"
+
+
+def test_create_ticket_requires_subject_and_comment():
+    result = json.loads(zendesk.zendesk_create_ticket("", "body"))
+    assert result["status"] == "error"
+
+    result = json.loads(zendesk.zendesk_create_ticket("subject", ""))
+    assert result["status"] == "error"
+
+
+def test_create_ticket_sends_expected_body(monkeypatch):
+    mock_request = Mock(
+        return_value=MockResponse(json_data={"ticket": {"id": 1, "subject": "Help"}})
+    )
+    monkeypatch.setattr(zendesk.requests, "request", mock_request)
+
+    result = json.loads(
+        zendesk.zendesk_create_ticket(
+            "Help",
+            "Something's broken",
+            requester_email="jane@example.com",
+            priority="high",
+            tags="bug, urgent",
+        )
+    )
+
+    assert result["status"] == "success"
+    body = mock_request.call_args.kwargs["json"]
+    assert body["ticket"]["subject"] == "Help"
+    assert body["ticket"]["comment"] == {"body": "Something's broken"}
+    assert body["ticket"]["requester"] == {"email": "jane@example.com"}
+    assert body["ticket"]["priority"] == "high"
+    assert body["ticket"]["tags"] == ["bug", "urgent"]
+    assert mock_request.call_args.kwargs["method"] == "POST"
+
+
+def test_update_ticket_requires_at_least_one_field():
+    result = json.loads(zendesk.zendesk_update_ticket(1))
+
+    assert result["status"] == "error"
+
+
+def test_update_ticket_sends_only_provided_fields(monkeypatch):
+    mock_request = Mock(
+        return_value=MockResponse(json_data={"ticket": {"id": 1, "status": "solved"}})
+    )
+    monkeypatch.setattr(zendesk.requests, "request", mock_request)
+
+    zendesk.zendesk_update_ticket(1, status="solved")
+
+    body = mock_request.call_args.kwargs["json"]
+    assert body["ticket"] == {"status": "solved"}
+    assert mock_request.call_args.kwargs["url"].endswith("/tickets/1.json")
+    assert mock_request.call_args.kwargs["method"] == "PUT"
+
+
+def test_list_ticket_comments_returns_summaries(monkeypatch):
+    monkeypatch.setattr(
+        zendesk.requests,
+        "request",
+        Mock(
+            return_value=MockResponse(
+                json_data={
+                    "comments": [
+                        {"id": 1, "plain_body": "Hi", "public": True, "author_id": 5}
+                    ],
+                    "meta": {"has_more": False},
+                }
+            )
+        ),
+    )
+
+    result = json.loads(zendesk.zendesk_list_ticket_comments(1))
+
+    assert result["status"] == "success"
+    assert result["comments"]["comments"][0]["body"] == "Hi"
+
+
+def test_reply_to_ticket_sends_public_true(monkeypatch):
+    mock_request = Mock(
+        return_value=MockResponse(json_data={"ticket": {"id": 1, "status": "open"}})
+    )
+    monkeypatch.setattr(zendesk.requests, "request", mock_request)
+
+    result = json.loads(zendesk.zendesk_reply_to_ticket(1, "Thanks for reaching out"))
+
+    assert result["status"] == "success"
+    body = mock_request.call_args.kwargs["json"]
+    assert body["ticket"]["comment"] == {
+        "body": "Thanks for reaching out",
+        "public": True,
+    }
+
+
+def test_add_internal_note_sends_public_false(monkeypatch):
+    mock_request = Mock(
+        return_value=MockResponse(json_data={"ticket": {"id": 1, "status": "open"}})
+    )
+    monkeypatch.setattr(zendesk.requests, "request", mock_request)
+
+    zendesk.zendesk_add_internal_note(1, "Escalating to tier 2")
+
+    body = mock_request.call_args.kwargs["json"]
+    assert body["ticket"]["comment"] == {
+        "body": "Escalating to tier 2",
+        "public": False,
+    }
+
+
+def test_add_comment_rejects_blank_body():
+    result = json.loads(zendesk.zendesk_reply_to_ticket(1, "   "))
+
+    assert result["status"] == "error"
+
+
+def test_list_users_returns_summaries(monkeypatch):
+    monkeypatch.setattr(
+        zendesk.requests,
+        "request",
+        Mock(
+            return_value=MockResponse(
+                json_data={
+                    "users": [{"id": 1, "name": "Jane", "email": "jane@example.com"}],
+                    "meta": {"has_more": False},
+                }
+            )
+        ),
+    )
+
+    result = json.loads(zendesk.zendesk_list_users())
+
+    assert result["status"] == "success"
+    assert result["users"]["users"][0]["email"] == "jane@example.com"
+
+
+def test_get_user_returns_summary(monkeypatch):
+    monkeypatch.setattr(
+        zendesk.requests,
+        "request",
+        Mock(return_value=MockResponse(json_data={"user": {"id": 1, "name": "Jane"}})),
+    )
+
+    result = json.loads(zendesk.zendesk_get_user(1))
+
+    assert result["status"] == "success"
+    assert result["user"]["name"] == "Jane"
+
+
+def test_search_users_requires_non_blank_query():
+    result = json.loads(zendesk.zendesk_search_users(""))
+
+    assert result["status"] == "error"
+
+
+def test_search_users_sends_query_and_page_params(monkeypatch):
+    mock_request = Mock(
+        return_value=MockResponse(
+            json_data={"users": [{"id": 1, "name": "Jane"}], "next_page": None}
+        )
+    )
+    monkeypatch.setattr(zendesk.requests, "request", mock_request)
+
+    result = json.loads(zendesk.zendesk_search_users("jane@example.com", limit=5))
+
+    assert result["status"] == "success"
+    assert mock_request.call_args.kwargs["url"].endswith("/users/search.json")
+    assert mock_request.call_args.kwargs["params"] == {
+        "query": "jane@example.com",
+        "per_page": 5,
+        "page": 1,
+    }
+
+
+def test_list_organizations_returns_summaries(monkeypatch):
+    monkeypatch.setattr(
+        zendesk.requests,
+        "request",
+        Mock(
+            return_value=MockResponse(
+                json_data={
+                    "organizations": [{"id": 1, "name": "Acme"}],
+                    "meta": {"has_more": False},
+                }
+            )
+        ),
+    )
+
+    result = json.loads(zendesk.zendesk_list_organizations())
+
+    assert result["status"] == "success"
+    assert result["organizations"]["organizations"][0]["name"] == "Acme"
+
+
+def test_get_organization_returns_summary(monkeypatch):
+    monkeypatch.setattr(
+        zendesk.requests,
+        "request",
+        Mock(
+            return_value=MockResponse(
+                json_data={"organization": {"id": 1, "name": "Acme"}}
+            )
+        ),
+    )
+
+    result = json.loads(zendesk.zendesk_get_organization(1))
+
+    assert result["status"] == "success"
+    assert result["organization"]["name"] == "Acme"
+
+
+def test_zendesk_app_registry_requires_subdomain_email_and_token():
+    from xagent.web.builtin_mcp_registry import get_builtin_public_mcp_app_rows
+
+    zendesk_app = next(
+        row for row in get_builtin_public_mcp_app_rows() if row["app_id"] == "zendesk"
+    )
+    assert zendesk_app["provider_name"] is None
+    assert zendesk_app["category"] == "Support"
+    assert zendesk_app["transport"] == "stdio"
+    assert zendesk_app["launch_config"]["required_env"] == [
+        "ZENDESK_SUBDOMAIN",
+        "ZENDESK_EMAIL",
+        "ZENDESK_API_TOKEN",
+    ]

@@ -77,7 +77,16 @@ class TaskCommandTaskMissing(ValueError):
 
 
 class TaskCommandDeferred(RuntimeError):
-    """The command is durable but its downstream handoff is still pending."""
+    """The command is durable but its downstream handoff is still pending.
+
+    ``resend_safe`` is true only when the failed handoff proves this command
+    never reached the downstream operation. The terminal-event projection can
+    then tell the sender to retry without risking a duplicate.
+    """
+
+    def __init__(self, message: str, *, resend_safe: bool = False) -> None:
+        super().__init__(message)
+        self.resend_safe = resend_safe
 
 
 class TaskCommandRejected(RuntimeError):

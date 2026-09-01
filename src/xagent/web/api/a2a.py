@@ -17,6 +17,7 @@ from ...core.agent.checkpoint import (
     CheckpointCorruptError,
     CheckpointReadError,
 )
+from ...core.agent.runner import UserMessageInjectionOutcome
 from ..models.agent import Agent
 from ..models.database import get_session_local
 from ..models.task import Task, TaskStatus
@@ -328,6 +329,7 @@ def _update_a2a_resume_input_sync(
     task_lease: TaskLease,
     text: str,
     interaction_id: int | None,
+    injection_outcome: UserMessageInjectionOutcome,
 ) -> bool:
     """Persist A2A input only while the exact prelease remains current.
 
@@ -336,6 +338,11 @@ def _update_a2a_resume_input_sync(
     function's session does not open until after the injection has already
     committed. See ``task_interaction_close``'s module docstring for why
     the read has to precede the injection.
+
+    ``injection_outcome`` is the caller's own ``post_user_message`` report,
+    not re-derived here: a replayed turn id must not retire the close, and
+    only the call that produced the short circuit can say whether this was
+    one.
     """
 
     SessionLocal = get_session_local()
@@ -381,12 +388,23 @@ def _update_a2a_resume_input_sync(
         # ordering obligation above means.
         assert task_lease.run_id is not None
         if interaction_requests_table_exists(db):
-            close_legacy_resume_interaction(
-                db,
-                task_id=task_lease.task_id,
-                run_id=task_lease.run_id,
-                interaction_id=interaction_id,
-            )
+            # A retried A2A message replays this site's deterministic turn
+            # id (f"a2a:{task_id}:{message_id}"), and inject_user_message
+            # short-circuits a repeated turn id without persisting
+            # anything. interaction_id above was read fresh by this
+            # attempt, so on such a replay it names whatever the resumed
+            # agent has staged since rather than the question this call
+            # answered, and closing on it would retire a live question.
+            # See task_interaction_close's module docstring for the rule,
+            # the other sites, and why the v1 reply resume-input path
+            # needs no guard at all.
+            if injection_outcome is UserMessageInjectionOutcome.POSTED_FRESH:
+                close_legacy_resume_interaction(
+                    db,
+                    task_id=task_lease.task_id,
+                    run_id=task_lease.run_id,
+                    interaction_id=interaction_id,
+                )
         db.commit()
         return True
 
@@ -473,26 +491,18 @@ async def _resume_input_required_a2a_task(
         # See task_interaction_close's module docstring for why.
         #
         # This site's turn id is deterministic (f"a2a:{task_id}:{message_id}"
-        # below), so a retried A2A message replays the same turn:
-        # AgentRunner.inject_user_message short-circuits a repeated turn id
-        # by returning the existing context without persisting anything, and
-        # reports the same truthy `posted` a first attempt does. On such a
-        # replay the id read here is not the question the replayed message
-        # answered but whatever the resumed agent has asked since, and the
-        # close would retire a live question. Nothing can be retired today:
-        # the only INSERT into task_interaction_requests is
-        # stage_interaction_request (task_interaction_staging.py), which has
-        # no caller in src/ and is held at none by
-        # tests/web/services/test_interaction_staging_production_gate.py, so
-        # this read returns None on every call. Closing the window is a
-        # precondition on the change that wires the first production writer,
-        # stated once at the online WebSocket injection site (websocket.py)
-        # and binding here identically.
+        # below), so a retried A2A message replays the same turn.
+        # AgentRunner.inject_user_message reports that replay explicitly
+        # (see UserMessageInjectionOutcome) instead of folding it into the
+        # same truthy value a fresh write produces, and
+        # _update_a2a_resume_input_sync reads that report to decide whether
+        # to skip its close call -- see the guard inside that function for
+        # why a replay must skip it.
         active_interaction_id = await run_db_io_cancellation_safe(
             lambda: active_interaction_id_sync(task_id)
         )
 
-        async def inject_user_message() -> tuple[Any, bool]:
+        async def inject_user_message() -> tuple[Any, UserMessageInjectionOutcome]:
             from .chat import get_agent_manager
 
             agent_service = await get_agent_manager().get_agent_for_task(
@@ -514,7 +524,7 @@ async def _resume_input_required_a2a_task(
                 request_interrupt=False,
                 reason="A2A input-required response",
             )
-            return agent_service, bool(posted)
+            return agent_service, posted
 
         with bind_task_lease_context(task_lease):
             agent_service, posted = await run_while_task_lease_owned(
@@ -541,7 +551,7 @@ async def _resume_input_required_a2a_task(
 
         updated = await run_db_io_cancellation_safe(
             lambda: _update_a2a_resume_input_sync(
-                task_lease, text, active_interaction_id
+                task_lease, text, active_interaction_id, posted
             )
         )
         if not updated:

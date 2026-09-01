@@ -94,16 +94,31 @@ export async function hireAgentFromTemplate({
   persona,
   strings,
   connections = [],
+  abortIfIdentityChanged,
 }: {
   templateId: string;
   persona: PersonaInfo;
   strings: HireMessageStrings;
   connections?: ConnectionInfo[];
+  /** Checked once, between resolve and task/create - a PR review finding
+   * caught that this function itself makes 2 independent network calls,
+   * each authenticated with whatever session apiRequest finds live at the
+   * moment IT fires, not one pinned at the start of this function. A
+   * caller whose own identity-swap guard only checked before invoking
+   * this function (the onboarding wizard's case) can't otherwise prevent
+   * resolve and task/create running under two DIFFERENT identities if a
+   * swap lands in the gap between them. Optional and unused by other
+   * callers (e.g. the templates marketplace quick-access flow), which
+   * don't accumulate identity-bound answers over time the same way. */
+  abortIfIdentityChanged?: () => boolean;
 }): Promise<HireAgentResult> {
   const { agent, created } = await resolveAgentForTemplate(templateId, persona.name);
   const agentId = toAgentId(agent);
   if (agentId === null) {
     throw new Error("Malformed resolve response: missing agent id");
+  }
+  if (abortIfIdentityChanged?.()) {
+    throw new Error("Aborted: authenticated identity changed mid-hire");
   }
 
   const title = persona.role ? `${persona.name} — ${persona.role}` : persona.name;

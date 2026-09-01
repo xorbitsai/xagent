@@ -24,7 +24,7 @@ from xagent.core.agent.language import (
     OUTPUT_LANGUAGE_SOURCE_METADATA_KEY,
     reset_output_language_to_request_context,
 )
-from xagent.core.agent.runner import AgentRunner
+from xagent.core.agent.runner import AgentRunner, UserMessageInjectionOutcome
 from xagent.core.agent.runtime import LLMCallInterrupted
 from xagent.core.task_runtime import PREFERRED_INPUT_MODALITIES_METADATA_KEY
 
@@ -169,7 +169,7 @@ class InjectingPattern:
         )
         return {
             "success": True,
-            "same_context": injected is context,
+            "same_context": injected.context is context,
             "messages": [message.content for message in context.messages],
         }
 
@@ -299,6 +299,22 @@ class EmptyCanonicalCheckpointStore:
         raise AssertionError("canonical empty result must end checkpoint lookup")
 
 
+def test_user_message_injection_outcome_truthiness_contract() -> None:
+    """``NOT_POSTED`` is the empty string, and the other two members are
+    not. That is the whole reason an unmodified ``if not posted`` /
+    ``bool(posted)`` caller keeps asking exactly the question it always
+    asked -- "did this hand back a usable context at all" -- across the
+    fresh/replay split. Roughly a dozen call sites in ``websocket.py``,
+    ``a2a.py`` and ``task_reply.py`` rest on it, and none of them names
+    the enum, so an edit to these values would break them all silently.
+    Assert the contract here instead, where the values live.
+    """
+    assert UserMessageInjectionOutcome.NOT_POSTED == ""
+    assert not UserMessageInjectionOutcome.NOT_POSTED
+    assert UserMessageInjectionOutcome.POSTED_FRESH
+    assert UserMessageInjectionOutcome.POSTED_REPLAY
+
+
 @pytest.mark.asyncio
 async def test_runner_treats_canonical_empty_checkpoint_as_authoritative() -> None:
     checkpoint_store = EmptyCanonicalCheckpointStore()
@@ -307,13 +323,14 @@ async def test_runner_treats_canonical_empty_checkpoint_as_authoritative() -> No
         tracer=checkpoint_store,
     )
 
-    context = await runner.inject_user_message(
+    result = await runner.inject_user_message(
         "missing-execution",
         "Continue",
         request_interrupt=False,
     )
 
-    assert context is None
+    assert result.context is None
+    assert result.outcome is UserMessageInjectionOutcome.NOT_POSTED
     assert checkpoint_store.legacy_reads == 0
 
 
@@ -435,7 +452,8 @@ async def test_inject_rejection_leaves_no_dedupe_residue() -> None:
         request_interrupt=False,
     )
 
-    assert result is context
+    assert result.context is context
+    assert result.outcome is UserMessageInjectionOutcome.POSTED_FRESH
     assert len(context.messages) == 1
     assert tracer.by_execution_id["exec-residue"]["context"]["messages"]
 
@@ -1304,16 +1322,16 @@ async def test_runner_inject_user_message_with_files_dispatches_trace_callback(
             "type": "application/pdf",
         }
     ]
-    context = await runner.post_user_message(
+    result = await runner.post_user_message(
         "exec-cont-files",
         "Use the attached PDF.",
         request_interrupt=False,
         files=files,
     )
 
-    assert context is not None
+    assert result.context is not None
     new_user_message = next(
-        msg for msg in reversed(context.messages) if msg.role == "user"
+        msg for msg in reversed(result.context.messages) if msg.role == "user"
     )
     assert new_user_message.metadata.get("files") == files
     turn_id = new_user_message.metadata.get("turn_id")
@@ -1355,15 +1373,15 @@ async def test_runner_post_user_message_alias_matches_inject_behavior(
         metadata={},
     )
 
-    context = await runner.post_user_message(
+    result = await runner.post_user_message(
         "exec-alias",
         "Follow-up from user.",
         request_interrupt=False,
     )
 
-    assert context is not None
+    assert result.context is not None
     user_messages = [
-        message.content for message in context.messages if message.role == "user"
+        message.content for message in result.context.messages if message.role == "user"
     ]
     assert user_messages == ["Original task", "Follow-up from user."]
 
@@ -1401,7 +1419,8 @@ async def test_runner_post_user_message_deduplicates_explicit_turn_id_after_fail
         request_interrupt=True,
     )
 
-    assert accepted is not None
+    assert accepted.context is not None
+    assert accepted.outcome is UserMessageInjectionOutcome.POSTED_FRESH
     failing_runner.pause.assert_called_once_with(
         execution_id,
         reason="new user message",
@@ -1413,17 +1432,21 @@ async def test_runner_post_user_message_deduplicates_explicit_turn_id_after_fail
         tracer=tracer,
         workspace_manager=FakeWorkspaceManager(tmp_path),
     )
-    context = await retry_runner.post_user_message(
+    result = await retry_runner.post_user_message(
         execution_id,
         "Choose B",
         turn_id="a2a:42:msg-1",
         request_interrupt=False,
     )
 
-    assert context is not None
+    # The retry cold-starts from the checkpoint the first (pre-callback-
+    # failure) attempt already persisted, so this is the short-circuit
+    # replaying an already-seen turn id, not a second fresh write.
+    assert result.context is not None
+    assert result.outcome is UserMessageInjectionOutcome.POSTED_REPLAY
     retried_messages = [
         message
-        for message in context.messages
+        for message in result.context.messages
         if message.role == "user" and message.metadata.get("turn_id") == "a2a:42:msg-1"
     ]
     assert len(retried_messages) == 1
@@ -1467,6 +1490,66 @@ async def test_runner_rejects_reused_turn_id_with_different_content(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("scenario", ["fresh", "replay", "conflicting_content"])
+async def test_runner_inject_user_message_reports_fresh_vs_replay(
+    tmp_path: Path, scenario: str
+) -> None:
+    """The three states this contract exists to name: a first write reports
+    POSTED_FRESH, a repeat of the same turn id with the same content
+    short-circuits and reports POSTED_REPLAY without persisting anything
+    new, and a repeat with different content still raises -- unchanged from
+    before this contract existed."""
+    tracer = TracerCheckpointStore()
+    execution_id = "exec-fresh-replay-grid"
+    agent = Agent(name="writer", patterns=[FakePattern({"success": True})])
+    runner = AgentRunner(
+        agent=agent,
+        tracer=tracer,
+        workspace_manager=FakeWorkspaceManager(tmp_path),
+    )
+    await runner.run(task="Original task", execution_id=execution_id)
+
+    first = await runner.inject_user_message(
+        execution_id,
+        "Choose B",
+        turn_id="turn-fresh-replay-grid",
+        request_interrupt=False,
+    )
+    assert first.outcome is UserMessageInjectionOutcome.POSTED_FRESH
+    assert first.context is not None
+
+    if scenario == "fresh":
+        return
+
+    if scenario == "replay":
+        second = await runner.inject_user_message(
+            execution_id,
+            "Choose B",
+            turn_id="turn-fresh-replay-grid",
+            request_interrupt=False,
+        )
+        assert second.outcome is UserMessageInjectionOutcome.POSTED_REPLAY
+        assert second.context is first.context
+        matching = [
+            message
+            for message in second.context.messages
+            if message.role == "user"
+            and message.metadata.get("turn_id") == "turn-fresh-replay-grid"
+        ]
+        assert len(matching) == 1
+        return
+
+    assert scenario == "conflicting_content"
+    with pytest.raises(ValueError, match="different user message"):
+        await runner.inject_user_message(
+            execution_id,
+            "Choose C",
+            turn_id="turn-fresh-replay-grid",
+            request_interrupt=False,
+        )
+
+
+@pytest.mark.asyncio
 async def test_runner_post_user_message_preserves_display_and_execution_contract(
     tmp_path: Path,
 ) -> None:
@@ -1492,7 +1575,7 @@ async def test_runner_post_user_message_preserves_display_and_execution_contract
 
     execution_message = "Read file\n\n## UPLOADED FILES\nfile_id=file-123"
     files = [{"file_id": "file-123", "name": "notes.txt"}]
-    context = await runner.post_user_message(
+    result = await runner.post_user_message(
         "exec-display-contract",
         execution_message=execution_message,
         display_message="Read file",
@@ -1501,10 +1584,10 @@ async def test_runner_post_user_message_preserves_display_and_execution_contract
         request_interrupt=False,
     )
 
-    assert context is not None
-    latest_user = [message for message in context.messages if message.role == "user"][
-        -1
-    ]
+    assert result.context is not None
+    latest_user = [
+        message for message in result.context.messages if message.role == "user"
+    ][-1]
     assert latest_user.content == execution_message
     assert latest_user.metadata["display_message"] == "Read file"
     assert latest_user.metadata["files"] == files
@@ -1603,15 +1686,15 @@ async def test_runner_attaches_uploaded_image_refs_to_injected_user_message(
     )
     await runner.run(task="Start", execution_id="exec-injected-image")
 
-    context = await runner.inject_user_message(
+    result = await runner.inject_user_message(
         "exec-injected-image",
         "Inspect the new image",
         files=[{"file_id": "image-456", "name": "screen.jpg", "type": "image/jpeg"}],
         request_interrupt=False,
     )
 
-    assert context is not None
-    assert context.messages[-1].context_refs[0].file_id == "image-456"
+    assert result.context is not None
+    assert result.context.messages[-1].context_refs[0].file_id == "image-456"
 
 
 @pytest.mark.asyncio
@@ -1938,14 +2021,14 @@ async def test_inject_user_message_cold_start_drops_legacy_output_language() -> 
     stored.metadata[OUTPUT_LANGUAGE_SOURCE_METADATA_KEY] = "auto_router"
     stored.add_user_message("Summarize the release notes.")
 
-    context = await _cold_start_runner(stored).inject_user_message(
+    result = await _cold_start_runner(stored).inject_user_message(
         "exec-inject-legacy-language",
         message="continue",
     )
 
-    assert context is not None
-    assert OUTPUT_LANGUAGE_METADATA_KEY not in context.metadata
-    assert OUTPUT_LANGUAGE_SOURCE_METADATA_KEY not in context.metadata
+    assert result.context is not None
+    assert OUTPUT_LANGUAGE_METADATA_KEY not in result.context.metadata
+    assert OUTPUT_LANGUAGE_SOURCE_METADATA_KEY not in result.context.metadata
 
 
 @pytest.mark.asyncio
@@ -1956,14 +2039,14 @@ async def test_inject_user_message_cold_start_keeps_caller_output_language() -> 
     stored.metadata[OUTPUT_LANGUAGE_SOURCE_METADATA_KEY] = "auto_router"
     stored.add_user_message("Summarize the release notes.")
 
-    context = await _cold_start_runner(stored).inject_user_message(
+    result = await _cold_start_runner(stored).inject_user_message(
         "exec-inject-caller-language",
         message="continue",
     )
 
-    assert context is not None
-    assert context.metadata[OUTPUT_LANGUAGE_METADATA_KEY] == "French"
-    assert OUTPUT_LANGUAGE_SOURCE_METADATA_KEY not in context.metadata
+    assert result.context is not None
+    assert result.context.metadata[OUTPUT_LANGUAGE_METADATA_KEY] == "French"
+    assert OUTPUT_LANGUAGE_SOURCE_METADATA_KEY not in result.context.metadata
 
 
 def test_resume_migration_only_touches_execution_context_nodes() -> None:

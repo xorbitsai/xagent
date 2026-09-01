@@ -11,10 +11,17 @@ import pytest
 from fastapi import HTTPException
 
 from xagent.web.api.skill_hub import (
+    _MAX_ARCHIVE_ENTRIES,
+    _MAX_SKILL_FILE_PATH_CHARS,
+    _MAX_SKILL_MD_CHARS,
+    _NAME_RE,
     _check_registry_security_gate,
+    _derive_upload_skill_name,
     _normalize_skill_files,
     _safe_zip_extract,
     _safe_zip_to_files,
+    _slugify_skill_name,
+    _validate_skill_name,
 )
 
 # ── helpers ───────────────────────────────────────────────────────────────────
@@ -440,6 +447,851 @@ class TestArchiveCruft:
             _safe_zip_extract(data)
         assert exc.value.status_code == 400
         assert "hidden file" in exc.value.detail
+
+
+# ── POST /upload — naming ────────────────────────────────────────────────────
+
+
+SKILL_MD_NAMED = b"""---
+name: pdf-tools
+description: Work with PDFs.
+---
+
+# PDF Tools
+"""
+
+
+class TestDeriveUploadSkillName:
+    def test_zip_root_wins(self):
+        name = _derive_upload_skill_name("archive.zip", "my-skill", SKILL_MD_NAMED)
+        assert name == "my-skill"
+
+    def test_frontmatter_name_beats_filename(self):
+        name = _derive_upload_skill_name("archive.zip", "", SKILL_MD_NAMED)
+        assert name == "pdf-tools"
+
+    def test_filename_stem_is_last_resort(self):
+        name = _derive_upload_skill_name("My Skill.zip", "", SKILL_MD)
+        assert name == "My-Skill"
+
+    def test_no_candidate_raises(self):
+        with pytest.raises(HTTPException) as exc:
+            _derive_upload_skill_name("---.zip", "", SKILL_MD)
+        assert exc.value.status_code == 400
+
+    def test_slugify(self):
+        assert _slugify_skill_name("  Café menu skill!  ") == "Caf-menu-skill"
+        assert _slugify_skill_name("ok_name-1") == "ok_name-1"
+        assert _slugify_skill_name("///") == ""
+
+
+class TestUploadNameOverride:
+    """An explicit name is honoured or refused, never silently rewritten.
+
+    Two separate bugs converge here. End-to-end testing found the server
+    slugifying an override, so ``name=bad name!`` returned 200 with a skill
+    called ``bad-name``. Refusing instead is only half the fix: the check then
+    round-tripped through the slugifier, which strips leading and trailing
+    "-"/"_", so ``_foo`` and ``my_skill_`` were refused citing the very pattern
+    they match — while the frontend and ``POST /create`` both accept them.
+    Validate against ``_NAME_RE`` directly and the three agree.
+    """
+
+    def test_valid_override_wins(self):
+        assert (
+            _derive_upload_skill_name("a.zip", "zip-root", SKILL_MD, override="mine")
+            == "mine"
+        )
+
+    @pytest.mark.parametrize("override", ["  mine  ", "   "])
+    def test_override_is_not_silently_trimmed_or_derived(self, override):
+        with pytest.raises(HTTPException) as exc:
+            _derive_upload_skill_name("a.zip", "root", SKILL_MD, override=override)
+        assert exc.value.status_code == 400
+
+    def test_empty_override_falls_back_to_zip_root(self):
+        assert (
+            _derive_upload_skill_name("a.zip", "root", SKILL_MD, override="") == "root"
+        )
+
+    def test_no_override_falls_back_to_zip_root(self):
+        assert _derive_upload_skill_name("a.zip", "root", SKILL_MD) == "root"
+
+    @pytest.mark.parametrize(
+        "name", ["_foo", "foo_", "my-skill-", "__init__", "my_skill_", "ok-name"]
+    )
+    def test_names_matching_the_pattern_are_accepted(self, name):
+        assert _NAME_RE.match(name), "test premise: this matches the documented rule"
+        assert (
+            _derive_upload_skill_name("a.zip", "root", SKILL_MD, override=name) == name
+        )
+
+    @pytest.mark.parametrize("bad", ["bad name!", "../evil", "my/skill", "x" * 65])
+    def test_names_breaking_the_pattern_are_refused(self, bad):
+        with pytest.raises(HTTPException) as exc:
+            _derive_upload_skill_name("a.zip", "root", SKILL_MD, override=bad)
+        assert exc.value.status_code == 400
+
+    @pytest.mark.parametrize(
+        "filename",
+        [
+            "../../evil.md",
+            "/etc/passwd.md",
+            "....//evil.md",
+            "a/../../b.md",
+            "~/.ssh/authorized_keys.md",
+            "C:\\Windows\\evil.md",
+        ],
+    )
+    def test_hostile_filenames_cannot_smuggle_a_path(self, filename):
+        """The filename is attacker-controlled and feeds the name of a
+        directory, so nothing resembling a path may survive into it.
+
+        Two independent stages hold this: the stem is taken and slugified to
+        [A-Za-z0-9_-]+, then ``_write_personal_skill`` validates the result
+        again. Asserting on the charset rather than on specific outputs keeps
+        this honest if the slugifier is ever changed.
+        """
+        derived = _derive_upload_skill_name(filename, "", SKILL_MD)
+        assert _NAME_RE.match(derived), f"{derived!r} escaped the charset"
+        assert not {"/", "\\"} & set(derived)
+        assert ".." not in derived
+        # The writer re-validates independently of the deriving step.
+        _validate_skill_name(derived)
+
+
+# ── POST /upload — route ─────────────────────────────────────────────────────
+
+
+def _make_upload(filename: str, data: bytes):
+    from fastapi import UploadFile
+
+    return UploadFile(file=io.BytesIO(data), filename=filename)
+
+
+def _upload_args():
+    from types import SimpleNamespace
+
+    from xagent.skills.library import SkillScopeContext
+
+    return (
+        SimpleNamespace(),
+        SkillScopeContext(user_id=7, metadata={}),
+        object(),
+        SimpleNamespace(id=7),
+    )
+
+
+def _stub_write_and_manager(monkeypatch, skill_hub):
+    """Record what the route would persist, and report it back as loaded."""
+    written: dict = {}
+
+    def _fake_write(*, db, user, name, files, origin="custom", **kwargs):
+        written.update(name=name, files=files, origin=origin)
+
+    class _Manager:
+        async def get_skill(self, name):
+            return {"name": name, "scope": "personal", "path": ""}
+
+    async def _scoped(*args):
+        return _Manager()
+
+    monkeypatch.setattr(skill_hub, "_write_personal_skill", _fake_write)
+    monkeypatch.setattr(skill_hub, "_get_scoped_manager", _scoped)
+    return written
+
+
+class TestUploadRoute:
+    @pytest.mark.asyncio
+    async def test_zip_with_traversal_rejected(self):
+        from xagent.web.api import skill_hub
+
+        data = _make_zip({"skill/SKILL.md": SKILL_MD, "skill/../../escape.py": b"evil"})
+        request, scope, db, user = _upload_args()
+        with pytest.raises(HTTPException) as exc:
+            await skill_hub.upload_skill(
+                request,
+                file=_make_upload("skill.zip", data),
+                scope="personal",
+                name=None,
+                context=scope,
+                db=db,
+                _user=user,
+            )
+        assert exc.value.status_code == 400
+        assert "unsafe" in exc.value.detail.lower()
+
+    @pytest.mark.asyncio
+    async def test_unsupported_extension_rejected(self):
+        from xagent.web.api import skill_hub
+
+        request, scope, db, user = _upload_args()
+        with pytest.raises(HTTPException) as exc:
+            await skill_hub.upload_skill(
+                request,
+                file=_make_upload("skill.tar.gz", b"x"),
+                scope="personal",
+                name=None,
+                context=scope,
+                db=db,
+                _user=user,
+            )
+        assert exc.value.status_code == 400
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("bad_scope", ["", "global", "PERSONAL", "team; drop"])
+    async def test_unknown_scope_rejected(self, bad_scope):
+        from xagent.web.api import skill_hub
+
+        request, scope, db, user = _upload_args()
+        with pytest.raises(HTTPException) as exc:
+            await skill_hub.upload_skill(
+                request,
+                file=_make_upload("skill.md", SKILL_MD),
+                scope=bad_scope,
+                name=None,
+                context=scope,
+                db=db,
+                _user=user,
+            )
+        assert exc.value.status_code == 400
+        assert "scope" in exc.value.detail
+
+    @pytest.mark.asyncio
+    async def test_configured_upload_limit_is_honoured(self, monkeypatch):
+        """A deployment that lowers XAGENT_MAX_UPLOAD_SIZE must actually get
+        the lower bound, and the message must quote the bound in force.
+
+        The route used to read the fixed 50 MiB registry-download budget, so a
+        1 MiB configured limit was ignored entirely and the detail advertised
+        whichever number the route happened to hold.
+        """
+        from xagent.web.api import skill_hub
+
+        monkeypatch.setenv("XAGENT_MAX_UPLOAD_SIZE", "1M")
+        request, scope, db, user = _upload_args()
+        with pytest.raises(HTTPException) as exc:
+            await skill_hub.upload_skill(
+                request,
+                file=_make_upload("skill.zip", b"x" * (1024 * 1024 + 1)),
+                scope="personal",
+                name=None,
+                context=scope,
+                db=db,
+                _user=user,
+            )
+        assert exc.value.status_code == 413
+        assert "1 MiB" in exc.value.detail, exc.value.detail
+
+    @pytest.mark.asyncio
+    async def test_configured_limit_cannot_exceed_the_decompression_budget(
+        self, monkeypatch
+    ):
+        """A configured limit above the extractor's own budget must clamp to
+        it, or the route would advertise a ceiling the extractor then refuses.
+        """
+        from xagent.web.api import skill_hub
+
+        monkeypatch.setenv("XAGENT_MAX_UPLOAD_SIZE", "4G")
+        request, scope, db, user = _upload_args()
+        with pytest.raises(HTTPException) as exc:
+            await skill_hub.upload_skill(
+                request,
+                file=_make_upload("s.txt", b"x"),
+                scope="personal",
+                name=None,
+                context=scope,
+                db=db,
+                _user=user,
+            )
+        # Falls through to the extension check, proving the 4G limit did not
+        # make the route try to buffer 4 GiB first.
+        assert exc.value.status_code == 400
+        assert "Unsupported upload" in exc.value.detail
+
+    @pytest.mark.asyncio
+    async def test_oversized_upload_rejected(self, monkeypatch):
+        from xagent.web.api import skill_hub
+
+        monkeypatch.setattr(skill_hub, "_MAX_DOWNLOAD_BYTES", 64)
+        request, scope, db, user = _upload_args()
+        with pytest.raises(HTTPException) as exc:
+            await skill_hub.upload_skill(
+                request,
+                file=_make_upload("skill.zip", b"x" * 65),
+                scope="personal",
+                name=None,
+                context=scope,
+                db=db,
+                _user=user,
+            )
+        assert exc.value.status_code == 413
+
+    @pytest.mark.asyncio
+    async def test_zip_happy_path_persists_with_upload_origin(self, monkeypatch):
+        from xagent.web.api import skill_hub
+
+        written = _stub_write_and_manager(monkeypatch, skill_hub)
+        data = _make_zip({"pdf-tools/SKILL.md": SKILL_MD, "pdf-tools/ref.md": b"r"})
+        request, scope, db, user = _upload_args()
+        summary = await skill_hub.upload_skill(
+            request,
+            file=_make_upload("archive.zip", data),
+            scope="personal",
+            name=None,
+            context=scope,
+            db=db,
+            _user=user,
+        )
+        assert summary.name == "pdf-tools"
+        assert written["name"] == "pdf-tools"
+        assert written["origin"] == "upload"
+        assert set(written["files"]) == {"SKILL.md", "ref.md"}
+
+    @pytest.mark.asyncio
+    async def test_bare_markdown_uses_frontmatter_name(self, monkeypatch):
+        from xagent.web.api import skill_hub
+
+        written = _stub_write_and_manager(monkeypatch, skill_hub)
+        request, scope, db, user = _upload_args()
+        summary = await skill_hub.upload_skill(
+            request,
+            file=_make_upload("whatever.md", SKILL_MD_NAMED),
+            scope="personal",
+            name=None,
+            context=scope,
+            db=db,
+            _user=user,
+        )
+        assert summary.name == "pdf-tools"
+        assert written["files"] == {"SKILL.md": SKILL_MD_NAMED}
+
+    @pytest.mark.asyncio
+    async def test_non_utf8_markdown_rejected(self):
+        from xagent.web.api import skill_hub
+
+        request, scope, db, user = _upload_args()
+        with pytest.raises(HTTPException) as exc:
+            await skill_hub.upload_skill(
+                request,
+                file=_make_upload("skill.md", b"\xff\xfe\x00bad"),
+                scope="personal",
+                name=None,
+                context=scope,
+                db=db,
+                _user=user,
+            )
+        assert exc.value.status_code == 400
+
+
+# ── POST /upload — no ghost rows ─────────────────────────────────────────────
+
+
+class TestNoGhostRows:
+    """A row that commits must be one the skill machinery can read.
+
+    ``_write_personal_skill`` validates the bundle *before* it commits, so an
+    unloadable bundle never reaches the table and there is nothing to undo.
+    That is what retired the old commit-then-rollback tail: a name-keyed
+    compensating delete had to identify the row it was undoing, and got it
+    wrong whenever the name had been reused by a concurrent attempt.
+
+    A read side that is merely behind is therefore not a failure -- the write
+    is durable and was parsed -- so the route answers from the validated
+    bundle instead of rolling back. These drive the real
+    ``_write_personal_skill`` against a live SQLite session and assert on the
+    table, so they can tell a genuine refusal from one that left a row.
+    """
+
+    @staticmethod
+    def _session(tmp_path):
+        from sqlalchemy import create_engine
+        from sqlalchemy.orm import sessionmaker
+
+        from xagent.web.models.database import Base
+        from xagent.web.models.skill import UserSkill, UserSkillFile
+        from xagent.web.models.user import User
+
+        engine = create_engine(f"sqlite:///{tmp_path / 'skills.db'}")
+        Base.metadata.create_all(
+            engine,
+            tables=[User.__table__, UserSkill.__table__, UserSkillFile.__table__],
+        )
+        session_factory = sessionmaker(bind=engine)
+        db = session_factory()
+        db.execute(
+            User.__table__.insert().values(
+                id=7, username="uploader", password_hash="hash", is_admin=False
+            )
+        )
+        db.commit()
+        return db
+
+    @staticmethod
+    def _rows(db):
+        from xagent.web.models.skill import UserSkill
+
+        return sorted(name for (name,) in db.query(UserSkill.name).all())
+
+    @classmethod
+    async def _upload(
+        cls,
+        monkeypatch,
+        db,
+        members,
+        *,
+        breaks_parse=False,
+        shadowed_by=None,
+        override=None,
+        filename="bundle.zip",
+    ):
+        """Drive the route with a manager that can model any cache outcome.
+
+        ``shadowed_by`` returns a record from another scope under the uploaded
+        name — what really happens when a personal record fails to parse and a
+        same-named builtin stays resident in the cache. A stub that can only
+        answer ``None`` or the skill's own dict cannot express that case at
+        all, which is why it went unnoticed.
+        """
+        from types import SimpleNamespace
+
+        from xagent.skills.library import SkillScopeContext
+        from xagent.web.api import skill_hub
+
+        class _Manager:
+            async def get_skill(self, name):
+                if shadowed_by is not None:
+                    # A record from another scope survives under this name.
+                    return {
+                        "name": name,
+                        "scope": None,
+                        "source": shadowed_by,
+                        "path": f"/{shadowed_by}/{name}",
+                        "description": "someone else's skill",
+                    }
+                # Model reload()'s log-and-skip: an unloadable record is simply
+                # absent, which is exactly what produced the ghost row.
+                return None if breaks_parse else {"name": name, "scope": "personal"}
+
+        async def _scoped(*args):
+            return _Manager()
+
+        monkeypatch.setattr(skill_hub, "_get_scoped_manager", _scoped)
+
+        data = members if isinstance(members, bytes) else _make_zip(members)
+        return await skill_hub.upload_skill(
+            SimpleNamespace(),
+            file=_make_upload(filename, data),
+            scope="personal",
+            name=override,
+            context=SkillScopeContext(user_id=7, metadata={}),
+            db=db,
+            _user=SimpleNamespace(id=7),
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("bad_file", ["SKILL.md", "template.md"])
+    async def test_non_utf8_is_refused_before_any_write(
+        self, monkeypatch, tmp_path, bad_file
+    ):
+        # A SKILL.md saved as Latin-1 by a Windows editor is enough to hit this.
+        db = self._session(tmp_path)
+        members = {"s/SKILL.md": SKILL_MD, f"s/{bad_file}": b"\xe9\xff\xfe latin-1"}
+        with pytest.raises(HTTPException) as exc:
+            await self._upload(monkeypatch, db, members)
+        assert exc.value.status_code == 400
+        assert bad_file in exc.value.detail
+        assert self._rows(db) == [], "nothing may be written when parsing fails"
+
+    @pytest.mark.asyncio
+    async def test_lagging_read_side_answers_from_the_validated_bundle(
+        self, monkeypatch, tmp_path
+    ):
+        """A cache that cannot serve the write yet is not a failed upload.
+
+        The bundle was parsed before the commit, so the row is durable and
+        loadable; only the manager's view is behind. Answering 5xx here would
+        be a lie the client cannot act on -- a replay re-enters the
+        ``(user, name)`` pre-check and gets a deterministic 409, so "retry" is
+        guidance that cannot work.
+        """
+        db = self._session(tmp_path)
+        summary = await self._upload(
+            monkeypatch, db, {"s/SKILL.md": SKILL_MD}, breaks_parse=True
+        )
+        assert summary.name == "s"
+        assert self._rows(db) == ["s"], "the durable row must survive untouched"
+
+    @pytest.mark.asyncio
+    async def test_unparsable_bundle_never_reaches_the_table(
+        self, monkeypatch, tmp_path
+    ):
+        """Validation happens before the commit, so there is nothing to undo.
+
+        This is the invariant that replaced the rollback: refuse at the gate
+        rather than commit, discover, and compensate by name.
+        """
+        db = self._session(tmp_path)
+        with pytest.raises(HTTPException) as exc:
+            await self._upload(monkeypatch, db, {"s/SKILL.md": b"\xff\xfe not utf-8"})
+        assert exc.value.status_code == 400
+        assert self._rows(db) == [], "nothing may be written when parsing fails"
+
+    @pytest.mark.asyncio
+    async def test_identical_upload_retry_replays_the_result(
+        self, monkeypatch, tmp_path
+    ):
+        """A lost success response can retry without becoming a false 409."""
+        db = self._session(tmp_path)
+        assert (
+            await self._upload(monkeypatch, db, {"s/SKILL.md": SKILL_MD})
+        ).name == "s"
+        replay = await self._upload(monkeypatch, db, {"s/SKILL.md": SKILL_MD})
+        assert replay.name == "s"
+        assert self._rows(db) == ["s"], "a replay must not create another row"
+
+    @pytest.mark.asyncio
+    async def test_same_name_with_different_content_is_still_409(
+        self, monkeypatch, tmp_path
+    ):
+        db = self._session(tmp_path)
+        await self._upload(monkeypatch, db, {"s/SKILL.md": SKILL_MD})
+        with pytest.raises(HTTPException) as exc:
+            await self._upload(
+                monkeypatch,
+                db,
+                {"s/SKILL.md": SKILL_MD + b"\nDifferent instructions.\n"},
+            )
+        assert exc.value.status_code == 409
+        assert self._rows(db) == ["s"], "the first skill must survive untouched"
+
+    @pytest.mark.asyncio
+    async def test_same_bundle_from_another_write_path_is_not_an_upload_replay(
+        self, monkeypatch, tmp_path
+    ):
+        from types import SimpleNamespace
+
+        from xagent.web.api import skill_hub
+
+        db = self._session(tmp_path)
+        skill_hub._write_personal_skill(
+            db=db,
+            user=SimpleNamespace(id=7),
+            name="s",
+            files={"SKILL.md": SKILL_MD},
+            origin="custom",
+        )
+        with pytest.raises(HTTPException) as exc:
+            await self._upload(monkeypatch, db, {"s/SKILL.md": SKILL_MD})
+        assert exc.value.status_code == 409
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("override", [None, "my-name"])
+    async def test_parser_failure_refused_on_both_naming_paths(
+        self, monkeypatch, tmp_path, override
+    ):
+        """Validation must not depend on which naming branch runs.
+
+        Deriving the name parses frontmatter itself, so a check placed after it
+        never sees a bundle that breaks the parser — and an explicit name
+        short-circuits that derivation entirely. Both branches must refuse.
+
+        The trigger is injected rather than crafted: a payload deep enough to
+        exhaust the stack is a property of the runner's recursion limit, not of
+        this code, so a fixed depth passes locally and parses fine on a runner
+        with more headroom. What matters is that *any* parser failure is
+        refused before the write, whatever provokes it.
+        """
+        from xagent.skills.parser import SkillParser
+
+        db = self._session(tmp_path)
+
+        # Explode inside _extract_frontmatter: that is what deep YAML actually
+        # blows up, and — crucially — what the *naming* step calls. Injecting
+        # at parse_bundle instead would still pass with the check placed after
+        # naming, so it would not pin the ordering this test exists for.
+        real_extract = SkillParser._extract_frontmatter
+
+        def exploding_extract(content):
+            if "BOOM" in content:
+                raise RecursionError("simulated deep-YAML stack exhaustion")
+            return real_extract(content)
+
+        monkeypatch.setattr(
+            SkillParser, "_extract_frontmatter", staticmethod(exploding_extract)
+        )
+
+        with pytest.raises(HTTPException) as exc:
+            await self._upload(
+                monkeypatch,
+                db,
+                {"s/SKILL.md": SKILL_MD + b"\nBOOM\n"},
+                override=override,
+            )
+        assert exc.value.status_code == 400
+        assert self._rows(db) == [], "an unparsable bundle must never be written"
+
+    @pytest.mark.asyncio
+    async def test_name_override_does_not_skip_the_parse_check(
+        self, monkeypatch, tmp_path
+    ):
+        """An explicit name must not opt out of the pre-write parse.
+
+        Naming used to be the only thing that parsed frontmatter, so passing
+        ``name=`` skipped it: deeply nested YAML (valid UTF-8, so the old check
+        passed it) then reached the database.
+        """
+        # Non-UTF-8 rather than deep YAML: it fails the parser identically but
+        # deterministically, without depending on the runner's stack depth.
+        db = self._session(tmp_path)
+        with pytest.raises(HTTPException) as exc:
+            await self._upload(
+                monkeypatch,
+                db,
+                {"s/SKILL.md": b"\xff\xfe not utf-8"},
+                override="my-name",
+            )
+        assert exc.value.status_code == 400
+        assert self._rows(db) == [], "an unparsable bundle must never be written"
+
+    @pytest.mark.asyncio
+    async def test_shadowing_record_is_not_reported_as_success(
+        self, monkeypatch, tmp_path
+    ):
+        """A same-named builtin must not satisfy the post-write check.
+
+        ``reload`` keys the cache by name with filesystem records first, so a
+        builtin survives when the personal record fails to parse. A bare
+        ``is None`` test returned 200 carrying that unrelated skill's content
+        instead of the bundle that was actually written.
+
+        The write itself is valid and durable, so the answer comes from the
+        validated bundle -- what must never happen is reporting the *builtin*
+        back as though it were the upload.
+        """
+        db = self._session(tmp_path)
+        summary = await self._upload(
+            monkeypatch,
+            db,
+            {"s/SKILL.md": SKILL_MD},
+            shadowed_by="builtin",
+            override="agent-builder",
+        )
+        assert summary.name == "agent-builder"
+        assert summary.source != "builtin", "the shadowing record must not be returned"
+        assert self._rows(db) == ["agent-builder"], "our own row must survive"
+
+    @pytest.mark.asyncio
+    async def test_personal_success_does_not_depend_on_post_commit_readback(
+        self, monkeypatch, tmp_path
+    ):
+        """A provider failure after commit cannot turn success into a 500."""
+        from types import SimpleNamespace
+
+        from xagent.skills.library import SkillScopeContext
+        from xagent.web.api import skill_hub
+
+        db = TestNoGhostRows._session(tmp_path)
+
+        async def explode(*args, **kwargs):
+            raise RuntimeError("post-commit readback must not run")
+
+        monkeypatch.setattr(skill_hub, "_get_scoped_manager", explode)
+
+        summary = await skill_hub.upload_skill(
+            SimpleNamespace(),
+            file=_make_upload("bundle.zip", _make_zip({"s/SKILL.md": SKILL_MD})),
+            scope="personal",
+            name=None,
+            context=SkillScopeContext(user_id=7, metadata={}),
+            db=db,
+            _user=SimpleNamespace(id=7),
+        )
+        assert summary.name == "s"
+        assert TestNoGhostRows._rows(db) == ["s"], (
+            "the validated row must remain durable"
+        )
+
+
+# ── resource bounds on untrusted archives ────────────────────────────────────
+
+
+class TestArchiveResourceBounds:
+    """The byte budget does not bound the entry *count*, and the database
+    columns bound things the normalizer never checked."""
+
+    def test_entry_count_is_capped_before_any_member_is_read(self):
+        # 60k empty members fit in ~6 MiB: well inside the byte budget, but a
+        # synchronous walk over every entry plus one ORM insert per file.
+        members = {"root/SKILL.md": SKILL_MD}
+        members.update({f"root/f{i}.md": b"" for i in range(_MAX_ARCHIVE_ENTRIES + 50)})
+        data = _make_zip(members)
+        assert len(data) < 50 * 1024 * 1024, "test premise: within the byte budget"
+        with pytest.raises(HTTPException) as exc:
+            _safe_zip_extract(data, bad_zip_status=400)
+        assert exc.value.status_code == 400
+        assert "entries" in exc.value.detail
+
+    def test_padding_directories_count_towards_the_cap(self):
+        """Directories are skipped for content but still cost an entry to walk,
+        so excluding them would make the cap evadable with empty folders."""
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w") as zf:
+            zf.writestr("root/SKILL.md", SKILL_MD)
+            for i in range(_MAX_ARCHIVE_ENTRIES + 50):
+                zf.writestr(f"root/d{i}/", b"")
+        with pytest.raises(HTTPException) as exc:
+            _safe_zip_extract(buf.getvalue(), bad_zip_status=400)
+        assert exc.value.status_code == 400
+        assert "entries" in exc.value.detail
+
+    def test_an_ordinary_bundle_is_unaffected(self):
+        data = _make_zip(
+            {"root/SKILL.md": SKILL_MD, **{f"root/r{i}.md": b"x" for i in range(20)}}
+        )
+        files, root = _safe_zip_extract(data, bad_zip_status=400)
+        assert root == "root"
+        assert len(files) == 21
+
+    def test_path_longer_than_the_column_is_refused(self):
+        """UserSkillFile.path is String(500). PostgreSQL raises DataError at
+        commit and the request dies as a 500; SQLite accepts it silently, so
+        the bound cannot be left to the database."""
+        long_rel = "/".join(["d" * 90] * 6) + "/ref.md"
+        assert len(long_rel) > _MAX_SKILL_FILE_PATH_CHARS, "test premise"
+        data = _make_zip({"root/SKILL.md": SKILL_MD, f"root/{long_rel}": b"x"})
+        with pytest.raises(HTTPException) as exc:
+            _safe_zip_extract(data, bad_zip_status=400)
+        assert exc.value.status_code == 400
+        assert "longer than" in exc.value.detail
+
+    def test_path_at_the_column_boundary_is_accepted(self):
+        exact = "d" * (_MAX_SKILL_FILE_PATH_CHARS - len("x.md") - 1) + "/x.md"
+        assert len(exact) == _MAX_SKILL_FILE_PATH_CHARS
+        files = _normalize_skill_files({"SKILL.md": SKILL_MD, exact: b"x"})
+        assert exact in files
+
+    def test_skill_md_over_the_character_cap_is_refused(self):
+        """Create/Edit cap skill_md at 200,000 characters. SKILL.md is injected
+        into the system prompt on every model turn, so an upload that skipped
+        the cap would fail at inference time instead of here."""
+        big = ("# Big\n\n## Description\n" + "x" * _MAX_SKILL_MD_CHARS).encode()
+        with pytest.raises(HTTPException) as exc:
+            _normalize_skill_files({"SKILL.md": big})
+        assert exc.value.status_code == 400
+        assert "200000" in exc.value.detail
+
+    def test_multibyte_content_is_counted_in_characters_not_bytes(self):
+        """The Create/Edit cap is a character count, so a bundle whose UTF-8
+        encoding is three times the limit still passes when its character
+        count does not. Counting bytes here would reject it and put the two
+        write paths back out of step."""
+        body = "汉" * (_MAX_SKILL_MD_CHARS - 100)
+        content = f"# S\n\n## Description\n{body}\n".encode()
+        assert len(content) > _MAX_SKILL_MD_CHARS * 2, "test premise: bytes >> chars"
+        files = _normalize_skill_files({"SKILL.md": content})
+        assert files["SKILL.md"] == content
+
+
+# ── concurrent duplicate names ───────────────────────────────────────────────
+
+
+class TestDuplicateNameRace:
+    """The pre-check SELECT and the write are not atomic across sessions."""
+
+    @staticmethod
+    def _engine(tmp_path):
+        from sqlalchemy import create_engine
+        from sqlalchemy.orm import sessionmaker
+
+        from xagent.web.models.database import Base
+        from xagent.web.models.skill import UserSkill, UserSkillFile
+        from xagent.web.models.user import User
+
+        engine = create_engine(f"sqlite:///{tmp_path / 'race.db'}")
+        Base.metadata.create_all(
+            engine,
+            tables=[User.__table__, UserSkill.__table__, UserSkillFile.__table__],
+        )
+        factory = sessionmaker(bind=engine)
+        with factory() as db:
+            db.execute(
+                User.__table__.insert().values(
+                    id=7, username="racer", password_hash="h", is_admin=False
+                )
+            )
+            db.commit()
+        return factory
+
+    def test_loser_of_the_race_gets_409_not_500(self, tmp_path):
+        """Both sessions pass the pre-check, so one hits the unique constraint
+        at flush. Without the guard it escapes as IntegrityError and the API
+        answers 500 where the contract says 409."""
+        import threading
+        from types import SimpleNamespace
+
+        from xagent.web.api import skill_hub
+
+        factory = self._engine(tmp_path)
+        files = {"SKILL.md": SKILL_MD}
+        barrier = threading.Barrier(2)
+        flushed: dict[str, bool] = {}
+        results: dict[str, str] = {}
+
+        def attempt(tag: str) -> None:
+            db = factory()
+            original_flush = db.flush
+
+            def flush_then_sync(*args, **kwargs):
+                out = original_flush(*args, **kwargs)
+                if tag not in flushed:
+                    flushed[tag] = True
+                    # Both rows are now pending, neither committed.
+                    barrier.wait(timeout=10)
+                return out
+
+            db.flush = flush_then_sync
+            try:
+                skill_hub._write_personal_skill(
+                    db=db, user=SimpleNamespace(id=7), name="dup", files=files
+                )
+                results[tag] = "committed"
+            except HTTPException as exc:
+                results[tag] = f"http-{exc.status_code}"
+            finally:
+                db.close()
+
+        threads = [threading.Thread(target=attempt, args=(t,)) for t in ("a", "b")]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        assert sorted(results.values()) == ["committed", "http-409"], results
+
+    def test_an_unrelated_integrity_error_is_not_reported_as_a_duplicate(
+        self, tmp_path, monkeypatch
+    ):
+        """The guard must not swallow every IntegrityError. A foreign-key
+        violation is a bug, not a name conflict, and has to stay loud."""
+        from types import SimpleNamespace
+
+        from sqlalchemy.exc import IntegrityError
+
+        from xagent.web.api import skill_hub
+
+        factory = self._engine(tmp_path)
+        db = factory()
+        boom = IntegrityError("INSERT", {}, Exception("FOREIGN KEY constraint failed"))
+        monkeypatch.setattr(db, "flush", lambda *a, **k: (_ for _ in ()).throw(boom))
+        with pytest.raises(IntegrityError):
+            skill_hub._write_personal_skill(
+                db=db,
+                user=SimpleNamespace(id=9999),
+                name="orphan",
+                files={"SKILL.md": SKILL_MD},
+            )
+        db.close()
 
 
 # ── _check_registry_security_gate ────────────────────────────────────────────

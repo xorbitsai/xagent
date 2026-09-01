@@ -385,6 +385,7 @@ class FeishuBotInstance:
                 interactions=projection.interactions,
                 message_type=projection.message_type,
                 error_message=projection.diagnostic_error,
+                execution_result=result,
             ):
                 raise TaskLeaseLostError(
                     f"task {task_id} ownership changed before Feishu result"

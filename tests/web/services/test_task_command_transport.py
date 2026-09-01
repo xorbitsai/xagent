@@ -17,6 +17,7 @@ from sqlalchemy.exc import TimeoutError as SQLAlchemyTimeoutError
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import QueuePool
 
+from xagent.core.agent.runner import UserMessageInjectionOutcome
 from xagent.db.sqlite import apply_sqlite_concurrency_pragmas
 from xagent.web.api import websocket as websocket_api
 from xagent.web.api.websocket import (
@@ -1042,7 +1043,9 @@ async def test_recovery_dispatches_committed_message_across_run_rotation(
 
     runtime_agent = MagicMock()
     runtime_agent.supports_live_control.return_value = True
-    runtime_agent.post_user_message = AsyncMock(return_value=True)
+    runtime_agent.post_user_message = AsyncMock(
+        return_value=UserMessageInjectionOutcome.POSTED_FRESH
+    )
     runtime_manager = MagicMock(
         get_agent_for_task=AsyncMock(return_value=runtime_agent)
     )

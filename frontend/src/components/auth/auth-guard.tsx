@@ -1,11 +1,12 @@
 "use client"
 
-import React, { useEffect, useState } from "react"
+import React, { useEffect, useRef, useState } from "react"
 import { useAuth } from "@/contexts/auth-context"
-import { isAuthPublicPath } from "@/lib/auth-pages"
+import { isAuthPublicPath, ONBOARDING_PATH } from "@/lib/auth-pages"
 import { useRouter, usePathname } from "next/navigation"
 import { useI18n } from "@/contexts/i18n-context"
 import { getBrandingFromEnv } from "@/lib/branding"
+import { consumeOnboardingSaveEscapeFlag, fetchUserPreferences } from "@/lib/user-preferences"
 
 const branding = getBrandingFromEnv()
 
@@ -14,7 +15,7 @@ interface AuthGuardProps {
 }
 
 export function AuthGuard({ children }: AuthGuardProps) {
-  const { isAuthenticated, isLoading, checkAuth } = useAuth()
+  const { isAuthenticated, isLoading, checkAuth, user } = useAuth()
   const router = useRouter()
   const pathname = usePathname()
   const [mounted, setMounted] = useState(false)
@@ -34,6 +35,86 @@ export function AuthGuard({ children }: AuthGuardProps) {
       router.push("/login")
     }
   }, [isAuthenticated, isLoading, router, mounted, isAuthPage])
+
+  // Checked once per app load (this component doesn't remount on
+  // client-side navigation), not on every route change - deliberate
+  // product decision, confirmed explicitly: the mandatory-onboarding
+  // redirect only needs to FIRE once. A user who gets redirected to
+  // /onboarding and then leaves without completing it (e.g. a browser
+  // Back press, or any other client-side nav to a different
+  // already-visited protected route) is not re-prompted for the rest of
+  // the session - this latches regardless of whether the resolved
+  // `onboarded` value was true or false, not only on a confirmed-true
+  // outcome. A PR review finding flagged this exact behavior as a
+  // "bypass" and an alternate version of this file re-checked on every
+  // route change until confirmed true instead; that version was reverted
+  // once we confirmed the one-shot-prompt behavior is what's wanted here,
+  // not a bug.
+  //
+  // The ref only latches once the check actually finishes (not before the
+  // await) - if a dependency changes and cancels this run first (e.g. the
+  // user navigates again while the GET is still in flight), `active` goes
+  // false and the ref is left untouched, so the next run (with the new
+  // deps) retries instead of the check being silently disarmed forever.
+  //
+  // Keyed by user id, not a bare boolean: AuthGuard doesn't remount across
+  // a client-side auth swap - AuthProvider's own `storage`-event listener
+  // replaces `isAuthenticated`/`user` (a React state update, not an
+  // in-place mutation) when a DIFFERENT user logs in from another tab
+  // (same-origin localStorage change), so a bare "have we
+  // ever checked" boolean would stay latched from the PREVIOUS user's check
+  // and let the new one through with no check of their own at all. Storing
+  // whose check last completed, and comparing against the CURRENT user's id
+  // instead, forces a fresh check whenever the identity actually changes.
+  const checkedOnboardingUserIdRef = useRef<string | null>(null)
+  useEffect(() => {
+    if (!mounted || isAuthPage || pathname === ONBOARDING_PATH) return
+
+    // Consumed unconditionally, AHEAD of the "already checked" guard below -
+    // a previous version of this fix checked the flag only inside the async
+    // check itself, which the ref guard skips entirely once a check has
+    // already run this app-load (the common case: the user usually reached
+    // /onboarding via an earlier check on some OTHER page that already
+    // latched this ref). That left the flag unconsumed on the escape it was
+    // meant for, and let it linger to wrongly suppress some unrelated LATER
+    // onboarding check instead - a real regression an earlier round shipped.
+    // Reading it first, before any early return, guarantees it's consumed
+    // the very next time this effect runs after being set, regardless of
+    // which branch would otherwise apply.
+    if (consumeOnboardingSaveEscapeFlag(user?.id ?? null)) {
+      checkedOnboardingUserIdRef.current = user?.id ?? null
+      return
+    }
+
+    if (isLoading || !isAuthenticated || !user || checkedOnboardingUserIdRef.current === user.id) return
+
+    let active = true
+    void (async () => {
+      const preferences = await fetchUserPreferences()
+      if (!active) return
+      // null means the fetch itself failed - "unknown," not "confirmed not
+      // onboarded." Leave the ref unlatched so the next navigation retries
+      // instead of redirecting an already-onboarded user on a transient error.
+      if (preferences === null) return
+      checkedOnboardingUserIdRef.current = user.id
+      // Strict `!== true`, not `!preferences.onboarded`: the GET boundary
+      // doesn't validate this field's type, so a malformed stored value
+      // (e.g. a string "false", which is truthy) must not read as "already
+      // onboarded" - only an explicit boolean true should ever skip the redirect.
+      if (preferences.onboarded !== true) {
+        // replace, not push: a `push` here would leave the pre-redirect
+        // page in history, so a single Back press would return the user
+        // there while ALSO re-triggering that page's own onboarding
+        // effect (a second, redundant check) - replace avoids that, but
+        // does not (and is not meant to) prevent the Back press itself;
+        // the ref above already latches regardless of this outcome.
+        router.replace(ONBOARDING_PATH)
+      }
+    })()
+    return () => {
+      active = false
+    }
+  }, [mounted, isAuthPage, pathname, isLoading, isAuthenticated, user, router])
 
   useEffect(() => {
     // Reduce check frequency, only check when user is active

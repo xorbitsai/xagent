@@ -1529,6 +1529,135 @@ async def test_empty_output_edits_the_loading_message_with_a_placeholder(
 
 
 @pytest.mark.asyncio
+async def test_successful_telegram_turn_hands_finalize_the_execution_result(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The waiting-branch call site forwards its own execute_task() result.
+
+    finalize_result has no reader for execution_result yet, but the channel
+    must already supply the exact object execute_task returned so a future
+    reader gets the full result mapping rather than a synthesized draft.
+    """
+
+    bot = make_bot()
+    bot.channel_id = 1
+    bot.channel_name = "Telegram execution result"
+    bot.active_tasks = {}
+    bot.bot = object()
+    bot._save_active_tasks = lambda: True
+    bot._consume_user_stop_request = lambda _user_id: False
+    bot._clear_user_stop_request = lambda _user_id: None
+
+    lease = TaskLease(task_id=48, runner_id="runner-a", run_id="run-a")
+    finalized: list[dict] = []
+
+    class FakeManagedLease:
+        heartbeat_task = None
+
+        def __init__(self) -> None:
+            self.lease = lease
+
+        async def close(self) -> bool:
+            return True
+
+        async def finalize_result(self, **kwargs) -> bool:  # type: ignore[no-untyped-def]
+            finalized.append(kwargs)
+            return True
+
+    execution_result = {"success": True, "output": "Telegram reply"}
+
+    class FakeTracer:
+        def add_handler(self, _handler: object) -> None:
+            return None
+
+        def remove_handler(self, _handler: object) -> None:
+            return None
+
+    agent_service = SimpleNamespace(
+        tracer=FakeTracer(),
+        set_conversation_history=lambda _messages: None,
+        set_execution_context_messages=lambda _messages: None,
+        set_recovered_skill_context=lambda _context: None,
+    )
+
+    class FakeAgentManager:
+        async def get_agent_for_task(self, *_args, **_kwargs):  # type: ignore[no-untyped-def]
+            return agent_service
+
+        def refresh_connector_runtime_tools(self, _task_id):  # type: ignore[no-untyped-def]
+            pass
+
+        async def execute_task(self, **_kwargs):  # type: ignore[no-untyped-def]
+            return execution_result
+
+    async def extract_text(_message):  # type: ignore[no-untyped-def]
+        return "hello", []
+
+    async def await_execution(_user_id, execution, *, reason):  # type: ignore[no-untyped-def]
+        return await execution
+
+    async def fake_prepare(**_kwargs):  # type: ignore[no-untyped-def]
+        return SimpleNamespace(
+            user_id=5,
+            task_id=48,
+            is_new_task=True,
+            managed_lease=FakeManagedLease(),
+            requested_agent_missing=False,
+        )
+
+    async def persist_message(**_kwargs) -> None:  # type: ignore[no-untyped-def]
+        return None
+
+    monkeypatch.setattr(
+        "xagent.web.channels.telegram.bot.prepare_channel_task", fake_prepare
+    )
+    monkeypatch.setattr(
+        "xagent.web.channels.telegram.bot.load_task_setup_snapshot_sync",
+        lambda *_args: SimpleNamespace(
+            runtime_user=None,
+            conversation_history=(),
+            execution_recovery=TaskExecutionRecoverySnapshot(),
+        ),
+    )
+    monkeypatch.setattr(
+        "xagent.web.channels.telegram.bot.get_agent_manager",
+        lambda: FakeAgentManager(),
+    )
+    monkeypatch.setattr(
+        "xagent.web.channels.telegram.bot.persist_channel_user_message",
+        persist_message,
+    )
+    bot._extract_message_content = extract_text
+    bot._await_execution_with_stop_monitor = await_execution
+
+    class LoadingMessage:
+        message_id = 77
+
+        async def edit_text(self, text: str, **_kwargs) -> None:
+            return None
+
+        async def delete(self) -> None:
+            return None
+
+    class Message:
+        from_user = SimpleNamespace(id=123)
+        chat = SimpleNamespace(id=456)
+
+        def __init__(self) -> None:
+            self.answers: list[str] = []
+
+        async def answer(self, text: str, **_kwargs) -> LoadingMessage:
+            self.answers.append(text)
+            return LoadingMessage()
+
+    message = Message()
+    await bot._process_user_messages_batch(123, [message])  # type: ignore[arg-type]
+
+    assert len(finalized) == 1
+    assert finalized[0]["execution_result"] is execution_result
+
+
+@pytest.mark.asyncio
 async def test_channel_failure_suppresses_stale_error_after_exact_settlement_rejected(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1558,13 +1687,16 @@ async def test_channel_failure_suppresses_stale_error_after_exact_settlement_rej
             self,
             *,
             status: TaskStatus,
+            execution_result=None,
             **_kwargs,
         ) -> bool:
             settlements.append((self.lease, status))
+            settled_execution_results.append(execution_result)
             return False
 
     managed = FakeManagedLease()
     settlements: list[tuple[TaskLease, TaskStatus]] = []
+    settled_execution_results: list[object] = []
 
     class FakeTracer:
         def __init__(self) -> None:
@@ -1655,10 +1787,33 @@ async def test_channel_failure_suppresses_stale_error_after_exact_settlement_rej
     await bot._process_user_messages_batch(123, [message])  # type: ignore[arg-type]
 
     assert settlements == [(lease, TaskStatus.FAILED)]
+    # The except branch has no execution result in scope, so it settles
+    # through the default rather than passing one along.
+    assert settled_execution_results == [None]
     assert managed.closed is True
     assert "Sorry, an error occurred while processing your request." not in (
         message.answers
     )
+
+
+@pytest.mark.asyncio
+async def test_finalize_requested_stop_settles_with_no_execution_result() -> None:
+    """A requested /stop has no channel execution result to hand over."""
+
+    finalized: list[dict] = []
+
+    class FakeManagedLease:
+        async def finalize_result(self, **kwargs) -> bool:  # type: ignore[no-untyped-def]
+            finalized.append(kwargs)
+            return True
+
+    await TelegramBotInstance._finalize_requested_stop(
+        FakeManagedLease(),
+        task_id=45,  # type: ignore[arg-type]
+    )
+
+    assert finalized == [{"status": TaskStatus.PAUSED}]
+    assert "execution_result" not in finalized[0]
 
 
 @pytest.mark.parametrize(

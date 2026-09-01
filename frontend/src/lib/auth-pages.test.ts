@@ -1,7 +1,12 @@
 import { describe, expect, it } from "vitest"
 import { resolveTranslation } from "@/i18n/translations"
 
-import { authMutationUnavailableTranslationKey, isAuthPublicPath, isExternalRoutePath } from "./auth-pages"
+import {
+  authMutationUnavailableTranslationKey,
+  isAuthPublicPath,
+  isChromelessAuthenticatedPath,
+  isExternalRoutePath,
+} from "./auth-pages"
 
 describe("auth public paths", () => {
   it("allows the OIDC callback route through the auth guard", () => {
@@ -25,5 +30,18 @@ describe("auth public paths", () => {
     const key = authMutationUnavailableTranslationKey(reason)
     expect(resolveTranslation("en", key)).toBe(english)
     expect(resolveTranslation("zh", key)).toBe(chinese)
+  })
+})
+
+describe("chromeless authenticated paths", () => {
+  it("treats /onboarding as chromeless but still auth-gated", () => {
+    expect(isChromelessAuthenticatedPath("/onboarding")).toBe(true)
+    expect(isAuthPublicPath("/onboarding")).toBe(false)
+  })
+
+  it("does not treat unrelated or null paths as chromeless", () => {
+    expect(isChromelessAuthenticatedPath("/settings")).toBe(false)
+    expect(isChromelessAuthenticatedPath("/onboarding/extra")).toBe(false)
+    expect(isChromelessAuthenticatedPath(null)).toBe(false)
   })
 })

@@ -3,6 +3,7 @@ from __future__ import annotations
 import inspect
 import logging
 from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path
 from typing import Any, cast
 from uuid import uuid4
@@ -32,6 +33,47 @@ class ExecutionControl:
 
     runtime: PatternRuntime
     task: str | None
+
+
+class UserMessageInjectionOutcome(str, Enum):
+    """What ``AgentRunner.inject_user_message`` actually did on a given
+    call, threaded unmodified through every layer that forwards its
+    result (``ExecutionRegistry``, ``AgentExecutionAdapter``,
+    ``AgentService.post_user_message``).
+
+    ``POSTED_FRESH`` and ``POSTED_REPLAY`` both mean a live, durable user
+    turn answers the caller's message -- a short-circuited repeat
+    ``turn_id`` (``POSTED_REPLAY``) returns the same context the first
+    attempt did without writing anything new, while ``POSTED_FRESH``
+    persisted one. ``NOT_POSTED`` is the empty string and the other two
+    members are not, so an unmodified ``if not posted`` / ``bool(posted)``
+    caller keeps asking exactly the question it always asked -- "did this
+    hand back a usable context at all" -- unaffected by the fresh/replay
+    split. Telling a replay apart from a fresh write requires comparing
+    identity against ``POSTED_REPLAY``; truthiness alone cannot and must
+    not be used for that.
+    """
+
+    NOT_POSTED = ""
+    POSTED_FRESH = "posted_fresh"
+    POSTED_REPLAY = "posted_replay"
+
+
+@dataclass(frozen=True)
+class UserMessageInjectionResult:
+    """Bundles the execution context an injection attempt produced (or
+    found already holding the answered turn) with what kind of write, if
+    any, produced it.
+
+    ``context`` is ``None`` only when there was no execution context to
+    inject into at all (``outcome`` is then ``NOT_POSTED``); every layer
+    downstream of the registry drops the raw context and forwards only
+    ``outcome``, since nothing past that boundary reads the context
+    object itself today.
+    """
+
+    context: ExecutionContext | None
+    outcome: UserMessageInjectionOutcome
 
 
 class AgentRunner:
@@ -446,13 +488,16 @@ class AgentRunner:
         turn_id: str | None = None,
         request_interrupt: bool = True,
         reason: str | None = None,
-    ) -> ExecutionContext | None:
+    ) -> UserMessageInjectionResult:
         context = self.context_manager.get_context(execution_id)
         cold_start_checkpoint: dict[str, Any] | None = None
         if context is None:
             checkpoint = await self._load_latest_checkpoint(execution_id)
             if checkpoint is None:
-                return None
+                return UserMessageInjectionResult(
+                    context=None,
+                    outcome=UserMessageInjectionOutcome.NOT_POSTED,
+                )
             if not isinstance(checkpoint.get("context"), dict):
                 raise CheckpointCorruptError(
                     "Stored checkpoint carries no execution context to restore."
@@ -497,7 +542,10 @@ class AgentRunner:
                     )
                 if request_interrupt:
                     self.pause(execution_id, reason=reason or "new user message")
-                return context
+                return UserMessageInjectionResult(
+                    context=context,
+                    outcome=UserMessageInjectionOutcome.POSTED_REPLAY,
+                )
 
         # Resolve the checkpoint-merge baseline before any context mutation
         # below (add_user_message, pending marker) so a failed read leaves
@@ -608,7 +656,10 @@ class AgentRunner:
                 )
         if request_interrupt:
             self.pause(execution_id, reason=reason or "new user message")
-        return context
+        return UserMessageInjectionResult(
+            context=context,
+            outcome=UserMessageInjectionOutcome.POSTED_FRESH,
+        )
 
     @staticmethod
     def _read_trace_watermark(context: ExecutionContext) -> str | None:
@@ -696,7 +747,7 @@ class AgentRunner:
         turn_id: str | None = None,
         request_interrupt: bool = True,
         reason: str | None = None,
-    ) -> ExecutionContext | None:
+    ) -> UserMessageInjectionResult:
         """Alias for external callers to inject a user message into an execution.
 
         `send_message` is an agent-side tool (`agent -> user`).

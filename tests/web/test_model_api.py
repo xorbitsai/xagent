@@ -1,5 +1,6 @@
 """Test model management API functionality"""
 
+import asyncio
 import os
 import tempfile
 from unittest.mock import AsyncMock, Mock, patch
@@ -9,6 +10,7 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
+from xagent.web.api import model as model_module
 from xagent.web.api.auth import auth_router
 from xagent.web.api.model import model_router
 from xagent.web.models.database import Base, get_db, get_engine
@@ -218,6 +220,49 @@ def sample_video_model_data():
         "description": "Test Seedance video model",
         "share_with_users": False,
     }
+
+
+@pytest.mark.asyncio
+async def test_validate_provider_model_listing_honors_caller_supplied_timeout():
+    """The listing helper must use the caller's budget, not a literal of its own.
+
+    Guards against reintroducing the second hardcoded timeout this helper
+    used to carry independently of ``test_model_connection``'s own budget
+    (xorbitsai/xagent#1960): the two ``asyncio.wait_for`` layers wrapping a listing
+    call (the endpoint's own, and this helper's inner one around the actual
+    provider fetch) must always share the exact same number, sourced from
+    the ``timeout_seconds`` parameter -- never a second literal in here.
+    """
+
+    async def slow_fetch(*_args, **_kwargs):
+        await asyncio.sleep(0.2)
+        return [{"id": "gpt-4o-mini", "abilities": ["chat"]}]
+
+    with patch(
+        "xagent.web.services.model_list_service.fetch_models_from_provider",
+        side_effect=slow_fetch,
+    ):
+        with pytest.raises(asyncio.TimeoutError):
+            await model_module._validate_provider_model_listing(
+                provider="openai",
+                model_name="gpt-4o-mini",
+                api_key="key",
+                base_url=None,
+                timeout_seconds=0.05,
+            )
+
+        # A budget comfortably larger than the fetch's delay must succeed.
+        # This is what actually pins the parameter as the value in effect:
+        # a mutant that reverts to a hardcoded 10.0 inside the helper would
+        # also pass this half alone, but would fail the 0.05s case above by
+        # never timing out.
+        await model_module._validate_provider_model_listing(
+            provider="openai",
+            model_name="gpt-4o-mini",
+            api_key="key",
+            base_url=None,
+            timeout_seconds=1.0,
+        )
 
 
 class TestModelAPI:
@@ -496,6 +541,49 @@ class TestModelAPI:
         assert create_model.call_args.args[0].model_name == "future-sfx-model"
         sound_effect_model.validate_connection.assert_awaited_once_with()
         sound_effect_model.aclose.assert_awaited_once_with()
+
+    def test_test_connection_llm_timeout_reports_app_budget_not_network(
+        self, test_db, regular_user, regular_headers
+    ):
+        """A connection-test timeout must name the app's own wait budget.
+
+        xorbitsai/xagent#1960: the old message ("Please check your network connection
+        and provider status") told the user to go check their network when
+        the actual cause was this endpoint's own wait budget (10 seconds at
+        the time) expiring before a slow or reasoning-heavy model answered.
+        The provider was never shown to be unhealthy.
+        """
+
+        class SlowLLM:
+            async def chat(self, messages, **kwargs):
+                raise asyncio.TimeoutError()
+
+        with patch(
+            "xagent.core.model.chat.basic.adapter.create_base_llm",
+            return_value=SlowLLM(),
+        ):
+            response = client.post(
+                "/api/models/test-connection",
+                json={
+                    "model_provider": "openai",
+                    "model_name": "gpt-4o-mini",
+                    "api_key": "test-api-key",
+                    "base_url": "https://api.openai.com/v1",
+                    "category": "llm",
+                },
+                headers=regular_headers,
+            )
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["status"] == "failed"
+        assert data["message"] == "Connection timed out"
+        # Pin the contract value independently of the production constant:
+        # deriving the expected copy from _CONNECTION_TEST_TIMEOUT_SECONDS
+        # would keep this test green if the budget silently regressed.
+        assert model_module._CONNECTION_TEST_TIMEOUT_SECONDS == 60.0
+        assert "60 seconds" in data["error"]
+        assert "network" not in data["error"].lower()
 
     def test_create_model_as_admin(
         self, test_db, admin_user, admin_headers, sample_model_data

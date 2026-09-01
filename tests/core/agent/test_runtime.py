@@ -6,6 +6,7 @@ from typing import Any
 import pytest
 
 from xagent.core.agent import ExecutionContext, PatternRuntime
+from xagent.core.agent import runtime as runtime_module
 from xagent.core.agent.pattern.final_answer_stream import (
     ToolCallStringFieldStreamer,
     _JsonStringFieldReader,
@@ -616,6 +617,167 @@ async def test_runtime_stream_final_answer_emits_error_terminal_event() -> None:
     assert outbound.events[2]["error"] == "provider disconnected"
     assert len({event["message_id"] for event in outbound.events}) == 1
     assert runtime.last_final_answer_stream_message_id is None
+
+
+class RecordingLogger:
+    """Records info/warning calls without depending on the logging module's
+    own configuration - per the project rule against log assertions that
+    depend on caplog or other global logging state, this replaces the
+    module-level ``logger`` binding directly."""
+
+    def __init__(self) -> None:
+        self.info_calls: list[tuple[str, tuple[Any, ...]]] = []
+        self.warning_calls: list[tuple[str, tuple[Any, ...]]] = []
+
+    def info(self, msg: str, *args: Any) -> None:
+        self.info_calls.append((msg, args))
+
+    def warning(self, msg: str, *args: Any) -> None:
+        self.warning_calls.append((msg, args))
+
+
+_NEWLINE_AND_QUOTE_EXCEPTION_TEXT = (
+    "Traceback (most recent call last):\n"
+    '  File "provider.py", line 42, in call\n'
+    "    raise ValueError(\"bad 'quoted' response\")\n"
+    "ValueError: bad 'quoted' response"
+)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "label,reason,expected_reason",
+    [
+        (
+            "known_literal",
+            "interrupted during LLM stream",
+            "interrupted during LLM stream",
+        ),
+        (
+            "tool_protocol_retry_template",
+            "invalid some_provider_code tool protocol, retrying",
+            "invalid tool protocol (code:18 chars), retrying",
+        ),
+        ("unparsed_provider_exception", "x" * 5000, "<unparsed>:5000"),
+        (
+            "unparsed_exception_with_newlines_and_quotes",
+            _NEWLINE_AND_QUOTE_EXCEPTION_TEXT,
+            f"<unparsed>:{len(_NEWLINE_AND_QUOTE_EXCEPTION_TEXT)}",
+        ),
+    ],
+)
+async def test_runtime_stream_close_log_records_reason_in_one_of_three_shapes(
+    monkeypatch: pytest.MonkeyPatch,
+    label: str,
+    reason: str,
+    expected_reason: str,
+) -> None:
+    """I-8: fail_final_answer_stream logs a normalized reason that is always
+    one of three shapes - a known fixed string verbatim, the
+    tool-protocol-retry template folded to a fixed shape that keeps only the
+    provider error code's length, or <unparsed>:<length> for anything else -
+    never the raw external text itself."""
+
+    recording_logger = RecordingLogger()
+    monkeypatch.setattr(runtime_module, "logger", recording_logger)
+    runtime = PatternRuntime(execution_id="task-1")
+    runtime.last_final_answer_stream_message_id = "final_answer_abc"
+
+    await runtime.fail_final_answer_stream("final_answer_abc", reason)
+
+    assert len(recording_logger.warning_calls) == 1
+    msg, args = recording_logger.warning_calls[0]
+    logged = msg % args
+    assert f"reason={expected_reason}" in logged
+    if reason != expected_reason:
+        assert reason[:40] not in logged
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "has_handler", [True, False], ids=["with_handler", "without_handler"]
+)
+async def test_runtime_stream_events_are_logged_once_each(
+    monkeypatch: pytest.MonkeyPatch,
+    has_handler: bool,
+) -> None:
+    """I-9: each of the three final_answer stream events logs exactly once
+    per call, with the acting message_id present in the logged line - except
+    start_final_answer_stream, which logs nothing at all (and returns None)
+    when there is no outbound handler, because no stream was actually
+    opened."""
+
+    recording_logger = RecordingLogger()
+    monkeypatch.setattr(runtime_module, "logger", recording_logger)
+    outbound = OutboundCollector() if has_handler else None
+    runtime = PatternRuntime(execution_id="task-1", outbound_message_handler=outbound)
+
+    message_id = await runtime.start_final_answer_stream()
+
+    if not has_handler:
+        assert message_id is None
+        assert recording_logger.info_calls == []
+        assert recording_logger.warning_calls == []
+        return
+
+    assert message_id is not None
+    assert len(recording_logger.info_calls) == 1
+    logged_start = recording_logger.info_calls[0][0] % recording_logger.info_calls[0][1]
+    assert message_id in logged_start
+
+    await runtime.end_final_answer_stream(message_id, "answer text")
+    assert len(recording_logger.info_calls) == 2
+    logged_end = recording_logger.info_calls[1][0] % recording_logger.info_calls[1][1]
+    assert message_id in logged_end
+    assert "content_chars=11" in logged_end
+    # The answer text itself must never reach the log - only its length.
+    assert "answer text" not in logged_end
+
+    second_message_id = await runtime.start_final_answer_stream()
+    assert second_message_id is not None
+    assert len(recording_logger.info_calls) == 3
+
+    await runtime.fail_final_answer_stream(
+        second_message_id, "interrupted during LLM stream"
+    )
+    assert len(recording_logger.warning_calls) == 1
+    logged_fail = (
+        recording_logger.warning_calls[0][0] % recording_logger.warning_calls[0][1]
+    )
+    assert second_message_id in logged_fail
+    assert "reason=interrupted during LLM stream" in logged_fail
+
+
+@pytest.mark.asyncio
+async def test_runtime_stream_log_suppressed_when_outbound_handler_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The opened/closed/failed log lines sit after the outbound emit call in
+    all three stream methods, not before it - so when the outbound handler
+    itself raises, the exception propagates to the caller and the
+    corresponding log line is never written, because the emit it was meant
+    to describe never actually succeeded."""
+
+    async def raising_handler(payload: dict[str, Any]) -> None:
+        raise RuntimeError("outbound send failed")
+
+    recording_logger = RecordingLogger()
+    monkeypatch.setattr(runtime_module, "logger", recording_logger)
+    runtime = PatternRuntime(
+        execution_id="task-1", outbound_message_handler=raising_handler
+    )
+
+    with pytest.raises(RuntimeError, match="outbound send failed"):
+        await runtime.start_final_answer_stream()
+    assert recording_logger.info_calls == []
+
+    with pytest.raises(RuntimeError, match="outbound send failed"):
+        await runtime.end_final_answer_stream("final_answer_abc", "answer text")
+    assert recording_logger.info_calls == []
+
+    with pytest.raises(RuntimeError, match="outbound send failed"):
+        await runtime.fail_final_answer_stream("final_answer_abc", "some reason")
+    assert recording_logger.warning_calls == []
 
 
 @pytest.mark.asyncio

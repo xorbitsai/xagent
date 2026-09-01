@@ -22,7 +22,6 @@ from ...config import (
     get_task_lease_heartbeat_seconds,
     get_task_lease_ttl_seconds,
 )
-from ...core.agent.checkpoint import READABLE_CHECKPOINT_TYPES
 from ..models.task import Task, TaskStatus, TraceEvent, task_status_predicate
 from .db_runtime import (
     await_task_settlement,
@@ -348,29 +347,66 @@ def _checkpoint_row_matches_candidate(
     corruption of the row the pointer names, not a cue to search elsewhere.
 
     A ``False`` here always resolves the candidate to NOT_RECOVERABLE
-    (lease recovery fails the task). The checkpoint reader's own PK-anchor
-    validation (``_load_pk_anchored_checkpoint`` in ``trace_handlers.py``)
-    checks the same kind of row mismatch but calls it corrupt
-    (``CheckpointCorruptError``) instead -- two call sites judging the same
-    condition through different vocabularies for their own callers, not an
-    inconsistency to reconcile.
+    (lease recovery fails the task). The conditions themselves are no longer
+    written out here: this function and both by-primary-key read paths read
+    one predicate (``failed_checkpoint_row_conditions``,
+    ``trace_event_staging.py``), so there is nothing left for the three to
+    disagree about. Two rules stay this function's own and are applied
+    around that predicate rather than inside it: a candidate with no
+    ``run_id`` fails closed before the predicate is consulted, and the
+    missing-run-partition reclassification is handled by the caller
+    (``resolve_checkpoint_recovery``) rather than here, because only the
+    exact-pointer path has a second candidate set to defer to.
+
+    The vocabularies still differ -- this path calls the outcome a mismatch
+    and the reader calls it corrupt (``CheckpointCorruptError``) -- and that
+    difference is still deliberate, because each names the outcome for its
+    own caller. What is no longer true is that the two could drift on *what*
+    they judge.
     """
 
-    if (
-        row.task_id != candidate.task_id
-        or row.event_type != "system_update_general"
-        or row.build_id is not None
-    ):
+    if candidate.run_id is None:
         return False
+    _row_data, failed = _candidate_row_failures(row, candidate)
+    return not failed
+
+
+def _candidate_row_failures(
+    row: TraceEvent, candidate: TaskLeaseRecoveryCandidate
+) -> tuple[dict[str, Any], frozenset[str]]:
+    """The shared row-validity conditions ``row`` fails for this candidate,
+    with the normalized payload the caller needs alongside it.
+
+    Imported inside the function on purpose: ``trace_event_staging`` already
+    imports this module (``TASK_RUN_ID_TRACE_FIELD``, ``TaskLease``), so a
+    module-level import in this direction is a cycle, not a style choice.
+
+    ``candidate.run_id is None`` never reaches here. That case is this
+    module's own terminal outcome -- an exact pointer alone cannot prove a
+    checkpoint belongs to the expired run (see ``resolve_checkpoint_recovery``)
+    -- and the shared predicate deliberately does not encode it: a ``None``
+    ``run_id`` is a legitimate partition there, matched by a row whose own
+    run field is also absent. Both callers fail closed on it first, which is
+    exactly what that predicate's docstring tells callers with a terminal
+    ``run_id`` rule of their own to do.
+
+    ``execution_id`` is ``str(candidate.task_id)`` because web's execution id
+    *is* the task id -- the same value the other two callers pass
+    (``_load_pk_anchored_checkpoint``, ``resolve_interaction_anchor``).
+    """
+
+    from .trace_event_staging import failed_checkpoint_row_conditions
+
     data: dict[str, Any] = (
         cast(dict[str, Any], row.data) if isinstance(row.data, dict) else {}
     )
-    if data.get("checkpoint_type") not in READABLE_CHECKPOINT_TYPES:
-        return False
-    checkpoint_run_id = data.get(TASK_RUN_ID_TRACE_FIELD)
-    if checkpoint_run_id is None:
-        return False
-    return candidate.run_id is not None and str(checkpoint_run_id) == candidate.run_id
+    return data, failed_checkpoint_row_conditions(
+        row,
+        data,
+        task_id=candidate.task_id,
+        run_id=candidate.run_id,
+        execution_id=str(candidate.task_id),
+    )
 
 
 def _resolve_legacy_checkpoint_recovery(
@@ -449,17 +485,38 @@ def resolve_checkpoint_recovery(
     if candidate.last_checkpoint_trace_event_id is not None:
         row = db.get(TraceEvent, candidate.last_checkpoint_trace_event_id)
         if row is not None:
-            return (
-                CheckpointRecoveryVerdict.RECOVERABLE
-                if _checkpoint_row_matches_candidate(row, candidate)
-                else CheckpointRecoveryVerdict.NOT_RECOVERABLE
+            from .trace_event_staging import is_missing_run_partition_only
+
+            if candidate.run_id is None:
+                return CheckpointRecoveryVerdict.NOT_RECOVERABLE
+            row_data, failed = _candidate_row_failures(row, candidate)
+            if not failed:
+                return CheckpointRecoveryVerdict.RECOVERABLE
+            if not is_missing_run_partition_only(failed, row_data):
+                return CheckpointRecoveryVerdict.NOT_RECOVERABLE
+            # A pre-existing row, not a mismatched one: the 20260804 backfill
+            # can point this column at a trace_events row written before the
+            # run-partition field existed. Treating it as "this pointer did
+            # not answer" rather than "this pointer named a bad row" is the
+            # same verdict the two by-primary-key read paths reach for this
+            # exact shape, and it reaches the legacy scan the same way a
+            # dangling pointer does. Nothing is loosened: that scan validates
+            # whatever row it finds through the same predicate, so a
+            # RECOVERABLE verdict still requires a real run-partition match.
+            logger.info(
+                "Task %s's checkpoint pointer %s is missing its "
+                "run-partition field; deferring to the legacy event_id scan "
+                "rather than treating the row as a mismatch",
+                candidate.task_id,
+                candidate.last_checkpoint_trace_event_id,
             )
-        logger.warning(
-            "Task %s checkpoint pointer trace_event_id=%s has no matching "
-            "trace_events row; falling back to the legacy event_id scan",
-            candidate.task_id,
-            candidate.last_checkpoint_trace_event_id,
-        )
+        else:
+            logger.warning(
+                "Task %s checkpoint pointer trace_event_id=%s has no matching "
+                "trace_events row; falling back to the legacy event_id scan",
+                candidate.task_id,
+                candidate.last_checkpoint_trace_event_id,
+            )
     return _resolve_legacy_checkpoint_recovery(db, candidate)
 
 

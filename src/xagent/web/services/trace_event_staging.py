@@ -251,17 +251,25 @@ def failed_checkpoint_row_conditions(
     task's exact-row pointer names. An empty result means the row is a
     legitimate checkpoint for this ``(task_id, run_id, execution_id)``.
 
-    One definition, three readers. ``_load_pk_anchored_checkpoint``
-    (``api/trace_handlers.py``) and ``resolve_interaction_anchor``
-    (``services/task_interaction_anchor.py``) both consume it: they ask the
-    same question about the same row from opposite directions -- one decides
-    whether an already-written anchor still resolves, the other decides what
-    may be anchored to -- and an answer that differs between them is a bug
-    by construction, not a judgment call. They previously kept two
-    hand-copied disjunctions aligned through a static AST comparison; that
-    comparison could only see the operands, not how ``partition_matches``
-    was computed above them, and the two sides did in fact differ there.
-    ``_resolve_read_direction_anchor``
+    One definition, three consumers. ``_load_pk_anchored_checkpoint``
+    (``api/trace_handlers.py``), ``resolve_interaction_anchor``
+    (``services/task_interaction_anchor.py``) and lease recovery's
+    ``_candidate_row_failures`` (``services/task_lease_service.py``) all read
+    it. The first two ask the same question about the same row from opposite
+    directions -- one decides whether an already-written anchor still
+    resolves, the other decides what may be anchored to -- and an answer
+    that differs between them is a bug by construction, not a judgment call.
+    They previously kept two hand-copied disjunctions aligned through a
+    static AST comparison; that comparison could only see the operands, not
+    how ``partition_matches`` was computed above them, and the two sides did
+    in fact differ there. Lease recovery asks the same question from a third
+    direction: whether an expired lease's checkpoint pointer still names a
+    checkpoint to resume from, rather than a task to fail. Its import of
+    this function lives inside the function that calls it, not at module
+    level -- this module already imports ``task_lease_service`` for
+    ``TASK_RUN_ID_TRACE_FIELD`` and ``TaskLease``, so a module-level import
+    in the other direction is a cycle, not a style choice; do not move it to
+    the top of the file. ``_resolve_read_direction_anchor``
     (``services/task_interaction_service.py``) carries a related but not
     identical judgment and is not a caller -- see the note at the end.
 

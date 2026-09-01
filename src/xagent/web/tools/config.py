@@ -634,6 +634,13 @@ _OAUTH_REFRESH_RETRYABLE_EXCEPTIONS = (
     # the actual token endpoint either -- same "never transmitted"
     # guarantee as ConnectError, just one hop earlier.
     httpx.ProxyError,
+    # Timing out waiting for a free connection from the client's own pool
+    # happens before a single byte is written to the wire -- same
+    # guarantee again, and the likeliest of the four to actually fire in
+    # this function's own motivating scenario: a burst of concurrent
+    # refreshes contending for a still-small connection pool right after
+    # a cold start.
+    httpx.PoolTimeout,
 )
 
 

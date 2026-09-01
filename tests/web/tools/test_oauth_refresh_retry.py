@@ -227,6 +227,39 @@ async def test_refresh_retries_proxy_error_then_succeeds(db_session, monkeypatch
 
 
 @pytest.mark.asyncio
+async def test_refresh_retries_pool_timeout_then_succeeds(db_session, monkeypatch):
+    """PoolTimeout (waiting for a free connection from the client's own
+    pool) fires before a single byte is written to the wire -- the same
+    "never transmitted" guarantee as the other retryable exceptions, and
+    the likeliest of them to actually fire in this function's own
+    motivating scenario: a burst of concurrent refreshes right after a
+    cold start contending for a still-small connection pool."""
+    db, user = db_session
+    oauth_account = _github_oauth_account(user)
+    db.add(oauth_account)
+    db.commit()
+
+    calls: list[int] = []
+
+    async def post(*args, **kwargs):
+        calls.append(1)
+        if len(calls) == 1:
+            raise httpx.PoolTimeout("timed out waiting for a connection")
+        return MockResponse({"access_token": "new-token", "expires_in": 3600})
+
+    monkeypatch.setattr(
+        tool_config.httpx, "AsyncClient", lambda: _FakeAsyncClient(post)
+    )
+
+    assert (
+        await tool_config.refresh_oauth_token_if_needed(db, oauth_account, "github")
+        is True
+    )
+    assert len(calls) == 2
+    assert oauth_account.access_token == "new-token"
+
+
+@pytest.mark.asyncio
 async def test_refresh_succeeds_on_first_try_without_retry(db_session, monkeypatch):
     """The plain happy path: no failure, no retry spent."""
     db, user = db_session
